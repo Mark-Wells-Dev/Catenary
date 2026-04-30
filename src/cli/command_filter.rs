@@ -217,7 +217,7 @@ fn shell_split(s: &str) -> Vec<String> {
 /// 3. It is in `allow` but the specific subcommand is in `deny.<cmd>`.
 ///
 /// The heredoc exception suppresses denial for commands reading from stdin.
-/// Returns the denied command name if denied, `None` if allowed.
+/// Returns the denied command name and reason if denied, `None` if allowed.
 fn check_against_allowlist(
     name: &str,
     subcommand: Option<&str>,
@@ -225,7 +225,7 @@ fn check_against_allowlist(
     pipe_pos: usize,
     rules: &ResolvedCommands,
     cwd: Option<&std::path::Path>,
-) -> Option<String> {
+) -> Option<(String, DenialReason)> {
     // Heredoc exception: command is reading from stdin, not files.
     if has_heredoc {
         return None;
@@ -244,7 +244,7 @@ fn check_against_allowlist(
             && let Some(denied_subs) = rules.deny.get(name)
             && denied_subs.contains(sub)
         {
-            return Some(format!("{name} {sub}"));
+            return Some((format!("{name} {sub}"), DenialReason::DeniedSubcommand));
         }
         return None;
     }
@@ -253,13 +253,24 @@ fn check_against_allowlist(
     if rules.pipeline.contains(name) {
         // Pipeline commands are only allowed mid-pipeline (not at position 0).
         if pipe_pos == 0 {
-            return Some(name.to_string());
+            return Some((name.to_string(), DenialReason::PipelinePosition));
         }
         return None;
     }
 
     // Not in any allow list — denied.
-    Some(name.to_string())
+    Some((name.to_string(), DenialReason::NotAllowed))
+}
+
+/// Why a command was denied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DenialReason {
+    /// Command is not in `allow`, `pipeline`, or `build`.
+    NotAllowed,
+    /// Command is in `pipeline` but was used at pipeline position 0.
+    PipelinePosition,
+    /// Command is allowed but the specific subcommand is denied.
+    DeniedSubcommand,
 }
 
 /// Result of a command check that was denied.
@@ -267,6 +278,8 @@ fn check_against_allowlist(
 pub struct Denial {
     /// The denied command name (e.g., `"cargo"`, `"git grep"`).
     pub command: String,
+    /// Why the command was denied.
+    pub reason: DenialReason,
     /// Whether an unresolvable `cd` target (variable, command substitution)
     /// was encountered before the denied command. When `true`, the effective
     /// cwd may be stale and the denial may be a false positive.
@@ -340,7 +353,7 @@ pub fn check_command(
             let has_heredoc = rest.get(1).is_some_and(|t| t.starts_with("<<"));
             let subcommand = if rest.len() > 1 { Some(rest[1]) } else { None };
 
-            if let Some(denied) = check_against_allowlist(
+            if let Some((denied, reason)) = check_against_allowlist(
                 name,
                 subcommand,
                 has_heredoc,
@@ -350,6 +363,7 @@ pub fn check_command(
             ) {
                 return Some(Denial {
                     command: denied,
+                    reason,
                     unresolved_cd: saw_unresolved_cd,
                 });
             }
@@ -490,22 +504,71 @@ fn collect_command_names(cmd: &str, names: &mut Vec<String>) {
     }
 }
 
+/// Resolve per-client template variables in guidance messages.
+///
+/// `{read}` and `{edit}` resolve to the host CLI's tool names.
+#[allow(
+    clippy::literal_string_with_formatting_args,
+    reason = "{read} and {edit} are template variables, not format args"
+)]
+fn resolve_client_vars(msg: &str, format: Option<super::HostFormat>) -> String {
+    let (read, edit) = format.map_or(("Read", "Edit"), |f| (f.read_tool(), f.edit_tool()));
+    msg.replace("{read}", read).replace("{edit}", edit)
+}
+
+/// Format the opening line based on denial reason.
+fn format_opening_line(denied_cmd: &str, reason: DenialReason) -> String {
+    match reason {
+        DenialReason::NotAllowed => {
+            format!("`{denied_cmd}` isn't allowed by the current Catenary configuration.")
+        }
+        DenialReason::PipelinePosition => {
+            format!("`{denied_cmd}` isn't allowed at the start of a pipeline.")
+        }
+        DenialReason::DeniedSubcommand => {
+            format!("`{denied_cmd}` isn't allowed (denied subcommand).")
+        }
+    }
+}
+
 /// Format the full denial response with the complete allowlist configuration.
 ///
 /// Used on the first denial in a new turn (or after a config change) to give
 /// the agent full visibility into its allowed command surface.
 ///
 /// Lists are sorted alphabetically. Sections with no entries are omitted.
-/// The denied command is always named in the opening line.
+/// The denied command is always named in the opening line. `build_hint` is
+/// a pre-resolved build guidance string from the caller (when available).
 #[must_use]
 pub fn format_denial_full(
     denied_cmd: &str,
     commands: &ResolvedCommands,
     denial: &Denial,
+    format: Option<super::HostFormat>,
+    build_hint: Option<&str>,
 ) -> String {
-    let mut parts = vec![format!(
-        "`{denied_cmd}` isn't allowed by the current Catenary configuration."
-    )];
+    let mut parts = vec![format_opening_line(denied_cmd, denial.reason)];
+
+    // Guidance hint (static or build-resolved).
+    // For the full dump, the base command name is used for lookup (strip
+    // subcommand part: "git grep" → "git" won't match, but "grep" will).
+    let lookup_cmd = denied_cmd.split_whitespace().next().unwrap_or(denied_cmd);
+    if let Some(entry) = commands.guidance_for(lookup_cmd) {
+        match entry {
+            crate::config::GuidanceEntry::Static(msg) => {
+                let resolved = resolve_client_vars(msg, format);
+                parts.push(format!("Hint: {resolved}"));
+            }
+            crate::config::GuidanceEntry::Build(_) => {
+                // Use caller-provided build hint (full cwd-resolved context).
+                if let Some(hint) = build_hint
+                    && !hint.is_empty()
+                {
+                    parts.push(format!("Hint: {hint}"));
+                }
+            }
+        }
+    }
 
     if !commands.allow.is_empty() {
         let mut sorted: Vec<&str> = commands.allow.iter().map(String::as_str).collect();
@@ -568,12 +631,43 @@ pub fn format_denial_full(
 /// Format the short denial response for subsequent denials in the same turn.
 ///
 /// After the full config has been shown once in a turn, subsequent denials
-/// use this shorter form to reduce noise.
+/// use this shorter form to reduce noise. Includes guidance hint when
+/// available. `build_hint` is a pre-resolved short build guidance string.
 #[must_use]
-pub fn format_denial_short(denied_cmd: &str) -> String {
-    format!(
-        "`{denied_cmd}` isn't allowed — see earlier message for the current Catenary command configuration."
-    )
+pub fn format_denial_short(
+    denied_cmd: &str,
+    denial: &Denial,
+    commands: &ResolvedCommands,
+    format: Option<super::HostFormat>,
+    build_hint: Option<&str>,
+) -> String {
+    let lookup_cmd = denied_cmd.split_whitespace().next().unwrap_or(denied_cmd);
+
+    let no_guidance = " — see earlier message for the current Catenary command configuration.";
+    let suffix = commands.guidance_for(lookup_cmd).map_or_else(
+        || String::from(no_guidance),
+        |entry| match entry {
+            crate::config::GuidanceEntry::Static(msg) => {
+                let resolved = resolve_client_vars(msg, format);
+                format!(" — {resolved}")
+            }
+            crate::config::GuidanceEntry::Build(_) => {
+                build_hint.map_or_else(|| String::from(no_guidance), |hint| format!(" — {hint}"))
+            }
+        },
+    );
+
+    let opening = match denial.reason {
+        DenialReason::NotAllowed => format!("`{denied_cmd}` isn't allowed"),
+        DenialReason::PipelinePosition => {
+            format!("`{denied_cmd}` isn't allowed at the start of a pipeline")
+        }
+        DenialReason::DeniedSubcommand => {
+            format!("`{denied_cmd}` isn't allowed (denied subcommand)")
+        }
+    };
+
+    format!("{opening}{suffix}")
 }
 
 #[cfg(test)]
@@ -1454,6 +1548,7 @@ mod tests {
     fn no_cd_denial(cmd: &str) -> Denial {
         Denial {
             command: cmd.to_string(),
+            reason: DenialReason::NotAllowed,
             unresolved_cd: false,
         }
     }
@@ -1461,7 +1556,7 @@ mod tests {
     #[test]
     fn format_full_all_sections() {
         let rules = python_equivalent_rules();
-        let msg = format_denial_full("ls", &rules, &no_cd_denial("ls"));
+        let msg = format_denial_full("ls", &rules, &no_cd_denial("ls"), None, None);
 
         assert!(msg.starts_with("`ls` isn't allowed"), "opening line");
         assert!(msg.contains("Allowed:"), "allow section");
@@ -1476,7 +1571,7 @@ mod tests {
     #[test]
     fn format_full_sorted_alphabetically() {
         let rules = python_equivalent_rules();
-        let msg = format_denial_full("ls", &rules, &no_cd_denial("ls"));
+        let msg = format_denial_full("ls", &rules, &no_cd_denial("ls"), None, None);
 
         // Extract the Allowed line and verify sorting.
         let allowed_line = msg
@@ -1499,7 +1594,7 @@ mod tests {
             allow: HashSet::from(["git".into()]),
             ..ResolvedCommands::default()
         };
-        let msg = format_denial_full("ls", &rules, &no_cd_denial("ls"));
+        let msg = format_denial_full("ls", &rules, &no_cd_denial("ls"), None, None);
 
         assert!(msg.contains("Allowed: git"));
         assert!(
@@ -1529,7 +1624,7 @@ mod tests {
             ]),
             ..ResolvedCommands::default()
         };
-        let msg = format_denial_full("ls", &rules, &no_cd_denial("ls"));
+        let msg = format_denial_full("ls", &rules, &no_cd_denial("ls"), None, None);
 
         let deny_line = msg
             .lines()
@@ -1547,7 +1642,9 @@ mod tests {
 
     #[test]
     fn format_short_contains_command() {
-        let msg = format_denial_short("cargo");
+        let rules = basic_rules();
+        let denial = no_cd_denial("cargo");
+        let msg = format_denial_short("cargo", &denial, &rules, None, None);
         assert!(msg.contains("`cargo`"));
         assert!(msg.contains("see earlier message"));
     }
@@ -1709,9 +1806,10 @@ mod tests {
         let rules = cd_rules();
         let denial = Denial {
             command: "npm".into(),
+            reason: DenialReason::NotAllowed,
             unresolved_cd: true,
         };
-        let msg = format_denial_full("npm", &rules, &denial);
+        let msg = format_denial_full("npm", &rules, &denial, None, None);
         assert!(
             msg.contains("could not be resolved"),
             "should include unresolved cd note: {msg}",
@@ -1723,12 +1821,216 @@ mod tests {
         let rules = cd_rules();
         let denial = Denial {
             command: "npm".into(),
+            reason: DenialReason::NotAllowed,
             unresolved_cd: false,
         };
-        let msg = format_denial_full("npm", &rules, &denial);
+        let msg = format_denial_full("npm", &rules, &denial, None, None);
         assert!(
             !msg.contains("could not be resolved"),
             "should not include note when resolved: {msg}",
         );
+    }
+
+    // ── Guidance tests ────────────────────────────────────────────────
+
+    fn rules_with_guidance() -> ResolvedCommands {
+        use crate::config::{BuildGuidance, GuidanceEntry};
+
+        let mut rules = basic_rules();
+        rules.guidance.insert(
+            "grep".to_string(),
+            GuidanceEntry::Static("Use Catenary's grep tool instead".to_string()),
+        );
+        rules.guidance.insert(
+            "cat".to_string(),
+            GuidanceEntry::Static("Use {read} instead".to_string()),
+        );
+        rules.guidance.insert(
+            "cargo".to_string(),
+            GuidanceEntry::Build(BuildGuidance::default()),
+        );
+        rules
+    }
+
+    #[test]
+    fn format_full_static_guidance() {
+        let rules = rules_with_guidance();
+        let denial = Denial {
+            command: "grep".to_string(),
+            reason: DenialReason::PipelinePosition,
+            unresolved_cd: false,
+        };
+        let msg = format_denial_full("grep", &rules, &denial, None, None);
+        assert!(
+            msg.contains("Hint: Use Catenary's grep tool instead"),
+            "should include guidance hint: {msg}",
+        );
+    }
+
+    #[test]
+    fn format_full_pipeline_opening_line() {
+        let rules = rules_with_guidance();
+        let denial = Denial {
+            command: "grep".to_string(),
+            reason: DenialReason::PipelinePosition,
+            unresolved_cd: false,
+        };
+        let msg = format_denial_full("grep", &rules, &denial, None, None);
+        assert!(
+            msg.starts_with("`grep` isn't allowed at the start of a pipeline."),
+            "pipeline opening line: {msg}",
+        );
+    }
+
+    #[test]
+    fn format_full_denied_subcommand_opening_line() {
+        let rules = rules_with_guidance();
+        let denial = Denial {
+            command: "git grep".to_string(),
+            reason: DenialReason::DeniedSubcommand,
+            unresolved_cd: false,
+        };
+        let msg = format_denial_full("git grep", &rules, &denial, None, None);
+        assert!(
+            msg.starts_with("`git grep` isn't allowed (denied subcommand)."),
+            "subcommand opening line: {msg}",
+        );
+    }
+
+    #[test]
+    fn format_full_no_guidance_fallback() {
+        let rules = basic_rules();
+        let denial = no_cd_denial("ls");
+        let msg = format_denial_full("ls", &rules, &denial, None, None);
+        assert!(
+            !msg.contains("Hint:"),
+            "no guidance should mean no Hint line: {msg}",
+        );
+    }
+
+    #[test]
+    fn format_full_read_edit_template_vars_default() {
+        let rules = rules_with_guidance();
+        let denial = no_cd_denial("cat");
+        let msg = format_denial_full("cat", &rules, &denial, None, None);
+        assert!(
+            msg.contains("Hint: Use Read instead"),
+            "{{read}} should resolve to Read by default: {msg}",
+        );
+    }
+
+    #[test]
+    fn format_full_read_edit_template_vars_claude() {
+        let rules = rules_with_guidance();
+        let denial = no_cd_denial("cat");
+        let msg = format_denial_full(
+            "cat",
+            &rules,
+            &denial,
+            Some(crate::cli::HostFormat::Claude),
+            None,
+        );
+        assert!(
+            msg.contains("Hint: Use Read instead"),
+            "{{read}} should resolve to Read for Claude: {msg}",
+        );
+    }
+
+    #[test]
+    fn format_full_read_edit_template_vars_gemini() {
+        let rules = rules_with_guidance();
+        let denial = no_cd_denial("cat");
+        let msg = format_denial_full(
+            "cat",
+            &rules,
+            &denial,
+            Some(crate::cli::HostFormat::Gemini),
+            None,
+        );
+        assert!(
+            msg.contains("Hint: Use read_file instead"),
+            "{{read}} should resolve to read_file for Gemini: {msg}",
+        );
+    }
+
+    #[test]
+    fn format_full_build_guidance_with_hint() {
+        let rules = rules_with_guidance();
+        let denial = no_cd_denial("cargo");
+        let hint = "User config has make as the default build tool.\n\
+                     No local `.catenary.toml` was found.";
+        let msg = format_denial_full("cargo", &rules, &denial, None, Some(hint));
+        assert!(
+            msg.contains("Hint: User config has make"),
+            "build guidance should show resolved hint: {msg}"
+        );
+        assert!(
+            msg.contains("No local `.catenary.toml`"),
+            "build guidance should show project line: {msg}",
+        );
+    }
+
+    #[test]
+    fn format_full_build_guidance_without_hint() {
+        let rules = rules_with_guidance();
+        let denial = no_cd_denial("cargo");
+        let msg = format_denial_full("cargo", &rules, &denial, None, None);
+        assert!(
+            !msg.contains("Hint:"),
+            "no build_hint should mean no Hint line: {msg}",
+        );
+    }
+
+    #[test]
+    fn format_short_with_guidance() {
+        let rules = rules_with_guidance();
+        let denial = Denial {
+            command: "grep".to_string(),
+            reason: DenialReason::PipelinePosition,
+            unresolved_cd: false,
+        };
+        let msg = format_denial_short("grep", &denial, &rules, None, None);
+        assert!(
+            msg.contains("Use Catenary's grep tool instead"),
+            "short form should include guidance: {msg}",
+        );
+        assert!(
+            msg.contains("at the start of a pipeline"),
+            "short form should use pipeline reason: {msg}",
+        );
+    }
+
+    #[test]
+    fn format_short_no_guidance() {
+        let rules = basic_rules();
+        let denial = no_cd_denial("ls");
+        let msg = format_denial_short("ls", &denial, &rules, None, None);
+        assert!(
+            msg.contains("see earlier message"),
+            "no guidance should show fallback: {msg}",
+        );
+    }
+
+    #[test]
+    fn denial_reason_pipeline_position() {
+        let rules = basic_rules();
+        let denial = check_command("grep pattern file", &rules, None)
+            .expect("grep should be denied at pos 0");
+        assert_eq!(denial.reason, DenialReason::PipelinePosition);
+    }
+
+    #[test]
+    fn denial_reason_not_allowed() {
+        let rules = basic_rules();
+        let denial = check_command("cat file.txt", &rules, None).expect("cat should be denied");
+        assert_eq!(denial.reason, DenialReason::NotAllowed);
+    }
+
+    #[test]
+    fn denial_reason_denied_subcommand() {
+        let rules = basic_rules();
+        let denial =
+            check_command("git grep foo", &rules, None).expect("git grep should be denied");
+        assert_eq!(denial.reason, DenialReason::DeniedSubcommand);
     }
 }

@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use anyhow::Result;
 use serde::Deserialize;
 
-pub use commands::{CommandsConfig, ResolvedCommands};
+pub use commands::{BuildContext, BuildGuidance, CommandsConfig, GuidanceEntry, ResolvedCommands};
 pub use language::{LanguageConfig, ServerBinding};
 pub use parse::{ProjectConfig, SERVER_DEF_KEYS, config_sources, load_project_config};
 pub use server::ServerDef;

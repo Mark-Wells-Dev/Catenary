@@ -466,14 +466,20 @@ pub fn run_pre_tool(format: HostFormat) {
     // Fall back to client-side check (user config + cwd's project
     // config) when the session is unreachable.
     if let Some(shell_cmd) = extract_shell_command(&hook_json, tool_name, format) {
-        if let Some(reason) = ipc_check_command(&hook_json, &shell_cmd) {
+        if let Some(reason) = ipc_check_command(&hook_json, &shell_cmd, format) {
             print!("{}", format_deny(&reason, format));
             return;
         }
         // IPC failed or session unreachable — try client-side.
         if let Some((denial, resolved)) = check_shell_command(&hook_json, &shell_cmd) {
-            let reason =
-                crate::cli::command_filter::format_denial_full(&denial.command, &resolved, &denial);
+            let build_hint = resolve_client_build_hint(&hook_json, &denial.command, &resolved);
+            let reason = crate::cli::command_filter::format_denial_full(
+                &denial.command,
+                &resolved,
+                &denial,
+                Some(format),
+                build_hint.as_deref(),
+            );
             print!("{}", format_deny(&reason, format));
             return;
         }
@@ -571,6 +577,50 @@ fn check_shell_command(
     Some((denial, resolved))
 }
 
+/// Resolve build guidance for the client-side fallback path.
+///
+/// Uses the hook's `cwd` and user config to construct a [`BuildContext`].
+/// Returns `None` when the denied command has no build guidance.
+fn resolve_client_build_hint(
+    hook_json: &serde_json::Value,
+    denied_cmd: &str,
+    resolved: &crate::config::ResolvedCommands,
+) -> Option<String> {
+    let lookup = denied_cmd.split_whitespace().next().unwrap_or(denied_cmd);
+    let crate::config::GuidanceEntry::Build(bg) = resolved.guidance_for(lookup)? else {
+        return None;
+    };
+
+    let user_config_path = crate::config::config_sources()
+        .first()
+        .map(|p| p.display().to_string());
+    let user_path_str = user_config_path.as_deref().unwrap_or("user config");
+
+    let cwd = hook_json
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .map(PathBuf::from);
+    let project = cwd.as_deref().and_then(find_project_config);
+    let proj_path = project
+        .as_ref()
+        .map(|(r, _)| r.join(".catenary.toml").display().to_string());
+    let proj_build = project
+        .as_ref()
+        .and_then(|(_, pc)| pc.commands.as_ref())
+        .and_then(|cmds| cmds.build.as_deref());
+
+    let ctx = crate::config::BuildContext {
+        user_config_path: user_path_str,
+        default_build: resolved.default_build.as_deref(),
+        has_project_config: project.is_some(),
+        project_config_path: proj_path.as_deref(),
+        project_build: proj_build,
+        cwd_resolved: cwd.is_some(),
+    };
+
+    Some(bg.resolve(&ctx))
+}
+
 /// Walk up from `cwd` to find the nearest `.catenary.toml`.
 ///
 /// Stops at the user's home directory — a project config above `$HOME`
@@ -601,7 +651,11 @@ fn find_project_config(cwd: &std::path::Path) -> Option<(PathBuf, crate::config:
 /// session evaluates against the merged allowlist (all roots, all project
 /// configs) and handles debounce. Returns the denial reason string on
 /// denial, `None` on allow or IPC failure.
-fn ipc_check_command(hook_json: &serde_json::Value, shell_cmd: &str) -> Option<String> {
+fn ipc_check_command(
+    hook_json: &serde_json::Value,
+    shell_cmd: &str,
+    format: HostFormat,
+) -> Option<String> {
     let conn = db::open_and_migrate().ok()?;
     let catenary_sid = find_session_id(hook_json, &conn)?;
     let endpoint = notify_endpoint(&catenary_sid);
@@ -610,9 +664,15 @@ fn ipc_check_command(hook_json: &serde_json::Value, shell_cmd: &str) -> Option<S
     let cwd = hook_json.get("cwd").and_then(|v| v.as_str());
     let session_id = hook_json.get("session_id").and_then(|v| v.as_str());
 
+    let format_str = match format {
+        HostFormat::Claude => "claude",
+        HostFormat::Gemini => "gemini",
+    };
+
     let mut request = serde_json::json!({
         "method": "pre-tool/check-command",
         "command": shell_cmd,
+        "format": format_str,
     });
     if let Some(c) = cwd {
         request["cwd"] = serde_json::json!(c);

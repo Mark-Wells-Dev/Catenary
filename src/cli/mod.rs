@@ -25,6 +25,26 @@ pub enum HostFormat {
     Gemini,
 }
 
+impl HostFormat {
+    /// The host CLI's file-read tool name (for guidance template resolution).
+    #[must_use]
+    pub const fn read_tool(self) -> &'static str {
+        match self {
+            Self::Claude => "Read",
+            Self::Gemini => "read_file",
+        }
+    }
+
+    /// The host CLI's file-edit tool name (for guidance template resolution).
+    #[must_use]
+    pub const fn edit_tool(self) -> &'static str {
+        match self {
+            Self::Claude => "Edit",
+            Self::Gemini => "write_file",
+        }
+    }
+}
+
 /// Output format for the `query` command.
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum QueryFormat {

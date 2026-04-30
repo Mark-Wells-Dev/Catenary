@@ -17,6 +17,15 @@ use super::toolbox::Toolbox;
 use crate::hook::response::SystemMessageBuilder;
 use crate::hook::{HookRequest, HookResult};
 
+/// Parse a `HostFormat` from a string value sent over IPC.
+fn parse_host_format(s: &str) -> Option<crate::cli::HostFormat> {
+    match s {
+        "claude" => Some(crate::cli::HostFormat::Claude),
+        "gemini" => Some(crate::cli::HostFormat::Gemini),
+        _ => None,
+    }
+}
+
 // ── Tool classification helpers ─────────────────────────────────────────
 
 /// Returns `true` if the tool is an edit tool that requires `start_editing`.
@@ -185,7 +194,12 @@ impl HookRouter {
     /// configs for current roots. If the command is denied, applies debounce:
     /// full config dump on the first denial in a turn, short message on
     /// subsequent denials.
-    fn handle_check_command(&self, command: &str, cwd: Option<&str>) -> DispatchResult {
+    fn handle_check_command(
+        &self,
+        command: &str,
+        cwd: Option<&str>,
+        format: Option<crate::cli::HostFormat>,
+    ) -> DispatchResult {
         let Some(resolved) = self.toolbox.merged_commands() else {
             return DispatchResult {
                 result: None,
@@ -209,16 +223,84 @@ impl HookRouter {
             };
         };
 
+        // Resolve build guidance with full cwd context.
+        let build_hint = self.resolve_build_hint(&denial.command, &resolved, cwd);
+
         let message = if self.should_show_full_dump() {
-            crate::cli::command_filter::format_denial_full(&denial.command, &resolved, &denial)
+            crate::cli::command_filter::format_denial_full(
+                &denial.command,
+                &resolved,
+                &denial,
+                format,
+                build_hint.as_deref(),
+            )
         } else {
-            crate::cli::command_filter::format_denial_short(&denial.command)
+            crate::cli::command_filter::format_denial_short(
+                &denial.command,
+                &denial,
+                &resolved,
+                format,
+                build_hint.as_deref(),
+            )
         };
 
         DispatchResult {
             result: Some(HookResult::Deny(message)),
             system_message: None,
         }
+    }
+
+    /// Resolve build guidance for a denied command using session context.
+    ///
+    /// Constructs a [`BuildContext`] from the session's config state and the
+    /// hook's `cwd`, then resolves the `BuildGuidance` templates. Returns
+    /// `None` when the denied command has no build guidance entry.
+    fn resolve_build_hint(
+        &self,
+        denied_cmd: &str,
+        resolved: &crate::config::ResolvedCommands,
+        cwd: Option<&str>,
+    ) -> Option<String> {
+        let lookup = denied_cmd.split_whitespace().next().unwrap_or(denied_cmd);
+        let crate::config::GuidanceEntry::Build(bg) = resolved.guidance_for(lookup)? else {
+            return None;
+        };
+
+        // User config path — first source in the standard config chain.
+        let user_config_path = crate::config::config_sources()
+            .first()
+            .map(|p| p.display().to_string());
+        let user_path_str = user_config_path.as_deref().unwrap_or("user config");
+
+        // Project config state for the cwd's root.
+        let cwd_path = cwd.map(std::path::Path::new);
+        let project_commands = self.toolbox.client_manager.project_commands();
+        let roots = self.toolbox.client_manager.roots();
+
+        // Find the root matching cwd (longest prefix).
+        let matching_root = cwd_path.and_then(|cwd| {
+            roots
+                .iter()
+                .filter(|r| cwd.starts_with(r))
+                .max_by_key(|r| r.as_os_str().len())
+        });
+
+        let has_project = matching_root.is_some();
+        let project_build = matching_root
+            .and_then(|r| project_commands.get(r))
+            .and_then(|cmds| cmds.build.as_deref());
+        let project_path = matching_root.map(|r| r.join(".catenary.toml").display().to_string());
+
+        let ctx = crate::config::BuildContext {
+            user_config_path: user_path_str,
+            default_build: resolved.default_build.as_deref(),
+            has_project_config: has_project,
+            project_config_path: project_path.as_deref(),
+            project_build,
+            cwd_resolved: cwd.is_some(),
+        };
+
+        Some(bg.resolve(&ctx))
     }
 
     /// Dispatches a parsed hook request to the appropriate handler.
@@ -259,9 +341,11 @@ impl HookRouter {
                 command,
                 cwd,
                 session_id,
+                format,
             } => {
                 self.store_client_session_id(session_id.as_deref());
-                self.handle_check_command(&command, cwd.as_deref())
+                let host_format = format.as_deref().and_then(parse_host_format);
+                self.handle_check_command(&command, cwd.as_deref(), host_format)
             }
             HookRequest::PostTool {
                 file,
@@ -1396,6 +1480,7 @@ mod tests {
                 command: "cargo test".to_string(),
                 cwd: None,
                 session_id: None,
+                format: None,
             },
             0,
         )
@@ -1407,6 +1492,7 @@ mod tests {
                 command: "git status".to_string(),
                 cwd: None,
                 session_id: None,
+                format: None,
             },
             0,
         )

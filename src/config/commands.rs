@@ -18,11 +18,102 @@
 //! - `allow` — commands the agent can run unconditionally.
 //! - `pipeline` — commands allowed mid-pipeline only (denied at position 0).
 //! - `deny.<cmd>` — subcommand denylist within an allowed command.
+//! - `guidance.<group>` — per-command hint messages for denied commands.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+
+/// TOML shape for a single `[commands.guidance.<group>]` entry.
+///
+/// Each group maps a set of commands to a guidance message. The `build`
+/// group is special: it uses per-context message templates instead of a
+/// single `message` string. Detection: if `message` is absent and any
+/// `message_*` field is present, or if the group name is `"build"`, it's
+/// treated as a build group.
+#[derive(Debug, Default, Deserialize, Clone)]
+#[serde(default)]
+pub struct GuidanceGroup {
+    /// Static hint message (e.g., `"Use {read} instead"`).
+    /// Absent for the `build` group.
+    pub message: Option<String>,
+    /// Commands this guidance applies to.
+    pub commands: Vec<String>,
+    /// Build: message when user config has a build tool.
+    pub message_default: Option<String>,
+    /// Build: message when user config has no build tool.
+    pub message_default_absent: Option<String>,
+    /// Build: message when no `.catenary.toml` exists.
+    pub message_noproject: Option<String>,
+    /// Build: message when project config has a build tool.
+    pub message_project: Option<String>,
+    /// Build: message when project config has no build tool.
+    pub message_project_absent: Option<String>,
+    /// Build: message when cwd cannot be resolved.
+    pub message_cwd_unknown: Option<String>,
+}
+
+impl GuidanceGroup {
+    /// Whether this group uses build-style message templates.
+    const fn is_build(&self) -> bool {
+        self.message.is_none()
+            && (self.message_default.is_some()
+                || self.message_default_absent.is_some()
+                || self.message_noproject.is_some()
+                || self.message_project.is_some()
+                || self.message_project_absent.is_some()
+                || self.message_cwd_unknown.is_some())
+    }
+}
+
+/// Resolved guidance for a single command, ready for use at denial time.
+#[derive(Debug, Clone)]
+pub enum GuidanceEntry {
+    /// Static message (read, edit, scan, list groups).
+    Static(String),
+    /// Build group — message constructed at denial time from cwd context.
+    Build(BuildGuidance),
+}
+
+/// Build-specific guidance with per-context message templates.
+///
+/// All fields have sensible defaults. Template variables resolved at
+/// denial time: `{build}`, `{USERCONFIG}`, `{PROJCONFIG}`.
+#[derive(Debug, Clone)]
+pub struct BuildGuidance {
+    /// Message when user config has a build tool configured.
+    pub message_default: String,
+    /// Message when user config has no build tool.
+    pub message_default_absent: String,
+    /// Message when no `.catenary.toml` was found for the cwd.
+    pub message_noproject: String,
+    /// Message when project config has a build tool configured.
+    pub message_project: String,
+    /// Message when project config has no build tool.
+    pub message_project_absent: String,
+    /// Message when cwd cannot be resolved.
+    pub message_cwd_unknown: String,
+}
+
+#[allow(
+    clippy::literal_string_with_formatting_args,
+    reason = "{build}, {USERCONFIG}, {PROJCONFIG} are template variables, not format args"
+)]
+impl Default for BuildGuidance {
+    fn default() -> Self {
+        Self {
+            message_default: "{USERCONFIG} has {build} as the default build tool.".to_string(),
+            message_default_absent: "{USERCONFIG} has not configured a build tool.".to_string(),
+            message_noproject: "No local `.catenary.toml` was found.".to_string(),
+            message_project: "{PROJCONFIG} has {build} as the configured build tool.".to_string(),
+            message_project_absent: "{PROJCONFIG} has not configured a build tool.".to_string(),
+            message_cwd_unknown: "Unable to resolve the current working directory. Consider \
+                                  changing directory and retrying."
+                .to_string(),
+        }
+    }
+}
 
 /// Top-level `[commands]` config section.
 ///
@@ -44,6 +135,9 @@ pub struct CommandsConfig {
     /// Subcommand denylist within allowed commands.
     /// Key = command name, value = list of denied subcommands.
     pub deny: Option<HashMap<String, Vec<String>>>,
+    /// Per-command guidance groups.
+    /// Key = group name (e.g., `"read"`, `"build"`), value = group config.
+    pub guidance: Option<HashMap<String, GuidanceGroup>>,
 }
 
 /// A resolved command set after merging user and project configs.
@@ -67,6 +161,9 @@ pub struct ResolvedCommands {
     /// Subcommand denylist within allowed commands.
     /// Key = command name, value = set of denied subcommands.
     pub deny: HashMap<String, HashSet<String>>,
+    /// Per-command guidance messages for denial responses.
+    /// Key = command name, value = guidance entry.
+    pub guidance: HashMap<String, GuidanceEntry>,
 }
 
 impl ResolvedCommands {
@@ -76,6 +173,7 @@ impl ResolvedCommands {
     /// are replaced (not unioned) — the design doc specifies that project
     /// `allow` replaces the user list. `deny` entries are merged per-command.
     /// `build` is stored as `default_build` (user-level, no root context).
+    /// `guidance` groups are flattened into per-command entries.
     pub fn merge(&mut self, layer: &CommandsConfig) {
         if layer.client_enforcement_only {
             self.client_enforcement_only = true;
@@ -96,6 +194,9 @@ impl ResolvedCommands {
                     .or_default()
                     .extend(subs.iter().cloned());
             }
+        }
+        if let Some(ref groups) = layer.guidance {
+            self.guidance = flatten_guidance(groups);
         }
     }
 
@@ -173,6 +274,8 @@ impl ResolvedCommands {
             allow: merged_allow,
             pipeline: merged_pipeline,
             deny: merged_deny,
+            // Guidance is user-level only — not overridden per-root.
+            guidance: self.guidance.clone(),
         }
     }
 
@@ -205,6 +308,130 @@ impl ResolvedCommands {
                 || !self.pipeline.is_empty()
                 || !self.build.is_empty()
                 || self.default_build.is_some())
+    }
+
+    /// Look up guidance for a denied command.
+    #[must_use]
+    pub fn guidance_for(&self, cmd: &str) -> Option<&GuidanceEntry> {
+        self.guidance.get(cmd)
+    }
+}
+
+/// Flatten guidance groups into a per-command lookup map.
+///
+/// Each group's `commands` list is expanded so every command maps to the
+/// group's guidance entry. The `build` group is detected by `is_build()`
+/// (no `message`, has `message_*` fields) or by the group name `"build"`.
+fn flatten_guidance(groups: &HashMap<String, GuidanceGroup>) -> HashMap<String, GuidanceEntry> {
+    let mut map = HashMap::new();
+    for (name, group) in groups {
+        let entry = if name == "build" || group.is_build() {
+            let defaults = BuildGuidance::default();
+            GuidanceEntry::Build(BuildGuidance {
+                message_default: group
+                    .message_default
+                    .clone()
+                    .unwrap_or(defaults.message_default),
+                message_default_absent: group
+                    .message_default_absent
+                    .clone()
+                    .unwrap_or(defaults.message_default_absent),
+                message_noproject: group
+                    .message_noproject
+                    .clone()
+                    .unwrap_or(defaults.message_noproject),
+                message_project: group
+                    .message_project
+                    .clone()
+                    .unwrap_or(defaults.message_project),
+                message_project_absent: group
+                    .message_project_absent
+                    .clone()
+                    .unwrap_or(defaults.message_project_absent),
+                message_cwd_unknown: group
+                    .message_cwd_unknown
+                    .clone()
+                    .unwrap_or(defaults.message_cwd_unknown),
+            })
+        } else if let Some(ref msg) = group.message {
+            GuidanceEntry::Static(msg.clone())
+        } else {
+            // No message and not build — skip this group.
+            continue;
+        };
+        for cmd in &group.commands {
+            map.insert(cmd.clone(), entry.clone());
+        }
+    }
+    map
+}
+
+/// Context for resolving build guidance at denial time.
+pub struct BuildContext<'a> {
+    /// User config file path.
+    pub user_config_path: &'a str,
+    /// User-level default build tool.
+    pub default_build: Option<&'a str>,
+    /// Whether a project config was found for the cwd.
+    pub has_project_config: bool,
+    /// Project config file path (if found).
+    pub project_config_path: Option<&'a str>,
+    /// Project-level build tool for the cwd's root.
+    pub project_build: Option<&'a str>,
+    /// Whether cwd could be resolved.
+    pub cwd_resolved: bool,
+}
+
+impl BuildGuidance {
+    /// Resolve build guidance into a hint string for the denial response.
+    ///
+    /// Returns one or two lines depending on context. Empty-string templates
+    /// suppress their line.
+    #[must_use]
+    #[allow(
+        clippy::literal_string_with_formatting_args,
+        reason = "{build}, {USERCONFIG}, {PROJCONFIG} are template variables, not format args"
+    )]
+    pub fn resolve(&self, ctx: &BuildContext<'_>) -> String {
+        if !ctx.cwd_resolved {
+            return self.message_cwd_unknown.clone();
+        }
+
+        let mut lines = Vec::new();
+
+        // User default build tool line.
+        let user_line = ctx.default_build.map_or_else(
+            || {
+                self.message_default_absent
+                    .replace("{USERCONFIG}", ctx.user_config_path)
+            },
+            |build| {
+                self.message_default
+                    .replace("{build}", build)
+                    .replace("{USERCONFIG}", ctx.user_config_path)
+            },
+        );
+        if !user_line.is_empty() {
+            lines.push(user_line);
+        }
+
+        // Project config build tool line.
+        let proj_path = ctx.project_config_path.unwrap_or(".catenary.toml");
+        let project_line = if !ctx.has_project_config {
+            self.message_noproject.clone()
+        } else if let Some(build) = ctx.project_build {
+            self.message_project
+                .replace("{build}", build)
+                .replace("{PROJCONFIG}", proj_path)
+        } else {
+            self.message_project_absent
+                .replace("{PROJCONFIG}", proj_path)
+        };
+        if !project_line.is_empty() {
+            lines.push(project_line);
+        }
+
+        lines.join("\n")
     }
 }
 
@@ -310,13 +537,36 @@ pub fn validate(config: &CommandsConfig) -> (Vec<String>, Vec<String>) {
         errors.push("[commands] `build` is an empty string".to_string());
     }
 
+    // Guidance validation
+    if let Some(ref groups) = config.guidance {
+        for (name, group) in groups {
+            if group.commands.is_empty() {
+                errors.push(format!(
+                    "[commands] guidance.{name} has an empty commands list",
+                ));
+            }
+            for cmd in &group.commands {
+                if cmd.is_empty() {
+                    errors.push(format!(
+                        "[commands] guidance.{name} contains an empty command string",
+                    ));
+                }
+            }
+            // Non-build group must have a message
+            if name != "build" && !group.is_build() && group.message.is_none() {
+                errors.push(format!("[commands] guidance.{name} has no `message` field"));
+            }
+        }
+    }
+
     (errors, warnings)
 }
 
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
-    reason = "tests use expect for readable assertions"
+    clippy::literal_string_with_formatting_args,
+    reason = "tests use expect for readable assertions; template vars look like format args"
 )]
 mod tests {
     use super::*;
@@ -888,5 +1138,318 @@ git = ["grep", "ls-files"]
         // Root A: ls-files (project). Root B: grep (user). Union:
         assert!(git_deny.contains("grep"));
         assert!(git_deny.contains("ls-files"));
+    }
+
+    // ── Guidance tests ─────────────────────────────────────────────
+
+    #[test]
+    fn deserialize_guidance_static() {
+        let config: CommandsConfig = toml::from_str(
+            r#"
+allow = ["git"]
+
+[guidance.scan]
+message = "Use Catenary's grep tool instead"
+commands = ["grep", "rg"]
+"#,
+        )
+        .expect("valid TOML");
+
+        let groups = config.guidance.as_ref().expect("guidance");
+        assert_eq!(groups.len(), 1);
+        let scan = groups.get("scan").expect("scan group");
+        assert_eq!(
+            scan.message.as_deref(),
+            Some("Use Catenary's grep tool instead")
+        );
+        assert_eq!(scan.commands, vec!["grep", "rg"]);
+    }
+
+    #[test]
+    fn deserialize_guidance_build() {
+        let config: CommandsConfig = toml::from_str(
+            r#"
+allow = ["git"]
+
+[guidance.build]
+commands = ["cargo", "npm"]
+message_default = "custom: {build}"
+"#,
+        )
+        .expect("valid TOML");
+
+        let groups = config.guidance.as_ref().expect("guidance");
+        let build = groups.get("build").expect("build group");
+        assert!(
+            build.message.is_none(),
+            "build group should have no message"
+        );
+        assert_eq!(build.message_default.as_deref(), Some("custom: {build}"),);
+    }
+
+    #[test]
+    fn flatten_guidance_static() {
+        let config = CommandsConfig {
+            guidance: Some(HashMap::from([(
+                "scan".to_string(),
+                GuidanceGroup {
+                    message: Some("Use grep tool".to_string()),
+                    commands: vec!["grep".to_string(), "rg".to_string()],
+                    ..GuidanceGroup::default()
+                },
+            )])),
+            ..CommandsConfig::default()
+        };
+
+        let mut resolved = ResolvedCommands::default();
+        resolved.merge(&config);
+
+        assert!(matches!(
+            resolved.guidance.get("grep"),
+            Some(GuidanceEntry::Static(msg)) if msg == "Use grep tool"
+        ));
+        assert!(matches!(
+            resolved.guidance.get("rg"),
+            Some(GuidanceEntry::Static(msg)) if msg == "Use grep tool"
+        ));
+    }
+
+    #[test]
+    fn flatten_guidance_build() {
+        let config = CommandsConfig {
+            guidance: Some(HashMap::from([(
+                "build".to_string(),
+                GuidanceGroup {
+                    commands: vec!["cargo".to_string(), "npm".to_string()],
+                    ..GuidanceGroup::default()
+                },
+            )])),
+            ..CommandsConfig::default()
+        };
+
+        let mut resolved = ResolvedCommands::default();
+        resolved.merge(&config);
+
+        assert!(
+            matches!(
+                resolved.guidance.get("cargo"),
+                Some(GuidanceEntry::Build(_))
+            ),
+            "cargo should map to Build guidance",
+        );
+        assert!(
+            matches!(resolved.guidance.get("npm"), Some(GuidanceEntry::Build(_))),
+            "npm should map to Build guidance",
+        );
+    }
+
+    #[test]
+    fn build_guidance_resolve_both_configured() {
+        let bg = BuildGuidance::default();
+        let result = bg.resolve(&BuildContext {
+            user_config_path: "~/.config/catenary/config.toml",
+            default_build: Some("make"),
+            has_project_config: true,
+            project_config_path: Some(".catenary.toml"),
+            project_build: Some("npm"),
+            cwd_resolved: true,
+        });
+        assert!(
+            result.contains("make"),
+            "should mention user build tool: {result}"
+        );
+        assert!(
+            result.contains("npm"),
+            "should mention project build tool: {result}"
+        );
+    }
+
+    #[test]
+    fn build_guidance_resolve_no_project() {
+        let bg = BuildGuidance::default();
+        let result = bg.resolve(&BuildContext {
+            user_config_path: "~/.config/catenary/config.toml",
+            default_build: Some("make"),
+            has_project_config: false,
+            project_config_path: None,
+            project_build: None,
+            cwd_resolved: true,
+        });
+        assert!(
+            result.contains("make"),
+            "should mention user build: {result}"
+        );
+        assert!(
+            result.contains("No local"),
+            "should mention no project config: {result}",
+        );
+    }
+
+    #[test]
+    fn build_guidance_resolve_nothing_configured() {
+        let bg = BuildGuidance::default();
+        let result = bg.resolve(&BuildContext {
+            user_config_path: "~/.config/catenary/config.toml",
+            default_build: None,
+            has_project_config: false,
+            project_config_path: None,
+            project_build: None,
+            cwd_resolved: true,
+        });
+        assert!(
+            result.contains("not configured"),
+            "should say not configured: {result}",
+        );
+    }
+
+    #[test]
+    fn build_guidance_resolve_cwd_unknown() {
+        let bg = BuildGuidance::default();
+        let result = bg.resolve(&BuildContext {
+            user_config_path: "",
+            default_build: None,
+            has_project_config: false,
+            project_config_path: None,
+            project_build: None,
+            cwd_resolved: false,
+        });
+        assert!(
+            result.contains("Unable to resolve"),
+            "should show cwd unknown message: {result}",
+        );
+    }
+
+    #[test]
+    fn build_guidance_custom_messages() {
+        let bg = BuildGuidance {
+            message_default: "custom: {build}".to_string(),
+            message_noproject: "no project".to_string(),
+            ..BuildGuidance::default()
+        };
+        let result = bg.resolve(&BuildContext {
+            user_config_path: "config.toml",
+            default_build: Some("make"),
+            has_project_config: false,
+            project_config_path: None,
+            project_build: None,
+            cwd_resolved: true,
+        });
+        assert!(result.contains("custom: make"), "custom message: {result}");
+        assert!(result.contains("no project"), "custom no-project: {result}");
+    }
+
+    #[test]
+    fn build_guidance_empty_suppresses_line() {
+        let bg = BuildGuidance {
+            message_default: String::new(),
+            message_noproject: "visible".to_string(),
+            ..BuildGuidance::default()
+        };
+        let result = bg.resolve(&BuildContext {
+            user_config_path: "",
+            default_build: Some("make"),
+            has_project_config: false,
+            project_config_path: None,
+            project_build: None,
+            cwd_resolved: true,
+        });
+        // Empty message_default suppresses the user-default line.
+        assert_eq!(result, "visible");
+    }
+
+    #[test]
+    fn guidance_preserved_through_project_merge() {
+        let mut user = ResolvedCommands::default();
+        user.merge(&CommandsConfig {
+            allow: Some(vec!["git".into()]),
+            guidance: Some(HashMap::from([(
+                "scan".to_string(),
+                GuidanceGroup {
+                    message: Some("use grep tool".to_string()),
+                    commands: vec!["grep".to_string()],
+                    ..GuidanceGroup::default()
+                },
+            )])),
+            ..CommandsConfig::default()
+        });
+
+        let root = PathBuf::from("/project");
+        let merged = user.merge_project_commands(&[root], &HashMap::new());
+        assert!(
+            matches!(merged.guidance.get("grep"), Some(GuidanceEntry::Static(msg)) if msg == "use grep tool"),
+            "guidance should survive project merge",
+        );
+    }
+
+    // ── Guidance validation tests ──────────────────────────────────
+
+    #[test]
+    fn validate_guidance_empty_commands() {
+        let config = CommandsConfig {
+            guidance: Some(HashMap::from([(
+                "scan".to_string(),
+                GuidanceGroup {
+                    message: Some("hint".to_string()),
+                    commands: vec![],
+                    ..GuidanceGroup::default()
+                },
+            )])),
+            ..CommandsConfig::default()
+        };
+        let (errors, _) = validate(&config);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("empty commands list"));
+    }
+
+    #[test]
+    fn validate_guidance_empty_command_string() {
+        let config = CommandsConfig {
+            guidance: Some(HashMap::from([(
+                "scan".to_string(),
+                GuidanceGroup {
+                    message: Some("hint".to_string()),
+                    commands: vec![String::new()],
+                    ..GuidanceGroup::default()
+                },
+            )])),
+            ..CommandsConfig::default()
+        };
+        let (errors, _) = validate(&config);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("empty command string"));
+    }
+
+    #[test]
+    fn validate_guidance_no_message() {
+        let config = CommandsConfig {
+            guidance: Some(HashMap::from([(
+                "scan".to_string(),
+                GuidanceGroup {
+                    commands: vec!["grep".to_string()],
+                    ..GuidanceGroup::default()
+                },
+            )])),
+            ..CommandsConfig::default()
+        };
+        let (errors, _) = validate(&config);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("no `message` field"));
+    }
+
+    #[test]
+    fn validate_guidance_build_no_message_ok() {
+        // Build group doesn't need a message field.
+        let config = CommandsConfig {
+            guidance: Some(HashMap::from([(
+                "build".to_string(),
+                GuidanceGroup {
+                    commands: vec!["cargo".to_string()],
+                    ..GuidanceGroup::default()
+                },
+            )])),
+            ..CommandsConfig::default()
+        };
+        let (errors, _) = validate(&config);
+        assert!(errors.is_empty(), "build group should be valid: {errors:?}");
     }
 }

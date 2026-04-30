@@ -145,6 +145,10 @@ pub(crate) enum HookRequest {
         /// Host CLI session ID (Claude Code / Gemini CLI UUID).
         #[serde(default)]
         session_id: Option<String>,
+        /// Host CLI format (`"claude"` or `"gemini"`), for per-client
+        /// template variable resolution in guidance messages.
+        #[serde(default)]
+        format: Option<String>,
     },
 
     /// LSP diagnostics for a changed file.
@@ -543,12 +547,13 @@ mod tests {
         assert_eq!(session_id.as_deref(), Some("uuid-123"));
 
         // pre-tool/check-command
-        let json = r#"{"method": "pre-tool/check-command", "command": "cargo test", "cwd": "/project", "session_id": "abc123"}"#;
+        let json = r#"{"method": "pre-tool/check-command", "command": "cargo test", "cwd": "/project", "session_id": "abc123", "format": "claude"}"#;
         let req: HookRequest = serde_json::from_str(json).expect("check-command");
         let HookRequest::CheckCommand {
             command,
             cwd,
             session_id,
+            format,
         } = req
         else {
             unreachable!("expected CheckCommand");
@@ -556,13 +561,14 @@ mod tests {
         assert_eq!(command, "cargo test");
         assert_eq!(cwd.as_deref(), Some("/project"));
         assert_eq!(session_id.as_deref(), Some("abc123"));
+        assert_eq!(format.as_deref(), Some("claude"));
 
         // pre-tool/check-command minimal (only command required)
         let json = r#"{"method": "pre-tool/check-command", "command": "ls"}"#;
         let req: HookRequest = serde_json::from_str(json).expect("check-command minimal");
         assert!(matches!(
             req,
-            HookRequest::CheckCommand { command, cwd: None, session_id: None } if command == "ls"
+            HookRequest::CheckCommand { command, cwd: None, session_id: None, format: None } if command == "ls"
         ));
     }
 

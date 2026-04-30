@@ -55,6 +55,31 @@ const TEMPLATE: &str = r#"# Catenary recommended config
 # [commands.deny]
 # git = ["grep", "ls-files", "ls-tree"]
 # sqlite3 = ["-cmd"]
+#
+# # Per-command guidance — optional hints shown when a command is denied.
+# # Groups map commands to a message. {read} and {edit} resolve per-client.
+#
+# [commands.guidance.read]
+# message = "Use {read} instead"
+# commands = ["cat", "head", "tail", "less", "more"]
+#
+# [commands.guidance.edit]
+# message = "Use {edit} instead"
+# commands = ["sed"]
+#
+# [commands.guidance.scan]
+# message = "Use Catenary's grep tool instead"
+# commands = ["rg", "ag", "ack", "fd", "grep", "egrep",
+#             "fgrep", "rgrep", "zgrep"]
+#
+# [commands.guidance.list]
+# message = "Use Catenary's glob tool instead"
+# commands = ["ls", "dir", "tree", "find"]
+#
+# [commands.guidance.build]
+# commands = ["cargo", "rustc", "rustup", "npm", "npx", "yarn",
+#             "pnpm", "go", "gradle", "mvn", "cmake", "pip",
+#             "poetry", "pytest", "prettier"]
 
 # ── Project-local overrides (.catenary.toml) ─────────────────────
 #
@@ -173,6 +198,22 @@ mod tests {
         assert!(
             TEMPLATE.contains("# [commands]"),
             "template [commands] section should be commented out",
+        );
+    }
+
+    #[test]
+    fn template_contains_guidance_section() {
+        assert!(
+            TEMPLATE.contains("[commands.guidance."),
+            "template should contain guidance section",
+        );
+        assert!(
+            TEMPLATE.contains("guidance.scan"),
+            "template should contain scan guidance group",
+        );
+        assert!(
+            TEMPLATE.contains("guidance.build"),
+            "template should contain build guidance group",
         );
     }
 }
