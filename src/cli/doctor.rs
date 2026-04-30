@@ -551,6 +551,41 @@ fn doctor_check_config(colors: &ColorConfig) {
                 }
             }
         }
+
+        // [commands] entries with old denylist-format fields
+        if let Some(cmd_table) = raw.get("commands").and_then(toml::Value::as_table) {
+            if cmd_table.contains_key("deny_when_first") {
+                found_issues = true;
+                println!(
+                    "{}",
+                    colors.yellow(&format!(
+                        "⚠  {}: [commands] uses removed `deny_when_first` field — \
+                         Catenary now uses an allowlist model. \
+                         Run `catenary config` for the recommended template.",
+                        source.display(),
+                    )),
+                );
+            }
+
+            if let Some(deny_table) = cmd_table.get("deny").and_then(toml::Value::as_table) {
+                for (key, value) in deny_table {
+                    if value.is_str() {
+                        found_issues = true;
+                        println!(
+                            "{}",
+                            colors.yellow(&format!(
+                                "⚠  {}: [commands.deny.{key}] has a string value — \
+                                 the old guidance-string format is removed. `deny` now \
+                                 maps commands to arrays of denied subcommands \
+                                 (e.g., `git = [\"grep\", \"ls-files\"]`).",
+                                source.display(),
+                            )),
+                        );
+                        break; // One message per file is enough.
+                    }
+                }
+            }
+        }
     }
 
     if found_issues {

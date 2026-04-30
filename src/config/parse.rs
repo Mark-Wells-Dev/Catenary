@@ -247,12 +247,51 @@ fn deserialize_source(contents: &str) -> Result<RawConfig> {
         }
     }
 
-    // Both present or only language/neither: parse normally.
-    // The `server` field on RawConfig maps to [server.*] as ServerDef entries.
-    let config: RawConfig =
-        toml::from_str(contents).context("Failed to deserialize configuration")?;
+    // Detect old-format [commands] keys from workstream 14 (denylist model).
+    // Instead of crashing, strip the section and warn — the notification
+    // system surfaces this to the user once the server is running.
+    let stripped_commands = has_old_commands_format(&raw);
+    if stripped_commands {
+        tracing::warn!(
+            source = "config",
+            "[commands] uses the old denylist format (deny_when_first or string-valued \
+             deny entries). Catenary now uses an allowlist model — run `catenary config` \
+             for the recommended template. Command filtering is disabled until the \
+             config is updated.",
+        );
+    }
+
+    // When old-format [commands] was detected, strip it from the Value and
+    // deserialize from that (try_into). Otherwise deserialize from the
+    // original string to preserve source positions in error messages.
+    let config: RawConfig = if stripped_commands {
+        let mut raw = raw;
+        if let Some(table) = raw.as_table_mut() {
+            table.remove("commands");
+        }
+        raw.try_into()
+            .context("Failed to deserialize configuration")?
+    } else {
+        toml::from_str(contents).context("Failed to deserialize configuration")?
+    };
 
     Ok(config)
+}
+
+/// Check whether a raw TOML value contains old-format `[commands]` keys.
+///
+/// Detects `deny_when_first` (silently ignored by serde) and string-valued
+/// `deny` entries (would cause a type error). Used by both `deserialize_source`
+/// and `load_project_config` to warn-and-strip instead of crashing.
+fn has_old_commands_format(raw: &toml::Value) -> bool {
+    let Some(cmd_table) = raw.get("commands").and_then(toml::Value::as_table) else {
+        return false;
+    };
+    cmd_table.contains_key("deny_when_first")
+        || cmd_table
+            .get("deny")
+            .and_then(toml::Value::as_table)
+            .is_some_and(|d| d.values().any(toml::Value::is_str))
 }
 
 /// Merge a raw config layer into the resolved config. Later values override.
@@ -439,13 +478,32 @@ pub fn load_project_config(root: &std::path::Path) -> Result<Option<ProjectConfi
                     path = %config_path.display(),
                     key = key.as_str(),
                     "Project config {}: unsupported section [{}] — \
-                     only [language.*] and [server.*] are allowed in \
-                     .catenary.toml. Move [{key}] to your user config \
-                     (~/.config/catenary/config.toml).",
+                     only [language.*], [server.*], and [commands] are \
+                     allowed in .catenary.toml. Move [{key}] to your \
+                     user config (~/.config/catenary/config.toml).",
                     config_path.display(),
                     key,
                 );
             }
+        }
+    }
+
+    // Detect old-format [commands] keys (denylist model from workstream 14).
+    // Warn and strip instead of crashing — the notification system surfaces
+    // this to the user. The project's command config is ignored.
+    let mut raw = raw;
+    if has_old_commands_format(&raw) {
+        tracing::warn!(
+            source = "config.project",
+            path = %config_path.display(),
+            "Project config {}: [commands] uses the old denylist format. \
+             Catenary now uses an allowlist model — run `catenary config` \
+             for the recommended template. This project's command config \
+             is ignored.",
+            config_path.display(),
+        );
+        if let Some(table) = raw.as_table_mut() {
+            table.remove("commands");
         }
     }
 
@@ -891,6 +949,99 @@ allow = ["git"]
         let result = load_project_config(dir.path())?;
         let config = result.expect("should find project config");
         assert!(config.commands.is_none());
+
+        Ok(())
+    }
+
+    // ── Old-format [commands] stripped with warning ────────────────
+
+    #[test]
+    fn test_load_project_config_strips_deny_when_first() -> Result<()> {
+        let dir = tempdir()?;
+        fs::write(
+            dir.path().join(".catenary.toml"),
+            r#"
+[commands]
+allow = ["git"]
+
+[commands.deny_when_first]
+cargo = "Use make instead"
+"#,
+        )?;
+
+        // Should succeed — old format is stripped, not rejected.
+        let result = load_project_config(dir.path())?;
+        let config = result.expect("should find project config");
+        // [commands] section stripped entirely — treated as not configured.
+        assert!(
+            config.commands.is_none(),
+            "old-format commands should be stripped",
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_project_config_strips_old_deny_strings() -> Result<()> {
+        let dir = tempdir()?;
+        fs::write(
+            dir.path().join(".catenary.toml"),
+            r#"
+[commands]
+allow = ["git"]
+
+[commands.deny]
+cargo = "Use make instead"
+"#,
+        )?;
+
+        let result = load_project_config(dir.path())?;
+        let config = result.expect("should find project config");
+        assert!(
+            config.commands.is_none(),
+            "old-format commands should be stripped",
+        );
+
+        Ok(())
+    }
+
+    // ── Old-format [commands] stripped (user config) ─────────────────
+
+    #[test]
+    fn test_deserialize_source_strips_deny_when_first() -> Result<()> {
+        let config = deserialize_source(
+            r#"
+[commands]
+allow = ["git"]
+
+[commands.deny_when_first]
+cargo = "Use make instead"
+"#,
+        )?;
+        // [commands] section stripped — parsed as absent.
+        assert!(
+            config.commands.is_none(),
+            "old-format commands should be stripped",
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_deserialize_source_strips_old_deny_strings() -> Result<()> {
+        let config = deserialize_source(
+            r#"
+[commands]
+allow = ["git"]
+
+[commands.deny]
+cargo = "Use make instead"
+"#,
+        )?;
+        assert!(
+            config.commands.is_none(),
+            "old-format commands should be stripped",
+        );
 
         Ok(())
     }

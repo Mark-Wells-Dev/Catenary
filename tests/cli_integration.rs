@@ -582,7 +582,7 @@ fn test_doctor_no_suggestions_when_config_with_commands() -> Result<()> {
     std::fs::create_dir_all(&config_dir)?;
     std::fs::write(
         config_dir.join("config.toml"),
-        "[commands.deny]\ncat = \"Use read\"\n",
+        "[commands]\nallow = [\"git\"]\n",
     )?;
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));

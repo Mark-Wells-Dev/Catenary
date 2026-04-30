@@ -55,8 +55,8 @@ per-field basis:
    (`[commands]`, `[notifications]`, `[icons]`, `[tui]`, `[tools]`).
 
 3. **Project config** (`.catenary.toml` per workspace root) — scoped
-   to `[language.*]` and `[server.*]` only. Discovered at root
-   addition time. See [Project config scope](#project-config-scope)
+   to `[language.*]`, `[server.*]`, and `[commands]`. Discovered at
+   root addition time. See [Project config scope](#project-config-scope)
    below.
 
 4. **Explicit file** (`CATENARY_CONFIG` env var or `--config` flag) —
@@ -93,31 +93,43 @@ convention.
 
 ## Project config scope
 
-`.catenary.toml` is restricted to `[language.*]` and `[server.*]`.
-All other sections are rejected with a warning and guidance to move
-them to user config. This is a deliberate narrowing from the earlier
-model where project config could contain any section.
+`.catenary.toml` is restricted to `[language.*]`, `[server.*]`, and
+`[commands]`. Other sections are rejected with a warning and guidance
+to move them to user config. This is a deliberate narrowing from the
+earlier model where project config could contain any section.
 
-Why each section is excluded:
-
-- **`[commands]`** — command filtering is session-scoped. The
-  `PreToolUse` hook evaluates shell commands before execution, but it
-  has no mechanism to resolve which workspace root a command targets.
-  In a multi-root session with root A allowing `cargo` and root B
-  forbidding it, there is no correct session-global answer. Union of
-  denies is too restrictive; union of allows is too permissive;
-  order-dependent merge is unpredictable.
+Why each remaining section is excluded:
 
 - **`[notifications]`, `[icons]`, `[tui]`, `[tools]`** — these are
   user preferences, not project-specific. A notification threshold or
   icon preset shouldn't vary per-root.
 
+### `[commands]` in project config
+
+`[commands]` is the exception to the "user preferences only" rule.
+Two fields are project-scoped:
+
+- **`build`** — per-root build tool. The answer to "why can't I run
+  cargo/npm/go directly?" is inherently per-project. The evaluator
+  resolves `cwd` (from the hook JSON payload) to a root via
+  longest-prefix match, then looks up that root's build tool.
+
+- **`allow`** — replaces (not merges with) the user's `allow` list
+  for this root's contribution. Use case: a homelab root gets
+  `kubectl` and `ssh`, a Catenary repo root doesn't.
+
+In multi-root sessions, `allow` lists are unioned across roots —
+adding a root is an intentional scope expansion. `pipeline` and
+`deny` follow the same per-root replacement semantics. Disabled
+roots (`enabled = false`) contribute `[commands]` config but not
+LSP config, so a root can specify its build tool without spawning
+servers.
+
 The earlier model (walk up from cwd, merge all sections) worked for
 single-project sessions. Multi-root sessions — where `/add-dir` adds
 roots with potentially conflicting configs — broke the assumption.
-Rather than design a per-root scoping system for every section, the
-scope was narrowed to what is genuinely per-root: language server
-routing and configuration.
+The scope was narrowed to what is genuinely per-root: language server
+routing, server configuration, and command filtering.
 
 ## Per-root settings resolution
 

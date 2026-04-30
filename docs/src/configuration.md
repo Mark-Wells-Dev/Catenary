@@ -5,7 +5,7 @@ Catenary loads configuration from multiple sources, in order of priority
 
 1. **Defaults**: `log_retention_days = 7`.
 2. **User config**: `~/.config/catenary/config.toml`.
-3. **Project config**: `.catenary.toml` in each workspace root. Discovered when roots are added (at startup or via `/add-dir`). Scoped to `[language.*]` and `[server.*]` sections only — all other sections are user-level.
+3. **Project config**: `.catenary.toml` in each workspace root. Discovered when roots are added (at startup or via `/add-dir`). Scoped to `[language.*]`, `[server.*]`, and `[commands]` — other sections are user-level.
 4. **Explicit file**: `--config <path>`.
 5. **Environment variables**: Prefixed with `CATENARY_` (e.g., `CATENARY_LOG_RETENTION_DAYS=30`). Use `__` for nested keys (e.g., `CATENARY_ICONS__PRESET=nerd`).
 
@@ -242,11 +242,11 @@ Classification precedence (highest first): shebang > filename > extension.
 
 ## Project Configuration
 
-Place a `.catenary.toml` in a workspace root to override language and
-server configuration for that root. Supported fields are `enabled`,
-`[language.*]`, and `[server.*]` — all other sections (`[commands]`,
-`[notifications]`, `[icons]`, etc.) are user-level and belong in
-`~/.config/catenary/config.toml`.
+Place a `.catenary.toml` in a workspace root to override language,
+server, and command configuration for that root. Supported sections are
+`enabled`, `[language.*]`, `[server.*]`, and `[commands]` — other
+sections (`[notifications]`, `[icons]`, etc.) are user-level and belong
+in `~/.config/catenary/config.toml`.
 
 Project config is discovered when roots are added (at startup or via
 `/add-dir`). Changes to `.catenary.toml` require restarting the session.
@@ -424,6 +424,69 @@ If it starts with `#!`, the interpreter name is matched:
 | `scala` | `scala` |
 | `groovy` | `groovy` |
 | `crystal` | `crystal` |
+
+## Command Filtering
+
+The `[commands]` section defines which shell commands an agent may run.
+Allowlist-based: only explicitly permitted commands can execute.
+Everything else is denied with a dump of the allowed configuration so
+the agent knows its surface area.
+
+### Three states
+
+1. **No `[commands]` section** — not configured yet. Catenary emits a
+   hint notification once per session at startup.
+2. **`client_enforcement_only = true`** — deliberate opt-out. No hint,
+   no enforcement.
+3. **`allow = [...]` present** — active allowlist. Enforce.
+
+### Example
+
+```toml
+[commands]
+build = "make"
+allow = ["git", "gh", "cp", "rm", "mkdir", "mv", "touch",
+         "chmod", "sleep", "cd", "true", "false", "which"]
+pipeline = ["grep", "head", "tail", "wc", "jq", "awk",
+            "sort", "sed", "tr", "cut", "uniq", "tee"]
+
+[commands.deny]
+git = ["grep", "ls-files", "ls-tree"]
+sqlite3 = ["-cmd"]
+```
+
+### Keys
+
+| Key | Description |
+|-----|-------------|
+| `client_enforcement_only` | Deliberate opt-out — no enforcement, no hint notification. |
+| `build` | The project's build tool (e.g., `"make"`). On denial of a build-related command, the response directs the agent to the configured build tool. |
+| `allow` | Commands the agent can run unconditionally. |
+| `pipeline` | Commands allowed mid-pipeline (reading stdin) but denied at pipeline position 0 (reading files directly). Prevents `grep foo bar.rs` while allowing `make test \| grep FAIL`. |
+| `deny.<cmd>` | Subcommand denylist within an allowed command. `git` is allowed, but `git grep` is denied. |
+
+### Project-scoped commands
+
+In `.catenary.toml`, `[commands]` supports two fields:
+
+- **`build`** — per-root build tool. "In this project, the build tool
+  is `make`." Even disabled roots (`enabled = false`) contribute
+  `commands.build`.
+- **`allow`** — replaces (not merges with) the user's `allow` list for
+  this root's contribution.
+
+In multi-root sessions, `allow` lists are unioned across roots — adding
+a root is an intentional scope expansion. `build` is collected per-root;
+the evaluator resolves which root a command targets via `cwd`.
+
+```toml
+# .catenary.toml
+[commands]
+build = "make"
+```
+
+Run `catenary config` to generate a recommended config template with
+a commented-out `[commands]` section.
 
 ## Global Options
 
