@@ -316,15 +316,15 @@ async fn run_server() -> Result<()> {
         .collect::<Vec<_>>()
         .join(", ");
 
-    // Check primary root for `enabled = false` in `.catenary.toml`.
+    // Check primary root for `lsp = false` in `.catenary.toml`.
     let disabled = roots
         .first()
         .and_then(|r| catenary_mcp::config::load_project_config(r).ok().flatten())
-        .is_some_and(|pc| !pc.enabled);
+        .is_some_and(|pc| !pc.lsp);
 
     if disabled {
         info!(
-            "Catenary disabled by .catenary.toml (enabled = false) in {}",
+            "Catenary disabled by .catenary.toml (lsp = false) in {}",
             workspace_display
         );
         return run_disabled_server(logging).await;

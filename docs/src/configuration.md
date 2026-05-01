@@ -261,29 +261,33 @@ Classification precedence (highest first): shebang > filename > extension.
 
 Place a `.catenary.toml` in a workspace root to override language,
 server, and command configuration for that root. Supported sections are
-`enabled`, `[language.*]`, `[server.*]`, and `[commands]` — other
-sections (`[notifications]`, `[icons]`, etc.) are user-level and belong
-in `~/.config/catenary/config.toml`.
+`lsp`, `[language.*]`, `[server.*]`, and `[commands]` — other sections
+(`[notifications]`, `[icons]`, etc.) are user-level and belong in
+`~/.config/catenary/config.toml`.
 
 Project config is discovered when roots are added (at startup or via
 `/add-dir`). Changes to `.catenary.toml` require restarting the session.
 
 ### Disabling Catenary
 
-Set `enabled = false` to turn Catenary off for a workspace:
+Set `lsp = false` to turn Catenary off for a workspace:
 
 ```toml
 # .catenary.toml
-enabled = false
+lsp = false
 ```
 
-When the primary workspace root has `enabled = false`, the entire session
-is disabled: no tools appear in `tools/list`, no LSP servers spawn, all
+When the primary workspace root has `lsp = false`, the entire session is
+disabled: no tools appear in `tools/list`, no LSP servers spawn, all
 hooks pass through, and no database rows are written. The MCP process
 still runs (the host starts it) but is invisible to the agent.
 
 This is useful for media collections, documentation repos, data
 directories, or any workspace where LSP is pure overhead.
+
+> **Migration:** The old `enabled` key is still accepted with a
+> deprecation warning. Rename it to `lsp`. Using both in the same file
+> is an error.
 
 ### Merge Semantics
 
@@ -487,7 +491,7 @@ sqlite3 = ["-cmd"]
 In `.catenary.toml`, `[commands]` supports two fields:
 
 - **`build`** — per-root build tool. "In this project, the build tool
-  is `make`." Even disabled roots (`enabled = false`) contribute
+  is `make`." Even disabled roots (`lsp = false`) contribute
   `commands.build`.
 - **`allow`** — replaces (not merges with) the user's `allow` list for
   this root's contribution.

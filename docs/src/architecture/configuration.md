@@ -121,8 +121,8 @@ Two fields are project-scoped:
 In multi-root sessions, `allow` lists are unioned across roots —
 adding a root is an intentional scope expansion. `pipeline` and
 `deny` follow the same per-root replacement semantics. Disabled
-roots (`enabled = false`) contribute `[commands]` config but not
-LSP config, so a root can specify its build tool without spawning
+roots (`lsp = false`) contribute `[commands]` config but not LSP
+config, so a root can specify its build tool without spawning
 servers.
 
 The earlier model (walk up from cwd, merge all sections) worked for

@@ -410,21 +410,24 @@ pub(super) fn parse_server_specs(val: &str) -> Vec<(String, ServerDef, LanguageC
 }
 
 /// Top-level keys allowed in `.catenary.toml` project config files.
-const PROJECT_CONFIG_ALLOWED_KEYS: &[&str] = &["enabled", "language", "server", "commands"];
+///
+/// Both `lsp` (current) and `enabled` (deprecated) are accepted during
+/// transition. The unsupported-key warning skips both.
+const PROJECT_CONFIG_ALLOWED_KEYS: &[&str] = &["lsp", "enabled", "language", "server", "commands"];
 
 /// Per-root project configuration from `.catenary.toml`.
 ///
-/// Contains `enabled` (session kill switch), `[language.*]` and
-/// `[server.*]` sections, and an optional `[commands]` section.
-/// Disabled roots (`enabled = false`) still contribute `[commands]`
-/// config (both `build` and `allow`) but not LSP config.
+/// Contains `lsp` (LSP kill switch), `[language.*]` and `[server.*]`
+/// sections, and an optional `[commands]` section. Roots with
+/// `lsp = false` still contribute `[commands]` config (both `build`
+/// and `allow`) but not LSP config.
 #[derive(Debug, Clone)]
 pub struct ProjectConfig {
-    /// Whether Catenary is enabled for this workspace (default `true`).
+    /// Whether LSP is active for this workspace (default `true`).
     ///
     /// When `false` on the primary root, the entire session is disabled:
     /// no tools, no servers, no hooks, no database writes.
-    pub enabled: bool,
+    pub lsp: bool,
     /// Language definitions from the project config.
     pub language: HashMap<String, LanguageConfig>,
     /// Server definitions from the project config.
@@ -440,7 +443,7 @@ pub struct ProjectConfig {
 impl Default for ProjectConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            lsp: true,
             language: HashMap::new(),
             server: HashMap::new(),
             commands: None,
@@ -544,11 +547,29 @@ pub fn load_project_config(root: &std::path::Path) -> Result<Option<ProjectConfi
         }
     }
 
-    // Parse the `enabled` flag (default true).
-    let enabled = raw
-        .get("enabled")
-        .and_then(toml::Value::as_bool)
-        .unwrap_or(true);
+    // Parse `lsp` (preferred) or `enabled` (deprecated). Error if both.
+    let lsp_val = raw.get("lsp").and_then(toml::Value::as_bool);
+    let enabled_val = raw.get("enabled").and_then(toml::Value::as_bool);
+
+    if lsp_val.is_some() && enabled_val.is_some() {
+        bail!(
+            "Project config {}: both `lsp` and `enabled` are set — \
+             remove `enabled` and use `lsp` only.",
+            config_path.display(),
+        );
+    }
+
+    if enabled_val.is_some() {
+        tracing::warn!(
+            source = Source::ConfigParse.as_str(),
+            path = %config_path.display(),
+            "Project config {}: `enabled` is deprecated — \
+             rename it to `lsp`.",
+            config_path.display(),
+        );
+    }
+
+    let lsp = lsp_val.or(enabled_val).unwrap_or(true);
 
     // Deserialize only the supported sections.
     let language: HashMap<String, LanguageConfig> = raw
@@ -634,7 +655,7 @@ pub fn load_project_config(root: &std::path::Path) -> Result<Option<ProjectConfi
     }
 
     Ok(Some(ProjectConfig {
-        enabled,
+        lsp,
         language,
         server,
         commands: commands_config,
@@ -783,7 +804,7 @@ servers = ["pyright"]
     }
 
     #[test]
-    fn test_load_project_config_enabled_true_default() -> Result<()> {
+    fn test_load_project_config_lsp_true_default() -> Result<()> {
         let dir = tempdir()?;
         fs::write(
             dir.path().join(".catenary.toml"),
@@ -792,36 +813,69 @@ servers = ["pyright"]
 
         let result = load_project_config(dir.path())?;
         let config = result.expect("should find project config");
-        assert!(config.enabled, "enabled should default to true");
+        assert!(config.lsp, "lsp should default to true");
 
         Ok(())
     }
 
     #[test]
-    fn test_load_project_config_enabled_false() -> Result<()> {
+    fn test_load_project_config_lsp_false() -> Result<()> {
+        let dir = tempdir()?;
+        fs::write(dir.path().join(".catenary.toml"), "lsp = false\n")?;
+
+        let result = load_project_config(dir.path())?;
+        let config = result.expect("should find project config");
+        assert!(!config.lsp, "lsp should be false");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_project_config_lsp_true_explicit() -> Result<()> {
+        let dir = tempdir()?;
+        fs::write(
+            dir.path().join(".catenary.toml"),
+            "lsp = true\n\n[language.rust]\nservers = []\n",
+        )?;
+
+        let result = load_project_config(dir.path())?;
+        let config = result.expect("should find project config");
+        assert!(config.lsp);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_project_config_enabled_deprecated_still_works() -> Result<()> {
         let dir = tempdir()?;
         fs::write(dir.path().join(".catenary.toml"), "enabled = false\n")?;
 
         let result = load_project_config(dir.path())?;
         let config = result.expect("should find project config");
-        assert!(!config.enabled, "enabled should be false");
+        assert!(
+            !config.lsp,
+            "deprecated enabled = false should set lsp = false"
+        );
 
         Ok(())
     }
 
     #[test]
-    fn test_load_project_config_enabled_true_explicit() -> Result<()> {
-        let dir = tempdir()?;
+    fn test_load_project_config_both_lsp_and_enabled_errors() {
+        let dir = tempdir().expect("tempdir");
         fs::write(
             dir.path().join(".catenary.toml"),
-            "enabled = true\n\n[language.rust]\nservers = []\n",
-        )?;
+            "lsp = true\nenabled = false\n",
+        )
+        .expect("write");
 
-        let result = load_project_config(dir.path())?;
-        let config = result.expect("should find project config");
-        assert!(config.enabled);
-
-        Ok(())
+        let result = load_project_config(dir.path());
+        assert!(result.is_err());
+        let err = format!("{:#}", result.expect_err("should error"));
+        assert!(
+            err.contains("both `lsp` and `enabled`"),
+            "error should mention both keys: {err}",
+        );
     }
 
     #[test]
@@ -882,7 +936,7 @@ build = "make"
 
         let result = load_project_config(dir.path())?;
         let config = result.expect("should find project config");
-        assert!(config.enabled, "enabled defaults to true");
+        assert!(config.lsp, "lsp defaults to true");
         assert!(config.language.is_empty());
         assert!(config.server.is_empty());
         assert!(config.commands.is_some());
@@ -900,7 +954,7 @@ build = "make"
         fs::write(
             dir.path().join(".catenary.toml"),
             r#"
-enabled = false
+lsp = false
 
 [commands]
 build = "make"
@@ -910,7 +964,7 @@ allow = ["git"]
 
         let result = load_project_config(dir.path())?;
         let config = result.expect("should find project config");
-        assert!(!config.enabled);
+        assert!(!config.lsp);
         let cmds = config.commands.expect("commands present despite disabled");
         assert_eq!(cmds.build.as_deref(), Some("make"));
         assert!(

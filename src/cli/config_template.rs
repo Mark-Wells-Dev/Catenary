@@ -96,7 +96,7 @@ const TEMPLATE: &str = r#"# Catenary recommended config
 #
 #   # Disable Catenary LSP for this workspace entirely
 #   # (commands config still applies)
-#   enabled = false
+#   lsp = false
 
 # ── Notifications ────────────────────────────────────────────────
 #

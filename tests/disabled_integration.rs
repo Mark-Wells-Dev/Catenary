@@ -6,9 +6,9 @@
     clippy::expect_used,
     reason = "tests use expect for readable assertions"
 )]
-//! Integration tests for `enabled = false` in `.catenary.toml`.
+//! Integration tests for `lsp = false` in `.catenary.toml`.
 //!
-//! When the primary workspace root has `enabled = false`, the session
+//! When the primary workspace root has `lsp = false`, the session
 //! is disabled: no tools, no servers, no hooks, no database writes.
 
 mod common;
@@ -20,12 +20,9 @@ use std::path::PathBuf;
 
 use common::BridgeProcess;
 
-/// Spawn a bridge whose primary workspace root has `enabled = false`.
+/// Spawn a bridge whose primary workspace root has `lsp = false`.
 fn spawn_disabled_bridge(root: &str) -> Result<BridgeProcess> {
-    fs::write(
-        PathBuf::from(root).join(".catenary.toml"),
-        "enabled = false\n",
-    )?;
+    fs::write(PathBuf::from(root).join(".catenary.toml"), "lsp = false\n")?;
     BridgeProcess::spawn(&[], root)
 }
 

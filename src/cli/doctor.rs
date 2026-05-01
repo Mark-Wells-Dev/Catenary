@@ -619,6 +619,20 @@ fn doctor_check_project_config(
         config_path.display(),
     );
 
+    // Flag deprecated `enabled` key before parsing.
+    let has_deprecated_enabled = std::fs::read_to_string(&config_path)
+        .ok()
+        .and_then(|c| c.parse::<toml::Value>().ok())
+        .and_then(|raw| raw.get("enabled").map(|_| ()))
+        .is_some();
+
+    if has_deprecated_enabled {
+        println!(
+            "  {}",
+            colors.yellow("⚠  `enabled` is deprecated — rename it to `lsp`"),
+        );
+    }
+
     match crate::config::load_project_config(&resolved) {
         Ok(Some(pc)) => {
             // Count entries
