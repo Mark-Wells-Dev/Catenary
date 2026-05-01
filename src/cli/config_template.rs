@@ -57,14 +57,14 @@ const TEMPLATE: &str = r#"# Catenary recommended config
 # sqlite3 = ["-cmd"]
 #
 # # Per-command guidance — optional hints shown when a command is denied.
-# # Groups map commands to a message. {read} and {edit} resolve per-client.
+# # Groups map commands to a message. {READ} and {EDIT} resolve per-client.
 #
 # [commands.guidance.read]
-# message = "Use {read} instead"
+# message = "Use {READ} instead"
 # commands = ["cat", "head", "tail", "less", "more"]
 #
 # [commands.guidance.edit]
-# message = "Use {edit} instead"
+# message = "Use {EDIT} instead"
 # commands = ["sed"]
 #
 # [commands.guidance.scan]

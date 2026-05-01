@@ -79,7 +79,7 @@ pub enum GuidanceEntry {
 /// Build-specific guidance with per-context message templates.
 ///
 /// All fields have sensible defaults. Template variables resolved at
-/// denial time: `{build}`, `{USERCONFIG}`, `{PROJCONFIG}`.
+/// denial time: `{BUILD}`, `{CWD}`, `{USERCONFIG}`, `{PROJCONFIG}`.
 #[derive(Debug, Clone)]
 pub struct BuildGuidance {
     /// Message when user config has a build tool configured.
@@ -98,15 +98,15 @@ pub struct BuildGuidance {
 
 #[allow(
     clippy::literal_string_with_formatting_args,
-    reason = "{build}, {USERCONFIG}, {PROJCONFIG} are template variables, not format args"
+    reason = "{BUILD}, {CWD}, {USERCONFIG}, {PROJCONFIG} are template variables, not format args"
 )]
 impl Default for BuildGuidance {
     fn default() -> Self {
         Self {
-            message_default: "{USERCONFIG} has {build} as the default build tool.".to_string(),
+            message_default: "{USERCONFIG} has `{BUILD}` as the default build tool.".to_string(),
             message_default_absent: "{USERCONFIG} has not configured a build tool.".to_string(),
-            message_noproject: "No local `.catenary.toml` was found.".to_string(),
-            message_project: "{PROJCONFIG} has {build} as the configured build tool.".to_string(),
+            message_noproject: "No `.catenary.toml` was found in {CWD}.".to_string(),
+            message_project: "{PROJCONFIG} has `{BUILD}` as the configured build tool.".to_string(),
             message_project_absent: "{PROJCONFIG} has not configured a build tool.".to_string(),
             message_cwd_unknown: "Unable to resolve the current working directory. Consider \
                                   changing directory and retrying."
@@ -380,6 +380,8 @@ pub struct BuildContext<'a> {
     pub project_build: Option<&'a str>,
     /// Whether cwd could be resolved.
     pub cwd_resolved: bool,
+    /// The resolved working directory path (for context in messages).
+    pub resolved_cwd_path: Option<&'a str>,
 }
 
 impl BuildGuidance {
@@ -390,7 +392,7 @@ impl BuildGuidance {
     #[must_use]
     #[allow(
         clippy::literal_string_with_formatting_args,
-        reason = "{build}, {USERCONFIG}, {PROJCONFIG} are template variables, not format args"
+        reason = "{BUILD}, {CWD}, {USERCONFIG}, {PROJCONFIG} are template variables, not format args"
     )]
     pub fn resolve(&self, ctx: &BuildContext<'_>) -> String {
         if !ctx.cwd_resolved {
@@ -407,7 +409,7 @@ impl BuildGuidance {
             },
             |build| {
                 self.message_default
-                    .replace("{build}", build)
+                    .replace("{BUILD}", build)
                     .replace("{USERCONFIG}", ctx.user_config_path)
             },
         );
@@ -417,11 +419,12 @@ impl BuildGuidance {
 
         // Project config build tool line.
         let proj_path = ctx.project_config_path.unwrap_or(".catenary.toml");
+        let cwd_display = ctx.resolved_cwd_path.unwrap_or("the working directory");
         let project_line = if !ctx.has_project_config {
-            self.message_noproject.clone()
+            self.message_noproject.replace("{CWD}", cwd_display)
         } else if let Some(build) = ctx.project_build {
             self.message_project
-                .replace("{build}", build)
+                .replace("{BUILD}", build)
                 .replace("{PROJCONFIG}", proj_path)
         } else {
             self.message_project_absent
@@ -1173,7 +1176,7 @@ allow = ["git"]
 
 [guidance.build]
 commands = ["cargo", "npm"]
-message_default = "custom: {build}"
+message_default = "custom: {BUILD}"
 "#,
         )
         .expect("valid TOML");
@@ -1184,7 +1187,7 @@ message_default = "custom: {build}"
             build.message.is_none(),
             "build group should have no message"
         );
-        assert_eq!(build.message_default.as_deref(), Some("custom: {build}"),);
+        assert_eq!(build.message_default.as_deref(), Some("custom: {BUILD}"),);
     }
 
     #[test]
@@ -1253,13 +1256,14 @@ message_default = "custom: {build}"
             project_config_path: Some(".catenary.toml"),
             project_build: Some("npm"),
             cwd_resolved: true,
+            resolved_cwd_path: Some("/project"),
         });
         assert!(
-            result.contains("make"),
+            result.contains("`make`"),
             "should mention user build tool: {result}"
         );
         assert!(
-            result.contains("npm"),
+            result.contains("`npm`"),
             "should mention project build tool: {result}"
         );
     }
@@ -1274,14 +1278,15 @@ message_default = "custom: {build}"
             project_config_path: None,
             project_build: None,
             cwd_resolved: true,
+            resolved_cwd_path: Some("/other/project"),
         });
         assert!(
-            result.contains("make"),
+            result.contains("`make`"),
             "should mention user build: {result}"
         );
         assert!(
-            result.contains("No local"),
-            "should mention no project config: {result}",
+            result.contains("/other/project"),
+            "should mention resolved cwd: {result}",
         );
     }
 
@@ -1295,6 +1300,7 @@ message_default = "custom: {build}"
             project_config_path: None,
             project_build: None,
             cwd_resolved: true,
+            resolved_cwd_path: Some("/project"),
         });
         assert!(
             result.contains("not configured"),
@@ -1312,6 +1318,7 @@ message_default = "custom: {build}"
             project_config_path: None,
             project_build: None,
             cwd_resolved: false,
+            resolved_cwd_path: None,
         });
         assert!(
             result.contains("Unable to resolve"),
@@ -1322,7 +1329,7 @@ message_default = "custom: {build}"
     #[test]
     fn build_guidance_custom_messages() {
         let bg = BuildGuidance {
-            message_default: "custom: {build}".to_string(),
+            message_default: "custom: {BUILD}".to_string(),
             message_noproject: "no project".to_string(),
             ..BuildGuidance::default()
         };
@@ -1333,6 +1340,7 @@ message_default = "custom: {build}"
             project_config_path: None,
             project_build: None,
             cwd_resolved: true,
+            resolved_cwd_path: Some("/project"),
         });
         assert!(result.contains("custom: make"), "custom message: {result}");
         assert!(result.contains("no project"), "custom no-project: {result}");
@@ -1352,6 +1360,7 @@ message_default = "custom: {build}"
             project_config_path: None,
             project_build: None,
             cwd_resolved: true,
+            resolved_cwd_path: Some("/project"),
         });
         // Empty message_default suppresses the user-default line.
         assert_eq!(result, "visible");

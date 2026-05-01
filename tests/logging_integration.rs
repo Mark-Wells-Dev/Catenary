@@ -359,6 +359,7 @@ async fn stderr_captured_with_source_and_server() -> Result<()> {
         server.clone(),
         None,
         std::collections::HashMap::new(),
+        None,
     )?;
     client.initialize(&[dir.path().to_path_buf()], None).await?;
 

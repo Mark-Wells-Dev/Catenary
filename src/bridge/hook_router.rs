@@ -225,8 +225,15 @@ impl HookRouter {
             };
         };
 
-        // Resolve build guidance with full cwd context.
-        let build_hint = self.resolve_build_hint(&denial.command, &resolved, cwd);
+        // Resolve build guidance with full cwd context. Prefer the effective
+        // cwd from command parsing (accounts for `cd` within the command) over
+        // the raw hook cwd.
+        let effective_cwd_str = denial
+            .effective_cwd
+            .as_ref()
+            .map(|p| p.display().to_string());
+        let resolved_cwd = effective_cwd_str.as_deref().or(cwd);
+        let build_hint = self.resolve_build_hint(&denial.command, &resolved, resolved_cwd);
 
         let message = if self.should_show_full_dump() {
             crate::cli::command_filter::format_denial_full(
@@ -300,6 +307,7 @@ impl HookRouter {
             project_config_path: project_path.as_deref(),
             project_build,
             cwd_resolved: cwd.is_some(),
+            resolved_cwd_path: cwd,
         };
 
         Some(bg.resolve(&ctx))

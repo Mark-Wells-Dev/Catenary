@@ -609,6 +609,7 @@ fn resolve_client_build_hint(
         .and_then(|(_, pc)| pc.commands.as_ref())
         .and_then(|cmds| cmds.build.as_deref());
 
+    let cwd_str = cwd.as_ref().map(|p| p.display().to_string());
     let ctx = crate::config::BuildContext {
         user_config_path: user_path_str,
         default_build: resolved.default_build.as_deref(),
@@ -616,6 +617,7 @@ fn resolve_client_build_hint(
         project_config_path: proj_path.as_deref(),
         project_build: proj_build,
         cwd_resolved: cwd.is_some(),
+        resolved_cwd_path: cwd_str.as_deref(),
     };
 
     Some(bg.resolve(&ctx))

@@ -284,6 +284,10 @@ pub struct Denial {
     /// was encountered before the denied command. When `true`, the effective
     /// cwd may be stale and the denial may be a false positive.
     pub unresolved_cd: bool,
+    /// The effective working directory at the point of denial, after resolving
+    /// any `cd` commands earlier in the pipeline. Used for cwd-aware build
+    /// guidance.
+    pub effective_cwd: Option<std::path::PathBuf>,
 }
 
 /// Check all commands in a shell command string against the allowlist rules.
@@ -365,6 +369,7 @@ pub fn check_command(
                     command: denied,
                     reason,
                     unresolved_cd: saw_unresolved_cd,
+                    effective_cwd,
                 });
             }
 
@@ -506,14 +511,14 @@ fn collect_command_names(cmd: &str, names: &mut Vec<String>) {
 
 /// Resolve per-client template variables in guidance messages.
 ///
-/// `{read}` and `{edit}` resolve to the host CLI's tool names.
+/// `{READ}` and `{EDIT}` resolve to the host CLI's tool names.
 #[allow(
     clippy::literal_string_with_formatting_args,
-    reason = "{read} and {edit} are template variables, not format args"
+    reason = "{READ} and {EDIT} are template variables, not format args"
 )]
 fn resolve_client_vars(msg: &str, format: Option<super::HostFormat>) -> String {
     let (read, edit) = format.map_or(("Read", "Edit"), |f| (f.read_tool(), f.edit_tool()));
-    msg.replace("{read}", read).replace("{edit}", edit)
+    msg.replace("{READ}", read).replace("{EDIT}", edit)
 }
 
 /// Format the opening line based on denial reason.
@@ -598,21 +603,18 @@ pub fn format_denial_full(
         parts.push(format!("Denied subcommands: {}", denied_pairs.join(", ")));
     }
 
-    // Collect unique build tools across all roots + default.
-    let mut build_tools: Vec<&str> = commands
+    // Per-root build tools, then default. Each line is explicit about scope.
+    let mut root_entries: Vec<(&std::path::Path, &str)> = commands
         .build
-        .values()
-        .map(String::as_str)
-        .chain(commands.default_build.as_deref())
-        .collect::<std::collections::HashSet<_>>()
-        .into_iter()
+        .iter()
+        .map(|(root, tool)| (root.as_path(), tool.as_str()))
         .collect();
-    build_tools.sort_unstable();
-
-    if build_tools.len() == 1 {
-        parts.push(format!("Build tool: {}", build_tools[0]));
-    } else if build_tools.len() > 1 {
-        parts.push(format!("Build tools: {}", build_tools.join(", ")));
+    root_entries.sort_unstable_by_key(|(root, _)| *root);
+    for (root, tool) in &root_entries {
+        parts.push(format!("Build tool for `{}`: `{tool}`", root.display()));
+    }
+    if let Some(default) = &commands.default_build {
+        parts.push(format!("Default build tool: `{default}`"));
     }
 
     if denial.unresolved_cd {
@@ -1547,6 +1549,7 @@ mod tests {
 
     fn no_cd_denial(cmd: &str) -> Denial {
         Denial {
+            effective_cwd: None,
             command: cmd.to_string(),
             reason: DenialReason::NotAllowed,
             unresolved_cd: false,
@@ -1565,7 +1568,10 @@ mod tests {
             "pipeline section"
         );
         assert!(msg.contains("Denied subcommands:"), "deny section");
-        assert!(msg.contains("Build tool: make"), "build section");
+        assert!(
+            msg.contains("Default build tool: `make`"),
+            "build section: {msg}"
+        );
     }
 
     #[test]
@@ -1808,6 +1814,7 @@ mod tests {
             command: "npm".into(),
             reason: DenialReason::NotAllowed,
             unresolved_cd: true,
+            effective_cwd: None,
         };
         let msg = format_denial_full("npm", &rules, &denial, None, None);
         assert!(
@@ -1823,6 +1830,7 @@ mod tests {
             command: "npm".into(),
             reason: DenialReason::NotAllowed,
             unresolved_cd: false,
+            effective_cwd: None,
         };
         let msg = format_denial_full("npm", &rules, &denial, None, None);
         assert!(
@@ -1843,7 +1851,7 @@ mod tests {
         );
         rules.guidance.insert(
             "cat".to_string(),
-            GuidanceEntry::Static("Use {read} instead".to_string()),
+            GuidanceEntry::Static("Use {READ} instead".to_string()),
         );
         rules.guidance.insert(
             "cargo".to_string(),
@@ -1859,6 +1867,7 @@ mod tests {
             command: "grep".to_string(),
             reason: DenialReason::PipelinePosition,
             unresolved_cd: false,
+            effective_cwd: None,
         };
         let msg = format_denial_full("grep", &rules, &denial, None, None);
         assert!(
@@ -1874,6 +1883,7 @@ mod tests {
             command: "grep".to_string(),
             reason: DenialReason::PipelinePosition,
             unresolved_cd: false,
+            effective_cwd: None,
         };
         let msg = format_denial_full("grep", &rules, &denial, None, None);
         assert!(
@@ -1889,6 +1899,7 @@ mod tests {
             command: "git grep".to_string(),
             reason: DenialReason::DeniedSubcommand,
             unresolved_cd: false,
+            effective_cwd: None,
         };
         let msg = format_denial_full("git grep", &rules, &denial, None, None);
         assert!(
@@ -1915,7 +1926,7 @@ mod tests {
         let msg = format_denial_full("cat", &rules, &denial, None, None);
         assert!(
             msg.contains("Hint: Use Read instead"),
-            "{{read}} should resolve to Read by default: {msg}",
+            "{{READ}} should resolve to Read by default: {msg}",
         );
     }
 
@@ -1932,7 +1943,7 @@ mod tests {
         );
         assert!(
             msg.contains("Hint: Use Read instead"),
-            "{{read}} should resolve to Read for Claude: {msg}",
+            "{{READ}} should resolve to Read for Claude: {msg}",
         );
     }
 
@@ -1949,7 +1960,7 @@ mod tests {
         );
         assert!(
             msg.contains("Hint: Use read_file instead"),
-            "{{read}} should resolve to read_file for Gemini: {msg}",
+            "{{READ}} should resolve to read_file for Gemini: {msg}",
         );
     }
 
@@ -1988,6 +1999,7 @@ mod tests {
             command: "grep".to_string(),
             reason: DenialReason::PipelinePosition,
             unresolved_cd: false,
+            effective_cwd: None,
         };
         let msg = format_denial_short("grep", &denial, &rules, None, None);
         assert!(
