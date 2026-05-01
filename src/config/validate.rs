@@ -4,7 +4,7 @@
 //! Configuration validation.
 
 use super::Config;
-use crate::lsp::glob::LspGlob;
+use crate::lsp::glob::{LspGlob, is_glob_pattern};
 use crate::source::Source;
 
 /// Validate the merged config, returning all errors found.
@@ -70,6 +70,13 @@ pub fn validate(config: &Config) -> Vec<String> {
                 if marker.is_empty() {
                     errors.push(format!(
                         "Language '{key}' has an empty string in `root_markers`"
+                    ));
+                } else if is_glob_pattern(marker)
+                    && let Err(e) = LspGlob::new(marker)
+                {
+                    errors.push(format!(
+                        "Language '{key}' has an invalid glob in `root_markers`: \
+                         '{marker}' — {e}"
                     ));
                 }
             }
@@ -283,6 +290,65 @@ mod tests {
         assert!(
             errors.is_empty(),
             "valid root_markers should pass: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_root_markers_valid_glob_ok() {
+        let mut config = Config::default();
+        config.language.insert(
+            "test".to_string(),
+            LanguageConfig {
+                extensions: Some(vec!["cs".to_string()]),
+                root_markers: Some(vec!["*.sln".to_string(), "*.csproj".to_string()]),
+                ..LanguageConfig::default()
+            },
+        );
+
+        let errors = validate(&config);
+        assert!(
+            errors.is_empty(),
+            "valid glob root_markers should pass: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_root_markers_invalid_glob_rejected() {
+        let mut config = Config::default();
+        config.language.insert(
+            "test".to_string(),
+            LanguageConfig {
+                extensions: Some(vec!["cs".to_string()]),
+                root_markers: Some(vec!["[invalid".to_string()]),
+                ..LanguageConfig::default()
+            },
+        );
+
+        let errors = validate(&config);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("root_markers") && e.contains("[invalid")),
+            "should reject invalid glob in root_markers: {errors:?}",
+        );
+    }
+
+    #[test]
+    fn test_root_markers_mixed_exact_and_glob_ok() {
+        let mut config = Config::default();
+        config.language.insert(
+            "test".to_string(),
+            LanguageConfig {
+                extensions: Some(vec!["test".to_string()]),
+                root_markers: Some(vec!["Cargo.toml".to_string(), "*.sln".to_string()]),
+                ..LanguageConfig::default()
+            },
+        );
+
+        let errors = validate(&config);
+        assert!(
+            errors.is_empty(),
+            "mixed exact + glob root_markers should pass: {errors:?}"
         );
     }
 }

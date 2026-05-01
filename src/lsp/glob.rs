@@ -47,6 +47,12 @@ impl LspGlob {
     }
 }
 
+/// Returns `true` if the string contains glob metacharacters (`*`, `?`, `[`).
+#[must_use]
+pub fn is_glob_pattern(s: &str) -> bool {
+    s.contains('*') || s.contains('?') || s.contains('[')
+}
+
 /// Parsed glob pattern — plain string or `RelativePattern`.
 #[derive(Clone)]
 pub enum GlobPattern {
@@ -343,6 +349,18 @@ mod tests {
         assert!(wk.matches(FileChangeType::Created));
         assert!(!wk.matches(FileChangeType::Changed));
         assert!(wk.matches(FileChangeType::Deleted));
+    }
+
+    // ── is_glob_pattern ─────────────────────────────────────────
+
+    #[test]
+    fn is_glob_pattern_detects_metacharacters() {
+        assert!(is_glob_pattern("*.sln"));
+        assert!(is_glob_pattern("foo?bar"));
+        assert!(is_glob_pattern("[abc]"));
+        assert!(!is_glob_pattern("Cargo.toml"));
+        assert!(!is_glob_pattern("go.mod"));
+        assert!(!is_glob_pattern(".gitignore"));
     }
 
     // ── FileChangeType ───────────────────────────────────────────

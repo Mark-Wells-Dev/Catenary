@@ -123,10 +123,17 @@ const TEMPLATE: &str = r#"# Catenary recommended config
 #
 # Defaults are shipped for common languages (rust = ["Cargo.toml"],
 # go = ["go.mod"], python = ["pyproject.toml", ...], etc.). Override
-# per-language, or disable with an empty list:
+# per-language, or disable with an empty list.
+#
+# Entries can be exact filenames or glob patterns (*, ?, []).
+# Exact filenames use a fast exists() check; globs read directory
+# entries and match against compiled patterns.
 #
 # [language.rust]
 # root_markers = ["rust-toolchain.toml"]   # custom markers
+#
+# [language.csharp]
+# root_markers = ["*.sln", "*.csproj"]     # glob patterns
 #
 # [language.python]
 # root_markers = []                        # disable for python

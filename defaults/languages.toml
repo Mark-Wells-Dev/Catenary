@@ -71,9 +71,11 @@ extensions = ["clj", "cljs", "cljc"]
 
 [language.csharp]
 extensions = ["cs"]
+root_markers = ["*.sln", "*.csproj"]
 
 [language.fsharp]
 extensions = ["fs", "fsx", "fsi"]
+root_markers = ["*.sln", "*.fsproj"]
 
 # ── Apple ───────────────────────────────────────────────────────────
 

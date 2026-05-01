@@ -13,7 +13,7 @@ use crate::bridge::filesystem_manager::{ClassificationTables, FilesystemManager}
 use crate::config::{Config, DispatchMethod, LanguageConfig, ServerBinding, ServerDef};
 use crate::logging::LoggingServer;
 use crate::lsp::LspClient;
-use crate::lsp::glob::{FileChange, GlobPattern, LspGlob, WatchKind};
+use crate::lsp::glob::{self, FileChange, GlobPattern, LspGlob, WatchKind};
 use crate::lsp::instance_key::{InstanceKey, Scope};
 use crate::lsp::server::LspServer;
 use crate::lsp::state::ServerStatus;
@@ -84,11 +84,21 @@ fn file_matches_patterns(path: &Path, patterns: &[LspGlob]) -> bool {
 }
 
 /// Walks up from `file` toward `workspace_root`, returning the first
-/// directory containing any marker file.
+/// directory containing any marker.
 ///
 /// Bounded by `workspace_root` — the walk never escapes above it.
 /// Returns `workspace_root` if no marker is found.
-fn resolve_marker_root(file: &Path, markers: &[String], workspace_root: &Path) -> PathBuf {
+///
+/// `compiled_markers` contains only the glob-pattern entries from
+/// `markers`, pre-compiled at config load time. Exact filenames in
+/// `markers` use the fast `exists()` path; globs require reading
+/// directory entries.
+fn resolve_marker_root(
+    file: &Path,
+    markers: &[String],
+    compiled_markers: &[LspGlob],
+    workspace_root: &Path,
+) -> PathBuf {
     let mut dir = if file.is_dir() {
         file.to_path_buf()
     } else {
@@ -97,11 +107,8 @@ fn resolve_marker_root(file: &Path, markers: &[String], workspace_root: &Path) -
     };
 
     loop {
-        // Check if this directory contains any marker.
-        for marker in markers {
-            if dir.join(marker).exists() {
-                return dir;
-            }
+        if dir_has_marker(&dir, markers, compiled_markers) {
+            return dir;
         }
 
         // Stop at workspace root boundary.
@@ -121,9 +128,34 @@ fn resolve_marker_root(file: &Path, markers: &[String], workspace_root: &Path) -
     workspace_root.to_path_buf()
 }
 
-/// Whether a directory directly contains any of the given marker files.
-fn dir_has_marker(dir: &Path, markers: &[String]) -> bool {
-    markers.iter().any(|m| dir.join(m).exists())
+/// Whether a directory directly contains any of the given markers.
+///
+/// Exact filenames (no glob metacharacters) use `exists()` — no
+/// directory read needed. Glob patterns require reading directory
+/// entries and matching against compiled matchers. The glob-readdir
+/// branch is only entered when `compiled_markers` is non-empty.
+fn dir_has_marker(dir: &Path, markers: &[String], compiled_markers: &[LspGlob]) -> bool {
+    // Fast path: exact filename markers.
+    for m in markers {
+        if !glob::is_glob_pattern(m) && dir.join(m).exists() {
+            return true;
+        }
+    }
+    // Slow path: glob markers require readdir.
+    if !compiled_markers.is_empty()
+        && let Ok(entries) = std::fs::read_dir(dir)
+    {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_path = Path::new(&name);
+            for g in compiled_markers {
+                if g.is_match(name_path) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Manages the lifecycle of LSP clients, document state, and language detection.
@@ -206,10 +238,11 @@ impl LspClientManager {
     /// - The language has no root markers.
     /// - No marker is found within the workspace root.
     fn resolve_server_root(&self, file: &Path, lang: &str, workspace_root: &Path) -> PathBuf {
-        let Some(lang_config) = self.config.resolve_language(lang) else {
-            return workspace_root.to_path_buf();
-        };
-        let Some(markers) = lang_config.active_markers() else {
+        let Some((markers, compiled)) = self
+            .config
+            .resolve_language(lang)
+            .and_then(LanguageConfig::marker_set)
+        else {
             return workspace_root.to_path_buf();
         };
 
@@ -231,7 +264,7 @@ impl LspClientManager {
             }
         }
 
-        let resolved = resolve_marker_root(file, markers, workspace_root);
+        let resolved = resolve_marker_root(file, markers, compiled, workspace_root);
 
         let mut cache = self
             .marker_cache
@@ -286,8 +319,8 @@ impl LspClientManager {
 
                 // If the language has root markers but the workspace root
                 // doesn't contain any, defer to lazy spawn on first need.
-                if let Some(markers) = lang_config.active_markers()
-                    && !dir_has_marker(first_root, markers)
+                if let Some((markers, compiled)) = lang_config.marker_set()
+                    && !dir_has_marker(first_root, markers, compiled)
                 {
                     debug!(
                         language = lang.as_str(),
@@ -387,10 +420,10 @@ impl LspClientManager {
         }
         match &key.scope {
             Scope::Root(_) => {
-                let markers = self
+                let marker_set = self
                     .config
                     .resolve_language(lang)
-                    .and_then(LanguageConfig::active_markers);
+                    .and_then(LanguageConfig::marker_set);
                 info!(
                     source = Source::LspLifecycle.as_str(),
                     language = lang,
@@ -399,7 +432,7 @@ impl LspClientManager {
                 );
                 for root in &roots[1..] {
                     // Skip roots without markers when markers are configured.
-                    if markers.is_some_and(|m| !dir_has_marker(root, m)) {
+                    if marker_set.is_some_and(|(m, c)| !dir_has_marker(root, m, c)) {
                         continue;
                     }
                     if let Err(e) = self.ensure_server(lang, server_name, root).await {
@@ -1584,20 +1617,20 @@ impl LspClientManager {
             let Some(servers) = active_langs.get(lang) else {
                 continue;
             };
-            let markers = self
+            let marker_set = self
                 .config
                 .resolve_language(lang)
-                .and_then(LanguageConfig::active_markers);
+                .and_then(LanguageConfig::marker_set);
             for (server_name, is_workspace) in servers {
                 for root in added_roots {
                     // Skip roots without markers when markers are configured.
-                    if markers.is_some_and(|m| !dir_has_marker(root, m)) {
+                    if marker_set.is_some_and(|(m, c)| !dir_has_marker(root, m, c)) {
                         continue;
                     }
                     // Workspace-capable + non-project-scoped + no markers:
                     // already covered by the workspace instance (folder add
                     // sent in sync_roots).
-                    if (self.is_project_scoped(lang, root) || !is_workspace || markers.is_some())
+                    if (self.is_project_scoped(lang, root) || !is_workspace || marker_set.is_some())
                         && let Err(e) = self.ensure_server(lang, server_name, root).await
                     {
                         warn!(
@@ -5371,7 +5404,7 @@ mod tests {
         std::fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
         std::fs::write(&file, "").expect("write file");
 
-        let resolved = resolve_marker_root(&file, &["Cargo.toml".into()], &ws);
+        let resolved = resolve_marker_root(&file, &["Cargo.toml".into()], &[], &ws);
         assert_eq!(resolved, sub);
     }
 
@@ -5385,7 +5418,7 @@ mod tests {
         let file = sub.join("lib.rs");
         std::fs::write(&file, "").expect("write file");
 
-        let resolved = resolve_marker_root(&file, &["Cargo.toml".into()], &ws);
+        let resolved = resolve_marker_root(&file, &["Cargo.toml".into()], &[], &ws);
         assert_eq!(resolved, ws);
     }
 
@@ -5400,7 +5433,7 @@ mod tests {
         std::fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
         std::fs::write(&file, "").expect("write file");
 
-        let resolved = resolve_marker_root(&file, &["Cargo.toml".into()], &ws);
+        let resolved = resolve_marker_root(&file, &["Cargo.toml".into()], &[], &ws);
         assert_eq!(resolved, ws);
     }
 
@@ -5417,7 +5450,7 @@ mod tests {
         std::fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
         std::fs::write(&file, "").expect("write file");
 
-        let resolved = resolve_marker_root(&file, &["Cargo.toml".into()], &ws);
+        let resolved = resolve_marker_root(&file, &["Cargo.toml".into()], &[], &ws);
         assert_eq!(resolved, ws);
     }
 
@@ -5437,7 +5470,7 @@ mod tests {
         std::fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
         std::fs::write(&file, "").expect("write file");
 
-        let resolved = resolve_marker_root(&file, &["Cargo.toml".into()], &ws);
+        let resolved = resolve_marker_root(&file, &["Cargo.toml".into()], &[], &ws);
         assert_eq!(resolved, crate_a);
     }
 
@@ -5446,8 +5479,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("Cargo.toml"), "").expect("write");
 
-        assert!(dir_has_marker(dir.path(), &["Cargo.toml".into()]));
-        assert!(!dir_has_marker(dir.path(), &["go.mod".into()]));
+        assert!(dir_has_marker(dir.path(), &["Cargo.toml".into()], &[]));
+        assert!(!dir_has_marker(dir.path(), &["go.mod".into()], &[]));
     }
 
     #[test]
@@ -5462,7 +5495,7 @@ mod tests {
         std::fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
         std::fs::write(&file, "").expect("write file");
 
-        let resolved = resolve_marker_root(&file, &[], &ws);
+        let resolved = resolve_marker_root(&file, &[], &[], &ws);
         assert_eq!(resolved, ws);
     }
 
@@ -5555,5 +5588,122 @@ mod tests {
             ..LanguageConfig::default()
         };
         assert_eq!(lc.active_markers(), Some(&["Cargo.toml".into()][..]));
+    }
+
+    // ── Glob marker tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_dir_has_marker_glob() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("project.sln"), "").expect("write");
+
+        let glob = LspGlob::new("*.sln").expect("compile glob");
+        // Exact marker doesn't match, but glob does.
+        assert!(!dir_has_marker(dir.path(), &[], &[]));
+        assert!(dir_has_marker(dir.path(), &[], &[glob]));
+    }
+
+    #[test]
+    fn test_dir_has_marker_mixed_exact_and_glob() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("Cargo.toml"), "").expect("write");
+
+        let glob = LspGlob::new("*.sln").expect("compile glob");
+        // Exact marker matches — glob branch should not even be needed.
+        assert!(dir_has_marker(dir.path(), &["Cargo.toml".into()], &[glob],));
+    }
+
+    #[test]
+    fn test_dir_has_marker_glob_no_match() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("readme.txt"), "").expect("write");
+
+        let glob = LspGlob::new("*.sln").expect("compile glob");
+        assert!(!dir_has_marker(dir.path(), &[], &[glob]));
+    }
+
+    #[test]
+    fn test_resolve_marker_root_with_glob() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ws = dir.path().join("workspace");
+        let sub = ws.join("packages").join("my_project");
+        std::fs::create_dir_all(&sub).expect("mkdir");
+        std::fs::write(sub.join("my_project.csproj"), "").expect("write marker");
+
+        let file = sub.join("src").join("Program.cs");
+        std::fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&file, "").expect("write file");
+
+        let glob = LspGlob::new("*.csproj").expect("compile glob");
+        let resolved = resolve_marker_root(&file, &[], &[glob], &ws);
+        assert_eq!(resolved, sub);
+    }
+
+    #[test]
+    fn test_resolve_marker_root_glob_fallback_to_workspace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ws = dir.path().join("workspace");
+        let sub = ws.join("packages").join("no_marker");
+        std::fs::create_dir_all(&sub).expect("mkdir");
+
+        let file = sub.join("lib.rs");
+        std::fs::write(&file, "").expect("write file");
+
+        let glob = LspGlob::new("*.sln").expect("compile glob");
+        let resolved = resolve_marker_root(&file, &[], &[glob], &ws);
+        assert_eq!(resolved, ws);
+    }
+
+    #[test]
+    fn test_resolve_marker_root_mixed_exact_and_glob() {
+        // Exact marker at workspace root, glob marker at sub.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ws = dir.path().join("workspace");
+        let sub = ws.join("sub_project");
+        std::fs::create_dir_all(&sub).expect("mkdir");
+        std::fs::write(ws.join("Cargo.toml"), "").expect("write exact marker");
+        std::fs::write(sub.join("project.csproj"), "").expect("write glob marker");
+
+        let file = sub.join("src").join("Main.cs");
+        std::fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&file, "").expect("write file");
+
+        let glob = LspGlob::new("*.csproj").expect("compile glob");
+        // Nearest directory with any marker wins — sub has *.csproj.
+        let resolved = resolve_marker_root(&file, &["Cargo.toml".into()], &[glob], &ws);
+        assert_eq!(resolved, sub);
+    }
+
+    #[test]
+    fn test_compile_markers_separates_exact_and_glob() {
+        let mut lc = LanguageConfig {
+            root_markers: Some(vec![
+                "Cargo.toml".into(),
+                "*.sln".into(),
+                "go.mod".into(),
+                "*.csproj".into(),
+            ]),
+            ..LanguageConfig::default()
+        };
+        lc.compile_markers().expect("compile");
+        // Only glob patterns are compiled.
+        assert_eq!(lc.compiled_markers.len(), 2);
+    }
+
+    #[test]
+    fn test_compile_markers_no_globs() {
+        let mut lc = LanguageConfig {
+            root_markers: Some(vec!["Cargo.toml".into(), "go.mod".into()]),
+            ..LanguageConfig::default()
+        };
+        lc.compile_markers().expect("compile");
+        assert!(lc.compiled_markers.is_empty());
+    }
+
+    #[test]
+    fn test_compile_markers_none() {
+        let mut lc = LanguageConfig::default();
+        lc.compile_markers().expect("compile");
+        assert!(lc.compiled_markers.is_empty());
     }
 }

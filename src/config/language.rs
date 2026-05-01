@@ -3,8 +3,11 @@
 
 //! Language configuration.
 
+use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde::de::{self, Deserializer};
+
+use crate::lsp::glob::{LspGlob, is_glob_pattern};
 
 /// LSP methods dispatched through [`crate::lsp::LspClientManager::get_servers`].
 ///
@@ -235,12 +238,16 @@ pub struct LanguageConfig {
     #[serde(default)]
     pub shebangs: Option<Vec<String>>,
 
-    /// Root marker filenames for sub-root resolution.
+    /// Root marker filenames or glob patterns for sub-root resolution.
     ///
     /// When set, Catenary walks up from each file toward the workspace
     /// root boundary, stopping at the first directory containing any
-    /// marker file. That directory becomes the server instance's root.
+    /// marker. That directory becomes the server instance's root.
     /// Different resolved roots produce different server instances.
+    ///
+    /// Entries without glob metacharacters (`*`, `?`, `[`) are treated
+    /// as exact filenames (fast `exists()` check). Entries with glob
+    /// metacharacters are compiled and matched against directory entries.
     ///
     /// Markers are a property of the language ecosystem — `Cargo.toml`
     /// defines a Rust project boundary regardless of which server is used.
@@ -249,6 +256,12 @@ pub struct LanguageConfig {
     /// with `root_markers = []`.
     #[serde(default)]
     pub root_markers: Option<Vec<String>>,
+
+    /// Compiled glob patterns from `root_markers`. Populated by
+    /// [`Self::compile_markers`] after deserialization. Contains only
+    /// the entries that have glob metacharacters.
+    #[serde(skip)]
+    pub compiled_markers: Vec<LspGlob>,
 }
 
 impl Default for LanguageConfig {
@@ -260,6 +273,7 @@ impl Default for LanguageConfig {
             filenames: None,
             shebangs: None,
             root_markers: None,
+            compiled_markers: Vec::new(),
         }
     }
 }
@@ -300,6 +314,36 @@ impl LanguageConfig {
         self.root_markers
             .as_deref()
             .filter(|markers| !markers.is_empty())
+    }
+
+    /// Returns the active root markers split into exact filenames and
+    /// compiled glob patterns.
+    ///
+    /// Returns `None` when markers are absent or disabled (`root_markers = []`).
+    #[must_use]
+    pub fn marker_set(&self) -> Option<(&[String], &[LspGlob])> {
+        self.active_markers()
+            .map(|m| (m, self.compiled_markers.as_slice()))
+    }
+
+    /// Compiles glob patterns in `root_markers` into [`LspGlob`] matchers.
+    ///
+    /// Called once after deserialization. Only entries containing glob
+    /// metacharacters (`*`, `?`, `[`) are compiled — exact filenames
+    /// use the fast `exists()` path and don't need compilation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any glob pattern in `root_markers` fails to compile.
+    pub fn compile_markers(&mut self) -> Result<()> {
+        if let Some(markers) = &self.root_markers {
+            self.compiled_markers = markers
+                .iter()
+                .filter(|m| is_glob_pattern(m))
+                .map(|m| LspGlob::new(m).with_context(|| format!("root_markers glob '{m}'")))
+                .collect::<Result<Vec<_>>>()?;
+        }
+        Ok(())
     }
 
     /// Returns `true` if this entry has any classification fields set.

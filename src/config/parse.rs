@@ -163,6 +163,14 @@ pub fn load_from_sources(sources: &[PathBuf]) -> Result<Config> {
             .context("file_patterns compilation failed after validation (bug)")?;
     }
 
+    // Compile root_markers globs after validation. Same guarantee —
+    // validation already checked each glob pattern.
+    for lang_config in config.language.values_mut() {
+        lang_config
+            .compile_markers()
+            .context("root_markers compilation failed after validation (bug)")?;
+    }
+
     Ok(config)
 }
 
@@ -572,7 +580,7 @@ pub fn load_project_config(root: &std::path::Path) -> Result<Option<ProjectConfi
     let lsp = lsp_val.or(enabled_val).unwrap_or(true);
 
     // Deserialize only the supported sections.
-    let language: HashMap<String, LanguageConfig> = raw
+    let mut language: HashMap<String, LanguageConfig> = raw
         .get("language")
         .map(|v| {
             toml::Value::try_into(v.clone()).with_context(|| {
@@ -603,6 +611,16 @@ pub fn load_project_config(root: &std::path::Path) -> Result<Option<ProjectConfi
         server_def.compile_patterns().with_context(|| {
             format!(
                 "Project config {}: [server.{name}] file_patterns compilation failed",
+                config_path.display()
+            )
+        })?;
+    }
+
+    // Compile root_markers globs on project LanguageConfig entries.
+    for (name, lang_config) in &mut language {
+        lang_config.compile_markers().with_context(|| {
+            format!(
+                "Project config {}: [language.{name}] root_markers compilation failed",
                 config_path.display()
             )
         })?;

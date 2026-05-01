@@ -263,6 +263,16 @@ root.
 root_markers = ["Cargo.toml"]
 ```
 
+Entries can be exact filenames or glob patterns (`*`, `?`, `[`). Exact
+filenames use a fast `exists()` check; glob patterns are compiled at
+config load time and matched against directory entries. This is useful
+for ecosystems where project files have varying names:
+
+```toml
+[language.csharp]
+root_markers = ["*.sln", "*.csproj"]
+```
+
 This fixes polyglot repos and monorepos where the workspace root is
 broader than what a server needs. For example, a chezmoi dotfiles repo
 with Neovim config at `dot_config/nvim/` — lua\_ls rooted at the
@@ -271,8 +281,9 @@ chezmoi root never finds `dot_config/nvim/.luarc.json`. With
 subdirectory and discovers the config.
 
 **Defaults are shipped** for common languages (Rust, Go, Python,
-TypeScript, Lua, Java, C/C++, and others) in the builtin config. Run
-`catenary doctor <server>` to see active markers. Override per-language:
+TypeScript, Lua, Java, C/C++, C#, F#, and others) in the builtin
+config. Run `catenary doctor <server>` to see active markers. Override
+per-language:
 
 ```toml
 # Custom markers
