@@ -199,6 +199,12 @@ struct Args {
     /// Used to test stderr capture.
     #[arg(long)]
     stderr_message: Option<String>,
+
+    /// Include the value of the named environment variable in the
+    /// `serverInfo.version` field of the initialize response.
+    /// Used to verify that per-server `env` config reaches the process.
+    #[arg(long)]
+    report_env: Option<String>,
 }
 
 /// A JSON-RPC request.
@@ -797,7 +803,15 @@ impl MockServer {
             });
         }
 
-        serde_json::json!({ "capabilities": capabilities })
+        let mut result = serde_json::json!({ "capabilities": capabilities });
+        if let Some(ref var_name) = self.args.report_env {
+            let value = std::env::var(var_name).unwrap_or_default();
+            result["serverInfo"] = serde_json::json!({
+                "name": "mockls",
+                "version": value
+            });
+        }
+        result
     }
 
     fn handle_hover(&self, params: &Value) -> Option<Value> {
@@ -2360,6 +2374,7 @@ mod tests {
             report_open_count: false,
             reject_null_workspace: false,
             stderr_message: None,
+            report_env: None,
         }
     }
 

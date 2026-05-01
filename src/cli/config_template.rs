@@ -106,6 +106,14 @@ const TEMPLATE: &str = r#"# Catenary recommended config
 # [notifications]
 # threshold = "warn"
 
+# ── Server environment ────────────────────────────────────────────
+#
+# Per-server environment variables. Added to the inherited
+# environment (config value wins on conflict).
+#
+# [server.rust-analyzer]
+# env = { CLIPPY_DISABLE_DOCS_LINKS = "1" }
+
 # ── Tool budgets ─────────────────────────────────────────────────
 #
 # Output budgets in characters. Larger budgets give the agent more

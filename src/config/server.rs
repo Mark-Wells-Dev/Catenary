@@ -3,6 +3,8 @@
 
 //! Server definitions — how to run and configure a language server.
 
+use std::collections::HashMap;
+
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
@@ -22,6 +24,13 @@ pub struct ServerDef {
     /// Arguments to pass to the command.
     #[serde(default)]
     pub args: Vec<String>,
+
+    /// Environment variables to set on the spawned server process.
+    ///
+    /// Variables are **added** to the inherited environment. If a key
+    /// already exists, the config value wins.
+    #[serde(default)]
+    pub env: Option<HashMap<String, String>>,
 
     /// Initialization options to pass to the LSP server.
     #[serde(default)]

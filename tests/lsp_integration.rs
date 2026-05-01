@@ -31,6 +31,7 @@ async fn test_mockls_initialize() -> Result<()> {
         test_logging(),
         None,
         std::collections::HashMap::new(),
+        None,
     )?;
 
     let result = client.initialize(&[dir.path().to_path_buf()], None).await?;
@@ -56,6 +57,7 @@ async fn test_mockls_initialize_workspace_folders() -> Result<()> {
         test_logging(),
         None,
         std::collections::HashMap::new(),
+        None,
     )?;
 
     let result = client.initialize(&[dir.path().to_path_buf()], None).await?;
@@ -87,6 +89,7 @@ async fn test_mockls_document_lifecycle() -> Result<()> {
         test_logging(),
         None,
         std::collections::HashMap::new(),
+        None,
     )?;
 
     client.initialize(&[dir.path().to_path_buf()], None).await?;
@@ -127,6 +130,7 @@ async fn test_client_capabilities() -> Result<()> {
         test_logging(),
         None,
         std::collections::HashMap::new(),
+        None,
     )?;
 
     client.initialize(&[dir.path().to_path_buf()], None).await?;
@@ -241,6 +245,7 @@ async fn test_settle_waits_through_busy_to_healthy() -> Result<()> {
         test_logging(),
         None,
         std::collections::HashMap::new(),
+        None,
     )?;
 
     client.initialize(&[dir.path().to_path_buf()], None).await?;
@@ -284,6 +289,7 @@ async fn test_settle_returns_settled_on_quiet_tree() -> Result<()> {
         test_logging(),
         None,
         std::collections::HashMap::new(),
+        None,
     )?;
 
     client.initialize(&[dir.path().to_path_buf()], None).await?;
@@ -325,6 +331,7 @@ async fn test_content_modified_retry() -> Result<()> {
         test_logging(),
         None,
         std::collections::HashMap::new(),
+        None,
     )?;
 
     client.initialize(&[dir.path().to_path_buf()], None).await?;
@@ -367,6 +374,7 @@ async fn test_lifecycle_probing_to_healthy_on_tool_request() -> Result<()> {
         test_logging(),
         None,
         std::collections::HashMap::new(),
+        None,
     )?;
 
     // Before init: Initializing
@@ -409,6 +417,7 @@ async fn test_health_probe_transitions_to_healthy() -> Result<()> {
         test_logging(),
         None,
         std::collections::HashMap::new(),
+        None,
     )?;
 
     client.initialize(&[dir.path().to_path_buf()], None).await?;
@@ -422,6 +431,39 @@ async fn test_health_probe_transitions_to_healthy() -> Result<()> {
     // Health probe sends documentSymbol → Probing → Healthy
     assert!(client.run_health_probe(&uri).await);
     assert_eq!(client.lifecycle(), ServerLifecycle::Healthy);
+
+    client.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_server_env_passed_to_process() -> Result<()> {
+    let dir = tempdir()?;
+    let bin = env!("CARGO_BIN_EXE_mockls");
+
+    let mut env = std::collections::HashMap::new();
+    env.insert(
+        "CATENARY_TEST_ENV_VAR".to_string(),
+        "hello_from_config".to_string(),
+    );
+
+    let mut client = catenary_mcp::lsp::LspClient::spawn(
+        bin,
+        &[MOCK_LANG_A, "--report-env", "CATENARY_TEST_ENV_VAR"],
+        MOCK_LANG_A,
+        MOCK_LANG_A,
+        test_logging(),
+        None,
+        std::collections::HashMap::new(),
+        Some(&env),
+    )?;
+
+    let result = client.initialize(&[dir.path().to_path_buf()], None).await?;
+
+    let version = result["serverInfo"]["version"]
+        .as_str()
+        .expect("serverInfo.version should be present");
+    assert_eq!(version, "hello_from_config");
 
     client.shutdown().await?;
     Ok(())

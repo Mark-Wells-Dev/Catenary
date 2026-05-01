@@ -909,6 +909,7 @@ impl LspClientManager {
             self.logging.clone(),
             server_def.settings.clone(),
             settings_per_root,
+            server_def.env.as_ref(),
         )?;
 
         client
@@ -989,6 +990,7 @@ impl LspClientManager {
             self.logging.clone(),
             server_def.settings.clone(),
             HashMap::new(),
+            server_def.env.as_ref(),
         )?;
 
         // Initialize with null workspace (single-file mode per LSP spec).
@@ -1545,6 +1547,15 @@ impl LspClientManager {
             merged
                 .compiled_patterns
                 .clone_from(&project_def.compiled_patterns);
+        }
+        if let Some(ref project_env) = project_def.env {
+            if let Some(ref user_env) = user_def.env {
+                let mut env = user_env.clone();
+                env.extend(project_env.iter().map(|(k, v)| (k.clone(), v.clone())));
+                merged.env = Some(env);
+            } else {
+                merged.env = Some(project_env.clone());
+            }
         }
         if let Some(ref project_settings) = project_def.settings {
             if let Some(ref user_settings) = user_def.settings {
@@ -4071,6 +4082,7 @@ mod tests {
             "rust",
             "ra",
             test_logging(),
+            None,
         )?));
         let ws_client = Arc::new(Mutex::new(LspClient::spawn_quiet(
             bin.to_str().expect("bin"),
@@ -4078,6 +4090,7 @@ mod tests {
             "rust",
             "ra",
             test_logging(),
+            None,
         )?));
 
         let mut clients: HashMap<InstanceKey, Arc<Mutex<LspClient>>> = HashMap::new();
@@ -4109,6 +4122,7 @@ mod tests {
             "rust",
             "ra",
             test_logging(),
+            None,
         )?));
 
         let mut clients: HashMap<InstanceKey, Arc<Mutex<LspClient>>> = HashMap::new();
@@ -4132,6 +4146,7 @@ mod tests {
             "rust",
             "ra",
             test_logging(),
+            None,
         )?));
 
         let mut clients: HashMap<InstanceKey, Arc<Mutex<LspClient>>> = HashMap::new();
@@ -4998,6 +5013,7 @@ mod tests {
                 ServerDef {
                     command: bin.to_string_lossy().to_string(),
                     args: vec![lang.to_string()],
+                    env: None,
                     initialization_options: None,
                     settings: None,
                     min_severity: None,

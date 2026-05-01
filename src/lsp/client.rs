@@ -68,6 +68,7 @@ impl LspClient {
     /// Returns an error if:
     /// - The server process cannot be spawned.
     /// - Stdin or stdout cannot be captured.
+    #[allow(clippy::too_many_arguments, reason = "spawn parameters from ServerDef")]
     pub fn spawn(
         program: &str,
         args: &[&str],
@@ -76,6 +77,7 @@ impl LspClient {
         logging: LoggingServer,
         settings: Option<serde_json::Value>,
         settings_per_root: HashMap<PathBuf, serde_json::Value>,
+        env: Option<&HashMap<String, String>>,
     ) -> Result<Self> {
         let (client, child_stderr) = Self::spawn_inner(
             program,
@@ -86,6 +88,7 @@ impl LspClient {
             Stdio::piped(),
             settings,
             settings_per_root,
+            env,
         )?;
         if let Some(stderr) = child_stderr {
             Self::spawn_stderr_reader(stderr, server_name);
@@ -105,6 +108,7 @@ impl LspClient {
         language_id: &str,
         server_name: &str,
         logging: LoggingServer,
+        env: Option<&HashMap<String, String>>,
     ) -> Result<Self> {
         let (client, _) = Self::spawn_inner(
             program,
@@ -115,6 +119,7 @@ impl LspClient {
             Stdio::null(),
             None,
             HashMap::new(),
+            env,
         )?;
         Ok(client)
     }
@@ -133,6 +138,7 @@ impl LspClient {
         language_id: &str,
         server_name: &str,
         logging: LoggingServer,
+        env: Option<&HashMap<String, String>>,
     ) -> Result<(Self, Option<tokio::process::ChildStderr>)> {
         Self::spawn_inner(
             program,
@@ -143,6 +149,7 @@ impl LspClient {
             Stdio::piped(),
             None,
             HashMap::new(),
+            env,
         )
     }
 
@@ -159,6 +166,7 @@ impl LspClient {
         stderr: Stdio,
         settings: Option<serde_json::Value>,
         settings_per_root: HashMap<PathBuf, serde_json::Value>,
+        env: Option<&HashMap<String, String>>,
     ) -> Result<(Self, Option<tokio::process::ChildStderr>)> {
         let server = Arc::new(LspServer::new(
             language_id.to_string(),
@@ -171,6 +179,7 @@ impl LspClient {
             program,
             args,
             stderr,
+            env,
             &server,
             language_id.to_string(),
             logging,

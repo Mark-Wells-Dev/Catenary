@@ -146,6 +146,7 @@ pub async fn run_doctor(project_root: &Path, nocolor: bool, show_diff: bool) -> 
             name,
             name,
             crate::logging::LoggingServer::new(),
+            server_def.env.as_ref(),
         );
 
         let mut client = match spawn_result {
@@ -352,6 +353,7 @@ pub async fn run_doctor_single(
         server_name,
         server_name,
         crate::logging::LoggingServer::new(),
+        server_def.env.as_ref(),
     );
 
     let (mut client, child_stderr) = match spawn_result {

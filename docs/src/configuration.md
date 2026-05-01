@@ -118,6 +118,23 @@ args = ["server"]
 min_severity = "warning"
 ```
 
+### Environment Variables
+
+`env` on `[server.*]` sets environment variables on the spawned server
+process. Variables are added to the inherited environment — if a key
+already exists, the config value wins.
+
+```toml
+[server.rust-analyzer]
+command = "rustup"
+args = ["run", "stable", "rust-analyzer"]
+env = { CLIPPY_DISABLE_DOCS_LINKS = "1" }
+```
+
+Use cases include stripping lint URLs from diagnostics (saves agent
+context tokens), setting custom module paths, and passing runtime flags
+to language servers that read them from the environment.
+
 ### Multi-server Bindings
 
 The `servers` list on `[language.*]` supports multiple servers. List order

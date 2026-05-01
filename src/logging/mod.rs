@@ -794,6 +794,7 @@ pub mod test_support {
             logging,
             None,
             std::collections::HashMap::new(),
+            None,
         )?;
 
         client.initialize(&[dir.path().to_path_buf()], None).await?;

@@ -173,6 +173,7 @@ pub const SERVER_DEF_KEYS: &[&str] = &[
     "initialization_options",
     "settings",
     "min_severity",
+    "env",
     "file_patterns",
 ];
 
@@ -1044,6 +1045,57 @@ cargo = "Use make instead"
             config.commands.is_none(),
             "old-format commands should be stripped",
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_project_config_server_env() -> Result<()> {
+        let dir = tempdir()?;
+        fs::write(
+            dir.path().join(".catenary.toml"),
+            r#"
+[server.rust-analyzer]
+command = "rust-analyzer"
+env = { CLIPPY_DISABLE_DOCS_LINKS = "1", RUST_LOG = "info" }
+
+[language.rust]
+servers = ["rust-analyzer"]
+"#,
+        )?;
+
+        let result = load_project_config(dir.path())?;
+        let config = result.expect("should find project config");
+        let ra = &config.server["rust-analyzer"];
+        let env = ra.env.as_ref().expect("env should be present");
+        assert_eq!(
+            env.get("CLIPPY_DISABLE_DOCS_LINKS").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(env.get("RUST_LOG").map(String::as_str), Some("info"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_project_config_server_env_absent() -> Result<()> {
+        let dir = tempdir()?;
+        fs::write(
+            dir.path().join(".catenary.toml"),
+            r#"
+[server.pyright]
+command = "pyright-langserver"
+args = ["--stdio"]
+
+[language.python]
+servers = ["pyright"]
+"#,
+        )?;
+
+        let result = load_project_config(dir.path())?;
+        let config = result.expect("should find project config");
+        let pyright = &config.server["pyright"];
+        assert!(pyright.env.is_none(), "env should default to None");
 
         Ok(())
     }

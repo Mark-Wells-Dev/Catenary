@@ -113,10 +113,33 @@
           "description": "Initialization options to pass to the LSP server during the 'initialize' request.",
           "additionalProperties": true
         },
+        "env": {
+          "type": "object",
+          "description": "Environment variables to set on the spawned server process. Variables are added to the inherited environment; if a key already exists, the config value wins.",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
         "settings": {
           "type": "object",
           "description": "Server-specific settings returned in workspace/configuration responses. The TOML nesting mirrors the JSON the server expects. Catenary matches the 'section' path from configuration requests and returns the subtree.",
           "additionalProperties": true
+        },
+        "min_severity": {
+          "type": "string",
+          "description": "Minimum diagnostic severity to deliver to agents. When absent, all severities are delivered.",
+          "enum": ["error", "warning", "information", "hint"]
+        },
+        "single_file": {
+          "type": "boolean",
+          "description": "Whether this server supports single-file mode (tier 3). When true, the server may be spawned with rootUri: null for files outside all workspace roots.",
+          "default": false
+        },
+        "file_patterns": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Glob patterns to filter which files this server handles within its language. Matched against the filename (not path). Servers without file_patterns handle all files for their language.",
+          "default": []
         }
       }
     }

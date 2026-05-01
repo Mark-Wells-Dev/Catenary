@@ -832,6 +832,7 @@ mod tests {
             ServerDef {
                 command: "mockls".to_string(),
                 args: vec![SF_LANG.to_string()],
+                env: None,
                 initialization_options: None,
                 settings: None,
                 min_severity: None,

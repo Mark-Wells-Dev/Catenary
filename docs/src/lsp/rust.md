@@ -28,6 +28,7 @@ Add to `~/.config/catenary/config.toml`:
 [server.rust-analyzer]
 command = "rustup"
 args = ["run", "stable", "rust-analyzer"]
+env = { CLIPPY_DISABLE_DOCS_LINKS = "1" }
 
 [server.rust-analyzer.initialization_options]
 check.command = "clippy"
@@ -37,6 +38,10 @@ diagnostics.disabled = ["inactive-code"]
 [language.rust]
 servers = ["rust-analyzer"]
 ```
+
+Setting `CLIPPY_DISABLE_DOCS_LINKS=1` strips "for further information
+visit ..." suffixes from clippy diagnostics, saving agent context
+tokens.
 
 ## Notes
 

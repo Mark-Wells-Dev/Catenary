@@ -128,10 +128,12 @@ impl Connection {
     /// Returns an error if:
     /// - The server process cannot be spawned.
     /// - Stdin or stdout cannot be captured.
+    #[allow(clippy::too_many_arguments, reason = "spawn parameters from ServerDef")]
     pub fn new(
         program: &str,
         args: &[&str],
         stderr: Stdio,
+        env: Option<&HashMap<String, String>>,
         server: &Arc<LspServer>,
         language: String,
         logging: LoggingServer,
@@ -142,6 +144,9 @@ impl Connection {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(stderr);
+        if let Some(env) = env {
+            cmd.envs(env);
+        }
         catenary_proc::set_parent_death_signal(cmd.as_std_mut());
         let mut child = cmd
             .spawn()
