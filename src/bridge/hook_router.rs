@@ -855,13 +855,8 @@ mod tests {
             ServerDef {
                 command: "mockls".to_string(),
                 args: vec![SF_LANG.to_string()],
-                env: None,
-                initialization_options: None,
-                settings: None,
-                min_severity: None,
                 single_file: true,
-                file_patterns: Vec::new(),
-                compiled_patterns: Vec::new(),
+                ..ServerDef::default()
             },
         );
         config.language.insert(

@@ -249,6 +249,57 @@ flag that distinguishes these cases. Neovim's `nvim-lspconfig` uses the
 same approach: a per-server `single_file_support` flag, opt-in, set by
 the server config maintainers who know which servers handle it well.
 
+### Root Markers
+
+`root_markers` on `[language.*]` defines project boundary files for
+sub-root resolution. When a file in a workspace root needs a server
+instance that doesn't exist yet, Catenary walks up from the file
+toward the workspace root boundary, stopping at the first directory
+containing any marker. That directory becomes the server instance's
+root.
+
+```toml
+[language.rust]
+root_markers = ["Cargo.toml"]
+```
+
+This fixes polyglot repos and monorepos where the workspace root is
+broader than what a server needs. For example, a chezmoi dotfiles repo
+with Neovim config at `dot_config/nvim/` — lua\_ls rooted at the
+chezmoi root never finds `dot_config/nvim/.luarc.json`. With
+`root_markers = [".luarc.json"]`, lua\_ls spawns rooted at the
+subdirectory and discovers the config.
+
+**Defaults are shipped** for common languages (Rust, Go, Python,
+TypeScript, Lua, Java, C/C++, and others) in the builtin config. Run
+`catenary doctor <server>` to see active markers. Override per-language:
+
+```toml
+# Custom markers
+[language.rust]
+root_markers = ["rust-toolchain.toml"]
+
+# Disable markers entirely
+[language.python]
+root_markers = []
+```
+
+**Key behaviors:**
+
+- **Bounded by workspace root.** The walk never escapes above the
+  workspace root. Markers subdivide within roots — they don't extend
+  beyond them.
+- **Nearest wins.** The closest marker to the file is used. Nested
+  markers (workspace `Cargo.toml` + crate `Cargo.toml`) resolve to
+  the nearest.
+- **No marker → workspace root.** Falls back to current behavior when
+  no marker exists.
+- **Eager/lazy spawn.** If the workspace root itself contains a marker,
+  the server spawns at startup. If markers only exist in subdirectories,
+  spawn is deferred until a file there is first accessed.
+- **Instance isolation.** Files in different marker-resolved sub-roots
+  get separate server instances. Files in the same sub-root share one.
+
 ### Custom Languages
 
 Define a custom language by adding a `[language.*]` entry with

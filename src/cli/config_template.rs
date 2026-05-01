@@ -114,6 +114,23 @@ const TEMPLATE: &str = r#"# Catenary recommended config
 # [server.rust-analyzer]
 # env = { CLIPPY_DISABLE_DOCS_LINKS = "1" }
 
+# ── Root markers ──────────────────────────────────────────────────
+#
+# Root markers define project boundaries within workspace roots.
+# Catenary walks up from each file, stopping at the first directory
+# containing any marker. That directory becomes the server's root.
+# Different resolved roots get separate server instances.
+#
+# Defaults are shipped for common languages (rust = ["Cargo.toml"],
+# go = ["go.mod"], python = ["pyproject.toml", ...], etc.). Override
+# per-language, or disable with an empty list:
+#
+# [language.rust]
+# root_markers = ["rust-toolchain.toml"]   # custom markers
+#
+# [language.python]
+# root_markers = []                        # disable for python
+
 # ── Tool budgets ─────────────────────────────────────────────────
 #
 # Output budgets in characters. Larger budgets give the agent more

@@ -65,6 +65,15 @@ pub fn validate(config: &Config) -> Vec<String> {
                 }
             }
         }
+        if let Some(ref markers) = lang_config.root_markers {
+            for marker in markers {
+                if marker.is_empty() {
+                    errors.push(format!(
+                        "Language '{key}' has an empty string in `root_markers`"
+                    ));
+                }
+            }
+        }
     }
 
     // Validate server definitions
@@ -238,5 +247,42 @@ mod tests {
         let root = PathBuf::from("/test");
 
         warn_orphan_project_servers(&project, &user_config, &root);
+    }
+
+    #[test]
+    fn test_root_markers_empty_string_rejected() {
+        let mut config = Config::default();
+        config.language.insert(
+            "test".to_string(),
+            LanguageConfig {
+                root_markers: Some(vec![String::new()]),
+                ..LanguageConfig::default()
+            },
+        );
+
+        let errors = validate(&config);
+        assert!(
+            errors.iter().any(|e| e.contains("root_markers")),
+            "should reject empty string in root_markers: {errors:?}",
+        );
+    }
+
+    #[test]
+    fn test_root_markers_valid_entries_ok() {
+        let mut config = Config::default();
+        config.language.insert(
+            "test".to_string(),
+            LanguageConfig {
+                extensions: Some(vec!["test".to_string()]),
+                root_markers: Some(vec!["Cargo.toml".to_string()]),
+                ..LanguageConfig::default()
+            },
+        );
+
+        let errors = validate(&config);
+        assert!(
+            errors.is_empty(),
+            "valid root_markers should pass: {errors:?}"
+        );
     }
 }

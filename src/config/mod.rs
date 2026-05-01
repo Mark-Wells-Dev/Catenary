@@ -2223,4 +2223,121 @@ build = "npm"
 
         Ok(())
     }
+
+    // ── Root marker defaults tests ───────────────────────────────────
+
+    #[test]
+    fn test_default_root_markers_from_defaults() -> anyhow::Result<()> {
+        // Rust gets root_markers = ["Cargo.toml"] from defaults/languages.toml.
+        // User config only adds server binding — markers come from defaults.
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+
+        fs::write(
+            &config_path,
+            r#"
+[server.rust-analyzer]
+command = "rust-analyzer"
+
+[language.rust]
+servers = ["rust-analyzer"]
+"#,
+        )
+        .expect("write config");
+
+        let config = Config::load_from_sources(&[config_path])?;
+        let rust = config.language.get("rust").expect("rust");
+        assert_eq!(
+            rust.root_markers.as_deref(),
+            Some(&["Cargo.toml".to_string()][..]),
+            "default root_markers should be applied for rust",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_explicit_root_markers_override_defaults() -> anyhow::Result<()> {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+
+        fs::write(
+            &config_path,
+            r#"
+[server.rust-analyzer]
+command = "rust-analyzer"
+
+[language.rust]
+servers = ["rust-analyzer"]
+root_markers = ["rust-toolchain.toml"]
+"#,
+        )
+        .expect("write config");
+
+        let config = Config::load_from_sources(&[config_path])?;
+        let rust = config.language.get("rust").expect("rust");
+        assert_eq!(
+            rust.root_markers.as_deref(),
+            Some(&["rust-toolchain.toml".to_string()][..]),
+            "user-specified root_markers should override defaults",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_empty_root_markers_disables_defaults() -> anyhow::Result<()> {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+
+        fs::write(
+            &config_path,
+            r#"
+[server.rust-analyzer]
+command = "rust-analyzer"
+
+[language.rust]
+servers = ["rust-analyzer"]
+root_markers = []
+"#,
+        )
+        .expect("write config");
+
+        let config = Config::load_from_sources(&[config_path])?;
+        let rust = config.language.get("rust").expect("rust");
+        assert_eq!(
+            rust.root_markers.as_deref(),
+            Some(&[][..]),
+            "explicit empty root_markers should disable defaults",
+        );
+        assert!(
+            rust.active_markers().is_none(),
+            "active_markers should return None for empty markers",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_unknown_language_no_default_markers() -> anyhow::Result<()> {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+
+        fs::write(
+            &config_path,
+            r#"
+[server.my-custom-server]
+command = "my-server"
+
+[language.custom]
+servers = ["my-custom-server"]
+"#,
+        )
+        .expect("write config");
+
+        let config = Config::load_from_sources(&[config_path])?;
+        let custom = config.language.get("custom").expect("custom");
+        assert!(
+            custom.root_markers.is_none(),
+            "unknown languages should not get default root_markers",
+        );
+        Ok(())
+    }
 }

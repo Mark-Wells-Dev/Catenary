@@ -10,7 +10,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use crate::bridge::filesystem_manager::{ClassificationTables, FilesystemManager};
-use crate::config::{Config, DispatchMethod, ServerBinding, ServerDef};
+use crate::config::{Config, DispatchMethod, LanguageConfig, ServerBinding, ServerDef};
 use crate::logging::LoggingServer;
 use crate::lsp::LspClient;
 use crate::lsp::glob::{FileChange, GlobPattern, LspGlob, WatchKind};
@@ -83,6 +83,49 @@ fn file_matches_patterns(path: &Path, patterns: &[LspGlob]) -> bool {
     patterns.iter().any(|g| g.is_match(file_path))
 }
 
+/// Walks up from `file` toward `workspace_root`, returning the first
+/// directory containing any marker file.
+///
+/// Bounded by `workspace_root` — the walk never escapes above it.
+/// Returns `workspace_root` if no marker is found.
+fn resolve_marker_root(file: &Path, markers: &[String], workspace_root: &Path) -> PathBuf {
+    let mut dir = if file.is_dir() {
+        file.to_path_buf()
+    } else {
+        file.parent()
+            .map_or_else(|| workspace_root.to_path_buf(), Path::to_path_buf)
+    };
+
+    loop {
+        // Check if this directory contains any marker.
+        for marker in markers {
+            if dir.join(marker).exists() {
+                return dir;
+            }
+        }
+
+        // Stop at workspace root boundary.
+        if dir == workspace_root {
+            break;
+        }
+
+        // Move up one level, but never above workspace root.
+        match dir.parent() {
+            Some(parent) if parent.starts_with(workspace_root) || parent == workspace_root => {
+                dir = parent.to_path_buf();
+            }
+            _ => break,
+        }
+    }
+
+    workspace_root.to_path_buf()
+}
+
+/// Whether a directory directly contains any of the given marker files.
+fn dir_has_marker(dir: &Path, markers: &[String]) -> bool {
+    markers.iter().any(|m| dir.join(m).exists())
+}
+
 /// Manages the lifecycle of LSP clients, document state, and language detection.
 ///
 /// Single authority for LSP server spawning, caching, shutdown, and document
@@ -101,6 +144,11 @@ pub struct LspClientManager {
     /// initialization at runtime. Uses `std::sync::Mutex` — reads are
     /// fast and non-contended.
     pub(crate) single_file_failures: std::sync::Mutex<HashSet<(String, String)>>,
+    /// Cache for root marker resolution results.
+    /// Key: `(directory, server_name)` → resolved root path.
+    /// Avoids re-walking the directory tree for files in the same
+    /// directory. Cleared on root changes (`sync_roots`).
+    marker_cache: std::sync::Mutex<HashMap<(PathBuf, String), PathBuf>>,
     logging: LoggingServer,
     fs: Arc<FilesystemManager>,
 }
@@ -122,6 +170,7 @@ impl LspClientManager {
             project_configs: std::sync::Mutex::new(HashMap::new()),
             clients: Mutex::new(HashMap::new()),
             single_file_failures: std::sync::Mutex::new(HashSet::new()),
+            marker_cache: std::sync::Mutex::new(HashMap::new()),
             logging,
             fs,
         }
@@ -145,6 +194,52 @@ impl LspClientManager {
             .iter()
             .filter_map(|(root, pc)| pc.commands.clone().map(|cmds| (root.clone(), cmds)))
             .collect()
+    }
+
+    /// Resolves the effective root for a server instance given a file path.
+    ///
+    /// If the language has active `root_markers`, walks up from `file`
+    /// toward `workspace_root` and returns the first directory containing
+    /// any marker. Results are cached by `(directory, language_id)`.
+    ///
+    /// Returns `workspace_root` when:
+    /// - The language has no root markers.
+    /// - No marker is found within the workspace root.
+    fn resolve_server_root(&self, file: &Path, lang: &str, workspace_root: &Path) -> PathBuf {
+        let Some(lang_config) = self.config.resolve_language(lang) else {
+            return workspace_root.to_path_buf();
+        };
+        let Some(markers) = lang_config.active_markers() else {
+            return workspace_root.to_path_buf();
+        };
+
+        let dir = if file.is_dir() {
+            file.to_path_buf()
+        } else {
+            file.parent()
+                .map_or_else(|| workspace_root.to_path_buf(), Path::to_path_buf)
+        };
+
+        let cache_key = (dir, lang.to_string());
+        {
+            let cache = self
+                .marker_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(cached) = cache.get(&cache_key) {
+                return cached.clone();
+            }
+        }
+
+        let resolved = resolve_marker_root(file, markers, workspace_root);
+
+        let mut cache = self
+            .marker_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.insert(cache_key, resolved.clone());
+
+        resolved
     }
 
     /// Spawns LSP servers for languages detected in the workspace.
@@ -188,6 +283,19 @@ impl LspClientManager {
                 let Some(first_root) = roots.first() else {
                     continue;
                 };
+
+                // If the language has root markers but the workspace root
+                // doesn't contain any, defer to lazy spawn on first need.
+                if let Some(markers) = lang_config.active_markers()
+                    && !dir_has_marker(first_root, markers)
+                {
+                    debug!(
+                        language = lang.as_str(),
+                        server = binding.name.as_str(),
+                        "No root marker at workspace root — deferring to lazy spawn",
+                    );
+                    continue;
+                }
 
                 let client = match self.ensure_server(lang, &binding.name, first_root).await {
                     Ok(c) => c,
@@ -279,6 +387,10 @@ impl LspClientManager {
         }
         match &key.scope {
             Scope::Root(_) => {
+                let markers = self
+                    .config
+                    .resolve_language(lang)
+                    .and_then(LanguageConfig::active_markers);
                 info!(
                     source = Source::LspLifecycle.as_str(),
                     language = lang,
@@ -286,6 +398,10 @@ impl LspClientManager {
                     "Server does not support workspaceFolders — spawning per-root instances",
                 );
                 for root in &roots[1..] {
+                    // Skip roots without markers when markers are configured.
+                    if markers.is_some_and(|m| !dir_has_marker(root, m)) {
+                        continue;
+                    }
                     if let Err(e) = self.ensure_server(lang, server_name, root).await {
                         warn!(
                             source = Source::LspLifecycle.as_str(),
@@ -536,6 +652,12 @@ impl LspClientManager {
             to_remove.len()
         );
 
+        // Clear marker cache — root boundaries changed.
+        self.marker_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+
         // Update project configs: load for added roots, remove for removed.
         self.load_project_configs_for_roots(&to_add);
         self.set_per_root_classification(&to_add);
@@ -647,6 +769,8 @@ impl LspClientManager {
         // tier 3 (single-file servers).
         if let Some(root) = self.fs.resolve_root(path) {
             // Tiers 1–2: rooted file lookup.
+            // Resolve marker root once for all servers in this language.
+            let resolved = self.resolve_server_root(path, &lang_id, &root);
             let clients = self.clients.lock().await;
             let mut result = Vec::new();
 
@@ -660,7 +784,8 @@ impl LspClientManager {
                 if !file_matches_patterns(path, &server_def.compiled_patterns) {
                     continue;
                 }
-                let Some(client) = find_instance(&clients, &lang_id, &binding.name, &root) else {
+                let Some(client) = find_instance(&clients, &lang_id, &binding.name, &resolved)
+                else {
                     continue;
                 };
                 let locked = client.lock().await;
@@ -858,16 +983,24 @@ impl LspClientManager {
                 .clone()
         };
 
+        let marker_scoped = !project_scoped
+            && self
+                .config
+                .resolve_language(lang)
+                .and_then(LanguageConfig::active_markers)
+                .is_some();
+        let force_root = project_scoped || marker_scoped;
+
         let roots = self.fs.roots();
         let mut clients = self.clients.lock().await;
 
         // Double-check: another task may have spawned this server
         // while we waited.
         //
-        // Project-scoped spawns only check the exact Root(root) key —
-        // an existing Workspace instance must NOT prevent the
-        // project-scoped spawn (that's the whole point of Rule A).
-        let existing = if project_scoped {
+        // Project-scoped and marker-scoped spawns only check the exact
+        // Root(root) key — a workspace instance must NOT prevent
+        // spawning the isolated instance.
+        let existing = if force_root {
             let root_key = InstanceKey::new(
                 lang.to_string(),
                 server_name.to_string(),
@@ -908,6 +1041,14 @@ impl LspClientManager {
             self.collect_per_root_settings(server_name, &roots)
         };
 
+        // Marker-scoped instances are initialized with only their
+        // resolved root — the server sees only the sub-root.
+        let init_roots = if marker_scoped {
+            vec![root.to_path_buf()]
+        } else {
+            roots
+        };
+
         let args: Vec<&str> = server_def
             .args
             .iter()
@@ -925,12 +1066,13 @@ impl LspClientManager {
         )?;
 
         client
-            .initialize(&roots, server_def.initialization_options.clone())
+            .initialize(&init_roots, server_def.initialization_options.clone())
             .await?;
 
-        // Project-scoped instances always get Scope::Root regardless
-        // of capabilities — they are isolated by Rule A.
-        let scope = if project_scoped {
+        // Project-scoped and marker-scoped instances always get
+        // Scope::Root regardless of capabilities — they are isolated
+        // to their specific root.
+        let scope = if force_root {
             Scope::Root(root.to_path_buf())
         } else if client.supports_workspace_folders() {
             Scope::Workspace
@@ -1103,13 +1245,21 @@ impl LspClientManager {
         root: &Path,
     ) -> Result<Arc<Mutex<LspClient>>> {
         let project_scoped = self.is_project_scoped(lang, root);
+        let marker_scoped = !project_scoped
+            && self
+                .config
+                .resolve_language(lang)
+                .and_then(LanguageConfig::active_markers)
+                .is_some();
+        let force_root = project_scoped || marker_scoped;
 
         // Fast path: check for an existing instance. Project-scoped
-        // roots only check the exact Root(root) key — a workspace
-        // instance must not prevent spawning the isolated instance.
+        // and marker-scoped roots only check the exact Root(root) key
+        // — a workspace instance must not prevent spawning the
+        // isolated instance.
         {
             let clients = self.clients.lock().await;
-            let existing = if project_scoped {
+            let existing = if force_root {
                 let root_key = InstanceKey::new(
                     lang.to_string(),
                     server_name.to_string(),
@@ -1266,9 +1416,12 @@ impl LspClientManager {
                 };
 
                 // Check all servers in the binding, not just the first.
+                // Resolve marker root once per language — all servers
+                // share the same markers.
+                let resolved = self.resolve_server_root(path, &lang, &root);
                 for binding in &lang_config.servers {
-                    if find_instance(&active, &lang, &binding.name, &root).is_none() {
-                        to_spawn.insert((lang.clone(), binding.name.clone(), root.clone()));
+                    if find_instance(&active, &lang, &binding.name, &resolved).is_none() {
+                        to_spawn.insert((lang.clone(), binding.name.clone(), resolved.clone()));
                     }
                 }
             }
@@ -1431,12 +1584,20 @@ impl LspClientManager {
             let Some(servers) = active_langs.get(lang) else {
                 continue;
             };
+            let markers = self
+                .config
+                .resolve_language(lang)
+                .and_then(LanguageConfig::active_markers);
             for (server_name, is_workspace) in servers {
                 for root in added_roots {
-                    // Workspace-capable + non-project-scoped: already
-                    // covered by the workspace instance (folder add
+                    // Skip roots without markers when markers are configured.
+                    if markers.is_some_and(|m| !dir_has_marker(root, m)) {
+                        continue;
+                    }
+                    // Workspace-capable + non-project-scoped + no markers:
+                    // already covered by the workspace instance (folder add
                     // sent in sync_roots).
-                    if (self.is_project_scoped(lang, root) || !is_workspace)
+                    if (self.is_project_scoped(lang, root) || !is_workspace || markers.is_some())
                         && let Err(e) = self.ensure_server(lang, server_name, root).await
                     {
                         warn!(
@@ -5111,13 +5272,8 @@ mod tests {
                 ServerDef {
                     command: bin.to_string_lossy().to_string(),
                     args: vec![lang.to_string()],
-                    env: None,
-                    initialization_options: None,
-                    settings: None,
-                    min_severity: None,
                     single_file: true,
-                    file_patterns: Vec::new(),
-                    compiled_patterns: Vec::new(),
+                    ..ServerDef::default()
                 },
             );
             config.language.insert(
@@ -5199,5 +5355,205 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    // ── Root marker resolution tests ─────────────────────────────────
+
+    #[test]
+    fn test_resolve_marker_root_finds_nearest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ws = dir.path().join("workspace");
+        let sub = ws.join("packages").join("crate_a");
+        std::fs::create_dir_all(&sub).expect("mkdir");
+        std::fs::write(sub.join("Cargo.toml"), "").expect("write marker");
+
+        let file = sub.join("src").join("lib.rs");
+        std::fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&file, "").expect("write file");
+
+        let resolved = resolve_marker_root(&file, &["Cargo.toml".into()], &ws);
+        assert_eq!(resolved, sub);
+    }
+
+    #[test]
+    fn test_resolve_marker_root_workspace_fallback() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ws = dir.path().join("workspace");
+        let sub = ws.join("packages").join("no_marker");
+        std::fs::create_dir_all(&sub).expect("mkdir");
+
+        let file = sub.join("lib.rs");
+        std::fs::write(&file, "").expect("write file");
+
+        let resolved = resolve_marker_root(&file, &["Cargo.toml".into()], &ws);
+        assert_eq!(resolved, ws);
+    }
+
+    #[test]
+    fn test_resolve_marker_root_at_workspace_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ws = dir.path().join("workspace");
+        std::fs::create_dir_all(&ws).expect("mkdir");
+        std::fs::write(ws.join("Cargo.toml"), "").expect("write marker");
+
+        let file = ws.join("src").join("main.rs");
+        std::fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&file, "").expect("write file");
+
+        let resolved = resolve_marker_root(&file, &["Cargo.toml".into()], &ws);
+        assert_eq!(resolved, ws);
+    }
+
+    #[test]
+    fn test_resolve_marker_root_never_escapes_workspace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let parent = dir.path().join("parent");
+        let ws = parent.join("workspace");
+        std::fs::create_dir_all(&ws).expect("mkdir");
+        // Marker is above workspace root — should NOT be found.
+        std::fs::write(parent.join("Cargo.toml"), "").expect("write marker");
+
+        let file = ws.join("src").join("lib.rs");
+        std::fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&file, "").expect("write file");
+
+        let resolved = resolve_marker_root(&file, &["Cargo.toml".into()], &ws);
+        assert_eq!(resolved, ws);
+    }
+
+    #[test]
+    fn test_resolve_marker_root_nested_nearest_wins() {
+        // workspace/Cargo.toml (workspace manifest)
+        // workspace/crate_a/Cargo.toml (crate manifest)
+        // File is in crate_a → crate_a wins.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ws = dir.path().join("workspace");
+        let crate_a = ws.join("crate_a");
+        std::fs::create_dir_all(&crate_a).expect("mkdir");
+        std::fs::write(ws.join("Cargo.toml"), "").expect("write ws marker");
+        std::fs::write(crate_a.join("Cargo.toml"), "").expect("write crate marker");
+
+        let file = crate_a.join("src").join("lib.rs");
+        std::fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&file, "").expect("write file");
+
+        let resolved = resolve_marker_root(&file, &["Cargo.toml".into()], &ws);
+        assert_eq!(resolved, crate_a);
+    }
+
+    #[test]
+    fn test_dir_has_marker() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("Cargo.toml"), "").expect("write");
+
+        assert!(dir_has_marker(dir.path(), &["Cargo.toml".into()]));
+        assert!(!dir_has_marker(dir.path(), &["go.mod".into()]));
+    }
+
+    #[test]
+    fn test_resolve_marker_root_empty_markers() {
+        // Empty markers list should return workspace root immediately.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ws = dir.path().join("workspace");
+        std::fs::create_dir_all(&ws).expect("mkdir");
+        std::fs::write(ws.join("Cargo.toml"), "").expect("write marker");
+
+        let file = ws.join("src").join("lib.rs");
+        std::fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&file, "").expect("write file");
+
+        let resolved = resolve_marker_root(&file, &[], &ws);
+        assert_eq!(resolved, ws);
+    }
+
+    #[test]
+    fn test_marker_cache_hit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ws = dir.path().join("workspace");
+        let sub = ws.join("crate_a");
+        std::fs::create_dir_all(sub.join("src")).expect("mkdir");
+        std::fs::write(sub.join("Cargo.toml"), "").expect("write marker");
+
+        let file1 = sub.join("src").join("lib.rs");
+        let file2 = sub.join("src").join("main.rs");
+        std::fs::write(&file1, "").expect("write");
+        std::fs::write(&file2, "").expect("write");
+
+        let mut config = test_config_raw();
+        config.language.insert(
+            "rust".to_string(),
+            LanguageConfig {
+                root_markers: Some(vec!["Cargo.toml".into()]),
+                ..LanguageConfig::default()
+            },
+        );
+
+        let fs = test_fs_with_roots(&[ws.to_str().expect("ws")]);
+        let manager = LspClientManager::new(config, test_logging(), fs);
+
+        let r1 = manager.resolve_server_root(&file1, "rust", &ws);
+        let r2 = manager.resolve_server_root(&file2, "rust", &ws);
+        assert_eq!(r1, sub);
+        assert_eq!(r2, sub);
+
+        // Verify cache was populated.
+        let cache_len = manager
+            .marker_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        // Both files are in the same directory, so one cache entry.
+        assert_eq!(cache_len, 1);
+    }
+
+    #[test]
+    fn test_resolve_server_root_no_markers() {
+        let ws = PathBuf::from("/workspace");
+        let config = test_config_raw();
+        let manager = LspClientManager::new(config, test_logging(), test_fs());
+
+        let file = PathBuf::from("/workspace/src/lib.rs");
+        let resolved = manager.resolve_server_root(&file, "nonexistent", &ws);
+        assert_eq!(resolved, ws);
+    }
+
+    #[test]
+    fn test_resolve_server_root_disabled_markers() {
+        // root_markers = [] → no marker resolution.
+        let ws = PathBuf::from("/workspace");
+        let mut config = test_config_raw();
+        config.language.insert(
+            "rust".to_string(),
+            LanguageConfig {
+                root_markers: Some(Vec::new()),
+                ..LanguageConfig::default()
+            },
+        );
+
+        let manager = LspClientManager::new(config, test_logging(), test_fs());
+        let file = PathBuf::from("/workspace/src/lib.rs");
+        let resolved = manager.resolve_server_root(&file, "rust", &ws);
+        assert_eq!(resolved, ws);
+    }
+
+    #[test]
+    fn test_active_markers_states() {
+        // None → not set → None
+        let lc = LanguageConfig::default();
+        assert!(lc.active_markers().is_none());
+
+        // Some(empty) → disabled
+        let lc = LanguageConfig {
+            root_markers: Some(Vec::new()),
+            ..LanguageConfig::default()
+        };
+        assert!(lc.active_markers().is_none());
+
+        // Some(non-empty) → active
+        let lc = LanguageConfig {
+            root_markers: Some(vec!["Cargo.toml".into()]),
+            ..LanguageConfig::default()
+        };
+        assert_eq!(lc.active_markers(), Some(&["Cargo.toml".into()][..]));
     }
 }

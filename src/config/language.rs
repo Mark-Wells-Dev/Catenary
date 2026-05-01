@@ -234,6 +234,21 @@ pub struct LanguageConfig {
     /// Example: `["bash", "sh", "zsh"]`
     #[serde(default)]
     pub shebangs: Option<Vec<String>>,
+
+    /// Root marker filenames for sub-root resolution.
+    ///
+    /// When set, Catenary walks up from each file toward the workspace
+    /// root boundary, stopping at the first directory containing any
+    /// marker file. That directory becomes the server instance's root.
+    /// Different resolved roots produce different server instances.
+    ///
+    /// Markers are a property of the language ecosystem — `Cargo.toml`
+    /// defines a Rust project boundary regardless of which server is used.
+    /// Defaults are shipped in `defaults/languages.toml` for common
+    /// languages. Override with explicit `root_markers = [...]` or disable
+    /// with `root_markers = []`.
+    #[serde(default)]
+    pub root_markers: Option<Vec<String>>,
 }
 
 impl Default for LanguageConfig {
@@ -244,6 +259,7 @@ impl Default for LanguageConfig {
             extensions: None,
             filenames: None,
             shebangs: None,
+            root_markers: None,
         }
     }
 }
@@ -269,6 +285,21 @@ impl LanguageConfig {
         if other.shebangs.is_some() {
             self.shebangs = other.shebangs;
         }
+        if other.root_markers.is_some() {
+            self.root_markers = other.root_markers;
+        }
+    }
+
+    /// Returns the active root markers, if any.
+    ///
+    /// Returns `Some(&[String])` when markers are configured (either
+    /// from defaults or user-specified). Returns `None` when markers
+    /// are absent or explicitly disabled (`root_markers = []`).
+    #[must_use]
+    pub fn active_markers(&self) -> Option<&[String]> {
+        self.root_markers
+            .as_deref()
+            .filter(|markers| !markers.is_empty())
     }
 
     /// Returns `true` if this entry has any classification fields set.

@@ -331,6 +331,24 @@ pub async fn run_doctor_single(
     println!("  {command}{args_display}");
     println!();
 
+    // ── 1b. Root markers ────────────────────────────────────────────
+    // Find languages that bind to this server and show their markers.
+    let mut shown_markers = false;
+    for (lang_name, lang_config) in &merged_config.language {
+        if lang_config.servers.iter().any(|b| b.name == server_name)
+            && let Some(markers) = lang_config.active_markers()
+        {
+            if !shown_markers {
+                println!("{}:", colors.bold("Root markers"));
+                shown_markers = true;
+            }
+            println!("  {lang_name}: {}", markers.join(", "));
+        }
+    }
+    if shown_markers {
+        println!();
+    }
+
     // ── 2. Binary check ────────────────────────────────────────────
     println!("{}:", colors.bold("Binary"));
     if let Some(path) = resolve_binary(command) {

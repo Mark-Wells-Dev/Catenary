@@ -105,6 +105,11 @@ impl DiagnosticsServer {
         // Notify servers about filesystem changes once before the batch.
         self.client_manager.notify_file_changes().await;
 
+        // Ensure servers exist for all files before looking them up.
+        // Triggers lazy spawn for files in sub-roots that haven't
+        // been visited by grep/glob yet (root marker resolution).
+        self.client_manager.ensure_clients_for_paths(files).await;
+
         // ── Phase 1: resolve + canonicalize ────────────────────────
         let mut canonical_paths: Vec<PathBuf> = Vec::new();
         let mut uncovered: Vec<TrackedEntry> = Vec::new();

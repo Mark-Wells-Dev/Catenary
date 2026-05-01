@@ -1,30 +1,42 @@
-# Default language classification rules.
+# Default language classification and root marker rules.
 #
 # Loaded as the lowest-priority config layer. User and project configs
 # override individual fields via field-level merge. No server bindings
 # are defined here — those come from user configuration.
 #
 # Classification precedence: shebang > filename > extension.
+#
+# Root markers define project boundaries within workspace roots.
+# When a file is opened, Catenary walks up from the file toward the
+# workspace root, stopping at the first directory containing any marker.
+# That directory becomes the server instance's root. Override with
+# `root_markers = [...]` or disable with `root_markers = []`.
 
 # ── Systems ─────────────────────────────────────────────────────────
 
 [language.rust]
 extensions = ["rs"]
+root_markers = ["Cargo.toml"]
 
 [language.go]
 extensions = ["go"]
+root_markers = ["go.mod"]
 
 [language.c]
 extensions = ["c"]
+root_markers = ["compile_commands.json", ".clangd"]
 
 [language.cpp]
 extensions = ["cpp", "cc", "cxx", "h", "hpp"]
+root_markers = ["compile_commands.json", ".clangd"]
 
 [language.zig]
 extensions = ["zig"]
+root_markers = ["build.zig"]
 
 [language.d]
 extensions = ["d"]
+root_markers = ["dub.json", "dub.sdl"]
 
 [language.v]
 extensions = ["v"]
@@ -36,14 +48,17 @@ extensions = ["nim"]
 
 [language.java]
 extensions = ["java"]
+root_markers = ["pom.xml", "build.gradle", "build.gradle.kts"]
 
 [language.kotlin]
 extensions = ["kt", "kts"]
 shebangs = ["kotlin"]
+root_markers = ["build.gradle", "build.gradle.kts"]
 
 [language.scala]
 extensions = ["scala", "sc"]
 shebangs = ["scala"]
+root_markers = ["build.sbt", "build.sc"]
 
 [language.groovy]
 extensions = ["groovy", "gvy"]
@@ -74,11 +89,13 @@ extensions = ["m", "mm"]
 [language.python]
 extensions = ["py"]
 shebangs = ["python", "python3", "python2"]
+root_markers = ["pyrightconfig.json", "pyproject.toml", "setup.py"]
 
 [language.ruby]
 extensions = ["rb"]
 filenames = ["Gemfile", "Rakefile"]
 shebangs = ["ruby", "irb"]
+root_markers = ["Gemfile"]
 
 [language.perl]
 extensions = ["pl", "pm"]
@@ -87,10 +104,12 @@ shebangs = ["perl"]
 [language.php]
 extensions = ["php"]
 shebangs = ["php"]
+root_markers = ["composer.json"]
 
 [language.lua]
 extensions = ["lua"]
 shebangs = ["lua", "luajit"]
+root_markers = [".luarc.json", ".luarc.jsonc"]
 
 [language.tcl]
 extensions = ["tcl"]
@@ -99,44 +118,55 @@ shebangs = ["tclsh", "wish"]
 [language.crystal]
 extensions = ["cr"]
 shebangs = ["crystal"]
+root_markers = ["shard.yml"]
 
 # ── JavaScript / TypeScript ─────────────────────────────────────────
 
 [language.javascript]
 extensions = ["js", "mjs", "cjs"]
 shebangs = ["node", "nodejs"]
+root_markers = ["package.json"]
 
 [language.typescript]
 extensions = ["ts", "mts", "cts"]
 shebangs = ["deno"]
+root_markers = ["tsconfig.json"]
 
 [language.typescriptreact]
 extensions = ["tsx"]
+root_markers = ["tsconfig.json"]
 
 [language.javascriptreact]
 extensions = ["jsx"]
+root_markers = ["package.json"]
 
 # ── Functional ──────────────────────────────────────────────────────
 
 [language.haskell]
 extensions = ["hs", "lhs"]
+root_markers = ["hie.yaml", "cabal.project", "stack.yaml"]
 
 [language.ocaml]
 extensions = ["ml", "mli"]
+root_markers = ["dune-project"]
 
 [language.elm]
 extensions = ["elm"]
+root_markers = ["elm.json"]
 
 [language.gleam]
 extensions = ["gleam"]
+root_markers = ["gleam.toml"]
 
 [language.elixir]
 extensions = ["ex", "exs"]
 shebangs = ["elixir", "iex"]
+root_markers = ["mix.exs"]
 
 [language.erlang]
 extensions = ["erl", "hrl"]
 shebangs = ["erl"]
+root_markers = ["rebar.config"]
 
 [language.purescript]
 extensions = ["purs"]
@@ -187,6 +217,7 @@ extensions = ["less"]
 
 [language.svelte]
 extensions = ["svelte"]
+root_markers = ["svelte.config.js", "svelte.config.ts"]
 
 [language.vue]
 extensions = ["vue"]
@@ -233,6 +264,7 @@ extensions = ["typ"]
 
 [language.nix]
 extensions = ["nix"]
+root_markers = ["flake.nix"]
 
 [language.terraform]
 extensions = ["tf", "tfvars"]
@@ -243,6 +275,7 @@ filenames = ["CMakeLists.txt"]
 
 [language.dart]
 extensions = ["dart"]
+root_markers = ["pubspec.yaml"]
 
 [language.dockerfile]
 extensions = ["dockerfile"]
