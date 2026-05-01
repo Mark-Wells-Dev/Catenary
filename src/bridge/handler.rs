@@ -75,6 +75,40 @@ pub(super) fn display_path(file: &str, fs: &FilesystemManager) -> String {
     )
 }
 
+/// Resolve relative pattern parameters against the host CLI's cwd.
+///
+/// For grep: resolves `glob` and `exclude` params.
+/// For glob: resolves `pattern` param.
+///
+/// A pattern is considered relative (and therefore resolved) when it does
+/// not start with `/` or `~` after tilde expansion. Absolute patterns are
+/// left unchanged.
+fn resolve_params_against_cwd(tool: &str, params: &mut Value, cwd: &Path) {
+    match tool {
+        "grep" => {
+            resolve_param(params, "glob", cwd);
+            resolve_param(params, "exclude", cwd);
+        }
+        "glob" => {
+            resolve_param(params, "pattern", cwd);
+        }
+        _ => {}
+    }
+}
+
+/// Resolve a single string parameter to an absolute path if it is relative.
+fn resolve_param(params: &mut Value, key: &str, cwd: &Path) {
+    let Some(val) = params.get(key).and_then(Value::as_str) else {
+        return;
+    };
+    let expanded = expand_tilde(val);
+    if Path::new(&expanded).is_absolute() {
+        return;
+    }
+    let resolved = cwd.join(&expanded);
+    params[key] = Value::String(resolved.to_string_lossy().into_owned());
+}
+
 impl ToolHandler for McpRouter {
     fn list_tools(&self) -> Vec<Tool> {
         let grep_budget = self.toolbox.grep.budget;
@@ -276,7 +310,15 @@ impl ToolHandler for McpRouter {
             .block_on(self.toolbox.notify_file_changes());
 
         // ToolServer dispatch: grep, glob
-        let params = arguments.unwrap_or(Value::Null);
+        let mut params = arguments.unwrap_or(Value::Null);
+
+        // Resolve relative patterns against the host CLI's working
+        // directory (stashed by the PreToolUse hook). Absolute patterns
+        // and tilde-prefixed patterns pass through unchanged.
+        if let Some(cwd) = self.toolbox.cwd_stash.take() {
+            resolve_params_against_cwd(name, &mut params, &cwd);
+        }
+
         let result = match name {
             "grep" => self
                 .toolbox
@@ -296,5 +338,92 @@ impl ToolHandler for McpRouter {
             }
             Err(e) => Err(e),
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, reason = "test assertions")]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_param_relative_becomes_absolute() {
+        let mut params = serde_json::json!({"glob": "src/**/*.rs"});
+        resolve_param(&mut params, "glob", Path::new("/home/user/project"));
+        assert_eq!(
+            params["glob"].as_str(),
+            Some("/home/user/project/src/**/*.rs")
+        );
+    }
+
+    #[test]
+    fn resolve_param_absolute_unchanged() {
+        let mut params = serde_json::json!({"glob": "/tmp/src/**/*.rs"});
+        resolve_param(&mut params, "glob", Path::new("/home/user/project"));
+        assert_eq!(params["glob"].as_str(), Some("/tmp/src/**/*.rs"));
+    }
+
+    #[test]
+    fn resolve_param_tilde_unchanged() {
+        let mut params = serde_json::json!({"glob": "~/projects/*.rs"});
+        resolve_param(&mut params, "glob", Path::new("/home/user/project"));
+        // expand_tilde expands to absolute internally → resolve_param
+        // returns early. The param value stays as "~/..." because
+        // downstream tools (ResolvedGlob::new, resolve_path) also
+        // call expand_tilde.
+        assert_eq!(
+            params["glob"].as_str(),
+            Some("~/projects/*.rs"),
+            "tilde patterns should not be resolved against cwd"
+        );
+    }
+
+    #[test]
+    fn resolve_param_missing_key_is_noop() {
+        let mut params = serde_json::json!({"pattern": "foo"});
+        resolve_param(&mut params, "glob", Path::new("/cwd"));
+        assert!(params.get("glob").is_none());
+    }
+
+    #[test]
+    fn resolve_grep_resolves_glob_and_exclude() {
+        let mut params = serde_json::json!({
+            "pattern": "TODO",
+            "glob": "src/**/*.rs",
+            "exclude": "tests/**"
+        });
+        let cwd = Path::new("/project");
+        resolve_params_against_cwd("grep", &mut params, cwd);
+        assert_eq!(params["glob"].as_str(), Some("/project/src/**/*.rs"));
+        assert_eq!(params["exclude"].as_str(), Some("/project/tests/**"));
+        // pattern is not resolved for grep
+        assert_eq!(params["pattern"].as_str(), Some("TODO"));
+    }
+
+    #[test]
+    fn resolve_glob_resolves_pattern() {
+        let mut params = serde_json::json!({"pattern": "src/"});
+        let cwd = Path::new("/project");
+        resolve_params_against_cwd("glob", &mut params, cwd);
+        assert_eq!(params["pattern"].as_str(), Some("/project/src/"));
+    }
+
+    #[test]
+    fn resolve_glob_does_not_resolve_exclude() {
+        let mut params = serde_json::json!({"pattern": "/abs/path", "exclude": "test_*"});
+        let cwd = Path::new("/project");
+        resolve_params_against_cwd("glob", &mut params, cwd);
+        // pattern is absolute → unchanged
+        assert_eq!(params["pattern"].as_str(), Some("/abs/path"));
+        // exclude is NOT resolved for glob (not in scope per ticket)
+        assert_eq!(params["exclude"].as_str(), Some("test_*"));
+    }
+
+    #[test]
+    fn resolve_unknown_tool_is_noop() {
+        let mut params = serde_json::json!({"pattern": "relative"});
+        let cwd = Path::new("/project");
+        resolve_params_against_cwd("start_editing", &mut params, cwd);
+        assert_eq!(params["pattern"].as_str(), Some("relative"));
     }
 }

@@ -92,7 +92,7 @@ fn is_allowed_during_editing(tool_name: &str) -> bool {
 
 /// Matches Catenary tool names: bare `{suffix}` or MCP-qualified
 /// `mcp*catenary*{suffix}` (Claude Code, Gemini CLI).
-fn is_catenary_tool(tool_name: &str, suffix: &str) -> bool {
+pub fn is_catenary_tool(tool_name: &str, suffix: &str) -> bool {
     tool_name == suffix
         || (tool_name.starts_with("mcp")
             && tool_name.contains("catenary")
@@ -338,15 +338,30 @@ impl HookRouter {
                 command,
                 agent_id,
                 session_id,
+                cwd,
             } => {
                 self.store_client_session_id(session_id.as_deref());
+                let result = self.handle_enforce_editing(
+                    &tool_name,
+                    file_path.as_deref(),
+                    command.as_deref(),
+                    &agent_id,
+                );
+                // Stash the host CLI's cwd for the upcoming MCP grep/glob
+                // call, but only when the tool is allowed (denied tools
+                // won't produce an MCP call, so stashing would leave a
+                // stale entry).
+                if result.is_none()
+                    && let Some(cwd_str) = cwd
+                    && (is_catenary_tool(&tool_name, "grep")
+                        || is_catenary_tool(&tool_name, "glob"))
+                {
+                    self.toolbox
+                        .cwd_stash
+                        .stash(std::path::PathBuf::from(cwd_str));
+                }
                 DispatchResult {
-                    result: self.handle_enforce_editing(
-                        &tool_name,
-                        file_path.as_deref(),
-                        command.as_deref(),
-                        &agent_id,
-                    ),
+                    result,
                     system_message: None,
                 }
             }
@@ -1279,6 +1294,7 @@ mod tests {
                 command: None,
                 agent_id: String::new(),
                 session_id: None,
+                cwd: None,
             },
             0,
         );
@@ -1603,6 +1619,109 @@ mod tests {
         assert!(
             result.result.is_none(),
             "no commands config should return no result"
+        );
+    }
+
+    // ── CWD stash tests ────────────────────────────────────────────��─
+
+    #[test]
+    fn dispatch_pre_tool_grep_stashes_cwd() {
+        let router = test_router();
+        router.dispatch(
+            crate::hook::HookRequest::PreTool {
+                tool_name: "mcp__plugin_catenary_catenary__grep".to_string(),
+                file_path: None,
+                command: None,
+                agent_id: String::new(),
+                session_id: None,
+                cwd: Some("/home/user/project".to_string()),
+            },
+            0,
+        );
+        let stashed = router.toolbox.cwd_stash.take();
+        assert_eq!(stashed, Some(PathBuf::from("/home/user/project")));
+    }
+
+    #[test]
+    fn dispatch_pre_tool_glob_stashes_cwd() {
+        let router = test_router();
+        router.dispatch(
+            crate::hook::HookRequest::PreTool {
+                tool_name: "mcp_catenary_glob".to_string(),
+                file_path: None,
+                command: None,
+                agent_id: String::new(),
+                session_id: None,
+                cwd: Some("/workspace".to_string()),
+            },
+            0,
+        );
+        assert_eq!(
+            router.toolbox.cwd_stash.take(),
+            Some(PathBuf::from("/workspace"))
+        );
+    }
+
+    #[test]
+    fn dispatch_pre_tool_non_catenary_does_not_stash() {
+        let router = test_router();
+        router.dispatch(
+            crate::hook::HookRequest::PreTool {
+                tool_name: "Read".to_string(),
+                file_path: None,
+                command: None,
+                agent_id: String::new(),
+                session_id: None,
+                cwd: Some("/home/user".to_string()),
+            },
+            0,
+        );
+        assert!(
+            router.toolbox.cwd_stash.take().is_none(),
+            "non-Catenary tools should not stash cwd"
+        );
+    }
+
+    #[test]
+    fn dispatch_pre_tool_denied_does_not_stash() {
+        let router = test_router();
+        // Enter editing mode so non-allowed tools are denied.
+        router.handle_enforce_editing(START_EDITING, None, None, "");
+
+        router.dispatch(
+            crate::hook::HookRequest::PreTool {
+                tool_name: "Bash".to_string(),
+                file_path: None,
+                command: None,
+                agent_id: String::new(),
+                session_id: None,
+                cwd: Some("/should/not/stash".to_string()),
+            },
+            0,
+        );
+        assert!(
+            router.toolbox.cwd_stash.take().is_none(),
+            "denied tools should not stash cwd"
+        );
+    }
+
+    #[test]
+    fn dispatch_pre_tool_no_cwd_does_not_stash() {
+        let router = test_router();
+        router.dispatch(
+            crate::hook::HookRequest::PreTool {
+                tool_name: "mcp_catenary_grep".to_string(),
+                file_path: None,
+                command: None,
+                agent_id: String::new(),
+                session_id: None,
+                cwd: None,
+            },
+            0,
+        );
+        assert!(
+            router.toolbox.cwd_stash.take().is_none(),
+            "missing cwd should not stash"
         );
     }
 }

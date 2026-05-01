@@ -517,6 +517,13 @@ pub fn run_pre_tool(format: HostFormat) {
     if let Some(sid) = session_id {
         request["session_id"] = serde_json::json!(sid);
     }
+    // Pass the host CLI's cwd for Catenary grep/glob so the session
+    // can resolve relative patterns against the agent's working directory.
+    if is_catenary_grep_or_glob(tool_name)
+        && let Some(c) = hook_json.get("cwd").and_then(|v| v.as_str())
+    {
+        request["cwd"] = serde_json::json!(c);
+    }
 
     let lines = ipc_exchange(stream, &request);
 
@@ -690,6 +697,15 @@ fn ipc_check_command(
         Some(crate::hook::HookResult::Deny(reason)) => Some(reason),
         _ => None,
     }
+}
+
+/// Returns `true` if the tool name is a Catenary grep or glob tool.
+///
+/// Matches bare names and MCP-qualified names from Claude Code
+/// (`mcp*catenary*grep`) and Gemini CLI (`mcp_catenary_grep`).
+fn is_catenary_grep_or_glob(tool_name: &str) -> bool {
+    use crate::bridge::is_catenary_tool;
+    is_catenary_tool(tool_name, "grep") || is_catenary_tool(tool_name, "glob")
 }
 
 /// Extract the shell command string from hook JSON for Bash-like tools.
@@ -879,5 +895,37 @@ mod tests {
             "tool_input": {}
         });
         assert!(extract_shell_command(&json, "Bash", HostFormat::Claude).is_none());
+    }
+
+    // ── is_catenary_grep_or_glob tests ─────────────────────────────────
+
+    #[test]
+    fn catenary_grep_or_glob_bare_names() {
+        assert!(is_catenary_grep_or_glob("grep"));
+        assert!(is_catenary_grep_or_glob("glob"));
+    }
+
+    #[test]
+    fn catenary_grep_or_glob_claude_code_names() {
+        assert!(is_catenary_grep_or_glob(
+            "mcp__plugin_catenary_catenary__grep"
+        ));
+        assert!(is_catenary_grep_or_glob(
+            "mcp__plugin_catenary_catenary__glob"
+        ));
+    }
+
+    #[test]
+    fn catenary_grep_or_glob_gemini_names() {
+        assert!(is_catenary_grep_or_glob("mcp_catenary_grep"));
+        assert!(is_catenary_grep_or_glob("mcp_catenary_glob"));
+    }
+
+    #[test]
+    fn catenary_grep_or_glob_non_matching() {
+        assert!(!is_catenary_grep_or_glob("Edit"));
+        assert!(!is_catenary_grep_or_glob("Bash"));
+        assert!(!is_catenary_grep_or_glob("start_editing"));
+        assert!(!is_catenary_grep_or_glob("mcp_catenary_start_editing"));
     }
 }

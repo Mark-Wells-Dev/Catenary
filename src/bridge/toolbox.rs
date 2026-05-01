@@ -13,6 +13,7 @@ use std::sync::Arc;
 use tokio::runtime::Handle;
 use tokio::sync::RwLock;
 
+use super::cwd_stash::CwdStash;
 use super::diagnostics_server::DiagnosticsServer;
 use super::editing_manager::EditingManager;
 use super::file_tools::GlobServer;
@@ -139,6 +140,8 @@ pub struct Toolbox {
     pub diagnostics: Arc<DiagnosticsServer>,
     /// In-memory editing state (`start_editing`/`done_editing` lifecycle).
     pub editing: EditingManager,
+    /// Pending host-CLI cwd for grep/glob relative-pattern resolution.
+    pub cwd_stash: CwdStash,
     /// LSP client manager (also owns document manager).
     pub(super) client_manager: Arc<LspClientManager>,
     /// File classification and root resolution.
@@ -257,6 +260,7 @@ impl Toolbox {
             glob,
             diagnostics,
             editing: EditingManager::new(),
+            cwd_stash: CwdStash::new(),
             client_manager,
             fs_manager,
             path_validator,

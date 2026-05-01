@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
+/// Pending CWD stash for grep/glob relative-pattern resolution.
+pub mod cwd_stash;
 /// Diagnostics pipeline for PostToolUse hook requests.
 pub mod diagnostics_server;
 /// In-memory editing state manager.
@@ -26,5 +28,6 @@ pub use diagnostics_server::DiagnosticsServer;
 pub use editing_manager::EditingManager;
 pub use handler::McpRouter;
 pub use hook_router::HookRouter;
+pub(crate) use hook_router::is_catenary_tool;
 pub use path_security::PathValidator;
 pub use tool_server::ToolServer;

@@ -127,6 +127,10 @@ pub(crate) enum HookRequest {
         /// Host CLI session ID (Claude Code / Gemini CLI UUID).
         #[serde(default)]
         session_id: Option<String>,
+        /// Host CLI working directory. Stashed for Catenary grep/glob
+        /// calls so the MCP handler can resolve relative patterns.
+        #[serde(default)]
+        cwd: Option<String>,
     },
 
     /// Session-side command check with debounce.
@@ -490,6 +494,7 @@ mod tests {
             command,
             agent_id,
             session_id,
+            cwd,
         } = req
         else {
             unreachable!("expected PreTool");
@@ -499,6 +504,7 @@ mod tests {
         assert!(command.is_none());
         assert_eq!(agent_id, "");
         assert_eq!(session_id.as_deref(), Some("abc123"));
+        assert!(cwd.is_none());
 
         // pre-tool/editing-state with command (Bash tool)
         let json = r#"{"method": "pre-tool/editing-state", "tool_name": "Bash", "command": "rm -rf target/", "agent_id": ""}"#;
@@ -507,6 +513,14 @@ mod tests {
             unreachable!("expected PreTool");
         };
         assert_eq!(command.as_deref(), Some("rm -rf target/"));
+
+        // pre-tool/editing-state with cwd (grep/glob cwd resolution)
+        let json = r#"{"method": "pre-tool/editing-state", "tool_name": "mcp__plugin_catenary_catenary__grep", "agent_id": "", "cwd": "/home/user/project"}"#;
+        let req: HookRequest = serde_json::from_str(json).expect("editing-state with cwd");
+        let HookRequest::PreTool { cwd, .. } = req else {
+            unreachable!("expected PreTool");
+        };
+        assert_eq!(cwd.as_deref(), Some("/home/user/project"));
 
         // post-tool/diagnostics with optional fields
         let json =
