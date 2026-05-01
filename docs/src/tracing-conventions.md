@@ -49,6 +49,7 @@ applicable so notifications with the same identity collapse.
 | `config.validation` | Semantic config errors |
 | `lsp.lifecycle` | Server spawn / init / crash / recovery |
 | `lsp.logging` | Server `window/logMessage` telemetry |
+| `lsp.stderr` | Raw server process stderr output |
 | `lsp.protocol` | Protocol-level failures not tied to a specific server |
 | `mcp.dispatch` | MCP message dispatch and roots |
 | `hook.router` | Hook request routing |
