@@ -271,7 +271,10 @@ impl<H: ToolHandler> McpServer<H> {
             if self.should_fetch_roots
                 && let Err(e) = self.fetch_roots(&rx, &mut writer)
             {
-                error!(source = "mcp.dispatch", "Failed to fetch roots: {}", e,);
+                error!(
+                    source = crate::source::Source::McpDispatch.as_str(),
+                    "Failed to fetch roots: {}", e,
+                );
             }
         }
 
@@ -369,7 +372,7 @@ impl<H: ToolHandler> McpServer<H> {
             }
             Err(e) => {
                 warn!(
-                    source = "mcp.dispatch",
+                    source = crate::source::Source::McpDispatch.as_str(),
                     method = method,
                     "MCP {method} failed: {e}"
                 );
@@ -740,7 +743,7 @@ impl<H: ToolHandler> McpServer<H> {
     fn handle_roots_response(&self, response: Response) -> Result<()> {
         if let Some(error) = response.error {
             warn!(
-                source = "mcp.dispatch",
+                source = crate::source::Source::McpDispatch.as_str(),
                 "roots/list request failed: {} (code {})", error.message, error.code,
             );
             return Ok(()); // Non-fatal
@@ -768,7 +771,10 @@ impl<H: ToolHandler> McpServer<H> {
         if let Some(ref callback) = self.on_roots_changed
             && let Err(e) = callback(roots_result.roots)
         {
-            error!(source = "mcp.dispatch", "Failed to apply roots: {}", e,);
+            error!(
+                source = crate::source::Source::McpDispatch.as_str(),
+                "Failed to apply roots: {}", e,
+            );
         }
 
         Ok(())

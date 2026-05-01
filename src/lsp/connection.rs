@@ -577,7 +577,7 @@ impl Connection {
                                     client = "catenary",
                                     request_id = notif_id.0,
                                     payload = payload_str.as_str(),
-                                    source = "lsp.logging",
+                                    source = crate::source::Source::LspLogging.as_str(),
                                     lsp_level = lsp_level,
                                     "{server_name}: {text}"
                                 );
@@ -589,7 +589,7 @@ impl Connection {
                                     client = "catenary",
                                     request_id = notif_id.0,
                                     payload = payload_str.as_str(),
-                                    source = "lsp.logging",
+                                    source = crate::source::Source::LspLogging.as_str(),
                                     "{server_name}: {text}"
                                 );
                             }

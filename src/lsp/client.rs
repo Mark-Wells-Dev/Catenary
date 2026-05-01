@@ -224,7 +224,7 @@ impl LspClient {
                 debug!(
                     kind = "lsp",
                     method = "stderr",
-                    source = "lsp.stderr",
+                    source = crate::source::Source::LspStderr.as_str(),
                     server = %server_name,
                     payload = %line,
                     "{server_name}: {line}",

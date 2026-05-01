@@ -399,7 +399,7 @@ impl LoggingServer {
 
             if bs.dropped > 0 {
                 tracing::warn!(
-                    source = "logging.bootstrap",
+                    source = crate::source::Source::LoggingBootstrap.as_str(),
                     dropped = i64::from(bs.dropped),
                     "{} bootstrap events dropped (buffer overflow)",
                     bs.dropped,
@@ -1075,7 +1075,7 @@ mod tests {
                 client = "claude-code",
                 request_id = 7_i64,
                 parent_id = 3_i64,
-                source = "lsp.protocol",
+                source = crate::source::Source::LspDispatch.as_str(),
                 language = "rust",
                 payload = "{}",
                 "outgoing"
@@ -1090,7 +1090,10 @@ mod tests {
         assert_eq!(e.client.as_deref(), Some("claude-code"));
         assert_eq!(e.request_id, Some(7));
         assert_eq!(e.parent_id, Some(3));
-        assert_eq!(e.source.as_deref(), Some("lsp.protocol"));
+        assert_eq!(
+            e.source.as_deref(),
+            Some(crate::source::Source::LspDispatch.as_str())
+        );
         assert_eq!(e.language.as_deref(), Some("rust"));
         assert_eq!(e.payload.as_deref(), Some("{}"));
         assert_eq!(e.message, "outgoing");

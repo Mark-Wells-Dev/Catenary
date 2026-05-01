@@ -43,18 +43,49 @@ applicable so notifications with the same identity collapse.
 
 ## Source taxonomy
 
-| Source | Subsystem |
+The `source` field uses a fixed two-level `subsystem.concern` taxonomy.
+The `Source` enum in `src/source.rs` is the single source of truth;
+convenience constants are derived from it for use in `tracing` macros.
+
+### Subsystems
+
+| Subsystem | Scope |
 |---|---|
-| `config.parse` | Config loading errors |
-| `config.validation` | Semantic config errors |
-| `lsp.lifecycle` | Server spawn / init / crash / recovery |
-| `lsp.logging` | Server `window/logMessage` telemetry |
-| `lsp.stderr` | Raw server process stderr output |
-| `lsp.protocol` | Protocol-level failures not tied to a specific server |
-| `mcp.dispatch` | MCP message dispatch and roots |
-| `hook.router` | Hook request routing |
-| `bridge.routing` | File-to-server routing errors |
-| `bridge.tool` | Tool-level diagnostics (glob, grep, etc.) |
+| `config` | Configuration loading and validation |
+| `hook` | Hook layer (pre/post tool hooks) |
+| `logging` | Logging infrastructure itself |
+| `lsp` | LSP client layer (server communication, lifecycle, routing) |
+| `mcp` | MCP server layer (host communication, dispatch) |
+
+### Concerns
+
+| Concern | Meaning |
+|---|---|
+| `bootstrap` | Startup sequencing |
+| `dispatch` | Message routing, method dispatch, capability checks |
+| `lifecycle` | Spawn, init, crash, recovery, shutdown |
+| `logging` | Forwarded log streams (e.g., server `window/logMessage`) |
+| `parse` | Parsing and deserialization |
+| `stderr` | Raw server process stderr output |
+| `validation` | Semantic correctness checks |
+
+### Valid combinations
+
+| Source | Description | Constant |
+|---|---|---|
+| `config.parse` | Config loading errors (TOML parsing, deserialization) | `ConfigParse` |
+| `config.validation` | Semantic config errors (orphan servers, unsupported keys) | `ConfigValidation` |
+| `hook.dispatch` | Hook request routing and dispatch | `HookDispatch` |
+| `logging.bootstrap` | Logging infrastructure startup sequencing | `LoggingBootstrap` |
+| `lsp.dispatch` | LSP message routing, method dispatch, capability checks | `LspDispatch` |
+| `lsp.lifecycle` | Server spawn, init, crash, recovery, shutdown | `LspLifecycle` |
+| `lsp.logging` | Server `window/logMessage` telemetry | `LspLogging` |
+| `lsp.stderr` | Raw server process stderr output | `LspStderr` |
+| `mcp.dispatch` | MCP message dispatch and roots handling | `McpDispatch` |
+
+Not every subsystem uses every concern. Only the combinations listed
+above are valid. New values must be added as variants to the `Source`
+enum in `src/source.rs`.
 
 ## Protocol events
 

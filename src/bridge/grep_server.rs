@@ -22,6 +22,7 @@ use super::tool_server::ToolServer;
 use crate::bucketing::{self, BucketEntry};
 use crate::lsp::LspClientManager;
 use crate::lsp::server::LspServer;
+use crate::source::Source;
 use crate::symbol_index::{Symbol, SymbolIndex, format_symbol_kind};
 
 /// Input for grep tool.
@@ -502,7 +503,10 @@ impl GrepServer {
                 Ok(v) if v.is_null() => return false, // null → keyword
                 Ok(_) => return true,                 // range → symbol
                 Err(e) => {
-                    debug!(source = "lsp.dispatch", "prepare_rename failed: {e}");
+                    debug!(
+                        source = Source::LspDispatch.as_str(),
+                        "prepare_rename failed: {e}"
+                    );
                 }
             }
         }
@@ -584,7 +588,10 @@ impl GrepServer {
                     opened_servers.push(Arc::clone(server));
                 }
                 Err(e) => {
-                    debug!(source = "lsp.dispatch", "enrichment open failed: {e}");
+                    debug!(
+                        source = Source::LspDispatch.as_str(),
+                        "enrichment open failed: {e}"
+                    );
                 }
             }
         }
@@ -704,7 +711,10 @@ impl GrepServer {
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    debug!(source = "lsp.dispatch", "references failed: {e}");
+                    debug!(
+                        source = Source::LspDispatch.as_str(),
+                        "references failed: {e}"
+                    );
                 }
             }
         }
@@ -777,7 +787,7 @@ impl GrepServer {
                 Ok(_) => None,
                 Err(e) => {
                     debug!(
-                        source = "lsp.dispatch",
+                        source = Source::LspDispatch.as_str(),
                         "prepare_call_hierarchy failed: {e}"
                     );
                     None
@@ -856,7 +866,10 @@ impl GrepServer {
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    debug!(source = "lsp.dispatch", "implementation failed: {e}");
+                    debug!(
+                        source = Source::LspDispatch.as_str(),
+                        "implementation failed: {e}"
+                    );
                 }
             }
         }
@@ -927,7 +940,7 @@ impl GrepServer {
                 Ok(_) => None,
                 Err(e) => {
                     debug!(
-                        source = "lsp.dispatch",
+                        source = Source::LspDispatch.as_str(),
                         "prepare_type_hierarchy failed: {e}"
                     );
                     None

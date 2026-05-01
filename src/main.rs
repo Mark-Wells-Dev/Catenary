@@ -23,6 +23,7 @@ use catenary_mcp::cli::{self, HostFormat, QueryFormat};
 use catenary_mcp::logging::LoggingServer;
 use catenary_mcp::mcp::McpServer;
 use catenary_mcp::session::{self, Session};
+use catenary_mcp::source::Source;
 
 /// Command-line arguments for Catenary.
 #[derive(Parser, Debug)]
@@ -409,7 +410,10 @@ async fn run_server() -> Result<()> {
                         match path.canonicalize() {
                             Ok(canonical) => Some(canonical),
                             Err(e) => {
-                                warn!(source = "config.validation", "Skipping root {p}: {e}",);
+                                warn!(
+                                    source = Source::ConfigValidation.as_str(),
+                                    "Skipping root {p}: {e}",
+                                );
                                 None
                             }
                         }

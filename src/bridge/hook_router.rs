@@ -13,6 +13,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::debug;
 
+use crate::source::Source;
+
 use super::toolbox::Toolbox;
 use crate::hook::response::SystemMessageBuilder;
 use crate::hook::{HookRequest, HookResult};
@@ -313,7 +315,10 @@ impl HookRouter {
         match request {
             HookRequest::PreAgent {} => {
                 let turn = self.turn_counter.fetch_add(1, Ordering::AcqRel) + 1;
-                debug!(turn, "Hook: turn start");
+                debug!(
+                    source = Source::HookDispatch.as_str(),
+                    turn, "Hook: turn start"
+                );
                 DispatchResult {
                     result: None,
                     system_message: None,
@@ -354,7 +359,10 @@ impl HookRouter {
                 session_id,
             } => {
                 self.store_client_session_id(session_id.as_deref());
-                debug!("Hook: processing file {file}");
+                debug!(
+                    source = Source::HookDispatch.as_str(),
+                    "Hook: processing file {file}"
+                );
                 DispatchResult {
                     result: self.handle_file_accumulation(&file, &agent_id, tool.as_deref()),
                     system_message: None,

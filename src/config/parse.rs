@@ -9,6 +9,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
+use crate::source::Source;
+
 use super::commands::{self, CommandsConfig};
 use super::{
     Config, IconConfig, LanguageConfig, NotificationConfig, ServerBinding, ServerDef, ToolsConfig,
@@ -253,7 +255,7 @@ fn deserialize_source(contents: &str) -> Result<RawConfig> {
     let stripped_commands = has_old_commands_format(&raw);
     if stripped_commands {
         tracing::warn!(
-            source = "config",
+            source = Source::ConfigParse.as_str(),
             "[commands] uses the old denylist format (deny_when_first or string-valued \
              deny entries). Catenary now uses an allowlist model — run `catenary config` \
              for the recommended template. Command filtering is disabled until the \
@@ -474,7 +476,7 @@ pub fn load_project_config(root: &std::path::Path) -> Result<Option<ProjectConfi
         for key in table.keys() {
             if !PROJECT_CONFIG_ALLOWED_KEYS.contains(&key.as_str()) {
                 tracing::warn!(
-                    source = "config.project",
+                    source = Source::ConfigValidation.as_str(),
                     path = %config_path.display(),
                     key = key.as_str(),
                     "Project config {}: unsupported section [{}] — \
@@ -494,7 +496,7 @@ pub fn load_project_config(root: &std::path::Path) -> Result<Option<ProjectConfi
     let mut raw = raw;
     if has_old_commands_format(&raw) {
         tracing::warn!(
-            source = "config.project",
+            source = Source::ConfigParse.as_str(),
             path = %config_path.display(),
             "Project config {}: [commands] uses the old denylist format. \
              Catenary now uses an allowlist model — run `catenary config` \
@@ -619,7 +621,7 @@ pub fn load_project_config(root: &std::path::Path) -> Result<Option<ProjectConfi
         }
         for warning in warnings {
             tracing::warn!(
-                source = "config.project",
+                source = Source::ConfigValidation.as_str(),
                 path = %config_path.display(),
                 "{warning}",
             );

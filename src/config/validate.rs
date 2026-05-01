@@ -5,6 +5,7 @@
 
 use super::Config;
 use crate::lsp::glob::LspGlob;
+use crate::source::Source;
 
 /// Validate the merged config, returning all errors found.
 ///
@@ -122,7 +123,7 @@ pub fn warn_orphan_project_servers(
 
         if !referenced_by_project && !referenced_by_user {
             tracing::warn!(
-                source = "config.project",
+                source = Source::ConfigValidation.as_str(),
                 root = %root.display(),
                 server = server_name.as_str(),
                 "Project config at {}: [server.{server_name}] has a `command` \

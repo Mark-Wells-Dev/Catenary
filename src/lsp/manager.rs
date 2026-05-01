@@ -17,6 +17,7 @@ use crate::lsp::glob::{FileChange, GlobPattern, LspGlob, WatchKind};
 use crate::lsp::instance_key::{InstanceKey, Scope};
 use crate::lsp::server::LspServer;
 use crate::lsp::state::ServerStatus;
+use crate::source::Source;
 
 /// Filters filesystem changes against a server's watcher registrations.
 ///
@@ -192,7 +193,7 @@ impl LspClientManager {
                     Ok(c) => c,
                     Err(e) => {
                         warn!(
-                            source = "lsp.lifecycle",
+                            source = Source::LspLifecycle.as_str(),
                             language = lang.as_str(),
                             server = binding.name.as_str(),
                             "Failed to spawn LSP server for {lang}: {e}",
@@ -279,7 +280,7 @@ impl LspClientManager {
         match &key.scope {
             Scope::Root(_) => {
                 info!(
-                    source = "lsp.lifecycle",
+                    source = Source::LspLifecycle.as_str(),
                     language = lang,
                     server = server_name,
                     "Server does not support workspaceFolders — spawning per-root instances",
@@ -287,7 +288,7 @@ impl LspClientManager {
                 for root in &roots[1..] {
                     if let Err(e) = self.ensure_server(lang, server_name, root).await {
                         warn!(
-                            source = "lsp.lifecycle",
+                            source = Source::LspLifecycle.as_str(),
                             language = lang,
                             server = server_name,
                             "Failed to spawn per-root instance for {lang} ({server_name}) at {}: {e}",
@@ -304,7 +305,7 @@ impl LspClientManager {
                         && let Err(e) = self.spawn_project_scoped(server_name, lang, root).await
                     {
                         warn!(
-                            source = "lsp.lifecycle",
+                            source = Source::LspLifecycle.as_str(),
                             language = lang,
                             server = server_name,
                             "Failed to spawn project-scoped instance for {lang} ({server_name}) at {}: {e}",
@@ -666,7 +667,7 @@ impl LspClientManager {
 
             if result.is_empty() && !lang_config.servers.is_empty() {
                 info!(
-                    source = "lsp.routing",
+                    source = Source::LspDispatch.as_str(),
                     language = lang_id.as_str(),
                     "No server supports the requested capability for {lang_id} files",
                 );
@@ -996,7 +997,7 @@ impl LspClientManager {
             .await
         {
             info!(
-                source = "lsp.lifecycle",
+                source = Source::LspLifecycle.as_str(),
                 language = lang,
                 server = server_name,
                 "Server '{server_name}' rejected single-file mode: {e}",
@@ -1271,7 +1272,7 @@ impl LspClientManager {
         for (lang, server_name, root) in &to_spawn {
             if let Err(e) = self.ensure_server(lang, server_name, root).await {
                 warn!(
-                    source = "lsp.lifecycle",
+                    source = Source::LspLifecycle.as_str(),
                     language = lang.as_str(),
                     server = server_name.as_str(),
                     "Failed to spawn LSP server for {lang} ({server_name}): {e}",
@@ -1425,7 +1426,7 @@ impl LspClientManager {
                         && let Err(e) = self.ensure_server(lang, server_name, root).await
                     {
                         warn!(
-                            source = "lsp.lifecycle",
+                            source = Source::LspLifecycle.as_str(),
                             language = lang.as_str(),
                             server = server_name.as_str(),
                             "Failed to spawn instance for {lang} ({server_name}) at {}: {e}",
@@ -1647,7 +1648,7 @@ impl LspClientManager {
             match crate::config::load_project_config(root) {
                 Ok(Some(pc)) => {
                     info!(
-                        source = "config.project",
+                        source = Source::ConfigParse.as_str(),
                         root = %root.display(),
                         "Loaded project config from {}",
                         root.join(".catenary.toml").display(),
@@ -1661,7 +1662,7 @@ impl LspClientManager {
                 Ok(None) => {} // No project config — fine.
                 Err(e) => {
                     warn!(
-                        source = "config.project",
+                        source = Source::ConfigParse.as_str(),
                         root = %root.display(),
                         "Failed to load project config from {}: {e}",
                         root.join(".catenary.toml").display(),

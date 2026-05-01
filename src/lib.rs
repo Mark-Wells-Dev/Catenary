@@ -30,6 +30,8 @@ pub mod mcp;
 pub mod protocol;
 /// Session management and event broadcasting.
 pub mod session;
+/// Canonical `source` taxonomy for structured tracing events.
+pub mod source;
 /// Symbol index for workspace-wide symbol extraction.
 pub mod symbol_index;
 /// Interactive TUI for session browsing and event tailing.

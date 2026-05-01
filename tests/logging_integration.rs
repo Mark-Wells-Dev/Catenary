@@ -17,6 +17,7 @@
 //! to avoid global subscriber conflicts in parallel test execution.
 
 use anyhow::Result;
+use catenary_mcp::source::Source;
 use tempfile::tempdir;
 use tracing_subscriber::layer::SubscriberExt;
 
@@ -54,7 +55,7 @@ fn multi_sink_dispatch_routes_correctly() {
         );
 
         // Warn event without kind → message DB with type "internal" + notification queue.
-        tracing::warn!(source = "lsp.lifecycle", "server crashed");
+        tracing::warn!(source = Source::LspLifecycle.as_str(), "server crashed");
 
         // Debug event without kind → message DB with type "internal" only (below notification threshold).
         tracing::debug!("verbose trace");
@@ -312,8 +313,12 @@ fn bootstrap_buffer_drains_to_all_sinks() {
     let subscriber = tracing_subscriber::registry().with(server.clone());
     tracing::subscriber::with_default(subscriber, || {
         // Bootstrap: events buffered.
-        tracing::warn!(source = "config.parse", "bad TOML");
-        tracing::warn!(source = "config.parse", server = "x", "bad key");
+        tracing::warn!(source = Source::ConfigParse.as_str(), "bad TOML");
+        tracing::warn!(
+            source = Source::ConfigParse.as_str(),
+            server = "x",
+            "bad key"
+        );
         assert_eq!(server.buffered_len(), 2);
 
         // Activate: buffer drains to sinks.

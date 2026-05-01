@@ -501,7 +501,7 @@ impl LspServer {
             && let Some(key) = self.key()
         {
             tracing::warn!(
-                source = "lsp.lifecycle",
+                source = crate::source::Source::LspLifecycle.as_str(),
                 language = key.language_id.as_str(),
                 server = key.server.as_str(),
                 "Language server unavailable: {} ({}) \u{2014} \
