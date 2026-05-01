@@ -207,6 +207,10 @@ pub struct IconConfig {
 /// Controls the interactive monitor's layout and behavior.
 #[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "config struct — each field is an independent toggle"
+)]
 pub struct TuiConfig {
     /// Automatically add new sessions to the grid (default: true).
     pub auto_add_sessions: bool,
@@ -221,6 +225,11 @@ pub struct TuiConfig {
     /// Capture full tool output in `ToolResult` events for TUI detail
     /// expansion (default: false). Increases database size.
     pub capture_tool_output: bool,
+
+    /// Keep panels open after a session dies instead of closing them
+    /// (default: false). Dead panels show the session ID with dimmed
+    /// styling. When false, panels are closed on the next liveness check.
+    pub keep_dead_panels: bool,
 }
 
 impl Default for TuiConfig {
@@ -230,6 +239,7 @@ impl Default for TuiConfig {
             sessions_width: 0.25,
             focus_follows_mouse: false,
             capture_tool_output: false,
+            keep_dead_panels: false,
         }
     }
 }

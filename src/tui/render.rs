@@ -384,6 +384,8 @@ pub fn handle_key_normal(app: &mut App<'_>, key: crossterm::event::KeyEvent) -> 
                     let idx = app.grid.open_panel(session_id.clone());
                     app.grid.focus_panel(idx);
                     app.focus = FocusedPane::Events;
+                    // Reflect session liveness in the panel.
+                    app.grid.panels[idx].alive = app.tree.is_session_alive(&session_id);
                     // Load messages for the panel.
                     let include_debug = app.level_threshold.include_debug();
                     if let Ok(messages) = app.data.monitor_messages(&session_id, include_debug)
@@ -815,7 +817,7 @@ mod tests {
         );
 
         let data = Box::new(make_mock_data(sessions, messages_map));
-        let mut app = App::new(&theme, &icons, data, 0.4).expect("App creation");
+        let mut app = App::new(&theme, &icons, data, 0.4, false).expect("App creation");
 
         // Load events into the open panels.
         let panel_ids: Vec<String> = app
@@ -855,7 +857,7 @@ mod tests {
         let theme = Theme::new();
         let icons = IconSet::from_config(IconConfig::default());
         let data = Box::new(make_mock_data(vec![], HashMap::new()));
-        let mut app = App::new(&theme, &icons, data, 0.4).expect("App creation");
+        let mut app = App::new(&theme, &icons, data, 0.4, false).expect("App creation");
 
         let backend = TestBackend::new(3, 1);
         let mut terminal = Terminal::new(backend).expect("terminal creation");
@@ -880,7 +882,7 @@ mod tests {
         let theme = Theme::new();
         let icons = IconSet::from_config(IconConfig::default());
         let data = Box::new(make_mock_data(vec![], HashMap::new()));
-        let mut app = App::new(&theme, &icons, data, 0.4).expect("App creation");
+        let mut app = App::new(&theme, &icons, data, 0.4, false).expect("App creation");
 
         let key = crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Char('q'),
@@ -899,7 +901,7 @@ mod tests {
         let mut messages_map = HashMap::new();
         messages_map.insert("sess0001".to_string(), vec![make_message("initialize")]);
         let data = Box::new(make_mock_data(sessions, messages_map));
-        let mut app = App::new(&theme, &icons, data, 0.4).expect("App creation");
+        let mut app = App::new(&theme, &icons, data, 0.4, false).expect("App creation");
 
         assert_eq!(app.focus, FocusedPane::Sessions);
 
@@ -924,7 +926,7 @@ mod tests {
         let mut messages_map = HashMap::new();
         messages_map.insert("sess0001".to_string(), vec![make_message("initialize")]);
         let data = Box::new(make_mock_data(sessions, messages_map));
-        let mut app = App::new(&theme, &icons, data, 0.4).expect("App creation");
+        let mut app = App::new(&theme, &icons, data, 0.4, false).expect("App creation");
 
         // Move focus to Events.
         app.focus = FocusedPane::Events;
@@ -951,7 +953,7 @@ mod tests {
             make_session("active02", "/ws/test", true),
         ];
         let data = Box::new(make_mock_data(sessions, HashMap::new()));
-        let app = App::new(&theme, &icons, data, 0.4).expect("App creation");
+        let app = App::new(&theme, &icons, data, 0.4, false).expect("App creation");
 
         assert_eq!(
             app.grid.panels.len(),
@@ -970,7 +972,7 @@ mod tests {
             make_session("dead0001", "/ws/test", false),
         ];
         let data = Box::new(make_mock_data(sessions, HashMap::new()));
-        let app = App::new(&theme, &icons, data, 0.4).expect("App creation");
+        let app = App::new(&theme, &icons, data, 0.4, false).expect("App creation");
 
         // The cursor should be on the first active session.
         // The tree is: workspace node (idx 0), active session (idx 1), dead session (idx 2).
@@ -1007,7 +1009,7 @@ mod tests {
         messages_map.insert("s1".to_string(), messages);
 
         let data = Box::new(make_mock_data(sessions, messages_map));
-        let mut app = App::new(&theme, &icons, data, 0.4).expect("App creation");
+        let mut app = App::new(&theme, &icons, data, 0.4, false).expect("App creation");
 
         // Load messages at default (Info) threshold.
         let include_debug = app.level_threshold.include_debug();

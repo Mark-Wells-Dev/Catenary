@@ -379,6 +379,16 @@ impl SessionTree {
             .collect()
     }
 
+    /// Check whether a session is alive by ID.
+    #[must_use]
+    pub fn is_session_alive(&self, session_id: &str) -> bool {
+        self.workspaces
+            .iter()
+            .flat_map(|ws| &ws.sessions)
+            .find(|s| s.info.id == session_id)
+            .is_some_and(|s| s.alive)
+    }
+
     /// If cursor is on a session, return its ID.
     #[must_use]
     pub fn selected_session_id(&self) -> Option<&str> {

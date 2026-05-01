@@ -53,6 +53,8 @@ pub struct PanelState<'a> {
     pub visual_selection: Option<VisualSelection>,
     /// Last known viewport height (updated each render frame).
     pub viewport_height: usize,
+    /// Whether the session is still alive (process running).
+    pub alive: bool,
     /// Active filter pattern (case-insensitive substring match).
     pub filter_pattern: Option<String>,
     /// Semantic color theme (borrowed from the application).
@@ -78,6 +80,7 @@ impl<'a> PanelState<'a> {
             tail_attached: true,
             horizontal_scroll: 0,
             pinned: false,
+            alive: true,
             language_servers: Vec::new(),
             expanded: HashSet::new(),
             visual_selection: None,
@@ -409,7 +412,16 @@ fn build_title<'a>(state: &'a PanelState<'a>) -> Line<'a> {
         &state.session_id
     };
 
-    let mut spans = vec![Span::raw(format!(" Events [{id_short}]"))];
+    let id_style = if state.alive {
+        state.theme.session_active
+    } else {
+        state.theme.session_dead
+    };
+    let mut spans = vec![
+        Span::raw(" Events ["),
+        Span::styled(id_short, id_style),
+        Span::raw("]"),
+    ];
 
     if state.language_servers.is_empty() {
         spans.push(Span::styled(" no ls", Style::default().fg(Color::DarkGray)));
@@ -1983,5 +1995,32 @@ mod tests {
             panel.cursor, 0,
             "cursor should move to ScopeHeader after separator toggle"
         );
+    }
+
+    #[test]
+    fn test_panel_title_alive_style() {
+        let theme = test_theme();
+        let icons = test_icons();
+        let panel = PanelState::new("abcd1234".to_string(), &theme, &icons);
+        assert!(panel.alive);
+
+        let title = build_title(&panel);
+        // The second span is the session ID with the alive style.
+        let id_span = &title.spans[1];
+        assert_eq!(id_span.content, "abcd1234");
+        assert_eq!(id_span.style, theme.session_active);
+    }
+
+    #[test]
+    fn test_panel_title_dead_style() {
+        let theme = test_theme();
+        let icons = test_icons();
+        let mut panel = PanelState::new("abcd1234".to_string(), &theme, &icons);
+        panel.alive = false;
+
+        let title = build_title(&panel);
+        let id_span = &title.spans[1];
+        assert_eq!(id_span.content, "abcd1234");
+        assert_eq!(id_span.style, theme.session_dead);
     }
 }

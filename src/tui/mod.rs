@@ -149,7 +149,13 @@ fn run_with_data_and_watcher(
         .and_then(|c| c.tui)
         .unwrap_or_default();
 
-    let mut app = App::new(&theme, &icons, data, tui_config.sessions_width)?;
+    let mut app = App::new(
+        &theme,
+        &icons,
+        data,
+        tui_config.sessions_width,
+        tui_config.keep_dead_panels,
+    )?;
 
     // Load messages for auto-opened panels and create tails.
     let panel_ids: Vec<String> = app
@@ -569,10 +575,14 @@ fn check_session_liveness(app: &mut App<'_>) {
         if !session::is_process_alive(*pid) {
             app.tree.mark_session_dead(id);
             if let Some(idx) = app.grid.panel_for_session(id) {
-                app.grid.close_panel(idx);
+                if app.keep_dead_panels {
+                    app.grid.panels[idx].alive = false;
+                } else {
+                    app.grid.close_panel(idx);
+                    any_died = true;
+                }
             }
             app.tails.remove(id);
-            any_died = true;
         }
     }
     if any_died && app.grid.panels.is_empty() && app.focus == FocusedPane::Events {

@@ -92,6 +92,8 @@ pub struct App<'a> {
     pub tails: HashMap<String, Box<dyn MessageTail>>,
     /// Current display level threshold.
     pub level_threshold: LevelThreshold,
+    /// Keep panels open after a session dies (from `[tui]` config).
+    pub keep_dead_panels: bool,
 }
 
 impl<'a> App<'a> {
@@ -108,6 +110,7 @@ impl<'a> App<'a> {
         icons: &'a IconSet,
         data: Box<dyn DataSource>,
         sessions_width_ratio: f64,
+        keep_dead_panels: bool,
     ) -> anyhow::Result<Self> {
         let rows = data.list_sessions()?;
 
@@ -159,6 +162,7 @@ impl<'a> App<'a> {
             grid_layout: None,
             tails: HashMap::new(),
             level_threshold: LevelThreshold::Info,
+            keep_dead_panels,
         })
     }
 }
