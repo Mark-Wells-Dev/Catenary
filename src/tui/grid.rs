@@ -223,7 +223,7 @@ impl<'a> EventsGrid<'a> {
 /// Computes the BSP layout from the grid's composition and pinned set, then
 /// renders each panel into its assigned rect. The focused panel receives a
 /// highlighted border.
-pub fn render_grid(grid: &EventsGrid<'_>, area: Rect, buf: &mut Buffer) {
+pub fn render_grid(grid: &EventsGrid<'_>, area: Rect, buf: &mut Buffer, show_borders: bool) {
     if grid.panels.is_empty() {
         return;
     }
@@ -241,6 +241,7 @@ pub fn render_grid(grid: &EventsGrid<'_>, area: Rect, buf: &mut Buffer) {
             panel_rect.rect,
             buf,
             is_focused,
+            show_borders,
         );
     }
 }
@@ -499,7 +500,7 @@ mod tests {
         terminal
             .draw(|f| {
                 let area = f.area();
-                render_grid(&grid, area, f.buffer_mut());
+                render_grid(&grid, area, f.buffer_mut(), true);
             })
             .expect("draw");
 

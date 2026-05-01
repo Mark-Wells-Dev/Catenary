@@ -80,6 +80,7 @@ pub fn draw(frame: &mut Frame, app: &mut App<'_>) {
 
     app.tree_area = tree_area;
     app.grid_area = grid_area;
+    app.show_borders = degrade.show_borders;
 
     // Render sessions tree.
     if app.sessions_visible && tree_area.width > 0 && tree_area.height > 0 {
@@ -163,8 +164,10 @@ pub fn draw(frame: &mut Frame, app: &mut App<'_>) {
                 continue;
             }
             // Record real viewport height so snap_viewport uses it between frames.
+            // When borders are shown, 1 row is used for the title bar.
+            let chrome_rows = u16::from(degrade.show_borders);
             app.grid.panels[panel_rect.index].viewport_height =
-                panel_rect.rect.height.saturating_sub(1) as usize;
+                panel_rect.rect.height.saturating_sub(chrome_rows) as usize;
             let is_focused =
                 app.focus == FocusedPane::Events && app.grid.focused == Some(panel_rect.index);
             render_panel(
@@ -172,18 +175,19 @@ pub fn draw(frame: &mut Frame, app: &mut App<'_>) {
                 panel_rect.rect,
                 frame.buffer_mut(),
                 is_focused,
+                degrade.show_borders,
             );
 
             // Render scrollbar for this panel.
             let panel = &app.grid.panels[panel_rect.index];
             let flat_len = panel.flat_lines().len();
-            let inner_height = panel_rect.rect.height.saturating_sub(1) as usize; // title row
+            let inner_height = panel_rect.rect.height.saturating_sub(chrome_rows) as usize;
             if flat_len > inner_height && panel_rect.rect.width > 0 {
                 let track_area = Rect::new(
                     panel_rect.rect.x + panel_rect.rect.width.saturating_sub(1),
-                    panel_rect.rect.y + 1,
+                    panel_rect.rect.y + chrome_rows,
                     1,
-                    panel_rect.rect.height.saturating_sub(1),
+                    panel_rect.rect.height.saturating_sub(chrome_rows),
                 );
                 let metrics = ScrollMetrics {
                     content_length: flat_len,
@@ -201,9 +205,9 @@ pub fn draw(frame: &mut Frame, app: &mut App<'_>) {
                 // Render overflow counts.
                 let content_area = Rect::new(
                     panel_rect.rect.x + 1,
-                    panel_rect.rect.y + 1,
+                    panel_rect.rect.y + chrome_rows,
                     panel_rect.rect.width.saturating_sub(2),
-                    panel_rect.rect.height.saturating_sub(1),
+                    panel_rect.rect.height.saturating_sub(chrome_rows),
                 );
                 let counts = compute_overflow(&metrics);
                 render_overflow_counts(

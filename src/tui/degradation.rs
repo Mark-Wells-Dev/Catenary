@@ -19,40 +19,17 @@ const MIN_WORKSPACE_TAIL: usize = 5;
 
 // ── Types ───────────────────────────────────────────────────────────────
 
-/// Terminal size classification for degradation decisions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SizeClass {
-    /// Full featured — no degradation needed.
-    Full,
-    /// Comfortable — minor adjustments.
-    Comfortable,
-    /// Tight — significant trimming.
-    Tight,
-    /// Cramped — minimal chrome.
-    Cramped,
-    /// Extreme — bare content, no borders.
-    Extreme,
-    /// Below minimum — fill with ╳.
-    BelowMinimum,
-}
-
 /// Computed degradation state for the current terminal size.
 #[derive(Debug, Clone)]
 pub struct DegradationState {
-    /// Overall size classification.
-    pub size_class: SizeClass,
     /// Whether the Sessions tree should be visible.
     pub sessions_visible: bool,
     /// Width for the Sessions tree (0 if hidden).
     pub sessions_width: u16,
     /// How many hint levels to drop (0 = all hints visible).
     pub hint_drop_level: u8,
-    /// Title degradation level (0 = full, 6 = extreme).
-    pub title_level: u8,
-    /// Whether panel borders should be rendered.
+    /// Whether panel borders (title bar) should be rendered.
     pub show_borders: bool,
-    /// Whether language server info fits in titles.
-    pub show_ls_info: bool,
 }
 
 /// Configuration for degradation thresholds.
@@ -122,13 +99,10 @@ pub fn compute_degradation(
 ) -> DegradationState {
     if is_below_minimum(width, height) {
         return DegradationState {
-            size_class: SizeClass::BelowMinimum,
             sessions_visible: false,
             sessions_width: 0,
             hint_drop_level: 7,
-            title_level: 6,
             show_borders: false,
-            show_ls_info: false,
         };
     }
 
@@ -160,13 +134,6 @@ pub fn compute_degradation(
         }
     };
 
-    let events_width = width.saturating_sub(sessions_width);
-    let per_panel_width = if panels_per_row > 0 && events_width > 0 {
-        events_width / panels_per_row_u16
-    } else {
-        width
-    };
-
     // Per-panel height (balanced grid assumption).
     let rows = if panel_count > 0 {
         panel_count.div_ceil(panels_per_row).max(1) as u16
@@ -182,30 +149,13 @@ pub fn compute_degradation(
     let hint_avail = width.saturating_sub(6); // chrome: ──┤ ... ├──┘
     let hint_drop_level = compute_hint_drop_level(hint_avail);
 
-    let title_level = compute_title_level(per_panel_width);
     let show_borders = per_panel_height >= config.panel_min_height;
-    let show_ls_info = per_panel_width >= 30;
-
-    let size_class = if hint_drop_level == 0 && show_borders && show_ls_info && sessions_visible {
-        SizeClass::Full
-    } else if show_borders && sessions_visible {
-        SizeClass::Comfortable
-    } else if show_borders {
-        SizeClass::Tight
-    } else if per_panel_height >= 2 {
-        SizeClass::Cramped
-    } else {
-        SizeClass::Extreme
-    };
 
     DegradationState {
-        size_class,
         sessions_visible,
         sessions_width,
         hint_drop_level,
-        title_level,
         show_borders,
-        show_ls_info,
     }
 }
 
@@ -247,41 +197,40 @@ const fn compute_hint_drop_level(available: u16) -> u8 {
     }
 }
 
-/// Compute title degradation level from per-panel width.
-const fn compute_title_level(per_panel_width: u16) -> u8 {
-    if per_panel_width >= 35 {
-        0
-    } else if per_panel_width >= 25 {
-        1
-    } else if per_panel_width >= 17 {
-        2
-    } else if per_panel_width >= 14 {
-        3
-    } else if per_panel_width >= 7 {
-        4
-    } else if per_panel_width >= 2 {
-        5
-    } else {
-        6
-    }
-}
-
 // ── Title degradation ───────────────────────────────────────────────────
+
+/// A segment of the panel title bar.
+///
+/// The caller maps these to styled spans: `Chrome` uses the base title
+/// style, `SessionId` receives alive/dead styling from the theme.
+pub enum TitleSegment {
+    /// Plain text (brackets, "Events " prefix, ellipsis, workspace path).
+    Chrome(String),
+    /// Session ID portion — caller applies alive/dead styling.
+    SessionId(String),
+}
 
 /// Progressively truncate the panel title to fit the available width.
 ///
-/// Computes the appropriate degradation level from `max_width`:
+/// Returns structured segments so the caller can apply per-segment styling
+/// (e.g., alive/dead on the session ID). Width fitting uses the same
+/// levels as before:
+///
 /// ```text
-/// Level 0: "Events [029ba740 ~/Projects/Catenary]"
-/// Level 1: "Events [029ba740 …ects/Catenary]"
-/// Level 2: "Events [029ba740]"
-/// Level 3: "Events [029b…]"
-/// Level 4: "[029b…]"
-/// Level 5: "029b…"
-/// Level 6: "0…"
+/// Level 0: " Events [" + id8 + " " + workspace + "]"
+/// Level 1: " Events [" + id8 + " …" + ws_tail + "]"
+/// Level 2: " Events [" + id8 + "]"
+/// Level 3: " Events [" + id4… + "]"
+/// Level 4: " [" + id4… + "]"
+/// Level 5: " " + id_prefix + "…"
+/// Level 6: " " + first_char + "…"  (or single char at width 2)
 /// ```
 #[must_use]
-pub fn degrade_title(session_id: &str, workspace: Option<&str>, max_width: u16) -> String {
+pub fn degrade_title(
+    session_id: &str,
+    workspace: Option<&str>,
+    max_width: u16,
+) -> Vec<TitleSegment> {
     let max = max_width as usize;
     let id8 = if session_id.len() > 8 {
         &session_id[..8]
@@ -291,66 +240,91 @@ pub fn degrade_title(session_id: &str, workspace: Option<&str>, max_width: u16) 
 
     // Level 0: full context with workspace.
     if let Some(ws) = workspace {
-        let full = format!("Events [{id8} {ws}]");
-        if UnicodeWidthStr::width(full.as_str()) <= max {
-            return full;
+        let full_width =
+            " Events [".len() + id8.len() + " ".len() + UnicodeWidthStr::width(ws) + "]".len();
+        if full_width <= max {
+            return vec![
+                TitleSegment::Chrome(" Events [".to_string()),
+                TitleSegment::SessionId(id8.to_string()),
+                TitleSegment::Chrome(format!(" {ws}]")),
+            ];
         }
 
         // Level 1: truncated workspace — keep the last N chars.
-        let prefix = format!("Events [{id8} \u{2026}");
-        let suffix = "]";
-        let overhead = UnicodeWidthStr::width(prefix.as_str()) + UnicodeWidthStr::width(suffix);
-        let budget = max.saturating_sub(overhead);
+        let prefix_width = " Events [".len() + id8.len() + " \u{2026}".len();
+        let suffix_width = "]".len();
+        let budget = max.saturating_sub(prefix_width + suffix_width);
         if budget >= MIN_WORKSPACE_TAIL {
             let ws_chars: Vec<char> = ws.chars().collect();
             let start = ws_chars.len().saturating_sub(budget);
             let ws_tail: String = ws_chars[start..].iter().collect();
-            let candidate = format!("{prefix}{ws_tail}{suffix}");
-            if UnicodeWidthStr::width(candidate.as_str()) <= max {
-                return candidate;
+            let candidate_width =
+                prefix_width + UnicodeWidthStr::width(ws_tail.as_str()) + suffix_width;
+            if candidate_width <= max {
+                return vec![
+                    TitleSegment::Chrome(" Events [".to_string()),
+                    TitleSegment::SessionId(id8.to_string()),
+                    TitleSegment::Chrome(format!(" \u{2026}{ws_tail}]")),
+                ];
             }
         }
     }
 
     // Level 2: session ID only.
-    let level2 = format!("Events [{id8}]");
-    if UnicodeWidthStr::width(level2.as_str()) <= max {
-        return level2;
+    let level2_width = " Events [".len() + id8.len() + "]".len();
+    if level2_width <= max {
+        return vec![
+            TitleSegment::Chrome(" Events [".to_string()),
+            TitleSegment::SessionId(id8.to_string()),
+            TitleSegment::Chrome("]".to_string()),
+        ];
     }
 
-    // Level 3: truncated session ID (first 4 chars).
+    // Level 3: truncated session ID (first 4 chars + ellipsis).
     let id4 = if session_id.len() > 4 {
         &session_id[..4]
     } else {
         session_id
     };
-    let level3 = format!("Events [{id4}\u{2026}]");
-    if UnicodeWidthStr::width(level3.as_str()) <= max {
-        return level3;
+    let level3_width = " Events [".len() + id4.len() + "\u{2026}".len() + "]".len();
+    if level3_width <= max {
+        return vec![
+            TitleSegment::Chrome(" Events [".to_string()),
+            TitleSegment::SessionId(format!("{id4}\u{2026}")),
+            TitleSegment::Chrome("]".to_string()),
+        ];
     }
 
     // Level 4: drop "Events" prefix.
-    let level4 = format!("[{id4}\u{2026}]");
-    if UnicodeWidthStr::width(level4.as_str()) <= max {
-        return level4;
+    let level4_width = " [".len() + id4.len() + "\u{2026}".len() + "]".len();
+    if level4_width <= max {
+        return vec![
+            TitleSegment::Chrome(" [".to_string()),
+            TitleSegment::SessionId(format!("{id4}\u{2026}")),
+            TitleSegment::Chrome("]".to_string()),
+        ];
     }
 
     // Levels 5–6: bare ID prefix with ellipsis.
-    if max >= 2 {
-        let id_budget = max - 1; // 1 column for …
+    // Reserve 1 column for leading space, 1 for ellipsis.
+    if max >= 3 {
+        let id_budget = max - 2; // leading space + trailing …
         let id_prefix: String = session_id.chars().take(id_budget).collect();
-        return format!("{id_prefix}\u{2026}");
+        return vec![
+            TitleSegment::Chrome(" ".to_string()),
+            TitleSegment::SessionId(format!("{id_prefix}\u{2026}")),
+        ];
     }
 
-    if max == 1 {
-        return session_id
-            .chars()
-            .next()
-            .map(String::from)
-            .unwrap_or_default();
+    if max == 2 {
+        let first: String = session_id.chars().take(1).collect();
+        return vec![
+            TitleSegment::Chrome(" ".to_string()),
+            TitleSegment::SessionId(first),
+        ];
     }
 
-    String::new()
+    Vec::new()
 }
 
 // ── Hint degradation ────────────────────────────────────────────────────
@@ -496,64 +470,6 @@ pub fn degrade_sessions_path(path: &str, max_width: u16) -> String {
     String::new()
 }
 
-// ── Language server title degradation ───────────────────────────────────
-
-/// Build a degraded language server info string for the title bar.
-///
-/// Degradation levels:
-/// 1. Full names with status icons: `● rust ╱ ● ts`
-/// 2. Names with separators, no icons: `rust ╱ ts`
-/// 3. Names space-separated: `rust ts`
-/// 4. Empty string (not enough room).
-#[must_use]
-pub fn degrade_ls_title(servers: &[String], max_width: u16) -> String {
-    if servers.is_empty() {
-        return String::new();
-    }
-
-    let max = max_width as usize;
-
-    // Level 1: icons + fancy separators.
-    let full = build_ls_string(servers, true, true);
-    if UnicodeWidthStr::width(full.as_str()) <= max {
-        return full;
-    }
-
-    // Level 2: no icons, fancy separators.
-    let no_icons = build_ls_string(servers, false, true);
-    if UnicodeWidthStr::width(no_icons.as_str()) <= max {
-        return no_icons;
-    }
-
-    // Level 3: no icons, space-separated.
-    let no_seps = build_ls_string(servers, false, false);
-    if UnicodeWidthStr::width(no_seps.as_str()) <= max {
-        return no_seps;
-    }
-
-    // Level 4: empty.
-    String::new()
-}
-
-/// Build a language server info string with configurable icons and separators.
-fn build_ls_string(servers: &[String], icons: bool, fancy_sep: bool) -> String {
-    let mut result = String::new();
-    for (i, name) in servers.iter().enumerate() {
-        if i > 0 {
-            if fancy_sep {
-                result.push_str(" \u{2571} "); // ╱
-            } else {
-                result.push(' ');
-            }
-        }
-        if icons {
-            result.push_str("\u{25CF} "); // ● + space
-        }
-        result.push_str(name);
-    }
-    result
-}
-
 // ── Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -614,56 +530,95 @@ mod tests {
         );
     }
 
+    /// Concatenate title segments into a flat string for assertions.
+    fn segments_to_string(segments: &[TitleSegment]) -> String {
+        segments
+            .iter()
+            .map(|s| match s {
+                TitleSegment::Chrome(t) | TitleSegment::SessionId(t) => t.as_str(),
+            })
+            .collect()
+    }
+
+    /// Extract the session ID segment text.
+    fn session_id_text(segments: &[TitleSegment]) -> String {
+        segments
+            .iter()
+            .filter_map(|s| match s {
+                TitleSegment::SessionId(t) => Some(t.as_str()),
+                TitleSegment::Chrome(_) => None,
+            })
+            .collect()
+    }
+
     #[test]
     fn test_title_degradation_full() {
-        let result = degrade_title("029ba740", Some("~/Projects/Catenary"), 50);
+        let segments = degrade_title("029ba740", Some("~/Projects/Catenary"), 50);
+        let text = segments_to_string(&segments);
         assert!(
-            result.contains("029ba740"),
-            "full title should contain session ID: {result}"
+            text.contains("029ba740"),
+            "should contain session ID: {text}"
         );
         assert!(
-            result.contains("~/Projects/Catenary"),
-            "full title should contain workspace: {result}"
+            text.contains("~/Projects/Catenary"),
+            "should contain workspace: {text}"
         );
+        // Session ID is in its own segment.
+        assert_eq!(session_id_text(&segments), "029ba740");
     }
 
     #[test]
     fn test_title_degradation_drop_workspace() {
-        let result = degrade_title("029ba740", Some("~/Projects/Catenary"), 20);
+        let segments = degrade_title("029ba740", Some("~/Projects/Catenary"), 20);
+        let text = segments_to_string(&segments);
         assert!(
-            result.contains("029ba740"),
-            "title should contain session ID: {result}"
+            text.contains("029ba740"),
+            "should contain session ID: {text}"
         );
         assert!(
-            !result.contains("Catenary"),
-            "title should not contain workspace at width 20: {result}"
+            !text.contains("Catenary"),
+            "should not contain workspace at width 20: {text}"
         );
     }
 
     #[test]
     fn test_title_degradation_truncate_id() {
-        let result = degrade_title("029ba740", Some("~/Projects/Catenary"), 12);
+        let segments = degrade_title("029ba740", Some("~/Projects/Catenary"), 14);
+        let text = segments_to_string(&segments);
+        assert!(text.contains("029b"), "should contain ID prefix: {text}");
+        let id = session_id_text(&segments);
         assert!(
-            result.contains('\u{2026}'),
-            "truncated title should contain ellipsis: {result}"
-        );
-        assert!(
-            result.contains("029b"),
-            "truncated title should contain ID prefix: {result}"
+            id.contains('\u{2026}'),
+            "session ID segment should contain ellipsis: {id}"
         );
     }
 
     #[test]
     fn test_title_degradation_extreme() {
-        let result = degrade_title("029ba740", Some("~/Projects/Catenary"), 3);
+        let segments = degrade_title("029ba740", Some("~/Projects/Catenary"), 3);
+        let text = segments_to_string(&segments);
         assert!(
-            result.contains('\u{2026}'),
-            "extreme title should contain ellipsis: {result}"
+            UnicodeWidthStr::width(text.as_str()) <= 3,
+            "extreme title width should be \u{2264} 3: {text}"
         );
+        assert!(!segments.is_empty(), "should produce at least one segment");
+    }
+
+    #[test]
+    fn test_title_no_workspace_level2() {
+        let segments = degrade_title("029ba740", None, 30);
+        let text = segments_to_string(&segments);
         assert!(
-            UnicodeWidthStr::width(result.as_str()) <= 3,
-            "extreme title width should be \u{2264} 3: {result}"
+            text.contains("Events"),
+            "level 2 should have Events prefix: {text}"
         );
+        assert_eq!(session_id_text(&segments), "029ba740");
+    }
+
+    #[test]
+    fn test_title_empty_at_zero_width() {
+        let segments = degrade_title("029ba740", None, 0);
+        assert!(segments.is_empty(), "zero width should produce no segments");
     }
 
     #[test]
@@ -741,34 +696,6 @@ mod tests {
         assert!(
             result.contains('\u{2026}'),
             "minimal path should contain ellipsis: {result}"
-        );
-    }
-
-    #[test]
-    fn test_ls_title_full() {
-        let servers = vec!["rust".to_string(), "ts".to_string()];
-        let result = degrade_ls_title(&servers, 40);
-        assert!(
-            result.contains("rust"),
-            "full LS title should contain 'rust': {result}"
-        );
-        assert!(
-            result.contains("ts"),
-            "full LS title should contain 'ts': {result}"
-        );
-        assert!(
-            result.contains('\u{25CF}'),
-            "full LS title should contain status icon: {result}"
-        );
-    }
-
-    #[test]
-    fn test_ls_title_dropped() {
-        let servers = vec!["rust".to_string(), "ts".to_string()];
-        let result = degrade_ls_title(&servers, 5);
-        assert!(
-            result.is_empty(),
-            "LS title should be empty at width 5: {result}"
         );
     }
 }

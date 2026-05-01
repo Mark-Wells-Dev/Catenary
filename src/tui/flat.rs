@@ -1274,7 +1274,7 @@ mod tests {
         terminal
             .draw(|f| {
                 let area = f.area();
-                crate::tui::panel::render_panel(&panel, area, f.buffer_mut(), true);
+                crate::tui::panel::render_panel(&panel, area, f.buffer_mut(), true, true);
             })
             .expect("draw");
 

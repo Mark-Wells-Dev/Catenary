@@ -11,6 +11,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 
 use super::data::SessionRow;
+use super::degradation::degrade_sessions_path;
 use super::icons::IconSet;
 use super::selection::VisualSelection;
 use super::theme::Theme;
@@ -422,17 +423,6 @@ const CHEATSHEET: &[(&str, &str)] = &[
     ("Esc", "unpin all / cancel"),
 ];
 
-/// Format workspace path: use basename if full path exceeds `max_width`.
-fn format_workspace_path(path: &str, max_width: usize) -> &str {
-    if path.len() <= max_width {
-        return path;
-    }
-    std::path::Path::new(path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(path)
-}
-
 /// Format a session age from `started_at`.
 fn format_age(started: chrono::DateTime<chrono::Utc>) -> String {
     super::format::format_ago(started)
@@ -535,10 +525,11 @@ pub fn render_tree(
                 } else {
                     theme.session_dead
                 };
-                let path = format_workspace_path(&node.path, max_width.saturating_sub(4));
+                let path_budget = max_width.saturating_sub(4) as u16;
+                let path = degrade_sessions_path(&node.path, path_budget);
                 let label = node
                     .grouped_count
-                    .map_or_else(|| path.to_string(), |n| format!("{path} ({n} sessions)"));
+                    .map_or_else(|| path.clone(), |n| format!("{path} ({n} sessions)"));
                 Line::from(vec![
                     Span::styled(
                         collapse_icon,

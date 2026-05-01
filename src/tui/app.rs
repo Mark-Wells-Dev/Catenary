@@ -57,6 +57,10 @@ impl LevelThreshold {
 }
 
 /// Application state driving the TUI.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "application state — each bool is an independent flag"
+)]
 pub struct App<'a> {
     /// Semantic color theme.
     pub theme: &'a Theme,
@@ -88,6 +92,8 @@ pub struct App<'a> {
     pub grid_area: Rect,
     /// Cached panel layout (updated each frame).
     pub grid_layout: Option<PanelLayout>,
+    /// Whether panel borders are shown (updated each frame by degradation).
+    pub show_borders: bool,
     /// Event tails keyed by session ID, for streaming new events into panels.
     pub tails: HashMap<String, Box<dyn MessageTail>>,
     /// Current display level threshold.
@@ -160,6 +166,7 @@ impl<'a> App<'a> {
             tree_area: Rect::default(),
             grid_area: Rect::default(),
             grid_layout: None,
+            show_borders: true,
             tails: HashMap::new(),
             level_threshold: LevelThreshold::Info,
             keep_dead_panels,

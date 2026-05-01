@@ -311,6 +311,7 @@ fn handle_mouse(app: &mut App<'_>, mouse: event::MouseEvent) {
                 app.tree.scroll_offset,
                 &panel_scroll_offsets,
                 &overflow_counts,
+                app.show_borders,
             );
 
             dispatch_mouse_action(app, &action);
@@ -335,6 +336,7 @@ fn handle_mouse(app: &mut App<'_>, mouse: event::MouseEvent) {
                 &app.drag_state,
                 layout,
                 &panel_scroll_offsets,
+                app.show_borders,
             );
             dispatch_mouse_action(app, &action);
         }

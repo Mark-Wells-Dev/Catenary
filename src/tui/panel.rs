@@ -20,6 +20,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Widget};
 use unicode_width::UnicodeWidthStr;
 
+use super::degradation::{TitleSegment, degrade_title};
 use super::flat::FlatLine;
 use super::format::{
     format_collapsed_styled, format_message_styled, format_pair_styled, format_scope_styled,
@@ -404,41 +405,132 @@ pub fn frontmatter_lines(msg: &SessionMessage, theme: &Theme) -> Vec<Line<'stati
 
 // ── Rendering ───────────────────────────────────────────────────────────
 
-/// Build the title line for a panel.
-fn build_title<'a>(state: &'a PanelState<'a>) -> Line<'a> {
-    let id_short = if state.session_id.len() > 8 {
-        &state.session_id[..8]
-    } else {
-        &state.session_id
-    };
-
+/// Build the title line for a panel, fitting to the available width.
+///
+/// Uses [`degrade_title`] for progressive truncation of the session ID
+/// portion, then appends language server info if there's remaining width.
+fn build_title(state: &PanelState<'_>, max_width: u16) -> Line<'static> {
     let id_style = if state.alive {
         state.theme.session_active
     } else {
         state.theme.session_dead
     };
-    let mut spans = vec![
-        Span::raw(" Events ["),
-        Span::styled(id_short, id_style),
-        Span::raw("]"),
-    ];
 
-    if state.language_servers.is_empty() {
-        spans.push(Span::styled(" no ls", Style::default().fg(Color::DarkGray)));
-    } else {
-        let style = Style::default().fg(Color::Green);
-        spans.push(Span::raw(" "));
-        for (i, name) in state.language_servers.iter().enumerate() {
-            if i > 0 {
-                spans.push(Span::raw(" \u{2571} ")); // ╱
+    // Build the core title (session ID + chrome) via degradation.
+    // Reserve 1 column for the trailing space after the title.
+    let title_budget = max_width.saturating_sub(1);
+    let segments = degrade_title(&state.session_id, None, title_budget);
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut used_width: usize = 0;
+
+    for seg in &segments {
+        match seg {
+            TitleSegment::Chrome(text) => {
+                used_width += UnicodeWidthStr::width(text.as_str());
+                spans.push(Span::raw(text.clone()));
             }
-            spans.push(Span::styled(state.icons.ls_active.as_str(), style));
-            spans.push(Span::styled(name.as_str(), style));
+            TitleSegment::SessionId(text) => {
+                used_width += UnicodeWidthStr::width(text.as_str());
+                spans.push(Span::styled(text.clone(), id_style));
+            }
         }
     }
 
-    spans.push(Span::raw(" "));
+    // Append language server info if there's remaining width.
+    let remaining = (max_width as usize).saturating_sub(used_width);
+    append_ls_info(&mut spans, state, remaining);
+
+    // Trailing space.
+    spans.push(Span::raw(" ".to_string()));
     Line::from(spans)
+}
+
+/// Append language server info to the title spans, fitting to `budget` columns.
+///
+/// Progressive degradation:
+/// 1. Icons + names with `╱` separators (e.g., `● rust ╱ ● ts`)
+/// 2. Names with `╱` separators (e.g., `rust ╱ ts`)
+/// 3. Names space-separated (e.g., `rust ts`)
+/// 4. Nothing (not enough room)
+fn append_ls_info(spans: &mut Vec<Span<'static>>, state: &PanelState<'_>, budget: usize) {
+    if state.language_servers.is_empty() || budget < 5 {
+        return;
+    }
+
+    let style = Style::default().fg(Color::Green);
+    let icon = &state.icons.ls_active;
+    let sep = " \u{2571} "; // ╱
+
+    // Compute widths for each degradation level.
+    let with_icons_width: usize = state
+        .language_servers
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let sep_w = if i > 0 {
+                UnicodeWidthStr::width(sep)
+            } else {
+                0
+            };
+            sep_w + UnicodeWidthStr::width(icon.as_str()) + UnicodeWidthStr::width(name.as_str())
+        })
+        .sum::<usize>()
+        + 1; // leading space
+
+    let names_sep_width: usize = state
+        .language_servers
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let sep_w = if i > 0 {
+                UnicodeWidthStr::width(sep)
+            } else {
+                0
+            };
+            sep_w + UnicodeWidthStr::width(name.as_str())
+        })
+        .sum::<usize>()
+        + 1;
+
+    let names_space_width: usize = state
+        .language_servers
+        .iter()
+        .enumerate()
+        .map(|(i, name)| usize::from(i > 0) + UnicodeWidthStr::width(name.as_str()))
+        .sum::<usize>()
+        + 1;
+
+    if with_icons_width <= budget {
+        // Level 1: icons + fancy separators.
+        spans.push(Span::raw(" ".to_string()));
+        for (i, name) in state.language_servers.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::raw(sep.to_string()));
+            }
+            spans.push(Span::styled(icon.clone(), style));
+            spans.push(Span::styled(name.clone(), style));
+        }
+    } else if names_sep_width <= budget {
+        // Level 2: names + fancy separators.
+        spans.push(Span::raw(" ".to_string()));
+        for (i, name) in state.language_servers.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::raw(sep.to_string()));
+            }
+            spans.push(Span::styled(name.clone(), style));
+        }
+    } else if names_space_width <= budget {
+        // Level 3: names space-separated.
+        spans.push(Span::raw(" ".to_string()));
+        for (i, name) in state.language_servers.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::raw(" ".to_string()));
+            }
+            spans.push(Span::styled(name.clone(), style));
+        }
+    }
+    // Level 4: nothing fits — don't append anything.
 }
 
 /// Convert a borrowed `Line` into a fully owned `Line<'static>`.
@@ -648,19 +740,19 @@ fn render_flat_line_styled(
     clippy::too_many_lines,
     reason = "terminal coordinates are always small; pair merge adds detail lookup logic"
 )]
-pub fn render_panel(state: &PanelState<'_>, area: Rect, buf: &mut Buffer, focused: bool) {
-    if area.width < 4 || area.height < 2 {
+pub fn render_panel(
+    state: &PanelState<'_>,
+    area: Rect,
+    buf: &mut Buffer,
+    focused: bool,
+    show_borders: bool,
+) {
+    if area.width < 2 || area.height < 1 {
         return;
     }
 
     let border_style = if focused {
         state.theme.border_focused
-    } else {
-        state.theme.border_unfocused
-    };
-
-    let title_style = if focused {
-        state.theme.title
     } else {
         state.theme.border_unfocused
     };
@@ -671,13 +763,30 @@ pub fn render_panel(state: &PanelState<'_>, area: Rect, buf: &mut Buffer, focuse
         symbols::border::PLAIN
     };
 
-    let title = build_title(state);
-    let block = Block::default()
-        .borders(Borders::TOP | Borders::RIGHT)
+    // When borders are shown, the top row is the title bar. When hidden,
+    // only the right-column border is drawn (for grid panel separation).
+    let borders = if show_borders {
+        Borders::TOP | Borders::RIGHT
+    } else {
+        Borders::RIGHT
+    };
+
+    let mut block = Block::default()
+        .borders(borders)
         .border_set(border_set)
-        .border_style(border_style)
-        .title(title)
-        .title_style(title_style);
+        .border_style(border_style);
+
+    if show_borders {
+        let title_style = if focused {
+            state.theme.title
+        } else {
+            state.theme.border_unfocused
+        };
+        let title_width = area.width.saturating_sub(1); // right border
+        let title = build_title(state, title_width);
+        block = block.title(title).title_style(title_style);
+    }
+
     let inner = block.inner(area);
     block.render(area, buf);
 
@@ -1035,7 +1144,7 @@ mod tests {
         terminal
             .draw(|f| {
                 let area = f.area();
-                render_panel(&panel, area, f.buffer_mut(), true);
+                render_panel(&panel, area, f.buffer_mut(), true, true);
             })
             .expect("draw");
 
@@ -1057,7 +1166,7 @@ mod tests {
         terminal
             .draw(|f| {
                 let area = f.area();
-                render_panel(&panel, area, f.buffer_mut(), true);
+                render_panel(&panel, area, f.buffer_mut(), true, true);
             })
             .expect("draw");
 
@@ -1085,7 +1194,7 @@ mod tests {
         terminal
             .draw(|f| {
                 let area = f.area();
-                render_panel(&panel, area, f.buffer_mut(), true);
+                render_panel(&panel, area, f.buffer_mut(), true, true);
             })
             .expect("draw");
 
@@ -1369,7 +1478,7 @@ mod tests {
         terminal
             .draw(|f| {
                 let area = f.area();
-                render_panel(&panel, area, f.buffer_mut(), true);
+                render_panel(&panel, area, f.buffer_mut(), true, true);
             })
             .expect("draw");
 
@@ -1651,7 +1760,7 @@ mod tests {
         terminal
             .draw(|f| {
                 let area = f.area();
-                render_panel(&panel, area, f.buffer_mut(), true);
+                render_panel(&panel, area, f.buffer_mut(), true, true);
             })
             .expect("draw");
 
@@ -2004,10 +2113,13 @@ mod tests {
         let panel = PanelState::new("abcd1234".to_string(), &theme, &icons);
         assert!(panel.alive);
 
-        let title = build_title(&panel);
-        // The second span is the session ID with the alive style.
-        let id_span = &title.spans[1];
-        assert_eq!(id_span.content, "abcd1234");
+        let title = build_title(&panel, 60);
+        // Find the session ID span.
+        let id_span = title
+            .spans
+            .iter()
+            .find(|s| s.content.contains("abcd1234"))
+            .expect("session ID span");
         assert_eq!(id_span.style, theme.session_active);
     }
 
@@ -2018,9 +2130,78 @@ mod tests {
         let mut panel = PanelState::new("abcd1234".to_string(), &theme, &icons);
         panel.alive = false;
 
-        let title = build_title(&panel);
-        let id_span = &title.spans[1];
-        assert_eq!(id_span.content, "abcd1234");
+        let title = build_title(&panel, 60);
+        let id_span = title
+            .spans
+            .iter()
+            .find(|s| s.content.contains("abcd1234"))
+            .expect("session ID span");
         assert_eq!(id_span.style, theme.session_dead);
+    }
+
+    #[test]
+    fn test_panel_title_degradation_drops_ls() {
+        let theme = test_theme();
+        let icons = test_icons();
+        let mut panel = PanelState::new("abcd1234".to_string(), &theme, &icons);
+        panel.language_servers = vec!["rust-analyzer".to_string()];
+
+        // Wide: LS info visible.
+        let wide = build_title(&panel, 60);
+        let wide_text: String = wide.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            wide_text.contains("rust-analyzer"),
+            "wide title should contain LS name: {wide_text}"
+        );
+
+        // Narrow: LS info dropped.
+        let narrow = build_title(&panel, 20);
+        let narrow_text: String = narrow.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            !narrow_text.contains("rust-analyzer"),
+            "narrow title should not contain LS name: {narrow_text}"
+        );
+        assert!(
+            narrow_text.contains("abcd1234"),
+            "narrow title should still contain session ID: {narrow_text}"
+        );
+    }
+
+    #[test]
+    fn test_panel_title_degradation_truncates_id() {
+        let theme = test_theme();
+        let icons = test_icons();
+        let panel = PanelState::new("abcd1234".to_string(), &theme, &icons);
+
+        // Very narrow: session ID truncated, "Events" dropped.
+        let title = build_title(&panel, 10);
+        let text: String = title.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            !text.contains("Events"),
+            "very narrow title should drop Events: {text}"
+        );
+        assert!(
+            text.contains("abcd"),
+            "very narrow title should contain ID prefix: {text}"
+        );
+    }
+
+    #[test]
+    fn test_panel_title_alive_style_survives_degradation() {
+        let theme = test_theme();
+        let icons = test_icons();
+        let panel = PanelState::new("abcd1234".to_string(), &theme, &icons);
+
+        // Even at narrow width, the session ID span has alive style.
+        let title = build_title(&panel, 8);
+        let id_span = title
+            .spans
+            .iter()
+            .find(|s| s.style == theme.session_active)
+            .expect("should have an alive-styled span");
+        assert!(
+            !id_span.content.is_empty(),
+            "alive-styled span should have content"
+        );
     }
 }

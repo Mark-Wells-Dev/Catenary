@@ -529,8 +529,8 @@ pub enum PanelZone {
 /// (scrollbar). Points on chrome return `None`. Points in the content
 /// interior return the panel index.
 #[must_use]
-pub fn panel_at(layout: &PanelLayout, x: u16, y: u16) -> Option<usize> {
-    panel_zone_at(layout, x, y).and_then(|(idx, zone)| {
+pub fn panel_at(layout: &PanelLayout, x: u16, y: u16, show_borders: bool) -> Option<usize> {
+    panel_zone_at(layout, x, y, show_borders).and_then(|(idx, zone)| {
         if zone == PanelZone::Content {
             Some(idx)
         } else {
@@ -545,7 +545,12 @@ pub fn panel_at(layout: &PanelLayout, x: u16, y: u16) -> Option<usize> {
 /// A panel's owned chrome is its **top** row (title bar) and **right**
 /// column (scrollbar). Points outside all panels return `None`.
 #[must_use]
-pub fn panel_zone_at(layout: &PanelLayout, x: u16, y: u16) -> Option<(usize, PanelZone)> {
+pub fn panel_zone_at(
+    layout: &PanelLayout,
+    x: u16,
+    y: u16,
+    show_borders: bool,
+) -> Option<(usize, PanelZone)> {
     for panel in &layout.panels {
         let r = &panel.rect;
         // Must be within the panel's bounding rect.
@@ -553,7 +558,7 @@ pub fn panel_zone_at(layout: &PanelLayout, x: u16, y: u16) -> Option<(usize, Pan
             continue;
         }
         let right = r.x + r.width.saturating_sub(1);
-        if y == r.y {
+        if show_borders && y == r.y {
             return Some((panel.index, PanelZone::TitleBar));
         }
         if x == right {
@@ -763,9 +768,9 @@ mod tests {
         let comp = Composition(vec![2]);
         let layout = compute_layout(area, &comp, &HashSet::new(), 1.0);
         // Point inside panel 0 content area.
-        assert_eq!(panel_at(&layout, 10, 5), Some(0));
+        assert_eq!(panel_at(&layout, 10, 5, true), Some(0));
         // Point inside panel 1 content area.
-        assert_eq!(panel_at(&layout, 50, 5), Some(1));
+        assert_eq!(panel_at(&layout, 50, 5, true), Some(1));
     }
 
     #[test]
@@ -776,29 +781,41 @@ mod tests {
         let p0 = &layout.panels[0].rect;
         let p1 = &layout.panels[1].rect;
         // Top title row of panel 0 is chrome.
-        assert_eq!(panel_at(&layout, 10, p0.y), None, "top title row is chrome");
+        assert_eq!(
+            panel_at(&layout, 10, p0.y, true),
+            None,
+            "top title row is chrome"
+        );
         // Right scrollbar column of panel 0 is chrome.
         let scrollbar_x = p0.x + p0.width - 1;
         assert_eq!(
-            panel_at(&layout, scrollbar_x, 5),
+            panel_at(&layout, scrollbar_x, 5, true),
             None,
             "right scrollbar is chrome"
         );
         // Left edge of panel 0 is content (no left border).
-        assert_eq!(panel_at(&layout, p0.x, 1), Some(0), "left edge is content");
+        assert_eq!(
+            panel_at(&layout, p0.x, 1, true),
+            Some(0),
+            "left edge is content"
+        );
         // Bottom edge of panel 0 is content (no bottom border).
         let bottom_y = p0.y + p0.height - 1;
         assert_eq!(
-            panel_at(&layout, 10, bottom_y),
+            panel_at(&layout, 10, bottom_y, true),
             Some(0),
             "bottom edge is content"
         );
         // Top title row of panel 1 is chrome.
-        assert_eq!(panel_at(&layout, p1.x + 1, p1.y), None, "panel 1 title row");
+        assert_eq!(
+            panel_at(&layout, p1.x + 1, p1.y, true),
+            None,
+            "panel 1 title row"
+        );
         // Right scrollbar of panel 1 is chrome.
         let scrollbar_x1 = p1.x + p1.width - 1;
         assert_eq!(
-            panel_at(&layout, scrollbar_x1, 5),
+            panel_at(&layout, scrollbar_x1, 5, true),
             None,
             "panel 1 scrollbar"
         );
