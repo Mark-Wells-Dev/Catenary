@@ -212,7 +212,7 @@ impl ToolHandler for McpRouter {
                 title: Some("Catenary: Start Editing".to_string()),
                 description: Some(
                     "Enter editing mode. Diagnostics are deferred until done_editing is called. \
-                     Call this before using Edit."
+                     Call this before using Edit. Takes no arguments."
                         .to_string(),
                 ),
                 input_schema: serde_json::json!({
