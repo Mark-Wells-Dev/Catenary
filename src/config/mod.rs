@@ -17,7 +17,7 @@ use anyhow::Result;
 use serde::Deserialize;
 
 pub use commands::{BuildContext, BuildGuidance, CommandsConfig, GuidanceEntry, ResolvedCommands};
-pub use language::{LanguageConfig, ServerBinding};
+pub use language::{DispatchMethod, LanguageConfig, ServerBinding};
 pub use parse::{ProjectConfig, SERVER_DEF_KEYS, config_sources, load_project_config};
 pub use server::ServerDef;
 
@@ -1325,6 +1325,7 @@ servers = ["alpha", { name = "beta", diagnostics = false }]
                 ServerBinding {
                     name: "beta".to_string(),
                     diagnostics: false,
+                    disabled_methods: Vec::new(),
                 },
             ],
         );
@@ -1355,6 +1356,106 @@ servers = [{ name = "foo", typo = true }]
             err.contains("typo"),
             "error should mention the unknown key: {err}",
         );
+    }
+
+    #[test]
+    fn test_disabled_methods_parsed() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[server.alpha]
+command = "alpha-server"
+
+[language.test]
+servers = [{ name = "alpha", disabled_methods = ["textDocument/references"] }]
+"#,
+        )?;
+
+        let config = Config::load_from_sources(&[path])?;
+        let lc = config.language.get("test").expect("test language");
+        assert_eq!(lc.servers.len(), 1);
+        assert_eq!(
+            lc.servers[0].disabled_methods,
+            vec![DispatchMethod::References]
+        );
+        assert!(lc.servers[0].is_method_disabled(DispatchMethod::References));
+        assert!(!lc.servers[0].is_method_disabled(DispatchMethod::Implementation));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_disabled_methods_unknown_rejected() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[server.alpha]
+command = "alpha-server"
+
+[language.test]
+servers = [{ name = "alpha", disabled_methods = ["textDocument/typo"] }]
+"#,
+        )
+        .expect("write config");
+
+        let result = Config::load_from_sources(&[path]);
+        assert!(result.is_err());
+        let err = format!("{:#}", result.expect_err("should error"));
+        assert!(
+            err.contains("typo"),
+            "error should mention the unknown method: {err}",
+        );
+    }
+
+    #[test]
+    fn test_disabled_methods_diagnostic_rejected() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[server.alpha]
+command = "alpha-server"
+
+[language.test]
+servers = [{ name = "alpha", disabled_methods = ["textDocument/diagnostic"] }]
+"#,
+        )
+        .expect("write config");
+
+        let result = Config::load_from_sources(&[path]);
+        assert!(result.is_err());
+        let err = format!("{:#}", result.expect_err("should error"));
+        assert!(
+            err.contains("diagnostics = false"),
+            "error should guide toward diagnostics flag: {err}",
+        );
+    }
+
+    #[test]
+    fn test_disabled_methods_default_empty() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[server.foo]
+command = "foo-server"
+
+[language.test]
+servers = ["foo"]
+"#,
+        )?;
+
+        let config = Config::load_from_sources(&[path])?;
+        let lc = config.language.get("test").expect("test language");
+        assert!(lc.servers[0].disabled_methods.is_empty());
+
+        Ok(())
     }
 
     #[test]
@@ -1424,6 +1525,7 @@ diagnostics = false
             servers: vec![ServerBinding {
                 name: "s".to_string(),
                 diagnostics: false,
+                disabled_methods: Vec::new(),
             }],
             ..LanguageConfig::default()
         };
@@ -1434,6 +1536,7 @@ diagnostics = false
             servers: vec![ServerBinding {
                 name: "s".to_string(),
                 diagnostics: false,
+                disabled_methods: Vec::new(),
             }],
             diagnostics: false,
             ..LanguageConfig::default()

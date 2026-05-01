@@ -20,6 +20,7 @@ use super::filesystem_manager::FilesystemManager;
 use super::handler::display_path;
 use super::tool_server::ToolServer;
 use crate::bucketing::{self, BucketEntry};
+use crate::config::DispatchMethod;
 use crate::lsp::LspClientManager;
 use crate::lsp::server::LspServer;
 use crate::source::Source;
@@ -209,7 +210,11 @@ impl GrepServer {
         for path in &needs_populate {
             let servers = self
                 .client_manager
-                .get_servers(path, LspServer::supports_document_symbols)
+                .get_servers(
+                    path,
+                    LspServer::supports_document_symbols,
+                    Some(DispatchMethod::DocumentSymbol),
+                )
                 .await;
             let Some(server) = servers.first() else {
                 continue;
@@ -476,7 +481,11 @@ impl GrepServer {
     ) -> bool {
         let servers = self
             .client_manager
-            .get_servers(path, LspServer::supports_rename)
+            .get_servers(
+                path,
+                LspServer::supports_rename,
+                Some(DispatchMethod::Rename),
+            )
             .await;
 
         for client_mutex in &servers {
@@ -526,6 +535,10 @@ impl GrepServer {
     /// runs all four enrichment methods (skipping their per-method open/close),
     /// then closes the document on each server. This avoids `didClose` between
     /// methods causing the server to evict document state.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "orchestration across four LSP methods"
+    )]
     async fn enrich_at_position(
         &self,
         path: &Path,
@@ -547,19 +560,35 @@ impl GrepServer {
         // Collect the union of servers across all enrichment capabilities.
         let ref_servers = self
             .client_manager
-            .get_servers(path, LspServer::supports_references)
+            .get_servers(
+                path,
+                LspServer::supports_references,
+                Some(DispatchMethod::References),
+            )
             .await;
         let call_servers = self
             .client_manager
-            .get_servers(path, LspServer::supports_call_hierarchy)
+            .get_servers(
+                path,
+                LspServer::supports_call_hierarchy,
+                Some(DispatchMethod::CallHierarchy),
+            )
             .await;
         let impl_servers = self
             .client_manager
-            .get_servers(path, LspServer::supports_implementation)
+            .get_servers(
+                path,
+                LspServer::supports_implementation,
+                Some(DispatchMethod::Implementation),
+            )
             .await;
         let type_servers = self
             .client_manager
-            .get_servers(path, LspServer::supports_type_hierarchy)
+            .get_servers(
+                path,
+                LspServer::supports_type_hierarchy,
+                Some(DispatchMethod::TypeHierarchy),
+            )
             .await;
 
         let mut all_servers = Vec::new();
@@ -665,7 +694,11 @@ impl GrepServer {
     ) -> HashMap<String, HashSet<u32>> {
         let servers = self
             .client_manager
-            .get_servers(path, LspServer::supports_references)
+            .get_servers(
+                path,
+                LspServer::supports_references,
+                Some(DispatchMethod::References),
+            )
             .await;
 
         for client_mutex in &servers {
@@ -738,7 +771,11 @@ impl GrepServer {
     ) -> (Vec<CallEdge>, Vec<CallEdge>) {
         let servers = self
             .client_manager
-            .get_servers(path, LspServer::supports_call_hierarchy)
+            .get_servers(
+                path,
+                LspServer::supports_call_hierarchy,
+                Some(DispatchMethod::CallHierarchy),
+            )
             .await;
 
         for client_mutex in &servers {
@@ -821,7 +858,11 @@ impl GrepServer {
     ) -> Vec<(String, u32)> {
         let servers = self
             .client_manager
-            .get_servers(path, LspServer::supports_implementation)
+            .get_servers(
+                path,
+                LspServer::supports_implementation,
+                Some(DispatchMethod::Implementation),
+            )
             .await;
 
         for client_mutex in &servers {
@@ -893,7 +934,11 @@ impl GrepServer {
     ) -> (Vec<TypeEdge>, Vec<TypeEdge>) {
         let servers = self
             .client_manager
-            .get_servers(path, LspServer::supports_type_hierarchy)
+            .get_servers(
+                path,
+                LspServer::supports_type_hierarchy,
+                Some(DispatchMethod::TypeHierarchy),
+            )
             .await;
 
         for client_mutex in &servers {

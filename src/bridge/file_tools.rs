@@ -28,6 +28,7 @@ use super::handler::{expand_tilde, resolve_path};
 use super::tool_server::ToolServer;
 use super::toolbox::ResolvedGlob;
 use crate::bucketing::{self, BucketEntry};
+use crate::config::DispatchMethod;
 use crate::lsp::LspClientManager;
 use crate::lsp::server::LspServer;
 use crate::symbol_index::{ScopeFilter, Symbol, SymbolIndex, format_symbol_kind};
@@ -668,7 +669,11 @@ impl GlobServer {
         for path in &needs_populate {
             let servers = self
                 .client_manager
-                .get_servers(path, LspServer::supports_document_symbols)
+                .get_servers(
+                    path,
+                    LspServer::supports_document_symbols,
+                    Some(DispatchMethod::DocumentSymbol),
+                )
                 .await;
             let Some(server) = servers.first() else {
                 continue;

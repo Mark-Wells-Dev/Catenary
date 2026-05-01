@@ -10,7 +10,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use crate::bridge::filesystem_manager::{ClassificationTables, FilesystemManager};
-use crate::config::{Config, ServerBinding, ServerDef};
+use crate::config::{Config, DispatchMethod, ServerBinding, ServerDef};
 use crate::logging::LoggingServer;
 use crate::lsp::LspClient;
 use crate::lsp::glob::{FileChange, GlobPattern, LspGlob, WatchKind};
@@ -600,14 +600,19 @@ impl LspClientManager {
         Ok(())
     }
 
-    /// Returns clients for a file path, filtered by capability and
-    /// `file_patterns`, in priority order (from the `servers` list in
-    /// `[language.*]`).
+    /// Returns clients for a file path, filtered by capability,
+    /// `file_patterns`, and `disabled_methods`, in priority order
+    /// (from the `servers` list in `[language.*]`).
     ///
     /// Resolves language from path via `FilesystemManager`, iterates
     /// the binding's servers, filters by:
-    /// 1. `file_patterns` on `[server.*]` (filename-level glob)
-    /// 2. The given capability check
+    /// 1. `disabled_methods` on the binding (per-binding suppression)
+    /// 2. `file_patterns` on `[server.*]` (filename-level glob)
+    /// 3. The given capability check
+    ///
+    /// `method` is the [`DispatchMethod`] being dispatched. Pass
+    /// `None` when the caller has its own suppression mechanism
+    /// (e.g., diagnostic dispatch uses the `diagnostics` flag).
     ///
     /// Returns an empty Vec when no server matches. On empty result,
     /// emits a `warn!()` — dedup handled by `NotificationQueueSink`.
@@ -622,6 +627,7 @@ impl LspClientManager {
         &self,
         path: &Path,
         capability: fn(&LspServer) -> bool,
+        method: Option<DispatchMethod>,
     ) -> Vec<Arc<Mutex<LspClient>>> {
         // Detect language: primary (FilesystemManager) then fallback (raw extension).
         let Some(lang_id) = self.fs.language_id(path).or_else(|| {
@@ -645,6 +651,9 @@ impl LspClientManager {
             let mut result = Vec::new();
 
             for binding in &lang_config.servers {
+                if method.is_some_and(|m| binding.is_method_disabled(m)) {
+                    continue;
+                }
                 let Some(server_def) = self.config.server.get(&binding.name) else {
                     continue;
                 };
@@ -679,6 +688,9 @@ impl LspClientManager {
         // Tier 3: single-file servers for unrooted files.
         let mut result = Vec::new();
         for binding in &lang_config.servers {
+            if method.is_some_and(|m| binding.is_method_disabled(m)) {
+                continue;
+            }
             let Some(server_def) = self.config.server.get(&binding.name) else {
                 continue;
             };
@@ -1185,7 +1197,7 @@ impl LspClientManager {
     /// Returns an empty Vec when no server qualifies.
     pub async fn diagnostic_servers(&self, path: &Path) -> Vec<Arc<Mutex<LspClient>>> {
         let servers = self
-            .get_servers(path, LspServer::supports_diagnostics)
+            .get_servers(path, LspServer::supports_diagnostics, None)
             .await;
 
         if servers.is_empty() {
@@ -1719,7 +1731,7 @@ impl LspClientManager {
 )]
 mod tests {
     use super::*;
-    use crate::config::{LanguageConfig, ServerBinding, ServerDef};
+    use crate::config::{DispatchMethod, LanguageConfig, ServerBinding, ServerDef};
     use anyhow::Result;
 
     const MOCK_LANG_A: &str = "yX4Za";
@@ -2867,7 +2879,7 @@ mod tests {
         // Use a capability that mockls supports (document symbols — all mockls
         // instances advertise it).
         let servers = manager
-            .get_servers(&path, LspServer::supports_document_symbols)
+            .get_servers(&path, LspServer::supports_document_symbols, None)
             .await;
         assert_eq!(servers.len(), 1);
         Ok(())
@@ -2887,7 +2899,7 @@ mod tests {
         // Use a capability that mockls does NOT support (pull diagnostics
         // requires --pull-diagnostics flag which mockls_config doesn't set).
         let servers = manager
-            .get_servers(&path, LspServer::supports_pull_diagnostics)
+            .get_servers(&path, LspServer::supports_pull_diagnostics, None)
             .await;
         assert!(
             servers.is_empty(),
@@ -2944,7 +2956,7 @@ mod tests {
         // Filename "special.yX4Za" matches pattern "special.*"
         let path = PathBuf::from(format!("/tmp/special.{MOCK_LANG_A}"));
         let servers = manager
-            .get_servers(&path, LspServer::supports_document_symbols)
+            .get_servers(&path, LspServer::supports_document_symbols, None)
             .await;
         assert_eq!(
             servers.len(),
@@ -3000,7 +3012,7 @@ mod tests {
         // Filename "other.yX4Za" does NOT match pattern "special.*"
         let path = PathBuf::from(format!("/tmp/other.{MOCK_LANG_A}"));
         let servers = manager
-            .get_servers(&path, LspServer::supports_document_symbols)
+            .get_servers(&path, LspServer::supports_document_symbols, None)
             .await;
         assert!(
             servers.is_empty(),
@@ -3054,7 +3066,7 @@ mod tests {
 
         let path = PathBuf::from(format!("/tmp/foo.{MOCK_LANG_A}"));
         let servers = manager
-            .get_servers(&path, LspServer::supports_document_symbols)
+            .get_servers(&path, LspServer::supports_document_symbols, None)
             .await;
         assert_eq!(servers.len(), 1, "*.ext glob should match");
         Ok(())
@@ -3072,7 +3084,7 @@ mod tests {
 
         let path = PathBuf::from(format!("/tmp/anything.{MOCK_LANG_A}"));
         let servers = manager
-            .get_servers(&path, LspServer::supports_document_symbols)
+            .get_servers(&path, LspServer::supports_document_symbols, None)
             .await;
         assert_eq!(
             servers.len(),
@@ -3097,9 +3109,91 @@ mod tests {
 
         let path = PathBuf::from(format!("/tmp/test.{MOCK_LANG_A}"));
         let servers = manager
-            .get_servers(&path, LspServer::supports_document_symbols)
+            .get_servers(&path, LspServer::supports_document_symbols, None)
             .await;
         assert!(servers.is_empty(), "dead server should be skipped");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_servers_disabled_methods() -> Result<()> {
+        // disabled_methods on the binding suppresses the server for that method.
+        let bin = mockls_bin();
+        let server_name = format!("mockls-{MOCK_LANG_A}");
+        let mut server = HashMap::new();
+        server.insert(
+            server_name.clone(),
+            ServerDef {
+                command: bin.to_string_lossy().to_string(),
+                args: vec![MOCK_LANG_A.to_string()],
+                ..ServerDef::default()
+            },
+        );
+        let mut language = HashMap::new();
+        language.insert(
+            MOCK_LANG_A.to_string(),
+            LanguageConfig {
+                servers: vec![ServerBinding {
+                    name: server_name,
+                    diagnostics: true,
+                    disabled_methods: vec![DispatchMethod::References],
+                }],
+                ..LanguageConfig::default()
+            },
+        );
+        let config = Arc::new(Config {
+            language,
+            server,
+            log_retention_days: 7,
+            notifications: None,
+            icons: None,
+            tui: None,
+            tools: None,
+            resolved_commands: None,
+        });
+
+        let manager = LspClientManager::new(config, test_logging(), test_fs_with_roots(&["/tmp"]));
+        let _ = ensure_first_server(&manager, MOCK_LANG_A).await?;
+
+        let path = PathBuf::from(format!("/tmp/test.{MOCK_LANG_A}"));
+
+        // Method that is disabled — should return empty.
+        let servers = manager
+            .get_servers(
+                &path,
+                LspServer::supports_references,
+                Some(DispatchMethod::References),
+            )
+            .await;
+        assert!(
+            servers.is_empty(),
+            "disabled method should suppress the server"
+        );
+
+        // Different method — should return the server.
+        let servers = manager
+            .get_servers(
+                &path,
+                LspServer::supports_document_symbols,
+                Some(DispatchMethod::DocumentSymbol),
+            )
+            .await;
+        assert_eq!(
+            servers.len(),
+            1,
+            "non-disabled method should still return the server"
+        );
+
+        // No method (diagnostics path) — should return the server.
+        let servers = manager
+            .get_servers(&path, LspServer::supports_document_symbols, None)
+            .await;
+        assert_eq!(
+            servers.len(),
+            1,
+            "None method should bypass disabled_methods check"
+        );
+
         Ok(())
     }
 
@@ -3115,7 +3209,7 @@ mod tests {
 
         let path = PathBuf::from(format!("/other/test.{MOCK_LANG_A}"));
         let servers = manager
-            .get_servers(&path, LspServer::supports_document_symbols)
+            .get_servers(&path, LspServer::supports_document_symbols, None)
             .await;
         assert_eq!(
             servers.len(),
@@ -3142,7 +3236,11 @@ mod tests {
         );
 
         let servers = manager
-            .get_servers(Path::new("/tmp/test.xyz"), LspServer::supports_references)
+            .get_servers(
+                Path::new("/tmp/test.xyz"),
+                LspServer::supports_references,
+                None,
+            )
             .await;
         assert!(servers.is_empty(), "unknown language should return empty");
     }
@@ -3162,7 +3260,7 @@ mod tests {
 
         let path = PathBuf::from(format!("/tmp/test.{MOCK_LANG_A}"));
         let servers = manager
-            .get_servers(&path, LspServer::supports_document_symbols)
+            .get_servers(&path, LspServer::supports_document_symbols, None)
             .await;
         assert_eq!(servers.len(), 1);
         Ok(())
@@ -3762,7 +3860,7 @@ mod tests {
             .await;
 
         let servers = manager
-            .get_servers(&path, LspServer::supports_document_symbols)
+            .get_servers(&path, LspServer::supports_document_symbols, None)
             .await;
         assert_eq!(servers.len(), 2);
 
@@ -4463,7 +4561,7 @@ mod tests {
         // get_servers for a file in /var should return the project instance.
         let path = PathBuf::from(format!("/var/test.{MOCK_LANG_A}"));
         let servers = manager
-            .get_servers(&path, LspServer::supports_document_symbols)
+            .get_servers(&path, LspServer::supports_document_symbols, None)
             .await;
         assert_eq!(servers.len(), 1);
         assert!(
@@ -4474,7 +4572,7 @@ mod tests {
         // get_servers for a file in /tmp should return the workspace instance.
         let path = PathBuf::from(format!("/tmp/test.{MOCK_LANG_A}"));
         let servers = manager
-            .get_servers(&path, LspServer::supports_document_symbols)
+            .get_servers(&path, LspServer::supports_document_symbols, None)
             .await;
         assert_eq!(servers.len(), 1);
         assert!(
@@ -4880,7 +4978,7 @@ mod tests {
 
         let path = PathBuf::from(format!("/some/random/file.{MOCK_LANG_A}"));
         let servers = manager
-            .get_servers(&path, LspServer::supports_references)
+            .get_servers(&path, LspServer::supports_references, None)
             .await;
         assert_eq!(servers.len(), 1, "Should have spawned a single-file server");
 
@@ -4901,7 +4999,7 @@ mod tests {
 
         let path = PathBuf::from(format!("/some/random/file.{MOCK_LANG_A}"));
         let servers = manager
-            .get_servers(&path, LspServer::supports_references)
+            .get_servers(&path, LspServer::supports_references, None)
             .await;
         assert!(
             servers.is_empty(),
@@ -4950,7 +5048,7 @@ mod tests {
         let manager = LspClientManager::new(config, test_logging(), fs.clone());
 
         let servers = manager
-            .get_servers(&file_path, LspServer::supports_references)
+            .get_servers(&file_path, LspServer::supports_references, None)
             .await;
         assert_eq!(servers.len(), 1);
 
@@ -4984,7 +5082,7 @@ mod tests {
         // Spawn the rooted server and verify get_servers routes there.
         let _ = ensure_first_server(&manager, MOCK_LANG_A).await?;
         let servers = manager
-            .get_servers(&file_path, LspServer::supports_references)
+            .get_servers(&file_path, LspServer::supports_references, None)
             .await;
         assert_eq!(servers.len(), 1);
 

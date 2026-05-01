@@ -176,6 +176,21 @@ suppresses delivery.
 | `false` | any | suppress (language-wide) |
 | unset / `true` | `false` | suppress (per-server) |
 
+To suppress specific LSP methods from a server for a language binding, use
+`disabled_methods`:
+
+```toml
+[language.shellscript]
+servers = [
+    "termux-ls",
+    { name = "bash-ls", disabled_methods = ["textDocument/references"] },
+]
+```
+
+When a method appears in `disabled_methods`, the server is excluded from
+dispatch for that method. Other methods (definition, document symbols, etc.)
+remain available. Method names use the LSP protocol form.
+
 ### Dispatch Filtering
 
 `file_patterns` on `[server.*]` narrows which files a server handles

@@ -6,11 +6,93 @@
 use serde::Deserialize;
 use serde::de::{self, Deserializer};
 
+/// LSP methods dispatched through [`crate::lsp::LspClientManager::get_servers`].
+///
+/// Each variant corresponds to a capability gate on the LSP server and
+/// an LSP protocol method name. Used as validated values in
+/// [`ServerBinding::disabled_methods`] and as the type-safe `method`
+/// parameter in dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DispatchMethod {
+    /// `textDocument/references`
+    References,
+    /// `textDocument/documentSymbol`
+    DocumentSymbol,
+    /// `textDocument/rename`
+    Rename,
+    /// `textDocument/implementation`
+    Implementation,
+    /// `textDocument/prepareCallHierarchy`
+    CallHierarchy,
+    /// `textDocument/prepareTypeHierarchy`
+    TypeHierarchy,
+}
+
+impl DispatchMethod {
+    /// All valid method names, for error messages.
+    const ALL_NAMES: &[&str] = &[
+        "textDocument/references",
+        "textDocument/documentSymbol",
+        "textDocument/rename",
+        "textDocument/implementation",
+        "textDocument/prepareCallHierarchy",
+        "textDocument/prepareTypeHierarchy",
+    ];
+
+    /// Returns the LSP protocol method name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::References => "textDocument/references",
+            Self::DocumentSymbol => "textDocument/documentSymbol",
+            Self::Rename => "textDocument/rename",
+            Self::Implementation => "textDocument/implementation",
+            Self::CallHierarchy => "textDocument/prepareCallHierarchy",
+            Self::TypeHierarchy => "textDocument/prepareTypeHierarchy",
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for DispatchMethod {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct MethodVisitor;
+
+        impl de::Visitor<'_> for MethodVisitor {
+            type Value = DispatchMethod;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an LSP method name like \"textDocument/references\"")
+            }
+
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                match v {
+                    "textDocument/references" => Ok(DispatchMethod::References),
+                    "textDocument/documentSymbol" => Ok(DispatchMethod::DocumentSymbol),
+                    "textDocument/rename" => Ok(DispatchMethod::Rename),
+                    "textDocument/implementation" => Ok(DispatchMethod::Implementation),
+                    "textDocument/prepareCallHierarchy" => Ok(DispatchMethod::CallHierarchy),
+                    "textDocument/prepareTypeHierarchy" => Ok(DispatchMethod::TypeHierarchy),
+                    "textDocument/diagnostic" => Err(de::Error::custom(
+                        "textDocument/diagnostic cannot be suppressed via disabled_methods; \
+                         use `diagnostics = false` on the binding instead",
+                    )),
+                    _ => Err(de::Error::unknown_variant(v, DispatchMethod::ALL_NAMES)),
+                }
+            }
+        }
+
+        deserializer.deserialize_str(MethodVisitor)
+    }
+}
+
 /// A server reference within a language binding.
 ///
 /// Supports both bare string form (`"foo"`) and inline-table form
 /// (`{ name = "foo", diagnostics = false }`). Bare strings expand
-/// to `{ name, diagnostics: true }`.
+/// to `{ name, diagnostics: true, disabled_methods: [] }`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerBinding {
     /// Server name (references a `[server.*]` entry).
@@ -19,16 +101,31 @@ pub struct ServerBinding {
     /// Whether this server delivers diagnostics for this language.
     /// Defaults to `true`.
     pub diagnostics: bool,
+
+    /// LSP methods suppressed for this binding.
+    ///
+    /// When a method appears in this list, the server is excluded from
+    /// dispatch for that method under this language binding.
+    pub disabled_methods: Vec<DispatchMethod>,
 }
 
 impl ServerBinding {
-    /// Creates a new binding with diagnostics enabled (the default).
+    /// Creates a new binding with diagnostics enabled and no disabled
+    /// methods (the defaults).
     #[must_use]
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
             diagnostics: true,
+            disabled_methods: Vec::new(),
         }
+    }
+
+    /// Returns `true` if the given dispatch method is suppressed for
+    /// this binding.
+    #[must_use]
+    pub fn is_method_disabled(&self, method: DispatchMethod) -> bool {
+        self.disabled_methods.contains(&method)
     }
 }
 
@@ -53,12 +150,14 @@ impl<'de> Deserialize<'de> for ServerBinding {
                 Ok(ServerBinding {
                     name: v.to_string(),
                     diagnostics: true,
+                    disabled_methods: Vec::new(),
                 })
             }
 
             fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
                 let mut name: Option<String> = None;
                 let mut diagnostics: Option<bool> = None;
+                let mut disabled_methods: Option<Vec<DispatchMethod>> = None;
 
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
@@ -74,8 +173,17 @@ impl<'de> Deserialize<'de> for ServerBinding {
                             }
                             diagnostics = Some(map.next_value()?);
                         }
+                        "disabled_methods" => {
+                            if disabled_methods.is_some() {
+                                return Err(de::Error::duplicate_field("disabled_methods"));
+                            }
+                            disabled_methods = Some(map.next_value()?);
+                        }
                         other => {
-                            return Err(de::Error::unknown_field(other, &["name", "diagnostics"]));
+                            return Err(de::Error::unknown_field(
+                                other,
+                                &["name", "diagnostics", "disabled_methods"],
+                            ));
                         }
                     }
                 }
@@ -84,6 +192,7 @@ impl<'de> Deserialize<'de> for ServerBinding {
                 Ok(ServerBinding {
                     name,
                     diagnostics: diagnostics.unwrap_or(true),
+                    disabled_methods: disabled_methods.unwrap_or_default(),
                 })
             }
         }
