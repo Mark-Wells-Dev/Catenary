@@ -77,16 +77,19 @@ impl LspClient {
         settings: Option<serde_json::Value>,
         settings_per_root: HashMap<PathBuf, serde_json::Value>,
     ) -> Result<Self> {
-        let (client, _) = Self::spawn_inner(
+        let (client, child_stderr) = Self::spawn_inner(
             program,
             args,
             language_id,
             server_name,
             logging,
-            Stdio::inherit(),
+            Stdio::piped(),
             settings,
             settings_per_root,
         )?;
+        if let Some(stderr) = child_stderr {
+            Self::spawn_stderr_reader(stderr, server_name);
+        }
         Ok(client)
     }
 
@@ -190,6 +193,44 @@ impl LspClient {
             },
             child_stderr,
         ))
+    }
+
+    /// Spawns a background task that reads stderr line-by-line and emits
+    /// each line as a `debug!` tracing event with `source = "lsp.stderr"`.
+    fn spawn_stderr_reader(stderr: tokio::process::ChildStderr, server_name: &str) {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        let server_name = server_name.to_string();
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(stderr);
+            let mut buf = Vec::new();
+            loop {
+                buf.clear();
+                match reader.read_until(b'\n', &mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+                let text = String::from_utf8(std::mem::take(&mut buf))
+                    .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+                let trimmed = text.trim_end_matches('\n').trim_end_matches('\r');
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let line = if trimmed.len() > 4096 {
+                    format!("{}… [truncated]", &trimmed[..4096])
+                } else {
+                    trimmed.to_string()
+                };
+                debug!(
+                    kind = "lsp",
+                    method = "stderr",
+                    source = "lsp.stderr",
+                    server = %server_name,
+                    payload = %line,
+                    "{server_name}: {line}",
+                );
+            }
+        });
     }
 
     /// Sets the parent message ID for causation tracking.

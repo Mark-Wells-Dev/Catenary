@@ -328,3 +328,79 @@ fn bootstrap_buffer_drains_to_all_sinks() {
     let drained = notifications.drain();
     assert_eq!(drained.len(), 2);
 }
+
+/// Verify that LSP server stderr output is captured as attributed tracing
+/// events stored in the message DB with `source = "lsp.stderr"`.
+#[tokio::test]
+async fn stderr_captured_with_source_and_server() -> Result<()> {
+    let db = logging_test_db();
+    let message_db = MessageDbSink::new(db.clone(), "s1".into());
+    let server = LoggingServer::new();
+    server.activate(vec![message_db]);
+
+    let subscriber = tracing_subscriber::registry().with(server.clone());
+    let guard = tracing::subscriber::set_default(subscriber);
+
+    let dir = tempdir()?;
+    let bin = env!("CARGO_BIN_EXE_mockls");
+    let stderr_text = "mockls: test stderr capture line";
+    let mut client = catenary_mcp::lsp::LspClient::spawn(
+        bin,
+        &[MOCK_LANG_A, "--stderr-message", stderr_text],
+        MOCK_LANG_A,
+        MOCK_LANG_A,
+        server.clone(),
+        None,
+        std::collections::HashMap::new(),
+    )?;
+    client.initialize(&[dir.path().to_path_buf()], None).await?;
+
+    // Poll for the stderr event to appear (async reader task).
+    let mut found = false;
+    for _ in 0..50 {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let c = db.lock().expect("lock");
+        let count: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM messages \
+                 WHERE type = 'lsp' AND level = 'debug' \
+                   AND payload LIKE '%test stderr capture%'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        drop(c);
+        if count > 0 {
+            found = true;
+            break;
+        }
+    }
+    assert!(found, "stderr line should appear in message DB");
+
+    // Verify server attribution, method, and payload.
+    let c = db.lock().expect("lock");
+    let (stored_server, stored_method, stored_payload): (String, String, String) = c
+        .query_row(
+            "SELECT server, method, payload FROM messages \
+             WHERE type = 'lsp' AND level = 'debug' \
+               AND payload LIKE '%test stderr capture%' \
+             LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("query stderr row");
+    drop(c);
+
+    assert_eq!(
+        stored_server, MOCK_LANG_A,
+        "server should be the mockls name"
+    );
+    assert_eq!(stored_method, "stderr", "method should be 'stderr'");
+    assert!(
+        stored_payload.contains(stderr_text),
+        "payload should contain the stderr text, got: {stored_payload}"
+    );
+
+    drop(guard);
+    Ok(())
+}

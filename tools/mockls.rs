@@ -194,6 +194,11 @@ struct Args {
     /// to test single-file mode negative caching.
     #[arg(long)]
     reject_null_workspace: bool,
+
+    /// Write this message to stderr after receiving `initialized`.
+    /// Used to test stderr capture.
+    #[arg(long)]
+    stderr_message: Option<String>,
 }
 
 /// A JSON-RPC request.
@@ -570,6 +575,9 @@ impl MockServer {
 
         match method {
             "initialized" => {
+                if let Some(ref msg) = self.args.stderr_message {
+                    let _ = writeln!(std::io::stderr(), "{msg}");
+                }
                 if let Some(busy_ms) = self.args.cpu_on_initialized {
                     let start = std::time::Instant::now();
                     while start.elapsed() < Duration::from_millis(busy_ms) {
@@ -2351,6 +2359,7 @@ mod tests {
             watcher_kind: None,
             report_open_count: false,
             reject_null_workspace: false,
+            stderr_message: None,
         }
     }
 
