@@ -166,7 +166,10 @@ pub fn load_from_sources(sources: &[PathBuf]) -> Result<Config> {
     Ok(config)
 }
 
-/// Keys that belong on `ServerDef`, not `LanguageConfig`.
+/// Keys that belong on [`ServerDef`](super::ServerDef), not `LanguageConfig`.
+///
+/// Must match every config-visible field on `ServerDef` (i.e. every
+/// field except `#[serde(skip)]`). `test_server_def_keys_sync` enforces this.
 pub const SERVER_DEF_KEYS: &[&str] = &[
     "command",
     "args",
@@ -175,6 +178,7 @@ pub const SERVER_DEF_KEYS: &[&str] = &[
     "min_severity",
     "env",
     "file_patterns",
+    "single_file",
 ];
 
 /// Deserialize a TOML source, handling the `[server.*]` / `[language.*]`

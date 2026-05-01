@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::lsp::glob::LspGlob;
 
@@ -15,7 +15,11 @@ use crate::lsp::glob::LspGlob;
 /// Defined in `[server.*]` config sections, referenced by name from
 /// `[language.*]` entries. This is adapter-level config consumed by
 /// the LSP client layer — the routing core never sees it directly.
-#[derive(Debug, Default, Deserialize, Clone)]
+///
+/// **Sync note:** Config-visible fields must be listed in
+/// [`super::parse::SERVER_DEF_KEYS`] for misplaced-field detection.
+/// `test_server_def_keys_sync` enforces this.
+#[derive(Debug, Default, Deserialize, Serialize, Clone)]
 pub struct ServerDef {
     /// The command to execute (e.g., "rust-analyzer", "clangd").
     #[serde(default)]

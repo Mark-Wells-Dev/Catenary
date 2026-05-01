@@ -860,6 +860,75 @@ command = "rust-analyzer"
     }
 
     #[test]
+    fn test_inline_single_file_hard_error() {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+
+        fs::write(
+            &config_path,
+            r#"
+[language.shellscript]
+single_file = true
+servers = ["bash-language-server"]
+
+[server.bash-language-server]
+command = "bash-language-server"
+args = ["start"]
+"#,
+        )
+        .expect("write config");
+
+        let result = Config::load_from_sources(&[config_path]);
+        assert!(result.is_err());
+        let err = format!("{:#}", result.expect_err("should error"));
+        assert!(
+            err.contains("single_file") && err.contains("[server.*]"),
+            "error should mention server definition migration: {err}",
+        );
+    }
+
+    /// Ensures every config-visible `ServerDef` field is listed in
+    /// `SERVER_DEF_KEYS`. Fails when a field is added to the struct
+    /// without updating the constant.
+    #[test]
+    fn test_server_def_keys_sync() {
+        use std::collections::HashMap;
+
+        let def = ServerDef {
+            command: "x".into(),
+            args: vec!["a".into()],
+            env: Some(HashMap::from([("K".into(), "V".into())])),
+            initialization_options: Some(serde_json::json!({})),
+            settings: Some(serde_json::json!({})),
+            min_severity: Some("error".into()),
+            single_file: true,
+            file_patterns: vec!["*.rs".into()],
+            compiled_patterns: Vec::new(),
+        };
+
+        let value = toml::Value::try_from(&def).expect("serialize ServerDef");
+        let table = value.as_table().expect("should be a table");
+
+        for key in table.keys() {
+            assert!(
+                SERVER_DEF_KEYS.contains(&key.as_str()),
+                "ServerDef field `{key}` missing from SERVER_DEF_KEYS — \
+                 add it so misplaced-field detection catches it on [language.*]",
+            );
+        }
+
+        // Reverse check: every key in SERVER_DEF_KEYS should appear in
+        // the serialized output (catches stale entries).
+        for key in SERVER_DEF_KEYS {
+            assert!(
+                table.contains_key(*key),
+                "SERVER_DEF_KEYS lists `{key}` but ServerDef has no such field — \
+                 remove it from the constant",
+            );
+        }
+    }
+
+    #[test]
     fn test_undefined_server_ref() {
         let dir = tempdir().expect("tempdir");
         let config_path = dir.path().join("config.toml");
