@@ -61,6 +61,7 @@ find-references, rename, and search without shell-based text scanning.
 - **Imports:** No wildcard imports (`use crate::*`).
 - **Formatting:** Code must be formatted with `rustfmt`.
 - **Linting:** Must pass `cargo clippy` with `pedantic`, `nursery`, and `cargo` groups enabled.
+- **Dependencies:** Must pass `cargo machete` (no unused dependencies).
 
 ## Quality Standards
 - **License Compliance:** All new dependencies MUST have permissive licenses (MIT, Apache-2.0, etc.) as specified in `@./deny.toml`. Catenary is dual-licensed under AGPL-3.0-or-later and a commercial license.
@@ -72,12 +73,13 @@ find-references, rename, and search without shell-based text scanning.
 
 ## Development Commands
 - **Build:** `cargo build`
-- **Check (full):** `make check` — format, lint, deny, and test in one pass.
+- **Check (full):** `make check` — format, lint, deny, machete, and test in one pass.
 - **Test (all):** `make test`
 - **Test (filtered):** `make test T=<filter>` — run only tests matching the filter (e.g., `make test T=json_diagnostics`).
 - **Test (repeat):** `make test T=<filter> N=<count>` — stress-test by repeating N times (e.g., `make test T=flaky_test N=5`).
 - **Lint:** `cargo clippy`
 - **Format:** `cargo fmt`
+- **Mutation testing:** `make mutants` — pre-release only. Pass `T=<module>` to scope (e.g., `make mutants T=command_filter`).
 
 ## Release Workflow
 Versioning and releases are managed via the `Makefile`.
@@ -105,6 +107,7 @@ every push to `main`.
 ### Pre-release checklist
 Before running `make release-*`:
 1. Ensure `git push` has been run so local `main` matches `origin/main`.
+2. Run `make mutants` and address any surviving mutants (for major releases).
 
 If checks or the commit fail, the Makefile automatically rolls back
 the version bump — it is safe to re-run `make release-*` after fixing
