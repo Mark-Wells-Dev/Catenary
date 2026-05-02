@@ -259,6 +259,35 @@ impl DiagnosticsServer {
         entry_id: i64,
         file_results: &mut BTreeMap<String, (String, Vec<ServerDiagnostics>)>,
     ) {
+        // ── Settle before opens ───────────────────────────────────
+        // Wait for the server to go idle before sending didOpen.
+        // notify_file_changes() may have sent didChangeWatchedFiles
+        // which triggers re-indexing — opening files while that is
+        // in progress can produce transient false-positive diagnostics
+        // that persist in the push cache.
+        {
+            let client = client_mutex.lock().await;
+            if matches!(
+                client.lifecycle(),
+                ServerLifecycle::Failed | ServerLifecycle::Dead
+            ) {
+                return;
+            }
+            let server = client.server().clone();
+            let server_name = client.server_name().to_string();
+            drop(client);
+
+            let detector = IdleDetector::unconditional();
+            let result = await_idle(&server, detector, CancellationToken::new()).await;
+            debug!(
+                server = %server_name,
+                "batch pre-open idle result: {result:?}",
+            );
+            if result == SettleResult::RootDied {
+                return;
+            }
+        }
+
         // ── Open all files ─────────────────────────────────────────
         let mut opened_uris: Vec<(PathBuf, String)> = Vec::new();
 
