@@ -212,14 +212,16 @@ fn shell_split(s: &str) -> Vec<String> {
 /// Check whether a command is denied by the allowlist rules.
 ///
 /// A command is denied if:
-/// 1. It is not in `allow` or `pipeline` (and not the `build` tool).
+/// 1. It is not in `allow` or `pipeline` (and not a `build` tool).
 /// 2. It is in `pipeline` but at pipe position 0.
 /// 3. It is in `allow` but the specific subcommand is in `deny.<cmd>`.
+/// 4. It is otherwise allowed but uses a flag in `deny_flags.<cmd>`.
 ///
 /// The heredoc exception suppresses denial for commands reading from stdin.
 /// Returns the denied command name and reason if denied, `None` if allowed.
 fn check_against_allowlist(
     name: &str,
+    rest: &[&str],
     subcommand: Option<&str>,
     has_heredoc: bool,
     pipe_pos: usize,
@@ -232,7 +234,10 @@ fn check_against_allowlist(
     }
 
     // Build tool is always allowed (per-root lookup with default fallback).
-    if rules.build_for_cwd(cwd) == Some(name) {
+    if rules.build_for_cwd(cwd).iter().any(|t| t == name) {
+        if let Some(flag) = check_denied_flags(name, rest, rules) {
+            return Some((format!("{name} {flag}"), DenialReason::DeniedFlag));
+        }
         return None;
     }
 
@@ -246,6 +251,9 @@ fn check_against_allowlist(
         {
             return Some((format!("{name} {sub}"), DenialReason::DeniedSubcommand));
         }
+        if let Some(flag) = check_denied_flags(name, rest, rules) {
+            return Some((format!("{name} {flag}"), DenialReason::DeniedFlag));
+        }
         return None;
     }
 
@@ -255,11 +263,38 @@ fn check_against_allowlist(
         if pipe_pos == 0 {
             return Some((name.to_string(), DenialReason::PipelinePosition));
         }
+        if let Some(flag) = check_denied_flags(name, rest, rules) {
+            return Some((format!("{name} {flag}"), DenialReason::DeniedFlag));
+        }
         return None;
     }
 
     // Not in any allow list — denied.
     Some((name.to_string(), DenialReason::NotAllowed))
+}
+
+/// Scan arguments for denied flags.
+///
+/// Checks `rest[1..]` (everything after the command name) against
+/// `deny_flags.<name>`. Long flags with `=` are split (e.g.,
+/// `--manifest-path=Cargo.toml` matches `--manifest-path`). Short flags
+/// are matched as-is — no combined flag decomposition (`-rf` does not
+/// match `-r`).
+///
+/// Returns the matched flag if found.
+fn check_denied_flags(name: &str, rest: &[&str], rules: &ResolvedCommands) -> Option<String> {
+    let denied = rules.deny_flags.get(name)?;
+    for token in rest.iter().skip(1) {
+        let flag = if token.starts_with("--") {
+            token.split_once('=').map_or(*token, |(flag, _)| flag)
+        } else {
+            token
+        };
+        if denied.contains(flag) {
+            return Some(flag.to_string());
+        }
+    }
+    None
 }
 
 /// Why a command was denied.
@@ -271,6 +306,8 @@ pub enum DenialReason {
     PipelinePosition,
     /// Command is allowed but the specific subcommand is denied.
     DeniedSubcommand,
+    /// Command is allowed but a specific flag is denied.
+    DeniedFlag,
 }
 
 /// Result of a command check that was denied.
@@ -359,6 +396,7 @@ pub fn check_command(
 
             if let Some((denied, reason)) = check_against_allowlist(
                 name,
+                rest,
                 subcommand,
                 has_heredoc,
                 pipe_pos,
@@ -533,6 +571,9 @@ fn format_opening_line(denied_cmd: &str, reason: DenialReason) -> String {
         DenialReason::DeniedSubcommand => {
             format!("`{denied_cmd}` isn't allowed (denied subcommand).")
         }
+        DenialReason::DeniedFlag => {
+            format!("`{denied_cmd}` isn't allowed (denied flag).")
+        }
     }
 }
 
@@ -603,18 +644,41 @@ pub fn format_denial_full(
         parts.push(format!("Denied subcommands: {}", denied_pairs.join(", ")));
     }
 
+    if !commands.deny_flags.is_empty() {
+        let mut flag_pairs: Vec<String> = Vec::new();
+        for (cmd, flags) in &commands.deny_flags {
+            let mut sorted_flags: Vec<&str> = flags.iter().map(String::as_str).collect();
+            sorted_flags.sort_unstable();
+            for flag in sorted_flags {
+                flag_pairs.push(format!("{cmd} {flag}"));
+            }
+        }
+        flag_pairs.sort_unstable();
+        parts.push(format!("Denied flags: {}", flag_pairs.join(", ")));
+    }
+
     // Per-root build tools, then default. Each line is explicit about scope.
-    let mut root_entries: Vec<(&std::path::Path, &str)> = commands
+    let mut root_entries: Vec<(&std::path::Path, &[String])> = commands
         .build
         .iter()
-        .map(|(root, tool)| (root.as_path(), tool.as_str()))
+        .map(|(root, tools)| (root.as_path(), tools.as_slice()))
         .collect();
     root_entries.sort_unstable_by_key(|(root, _)| *root);
-    for (root, tool) in &root_entries {
-        parts.push(format!("Build tool for `{}`: `{tool}`", root.display()));
+    for (root, tools) in &root_entries {
+        let tool_list: Vec<String> = tools.iter().map(|t| format!("`{t}`")).collect();
+        parts.push(format!(
+            "Build tool for `{}`: {}",
+            root.display(),
+            tool_list.join(", ")
+        ));
     }
-    if let Some(default) = &commands.default_build {
-        parts.push(format!("Default build tool: `{default}`"));
+    if !commands.default_build.is_empty() {
+        let tool_list: Vec<String> = commands
+            .default_build
+            .iter()
+            .map(|t| format!("`{t}`"))
+            .collect();
+        parts.push(format!("Default build tool: {}", tool_list.join(", ")));
     }
 
     if denial.unresolved_cd {
@@ -666,6 +730,9 @@ pub fn format_denial_short(
         }
         DenialReason::DeniedSubcommand => {
             format!("`{denied_cmd}` isn't allowed (denied subcommand)")
+        }
+        DenialReason::DeniedFlag => {
+            format!("`{denied_cmd}` isn't allowed (denied flag)")
         }
     };
 
@@ -725,7 +792,7 @@ mod tests {
                 "git".into(),
                 HashSet::from(["grep".into(), "ls-files".into(), "ls-tree".into()]),
             )]),
-            default_build: Some("make".into()),
+            default_build: vec!["make".into()],
             client_enforcement_only: false,
             ..ResolvedCommands::default()
         }
@@ -746,7 +813,7 @@ mod tests {
                 "git".into(),
                 HashSet::from(["grep".into(), "ls-files".into(), "ls-tree".into()]),
             )]),
-            default_build: Some("make".into()),
+            default_build: vec!["make".into()],
             client_enforcement_only: false,
             ..ResolvedCommands::default()
         }
@@ -1570,7 +1637,29 @@ mod tests {
         assert!(msg.contains("Denied subcommands:"), "deny section");
         assert!(
             msg.contains("Default build tool: `make`"),
-            "build section: {msg}"
+            "build section: {msg}",
+        );
+    }
+
+    #[test]
+    fn format_full_multi_build_tools() {
+        let rules = ResolvedCommands {
+            allow: HashSet::from(["git".into()]),
+            default_build: vec!["make".into(), "npm".into()],
+            build: HashMap::from([(
+                std::path::PathBuf::from("/project"),
+                vec!["cargo".into(), "npm".into()],
+            )]),
+            ..ResolvedCommands::default()
+        };
+        let msg = format_denial_full("ls", &rules, &no_cd_denial("ls"), None, None);
+        assert!(
+            msg.contains("Default build tool: `make`, `npm`"),
+            "multi default: {msg}",
+        );
+        assert!(
+            msg.contains("Build tool for `/project`: `cargo`, `npm`"),
+            "multi per-root: {msg}",
         );
     }
 
@@ -1673,8 +1762,8 @@ mod tests {
         ResolvedCommands {
             allow: HashSet::from(["git".into(), "cd".into()]),
             build: HashMap::from([
-                (std::path::PathBuf::from("/project/a"), "make".into()),
-                (std::path::PathBuf::from("/project/b"), "npm".into()),
+                (std::path::PathBuf::from("/project/a"), vec!["make".into()]),
+                (std::path::PathBuf::from("/project/b"), vec!["npm".into()]),
             ]),
             ..ResolvedCommands::default()
         }
@@ -2044,5 +2133,130 @@ mod tests {
         let denial =
             check_command("git grep foo", &rules, None).expect("git grep should be denied");
         assert_eq!(denial.reason, DenialReason::DeniedSubcommand);
+    }
+
+    // ── Flag deny tests ─────────────────────────────────────────────
+
+    fn rules_with_deny_flags() -> ResolvedCommands {
+        let mut rules = basic_rules();
+        rules.deny_flags = HashMap::from([
+            ("make".into(), HashSet::from(["-C".into()])),
+            ("cargo".into(), HashSet::from(["--manifest-path".into()])),
+        ]);
+        // Add cargo as a build tool so it's allowed
+        rules.default_build = vec!["make".into(), "cargo".into()];
+        // cd needed for cd-then-build tests
+        rules.allow.insert("cd".into());
+        rules
+    }
+
+    #[test]
+    fn deny_flag_make_c() {
+        let rules = rules_with_deny_flags();
+        let denial = check_command("make -C dir", &rules, None).expect("make -C denied");
+        assert_eq!(denial.reason, DenialReason::DeniedFlag);
+        assert_eq!(denial.command, "make -C");
+    }
+
+    #[test]
+    fn deny_flag_cargo_manifest_path() {
+        let rules = rules_with_deny_flags();
+        let denial = check_command("cargo build --manifest-path Cargo.toml", &rules, None)
+            .expect("cargo --manifest-path denied");
+        assert_eq!(denial.reason, DenialReason::DeniedFlag);
+        assert_eq!(denial.command, "cargo --manifest-path");
+    }
+
+    #[test]
+    fn deny_flag_cargo_manifest_path_eq() {
+        let rules = rules_with_deny_flags();
+        let denial = check_command("cargo --manifest-path=Cargo.toml build", &rules, None)
+            .expect("cargo --manifest-path=value denied");
+        assert_eq!(denial.reason, DenialReason::DeniedFlag);
+        assert_eq!(denial.command, "cargo --manifest-path");
+    }
+
+    #[test]
+    fn deny_flag_make_without_c_allowed() {
+        let rules = rules_with_deny_flags();
+        assert!(check_command("make check", &rules, None).is_none());
+    }
+
+    #[test]
+    fn deny_flag_no_combined_decomposition() {
+        // -rf should NOT match -r
+        let mut rules = basic_rules();
+        rules.deny_flags = HashMap::from([("make".into(), HashSet::from(["-r".into()]))]);
+        assert!(
+            check_command("make -rf", &rules, None).is_none(),
+            "-rf should not match -r",
+        );
+    }
+
+    #[test]
+    fn deny_flag_cd_then_make_allowed() {
+        let rules = rules_with_deny_flags();
+        // cd dir && make is fine — not affected by deny_flags
+        assert!(
+            check_command(
+                "cd dir && make check",
+                &rules,
+                Some(std::path::Path::new("/project")),
+            )
+            .is_none(),
+        );
+    }
+
+    #[test]
+    fn deny_flag_opening_line() {
+        let rules = rules_with_deny_flags();
+        let denial = Denial {
+            command: "make -C".into(),
+            reason: DenialReason::DeniedFlag,
+            unresolved_cd: false,
+            effective_cwd: None,
+        };
+        let msg = format_denial_full("make -C", &rules, &denial, None, None);
+        assert!(
+            msg.starts_with("`make -C` isn't allowed (denied flag)."),
+            "flag denial opening: {msg}",
+        );
+    }
+
+    #[test]
+    fn format_full_denied_flags_section() {
+        let rules = rules_with_deny_flags();
+        let msg = format_denial_full("ls", &rules, &no_cd_denial("ls"), None, None);
+        assert!(
+            msg.contains("Denied flags:"),
+            "should have denied flags section: {msg}",
+        );
+        assert!(
+            msg.contains("cargo --manifest-path"),
+            "should list cargo --manifest-path: {msg}",
+        );
+        assert!(msg.contains("make -C"), "should list make -C: {msg}");
+    }
+
+    #[test]
+    fn multi_build_tool_both_allowed() {
+        let rules = ResolvedCommands {
+            allow: HashSet::from(["git".into()]),
+            default_build: vec!["make".into(), "npm".into()],
+            ..ResolvedCommands::default()
+        };
+        assert!(check_command("make check", &rules, None).is_none());
+        assert!(check_command("npm install", &rules, None).is_none());
+    }
+
+    #[test]
+    fn multi_build_tool_non_member_denied() {
+        let rules = ResolvedCommands {
+            allow: HashSet::from(["git".into()]),
+            default_build: vec!["make".into(), "npm".into()],
+            ..ResolvedCommands::default()
+        };
+        let denial = check_command("cargo build", &rules, None).expect("cargo should be denied");
+        assert_eq!(denial.reason, DenialReason::NotAllowed);
     }
 }

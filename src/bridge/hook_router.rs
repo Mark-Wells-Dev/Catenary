@@ -295,17 +295,18 @@ impl HookRouter {
         });
 
         let has_project = matching_root.is_some();
-        let project_build = matching_root
+        let project_build_owned = matching_root
             .and_then(|r| project_commands.get(r))
-            .and_then(|cmds| cmds.build.as_deref());
+            .and_then(|cmds| cmds.build.as_ref())
+            .map_or(&[] as &[String], |sv| &sv.0);
         let project_path = matching_root.map(|r| r.join(".catenary.toml").display().to_string());
 
         let ctx = crate::config::BuildContext {
             user_config_path: user_path_str,
-            default_build: resolved.default_build.as_deref(),
+            default_build: &resolved.default_build,
             has_project_config: has_project,
             project_config_path: project_path.as_deref(),
-            project_build,
+            project_build: project_build_owned,
             cwd_resolved: cwd.is_some(),
             resolved_cwd_path: cwd,
         };

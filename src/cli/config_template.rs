@@ -56,6 +56,10 @@ const TEMPLATE: &str = r#"# Catenary recommended config
 # git = ["grep", "ls-files", "ls-tree"]
 # sqlite3 = ["-cmd"]
 #
+# [commands.deny_flags]
+# make = ["-C"]
+# cargo = ["--manifest-path"]
+#
 # # Per-command guidance — optional hints shown when a command is denied.
 # # Groups map commands to a message. {READ} and {EDIT} resolve per-client.
 #
@@ -212,6 +216,10 @@ mod tests {
         assert!(
             TEMPLATE.contains("[commands.deny]"),
             "template should contain [commands.deny] section",
+        );
+        assert!(
+            TEMPLATE.contains("[commands.deny_flags]"),
+            "template should contain [commands.deny_flags] section",
         );
     }
 

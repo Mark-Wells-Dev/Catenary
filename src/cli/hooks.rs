@@ -614,12 +614,13 @@ fn resolve_client_build_hint(
     let proj_build = project
         .as_ref()
         .and_then(|(_, pc)| pc.commands.as_ref())
-        .and_then(|cmds| cmds.build.as_deref());
+        .and_then(|cmds| cmds.build.as_ref())
+        .map_or(&[] as &[String], |sv| &sv.0);
 
     let cwd_str = cwd.as_ref().map(|p| p.display().to_string());
     let ctx = crate::config::BuildContext {
         user_config_path: user_path_str,
-        default_build: resolved.default_build.as_deref(),
+        default_build: &resolved.default_build,
         has_project_config: project.is_some(),
         project_config_path: proj_path.as_deref(),
         project_build: proj_build,

@@ -929,7 +929,10 @@ git = ["grep"]
         let result = load_project_config(dir.path())?;
         let config = result.expect("should find project config");
         let cmds = config.commands.expect("commands should be present");
-        assert_eq!(cmds.build.as_deref(), Some("npm"));
+        assert_eq!(
+            cmds.build.as_ref().map(|b| &b.0[..]),
+            Some(["npm".to_string()].as_slice()),
+        );
         assert_eq!(cmds.allow.as_ref().expect("allow").len(), 2);
         let deny = cmds.deny.as_ref().expect("deny");
         assert!(
@@ -959,8 +962,13 @@ build = "make"
         assert!(config.server.is_empty());
         assert!(config.commands.is_some());
         assert_eq!(
-            config.commands.expect("commands").build.as_deref(),
-            Some("make"),
+            config
+                .commands
+                .expect("commands")
+                .build
+                .as_ref()
+                .map(|b| &b.0[..]),
+            Some(["make".to_string()].as_slice()),
         );
 
         Ok(())
@@ -984,7 +992,10 @@ allow = ["git"]
         let config = result.expect("should find project config");
         assert!(!config.lsp);
         let cmds = config.commands.expect("commands present despite disabled");
-        assert_eq!(cmds.build.as_deref(), Some("make"));
+        assert_eq!(
+            cmds.build.as_ref().map(|b| &b.0[..]),
+            Some(["make".to_string()].as_slice()),
+        );
         assert!(
             cmds.allow
                 .as_ref()

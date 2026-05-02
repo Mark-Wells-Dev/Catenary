@@ -1193,33 +1193,38 @@ fn check_command_filter_config(colors: &ColorConfig, config: &crate::config::Con
         }
         Some(resolved) if resolved.is_active() => {
             let total = resolved.allow.len() + resolved.pipeline.len();
+            let build_suffix = if !resolved.default_build.is_empty() {
+                let tools = resolved.default_build.join(", ");
+                format!(
+                    ", build tool{}: {tools}",
+                    if resolved.default_build.len() == 1 {
+                        ""
+                    } else {
+                        "s"
+                    },
+                )
+            } else if !resolved.build.is_empty() {
+                let mut tools: Vec<&str> = resolved
+                    .build
+                    .values()
+                    .flat_map(|v| v.iter().map(String::as_str))
+                    .collect::<std::collections::HashSet<_>>()
+                    .into_iter()
+                    .collect();
+                tools.sort_unstable();
+                format!(
+                    ", build tool{}: {}",
+                    if tools.len() == 1 { "" } else { "s" },
+                    tools.join(", ")
+                )
+            } else {
+                String::new()
+            };
             println!(
                 "  {}",
                 colors.green(&format!(
-                    "✓ {total} command{} allowed{}",
+                    "✓ {total} command{} allowed{build_suffix}",
                     if total == 1 { "" } else { "s" },
-                    resolved.default_build.as_ref().map_or_else(
-                        || {
-                            if resolved.build.is_empty() {
-                                String::new()
-                            } else {
-                                let mut tools: Vec<&str> = resolved
-                                    .build
-                                    .values()
-                                    .map(String::as_str)
-                                    .collect::<std::collections::HashSet<_>>()
-                                    .into_iter()
-                                    .collect();
-                                tools.sort_unstable();
-                                format!(
-                                    ", build tool{}: {}",
-                                    if tools.len() == 1 { "" } else { "s" },
-                                    tools.join(", ")
-                                )
-                            }
-                        },
-                        |b| format!(", build tool: {b}"),
-                    ),
                 )),
             );
         }

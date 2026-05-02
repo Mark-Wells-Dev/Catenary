@@ -25,6 +25,62 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+/// Serde helper that deserializes a string or a list of strings,
+/// normalizing to `Vec<String>`.
+///
+/// Accepts both forms in TOML:
+/// ```toml
+/// build = "make"          # → vec!["make"]
+/// build = ["make", "npm"] # → vec!["make", "npm"]
+/// ```
+#[derive(Debug, Clone)]
+pub struct StringOrVec(pub Vec<String>);
+
+impl<'de> Deserialize<'de> for StringOrVec {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = StringOrVec;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a string or list of strings")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<StringOrVec, E> {
+                Ok(StringOrVec(vec![v.to_string()]))
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<StringOrVec, A::Error> {
+                let mut vec = Vec::new();
+                while let Some(s) = seq.next_element()? {
+                    vec.push(s);
+                }
+                Ok(StringOrVec(vec))
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+/// Format a list of build tools as a comma-separated backtick-quoted string.
+///
+/// e.g., `["make", "npm"]` → `` `make`, `npm` ``.
+fn format_build_list(tools: &[String]) -> String {
+    tools
+        .iter()
+        .map(|t| format!("`{t}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// TOML shape for a single `[commands.guidance.<group>]` entry.
 ///
 /// Each group maps a set of commands to a guidance message. The `build`
@@ -103,10 +159,10 @@ pub struct BuildGuidance {
 impl Default for BuildGuidance {
     fn default() -> Self {
         Self {
-            message_default: "{USERCONFIG} has `{BUILD}` as the default build tool.".to_string(),
+            message_default: "{USERCONFIG} has {BUILD} as the default build tool.".to_string(),
             message_default_absent: "{USERCONFIG} has not configured a build tool.".to_string(),
             message_noproject: "No `.catenary.toml` was found in {CWD}.".to_string(),
-            message_project: "{PROJCONFIG} has `{BUILD}` as the configured build tool.".to_string(),
+            message_project: "{PROJCONFIG} has {BUILD} as the configured build tool.".to_string(),
             message_project_absent: "{PROJCONFIG} has not configured a build tool.".to_string(),
             message_cwd_unknown: "Unable to resolve the current working directory. Consider \
                                   changing directory and retrying."
@@ -126,8 +182,8 @@ pub struct CommandsConfig {
     /// Deliberate opt-out — no enforcement, no hint notification.
     #[serde(default)]
     pub client_enforcement_only: bool,
-    /// The project's build tool (e.g., `"make"`).
-    pub build: Option<String>,
+    /// The project's build tool(s) (e.g., `"make"` or `["make", "npm"]`).
+    pub build: Option<StringOrVec>,
     /// Commands the agent can run unconditionally.
     pub allow: Option<Vec<String>>,
     /// Commands allowed mid-pipeline only (denied at pipeline position 0).
@@ -135,6 +191,9 @@ pub struct CommandsConfig {
     /// Subcommand denylist within allowed commands.
     /// Key = command name, value = list of denied subcommands.
     pub deny: Option<HashMap<String, Vec<String>>>,
+    /// Per-command flag denylist. Scans all argument positions.
+    /// Key = command name, value = list of denied flags.
+    pub deny_flags: Option<HashMap<String, Vec<String>>>,
     /// Per-command guidance groups.
     /// Key = group name (e.g., `"read"`, `"build"`), value = group config.
     pub guidance: Option<HashMap<String, GuidanceGroup>>,
@@ -145,15 +204,15 @@ pub struct CommandsConfig {
 pub struct ResolvedCommands {
     /// Deliberate opt-out — no enforcement, no hint notification.
     pub client_enforcement_only: bool,
-    /// User-level default build tool (from user config, no root context).
+    /// User-level default build tools (from user config, no root context).
     ///
     /// Used as fallback when `cwd` doesn't match any root in `build`.
-    pub default_build: Option<String>,
-    /// Per-root build tools. Key = workspace root path, value = build tool name.
+    pub default_build: Vec<String>,
+    /// Per-root build tools. Key = workspace root path, value = build tool names.
     ///
     /// Populated by [`merge_project_commands`](Self::merge_project_commands).
-    /// The evaluator looks up `cwd` → root (longest prefix match) → build tool.
-    pub build: HashMap<PathBuf, String>,
+    /// The evaluator looks up `cwd` → root (longest prefix match) → build tools.
+    pub build: HashMap<PathBuf, Vec<String>>,
     /// Commands the agent can run unconditionally.
     pub allow: HashSet<String>,
     /// Commands allowed mid-pipeline only.
@@ -161,6 +220,9 @@ pub struct ResolvedCommands {
     /// Subcommand denylist within allowed commands.
     /// Key = command name, value = set of denied subcommands.
     pub deny: HashMap<String, HashSet<String>>,
+    /// Per-command flag denylist. Scans all argument positions.
+    /// Key = command name, value = set of denied flags.
+    pub deny_flags: HashMap<String, HashSet<String>>,
     /// Per-command guidance messages for denial responses.
     /// Key = command name, value = guidance entry.
     pub guidance: HashMap<String, GuidanceEntry>,
@@ -178,8 +240,8 @@ impl ResolvedCommands {
         if layer.client_enforcement_only {
             self.client_enforcement_only = true;
         }
-        if layer.build.is_some() {
-            self.default_build.clone_from(&layer.build);
+        if let Some(ref build) = layer.build {
+            self.default_build.clone_from(&build.0);
         }
         if let Some(ref allow) = layer.allow {
             self.allow = allow.iter().cloned().collect();
@@ -193,6 +255,14 @@ impl ResolvedCommands {
                     .entry(cmd.clone())
                     .or_default()
                     .extend(subs.iter().cloned());
+            }
+        }
+        if let Some(ref deny_flags) = layer.deny_flags {
+            for (cmd, flags) in deny_flags {
+                self.deny_flags
+                    .entry(cmd.clone())
+                    .or_default()
+                    .extend(flags.iter().cloned());
             }
         }
         if let Some(ref groups) = layer.guidance {
@@ -222,7 +292,8 @@ impl ResolvedCommands {
         let mut merged_allow: HashSet<String> = HashSet::new();
         let mut merged_pipeline: HashSet<String> = HashSet::new();
         let mut merged_deny: HashMap<String, HashSet<String>> = HashMap::new();
-        let mut merged_build: HashMap<PathBuf, String> = HashMap::new();
+        let mut merged_deny_flags: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut merged_build: HashMap<PathBuf, Vec<String>> = HashMap::new();
 
         for root in roots {
             let project = project_commands.get(root);
@@ -258,12 +329,29 @@ impl ResolvedCommands {
                 }
             }
 
+            // deny_flags: same replacement semantics as deny
+            if let Some(project_deny_flags) = project.and_then(|p| p.deny_flags.as_ref()) {
+                for (cmd, flags) in project_deny_flags {
+                    merged_deny_flags
+                        .entry(cmd.clone())
+                        .or_default()
+                        .extend(flags.iter().cloned());
+                }
+            } else {
+                for (cmd, flags) in &self.deny_flags {
+                    merged_deny_flags
+                        .entry(cmd.clone())
+                        .or_default()
+                        .extend(flags.iter().cloned());
+                }
+            }
+
             // build: project overrides user default for this root
             let root_build = project
                 .and_then(|p| p.build.as_ref())
-                .or(self.default_build.as_ref());
-            if let Some(build_tool) = root_build {
-                merged_build.insert(root.clone(), build_tool.clone());
+                .map_or(&self.default_build[..], |sv| &sv.0);
+            if !root_build.is_empty() {
+                merged_build.insert(root.clone(), root_build.to_vec());
             }
         }
 
@@ -274,29 +362,31 @@ impl ResolvedCommands {
             allow: merged_allow,
             pipeline: merged_pipeline,
             deny: merged_deny,
+            deny_flags: merged_deny_flags,
             // Guidance is user-level only — not overridden per-root.
             guidance: self.guidance.clone(),
         }
     }
 
-    /// Look up the build tool for a given `cwd`.
+    /// Look up the build tools for a given `cwd`.
     ///
     /// Finds the root whose path is the longest prefix of `cwd` and returns
-    /// that root's build tool. Falls back to [`default_build`](Self::default_build)
+    /// that root's build tools. Falls back to [`default_build`](Self::default_build)
     /// when no root matches (e.g., no session or `cwd` outside all roots).
+    /// Returns an empty slice when no build tools are configured.
     #[must_use]
-    pub fn build_for_cwd(&self, cwd: Option<&Path>) -> Option<&str> {
+    pub fn build_for_cwd(&self, cwd: Option<&Path>) -> &[String] {
         if let Some(cwd) = cwd
-            && let Some(tool) = self
+            && let Some(tools) = self
                 .build
                 .iter()
                 .filter(|(root, _)| cwd.starts_with(root))
                 .max_by_key(|(root, _)| root.as_os_str().len())
-                .map(|(_, tool)| tool.as_str())
+                .map(|(_, tools)| tools.as_slice())
         {
-            return Some(tool);
+            return tools;
         }
-        self.default_build.as_deref()
+        &self.default_build
     }
 
     /// Whether the allowlist is active (has at least one allowed command,
@@ -307,7 +397,7 @@ impl ResolvedCommands {
             && (!self.allow.is_empty()
                 || !self.pipeline.is_empty()
                 || !self.build.is_empty()
-                || self.default_build.is_some())
+                || !self.default_build.is_empty())
     }
 
     /// Look up guidance for a denied command.
@@ -370,14 +460,14 @@ fn flatten_guidance(groups: &HashMap<String, GuidanceGroup>) -> HashMap<String, 
 pub struct BuildContext<'a> {
     /// User config file path.
     pub user_config_path: &'a str,
-    /// User-level default build tool.
-    pub default_build: Option<&'a str>,
+    /// User-level default build tools.
+    pub default_build: &'a [String],
     /// Whether a project config was found for the cwd.
     pub has_project_config: bool,
     /// Project config file path (if found).
     pub project_config_path: Option<&'a str>,
-    /// Project-level build tool for the cwd's root.
-    pub project_build: Option<&'a str>,
+    /// Project-level build tools for the cwd's root.
+    pub project_build: &'a [String],
     /// Whether cwd could be resolved.
     pub cwd_resolved: bool,
     /// The resolved working directory path (for context in messages).
@@ -402,17 +492,15 @@ impl BuildGuidance {
         let mut lines = Vec::new();
 
         // User default build tool line.
-        let user_line = ctx.default_build.map_or_else(
-            || {
-                self.message_default_absent
-                    .replace("{USERCONFIG}", ctx.user_config_path)
-            },
-            |build| {
-                self.message_default
-                    .replace("{BUILD}", build)
-                    .replace("{USERCONFIG}", ctx.user_config_path)
-            },
-        );
+        let user_line = if ctx.default_build.is_empty() {
+            self.message_default_absent
+                .replace("{USERCONFIG}", ctx.user_config_path)
+        } else {
+            let build_list = format_build_list(ctx.default_build);
+            self.message_default
+                .replace("{BUILD}", &build_list)
+                .replace("{USERCONFIG}", ctx.user_config_path)
+        };
         if !user_line.is_empty() {
             lines.push(user_line);
         }
@@ -422,9 +510,10 @@ impl BuildGuidance {
         let cwd_display = ctx.resolved_cwd_path.unwrap_or("the working directory");
         let project_line = if !ctx.has_project_config {
             self.message_noproject.replace("{CWD}", cwd_display)
-        } else if let Some(build) = ctx.project_build {
+        } else if !ctx.project_build.is_empty() {
+            let build_list = format_build_list(ctx.project_build);
             self.message_project
-                .replace("{BUILD}", build)
+                .replace("{BUILD}", &build_list)
                 .replace("{PROJCONFIG}", proj_path)
         } else {
             self.message_project_absent
@@ -446,6 +535,7 @@ impl BuildGuidance {
 /// - `deny` keys not present in `allow`
 /// - Empty `allow` or `pipeline` entries
 /// - Empty `deny` subcommand entries
+#[allow(clippy::too_many_lines, reason = "validation covers many fields")]
 pub fn validate(config: &CommandsConfig) -> (Vec<String>, Vec<String>) {
     let mut errors = Vec::new();
     let warnings = Vec::new();
@@ -455,20 +545,36 @@ pub fn validate(config: &CommandsConfig) -> (Vec<String>, Vec<String>) {
         && (config.allow.is_some()
             || config.pipeline.is_some()
             || config.deny.is_some()
+            || config.deny_flags.is_some()
             || config.build.is_some())
     {
         errors.push(
             "[commands] `client_enforcement_only = true` with `allow`, `pipeline`, \
-             `deny`, or `build` is contradictory — opt-out means no enforcement"
+             `deny`, `deny_flags`, or `build` is contradictory — opt-out means \
+             no enforcement"
                 .to_string(),
         );
     }
 
-    // Collect allow set for cross-checks
+    // Collect allow/pipeline/build sets for cross-checks
     let allow_set: HashSet<&str> = config
         .allow
         .as_deref()
         .unwrap_or_default()
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let pipeline_set: HashSet<&str> = config
+        .pipeline
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let build_set: HashSet<&str> = config
+        .build
+        .as_ref()
+        .map_or(&[] as &[String], |sv| &sv.0)
         .iter()
         .map(String::as_str)
         .collect();
@@ -533,11 +639,44 @@ pub fn validate(config: &CommandsConfig) -> (Vec<String>, Vec<String>) {
         }
     }
 
-    // Empty build string
-    if let Some(ref build) = config.build
-        && build.is_empty()
-    {
-        errors.push("[commands] `build` is an empty string".to_string());
+    // Empty build list or entries
+    if let Some(ref build) = config.build {
+        if build.0.is_empty() {
+            errors.push("[commands] `build` is an empty list".to_string());
+        }
+        for b in &build.0 {
+            if b.is_empty() {
+                errors.push("[commands] `build` contains an empty string".to_string());
+            }
+        }
+    }
+
+    // deny_flags: keys must be in allow, pipeline, or build
+    if let Some(ref deny_flags) = config.deny_flags {
+        for (cmd, flags) in deny_flags {
+            if !allow_set.contains(cmd.as_str())
+                && !pipeline_set.contains(cmd.as_str())
+                && !build_set.contains(cmd.as_str())
+            {
+                errors.push(format!(
+                    "[commands] deny_flags.{cmd} references '{cmd}' which is not in \
+                     `allow`, `pipeline`, or `build` — can only deny flags of \
+                     permitted commands",
+                ));
+            }
+            if flags.is_empty() {
+                errors.push(format!(
+                    "[commands] deny_flags.{cmd} has an empty flag list",
+                ));
+            }
+            for flag in flags {
+                if flag.is_empty() {
+                    errors.push(format!(
+                        "[commands] deny_flags.{cmd} contains an empty flag string",
+                    ));
+                }
+            }
+        }
     }
 
     // Guidance validation
@@ -608,11 +747,46 @@ git = ["grep", "ls-files"]
         )
         .expect("valid TOML");
 
-        assert_eq!(config.build.as_deref(), Some("make"));
+        assert_eq!(
+            config.build.as_ref().map(|b| &b.0[..]),
+            Some(["make".to_string()].as_slice()),
+        );
         assert_eq!(config.allow.as_ref().expect("allow").len(), 3);
         assert_eq!(config.pipeline.as_ref().expect("pipeline").len(), 3);
         let deny = config.deny.as_ref().expect("deny");
         assert_eq!(deny.get("git").expect("git deny").len(), 2);
+    }
+
+    #[test]
+    fn deserialize_build_multi_value() {
+        let config: CommandsConfig = toml::from_str(
+            r#"
+build = ["make", "npm"]
+allow = ["git"]
+"#,
+        )
+        .expect("valid TOML");
+
+        let build = config.build.as_ref().expect("build");
+        assert_eq!(build.0, vec!["make", "npm"]);
+    }
+
+    #[test]
+    fn deserialize_deny_flags() {
+        let config: CommandsConfig = toml::from_str(
+            r#"
+allow = ["git", "make"]
+
+[deny_flags]
+make = ["-C"]
+git = ["--no-verify", "--force"]
+"#,
+        )
+        .expect("valid TOML");
+
+        let deny_flags = config.deny_flags.as_ref().expect("deny_flags");
+        assert_eq!(deny_flags.get("make").expect("make").len(), 1);
+        assert_eq!(deny_flags.get("git").expect("git").len(), 2);
     }
 
     #[test]
@@ -625,7 +799,7 @@ git = ["grep", "ls-files"]
     #[test]
     fn resolve_single_layer() {
         let layer = CommandsConfig {
-            build: Some("make".to_string()),
+            build: Some(StringOrVec(vec!["make".to_string()])),
             allow: Some(vec!["git".to_string(), "gh".to_string()]),
             pipeline: Some(vec!["grep".to_string()]),
             deny: Some(HashMap::from([(
@@ -638,7 +812,7 @@ git = ["grep", "ls-files"]
         let mut resolved = ResolvedCommands::default();
         resolved.merge(&layer);
 
-        assert_eq!(resolved.default_build.as_deref(), Some("make"));
+        assert_eq!(resolved.default_build, vec!["make"]);
         assert!(resolved.allow.contains("git"));
         assert!(resolved.allow.contains("gh"));
         assert!(resolved.pipeline.contains("grep"));
@@ -674,12 +848,12 @@ git = ["grep", "ls-files"]
     #[test]
     fn project_build_overrides_user() {
         let user = CommandsConfig {
-            build: Some("make".to_string()),
+            build: Some(StringOrVec(vec!["make".to_string()])),
             allow: Some(vec!["git".to_string()]),
             ..CommandsConfig::default()
         };
         let project = CommandsConfig {
-            build: Some("npm".to_string()),
+            build: Some(StringOrVec(vec!["npm".to_string()])),
             ..CommandsConfig::default()
         };
 
@@ -687,7 +861,7 @@ git = ["grep", "ls-files"]
         resolved.merge(&user);
         resolved.merge(&project);
 
-        assert_eq!(resolved.default_build.as_deref(), Some("npm"));
+        assert_eq!(resolved.default_build, vec!["npm"]);
         // User's allow preserved (project didn't specify allow)
         assert!(resolved.allow.contains("git"));
     }
@@ -758,7 +932,7 @@ git = ["grep", "ls-files"]
     #[test]
     fn is_active_with_default_build() {
         let resolved = ResolvedCommands {
-            default_build: Some("make".to_string()),
+            default_build: vec!["make".to_string()],
             ..ResolvedCommands::default()
         };
         assert!(resolved.is_active());
@@ -767,7 +941,7 @@ git = ["grep", "ls-files"]
     #[test]
     fn is_active_with_per_root_build() {
         let resolved = ResolvedCommands {
-            build: HashMap::from([(PathBuf::from("/project"), "make".to_string())]),
+            build: HashMap::from([(PathBuf::from("/project"), vec!["make".to_string()])]),
             ..ResolvedCommands::default()
         };
         assert!(resolved.is_active());
@@ -794,7 +968,7 @@ git = ["grep", "ls-files"]
     #[test]
     fn validate_valid_config() {
         let config = CommandsConfig {
-            build: Some("make".to_string()),
+            build: Some(StringOrVec(vec!["make".to_string()])),
             allow: Some(vec!["git".to_string(), "gh".to_string()]),
             pipeline: Some(vec!["grep".to_string(), "head".to_string()]),
             deny: Some(HashMap::from([(
@@ -905,16 +1079,126 @@ git = ["grep", "ls-files"]
     }
 
     #[test]
-    fn validate_empty_build() {
+    fn validate_empty_build_list() {
         let config = CommandsConfig {
-            build: Some(String::new()),
+            build: Some(StringOrVec(vec![])),
             ..CommandsConfig::default()
         };
 
         let (errors, _) = validate(&config);
         assert_eq!(errors.len(), 1);
-        assert!(errors[0].contains("build"));
-        assert!(errors[0].contains("empty"));
+        assert!(errors[0].contains("empty list"));
+    }
+
+    #[test]
+    fn validate_empty_build_string() {
+        let config = CommandsConfig {
+            build: Some(StringOrVec(vec![String::new()])),
+            ..CommandsConfig::default()
+        };
+
+        let (errors, _) = validate(&config);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("empty string"));
+    }
+
+    #[test]
+    fn validate_deny_flags_key_not_in_any_list() {
+        let config = CommandsConfig {
+            allow: Some(vec!["git".to_string()]),
+            deny_flags: Some(HashMap::from([(
+                "sqlite3".to_string(),
+                vec!["-cmd".to_string()],
+            )])),
+            ..CommandsConfig::default()
+        };
+
+        let (errors, _) = validate(&config);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("deny_flags.sqlite3"));
+        assert!(errors[0].contains("not in `allow`, `pipeline`, or `build`"));
+    }
+
+    #[test]
+    fn validate_deny_flags_key_in_allow_ok() {
+        let config = CommandsConfig {
+            allow: Some(vec!["git".to_string()]),
+            deny_flags: Some(HashMap::from([(
+                "git".to_string(),
+                vec!["--no-verify".to_string()],
+            )])),
+            ..CommandsConfig::default()
+        };
+
+        let (errors, _) = validate(&config);
+        assert!(
+            errors.is_empty(),
+            "deny_flags key in allow is valid: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_deny_flags_key_in_pipeline_ok() {
+        let config = CommandsConfig {
+            allow: Some(vec!["git".to_string()]),
+            pipeline: Some(vec!["jq".to_string()]),
+            deny_flags: Some(HashMap::from([(
+                "jq".to_string(),
+                vec!["--rawfile".to_string()],
+            )])),
+            ..CommandsConfig::default()
+        };
+
+        let (errors, _) = validate(&config);
+        assert!(
+            errors.is_empty(),
+            "deny_flags key in pipeline is valid: {errors:?}",
+        );
+    }
+
+    #[test]
+    fn validate_deny_flags_key_in_build_ok() {
+        let config = CommandsConfig {
+            allow: Some(vec!["git".to_string()]),
+            build: Some(StringOrVec(vec!["make".to_string()])),
+            deny_flags: Some(HashMap::from([(
+                "make".to_string(),
+                vec!["-C".to_string()],
+            )])),
+            ..CommandsConfig::default()
+        };
+
+        let (errors, _) = validate(&config);
+        assert!(
+            errors.is_empty(),
+            "deny_flags key in build is valid: {errors:?}",
+        );
+    }
+
+    #[test]
+    fn validate_deny_flags_empty_list() {
+        let config = CommandsConfig {
+            allow: Some(vec!["git".to_string()]),
+            deny_flags: Some(HashMap::from([("git".to_string(), vec![])])),
+            ..CommandsConfig::default()
+        };
+
+        let (errors, _) = validate(&config);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("empty flag list"));
+    }
+
+    #[test]
+    fn validate_deny_flags_empty_string() {
+        let config = CommandsConfig {
+            allow: Some(vec!["git".to_string()]),
+            deny_flags: Some(HashMap::from([("git".to_string(), vec![String::new()])])),
+            ..CommandsConfig::default()
+        };
+
+        let (errors, _) = validate(&config);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("empty flag string"));
     }
 
     #[test]
@@ -995,7 +1279,7 @@ git = ["grep", "ls-files"]
         let mut user = ResolvedCommands::default();
         user.merge(&CommandsConfig {
             allow: Some(vec!["git".into()]),
-            build: Some("make".into()),
+            build: Some(StringOrVec(vec!["make".into()])),
             ..CommandsConfig::default()
         });
 
@@ -1003,13 +1287,16 @@ git = ["grep", "ls-files"]
         let project_commands = HashMap::from([(
             root.clone(),
             CommandsConfig {
-                build: Some("npm".into()),
+                build: Some(StringOrVec(vec!["npm".into()])),
                 ..CommandsConfig::default()
             },
         )]);
 
         let merged = user.merge_project_commands(std::slice::from_ref(&root), &project_commands);
-        assert_eq!(merged.build.get(&root).map(String::as_str), Some("npm"));
+        assert_eq!(
+            merged.build.get(&root).map(Vec::as_slice),
+            Some(["npm".to_string()].as_slice()),
+        );
     }
 
     #[test]
@@ -1017,7 +1304,7 @@ git = ["grep", "ls-files"]
         let mut user = ResolvedCommands::default();
         user.merge(&CommandsConfig {
             allow: Some(vec!["git".into()]),
-            build: Some("make".into()),
+            build: Some(StringOrVec(vec!["make".into()])),
             ..CommandsConfig::default()
         });
 
@@ -1026,7 +1313,7 @@ git = ["grep", "ls-files"]
         let project_commands = HashMap::from([(
             root_a.clone(),
             CommandsConfig {
-                build: Some("npm".into()),
+                build: Some(StringOrVec(vec!["npm".into()])),
                 ..CommandsConfig::default()
             },
         )]);
@@ -1035,11 +1322,11 @@ git = ["grep", "ls-files"]
         // Root A: npm (project override). Root B: make (user default).
         assert_eq!(
             merged.build_for_cwd(Some(Path::new("/project/a/src"))),
-            Some("npm"),
+            &["npm".to_string()],
         );
         assert_eq!(
             merged.build_for_cwd(Some(Path::new("/project/b/lib"))),
-            Some("make"),
+            &["make".to_string()],
         );
     }
 
@@ -1048,47 +1335,88 @@ git = ["grep", "ls-files"]
         let mut user = ResolvedCommands::default();
         user.merge(&CommandsConfig {
             allow: Some(vec!["git".into()]),
-            build: Some("make".into()),
+            build: Some(StringOrVec(vec!["make".into()])),
             ..CommandsConfig::default()
         });
 
         let merged = user.merge_project_commands(&[], &HashMap::new());
         assert!(merged.allow.contains("git"));
-        assert_eq!(merged.default_build.as_deref(), Some("make"));
+        assert_eq!(merged.default_build, vec!["make"]);
         assert!(merged.build.is_empty());
     }
 
     #[test]
     fn build_for_cwd_falls_back_to_default() {
         let resolved = ResolvedCommands {
-            default_build: Some("make".into()),
+            default_build: vec!["make".into()],
             ..ResolvedCommands::default()
         };
         // No roots in build map — falls back to default
         assert_eq!(
             resolved.build_for_cwd(Some(Path::new("/any/path"))),
-            Some("make")
+            &["make".to_string()],
         );
-        assert_eq!(resolved.build_for_cwd(None), Some("make"));
+        assert_eq!(resolved.build_for_cwd(None), &["make".to_string()]);
+    }
+
+    #[test]
+    fn build_for_cwd_no_build_returns_empty() {
+        let resolved = ResolvedCommands::default();
+        assert!(
+            resolved
+                .build_for_cwd(Some(Path::new("/any/path")))
+                .is_empty()
+        );
+        assert!(resolved.build_for_cwd(None).is_empty());
     }
 
     #[test]
     fn build_for_cwd_longest_prefix_match() {
         let resolved = ResolvedCommands {
             build: HashMap::from([
-                (PathBuf::from("/project"), "make".into()),
-                (PathBuf::from("/project/nested"), "npm".into()),
+                (PathBuf::from("/project"), vec!["make".into()]),
+                (PathBuf::from("/project/nested"), vec!["npm".into()]),
             ]),
             ..ResolvedCommands::default()
         };
         assert_eq!(
             resolved.build_for_cwd(Some(Path::new("/project/nested/src"))),
-            Some("npm"),
+            &["npm".to_string()],
         );
         assert_eq!(
             resolved.build_for_cwd(Some(Path::new("/project/other"))),
-            Some("make"),
+            &["make".to_string()],
         );
+    }
+
+    #[test]
+    fn merge_project_build_multi_value() {
+        let mut user = ResolvedCommands::default();
+        user.merge(&CommandsConfig {
+            allow: Some(vec!["git".into()]),
+            build: Some(StringOrVec(vec!["make".into(), "npm".into()])),
+            ..CommandsConfig::default()
+        });
+
+        assert_eq!(user.default_build, vec!["make", "npm"]);
+
+        let root = PathBuf::from("/project");
+        let project_commands = HashMap::from([(
+            root.clone(),
+            CommandsConfig {
+                build: Some(StringOrVec(vec!["cargo".into()])),
+                ..CommandsConfig::default()
+            },
+        )]);
+
+        let merged = user.merge_project_commands(std::slice::from_ref(&root), &project_commands);
+        // Project replaces user default for that root
+        assert_eq!(
+            merged.build.get(&root).map(Vec::as_slice),
+            Some(["cargo".to_string()].as_slice()),
+        );
+        // Default preserved
+        assert_eq!(merged.default_build, vec!["make", "npm"]);
     }
 
     #[test]
@@ -1251,10 +1579,10 @@ message_default = "custom: {BUILD}"
         let bg = BuildGuidance::default();
         let result = bg.resolve(&BuildContext {
             user_config_path: "~/.config/catenary/config.toml",
-            default_build: Some("make"),
+            default_build: &["make".to_string()],
             has_project_config: true,
             project_config_path: Some(".catenary.toml"),
-            project_build: Some("npm"),
+            project_build: &["npm".to_string()],
             cwd_resolved: true,
             resolved_cwd_path: Some("/project"),
         });
@@ -1273,10 +1601,10 @@ message_default = "custom: {BUILD}"
         let bg = BuildGuidance::default();
         let result = bg.resolve(&BuildContext {
             user_config_path: "~/.config/catenary/config.toml",
-            default_build: Some("make"),
+            default_build: &["make".to_string()],
             has_project_config: false,
             project_config_path: None,
-            project_build: None,
+            project_build: &[],
             cwd_resolved: true,
             resolved_cwd_path: Some("/other/project"),
         });
@@ -1295,10 +1623,10 @@ message_default = "custom: {BUILD}"
         let bg = BuildGuidance::default();
         let result = bg.resolve(&BuildContext {
             user_config_path: "~/.config/catenary/config.toml",
-            default_build: None,
+            default_build: &[],
             has_project_config: false,
             project_config_path: None,
-            project_build: None,
+            project_build: &[],
             cwd_resolved: true,
             resolved_cwd_path: Some("/project"),
         });
@@ -1313,10 +1641,10 @@ message_default = "custom: {BUILD}"
         let bg = BuildGuidance::default();
         let result = bg.resolve(&BuildContext {
             user_config_path: "",
-            default_build: None,
+            default_build: &[],
             has_project_config: false,
             project_config_path: None,
-            project_build: None,
+            project_build: &[],
             cwd_resolved: false,
             resolved_cwd_path: None,
         });
@@ -1335,14 +1663,17 @@ message_default = "custom: {BUILD}"
         };
         let result = bg.resolve(&BuildContext {
             user_config_path: "config.toml",
-            default_build: Some("make"),
+            default_build: &["make".to_string()],
             has_project_config: false,
             project_config_path: None,
-            project_build: None,
+            project_build: &[],
             cwd_resolved: true,
             resolved_cwd_path: Some("/project"),
         });
-        assert!(result.contains("custom: make"), "custom message: {result}");
+        assert!(
+            result.contains("custom: `make`"),
+            "custom message: {result}",
+        );
         assert!(result.contains("no project"), "custom no-project: {result}");
     }
 
@@ -1355,15 +1686,37 @@ message_default = "custom: {BUILD}"
         };
         let result = bg.resolve(&BuildContext {
             user_config_path: "",
-            default_build: Some("make"),
+            default_build: &["make".to_string()],
             has_project_config: false,
             project_config_path: None,
-            project_build: None,
+            project_build: &[],
             cwd_resolved: true,
             resolved_cwd_path: Some("/project"),
         });
         // Empty message_default suppresses the user-default line.
         assert_eq!(result, "visible");
+    }
+
+    #[test]
+    fn build_guidance_multi_value() {
+        let bg = BuildGuidance::default();
+        let result = bg.resolve(&BuildContext {
+            user_config_path: "config.toml",
+            default_build: &["make".to_string(), "npm".to_string()],
+            has_project_config: true,
+            project_config_path: Some(".catenary.toml"),
+            project_build: &["cargo".to_string(), "npm".to_string()],
+            cwd_resolved: true,
+            resolved_cwd_path: Some("/project"),
+        });
+        assert!(
+            result.contains("`make`, `npm`"),
+            "should format multi-value default: {result}",
+        );
+        assert!(
+            result.contains("`cargo`, `npm`"),
+            "should format multi-value project: {result}",
+        );
     }
 
     #[test]
