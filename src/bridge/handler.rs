@@ -122,7 +122,8 @@ impl ToolHandler for McpRouter {
                 description: Some(format!(
                     "Search for a pattern across the workspace. Queries the LSP symbol index \
                      and ripgrep in parallel. Use `|` for alternation (e.g., `foo|bar`). \
-                     Scope with `glob` and `exclude` to narrow the file set.\n\n\
+                     Scope with `glob` and `exclude` to narrow the file set. Relative \
+                     glob patterns resolve against your current working directory.\n\n\
                      Output fits a {grep_budget}-character budget. Broad queries produce more \
                      matches than the budget can show at full detail, so the tool reduces \
                      detail automatically. Narrow your pattern or add a glob to get richer \
@@ -167,7 +168,8 @@ impl ToolHandler for McpRouter {
                 description: Some(format!(
                     "Browse the workspace. Auto-detects intent: file path \u{2192} symbol outline, \
                      directory path \u{2192} listing with symbols, glob pattern \u{2192} matching files \
-                     with symbols. Always shows outline-level symbols (structs, classes, enums, \
+                     with symbols. Relative paths resolve against your current working \
+                     directory. Always shows outline-level symbols (structs, classes, enums, \
                      interfaces, modules, constants).\n\n\
                      Output fits a {glob_budget}-character budget. Large directories are \
                      bucketed into drillable glob patterns. Files over {outline_threshold} \
