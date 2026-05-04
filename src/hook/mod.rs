@@ -931,4 +931,77 @@ mod tests {
         let level = HookServer::hook_outcome_level("pre-agent/turn-start", &env);
         assert_eq!(level, tracing::Level::DEBUG);
     }
+
+    // ── Host payload capture tests ────────────────────────────────────
+
+    #[test]
+    fn hook_request_tolerates_host_payload() {
+        // HookRequest deserialization silently ignores `host_payload` —
+        // no deny_unknown_fields — so the field survives in the raw Value
+        // for logging without breaking dispatch deserialization.
+        let json = r#"{
+            "method": "pre-agent/turn-start",
+            "host_payload": {
+                "transcript_path": "/tmp/transcript.jsonl",
+                "cwd": "/home/user/project",
+                "hook_event_name": "UserPromptSubmit"
+            }
+        }"#;
+        let req: HookRequest = serde_json::from_str(json).expect("should deserialize");
+        assert!(matches!(req, HookRequest::PreAgent {}));
+
+        // The raw Value retains host_payload for protocol logging.
+        let raw: serde_json::Value = serde_json::from_str(json).expect("parse raw");
+        assert_eq!(
+            raw["host_payload"]["transcript_path"].as_str(),
+            Some("/tmp/transcript.jsonl"),
+        );
+    }
+
+    #[test]
+    fn hook_event_stores_host_payload() {
+        let (logging, conn, _guard) = setup_logging();
+
+        let id = logging.next_id();
+        let payload = serde_json::json!({
+            "method": "pre-agent/turn-start",
+            "host_payload": {
+                "transcript_path": "/tmp/transcript.jsonl",
+                "cwd": "/home/user/project",
+                "hook_event_name": "UserPromptSubmit"
+            }
+        });
+
+        emit_hook_event(
+            tracing::Level::DEBUG,
+            "claude-code",
+            "pre-agent/turn-start",
+            id.0,
+            None,
+            &payload.to_string(),
+            "incoming hook",
+        );
+
+        let rows = hook_messages(&conn);
+        assert_eq!(rows.len(), 1);
+
+        // Verify the stored payload contains the nested host data.
+        let stored_payload: String = {
+            let c = conn.lock().expect("lock");
+            c.query_row("SELECT payload FROM messages WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .expect("query payload")
+        };
+        let stored: serde_json::Value =
+            serde_json::from_str(&stored_payload).expect("parse stored payload");
+        assert_eq!(
+            stored["host_payload"]["transcript_path"].as_str(),
+            Some("/tmp/transcript.jsonl"),
+        );
+        assert_eq!(
+            stored["host_payload"]["hook_event_name"].as_str(),
+            Some("UserPromptSubmit"),
+        );
+    }
 }

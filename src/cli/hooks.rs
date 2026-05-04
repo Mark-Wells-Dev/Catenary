@@ -173,6 +173,62 @@ fn extract_file_path(hook_json: &serde_json::Value) -> Option<String> {
     Some(abs_path.to_string_lossy().into_owned())
 }
 
+// ── Host payload capture ───────────────────────────────────────────────
+
+/// Maximum character count for string values in the host payload.
+///
+/// Longer than any file path but short enough to trim multi-line code
+/// content from `tool_input` and `tool_result`.
+const HOST_PAYLOAD_STRING_MAX: usize = 512;
+
+/// Prepare the host CLI JSON for inclusion in the IPC request.
+///
+/// Clones the payload and truncates string values at the first newline
+/// or [`HOST_PAYLOAD_STRING_MAX`] characters to prevent oversized
+/// payloads from `tool_input` and `tool_result` fields (Edit/Write
+/// hooks can include full file content).
+fn prepare_host_payload(hook_json: &serde_json::Value) -> serde_json::Value {
+    let mut payload = hook_json.clone();
+    truncate_host_strings(&mut payload, HOST_PAYLOAD_STRING_MAX);
+    payload
+}
+
+/// Truncate string values in a JSON tree to prevent oversized payloads.
+///
+/// String values are truncated at the first newline or `max_chars`
+/// characters (whichever comes first). This preserves file paths and
+/// identifiers while trimming multi-line code content.
+fn truncate_host_strings(value: &mut serde_json::Value, max_chars: usize) {
+    match value {
+        serde_json::Value::String(s) => {
+            // Find the byte offset to truncate at: first newline or
+            // the max_chars-th character, whichever comes first.
+            let mut byte_offset = None;
+            for (i, (pos, ch)) in s.char_indices().enumerate() {
+                if ch == '\n' || i >= max_chars {
+                    byte_offset = Some(pos);
+                    break;
+                }
+            }
+            if let Some(pos) = byte_offset {
+                s.truncate(pos);
+                s.push('…');
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for v in map.values_mut() {
+                truncate_host_strings(v, max_chars);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr {
+                truncate_host_strings(v, max_chars);
+            }
+        }
+        _ => {}
+    }
+}
+
 // ── Hook transport functions ────────────────────────────────────────────
 
 /// Clear all editing state for a session (`SessionStart` hook handler).
@@ -228,6 +284,7 @@ pub fn run_session_start(format: HostFormat) {
     if let Some(sid) = session_id {
         request["session_id"] = serde_json::json!(sid);
     }
+    request["host_payload"] = prepare_host_payload(&hook_json);
 
     let lines = ipc_exchange(stream, &request);
 
@@ -305,11 +362,12 @@ pub fn run_post_agent(format: HostFormat) {
         .unwrap_or(false);
     let agent_id = extract_agent_id(&hook_json);
 
-    let request = serde_json::json!({
+    let mut request = serde_json::json!({
         "method": "post-agent/require-release",
         "agent_id": agent_id,
         "stop_hook_active": stop_hook_active,
     });
+    request["host_payload"] = prepare_host_payload(&hook_json);
 
     let lines = ipc_exchange(stream, &request);
 
@@ -401,6 +459,7 @@ pub fn run_post_tool(format: HostFormat) {
     if let Some(sid) = session_id {
         request["session_id"] = serde_json::json!(sid);
     }
+    request["host_payload"] = prepare_host_payload(&hook_json);
 
     // Response is unused — the server only accumulates file paths
     // during editing mode. Diagnostics are returned by `done_editing`.
@@ -431,7 +490,10 @@ pub fn run_pre_agent(format: HostFormat) {
     if let Some(catenary_sid) = find_session_id(&hook_json, &conn) {
         let endpoint = notify_endpoint(&catenary_sid);
         if let Some(stream) = notify_connect(&endpoint) {
-            let request = serde_json::json!({"method": "pre-agent/turn-start"});
+            let request = serde_json::json!({
+                "method": "pre-agent/turn-start",
+                "host_payload": prepare_host_payload(&hook_json),
+            });
             let _ = ipc_exchange(stream, &request);
         }
     }
@@ -524,6 +586,7 @@ pub fn run_pre_tool(format: HostFormat) {
     {
         request["cwd"] = serde_json::json!(c);
     }
+    request["host_payload"] = prepare_host_payload(&hook_json);
 
     let lines = ipc_exchange(stream, &request);
 
@@ -690,6 +753,7 @@ fn ipc_check_command(
     if let Some(sid) = session_id {
         request["session_id"] = serde_json::json!(sid);
     }
+    request["host_payload"] = prepare_host_payload(hook_json);
 
     let lines = ipc_exchange(stream, &request);
     let line = lines.first()?;
@@ -928,5 +992,107 @@ mod tests {
         assert!(!is_catenary_grep_or_glob("Bash"));
         assert!(!is_catenary_grep_or_glob("start_editing"));
         assert!(!is_catenary_grep_or_glob("mcp_catenary_start_editing"));
+    }
+
+    // ── Host payload truncation tests ─────────────────────────────────
+
+    #[test]
+    fn truncate_preserves_short_strings() {
+        let mut val = serde_json::json!({
+            "cwd": "/home/user/project",
+            "session_id": "abc-123",
+            "hook_event_name": "PreToolUse"
+        });
+        truncate_host_strings(&mut val, 512);
+        assert_eq!(val["cwd"], "/home/user/project");
+        assert_eq!(val["session_id"], "abc-123");
+        assert_eq!(val["hook_event_name"], "PreToolUse");
+    }
+
+    #[test]
+    fn truncate_at_newline() {
+        let mut val = serde_json::json!({
+            "tool_input": {
+                "file_path": "/src/main.rs",
+                "old_string": "fn main() {\n    println!(\"hello\");\n}\n",
+                "new_string": "fn main() {\n    eprintln!(\"hello\");\n}\n"
+            }
+        });
+        truncate_host_strings(&mut val, 512);
+        assert_eq!(val["tool_input"]["file_path"], "/src/main.rs");
+        assert_eq!(val["tool_input"]["old_string"], "fn main() {…");
+        assert_eq!(val["tool_input"]["new_string"], "fn main() {…");
+    }
+
+    #[test]
+    fn truncate_at_max_chars_without_newline() {
+        let long = "a".repeat(600);
+        let mut val = serde_json::json!({"field": long});
+        truncate_host_strings(&mut val, 512);
+        let result = val["field"].as_str().expect("string");
+        // 512 'a' chars + '…'
+        assert_eq!(result.chars().count(), 513);
+        assert!(result.ends_with('…'));
+    }
+
+    #[test]
+    fn truncate_counts_characters_not_bytes() {
+        // 600 multi-byte characters — should truncate at the 512th char,
+        // not at byte 512 (which would split a character).
+        let long: String = std::iter::repeat_n('é', 600).collect();
+        let mut val = serde_json::json!({"field": long});
+        truncate_host_strings(&mut val, 512);
+        let result = val["field"].as_str().expect("string");
+        assert_eq!(result.chars().count(), 513); // 512 'é' + '…'
+        assert!(result.ends_with('…'));
+        assert!(result.starts_with('é'));
+    }
+
+    #[test]
+    fn truncate_newline_before_max_chars_wins() {
+        // Newline at character 10, max_chars 512 → truncate at 10.
+        let mut val = serde_json::json!({"field": "short line\nrest of content"});
+        truncate_host_strings(&mut val, 512);
+        assert_eq!(val["field"], "short line…");
+    }
+
+    #[test]
+    fn truncate_recurses_into_arrays() {
+        let mut val = serde_json::json!({
+            "items": ["ok", "multi\nline", "also\nhere"]
+        });
+        truncate_host_strings(&mut val, 512);
+        assert_eq!(val["items"][0], "ok");
+        assert_eq!(val["items"][1], "multi…");
+        assert_eq!(val["items"][2], "also…");
+    }
+
+    #[test]
+    fn truncate_leaves_non_strings_unchanged() {
+        let mut val = serde_json::json!({
+            "count": 42,
+            "active": true,
+            "data": null
+        });
+        truncate_host_strings(&mut val, 512);
+        assert_eq!(val["count"], 42);
+        assert_eq!(val["active"], true);
+        assert!(val["data"].is_null());
+    }
+
+    #[test]
+    fn prepare_host_payload_truncates() {
+        let hook_json = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "cwd": "/home/user/project",
+            "tool_input": {
+                "file_path": "/src/lib.rs",
+                "old_string": "line1\nline2\nline3\nline4"
+            }
+        });
+        let prepared = prepare_host_payload(&hook_json);
+        assert_eq!(prepared["cwd"], "/home/user/project");
+        assert_eq!(prepared["tool_input"]["file_path"], "/src/lib.rs");
+        assert_eq!(prepared["tool_input"]["old_string"], "line1…");
     }
 }
