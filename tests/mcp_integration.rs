@@ -20,7 +20,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::json;
 
-use common::{BridgeProcess, mockls_lsp_arg};
+use common::{BridgeProcess, find_notify_socket, ipc_request, mockls_lsp_arg};
 
 const MOCK_LANG_A: &str = "yX4Za";
 const MOCK_LANG_B: &str = "d5apI";
@@ -3919,6 +3919,110 @@ fn test_mcp_cancel_already_completed() -> Result<()> {
     assert!(
         ping_response.get("result").is_some(),
         "bridge should respond after late cancellation: {ping_response}"
+    );
+
+    Ok(())
+}
+
+// ── Turn-boundary roots refresh ─────────────────────────────────────
+
+/// `PreAgent` hook triggers `roots/list` poll. The bridge sends a `roots/list`
+/// request and the MCP client responds with updated roots. A tool call sent
+/// immediately after `PreAgent` is queued behind the roots refresh.
+#[test]
+fn test_turn_boundary_roots_refresh() -> Result<()> {
+    let dir_a = tempfile::tempdir()?;
+    let root_a = dir_a.path().to_str().context("dir_a")?;
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "");
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root_a)?;
+
+    // Initialize with roots capability — first roots/list happens here.
+    bridge.initialize_with_roots(&[root_a])?;
+
+    // Find the hook socket.
+    let sessions_dir = PathBuf::from(bridge.state_home())
+        .join("catenary")
+        .join("sessions");
+    let socket_path = find_notify_socket(&sessions_dir)?;
+
+    // Send PreAgent hook — this should set the roots_refresh_requested flag.
+    ipc_request(&socket_path, &json!({"method": "pre-agent/turn-start"}))?;
+
+    // Now send a tool call. The run loop should check the flag BEFORE
+    // dispatch, triggering a roots/list request. The tool call is
+    // buffered behind the roots response.
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 500,
+        "method": "tools/call",
+        "params": {"name": "start_editing", "arguments": {}}
+    }))?;
+
+    // The bridge should send a roots/list request BEFORE responding
+    // to the tool call.
+    let msg = bridge.recv()?;
+    let method = msg.get("method").and_then(|m| m.as_str());
+    assert_eq!(
+        method,
+        Some("roots/list"),
+        "bridge should send roots/list before the tool response, got: {msg}"
+    );
+
+    // Respond to the roots/list request with the same roots (no change).
+    let request_id = msg.get("id").context("roots/list missing id")?.clone();
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "result": {"roots": [{"uri": format!("file://{root_a}")}]}
+    }))?;
+
+    // NOW the buffered tool call should be dispatched — read the response.
+    let tool_response = bridge.recv()?;
+    assert!(
+        tool_response.get("result").is_some(),
+        "tool call should succeed after roots refresh: {tool_response}"
+    );
+
+    Ok(())
+}
+
+/// `PreAgent` hook does NOT trigger `roots/list` when the client lacks roots
+/// capability.
+#[test]
+fn test_turn_boundary_no_roots_capability() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().to_str().context("dir")?;
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "");
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+
+    // Initialize WITHOUT roots capability.
+    bridge.initialize()?;
+
+    let sessions_dir = PathBuf::from(bridge.state_home())
+        .join("catenary")
+        .join("sessions");
+    let socket_path = find_notify_socket(&sessions_dir)?;
+
+    // Send PreAgent hook.
+    ipc_request(&socket_path, &json!({"method": "pre-agent/turn-start"}))?;
+
+    // Send a tool call. Without roots capability, the bridge should NOT
+    // send roots/list — the response should be the tool call result directly.
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 600,
+        "method": "ping"
+    }))?;
+
+    let response = bridge.recv()?;
+    assert!(
+        response.get("result").is_some(),
+        "should get ping result directly (no roots/list): {response}"
+    );
+    // Confirm it's the ping response, not a roots/list request.
+    assert!(
+        response.get("method").is_none(),
+        "should be a response, not a request: {response}"
     );
 
     Ok(())

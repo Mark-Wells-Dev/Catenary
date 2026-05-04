@@ -388,6 +388,7 @@ async fn run_server() -> Result<()> {
         .map_err(|_| anyhow::anyhow!("mutex poisoned"))?
         .set_socket_active();
 
+    let roots_refresh = toolbox.roots_refresh_requested.clone();
     let toolbox_for_roots = toolbox.clone();
     let toolbox_for_shutdown = toolbox.clone();
     let handler = McpRouter::new(toolbox);
@@ -396,6 +397,7 @@ async fn run_server() -> Result<()> {
     let session_for_callback = session.clone();
     let runtime_for_roots = tokio::runtime::Handle::current();
     let mut mcp_server = McpServer::new(handler, toolbox_for_roots.logging.clone())
+        .on_roots_refresh(roots_refresh)
         .on_client_info(Box::new(move |name: &str, version: &str| {
             if let Ok(mut session) = session_for_callback.lock() {
                 session.set_client_info(name, version);

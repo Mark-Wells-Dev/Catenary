@@ -158,6 +158,9 @@ pub struct Toolbox {
     pub instance_id: Arc<str>,
     /// Tokio runtime handle for blocking dispatch.
     pub runtime: Handle,
+    /// Set by `HookRouter` on `PreAgent` dispatch, cleared by `McpServer`
+    /// run loop. Triggers a `roots/list` poll at the next turn boundary.
+    pub roots_refresh_requested: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Toolbox {
@@ -269,6 +272,7 @@ impl Toolbox {
             symbol_index,
             instance_id,
             runtime,
+            roots_refresh_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
