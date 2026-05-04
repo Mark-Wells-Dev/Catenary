@@ -53,7 +53,6 @@ grep-matcher = "0.1.8"
 grep-regex = "0.1.14"
 grep-searcher = "0.1.16"
 ignore = "0.4.25"
-libc = "0.2"
 memchr = "2"
 notify = "8"
 regex = "1.10"
@@ -68,7 +67,6 @@ tokio-util = "0.7"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 unicode-width = "0.2"
-url = "2.5.8"
 
 [dev-dependencies]
 
