@@ -29,6 +29,7 @@ use tracing::{debug, info};
 use crate::bridge::HookRouter;
 use crate::bridge::toolbox::Toolbox;
 use crate::protocol::category::hook_category;
+use crate::source::Source;
 
 /// Emit a hook protocol event at the given tracing level.
 ///
@@ -400,10 +401,18 @@ impl HookServer {
                     current.push(root.clone());
                 }
             }
-            if current.len() > before
-                && let Err(e) = toolbox.sync_roots(current).await
-            {
-                debug!("transcript root sync failed: {e}");
+            let added = current.len() - before;
+            if added > 0 {
+                debug!(
+                    source = Source::HookDispatch.as_str(),
+                    added, "transcript root sync: syncing new roots",
+                );
+                if let Err(e) = toolbox.sync_roots(current).await {
+                    debug!(
+                        source = Source::HookDispatch.as_str(),
+                        "transcript root sync failed: {e}",
+                    );
+                }
             }
         }
 

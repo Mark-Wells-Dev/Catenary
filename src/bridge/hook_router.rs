@@ -152,6 +152,12 @@ fn scan_transcript(toolbox: &Toolbox) -> Vec<PathBuf> {
         }
     };
 
+    let file_len = file.metadata().map_or(0, |m| m.len());
+    debug!(
+        source = Source::HookDispatch.as_str(),
+        offset, file_len, "transcript scan: starting",
+    );
+
     if file.seek(SeekFrom::Start(offset)).is_err() {
         return Vec::new();
     }
@@ -178,6 +184,11 @@ fn scan_transcript(toolbox: &Toolbox) -> Vec<PathBuf> {
                 if path.is_absolute() {
                     match path.canonicalize() {
                         Ok(canonical) => {
+                            debug!(
+                                source = Source::HookDispatch.as_str(),
+                                root = %canonical.display(),
+                                "transcript scan: found /add-dir root",
+                            );
                             if !roots.contains(&canonical) {
                                 roots.push(canonical);
                             }
@@ -198,11 +209,17 @@ fn scan_transcript(toolbox: &Toolbox) -> Vec<PathBuf> {
         }
     }
 
-    if let Ok(pos) = file.stream_position() {
-        toolbox
-            .transcript_offset
-            .store(pos, std::sync::atomic::Ordering::Release);
-    }
+    let new_offset = file.stream_position().unwrap_or(offset);
+    toolbox
+        .transcript_offset
+        .store(new_offset, std::sync::atomic::Ordering::Release);
+
+    debug!(
+        source = Source::HookDispatch.as_str(),
+        roots_found = roots.len(),
+        new_offset,
+        "transcript scan: complete",
+    );
 
     roots
 }
