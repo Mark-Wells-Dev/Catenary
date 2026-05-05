@@ -361,12 +361,16 @@ pub fn run_post_agent(format: HostFormat) {
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     let agent_id = extract_agent_id(&hook_json);
+    let session_id = hook_json.get("session_id").and_then(|v| v.as_str());
 
     let mut request = serde_json::json!({
         "method": "post-agent/require-release",
         "agent_id": agent_id,
         "stop_hook_active": stop_hook_active,
     });
+    if let Some(sid) = session_id {
+        request["session_id"] = serde_json::json!(sid);
+    }
     request["host_payload"] = prepare_host_payload(&hook_json);
 
     let lines = ipc_exchange(stream, &request);

@@ -184,6 +184,9 @@ pub(crate) enum HookRequest {
         /// Agent ID (empty string for the main agent).
         #[serde(default)]
         agent_id: String,
+        /// Host CLI session ID (Claude Code / Gemini CLI UUID).
+        #[serde(default)]
+        session_id: Option<String>,
         /// Whether this is a retry (Claude Code `stop_hook_active`).
         #[serde(default)]
         stop_hook_active: bool,
@@ -503,6 +506,7 @@ mod tests {
     // ── Request deserialization tests ────────────────────────────────────
 
     #[test]
+    #[allow(clippy::too_many_lines, reason = "one assertion per variant")]
     fn test_hook_request_tagged_deserialization() {
         // pre-agent/turn-start (no transcript_path)
         let json = r#"{"method": "pre-agent/turn-start"}"#;
@@ -580,17 +584,35 @@ mod tests {
         };
         assert!(tool.is_none());
 
-        // post-agent/require-release
+        // post-agent/require-release (without session_id — backward compat)
         let json =
             r#"{"method": "post-agent/require-release", "agent_id": "", "stop_hook_active": true}"#;
         let req: HookRequest = serde_json::from_str(json).expect("require-release");
         let HookRequest::PostAgent {
-            stop_hook_active, ..
+            session_id,
+            stop_hook_active,
+            ..
         } = req
         else {
             unreachable!("expected PostAgent");
         };
         assert!(stop_hook_active);
+        assert!(session_id.is_none());
+
+        // post-agent/require-release with session_id
+        let json = r#"{"method": "post-agent/require-release", "agent_id": "sub-1", "session_id": "sess-abc", "stop_hook_active": false}"#;
+        let req: HookRequest = serde_json::from_str(json).expect("require-release with session");
+        let HookRequest::PostAgent {
+            agent_id,
+            session_id,
+            stop_hook_active,
+        } = req
+        else {
+            unreachable!("expected PostAgent");
+        };
+        assert_eq!(agent_id, "sub-1");
+        assert_eq!(session_id.as_deref(), Some("sess-abc"));
+        assert!(!stop_hook_active);
 
         // session-start/clear-editing
         let json = r#"{"method": "session-start/clear-editing", "session_id": "uuid-123"}"#;

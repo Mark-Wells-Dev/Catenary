@@ -473,6 +473,7 @@ impl HookRouter {
                     &tool_name,
                     file_path.as_deref(),
                     command.as_deref(),
+                    session_id.as_deref(),
                     &agent_id,
                 );
                 // Stash the host CLI's cwd for the upcoming MCP grep/glob
@@ -516,16 +517,24 @@ impl HookRouter {
                     "Hook: processing file {file}"
                 );
                 DispatchResult {
-                    result: self.handle_file_accumulation(&file, &agent_id, tool.as_deref()),
+                    result: self.handle_file_accumulation(
+                        &file,
+                        session_id.as_deref(),
+                        &agent_id,
+                        tool.as_deref(),
+                    ),
                     system_message: None,
                     add_roots: Vec::new(),
                 }
             }
             HookRequest::PostAgent {
                 agent_id,
+                session_id,
                 stop_hook_active,
             } => {
-                let result = self.handle_require_release(&agent_id, stop_hook_active);
+                self.store_client_session_id(session_id.as_deref());
+                let result =
+                    self.handle_require_release(session_id.as_deref(), &agent_id, stop_hook_active);
                 // Drain at stationary point: only when allowing the stop.
                 let system_message = if matches!(result, Some(HookResult::Block(_))) {
                     None
@@ -578,15 +587,16 @@ impl HookRouter {
         tool_name: &str,
         file_path: Option<&str>,
         command: Option<&str>,
+        session_id: Option<&str>,
         agent_id: &str,
     ) -> Option<HookResult> {
         // start_editing: enter editing mode and allow unconditionally.
         if is_catenary_tool(tool_name, "start_editing") {
-            let _ = self.toolbox.editing.start_editing(agent_id);
+            let _ = self.toolbox.editing.start_editing(session_id, agent_id);
             return None;
         }
 
-        let agent_editing = self.toolbox.editing.is_editing(agent_id);
+        let agent_editing = self.toolbox.editing.is_editing(session_id, agent_id);
 
         if agent_editing {
             if is_allowed_during_editing(tool_name)
@@ -625,10 +635,13 @@ impl HookRouter {
     fn handle_file_accumulation(
         &self,
         file_path: &str,
+        session_id: Option<&str>,
         agent_id: &str,
         tool_name: Option<&str>,
     ) -> Option<HookResult> {
-        if self.toolbox.editing.is_editing(agent_id) && tool_name.is_some_and(is_edit_tool) {
+        if self.toolbox.editing.is_editing(session_id, agent_id)
+            && tool_name.is_some_and(is_edit_tool)
+        {
             // Only accumulate files with known LSP coverage — files
             // without coverage have no server to produce diagnostics,
             // so processing them in done_editing is wasted work.
@@ -636,7 +649,7 @@ impl HookRouter {
             if self.toolbox.has_lsp_coverage(path) {
                 self.toolbox
                     .editing
-                    .add_file(agent_id, PathBuf::from(file_path));
+                    .add_file(session_id, agent_id, PathBuf::from(file_path));
             }
         }
         None
@@ -647,15 +660,20 @@ impl HookRouter {
     /// If `stop_hook_active` is true (retry after the agent failed to call
     /// `done_editing`), force-clears the stale editing state and allows.
     /// Otherwise blocks if the agent is in editing mode.
-    fn handle_require_release(&self, agent_id: &str, stop_hook_active: bool) -> Option<HookResult> {
+    fn handle_require_release(
+        &self,
+        session_id: Option<&str>,
+        agent_id: &str,
+        stop_hook_active: bool,
+    ) -> Option<HookResult> {
         if stop_hook_active {
             // Agent was told to call done_editing but didn't. Clear stale
             // state rather than leaving it for SessionStart/GC cleanup.
-            self.toolbox.editing.done_editing(agent_id);
+            self.toolbox.editing.done_editing(session_id, agent_id);
             return None;
         }
 
-        if self.toolbox.editing.is_editing(agent_id) {
+        if self.toolbox.editing.is_editing(session_id, agent_id) {
             Some(HookResult::Block(
                 "call done_editing to get diagnostics before finishing".into(),
             ))
@@ -796,7 +814,7 @@ mod tests {
     fn test_hook_enforce_editing_deny() {
         let router = test_router();
         // No editing state — Edit should be denied
-        let result = router.handle_enforce_editing("Edit", None, None, "");
+        let result = router.handle_enforce_editing("Edit", None, None, None, "");
         let Some(HookResult::Deny(reason)) = result else {
             unreachable!("expected Deny, got {result:?}");
         };
@@ -807,23 +825,23 @@ mod tests {
     fn test_hook_enforce_editing_allow() {
         let router = test_router();
         // Enter editing mode through the hook handler
-        let result = router.handle_enforce_editing(START_EDITING, None, None, "");
+        let result = router.handle_enforce_editing(START_EDITING, None, None, None, "");
         assert!(result.is_none(), "start_editing should allow");
         assert!(
-            router.toolbox.editing.is_editing(""),
+            router.toolbox.editing.is_editing(None, ""),
             "should be in editing mode"
         );
 
         // Edit tool — should allow during editing mode
-        let result = router.handle_enforce_editing("Edit", None, None, "");
+        let result = router.handle_enforce_editing("Edit", None, None, None, "");
         assert!(result.is_none(), "expected allow, got {result:?}");
 
         // Read tool — always allowed during editing
-        let result = router.handle_enforce_editing("Read", None, None, "");
+        let result = router.handle_enforce_editing("Read", None, None, None, "");
         assert!(result.is_none(), "expected allow for Read, got {result:?}");
 
         // Non-edit, non-read tool while editing — should deny
-        let result = router.handle_enforce_editing("Bash", None, None, "");
+        let result = router.handle_enforce_editing("Bash", None, None, None, "");
         let Some(HookResult::Deny(reason)) = result else {
             unreachable!("expected Deny for Bash, got {result:?}");
         };
@@ -833,20 +851,20 @@ mod tests {
     #[test]
     fn test_hook_file_accumulation() {
         let (router, root) = test_router_with_root();
-        router.handle_enforce_editing(START_EDITING, None, None, "");
+        router.handle_enforce_editing(START_EDITING, None, None, None, "");
 
         let main_rs = format!("{}/src/main.rs", root.display());
 
         // Edit tool accumulates file within root
-        let result = router.handle_file_accumulation(&main_rs, "", Some("Edit"));
+        let result = router.handle_file_accumulation(&main_rs, None, "", Some("Edit"));
         assert!(result.is_none());
 
         // Read tool does not accumulate
         let lib_rs = format!("{}/src/lib.rs", root.display());
-        let result = router.handle_file_accumulation(&lib_rs, "", Some("Read"));
+        let result = router.handle_file_accumulation(&lib_rs, None, "", Some("Read"));
         assert!(result.is_none());
 
-        let files = router.toolbox.editing.drain_files("");
+        let files = router.toolbox.editing.drain_files(None, "");
         assert_eq!(files, vec![PathBuf::from(&main_rs)]);
     }
 
@@ -854,9 +872,9 @@ mod tests {
     fn test_hook_require_release_block() {
         let router = test_router();
         // Enter editing mode through the hook handler
-        router.handle_enforce_editing(START_EDITING, None, None, "");
+        router.handle_enforce_editing(START_EDITING, None, None, None, "");
 
-        let result = router.handle_require_release("", false);
+        let result = router.handle_require_release(None, "", false);
         let Some(HookResult::Block(reason)) = result else {
             unreachable!("expected Block, got {result:?}");
         };
@@ -867,7 +885,7 @@ mod tests {
     fn test_hook_require_release_allow() {
         let router = test_router();
         // No editing state — should allow
-        let result = router.handle_require_release("", false);
+        let result = router.handle_require_release(None, "", false);
         assert!(result.is_none(), "expected allow, got {result:?}");
     }
 
@@ -875,15 +893,15 @@ mod tests {
     fn test_hook_require_release_retry() {
         let router = test_router();
         // Enter editing mode through the hook handler
-        router.handle_enforce_editing(START_EDITING, None, None, "");
+        router.handle_enforce_editing(START_EDITING, None, None, None, "");
 
         // stop_hook_active = true → always allow regardless of state
-        let result = router.handle_require_release("", true);
+        let result = router.handle_require_release(None, "", true);
         assert!(result.is_none(), "expected allow on retry, got {result:?}");
 
         // State should be cleared
         assert!(
-            !router.toolbox.editing.is_editing(""),
+            !router.toolbox.editing.is_editing(None, ""),
             "editing state should be cleared after retry"
         );
     }
@@ -892,8 +910,8 @@ mod tests {
     fn test_hook_clear_editing() {
         let router = test_router();
         // Enter editing mode for two agents through the hook handler
-        router.handle_enforce_editing(START_EDITING, None, None, "");
-        router.handle_enforce_editing(START_EDITING, None, None, "agent-b");
+        router.handle_enforce_editing(START_EDITING, None, None, None, "");
+        router.handle_enforce_editing(START_EDITING, None, None, None, "agent-b");
 
         let result = router.handle_clear_editing();
         assert_eq!(result, Some(HookResult::Cleared(2)));
@@ -913,7 +931,8 @@ mod tests {
         let router = test_router();
         // Edit on a file outside workspace roots while not editing →
         // should allow (no diagnostics will come for out-of-root files).
-        let result = router.handle_enforce_editing("Edit", Some("/outside/some/file.rs"), None, "");
+        let result =
+            router.handle_enforce_editing("Edit", Some("/outside/some/file.rs"), None, None, "");
         assert!(
             result.is_none(),
             "out-of-root edit should be allowed without start_editing, got {result:?}"
@@ -925,7 +944,7 @@ mod tests {
         let (router, root) = test_router_with_root();
         // Edit on a file inside workspace roots while not editing → deny.
         let in_root = format!("{}/src/main.rs", root.display());
-        let result = router.handle_enforce_editing("Edit", Some(&in_root), None, "");
+        let result = router.handle_enforce_editing("Edit", Some(&in_root), None, None, "");
         let Some(HookResult::Deny(reason)) = result else {
             unreachable!("expected Deny for in-root edit, got {result:?}");
         };
@@ -936,7 +955,7 @@ mod tests {
     fn test_enforce_editing_no_file_path_still_denies() {
         let router = test_router();
         // Edit with no file path (e.g., host didn't supply it) → deny.
-        let result = router.handle_enforce_editing("Edit", None, None, "");
+        let result = router.handle_enforce_editing("Edit", None, None, None, "");
         let Some(HookResult::Deny(_)) = result else {
             unreachable!("expected Deny when file_path is None, got {result:?}");
         };
@@ -945,11 +964,11 @@ mod tests {
     #[test]
     fn test_file_accumulation_skips_out_of_root() {
         let router = test_router();
-        router.handle_enforce_editing(START_EDITING, None, None, "");
+        router.handle_enforce_editing(START_EDITING, None, None, None, "");
 
         // File outside workspace roots — should not be accumulated.
-        router.handle_file_accumulation("/outside/some/file.rs", "", Some("Edit"));
-        let files = router.toolbox.editing.drain_files("");
+        router.handle_file_accumulation("/outside/some/file.rs", None, "", Some("Edit"));
+        let files = router.toolbox.editing.drain_files(None, "");
         assert!(
             files.is_empty(),
             "out-of-root file should not be accumulated"
@@ -959,11 +978,11 @@ mod tests {
     #[test]
     fn test_file_accumulation_keeps_in_root() {
         let (router, root) = test_router_with_root();
-        router.handle_enforce_editing(START_EDITING, None, None, "");
+        router.handle_enforce_editing(START_EDITING, None, None, None, "");
 
         let in_root = format!("{}/src/main.rs", root.display());
-        router.handle_file_accumulation(&in_root, "", Some("Edit"));
-        let files = router.toolbox.editing.drain_files("");
+        router.handle_file_accumulation(&in_root, None, "", Some("Edit"));
+        let files = router.toolbox.editing.drain_files(None, "");
         assert_eq!(files.len(), 1, "in-root file should be accumulated");
     }
 
@@ -1055,7 +1074,7 @@ mod tests {
         // single_file = true, no failure → server expected to work → gate.
         let router = test_router_with_sf_config(false);
         let path = format!("/outside/file.{SF_LANG}");
-        let result = router.handle_enforce_editing("Edit", Some(&path), None, "");
+        let result = router.handle_enforce_editing("Edit", Some(&path), None, None, "");
         let Some(HookResult::Deny(reason)) = result else {
             unreachable!("expected Deny for single_file out-of-root edit, got {result:?}");
         };
@@ -1067,7 +1086,7 @@ mod tests {
         // single_file = true but server rejected at runtime → skip gate.
         let router = test_router_with_sf_config(true);
         let path = format!("/outside/file.{SF_LANG}");
-        let result = router.handle_enforce_editing("Edit", Some(&path), None, "");
+        let result = router.handle_enforce_editing("Edit", Some(&path), None, None, "");
         assert!(
             result.is_none(),
             "runtime-failed out-of-root edit should be allowed, got {result:?}"
@@ -1078,7 +1097,8 @@ mod tests {
     fn test_enforce_editing_skips_out_of_root_without_single_file_config() {
         // No single_file config at all → skip gate.
         let router = test_router();
-        let result = router.handle_enforce_editing("Edit", Some("/outside/some/file.rs"), None, "");
+        let result =
+            router.handle_enforce_editing("Edit", Some("/outside/some/file.rs"), None, None, "");
         assert!(
             result.is_none(),
             "out-of-root edit without single_file config should be allowed, got {result:?}"
@@ -1089,11 +1109,11 @@ mod tests {
     fn test_file_accumulation_includes_out_of_root_with_single_file_config() {
         // single_file = true, no failure → file should be accumulated.
         let router = test_router_with_sf_config(false);
-        router.handle_enforce_editing(START_EDITING, None, None, "");
+        router.handle_enforce_editing(START_EDITING, None, None, None, "");
 
         let path = format!("/outside/file.{SF_LANG}");
-        router.handle_file_accumulation(&path, "", Some("Edit"));
-        let files = router.toolbox.editing.drain_files("");
+        router.handle_file_accumulation(&path, None, "", Some("Edit"));
+        let files = router.toolbox.editing.drain_files(None, "");
         assert_eq!(
             files.len(),
             1,
@@ -1105,11 +1125,11 @@ mod tests {
     fn test_file_accumulation_skips_out_of_root_with_runtime_failure() {
         // single_file = true but runtime failure → file should NOT be accumulated.
         let router = test_router_with_sf_config(true);
-        router.handle_enforce_editing(START_EDITING, None, None, "");
+        router.handle_enforce_editing(START_EDITING, None, None, None, "");
 
         let path = format!("/outside/file.{SF_LANG}");
-        router.handle_file_accumulation(&path, "", Some("Edit"));
-        let files = router.toolbox.editing.drain_files("");
+        router.handle_file_accumulation(&path, None, "", Some("Edit"));
+        let files = router.toolbox.editing.drain_files(None, "");
         assert!(
             files.is_empty(),
             "runtime-failed out-of-root file should not be accumulated"
@@ -1169,10 +1189,10 @@ mod tests {
     #[test]
     fn test_enforce_editing_allows_filesystem_bash() {
         let router = test_router();
-        router.handle_enforce_editing(START_EDITING, None, None, "");
+        router.handle_enforce_editing(START_EDITING, None, None, None, "");
 
         // Filesystem-only Bash — should allow during editing
-        let result = router.handle_enforce_editing("Bash", None, Some("rm -rf target/"), "");
+        let result = router.handle_enforce_editing("Bash", None, Some("rm -rf target/"), None, "");
         assert!(
             result.is_none(),
             "filesystem-only Bash should be allowed during editing, got {result:?}"
@@ -1183,6 +1203,7 @@ mod tests {
             "run_shell_command",
             None,
             Some("mkdir -p src/new_module"),
+            None,
             "",
         );
         assert!(
@@ -1194,10 +1215,10 @@ mod tests {
     #[test]
     fn test_enforce_editing_denies_non_filesystem_bash() {
         let router = test_router();
-        router.handle_enforce_editing(START_EDITING, None, None, "");
+        router.handle_enforce_editing(START_EDITING, None, None, None, "");
 
         // Non-filesystem Bash — should deny during editing
-        let result = router.handle_enforce_editing("Bash", None, Some("cargo build"), "");
+        let result = router.handle_enforce_editing("Bash", None, Some("cargo build"), None, "");
         let Some(HookResult::Deny(reason)) = result else {
             unreachable!("expected Deny for non-filesystem Bash, got {result:?}");
         };
@@ -1207,10 +1228,10 @@ mod tests {
     #[test]
     fn test_enforce_editing_denies_bash_without_command() {
         let router = test_router();
-        router.handle_enforce_editing(START_EDITING, None, None, "");
+        router.handle_enforce_editing(START_EDITING, None, None, None, "");
 
         // Bash without command string — cannot verify, must deny
-        let result = router.handle_enforce_editing("Bash", None, None, "");
+        let result = router.handle_enforce_editing("Bash", None, None, None, "");
         let Some(HookResult::Deny(_)) = result else {
             unreachable!("expected Deny for Bash without command, got {result:?}");
         };
@@ -1364,6 +1385,7 @@ mod tests {
         let result = router.dispatch(
             crate::hook::HookRequest::PostAgent {
                 agent_id: String::new(),
+                session_id: None,
                 stop_hook_active: false,
             },
             0,
@@ -1380,7 +1402,7 @@ mod tests {
     fn dispatch_stop_block_preserves_notifications() {
         let router = test_router();
         // Enter editing mode so stop blocks.
-        router.handle_enforce_editing(START_EDITING, None, None, "");
+        router.handle_enforce_editing(START_EDITING, None, None, None, "");
 
         crate::logging::Sink::handle(
             router.toolbox.notifications.as_ref(),
@@ -1390,6 +1412,7 @@ mod tests {
         let result = router.dispatch(
             crate::hook::HookRequest::PostAgent {
                 agent_id: String::new(),
+                session_id: None,
                 stop_hook_active: false,
             },
             0,
@@ -1433,7 +1456,7 @@ mod tests {
     fn dispatch_stop_block_then_allow_drains_accumulated() {
         let router = test_router();
         // Enter editing mode so stop blocks.
-        router.handle_enforce_editing(START_EDITING, None, None, "");
+        router.handle_enforce_editing(START_EDITING, None, None, None, "");
 
         // Enqueue a notification before the first stop.
         crate::logging::Sink::handle(
@@ -1445,6 +1468,7 @@ mod tests {
         let result = router.dispatch(
             crate::hook::HookRequest::PostAgent {
                 agent_id: String::new(),
+                session_id: None,
                 stop_hook_active: false,
             },
             0,
@@ -1464,6 +1488,7 @@ mod tests {
         let result = router.dispatch(
             crate::hook::HookRequest::PostAgent {
                 agent_id: String::new(),
+                session_id: None,
                 stop_hook_active: true,
             },
             0,
@@ -1486,7 +1511,7 @@ mod tests {
     #[test]
     fn dispatch_stop_dedup_persists_across_blocked_cycle() {
         let router = test_router();
-        router.handle_enforce_editing(START_EDITING, None, None, "");
+        router.handle_enforce_editing(START_EDITING, None, None, None, "");
 
         // Enqueue a notification.
         crate::logging::Sink::handle(
@@ -1498,6 +1523,7 @@ mod tests {
         let result = router.dispatch(
             crate::hook::HookRequest::PostAgent {
                 agent_id: String::new(),
+                session_id: None,
                 stop_hook_active: false,
             },
             0,
@@ -1519,6 +1545,7 @@ mod tests {
         let result = router.dispatch(
             crate::hook::HookRequest::PostAgent {
                 agent_id: String::new(),
+                session_id: None,
                 stop_hook_active: true,
             },
             0,
@@ -1854,7 +1881,7 @@ mod tests {
     fn dispatch_pre_tool_denied_does_not_stash() {
         let router = test_router();
         // Enter editing mode so non-allowed tools are denied.
-        router.handle_enforce_editing(START_EDITING, None, None, "");
+        router.handle_enforce_editing(START_EDITING, None, None, None, "");
 
         router.dispatch(
             crate::hook::HookRequest::PreTool {
