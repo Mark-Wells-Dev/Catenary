@@ -404,7 +404,7 @@ async fn run_server() -> Result<()> {
             }
         }))
         .on_roots_changed(Box::new(move |roots| {
-            let paths: Vec<PathBuf> = roots
+            let mut paths: Vec<PathBuf> = roots
                 .iter()
                 .filter_map(|root| {
                     root.uri.strip_prefix("file://").and_then(|p| {
@@ -422,6 +422,10 @@ async fn run_server() -> Result<()> {
                     })
                 })
                 .collect();
+
+            // Merge stored transcript roots so fetch_roots can't overwrite
+            // them with a roots/list response that omits /add-dir roots.
+            toolbox_for_roots.merge_transcript_roots(&mut paths);
 
             runtime_for_roots.block_on(toolbox_for_roots.sync_roots(paths))?;
             Ok(())

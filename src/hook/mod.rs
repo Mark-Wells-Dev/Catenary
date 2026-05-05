@@ -104,7 +104,12 @@ fn emit_hook_event(
 pub(crate) enum HookRequest {
     /// Turn boundary signal (fires at each user prompt / agent turn start).
     #[serde(rename = "pre-agent/turn-start")]
-    PreAgent {},
+    PreAgent {
+        /// Path to the host CLI's transcript file (Claude Code only).
+        /// Used for transcript-based `/add-dir` root detection.
+        #[serde(default)]
+        transcript_path: Option<String>,
+    },
 
     /// Editing state enforcement: deny or allow a tool call.
     #[serde(rename = "pre-tool/editing-state")]
@@ -380,6 +385,25 @@ impl HookServer {
 
         let result = self.router.dispatch(request, id.0);
 
+        // Apply transcript-discovered roots before responding to the hook.
+        // Runs async in the hook server task — sync_roots is the single
+        // serialization point for root updates.
+        if !result.add_roots.is_empty() {
+            let toolbox = &self.router.toolbox;
+            let mut current = toolbox.roots();
+            let before = current.len();
+            for root in &result.add_roots {
+                if !current.contains(root) {
+                    current.push(root.clone());
+                }
+            }
+            if current.len() > before
+                && let Err(e) = toolbox.sync_roots(current).await
+            {
+                debug!("transcript root sync failed: {e}");
+            }
+        }
+
         let envelope = HookResponseEnvelope {
             result: result.result,
             system_message: result.system_message,
@@ -480,10 +504,26 @@ mod tests {
 
     #[test]
     fn test_hook_request_tagged_deserialization() {
-        // pre-agent/turn-start
+        // pre-agent/turn-start (no transcript_path)
         let json = r#"{"method": "pre-agent/turn-start"}"#;
         let req: HookRequest = serde_json::from_str(json).expect("turn-start");
-        assert!(matches!(req, HookRequest::PreAgent {}));
+        assert!(matches!(
+            req,
+            HookRequest::PreAgent {
+                transcript_path: None
+            }
+        ));
+
+        // pre-agent/turn-start with transcript_path
+        let json =
+            r#"{"method": "pre-agent/turn-start", "transcript_path": "/tmp/transcript.jsonl"}"#;
+        let req: HookRequest = serde_json::from_str(json).expect("turn-start with transcript");
+        assert!(matches!(
+            req,
+            HookRequest::PreAgent {
+                transcript_path: Some(ref p)
+            } if p == "/tmp/transcript.jsonl"
+        ));
 
         // pre-tool/editing-state with all fields
         let json = r#"{"method": "pre-tool/editing-state", "tool_name": "Edit", "file_path": "/tmp/foo.rs", "agent_id": "", "session_id": "abc123"}"#;
@@ -948,7 +988,12 @@ mod tests {
             }
         }"#;
         let req: HookRequest = serde_json::from_str(json).expect("should deserialize");
-        assert!(matches!(req, HookRequest::PreAgent {}));
+        assert!(matches!(
+            req,
+            HookRequest::PreAgent {
+                transcript_path: None
+            }
+        ));
 
         // The raw Value retains host_payload for protocol logging.
         let raw: serde_json::Value = serde_json::from_str(json).expect("parse raw");

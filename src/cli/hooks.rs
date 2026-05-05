@@ -490,10 +490,13 @@ pub fn run_pre_agent(format: HostFormat) {
     if let Some(catenary_sid) = find_session_id(&hook_json, &conn) {
         let endpoint = notify_endpoint(&catenary_sid);
         if let Some(stream) = notify_connect(&endpoint) {
-            let request = serde_json::json!({
+            let mut request = serde_json::json!({
                 "method": "pre-agent/turn-start",
                 "host_payload": prepare_host_payload(&hook_json),
             });
+            if let Some(tp) = hook_json.get("transcript_path").and_then(|v| v.as_str()) {
+                request["transcript_path"] = serde_json::json!(tp);
+            }
             let _ = ipc_exchange(stream, &request);
         }
     }

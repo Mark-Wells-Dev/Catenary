@@ -161,6 +161,15 @@ pub struct Toolbox {
     /// Set by `HookRouter` on `PreAgent` dispatch, cleared by `McpServer`
     /// run loop. Triggers a `roots/list` poll at the next turn boundary.
     pub roots_refresh_requested: Arc<std::sync::atomic::AtomicBool>,
+    /// Transcript file path, stashed by `HookRouter` on `PreAgent` dispatch.
+    /// Read by [`scan_transcript`] for `/add-dir` root detection.
+    pub transcript_path: std::sync::Mutex<Option<PathBuf>>,
+    /// Byte offset for incremental transcript scanning.
+    pub transcript_offset: std::sync::atomic::AtomicU64,
+    /// Cumulative set of roots discovered from the transcript.
+    /// Written by the eager scan (`PreAgent`), read by `on_roots_changed`
+    /// to prevent `fetch_roots` from overwriting them.
+    pub transcript_roots: std::sync::Mutex<Vec<PathBuf>>,
 }
 
 impl Toolbox {
@@ -273,6 +282,9 @@ impl Toolbox {
             instance_id,
             runtime,
             roots_refresh_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            transcript_path: std::sync::Mutex::new(None),
+            transcript_offset: std::sync::atomic::AtomicU64::new(0),
+            transcript_roots: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -319,6 +331,11 @@ impl Toolbox {
         lang.is_some_and(|id| self.client_manager.has_single_file_coverage(&id))
     }
 
+    /// Returns the current workspace roots.
+    pub fn roots(&self) -> Vec<PathBuf> {
+        self.client_manager.roots()
+    }
+
     /// Diffs the filesystem and notifies servers with matching file watcher
     /// registrations. Delegates to [`LspClientManager::notify_file_changes`].
     pub async fn notify_file_changes(&self) {
@@ -328,6 +345,22 @@ impl Toolbox {
     /// Spawns LSP servers for languages detected in the workspace.
     pub async fn spawn_all(&self) {
         self.client_manager.spawn_all().await;
+    }
+
+    /// Merges stored transcript roots into the given root set.
+    ///
+    /// Appends any transcript-discovered roots that aren't already present.
+    /// Used by the `on_roots_changed` callback to prevent `fetch_roots`
+    /// from overwriting transcript-discovered roots with a `roots/list`
+    /// response that omits `/add-dir` roots.
+    pub fn merge_transcript_roots(&self, paths: &mut Vec<PathBuf>) {
+        if let Ok(stored) = self.transcript_roots.lock() {
+            for root in stored.iter() {
+                if !paths.contains(root) {
+                    paths.push(root.clone());
+                }
+            }
+        }
     }
 
     /// Synchronizes workspace roots with a new set.
@@ -563,5 +596,81 @@ mod tests {
         // When strip_prefix fails, falls back to matching the full path.
         // A bare filename matches *.txt.
         assert!(rg.is_match(Path::new("notes.txt"), Path::new("/nonexistent")));
+    }
+
+    // ── merge_transcript_roots ────────────────────────────────────────
+
+    fn make_toolbox() -> (tempfile::TempDir, tokio::runtime::Runtime, Toolbox) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("catenary").join("catenary.db");
+        let conn = crate::db::open_and_migrate_at(&db_path).expect("open test DB");
+        let conn = Arc::new(std::sync::Mutex::new(conn));
+        let logging = crate::logging::LoggingServer::new();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let instance_id: Arc<str> = "test".into();
+        let toolbox = Toolbox::new(
+            Config::default(),
+            vec![],
+            logging,
+            conn,
+            instance_id,
+            runtime.handle().clone(),
+        );
+        (dir, runtime, toolbox)
+    }
+
+    #[test]
+    fn merge_transcript_roots_adds_missing() {
+        let (_dir, _rt, toolbox) = make_toolbox();
+        let root_a = PathBuf::from("/tmp/a");
+        let root_b = PathBuf::from("/tmp/b");
+
+        // Pre-populate transcript roots with root_b.
+        toolbox
+            .transcript_roots
+            .lock()
+            .expect("lock")
+            .push(root_b.clone());
+
+        // MCP roots only has root_a.
+        let mut paths = vec![root_a.clone()];
+        toolbox.merge_transcript_roots(&mut paths);
+
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0], root_a);
+        assert_eq!(paths[1], root_b);
+    }
+
+    #[test]
+    fn merge_transcript_roots_deduplicates() {
+        let (_dir, _rt, toolbox) = make_toolbox();
+        let root = PathBuf::from("/tmp/shared");
+
+        // Transcript roots has the same root as MCP roots.
+        toolbox
+            .transcript_roots
+            .lock()
+            .expect("lock")
+            .push(root.clone());
+
+        let mut paths = vec![root.clone()];
+        toolbox.merge_transcript_roots(&mut paths);
+
+        // No duplicate added.
+        assert_eq!(paths, vec![root]);
+    }
+
+    #[test]
+    fn merge_transcript_roots_empty_stored() {
+        let (_dir, _rt, toolbox) = make_toolbox();
+
+        let mut paths = vec![PathBuf::from("/tmp/mcp_root")];
+        toolbox.merge_transcript_roots(&mut paths);
+
+        // No change when transcript_roots is empty.
+        assert_eq!(paths.len(), 1);
     }
 }

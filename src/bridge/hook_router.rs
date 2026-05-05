@@ -106,6 +106,105 @@ pub struct DispatchResult {
     pub result: Option<HookResult>,
     /// Composed `systemMessage` content (direct + background drain).
     pub system_message: Option<String>,
+    /// Roots discovered from transcript scanning (`PreAgent` only).
+    pub add_roots: Vec<PathBuf>,
+}
+
+// ── Transcript scanning ───────────────────────────────────────────────
+
+/// Prefix of the `/add-dir` confirmation message in Claude Code's JSONL
+/// transcript. ANSI bold escape is JSON-encoded as `\u001b[1m`.
+const ADD_DIR_PREFIX: &str = "Added \\u001b[1m";
+
+/// Suffix of the `/add-dir` confirmation message.
+const ADD_DIR_SUFFIX: &str = "\\u001b[22m as a working directory";
+
+/// Scan the transcript for `/add-dir` confirmation messages.
+///
+/// Reads from the byte offset stored on `toolbox`, scans new lines for
+/// the confirmation pattern, updates the offset, and returns newly
+/// discovered root paths. Returns an empty vec if no transcript path is
+/// stashed, the file is unreadable, or no new `/add-dir` entries exist.
+fn scan_transcript(toolbox: &Toolbox) -> Vec<PathBuf> {
+    use std::io::{BufRead, Seek, SeekFrom};
+
+    let path = match toolbox.transcript_path.lock() {
+        Ok(guard) => match guard.as_ref() {
+            Some(p) => p.clone(),
+            None => return Vec::new(),
+        },
+        Err(_) => return Vec::new(),
+    };
+
+    let offset = toolbox
+        .transcript_offset
+        .load(std::sync::atomic::Ordering::Acquire);
+
+    let mut file = match std::fs::File::open(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            debug!(
+                source = Source::HookDispatch.as_str(),
+                "transcript scan: cannot open {}: {e}",
+                path.display(),
+            );
+            return Vec::new();
+        }
+    };
+
+    if file.seek(SeekFrom::Start(offset)).is_err() {
+        return Vec::new();
+    }
+
+    let mut roots = Vec::new();
+    let reader = std::io::BufReader::new(&mut file);
+
+    for line in reader.lines() {
+        let Ok(line) = line else { break };
+        if !line.contains(ADD_DIR_PREFIX) {
+            continue;
+        }
+        let mut search_from = 0;
+        while let Some(start) = line[search_from..].find(ADD_DIR_PREFIX) {
+            let abs_start = search_from + start + ADD_DIR_PREFIX.len();
+            if let Some(end) = line[abs_start..].find(ADD_DIR_SUFFIX) {
+                let path_str = &line[abs_start..abs_start + end];
+                // Unescape JSON string escapes (path is inside a JSON string)
+                let path_str = path_str
+                    .replace("\\\\", "\\")
+                    .replace("\\/", "/")
+                    .replace("\\\"", "\"");
+                let path = PathBuf::from(&path_str);
+                if path.is_absolute() {
+                    match path.canonicalize() {
+                        Ok(canonical) => {
+                            if !roots.contains(&canonical) {
+                                roots.push(canonical);
+                            }
+                        }
+                        Err(e) => {
+                            debug!(
+                                source = Source::HookDispatch.as_str(),
+                                "transcript scan: cannot canonicalize {}: {e}",
+                                path.display(),
+                            );
+                        }
+                    }
+                }
+                search_from = abs_start + end + ADD_DIR_SUFFIX.len();
+            } else {
+                break;
+            }
+        }
+    }
+
+    if let Ok(pos) = file.stream_position() {
+        toolbox
+            .transcript_offset
+            .store(pos, std::sync::atomic::Ordering::Release);
+    }
+
+    roots
 }
 
 // ── HookRouter ──────────────────────────────────────────────────────────
@@ -206,6 +305,7 @@ impl HookRouter {
             return DispatchResult {
                 result: None,
                 system_message: None,
+                add_roots: Vec::new(),
             };
         };
 
@@ -213,6 +313,7 @@ impl HookRouter {
             return DispatchResult {
                 result: None,
                 system_message: None,
+                add_roots: Vec::new(),
             };
         }
 
@@ -222,6 +323,7 @@ impl HookRouter {
             return DispatchResult {
                 result: None,
                 system_message: None,
+                add_roots: Vec::new(),
             };
         };
 
@@ -256,6 +358,7 @@ impl HookRouter {
         DispatchResult {
             result: Some(HookResult::Deny(message)),
             system_message: None,
+            add_roots: Vec::new(),
         }
     }
 
@@ -319,10 +422,10 @@ impl HookRouter {
     /// Returns a [`DispatchResult`] with the handler's result and an optional
     /// `systemMessage` from the notification queue drain. The queue is drained
     /// only at stationary points (`SessionStart`, `Stop`/`AfterAgent` when allowing).
-    ///
+    #[allow(clippy::too_many_lines, reason = "match arms are sequential and flat")]
     pub(crate) fn dispatch(&self, request: HookRequest, _entry_id: i64) -> DispatchResult {
         match request {
-            HookRequest::PreAgent {} => {
+            HookRequest::PreAgent { transcript_path } => {
                 let turn = self.turn_counter.fetch_add(1, Ordering::AcqRel) + 1;
                 debug!(
                     source = Source::HookDispatch.as_str(),
@@ -331,9 +434,30 @@ impl HookRouter {
                 self.toolbox
                     .roots_refresh_requested
                     .store(true, Ordering::Release);
+
+                // Stash transcript path for scanning.
+                if let Some(path) = transcript_path
+                    && let Ok(mut tp) = self.toolbox.transcript_path.lock()
+                {
+                    *tp = Some(PathBuf::from(path));
+                }
+
+                // Scan transcript for /add-dir roots and store them.
+                let new_roots = scan_transcript(&self.toolbox);
+                if !new_roots.is_empty()
+                    && let Ok(mut stored) = self.toolbox.transcript_roots.lock()
+                {
+                    for root in &new_roots {
+                        if !stored.contains(root) {
+                            stored.push(root.clone());
+                        }
+                    }
+                }
+
                 DispatchResult {
                     result: None,
                     system_message: None,
+                    add_roots: new_roots,
                 }
             }
             HookRequest::PreTool {
@@ -367,6 +491,7 @@ impl HookRouter {
                 DispatchResult {
                     result,
                     system_message: None,
+                    add_roots: Vec::new(),
                 }
             }
             HookRequest::CheckCommand {
@@ -393,6 +518,7 @@ impl HookRouter {
                 DispatchResult {
                     result: self.handle_file_accumulation(&file, &agent_id, tool.as_deref()),
                     system_message: None,
+                    add_roots: Vec::new(),
                 }
             }
             HookRequest::PostAgent {
@@ -409,6 +535,7 @@ impl HookRouter {
                 DispatchResult {
                     result,
                     system_message,
+                    add_roots: Vec::new(),
                 }
             }
             HookRequest::SessionStart { session_id } => {
@@ -419,6 +546,7 @@ impl HookRouter {
                 DispatchResult {
                     result,
                     system_message,
+                    add_roots: Vec::new(),
                 }
             }
         }
@@ -1454,10 +1582,20 @@ mod tests {
         let router = test_router();
         assert_eq!(router.turn(), 0);
 
-        router.dispatch(crate::hook::HookRequest::PreAgent {}, 0);
+        router.dispatch(
+            crate::hook::HookRequest::PreAgent {
+                transcript_path: None,
+            },
+            0,
+        );
         assert_eq!(router.turn(), 1);
 
-        router.dispatch(crate::hook::HookRequest::PreAgent {}, 0);
+        router.dispatch(
+            crate::hook::HookRequest::PreAgent {
+                transcript_path: None,
+            },
+            0,
+        );
         assert_eq!(router.turn(), 2);
     }
 
@@ -1472,7 +1610,12 @@ mod tests {
             "flag should start false"
         );
 
-        router.dispatch(crate::hook::HookRequest::PreAgent {}, 0);
+        router.dispatch(
+            crate::hook::HookRequest::PreAgent {
+                transcript_path: None,
+            },
+            0,
+        );
         assert!(
             router
                 .toolbox
@@ -1602,7 +1745,12 @@ mod tests {
         dispatch_check_denied(&router); // short
 
         // Advance turn, next denial → full again.
-        router.dispatch(crate::hook::HookRequest::PreAgent {}, 0);
+        router.dispatch(
+            crate::hook::HookRequest::PreAgent {
+                transcript_path: None,
+            },
+            0,
+        );
         let result = dispatch_check_denied(&router);
         let Some(HookResult::Deny(msg)) = result.result else {
             unreachable!("expected Deny, got {:?}", result.result);
@@ -1743,5 +1891,268 @@ mod tests {
             router.toolbox.cwd_stash.take().is_none(),
             "missing cwd should not stash"
         );
+    }
+
+    // ── Transcript root sync tests ────────────────────────────────────
+
+    /// Write a transcript JSONL file with the given lines.
+    fn write_transcript(dir: &std::path::Path, lines: &[&str]) -> PathBuf {
+        let path = dir.join("transcript.jsonl");
+        std::fs::write(&path, lines.join("\n")).expect("write transcript");
+        path
+    }
+
+    /// Create a real directory so `canonicalize` succeeds.
+    fn make_dir(base: &std::path::Path, name: &str) -> PathBuf {
+        let dir = base.join(name);
+        std::fs::create_dir_all(&dir).expect("create dir");
+        dir.canonicalize().expect("canonicalize")
+    }
+
+    #[test]
+    fn scan_transcript_finds_add_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = make_dir(dir.path(), "project");
+        let line = format!(
+            r#"{{"message":"Added \u001b[1m{}\u001b[22m as a working directory"}}"#,
+            root.display()
+        );
+        let transcript = write_transcript(dir.path(), &[&line]);
+
+        let router = test_router();
+        *router.toolbox.transcript_path.lock().expect("lock") = Some(transcript);
+
+        let roots = scan_transcript(&router.toolbox);
+        assert_eq!(roots, vec![root]);
+    }
+
+    #[test]
+    #[allow(
+        clippy::similar_names,
+        reason = "root1/root2 naming is clear in context"
+    )]
+    fn scan_transcript_incremental() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root1 = make_dir(dir.path(), "project1");
+        let line1 = format!(
+            r#"{{"message":"Added \u001b[1m{}\u001b[22m as a working directory"}}"#,
+            root1.display()
+        );
+        let transcript = write_transcript(dir.path(), &[&line1]);
+
+        let router = test_router();
+        *router.toolbox.transcript_path.lock().expect("lock") = Some(transcript.clone());
+
+        let roots = scan_transcript(&router.toolbox);
+        assert_eq!(roots, vec![root1]);
+
+        // Second scan with same content → empty (offset advanced).
+        let roots = scan_transcript(&router.toolbox);
+        assert!(roots.is_empty(), "second scan should find nothing new");
+
+        // Append a new line and scan again.
+        let root2 = make_dir(dir.path(), "project2");
+        let line2 = format!(
+            r#"{{"message":"Added \u001b[1m{}\u001b[22m as a working directory"}}"#,
+            root2.display()
+        );
+        let mut content = std::fs::read_to_string(&transcript).expect("read");
+        content.push('\n');
+        content.push_str(&line2);
+        std::fs::write(&transcript, content).expect("append");
+
+        let roots = scan_transcript(&router.toolbox);
+        assert_eq!(roots, vec![root2]);
+    }
+
+    #[test]
+    #[allow(
+        clippy::similar_names,
+        reason = "root1/root2 naming is clear in context"
+    )]
+    fn scan_transcript_multiple_roots() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root1 = make_dir(dir.path(), "a");
+        let root2 = make_dir(dir.path(), "b");
+        let line1 = format!(
+            r#"{{"message":"Added \u001b[1m{}\u001b[22m as a working directory"}}"#,
+            root1.display()
+        );
+        let line2 = format!(
+            r#"{{"message":"Added \u001b[1m{}\u001b[22m as a working directory"}}"#,
+            root2.display()
+        );
+        let transcript = write_transcript(dir.path(), &[&line1, &line2]);
+
+        let router = test_router();
+        *router.toolbox.transcript_path.lock().expect("lock") = Some(transcript);
+
+        let roots = scan_transcript(&router.toolbox);
+        assert_eq!(roots.len(), 2);
+        assert!(roots.contains(&root1));
+        assert!(roots.contains(&root2));
+    }
+
+    #[test]
+    fn scan_transcript_deduplicates() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = make_dir(dir.path(), "dup");
+        let line = format!(
+            r#"{{"message":"Added \u001b[1m{}\u001b[22m as a working directory"}}"#,
+            root.display()
+        );
+        let transcript = write_transcript(dir.path(), &[&line, &line]);
+
+        let router = test_router();
+        *router.toolbox.transcript_path.lock().expect("lock") = Some(transcript);
+
+        let roots = scan_transcript(&router.toolbox);
+        assert_eq!(roots, vec![root]);
+    }
+
+    #[test]
+    fn scan_transcript_skips_non_matching() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transcript = write_transcript(
+            dir.path(),
+            &[
+                r#"{"message":"some other line"}"#,
+                r#"{"message":"tool call completed"}"#,
+            ],
+        );
+
+        let router = test_router();
+        *router.toolbox.transcript_path.lock().expect("lock") = Some(transcript);
+
+        let roots = scan_transcript(&router.toolbox);
+        assert!(roots.is_empty());
+    }
+
+    #[test]
+    fn scan_transcript_missing_file() {
+        let router = test_router();
+        *router.toolbox.transcript_path.lock().expect("lock") =
+            Some(PathBuf::from("/nonexistent/transcript.jsonl"));
+
+        let roots = scan_transcript(&router.toolbox);
+        assert!(roots.is_empty());
+    }
+
+    #[test]
+    fn scan_transcript_no_path_stashed() {
+        let router = test_router();
+        let roots = scan_transcript(&router.toolbox);
+        assert!(roots.is_empty());
+    }
+
+    #[test]
+    fn dispatch_pre_agent_stashes_transcript_path() {
+        let router = test_router();
+        assert!(
+            router
+                .toolbox
+                .transcript_path
+                .lock()
+                .expect("lock")
+                .is_none()
+        );
+
+        router.dispatch(
+            crate::hook::HookRequest::PreAgent {
+                transcript_path: Some("/tmp/transcript.jsonl".to_string()),
+            },
+            0,
+        );
+        assert_eq!(
+            router
+                .toolbox
+                .transcript_path
+                .lock()
+                .expect("lock")
+                .as_deref(),
+            Some(std::path::Path::new("/tmp/transcript.jsonl")),
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "lock guard dropped at end of test"
+    )]
+    fn dispatch_pre_agent_returns_transcript_roots() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = make_dir(dir.path(), "new_root");
+        let line = format!(
+            r#"{{"message":"Added \u001b[1m{}\u001b[22m as a working directory"}}"#,
+            root.display()
+        );
+        let transcript = write_transcript(dir.path(), &[&line]);
+
+        let router = test_router();
+        let result = router.dispatch(
+            crate::hook::HookRequest::PreAgent {
+                transcript_path: Some(transcript.to_string_lossy().to_string()),
+            },
+            0,
+        );
+        assert_eq!(result.add_roots, vec![root.clone()]);
+
+        // Verify the roots are stored in transcript_roots.
+        let stored = router.toolbox.transcript_roots.lock().expect("lock");
+        assert_eq!(stored.as_slice(), &[root]);
+    }
+
+    #[test]
+    #[allow(
+        clippy::similar_names,
+        reason = "root1/root2 naming is clear in context"
+    )]
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "lock guard dropped at end of test"
+    )]
+    fn transcript_roots_accumulate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root1 = make_dir(dir.path(), "first");
+        let line1 = format!(
+            r#"{{"message":"Added \u001b[1m{}\u001b[22m as a working directory"}}"#,
+            root1.display()
+        );
+        let transcript = write_transcript(dir.path(), &[&line1]);
+
+        let router = test_router();
+
+        // First dispatch: discovers root1.
+        router.dispatch(
+            crate::hook::HookRequest::PreAgent {
+                transcript_path: Some(transcript.to_string_lossy().to_string()),
+            },
+            0,
+        );
+
+        // Append root2 and dispatch again.
+        let root2 = make_dir(dir.path(), "second");
+        let line2 = format!(
+            r#"{{"message":"Added \u001b[1m{}\u001b[22m as a working directory"}}"#,
+            root2.display()
+        );
+        let mut content = std::fs::read_to_string(&transcript).expect("read");
+        content.push('\n');
+        content.push_str(&line2);
+        std::fs::write(&transcript, content).expect("append");
+
+        let result = router.dispatch(
+            crate::hook::HookRequest::PreAgent {
+                transcript_path: Some(transcript.to_string_lossy().to_string()),
+            },
+            0,
+        );
+        assert_eq!(result.add_roots, vec![root2.clone()]);
+
+        // Stored set contains both.
+        let stored = router.toolbox.transcript_roots.lock().expect("lock");
+        assert_eq!(stored.len(), 2);
+        assert!(stored.contains(&root1));
+        assert!(stored.contains(&root2));
     }
 }
