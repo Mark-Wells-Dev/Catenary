@@ -288,6 +288,93 @@ impl Session {
         }
     }
 
+    /// Creates a per-session `Session` for daemon mode.
+    ///
+    /// Shares heavy resources (`LspClientManager`, `FilesystemManager`,
+    /// `SymbolIndex`, config, logging) with the daemon's primary session.
+    /// Creates fresh per-session state: editing manager, CWD stash,
+    /// transcript state, notification queue, and roots-refresh flag.
+    ///
+    /// The `NotificationQueueSink` is created but **not** registered as a
+    /// tracing sink — per-session notification routing is added in a later
+    /// phase. Until then, the per-session queue stays empty on drain.
+    #[must_use]
+    pub fn new_for_daemon(primary: &Self, session_id: Arc<str>) -> Self {
+        let threshold = primary
+            .config
+            .notifications
+            .as_ref()
+            .map_or_else(SeverityConfig::default, |n| n.threshold)
+            .into();
+        let notifications =
+            crate::logging::notification_queue::NotificationQueueSink::new(threshold);
+
+        let grep_budget = primary
+            .config
+            .tools
+            .as_ref()
+            .map_or(4000, |t| t.grep.budget as usize);
+        let glob_budget = primary
+            .config
+            .tools
+            .as_ref()
+            .map_or(2000, |t| t.glob.budget as usize);
+        let glob_config = primary
+            .config
+            .tools
+            .as_ref()
+            .map_or_else(crate::config::GlobConfig::default, |t| t.glob.clone());
+
+        let outline_suppress: Vec<globset::GlobMatcher> = glob_config
+            .outline_suppress
+            .iter()
+            .filter_map(|pat| {
+                let effective = if pat.contains('/') {
+                    pat.clone()
+                } else {
+                    format!("**/{pat}")
+                };
+                globset::Glob::new(&effective)
+                    .ok()
+                    .map(|g| g.compile_matcher())
+            })
+            .collect();
+
+        Self {
+            config: primary.config.clone(),
+            config_version: std::sync::atomic::AtomicU64::new(0),
+            grep: GrepServer {
+                client_manager: primary.client_manager.clone(),
+                fs_manager: primary.fs_manager.clone(),
+                symbol_index: primary.symbol_index.clone(),
+                budget: grep_budget,
+            },
+            glob: GlobServer {
+                client_manager: primary.client_manager.clone(),
+                fs_manager: primary.fs_manager.clone(),
+                symbol_index: primary.symbol_index.clone(),
+                budget: glob_budget,
+                outline_threshold: glob_config.outline_threshold,
+                outline_suppress,
+            },
+            diagnostics: primary.diagnostics.clone(),
+            editing: EditingManager::new(),
+            cwd_stash: CwdStash::new(),
+            client_manager: primary.client_manager.clone(),
+            fs_manager: primary.fs_manager.clone(),
+            path_validator: primary.path_validator.clone(),
+            logging: primary.logging.clone(),
+            notifications,
+            symbol_index: primary.symbol_index.clone(),
+            instance_id: session_id,
+            runtime: primary.runtime.clone(),
+            roots_refresh_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            transcript_path: std::sync::Mutex::new(None),
+            transcript_offset: std::sync::atomic::AtomicU64::new(0),
+            transcript_roots: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
     /// Builds the merged command filter from user config + all project configs.
     ///
     /// Returns `None` when no `[commands]` section is configured. The merged

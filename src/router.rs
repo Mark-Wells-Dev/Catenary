@@ -112,21 +112,35 @@ pub fn bind_daemon_sockets() -> Result<DaemonSockets> {
     })
 }
 
+/// Per-session state: the session's own `Session` and its `HookRouter`.
+///
+/// The `session` field is used by MCP connection correlation (ticket 08)
+/// to bind MCP connections to the correct session's tool servers.
+#[cfg(unix)]
+struct SessionEntry {
+    #[allow(dead_code, reason = "used by MCP correlation in ticket 08")]
+    session: Arc<Session>,
+    router: Arc<HookRouter>,
+}
+
 /// Shared context for session-aware hook dispatch.
 ///
 /// When set on [`SessionManager`], hook connections are routed to
-/// per-`session_id` [`HookRouter`] instances backed by the shared
-/// daemon [`Session`]. When absent, hooks receive passthrough responses
-/// (allow everything).
+/// per-`session_id` [`Session`] + [`HookRouter`] pairs. Each session
+/// has independent editing state, CWD stash, transcript state, and
+/// turn counter. Heavy resources (`LspClientManager`, config, logging)
+/// are shared via `Arc` from the daemon's primary session. When absent,
+/// hooks receive passthrough responses (allow everything).
 #[cfg(unix)]
 #[derive(Clone)]
 struct HookDispatchContext {
-    /// Per-`session_id` hook routers. Each router has its own turn
-    /// counter and debounce state; all share the daemon's `Session`.
-    sessions: Arc<std::sync::Mutex<HashMap<String, Arc<HookRouter>>>>,
-    /// Shared daemon session (owns `LspClientManager`, config, editing
-    /// state, etc.).
-    session: Arc<Session>,
+    /// Per-`session_id` session entries. Each entry has its own
+    /// `Session` (per-session state) and `HookRouter` (turn counter,
+    /// debounce).
+    sessions: Arc<std::sync::Mutex<HashMap<String, SessionEntry>>>,
+    /// Daemon's primary session — used as the template for creating
+    /// per-session sessions via [`Session::new_for_daemon`].
+    primary: Arc<Session>,
     /// Shared database connection for `HookRouter` DB writes.
     conn: Arc<std::sync::Mutex<rusqlite::Connection>>,
     /// Logging server for correlation ID minting and sink access.
@@ -394,9 +408,11 @@ impl SessionManager {
 
     /// Enables session-aware hook dispatch.
     ///
-    /// Once set, hook connections are routed to per-`session_id`
-    /// [`HookRouter`] instances backed by the shared daemon `Session`.
-    /// Without this, hooks receive passthrough responses (test mode).
+    /// Once set, hook connections create per-`session_id` [`Session`]
+    /// instances (via [`Session::new_for_daemon`]) with independent
+    /// per-session state. Heavy resources are shared from the primary
+    /// session. Without this, hooks receive passthrough responses (test
+    /// mode).
     #[must_use]
     pub fn with_session(
         mut self,
@@ -405,7 +421,7 @@ impl SessionManager {
     ) -> Self {
         self.hook_ctx = Some(HookDispatchContext {
             sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            session,
+            primary: session,
             conn,
             logging: self.logging.clone(),
         });
@@ -459,32 +475,35 @@ async fn handle_hook_passthrough(stream: tokio::net::UnixStream) -> Result<()> {
     Ok(())
 }
 
-/// Looks up or creates a [`HookRouter`] for the given `session_id`.
+/// Looks up or creates a per-session [`Session`] + [`HookRouter`] pair.
 ///
-/// Each `session_id` gets its own router with independent turn counter
-/// and debounce state. All routers share the daemon's [`Session`]
-/// (editing state is already keyed by `session_id` inside
-/// [`crate::bridge::EditingManager`]).
+/// Each `session_id` gets its own `Session` (via
+/// [`Session::new_for_daemon`]) with independent editing state, CWD
+/// stash, transcript state, and notification queue. The `HookRouter`
+/// wraps the per-session `Session` with its own turn counter and
+/// debounce state.
 #[cfg(unix)]
 fn get_or_create_router(ctx: &HookDispatchContext, session_id: &str) -> Arc<HookRouter> {
-    let mut sessions = ctx
-        .sessions
+    ctx.sessions
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    sessions
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .entry(session_id.to_string())
         .or_insert_with(|| {
             debug!(
                 source = Source::DaemonDispatch.as_str(),
                 session_id, "creating session",
             );
-            Arc::new(HookRouter::new(
-                ctx.session.clone(),
+            let session_id_arc: Arc<str> = session_id.into();
+            let session = Arc::new(Session::new_for_daemon(&ctx.primary, session_id_arc));
+            let router = Arc::new(HookRouter::new(
+                session.clone(),
                 ctx.conn.clone(),
-                ctx.session.instance_id.clone(),
+                session.instance_id.clone(),
                 session_id.to_string(),
-            ))
+            ));
+            SessionEntry { session, router }
         })
+        .router
         .clone()
 }
 
@@ -1663,8 +1682,8 @@ mod tests {
         // Verify independence through the hook_ctx.
         let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
         let sessions = ctx.sessions.lock().expect("lock");
-        let router_a = Arc::clone(sessions.get("session-a").expect("session-a"));
-        let router_b = Arc::clone(sessions.get("session-b").expect("session-b"));
+        let router_a = Arc::clone(&sessions.get("session-a").expect("session-a").router);
+        let router_b = Arc::clone(&sessions.get("session-b").expect("session-b").router);
         drop(sessions);
         assert_eq!(router_a.turn(), 2, "session A should have turn 2");
         assert_eq!(router_b.turn(), 1, "session B should have turn 1");
