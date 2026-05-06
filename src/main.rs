@@ -138,6 +138,10 @@ enum Command {
         #[arg(long)]
         session: Option<String>,
     },
+
+    /// Run as the Catenary daemon (internal, spawned by bridge proxy).
+    #[command(hide = true)]
+    Daemon,
 }
 
 /// Hook subcommands invoked by host CLI hooks.
@@ -259,6 +263,10 @@ async fn main() -> Result<()> {
             let conn = catenary_mcp::db::open_and_migrate()?;
             cli::commands::run_gc(&conn, older_than.as_deref(), dead, session.as_deref())
         }
+        #[cfg(unix)]
+        Some(Command::Daemon) => run_daemon().await,
+        #[cfg(not(unix))]
+        Some(Command::Daemon) => Err(anyhow::anyhow!("daemon mode requires Unix")),
     }
 }
 
@@ -474,6 +482,30 @@ async fn run_server() -> Result<()> {
     }
 
     mcp_result
+}
+
+/// Runs the Catenary daemon.
+///
+/// Binds the MCP socket and accepts connections. The daemon exits when
+/// interrupted by a signal. Per-connection MCP stacks are added in a
+/// subsequent phase.
+///
+/// # Errors
+///
+/// Returns an error if the socket cannot be bound or the accept loop fails.
+#[cfg(unix)]
+async fn run_daemon() -> Result<()> {
+    use catenary_mcp::router::SessionManager;
+
+    let manager = SessionManager::bind()?;
+
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+
+    tokio::select! {
+        res = manager.accept_loop() => res,
+        _ = tokio::signal::ctrl_c() => Ok(()),
+        _ = async { sigterm.recv().await } => Ok(()),
+    }
 }
 
 /// Runs a minimal MCP server for disabled sessions.

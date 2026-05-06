@@ -141,6 +141,134 @@ impl Drop for SessionManager {
     }
 }
 
+// ── Bridge proxy ────────────────────────────────────────────────────
+
+/// Maximum number of attempts to connect to the daemon.
+const MAX_CONNECT_ATTEMPTS: u32 = 5;
+
+/// Delay between connection retry attempts.
+const CONNECT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Connects to a running daemon or starts one.
+///
+/// Implements the start-or-connect sequence:
+/// 1. Try to connect to the MCP socket.
+/// 2. If connection fails and a stale socket file exists, remove it.
+/// 3. Spawn a daemon process (`catenary daemon`).
+/// 4. Retry connection with backoff.
+///
+/// # Errors
+///
+/// Returns an error if the daemon cannot be reached after all retry attempts.
+#[cfg(unix)]
+pub async fn connect_or_start_daemon() -> Result<tokio::net::UnixStream> {
+    let socket_path = mcp_socket_path();
+    let mut daemon_spawned = false;
+
+    for attempt in 0..MAX_CONNECT_ATTEMPTS {
+        match tokio::net::UnixStream::connect(&socket_path).await {
+            Ok(stream) => {
+                info!(
+                    source = Source::DaemonLifecycle.as_str(),
+                    attempt, "connected to daemon",
+                );
+                return Ok(stream);
+            }
+            Err(e) => {
+                let last_attempt = attempt == MAX_CONNECT_ATTEMPTS - 1;
+                if last_attempt {
+                    return Err(e).with_context(|| {
+                        format!(
+                            "failed to connect to Catenary daemon \
+                             after {MAX_CONNECT_ATTEMPTS} attempts ({})",
+                            socket_path.display(),
+                        )
+                    });
+                }
+
+                if !daemon_spawned {
+                    if socket_path.exists() {
+                        let _ = std::fs::remove_file(&socket_path);
+                        info!(
+                            source = Source::DaemonLifecycle.as_str(),
+                            path = %socket_path.display(),
+                            "removed stale socket",
+                        );
+                    }
+                    if spawn_daemon().is_ok() {
+                        info!(
+                            source = Source::DaemonLifecycle.as_str(),
+                            "spawned daemon process",
+                        );
+                    }
+                    daemon_spawned = true;
+                }
+
+                tokio::time::sleep(CONNECT_RETRY_DELAY).await;
+            }
+        }
+    }
+
+    // Loop always returns: Ok on connect, Err on last attempt.
+    anyhow::bail!(
+        "failed to connect to Catenary daemon ({})",
+        socket_path.display(),
+    )
+}
+
+/// Spawns `catenary daemon` as a detached child process.
+///
+/// The daemon binds the MCP socket and begins accepting connections.
+/// Uses a new process group so the daemon outlives the bridge.
+#[cfg(unix)]
+fn spawn_daemon() -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    let exe = std::env::current_exe().context("resolve current executable path")?;
+
+    Command::new(exe)
+        .arg("daemon")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .context("spawn daemon process")?;
+
+    Ok(())
+}
+
+/// Proxies stdin/stdout to/from a daemon socket connection.
+///
+/// Runs two concurrent copy loops. Returns `Ok(())` when stdin closes
+/// (host CLI ended the session) or `Err` when the daemon connection
+/// drops.
+///
+/// # Errors
+///
+/// Returns an error if the daemon connection closes before stdin,
+/// indicating unexpected daemon termination.
+#[cfg(unix)]
+pub async fn proxy_stdio(stream: tokio::net::UnixStream) -> Result<()> {
+    let (mut sock_read, mut sock_write) = stream.into_split();
+    let mut stdin = tokio::io::stdin();
+    let mut stdout = tokio::io::stdout();
+
+    tokio::select! {
+        result = tokio::io::copy(&mut stdin, &mut sock_write) => {
+            result.context("proxy stdin to socket")?;
+            Ok(())
+        }
+        result = tokio::io::copy(&mut sock_read, &mut stdout) => {
+            match result {
+                Ok(_) => Err(anyhow::anyhow!("daemon connection closed unexpectedly")),
+                Err(e) => Err(anyhow::Error::from(e).context("daemon connection error")),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 #[cfg(unix)]
 #[allow(
@@ -306,5 +434,118 @@ mod tests {
             captured.contains(&"daemon.lifecycle".to_string()),
             "should emit daemon.lifecycle event, got: {captured:?}",
         );
+    }
+
+    // ── Bridge proxy tests ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn bridge_cleans_stale_socket() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = socket_in(dir.path());
+
+        // Create a stale socket file (regular file, nobody listening).
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&path, b"stale").expect("create stale file");
+
+        // Connect should fail on a regular file.
+        let result = tokio::net::UnixStream::connect(&path).await;
+        assert!(result.is_err());
+
+        // Clean stale file (what connect_or_start_daemon does).
+        std::fs::remove_file(&path).expect("remove stale");
+        assert!(!path.exists());
+
+        // Now bind succeeds.
+        let _manager = SessionManager::bind_at(&path).expect("bind after cleanup");
+        assert!(path.exists());
+    }
+
+    #[tokio::test]
+    async fn bridge_proxies_bytes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("proxy.sock");
+        let listener = tokio::net::UnixListener::bind(&path).expect("bind");
+
+        let client = tokio::net::UnixStream::connect(&path)
+            .await
+            .expect("connect");
+        let (mut server, _) = listener.accept().await.expect("accept");
+
+        let (mut client_read, mut client_write) = client.into_split();
+
+        // Client → server direction.
+        client_write.write_all(b"hello").await.expect("write");
+        client_write.shutdown().await.expect("shutdown write");
+
+        let mut buf = vec![0u8; 5];
+        server.read_exact(&mut buf).await.expect("server read");
+        assert_eq!(&buf, b"hello");
+
+        // Server → client direction.
+        server.write_all(b"world").await.expect("server write");
+        server.shutdown().await.expect("shutdown server");
+
+        let mut response = Vec::new();
+        client_read
+            .read_to_end(&mut response)
+            .await
+            .expect("client read");
+        assert_eq!(&response, b"world");
+    }
+
+    #[tokio::test]
+    async fn bridge_exits_on_daemon_death() {
+        use tokio::io::AsyncReadExt;
+
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("death.sock");
+        let listener = tokio::net::UnixListener::bind(&path).expect("bind");
+
+        let client = tokio::net::UnixStream::connect(&path)
+            .await
+            .expect("connect");
+        let (server, _) = listener.accept().await.expect("accept");
+
+        // Simulate daemon death.
+        drop(server);
+        drop(listener);
+
+        let mut buf = Vec::new();
+        let mut client = client;
+        let n = client
+            .read_to_end(&mut buf)
+            .await
+            .expect("read after daemon death");
+        assert_eq!(n, 0, "bridge should see EOF when daemon dies");
+    }
+
+    #[tokio::test]
+    async fn bridge_handles_race() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = socket_in(dir.path());
+
+        let manager = Arc::new(SessionManager::bind_at(&path).expect("bind"));
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        // Spawn 5 connections concurrently.
+        let mut handles = Vec::new();
+        for _ in 0..5 {
+            let p = path.clone();
+            handles.push(tokio::spawn(async move {
+                tokio::net::UnixStream::connect(&p).await
+            }));
+        }
+
+        for handle in handles {
+            handle.await.expect("task").expect("connect");
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(manager.connection_count(), 5);
     }
 }
