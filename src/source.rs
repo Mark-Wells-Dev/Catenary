@@ -13,6 +13,7 @@
 //! # Subsystems
 //!
 //! - `config` — configuration loading and validation
+//! - `daemon` — daemon process (socket listeners, connection management)
 //! - `hook` — hook layer (pre/post tool hooks)
 //! - `logging` — logging infrastructure itself
 //! - `lsp` — LSP client layer (server communication, lifecycle, routing)
@@ -38,6 +39,10 @@ pub enum Source {
     ConfigParse,
     /// Semantic configuration errors (orphan servers, unsupported keys).
     ConfigValidation,
+    /// Daemon connection accept, correlation, and session routing.
+    DaemonDispatch,
+    /// Daemon startup, shutdown, and signal handling.
+    DaemonLifecycle,
     /// Hook request routing and dispatch.
     HookDispatch,
     /// Logging infrastructure startup sequencing.
@@ -61,6 +66,8 @@ impl Source {
         match self {
             Self::ConfigParse => "config.parse",
             Self::ConfigValidation => "config.validation",
+            Self::DaemonDispatch => "daemon.dispatch",
+            Self::DaemonLifecycle => "daemon.lifecycle",
             Self::HookDispatch => "hook.dispatch",
             Self::LoggingBootstrap => "logging.bootstrap",
             Self::LspDispatch => "lsp.dispatch",
@@ -85,6 +92,8 @@ impl FromStr for Source {
         match s {
             "config.parse" => Ok(Self::ConfigParse),
             "config.validation" => Ok(Self::ConfigValidation),
+            "daemon.dispatch" => Ok(Self::DaemonDispatch),
+            "daemon.lifecycle" => Ok(Self::DaemonLifecycle),
             "hook.dispatch" => Ok(Self::HookDispatch),
             "logging.bootstrap" => Ok(Self::LoggingBootstrap),
             "lsp.dispatch" => Ok(Self::LspDispatch),

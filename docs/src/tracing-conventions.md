@@ -52,6 +52,7 @@ convenience constants are derived from it for use in `tracing` macros.
 | Subsystem | Scope |
 |---|---|
 | `config` | Configuration loading and validation |
+| `daemon` | Daemon process (socket listeners, connection management) |
 | `hook` | Hook layer (pre/post tool hooks) |
 | `logging` | Logging infrastructure itself |
 | `lsp` | LSP client layer (server communication, lifecycle, routing) |
@@ -75,6 +76,8 @@ convenience constants are derived from it for use in `tracing` macros.
 |---|---|---|
 | `config.parse` | Config loading errors (TOML parsing, deserialization) | `ConfigParse` |
 | `config.validation` | Semantic config errors (orphan servers, unsupported keys) | `ConfigValidation` |
+| `daemon.dispatch` | Connection accept, correlation, session routing | `DaemonDispatch` |
+| `daemon.lifecycle` | Daemon startup, shutdown, signal handling | `DaemonLifecycle` |
 | `hook.dispatch` | Hook request routing and dispatch | `HookDispatch` |
 | `logging.bootstrap` | Logging infrastructure startup sequencing | `LoggingBootstrap` |
 | `lsp.dispatch` | LSP message routing, method dispatch, capability checks | `LspDispatch` |

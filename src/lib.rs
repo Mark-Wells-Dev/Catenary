@@ -28,6 +28,8 @@ pub mod lsp;
 pub mod mcp;
 /// Protocol classification shared by core and display layers.
 pub mod protocol;
+/// Daemon session manager and MCP socket listener.
+pub mod router;
 /// Session management and event broadcasting.
 pub mod session;
 /// Canonical `source` taxonomy for structured tracing events.
