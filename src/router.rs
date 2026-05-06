@@ -9,13 +9,17 @@
 //! connections by file descriptor. Hook connections are short-lived
 //! (one request-response each).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use tracing::{Instrument, debug, error, info};
 
+use crate::bridge::HookRouter;
+use crate::bridge::session::Session;
+use crate::hook::{HookRequest, HookResponseEnvelope, emit_hook_event, hook_outcome_level};
 use crate::logging::LoggingServer;
 use crate::mcp::{McpServer, ToolHandler};
 use crate::source::Source;
@@ -108,6 +112,27 @@ pub fn bind_daemon_sockets() -> Result<DaemonSockets> {
     })
 }
 
+/// Shared context for session-aware hook dispatch.
+///
+/// When set on [`SessionManager`], hook connections are routed to
+/// per-`session_id` [`HookRouter`] instances backed by the shared
+/// daemon [`Session`]. When absent, hooks receive passthrough responses
+/// (allow everything).
+#[cfg(unix)]
+#[derive(Clone)]
+struct HookDispatchContext {
+    /// Per-`session_id` hook routers. Each router has its own turn
+    /// counter and debounce state; all share the daemon's `Session`.
+    sessions: Arc<std::sync::Mutex<HashMap<String, Arc<HookRouter>>>>,
+    /// Shared daemon session (owns `LspClientManager`, config, editing
+    /// state, etc.).
+    session: Arc<Session>,
+    /// Shared database connection for `HookRouter` DB writes.
+    conn: Arc<std::sync::Mutex<rusqlite::Connection>>,
+    /// Logging server for correlation ID minting and sink access.
+    logging: LoggingServer,
+}
+
 /// Core daemon component that manages MCP and hook socket connections.
 ///
 /// Binds two Unix domain sockets: one for MCP connections from `catenary
@@ -115,8 +140,9 @@ pub fn bind_daemon_sockets() -> Result<DaemonSockets> {
 /// processes. Each MCP connection spawns a per-connection async task
 /// with a full domain stack (`McpServer`/`ToolServer`), dispatching to
 /// the shared `LspClientManager` via the tool handler. Hook connections
-/// are short-lived (one request-response each) and handled in spawned
-/// tasks with passthrough responses until session-aware dispatch is added.
+/// are routed to per-`session_id` [`HookRouter`] instances when a shared
+/// [`Session`] is configured (daemon mode), or receive passthrough
+/// responses (test mode).
 #[cfg(unix)]
 pub struct SessionManager {
     mcp_listener: tokio::net::UnixListener,
@@ -126,6 +152,9 @@ pub struct SessionManager {
     handler: Arc<dyn ToolHandler>,
     logging: LoggingServer,
     connection_count: Arc<AtomicUsize>,
+    /// Session-aware hook dispatch context. `None` in tests that don't
+    /// exercise hook routing (passthrough mode).
+    hook_ctx: Option<HookDispatchContext>,
 }
 
 #[cfg(unix)]
@@ -161,6 +190,7 @@ impl SessionManager {
             handler,
             logging,
             connection_count: Arc::new(AtomicUsize::new(0)),
+            hook_ctx: None,
         }
     }
 
@@ -207,6 +237,7 @@ impl SessionManager {
             handler,
             logging,
             connection_count: Arc::new(AtomicUsize::new(0)),
+            hook_ctx: None,
         })
     }
 
@@ -233,14 +264,26 @@ impl SessionManager {
                 }
                 result = self.hook_listener.accept() => {
                     let (stream, _addr) = result.context("accept hook connection")?;
-                    tokio::spawn(async move {
-                        if let Err(e) = handle_hook_passthrough(stream).await {
-                            debug!(
-                                source = Source::DaemonDispatch.as_str(),
-                                "hook connection error: {e}",
-                            );
-                        }
-                    });
+                    if let Some(ctx) = &self.hook_ctx {
+                        let ctx = ctx.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = handle_hook_dispatch(stream, ctx).await {
+                                debug!(
+                                    source = Source::DaemonDispatch.as_str(),
+                                    "hook connection error: {e}",
+                                );
+                            }
+                        });
+                    } else {
+                        tokio::spawn(async move {
+                            if let Err(e) = handle_hook_passthrough(stream).await {
+                                debug!(
+                                    source = Source::DaemonDispatch.as_str(),
+                                    "hook connection error: {e}",
+                                );
+                            }
+                        });
+                    }
                 }
             }
         }
@@ -348,13 +391,44 @@ impl SessionManager {
     pub fn hook_path(&self) -> &Path {
         &self.hook_socket_path
     }
+
+    /// Enables session-aware hook dispatch.
+    ///
+    /// Once set, hook connections are routed to per-`session_id`
+    /// [`HookRouter`] instances backed by the shared daemon `Session`.
+    /// Without this, hooks receive passthrough responses (test mode).
+    #[must_use]
+    pub fn with_session(
+        mut self,
+        session: Arc<Session>,
+        conn: Arc<std::sync::Mutex<rusqlite::Connection>>,
+    ) -> Self {
+        self.hook_ctx = Some(HookDispatchContext {
+            sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            session,
+            conn,
+            logging: self.logging.clone(),
+        });
+        self
+    }
+
+    /// Returns the number of active sessions in the registry.
+    #[must_use]
+    pub fn session_count(&self) -> usize {
+        self.hook_ctx.as_ref().map_or(0, |ctx| {
+            ctx.sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len()
+        })
+    }
 }
 
 /// Handles a single hook connection with a passthrough response.
 ///
 /// Reads the JSON request, logs the method for visibility, and sends an
-/// empty response (which means "allow" in the hook protocol). Session-aware
-/// dispatch replaces this in a subsequent phase.
+/// empty response (which means "allow" in the hook protocol). Used when
+/// no shared session is configured (test mode).
 #[cfg(unix)]
 async fn handle_hook_passthrough(stream: tokio::net::UnixStream) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -379,6 +453,150 @@ async fn handle_hook_passthrough(stream: tokio::net::UnixStream) -> Result<()> {
     }
 
     // Empty response = "allow" for all hook types.
+    writer.write_all(b"\n").await?;
+    writer.shutdown().await?;
+
+    Ok(())
+}
+
+/// Looks up or creates a [`HookRouter`] for the given `session_id`.
+///
+/// Each `session_id` gets its own router with independent turn counter
+/// and debounce state. All routers share the daemon's [`Session`]
+/// (editing state is already keyed by `session_id` inside
+/// [`crate::bridge::EditingManager`]).
+#[cfg(unix)]
+fn get_or_create_router(ctx: &HookDispatchContext, session_id: &str) -> Arc<HookRouter> {
+    let mut sessions = ctx
+        .sessions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    sessions
+        .entry(session_id.to_string())
+        .or_insert_with(|| {
+            debug!(
+                source = Source::DaemonDispatch.as_str(),
+                session_id, "creating session",
+            );
+            Arc::new(HookRouter::new(
+                ctx.session.clone(),
+                ctx.conn.clone(),
+                ctx.session.instance_id.clone(),
+                session_id.to_string(),
+            ))
+        })
+        .clone()
+}
+
+/// Handles a single hook connection with session-aware dispatch.
+///
+/// Reads the JSON request, extracts `session_id` for routing, looks up
+/// (or creates) the per-session [`HookRouter`], dispatches the request,
+/// handles transcript root syncing, logs the protocol pair, and writes
+/// the response.
+#[cfg(unix)]
+#[allow(clippy::too_many_lines, reason = "sequential protocol steps")]
+async fn handle_hook_dispatch(
+    stream: tokio::net::UnixStream,
+    ctx: HookDispatchContext,
+) -> Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut buf_reader = BufReader::new(reader);
+    let mut line = String::new();
+    buf_reader
+        .read_line(&mut line)
+        .await
+        .context("read hook request")?;
+
+    let raw: serde_json::Value =
+        serde_json::from_str(line.trim()).map_err(|e| anyhow!("Invalid hook request: {e}"))?;
+    let method = raw
+        .get("method")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    // Extract session_id for routing. Falls back to "default" for hooks
+    // that don't carry a session_id (backward compatibility).
+    let session_id = raw
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("default")
+        .to_string();
+
+    let router = get_or_create_router(&ctx, &session_id);
+
+    // Mint a correlation ID for this request/response pair.
+    let id = ctx.logging.next_id();
+
+    let request: HookRequest =
+        serde_json::from_value(raw.clone()).map_err(|e| anyhow!("Invalid hook request: {e}"))?;
+
+    let result = router.dispatch(request, id.0);
+
+    // Apply transcript-discovered roots before responding.
+    if !result.add_roots.is_empty() {
+        let session = &router.session;
+        let mut current = session.roots();
+        let before = current.len();
+        for root in &result.add_roots {
+            if !current.contains(root) {
+                current.push(root.clone());
+            }
+        }
+        let added = current.len() - before;
+        if added > 0 {
+            debug!(
+                source = Source::DaemonDispatch.as_str(),
+                added, "transcript root sync: syncing new roots",
+            );
+            if let Err(e) = session.sync_roots(current).await {
+                debug!(
+                    source = Source::DaemonDispatch.as_str(),
+                    "transcript root sync failed: {e}",
+                );
+            }
+        }
+    }
+
+    let envelope = HookResponseEnvelope {
+        result: result.result,
+        system_message: result.system_message,
+    };
+    let response = if envelope.result.is_some() || envelope.system_message.is_some() {
+        serde_json::to_string(&envelope)?
+    } else {
+        String::new()
+    };
+
+    // Determine level from outcome and hook category.
+    let level = hook_outcome_level(&method, &envelope);
+
+    // Log incoming hook request (deferred — uses outcome-determined level).
+    emit_hook_event(
+        level,
+        &session_id,
+        &method,
+        id.0,
+        None,
+        &raw.to_string(),
+        "incoming hook",
+    );
+
+    // Log outgoing hook response.
+    emit_hook_event(
+        level,
+        &session_id,
+        &method,
+        id.0,
+        Some(id.0),
+        &response,
+        "outgoing hook response",
+    );
+
+    writer.write_all(response.as_bytes()).await?;
     writer.write_all(b"\n").await?;
     writer.shutdown().await?;
 
@@ -1244,6 +1462,238 @@ mod tests {
             manager.connection_count(),
             0,
             "connection should be cleaned up after disconnect"
+        );
+    }
+
+    // ── Session state tests ─────────────────────────────────────────────
+
+    /// Create a `SessionManager` with a real `Session` for hook dispatch tests.
+    fn bind_with_session(dir: &Path) -> SessionManager {
+        let db_path = dir.join("catenary").join("catenary.db");
+        let conn = crate::db::open_and_migrate_at(&db_path).expect("open test DB");
+        let conn = Arc::new(std::sync::Mutex::new(conn));
+
+        conn.lock()
+            .expect("lock")
+            .execute(
+                "INSERT INTO sessions (id, pid, display_name, started_at) \
+                 VALUES ('daemon', 1, 'test-daemon', '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .expect("insert session");
+
+        let logging = LoggingServer::new();
+        let runtime = tokio::runtime::Handle::current();
+        let instance_id: Arc<str> = "daemon".into();
+        let session = Arc::new(crate::bridge::session::Session::new(
+            crate::config::Config::default(),
+            vec![],
+            logging.clone(),
+            conn.clone(),
+            instance_id,
+            runtime,
+        ));
+
+        SessionManager::bind_at(
+            &mcp_socket_in(dir),
+            &hook_socket_in(dir),
+            Arc::new(NoOpHandler),
+            logging,
+        )
+        .expect("bind")
+        .with_session(session, conn)
+    }
+
+    /// Send a hook JSON request and read the response line.
+    async fn hook_roundtrip(hook_path: &Path, request: &serde_json::Value) -> String {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let stream = tokio::net::UnixStream::connect(hook_path)
+            .await
+            .expect("connect to hook socket");
+        let (reader, mut writer) = stream.into_split();
+
+        let mut payload = serde_json::to_string(request).expect("serialize");
+        payload.push('\n');
+        writer.write_all(payload.as_bytes()).await.expect("write");
+
+        let mut buf_reader = BufReader::new(reader);
+        let mut line = String::new();
+        buf_reader.read_line(&mut line).await.expect("read");
+        line
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_state_hook_creates_session() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let hook_path = hook_socket_in(dir.path());
+
+        let manager = Arc::new(bind_with_session(dir.path()));
+        assert_eq!(manager.session_count(), 0, "no sessions initially");
+
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        // Send a hook with session_id = "abc".
+        let request = serde_json::json!({
+            "method": "pre-agent/turn-start",
+            "session_id": "abc"
+        });
+        let _ = hook_roundtrip(&hook_path, &request).await;
+
+        assert_eq!(
+            manager.session_count(),
+            1,
+            "session 'abc' should exist in registry"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_state_hook_routes_to_correct_session() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let hook_path = hook_socket_in(dir.path());
+
+        let manager = Arc::new(bind_with_session(dir.path()));
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        // Send hooks with two different session_ids.
+        let req_a = serde_json::json!({
+            "method": "pre-agent/turn-start",
+            "session_id": "session-a"
+        });
+        let req_b = serde_json::json!({
+            "method": "pre-agent/turn-start",
+            "session_id": "session-b"
+        });
+        let _ = hook_roundtrip(&hook_path, &req_a).await;
+        let _ = hook_roundtrip(&hook_path, &req_b).await;
+
+        assert_eq!(
+            manager.session_count(),
+            2,
+            "should have two independent sessions"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_state_editing_per_session() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let hook_path = hook_socket_in(dir.path());
+
+        let manager = Arc::new(bind_with_session(dir.path()));
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        // Session A: enter editing mode via start_editing pre-tool hook.
+        let req = serde_json::json!({
+            "method": "pre-tool/editing-state",
+            "tool_name": "mcp_catenary_start_editing",
+            "agent_id": "",
+            "session_id": "session-a"
+        });
+        let _ = hook_roundtrip(&hook_path, &req).await;
+
+        // Session A: Edit should be allowed (in editing mode).
+        let req = serde_json::json!({
+            "method": "pre-tool/editing-state",
+            "tool_name": "Edit",
+            "agent_id": "",
+            "session_id": "session-a"
+        });
+        let line = hook_roundtrip(&hook_path, &req).await;
+        assert_eq!(
+            line.trim(),
+            "",
+            "session A should allow Edit (in editing mode)"
+        );
+
+        // Session B: Edit should be denied (not in editing mode).
+        let req = serde_json::json!({
+            "method": "pre-tool/editing-state",
+            "tool_name": "Edit",
+            "agent_id": "",
+            "session_id": "session-b"
+        });
+        let line = hook_roundtrip(&hook_path, &req).await;
+        let envelope: crate::hook::HookResponseEnvelope =
+            serde_json::from_str(line.trim()).expect("parse response");
+        assert!(
+            matches!(envelope.result, Some(crate::hook::HookResult::Deny(_))),
+            "session B should deny Edit (not editing), got: {envelope:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_state_turn_counter_per_session() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let hook_path = hook_socket_in(dir.path());
+
+        let manager = Arc::new(bind_with_session(dir.path()));
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        // Send two turn-start hooks to session A.
+        let req_a = serde_json::json!({
+            "method": "pre-agent/turn-start",
+            "session_id": "session-a"
+        });
+        let _ = hook_roundtrip(&hook_path, &req_a).await;
+        let _ = hook_roundtrip(&hook_path, &req_a).await;
+
+        // Send one turn-start hook to session B.
+        let req_b = serde_json::json!({
+            "method": "pre-agent/turn-start",
+            "session_id": "session-b"
+        });
+        let _ = hook_roundtrip(&hook_path, &req_b).await;
+
+        // Verify each session has its own turn counter by checking
+        // that session A and B exist independently.
+        assert_eq!(manager.session_count(), 2);
+
+        // Verify independence through the hook_ctx.
+        let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
+        let sessions = ctx.sessions.lock().expect("lock");
+        let router_a = Arc::clone(sessions.get("session-a").expect("session-a"));
+        let router_b = Arc::clone(sessions.get("session-b").expect("session-b"));
+        drop(sessions);
+        assert_eq!(router_a.turn(), 2, "session A should have turn 2");
+        assert_eq!(router_b.turn(), 1, "session B should have turn 1");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_state_subagent_passthrough() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let hook_path = hook_socket_in(dir.path());
+
+        let manager = Arc::new(bind_with_session(dir.path()));
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        // Hook with non-empty agent_id should pass through without
+        // triggering diagnostics or editing enforcement.
+        let req = serde_json::json!({
+            "method": "post-tool/diagnostics",
+            "file": "/tmp/test.rs",
+            "agent_id": "sub-agent-1",
+            "session_id": "sess-1"
+        });
+        let line = hook_roundtrip(&hook_path, &req).await;
+        assert_eq!(
+            line.trim(),
+            "",
+            "subagent hook should pass through (empty response)"
         );
     }
 }

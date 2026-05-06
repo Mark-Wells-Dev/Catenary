@@ -481,6 +481,9 @@ pub fn run_pre_agent(format: HostFormat) {
         if let Some(tp) = hook_json.get("transcript_path").and_then(|v| v.as_str()) {
             request["transcript_path"] = serde_json::json!(tp);
         }
+        if let Some(sid) = hook_json.get("session_id").and_then(|v| v.as_str()) {
+            request["session_id"] = serde_json::json!(sid);
+        }
         let _ = ipc_exchange(stream, &request);
     }
 }

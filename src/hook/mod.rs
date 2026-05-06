@@ -36,7 +36,7 @@ use crate::source::Source;
 /// Protocol routing is by `kind` field — `MessageDbSink` matches
 /// `kind in {lsp, mcp, hook}` regardless of tracing level.
 /// The level controls DB `level` column and TUI filtering threshold.
-fn emit_hook_event(
+pub(crate) fn emit_hook_event(
     level: tracing::Level,
     client_name: &str,
     method: &str,
@@ -110,6 +110,10 @@ pub(crate) enum HookRequest {
         /// Used for transcript-based `/add-dir` root detection.
         #[serde(default)]
         transcript_path: Option<String>,
+        /// Host CLI session ID. Used by the daemon to route the hook
+        /// to the correct per-session `HookRouter`.
+        #[serde(default)]
+        session_id: Option<String>,
     },
 
     /// Editing state enforcement: deny or allow a tool call.
@@ -462,19 +466,28 @@ impl HookServer {
     /// Determine the tracing level for a hook request/response pair
     /// based on the method category and the dispatch outcome.
     fn hook_outcome_level(method: &str, envelope: &HookResponseEnvelope) -> tracing::Level {
-        let category = hook_category(method);
-        match category {
-            // diagnostics / lifecycle: non-empty result → info, empty → debug
-            "diagnostics" | "lifecycle" => {
-                if envelope.result.is_some() {
-                    tracing::Level::INFO
-                } else {
-                    tracing::Level::DEBUG
-                }
+        crate::hook::hook_outcome_level(method, envelope)
+    }
+}
+
+/// Determine the tracing level for a hook request/response pair
+/// based on the method category and the dispatch outcome.
+///
+/// Used by both [`HookServer`] (per-session IPC) and the daemon's
+/// hook dispatch path in [`crate::router::SessionManager`].
+pub(crate) fn hook_outcome_level(method: &str, envelope: &HookResponseEnvelope) -> tracing::Level {
+    let category = hook_category(method);
+    match category {
+        // diagnostics / lifecycle: non-empty result → info, empty → debug
+        "diagnostics" | "lifecycle" => {
+            if envelope.result.is_some() {
+                tracing::Level::INFO
+            } else {
+                tracing::Level::DEBUG
             }
-            // unknown and everything else → debug
-            _ => tracing::Level::DEBUG,
         }
+        // unknown and everything else → debug
+        _ => tracing::Level::DEBUG,
     }
 }
 
@@ -517,13 +530,14 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines, reason = "one assertion per variant")]
     fn test_hook_request_tagged_deserialization() {
-        // pre-agent/turn-start (no transcript_path)
+        // pre-agent/turn-start (no transcript_path, no session_id)
         let json = r#"{"method": "pre-agent/turn-start"}"#;
         let req: HookRequest = serde_json::from_str(json).expect("turn-start");
         assert!(matches!(
             req,
             HookRequest::PreAgent {
-                transcript_path: None
+                transcript_path: None,
+                session_id: None,
             }
         ));
 
@@ -534,8 +548,20 @@ mod tests {
         assert!(matches!(
             req,
             HookRequest::PreAgent {
-                transcript_path: Some(ref p)
+                transcript_path: Some(ref p),
+                session_id: None,
             } if p == "/tmp/transcript.jsonl"
+        ));
+
+        // pre-agent/turn-start with session_id
+        let json = r#"{"method": "pre-agent/turn-start", "session_id": "sess-123"}"#;
+        let req: HookRequest = serde_json::from_str(json).expect("turn-start with session_id");
+        assert!(matches!(
+            req,
+            HookRequest::PreAgent {
+                transcript_path: None,
+                session_id: Some(ref s),
+            } if s == "sess-123"
         ));
 
         // pre-tool/editing-state with all fields
@@ -1022,7 +1048,8 @@ mod tests {
         assert!(matches!(
             req,
             HookRequest::PreAgent {
-                transcript_path: None
+                transcript_path: None,
+                session_id: None,
             }
         ));
 

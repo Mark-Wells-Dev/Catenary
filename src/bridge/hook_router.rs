@@ -442,7 +442,11 @@ impl HookRouter {
     #[allow(clippy::too_many_lines, reason = "match arms are sequential and flat")]
     pub(crate) fn dispatch(&self, request: HookRequest, _entry_id: i64) -> DispatchResult {
         match request {
-            HookRequest::PreAgent { transcript_path } => {
+            HookRequest::PreAgent {
+                transcript_path,
+                session_id,
+            } => {
+                self.store_client_session_id(session_id.as_deref());
                 let turn = self.turn_counter.fetch_add(1, Ordering::AcqRel) + 1;
                 debug!(
                     source = Source::HookDispatch.as_str(),
@@ -1629,6 +1633,7 @@ mod tests {
         router.dispatch(
             crate::hook::HookRequest::PreAgent {
                 transcript_path: None,
+                session_id: None,
             },
             0,
         );
@@ -1637,6 +1642,7 @@ mod tests {
         router.dispatch(
             crate::hook::HookRequest::PreAgent {
                 transcript_path: None,
+                session_id: None,
             },
             0,
         );
@@ -1657,6 +1663,7 @@ mod tests {
         router.dispatch(
             crate::hook::HookRequest::PreAgent {
                 transcript_path: None,
+                session_id: None,
             },
             0,
         );
@@ -1792,6 +1799,7 @@ mod tests {
         router.dispatch(
             crate::hook::HookRequest::PreAgent {
                 transcript_path: None,
+                session_id: None,
             },
             0,
         );
@@ -2104,6 +2112,7 @@ mod tests {
         router.dispatch(
             crate::hook::HookRequest::PreAgent {
                 transcript_path: Some("/tmp/transcript.jsonl".to_string()),
+                session_id: None,
             },
             0,
         );
@@ -2136,6 +2145,7 @@ mod tests {
         let result = router.dispatch(
             crate::hook::HookRequest::PreAgent {
                 transcript_path: Some(transcript.to_string_lossy().to_string()),
+                session_id: None,
             },
             0,
         );
@@ -2170,6 +2180,7 @@ mod tests {
         router.dispatch(
             crate::hook::HookRequest::PreAgent {
                 transcript_path: Some(transcript.to_string_lossy().to_string()),
+                session_id: None,
             },
             0,
         );
@@ -2188,6 +2199,7 @@ mod tests {
         let result = router.dispatch(
             crate::hook::HookRequest::PreAgent {
                 transcript_path: Some(transcript.to_string_lossy().to_string()),
+                session_id: None,
             },
             0,
         );

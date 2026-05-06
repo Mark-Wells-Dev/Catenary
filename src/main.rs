@@ -551,9 +551,10 @@ async fn run_daemon() -> Result<()> {
         .and_then(|r| catenary_mcp::config::load_project_config(r).ok().flatten())
         .is_some_and(|pc| !pc.lsp);
 
-    let handler: Arc<dyn catenary_mcp::mcp::ToolHandler> = if disabled {
+    let (handler, shared_session, shared_conn) = if disabled {
         info!("Catenary disabled by .catenary.toml (lsp = false) in {workspace_display}");
-        Arc::new(DaemonDisabledHandler)
+        let handler: Arc<dyn catenary_mcp::mcp::ToolHandler> = Arc::new(DaemonDisabledHandler);
+        (handler, None, None)
     } else {
         let conn = catenary_mcp::db::open_and_migrate()?;
         let conn = Arc::new(std::sync::Mutex::new(conn));
@@ -563,7 +564,7 @@ async fn run_daemon() -> Result<()> {
             config,
             roots,
             logging.clone(),
-            conn,
+            conn.clone(),
             instance_id,
             tokio::runtime::Handle::current(),
         ));
@@ -575,10 +576,16 @@ async fn run_daemon() -> Result<()> {
         let session_for_spawn = session.clone();
         tokio::spawn(async move { session_for_spawn.spawn_all().await });
 
-        Arc::new(McpRouter::new(session))
+        let handler: Arc<dyn catenary_mcp::mcp::ToolHandler> =
+            Arc::new(McpRouter::new(session.clone()));
+        (handler, Some(session), Some(conn))
     };
 
     let manager = SessionManager::from_sockets(sockets, handler, logging);
+    let manager = match (shared_session, shared_conn) {
+        (Some(session), Some(conn)) => manager.with_session(session, conn),
+        _ => manager,
+    };
 
     info!("Daemon serving workspace: {workspace_display}");
 
