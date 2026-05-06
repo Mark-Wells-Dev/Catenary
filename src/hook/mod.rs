@@ -27,7 +27,7 @@ use tokio::net::UnixListener;
 use tracing::{debug, info};
 
 use crate::bridge::HookRouter;
-use crate::bridge::toolbox::Toolbox;
+use crate::bridge::session::Session;
 use crate::protocol::category::hook_category;
 use crate::source::Source;
 
@@ -251,12 +251,12 @@ impl HookServer {
     /// Creates a new `HookServer`.
     #[must_use]
     pub fn new(
-        toolbox: Arc<Toolbox>,
+        session: Arc<Session>,
         conn: Arc<Mutex<Connection>>,
         instance_id: Arc<str>,
         client_name: String,
     ) -> Self {
-        let router = Arc::new(HookRouter::new(toolbox, conn, instance_id, client_name));
+        let router = Arc::new(HookRouter::new(session, conn, instance_id, client_name));
         Self { router }
     }
 
@@ -382,7 +382,7 @@ impl HookServer {
             .to_string();
 
         // Mint a correlation ID for this request/response pair
-        let id = self.router.toolbox.logging.next_id();
+        let id = self.router.session.logging.next_id();
 
         let request: HookRequest = serde_json::from_value(raw.clone())
             .map_err(|e| anyhow!("Invalid hook request: {e}"))?;
@@ -393,8 +393,8 @@ impl HookServer {
         // Runs async in the hook server task — sync_roots is the single
         // serialization point for root updates.
         if !result.add_roots.is_empty() {
-            let toolbox = &self.router.toolbox;
-            let mut current = toolbox.roots();
+            let session = &self.router.session;
+            let mut current = session.roots();
             let before = current.len();
             for root in &result.add_roots {
                 if !current.contains(root) {
@@ -407,7 +407,7 @@ impl HookServer {
                     source = Source::HookDispatch.as_str(),
                     added, "transcript root sync: syncing new roots",
                 );
-                if let Err(e) = toolbox.sync_roots(current).await {
+                if let Err(e) = session.sync_roots(current).await {
                     debug!(
                         source = Source::HookDispatch.as_str(),
                         "transcript root sync failed: {e}",

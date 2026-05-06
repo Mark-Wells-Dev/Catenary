@@ -25,8 +25,8 @@ use std::sync::{Arc, Mutex};
 
 use super::filesystem_manager::{FilesystemManager, format_file_size};
 use super::handler::{expand_tilde, resolve_path};
+use super::session::ResolvedGlob;
 use super::tool_server::ToolServer;
-use super::toolbox::ResolvedGlob;
 use crate::bucketing::{self, BucketEntry};
 use crate::config::DispatchMethod;
 use crate::lsp::LspClientManager;

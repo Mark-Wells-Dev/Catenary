@@ -11,8 +11,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::filesystem_manager::FilesystemManager;
 
+use super::session::Session;
 use super::tool_server::ToolServer;
-use super::toolbox::Toolbox;
 use crate::mcp::{CallToolResult, Tool, ToolHandler};
 
 /// MCP tool call router.
@@ -22,14 +22,14 @@ use crate::mcp::{CallToolResult, Tool, ToolHandler};
 /// Implements [`ToolHandler`] to maintain clean dependency direction
 /// between the `mcp` (protocol) and `bridge` (application) modules.
 pub struct McpRouter {
-    toolbox: Arc<Toolbox>,
+    session: Arc<Session>,
 }
 
 impl McpRouter {
-    /// Creates a new `McpRouter` wrapping a shared `Toolbox`.
+    /// Creates a new `McpRouter` wrapping a shared `Session`.
     #[must_use]
-    pub const fn new(toolbox: Arc<Toolbox>) -> Self {
-        Self { toolbox }
+    pub const fn new(session: Arc<Session>) -> Self {
+        Self { session }
     }
 }
 
@@ -111,9 +111,9 @@ fn resolve_param(params: &mut Value, key: &str, cwd: &Path) {
 
 impl ToolHandler for McpRouter {
     fn list_tools(&self) -> Vec<Tool> {
-        let grep_budget = self.toolbox.grep.budget;
-        let glob_budget = self.toolbox.glob.budget;
-        let outline_threshold = self.toolbox.glob.outline_threshold;
+        let grep_budget = self.session.grep.budget;
+        let glob_budget = self.session.glob.budget;
+        let outline_threshold = self.session.glob.outline_threshold;
 
         vec![
             Tool {
@@ -271,7 +271,7 @@ impl ToolHandler for McpRouter {
         // diagnostics (done_editing). The hooks own the state transitions
         // because they have the real agent_id from the host CLI.
         if name == "start_editing" {
-            self.toolbox.diagnostics.clear_cache();
+            self.session.diagnostics.clear_cache();
             return Ok(CallToolResult::text(
                 "editing mode \u{2014} diagnostics deferred until done_editing",
             ));
@@ -286,7 +286,7 @@ impl ToolHandler for McpRouter {
             if let Some(token) = cursor {
                 // Serve from cache — no editing state change, no LSP.
                 let output = self
-                    .toolbox
+                    .session
                     .diagnostics
                     .get_cursor(token)
                     .unwrap_or_else(|| {
@@ -295,10 +295,10 @@ impl ToolHandler for McpRouter {
                 return Ok(CallToolResult::text(output));
             }
 
-            let files = self.toolbox.editing.drain_all_and_clear();
+            let files = self.session.editing.drain_all_and_clear();
             let entry_id = parent_id.unwrap_or(0);
-            let output = self.toolbox.runtime.block_on(
-                self.toolbox
+            let output = self.session.runtime.block_on(
+                self.session
                     .diagnostics
                     .process_files_batched(&files, entry_id),
             );
@@ -307,9 +307,9 @@ impl ToolHandler for McpRouter {
         }
 
         // Notify servers about filesystem changes before any LSP interaction.
-        self.toolbox
+        self.session
             .runtime
-            .block_on(self.toolbox.notify_file_changes());
+            .block_on(self.session.notify_file_changes());
 
         // ToolServer dispatch: grep, glob
         let mut params = arguments.unwrap_or(Value::Null);
@@ -317,19 +317,19 @@ impl ToolHandler for McpRouter {
         // Resolve relative patterns against the host CLI's working
         // directory (stashed by the PreToolUse hook). Absolute patterns
         // and tilde-prefixed patterns pass through unchanged.
-        if let Some(cwd) = self.toolbox.cwd_stash.take() {
+        if let Some(cwd) = self.session.cwd_stash.take() {
             resolve_params_against_cwd(name, &mut params, &cwd);
         }
 
         let result = match name {
             "grep" => self
-                .toolbox
+                .session
                 .runtime
-                .block_on(self.toolbox.grep.execute(&params, parent_id, cancel)),
+                .block_on(self.session.grep.execute(&params, parent_id, cancel)),
             "glob" => self
-                .toolbox
+                .session
                 .runtime
-                .block_on(self.toolbox.glob.execute(&params, parent_id, cancel)),
+                .block_on(self.session.glob.execute(&params, parent_id, cancel)),
             _ => return Err(anyhow!("Unknown tool: {name}")),
         };
 

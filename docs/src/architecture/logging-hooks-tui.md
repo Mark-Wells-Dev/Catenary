@@ -45,7 +45,7 @@ loading, database migration), tracing events are captured in a bounded
 in-memory buffer (4096 events). Nothing is written to disk yet — the
 database connection does not exist.
 
-When `Toolbox` assembly creates the database connection and sinks,
+When `Session` assembly creates the database connection and sinks,
 `LoggingServer::activate()` is called. This drains the bootstrap buffer
 through the sinks in FIFO order and switches to direct dispatch. From
 this point, every tracing event flows to the database immediately.

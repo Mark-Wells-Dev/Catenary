@@ -431,7 +431,7 @@ fn migrate_v5_to_v6(conn: &Connection) -> Result<()> {
 /// Migrates the database from schema version 6 to 7.
 ///
 /// Drops the `editing_state` and `editing_files` tables. Editing state
-/// is now managed in-memory by `EditingManager` on `Toolbox`.
+/// is now managed in-memory by `EditingManager` on `Session`.
 ///
 /// # Errors
 ///

@@ -29,7 +29,7 @@ terminal, it runs as an MCP server. The startup sequence is:
    directory (`~/.local/state/catenary/sessions/<id>/`) is created for
    the IPC socket.
 
-5. **`Toolbox` assembly.** The application container is constructed:
+5. **`Session` assembly.** The application container is constructed:
    - Logging sinks are created (notification queue, message DB) and
      `LoggingServer::activate()` is called. This drains the
      bootstrap buffer through the sinks and switches to direct
@@ -71,7 +71,7 @@ terminal, it runs as an MCP server. The startup sequence is:
    (which implements `ToolHandler`) and begins reading JSON-RPC
    messages from stdin. The `on_client_info` callback records the MCP
    client's name and version in the session. The `on_roots_changed`
-   callback triggers `Toolbox::sync_roots` when the MCP client
+   callback triggers `Session::sync_roots` when the MCP client
    updates its root list.
 
 ## Root discovery
@@ -135,7 +135,7 @@ allowed without calling `done_editing` first.
 
 When the host CLI adds a workspace directory (`/add-dir` in Claude
 Code), the MCP client sends a `roots/list` update. Catenary processes
-it through `Toolbox::sync_roots`:
+it through `Session::sync_roots`:
 
 1. `FilesystemManager` roots are updated and the filesystem is
    re-seeded.
@@ -157,7 +157,7 @@ or SIGTERM:
 
 1. The MCP dispatch loop exits.
 2. The hook server's IPC listener is aborted.
-3. `Toolbox::shutdown()` sends LSP `shutdown` requests to all active
+3. `Session::shutdown()` sends LSP `shutdown` requests to all active
    servers, waits for responses, then sends `exit` notifications.
 4. The session is marked dead in the database (`alive = 0`,
    `ended_at` is set).

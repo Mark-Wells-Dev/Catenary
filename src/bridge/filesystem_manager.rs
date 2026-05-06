@@ -249,7 +249,7 @@ impl ClassificationTables {
 ///
 /// Single authority for file metadata: binary detection, line count,
 /// language ID, and shebang detection. Shared by `GrepServer` and
-/// `GlobServer` through `Toolbox`.
+/// `GlobServer` through `Session`.
 ///
 /// Also owns the workspace root list for longest-prefix root resolution
 /// and the classification lookup tables built from config.

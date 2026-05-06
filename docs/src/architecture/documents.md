@@ -168,7 +168,7 @@ reflect the fully consistent state.
 `EditingManager` holds the in-memory editing state: a map from
 `agent_id` to accumulated file paths. Both the `HookRouter` (which
 has the real `agent_id` from the host CLI) and the `McpRouter` (which
-produces the tool result) access it through `Toolbox`.
+produces the tool result) access it through `Session`.
 
 The MCP `start_editing` and `done_editing` tools are triggers — the
 `PreToolUse` hook owns the state transition for `start_editing`

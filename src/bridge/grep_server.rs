@@ -3,7 +3,7 @@
 
 //! Grep tool: ripgrep + tree-sitter index pipeline with LSP enrichment.
 
-use super::toolbox::ResolvedGlob;
+use super::session::ResolvedGlob;
 use anyhow::{Result, anyhow};
 use grep_matcher::Matcher;
 use grep_regex::RegexMatcherBuilder;

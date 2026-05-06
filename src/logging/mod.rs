@@ -310,7 +310,7 @@ const DEFAULT_BUFFER_CAP: usize = 4096;
 ///
 /// Cheaply cloneable: the public type wraps an `Arc<Inner>`, so multiple
 /// handles share the same sinks and buffer. Install one clone as the
-/// tracing Layer and keep another on [`crate::bridge::Toolbox`] (or
+/// tracing Layer and keep another on [`crate::bridge::Session`] (or
 /// equivalent) for post-startup [`LoggingServer::activate`] calls.
 ///
 /// Post-activation, the hot path is a single [`OnceLock::get`] (atomic

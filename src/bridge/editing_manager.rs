@@ -5,7 +5,7 @@
 //!
 //! Tracks which agents are in editing mode and accumulates modified file
 //! paths during editing sessions. State is per-session lifetime — no
-//! database persistence needed since the session owns the [`super::toolbox::Toolbox`]
+//! database persistence needed since the session owns the [`super::session::Session`]
 //! which owns the `EditingManager`.
 
 use std::collections::HashMap;
@@ -31,7 +31,7 @@ fn editing_key(session_id: Option<&str>, agent_id: &str) -> String {
 /// Owns editing state for a single Catenary session. Both
 /// [`super::hook_router::HookRouter`] (which has the real `agent_id` from
 /// the host CLI) and [`super::handler::McpRouter`] (which produces the
-/// tool result) access this through [`super::toolbox::Toolbox`].
+/// tool result) access this through [`super::session::Session`].
 ///
 /// State is keyed by a composite of `(session_id, agent_id)` to prevent
 /// cross-session collisions when multiple host CLI sessions share a

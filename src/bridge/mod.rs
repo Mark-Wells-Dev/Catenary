@@ -19,10 +19,10 @@ mod handler;
 mod hook_router;
 /// Path validation for LSP-aware operations and config file protection.
 pub mod path_security;
+/// Shared container for tool servers and cross-tool infrastructure.
+pub mod session;
 /// Transformation layer trait between protocol boundaries and LSP.
 pub mod tool_server;
-/// Shared container for tool servers and cross-tool infrastructure.
-pub mod toolbox;
 
 pub use diagnostics_server::DiagnosticsServer;
 pub use editing_manager::EditingManager;

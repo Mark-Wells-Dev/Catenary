@@ -3,8 +3,8 @@
 
 //! Shared application container for tool servers and cross-tool infrastructure.
 //!
-//! `Toolbox` creates and owns all internal servers and shared dependencies.
-//! Protocol boundaries (`LspBridgeHandler`, `HookServer`) hold `Arc<Toolbox>`
+//! `Session` creates and owns all internal servers and shared dependencies.
+//! Protocol boundaries (`LspBridgeHandler`, `HookServer`) hold `Arc<Session>`
 //! and access any dependency through it.
 
 use anyhow::Result;
@@ -123,9 +123,9 @@ impl ResolvedGlob {
 /// Shared application container for tool servers and cross-tool infrastructure.
 ///
 /// Creates and owns all internal servers and shared dependencies.
-/// [`super::handler::LspBridgeHandler`] holds an `Arc<Toolbox>` and handles
+/// [`super::handler::LspBridgeHandler`] holds an `Arc<Session>` and handles
 /// protocol boundary concerns (health checks, readiness, dispatch routing).
-pub struct Toolbox {
+pub struct Session {
     /// Session-wide configuration (shared with `LspClientManager`).
     pub config: Arc<Config>,
     /// Monotonic config version — bumped when merged command config changes
@@ -172,8 +172,8 @@ pub struct Toolbox {
     pub transcript_roots: std::sync::Mutex<Vec<PathBuf>>,
 }
 
-impl Toolbox {
-    /// Creates a new `Toolbox`, constructing all internal dependencies.
+impl Session {
+    /// Creates a new `Session`, constructing all internal dependencies.
     ///
     /// Constructs the logging sinks and activates the `LoggingServer`,
     /// draining any bootstrap-buffered events. After this call, all
@@ -600,7 +600,7 @@ mod tests {
 
     // ── merge_transcript_roots ────────────────────────────────────────
 
-    fn make_toolbox() -> (tempfile::TempDir, tokio::runtime::Runtime, Toolbox) {
+    fn make_session() -> (tempfile::TempDir, tokio::runtime::Runtime, Session) {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("catenary").join("catenary.db");
         let conn = crate::db::open_and_migrate_at(&db_path).expect("open test DB");
@@ -611,7 +611,7 @@ mod tests {
             .build()
             .expect("runtime");
         let instance_id: Arc<str> = "test".into();
-        let toolbox = Toolbox::new(
+        let session = Session::new(
             Config::default(),
             vec![],
             logging,
@@ -619,17 +619,17 @@ mod tests {
             instance_id,
             runtime.handle().clone(),
         );
-        (dir, runtime, toolbox)
+        (dir, runtime, session)
     }
 
     #[test]
     fn merge_transcript_roots_adds_missing() {
-        let (_dir, _rt, toolbox) = make_toolbox();
+        let (_dir, _rt, session) = make_session();
         let root_a = PathBuf::from("/tmp/a");
         let root_b = PathBuf::from("/tmp/b");
 
         // Pre-populate transcript roots with root_b.
-        toolbox
+        session
             .transcript_roots
             .lock()
             .expect("lock")
@@ -637,7 +637,7 @@ mod tests {
 
         // MCP roots only has root_a.
         let mut paths = vec![root_a.clone()];
-        toolbox.merge_transcript_roots(&mut paths);
+        session.merge_transcript_roots(&mut paths);
 
         assert_eq!(paths.len(), 2);
         assert_eq!(paths[0], root_a);
@@ -646,18 +646,18 @@ mod tests {
 
     #[test]
     fn merge_transcript_roots_deduplicates() {
-        let (_dir, _rt, toolbox) = make_toolbox();
+        let (_dir, _rt, session) = make_session();
         let root = PathBuf::from("/tmp/shared");
 
         // Transcript roots has the same root as MCP roots.
-        toolbox
+        session
             .transcript_roots
             .lock()
             .expect("lock")
             .push(root.clone());
 
         let mut paths = vec![root.clone()];
-        toolbox.merge_transcript_roots(&mut paths);
+        session.merge_transcript_roots(&mut paths);
 
         // No duplicate added.
         assert_eq!(paths, vec![root]);
@@ -665,10 +665,10 @@ mod tests {
 
     #[test]
     fn merge_transcript_roots_empty_stored() {
-        let (_dir, _rt, toolbox) = make_toolbox();
+        let (_dir, _rt, session) = make_session();
 
         let mut paths = vec![PathBuf::from("/tmp/mcp_root")];
-        toolbox.merge_transcript_roots(&mut paths);
+        session.merge_transcript_roots(&mut paths);
 
         // No change when transcript_roots is empty.
         assert_eq!(paths.len(), 1);

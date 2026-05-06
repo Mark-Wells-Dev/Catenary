@@ -6,7 +6,7 @@
 //! `HookRouter` owns all hook method handlers and application logic
 //! (editing state enforcement, diagnostics dispatch, turn tracking).
 //! Mirrors the [`super::handler::McpRouter`] pattern: protocol boundary
-//! delegates to router, router delegates to [`super::toolbox::Toolbox`].
+//! delegates to router, router delegates to [`super::session::Session`].
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -15,7 +15,7 @@ use tracing::debug;
 
 use crate::source::Source;
 
-use super::toolbox::Toolbox;
+use super::session::Session;
 use crate::hook::response::SystemMessageBuilder;
 use crate::hook::{HookRequest, HookResult};
 
@@ -121,14 +121,14 @@ const ADD_DIR_SUFFIX: &str = "\\u001b[22m as a working directory";
 
 /// Scan the transcript for `/add-dir` confirmation messages.
 ///
-/// Reads from the byte offset stored on `toolbox`, scans new lines for
+/// Reads from the byte offset stored on `session`, scans new lines for
 /// the confirmation pattern, updates the offset, and returns newly
 /// discovered root paths. Returns an empty vec if no transcript path is
 /// stashed, the file is unreadable, or no new `/add-dir` entries exist.
-fn scan_transcript(toolbox: &Toolbox) -> Vec<PathBuf> {
+fn scan_transcript(session: &Session) -> Vec<PathBuf> {
     use std::io::{BufRead, Seek, SeekFrom};
 
-    let path = match toolbox.transcript_path.lock() {
+    let path = match session.transcript_path.lock() {
         Ok(guard) => match guard.as_ref() {
             Some(p) => p.clone(),
             None => return Vec::new(),
@@ -136,7 +136,7 @@ fn scan_transcript(toolbox: &Toolbox) -> Vec<PathBuf> {
         Err(_) => return Vec::new(),
     };
 
-    let offset = toolbox
+    let offset = session
         .transcript_offset
         .load(std::sync::atomic::Ordering::Acquire);
 
@@ -210,7 +210,7 @@ fn scan_transcript(toolbox: &Toolbox) -> Vec<PathBuf> {
     }
 
     let new_offset = file.stream_position().unwrap_or(offset);
-    toolbox
+    session
         .transcript_offset
         .store(new_offset, std::sync::atomic::Ordering::Release);
 
@@ -231,9 +231,9 @@ fn scan_transcript(toolbox: &Toolbox) -> Vec<PathBuf> {
 /// Routes parsed [`HookRequest`] values to the appropriate handler and
 /// returns an optional [`HookResult`]. Holds all shared application state
 /// needed by hook handlers: editing state (via [`super::editing_manager::EditingManager`]
-/// on [`Toolbox`]) and a turn counter for per-turn debounce.
+/// on [`Session`]) and a turn counter for per-turn debounce.
 pub struct HookRouter {
-    pub(crate) toolbox: Arc<Toolbox>,
+    pub(crate) session: Arc<Session>,
     turn_counter: AtomicU64,
     /// Last turn number where a full config dump was shown on denial.
     last_config_dump_turn: AtomicU64,
@@ -249,13 +249,13 @@ impl HookRouter {
     /// Creates a new `HookRouter`.
     #[must_use]
     pub const fn new(
-        toolbox: Arc<Toolbox>,
+        session: Arc<Session>,
         conn: Arc<std::sync::Mutex<rusqlite::Connection>>,
         instance_id: Arc<str>,
         client_name: String,
     ) -> Self {
         Self {
-            toolbox,
+            session,
             turn_counter: AtomicU64::new(0),
             // Initialized to MAX so the first denial always triggers a full
             // config dump (turn 0 != MAX).
@@ -278,11 +278,11 @@ impl HookRouter {
 
     /// Bump the config version counter.
     ///
-    /// Delegates to `Toolbox::config_version`. Forces the next denial
+    /// Delegates to `Session::config_version`. Forces the next denial
     /// to show a full config dump regardless of turn.
     #[cfg(test)]
     pub(crate) fn bump_config_version(&self) {
-        self.toolbox.config_version.fetch_add(1, Ordering::AcqRel);
+        self.session.config_version.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Check whether the next command denial should show a full config dump.
@@ -291,7 +291,7 @@ impl HookRouter {
     /// or config version changed), `false` for a short message.
     fn should_show_full_dump(&self) -> bool {
         let current_turn = self.turn_counter.load(Ordering::Acquire);
-        let current_version = self.toolbox.config_version.load(Ordering::Acquire);
+        let current_version = self.session.config_version.load(Ordering::Acquire);
         let last_dump_turn = self.last_config_dump_turn.load(Ordering::Acquire);
         let last_dump_version = self.last_config_dump_version.load(Ordering::Acquire);
 
@@ -318,7 +318,7 @@ impl HookRouter {
         cwd: Option<&str>,
         format: Option<crate::cli::HostFormat>,
     ) -> DispatchResult {
-        let Some(resolved) = self.toolbox.merged_commands() else {
+        let Some(resolved) = self.session.merged_commands() else {
             return DispatchResult {
                 result: None,
                 system_message: None,
@@ -403,8 +403,8 @@ impl HookRouter {
 
         // Project config state for the cwd's root.
         let cwd_path = cwd.map(std::path::Path::new);
-        let project_commands = self.toolbox.client_manager.project_commands();
-        let roots = self.toolbox.client_manager.roots();
+        let project_commands = self.session.client_manager.project_commands();
+        let roots = self.session.client_manager.roots();
 
         // Find the root matching cwd (longest prefix).
         let matching_root = cwd_path.and_then(|cwd| {
@@ -448,21 +448,21 @@ impl HookRouter {
                     source = Source::HookDispatch.as_str(),
                     turn, "Hook: turn start"
                 );
-                self.toolbox
+                self.session
                     .roots_refresh_requested
                     .store(true, Ordering::Release);
 
                 // Stash transcript path for scanning.
                 if let Some(path) = transcript_path
-                    && let Ok(mut tp) = self.toolbox.transcript_path.lock()
+                    && let Ok(mut tp) = self.session.transcript_path.lock()
                 {
                     *tp = Some(PathBuf::from(path));
                 }
 
                 // Scan transcript for /add-dir roots and store them.
-                let new_roots = scan_transcript(&self.toolbox);
+                let new_roots = scan_transcript(&self.session);
                 if !new_roots.is_empty()
-                    && let Ok(mut stored) = self.toolbox.transcript_roots.lock()
+                    && let Ok(mut stored) = self.session.transcript_roots.lock()
                 {
                     for root in &new_roots {
                         if !stored.contains(root) {
@@ -502,7 +502,7 @@ impl HookRouter {
                     && (is_catenary_tool(&tool_name, "grep")
                         || is_catenary_tool(&tool_name, "glob"))
                 {
-                    self.toolbox
+                    self.session
                         .cwd_stash
                         .stash(std::path::PathBuf::from(cwd_str));
                 }
@@ -583,7 +583,7 @@ impl HookRouter {
     /// Returns `None` if the queue is empty and no sink panics occurred.
     fn drain_notifications(&self) -> Option<String> {
         let mut builder = SystemMessageBuilder::new();
-        builder.drain_background(&self.toolbox.notifications, &self.toolbox.logging);
+        builder.drain_background(&self.session.notifications, &self.session.logging);
         builder.finish()
     }
 
@@ -609,11 +609,11 @@ impl HookRouter {
     ) -> Option<HookResult> {
         // start_editing: enter editing mode and allow unconditionally.
         if is_catenary_tool(tool_name, "start_editing") {
-            let _ = self.toolbox.editing.start_editing(session_id, agent_id);
+            let _ = self.session.editing.start_editing(session_id, agent_id);
             return None;
         }
 
-        let agent_editing = self.toolbox.editing.is_editing(session_id, agent_id);
+        let agent_editing = self.session.editing.is_editing(session_id, agent_id);
 
         if agent_editing {
             if is_allowed_during_editing(tool_name)
@@ -634,7 +634,7 @@ impl HookRouter {
             // initialized (positive cache). Files with no cache entry or
             // a negative cache entry skip the gate — no diagnostics would
             // be produced, so requiring start_editing is pointless.
-            if file_path.is_some_and(|p| !self.toolbox.has_lsp_coverage(Path::new(p))) {
+            if file_path.is_some_and(|p| !self.session.has_lsp_coverage(Path::new(p))) {
                 return None;
             }
             Some(HookResult::Deny("call start_editing before editing".into()))
@@ -656,15 +656,15 @@ impl HookRouter {
         agent_id: &str,
         tool_name: Option<&str>,
     ) -> Option<HookResult> {
-        if self.toolbox.editing.is_editing(session_id, agent_id)
+        if self.session.editing.is_editing(session_id, agent_id)
             && tool_name.is_some_and(is_edit_tool)
         {
             // Only accumulate files with known LSP coverage — files
             // without coverage have no server to produce diagnostics,
             // so processing them in done_editing is wasted work.
             let path = Path::new(file_path);
-            if self.toolbox.has_lsp_coverage(path) {
-                self.toolbox
+            if self.session.has_lsp_coverage(path) {
+                self.session
                     .editing
                     .add_file(session_id, agent_id, PathBuf::from(file_path));
             }
@@ -686,11 +686,11 @@ impl HookRouter {
         if stop_hook_active {
             // Agent was told to call done_editing but didn't. Clear stale
             // state rather than leaving it for SessionStart/GC cleanup.
-            self.toolbox.editing.done_editing(session_id, agent_id);
+            self.session.editing.done_editing(session_id, agent_id);
             return None;
         }
 
-        if self.toolbox.editing.is_editing(session_id, agent_id) {
+        if self.session.editing.is_editing(session_id, agent_id) {
             Some(HookResult::Block(
                 "call done_editing to get diagnostics before finishing".into(),
             ))
@@ -703,7 +703,7 @@ impl HookRouter {
     ///
     /// Returns the count of cleared entries, or `None` if nothing was cleared.
     fn handle_clear_editing(&self) -> Option<HookResult> {
-        let count = self.toolbox.editing.clear_all();
+        let count = self.session.editing.clear_all();
 
         if count > 0 {
             Some(HookResult::Cleared(count))
@@ -845,7 +845,7 @@ mod tests {
         let result = router.handle_enforce_editing(START_EDITING, None, None, None, "");
         assert!(result.is_none(), "start_editing should allow");
         assert!(
-            router.toolbox.editing.is_editing(None, ""),
+            router.session.editing.is_editing(None, ""),
             "should be in editing mode"
         );
 
@@ -881,7 +881,7 @@ mod tests {
         let result = router.handle_file_accumulation(&lib_rs, None, "", Some("Read"));
         assert!(result.is_none());
 
-        let files = router.toolbox.editing.drain_files(None, "");
+        let files = router.session.editing.drain_files(None, "");
         assert_eq!(files, vec![PathBuf::from(&main_rs)]);
     }
 
@@ -918,7 +918,7 @@ mod tests {
 
         // State should be cleared
         assert!(
-            !router.toolbox.editing.is_editing(None, ""),
+            !router.session.editing.is_editing(None, ""),
             "editing state should be cleared after retry"
         );
     }
@@ -985,7 +985,7 @@ mod tests {
 
         // File outside workspace roots — should not be accumulated.
         router.handle_file_accumulation("/outside/some/file.rs", None, "", Some("Edit"));
-        let files = router.toolbox.editing.drain_files(None, "");
+        let files = router.session.editing.drain_files(None, "");
         assert!(
             files.is_empty(),
             "out-of-root file should not be accumulated"
@@ -999,7 +999,7 @@ mod tests {
 
         let in_root = format!("{}/src/main.rs", root.display());
         router.handle_file_accumulation(&in_root, None, "", Some("Edit"));
-        let files = router.toolbox.editing.drain_files(None, "");
+        let files = router.session.editing.drain_files(None, "");
         assert_eq!(files.len(), 1, "in-root file should be accumulated");
     }
 
@@ -1059,7 +1059,7 @@ mod tests {
         let handle = runtime.handle().clone();
 
         let instance_id: Arc<str> = "test-session".into();
-        let toolbox = Arc::new(Toolbox::new(
+        let session = Arc::new(Session::new(
             config,
             vec![],
             logging,
@@ -1069,7 +1069,7 @@ mod tests {
         ));
 
         if failed {
-            toolbox
+            session
                 .client_manager
                 .single_file_failures
                 .lock()
@@ -1077,7 +1077,7 @@ mod tests {
                 .insert((SF_LANG.to_string(), SF_SERVER.to_string()));
         }
 
-        let router = HookRouter::new(toolbox, conn, instance_id, "test".to_string());
+        let router = HookRouter::new(session, conn, instance_id, "test".to_string());
 
         TestHookRouter {
             _dir: dir,
@@ -1130,7 +1130,7 @@ mod tests {
 
         let path = format!("/outside/file.{SF_LANG}");
         router.handle_file_accumulation(&path, None, "", Some("Edit"));
-        let files = router.toolbox.editing.drain_files(None, "");
+        let files = router.session.editing.drain_files(None, "");
         assert_eq!(
             files.len(),
             1,
@@ -1146,7 +1146,7 @@ mod tests {
 
         let path = format!("/outside/file.{SF_LANG}");
         router.handle_file_accumulation(&path, None, "", Some("Edit"));
-        let files = router.toolbox.editing.drain_files(None, "");
+        let files = router.session.editing.drain_files(None, "");
         assert!(
             files.is_empty(),
             "runtime-failed out-of-root file should not be accumulated"
@@ -1268,7 +1268,7 @@ mod tests {
     ///
     /// Uses minimal dependencies (no live LSP servers). Editing state is
     /// managed in-memory via [`super::super::editing_manager::EditingManager`]
-    /// on the `Toolbox`.
+    /// on the `Session`.
     fn test_router() -> TestHookRouter {
         let (dir, _path, conn) = test_db();
         let conn = Arc::new(std::sync::Mutex::new(conn));
@@ -1286,12 +1286,12 @@ mod tests {
         let config = Config::default();
         let logging = crate::logging::LoggingServer::new();
 
-        // Toolbox requires a tokio runtime handle for async dispatch.
+        // Session requires a tokio runtime handle for async dispatch.
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
         let handle = runtime.handle().clone();
 
         let instance_id: Arc<str> = "test-session".into();
-        let toolbox = Arc::new(Toolbox::new(
+        let session = Arc::new(Session::new(
             config,
             vec![],
             logging,
@@ -1299,7 +1299,7 @@ mod tests {
             instance_id.clone(),
             handle,
         ));
-        let router = HookRouter::new(toolbox, conn, instance_id, "test".to_string());
+        let router = HookRouter::new(session, conn, instance_id, "test".to_string());
 
         TestHookRouter {
             _dir: dir,
@@ -1332,7 +1332,7 @@ mod tests {
         std::fs::create_dir_all(&root).expect("create workspace dir");
 
         let instance_id: Arc<str> = "test-session".into();
-        let toolbox = Arc::new(Toolbox::new(
+        let session = Arc::new(Session::new(
             config,
             vec![root.clone()],
             logging,
@@ -1341,7 +1341,7 @@ mod tests {
             handle,
         ));
 
-        let router = HookRouter::new(toolbox, conn, instance_id, "test".to_string());
+        let router = HookRouter::new(session, conn, instance_id, "test".to_string());
 
         (
             TestHookRouter {
@@ -1374,10 +1374,10 @@ mod tests {
         let router = test_router();
         // Populate the notification queue.
         crate::logging::Sink::handle(
-            router.toolbox.notifications.as_ref(),
+            router.session.notifications.as_ref(),
             &make_notify_event("server offline", "ra"),
         );
-        assert_eq!(router.toolbox.notifications.len(), 1);
+        assert_eq!(router.session.notifications.len(), 1);
 
         let result = router.dispatch(
             crate::hook::HookRequest::SessionStart { session_id: None },
@@ -1387,14 +1387,14 @@ mod tests {
             result.system_message.is_some(),
             "session start should drain notifications"
         );
-        assert!(router.toolbox.notifications.is_empty());
+        assert!(router.session.notifications.is_empty());
     }
 
     #[test]
     fn dispatch_stop_allow_drains_notifications() {
         let router = test_router();
         crate::logging::Sink::handle(
-            router.toolbox.notifications.as_ref(),
+            router.session.notifications.as_ref(),
             &make_notify_event("server offline", "ra"),
         );
 
@@ -1412,7 +1412,7 @@ mod tests {
             result.system_message.is_some(),
             "allow should drain notifications"
         );
-        assert!(router.toolbox.notifications.is_empty());
+        assert!(router.session.notifications.is_empty());
     }
 
     #[test]
@@ -1422,7 +1422,7 @@ mod tests {
         router.handle_enforce_editing(START_EDITING, None, None, None, "");
 
         crate::logging::Sink::handle(
-            router.toolbox.notifications.as_ref(),
+            router.session.notifications.as_ref(),
             &make_notify_event("server offline", "ra"),
         );
 
@@ -1440,7 +1440,7 @@ mod tests {
         );
         assert!(result.system_message.is_none(), "block should not drain");
         assert_eq!(
-            router.toolbox.notifications.len(),
+            router.session.notifications.len(),
             1,
             "queue should be preserved"
         );
@@ -1450,7 +1450,7 @@ mod tests {
     fn dispatch_pre_tool_does_not_drain() {
         let router = test_router();
         crate::logging::Sink::handle(
-            router.toolbox.notifications.as_ref(),
+            router.session.notifications.as_ref(),
             &make_notify_event("server offline", "ra"),
         );
 
@@ -1466,7 +1466,7 @@ mod tests {
             0,
         );
         assert!(result.system_message.is_none(), "pre-tool should not drain");
-        assert_eq!(router.toolbox.notifications.len(), 1);
+        assert_eq!(router.session.notifications.len(), 1);
     }
 
     #[test]
@@ -1477,7 +1477,7 @@ mod tests {
 
         // Enqueue a notification before the first stop.
         crate::logging::Sink::handle(
-            router.toolbox.notifications.as_ref(),
+            router.session.notifications.as_ref(),
             &make_notify_event("server offline", "ra"),
         );
 
@@ -1492,14 +1492,14 @@ mod tests {
         );
         assert!(matches!(result.result, Some(HookResult::Block(_))));
         assert!(result.system_message.is_none());
-        assert_eq!(router.toolbox.notifications.len(), 1);
+        assert_eq!(router.session.notifications.len(), 1);
 
         // Enqueue another notification between block and retry.
         crate::logging::Sink::handle(
-            router.toolbox.notifications.as_ref(),
+            router.session.notifications.as_ref(),
             &make_notify_event("config error", "pylsp"),
         );
-        assert_eq!(router.toolbox.notifications.len(), 2);
+        assert_eq!(router.session.notifications.len(), 2);
 
         // Second stop: retry (stop_hook_active) — force-clears editing, allows, drains.
         let result = router.dispatch(
@@ -1522,7 +1522,7 @@ mod tests {
             msg.contains("config error"),
             "drain should include second-cycle notification"
         );
-        assert!(router.toolbox.notifications.is_empty());
+        assert!(router.session.notifications.is_empty());
     }
 
     #[test]
@@ -1532,7 +1532,7 @@ mod tests {
 
         // Enqueue a notification.
         crate::logging::Sink::handle(
-            router.toolbox.notifications.as_ref(),
+            router.session.notifications.as_ref(),
             &make_notify_event("server offline", "ra"),
         );
 
@@ -1549,11 +1549,11 @@ mod tests {
 
         // Same notification again — dedup should reject.
         crate::logging::Sink::handle(
-            router.toolbox.notifications.as_ref(),
+            router.session.notifications.as_ref(),
             &make_notify_event("server offline", "ra"),
         );
         assert_eq!(
-            router.toolbox.notifications.len(),
+            router.session.notifications.len(),
             1,
             "dedup should reject duplicate across blocked cycle"
         );
@@ -1599,7 +1599,7 @@ mod tests {
     fn dispatch_post_tool_does_not_drain() {
         let router = test_router();
         crate::logging::Sink::handle(
-            router.toolbox.notifications.as_ref(),
+            router.session.notifications.as_ref(),
             &make_notify_event("server offline", "ra"),
         );
 
@@ -1616,7 +1616,7 @@ mod tests {
             result.system_message.is_none(),
             "post-tool should not drain"
         );
-        assert_eq!(router.toolbox.notifications.len(), 1);
+        assert_eq!(router.session.notifications.len(), 1);
     }
 
     // ── Turn counter tests ────────────────────────────────────────────
@@ -1648,7 +1648,7 @@ mod tests {
         let router = test_router();
         assert!(
             !router
-                .toolbox
+                .session
                 .roots_refresh_requested
                 .load(Ordering::Acquire),
             "flag should start false"
@@ -1662,7 +1662,7 @@ mod tests {
         );
         assert!(
             router
-                .toolbox
+                .session
                 .roots_refresh_requested
                 .load(Ordering::Acquire),
             "flag should be set after PreAgent"
@@ -1698,7 +1698,7 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
         let handle = runtime.handle().clone();
         let instance_id: Arc<str> = "test-session".into();
-        let toolbox = Arc::new(Toolbox::new(
+        let session = Arc::new(Session::new(
             config,
             vec![],
             logging,
@@ -1706,7 +1706,7 @@ mod tests {
             instance_id.clone(),
             handle,
         ));
-        let router = HookRouter::new(toolbox, conn, instance_id, "test".to_string());
+        let router = HookRouter::new(session, conn, instance_id, "test".to_string());
         TestHookRouter {
             _dir: dir,
             _runtime: runtime,
@@ -1850,7 +1850,7 @@ mod tests {
             },
             0,
         );
-        let stashed = router.toolbox.cwd_stash.take();
+        let stashed = router.session.cwd_stash.take();
         assert_eq!(stashed, Some(PathBuf::from("/home/user/project")));
     }
 
@@ -1869,7 +1869,7 @@ mod tests {
             0,
         );
         assert_eq!(
-            router.toolbox.cwd_stash.take(),
+            router.session.cwd_stash.take(),
             Some(PathBuf::from("/workspace"))
         );
     }
@@ -1889,7 +1889,7 @@ mod tests {
             0,
         );
         assert!(
-            router.toolbox.cwd_stash.take().is_none(),
+            router.session.cwd_stash.take().is_none(),
             "non-Catenary tools should not stash cwd"
         );
     }
@@ -1912,7 +1912,7 @@ mod tests {
             0,
         );
         assert!(
-            router.toolbox.cwd_stash.take().is_none(),
+            router.session.cwd_stash.take().is_none(),
             "denied tools should not stash cwd"
         );
     }
@@ -1932,7 +1932,7 @@ mod tests {
             0,
         );
         assert!(
-            router.toolbox.cwd_stash.take().is_none(),
+            router.session.cwd_stash.take().is_none(),
             "missing cwd should not stash"
         );
     }
@@ -1964,9 +1964,9 @@ mod tests {
         let transcript = write_transcript(dir.path(), &[&line]);
 
         let router = test_router();
-        *router.toolbox.transcript_path.lock().expect("lock") = Some(transcript);
+        *router.session.transcript_path.lock().expect("lock") = Some(transcript);
 
-        let roots = scan_transcript(&router.toolbox);
+        let roots = scan_transcript(&router.session);
         assert_eq!(roots, vec![root]);
     }
 
@@ -1985,13 +1985,13 @@ mod tests {
         let transcript = write_transcript(dir.path(), &[&line1]);
 
         let router = test_router();
-        *router.toolbox.transcript_path.lock().expect("lock") = Some(transcript.clone());
+        *router.session.transcript_path.lock().expect("lock") = Some(transcript.clone());
 
-        let roots = scan_transcript(&router.toolbox);
+        let roots = scan_transcript(&router.session);
         assert_eq!(roots, vec![root1]);
 
         // Second scan with same content → empty (offset advanced).
-        let roots = scan_transcript(&router.toolbox);
+        let roots = scan_transcript(&router.session);
         assert!(roots.is_empty(), "second scan should find nothing new");
 
         // Append a new line and scan again.
@@ -2005,7 +2005,7 @@ mod tests {
         content.push_str(&line2);
         std::fs::write(&transcript, content).expect("append");
 
-        let roots = scan_transcript(&router.toolbox);
+        let roots = scan_transcript(&router.session);
         assert_eq!(roots, vec![root2]);
     }
 
@@ -2029,9 +2029,9 @@ mod tests {
         let transcript = write_transcript(dir.path(), &[&line1, &line2]);
 
         let router = test_router();
-        *router.toolbox.transcript_path.lock().expect("lock") = Some(transcript);
+        *router.session.transcript_path.lock().expect("lock") = Some(transcript);
 
-        let roots = scan_transcript(&router.toolbox);
+        let roots = scan_transcript(&router.session);
         assert_eq!(roots.len(), 2);
         assert!(roots.contains(&root1));
         assert!(roots.contains(&root2));
@@ -2048,9 +2048,9 @@ mod tests {
         let transcript = write_transcript(dir.path(), &[&line, &line]);
 
         let router = test_router();
-        *router.toolbox.transcript_path.lock().expect("lock") = Some(transcript);
+        *router.session.transcript_path.lock().expect("lock") = Some(transcript);
 
-        let roots = scan_transcript(&router.toolbox);
+        let roots = scan_transcript(&router.session);
         assert_eq!(roots, vec![root]);
     }
 
@@ -2066,26 +2066,26 @@ mod tests {
         );
 
         let router = test_router();
-        *router.toolbox.transcript_path.lock().expect("lock") = Some(transcript);
+        *router.session.transcript_path.lock().expect("lock") = Some(transcript);
 
-        let roots = scan_transcript(&router.toolbox);
+        let roots = scan_transcript(&router.session);
         assert!(roots.is_empty());
     }
 
     #[test]
     fn scan_transcript_missing_file() {
         let router = test_router();
-        *router.toolbox.transcript_path.lock().expect("lock") =
+        *router.session.transcript_path.lock().expect("lock") =
             Some(PathBuf::from("/nonexistent/transcript.jsonl"));
 
-        let roots = scan_transcript(&router.toolbox);
+        let roots = scan_transcript(&router.session);
         assert!(roots.is_empty());
     }
 
     #[test]
     fn scan_transcript_no_path_stashed() {
         let router = test_router();
-        let roots = scan_transcript(&router.toolbox);
+        let roots = scan_transcript(&router.session);
         assert!(roots.is_empty());
     }
 
@@ -2094,7 +2094,7 @@ mod tests {
         let router = test_router();
         assert!(
             router
-                .toolbox
+                .session
                 .transcript_path
                 .lock()
                 .expect("lock")
@@ -2109,7 +2109,7 @@ mod tests {
         );
         assert_eq!(
             router
-                .toolbox
+                .session
                 .transcript_path
                 .lock()
                 .expect("lock")
@@ -2142,7 +2142,7 @@ mod tests {
         assert_eq!(result.add_roots, vec![root.clone()]);
 
         // Verify the roots are stored in transcript_roots.
-        let stored = router.toolbox.transcript_roots.lock().expect("lock");
+        let stored = router.session.transcript_roots.lock().expect("lock");
         assert_eq!(stored.as_slice(), &[root]);
     }
 
@@ -2194,7 +2194,7 @@ mod tests {
         assert_eq!(result.add_roots, vec![root2.clone()]);
 
         // Stored set contains both.
-        let stored = router.toolbox.transcript_roots.lock().expect("lock");
+        let stored = router.session.transcript_roots.lock().expect("lock");
         assert_eq!(stored.len(), 2);
         assert!(stored.contains(&root1));
         assert!(stored.contains(&root2));

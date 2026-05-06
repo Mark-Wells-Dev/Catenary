@@ -75,7 +75,7 @@ Agent ◄──MCP──► │  McpServer ──► McpRouter ──► ToolSer
                                         rust-analyzer  typescript-
                                                        language-server
                 ┌──────────────────────────────────────────────────────┐
-  Host CLI ◄──IPC──► HookServer ──► HookRouter ──► Toolbox           │
+  Host CLI ◄──IPC──► HookServer ──► HookRouter ──► Session           │
   (hooks)       │                                                      │
                 └──────────────────────────────────────────────────────┘
 
@@ -86,9 +86,9 @@ Agent ◄──MCP──► │  McpServer ──► McpRouter ──► ToolSer
 
 ## Shared infrastructure
 
-- **`Toolbox`** — application container. Owns tool servers, the client
+- **`Session`** — application container. Owns tool servers, the client
   manager, filesystem manager, editing state, path validation, logging,
-  and the tree-sitter index. Protocol boundaries hold `Arc<Toolbox>`.
+  and the tree-sitter index. Protocol boundaries hold `Arc<Session>`.
 - **`FilesystemManager`** — file classification and root resolution.
   Single authority for language detection, shebang parsing, and
   workspace root membership. Also implements the snapshot-and-diff
