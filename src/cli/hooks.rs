@@ -25,23 +25,60 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::cli::HostFormat;
+use crate::{db, session};
 
-/// Returns the daemon hook socket endpoint path.
+/// Per-session IPC endpoint path (legacy fallback).
 ///
-/// On Unix this is the deterministic daemon hook socket. On Windows
-/// this falls back to a named pipe in the kernel namespace (daemon
-/// support is Unix-only for now).
-fn hook_endpoint() -> PathBuf {
+/// Used when the daemon hook socket is not available.
+fn legacy_hook_endpoint(session_id: &str) -> PathBuf {
     #[cfg(unix)]
     {
-        crate::router::hook_socket_path()
+        session::sessions_dir().join(session_id).join("notify.sock")
     }
     #[cfg(windows)]
     {
-        // Daemon is Unix-only; Windows uses a placeholder path that
-        // will fail to connect, falling through to silent allow.
-        PathBuf::from(r"\\.\pipe\catenary-hooks")
+        PathBuf::from(format!(r"\\.\pipe\catenary-{session_id}"))
     }
+}
+
+/// Find the Catenary session ID for a hook payload, using the working directory
+/// to match against workspace roots. Returns `None` if no matching session.
+fn find_session_id(hook_json: &serde_json::Value, conn: &rusqlite::Connection) -> Option<String> {
+    let cwd = hook_json.get("cwd").and_then(|v| v.as_str()).map_or_else(
+        || std::env::current_dir().unwrap_or_default(),
+        PathBuf::from,
+    );
+    let cwd_str = cwd.to_string_lossy();
+    let sessions = session::list_sessions_with_conn(conn).unwrap_or_default();
+    sessions
+        .into_iter()
+        .find(|(s, alive)| *alive && cwd_str.starts_with(&s.workspace))
+        .map(|(s, _)| s.id)
+}
+
+/// Connect to a hook IPC endpoint.
+///
+/// Tries the daemon hook socket first. Falls back to per-session
+/// socket discovery when the daemon is not running.
+#[cfg(unix)]
+fn hook_connect(hook_json: &serde_json::Value) -> Option<std::os::unix::net::UnixStream> {
+    let daemon_path = crate::router::hook_socket_path();
+    if let Some(stream) = notify_connect(&daemon_path) {
+        return Some(stream);
+    }
+    let conn = db::open_and_migrate().ok()?;
+    let sid = find_session_id(hook_json, &conn)?;
+    notify_connect(&legacy_hook_endpoint(&sid))
+}
+
+/// Connect to a hook IPC endpoint (Windows fallback).
+///
+/// Daemon is Unix-only; uses per-session socket discovery directly.
+#[cfg(windows)]
+fn hook_connect(hook_json: &serde_json::Value) -> Option<std::fs::File> {
+    let conn = db::open_and_migrate().ok()?;
+    let sid = find_session_id(hook_json, &conn)?;
+    notify_connect(&legacy_hook_endpoint(&sid))
 }
 
 /// Connects to a notify IPC endpoint and returns a stream for I/O.
@@ -253,8 +290,7 @@ pub fn run_session_start(format: HostFormat) {
         return;
     };
 
-    let endpoint = hook_endpoint();
-    let Some(stream) = notify_connect(&endpoint) else {
+    let Some(stream) = hook_connect(&hook_json) else {
         emit_system_message(builder, format);
         return;
     };
@@ -324,8 +360,7 @@ pub fn run_post_agent(format: HostFormat) {
         return;
     };
 
-    let endpoint = hook_endpoint();
-    let Some(stream) = notify_connect(&endpoint) else {
+    let Some(stream) = hook_connect(&hook_json) else {
         return;
     };
 
@@ -396,8 +431,7 @@ pub fn run_post_tool(format: HostFormat) {
         return;
     };
 
-    let endpoint = hook_endpoint();
-    let Some(stream) = notify_connect(&endpoint) else {
+    let Some(stream) = hook_connect(&hook_json) else {
         return;
     };
 
@@ -439,8 +473,7 @@ pub fn run_pre_agent(format: HostFormat) {
         return;
     };
 
-    let endpoint = hook_endpoint();
-    if let Some(stream) = notify_connect(&endpoint) {
+    if let Some(stream) = hook_connect(&hook_json) {
         let mut request = serde_json::json!({
             "method": "pre-agent/turn-start",
             "host_payload": prepare_host_payload(&hook_json),
@@ -500,9 +533,8 @@ pub fn run_pre_tool(format: HostFormat) {
         }
     }
 
-    // ── Editing state enforcement (IPC to daemon) ────────────────
-    let endpoint = hook_endpoint();
-    let Some(stream) = notify_connect(&endpoint) else {
+    // ── Editing state enforcement (IPC to daemon / session) ──────
+    let Some(stream) = hook_connect(&hook_json) else {
         return;
     };
 
@@ -675,8 +707,7 @@ fn ipc_check_command(
     shell_cmd: &str,
     format: HostFormat,
 ) -> Option<String> {
-    let endpoint = hook_endpoint();
-    let stream = notify_connect(&endpoint)?;
+    let stream = hook_connect(hook_json)?;
 
     let cwd = hook_json.get("cwd").and_then(|v| v.as_str());
     let session_id = hook_json.get("session_id").and_then(|v| v.as_str());
