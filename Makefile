@@ -34,7 +34,16 @@ check:
 	@cargo update --quiet
 	@cargo fmt -- -l | sed 's/^/fmt: formatted /'
 	@cargo clippy --tests --features mockls --quiet -- -D warnings
-	@cargo deny --log-level error check
+	@tries=0; while true; do \
+	   cargo deny --log-level error check; rc=$$?; \
+	   if [ $$rc -eq 0 ]; then break; \
+	   elif [ $$rc -ne 139 ]; then exit $$rc; \
+	   else \
+	     tries=$$((tries + 1)); \
+	     if [ $$tries -ge 5 ]; then echo "cargo-deny segfaulted 5 times, giving up"; exit 139; fi; \
+	     echo "cargo-deny segfaulted (EmbarkStudios/cargo-deny#855), retry $$tries/5..."; \
+	   fi; \
+	 done
 	@cargo machete --skip-target-dir
 	@cargo nextest run --workspace --features mockls --no-fail-fast --status-level fail --final-status-level fail --cargo-quiet --show-progress only
 
@@ -52,7 +61,16 @@ rustdoc:
 
 # Run cargo-deny license and advisory checks
 deny:
-	@cargo deny --log-level error check
+	@tries=0; while true; do \
+	   cargo deny --log-level error check; rc=$$?; \
+	   if [ $$rc -eq 0 ]; then break; \
+	   elif [ $$rc -ne 139 ]; then exit $$rc; \
+	   else \
+	     tries=$$((tries + 1)); \
+	     if [ $$tries -ge 5 ]; then echo "cargo-deny segfaulted 5 times, giving up"; exit 139; fi; \
+	     echo "cargo-deny segfaulted (EmbarkStudios/cargo-deny#855), retry $$tries/5..."; \
+	   fi; \
+	 done
 
 # Run mutation testing. Expensive — use before releases, not on every commit.
 # Pass T= to scope to specific modules, e.g.: make mutants T=command_filter
