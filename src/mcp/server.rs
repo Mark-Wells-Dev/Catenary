@@ -551,6 +551,22 @@ impl<H: ToolHandler> McpServer<H> {
                 // If we see it here, the tool call already finished.
                 debug!("notifications/cancelled received (tool call already complete)");
             }
+            "catenary/version-mismatch" => {
+                let bridge_version = notification
+                    .params
+                    .as_ref()
+                    .and_then(|p| p.get("bridgeVersion"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                warn!(
+                    source = crate::source::Source::DaemonLifecycle.as_str(),
+                    daemon_version = env!("CATENARY_VERSION"),
+                    bridge_version = bridge_version,
+                    "Version mismatch: bridge v{bridge_version} rejected \
+                     (daemon is v{})",
+                    env!("CATENARY_VERSION"),
+                );
+            }
             _ => {
                 debug!("Ignoring unknown notification: {}", notification.method);
             }
@@ -1845,6 +1861,73 @@ mod tests {
             "should not fetch when no external flag is wired"
         );
         Ok(())
+    }
+
+    // ── Version mismatch notification tests ────────────────────────
+
+    #[test]
+    fn mismatch_emits_warning() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::layer::SubscriberExt;
+
+        struct WarnCapture {
+            sources: Arc<Mutex<Vec<String>>>,
+        }
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnCapture {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if *event.metadata().level() == tracing::Level::WARN {
+                    struct Visitor(Option<String>);
+                    impl tracing::field::Visit for Visitor {
+                        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                            if field.name() == "source" {
+                                self.0 = Some(value.to_string());
+                            }
+                        }
+                        fn record_debug(
+                            &mut self,
+                            _field: &tracing::field::Field,
+                            _value: &dyn std::fmt::Debug,
+                        ) {
+                        }
+                    }
+                    let mut v = Visitor(None);
+                    event.record(&mut v);
+                    if let Some(src) = v.0
+                        && let Ok(mut w) = self.sources.lock()
+                    {
+                        w.push(src);
+                    }
+                }
+            }
+        }
+
+        let sources = Arc::new(Mutex::new(Vec::new()));
+        let layer = WarnCapture {
+            sources: Arc::clone(&sources),
+        };
+
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let mut server = McpServer::new(TestHandler, LoggingServer::new());
+
+        let notification = Notification {
+            jsonrpc: "2.0".to_string(),
+            method: "catenary/version-mismatch".to_string(),
+            params: Some(serde_json::json!({"bridgeVersion": "0.0.0-fake"})),
+        };
+        server.handle_notification(&notification);
+
+        let captured = sources.lock().expect("lock").clone();
+        assert!(
+            captured.contains(&"daemon.lifecycle".to_string()),
+            "should emit daemon.lifecycle warning, got: {captured:?}",
+        );
     }
 
     #[test]

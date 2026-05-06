@@ -739,6 +739,10 @@ fn spawn_daemon() -> Result<()> {
 
 /// Proxies stdin/stdout to/from a daemon socket connection.
 ///
+/// Before entering the concurrent proxy, intercepts the first MCP
+/// exchange (initialize) to verify the daemon's version matches this
+/// bridge's version. On mismatch, returns an error without proxying.
+///
 /// Runs two concurrent copy loops. Returns `Ok(())` when stdin closes
 /// (host CLI ended the session) or `Err` when the daemon connection
 /// drops.
@@ -756,16 +760,33 @@ fn spawn_daemon() -> Result<()> {
 ///
 /// # Errors
 ///
-/// Returns an error if the daemon connection closes before stdin,
-/// indicating unexpected daemon termination.
+/// Returns an error if the daemon version does not match, or if the
+/// daemon connection closes before stdin (unexpected termination).
 #[cfg(unix)]
 pub async fn proxy_stdio(stream: tokio::net::UnixStream) -> Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    // Convert to std for the blocking stdin→socket direction.
-    // try_clone gives us a second handle to the same fd so we can
-    // split read/write without consuming the tokio stream.
+    // Convert to std for the blocking handshake phase.
+    // The stream starts in blocking mode from into_std().
     let std_stream = stream.into_std().context("convert daemon socket to std")?;
+
+    // Phase 1: Version handshake (blocking, sequential).
+    // Intercepts the first MCP exchange (initialize) to verify that the
+    // daemon version matches this bridge. On mismatch, the handshake
+    // sends a catenary/version-mismatch notification to the daemon and
+    // returns Err.
+    let std_stream = tokio::task::spawn_blocking(move || -> Result<_> {
+        let stdin_handle = std::io::stdin();
+        let mut stdin = stdin_handle.lock();
+        let stdout_handle = std::io::stdout();
+        let mut stdout = stdout_handle.lock();
+        version_handshake(&mut stdin, &std_stream, &mut stdout)?;
+        Ok(std_stream)
+    })
+    .await
+    .context("version handshake task")??;
+
+    // Phase 2: Concurrent byte proxy for remaining messages.
     let std_write = std_stream
         .try_clone()
         .context("clone daemon socket for writer")?;
@@ -778,7 +799,6 @@ pub async fn proxy_stdio(stream: tokio::net::UnixStream) -> Result<()> {
         .context("re-wrap socket read half as tokio")?;
 
     // stdin→socket: dedicated OS thread with blocking I/O.
-    // std_write is already in blocking mode (into_std default).
     std_write
         .set_nonblocking(false)
         .context("set write half blocking")?;
@@ -813,6 +833,113 @@ pub async fn proxy_stdio(stream: tokio::net::UnixStream) -> Result<()> {
             }
         }
     }
+}
+
+/// Intercepts the MCP initialize handshake to verify daemon version.
+///
+/// Reads the initialize request from `client`, forwards it to `socket`,
+/// reads the response, and checks `serverInfo.version` against this
+/// bridge's version ([`CATENARY_VERSION`](env!("CATENARY_VERSION"))).
+/// On match, forwards the response to `output`. On mismatch, sends a
+/// `catenary/version-mismatch` notification to the daemon and returns
+/// an error.
+///
+/// Generic over reader/writer for testability — `proxy_stdio` passes
+/// stdin/stdout, tests pass in-memory buffers.
+#[cfg(unix)]
+fn version_handshake<R: std::io::BufRead, W: std::io::Write>(
+    client: &mut R,
+    socket: &std::os::unix::net::UnixStream,
+    output: &mut W,
+) -> Result<()> {
+    use std::io::Write;
+
+    // Read the initialize request from the client (one JSON-RPC line).
+    let mut init_line = String::new();
+    client
+        .read_line(&mut init_line)
+        .context("read initialize request from client")?;
+
+    // Forward to daemon.
+    (&*socket)
+        .write_all(init_line.as_bytes())
+        .context("forward initialize request to daemon")?;
+    (&*socket).flush()?;
+
+    // Read the initialize response from daemon.
+    // Byte-by-byte to avoid consuming data beyond the line boundary,
+    // which would be lost to the subsequent concurrent byte proxy.
+    let response_line = read_json_line(socket).context("read initialize response from daemon")?;
+
+    // Parse and check version.
+    let response: serde_json::Value =
+        serde_json::from_str(response_line.trim()).context("parse initialize response")?;
+
+    let daemon_version = response
+        .pointer("/result/serverInfo/version")
+        .and_then(|v| v.as_str());
+
+    let bridge_version = env!("CATENARY_VERSION");
+
+    match daemon_version {
+        Some(dv) if dv == bridge_version => {}
+        Some(dv) => {
+            // Notify daemon of the mismatch before disconnecting so it
+            // can surface the event via the notification sink.
+            let notification = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "catenary/version-mismatch",
+                "params": { "bridgeVersion": bridge_version }
+            });
+            if let Ok(line) = serde_json::to_string(&notification) {
+                let _ = (&*socket).write_all(line.as_bytes());
+                let _ = (&*socket).write_all(b"\n");
+                let _ = (&*socket).flush();
+            }
+
+            anyhow::bail!(
+                "Catenary version mismatch: daemon is v{dv}, \
+                 bridge is v{bridge_version}. Run 'catenary stop' and retry."
+            );
+        }
+        None => {
+            anyhow::bail!(
+                "daemon did not report a version in serverInfo — \
+                 not a Catenary daemon or a bug"
+            );
+        }
+    }
+
+    // Version matches — forward the response to the client.
+    output
+        .write_all(response_line.as_bytes())
+        .context("forward initialize response to client")?;
+    output.flush()?;
+
+    Ok(())
+}
+
+/// Reads a single newline-terminated line from a socket without buffering.
+///
+/// Reads byte-by-byte so that no data beyond the line boundary is consumed
+/// from the kernel's receive buffer, which is shared across all handles to
+/// the same file descriptor.
+#[cfg(unix)]
+fn read_json_line(socket: &std::os::unix::net::UnixStream) -> Result<String> {
+    use std::io::Read;
+
+    let mut buf = Vec::with_capacity(4096);
+    let mut byte = [0u8; 1];
+    loop {
+        (&*socket)
+            .read_exact(&mut byte)
+            .context("read byte from socket")?;
+        buf.push(byte[0]);
+        if byte[0] == b'\n' {
+            break;
+        }
+    }
+    String::from_utf8(buf).context("response is not valid UTF-8")
 }
 
 #[cfg(test)]
@@ -1713,6 +1840,151 @@ mod tests {
             line.trim(),
             "",
             "subagent hook should pass through (empty response)"
+        );
+    }
+
+    // ── Version handshake tests ──────────────────────────────────────
+
+    /// Helper: build an initialize request JSON line.
+    fn init_request_line() -> String {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "test", "version": "0.1"}
+            }
+        });
+        format!("{}\n", serde_json::to_string(&request).expect("serialize"))
+    }
+
+    /// Spawn a fake daemon thread that reads an initialize request and
+    /// responds with the given version in `serverInfo`.
+    fn fake_daemon(
+        stream: std::os::unix::net::UnixStream,
+        version: &str,
+    ) -> std::thread::JoinHandle<()> {
+        let version = version.to_string();
+        std::thread::spawn(move || {
+            use std::io::{BufRead, Write};
+            let mut reader = std::io::BufReader::new(&stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("read init request");
+
+            let response = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "serverInfo": {
+                        "name": "catenary",
+                        "version": version,
+                    }
+                }
+            });
+            let mut w: &std::os::unix::net::UnixStream = &stream;
+            writeln!(w, "{}", serde_json::to_string(&response).expect("ser"))
+                .expect("write response");
+            // Thread exits immediately — the response is in the kernel
+            // buffer for the client to read. Any follow-up notification
+            // (version-mismatch) is best-effort on the client side.
+        })
+    }
+
+    #[test]
+    fn matching_version_connects() {
+        let (server_sock, client_sock) =
+            std::os::unix::net::UnixStream::pair().expect("stream pair");
+
+        let handle = fake_daemon(server_sock, env!("CATENARY_VERSION"));
+
+        let mut stdin = std::io::Cursor::new(init_request_line());
+        let mut stdout = Vec::new();
+
+        version_handshake(&mut stdin, &client_sock, &mut stdout)
+            .expect("handshake should succeed with matching version");
+        handle.join().expect("daemon thread");
+
+        assert!(!stdout.is_empty(), "response should be forwarded to stdout");
+        let response: serde_json::Value =
+            serde_json::from_str(String::from_utf8(stdout).expect("utf8").trim())
+                .expect("parse response");
+        assert_eq!(response["result"]["serverInfo"]["name"], "catenary");
+        assert_eq!(
+            response["result"]["serverInfo"]["version"],
+            env!("CATENARY_VERSION"),
+        );
+    }
+
+    #[test]
+    fn mismatched_version_rejected() {
+        let (server_sock, client_sock) =
+            std::os::unix::net::UnixStream::pair().expect("stream pair");
+
+        let handle = fake_daemon(server_sock, "0.0.0-fake");
+
+        let mut stdin = std::io::Cursor::new(init_request_line());
+        let mut stdout = Vec::new();
+
+        let result = version_handshake(&mut stdin, &client_sock, &mut stdout);
+        handle.join().expect("daemon thread");
+
+        assert!(result.is_err(), "handshake should fail on version mismatch");
+        let err = result.expect_err("expected error").to_string();
+        assert!(
+            err.contains("version mismatch"),
+            "error should mention mismatch: {err}",
+        );
+        assert!(
+            err.contains("0.0.0-fake"),
+            "error should contain daemon version: {err}",
+        );
+        assert!(stdout.is_empty(), "should not forward response on mismatch");
+    }
+
+    #[test]
+    fn missing_version_rejected() {
+        let (server_sock, client_sock) =
+            std::os::unix::net::UnixStream::pair().expect("stream pair");
+
+        // Daemon responds without a version field in serverInfo.
+        let handle = std::thread::spawn(move || {
+            use std::io::{BufRead, Write};
+            let mut reader = std::io::BufReader::new(&server_sock);
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("read init request");
+
+            let response = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "serverInfo": { "name": "not-catenary" }
+                }
+            });
+            let mut w: &std::os::unix::net::UnixStream = &server_sock;
+            writeln!(w, "{}", serde_json::to_string(&response).expect("ser"))
+                .expect("write response");
+        });
+
+        let mut stdin = std::io::Cursor::new(init_request_line());
+        let mut stdout = Vec::new();
+
+        let result = version_handshake(&mut stdin, &client_sock, &mut stdout);
+        handle.join().expect("daemon thread");
+
+        assert!(
+            result.is_err(),
+            "handshake should fail when version is missing"
+        );
+        let err = result.expect_err("expected error").to_string();
+        assert!(
+            err.contains("did not report a version"),
+            "error should explain missing version: {err}",
         );
     }
 }
