@@ -4,8 +4,10 @@
 //! Hook handlers for host CLI integration.
 //!
 //! Each function is a thin transport: read stdin from the host CLI,
-//! connect to the running Catenary session's IPC socket, forward the
-//! request as a `HookRequest`, and format the response for the host.
+//! connect to the daemon's hook socket, forward the request as a
+//! [`HookRequest`](crate::hook::HookRequest), and format the response
+//! for the host. The `session_id` is sent in the payload — routing
+//! to the correct session happens daemon-side.
 //!
 //! All hook logic runs server-side in `HookServer` (`src/hook.rs`).
 //!
@@ -23,20 +25,22 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::cli::HostFormat;
-use crate::{db, session};
 
-/// Returns the IPC endpoint path for a session.
+/// Returns the daemon hook socket endpoint path.
 ///
-/// On Unix this is the Unix socket path in the session directory.
-/// On Windows this is a named pipe in the kernel namespace.
-fn notify_endpoint(session_id: &str) -> PathBuf {
+/// On Unix this is the deterministic daemon hook socket. On Windows
+/// this falls back to a named pipe in the kernel namespace (daemon
+/// support is Unix-only for now).
+fn hook_endpoint() -> PathBuf {
     #[cfg(unix)]
     {
-        session::sessions_dir().join(session_id).join("notify.sock")
+        crate::router::hook_socket_path()
     }
     #[cfg(windows)]
     {
-        PathBuf::from(format!(r"\\.\pipe\catenary-{session_id}"))
+        // Daemon is Unix-only; Windows uses a placeholder path that
+        // will fail to connect, falling through to silent allow.
+        PathBuf::from(r"\\.\pipe\catenary-hooks")
     }
 }
 
@@ -127,21 +131,6 @@ fn format_stop_block(reason: &str, format: HostFormat) -> String {
         })
         .to_string(),
     }
-}
-
-/// Find the Catenary session ID for a hook payload, using the working directory
-/// to match against workspace roots. Returns `None` if no matching session.
-fn find_session_id(hook_json: &serde_json::Value, conn: &rusqlite::Connection) -> Option<String> {
-    let cwd = hook_json.get("cwd").and_then(|v| v.as_str()).map_or_else(
-        || std::env::current_dir().unwrap_or_default(),
-        PathBuf::from,
-    );
-    let cwd_str = cwd.to_string_lossy();
-    let sessions = session::list_sessions_with_conn(conn).unwrap_or_default();
-    sessions
-        .into_iter()
-        .find(|(s, alive)| *alive && cwd_str.starts_with(&s.workspace))
-        .map(|(s, _)| s.id)
 }
 
 /// Extract `agent_id` from hook payload. Defaults to empty string (main agent).
@@ -264,16 +253,7 @@ pub fn run_session_start(format: HostFormat) {
         return;
     };
 
-    let Ok(conn) = db::open_and_migrate() else {
-        emit_system_message(builder, format);
-        return;
-    };
-    let Some(catenary_sid) = find_session_id(&hook_json, &conn) else {
-        emit_system_message(builder, format);
-        return;
-    };
-
-    let endpoint = notify_endpoint(&catenary_sid);
+    let endpoint = hook_endpoint();
     let Some(stream) = notify_connect(&endpoint) else {
         emit_system_message(builder, format);
         return;
@@ -344,14 +324,7 @@ pub fn run_post_agent(format: HostFormat) {
         return;
     };
 
-    let Ok(conn) = db::open_and_migrate() else {
-        return;
-    };
-    let Some(catenary_sid) = find_session_id(&hook_json, &conn) else {
-        return;
-    };
-
-    let endpoint = notify_endpoint(&catenary_sid);
+    let endpoint = hook_endpoint();
     let Some(stream) = notify_connect(&endpoint) else {
         return;
     };
@@ -423,29 +396,8 @@ pub fn run_post_tool(format: HostFormat) {
         return;
     };
 
-    let Ok(conn) = db::open_and_migrate() else {
-        print!(
-            "{}",
-            notify_error(
-                "state database unavailable — try running: catenary list",
-                format
-            )
-        );
-        return;
-    };
-    let Some(catenary_sid) = find_session_id(&hook_json, &conn) else {
-        return;
-    };
-
-    let endpoint = notify_endpoint(&catenary_sid);
+    let endpoint = hook_endpoint();
     let Some(stream) = notify_connect(&endpoint) else {
-        print!(
-            "{}",
-            notify_error(
-                &format!("session {catenary_sid} is not responding — it may have crashed"),
-                format,
-            )
-        );
         return;
     };
 
@@ -487,22 +439,16 @@ pub fn run_pre_agent(format: HostFormat) {
         return;
     };
 
-    let Ok(conn) = db::open_and_migrate() else {
-        return;
-    };
-
-    if let Some(catenary_sid) = find_session_id(&hook_json, &conn) {
-        let endpoint = notify_endpoint(&catenary_sid);
-        if let Some(stream) = notify_connect(&endpoint) {
-            let mut request = serde_json::json!({
-                "method": "pre-agent/turn-start",
-                "host_payload": prepare_host_payload(&hook_json),
-            });
-            if let Some(tp) = hook_json.get("transcript_path").and_then(|v| v.as_str()) {
-                request["transcript_path"] = serde_json::json!(tp);
-            }
-            let _ = ipc_exchange(stream, &request);
+    let endpoint = hook_endpoint();
+    if let Some(stream) = notify_connect(&endpoint) {
+        let mut request = serde_json::json!({
+            "method": "pre-agent/turn-start",
+            "host_payload": prepare_host_payload(&hook_json),
+        });
+        if let Some(tp) = hook_json.get("transcript_path").and_then(|v| v.as_str()) {
+            request["transcript_path"] = serde_json::json!(tp);
         }
+        let _ = ipc_exchange(stream, &request);
     }
 }
 
@@ -554,15 +500,8 @@ pub fn run_pre_tool(format: HostFormat) {
         }
     }
 
-    // ── Editing state enforcement (IPC to session) ───────────────
-    let Ok(conn) = db::open_and_migrate() else {
-        return;
-    };
-    let Some(catenary_sid) = find_session_id(&hook_json, &conn) else {
-        return;
-    };
-
-    let endpoint = notify_endpoint(&catenary_sid);
+    // ── Editing state enforcement (IPC to daemon) ────────────────
+    let endpoint = hook_endpoint();
     let Some(stream) = notify_connect(&endpoint) else {
         return;
     };
@@ -736,9 +675,7 @@ fn ipc_check_command(
     shell_cmd: &str,
     format: HostFormat,
 ) -> Option<String> {
-    let conn = db::open_and_migrate().ok()?;
-    let catenary_sid = find_session_id(hook_json, &conn)?;
-    let endpoint = notify_endpoint(&catenary_sid);
+    let endpoint = hook_endpoint();
     let stream = notify_connect(&endpoint)?;
 
     let cwd = hook_json.get("cwd").and_then(|v| v.as_str());

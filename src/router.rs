@@ -1,19 +1,20 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
-//! Daemon session manager and MCP socket listener.
+//! Daemon session manager and socket listeners.
 //!
-//! [`SessionManager`] is the core daemon component. It binds a Unix domain
-//! socket at `$XDG_STATE_HOME/catenary/catenary.sock`, accepts incoming
-//! connections from `catenary bridge` proxies, and tracks them by file
-//! descriptor.
+//! [`SessionManager`] is the core daemon component. It binds two Unix domain
+//! sockets — one for MCP connections from `catenary bridge` proxies, one for
+//! hook connections from `catenary hook` CLI processes — and tracks MCP
+//! connections by file descriptor. Hook connections are short-lived
+//! (one request-response each).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::{Context, Result};
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::source::Source;
 
@@ -28,96 +29,135 @@ pub fn mcp_socket_path() -> PathBuf {
         .join("catenary.sock")
 }
 
-/// Core daemon component that manages MCP socket connections.
+/// Returns the hook socket path for the daemon.
 ///
-/// Binds a Unix domain socket and accepts incoming connections from
-/// `catenary bridge` proxies. Connection tracking by file descriptor
-/// enables lifecycle management (shutdown on last disconnect).
+/// The path is deterministic: `$XDG_STATE_HOME/catenary/catenary-hooks.sock`
+/// (or platform equivalent via [`crate::db::state_dir`]).
+///
+/// Hook CLI processes (`catenary hook pre-tool`, `post-tool`, etc.) connect
+/// to this socket instead of discovering a per-session socket. The
+/// `session_id` is sent in the hook payload — routing happens daemon-side.
+#[must_use]
+pub fn hook_socket_path() -> PathBuf {
+    crate::db::state_dir()
+        .join("catenary")
+        .join("catenary-hooks.sock")
+}
+
+/// Core daemon component that manages MCP and hook socket connections.
+///
+/// Binds two Unix domain sockets: one for MCP connections from `catenary
+/// bridge` proxies, one for hook connections from `catenary hook` CLI
+/// processes. MCP connections are long-lived and tracked by file
+/// descriptor. Hook connections are short-lived (one request-response
+/// each) and handled in spawned tasks.
 ///
 /// No MCP processing happens here — per-connection domain stacks are
-/// spawned in a subsequent phase.
+/// spawned in a subsequent phase. Hook connections receive passthrough
+/// responses until session-aware dispatch is added.
 #[cfg(unix)]
 pub struct SessionManager {
     mcp_listener: tokio::net::UnixListener,
-    socket_path: PathBuf,
+    hook_listener: tokio::net::UnixListener,
+    mcp_socket_path: PathBuf,
+    hook_socket_path: PathBuf,
     connections: Mutex<HashMap<i32, tokio::net::UnixStream>>,
 }
 
 #[cfg(unix)]
 impl SessionManager {
-    /// Binds the MCP socket at the default path.
+    /// Binds the MCP and hook sockets at the default paths.
     ///
     /// # Errors
     ///
-    /// Returns an error if the parent directory cannot be created or the
-    /// socket cannot be bound (e.g., another daemon is already running).
+    /// Returns an error if the parent directory cannot be created or
+    /// either socket cannot be bound (e.g., another daemon is already
+    /// running).
     pub fn bind() -> Result<Self> {
-        Self::bind_at(&mcp_socket_path())
+        Self::bind_at(&mcp_socket_path(), &hook_socket_path())
     }
 
-    /// Binds the MCP socket at an explicit path.
+    /// Binds the MCP and hook sockets at explicit paths.
     ///
     /// Used by tests to isolate socket files in tempdirs.
     ///
     /// # Errors
     ///
-    /// Returns an error if the parent directory cannot be created or the
-    /// socket cannot be bound.
-    pub fn bind_at(path: &Path) -> Result<Self> {
-        if let Some(parent) = path.parent() {
+    /// Returns an error if the parent directories cannot be created or
+    /// either socket cannot be bound.
+    pub fn bind_at(mcp_path: &Path, hook_path: &Path) -> Result<Self> {
+        if let Some(parent) = mcp_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create socket directory: {}", parent.display()))?;
+        }
+        if let Some(parent) = hook_path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create socket directory: {}", parent.display()))?;
         }
 
-        let mcp_listener = tokio::net::UnixListener::bind(path)
-            .with_context(|| format!("bind MCP socket: {}", path.display()))?;
+        let mcp_listener = tokio::net::UnixListener::bind(mcp_path)
+            .with_context(|| format!("bind MCP socket: {}", mcp_path.display()))?;
+        let hook_listener = tokio::net::UnixListener::bind(hook_path)
+            .with_context(|| format!("bind hook socket: {}", hook_path.display()))?;
 
         info!(
             source = Source::DaemonLifecycle.as_str(),
-            path = %path.display(),
+            mcp_path = %mcp_path.display(),
+            hook_path = %hook_path.display(),
             "daemon started",
         );
 
         Ok(Self {
             mcp_listener,
-            socket_path: path.to_path_buf(),
+            hook_listener,
+            mcp_socket_path: mcp_path.to_path_buf(),
+            hook_socket_path: hook_path.to_path_buf(),
             connections: Mutex::new(HashMap::new()),
         })
     }
 
-    /// Accepts incoming MCP connections in a loop.
+    /// Accepts incoming MCP and hook connections in a loop.
     ///
-    /// Each accepted connection is tracked by its file descriptor.
-    /// Per-connection domain stacks are not spawned yet.
+    /// MCP connections are tracked by file descriptor. Hook connections
+    /// are short-lived and handled in spawned tasks with passthrough
+    /// responses (session-aware dispatch comes in a subsequent phase).
     ///
     /// # Errors
     ///
-    /// Returns an error if the listener encounters a fatal I/O error.
+    /// Returns an error if either listener encounters a fatal I/O error.
     pub async fn accept_loop(&self) -> Result<()> {
         use std::os::fd::AsRawFd;
 
         loop {
-            let (stream, _addr) = self
-                .mcp_listener
-                .accept()
-                .await
-                .context("accept MCP connection")?;
-
-            let fd = stream.as_raw_fd();
-
-            {
-                let mut conns = self
-                    .connections
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("connection mutex poisoned"))?;
-                conns.insert(fd, stream);
+            tokio::select! {
+                result = self.mcp_listener.accept() => {
+                    let (stream, _addr) = result.context("accept MCP connection")?;
+                    let fd = stream.as_raw_fd();
+                    {
+                        let mut conns = self
+                            .connections
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("connection mutex poisoned"))?;
+                        conns.insert(fd, stream);
+                    }
+                    info!(
+                        source = Source::DaemonDispatch.as_str(),
+                        mcp_fd = fd,
+                        "connection accepted",
+                    );
+                }
+                result = self.hook_listener.accept() => {
+                    let (stream, _addr) = result.context("accept hook connection")?;
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_hook_passthrough(stream).await {
+                            debug!(
+                                source = Source::DaemonDispatch.as_str(),
+                                "hook connection error: {e}",
+                            );
+                        }
+                    });
+                }
             }
-
-            info!(
-                source = Source::DaemonDispatch.as_str(),
-                mcp_fd = fd,
-                "connection accepted",
-            );
         }
     }
 
@@ -127,17 +167,59 @@ impl SessionManager {
         self.connections.lock().map_or(0, |c| c.len())
     }
 
-    /// Returns the socket path this manager is bound to.
+    /// Returns the MCP socket path this manager is bound to.
     #[must_use]
-    pub fn socket_path(&self) -> &Path {
-        &self.socket_path
+    pub fn mcp_path(&self) -> &Path {
+        &self.mcp_socket_path
     }
+
+    /// Returns the hook socket path this manager is bound to.
+    #[must_use]
+    pub fn hook_path(&self) -> &Path {
+        &self.hook_socket_path
+    }
+}
+
+/// Handles a single hook connection with a passthrough response.
+///
+/// Reads the JSON request, logs the method for visibility, and sends an
+/// empty response (which means "allow" in the hook protocol). Session-aware
+/// dispatch replaces this in a subsequent phase.
+#[cfg(unix)]
+async fn handle_hook_passthrough(stream: tokio::net::UnixStream) -> Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut buf_reader = BufReader::new(reader);
+    let mut line = String::new();
+    buf_reader
+        .read_line(&mut line)
+        .await
+        .context("read hook request")?;
+
+    if let Ok(raw) = serde_json::from_str::<serde_json::Value>(line.trim()) {
+        let method = raw
+            .get("method")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        info!(
+            source = Source::DaemonDispatch.as_str(),
+            method, "hook request (passthrough)",
+        );
+    }
+
+    // Empty response = "allow" for all hook types.
+    writer.write_all(b"\n").await?;
+    writer.shutdown().await?;
+
+    Ok(())
 }
 
 #[cfg(unix)]
 impl Drop for SessionManager {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.socket_path);
+        let _ = std::fs::remove_file(&self.mcp_socket_path);
+        let _ = std::fs::remove_file(&self.hook_socket_path);
     }
 }
 
@@ -193,6 +275,15 @@ pub async fn connect_or_start_daemon() -> Result<tokio::net::UnixStream> {
                             source = Source::DaemonLifecycle.as_str(),
                             path = %socket_path.display(),
                             "removed stale socket",
+                        );
+                    }
+                    let hook_path = hook_socket_path();
+                    if hook_path.exists() {
+                        let _ = std::fs::remove_file(&hook_path);
+                        info!(
+                            source = Source::DaemonLifecycle.as_str(),
+                            path = %hook_path.display(),
+                            "removed stale hook socket",
                         );
                     }
                     if spawn_daemon().is_ok() {
@@ -280,9 +371,19 @@ mod tests {
     use std::sync::Arc;
     use tracing_subscriber::layer::SubscriberExt;
 
-    /// Create a socket path inside a tempdir.
-    fn socket_in(dir: &Path) -> PathBuf {
+    /// Create an MCP socket path inside a tempdir.
+    fn mcp_socket_in(dir: &Path) -> PathBuf {
         dir.join("catenary").join("catenary.sock")
+    }
+
+    /// Create a hook socket path inside a tempdir.
+    fn hook_socket_in(dir: &Path) -> PathBuf {
+        dir.join("catenary").join("catenary-hooks.sock")
+    }
+
+    /// Bind a `SessionManager` with both sockets in a tempdir.
+    fn bind_in(dir: &Path) -> SessionManager {
+        SessionManager::bind_at(&mcp_socket_in(dir), &hook_socket_in(dir)).expect("bind")
     }
 
     // ── Tracing capture layer ──────────────────────────────────────
@@ -330,25 +431,25 @@ mod tests {
     #[tokio::test]
     async fn bind_creates_socket_file() {
         let dir = tempfile::tempdir().expect("create tempdir");
-        let path = socket_in(dir.path());
+        let mcp_path = mcp_socket_in(dir.path());
 
-        let _manager = SessionManager::bind_at(&path).expect("bind");
+        let _manager = bind_in(dir.path());
 
-        assert!(path.exists(), "socket file should exist after bind");
+        assert!(mcp_path.exists(), "MCP socket file should exist after bind");
     }
 
     #[tokio::test]
     async fn accept_connection() {
         let dir = tempfile::tempdir().expect("create tempdir");
-        let path = socket_in(dir.path());
+        let mcp_path = mcp_socket_in(dir.path());
 
-        let manager = Arc::new(SessionManager::bind_at(&path).expect("bind"));
+        let manager = Arc::new(bind_in(dir.path()));
         let m = Arc::clone(&manager);
         tokio::spawn(async move {
             let _ = m.accept_loop().await;
         });
 
-        let _stream = tokio::net::UnixStream::connect(&path)
+        let _stream = tokio::net::UnixStream::connect(&mcp_path)
             .await
             .expect("connect");
 
@@ -360,9 +461,9 @@ mod tests {
     #[tokio::test]
     async fn multiple_connections() {
         let dir = tempfile::tempdir().expect("create tempdir");
-        let path = socket_in(dir.path());
+        let mcp_path = mcp_socket_in(dir.path());
 
-        let manager = Arc::new(SessionManager::bind_at(&path).expect("bind"));
+        let manager = Arc::new(bind_in(dir.path()));
         let m = Arc::clone(&manager);
         tokio::spawn(async move {
             let _ = m.accept_loop().await;
@@ -372,7 +473,7 @@ mod tests {
             let mut v = Vec::new();
             for _ in 0..3 {
                 v.push(
-                    tokio::net::UnixStream::connect(&path)
+                    tokio::net::UnixStream::connect(&mcp_path)
                         .await
                         .expect("connect"),
                 );
@@ -388,29 +489,56 @@ mod tests {
     #[tokio::test]
     async fn drop_removes_socket() {
         let dir = tempfile::tempdir().expect("create tempdir");
-        let path = socket_in(dir.path());
+        let mcp_path = mcp_socket_in(dir.path());
+        let hook_path = hook_socket_in(dir.path());
 
-        let manager = SessionManager::bind_at(&path).expect("bind");
-        assert!(path.exists(), "socket should exist before drop");
+        let manager = bind_in(dir.path());
+        assert!(mcp_path.exists(), "MCP socket should exist before drop");
+        assert!(hook_path.exists(), "hook socket should exist before drop");
 
         drop(manager);
 
-        assert!(!path.exists(), "socket should be removed after drop");
+        assert!(
+            !mcp_path.exists(),
+            "MCP socket should be removed after drop"
+        );
+        assert!(
+            !hook_path.exists(),
+            "hook socket should be removed after drop"
+        );
     }
 
     #[tokio::test]
-    async fn bind_fails_if_socket_exists() {
+    async fn bind_fails_if_mcp_socket_exists() {
         let dir = tempfile::tempdir().expect("create tempdir");
-        let path = socket_in(dir.path());
+        let mcp_path = mcp_socket_in(dir.path());
+        let hook_path = hook_socket_in(dir.path());
 
-        // Create a regular file at the socket path.
-        std::fs::create_dir_all(path.parent().expect("parent")).expect("create dir");
-        std::fs::write(&path, b"").expect("create file");
+        // Create a regular file at the MCP socket path.
+        std::fs::create_dir_all(mcp_path.parent().expect("parent")).expect("create dir");
+        std::fs::write(&mcp_path, b"").expect("create file");
 
-        let result = SessionManager::bind_at(&path);
+        let result = SessionManager::bind_at(&mcp_path, &hook_path);
         assert!(
             result.is_err(),
-            "bind should fail when socket already exists"
+            "bind should fail when MCP socket already exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn bind_fails_if_hook_socket_exists() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let mcp_path = mcp_socket_in(dir.path());
+        let hook_path = hook_socket_in(dir.path());
+
+        // Create a regular file at the hook socket path.
+        std::fs::create_dir_all(hook_path.parent().expect("parent")).expect("create dir");
+        std::fs::write(&hook_path, b"").expect("create file");
+
+        let result = SessionManager::bind_at(&mcp_path, &hook_path);
+        assert!(
+            result.is_err(),
+            "bind should fail when hook socket already exists"
         );
     }
 
@@ -423,11 +551,13 @@ mod tests {
 
         let subscriber = tracing_subscriber::registry().with(layer);
         let dir = tempfile::tempdir().expect("create tempdir");
-        let path = socket_in(dir.path());
+        let mcp_path = mcp_socket_in(dir.path());
+        let hook_path = hook_socket_in(dir.path());
 
-        let _manager =
-            tracing::subscriber::with_default(subscriber, || SessionManager::bind_at(&path))
-                .expect("bind");
+        let _manager = tracing::subscriber::with_default(subscriber, || {
+            SessionManager::bind_at(&mcp_path, &hook_path)
+        })
+        .expect("bind");
 
         let captured = sources.lock().expect("lock").clone();
         assert!(
@@ -441,23 +571,23 @@ mod tests {
     #[tokio::test]
     async fn bridge_cleans_stale_socket() {
         let dir = tempfile::tempdir().expect("create tempdir");
-        let path = socket_in(dir.path());
+        let mcp_path = mcp_socket_in(dir.path());
 
         // Create a stale socket file (regular file, nobody listening).
-        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
-        std::fs::write(&path, b"stale").expect("create stale file");
+        std::fs::create_dir_all(mcp_path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&mcp_path, b"stale").expect("create stale file");
 
         // Connect should fail on a regular file.
-        let result = tokio::net::UnixStream::connect(&path).await;
+        let result = tokio::net::UnixStream::connect(&mcp_path).await;
         assert!(result.is_err());
 
         // Clean stale file (what connect_or_start_daemon does).
-        std::fs::remove_file(&path).expect("remove stale");
-        assert!(!path.exists());
+        std::fs::remove_file(&mcp_path).expect("remove stale");
+        assert!(!mcp_path.exists());
 
         // Now bind succeeds.
-        let _manager = SessionManager::bind_at(&path).expect("bind after cleanup");
-        assert!(path.exists());
+        let _manager = bind_in(dir.path());
+        assert!(mcp_path.exists());
     }
 
     #[tokio::test]
@@ -524,9 +654,9 @@ mod tests {
     #[tokio::test]
     async fn bridge_handles_race() {
         let dir = tempfile::tempdir().expect("create tempdir");
-        let path = socket_in(dir.path());
+        let mcp_path = mcp_socket_in(dir.path());
 
-        let manager = Arc::new(SessionManager::bind_at(&path).expect("bind"));
+        let manager = Arc::new(bind_in(dir.path()));
         let m = Arc::clone(&manager);
         tokio::spawn(async move {
             let _ = m.accept_loop().await;
@@ -535,7 +665,7 @@ mod tests {
         // Spawn 5 connections concurrently.
         let mut handles = Vec::new();
         for _ in 0..5 {
-            let p = path.clone();
+            let p = mcp_path.clone();
             handles.push(tokio::spawn(async move {
                 tokio::net::UnixStream::connect(&p).await
             }));
@@ -547,5 +677,99 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(manager.connection_count(), 5);
+    }
+
+    // ── Hook socket tests ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn hook_socket_created_on_bind() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let hook_path = hook_socket_in(dir.path());
+
+        let _manager = bind_in(dir.path());
+
+        assert!(
+            hook_path.exists(),
+            "hook socket file should exist after bind"
+        );
+    }
+
+    #[tokio::test]
+    async fn hook_connection_accepted() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let hook_path = hook_socket_in(dir.path());
+
+        let manager = Arc::new(bind_in(dir.path()));
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        let _stream = tokio::net::UnixStream::connect(&hook_path)
+            .await
+            .expect("connect to hook socket");
+    }
+
+    #[tokio::test]
+    async fn hook_and_mcp_sockets_independent() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let mcp_path = mcp_socket_in(dir.path());
+        let hook_path = hook_socket_in(dir.path());
+
+        let manager = Arc::new(bind_in(dir.path()));
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        // Connect to both sockets simultaneously.
+        let (mcp_result, hook_result) = tokio::join!(
+            tokio::net::UnixStream::connect(&mcp_path),
+            tokio::net::UnixStream::connect(&hook_path),
+        );
+
+        let _mcp_stream = mcp_result.expect("connect to MCP socket");
+        let _hook_stream = hook_result.expect("connect to hook socket");
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Only MCP connections are tracked.
+        assert_eq!(manager.connection_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn hook_passthrough_response() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let hook_path = hook_socket_in(dir.path());
+
+        let manager = Arc::new(bind_in(dir.path()));
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        let stream = tokio::net::UnixStream::connect(&hook_path)
+            .await
+            .expect("connect");
+        let (reader, mut writer) = stream.into_split();
+
+        // Send a hook request.
+        let request = serde_json::json!({
+            "method": "pre-tool/editing-state",
+            "tool_name": "Edit",
+            "agent_id": "",
+            "session_id": "test-session"
+        });
+        let mut payload = serde_json::to_string(&request).expect("serialize");
+        payload.push('\n');
+        writer.write_all(payload.as_bytes()).await.expect("write");
+
+        // Read the passthrough response (empty line = allow).
+        let mut buf_reader = BufReader::new(reader);
+        let mut line = String::new();
+        buf_reader.read_line(&mut line).await.expect("read");
+        assert_eq!(line.trim(), "", "passthrough should return empty response");
     }
 }
