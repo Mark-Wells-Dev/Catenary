@@ -52,8 +52,21 @@ fn find_session_id(hook_json: &serde_json::Value, conn: &rusqlite::Connection) -
     let sessions = session::list_sessions_with_conn(conn).unwrap_or_default();
     sessions
         .into_iter()
-        .find(|(s, alive)| *alive && cwd_str.starts_with(&s.workspace))
+        .find(|(s, alive)| *alive && is_path_prefix(&cwd_str, &s.workspace))
         .map(|(s, _)| s.id)
+}
+
+/// Path-component-aware prefix check.
+///
+/// Returns `true` if `path` starts with `prefix` at a path boundary:
+/// exact match, or the character after the prefix is `/`. Plain string
+/// prefix matching would let `/home/user/Catenary` match a cwd of
+/// `/home/user/Catenary-06`, routing hooks to the wrong session.
+fn is_path_prefix(path: &str, prefix: &str) -> bool {
+    if path == prefix {
+        return true;
+    }
+    path.starts_with(prefix) && path.as_bytes().get(prefix.len()) == Some(&b'/')
 }
 
 /// Connect to a hook IPC endpoint.
@@ -1072,5 +1085,44 @@ mod tests {
         assert_eq!(prepared["cwd"], "/home/user/project");
         assert_eq!(prepared["tool_input"]["file_path"], "/src/lib.rs");
         assert_eq!(prepared["tool_input"]["old_string"], "line1…");
+    }
+
+    // ── is_path_prefix tests ────────────────────────────────────────
+
+    #[test]
+    fn path_prefix_exact_match() {
+        assert!(is_path_prefix("/home/user/Catenary", "/home/user/Catenary"));
+    }
+
+    #[test]
+    fn path_prefix_subdirectory() {
+        assert!(is_path_prefix(
+            "/home/user/Catenary/src",
+            "/home/user/Catenary",
+        ));
+    }
+
+    #[test]
+    fn path_prefix_rejects_partial_component() {
+        assert!(!is_path_prefix(
+            "/home/user/Catenary-06",
+            "/home/user/Catenary",
+        ));
+    }
+
+    #[test]
+    fn path_prefix_rejects_partial_component_deep() {
+        assert!(!is_path_prefix(
+            "/home/user/Catenary-06/src/main.rs",
+            "/home/user/Catenary",
+        ));
+    }
+
+    #[test]
+    fn path_prefix_no_match() {
+        assert!(!is_path_prefix(
+            "/home/user/OtherProject",
+            "/home/user/Catenary",
+        ));
     }
 }
