@@ -21,6 +21,7 @@ use crate::mcp::{CallToolResult, Tool, ToolHandler};
 /// handles editing lifecycle (`start_editing`/`done_editing`).
 /// Implements [`ToolHandler`] to maintain clean dependency direction
 /// between the `mcp` (protocol) and `bridge` (application) modules.
+#[derive(Clone)]
 pub struct McpRouter {
     session: Arc<Session>,
 }

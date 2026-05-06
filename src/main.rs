@@ -401,7 +401,7 @@ async fn run_server() -> Result<()> {
     let toolbox_for_shutdown = toolbox.clone();
     let handler = McpRouter::new(toolbox);
 
-    // Run MCP server (blocking - reads from stdin)
+    // Run MCP server (blocking - reads from stdin, writes to stdout)
     let session_for_callback = session.clone();
     let runtime_for_roots = tokio::runtime::Handle::current();
     let mut mcp_server = McpServer::new(handler, toolbox_for_roots.logging.clone())
@@ -440,7 +440,8 @@ async fn run_server() -> Result<()> {
         }));
 
     // Run in a blocking task since MCP server uses synchronous I/O
-    let mcp_task = tokio::task::spawn_blocking(move || mcp_server.run());
+    let mcp_task =
+        tokio::task::spawn_blocking(move || mcp_server.run(std::io::stdin(), std::io::stdout()));
 
     // Wait for either the MCP task to finish or a termination signal.
     // On Unix, also catch SIGTERM so the host CLI killing us triggers
@@ -486,18 +487,100 @@ async fn run_server() -> Result<()> {
 
 /// Runs the Catenary daemon.
 ///
-/// Binds the MCP socket and accepts connections. The daemon exits when
-/// interrupted by a signal. Per-connection MCP stacks are added in a
-/// subsequent phase.
+/// Creates the shared bridge infrastructure (`LspClientManager`,
+/// `Session`, tool handler) and binds the MCP/hook sockets. Each
+/// incoming MCP connection spawns a per-connection `McpServer`
+/// backed by the shared tool handler. The daemon exits when
+/// interrupted by a signal.
 ///
 /// # Errors
 ///
-/// Returns an error if the socket cannot be bound or the accept loop fails.
+/// Returns an error if setup or the accept loop fails.
 #[cfg(unix)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Daemon setup requires sequential initialization steps"
+)]
 async fn run_daemon() -> Result<()> {
     use catenary_mcp::router::SessionManager;
 
-    let manager = SessionManager::bind()?;
+    /// Tool handler that exposes no tools (disabled workspace).
+    struct DaemonDisabledHandler;
+    impl catenary_mcp::mcp::ToolHandler for DaemonDisabledHandler {
+        fn list_tools(&self) -> Vec<catenary_mcp::mcp::Tool> {
+            Vec::new()
+        }
+        fn call_tool(
+            &self,
+            _name: &str,
+            _arguments: Option<serde_json::Value>,
+            _parent_id: Option<i64>,
+            _cancel: &tokio_util::sync::CancellationToken,
+        ) -> Result<catenary_mcp::mcp::CallToolResult> {
+            Err(anyhow::anyhow!("Catenary is disabled for this workspace"))
+        }
+    }
+
+    // Bind sockets immediately so bridge proxies can connect while
+    // heavy initialization (config, DB, LSP servers) proceeds. The
+    // kernel queues connections until accept_loop starts.
+    let sockets = catenary_mcp::router::bind_daemon_sockets()?;
+
+    let logging = LoggingServer::new();
+    tracing_subscriber::registry().with(logging.clone()).init();
+
+    let config = catenary_mcp::config::Config::load()?;
+
+    let raw_roots: Vec<PathBuf> = match std::env::var("CATENARY_ROOTS") {
+        Ok(val) if !val.is_empty() => std::env::split_paths(&val).collect(),
+        _ => vec![PathBuf::from(".")],
+    };
+    let roots: Vec<PathBuf> = raw_roots
+        .into_iter()
+        .map(|r| r.canonicalize())
+        .collect::<std::io::Result<Vec<_>>>()?;
+
+    let workspace_display = roots
+        .iter()
+        .map(|r| r.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let disabled = roots
+        .first()
+        .and_then(|r| catenary_mcp::config::load_project_config(r).ok().flatten())
+        .is_some_and(|pc| !pc.lsp);
+
+    let handler: Arc<dyn catenary_mcp::mcp::ToolHandler> = if disabled {
+        info!("Catenary disabled by .catenary.toml (lsp = false) in {workspace_display}");
+        Arc::new(DaemonDisabledHandler)
+    } else {
+        let conn = catenary_mcp::db::open_and_migrate()?;
+        let conn = Arc::new(std::sync::Mutex::new(conn));
+        let instance_id: Arc<str> = "daemon".into();
+
+        let session = Arc::new(catenary_mcp::bridge::session::Session::new(
+            config,
+            roots,
+            logging.clone(),
+            conn,
+            instance_id,
+            tokio::runtime::Handle::current(),
+        ));
+
+        // Spawn LSP servers in the background so the accept loop
+        // starts immediately. Tool calls that need a server before
+        // spawn_all finishes trigger on-demand spawning via
+        // LspClientManager.
+        let session_for_spawn = session.clone();
+        tokio::spawn(async move { session_for_spawn.spawn_all().await });
+
+        Arc::new(McpRouter::new(session))
+    };
+
+    let manager = SessionManager::from_sockets(sockets, handler, logging);
+
+    info!("Daemon serving workspace: {workspace_display}");
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
@@ -536,7 +619,8 @@ async fn run_disabled_server(logging: LoggingServer) -> Result<()> {
     }
 
     let mut server = McpServer::new(DisabledHandler, logging);
-    let mcp_task = tokio::task::spawn_blocking(move || server.run());
+    let mcp_task =
+        tokio::task::spawn_blocking(move || server.run(std::io::stdin(), std::io::stdout()));
     mcp_task.await?
 }
 

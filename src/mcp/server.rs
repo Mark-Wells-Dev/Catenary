@@ -130,7 +130,24 @@ pub trait ToolHandler: Send + Sync {
     ) -> Result<CallToolResult>;
 }
 
-/// MCP server that communicates over stdin/stdout.
+/// Delegates to the inner handler, enabling shared ownership across
+/// per-connection `McpServer` instances in daemon mode.
+impl<T: ToolHandler + ?Sized> ToolHandler for Arc<T> {
+    fn list_tools(&self) -> Vec<Tool> {
+        (**self).list_tools()
+    }
+
+    fn call_tool(
+        &self,
+        name: &str,
+        arguments: Option<serde_json::Value>,
+        parent_id: Option<i64>,
+        cancel: &CancellationToken,
+    ) -> Result<CallToolResult> {
+        (**self).call_tool(name, arguments, parent_id, cancel)
+    }
+}
+
 /// Callback invoked when MCP client info is received during initialize.
 pub type ClientInfoCallback = Box<dyn Fn(&str, &str) + Send + Sync>;
 
@@ -218,27 +235,33 @@ impl<H: ToolHandler> McpServer<H> {
         self
     }
 
-    /// Runs the MCP server, reading from stdin and writing to stdout.
+    /// Runs the MCP server, reading messages from `reader` and writing
+    /// responses to `writer`.
     ///
-    /// Spawns a background reader thread for stdin so that
-    /// `notifications/cancelled` can trigger cancellation of in-flight
-    /// tool calls while the main loop is blocked.
+    /// The reader/writer abstraction makes the server transport-agnostic:
+    /// callers pass stdin/stdout for direct mode, or socket stream halves
+    /// for daemon mode.
+    ///
+    /// Spawns a background reader thread so that `notifications/cancelled`
+    /// can trigger cancellation of in-flight tool calls while the main
+    /// loop is blocked.
     ///
     /// # Errors
     ///
-    /// Returns an error if reading from stdin or writing to stdout fails.
-    pub fn run(&mut self) -> Result<()> {
-        let stdout = std::io::stdout();
-        let mut writer = stdout.lock();
-
-        info!("MCP server starting, waiting for requests on stdin");
+    /// Returns an error if reading or writing fails.
+    pub fn run<R, W>(&mut self, reader: R, mut writer: W) -> Result<()>
+    where
+        R: std::io::Read + Send + 'static,
+        W: std::io::Write,
+    {
+        info!("MCP server starting");
 
         // Spawn a reader thread that feeds lines into a channel and
         // triggers cancellation tokens for `notifications/cancelled`.
         let (tx, rx) = std::sync::mpsc::channel::<String>();
         let cancel_map = self.cancel_map.clone();
         let _reader_thread = std::thread::spawn(move || {
-            Self::stdin_reader_loop(&tx, &cancel_map);
+            Self::reader_loop(reader, &tx, &cancel_map);
         });
 
         while let Ok(line) = rx.recv() {
@@ -327,17 +350,21 @@ impl<H: ToolHandler> McpServer<H> {
             }
         }
 
-        info!("MCP server shutting down (stdin closed)");
+        info!("MCP server shutting down (reader closed)");
         Ok(())
     }
 
-    /// Background thread that reads stdin and feeds lines into the
-    /// channel. Also detects `notifications/cancelled` and triggers
-    /// the matching cancellation token from the shared `cancel_map`.
-    fn stdin_reader_loop(tx: &std::sync::mpsc::Sender<String>, cancel_map: &CancelMap) {
+    /// Background thread that reads from a generic reader and feeds
+    /// lines into the channel. Also detects `notifications/cancelled`
+    /// and triggers the matching cancellation token from the shared
+    /// `cancel_map`.
+    fn reader_loop<R: std::io::Read>(
+        reader: R,
+        tx: &std::sync::mpsc::Sender<String>,
+        cancel_map: &CancelMap,
+    ) {
         use std::io::BufRead;
-        let stdin = std::io::stdin();
-        let mut reader = std::io::BufReader::new(stdin.lock());
+        let mut reader = std::io::BufReader::new(reader);
         let mut line = String::new();
 
         loop {
