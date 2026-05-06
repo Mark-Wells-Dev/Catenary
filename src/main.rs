@@ -142,6 +142,9 @@ enum Command {
     /// Run as the Catenary daemon (internal, spawned by bridge proxy).
     #[command(hide = true)]
     Daemon,
+
+    /// Stop the running Catenary daemon.
+    Stop,
 }
 
 /// Hook subcommands invoked by host CLI hooks.
@@ -267,6 +270,10 @@ async fn main() -> Result<()> {
         Some(Command::Daemon) => run_daemon().await,
         #[cfg(not(unix))]
         Some(Command::Daemon) => Err(anyhow::anyhow!("daemon mode requires Unix")),
+        #[cfg(unix)]
+        Some(Command::Stop) => run_stop().await,
+        #[cfg(not(unix))]
+        Some(Command::Stop) => Err(anyhow::anyhow!("daemon mode requires Unix")),
     }
 }
 
@@ -581,21 +588,91 @@ async fn run_daemon() -> Result<()> {
         (handler, Some(session), Some(conn))
     };
 
+    let session_for_shutdown = shared_session.clone();
+
     let manager = SessionManager::from_sockets(sockets, handler, logging);
     let manager = match (shared_session, shared_conn) {
         (Some(session), Some(conn)) => manager.with_session(session, conn),
         _ => manager,
     };
 
-    info!("Daemon serving workspace: {workspace_display}");
+    info!(
+        source = Source::DaemonLifecycle.as_str(),
+        "daemon serving workspace: {workspace_display}",
+    );
 
+    // Wire signals to the daemon's shutdown token so accept_loop
+    // exits on SIGINT/SIGTERM.
+    let shutdown = manager.shutdown_token();
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                info!(
+                    source = Source::DaemonLifecycle.as_str(),
+                    "received SIGINT",
+                );
+            }
+            _ = async { sigterm.recv().await } => {
+                info!(
+                    source = Source::DaemonLifecycle.as_str(),
+                    "received SIGTERM",
+                );
+            }
+        }
+        shutdown.cancel();
+    });
 
-    tokio::select! {
-        res = manager.accept_loop() => res,
-        _ = tokio::signal::ctrl_c() => Ok(()),
-        _ = async { sigterm.recv().await } => Ok(()),
+    let result = manager.accept_loop().await;
+
+    // Graceful LSP shutdown.
+    if let Some(session) = session_for_shutdown {
+        info!(
+            source = Source::DaemonLifecycle.as_str(),
+            "shutting down LSP servers",
+        );
+        session.shutdown().await;
     }
+
+    // Drop removes socket files.
+    drop(manager);
+
+    info!(source = Source::DaemonLifecycle.as_str(), "daemon stopped",);
+
+    result
+}
+
+/// Stops the running Catenary daemon.
+///
+/// Connects to the daemon's hook socket and sends a shutdown request.
+/// If no daemon is running, prints a message and returns successfully.
+///
+/// # Errors
+///
+/// Returns an error if the shutdown request fails after connecting.
+#[cfg(unix)]
+async fn run_stop() -> Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let hook_path = catenary_mcp::router::hook_socket_path();
+
+    let Ok(stream) = tokio::net::UnixStream::connect(&hook_path).await else {
+        println!("No daemon running");
+        return Ok(());
+    };
+
+    let (reader, mut writer) = stream.into_split();
+    let request = serde_json::json!({"method": "shutdown"});
+    let mut payload = serde_json::to_string(&request)?;
+    payload.push('\n');
+    writer.write_all(payload.as_bytes()).await?;
+
+    let mut buf_reader = BufReader::new(reader);
+    let mut line = String::new();
+    buf_reader.read_line(&mut line).await?;
+
+    println!("Daemon stopped");
+    Ok(())
 }
 
 /// Runs a minimal MCP server for disabled sessions.

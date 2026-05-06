@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, Result, anyhow};
+use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error, info};
 
 use crate::bridge::HookRouter;
@@ -169,6 +170,8 @@ pub struct SessionManager {
     /// Session-aware hook dispatch context. `None` in tests that don't
     /// exercise hook routing (passthrough mode).
     hook_ctx: Option<HookDispatchContext>,
+    shutdown: CancellationToken,
+    disconnect: Arc<tokio::sync::Notify>,
 }
 
 #[cfg(unix)]
@@ -205,6 +208,8 @@ impl SessionManager {
             logging,
             connection_count: Arc::new(AtomicUsize::new(0)),
             hook_ctx: None,
+            shutdown: CancellationToken::new(),
+            disconnect: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -252,6 +257,8 @@ impl SessionManager {
             logging,
             connection_count: Arc::new(AtomicUsize::new(0)),
             hook_ctx: None,
+            shutdown: CancellationToken::new(),
+            disconnect: Arc::new(tokio::sync::Notify::new()),
         })
     }
 
@@ -262,6 +269,11 @@ impl SessionManager {
     /// task runs in a tracing span tagged with `mcp_fd` for log
     /// correlation. Hook connections are short-lived and handled in
     /// spawned tasks with passthrough responses.
+    ///
+    /// Returns `Ok(())` when the shutdown token is cancelled — either
+    /// because the last MCP client disconnected, a `catenary stop`
+    /// command was received on the hook socket, or an external signal
+    /// cancelled the token.
     ///
     /// # Errors
     ///
@@ -278,10 +290,11 @@ impl SessionManager {
                 }
                 result = self.hook_listener.accept() => {
                     let (stream, _addr) = result.context("accept hook connection")?;
+                    let shutdown = self.shutdown.clone();
                     if let Some(ctx) = &self.hook_ctx {
                         let ctx = ctx.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_hook_dispatch(stream, ctx).await {
+                            if let Err(e) = handle_hook_dispatch(stream, ctx, shutdown).await {
                                 debug!(
                                     source = Source::DaemonDispatch.as_str(),
                                     "hook connection error: {e}",
@@ -290,7 +303,7 @@ impl SessionManager {
                         });
                     } else {
                         tokio::spawn(async move {
-                            if let Err(e) = handle_hook_passthrough(stream).await {
+                            if let Err(e) = handle_hook_connection(stream, shutdown).await {
                                 debug!(
                                     source = Source::DaemonDispatch.as_str(),
                                     "hook connection error: {e}",
@@ -299,8 +312,38 @@ impl SessionManager {
                         });
                     }
                 }
+                () = self.shutdown.cancelled() => {
+                    self.remove_sockets();
+                    return Ok(());
+                }
+                () = self.disconnect.notified() => {
+                    if self.connection_count.load(Ordering::Acquire) == 0 {
+                        info!(
+                            source = Source::DaemonLifecycle.as_str(),
+                            "last client disconnected",
+                        );
+                        self.remove_sockets();
+                        return Ok(());
+                    }
+                }
             }
         }
+    }
+
+    /// Returns the shutdown token for this daemon.
+    ///
+    /// Cancel this token to initiate daemon shutdown. The
+    /// [`accept_loop`](Self::accept_loop) removes socket files and
+    /// returns `Ok(())` when the token is cancelled.
+    #[must_use]
+    pub fn shutdown_token(&self) -> CancellationToken {
+        self.shutdown.clone()
+    }
+
+    /// Removes socket files so new bridges start a fresh daemon.
+    fn remove_sockets(&self) {
+        let _ = std::fs::remove_file(&self.mcp_socket_path);
+        let _ = std::fs::remove_file(&self.hook_socket_path);
     }
 
     /// Spawns a per-connection MCP task.
@@ -308,16 +351,22 @@ impl SessionManager {
     /// Converts the tokio `UnixStream` to a `std::os::unix::net::UnixStream`
     /// (since `McpServer` uses synchronous I/O), clones it for
     /// read/write halves, and runs the MCP message loop in a blocking task.
+    /// A [`ConnectionGuard`] decrements the connection count on any exit
+    /// path and notifies the accept loop, which checks whether the daemon
+    /// should shut down.
     fn handle_mcp_connection(&self, stream: tokio::net::UnixStream, fd: i32) {
         let handler = self.handler.clone();
         let logging = self.logging.clone();
         let count = Arc::clone(&self.connection_count);
+        let disconnect = Arc::clone(&self.disconnect);
 
         count.fetch_add(1, Ordering::Relaxed);
 
         tokio::spawn(async move {
             let span = tracing::info_span!("mcp_connection", mcp_fd = fd);
             async {
+                let _guard = ConnectionGuard { count, disconnect };
+
                 info!(
                     source = Source::DaemonDispatch.as_str(),
                     "MCP connection accepted",
@@ -333,7 +382,6 @@ impl SessionManager {
                                 source = Source::DaemonDispatch.as_str(),
                                 "failed to set stream to blocking: {e}",
                             );
-                            count.fetch_sub(1, Ordering::Relaxed);
                             return;
                         }
                         s
@@ -343,7 +391,6 @@ impl SessionManager {
                             source = Source::DaemonDispatch.as_str(),
                             "failed to convert socket to std: {e}",
                         );
-                        count.fetch_sub(1, Ordering::Relaxed);
                         return;
                     }
                 };
@@ -354,7 +401,6 @@ impl SessionManager {
                             source = Source::DaemonDispatch.as_str(),
                             "failed to clone socket for reader: {e}",
                         );
-                        count.fetch_sub(1, Ordering::Relaxed);
                         return;
                     }
                 };
@@ -380,8 +426,6 @@ impl SessionManager {
                         "MCP task panicked: {e}",
                     ),
                 }
-
-                count.fetch_sub(1, Ordering::Relaxed);
             }
             .instrument(span)
             .await;
@@ -440,13 +484,38 @@ impl SessionManager {
     }
 }
 
-/// Handles a single hook connection with a passthrough response.
+/// RAII guard that decrements the connection count on drop.
+///
+/// Always notifies the accept loop after decrementing. The accept loop
+/// checks the count atomically and decides whether to shut down — this
+/// keeps the shutdown decision synchronous on the accept loop's task,
+/// eliminating the race between a new connection arriving and the
+/// shutdown firing.
+#[cfg(unix)]
+struct ConnectionGuard {
+    count: Arc<AtomicUsize>,
+    disconnect: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(unix)]
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.count.fetch_sub(1, Ordering::AcqRel);
+        self.disconnect.notify_one();
+    }
+}
+
+/// Handles a single hook connection.
 ///
 /// Reads the JSON request, logs the method for visibility, and sends an
-/// empty response (which means "allow" in the hook protocol). Used when
-/// no shared session is configured (test mode).
+/// empty response (which means "allow" in the hook protocol). Recognizes
+/// the `"shutdown"` method from `catenary stop` and cancels the daemon
+/// shutdown token. Used when no shared session is configured (test mode).
 #[cfg(unix)]
-async fn handle_hook_passthrough(stream: tokio::net::UnixStream) -> Result<()> {
+async fn handle_hook_connection(
+    stream: tokio::net::UnixStream,
+    shutdown: CancellationToken,
+) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     let (reader, mut writer) = tokio::io::split(stream);
@@ -462,6 +531,18 @@ async fn handle_hook_passthrough(stream: tokio::net::UnixStream) -> Result<()> {
             .get("method")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
+
+        if method == "shutdown" {
+            info!(
+                source = Source::DaemonLifecycle.as_str(),
+                "shutdown requested via stop command",
+            );
+            writer.write_all(b"{\"status\":\"ok\"}\n").await?;
+            writer.shutdown().await?;
+            shutdown.cancel();
+            return Ok(());
+        }
+
         info!(
             source = Source::DaemonDispatch.as_str(),
             method, "hook request (passthrough)",
@@ -518,6 +599,7 @@ fn get_or_create_router(ctx: &HookDispatchContext, session_id: &str) -> Arc<Hook
 async fn handle_hook_dispatch(
     stream: tokio::net::UnixStream,
     ctx: HookDispatchContext,
+    shutdown: CancellationToken,
 ) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -536,6 +618,18 @@ async fn handle_hook_dispatch(
         .and_then(|v| v.as_str())
         .unwrap_or("unknown")
         .to_string();
+
+    // Handle shutdown from `catenary stop`.
+    if method == "shutdown" {
+        info!(
+            source = Source::DaemonLifecycle.as_str(),
+            "shutdown requested via stop command",
+        );
+        writer.write_all(b"{\"status\":\"ok\"}\n").await?;
+        writer.shutdown().await?;
+        shutdown.cancel();
+        return Ok(());
+    }
 
     // Extract session_id for routing. Falls back to "default" for hooks
     // that don't carry a session_id (backward compatibility).
@@ -1611,6 +1705,155 @@ mod tests {
         );
     }
 
+    // ── Lifecycle tests ─────────────────────────────────────────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_on_last_disconnect() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let mcp_path = mcp_socket_in(dir.path());
+        let hook_path = hook_socket_in(dir.path());
+
+        let manager = Arc::new(bind_in(dir.path()));
+        let m = Arc::clone(&manager);
+        let handle = tokio::spawn(async move { m.accept_loop().await });
+
+        // Connect one client.
+        let stream = tokio::net::UnixStream::connect(&mcp_path)
+            .await
+            .expect("connect");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(manager.connection_count(), 1);
+
+        // Disconnect — last client gone, accept_loop should exit.
+        drop(stream);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("accept_loop should exit within 5s")
+            .expect("task should not panic");
+
+        assert!(result.is_ok(), "accept_loop should return Ok");
+
+        // Sockets removed so new bridges start a fresh daemon.
+        assert!(
+            !mcp_path.exists(),
+            "MCP socket should be removed after shutdown",
+        );
+        assert!(
+            !hook_path.exists(),
+            "hook socket should be removed after shutdown",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_with_multiple_clients() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let mcp_path = mcp_socket_in(dir.path());
+
+        let manager = Arc::new(bind_in(dir.path()));
+        let m = Arc::clone(&manager);
+        let handle = tokio::spawn(async move { m.accept_loop().await });
+
+        // Connect two clients.
+        let stream1 = tokio::net::UnixStream::connect(&mcp_path)
+            .await
+            .expect("connect 1");
+        let stream2 = tokio::net::UnixStream::connect(&mcp_path)
+            .await
+            .expect("connect 2");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(manager.connection_count(), 2);
+
+        // Disconnect first — daemon should stay alive.
+        drop(stream1);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !handle.is_finished(),
+            "accept_loop should still be running with one client",
+        );
+
+        // Disconnect second — daemon should exit.
+        drop(stream2);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("accept_loop should exit within 5s")
+            .expect("task should not panic");
+
+        assert!(result.is_ok(), "accept_loop should return Ok");
+    }
+
+    #[tokio::test]
+    async fn stop_via_hook_socket() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let mcp_path = mcp_socket_in(dir.path());
+        let hook_path = hook_socket_in(dir.path());
+
+        let manager = Arc::new(bind_in(dir.path()));
+        let m = Arc::clone(&manager);
+        let handle = tokio::spawn(async move { m.accept_loop().await });
+
+        // Send shutdown via hook socket.
+        let stream = tokio::net::UnixStream::connect(&hook_path)
+            .await
+            .expect("connect to hook socket");
+        let (reader, mut writer) = stream.into_split();
+
+        let request = serde_json::json!({"method": "shutdown"});
+        let mut payload = serde_json::to_string(&request).expect("serialize");
+        payload.push('\n');
+        writer.write_all(payload.as_bytes()).await.expect("write");
+
+        // Read the ack response.
+        let mut buf_reader = BufReader::new(reader);
+        let mut line = String::new();
+        buf_reader.read_line(&mut line).await.expect("read");
+        assert!(
+            line.contains("ok"),
+            "should receive ok response, got: {line}",
+        );
+
+        // accept_loop should exit.
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("accept_loop should exit within 5s")
+            .expect("task should not panic");
+
+        assert!(result.is_ok(), "accept_loop should return Ok");
+
+        // Sockets removed so new bridges start a fresh daemon.
+        assert!(
+            !mcp_path.exists(),
+            "MCP socket should be removed after stop",
+        );
+        assert!(
+            !hook_path.exists(),
+            "hook socket should be removed after stop",
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_token_exits_accept_loop() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+
+        let manager = Arc::new(bind_in(dir.path()));
+        let shutdown = manager.shutdown_token();
+        let m = Arc::clone(&manager);
+        let handle = tokio::spawn(async move { m.accept_loop().await });
+
+        // Cancel the token directly (simulates signal handling).
+        shutdown.cancel();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("accept_loop should exit within 5s")
+            .expect("task should not panic");
+
+        assert!(result.is_ok(), "accept_loop should return Ok");
+    }
+
     // ── Session state tests ─────────────────────────────────────────────
 
     /// Create a `SessionManager` with a real `Session` for hook dispatch tests.
@@ -1888,9 +2131,6 @@ mod tests {
             let mut w: &std::os::unix::net::UnixStream = &stream;
             writeln!(w, "{}", serde_json::to_string(&response).expect("ser"))
                 .expect("write response");
-            // Thread exits immediately — the response is in the kernel
-            // buffer for the client to read. Any follow-up notification
-            // (version-mismatch) is best-effort on the client side.
         })
     }
 
