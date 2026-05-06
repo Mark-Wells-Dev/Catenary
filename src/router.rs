@@ -270,10 +270,13 @@ impl SessionManager {
     /// correlation. Hook connections are short-lived and handled in
     /// spawned tasks with passthrough responses.
     ///
-    /// Returns `Ok(())` when the shutdown token is cancelled — either
-    /// because the last MCP client disconnected, a `catenary stop`
-    /// command was received on the hook socket, or an external signal
-    /// cancelled the token.
+    /// Returns `Ok(())` when the daemon should shut down. Three triggers:
+    /// - Last MCP client disconnected (disconnect notify, count == 0)
+    /// - `catenary stop` received on the hook socket (shutdown token)
+    /// - External signal cancelled the shutdown token
+    ///
+    /// On exit, socket files are removed so new bridges start a fresh
+    /// daemon instead of connecting to one that is shutting down.
     ///
     /// # Errors
     ///
