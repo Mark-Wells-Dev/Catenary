@@ -150,6 +150,7 @@ mod tests {
             source: source.map(str::to_string),
             language: None,
             payload: None,
+            session_id: None,
             fields: serde_json::Map::new(),
         }
     }

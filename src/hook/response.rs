@@ -158,6 +158,7 @@ mod tests {
             source: None,
             language: None,
             payload: None,
+            session_id: None,
             fields: serde_json::Map::new(),
         }
     }

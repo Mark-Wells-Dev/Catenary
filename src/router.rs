@@ -658,6 +658,10 @@ impl SessionManager {
             .hook_ctx
             .as_ref()
             .map(|ctx| ctx.editing_guardrail.clone());
+        let notification_router = self
+            .hook_ctx
+            .as_ref()
+            .and_then(|ctx| ctx.primary.notification_router.clone());
         let db_conn = self.db_conn.clone();
 
         count.fetch_add(1, Ordering::Relaxed);
@@ -718,6 +722,7 @@ impl SessionManager {
                 let sessions_cleanup = sessions_for_callback.clone();
                 let lsp_cleanup = lsp.clone();
                 let guardrail_cleanup = editing_guardrail.clone();
+                let notification_router_cleanup = notification_router.clone();
 
                 let result = tokio::task::spawn_blocking(move || {
                     let _entered = span_for_blocking.enter();
@@ -882,6 +887,12 @@ impl SessionManager {
                         // locks if the agent dies mid-edit).
                         if let Some(ref guardrail) = guardrail_cleanup {
                             guardrail.release_all(sid);
+                        }
+
+                        // Remove session from notification router
+                        // (idempotent if SessionEnd already ran).
+                        if let Some(ref router) = notification_router_cleanup {
+                            router.remove_session(sid);
                         }
 
                         // Clean up correlation state.
@@ -1232,6 +1243,10 @@ async fn handle_hook_connection(
 /// stash, transcript state, and notification queue. The `HookRouter`
 /// wraps the per-session `Session` with its own turn counter and
 /// debounce state.
+///
+/// Registers the session with the shared [`crate::logging::notification_router::NotificationRouter`]
+/// so `warn!()` / `error!()` events carrying this `session_id` in
+/// their span context route to this session's notification queue.
 #[cfg(unix)]
 fn get_or_create_router(ctx: &HookDispatchContext, session_id: &str) -> Arc<HookRouter> {
     ctx.sessions
@@ -1249,6 +1264,13 @@ fn get_or_create_router(ctx: &HookDispatchContext, session_id: &str) -> Arc<Hook
                 session_id_arc,
                 Some(ctx.editing_guardrail.clone()),
             ));
+
+            // Register session with the notification router so
+            // events carrying this session_id route to its queue.
+            if let Some(ref router) = session.notification_router {
+                router.register_session(session_id);
+            }
+
             let router = Arc::new(HookRouter::new(
                 session.clone(),
                 ctx.conn.clone(),
@@ -1364,6 +1386,12 @@ async fn handle_hook_dispatch(
         // Release editing guardrail locks (idempotent if MCP
         // disconnect already ran).
         ctx.editing_guardrail.release_all(&session_id);
+
+        // Remove session from notification router (idempotent if
+        // MCP disconnect already ran).
+        if let Some(ref router) = ctx.primary.notification_router {
+            router.remove_session(&session_id);
+        }
 
         if let Some(ref tracker) = ctx.root_tracker {
             let transcript_key = format!("transcript:{session_id}");
@@ -2703,6 +2731,7 @@ mod tests {
             conn.clone(),
             instance_id,
             runtime,
+            None,
         ));
 
         SessionManager::bind_at(
@@ -3078,6 +3107,7 @@ mod tests {
             conn.clone(),
             instance_id,
             runtime,
+            None,
         ));
 
         SessionManager::bind_at(

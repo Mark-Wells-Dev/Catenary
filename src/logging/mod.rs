@@ -24,6 +24,7 @@
 
 pub mod message_db;
 pub mod notification_queue;
+pub mod notification_router;
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -36,6 +37,7 @@ use chrono::DateTime;
 use chrono::Utc;
 use tracing::Subscriber;
 use tracing_subscriber::layer::Context;
+use tracing_subscriber::registry::LookupSpan;
 
 /// In-process monotonic correlation ID.
 ///
@@ -163,6 +165,12 @@ pub struct LogEvent<'a> {
     pub language: Option<String>,
     /// Raw protocol JSON payload (for `kind in {lsp, mcp, hook}`).
     pub payload: Option<String>,
+    /// Session ID from the tracing span hierarchy.
+    ///
+    /// Extracted from the nearest ancestor span with a `session_id` field.
+    /// Used by [`notification_router::NotificationRouter`] to route
+    /// notifications to per-session queues.
+    pub session_id: Option<String>,
     /// All non-reserved structured fields.
     pub fields: serde_json::Map<String, serde_json::Value>,
 }
@@ -185,6 +193,7 @@ struct OwnedEvent {
     source: Option<String>,
     language: Option<String>,
     payload: Option<String>,
+    session_id: Option<String>,
     fields: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -203,6 +212,7 @@ impl OwnedEvent {
             source: self.source.clone(),
             language: self.language.clone(),
             payload: self.payload.clone(),
+            session_id: self.session_id.clone(),
             fields: self.fields.clone(),
         }
     }
@@ -487,8 +497,75 @@ fn dispatch_to_sinks(
     }
 }
 
-impl<S: Subscriber> tracing_subscriber::Layer<S> for LoggingServer {
-    fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+/// Span extension for `session_id` propagation.
+///
+/// Stored in each span's extensions when it (or an ancestor) carries a
+/// `session_id` field. The [`LoggingServer`] Layer populates this on
+/// `on_new_span` and `on_record`, then reads it in `on_event` to attach
+/// the session context to [`LogEvent`].
+#[derive(Default)]
+struct SpanFields {
+    session_id: Option<String>,
+}
+
+/// Visitor for extracting `session_id` from span attributes.
+#[derive(Default)]
+struct SpanFieldVisitor {
+    session_id: Option<String>,
+}
+
+impl tracing::field::Visit for SpanFieldVisitor {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "session_id" {
+            self.session_id = Some(value.to_string());
+        }
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "session_id" {
+            self.session_id = Some(format!("{value:?}"));
+        }
+    }
+}
+
+impl<S> tracing_subscriber::Layer<S> for LoggingServer
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+{
+    fn on_new_span(
+        &self,
+        attrs: &tracing::span::Attributes<'_>,
+        id: &tracing::span::Id,
+        ctx: Context<'_, S>,
+    ) {
+        let mut visitor = SpanFieldVisitor::default();
+        attrs.record(&mut visitor);
+        if let Some(span) = ctx.span(id) {
+            span.extensions_mut().insert(SpanFields {
+                session_id: visitor.session_id,
+            });
+        }
+    }
+
+    fn on_record(
+        &self,
+        id: &tracing::span::Id,
+        values: &tracing::span::Record<'_>,
+        ctx: Context<'_, S>,
+    ) {
+        let mut visitor = SpanFieldVisitor::default();
+        values.record(&mut visitor);
+        if let Some(session_id) = visitor.session_id
+            && let Some(span) = ctx.span(id)
+        {
+            let mut ext = span.extensions_mut();
+            if let Some(fields) = ext.get_mut::<SpanFields>() {
+                fields.session_id = Some(session_id);
+            }
+        }
+    }
+
+    fn on_event(&self, event: &tracing::Event<'_>, ctx: Context<'_, S>) {
         let meta = event.metadata();
         let severity = Severity::from(meta.level());
         let target = meta.target();
@@ -496,10 +573,24 @@ impl<S: Subscriber> tracing_subscriber::Layer<S> for LoggingServer {
         let mut visitor = FieldVisitor::default();
         event.record(&mut visitor);
 
+        // Walk the span chain to find session_id if not on the event.
+        let span_session_id = if visitor.session_id.is_some() {
+            None // event field takes priority in finish()
+        } else {
+            ctx.event_span(event).and_then(|span| {
+                // Check current span first, then walk ancestors.
+                span.scope().find_map(|s| {
+                    s.extensions()
+                        .get::<SpanFields>()
+                        .and_then(|f| f.session_id.clone())
+                })
+            })
+        };
+
         // Fast path: sinks set (post-activate). Single atomic load — no
         // Mutex, no Vec clone, no refcount bumps.
         if let Some(sinks) = self.inner.sinks.get() {
-            let log_event = visitor.finish(severity, target);
+            let log_event = visitor.finish(severity, target, span_session_id);
             dispatch_to_sinks(sinks, &log_event, &self.inner.sink_panic);
             return;
         }
@@ -511,13 +602,17 @@ impl<S: Subscriber> tracing_subscriber::Layer<S> for LoggingServer {
         // and lock acquisition.
         if let Some(sinks) = self.inner.sinks.get() {
             drop(guard);
-            let log_event = visitor.finish(severity, target);
+            let log_event = visitor.finish(severity, target, span_session_id);
             dispatch_to_sinks(sinks, &log_event, &self.inner.sink_panic);
             return;
         }
 
         if let Some(bs) = guard.as_mut() {
-            let owned = visitor.finish_owned(severity, target.to_string());
+            let mut owned = visitor.finish_owned(severity, target.to_string());
+            // Bootstrap events lack span context; merge if available.
+            if owned.session_id.is_none() {
+                owned.session_id = span_session_id;
+            }
             if bs.buffer.len() >= bs.cap {
                 let _ = bs.buffer.pop_front();
                 bs.dropped = bs.dropped.saturating_add(1);
@@ -544,6 +639,7 @@ struct FieldVisitor {
     source: Option<String>,
     language: Option<String>,
     payload: Option<String>,
+    session_id: Option<String>,
     fields: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -558,6 +654,7 @@ impl FieldVisitor {
             "source" => self.source = Some(value),
             "language" => self.language = Some(value),
             "payload" => self.payload = Some(value),
+            "session_id" => self.session_id = Some(value),
             _ => {
                 self.fields
                     .insert(name.to_string(), serde_json::Value::String(value));
@@ -565,7 +662,12 @@ impl FieldVisitor {
         }
     }
 
-    fn finish(self, severity: Severity, target: &str) -> LogEvent<'_> {
+    fn finish(
+        self,
+        severity: Severity,
+        target: &str,
+        span_session_id: Option<String>,
+    ) -> LogEvent<'_> {
         LogEvent {
             severity,
             target,
@@ -579,6 +681,8 @@ impl FieldVisitor {
             source: self.source,
             language: self.language,
             payload: self.payload,
+            // Event field takes priority; fall back to span context.
+            session_id: self.session_id.or(span_session_id),
             fields: self.fields,
         }
     }
@@ -597,6 +701,7 @@ impl FieldVisitor {
             source: self.source,
             language: self.language,
             payload: self.payload,
+            session_id: self.session_id,
             fields: self.fields,
         }
     }
@@ -839,6 +944,7 @@ mod tests {
         source: Option<String>,
         language: Option<String>,
         payload: Option<String>,
+        session_id: Option<String>,
         fields: serde_json::Map<String, serde_json::Value>,
     }
 
@@ -865,6 +971,7 @@ mod tests {
                     source: event.source.clone(),
                     language: event.language.clone(),
                     payload: event.payload.clone(),
+                    session_id: event.session_id.clone(),
                     fields: event.fields.clone(),
                 });
         }
@@ -884,6 +991,7 @@ mod tests {
             source: source.map(str::to_string),
             language: None,
             payload: None,
+            session_id: None,
             fields: serde_json::Map::new(),
         }
     }
@@ -1348,5 +1456,96 @@ mod tests {
             server.take_sink_panic().as_deref(),
             Some("first-event panic")
         );
+    }
+
+    #[test]
+    fn session_id_from_span_propagates_to_event() {
+        let server = LoggingServer::new();
+        let sink = Arc::new(RecorderSink::default());
+        with_subscriber(server.clone(), || {
+            server.activate(vec![sink.clone()]);
+
+            let span = tracing::info_span!("test_session", session_id = "sess-42");
+            let _guard = span.enter();
+            tracing::warn!("inside span");
+        });
+        let events = sink.snapshot();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].session_id.as_deref(), Some("sess-42"));
+    }
+
+    #[test]
+    fn session_id_from_ancestor_span() {
+        let server = LoggingServer::new();
+        let sink = Arc::new(RecorderSink::default());
+        with_subscriber(server.clone(), || {
+            server.activate(vec![sink.clone()]);
+
+            let outer = tracing::info_span!("connection", session_id = "sess-99");
+            let _outer_guard = outer.enter();
+
+            let inner = tracing::info_span!("tool_call");
+            let _inner_guard = inner.enter();
+            tracing::warn!("deep inside");
+        });
+        let events = sink.snapshot();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].session_id.as_deref(), Some("sess-99"));
+    }
+
+    #[test]
+    fn session_id_absent_without_span() {
+        let server = LoggingServer::new();
+        let sink = Arc::new(RecorderSink::default());
+        with_subscriber(server.clone(), || {
+            server.activate(vec![sink.clone()]);
+            tracing::warn!("no span");
+        });
+        let events = sink.snapshot();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].session_id.is_none());
+    }
+
+    #[test]
+    fn session_id_recorded_after_span_creation() {
+        // Simulates the daemon pattern: span starts with Empty, filled
+        // after correlation.
+        let server = LoggingServer::new();
+        let sink = Arc::new(RecorderSink::default());
+        with_subscriber(server.clone(), || {
+            server.activate(vec![sink.clone()]);
+
+            let span = tracing::info_span!("mcp_connection", session_id = tracing::field::Empty,);
+            let _guard = span.enter();
+
+            // Before recording: no session_id.
+            tracing::warn!("before record");
+
+            // Record session_id (mimics resolve_correlation).
+            span.record("session_id", "correlated-sess");
+
+            // After recording: session_id present.
+            tracing::warn!("after record");
+        });
+        let events = sink.snapshot();
+        assert_eq!(events.len(), 2);
+        assert!(events[0].session_id.is_none());
+        assert_eq!(events[1].session_id.as_deref(), Some("correlated-sess"));
+    }
+
+    #[test]
+    fn event_field_session_id_takes_priority() {
+        let server = LoggingServer::new();
+        let sink = Arc::new(RecorderSink::default());
+        with_subscriber(server.clone(), || {
+            server.activate(vec![sink.clone()]);
+
+            let span = tracing::info_span!("session", session_id = "span-sess");
+            let _guard = span.enter();
+            tracing::warn!(session_id = "event-sess", "explicit field");
+        });
+        let events = sink.snapshot();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].session_id.as_deref(), Some("event-sess"));
     }
 }

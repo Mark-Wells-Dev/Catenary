@@ -219,6 +219,7 @@ mod tests {
             source: None,
             language: None,
             payload: payload.map(str::to_string),
+            session_id: None,
             fields: serde_json::Map::new(),
         }
     }
@@ -237,6 +238,7 @@ mod tests {
             source: None,
             language: None,
             payload: None,
+            session_id: None,
             fields: serde_json::Map::new(),
         }
     }

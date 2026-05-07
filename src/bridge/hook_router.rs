@@ -594,10 +594,28 @@ impl HookRouter {
 
     /// Drain the notification queue into a `systemMessage` string.
     ///
+    /// In daemon mode, drains from the shared [`crate::logging::notification_router::NotificationRouter`]
+    /// using this session's `session_id`. In single-session mode, drains from
+    /// the per-session [`crate::logging::notification_queue::NotificationQueueSink`].
+    ///
     /// Returns `None` if the queue is empty and no sink panics occurred.
     fn drain_notifications(&self) -> Option<String> {
         let mut builder = SystemMessageBuilder::new();
-        builder.drain_background(&self.session.notifications, &self.session.logging);
+        if let Some(router) = &self.session.notification_router {
+            // Daemon mode: drain from the per-session queue in the router.
+            if let Some(panic_msg) = self.session.logging.take_sink_panic() {
+                builder.push_background(format!(
+                    "[{}] sink panic: {panic_msg}",
+                    crate::logging::Severity::Error.tag()
+                ));
+            }
+            for notification in &router.drain(&self.session.instance_id) {
+                builder.push_background(notification.format());
+            }
+        } else {
+            // Single-session mode: drain from the per-session queue.
+            builder.drain_background(&self.session.notifications, &self.session.logging);
+        }
         builder.finish()
     }
 
@@ -1102,6 +1120,7 @@ mod tests {
             conn.clone(),
             instance_id.clone(),
             handle,
+            None,
         ));
 
         if failed {
@@ -1334,6 +1353,7 @@ mod tests {
             conn.clone(),
             instance_id.clone(),
             handle,
+            None,
         ));
         let router = HookRouter::new(session, conn, instance_id, "test".to_string());
 
@@ -1375,6 +1395,7 @@ mod tests {
             conn.clone(),
             instance_id.clone(),
             handle,
+            None,
         ));
 
         let router = HookRouter::new(session, conn, instance_id, "test".to_string());
@@ -1627,6 +1648,7 @@ mod tests {
             source: None,
             language: None,
             payload: None,
+            session_id: None,
             fields: serde_json::Map::new(),
         }
     }
@@ -1744,6 +1766,7 @@ mod tests {
             conn.clone(),
             instance_id.clone(),
             handle,
+            None,
         ));
         let router = HookRouter::new(session, conn, instance_id, "test".to_string());
         TestHookRouter {

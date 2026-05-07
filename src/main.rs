@@ -419,6 +419,7 @@ async fn run_server() -> Result<()> {
         session_conn,
         instance_id.clone(),
         tokio::runtime::Handle::current(),
+        None,
     ));
     toolbox.spawn_all().await;
 
@@ -649,6 +650,17 @@ fn run_daemon_main() -> Result<()> {
 
         let conn = Arc::new(std::sync::Mutex::new(conn));
 
+        let threshold: catenary_mcp::logging::Severity = config
+            .notifications
+            .as_ref()
+            .map_or_else(catenary_mcp::config::SeverityConfig::default, |n| {
+                n.threshold
+            })
+            .into();
+        let notification_router = Arc::new(
+            catenary_mcp::logging::notification_router::NotificationRouter::new(threshold),
+        );
+
         let session = Arc::new(catenary_mcp::bridge::session::Session::new(
             config,
             roots,
@@ -656,6 +668,7 @@ fn run_daemon_main() -> Result<()> {
             conn.clone(),
             instance_id,
             rt.handle().clone(),
+            Some(notification_router),
         ));
 
         // Spawn LSP servers in the background.

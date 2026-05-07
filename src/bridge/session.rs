@@ -158,7 +158,16 @@ pub struct Session {
     /// Multi-sink tracing dispatcher.
     pub logging: LoggingServer,
     /// Notification queue for draining into `systemMessage`.
+    ///
+    /// Used in single-session mode. In daemon mode, the
+    /// [`crate::logging::notification_router::NotificationRouter`] handles
+    /// per-session routing instead — this field is still present but empty.
     pub notifications: Arc<NotificationQueueSink>,
+    /// Per-session notification router (daemon mode only).
+    ///
+    /// When set, `HookRouter::drain_notifications` drains from the router
+    /// instead of `self.notifications`. `None` in single-session mode.
+    pub notification_router: Option<Arc<crate::logging::notification_router::NotificationRouter>>,
     /// Symbol index populated from `documentSymbol` responses (shared with grep).
     pub symbol_index: Option<Arc<std::sync::Mutex<SymbolIndex>>>,
     /// Catenary instance ID (unique per process invocation).
@@ -185,6 +194,11 @@ impl Session {
     /// Constructs the logging sinks and activates the `LoggingServer`,
     /// draining any bootstrap-buffered events. After this call, all
     /// `tracing` events flow through the logging pipeline.
+    ///
+    /// When `notification_router` is `Some` (daemon mode), the router is
+    /// registered as the notification sink instead of a per-session queue.
+    /// The router routes events to per-session queues based on `session_id`
+    /// from the tracing span hierarchy.
     #[must_use]
     pub fn new(
         config: Config,
@@ -193,6 +207,7 @@ impl Session {
         conn: Arc<std::sync::Mutex<rusqlite::Connection>>,
         instance_id: Arc<str>,
         runtime: Handle,
+        notification_router: Option<Arc<crate::logging::notification_router::NotificationRouter>>,
     ) -> Self {
         let config = Arc::new(config);
 
@@ -206,7 +221,13 @@ impl Session {
         let message_db = crate::logging::message_db::MessageDbSink::new(conn, instance_id.clone());
 
         // Activate — drains bootstrap buffer, enables direct dispatch.
-        logging.activate(vec![notifications.clone(), message_db]);
+        // In daemon mode, the notification router replaces the per-session
+        // queue as the notification sink.
+        if let Some(ref router) = notification_router {
+            logging.activate(vec![router.clone(), message_db]);
+        } else {
+            logging.activate(vec![notifications.clone(), message_db]);
+        }
 
         let classification = super::filesystem_manager::ClassificationTables::from_config(&config);
         let fs_manager = Arc::new(FilesystemManager::with_classification(classification));
@@ -286,6 +307,7 @@ impl Session {
             path_validator,
             logging,
             notifications,
+            notification_router,
             symbol_index,
             instance_id,
             runtime,
@@ -301,11 +323,11 @@ impl Session {
     /// Shares heavy resources (`LspClientManager`, `FilesystemManager`,
     /// `SymbolIndex`, config, logging) with the daemon's primary session.
     /// Creates fresh per-session state: editing manager, CWD stash,
-    /// transcript state, notification queue, and roots-refresh flag.
+    /// transcript state, and roots-refresh flag.
     ///
-    /// The `NotificationQueueSink` is created but **not** registered as a
-    /// tracing sink — per-session notification routing is added in a later
-    /// phase. Until then, the per-session queue stays empty on drain.
+    /// The per-session notification queue is not registered as a tracing
+    /// sink — the shared [`crate::logging::notification_router::NotificationRouter`]
+    /// handles per-session routing via the `session_id` tracing span.
     #[must_use]
     pub fn new_for_daemon(
         primary: &Self,
@@ -378,6 +400,7 @@ impl Session {
             path_validator: primary.path_validator.clone(),
             logging: primary.logging.clone(),
             notifications,
+            notification_router: primary.notification_router.clone(),
             symbol_index: primary.symbol_index.clone(),
             instance_id: session_id,
             runtime: primary.runtime.clone(),
@@ -738,6 +761,7 @@ mod tests {
             conn,
             instance_id,
             runtime.handle().clone(),
+            None,
         );
         (dir, runtime, session)
     }
