@@ -208,7 +208,25 @@ impl NotificationRouter {
 }
 
 impl Sink for NotificationRouter {
+    #[allow(
+        clippy::suspicious_operation_groupings,
+        reason = "false positive: event.severity < self.threshold is correct"
+    )]
     fn handle(&self, event: &LogEvent<'_>) {
+        let has_session = event.session_id.is_some();
+        let has_server = event.server.is_some();
+
+        // Fast path: no routing information — skip the lock.
+        if !has_session && !has_server {
+            return;
+        }
+
+        // Below threshold and no affinity to record — skip the lock.
+        // Affinity requires both session_id and server.
+        if event.severity < self.threshold && !(has_session && has_server) {
+            return;
+        }
+
         let mut state = self.lock();
 
         // Record affinity at any severity: any event with both session_id
@@ -235,7 +253,6 @@ impl Sink for NotificationRouter {
             // LSP-scoped: broadcast to all sessions with affinity.
             Self::broadcast_to_affinity(&mut state, server, event);
         }
-        // Events with neither session_id nor server: no routing target.
     }
 }
 
