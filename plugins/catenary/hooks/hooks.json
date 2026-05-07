@@ -66,6 +66,17 @@
           }
         ]
       }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "catenary hook session-end --format=claude"
+          }
+        ]
+      }
     ]
   }
 }

@@ -579,6 +579,16 @@ impl HookRouter {
                     add_roots: Vec::new(),
                 }
             }
+            HookRequest::SessionEnd { session_id } => {
+                self.store_client_session_id(session_id.as_deref());
+                // No-op at the router level — cleanup happens in the
+                // daemon's handle_hook_dispatch (root tracker removal).
+                DispatchResult {
+                    result: None,
+                    system_message: None,
+                    add_roots: Vec::new(),
+                }
+            }
         }
     }
 

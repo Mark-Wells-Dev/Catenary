@@ -1305,6 +1305,66 @@ async fn handle_hook_dispatch(
         spawn_correlation_timeout(correlation.pending.clone(), session_id.clone());
     }
 
+    // ── Session-end cleanup ───────────────────────────────────────
+    // Short-circuit before get_or_create_router — don't create a
+    // new session just to immediately clean it up.
+    if method == "session-end/cleanup" {
+        let id = ctx.logging.next_id();
+
+        if let Some(ref tracker) = ctx.root_tracker {
+            let transcript_key = format!("transcript:{session_id}");
+            tracker.remove_contributor(&transcript_key);
+
+            // Remove the session if it was never correlated to an
+            // MCP connection. Correlated sessions are cleaned up by
+            // the MCP disconnect path.
+            if !is_session_correlated(&correlation, &session_id) {
+                ctx.sessions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&session_id);
+            }
+
+            // Sync the reduced root set.
+            let global = tracker.global_roots();
+            if let Err(e) = ctx.primary.sync_roots(global).await {
+                debug!(
+                    source = Source::DaemonDispatch.as_str(),
+                    "root sync after session end failed: {e}",
+                );
+            }
+
+            info!(
+                source = Source::DaemonDispatch.as_str(),
+                session_id = %session_id,
+                "session ended: roots cleaned up",
+            );
+        }
+
+        emit_hook_event(
+            tracing::Level::DEBUG,
+            &session_id,
+            &method,
+            id.0,
+            None,
+            &raw.to_string(),
+            "incoming hook",
+        );
+        emit_hook_event(
+            tracing::Level::DEBUG,
+            &session_id,
+            &method,
+            id.0,
+            Some(id.0),
+            "",
+            "outgoing hook response",
+        );
+
+        writer.write_all(b"\n").await?;
+        writer.shutdown().await?;
+        return Ok(());
+    }
+
     let router = get_or_create_router(&ctx, &session_id);
 
     // Mint a correlation ID for this request/response pair.
@@ -3546,6 +3606,52 @@ mod tests {
         assert!(
             !global.contains(&exclusive),
             "/exclusive should not be in global roots",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_end_cleans_up_transcript_roots() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let hook_path = hook_socket_in(dir.path());
+
+        let manager = Arc::new(bind_with_session(dir.path()));
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        // Create session via PreAgent (never correlated — no MCP connection).
+        let req = serde_json::json!({
+            "method": "pre-agent/turn-start",
+            "session_id": "end-sess"
+        });
+        let _ = hook_roundtrip(&hook_path, &req).await;
+        assert_eq!(manager.session_count(), 1, "session should exist");
+
+        // Simulate transcript roots added by the session.
+        let tracker = manager.root_tracker.as_ref().expect("tracker");
+        tracker.add_roots("transcript:end-sess", &[PathBuf::from("/transcript/root")]);
+        assert_eq!(tracker.refcount(Path::new("/transcript/root")), 1,);
+
+        // Send session-end hook.
+        let req = serde_json::json!({
+            "method": "session-end/cleanup",
+            "session_id": "end-sess"
+        });
+        let _ = hook_roundtrip(&hook_path, &req).await;
+
+        // Transcript roots should be cleaned up.
+        assert_eq!(
+            tracker.refcount(Path::new("/transcript/root")),
+            0,
+            "transcript roots should be removed after session end",
+        );
+
+        // Never-correlated session should be removed from registry.
+        assert_eq!(
+            manager.session_count(),
+            0,
+            "never-correlated session should be removed on session end",
         );
     }
 }

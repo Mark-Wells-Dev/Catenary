@@ -204,6 +204,19 @@ pub(crate) enum HookRequest {
         #[serde(default)]
         session_id: Option<String>,
     },
+
+    /// Clean up session state on session end.
+    ///
+    /// Fires when the host CLI session ends (exit, `/clear`, resume,
+    /// logout). No decision control — the session is already ending.
+    /// Used by the daemon to remove the session's root contributions
+    /// from the refcount tracker.
+    #[serde(rename = "session-end/cleanup")]
+    SessionEnd {
+        /// Host CLI session ID (Claude Code / Gemini CLI UUID).
+        #[serde(default)]
+        session_id: Option<String>,
+    },
 }
 
 /// IPC response from the hook server to the CLI.
@@ -681,6 +694,19 @@ mod tests {
             req,
             HookRequest::CheckCommand { command, cwd: None, session_id: None, format: None } if command == "ls"
         ));
+
+        // session-end/cleanup
+        let json = r#"{"method": "session-end/cleanup", "session_id": "uuid-456"}"#;
+        let req: HookRequest = serde_json::from_str(json).expect("session-end");
+        let HookRequest::SessionEnd { session_id } = req else {
+            unreachable!("expected SessionEnd");
+        };
+        assert_eq!(session_id.as_deref(), Some("uuid-456"));
+
+        // session-end/cleanup minimal (no session_id)
+        let json = r#"{"method": "session-end/cleanup"}"#;
+        let req: HookRequest = serde_json::from_str(json).expect("session-end minimal");
+        assert!(matches!(req, HookRequest::SessionEnd { session_id: None }));
     }
 
     // ── Logging tests ───────────────────────────────────────────────────

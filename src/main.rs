@@ -193,6 +193,13 @@ enum HookCommand {
         #[arg(long, value_enum)]
         format: HostFormat,
     },
+    /// `SessionEnd`: clean up session state (roots, editing).
+    #[command(name = "session-end")]
+    SessionEnd {
+        /// Output format: "claude" or "gemini".
+        #[arg(long, value_enum)]
+        format: HostFormat,
+    },
 }
 
 /// Entry point for the Catenary binary.
@@ -253,6 +260,7 @@ fn main() -> Result<()> {
                 HookCommand::PostTool { format } => cli::hooks::run_post_tool(format),
                 HookCommand::PostAgent { format } => cli::hooks::run_post_agent(format),
                 HookCommand::SessionStart { format } => cli::hooks::run_session_start(format),
+                HookCommand::SessionEnd { format: _ } => cli::hooks::run_session_end(),
             }
             Ok(())
         }
@@ -846,6 +854,17 @@ mod tests {
             unreachable!("expected Hook command");
         };
         assert!(matches!(command, HookCommand::SessionStart { .. }));
+    }
+
+    #[test]
+    fn test_cli_hook_session_end() {
+        use clap::Parser;
+        let args = Args::try_parse_from(["catenary", "hook", "session-end", "--format=claude"]);
+        let args = args.expect("hook session-end should parse");
+        let Some(Command::Hook { command }) = args.command else {
+            unreachable!("expected Hook command");
+        };
+        assert!(matches!(command, HookCommand::SessionEnd { .. }));
     }
 
     #[test]

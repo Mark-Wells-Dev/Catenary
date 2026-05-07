@@ -357,6 +357,34 @@ pub fn run_session_start(format: HostFormat) {
     emit_system_message(builder, format);
 }
 
+/// Clean up session state on exit (`SessionEnd` hook handler).
+///
+/// Forwards the session-end signal to the daemon so it can remove
+/// the session's root contributions from the refcount tracker.
+/// Best effort — the host CLI will not wait for completion and
+/// ignores all flow-control fields.
+pub fn run_session_end() {
+    let Ok(stdin_data) = std::io::read_to_string(std::io::stdin()) else {
+        return;
+    };
+    let Ok(hook_json) = serde_json::from_str::<serde_json::Value>(&stdin_data) else {
+        return;
+    };
+
+    let Some(stream) = hook_connect(&hook_json) else {
+        return;
+    };
+
+    let session_id = hook_json.get("session_id").and_then(|v| v.as_str());
+    let mut request = serde_json::json!({"method": "session-end/cleanup"});
+    if let Some(sid) = session_id {
+        request["session_id"] = serde_json::json!(sid);
+    }
+
+    // Fire and forget — no response processing needed.
+    let _ = ipc_exchange(stream, &request);
+}
+
 /// Finalize a [`SystemMessageBuilder`] and print the `systemMessage` JSON
 /// if there is content.
 fn emit_system_message(builder: crate::hook::response::SystemMessageBuilder, format: HostFormat) {
