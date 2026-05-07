@@ -667,6 +667,12 @@ impl SessionManager {
         count.fetch_add(1, Ordering::Relaxed);
 
         tokio::spawn(async move {
+            // session_id starts Empty — filled by sandwich correlation on
+            // first tools/call. Events before correlation have no session
+            // routing: warn!/error! won't reach the agent via systemMessage.
+            // This is fine: pre-correlation errors are fatal (connection
+            // dies, bridge reports via stderr) or protocol-level (info/debug).
+            // Do not add warn!() to the init path expecting agent delivery.
             let span = tracing::info_span!(
                 "mcp_connection",
                 mcp_fd = fd,
