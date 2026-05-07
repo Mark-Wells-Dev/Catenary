@@ -69,6 +69,18 @@
           }
         ]
       }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "name": "catenary-session-end",
+            "type": "command",
+            "command": "catenary hook session-end --format=gemini"
+          }
+        ]
+      }
     ]
   }
 }
