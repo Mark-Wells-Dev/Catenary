@@ -2325,3 +2325,225 @@ fn test_into_glob_pattern() -> Result<()> {
     assert!(text.contains("handle_b"), "Should show handle_b: {text}");
     Ok(())
 }
+
+// ─── Ticket 65: directory matching in glob patterns ─────────────────
+
+#[test]
+fn test_glob_pattern_matches_directories() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    // Directory containing only subdirectories — no files.
+    std::fs::create_dir(dir.path().join("movies"))?;
+    std::fs::create_dir(dir.path().join("music"))?;
+    std::fs::create_dir(dir.path().join("photos"))?;
+
+    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text(
+        "glob",
+        &json!({ "pattern": format!("{}/*", dir.path().display()) }),
+    )?;
+
+    assert!(
+        text.contains("movies/"),
+        "Should match movies directory: {text}"
+    );
+    assert!(
+        text.contains("music/"),
+        "Should match music directory: {text}"
+    );
+    assert!(
+        text.contains("photos/"),
+        "Should match photos directory: {text}"
+    );
+    assert!(
+        !text.contains("No matches found"),
+        "Should not report no matches: {text}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_glob_pattern_mixed_entries() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::create_dir(dir.path().join("subdir"))?;
+    std::fs::write(dir.path().join("file.txt"), "content\n")?;
+
+    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text(
+        "glob",
+        &json!({ "pattern": format!("{}/*", dir.path().display()) }),
+    )?;
+
+    assert!(
+        text.contains("subdir/"),
+        "Should include directory with trailing /: {text}"
+    );
+    assert!(text.contains("file.txt"), "Should include file: {text}");
+    Ok(())
+}
+
+#[test]
+fn test_glob_recursive_pattern_includes_dirs() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let sub = dir.path().join("level1");
+    let subsub = sub.join("level2");
+    std::fs::create_dir_all(&subsub)?;
+    std::fs::write(subsub.join("file.txt"), "content\n")?;
+
+    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text(
+        "glob",
+        &json!({ "pattern": format!("{}/**/*", dir.path().display()) }),
+    )?;
+
+    assert!(text.contains("level1/"), "Should include level1/: {text}");
+    assert!(text.contains("level2/"), "Should include level2/: {text}");
+    assert!(text.contains("file.txt"), "Should include files: {text}");
+
+    // Directories that appear as tree branches should NOT also appear as
+    // file-level leaves (prune_dir_dupes).
+    let level1_count = text.matches("level1/").count();
+    assert_eq!(
+        level1_count, 1,
+        "level1/ should appear exactly once, not duplicated: {text}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_glob_pattern_dirs_no_enrichment() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    // Only directories — no files to enrich.
+    std::fs::create_dir(dir.path().join("alpha"))?;
+    std::fs::create_dir(dir.path().join("beta"))?;
+
+    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text(
+        "glob",
+        &json!({ "pattern": format!("{}/*", dir.path().display()) }),
+    )?;
+
+    // Directories should have no line counts or symbol markers.
+    assert!(
+        !text.contains("lines)"),
+        "Directories should have no line counts: {text}"
+    );
+    assert!(
+        !text.contains("[symbols available]"),
+        "Directories should have no symbol markers: {text}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_glob_pattern_dir_count_tier() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    // Create many files across many directories to exceed tree budget
+    // but fit in directory+count budget.
+    for i in 0..30 {
+        let sub = dir.path().join(format!("dir_{i:02}"));
+        std::fs::create_dir(&sub)?;
+        for j in 0..5 {
+            std::fs::write(sub.join(format!("file_{j}.txt")), format!("line {j}\n"))?;
+        }
+    }
+
+    // Small budget to force degradation past the tree tier.
+    let config_dir = tempfile::tempdir()?;
+    let config_path = config_dir.path().join("config.toml");
+    std::fs::write(&config_path, "[tools.glob]\nbudget = 600\n")?;
+
+    let mut bridge = BridgeProcess::spawn_with_config(&config_path, &dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text(
+        "glob",
+        &json!({ "pattern": format!("{}/**/*.txt", dir.path().display()) }),
+    )?;
+
+    // With 150 files across 30 dirs, the tree won't fit in 600 chars.
+    // The dir+count tier should collapse to directory names with counts.
+    // Check that at least some directories appear with counts.
+    let has_dir_count = text.contains("dir_") && text.contains('\t');
+    let has_bucketed = text.contains("files)");
+    assert!(
+        has_dir_count || has_bucketed,
+        "Should degrade to dir+count or bucketed tier: {text}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_glob_bucketing_uses_relative_paths() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    // Create deeply nested files to test that bucketing uses path prefixes
+    // instead of extension-based grouping.
+    let src = dir.path().join("src");
+    let bridge_dir = src.join("bridge");
+    let lsp_dir = src.join("lsp");
+    std::fs::create_dir_all(&bridge_dir)?;
+    std::fs::create_dir_all(&lsp_dir)?;
+
+    for i in 0..20 {
+        std::fs::write(
+            bridge_dir.join(format!("handler_{i}.rs")),
+            format!("fn handle_{i}() {{}}\n"),
+        )?;
+    }
+    for i in 0..20 {
+        std::fs::write(
+            lsp_dir.join(format!("client_{i}.rs")),
+            format!("struct Client{i};\n"),
+        )?;
+    }
+
+    // Small budget to force bucketing.
+    let config_dir = tempfile::tempdir()?;
+    let config_path = config_dir.path().join("config.toml");
+    std::fs::write(&config_path, "[tools.glob]\nbudget = 400\n")?;
+
+    let mut bridge = BridgeProcess::spawn_with_config(&config_path, &dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text("glob", &json!({ "pattern": "src/**/*.rs" }))?;
+
+    // Bucketing on relative paths should produce path-prefix patterns
+    // (e.g. "src/bridge/*" or "src/lsp/*"), not extension patterns
+    // (e.g. "*.rs").
+    assert!(
+        text.contains("bridge") || text.contains("lsp"),
+        "Bucketed output should reference path prefixes, not just extensions: {text}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_glob_pattern_in_roots_unchanged() -> Result<()> {
+    // Verify that in-root file matching still works with enrichment.
+    let dir = tempfile::tempdir()?;
+    std::fs::write(dir.path().join("main.rs"), "fn main() {}\n")?;
+    std::fs::write(dir.path().join("lib.rs"), "pub mod lib;\n")?;
+
+    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text("glob", &json!({ "pattern": "*.rs" }))?;
+
+    assert!(text.contains("main.rs"), "Should match main.rs: {text}");
+    assert!(text.contains("lib.rs"), "Should match lib.rs: {text}");
+    // File entries should still have line counts.
+    assert!(
+        text.contains("lines)"),
+        "File entries should still have line counts: {text}"
+    );
+    Ok(())
+}

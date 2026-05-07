@@ -264,6 +264,20 @@ impl DirNode {
         }
     }
 
+    /// Removes `FileNode` leaves whose name (minus trailing `/`) duplicates
+    /// a `DirNode` key at the same level. Recurses into children.
+    ///
+    /// This happens when `**/*` matches both a directory and files inside
+    /// it — the directory appears as a `DirNode` branch (from deeper
+    /// matches) and as a `FileNode` leaf (from the directory itself).
+    fn prune_dir_dupes(&mut self) {
+        self.files
+            .retain(|f| !self.dirs.contains_key(f.name.trim_end_matches('/')));
+        for child in self.dirs.values_mut() {
+            child.prune_dir_dupes();
+        }
+    }
+
     /// Returns true if this tree has any subdirectories.
     fn has_dirs(&self) -> bool {
         !self.dirs.is_empty()
@@ -1011,19 +1025,15 @@ impl GlobServer {
                     .git_ignore(true)
                     .hidden(!input.include_hidden)
                     .build();
-                set.extend(
-                    walker
-                        .flatten()
-                        .filter(|e| e.file_type().is_some_and(|ft| ft.is_file()))
-                        .map(ignore::DirEntry::into_path),
-                );
+                set.extend(walker.flatten().map(ignore::DirEntry::into_path));
             }
             set
         } else {
             HashSet::new()
         };
 
-        let mut matched_files: Vec<(PathBuf, PathBuf, bool)> = Vec::new(); // (abs, root, gitignored)
+        // (abs, root, gitignored, is_dir)
+        let mut matched_entries: Vec<(PathBuf, PathBuf, bool, bool)> = Vec::new();
 
         for root in &search_roots {
             let walker = WalkBuilder::new(root)
@@ -1032,12 +1042,20 @@ impl GlobServer {
                 .build();
 
             for entry in walker.flatten() {
-                let is_file = entry.file_type().is_some_and(|ft| ft.is_file());
-                if !is_file {
+                let ft = entry.file_type();
+                let is_file = ft.is_some_and(|ft| ft.is_file());
+                let is_dir = ft.is_some_and(|ft| ft.is_dir());
+                if !is_file && !is_dir {
                     continue;
                 }
 
                 let entry_path = entry.path();
+
+                // Skip the search root itself (walker emits it as first entry).
+                if is_dir && entry_path == root.as_path() {
+                    continue;
+                }
+
                 if resolved.is_match(entry_path, root) {
                     if let Some(matcher) = exclude
                         && matcher.is_match(entry_path.strip_prefix(root).unwrap_or(entry_path))
@@ -1045,21 +1063,26 @@ impl GlobServer {
                         continue;
                     }
                     let gitignored = input.include_gitignored && !non_ignored.contains(entry_path);
-                    matched_files.push((entry_path.to_path_buf(), root.clone(), gitignored));
+                    matched_entries.push((
+                        entry_path.to_path_buf(),
+                        root.clone(),
+                        gitignored,
+                        is_dir,
+                    ));
                 }
             }
         }
 
-        matched_files.sort_by(|a, b| a.0.cmp(&b.0));
-        matched_files.dedup_by(|a, b| a.0 == b.0);
+        matched_entries.sort_by(|a, b| a.0.cmp(&b.0));
+        matched_entries.dedup_by(|a, b| a.0 == b.0);
 
-        if matched_files.is_empty() {
+        if matched_entries.is_empty() {
             return Ok("No matches found".to_string());
         }
 
         // Group by search root and build one tree per group.
-        let mut grouped: BTreeMap<&PathBuf, Vec<&(PathBuf, PathBuf, bool)>> = BTreeMap::new();
-        for entry in &matched_files {
+        let mut grouped: BTreeMap<&PathBuf, Vec<&(PathBuf, PathBuf, bool, bool)>> = BTreeMap::new();
+        for entry in &matched_entries {
             grouped.entry(&entry.1).or_default().push(entry);
         }
 
@@ -1069,36 +1092,60 @@ impl GlobServer {
             let mut flat_names = Vec::new();
             let mut files = Vec::new();
 
-            for (abs_path, _, gitignored) in entries.iter().copied() {
+            for (abs_path, _, gitignored, is_dir) in entries.iter().copied() {
                 let rel = abs_path.strip_prefix(root).unwrap_or(abs_path);
                 let rel_str = rel.to_string_lossy();
                 let components: Vec<&str> = rel_str.split('/').collect();
 
-                let metadata = std::fs::metadata(abs_path).ok();
-                let file_name = components.last().unwrap_or(&"").to_string();
-                let snap = is_snapshot(&file_name);
-
-                let (line_count, binary_size) = if snap {
-                    (None, None)
+                if *is_dir {
+                    // Directory entries: trailing `/`, no line count, no enrichment.
+                    let dir_name = components.last().unwrap_or(&"").to_string();
+                    let display_name = format!("{dir_name}/");
+                    flat_names.push(rel_str.to_string());
+                    files.push((abs_path.clone(), (*root).clone(), *gitignored));
+                    node.insert(
+                        &components,
+                        FileNode {
+                            name: display_name,
+                            abs_path: abs_path.clone(),
+                            line_count: None,
+                            binary_size: None,
+                            is_gitignored: *gitignored,
+                            is_snapshot: false,
+                        },
+                    );
                 } else {
-                    self.file_info(abs_path, metadata.as_ref())
-                };
+                    let metadata = std::fs::metadata(abs_path).ok();
+                    let file_name = components.last().unwrap_or(&"").to_string();
+                    let snap = is_snapshot(&file_name);
 
-                flat_names.push(file_name.clone());
-                files.push((abs_path.clone(), (*root).clone(), *gitignored));
+                    let (line_count, binary_size) = if snap {
+                        (None, None)
+                    } else {
+                        self.file_info(abs_path, metadata.as_ref())
+                    };
 
-                node.insert(
-                    &components,
-                    FileNode {
-                        name: file_name,
-                        abs_path: abs_path.clone(),
-                        line_count,
-                        binary_size,
-                        is_gitignored: *gitignored,
-                        is_snapshot: snap,
-                    },
-                );
+                    flat_names.push(rel_str.to_string());
+                    files.push((abs_path.clone(), (*root).clone(), *gitignored));
+
+                    node.insert(
+                        &components,
+                        FileNode {
+                            name: file_name,
+                            abs_path: abs_path.clone(),
+                            line_count,
+                            binary_size,
+                            is_gitignored: *gitignored,
+                            is_snapshot: snap,
+                        },
+                    );
+                }
             }
+
+            // Remove directory FileNode leaves that duplicate DirNode
+            // branches (happens with `**/*` matching both a dir and its
+            // contents).
+            node.prune_dir_dupes();
 
             sections.push(GlobSection {
                 root: (*root).clone(),
@@ -1108,12 +1155,16 @@ impl GlobServer {
             });
         }
 
-        // Populate symbol index for matched files.
-        let abs_paths: Vec<PathBuf> = matched_files.iter().map(|(p, _, _)| p.clone()).collect();
+        // Populate symbol index for matched files (not directories).
+        let file_paths: Vec<PathBuf> = matched_entries
+            .iter()
+            .filter(|(_, _, _, is_dir)| !is_dir)
+            .map(|(p, _, _, _)| p.clone())
+            .collect();
         self.client_manager
-            .ensure_and_wait_for_paths(&abs_paths)
+            .ensure_and_wait_for_paths(&file_paths)
             .await;
-        self.ensure_symbols(&abs_paths).await;
+        self.ensure_symbols(&file_paths).await;
 
         // Global tier selection: promote from bottom across all roots.
         let ts_guard = self.symbol_index.as_ref().and_then(|m| m.lock().ok());
@@ -1144,11 +1195,22 @@ impl GlobServer {
             out
         };
 
-        // Tier 3 (bucketed) — always fits.
-        let t3: Vec<String> = sections
+        // Tier 4 (bucketed) — always fits.
+        let t4: Vec<String> = sections
             .iter()
             .map(|s| render_bucketed(&s.flat_names, content_budget))
             .collect();
+
+        // Tier 3 (directory + count) — collapse matched files into their
+        // immediate parent directory with a match count.
+        let t3: Vec<String> = sections
+            .iter()
+            .map(|s| render_dir_count(&s.flat_names))
+            .collect();
+        let t3_content: usize = t3.iter().map(String::len).sum();
+        if t3_content > content_budget {
+            return Ok(assemble(&t4));
+        }
 
         // Tier 2 (tree listing with flags) — promote if content fits.
         let t2: Vec<String> = sections
@@ -1711,15 +1773,11 @@ fn select_dir_tier(
     outline_suppress: &[globset::GlobMatcher],
     fs_manager: &FilesystemManager,
 ) -> String {
-    // Collect file names for bucketing.
-    let file_names: Vec<String> = entries
-        .iter()
-        .filter(|e| !e.is_dir)
-        .map(|e| e.name.clone())
-        .collect();
+    // Collect entry names for bucketing (files and directories).
+    let entry_names: Vec<String> = entries.iter().map(|e| e.name.clone()).collect();
 
     // 1. Tier 3 (bucketed) — always succeeds.
-    let tier3 = render_bucketed(&file_names, budget);
+    let tier3 = render_bucketed(&entry_names, budget);
 
     // 2. Tier 2 (file listing with flags).
     let tier2 = render_dir_listing_with_flags(
@@ -2512,9 +2570,9 @@ fn build_children_set_for_file(symbol_index: &SymbolIndex, path: &Path) -> HashS
         .unwrap_or_default()
 }
 
-// ─── Bucketed rendering (tier 3) ──────────────────────────────────────
+// ─── Bucketed rendering ──────────────────────────────────────────────
 
-/// Renders tier 3 bucketed output from file names.
+/// Renders bucketed output from entry names.
 fn render_bucketed(file_names: &[String], budget: usize) -> String {
     if file_names.is_empty() {
         return String::new();
@@ -2545,6 +2603,51 @@ fn render_bucketed(file_names: &[String], budget: usize) -> String {
         }
     }
 
+    result
+}
+
+/// Renders directory + count tier: groups matched entries by their
+/// immediate parent directory and emits `dir/\tcount`.
+///
+/// Entries without a parent component (top-level files/dirs) are listed
+/// individually. Directory entries (trailing `/`) count as entries in
+/// their parent.
+fn render_dir_count(rel_paths: &[String]) -> String {
+    if rel_paths.is_empty() {
+        return String::new();
+    }
+
+    let mut dir_counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut top_level: Vec<String> = Vec::new();
+
+    for rel in rel_paths {
+        if let Some(pos) = rel.rfind('/') {
+            // Strip trailing slash from directory entries before splitting.
+            let effective = rel.strip_suffix('/').unwrap_or(rel);
+            if let Some(dir_pos) = effective.rfind('/') {
+                let dir = &effective[..dir_pos];
+                *dir_counts.entry(format!("{dir}/")).or_insert(0) += 1;
+            } else if pos == rel.len() - 1 {
+                // Top-level directory entry like "subdir/"
+                top_level.push(rel.clone());
+            } else {
+                // File in a subdirectory at depth 1
+                let dir = &rel[..pos];
+                *dir_counts.entry(format!("{dir}/")).or_insert(0) += 1;
+            }
+        } else {
+            // Top-level file
+            top_level.push(rel.clone());
+        }
+    }
+
+    let mut result = String::new();
+    for name in &top_level {
+        let _ = writeln!(result, "{name}");
+    }
+    for (dir, count) in &dir_counts {
+        let _ = writeln!(result, "{dir}\t{count}");
+    }
     result
 }
 
@@ -2690,5 +2793,120 @@ mod tests {
             tier2.contains("Root: /test/root"),
             "tier2 should contain Root header: {tier2}"
         );
+    }
+
+    #[test]
+    fn test_render_dir_count_basic() {
+        let paths = vec![
+            "dirA/file1.rs".to_string(),
+            "dirA/file2.rs".to_string(),
+            "dirB/file1.rs".to_string(),
+        ];
+        let result = render_dir_count(&paths);
+        assert!(
+            result.contains("dirA/\t2"),
+            "should show dirA with count 2: {result}"
+        );
+        assert!(
+            result.contains("dirB/\t1"),
+            "should show dirB with count 1: {result}"
+        );
+    }
+
+    #[test]
+    fn test_render_dir_count_top_level() {
+        let paths = vec!["top.rs".to_string(), "dirA/nested.rs".to_string()];
+        let result = render_dir_count(&paths);
+        assert!(
+            result.contains("top.rs"),
+            "should list top-level file: {result}"
+        );
+        assert!(
+            result.contains("dirA/\t1"),
+            "should show dirA with count: {result}"
+        );
+    }
+
+    #[test]
+    fn test_render_dir_count_dir_entries() {
+        // Directory entries (trailing /) at top level are listed individually.
+        let paths = vec!["subdir/".to_string(), "another/".to_string()];
+        let result = render_dir_count(&paths);
+        assert!(result.contains("subdir/"), "should list subdir: {result}");
+        assert!(result.contains("another/"), "should list another: {result}");
+    }
+
+    #[test]
+    fn test_render_dir_count_empty() {
+        let result = render_dir_count(&[]);
+        assert!(result.is_empty(), "empty input should produce empty output");
+    }
+
+    #[test]
+    fn test_render_dir_count_nested() {
+        let paths = vec![
+            "a/b/file1.rs".to_string(),
+            "a/b/file2.rs".to_string(),
+            "a/c/file3.rs".to_string(),
+        ];
+        let result = render_dir_count(&paths);
+        assert!(
+            result.contains("a/b/\t2"),
+            "should group nested dir: {result}"
+        );
+        assert!(
+            result.contains("a/c/\t1"),
+            "should group nested dir: {result}"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn test_prune_dir_dupes() {
+        let mut node = DirNode::new();
+
+        // Simulate `**/*` matching both "sub" (dir) and "sub/file.rs" (file).
+        // The dir match inserts a FileNode leaf at root level.
+        node.insert(
+            &["sub"],
+            FileNode {
+                name: "sub/".to_string(),
+                abs_path: PathBuf::from("/r/sub"),
+                line_count: None,
+                binary_size: None,
+                is_gitignored: false,
+                is_snapshot: false,
+            },
+        );
+        // The file match creates a DirNode branch and inserts inside it.
+        node.insert(
+            &["sub", "file.rs"],
+            FileNode {
+                name: "file.rs".to_string(),
+                abs_path: PathBuf::from("/r/sub/file.rs"),
+                line_count: Some(10),
+                binary_size: None,
+                is_gitignored: false,
+                is_snapshot: false,
+            },
+        );
+
+        // Before prune: root has both a "sub" DirNode and a "sub/" FileNode.
+        assert_eq!(node.files.len(), 1, "should have dir leaf before prune");
+        assert_eq!(node.dirs.len(), 1, "should have dir branch");
+
+        node.prune_dir_dupes();
+
+        // After prune: the duplicate FileNode leaf is removed.
+        assert!(
+            node.files.is_empty(),
+            "dir leaf should be pruned: {:?}",
+            node.files.iter().map(|f| &f.name).collect::<Vec<_>>()
+        );
+        assert_eq!(node.dirs.len(), 1, "dir branch should remain");
+
+        // The file inside the DirNode should be unaffected.
+        let sub = node.dirs.get("sub").expect("sub dir should exist");
+        assert_eq!(sub.files.len(), 1, "nested file should remain");
     }
 }
