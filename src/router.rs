@@ -9,7 +9,7 @@
 //! connections by file descriptor. Hook connections are short-lived
 //! (one request-response each).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -314,6 +314,88 @@ struct HookDispatchContext {
     conn: Arc<std::sync::Mutex<rusqlite::Connection>>,
     /// Logging server for correlation ID minting and sink access.
     logging: LoggingServer,
+    /// Root tracker for refcount-aware root management across sessions.
+    root_tracker: Option<RootTracker>,
+}
+
+/// Tracks per-contributor workspace root sets for reference counting.
+///
+/// Each MCP connection and transcript scan contributes a set of roots
+/// keyed by a contributor string. The global root set (union of all
+/// contributors) is synced to the shared [`crate::lsp::LspClientManager`]
+/// after each mutation. When a contributor is removed (MCP disconnect),
+/// its roots leave the union — roots that no other contributor provides
+/// are removed from LSP servers via `didChangeWorkspaceFolders`.
+///
+/// Contributor keys:
+/// - `"mcp:{fd}"` — roots from MCP `roots/list` for a connection
+/// - `"transcript:{session_id}"` — roots from `/add-dir` transcript scan
+#[cfg(unix)]
+#[derive(Clone)]
+struct RootTracker {
+    /// Per-contributor root sets. The global root set is the union of
+    /// all values.
+    contributors: Arc<std::sync::Mutex<HashMap<String, HashSet<PathBuf>>>>,
+}
+
+#[cfg(unix)]
+impl RootTracker {
+    fn new() -> Self {
+        Self {
+            contributors: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Replaces a contributor's root set.
+    fn set_roots(&self, contributor: &str, roots: Vec<PathBuf>) {
+        self.contributors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(contributor.to_string(), roots.into_iter().collect());
+    }
+
+    /// Adds roots to a contributor's set (does not remove existing ones).
+    fn add_roots(&self, contributor: &str, roots: &[PathBuf]) {
+        self.contributors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(contributor.to_string())
+            .or_default()
+            .extend(roots.iter().cloned());
+    }
+
+    /// Removes a contributor entirely.
+    fn remove_contributor(&self, contributor: &str) {
+        self.contributors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(contributor);
+    }
+
+    /// Returns the union of all contributors' root sets.
+    fn global_roots(&self) -> Vec<PathBuf> {
+        let map = self
+            .contributors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut all = HashSet::new();
+        for roots in map.values() {
+            all.extend(roots.iter().cloned());
+        }
+        drop(map);
+        all.into_iter().collect()
+    }
+
+    /// Returns the number of contributors that include the given root.
+    #[cfg(test)]
+    fn refcount(&self, root: &Path) -> usize {
+        self.contributors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .filter(|roots| roots.contains(root))
+            .count()
+    }
 }
 
 /// Core daemon component that manages MCP and hook socket connections.
@@ -341,6 +423,9 @@ pub struct SessionManager {
     /// Shared LSP infrastructure for MCP lifecycle callbacks
     /// (`on_roots_changed`). `None` in transport-only tests.
     lsp: Option<Arc<crate::lsp::LspClientManager>>,
+    /// Root tracker for refcount-aware root management across sessions.
+    /// `None` in transport-only tests; set by [`Self::with_session`].
+    root_tracker: Option<RootTracker>,
     /// Shared DB connection for `on_client_info`. `None` in
     /// transport-only tests.
     db_conn: Option<Arc<std::sync::Mutex<rusqlite::Connection>>>,
@@ -385,6 +470,7 @@ impl SessionManager {
             connection_count: Arc::new(AtomicUsize::new(0)),
             hook_ctx: None,
             lsp: None,
+            root_tracker: None,
             db_conn: None,
             correlation: CorrelationState::new(),
             shutdown: CancellationToken::new(),
@@ -437,6 +523,7 @@ impl SessionManager {
             connection_count: Arc::new(AtomicUsize::new(0)),
             hook_ctx: None,
             lsp: None,
+            root_tracker: None,
             db_conn: None,
             correlation: CorrelationState::new(),
             shutdown: CancellationToken::new(),
@@ -561,6 +648,7 @@ impl SessionManager {
         let disconnect = Arc::clone(&self.disconnect);
         let correlation = self.correlation.clone();
         let lsp = self.lsp.clone();
+        let root_tracker = self.root_tracker.clone();
         let db_conn = self.db_conn.clone();
 
         count.fetch_add(1, Ordering::Relaxed);
@@ -613,6 +701,13 @@ impl SessionManager {
                     }
                 };
                 let writer = std_stream;
+
+                // Clone shared state for post-disconnect cleanup
+                // (originals move into spawn_blocking).
+                let tracker_cleanup = root_tracker.clone();
+                let correlation_cleanup = correlation.clone();
+                let sessions_cleanup = sessions_for_callback.clone();
+                let lsp_cleanup = lsp.clone();
 
                 let result = tokio::task::spawn_blocking(move || {
                     let _entered = span_for_blocking.enter();
@@ -669,33 +764,30 @@ impl SessionManager {
                         }));
 
                     // Wire lifecycle callbacks when the shared LSP
-                    // infrastructure is available (daemon mode). Routes
-                    // roots directly to the LspClientManager — no
-                    // session identity needed.
-                    if let Some(cm) = lsp {
-                        mcp = mcp.on_roots_changed(Box::new(move |roots| {
-                            let paths: Vec<std::path::PathBuf> = roots
-                                .iter()
-                                .filter_map(|root| {
-                                    root.uri.strip_prefix("file://").and_then(|p| {
-                                        let path = std::path::PathBuf::from(p);
-                                        match path.canonicalize() {
-                                            Ok(canonical) => Some(canonical),
-                                            Err(e) => {
-                                                warn!(
-                                                    source = Source::ConfigValidation.as_str(),
-                                                    "Skipping root {p}: {e}",
-                                                );
-                                                None
-                                            }
-                                        }
-                                    })
-                                })
-                                .collect();
-
-                            tokio::runtime::Handle::current().block_on(cm.sync_roots(paths))?;
-                            Ok(())
-                        }));
+                    // infrastructure is available (daemon mode). When a
+                    // root tracker is configured, root changes go through
+                    // refcounting so multiple sessions can share roots
+                    // without clobbering each other.
+                    match (root_tracker, lsp) {
+                        (Some(tracker), Some(cm)) => {
+                            let mcp_key = format!("mcp:{fd}");
+                            mcp = mcp.on_roots_changed(Box::new(move |roots| {
+                                let paths = parse_root_uris(&roots);
+                                tracker.set_roots(&mcp_key, paths);
+                                let global = tracker.global_roots();
+                                tokio::runtime::Handle::current()
+                                    .block_on(cm.sync_roots(global))?;
+                                Ok(())
+                            }));
+                        }
+                        (None, Some(cm)) => {
+                            mcp = mcp.on_roots_changed(Box::new(move |roots| {
+                                let paths = parse_root_uris(&roots);
+                                tokio::runtime::Handle::current().block_on(cm.sync_roots(paths))?;
+                                Ok(())
+                            }));
+                        }
+                        _ => {}
                     }
 
                     if let Some(conn) = db_conn {
@@ -727,6 +819,64 @@ impl SessionManager {
                         source = Source::DaemonDispatch.as_str(),
                         "MCP task panicked: {e}",
                     ),
+                }
+
+                // ── Disconnect cleanup ────────────────────────────
+                // Remove this connection's roots, clean up session
+                // and correlation state, then sync the reduced root
+                // set so LSP servers drop unused workspace folders.
+                if let Some(ref tracker) = tracker_cleanup {
+                    let mcp_key = format!("mcp:{fd}");
+                    tracker.remove_contributor(&mcp_key);
+
+                    // Look up and remove fd → session_id mapping.
+                    let session_id = correlation_cleanup
+                        .connection_sessions
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(&fd);
+
+                    if let Some(ref sid) = session_id {
+                        let transcript_key = format!("transcript:{sid}");
+                        tracker.remove_contributor(&transcript_key);
+
+                        // Remove session from registry.
+                        if let Some(ref sessions) = sessions_cleanup {
+                            sessions
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .remove(sid.as_str());
+                        }
+
+                        // Clean up correlation state.
+                        correlation_cleanup
+                            .session_connections
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .remove(sid.as_str());
+                        correlation_cleanup
+                            .roots_refresh_flags
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .remove(sid.as_str());
+
+                        info!(
+                            source = Source::DaemonDispatch.as_str(),
+                            session_id = sid.as_str(),
+                            "session cleaned up on disconnect",
+                        );
+                    }
+
+                    // Sync the reduced root set.
+                    if let Some(ref cm) = lsp_cleanup {
+                        let global = tracker.global_roots();
+                        if let Err(e) = cm.sync_roots(global).await {
+                            debug!(
+                                source = Source::DaemonDispatch.as_str(),
+                                "root sync after disconnect failed: {e}",
+                            );
+                        }
+                    }
                 }
             }
             .instrument(span)
@@ -767,11 +917,14 @@ impl SessionManager {
     ) -> Self {
         self.lsp = Some(session.lsp_client_manager().clone());
         self.db_conn = Some(conn.clone());
+        let root_tracker = RootTracker::new();
+        self.root_tracker = Some(root_tracker.clone());
         self.hook_ctx = Some(HookDispatchContext {
             sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
             primary: session,
             conn,
             logging: self.logging.clone(),
+            root_tracker: Some(root_tracker),
         });
         self
     }
@@ -957,6 +1110,31 @@ fn spawn_correlation_timeout(
             *guard = None;
         }
     });
+}
+
+/// Extracts canonical file paths from MCP root URIs.
+///
+/// Filters out non-`file://` URIs and roots that fail to canonicalize.
+#[cfg(unix)]
+fn parse_root_uris(roots: &[crate::mcp::Root]) -> Vec<PathBuf> {
+    roots
+        .iter()
+        .filter_map(|root| {
+            root.uri.strip_prefix("file://").and_then(|p| {
+                let path = PathBuf::from(p);
+                match path.canonicalize() {
+                    Ok(canonical) => Some(canonical),
+                    Err(e) => {
+                        warn!(
+                            source = Source::ConfigValidation.as_str(),
+                            "Skipping root {p}: {e}",
+                        );
+                        None
+                    }
+                }
+            })
+        })
+        .collect()
 }
 
 /// Handles a single hook connection.
@@ -1152,25 +1330,44 @@ async fn handle_hook_dispatch(
 
     // Apply transcript-discovered roots before responding.
     if !result.add_roots.is_empty() {
-        let session = &router.session;
-        let mut current = session.roots();
-        let before = current.len();
-        for root in &result.add_roots {
-            if !current.contains(root) {
-                current.push(root.clone());
-            }
-        }
-        let added = current.len() - before;
-        if added > 0 {
+        if let Some(ref tracker) = ctx.root_tracker {
+            // Daemon mode: route through refcount tracker so
+            // multi-session root sets stay isolated.
+            let transcript_key = format!("transcript:{session_id}");
+            tracker.add_roots(&transcript_key, &result.add_roots);
+            let global = tracker.global_roots();
             debug!(
                 source = Source::DaemonDispatch.as_str(),
-                added, "transcript root sync: syncing new roots",
+                added = result.add_roots.len(),
+                "transcript root sync: syncing new roots",
             );
-            if let Err(e) = session.sync_roots(current).await {
+            if let Err(e) = router.session.sync_roots(global).await {
                 debug!(
                     source = Source::DaemonDispatch.as_str(),
                     "transcript root sync failed: {e}",
                 );
+            }
+        } else {
+            let session = &router.session;
+            let mut current = session.roots();
+            let before = current.len();
+            for root in &result.add_roots {
+                if !current.contains(root) {
+                    current.push(root.clone());
+                }
+            }
+            let added = current.len() - before;
+            if added > 0 {
+                debug!(
+                    source = Source::DaemonDispatch.as_str(),
+                    added, "transcript root sync: syncing new roots",
+                );
+                if let Err(e) = session.sync_roots(current).await {
+                    debug!(
+                        source = Source::DaemonDispatch.as_str(),
+                        "transcript root sync failed: {e}",
+                    );
+                }
             }
         }
     }
@@ -3051,5 +3248,184 @@ mod tests {
             "non-Catenary tool should not trigger correlation",
         );
         drop(manager);
+    }
+
+    // ── Root refcounting tests ────────────────────────────────────────
+
+    #[test]
+    fn single_session_adds_roots() {
+        let tracker = RootTracker::new();
+        tracker.set_roots("mcp:10", vec![PathBuf::from("/foo"), PathBuf::from("/bar")]);
+
+        let global = tracker.global_roots();
+        assert_eq!(global.len(), 2);
+        assert!(global.contains(&PathBuf::from("/foo")));
+        assert!(global.contains(&PathBuf::from("/bar")));
+    }
+
+    #[test]
+    fn two_sessions_shared_root() {
+        let tracker = RootTracker::new();
+        tracker.set_roots("mcp:10", vec![PathBuf::from("/foo")]);
+        tracker.set_roots("mcp:20", vec![PathBuf::from("/foo"), PathBuf::from("/bar")]);
+
+        assert_eq!(tracker.refcount(Path::new("/foo")), 2);
+        assert_eq!(tracker.refcount(Path::new("/bar")), 1);
+
+        // Remove first session — /foo should survive (refcount 1).
+        tracker.remove_contributor("mcp:10");
+
+        let global = tracker.global_roots();
+        assert!(
+            global.contains(&PathBuf::from("/foo")),
+            "/foo should survive"
+        );
+        assert!(
+            global.contains(&PathBuf::from("/bar")),
+            "/bar should survive"
+        );
+        assert_eq!(tracker.refcount(Path::new("/foo")), 1);
+    }
+
+    #[test]
+    fn last_session_removes_root() {
+        let tracker = RootTracker::new();
+        tracker.set_roots("mcp:10", vec![PathBuf::from("/foo")]);
+        tracker.set_roots("mcp:20", vec![PathBuf::from("/foo")]);
+
+        // Remove first — still has refcount 1.
+        tracker.remove_contributor("mcp:10");
+        assert_eq!(tracker.refcount(Path::new("/foo")), 1);
+
+        // Remove second — refcount 0, gone from global set.
+        tracker.remove_contributor("mcp:20");
+        assert_eq!(tracker.refcount(Path::new("/foo")), 0);
+        assert!(tracker.global_roots().is_empty());
+    }
+
+    #[test]
+    fn add_dir_increments_refcount() {
+        let tracker = RootTracker::new();
+        tracker.set_roots("mcp:10", vec![PathBuf::from("/foo")]);
+
+        // Transcript scan adds a root for the same session.
+        tracker.add_roots("transcript:sess-a", &[PathBuf::from("/bar")]);
+
+        let global = tracker.global_roots();
+        assert_eq!(global.len(), 2);
+        assert!(global.contains(&PathBuf::from("/foo")));
+        assert!(global.contains(&PathBuf::from("/bar")));
+    }
+
+    #[test]
+    fn duplicate_root_same_session_no_double_count() {
+        let tracker = RootTracker::new();
+
+        // Same contributor sets the same root via set_roots (idempotent).
+        tracker.set_roots("mcp:10", vec![PathBuf::from("/foo")]);
+        tracker.set_roots("mcp:10", vec![PathBuf::from("/foo")]);
+        assert_eq!(tracker.refcount(Path::new("/foo")), 1);
+
+        // add_roots also deduplicates within the same contributor.
+        tracker.add_roots("mcp:10", &[PathBuf::from("/foo")]);
+        assert_eq!(tracker.refcount(Path::new("/foo")), 1);
+    }
+
+    #[test]
+    fn set_roots_replaces_previous() {
+        let tracker = RootTracker::new();
+        tracker.set_roots("mcp:10", vec![PathBuf::from("/foo"), PathBuf::from("/bar")]);
+        tracker.set_roots("mcp:10", vec![PathBuf::from("/baz")]);
+
+        let global = tracker.global_roots();
+        assert_eq!(global.len(), 1);
+        assert!(global.contains(&PathBuf::from("/baz")));
+        assert!(!global.contains(&PathBuf::from("/foo")));
+    }
+
+    #[test]
+    fn remove_nonexistent_contributor_is_noop() {
+        let tracker = RootTracker::new();
+        tracker.set_roots("mcp:10", vec![PathBuf::from("/foo")]);
+        tracker.remove_contributor("mcp:99");
+
+        assert_eq!(tracker.global_roots().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_cleanup_on_disconnect() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let hook_path = hook_socket_in(dir.path());
+        let mcp_path = mcp_socket_in(dir.path());
+
+        let manager = Arc::new(bind_echo_with_session(dir.path()));
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        // Correlate a session.
+        let stream = correlate_session(&hook_path, &mcp_path, "cleanup-sess").await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        assert_eq!(manager.session_count(), 1, "session should exist");
+        assert!(
+            manager.session_has_connection("cleanup-sess"),
+            "should be correlated",
+        );
+
+        // Disconnect.
+        drop(stream);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // Session should be cleaned up.
+        assert_eq!(
+            manager.session_count(),
+            0,
+            "session should be removed after disconnect",
+        );
+        assert!(
+            !manager.session_has_connection("cleanup-sess"),
+            "correlation should be cleaned up",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_sessions_disconnect_one_preserves_other() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let hook_path = hook_socket_in(dir.path());
+        let mcp_path = mcp_socket_in(dir.path());
+
+        let manager = Arc::new(bind_echo_with_session(dir.path()));
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        // Correlate two sessions.
+        let _s1 = correlate_session(&hook_path, &mcp_path, "sess-keep").await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let s2 = correlate_session(&hook_path, &mcp_path, "sess-drop").await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        assert_eq!(manager.session_count(), 2);
+
+        // Disconnect one session.
+        drop(s2);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        assert_eq!(
+            manager.session_count(),
+            1,
+            "only dropped session should be removed",
+        );
+        assert!(
+            manager.session_has_connection("sess-keep"),
+            "surviving session should still be correlated",
+        );
+        assert!(
+            !manager.session_has_connection("sess-drop"),
+            "dropped session should be cleaned up",
+        );
     }
 }
