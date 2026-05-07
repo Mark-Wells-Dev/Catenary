@@ -418,6 +418,16 @@ impl Session {
         lang.is_some_and(|id| self.client_manager.has_single_file_coverage(&id))
     }
 
+    /// Returns the shared `LspClientManager`.
+    ///
+    /// Used by the daemon's `SessionManager` to wire MCP lifecycle
+    /// callbacks (`on_roots_changed`) directly to the shared
+    /// infrastructure without routing through a `Session`.
+    #[must_use]
+    pub(crate) const fn lsp_client_manager(&self) -> &Arc<LspClientManager> {
+        &self.client_manager
+    }
+
     /// Returns the current workspace roots.
     pub fn roots(&self) -> Vec<PathBuf> {
         self.client_manager.roots()

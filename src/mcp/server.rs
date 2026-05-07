@@ -154,6 +154,12 @@ pub type ClientInfoCallback = Box<dyn Fn(&str, &str) + Send + Sync>;
 /// Callback invoked when MCP roots are received or updated.
 pub type RootsChangedCallback = Box<dyn Fn(Vec<Root>) -> Result<()> + Send + Sync>;
 
+/// Callback invoked before each `tools/call` dispatch.
+///
+/// Used by the daemon's sandwich correlation to bind MCP connections
+/// to sessions on their first tool call.
+pub type ToolsCallCallback = Box<dyn Fn() + Send + Sync>;
+
 /// An MCP server implementation.
 #[allow(
     clippy::struct_excessive_bools,
@@ -187,6 +193,9 @@ pub struct McpServer<H: ToolHandler> {
     /// `HookRouter` on `PreAgent` dispatch (turn boundary), cleared
     /// by this run loop after triggering `fetch_roots`.
     roots_refresh: Option<Arc<AtomicBool>>,
+    /// Optional callback invoked before each `tools/call` dispatch.
+    /// Used by daemon sandwich correlation.
+    on_tools_call: Option<ToolsCallCallback>,
 }
 
 impl<H: ToolHandler> McpServer<H> {
@@ -206,6 +215,7 @@ impl<H: ToolHandler> McpServer<H> {
             current_correlation_id: 0,
             cancel_map: Arc::new(std::sync::Mutex::new(HashMap::new())),
             roots_refresh: None,
+            on_tools_call: None,
         }
     }
 
@@ -232,6 +242,16 @@ impl<H: ToolHandler> McpServer<H> {
     #[must_use]
     pub fn on_roots_refresh(mut self, flag: Arc<AtomicBool>) -> Self {
         self.roots_refresh = Some(flag);
+        self
+    }
+
+    /// Set a callback invoked before each `tools/call` dispatch.
+    ///
+    /// Used by the daemon's sandwich correlation to bind MCP
+    /// connections to sessions on their first tool call.
+    #[must_use]
+    pub fn on_tools_call(mut self, callback: ToolsCallCallback) -> Self {
+        self.on_tools_call = Some(callback);
         self
     }
 
@@ -300,6 +320,15 @@ impl<H: ToolHandler> McpServer<H> {
 
             self.current_correlation_id = correlation_id;
 
+            // Run the pre-dispatch callback (correlation + flag
+            // bridging) BEFORE the roots refresh check so a bridged
+            // flag is visible to this iteration.
+            if method == "tools/call"
+                && let Some(cb) = &self.on_tools_call
+            {
+                cb();
+            }
+
             // Check for turn-boundary roots refresh BEFORE dispatch.
             // This guarantees tool calls execute against current roots:
             // the current message is buffered behind the roots/list
@@ -329,17 +358,11 @@ impl<H: ToolHandler> McpServer<H> {
 
             self.dispatch_message(&line, &mut writer, correlation_id, &method)?;
 
-            // Clean up the cancel token after dispatch completes.
-            if let Some(ref rid) = mcp_request_id
-                && let Ok(mut map) = self.cancel_map.lock()
-            {
-                map.remove(rid);
-            }
-
-            // Notification-triggered roots refresh (e.g., list_changed).
-            // No initial message — the notification itself was already
-            // dispatched, and the next message will execute after roots
-            // are updated.
+            // Dispatch may have set should_fetch_roots (e.g.,
+            // notifications/initialized, notifications/roots/list_changed).
+            // Act on it now rather than deferring to the next iteration,
+            // which would block on rx.recv() and deadlock if the client
+            // is waiting for the roots/list request.
             if self.should_fetch_roots
                 && let Err(e) = self.fetch_roots(&rx, &mut writer, None)
             {
@@ -347,6 +370,13 @@ impl<H: ToolHandler> McpServer<H> {
                     source = crate::source::Source::McpDispatch.as_str(),
                     "Failed to fetch roots: {}", e,
                 );
+            }
+
+            // Clean up the cancel token after dispatch completes.
+            if let Some(ref rid) = mcp_request_id
+                && let Ok(mut map) = self.cancel_map.lock()
+            {
+                map.remove(rid);
             }
         }
 

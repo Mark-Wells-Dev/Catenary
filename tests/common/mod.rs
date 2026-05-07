@@ -304,13 +304,30 @@ impl BridgeProcess {
         Ok(())
     }
 
+    /// Returns the daemon hook socket path for this test's XDG scope.
+    pub fn hook_socket_path(&self) -> PathBuf {
+        PathBuf::from(&self.state_home)
+            .join("catenary")
+            .join("catenary-hooks.sock")
+    }
+
+    /// Waits for the daemon hook socket to appear (up to 5 seconds).
+    pub fn wait_for_hook_socket(&self) -> Result<PathBuf> {
+        let path = self.hook_socket_path();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !path.exists() {
+            if std::time::Instant::now() > deadline {
+                bail!("Hook socket not found at {} within 5s", path.display());
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        Ok(path)
+    }
+
     /// Enters editing mode, accumulates a file, then calls `done_editing`
     /// via MCP to retrieve diagnostics from the tool result.
     pub fn call_diagnostics(&mut self, file: &str) -> Result<String> {
-        let sessions_dir = PathBuf::from(&self.state_home)
-            .join("catenary")
-            .join("sessions");
-        let socket_path = find_notify_socket(&sessions_dir)?;
+        let socket_path = self.wait_for_hook_socket()?;
 
         // Enter editing mode via IPC
         ipc_request(
@@ -357,10 +374,7 @@ impl BridgeProcess {
     /// Enters editing mode, accumulates multiple files, then calls
     /// `done_editing` via MCP to retrieve batched diagnostics.
     pub fn call_diagnostics_multi(&mut self, files: &[&str]) -> Result<String> {
-        let sessions_dir = PathBuf::from(&self.state_home)
-            .join("catenary")
-            .join("sessions");
-        let socket_path = find_notify_socket(&sessions_dir)?;
+        let socket_path = self.wait_for_hook_socket()?;
 
         // Enter editing mode via IPC
         ipc_request(
@@ -596,28 +610,6 @@ pub fn ipc_request(socket_path: &Path, request: &Value) -> Result<()> {
     let mut response = String::new();
     let _ = stream.read_to_string(&mut response);
     Ok(())
-}
-
-/// Scans the sessions directory for a `notify.sock` file.
-pub fn find_notify_socket(sessions_dir: &Path) -> Result<PathBuf> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        if let Ok(entries) = std::fs::read_dir(sessions_dir) {
-            for entry in entries.flatten() {
-                let sock = entry.path().join("notify.sock");
-                if sock.exists() {
-                    return Ok(sock);
-                }
-            }
-        }
-        if std::time::Instant::now() > deadline {
-            bail!(
-                "No notify.sock found in {} within 5s",
-                sessions_dir.display()
-            );
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
 }
 
 /// Builds a `CATENARY_SERVERS` spec for [`BridgeProcess::spawn`] using mockls.

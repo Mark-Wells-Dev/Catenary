@@ -12,13 +12,15 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use anyhow::{Context, Result, anyhow};
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, debug, error, info};
+use tracing::{Instrument, debug, error, info, warn};
 
 use crate::bridge::HookRouter;
+use crate::bridge::McpRouter;
+use crate::bridge::is_catenary_tool;
 use crate::bridge::session::Session;
 use crate::hook::{HookRequest, HookResponseEnvelope, emit_hook_event, hook_outcome_level};
 use crate::logging::LoggingServer;
@@ -113,13 +115,179 @@ pub fn bind_daemon_sockets() -> Result<DaemonSockets> {
     })
 }
 
+// ── Sandwich correlation ────────────────────────────────────────────
+
+/// Timeout for the correlation window. If no MCP `tools/call` arrives
+/// within this duration of a `PreToolUse` hook, the pending entry is
+/// discarded and the serialization lock is released.
+#[cfg(unix)]
+const CORRELATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Entry for a pending correlation: a session awaiting its MCP connection.
+///
+/// Holds an owned semaphore permit that keeps the serialization lock
+/// held. Dropping this entry releases the permit and unblocks the
+/// next unclaimed session.
+#[cfg(unix)]
+struct PendingEntry {
+    session_id: String,
+    #[allow(dead_code, reason = "compared for timeout staleness")]
+    created_at: std::time::Instant,
+    /// Owned semaphore permit — dropped when correlation resolves or
+    /// times out, releasing the serialization lock.
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+/// Shared correlation state for sandwich serialization.
+///
+/// Cloneable for passing to MCP connection callbacks and hook handlers.
+/// All fields are `Arc`-wrapped for concurrent access from multiple
+/// async tasks and blocking threads.
+#[cfg(unix)]
+#[derive(Clone)]
+struct CorrelationState {
+    /// Serialization semaphore (1 permit): only one unclaimed session
+    /// can be in the correlation window at a time.
+    semaphore: Arc<tokio::sync::Semaphore>,
+    /// Pending correlation entry. Set by hook dispatch for `PreToolUse`
+    /// on Catenary tools, consumed by the MCP `tools/call` handler.
+    pending: Arc<std::sync::Mutex<Option<PendingEntry>>>,
+    /// Resolved mappings: fd → `session_id`. Once set, permanent for
+    /// the lifetime of the connection.
+    connection_sessions: Arc<std::sync::Mutex<HashMap<i32, String>>>,
+    /// Reverse lookup: `session_id` → fd. Used for the fast-path
+    /// check (skip serialization lock when session already has a
+    /// bound connection).
+    session_connections: Arc<std::sync::Mutex<HashMap<String, i32>>>,
+    /// Per-connection roots refresh flags, keyed by `session_id`.
+    /// Created per MCP connection; stored here after correlation.
+    /// The hook dispatcher sets this on `PreAgent` to trigger a
+    /// `roots/list` poll on the correlated MCP connection.
+    roots_refresh_flags: Arc<std::sync::Mutex<HashMap<String, Arc<AtomicBool>>>>,
+}
+
+#[cfg(unix)]
+impl CorrelationState {
+    fn new() -> Self {
+        Self {
+            semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+            pending: Arc::new(std::sync::Mutex::new(None)),
+            connection_sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            session_connections: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            roots_refresh_flags: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+/// Per-connection tool handler that dispatches to the correct session
+/// after correlation.
+///
+/// Before correlation, delegates to the shared `ToolHandler` (which
+/// uses the daemon's shared `Session`). After correlation, looks up
+/// the per-session `Session` from the registry and dispatches through
+/// a per-session `McpRouter`.
+#[cfg(unix)]
+struct CorrelatingHandler {
+    /// Shared handler (pre-correlation fallback).
+    inner: Arc<dyn ToolHandler>,
+    /// Session registry (shared with hook dispatch).
+    sessions: Arc<std::sync::Mutex<HashMap<String, SessionEntry>>>,
+    /// Correlation state for fd → `session_id` lookup.
+    correlation: CorrelationState,
+    /// This connection's file descriptor.
+    fd: i32,
+    /// Per-connection roots refresh flag, wired to the `McpServer` via
+    /// `on_roots_refresh`. Each `call_tool` bridges the per-session
+    /// flag to this one so the MCP run loop sees it.
+    roots_refresh: Arc<AtomicBool>,
+    /// Cached per-session handler and session (set on first
+    /// post-correlation call).
+    cached: std::sync::Mutex<Option<(McpRouter, Arc<Session>)>>,
+}
+
+#[cfg(unix)]
+impl CorrelatingHandler {
+    /// Bridges the per-session `roots_refresh_requested` flag to the
+    /// per-connection flag. Called on every `call_tool` so the MCP run
+    /// loop's flag check (which happens between dispatches) sees the
+    /// value set by the `PreAgent` hook.
+    fn bridge_roots_refresh(&self, session: &Session) {
+        if session
+            .roots_refresh_requested
+            .swap(false, Ordering::AcqRel)
+        {
+            self.roots_refresh.store(true, Ordering::Release);
+        }
+    }
+}
+
+#[cfg(unix)]
+impl ToolHandler for CorrelatingHandler {
+    fn list_tools(&self) -> Vec<crate::mcp::Tool> {
+        self.inner.list_tools()
+    }
+
+    fn call_tool(
+        &self,
+        name: &str,
+        arguments: Option<serde_json::Value>,
+        parent_id: Option<i64>,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> anyhow::Result<crate::mcp::CallToolResult> {
+        // Fast path: already have a cached per-session handler.
+        if let Some((handler, session)) = self
+            .cached
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            self.bridge_roots_refresh(session);
+            return handler.call_tool(name, arguments, parent_id, cancel);
+        }
+
+        // Check if this connection has been correlated.
+        let session_id = self
+            .correlation
+            .connection_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&self.fd)
+            .cloned();
+
+        if let Some(sid) = session_id {
+            // Look up the per-session Session and cache a McpRouter.
+            let session = self
+                .sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&sid)
+                .map(|entry| entry.session.clone());
+
+            if let Some(session) = session {
+                self.bridge_roots_refresh(&session);
+                let router = McpRouter::new(session.clone());
+                let result = router.call_tool(name, arguments, parent_id, cancel);
+                *self
+                    .cached
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((router, session));
+                return result;
+            }
+        }
+
+        // Not yet correlated — use the shared handler.
+        self.inner.call_tool(name, arguments, parent_id, cancel)
+    }
+}
+
+// ── Session registry ───────────────────────────────────────────────
+
 /// Per-session state: the session's own `Session` and its `HookRouter`.
 ///
-/// The `session` field is used by MCP connection correlation (ticket 08)
-/// to bind MCP connections to the correct session's tool servers.
+/// The `session` field is used by MCP connection correlation to bind
+/// MCP connections to the correct session's tool servers.
 #[cfg(unix)]
 struct SessionEntry {
-    #[allow(dead_code, reason = "used by MCP correlation in ticket 08")]
     session: Arc<Session>,
     router: Arc<HookRouter>,
 }
@@ -170,6 +338,14 @@ pub struct SessionManager {
     /// Session-aware hook dispatch context. `None` in tests that don't
     /// exercise hook routing (passthrough mode).
     hook_ctx: Option<HookDispatchContext>,
+    /// Shared LSP infrastructure for MCP lifecycle callbacks
+    /// (`on_roots_changed`). `None` in transport-only tests.
+    lsp: Option<Arc<crate::lsp::LspClientManager>>,
+    /// Shared DB connection for `on_client_info`. `None` in
+    /// transport-only tests.
+    db_conn: Option<Arc<std::sync::Mutex<rusqlite::Connection>>>,
+    /// Sandwich correlation state for binding MCP connections to sessions.
+    correlation: CorrelationState,
     shutdown: CancellationToken,
     disconnect: Arc<tokio::sync::Notify>,
 }
@@ -208,6 +384,9 @@ impl SessionManager {
             logging,
             connection_count: Arc::new(AtomicUsize::new(0)),
             hook_ctx: None,
+            lsp: None,
+            db_conn: None,
+            correlation: CorrelationState::new(),
             shutdown: CancellationToken::new(),
             disconnect: Arc::new(tokio::sync::Notify::new()),
         }
@@ -257,6 +436,9 @@ impl SessionManager {
             logging,
             connection_count: Arc::new(AtomicUsize::new(0)),
             hook_ctx: None,
+            lsp: None,
+            db_conn: None,
+            correlation: CorrelationState::new(),
             shutdown: CancellationToken::new(),
             disconnect: Arc::new(tokio::sync::Notify::new()),
         })
@@ -296,8 +478,9 @@ impl SessionManager {
                     let shutdown = self.shutdown.clone();
                     if let Some(ctx) = &self.hook_ctx {
                         let ctx = ctx.clone();
+                        let correlation = self.correlation.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_hook_dispatch(stream, ctx, shutdown).await {
+                            if let Err(e) = handle_hook_dispatch(stream, ctx, correlation, shutdown).await {
                                 debug!(
                                     source = Source::DaemonDispatch.as_str(),
                                     "hook connection error: {e}",
@@ -357,16 +540,38 @@ impl SessionManager {
     /// A [`ConnectionGuard`] decrements the connection count on any exit
     /// path and notifies the accept loop, which checks whether the daemon
     /// should shut down.
+    #[allow(clippy::too_many_lines, reason = "sequential connection setup steps")]
     fn handle_mcp_connection(&self, stream: tokio::net::UnixStream, fd: i32) {
-        let handler = self.handler.clone();
+        let roots_refresh = Arc::new(AtomicBool::new(false));
+        let handler: Arc<dyn ToolHandler> = if let Some(ctx) = &self.hook_ctx {
+            Arc::new(CorrelatingHandler {
+                inner: self.handler.clone(),
+                sessions: ctx.sessions.clone(),
+                correlation: self.correlation.clone(),
+                fd,
+                roots_refresh: roots_refresh.clone(),
+                cached: std::sync::Mutex::new(None),
+            })
+        } else {
+            self.handler.clone()
+        };
+        let sessions_for_callback = self.hook_ctx.as_ref().map(|ctx| ctx.sessions.clone());
         let logging = self.logging.clone();
         let count = Arc::clone(&self.connection_count);
         let disconnect = Arc::clone(&self.disconnect);
+        let correlation = self.correlation.clone();
+        let lsp = self.lsp.clone();
+        let db_conn = self.db_conn.clone();
 
         count.fetch_add(1, Ordering::Relaxed);
 
         tokio::spawn(async move {
-            let span = tracing::info_span!("mcp_connection", mcp_fd = fd);
+            let span = tracing::info_span!(
+                "mcp_connection",
+                mcp_fd = fd,
+                session_id = tracing::field::Empty,
+            );
+            let span_for_blocking = span.clone();
             async {
                 let _guard = ConnectionGuard { count, disconnect };
 
@@ -410,7 +615,101 @@ impl SessionManager {
                 let writer = std_stream;
 
                 let result = tokio::task::spawn_blocking(move || {
-                    let mut mcp = McpServer::new(handler, logging);
+                    let _entered = span_for_blocking.enter();
+
+                    let corr = correlation;
+                    let corr_for_bridge = corr.clone();
+                    let resolved = AtomicBool::new(false);
+                    let span_ref = tracing::Span::current();
+                    let roots_refresh_for_corr = roots_refresh.clone();
+
+                    let mut mcp = McpServer::new(handler, logging)
+                        .on_roots_refresh(roots_refresh)
+                        .on_tools_call(Box::new(move || {
+                            if resolved.load(Ordering::Relaxed) {
+                                return;
+                            }
+                            resolve_correlation(
+                                fd,
+                                &corr,
+                                &roots_refresh_for_corr,
+                                &resolved,
+                                &span_ref,
+                            );
+                            if !resolved.load(Ordering::Relaxed) {
+                                return;
+                            }
+                            // Correlation just resolved — bridge the per-session
+                            // roots_refresh flag to the per-connection flag.
+                            let Some(ref sessions) = sessions_for_callback else {
+                                return;
+                            };
+                            let session_id = corr_for_bridge
+                                .connection_sessions
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .get(&fd)
+                                .cloned();
+                            let Some(sid) = session_id else {
+                                return;
+                            };
+                            let refreshed = sessions
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .get(&sid)
+                                .is_some_and(|entry| {
+                                    entry
+                                        .session
+                                        .roots_refresh_requested
+                                        .swap(false, Ordering::AcqRel)
+                                });
+                            if refreshed {
+                                roots_refresh_for_corr.store(true, Ordering::Release);
+                            }
+                        }));
+
+                    // Wire lifecycle callbacks when the shared LSP
+                    // infrastructure is available (daemon mode). Routes
+                    // roots directly to the LspClientManager — no
+                    // session identity needed.
+                    if let Some(cm) = lsp {
+                        mcp = mcp.on_roots_changed(Box::new(move |roots| {
+                            let paths: Vec<std::path::PathBuf> = roots
+                                .iter()
+                                .filter_map(|root| {
+                                    root.uri.strip_prefix("file://").and_then(|p| {
+                                        let path = std::path::PathBuf::from(p);
+                                        match path.canonicalize() {
+                                            Ok(canonical) => Some(canonical),
+                                            Err(e) => {
+                                                warn!(
+                                                    source = Source::ConfigValidation.as_str(),
+                                                    "Skipping root {p}: {e}",
+                                                );
+                                                None
+                                            }
+                                        }
+                                    })
+                                })
+                                .collect();
+
+                            tokio::runtime::Handle::current().block_on(cm.sync_roots(paths))?;
+                            Ok(())
+                        }));
+                    }
+
+                    if let Some(conn) = db_conn {
+                        mcp = mcp.on_client_info(Box::new(move |name: &str, version: &str| {
+                            if let Ok(c) = conn.lock() {
+                                let _ = c.execute(
+                                    "UPDATE sessions SET client_name = ?1, \
+                                     client_version = ?2 WHERE id = 'daemon'",
+                                    rusqlite::params![name, version],
+                                );
+                            }
+                        }));
+                    }
+
                     mcp.run(reader, writer)
                 })
                 .await;
@@ -466,6 +765,8 @@ impl SessionManager {
         session: Arc<Session>,
         conn: Arc<std::sync::Mutex<rusqlite::Connection>>,
     ) -> Self {
+        self.lsp = Some(session.lsp_client_manager().clone());
+        self.db_conn = Some(conn.clone());
         self.hook_ctx = Some(HookDispatchContext {
             sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
             primary: session,
@@ -484,6 +785,38 @@ impl SessionManager {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .len()
         })
+    }
+
+    /// Returns the `session_id` bound to an MCP connection, if any.
+    #[must_use]
+    pub fn session_for_fd(&self, fd: i32) -> Option<String> {
+        self.correlation
+            .connection_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&fd)
+            .cloned()
+    }
+
+    /// Returns `true` if the given session has a bound MCP connection.
+    #[must_use]
+    pub fn session_has_connection(&self, session_id: &str) -> bool {
+        self.correlation
+            .session_connections
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(session_id)
+    }
+
+    /// Returns `true` if a pending correlation entry is waiting for
+    /// an MCP `tools/call`.
+    #[must_use]
+    pub fn has_pending_correlation(&self) -> bool {
+        self.correlation
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
     }
 }
 
@@ -506,6 +839,124 @@ impl Drop for ConnectionGuard {
         self.count.fetch_sub(1, Ordering::AcqRel);
         self.disconnect.notify_one();
     }
+}
+
+/// Resolves sandwich correlation for an MCP connection.
+///
+/// Called from the `on_tools_call` callback on each `tools/call` dispatch.
+/// If a pending correlation entry exists (from a preceding `PreToolUse` hook),
+/// binds this connection's fd to the pending session permanently.
+#[cfg(unix)]
+fn resolve_correlation(
+    fd: i32,
+    corr: &CorrelationState,
+    roots_refresh: &Arc<AtomicBool>,
+    resolved: &AtomicBool,
+    span: &tracing::Span,
+) {
+    // Fast path: already correlated.
+    if corr
+        .connection_sessions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains_key(&fd)
+    {
+        resolved.store(true, Ordering::Relaxed);
+        return;
+    }
+
+    // Check pending correlation entry.
+    let mut pending = corr
+        .pending
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(PendingEntry {
+        session_id,
+        _permit,
+        ..
+    }) = pending.take()
+    {
+        info!(
+            source = Source::DaemonDispatch.as_str(),
+            session_id = %session_id,
+            mcp_fd = fd,
+            "correlation resolved: MCP connection bound to session",
+        );
+
+        corr.connection_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(fd, session_id.clone());
+        corr.session_connections
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session_id.clone(), fd);
+        corr.roots_refresh_flags
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session_id.clone(), roots_refresh.clone());
+
+        // Enrich the tracing span so subsequent events carry session_id.
+        span.record("session_id", &session_id);
+
+        resolved.store(true, Ordering::Relaxed);
+        // `_permit` drops here → semaphore released
+    }
+}
+
+/// Returns `true` if the given `session_id` already has a bound MCP
+/// connection (fast-path check for skipping the serialization lock).
+#[cfg(unix)]
+fn is_session_correlated(corr: &CorrelationState, session_id: &str) -> bool {
+    corr.session_connections
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains_key(session_id)
+}
+
+/// Returns `true` if this `PreToolUse` hook should trigger correlation.
+///
+/// Only `PreToolUse` for Catenary MCP tools (grep, glob, `start_editing`,
+/// `done_editing`) trigger correlation. Non-Catenary tool hooks (Edit,
+/// Bash) are processed entirely on session state without needing the
+/// MCP connection mapping.
+#[cfg(unix)]
+fn is_correlation_trigger(method: &str, raw: &serde_json::Value) -> bool {
+    if !method.starts_with("pre-tool") {
+        return false;
+    }
+    let tool_name = raw.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
+    is_catenary_tool(tool_name, "grep")
+        || is_catenary_tool(tool_name, "glob")
+        || is_catenary_tool(tool_name, "start_editing")
+        || is_catenary_tool(tool_name, "done_editing")
+}
+
+/// Spawns a background task that clears a stale pending correlation
+/// after [`CORRELATION_TIMEOUT`].
+#[cfg(unix)]
+fn spawn_correlation_timeout(
+    pending: Arc<std::sync::Mutex<Option<PendingEntry>>>,
+    session_id: String,
+) {
+    tokio::spawn(async move {
+        tokio::time::sleep(CORRELATION_TIMEOUT).await;
+        let mut guard = pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = guard.as_ref()
+            && entry.session_id == session_id
+        {
+            warn!(
+                source = Source::DaemonDispatch.as_str(),
+                session_id = %session_id,
+                "correlation timeout: no MCP tool call within 30s \
+                 of `PreToolUse` — session will re-correlate on next \
+                 Catenary tool call",
+            );
+            *guard = None;
+        }
+    });
 }
 
 /// Handles a single hook connection.
@@ -596,12 +1047,15 @@ fn get_or_create_router(ctx: &HookDispatchContext, session_id: &str) -> Arc<Hook
 /// Reads the JSON request, extracts `session_id` for routing, looks up
 /// (or creates) the per-session [`HookRouter`], dispatches the request,
 /// handles transcript root syncing, logs the protocol pair, and writes
-/// the response.
+/// the response. For `PreToolUse` hooks on Catenary tools, enters the
+/// sandwich correlation path to bind the next MCP `tools/call` to this
+/// session.
 #[cfg(unix)]
 #[allow(clippy::too_many_lines, reason = "sequential protocol steps")]
 async fn handle_hook_dispatch(
     stream: tokio::net::UnixStream,
     ctx: HookDispatchContext,
+    correlation: CorrelationState,
     shutdown: CancellationToken,
 ) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -642,6 +1096,37 @@ async fn handle_hook_dispatch(
         .unwrap_or("default")
         .to_string();
 
+    // ── Sandwich correlation ───────────────────────────────────────
+    // For PreToolUse on Catenary tools: if this session doesn't have
+    // a bound MCP connection yet, acquire the serialization lock and
+    // record the pending entry. The next MCP tools/call on an
+    // unclaimed connection will resolve the correlation.
+    if is_correlation_trigger(&method, &raw) && !is_session_correlated(&correlation, &session_id) {
+        let permit = correlation
+            .semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow!("correlation semaphore closed"))?;
+
+        *correlation
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(PendingEntry {
+            session_id: session_id.clone(),
+            created_at: std::time::Instant::now(),
+            _permit: permit,
+        });
+
+        debug!(
+            source = Source::DaemonDispatch.as_str(),
+            session_id = %session_id,
+            "correlation pending: awaiting MCP tools/call",
+        );
+
+        spawn_correlation_timeout(correlation.pending.clone(), session_id.clone());
+    }
+
     let router = get_or_create_router(&ctx, &session_id);
 
     // Mint a correlation ID for this request/response pair.
@@ -651,6 +1136,19 @@ async fn handle_hook_dispatch(
         serde_json::from_value(raw.clone()).map_err(|e| anyhow!("Invalid hook request: {e}"))?;
 
     let result = router.dispatch(request, id.0);
+
+    // Bridge roots refresh: if PreAgent set the per-session flag and
+    // this session has a correlated MCP connection, propagate the
+    // signal to the connection's flag so the MCP run loop sees it.
+    if method == "pre-agent/turn-start"
+        && let Some(flag) = correlation
+            .roots_refresh_flags
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&session_id)
+    {
+        flag.store(true, Ordering::Release);
+    }
 
     // Apply transcript-discovered roots before responding.
     if !result.add_roots.is_empty() {
@@ -1049,6 +1547,10 @@ fn read_json_line(socket: &std::os::unix::net::UnixStream) -> Result<String> {
 #[allow(
     clippy::expect_used,
     reason = "tests use expect for readable assertions"
+)]
+#[allow(
+    clippy::significant_drop_tightening,
+    reason = "tests intentionally hold SessionManager alive for socket lifetime"
 )]
 mod tests {
     use super::*;
@@ -2234,5 +2736,320 @@ mod tests {
             err.contains("did not report a version"),
             "error should explain missing version: {err}",
         );
+    }
+
+    // ── Correlation tests ──────────────────────────────────────────
+
+    /// Bind a `SessionManager` with both a session and echo handler
+    /// for full correlation testing.
+    fn bind_echo_with_session(dir: &Path) -> SessionManager {
+        let db_path = dir.join("catenary").join("catenary.db");
+        let conn = crate::db::open_and_migrate_at(&db_path).expect("open test DB");
+        let conn = Arc::new(std::sync::Mutex::new(conn));
+
+        conn.lock()
+            .expect("lock")
+            .execute(
+                "INSERT INTO sessions (id, pid, display_name, started_at) \
+                 VALUES ('daemon', 1, 'test-daemon', '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .expect("insert session");
+
+        let logging = LoggingServer::new();
+        let runtime = tokio::runtime::Handle::current();
+        let instance_id: Arc<str> = "daemon".into();
+        let session = Arc::new(crate::bridge::session::Session::new(
+            crate::config::Config::default(),
+            vec![],
+            logging.clone(),
+            conn.clone(),
+            instance_id,
+            runtime,
+        ));
+
+        SessionManager::bind_at(
+            &mcp_socket_in(dir),
+            &hook_socket_in(dir),
+            Arc::new(EchoHandler),
+            logging,
+        )
+        .expect("bind")
+        .with_session(session, conn)
+    }
+
+    /// Send a `PreToolUse` hook for a Catenary tool, then MCP `tools/call`
+    /// on a connection. Returns the MCP stream (kept alive for the
+    /// connection's lifetime).
+    async fn correlate_session(
+        hook_path: &Path,
+        mcp_path: &Path,
+        session_id: &str,
+    ) -> std::os::unix::net::UnixStream {
+        // 1. Send `PreToolUse` hook for a Catenary tool.
+        let req = serde_json::json!({
+            "method": "pre-tool/editing-state",
+            "tool_name": "mcp_catenary_grep",
+            "agent_id": "",
+            "session_id": session_id
+        });
+        let _ = hook_roundtrip(hook_path, &req).await;
+
+        // 2. Connect MCP and send initialize + tools/call.
+        let stream = std::os::unix::net::UnixStream::connect(mcp_path).expect("connect");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("set timeout");
+
+        let _ = mcp_roundtrip(
+            &stream,
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": {"name": "test", "version": "0.1"}
+                }
+            }),
+        );
+        let _ = mcp_roundtrip(
+            &stream,
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": "echo"}
+            }),
+        );
+
+        stream
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn correlation_binds_connection_to_session() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let hook_path = hook_socket_in(dir.path());
+        let mcp_path = mcp_socket_in(dir.path());
+
+        let manager = Arc::new(bind_echo_with_session(dir.path()));
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        let _stream = correlate_session(&hook_path, &mcp_path, "abc").await;
+
+        // Allow the spawn_blocking MCP task to process tools/call.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        assert!(
+            manager.session_has_connection("abc"),
+            "session 'abc' should have a bound MCP connection",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn correlation_is_permanent() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let hook_path = hook_socket_in(dir.path());
+        let mcp_path = mcp_socket_in(dir.path());
+
+        let manager = Arc::new(bind_echo_with_session(dir.path()));
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        let stream = correlate_session(&hook_path, &mcp_path, "abc").await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Second tools/call on the same connection should not change binding.
+        let _ = mcp_roundtrip(
+            &stream,
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {"name": "echo"}
+            }),
+        );
+
+        assert!(
+            manager.session_has_connection("abc"),
+            "binding should remain 'abc' after second tools/call",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn already_resolved_skips_lock() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let hook_path = hook_socket_in(dir.path());
+        let mcp_path = mcp_socket_in(dir.path());
+
+        let manager = Arc::new(bind_echo_with_session(dir.path()));
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        // Correlate session "abc".
+        let _stream = correlate_session(&hook_path, &mcp_path, "abc").await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Send another `PreToolUse` for the same session. It should not
+        // create a new pending entry (fast path).
+        let req = serde_json::json!({
+            "method": "pre-tool/editing-state",
+            "tool_name": "mcp_catenary_grep",
+            "agent_id": "",
+            "session_id": "abc"
+        });
+        let _ = hook_roundtrip(&hook_path, &req).await;
+
+        assert!(
+            !manager.has_pending_correlation(),
+            "already-resolved session should not create a pending entry",
+        );
+        drop(manager);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_sessions_serialize() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let hook_path = hook_socket_in(dir.path());
+        let mcp_path = mcp_socket_in(dir.path());
+
+        let manager = Arc::new(bind_echo_with_session(dir.path()));
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        // Correlate "abc" first, then "def".
+        let _s1 = correlate_session(&hook_path, &mcp_path, "abc").await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let _s2 = correlate_session(&hook_path, &mcp_path, "def").await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        assert!(
+            manager.session_has_connection("abc"),
+            "session 'abc' should be correlated",
+        );
+        assert!(
+            manager.session_has_connection("def"),
+            "session 'def' should be correlated",
+        );
+        drop(manager);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn timeout_releases_lock() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let hook_path = hook_socket_in(dir.path());
+
+        let manager = Arc::new(bind_echo_with_session(dir.path()));
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        // Send `PreToolUse` but do NOT send an MCP tools/call.
+        let req = serde_json::json!({
+            "method": "pre-tool/editing-state",
+            "tool_name": "mcp_catenary_grep",
+            "agent_id": "",
+            "session_id": "timeout-sess"
+        });
+        let _ = hook_roundtrip(&hook_path, &req).await;
+
+        assert!(
+            manager.has_pending_correlation(),
+            "should have a pending correlation entry",
+        );
+
+        // Since `CORRELATION_TIMEOUT` is 30s, we can't wait that long
+        // in a test. Instead, verify the pending state exists, then
+        // directly clear it (simulating the timeout task) to prove the
+        // lock is released.
+        *manager.correlation.pending.lock().expect("lock") = None;
+
+        assert!(
+            !manager.has_pending_correlation(),
+            "pending entry should be cleared after timeout",
+        );
+
+        // Verify the semaphore is available (lock was released).
+        let permit = manager.correlation.semaphore.try_acquire();
+        assert!(
+            permit.is_ok(),
+            "serialization lock should be available after timeout",
+        );
+        drop(permit);
+        drop(manager);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn timeout_session_re_correlates() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let hook_path = hook_socket_in(dir.path());
+        let mcp_path = mcp_socket_in(dir.path());
+
+        let manager = Arc::new(bind_echo_with_session(dir.path()));
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        // Simulate a timed-out correlation: send `PreToolUse`, then
+        // manually clear the pending entry (simulating timeout).
+        let req = serde_json::json!({
+            "method": "pre-tool/editing-state",
+            "tool_name": "mcp_catenary_glob",
+            "agent_id": "",
+            "session_id": "re-corr"
+        });
+        let _ = hook_roundtrip(&hook_path, &req).await;
+
+        // Clear pending (simulates timeout clearing).
+        *manager.correlation.pending.lock().expect("lock") = None;
+
+        // Now re-correlate the same session.
+        let _stream = correlate_session(&hook_path, &mcp_path, "re-corr").await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        assert!(
+            manager.session_has_connection("re-corr"),
+            "session should re-correlate after timeout",
+        );
+        drop(manager);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn non_catenary_hook_no_correlation() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let hook_path = hook_socket_in(dir.path());
+
+        let manager = Arc::new(bind_echo_with_session(dir.path()));
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        // Send `PreToolUse` for a non-Catenary tool (Bash).
+        let req = serde_json::json!({
+            "method": "pre-tool/editing-state",
+            "tool_name": "Bash",
+            "agent_id": "",
+            "session_id": "no-corr"
+        });
+        let _ = hook_roundtrip(&hook_path, &req).await;
+
+        assert!(
+            !manager.has_pending_correlation(),
+            "non-Catenary tool should not trigger correlation",
+        );
+        drop(manager);
     }
 }

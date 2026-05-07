@@ -20,7 +20,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::json;
 
-use common::{BridgeProcess, find_notify_socket, ipc_request, mockls_lsp_arg};
+use common::{BridgeProcess, ipc_request, mockls_lsp_arg};
 
 const MOCK_LANG_A: &str = "yX4Za";
 const MOCK_LANG_B: &str = "d5apI";
@@ -3926,9 +3926,10 @@ fn test_mcp_cancel_already_completed() -> Result<()> {
 
 // ── Turn-boundary roots refresh ─────────────────────────────────────
 
-/// `PreAgent` hook triggers `roots/list` poll. The bridge sends a `roots/list`
-/// request and the MCP client responds with updated roots. A tool call sent
-/// immediately after `PreAgent` is queued behind the roots refresh.
+/// `PreAgent` hook triggers `roots/list` poll. The `on_tools_call`
+/// callback bridges the per-session roots refresh flag on correlation,
+/// deferring the tool call until roots are updated. The bridge sends
+/// `roots/list` before responding to the tool call.
 #[test]
 fn test_turn_boundary_roots_refresh() -> Result<()> {
     let dir_a = tempfile::tempdir()?;
@@ -3939,18 +3940,27 @@ fn test_turn_boundary_roots_refresh() -> Result<()> {
     // Initialize with roots capability — first roots/list happens here.
     bridge.initialize_with_roots(&[root_a])?;
 
-    // Find the hook socket.
-    let sessions_dir = PathBuf::from(bridge.state_home())
-        .join("catenary")
-        .join("sessions");
-    let socket_path = find_notify_socket(&sessions_dir)?;
+    // Find the daemon hook socket.
+    let socket_path = bridge.wait_for_hook_socket()?;
 
-    // Send PreAgent hook — this should set the roots_refresh_requested flag.
+    // Send PreAgent hook — sets roots_refresh_requested on the session.
     ipc_request(&socket_path, &json!({"method": "pre-agent/turn-start"}))?;
 
-    // Now send a tool call. The run loop should check the flag BEFORE
-    // dispatch, triggering a roots/list request. The tool call is
-    // buffered behind the roots response.
+    // Send PreToolUse hook for the Catenary tool (as the host CLI does
+    // before dispatching an MCP tool call). This triggers correlation
+    // so the MCP connection is bound to the session.
+    ipc_request(
+        &socket_path,
+        &json!({
+            "method": "pre-tool/editing-state",
+            "tool_name": "start_editing",
+            "agent_id": ""
+        }),
+    )?;
+
+    // Send the tool call. The on_tools_call callback resolves
+    // correlation and bridges the roots refresh flag. The tool call
+    // is deferred: roots/list fires first, then the tool is dispatched.
     bridge.send(&json!({
         "jsonrpc": "2.0",
         "id": 500,
@@ -3958,8 +3968,7 @@ fn test_turn_boundary_roots_refresh() -> Result<()> {
         "params": {"name": "start_editing", "arguments": {}}
     }))?;
 
-    // The bridge should send a roots/list request BEFORE responding
-    // to the tool call.
+    // roots/list request comes before the tool response.
     let msg = bridge.recv()?;
     let method = msg.get("method").and_then(|m| m.as_str());
     assert_eq!(
@@ -3968,7 +3977,7 @@ fn test_turn_boundary_roots_refresh() -> Result<()> {
         "bridge should send roots/list before the tool response, got: {msg}"
     );
 
-    // Respond to the roots/list request with the same roots (no change).
+    // Respond to the roots/list request with the same roots.
     let request_id = msg.get("id").context("roots/list missing id")?.clone();
     bridge.send(&json!({
         "jsonrpc": "2.0",
@@ -3976,7 +3985,7 @@ fn test_turn_boundary_roots_refresh() -> Result<()> {
         "result": {"roots": [{"uri": format!("file://{root_a}")}]}
     }))?;
 
-    // NOW the buffered tool call should be dispatched — read the response.
+    // NOW the deferred tool call is dispatched.
     let tool_response = bridge.recv()?;
     assert!(
         tool_response.get("result").is_some(),
@@ -3998,10 +4007,7 @@ fn test_turn_boundary_no_roots_capability() -> Result<()> {
     // Initialize WITHOUT roots capability.
     bridge.initialize()?;
 
-    let sessions_dir = PathBuf::from(bridge.state_home())
-        .join("catenary")
-        .join("sessions");
-    let socket_path = find_notify_socket(&sessions_dir)?;
+    let socket_path = bridge.wait_for_hook_socket()?;
 
     // Send PreAgent hook.
     ipc_request(&socket_path, &json!({"method": "pre-agent/turn-start"}))?;

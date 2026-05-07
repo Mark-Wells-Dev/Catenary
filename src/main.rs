@@ -552,6 +552,10 @@ fn run_daemon() -> Result<()> {
     clippy::too_many_lines,
     reason = "Daemon setup requires sequential initialization steps"
 )]
+#[allow(
+    clippy::significant_drop_tightening,
+    reason = "SessionManager lifetime is correct — explicit drop(manager) at function end"
+)]
 fn run_daemon_main() -> Result<()> {
     use catenary_mcp::router::SessionManager;
 
@@ -621,11 +625,17 @@ fn run_daemon_main() -> Result<()> {
         // (messages.session_id → sessions.id) is satisfied. Without
         // this, every tracing event after activate() triggers an FK
         // violation → trace!() → recursive on_event → stack overflow.
+        let started_at = chrono::Utc::now().to_rfc3339();
         conn.execute(
             "INSERT OR IGNORE INTO sessions \
              (id, pid, display_name, started_at, alive) \
-             VALUES (?1, ?2, ?3, datetime('now'), 1)",
-            rusqlite::params![&*instance_id, std::process::id(), &workspace_display],
+             VALUES (?1, ?2, ?3, ?4, 1)",
+            rusqlite::params![
+                &*instance_id,
+                std::process::id(),
+                &workspace_display,
+                &started_at
+            ],
         )
         .context("insert daemon session row")?;
 
