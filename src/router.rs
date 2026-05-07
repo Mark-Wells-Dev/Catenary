@@ -822,9 +822,27 @@ impl SessionManager {
                 }
 
                 // ── Disconnect cleanup ────────────────────────────
-                // Remove this connection's roots, clean up session
-                // and correlation state, then sync the reduced root
-                // set so LSP servers drop unused workspace folders.
+                //
+                // Two paths clean up session state:
+                //
+                // 1. **MCP disconnect** (here) — always fires (kernel
+                //    delivers socket EOF). Handles fd-scoped state
+                //    (MCP roots, correlation mappings) and, for
+                //    correlated sessions, also cleans up session-scoped
+                //    state (transcript roots, session registry) as a
+                //    crash-safety fallback.
+                //
+                // 2. **SessionEnd hook** (`handle_hook_dispatch`) —
+                //    best-effort (host CLI may be killed before the
+                //    hook fires). Handles session-scoped state only.
+                //    For never-correlated sessions, this is the
+                //    primary cleanup path.
+                //
+                // The transcript root removal and session registry
+                // cleanup overlap intentionally: if SessionEnd ran
+                // first, the removals here are no-ops. If the host
+                // was killed and SessionEnd never fired, this path
+                // catches the leak.
                 if let Some(ref tracker) = tracker_cleanup {
                     let mcp_key = format!("mcp:{fd}");
                     tracker.remove_contributor(&mcp_key);
@@ -837,10 +855,11 @@ impl SessionManager {
                         .remove(&fd);
 
                     if let Some(ref sid) = session_id {
+                        // Crash-safety fallback: also remove session-
+                        // scoped state in case SessionEnd never fired.
                         let transcript_key = format!("transcript:{sid}");
                         tracker.remove_contributor(&transcript_key);
 
-                        // Remove session from registry.
                         if let Some(ref sessions) = sessions_cleanup {
                             sessions
                                 .lock()
@@ -1306,8 +1325,17 @@ async fn handle_hook_dispatch(
     }
 
     // ── Session-end cleanup ───────────────────────────────────────
-    // Short-circuit before get_or_create_router — don't create a
-    // new session just to immediately clean it up.
+    //
+    // Best-effort counterpart to the MCP disconnect cleanup. Fires
+    // when the host CLI sends a SessionEnd hook (exit, /clear,
+    // resume, logout). Handles session-scoped state that the
+    // disconnect path can't reach for never-correlated sessions
+    // (no fd → session_id mapping exists). For correlated sessions,
+    // this overlaps with the disconnect path — the removals are
+    // idempotent.
+    //
+    // Short-circuits before get_or_create_router to avoid creating
+    // a new session just to immediately clean it up.
     if method == "session-end/cleanup" {
         let id = ctx.logging.next_id();
 
@@ -1315,9 +1343,10 @@ async fn handle_hook_dispatch(
             let transcript_key = format!("transcript:{session_id}");
             tracker.remove_contributor(&transcript_key);
 
-            // Remove the session if it was never correlated to an
-            // MCP connection. Correlated sessions are cleaned up by
-            // the MCP disconnect path.
+            // Remove the session from the registry. For correlated
+            // sessions, the MCP disconnect path also does this (crash-
+            // safety fallback) — whichever runs first wins, the
+            // second is a no-op.
             if !is_session_correlated(&correlation, &session_id) {
                 ctx.sessions
                     .lock()
