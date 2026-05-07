@@ -25,14 +25,6 @@ use catenary_mcp::session;
 
 use catenary_mcp::source::Source;
 
-// Only needed for the in-process MCP server path (non-Unix).
-#[cfg(not(unix))]
-use catenary_mcp::mcp::McpServer;
-#[cfg(not(unix))]
-use catenary_mcp::session::Session;
-#[cfg(not(unix))]
-use tracing::warn;
-
 /// Command-line arguments for Catenary.
 #[derive(Parser, Debug)]
 #[command(name = "catenary")]
@@ -223,7 +215,9 @@ fn main() -> Result<()> {
                 }
                 #[cfg(not(unix))]
                 {
-                    build_runtime()?.block_on(run_server())
+                    Err(anyhow::anyhow!(
+                        "daemon mode requires Unix — Windows support is planned"
+                    ))
                 }
             }
         }
@@ -331,207 +325,6 @@ fn run_dashboard() -> Result<()> {
     }
 
     catenary_mcp::tui::run(config.icons.unwrap_or_default())
-}
-
-/// Runs the MCP server in-process.
-///
-/// On Unix, every non-terminal invocation goes through the daemon
-/// (`connect_or_start_daemon` + `proxy_stdio`). This in-process path
-/// only runs on non-Unix platforms.
-///
-/// # Errors
-///
-/// Returns an error if the server fails to start or encounters an internal error.
-#[cfg(not(unix))]
-#[allow(
-    clippy::too_many_lines,
-    reason = "Server setup requires sequential initialization steps"
-)]
-async fn run_server() -> Result<()> {
-    let logging = LoggingServer::new();
-
-    tracing_subscriber::registry().with(logging.clone()).init();
-
-    // Load configuration
-    let config = catenary_mcp::config::Config::load()?;
-
-    // Bootstrap roots from CATENARY_ROOTS env var (path-separated) or default to cwd.
-    // MCP client overrides via initialize params.
-    let raw_roots: Vec<PathBuf> = match std::env::var("CATENARY_ROOTS") {
-        Ok(val) if !val.is_empty() => std::env::split_paths(&val).collect(),
-        _ => vec![PathBuf::from(".")],
-    };
-    let roots: Vec<PathBuf> = raw_roots
-        .into_iter()
-        .map(|r| r.canonicalize())
-        .collect::<std::io::Result<Vec<_>>>()?;
-
-    let workspace_display = roots
-        .iter()
-        .map(|r| r.to_string_lossy().into_owned())
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    // Check primary root for `lsp = false` in `.catenary.toml`.
-    let disabled = roots
-        .first()
-        .and_then(|r| catenary_mcp::config::load_project_config(r).ok().flatten())
-        .is_some_and(|pc| !pc.lsp);
-
-    if disabled {
-        info!(
-            "Catenary disabled by .catenary.toml (lsp = false) in {}",
-            workspace_display
-        );
-        return run_disabled_server(logging).await;
-    }
-
-    // Create session for observability
-    let session = Arc::new(std::sync::Mutex::new(Session::create(&workspace_display)?));
-    info!("Starting catenary multiplexing bridge");
-    info!(
-        "Session ID: {}",
-        session
-            .lock()
-            .map_err(|_| anyhow::anyhow!("mutex poisoned"))?
-            .info
-            .id
-    );
-    info!("Workspace roots: {}", workspace_display);
-    let instance_id: Arc<str> = session
-        .lock()
-        .map_err(|_| anyhow::anyhow!("mutex poisoned"))?
-        .info
-        .id
-        .as_str()
-        .into();
-
-    let session_conn = session
-        .lock()
-        .map_err(|_| anyhow::anyhow!("mutex poisoned"))?
-        .conn()
-        .clone();
-
-    let toolbox = Arc::new(catenary_mcp::bridge::session::Session::new(
-        config.clone(),
-        roots,
-        logging,
-        session_conn,
-        instance_id.clone(),
-        tokio::runtime::Handle::current(),
-        None,
-    ));
-    toolbox.spawn_all().await;
-
-    // Start the hook server for PostToolUse/PreToolUse hook integration
-    let hook_conn = session
-        .lock()
-        .map_err(|_| anyhow::anyhow!("mutex poisoned"))?
-        .conn()
-        .clone();
-    let hook_server = catenary_mcp::hook::HookServer::new(
-        toolbox.clone(),
-        hook_conn,
-        instance_id,
-        "host".to_string(),
-    );
-    let socket_path = session
-        .lock()
-        .map_err(|_| anyhow::anyhow!("mutex poisoned"))?
-        .socket_path();
-    let notify_handle = hook_server.start(&socket_path)?;
-    session
-        .lock()
-        .map_err(|_| anyhow::anyhow!("mutex poisoned"))?
-        .set_socket_active();
-
-    let roots_refresh = toolbox.roots_refresh_requested.clone();
-    let toolbox_for_roots = toolbox.clone();
-    let toolbox_for_shutdown = toolbox.clone();
-    let handler = McpRouter::new(toolbox);
-
-    // Run MCP server (blocking - reads from stdin, writes to stdout)
-    let session_for_callback = session.clone();
-    let runtime_for_roots = tokio::runtime::Handle::current();
-    let mut mcp_server = McpServer::new(handler, toolbox_for_roots.logging.clone())
-        .on_roots_refresh(roots_refresh)
-        .on_client_info(Box::new(move |name: &str, version: &str| {
-            if let Ok(mut session) = session_for_callback.lock() {
-                session.set_client_info(name, version);
-            }
-        }))
-        .on_roots_changed(Box::new(move |roots| {
-            let mut paths: Vec<PathBuf> = roots
-                .iter()
-                .filter_map(|root| {
-                    root.uri.strip_prefix("file://").and_then(|p| {
-                        let path = PathBuf::from(p);
-                        match path.canonicalize() {
-                            Ok(canonical) => Some(canonical),
-                            Err(e) => {
-                                warn!(
-                                    source = Source::ConfigValidation.as_str(),
-                                    "Skipping root {p}: {e}",
-                                );
-                                None
-                            }
-                        }
-                    })
-                })
-                .collect();
-
-            // Merge stored transcript roots so fetch_roots can't overwrite
-            // them with a roots/list response that omits /add-dir roots.
-            toolbox_for_roots.merge_transcript_roots(&mut paths);
-
-            runtime_for_roots.block_on(toolbox_for_roots.sync_roots(paths))?;
-            Ok(())
-        }));
-
-    // Run in a blocking task since MCP server uses synchronous I/O
-    let mcp_task =
-        tokio::task::spawn_blocking(move || mcp_server.run(std::io::stdin(), std::io::stdout()));
-
-    // Wait for either the MCP task to finish or a termination signal.
-    // On Unix, also catch SIGTERM so the host CLI killing us triggers
-    // graceful LSP shutdown instead of orphaning child processes.
-    #[cfg(unix)]
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-
-    let mcp_result = tokio::select! {
-        res = mcp_task => {
-            res?
-        }
-        _ = tokio::signal::ctrl_c() => {
-            info!("Received shutdown signal");
-            Ok(())
-        }
-        _ = async {
-            #[cfg(unix)]
-            { sigterm.recv().await }
-            #[cfg(not(unix))]
-            { std::future::pending::<Option<()>>().await }
-        } => {
-            info!("Received SIGTERM");
-            Ok(())
-        }
-    };
-
-    // Stop notify socket server
-    notify_handle.abort();
-    let _ = notify_handle.await;
-
-    // Shutdown LSP clients gracefully
-    info!("Shutting down LSP servers");
-    toolbox_for_shutdown.shutdown().await;
-
-    // Mark session dead explicitly — Drop may not run because
-    // spawn_blocking holds an Arc<Session> clone that outlives the runtime.
-    if let Ok(s) = session.lock() {
-        s.mark_dead();
-    }
-
-    mcp_result
 }
 
 /// Runs the Catenary daemon on a dedicated thread with a 16 MB stack.
@@ -668,7 +461,7 @@ fn run_daemon_main() -> Result<()> {
             conn.clone(),
             instance_id,
             rt.handle().clone(),
-            Some(notification_router),
+            notification_router,
         ));
 
         // Spawn LSP servers in the background.
@@ -766,42 +559,6 @@ async fn run_stop() -> Result<()> {
 
     println!("Daemon stopped");
     Ok(())
-}
-
-/// Runs a minimal MCP server for disabled sessions.
-///
-/// When `.catenary.toml` has `enabled = false`, Catenary runs as a thin
-/// protocol stub: responds to MCP `initialize` and `tools/list` (empty),
-/// but creates no session, spawns no LSP servers, starts no hook IPC
-/// server, and writes nothing to the database. Hook CLI processes fail
-/// to connect and output nothing, so the host treats all hooks as "allow."
-///
-/// On Unix, the daemon handles the disabled case via `DaemonDisabledHandler`.
-#[cfg(not(unix))]
-async fn run_disabled_server(logging: LoggingServer) -> Result<()> {
-    /// Tool handler that exposes no tools.
-    struct DisabledHandler;
-
-    impl catenary_mcp::mcp::ToolHandler for DisabledHandler {
-        fn list_tools(&self) -> Vec<catenary_mcp::mcp::Tool> {
-            Vec::new()
-        }
-
-        fn call_tool(
-            &self,
-            _name: &str,
-            _arguments: Option<serde_json::Value>,
-            _parent_id: Option<i64>,
-            _cancel: &tokio_util::sync::CancellationToken,
-        ) -> Result<catenary_mcp::mcp::CallToolResult> {
-            Err(anyhow::anyhow!("Catenary is disabled for this workspace"))
-        }
-    }
-
-    let mut server = McpServer::new(DisabledHandler, logging);
-    let mcp_task =
-        tokio::task::spawn_blocking(move || server.run(std::io::stdin(), std::io::stdout()));
-    mcp_task.await?
 }
 
 #[cfg(test)]

@@ -661,7 +661,7 @@ impl SessionManager {
         let notification_router = self
             .hook_ctx
             .as_ref()
-            .and_then(|ctx| ctx.primary.notification_router.clone());
+            .map(|ctx| ctx.primary.notification_router.clone());
         let db_conn = self.db_conn.clone();
 
         count.fetch_add(1, Ordering::Relaxed);
@@ -1273,9 +1273,7 @@ fn get_or_create_router(ctx: &HookDispatchContext, session_id: &str) -> Arc<Hook
 
             // Register session with the notification router so
             // events carrying this session_id route to its queue.
-            if let Some(ref router) = session.notification_router {
-                router.register_session(session_id);
-            }
+            session.notification_router.register_session(session_id);
 
             let router = Arc::new(HookRouter::new(
                 session.clone(),
@@ -1395,9 +1393,7 @@ async fn handle_hook_dispatch(
 
         // Remove session from notification router (idempotent if
         // MCP disconnect already ran).
-        if let Some(ref router) = ctx.primary.notification_router {
-            router.remove_session(&session_id);
-        }
+        ctx.primary.notification_router.remove_session(&session_id);
 
         if let Some(ref tracker) = ctx.root_tracker {
             let transcript_key = format!("transcript:{session_id}");
@@ -2738,6 +2734,11 @@ mod tests {
         let logging = LoggingServer::new();
         let runtime = tokio::runtime::Handle::current();
         let instance_id: Arc<str> = "daemon".into();
+        let notification_router = Arc::new(
+            crate::logging::notification_router::NotificationRouter::new(
+                crate::logging::Severity::Warn,
+            ),
+        );
         let session = Arc::new(crate::bridge::session::Session::new(
             crate::config::Config::default(),
             vec![],
@@ -2745,7 +2746,7 @@ mod tests {
             conn.clone(),
             instance_id,
             runtime,
-            None,
+            notification_router,
         ));
 
         SessionManager::bind_at(
@@ -3114,6 +3115,11 @@ mod tests {
         let logging = LoggingServer::new();
         let runtime = tokio::runtime::Handle::current();
         let instance_id: Arc<str> = "daemon".into();
+        let notification_router = Arc::new(
+            crate::logging::notification_router::NotificationRouter::new(
+                crate::logging::Severity::Warn,
+            ),
+        );
         let session = Arc::new(crate::bridge::session::Session::new(
             crate::config::Config::default(),
             vec![],
@@ -3121,7 +3127,7 @@ mod tests {
             conn.clone(),
             instance_id,
             runtime,
-            None,
+            notification_router,
         ));
 
         SessionManager::bind_at(

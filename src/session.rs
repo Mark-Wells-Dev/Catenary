@@ -1,19 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
-//! Session management for observability.
+//! Session observability types and queries.
 //!
-//! Each Catenary instance creates a session that can be discovered and
-//! monitored from other terminals via `catenary list` and `catenary monitor`.
-//!
-//! Sessions are stored in SQLite via the [`crate::db`] module.
+//! Sessions are stored in SQLite via the [`crate::db`] module. The daemon
+//! writes session rows directly; this module provides the query functions
+//! for `catenary list`, `catenary monitor`, and `catenary query`.
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
 
 /// Session metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,193 +67,13 @@ pub struct SessionMessage {
     pub payload: serde_json::Value,
 }
 
-/// Returns the base directory for session runtime artifacts (notify sockets).
+/// Returns the base directory for session runtime artifacts.
+///
+/// Used by garbage collection and TUI for cleaning up socket directories
+/// left by previous (pre-daemon) Catenary versions.
 #[must_use]
 pub fn sessions_dir() -> PathBuf {
     crate::db::state_dir().join("catenary").join("sessions")
-}
-
-/// An active session that broadcasts events.
-pub struct Session {
-    /// Metadata about the session.
-    pub info: SessionInfo,
-
-    conn: Arc<Mutex<Connection>>,
-
-    /// Path to the notify IPC endpoint (if started).
-    socket_path: Option<PathBuf>,
-}
-
-impl Session {
-    /// Create a new session.
-    ///
-    /// Opens a database connection internally. For explicit connection
-    /// management, use [`Session::create_with_conn`].
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the database cannot be opened or the session
-    /// cannot be inserted.
-    pub fn create(workspace: &str) -> Result<Self> {
-        let conn = Arc::new(Mutex::new(crate::db::open_and_migrate()?));
-        Self::create_with_conn(workspace, conn)
-    }
-
-    /// Create a new session with an existing database connection.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the session cannot be inserted into the database
-    /// or the socket directory cannot be created.
-    pub fn create_with_conn(workspace: &str, conn: Arc<Mutex<Connection>>) -> Result<Self> {
-        let id = Self::generate_id();
-        let started_at = Utc::now();
-
-        let info = SessionInfo {
-            id,
-            pid: std::process::id(),
-            workspace: workspace.to_string(),
-            started_at,
-            client_name: None,
-            client_version: None,
-            client_session_id: None,
-        };
-
-        {
-            let c = conn.lock().map_err(|_| anyhow::anyhow!("mutex poisoned"))?;
-            c.execute(
-                "INSERT INTO sessions (id, pid, display_name, started_at, alive) \
-                 VALUES (?1, ?2, ?3, ?4, 1)",
-                rusqlite::params![&info.id, info.pid, workspace, started_at.to_rfc3339()],
-            )
-            .context("failed to insert session")?;
-
-            for root in workspace
-                .split(',')
-                .map(str::trim)
-                .filter(|r| !r.is_empty())
-            {
-                c.execute(
-                    "INSERT INTO workspace_roots (session_id, root_path) VALUES (?1, ?2)",
-                    rusqlite::params![&info.id, root],
-                )?;
-            }
-        }
-
-        // Create socket directory (for notify.sock)
-        let socket_dir = sessions_dir().join(&info.id);
-        std::fs::create_dir_all(&socket_dir)
-            .with_context(|| format!("failed to create socket dir: {}", socket_dir.display()))?;
-
-        let session = Self {
-            info,
-            conn,
-            socket_path: None,
-        };
-
-        Ok(session)
-    }
-
-    /// Generate a short unique session ID.
-    #[allow(
-        clippy::cast_possible_truncation,
-        reason = "intentional 32-bit wrap for compact hex ID"
-    )]
-    fn generate_id() -> String {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        use std::time::{SystemTime, UNIX_EPOCH};
-
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(std::time::Duration::ZERO)
-            .as_millis();
-
-        let pid = std::process::id();
-
-        // Atomic counter guarantees uniqueness within the same process,
-        // even when multiple sessions are created in the same millisecond.
-        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-
-        format!("{:x}{:x}{:x}", now as u32, pid, seq)
-    }
-
-    /// Returns the path to the notify IPC endpoint for this session.
-    #[must_use]
-    pub fn socket_path(&self) -> PathBuf {
-        #[cfg(unix)]
-        {
-            sessions_dir().join(&self.info.id).join("notify.sock")
-        }
-        #[cfg(windows)]
-        {
-            PathBuf::from(format!(r"\\.\pipe\catenary-{}", self.info.id))
-        }
-    }
-
-    /// Records that the notify socket has been started, so it will be
-    /// cleaned up on drop.
-    pub fn set_socket_active(&mut self) {
-        self.socket_path = Some(self.socket_path());
-    }
-
-    /// Update client info (called after MCP initialize).
-    pub fn set_client_info(&mut self, name: &str, version: &str) {
-        self.info.client_name = Some(name.to_string());
-        self.info.client_version = Some(version.to_string());
-
-        if let Ok(c) = self.conn.lock() {
-            let _ = c.execute(
-                "UPDATE sessions SET client_name = ?1, client_version = ?2 WHERE id = ?3",
-                rusqlite::params![name, version, &self.info.id],
-            );
-        }
-    }
-
-    /// Get the database connection for this session.
-    #[must_use]
-    pub const fn conn(&self) -> &Arc<Mutex<Connection>> {
-        &self.conn
-    }
-
-    /// Mark this session as dead in the database.
-    ///
-    /// Call this explicitly before shutdown. `Drop` also marks the session
-    /// dead, but when the `Session` is behind `Arc` the refcount may not
-    /// reach zero before the process exits (e.g. a `spawn_blocking` task
-    /// holds a clone).
-    pub fn mark_dead(&self) {
-        if let Ok(c) = self.conn.lock() {
-            let _ = c.execute(
-                "UPDATE sessions SET alive = 0, ended_at = ?1 WHERE id = ?2",
-                rusqlite::params![Utc::now().to_rfc3339(), &self.info.id],
-            );
-        }
-    }
-}
-
-impl Drop for Session {
-    fn drop(&mut self) {
-        // mark_dead is idempotent — safe to call again if already called
-        if let Ok(c) = self.conn.lock() {
-            let _ = c.execute(
-                "UPDATE sessions SET alive = 0, ended_at = ?1 WHERE id = ?2",
-                rusqlite::params![Utc::now().to_rfc3339(), &self.info.id],
-            );
-        }
-
-        // Clean up notify socket (Unix only — named pipes are kernel
-        // objects cleaned up automatically when all handles close)
-        #[cfg(unix)]
-        if let Some(ref sock) = self.socket_path {
-            let _ = std::fs::remove_file(sock);
-        }
-
-        // Remove socket directory (only succeeds if empty)
-        let socket_dir = sessions_dir().join(&self.info.id);
-        let _ = std::fs::remove_dir(&socket_dir);
-    }
 }
 
 // ── Message tailing (SQLite-backed) ──────────────────────────────────
@@ -911,7 +729,6 @@ pub(crate) mod test_support {
 mod tests {
     use super::*;
     use anyhow::Result;
-    use std::sync::Arc;
 
     /// Open an isolated test database in a tempdir.
     /// Returns `(TempDir, PathBuf, Connection)` — the tempdir guard must
@@ -923,12 +740,16 @@ mod tests {
         (dir, path, conn)
     }
 
-    /// Create a session backed by the database at `db_path`.
-    fn create_session(db_path: &std::path::Path, workspace: &str) -> Result<Session> {
-        let arc = Arc::new(std::sync::Mutex::new(crate::db::open_and_migrate_at(
-            db_path,
-        )?));
-        Session::create_with_conn(workspace, arc)
+    /// Insert a test session directly into the database.
+    ///
+    /// Uses the current PID so `is_process_alive` returns `true`.
+    fn insert_alive_session(conn: &Connection, id: &str, workspace: &str) {
+        conn.execute(
+            "INSERT INTO sessions (id, pid, display_name, started_at, alive) \
+             VALUES (?1, ?2, ?3, ?4, 1)",
+            rusqlite::params![id, std::process::id(), workspace, "2026-01-01T00:00:00Z"],
+        )
+        .expect("insert test session");
     }
 
     /// Insert a test message row directly into the `messages` table.
@@ -997,49 +818,32 @@ mod tests {
     }
 
     #[test]
-    fn test_session_create_and_list() -> Result<()> {
-        let (_dir, path, conn) = test_db();
-        let session = create_session(&path, "/tmp/test-workspace")?;
-        let id = session.info.id.clone();
+    fn test_session_list_and_get() -> Result<()> {
+        let (_dir, _path, conn) = test_db();
+        insert_alive_session(&conn, "s-test", "/tmp/test-workspace");
 
         // Should appear in list
         let sessions = list_sessions_with_conn(&conn)?;
-        assert!(sessions.iter().any(|(s, _)| s.id == id));
+        assert!(sessions.iter().any(|(s, _)| s.id == "s-test"));
 
         // Should be retrievable
-        let found = get_session_with_conn(&conn, &id)?;
-        let (found_session, _) = found.expect("session should be retrievable");
+        let found = get_session_with_conn(&conn, "s-test")?;
+        let (found_session, alive) = found.expect("session should be retrievable");
         assert_eq!(found_session.workspace, "/tmp/test-workspace");
+        assert!(alive);
 
-        // Drop session
-        drop(session);
-
-        // get_session should still return it (as dead)
-        let found = get_session_with_conn(&conn, &id)?;
-        let (_, alive) = found.expect("session should exist after drop");
-        assert!(!alive, "Session should be dead after drop");
+        // Mark dead and verify
+        conn.execute(
+            "UPDATE sessions SET alive = 0, ended_at = ?1 WHERE id = ?2",
+            rusqlite::params![Utc::now().to_rfc3339(), "s-test"],
+        )?;
+        let found = get_session_with_conn(&conn, "s-test")?;
+        let (_, alive) = found.expect("session should exist after marking dead");
+        assert!(!alive);
 
         // Clean up
-        delete_session_data_with_conn(&conn, &id)?;
+        delete_session_data_with_conn(&conn, "s-test")?;
 
-        Ok(())
-    }
-
-    #[test]
-    fn test_session_set_client_info() -> Result<()> {
-        let (_dir, path, conn) = test_db();
-        let mut session = create_session(&path, "/tmp/test-client-info")?;
-        let id = session.info.id.clone();
-
-        session.set_client_info("claude-code", "1.0.0");
-
-        let found = get_session_with_conn(&conn, &id)?;
-        let (info, _) = found.expect("session should exist");
-        assert_eq!(info.client_name.as_deref(), Some("claude-code"));
-        assert_eq!(info.client_version.as_deref(), Some("1.0.0"));
-
-        drop(session);
-        delete_session_data_with_conn(&conn, &id)?;
         Ok(())
     }
 
@@ -1191,25 +995,27 @@ mod tests {
         Ok(())
     }
 
-    /// Helper: create a dead session, optionally backdated.
-    fn create_dead_session(
-        db_path: &std::path::Path,
+    /// Insert a dead session, optionally backdated.
+    fn insert_dead_session(
         conn: &Connection,
+        id: &str,
         workspace: &str,
         backdate_days: Option<i64>,
-    ) -> Result<String> {
-        let session = create_session(db_path, workspace)?;
-        let id = session.info.id.clone();
-        drop(session);
-
-        if let Some(days) = backdate_days {
-            let new_start = (Utc::now() - chrono::Duration::days(days)).to_rfc3339();
-            conn.execute(
-                "UPDATE sessions SET started_at = ?1 WHERE id = ?2",
-                rusqlite::params![new_start, &id],
-            )?;
-        }
-        Ok(id)
+    ) {
+        let started_at =
+            backdate_days.map_or_else(Utc::now, |days| Utc::now() - chrono::Duration::days(days));
+        conn.execute(
+            "INSERT INTO sessions (id, pid, display_name, started_at, alive, ended_at) \
+             VALUES (?1, ?2, ?3, ?4, 0, ?5)",
+            rusqlite::params![
+                id,
+                0_u32, // PID 0 — not alive
+                workspace,
+                started_at.to_rfc3339(),
+                Utc::now().to_rfc3339(),
+            ],
+        )
+        .expect("insert dead session");
     }
 
     /// Single sequential test covering all `prune_sessions` behaviours.
@@ -1218,37 +1024,37 @@ mod tests {
     /// shared database and parallel execution causes interference.
     #[test]
     fn test_prune_sessions() -> Result<()> {
-        let (_dir, path, conn) = test_db();
+        let (_dir, _path, conn) = test_db();
         // -- retention=-1 retains forever --
-        let id_forever = create_dead_session(&path, &conn, "/tmp/test-prune-forever", Some(365))?;
+        insert_dead_session(&conn, "prune-forever", "/tmp/prune-forever", Some(365));
         let removed = prune_sessions_with_conn(&conn, -1)?;
         assert_eq!(removed, 0, "retention=-1 should never prune");
         assert!(
-            get_session_with_conn(&conn, &id_forever)?.is_some(),
+            get_session_with_conn(&conn, "prune-forever")?.is_some(),
             "session should still exist"
         );
-        delete_session_data_with_conn(&conn, &id_forever)?;
+        delete_session_data_with_conn(&conn, "prune-forever")?;
 
         // -- retention=7 keeps recent, removes old --
-        let id_recent = create_dead_session(&path, &conn, "/tmp/test-prune-recent", None)?;
-        let id_old = create_dead_session(&path, &conn, "/tmp/test-prune-old", Some(10))?;
+        insert_dead_session(&conn, "prune-recent", "/tmp/prune-recent", None);
+        insert_dead_session(&conn, "prune-old", "/tmp/prune-old", Some(10));
 
         let _ = prune_sessions_with_conn(&conn, 7)?;
         assert!(
-            get_session_with_conn(&conn, &id_recent)?.is_some(),
+            get_session_with_conn(&conn, "prune-recent")?.is_some(),
             "recent dead session should survive prune"
         );
         assert!(
-            get_session_with_conn(&conn, &id_old)?.is_none(),
+            get_session_with_conn(&conn, "prune-old")?.is_none(),
             "old dead session should be pruned"
         );
-        delete_session_data_with_conn(&conn, &id_recent)?;
+        delete_session_data_with_conn(&conn, "prune-recent")?;
 
         // -- retention=0 removes all dead --
-        let id_zero = create_dead_session(&path, &conn, "/tmp/test-prune-zero", None)?;
+        insert_dead_session(&conn, "prune-zero", "/tmp/prune-zero", None);
         let _ = prune_sessions_with_conn(&conn, 0)?;
         assert!(
-            get_session_with_conn(&conn, &id_zero)?.is_none(),
+            get_session_with_conn(&conn, "prune-zero")?.is_none(),
             "dead session should be removed with retention=0"
         );
 

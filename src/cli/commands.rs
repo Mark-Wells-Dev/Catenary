@@ -965,15 +965,19 @@ mod tests {
         (dir, path, conn)
     }
 
-    /// Create a session backed by the database at `db_path`.
-    fn create_session(
-        db_path: &std::path::Path,
-        workspace: &str,
-    ) -> anyhow::Result<session::Session> {
-        let arc = std::sync::Arc::new(std::sync::Mutex::new(crate::db::open_and_migrate_at(
-            db_path,
-        )?));
-        session::Session::create_with_conn(workspace, arc)
+    /// Insert a dead session directly into the database.
+    fn insert_dead_session(conn: &rusqlite::Connection, id: &str, workspace: &str) {
+        conn.execute(
+            "INSERT INTO sessions (id, pid, display_name, started_at, alive, ended_at) \
+             VALUES (?1, 0, ?2, ?3, 0, ?4)",
+            rusqlite::params![
+                id,
+                workspace,
+                "2026-01-01T00:00:00Z",
+                "2026-01-01T00:01:00Z",
+            ],
+        )
+        .expect("insert dead session");
     }
 
     // ── parse_since tests ────────────────────────────────────────────
@@ -1143,14 +1147,11 @@ mod tests {
 
     #[test]
     fn test_gc_dead_sessions() -> anyhow::Result<()> {
-        let (_dir, path, conn) = test_db();
-
-        let session = create_session(&path, "/tmp/test-gc-dead")?;
-        let id = session.info.id.clone();
-        drop(session); // marks as dead
+        let (_dir, _path, conn) = test_db();
+        insert_dead_session(&conn, "gc-dead-1", "/tmp/test-gc-dead");
 
         // Verify it exists as dead
-        let found = session::get_session_with_conn(&conn, &id)?;
+        let found = session::get_session_with_conn(&conn, "gc-dead-1")?;
         assert!(found.is_some(), "session should exist");
         assert!(!found.expect("checked above").1, "session should be dead");
 
@@ -1159,7 +1160,7 @@ mod tests {
 
         // Should be gone
         assert!(
-            session::get_session_with_conn(&conn, &id)?.is_none(),
+            session::get_session_with_conn(&conn, "gc-dead-1")?.is_none(),
             "dead session should be deleted"
         );
         Ok(())
@@ -1167,28 +1168,23 @@ mod tests {
 
     #[test]
     fn test_gc_specific_session() -> anyhow::Result<()> {
-        let (_dir, path, conn) = test_db();
-
-        let s1 = create_session(&path, "/tmp/test-gc-specific-1")?;
-        let id1 = s1.info.id.clone();
-        let s2 = create_session(&path, "/tmp/test-gc-specific-2")?;
-        let id2 = s2.info.id.clone();
-        drop(s1);
-        drop(s2);
+        let (_dir, _path, conn) = test_db();
+        insert_dead_session(&conn, "gc-s1", "/tmp/test-gc-specific-1");
+        insert_dead_session(&conn, "gc-s2", "/tmp/test-gc-specific-2");
 
         // Delete only s1
-        run_gc(&conn, None, false, Some(&id1))?;
+        run_gc(&conn, None, false, Some("gc-s1"))?;
 
         assert!(
-            session::get_session_with_conn(&conn, &id1)?.is_none(),
+            session::get_session_with_conn(&conn, "gc-s1")?.is_none(),
             "targeted session should be deleted"
         );
         assert!(
-            session::get_session_with_conn(&conn, &id2)?.is_some(),
+            session::get_session_with_conn(&conn, "gc-s2")?.is_some(),
             "other session should survive"
         );
 
-        session::delete_session_data_with_conn(&conn, &id2)?;
+        session::delete_session_data_with_conn(&conn, "gc-s2")?;
         Ok(())
     }
 

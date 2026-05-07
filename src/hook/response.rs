@@ -15,8 +15,8 @@
 //! just triggered), followed by a header and background lines ("oh by the
 //! way, these accumulated").
 
+use crate::logging::Severity;
 use crate::logging::notification_queue::NotificationQueueSink;
-use crate::logging::{LoggingServer, Severity};
 
 /// Background section header: 3 em-dashes, space, "background", space, 3 em-dashes.
 const BACKGROUND_HEADER: &str = "─── background ───";
@@ -57,19 +57,9 @@ impl SystemMessageBuilder {
         self.direct.push(format!("[{}] {message}", severity.tag()));
     }
 
-    /// Drain the notification queue and any sink panic, storing rendered
-    /// lines as background content.
-    ///
-    /// Sink panics (isolated by `catch_unwind` in the Layer) are surfaced
-    /// as `[err] sink panic: <message>` so the user sees them exactly once
-    /// through the same `systemMessage` channel as other notifications.
-    pub fn drain_background(&mut self, queue: &NotificationQueueSink, logging: &LoggingServer) {
-        if let Some(panic_msg) = logging.take_sink_panic() {
-            self.background.push(format!(
-                "[{}] sink panic: {panic_msg}",
-                Severity::Error.tag()
-            ));
-        }
+    /// Drain the notification queue, storing rendered lines as background
+    /// content.
+    pub fn drain_background(&mut self, queue: &NotificationQueueSink) {
         for notification in &queue.drain() {
             self.background.push(notification.format());
         }
@@ -124,24 +114,10 @@ impl Default for SystemMessageBuilder {
     clippy::expect_used,
     reason = "tests use expect for readable assertions"
 )]
-#[allow(
-    clippy::panic,
-    reason = "deliberate panic sinks for testing catch_unwind isolation"
-)]
 mod tests {
     use super::*;
     use crate::logging::notification_queue::NotificationQueueSink;
-    use crate::logging::{LogEvent, LoggingServer, Severity, Sink};
-    use std::sync::Arc;
-    use tracing_subscriber::layer::SubscriberExt;
-
-    /// Sink that always panics — used to test `take_sink_panic` surfacing.
-    struct PanicSink(&'static str);
-    impl crate::logging::Sink for PanicSink {
-        fn handle(&self, _event: &LogEvent<'_>) {
-            panic!("{}", self.0);
-        }
-    }
+    use crate::logging::{LogEvent, Severity, Sink};
 
     /// Helper: create a `LogEvent` for feeding into sinks directly.
     fn make_event(severity: Severity, message: &str, server: Option<&str>) -> LogEvent<'static> {
@@ -222,13 +198,12 @@ mod tests {
     #[test]
     fn drain_background_empties_queue() {
         let queue = NotificationQueueSink::new(Severity::Warn);
-        let logging = LoggingServer::new();
 
         queue.handle(&make_event(Severity::Warn, "server offline", Some("ra")));
         assert_eq!(queue.len(), 1);
 
         let mut builder = SystemMessageBuilder::new();
-        builder.drain_background(&queue, &logging);
+        builder.drain_background(&queue);
         assert!(queue.is_empty(), "queue should be empty after drain");
 
         let result = builder.finish().expect("should have background");
@@ -238,53 +213,10 @@ mod tests {
     #[test]
     fn drain_background_empty_queue_no_content() {
         let queue = NotificationQueueSink::new(Severity::Warn);
-        let logging = LoggingServer::new();
 
         let mut builder = SystemMessageBuilder::new();
-        builder.drain_background(&queue, &logging);
+        builder.drain_background(&queue);
         assert!(builder.finish().is_none());
-    }
-
-    #[test]
-    fn drain_background_surfaces_sink_panic() {
-        let logging = LoggingServer::new();
-        let queue = NotificationQueueSink::new(Severity::Warn);
-
-        let subscriber = tracing_subscriber::registry().with(logging.clone());
-        tracing::subscriber::with_default(subscriber, || {
-            logging.activate(vec![Arc::new(PanicSink("connection closed"))]);
-            tracing::warn!("trigger");
-        });
-
-        let mut builder = SystemMessageBuilder::new();
-        builder.drain_background(&queue, &logging);
-        let result = builder.finish().expect("should surface panic");
-        assert!(result.contains("[err] sink panic: connection closed"));
-        // take_sink_panic should be cleared after drain.
-        assert!(logging.take_sink_panic().is_none());
-    }
-
-    #[test]
-    fn drain_background_sink_panic_plus_notifications() {
-        let logging = LoggingServer::new();
-        let queue = NotificationQueueSink::new(Severity::Warn);
-
-        // Populate queue directly.
-        queue.handle(&make_event(Severity::Warn, "server offline", Some("ra")));
-
-        // Trigger a sink panic.
-        let subscriber = tracing_subscriber::registry().with(logging.clone());
-        tracing::subscriber::with_default(subscriber, || {
-            logging.activate(vec![Arc::new(PanicSink("db write failed"))]);
-            tracing::warn!("trigger");
-        });
-
-        let mut builder = SystemMessageBuilder::new();
-        builder.drain_background(&queue, &logging);
-        let result = builder.finish().expect("should have content");
-        // Sink panic appears first in background, then queue entries.
-        assert!(result.contains("[err] sink panic: db write failed"));
-        assert!(result.contains("[warn] server offline"));
     }
 
     // ── Integration-style: builder + queue + dispatch scenarios ─────────
@@ -292,21 +224,19 @@ mod tests {
     #[test]
     fn session_start_empty_queue_empty_direct_no_field() {
         let queue = NotificationQueueSink::new(Severity::Warn);
-        let logging = LoggingServer::new();
 
         let mut builder = SystemMessageBuilder::new();
-        builder.drain_background(&queue, &logging);
+        builder.drain_background(&queue);
         assert!(builder.finish().is_none());
     }
 
     #[test]
     fn session_start_direct_only() {
         let queue = NotificationQueueSink::new(Severity::Warn);
-        let logging = LoggingServer::new();
 
         let mut builder = SystemMessageBuilder::new();
         builder.push_direct(Severity::Warn, "config: invalid TOML on line 12");
-        builder.drain_background(&queue, &logging);
+        builder.drain_background(&queue);
         let result = builder.finish().expect("should have direct");
         assert_eq!(result, "[warn] config: invalid TOML on line 12");
         assert!(!result.contains("background"));
@@ -315,7 +245,6 @@ mod tests {
     #[test]
     fn session_start_direct_and_background() {
         let queue = NotificationQueueSink::new(Severity::Warn);
-        let logging = LoggingServer::new();
         queue.handle(&make_event(
             Severity::Error,
             "python-lsp crashed during previous teardown",
@@ -327,7 +256,7 @@ mod tests {
             Severity::Error,
             "config: removed `inherit` field — run `catenary doctor`",
         );
-        builder.drain_background(&queue, &logging);
+        builder.drain_background(&queue);
         let result = builder.finish().expect("should have both");
         assert!(result.starts_with("[err] config: removed `inherit` field"));
         assert!(result.contains("─── background ───"));
@@ -337,12 +266,11 @@ mod tests {
     #[test]
     fn stop_allow_drains() {
         let queue = NotificationQueueSink::new(Severity::Warn);
-        let logging = LoggingServer::new();
         queue.handle(&make_event(Severity::Warn, "ra offline", Some("ra")));
 
         // Simulate allow: drain background.
         let mut builder = SystemMessageBuilder::new();
-        builder.drain_background(&queue, &logging);
+        builder.drain_background(&queue);
         let result = builder.finish().expect("should drain");
         assert!(result.contains("[warn] ra offline"));
         assert!(queue.is_empty());
@@ -360,7 +288,6 @@ mod tests {
     #[test]
     fn dedup_persists_across_blocked_cycle() {
         let queue = NotificationQueueSink::new(Severity::Warn);
-        let logging = LoggingServer::new();
 
         // First cycle: enqueue, block (no drain).
         queue.handle(&make_event(Severity::Warn, "ra offline", Some("ra")));
@@ -372,7 +299,7 @@ mod tests {
 
         // Allow: drain.
         let mut builder = SystemMessageBuilder::new();
-        builder.drain_background(&queue, &logging);
+        builder.drain_background(&queue);
         let result = builder.finish().expect("should have one entry");
         // Header + 1 notification = 2 lines total.
         let line_count = result.lines().count();

@@ -25,89 +25,20 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::cli::HostFormat;
-use crate::{db, session};
 
-/// Per-session IPC endpoint path (legacy fallback).
-///
-/// Used when the daemon hook socket is not available.
-fn legacy_hook_endpoint(session_id: &str) -> PathBuf {
-    #[cfg(unix)]
-    {
-        session::sessions_dir().join(session_id).join("notify.sock")
-    }
-    #[cfg(windows)]
-    {
-        PathBuf::from(format!(r"\\.\pipe\catenary-{session_id}"))
-    }
-}
-
-/// Find the Catenary session ID for a hook payload.
-///
-/// Prefers matching the host CLI's `session_id` against the stored
-/// `client_session_id` on alive sessions (stable across cwd changes).
-/// Falls back to cwd-based workspace prefix matching when no
-/// `session_id` is present or no match is found (needed for
-/// `SessionStart` bootstrapping before `client_session_id` is stored).
-fn find_session_id(hook_json: &serde_json::Value, conn: &rusqlite::Connection) -> Option<String> {
-    let sessions = session::list_sessions_with_conn(conn).unwrap_or_default();
-
-    // Primary: match by client_session_id.
-    if let Some(host_session_id) = hook_json.get("session_id").and_then(|v| v.as_str())
-        && let Some((s, _)) = sessions
-            .iter()
-            .find(|(s, alive)| *alive && s.client_session_id.as_deref() == Some(host_session_id))
-    {
-        return Some(s.id.clone());
-    }
-
-    // Fallback: cwd-based workspace prefix matching.
-    let cwd = hook_json.get("cwd").and_then(|v| v.as_str()).map_or_else(
-        || std::env::current_dir().unwrap_or_default(),
-        PathBuf::from,
-    );
-    let cwd_str = cwd.to_string_lossy();
-    sessions
-        .into_iter()
-        .find(|(s, alive)| *alive && is_path_prefix(&cwd_str, &s.workspace))
-        .map(|(s, _)| s.id)
-}
-
-/// Path-component-aware prefix check.
-///
-/// Returns `true` if `path` starts with `prefix` at a path boundary:
-/// exact match, or the character after the prefix is `/`. Plain string
-/// prefix matching would let `/home/user/Catenary` match a cwd of
-/// `/home/user/Catenary-06`, routing hooks to the wrong session.
-fn is_path_prefix(path: &str, prefix: &str) -> bool {
-    if path == prefix {
-        return true;
-    }
-    path.starts_with(prefix) && path.as_bytes().get(prefix.len()) == Some(&b'/')
-}
-
-/// Connect to a hook IPC endpoint.
-///
-/// Tries the daemon hook socket first. Falls back to per-session
-/// socket discovery when the daemon is not running.
+/// Connect to the daemon's hook IPC endpoint.
 #[cfg(unix)]
-fn hook_connect(hook_json: &serde_json::Value) -> Option<std::os::unix::net::UnixStream> {
+fn hook_connect(_hook_json: &serde_json::Value) -> Option<std::os::unix::net::UnixStream> {
     let daemon_path = crate::router::hook_socket_path();
-    if let Some(stream) = notify_connect(&daemon_path) {
-        return Some(stream);
-    }
-    let conn = db::open_and_migrate().ok()?;
-    let sid = find_session_id(hook_json, &conn)?;
-    notify_connect(&legacy_hook_endpoint(&sid))
+    notify_connect(&daemon_path)
 }
 
-/// Connect to a hook IPC endpoint (Windows fallback).
+/// Connect to the daemon's hook IPC endpoint (Windows stub).
 ///
-/// Daemon is Unix-only; uses per-session socket discovery directly.
+/// The daemon is Unix-only. Windows hook support is planned.
 #[cfg(windows)]
-fn hook_connect(hook_json: &serde_json::Value) -> Option<std::fs::File> {
-    let conn = db::open_and_migrate().ok()?;
-    let sid = find_session_id(hook_json, &conn)?;
-    notify_connect(&legacy_hook_endpoint(&sid))
+fn hook_connect(_hook_json: &serde_json::Value) -> Option<std::fs::File> {
+    None
 }
 
 /// Connects to a notify IPC endpoint and returns a stream for I/O.
@@ -1129,146 +1060,5 @@ mod tests {
         assert_eq!(prepared["cwd"], "/home/user/project");
         assert_eq!(prepared["tool_input"]["file_path"], "/src/lib.rs");
         assert_eq!(prepared["tool_input"]["old_string"], "line1…");
-    }
-
-    // ── is_path_prefix tests ────────────────────────────────────────
-
-    #[test]
-    fn path_prefix_exact_match() {
-        assert!(is_path_prefix("/home/user/Catenary", "/home/user/Catenary"));
-    }
-
-    #[test]
-    fn path_prefix_subdirectory() {
-        assert!(is_path_prefix(
-            "/home/user/Catenary/src",
-            "/home/user/Catenary",
-        ));
-    }
-
-    #[test]
-    fn path_prefix_rejects_partial_component() {
-        assert!(!is_path_prefix(
-            "/home/user/Catenary-06",
-            "/home/user/Catenary",
-        ));
-    }
-
-    #[test]
-    fn path_prefix_rejects_partial_component_deep() {
-        assert!(!is_path_prefix(
-            "/home/user/Catenary-06/src/main.rs",
-            "/home/user/Catenary",
-        ));
-    }
-
-    #[test]
-    fn path_prefix_no_match() {
-        assert!(!is_path_prefix(
-            "/home/user/OtherProject",
-            "/home/user/Catenary",
-        ));
-    }
-
-    // ── find_session_id tests ──────────────────────────────────────────
-
-    /// Insert a test session row directly into the database.
-    /// Uses the current process PID so `is_process_alive` returns true.
-    fn insert_test_session(
-        conn: &rusqlite::Connection,
-        id: &str,
-        workspace: &str,
-        client_session_id: Option<&str>,
-    ) {
-        conn.execute(
-            "INSERT INTO sessions (id, pid, display_name, started_at, alive, client_session_id) \
-             VALUES (?1, ?2, ?3, '2026-01-01T00:00:00Z', 1, ?4)",
-            rusqlite::params![id, std::process::id(), workspace, client_session_id],
-        )
-        .expect("insert test session");
-    }
-
-    /// Open an isolated test database for hook tests.
-    fn hook_test_db() -> (tempfile::TempDir, rusqlite::Connection) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("catenary").join("catenary.db");
-        let conn = crate::db::open_and_migrate_at(&path).expect("open test DB");
-        (dir, conn)
-    }
-
-    #[test]
-    fn find_session_by_client_session_id() {
-        let (_dir, conn) = hook_test_db();
-        insert_test_session(&conn, "cat-001", "/home/user/ProjectA", Some("host-uuid-1"));
-
-        // Hook comes from a different cwd but carries the matching session_id.
-        let hook_json = serde_json::json!({
-            "session_id": "host-uuid-1",
-            "cwd": "/tmp/unrelated"
-        });
-
-        let result = find_session_id(&hook_json, &conn);
-        assert_eq!(result.as_deref(), Some("cat-001"));
-    }
-
-    #[test]
-    fn find_session_falls_back_to_cwd_when_no_session_id() {
-        let (_dir, conn) = hook_test_db();
-        insert_test_session(&conn, "cat-002", "/home/user/ProjectB", Some("host-uuid-2"));
-
-        // No session_id in hook payload — falls back to cwd matching.
-        let hook_json = serde_json::json!({
-            "cwd": "/home/user/ProjectB/src"
-        });
-
-        let result = find_session_id(&hook_json, &conn);
-        assert_eq!(result.as_deref(), Some("cat-002"));
-    }
-
-    #[test]
-    fn find_session_falls_back_to_cwd_when_session_id_unmatched() {
-        let (_dir, conn) = hook_test_db();
-        insert_test_session(&conn, "cat-003", "/home/user/ProjectC", Some("host-uuid-3"));
-
-        // session_id doesn't match any stored client_session_id,
-        // but cwd matches the workspace.
-        let hook_json = serde_json::json!({
-            "session_id": "unknown-uuid",
-            "cwd": "/home/user/ProjectC/tests"
-        });
-
-        let result = find_session_id(&hook_json, &conn);
-        assert_eq!(result.as_deref(), Some("cat-003"));
-    }
-
-    #[test]
-    fn find_session_prefers_session_id_over_cwd() {
-        let (_dir, conn) = hook_test_db();
-        insert_test_session(&conn, "cat-A", "/home/user/Alpha", Some("uuid-alpha"));
-        insert_test_session(&conn, "cat-B", "/home/user/Beta", Some("uuid-beta"));
-
-        // cwd matches Alpha, but session_id matches Beta — Beta wins.
-        let hook_json = serde_json::json!({
-            "session_id": "uuid-beta",
-            "cwd": "/home/user/Alpha/src"
-        });
-
-        let result = find_session_id(&hook_json, &conn);
-        assert_eq!(result.as_deref(), Some("cat-B"));
-    }
-
-    #[test]
-    fn find_session_returns_none_when_no_match() {
-        let (_dir, conn) = hook_test_db();
-        insert_test_session(&conn, "cat-X", "/home/user/X", Some("uuid-x"));
-
-        // Neither session_id nor cwd matches.
-        let hook_json = serde_json::json!({
-            "session_id": "unknown-uuid",
-            "cwd": "/tmp/nowhere"
-        });
-
-        let result = find_session_id(&hook_json, &conn);
-        assert!(result.is_none());
     }
 }

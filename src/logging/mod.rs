@@ -16,8 +16,6 @@
 //!
 //! Each sink call is wrapped in [`std::panic::catch_unwind`]. A panicking sink
 //! does not prevent other sinks from receiving the event or crash the caller.
-//! The last panic message is stored and retrievable via
-//! [`LoggingServer::take_sink_panic`] for surfacing through `systemMessage`.
 //!
 //! This module provides the scaffolding — types, field extraction, and the
 //! Layer impl. Concrete sinks are added in subsequent tickets.
@@ -335,8 +333,6 @@ struct Inner {
     sinks: OnceLock<Arc<[Arc<dyn Sink>]>>,
     /// Bootstrap buffer, `Some` until activation takes it.
     buffer: Mutex<Option<BufferingState>>,
-    /// Last sink panic message, retrievable via [`LoggingServer::take_sink_panic`].
-    sink_panic: Mutex<Option<String>>,
     /// In-process monotonic correlation ID counter. Session-scoped, starts
     /// at 0. `Relaxed` ordering suffices — monotonicity per thread, no
     /// inter-field synchronization.
@@ -367,7 +363,6 @@ impl LoggingServer {
                     cap,
                     dropped: 0,
                 })),
-                sink_panic: Mutex::new(None),
                 next_id: AtomicI64::new(0),
             }),
         }
@@ -404,7 +399,7 @@ impl LoggingServer {
         if let Some(bs) = buffered {
             for owned in &bs.buffer {
                 let log_event = owned.as_log_event();
-                dispatch_to_sinks(sinks, &log_event, &self.inner.sink_panic);
+                dispatch_to_sinks(sinks, &log_event);
             }
 
             if bs.dropped > 0 {
@@ -431,16 +426,6 @@ impl LoggingServer {
         lock_recover(&self.inner.buffer)
             .as_ref()
             .map_or(0, |bs| bs.buffer.len())
-    }
-
-    /// Take the last sink panic message, if any. Clears the stored value
-    /// so subsequent calls return `None` until another panic occurs.
-    ///
-    /// Used by the hook drain path (ticket 06) to surface sink panics
-    /// in `systemMessage`.
-    #[must_use]
-    pub fn take_sink_panic(&self) -> Option<String> {
-        lock_recover(&self.inner.sink_panic).take()
     }
 
     /// Mint a new correlation ID. Values are monotonically increasing,
@@ -473,27 +458,11 @@ fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// Dispatch an event to sinks with per-sink panic isolation.
 ///
 /// Each sink call is wrapped in [`std::panic::catch_unwind`]. A panicking
-/// sink stores its message in `panic_slot` (overwriting any previous value)
-/// and does not prevent other sinks from receiving the event. The panic
-/// message is recoverable via [`LoggingServer::take_sink_panic`].
-fn dispatch_to_sinks(
-    sinks: &[Arc<dyn Sink>],
-    event: &LogEvent<'_>,
-    panic_slot: &Mutex<Option<String>>,
-) {
+/// sink does not prevent other sinks from receiving the event or crash the
+/// caller.
+fn dispatch_to_sinks(sinks: &[Arc<dyn Sink>], event: &LogEvent<'_>) {
     for sink in sinks {
-        if let Err(payload) =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sink.handle(event)))
-        {
-            let msg = payload
-                .downcast_ref::<String>()
-                .map(String::as_str)
-                .or_else(|| payload.downcast_ref::<&str>().copied())
-                .unwrap_or("unknown panic");
-            if let Ok(mut guard) = panic_slot.lock() {
-                *guard = Some(msg.to_string());
-            }
-        }
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sink.handle(event)));
     }
 }
 
@@ -591,7 +560,7 @@ where
         // Mutex, no Vec clone, no refcount bumps.
         if let Some(sinks) = self.inner.sinks.get() {
             let log_event = visitor.finish(severity, target, span_session_id);
-            dispatch_to_sinks(sinks, &log_event, &self.inner.sink_panic);
+            dispatch_to_sinks(sinks, &log_event);
             return;
         }
 
@@ -603,7 +572,7 @@ where
         if let Some(sinks) = self.inner.sinks.get() {
             drop(guard);
             let log_event = visitor.finish(severity, target, span_session_id);
-            dispatch_to_sinks(sinks, &log_event, &self.inner.sink_panic);
+            dispatch_to_sinks(sinks, &log_event);
             return;
         }
 
@@ -1338,48 +1307,6 @@ mod tests {
     }
 
     #[test]
-    fn sink_panic_message_captured() {
-        struct PanicSink;
-        impl Sink for PanicSink {
-            fn handle(&self, _event: &LogEvent<'_>) {
-                panic!("connection closed");
-            }
-        }
-
-        let server = LoggingServer::new();
-        let panic_sink: Arc<dyn Sink> = Arc::new(PanicSink);
-        with_subscriber(server.clone(), || {
-            server.activate(vec![panic_sink]);
-            tracing::warn!("trigger");
-        });
-        let msg = server.take_sink_panic();
-        assert_eq!(msg.as_deref(), Some("connection closed"));
-        // take() clears the slot
-        assert!(server.take_sink_panic().is_none());
-    }
-
-    #[test]
-    fn sink_panic_during_buffer_drain_captured() {
-        struct PanicSink;
-        impl Sink for PanicSink {
-            fn handle(&self, _event: &LogEvent<'_>) {
-                panic!("drain boom");
-            }
-        }
-
-        let server = LoggingServer::new();
-        let panic_sink: Arc<dyn Sink> = Arc::new(PanicSink);
-        let recorder = Arc::new(RecorderSink::default());
-        with_subscriber(server.clone(), || {
-            tracing::warn!("buffered event");
-            server.activate(vec![panic_sink, recorder.clone()]);
-        });
-        // PanicSink panicked on the buffered event; recorder still got it
-        assert_eq!(recorder.snapshot().len(), 1);
-        assert_eq!(server.take_sink_panic().as_deref(), Some("drain boom"));
-    }
-
-    #[test]
     fn correlation_next_id_is_monotonic() {
         let server = LoggingServer::new();
         assert_eq!(server.next_id(), super::CorrelationId(0));
@@ -1451,11 +1378,6 @@ mod tests {
         // Panicking sink missed event-1 but got event-2.
         assert_eq!(panic_recorder.snapshot().len(), 1);
         assert_eq!(panic_recorder.snapshot()[0].message, "event-2");
-        // Panic was captured.
-        assert_eq!(
-            server.take_sink_panic().as_deref(),
-            Some("first-event panic")
-        );
     }
 
     #[test]

@@ -594,27 +594,18 @@ impl HookRouter {
 
     /// Drain the notification queue into a `systemMessage` string.
     ///
-    /// In daemon mode, drains from the shared [`crate::logging::notification_router::NotificationRouter`]
-    /// using this session's `session_id`. In single-session mode, drains from
-    /// the per-session [`crate::logging::notification_queue::NotificationQueueSink`].
+    /// Drains from the shared [`crate::logging::notification_router::NotificationRouter`]
+    /// using this session's `session_id`.
     ///
-    /// Returns `None` if the queue is empty and no sink panics occurred.
+    /// Returns `None` if the queue is empty.
     fn drain_notifications(&self) -> Option<String> {
         let mut builder = SystemMessageBuilder::new();
-        if let Some(router) = &self.session.notification_router {
-            // Daemon mode: drain from the per-session queue in the router.
-            if let Some(panic_msg) = self.session.logging.take_sink_panic() {
-                builder.push_background(format!(
-                    "[{}] sink panic: {panic_msg}",
-                    crate::logging::Severity::Error.tag()
-                ));
-            }
-            for notification in &router.drain(&self.session.instance_id) {
-                builder.push_background(notification.format());
-            }
-        } else {
-            // Single-session mode: drain from the per-session queue.
-            builder.drain_background(&self.session.notifications, &self.session.logging);
+        for notification in &self
+            .session
+            .notification_router
+            .drain(&self.session.instance_id)
+        {
+            builder.push_background(notification.format());
         }
         builder.finish()
     }
@@ -1113,6 +1104,12 @@ mod tests {
         let handle = runtime.handle().clone();
 
         let instance_id: Arc<str> = "test-session".into();
+        let notification_router = Arc::new(
+            crate::logging::notification_router::NotificationRouter::new(
+                crate::logging::Severity::Warn,
+            ),
+        );
+        notification_router.register_session(&instance_id);
         let session = Arc::new(Session::new(
             config,
             vec![],
@@ -1120,7 +1117,7 @@ mod tests {
             conn.clone(),
             instance_id.clone(),
             handle,
-            None,
+            notification_router,
         ));
 
         if failed {
@@ -1346,6 +1343,12 @@ mod tests {
         let handle = runtime.handle().clone();
 
         let instance_id: Arc<str> = "test-session".into();
+        let notification_router = Arc::new(
+            crate::logging::notification_router::NotificationRouter::new(
+                crate::logging::Severity::Warn,
+            ),
+        );
+        notification_router.register_session(&instance_id);
         let session = Arc::new(Session::new(
             config,
             vec![],
@@ -1353,7 +1356,7 @@ mod tests {
             conn.clone(),
             instance_id.clone(),
             handle,
-            None,
+            notification_router,
         ));
         let router = HookRouter::new(session, conn, instance_id, "test".to_string());
 
@@ -1388,6 +1391,12 @@ mod tests {
         std::fs::create_dir_all(&root).expect("create workspace dir");
 
         let instance_id: Arc<str> = "test-session".into();
+        let notification_router = Arc::new(
+            crate::logging::notification_router::NotificationRouter::new(
+                crate::logging::Severity::Warn,
+            ),
+        );
+        notification_router.register_session(&instance_id);
         let session = Arc::new(Session::new(
             config,
             vec![root.clone()],
@@ -1395,7 +1404,7 @@ mod tests {
             conn.clone(),
             instance_id.clone(),
             handle,
-            None,
+            notification_router,
         ));
 
         let router = HookRouter::new(session, conn, instance_id, "test".to_string());
@@ -1431,10 +1440,13 @@ mod tests {
         let router = test_router();
         // Populate the notification queue.
         crate::logging::Sink::handle(
-            router.session.notifications.as_ref(),
+            router.session.notification_router.as_ref(),
             &make_notify_event("server offline", "ra"),
         );
-        assert_eq!(router.session.notifications.len(), 1);
+        assert_eq!(
+            router.session.notification_router.queue_len("test-session"),
+            1
+        );
 
         let result = router.dispatch(
             crate::hook::HookRequest::SessionStart { session_id: None },
@@ -1444,14 +1456,14 @@ mod tests {
             result.system_message.is_some(),
             "session start should drain notifications"
         );
-        assert!(router.session.notifications.is_empty());
+        assert!(router.session.notification_router.queue_len("test-session") == 0);
     }
 
     #[test]
     fn dispatch_stop_allow_drains_notifications() {
         let router = test_router();
         crate::logging::Sink::handle(
-            router.session.notifications.as_ref(),
+            router.session.notification_router.as_ref(),
             &make_notify_event("server offline", "ra"),
         );
 
@@ -1469,7 +1481,7 @@ mod tests {
             result.system_message.is_some(),
             "allow should drain notifications"
         );
-        assert!(router.session.notifications.is_empty());
+        assert!(router.session.notification_router.queue_len("test-session") == 0);
     }
 
     #[test]
@@ -1479,7 +1491,7 @@ mod tests {
         router.handle_enforce_editing(START_EDITING, None, None, None, "");
 
         crate::logging::Sink::handle(
-            router.session.notifications.as_ref(),
+            router.session.notification_router.as_ref(),
             &make_notify_event("server offline", "ra"),
         );
 
@@ -1497,7 +1509,7 @@ mod tests {
         );
         assert!(result.system_message.is_none(), "block should not drain");
         assert_eq!(
-            router.session.notifications.len(),
+            router.session.notification_router.queue_len("test-session"),
             1,
             "queue should be preserved"
         );
@@ -1507,7 +1519,7 @@ mod tests {
     fn dispatch_pre_tool_does_not_drain() {
         let router = test_router();
         crate::logging::Sink::handle(
-            router.session.notifications.as_ref(),
+            router.session.notification_router.as_ref(),
             &make_notify_event("server offline", "ra"),
         );
 
@@ -1523,7 +1535,10 @@ mod tests {
             0,
         );
         assert!(result.system_message.is_none(), "pre-tool should not drain");
-        assert_eq!(router.session.notifications.len(), 1);
+        assert_eq!(
+            router.session.notification_router.queue_len("test-session"),
+            1
+        );
     }
 
     #[test]
@@ -1534,7 +1549,7 @@ mod tests {
 
         // Enqueue a notification before the first stop.
         crate::logging::Sink::handle(
-            router.session.notifications.as_ref(),
+            router.session.notification_router.as_ref(),
             &make_notify_event("server offline", "ra"),
         );
 
@@ -1549,14 +1564,20 @@ mod tests {
         );
         assert!(matches!(result.result, Some(HookResult::Block(_))));
         assert!(result.system_message.is_none());
-        assert_eq!(router.session.notifications.len(), 1);
+        assert_eq!(
+            router.session.notification_router.queue_len("test-session"),
+            1
+        );
 
         // Enqueue another notification between block and retry.
         crate::logging::Sink::handle(
-            router.session.notifications.as_ref(),
+            router.session.notification_router.as_ref(),
             &make_notify_event("config error", "pylsp"),
         );
-        assert_eq!(router.session.notifications.len(), 2);
+        assert_eq!(
+            router.session.notification_router.queue_len("test-session"),
+            2
+        );
 
         // Second stop: retry (stop_hook_active) — force-clears editing, allows, drains.
         let result = router.dispatch(
@@ -1579,7 +1600,7 @@ mod tests {
             msg.contains("config error"),
             "drain should include second-cycle notification"
         );
-        assert!(router.session.notifications.is_empty());
+        assert!(router.session.notification_router.queue_len("test-session") == 0);
     }
 
     #[test]
@@ -1589,7 +1610,7 @@ mod tests {
 
         // Enqueue a notification.
         crate::logging::Sink::handle(
-            router.session.notifications.as_ref(),
+            router.session.notification_router.as_ref(),
             &make_notify_event("server offline", "ra"),
         );
 
@@ -1606,11 +1627,11 @@ mod tests {
 
         // Same notification again — dedup should reject.
         crate::logging::Sink::handle(
-            router.session.notifications.as_ref(),
+            router.session.notification_router.as_ref(),
             &make_notify_event("server offline", "ra"),
         );
         assert_eq!(
-            router.session.notifications.len(),
+            router.session.notification_router.queue_len("test-session"),
             1,
             "dedup should reject duplicate across blocked cycle"
         );
@@ -1634,6 +1655,9 @@ mod tests {
     }
 
     /// Shorthand for constructing a notification-level `LogEvent`.
+    ///
+    /// Includes `session_id = "test-session"` so the `NotificationRouter`
+    /// routes the event to the test session's queue.
     fn make_notify_event(message: &str, server: &str) -> crate::logging::LogEvent<'static> {
         crate::logging::LogEvent {
             severity: crate::logging::Severity::Warn,
@@ -1648,7 +1672,7 @@ mod tests {
             source: None,
             language: None,
             payload: None,
-            session_id: None,
+            session_id: Some("test-session".to_string()),
             fields: serde_json::Map::new(),
         }
     }
@@ -1657,7 +1681,7 @@ mod tests {
     fn dispatch_post_tool_does_not_drain() {
         let router = test_router();
         crate::logging::Sink::handle(
-            router.session.notifications.as_ref(),
+            router.session.notification_router.as_ref(),
             &make_notify_event("server offline", "ra"),
         );
 
@@ -1674,7 +1698,10 @@ mod tests {
             result.system_message.is_none(),
             "post-tool should not drain"
         );
-        assert_eq!(router.session.notifications.len(), 1);
+        assert_eq!(
+            router.session.notification_router.queue_len("test-session"),
+            1
+        );
     }
 
     // ── Turn counter tests ────────────────────────────────────────────
@@ -1759,6 +1786,12 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
         let handle = runtime.handle().clone();
         let instance_id: Arc<str> = "test-session".into();
+        let notification_router = Arc::new(
+            crate::logging::notification_router::NotificationRouter::new(
+                crate::logging::Severity::Warn,
+            ),
+        );
+        notification_router.register_session(&instance_id);
         let session = Arc::new(Session::new(
             config,
             vec![],
@@ -1766,7 +1799,7 @@ mod tests {
             conn.clone(),
             instance_id.clone(),
             handle,
-            None,
+            notification_router,
         ));
         let router = HookRouter::new(session, conn, instance_id, "test".to_string());
         TestHookRouter {

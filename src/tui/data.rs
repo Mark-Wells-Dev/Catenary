@@ -500,31 +500,27 @@ mod tests {
 
     // ── SQLite tests ─────────────────────────────────────────────────
 
-    /// Create a session backed by the database at `db_path`.
-    fn create_session(
-        db_path: &std::path::Path,
-        workspace: &str,
-    ) -> Result<crate::session::Session> {
-        let arc = std::sync::Arc::new(std::sync::Mutex::new(crate::db::open_and_migrate_at(
-            db_path,
-        )?));
-        crate::session::Session::create_with_conn(workspace, arc)
+    /// Insert a test session directly into the database.
+    fn insert_session(conn: &rusqlite::Connection, id: &str, workspace: &str) {
+        conn.execute(
+            "INSERT INTO sessions (id, pid, display_name, started_at, alive) \
+             VALUES (?1, ?2, ?3, '2026-01-01T00:00:00Z', 1)",
+            rusqlite::params![id, std::process::id(), workspace],
+        )
+        .expect("insert test session");
     }
 
     #[test]
     fn test_sqlite_data_source_list_sessions() -> Result<()> {
         let (_dir, path, conn) = test_db();
+        let write_conn = crate::db::open_and_migrate_at(&path)?;
+        insert_session(&write_conn, "ds-list-1", "/tmp/test-ds-list");
         let ds = SqliteDataSource::with_conn(conn);
 
-        // Need a separate conn for creating the session (different handle).
-        let session = create_session(&path, "/tmp/test-ds-list")?;
-        let id = session.info.id.clone();
-
         let rows = ds.list_sessions()?;
-        assert!(rows.iter().any(|r| r.info.id == id));
+        assert!(rows.iter().any(|r| r.info.id == "ds-list-1"));
 
-        drop(session);
-        ds.delete_session(&id)?;
+        ds.delete_session("ds-list-1")?;
         Ok(())
     }
 
@@ -546,18 +542,14 @@ mod tests {
         let (_dir, path, conn) = test_db();
         let ds = SqliteDataSource::with_conn(conn);
 
-        let session = create_session(&path, "/tmp/test-ds-messages")?;
-        let id = session.info.id.clone();
-
-        // Insert via a separate connection (ds owns the read-only one).
         let write_conn = crate::db::open_and_migrate_at(&path)?;
-        insert_test_message(&write_conn, &id);
+        insert_session(&write_conn, "ds-msg-1", "/tmp/test-ds-messages");
+        insert_test_message(&write_conn, "ds-msg-1");
 
-        let messages = ds.monitor_messages(&id, true)?;
+        let messages = ds.monitor_messages("ds-msg-1", true)?;
         assert!(!messages.is_empty(), "should have at least one message");
 
-        drop(session);
-        ds.delete_session(&id)?;
+        ds.delete_session("ds-msg-1")?;
         Ok(())
     }
 
@@ -565,12 +557,12 @@ mod tests {
     fn test_sqlite_message_tail_streams() -> Result<()> {
         let (_dir, path, conn) = test_db();
 
-        let session = create_session(&path, "/tmp/test-ds-tail")?;
-        let id = session.info.id.clone();
+        let write_conn = crate::db::open_and_migrate_at(&path)?;
+        insert_session(&write_conn, "ds-tail-1", "/tmp/test-ds-tail");
 
         // Open a fresh connection for the tail (it takes ownership).
         let tail_conn = crate::db::open_at(&path)?;
-        let mut tail = crate::session::tail_messages_new_with_conn(tail_conn, &id, true)?;
+        let mut tail = crate::session::tail_messages_new_with_conn(tail_conn, "ds-tail-1", true)?;
 
         // No new messages since tail was created after any existing messages
         // (tail_messages_new starts from the current end).
@@ -580,8 +572,7 @@ mod tests {
         );
 
         // Insert a new message directly.
-        let write_conn = crate::db::open_and_migrate_at(&path)?;
-        insert_test_message(&write_conn, &id);
+        insert_test_message(&write_conn, "ds-tail-1");
 
         let msg = tail.try_next_message()?;
         assert!(msg.is_some(), "should see newly inserted message");
@@ -589,8 +580,7 @@ mod tests {
         // No more messages.
         assert!(tail.try_next_message()?.is_none());
 
-        drop(session);
-        conn.execute("DELETE FROM sessions WHERE id = ?1", [&id])?;
+        conn.execute("DELETE FROM sessions WHERE id = ?1", ["ds-tail-1"])?;
         Ok(())
     }
 
@@ -599,18 +589,17 @@ mod tests {
         let (_dir, path, conn) = test_db();
         let ds = SqliteDataSource::with_conn(conn);
 
-        let session = create_session(&path, "/tmp/test-ds-delete")?;
-        let id = session.info.id.clone();
-        drop(session);
+        let write_conn = crate::db::open_and_migrate_at(&path)?;
+        insert_session(&write_conn, "ds-del-1", "/tmp/test-ds-delete");
 
         // Should exist
-        assert!(ds.list_sessions()?.iter().any(|r| r.info.id == id));
+        assert!(ds.list_sessions()?.iter().any(|r| r.info.id == "ds-del-1"));
 
         // Delete
-        ds.delete_session(&id)?;
+        ds.delete_session("ds-del-1")?;
 
         // Should be gone
-        assert!(!ds.list_sessions()?.iter().any(|r| r.info.id == id));
+        assert!(!ds.list_sessions()?.iter().any(|r| r.info.id == "ds-del-1"));
 
         Ok(())
     }
@@ -650,17 +639,18 @@ mod tests {
     #[test]
     fn test_sqlite_list_alive_session_ids() -> Result<()> {
         let (_dir, path, conn) = test_db();
+        let write_conn = crate::db::open_and_migrate_at(&path)?;
+        insert_session(&write_conn, "ds-alive-1", "/tmp/test-ds-alive-ids");
         let ds = SqliteDataSource::with_conn(conn);
 
-        let session = create_session(&path, "/tmp/test-ds-alive-ids")?;
-        let id = session.info.id.clone();
-
-        // Session is alive (process is running).
+        // Session is alive (process is running, PID matches current).
         let ids = ds.list_alive_session_ids()?;
-        assert!(ids.contains(&id), "alive session should appear");
+        assert!(
+            ids.contains(&"ds-alive-1".to_string()),
+            "alive session should appear"
+        );
 
-        drop(session);
-        ds.delete_session(&id)?;
+        ds.delete_session("ds-alive-1")?;
         Ok(())
     }
 }

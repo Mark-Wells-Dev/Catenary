@@ -23,9 +23,8 @@ use super::grep_server::GrepServer;
 use super::handler::expand_tilde;
 use super::path_security::PathValidator;
 use crate::config::Config;
-use crate::config::SeverityConfig;
 use crate::logging::LoggingServer;
-use crate::logging::notification_queue::NotificationQueueSink;
+use crate::logging::notification_router::NotificationRouter;
 use crate::lsp::LspClientManager;
 use crate::lsp::glob::LspGlob;
 use crate::symbol_index::SymbolIndex;
@@ -157,17 +156,11 @@ pub struct Session {
     path_validator: Arc<RwLock<PathValidator>>,
     /// Multi-sink tracing dispatcher.
     pub logging: LoggingServer,
-    /// Notification queue for draining into `systemMessage`.
+    /// Per-session notification router.
     ///
-    /// Used in single-session mode. In daemon mode, the
-    /// [`crate::logging::notification_router::NotificationRouter`] handles
-    /// per-session routing instead — this field is still present but empty.
-    pub notifications: Arc<NotificationQueueSink>,
-    /// Per-session notification router (daemon mode only).
-    ///
-    /// When set, `HookRouter::drain_notifications` drains from the router
-    /// instead of `self.notifications`. `None` in single-session mode.
-    pub notification_router: Option<Arc<crate::logging::notification_router::NotificationRouter>>,
+    /// Routes notifications to per-session queues based on `session_id`
+    /// from the tracing span hierarchy. Drained at stationary hook points.
+    pub notification_router: Arc<NotificationRouter>,
     /// Symbol index populated from `documentSymbol` responses (shared with grep).
     pub symbol_index: Option<Arc<std::sync::Mutex<SymbolIndex>>>,
     /// Catenary instance ID (unique per process invocation).
@@ -195,9 +188,8 @@ impl Session {
     /// draining any bootstrap-buffered events. After this call, all
     /// `tracing` events flow through the logging pipeline.
     ///
-    /// When `notification_router` is `Some` (daemon mode), the router is
-    /// registered as the notification sink instead of a per-session queue.
-    /// The router routes events to per-session queues based on `session_id`
+    /// The `notification_router` is registered as a tracing sink. It
+    /// routes notifications to per-session queues based on `session_id`
     /// from the tracing span hierarchy.
     #[must_use]
     pub fn new(
@@ -207,27 +199,14 @@ impl Session {
         conn: Arc<std::sync::Mutex<rusqlite::Connection>>,
         instance_id: Arc<str>,
         runtime: Handle,
-        notification_router: Option<Arc<crate::logging::notification_router::NotificationRouter>>,
+        notification_router: Arc<NotificationRouter>,
     ) -> Self {
         let config = Arc::new(config);
 
-        // Construct logging sinks.
-        let threshold = config
-            .notifications
-            .as_ref()
-            .map_or_else(SeverityConfig::default, |n| n.threshold)
-            .into();
-        let notifications = NotificationQueueSink::new(threshold);
         let message_db = crate::logging::message_db::MessageDbSink::new(conn, instance_id.clone());
 
         // Activate — drains bootstrap buffer, enables direct dispatch.
-        // In daemon mode, the notification router replaces the per-session
-        // queue as the notification sink.
-        if let Some(ref router) = notification_router {
-            logging.activate(vec![router.clone(), message_db]);
-        } else {
-            logging.activate(vec![notifications.clone(), message_db]);
-        }
+        logging.activate(vec![notification_router.clone(), message_db]);
 
         let classification = super::filesystem_manager::ClassificationTables::from_config(&config);
         let fs_manager = Arc::new(FilesystemManager::with_classification(classification));
@@ -306,7 +285,6 @@ impl Session {
             fs_manager,
             path_validator,
             logging,
-            notifications,
             notification_router,
             symbol_index,
             instance_id,
@@ -325,24 +303,15 @@ impl Session {
     /// Creates fresh per-session state: editing manager, CWD stash,
     /// transcript state, and roots-refresh flag.
     ///
-    /// The per-session notification queue is not registered as a tracing
-    /// sink — the shared [`crate::logging::notification_router::NotificationRouter`]
-    /// handles per-session routing via the `session_id` tracing span.
+    /// The shared [`NotificationRouter`] handles per-session routing via
+    /// the `session_id` tracing span — no per-session sink registration
+    /// is needed.
     #[must_use]
     pub fn new_for_daemon(
         primary: &Self,
         session_id: Arc<str>,
         editing_guardrail: Option<Arc<EditingGuardrail>>,
     ) -> Self {
-        let threshold = primary
-            .config
-            .notifications
-            .as_ref()
-            .map_or_else(SeverityConfig::default, |n| n.threshold)
-            .into();
-        let notifications =
-            crate::logging::notification_queue::NotificationQueueSink::new(threshold);
-
         let grep_budget = primary
             .config
             .tools
@@ -399,7 +368,6 @@ impl Session {
             fs_manager: primary.fs_manager.clone(),
             path_validator: primary.path_validator.clone(),
             logging: primary.logging.clone(),
-            notifications,
             notification_router: primary.notification_router.clone(),
             symbol_index: primary.symbol_index.clone(),
             instance_id: session_id,
@@ -754,6 +722,11 @@ mod tests {
             .build()
             .expect("runtime");
         let instance_id: Arc<str> = "test".into();
+        let notification_router = Arc::new(
+            crate::logging::notification_router::NotificationRouter::new(
+                crate::logging::Severity::Warn,
+            ),
+        );
         let session = Session::new(
             Config::default(),
             vec![],
@@ -761,7 +734,7 @@ mod tests {
             conn,
             instance_id,
             runtime.handle().clone(),
-            None,
+            notification_router,
         );
         (dir, runtime, session)
     }
