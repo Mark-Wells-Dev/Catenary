@@ -1450,6 +1450,14 @@ async fn handle_hook_dispatch(
 
     let router = get_or_create_router(&ctx, &session_id);
 
+    // Span with session_id so warn!/error! events emitted during
+    // hook dispatch route to the correct notification queue.
+    let hook_span = tracing::info_span!(
+        "hook_dispatch",
+        session_id = %session_id,
+    );
+    let _hook_guard = hook_span.enter();
+
     // Mint a correlation ID for this request/response pair.
     let id = ctx.logging.next_id();
 
