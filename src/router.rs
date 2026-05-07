@@ -3428,4 +3428,124 @@ mod tests {
             "dropped session should be cleaned up",
         );
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disconnect_removes_root_scoped_roots() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let hook_path = hook_socket_in(dir.path());
+        let mcp_path = mcp_socket_in(dir.path());
+
+        let manager = Arc::new(bind_echo_with_session(dir.path()));
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        // Correlate a session.
+        let stream = correlate_session(&hook_path, &mcp_path, "root-sess").await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Look up the fd assigned to this connection.
+        let fd = *manager
+            .correlation
+            .session_connections
+            .lock()
+            .expect("lock")
+            .get("root-sess")
+            .expect("should be correlated");
+
+        // Set roots on the tracker for this connection (simulates
+        // what on_roots_changed would do when roots/list arrives).
+        let tracker = manager.root_tracker.as_ref().expect("tracker");
+        let root = PathBuf::from("/test/project");
+        tracker.set_roots(&format!("mcp:{fd}"), vec![root.clone()]);
+
+        assert_eq!(tracker.refcount(&root), 1, "root should have refcount 1");
+
+        // Disconnect — cleanup should remove this connection's roots.
+        drop(stream);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        assert_eq!(
+            tracker.refcount(&root),
+            0,
+            "root should be removed after last session disconnects",
+        );
+        assert!(
+            tracker.global_roots().is_empty(),
+            "global roots should be empty",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shared_root_survives_partial_disconnect() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let hook_path = hook_socket_in(dir.path());
+        let mcp_path = mcp_socket_in(dir.path());
+
+        let manager = Arc::new(bind_echo_with_session(dir.path()));
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        // Correlate two sessions.
+        let _s1 = correlate_session(&hook_path, &mcp_path, "ws-keep").await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let s2 = correlate_session(&hook_path, &mcp_path, "ws-drop").await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Look up fds.
+        let fd_keep = *manager
+            .correlation
+            .session_connections
+            .lock()
+            .expect("lock")
+            .get("ws-keep")
+            .expect("should be correlated");
+        let fd_drop = *manager
+            .correlation
+            .session_connections
+            .lock()
+            .expect("lock")
+            .get("ws-drop")
+            .expect("should be correlated");
+
+        // Both sessions share /shared, second also has /exclusive.
+        let tracker = manager.root_tracker.as_ref().expect("tracker");
+        let shared = PathBuf::from("/shared/workspace");
+        let exclusive = PathBuf::from("/exclusive/workspace");
+        tracker.set_roots(&format!("mcp:{fd_keep}"), vec![shared.clone()]);
+        tracker.set_roots(
+            &format!("mcp:{fd_drop}"),
+            vec![shared.clone(), exclusive.clone()],
+        );
+
+        assert_eq!(tracker.refcount(&shared), 2);
+        assert_eq!(tracker.refcount(&exclusive), 1);
+
+        // Disconnect second session — /shared should survive, /exclusive should go.
+        drop(s2);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        assert_eq!(
+            tracker.refcount(&shared),
+            1,
+            "/shared should still have refcount 1 from surviving session",
+        );
+        assert_eq!(
+            tracker.refcount(&exclusive),
+            0,
+            "/exclusive should be removed (only contributor disconnected)",
+        );
+        let global = tracker.global_roots();
+        assert!(
+            global.contains(&shared),
+            "/shared should be in global roots",
+        );
+        assert!(
+            !global.contains(&exclusive),
+            "/exclusive should not be in global roots",
+        );
+    }
 }
