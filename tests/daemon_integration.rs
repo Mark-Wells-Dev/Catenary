@@ -11,6 +11,7 @@
     clippy::expect_used,
     reason = "tests use expect for readable assertions"
 )]
+#![allow(clippy::panic, reason = "tests use panic for diagnostics")]
 
 mod common;
 
@@ -24,10 +25,14 @@ use anyhow::{Context, Result};
 struct DaemonProcess {
     child: std::process::Child,
     state_dir: tempfile::TempDir,
+    _stderr_log: PathBuf,
 }
 
 impl DaemonProcess {
     /// Spawns `catenary daemon` in an isolated tempdir.
+    ///
+    /// Daemon stderr is captured to `daemon_stderr.log` inside the
+    /// state dir for post-failure inspection.
     fn spawn() -> Result<Self> {
         let state_dir = tempfile::tempdir().context("create tempdir")?;
         let state_home = state_dir
@@ -36,16 +41,23 @@ impl DaemonProcess {
             .context("state dir to str")?
             .to_string();
 
+        let stderr_log = state_dir.path().join("daemon_stderr.log");
+        let stderr_file = std::fs::File::create(&stderr_log).context("create daemon stderr log")?;
+
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
         common::isolate_env(&mut cmd, &state_home);
         cmd.arg("daemon")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(Stdio::from(stderr_file));
 
         let child = cmd.spawn().context("spawn daemon")?;
 
-        Ok(Self { child, state_dir })
+        Ok(Self {
+            child,
+            state_dir,
+            _stderr_log: stderr_log,
+        })
     }
 
     /// Returns the expected MCP socket path.
@@ -183,4 +195,55 @@ async fn bridge_exits_on_daemon_death() {
             "expected ConnectionReset, got {e}",
         ),
     }
+}
+
+#[test]
+fn daemon_starts_with_servers_configured() {
+    let state_dir = tempfile::tempdir().expect("create tempdir");
+    let state_home = state_dir
+        .path()
+        .to_str()
+        .expect("state dir to str")
+        .to_string();
+
+    let root = tempfile::tempdir().expect("create root");
+    let lsp = common::mockls_lsp_arg("mock_a", "");
+
+    let stderr_log = state_dir.path().join("daemon_stderr.log");
+    let stderr_file = std::fs::File::create(&stderr_log).expect("create stderr");
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
+    common::isolate_env(&mut cmd, &state_home);
+    cmd.arg("daemon")
+        .env("CATENARY_SERVERS", &lsp)
+        .env("CATENARY_ROOTS", root.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(stderr_file));
+
+    let mut child = cmd.spawn().expect("spawn daemon");
+
+    let sock = state_dir.path().join("catenary").join("catenary.sock");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut appeared = false;
+    while Instant::now() < deadline {
+        if sock.exists() {
+            appeared = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    if !appeared {
+        let status = child.try_wait().ok().flatten();
+        let stderr_buf = std::fs::read_to_string(&stderr_log).unwrap_or_default();
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!(
+            "daemon did not create socket within 5s. exit status: {status:?}, stderr:\n{stderr_buf}"
+        );
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
 }

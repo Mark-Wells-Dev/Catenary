@@ -730,10 +730,36 @@ impl Drop for SessionManager {
 // ── Bridge proxy ────────────────────────────────────────────────────
 
 /// Maximum number of attempts to connect to the daemon.
-const MAX_CONNECT_ATTEMPTS: u32 = 5;
+const MAX_CONNECT_ATTEMPTS: u32 = 10;
 
 /// Delay between connection retry attempts.
 const CONNECT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Runs the bridge proxy: connect-or-start the daemon, then proxy
+/// stdin/stdout to/from the daemon socket.
+///
+/// Entirely synchronous — no tokio runtime involvement in the data
+/// path. This avoids any interaction between the tokio runtime's
+/// internal epoll/signal state and the blocking I/O threads.
+///
+/// # Errors
+///
+/// Returns an error if the daemon cannot be started, the connection
+/// fails, or the daemon closes the connection before stdin.
+#[cfg(unix)]
+pub fn run_bridge() -> Result<()> {
+    // Guard against recursive spawning. If the daemon subprocess
+    // somehow enters the bridge path (e.g., the "daemon" arg is lost),
+    // this prevents an infinite process chain.
+    if std::env::var_os("_CATENARY_BRIDGE").is_some() {
+        anyhow::bail!(
+            "recursive bridge detected — the daemon subprocess \
+             re-entered the bridge path instead of the daemon path"
+        );
+    }
+    let stream = connect_or_start_daemon()?;
+    proxy_stdio(stream)
+}
 
 /// Connects to a running daemon or starts one.
 ///
@@ -747,64 +773,43 @@ const CONNECT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_milli
 ///
 /// Returns an error if the daemon cannot be reached after all retry attempts.
 #[cfg(unix)]
-pub async fn connect_or_start_daemon() -> Result<tokio::net::UnixStream> {
+fn connect_or_start_daemon() -> Result<std::os::unix::net::UnixStream> {
     let socket_path = mcp_socket_path();
     let mut daemon_spawned = false;
 
     for attempt in 0..MAX_CONNECT_ATTEMPTS {
-        match tokio::net::UnixStream::connect(&socket_path).await {
-            Ok(stream) => {
-                info!(
-                    source = Source::DaemonLifecycle.as_str(),
-                    attempt, "connected to daemon",
-                );
-                return Ok(stream);
-            }
-            Err(e) => {
-                let last_attempt = attempt == MAX_CONNECT_ATTEMPTS - 1;
-                if last_attempt {
-                    return Err(e).with_context(|| {
-                        format!(
-                            "failed to connect to Catenary daemon \
-                             after {MAX_CONNECT_ATTEMPTS} attempts ({})",
-                            socket_path.display(),
-                        )
-                    });
-                }
-
-                if !daemon_spawned {
-                    if socket_path.exists() {
-                        let _ = std::fs::remove_file(&socket_path);
-                        info!(
-                            source = Source::DaemonLifecycle.as_str(),
-                            path = %socket_path.display(),
-                            "removed stale socket",
-                        );
-                    }
-                    let hook_path = hook_socket_path();
-                    if hook_path.exists() {
-                        let _ = std::fs::remove_file(&hook_path);
-                        info!(
-                            source = Source::DaemonLifecycle.as_str(),
-                            path = %hook_path.display(),
-                            "removed stale hook socket",
-                        );
-                    }
-                    if spawn_daemon().is_ok() {
-                        info!(
-                            source = Source::DaemonLifecycle.as_str(),
-                            "spawned daemon process",
-                        );
-                    }
-                    daemon_spawned = true;
-                }
-
-                tokio::time::sleep(CONNECT_RETRY_DELAY).await;
-            }
+        if let Ok(stream) = std::os::unix::net::UnixStream::connect(&socket_path) {
+            info!(
+                source = Source::DaemonLifecycle.as_str(),
+                attempt, "connected to daemon",
+            );
+            return Ok(stream);
         }
+
+        let last_attempt = attempt == MAX_CONNECT_ATTEMPTS - 1;
+        if last_attempt {
+            anyhow::bail!(
+                "failed to connect to Catenary daemon \
+                 after {MAX_CONNECT_ATTEMPTS} attempts ({})",
+                socket_path.display(),
+            );
+        }
+
+        if !daemon_spawned {
+            if socket_path.exists() {
+                let _ = std::fs::remove_file(&socket_path);
+            }
+            let hook_path = hook_socket_path();
+            if hook_path.exists() {
+                let _ = std::fs::remove_file(&hook_path);
+            }
+            spawn_daemon()?;
+            daemon_spawned = true;
+        }
+
+        std::thread::sleep(CONNECT_RETRY_DELAY);
     }
 
-    // Loop always returns: Ok on connect, Err on last attempt.
     anyhow::bail!(
         "failed to connect to Catenary daemon ({})",
         socket_path.display(),
@@ -814,7 +819,10 @@ pub async fn connect_or_start_daemon() -> Result<tokio::net::UnixStream> {
 /// Spawns `catenary daemon` as a detached child process.
 ///
 /// The daemon binds the MCP socket and begins accepting connections.
-/// Uses a new process group so the daemon outlives the bridge.
+/// Uses a new process group so the daemon outlives the bridge. Stderr
+/// is redirected to `$XDG_STATE_HOME/catenary/daemon.log` so that
+/// daemon crashes during initialization are diagnosable from the
+/// bridge side (and from integration test failure output).
 #[cfg(unix)]
 fn spawn_daemon() -> Result<()> {
     use std::os::unix::process::CommandExt;
@@ -822,11 +830,19 @@ fn spawn_daemon() -> Result<()> {
 
     let exe = std::env::current_exe().context("resolve current executable path")?;
 
+    let log_dir = crate::db::state_dir().join("catenary");
+    std::fs::create_dir_all(&log_dir)
+        .with_context(|| format!("create daemon log directory: {}", log_dir.display()))?;
+    let log_path = log_dir.join("daemon.log");
+    let stderr_file = std::fs::File::create(&log_path)
+        .with_context(|| format!("create daemon log: {}", log_path.display()))?;
+
     Command::new(exe)
         .arg("daemon")
+        .env("_CATENARY_BRIDGE", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::from(stderr_file))
         .process_group(0)
         .spawn()
         .context("spawn daemon process")?;
@@ -840,96 +856,85 @@ fn spawn_daemon() -> Result<()> {
 /// exchange (initialize) to verify the daemon's version matches this
 /// bridge's version. On mismatch, returns an error without proxying.
 ///
-/// Runs two concurrent copy loops. Returns `Ok(())` when stdin closes
-/// (host CLI ended the session) or `Err` when the daemon connection
-/// drops.
-///
-/// The stdin→socket direction uses a dedicated OS thread with blocking
-/// I/O because `tokio::io::Stdin` internally blocks a threadpool thread
-/// that cannot be cancelled ([tokio#2466]). A blocking `std::io::copy`
-/// on a dedicated thread avoids this and exits cleanly on EOF.
+/// Uses purely blocking I/O on two threads: one copies stdin to the
+/// daemon socket, the other copies the daemon socket to stdout. Both
+/// threads share the same socket fd via `try_clone()` — this is safe
+/// because both halves stay in blocking mode (no mixed
+/// blocking/non-blocking on the same file description). Full-duplex
+/// Unix sockets support concurrent read and write from different
+/// threads.
 ///
 /// The socket→stdout direction uses a read-write-flush loop because
 /// `std::io::Stdout` uses full buffering on pipes. Without explicit
 /// flushing, MCP responses sit in the buffer until it fills (8 KB).
 ///
-/// [tokio#2466]: https://github.com/tokio-rs/tokio/issues/2466
+/// Returns `Ok(())` when stdin closes (host CLI ended the session).
+/// Returns `Err` when the daemon connection drops first (unexpected).
 ///
 /// # Errors
 ///
 /// Returns an error if the daemon version does not match, or if the
 /// daemon connection closes before stdin (unexpected termination).
 #[cfg(unix)]
-pub async fn proxy_stdio(stream: tokio::net::UnixStream) -> Result<()> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    // Convert to std for the blocking handshake phase.
-    // The stream starts in blocking mode from into_std().
-    let std_stream = stream.into_std().context("convert daemon socket to std")?;
+fn proxy_stdio(stream: std::os::unix::net::UnixStream) -> Result<()> {
+    use std::io::{Read, Write};
 
     // Phase 1: Version handshake (blocking, sequential).
     // Intercepts the first MCP exchange (initialize) to verify that the
     // daemon version matches this bridge. On mismatch, the handshake
     // sends a catenary/version-mismatch notification to the daemon and
     // returns Err.
-    let std_stream = tokio::task::spawn_blocking(move || -> Result<_> {
-        let stdin_handle = std::io::stdin();
-        let mut stdin = stdin_handle.lock();
-        let stdout_handle = std::io::stdout();
-        let mut stdout = stdout_handle.lock();
-        version_handshake(&mut stdin, &std_stream, &mut stdout)?;
-        Ok(std_stream)
-    })
-    .await
-    .context("version handshake task")??;
+    {
+        let mut stdin = std::io::stdin().lock();
+        let mut stdout = std::io::stdout().lock();
+        version_handshake(&mut stdin, &stream, &mut stdout)?;
+    }
 
     // Phase 2: Concurrent byte proxy for remaining messages.
-    let std_write = std_stream
-        .try_clone()
-        .context("clone daemon socket for writer")?;
+    let writer = stream.try_clone().context("clone daemon socket")?;
+    let reader = stream;
 
-    // Wrap the read half back into tokio for async socket→stdout.
-    std_stream
-        .set_nonblocking(true)
-        .context("set socket non-blocking")?;
-    let mut sock_read = tokio::net::UnixStream::from_std(std_stream)
-        .context("re-wrap socket read half as tokio")?;
-
-    // stdin→socket: dedicated OS thread with blocking I/O.
-    std_write
-        .set_nonblocking(false)
-        .context("set write half blocking")?;
-    let stdin_task = tokio::task::spawn_blocking(move || {
+    // stdin → socket: dedicated thread, blocks until stdin EOF.
+    let stdin_thread = std::thread::spawn(move || -> Result<()> {
         let mut stdin = std::io::stdin().lock();
-        let mut writer = std_write;
-        std::io::copy(&mut stdin, &mut writer).context("proxy stdin to socket")
+        let mut w = writer;
+        std::io::copy(&mut stdin, &mut w).context("proxy stdin to socket")?;
+        let _ = w.shutdown(std::net::Shutdown::Write);
+        Ok(())
     });
 
-    // socket→stdout: async read with explicit flush after each chunk.
-    let mut stdout = tokio::io::stdout();
-
-    tokio::select! {
-        result = stdin_task => {
-            result.context("stdin proxy task")??;
-            Ok(())
-        }
-        result = async {
-            let mut buf = vec![0u8; 8192];
-            loop {
-                let n = sock_read.read(&mut buf).await?;
-                if n == 0 {
-                    return Ok::<(), std::io::Error>(());
+    // socket → stdout: runs on calling thread, blocks until socket EOF.
+    let mut stdout = std::io::stdout().lock();
+    let mut buf = vec![0u8; 8192];
+    let mut r = reader;
+    let stdout_result: Result<()> = loop {
+        match r.read(&mut buf) {
+            Ok(0) => break Err(anyhow::anyhow!("daemon connection closed unexpectedly")),
+            Ok(n) => {
+                if let Err(e) = stdout.write_all(&buf[..n]) {
+                    break Err(anyhow::Error::from(e).context("write to stdout"));
                 }
-                stdout.write_all(&buf[..n]).await?;
-                stdout.flush().await?;
+                if let Err(e) = stdout.flush() {
+                    break Err(anyhow::Error::from(e).context("flush stdout"));
+                }
             }
-        } => {
-            match result {
-                Ok(()) => Err(anyhow::anyhow!("daemon connection closed unexpectedly")),
-                Err(e) => Err(anyhow::Error::from(e).context("daemon connection error")),
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                // stdout pipe closed (host killed the process).
+                break Ok(());
             }
+            Err(e) => break Err(anyhow::Error::from(e).context("read from daemon")),
         }
-    }
+    };
+
+    // If we got here, the socket→stdout loop ended. Either the daemon
+    // died (Err) or stdout pipe broke (Ok). The stdin thread may still
+    // be blocked; don't join it — the process is exiting.
+    //
+    // If stdin closed first, the stdin thread already exited and the
+    // daemon will close the connection → we exit via the read loop above.
+    drop(stdin_thread);
+
+    stdout_result
 }
 
 /// Intercepts the MCP initialize handshake to verify daemon version.

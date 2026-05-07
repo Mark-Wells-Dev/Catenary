@@ -9,21 +9,29 @@
 #![allow(clippy::print_stdout, reason = "CLI tool needs to output to stdout")]
 #![allow(clippy::print_stderr, reason = "CLI tool needs to output to stderr")]
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::info;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 use catenary_mcp::bridge::McpRouter;
 use catenary_mcp::cli::{self, HostFormat, QueryFormat};
 use catenary_mcp::logging::LoggingServer;
-use catenary_mcp::mcp::McpServer;
-use catenary_mcp::session::{self, Session};
+use catenary_mcp::session;
+
 use catenary_mcp::source::Source;
+
+// Only needed for the in-process MCP server path (non-Unix).
+#[cfg(not(unix))]
+use catenary_mcp::mcp::McpServer;
+#[cfg(not(unix))]
+use catenary_mcp::session::Session;
+#[cfg(not(unix))]
+use tracing::warn;
 
 /// Command-line arguments for Catenary.
 #[derive(Parser, Debug)]
@@ -189,12 +197,12 @@ enum HookCommand {
 
 /// Entry point for the Catenary binary.
 ///
-/// # Errors
-///
-/// Returns an error if the subcommand fails.
-#[tokio::main]
+/// Subcommands that need async (Doctor, the in-process MCP server on
+/// non-Unix) build a standard tokio runtime on demand. The daemon
+/// builds its own runtime with larger thread stacks to accommodate its
+/// async state machines. The bridge proxy is entirely synchronous.
 #[allow(clippy::too_many_lines, reason = "Dispatch table for all subcommands")]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let args = Args::parse();
 
     match args.command {
@@ -202,7 +210,14 @@ async fn main() -> Result<()> {
             if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
                 run_dashboard()
             } else {
-                run_server().await
+                #[cfg(unix)]
+                {
+                    catenary_mcp::router::run_bridge()
+                }
+                #[cfg(not(unix))]
+                {
+                    build_runtime()?.block_on(run_server())
+                }
             }
         }
         Some(Command::List) => cli::commands::run_list(),
@@ -223,11 +238,13 @@ async fn main() -> Result<()> {
             nocolor,
             diff,
         }) => {
-            if let Some(server_name) = server {
-                cli::doctor::run_doctor_single(&server_name, &root, nocolor).await
-            } else {
-                cli::doctor::run_doctor(&root, nocolor, diff).await
-            }
+            let rt = build_runtime()?;
+            server.map_or_else(
+                || rt.block_on(cli::doctor::run_doctor(&root, nocolor, diff)),
+                |server_name| {
+                    rt.block_on(cli::doctor::run_doctor_single(&server_name, &root, nocolor))
+                },
+            )
         }
         Some(Command::Hook { command }) => {
             match command {
@@ -267,14 +284,25 @@ async fn main() -> Result<()> {
             cli::commands::run_gc(&conn, older_than.as_deref(), dead, session.as_deref())
         }
         #[cfg(unix)]
-        Some(Command::Daemon) => run_daemon().await,
+        Some(Command::Daemon) => run_daemon(),
         #[cfg(not(unix))]
         Some(Command::Daemon) => Err(anyhow::anyhow!("daemon mode requires Unix")),
         #[cfg(unix)]
-        Some(Command::Stop) => run_stop().await,
+        Some(Command::Stop) => build_runtime()?.block_on(run_stop()),
         #[cfg(not(unix))]
         Some(Command::Stop) => Err(anyhow::anyhow!("daemon mode requires Unix")),
     }
+}
+
+/// Builds a standard tokio multi-thread runtime.
+///
+/// Used by subcommands that need async (Doctor, in-process MCP server
+/// on non-Unix). The daemon builds its own runtime with larger stacks.
+fn build_runtime() -> Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime")
 }
 
 /// Launch the interactive TUI dashboard.
@@ -297,11 +325,16 @@ fn run_dashboard() -> Result<()> {
     catenary_mcp::tui::run(config.icons.unwrap_or_default())
 }
 
-/// Runs the MCP server.
+/// Runs the MCP server in-process.
+///
+/// On Unix, every non-terminal invocation goes through the daemon
+/// (`connect_or_start_daemon` + `proxy_stdio`). This in-process path
+/// only runs on non-Unix platforms.
 ///
 /// # Errors
 ///
 /// Returns an error if the server fails to start or encounters an internal error.
+#[cfg(not(unix))]
 #[allow(
     clippy::too_many_lines,
     reason = "Server setup requires sequential initialization steps"
@@ -492,23 +525,34 @@ async fn run_server() -> Result<()> {
     mcp_result
 }
 
-/// Runs the Catenary daemon.
+/// Runs the Catenary daemon on a dedicated thread with a 16 MB stack.
 ///
-/// Creates the shared bridge infrastructure (`LspClientManager`,
-/// `Session`, tool handler) and binds the MCP/hook sockets. Each
-/// incoming MCP connection spawns a per-connection `McpServer`
-/// backed by the shared tool handler. The daemon exits when
-/// interrupted by a signal.
+/// The synchronous initialization path (`Config::load` →
+/// `Session::new` → `LspClientManager::new`) has a deep call stack
+/// that exceeds the default 8 MB main thread stack in debug builds.
+/// Only the accept loop runs async via a tiny `block_on` future.
 ///
 /// # Errors
 ///
 /// Returns an error if setup or the accept loop fails.
 #[cfg(unix)]
+fn run_daemon() -> Result<()> {
+    std::thread::Builder::new()
+        .name("daemon".to_string())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_daemon_main)
+        .context("spawn daemon thread")?
+        .join()
+        .map_err(|_| anyhow::anyhow!("daemon thread panicked"))?
+}
+
+/// Daemon entry point, runs on a thread with a large stack.
+#[cfg(unix)]
 #[allow(
     clippy::too_many_lines,
     reason = "Daemon setup requires sequential initialization steps"
 )]
-async fn run_daemon() -> Result<()> {
+fn run_daemon_main() -> Result<()> {
     use catenary_mcp::router::SessionManager;
 
     /// Tool handler that exposes no tools (disabled workspace).
@@ -528,9 +572,16 @@ async fn run_daemon() -> Result<()> {
         }
     }
 
+    // Build runtime first — bind_daemon_sockets needs the tokio
+    // reactor for UnixListener::bind.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("build daemon runtime")?;
+    let _rt_guard = rt.enter();
+
     // Bind sockets immediately so bridge proxies can connect while
-    // heavy initialization (config, DB, LSP servers) proceeds. The
-    // kernel queues connections until accept_loop starts.
+    // heavy initialization (config, DB, LSP servers) proceeds.
     let sockets = catenary_mcp::router::bind_daemon_sockets()?;
 
     let logging = LoggingServer::new();
@@ -564,8 +615,21 @@ async fn run_daemon() -> Result<()> {
         (handler, None, None)
     } else {
         let conn = catenary_mcp::db::open_and_migrate()?;
-        let conn = Arc::new(std::sync::Mutex::new(conn));
         let instance_id: Arc<str> = "daemon".into();
+
+        // Insert a session row so MessageDbSink's FK constraint
+        // (messages.session_id → sessions.id) is satisfied. Without
+        // this, every tracing event after activate() triggers an FK
+        // violation → trace!() → recursive on_event → stack overflow.
+        conn.execute(
+            "INSERT OR IGNORE INTO sessions \
+             (id, pid, display_name, started_at, alive) \
+             VALUES (?1, ?2, ?3, datetime('now'), 1)",
+            rusqlite::params![&*instance_id, std::process::id(), &workspace_display],
+        )
+        .context("insert daemon session row")?;
+
+        let conn = Arc::new(std::sync::Mutex::new(conn));
 
         let session = Arc::new(catenary_mcp::bridge::session::Session::new(
             config,
@@ -573,15 +637,12 @@ async fn run_daemon() -> Result<()> {
             logging.clone(),
             conn.clone(),
             instance_id,
-            tokio::runtime::Handle::current(),
+            rt.handle().clone(),
         ));
 
-        // Spawn LSP servers in the background so the accept loop
-        // starts immediately. Tool calls that need a server before
-        // spawn_all finishes trigger on-demand spawning via
-        // LspClientManager.
+        // Spawn LSP servers in the background.
         let session_for_spawn = session.clone();
-        tokio::spawn(async move { session_for_spawn.spawn_all().await });
+        rt.spawn(async move { session_for_spawn.spawn_all().await });
 
         let handler: Arc<dyn catenary_mcp::mcp::ToolHandler> =
             Arc::new(McpRouter::new(session.clone()));
@@ -604,8 +665,9 @@ async fn run_daemon() -> Result<()> {
     // Wire signals to the daemon's shutdown token so accept_loop
     // exits on SIGINT/SIGTERM.
     let shutdown = manager.shutdown_token();
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    tokio::spawn(async move {
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("register SIGTERM")?;
+    rt.spawn(async move {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 info!(
@@ -623,7 +685,7 @@ async fn run_daemon() -> Result<()> {
         shutdown.cancel();
     });
 
-    let result = manager.accept_loop().await;
+    let result = rt.block_on(manager.accept_loop());
 
     // Graceful LSP shutdown.
     if let Some(session) = session_for_shutdown {
@@ -631,7 +693,7 @@ async fn run_daemon() -> Result<()> {
             source = Source::DaemonLifecycle.as_str(),
             "shutting down LSP servers",
         );
-        session.shutdown().await;
+        rt.block_on(session.shutdown());
     }
 
     // Drop removes socket files.
@@ -682,6 +744,9 @@ async fn run_stop() -> Result<()> {
 /// but creates no session, spawns no LSP servers, starts no hook IPC
 /// server, and writes nothing to the database. Hook CLI processes fail
 /// to connect and output nothing, so the host treats all hooks as "allow."
+///
+/// On Unix, the daemon handles the disabled case via `DaemonDisabledHandler`.
+#[cfg(not(unix))]
 async fn run_disabled_server(logging: LoggingServer) -> Result<()> {
     /// Tool handler that exposes no tools.
     struct DisabledHandler;

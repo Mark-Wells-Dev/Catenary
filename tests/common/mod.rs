@@ -197,9 +197,14 @@ impl BridgeProcess {
                 .as_ref()
                 .and_then(|p| std::fs::read_to_string(p).ok())
                 .unwrap_or_default();
+            // Also read daemon log if the bridge went through the daemon path.
+            let daemon_log = PathBuf::from(&self.state_home)
+                .join("catenary")
+                .join("daemon.log");
+            let daemon_buf = std::fs::read_to_string(&daemon_log).unwrap_or_default();
             let status = self.child.try_wait().ok().flatten();
             bail!(
-                "bridge process closed stdout (EOF). exit status: {status:?}, stderr:\n{stderr_buf}"
+                "bridge process closed stdout (EOF). exit status: {status:?}, stderr:\n{stderr_buf}\ndaemon log:\n{daemon_buf}"
             );
         }
         serde_json::from_str(&line).context("Failed to parse JSON response")
