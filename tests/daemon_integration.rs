@@ -1,10 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
-//! Integration tests for daemon transport (ticket 02).
+//! Integration tests for the daemon architecture.
 //!
-//! Tests spawn the `catenary daemon` subcommand as a subprocess and
+//! Transport tests (ticket 02) spawn `catenary daemon` directly and
 //! verify socket creation, connection acceptance, and byte flow.
+//!
+//! Multi-session tests (ticket 13) spawn multiple `BridgeProcess`
+//! instances sharing a single daemon via a shared `XDG_STATE_HOME`
+//! and verify session isolation, stale socket recovery, stop command,
+//! and cross-session editing guardrails.
 
 #![cfg(unix)]
 #![allow(
@@ -15,11 +20,14 @@
 
 mod common;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use serde_json::json;
+
+use common::{BridgeProcess, mockls_lsp_arg};
 
 /// Wrapper around a `catenary daemon` subprocess with cleanup on drop.
 struct DaemonProcess {
@@ -246,4 +254,411 @@ fn daemon_starts_with_servers_configured() {
 
     let _ = child.kill();
     let _ = child.wait();
+}
+
+// ── Multi-session integration tests (ticket 13) ───────────────────
+
+const MOCK_LANG: &str = "daemon_test";
+
+/// Returns the hook socket path for a given state home.
+fn hook_socket_in(state_home: &str) -> PathBuf {
+    Path::new(state_home)
+        .join("catenary")
+        .join("catenary-hooks.sock")
+}
+
+/// Waits for the hook socket to appear (up to 5 seconds).
+fn wait_for_hook_socket(state_home: &str) -> PathBuf {
+    let path = hook_socket_in(state_home);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "hook socket not found at {} within 5s",
+            path.display(),
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    path
+}
+
+/// Sends a hook JSON request and reads the response line.
+fn hook_roundtrip(hook_path: &Path, request: &serde_json::Value) -> Result<String> {
+    use std::io::{Read, Write};
+
+    let mut stream =
+        std::os::unix::net::UnixStream::connect(hook_path).context("connect to hook socket")?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    writeln!(stream, "{request}").context("write to hook socket")?;
+    stream.shutdown(std::net::Shutdown::Write)?;
+    let mut response = String::new();
+    let _ = stream.read_to_string(&mut response);
+    Ok(response)
+}
+
+/// Two bridges sharing a daemon can both initialize and call grep.
+#[test]
+fn two_bridges_share_daemon() -> Result<()> {
+    let state_dir = tempfile::tempdir()?;
+    let state_home = state_dir.path().to_str().context("state dir")?;
+
+    let root = tempfile::tempdir()?;
+    let root_str = root.path().to_str().context("root path")?;
+
+    let file = root.path().join(format!("hello.{MOCK_LANG}"));
+    std::fs::write(&file, "fn shared_sym()\nshared_sym\n")?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG, "--scan-roots");
+
+    // Bridge A starts the daemon.
+    let mut bridge_a = BridgeProcess::spawn_in_state(state_home, |cmd| {
+        cmd.env("CATENARY_SERVERS", &lsp);
+        cmd.env("CATENARY_ROOTS", root_str);
+    })?;
+    bridge_a.initialize()?;
+
+    // Bridge B connects to the existing daemon.
+    let mut bridge_b = BridgeProcess::spawn_in_state(state_home, |cmd| {
+        cmd.env("CATENARY_SERVERS", &lsp);
+        cmd.env("CATENARY_ROOTS", root_str);
+    })?;
+    bridge_b.initialize()?;
+
+    // Both can call grep.
+    let text_a = bridge_a.call_tool_text("grep", &json!({"pattern": "shared_sym"}))?;
+    assert!(
+        text_a.contains("shared_sym"),
+        "bridge A grep should find symbol, got:\n{text_a}",
+    );
+
+    let text_b = bridge_b.call_tool_text("grep", &json!({"pattern": "shared_sym"}))?;
+    assert!(
+        text_b.contains("shared_sym"),
+        "bridge B grep should find symbol, got:\n{text_b}",
+    );
+
+    Ok(())
+}
+
+/// Disconnecting one bridge preserves the other's session.
+///
+/// Uses `initialize_with_roots` so both bridges register their roots
+/// via `roots/list`. Without this, the root tracker would be empty and
+/// disconnecting one bridge would call `sync_roots([])`, shutting down
+/// all LSP servers.
+#[test]
+fn bridge_disconnect_preserves_other() -> Result<()> {
+    let state_dir = tempfile::tempdir()?;
+    let state_home = state_dir.path().to_str().context("state dir")?;
+
+    let root = tempfile::tempdir()?;
+    let root_str = root.path().to_str().context("root path")?;
+
+    let file = root.path().join(format!("keep.{MOCK_LANG}"));
+    std::fs::write(&file, "fn survivor()\nsurvivor\n")?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG, "--scan-roots");
+
+    let mut bridge_a = BridgeProcess::spawn_in_state(state_home, |cmd| {
+        cmd.env("CATENARY_SERVERS", &lsp);
+        cmd.env("CATENARY_ROOTS", root_str);
+    })?;
+    bridge_a.initialize_with_roots(&[root_str])?;
+
+    let mut bridge_b = BridgeProcess::spawn_in_state(state_home, |cmd| {
+        cmd.env("CATENARY_SERVERS", &lsp);
+        cmd.env("CATENARY_ROOTS", root_str);
+    })?;
+    bridge_b.initialize_with_roots(&[root_str])?;
+
+    // Bridge A can grep.
+    let text = bridge_a.call_tool_text("grep", &json!({"pattern": "survivor"}))?;
+    assert!(
+        text.contains("survivor"),
+        "bridge A should work before disconnect"
+    );
+
+    // Drop bridge A — daemon stays alive for bridge B. Root refcount
+    // goes from 2 to 1, so the LSP server stays up.
+    drop(bridge_a);
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Bridge B still works.
+    let text = bridge_b.call_tool_text("grep", &json!({"pattern": "survivor"}))?;
+    assert!(
+        text.contains("survivor"),
+        "bridge B should still work after A disconnects, got:\n{text}",
+    );
+
+    Ok(())
+}
+
+/// Bridge cleans up a stale socket file and starts a fresh daemon.
+#[test]
+fn stale_socket_recovery() -> Result<()> {
+    let state_dir = tempfile::tempdir()?;
+    let state_home = state_dir.path().to_str().context("state dir")?;
+
+    let root = tempfile::tempdir()?;
+    let root_str = root.path().to_str().context("root path")?;
+    let file = root.path().join(format!("stale.{MOCK_LANG}"));
+    std::fs::write(&file, "fn recovered()\n")?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG, "--scan-roots");
+
+    // Create a stale socket file (regular file, nobody listening).
+    let socket_dir = state_dir.path().join("catenary");
+    std::fs::create_dir_all(&socket_dir)?;
+    std::fs::write(socket_dir.join("catenary.sock"), b"stale")?;
+
+    // Bridge should detect the stale socket, remove it, start daemon,
+    // and connect successfully.
+    let mut bridge = BridgeProcess::spawn_in_state(state_home, |cmd| {
+        cmd.env("CATENARY_SERVERS", &lsp);
+        cmd.env("CATENARY_ROOTS", root_str);
+    })?;
+    bridge.initialize()?;
+
+    // Verify the bridge works.
+    let text = bridge.call_tool_text("grep", &json!({"pattern": "recovered"}))?;
+    assert!(
+        text.contains("recovered"),
+        "bridge should work after stale socket recovery, got:\n{text}",
+    );
+
+    Ok(())
+}
+
+/// `catenary stop` shuts down the daemon and cleans up socket files.
+#[test]
+fn stop_command_shuts_down_daemon() -> Result<()> {
+    let state_dir = tempfile::tempdir()?;
+    let state_home = state_dir.path().to_str().context("state dir")?;
+
+    let root = tempfile::tempdir()?;
+    let root_str = root.path().to_str().context("root path")?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG, "");
+
+    let mut bridge = BridgeProcess::spawn_in_state(state_home, |cmd| {
+        cmd.env("CATENARY_SERVERS", &lsp);
+        cmd.env("CATENARY_ROOTS", root_str);
+    })?;
+    bridge.initialize()?;
+
+    // Verify sockets exist before stop.
+    let mcp_sock = state_dir.path().join("catenary").join("catenary.sock");
+    let hook_sock = state_dir
+        .path()
+        .join("catenary")
+        .join("catenary-hooks.sock");
+    assert!(mcp_sock.exists(), "MCP socket should exist before stop");
+
+    // Run `catenary stop` targeting the same state dir.
+    let mut stop_cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
+    common::isolate_env(&mut stop_cmd, state_home);
+    stop_cmd.arg("stop");
+    let output = stop_cmd.output().context("run catenary stop")?;
+    assert!(
+        output.status.success(),
+        "catenary stop should exit 0, stderr: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    // Wait for the daemon's accept_loop to exit and remove sockets.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while mcp_sock.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    assert!(
+        !mcp_sock.exists(),
+        "MCP socket should be removed after stop",
+    );
+    assert!(
+        !hook_sock.exists(),
+        "hook socket should be removed after stop",
+    );
+
+    // Drop bridge — the daemon connection is gone, so the bridge
+    // process will exit naturally (or be killed by Drop).
+    drop(bridge);
+
+    Ok(())
+}
+
+/// Cross-session editing guardrail: session A editing a root blocks
+/// session B from editing the same root.
+///
+/// Each session needs its own bridge (MCP connection) and must be
+/// correlated first. Catenary tool hooks (`start_editing`) trigger
+/// the sandwich correlation path, which acquires a serialization
+/// semaphore. Without a matching MCP `tools/call` to resolve the
+/// correlation, the semaphore blocks subsequent sessions. Correlating
+/// both sessions upfront (via grep) avoids this.
+#[test]
+fn editing_guardrail_blocks_cross_session() -> Result<()> {
+    let state_dir = tempfile::tempdir()?;
+    let state_home = state_dir.path().to_str().context("state dir")?;
+
+    let root = tempfile::tempdir()?;
+    let root_str = root.path().to_str().context("root path")?;
+
+    let file = root.path().join(format!("guarded.{MOCK_LANG}"));
+    std::fs::write(&file, "fn guarded_fn()\n")?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG, "--scan-roots");
+
+    // Two bridges, one per session.
+    let mut bridge_a = BridgeProcess::spawn_in_state(state_home, |cmd| {
+        cmd.env("CATENARY_SERVERS", &lsp);
+        cmd.env("CATENARY_ROOTS", root_str);
+    })?;
+    bridge_a.initialize()?;
+
+    let mut bridge_b = BridgeProcess::spawn_in_state(state_home, |cmd| {
+        cmd.env("CATENARY_SERVERS", &lsp);
+        cmd.env("CATENARY_ROOTS", root_str);
+    })?;
+    bridge_b.initialize()?;
+
+    let hook_path = wait_for_hook_socket(state_home);
+
+    // Correlate session A: PreToolUse(grep) → MCP tools/call.
+    hook_roundtrip(
+        &hook_path,
+        &json!({
+            "method": "pre-tool/editing-state",
+            "tool_name": "mcp_catenary_grep",
+            "agent_id": "",
+            "session_id": "session-a"
+        }),
+    )?;
+    bridge_a.call_tool_text("grep", &json!({"pattern": "guarded_fn"}))?;
+
+    // Correlate session B: PreToolUse(grep) → MCP tools/call.
+    hook_roundtrip(
+        &hook_path,
+        &json!({
+            "method": "pre-tool/editing-state",
+            "tool_name": "mcp_catenary_grep",
+            "agent_id": "",
+            "session_id": "session-b"
+        }),
+    )?;
+    bridge_b.call_tool_text("grep", &json!({"pattern": "guarded_fn"}))?;
+
+    // Session A: enter editing mode + edit a file (acquires guardrail).
+    hook_roundtrip(
+        &hook_path,
+        &json!({
+            "method": "pre-tool/editing-state",
+            "tool_name": "mcp_catenary_start_editing",
+            "agent_id": "",
+            "session_id": "session-a"
+        }),
+    )?;
+    let response_a = hook_roundtrip(
+        &hook_path,
+        &json!({
+            "method": "pre-tool/editing-state",
+            "tool_name": "Edit",
+            "file_path": file.to_str().context("file path")?,
+            "agent_id": "",
+            "session_id": "session-a"
+        }),
+    )?;
+    assert!(
+        response_a.trim().is_empty() || !response_a.contains("deny"),
+        "session A should be allowed to edit, got: {response_a}",
+    );
+
+    // Session B: enter editing mode + try to edit same root.
+    hook_roundtrip(
+        &hook_path,
+        &json!({
+            "method": "pre-tool/editing-state",
+            "tool_name": "mcp_catenary_start_editing",
+            "agent_id": "",
+            "session_id": "session-b"
+        }),
+    )?;
+    let response_b = hook_roundtrip(
+        &hook_path,
+        &json!({
+            "method": "pre-tool/editing-state",
+            "tool_name": "Edit",
+            "file_path": file.to_str().context("file path")?,
+            "agent_id": "",
+            "session_id": "session-b"
+        }),
+    )?;
+    assert!(
+        response_b.contains("Another session is editing"),
+        "session B should be blocked by guardrail, got: {response_b}",
+    );
+
+    Ok(())
+}
+
+/// Sandwich correlation end-to-end: `PreToolUse` hook followed by MCP
+/// `tools/call` binds the connection to the session.
+#[test]
+fn correlation_end_to_end() -> Result<()> {
+    let state_dir = tempfile::tempdir()?;
+    let state_home = state_dir.path().to_str().context("state dir")?;
+
+    let root = tempfile::tempdir()?;
+    let root_str = root.path().to_str().context("root path")?;
+
+    let file = root.path().join(format!("corr.{MOCK_LANG}"));
+    std::fs::write(&file, "fn correlated_fn()\n")?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG, "--scan-roots");
+
+    let mut bridge = BridgeProcess::spawn_in_state(state_home, |cmd| {
+        cmd.env("CATENARY_SERVERS", &lsp);
+        cmd.env("CATENARY_ROOTS", root_str);
+    })?;
+    bridge.initialize()?;
+
+    let hook_path = wait_for_hook_socket(state_home);
+
+    // 1. Send PreToolUse hook for a Catenary tool with session_id.
+    hook_roundtrip(
+        &hook_path,
+        &json!({
+            "method": "pre-tool/editing-state",
+            "tool_name": "mcp_catenary_grep",
+            "agent_id": "",
+            "session_id": "corr-session"
+        }),
+    )?;
+
+    // 2. Send MCP tools/call — this resolves correlation.
+    let text = bridge.call_tool_text("grep", &json!({"pattern": "correlated_fn"}))?;
+    assert!(
+        text.contains("correlated_fn"),
+        "grep should work after correlation, got:\n{text}",
+    );
+
+    // 3. Subsequent hooks for the same session should route correctly.
+    //    Verify by sending a pre-agent hook (which increments the turn
+    //    counter on the correlated session).
+    hook_roundtrip(
+        &hook_path,
+        &json!({
+            "method": "pre-agent/turn-start",
+            "session_id": "corr-session"
+        }),
+    )?;
+
+    // Verify session is still functional — another grep should work.
+    let text = bridge.call_tool_text("grep", &json!({"pattern": "correlated_fn"}))?;
+    assert!(
+        text.contains("correlated_fn"),
+        "grep should work after turn-start hook, got:\n{text}",
+    );
+
+    Ok(())
 }

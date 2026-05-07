@@ -58,7 +58,8 @@ pub struct BridgeProcess {
     stderr_log: Option<PathBuf>,
     state_home: String,
     /// Internal tempdir for XDG state/config isolation.
-    _state_dir: tempfile::TempDir,
+    /// `None` when using a shared (externally-owned) state dir.
+    _state_dir: Option<tempfile::TempDir>,
 }
 
 impl BridgeProcess {
@@ -126,6 +127,43 @@ impl BridgeProcess {
         })
     }
 
+    /// Spawns using an externally-owned state directory.
+    ///
+    /// The caller keeps the state dir alive. Multiple bridges can share
+    /// the same `state_home` to connect to the same daemon — the first
+    /// bridge starts the daemon, subsequent bridges connect to it.
+    pub fn spawn_in_state(state_home: &str, configure: impl FnOnce(&mut Command)) -> Result<Self> {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static BRIDGE_SEQ: AtomicU32 = AtomicU32::new(0);
+
+        let state_home = state_home.to_string();
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
+        isolate_env(&mut cmd, &state_home);
+        configure(&mut cmd);
+
+        let seq = BRIDGE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let stderr_path = PathBuf::from(&state_home).join(format!("bridge_stderr_{seq}.log"));
+        let stderr_file =
+            std::fs::File::create(&stderr_path).context("Failed to create stderr log")?;
+
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::from(stderr_file));
+
+        let mut child = cmd.spawn().context("Failed to spawn bridge")?;
+        let stdin = child.stdin.take().context("Failed to get stdin")?;
+        let stdout = BufReader::new(child.stdout.take().context("Failed to get stdout")?);
+
+        Ok(Self {
+            child,
+            stdin: Some(stdin),
+            stdout: Some(stdout),
+            stderr_log: Some(stderr_path),
+            state_home,
+            _state_dir: None,
+        })
+    }
+
     /// Shared spawn: creates state dir, isolates env, lets `configure`
     /// set `CATENARY_*` vars (after `isolate_env` cleared them), then
     /// redirects stderr and starts the process.
@@ -172,7 +210,7 @@ impl BridgeProcess {
             stdout: Some(stdout),
             stderr_log: Some(stderr_path),
             state_home,
-            _state_dir: state_dir,
+            _state_dir: Some(state_dir),
         })
     }
 
