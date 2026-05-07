@@ -16,7 +16,6 @@
 //! way, these accumulated").
 
 use crate::logging::Severity;
-use crate::logging::notification_queue::NotificationQueueSink;
 
 /// Background section header: 3 em-dashes, space, "background", space, 3 em-dashes.
 const BACKGROUND_HEADER: &str = "─── background ───";
@@ -55,14 +54,6 @@ impl SystemMessageBuilder {
     /// Rendered as `[severity] message`.
     pub fn push_direct(&mut self, severity: Severity, message: &str) {
         self.direct.push(format!("[{}] {message}", severity.tag()));
-    }
-
-    /// Drain the notification queue, storing rendered lines as background
-    /// content.
-    pub fn drain_background(&mut self, queue: &NotificationQueueSink) {
-        for notification in &queue.drain() {
-            self.background.push(notification.format());
-        }
     }
 
     /// Add a pre-rendered background line.
@@ -116,28 +107,6 @@ impl Default for SystemMessageBuilder {
 )]
 mod tests {
     use super::*;
-    use crate::logging::notification_queue::NotificationQueueSink;
-    use crate::logging::{LogEvent, Severity, Sink};
-
-    /// Helper: create a `LogEvent` for feeding into sinks directly.
-    fn make_event(severity: Severity, message: &str, server: Option<&str>) -> LogEvent<'static> {
-        LogEvent {
-            severity,
-            target: "test",
-            message: message.to_string(),
-            kind: None,
-            method: None,
-            server: server.map(str::to_string),
-            client: None,
-            request_id: None,
-            parent_id: None,
-            source: None,
-            language: None,
-            payload: None,
-            session_id: None,
-            fields: serde_json::Map::new(),
-        }
-    }
 
     // ── Composition unit tests ─────────────────────────────────────────
 
@@ -191,133 +160,5 @@ mod tests {
         assert!(parts[0].starts_with("[err]"));
         assert!(parts[1].starts_with("─── background ───"));
         assert!(parts[1].contains("[warn] server crashed"));
-    }
-
-    // ── drain_background tests ─────────────────────────────────────────
-
-    #[test]
-    fn drain_background_empties_queue() {
-        let queue = NotificationQueueSink::new(Severity::Warn);
-
-        queue.handle(&make_event(Severity::Warn, "server offline", Some("ra")));
-        assert_eq!(queue.len(), 1);
-
-        let mut builder = SystemMessageBuilder::new();
-        builder.drain_background(&queue);
-        assert!(queue.is_empty(), "queue should be empty after drain");
-
-        let result = builder.finish().expect("should have background");
-        assert!(result.contains("[warn] server offline"));
-    }
-
-    #[test]
-    fn drain_background_empty_queue_no_content() {
-        let queue = NotificationQueueSink::new(Severity::Warn);
-
-        let mut builder = SystemMessageBuilder::new();
-        builder.drain_background(&queue);
-        assert!(builder.finish().is_none());
-    }
-
-    // ── Integration-style: builder + queue + dispatch scenarios ─────────
-
-    #[test]
-    fn session_start_empty_queue_empty_direct_no_field() {
-        let queue = NotificationQueueSink::new(Severity::Warn);
-
-        let mut builder = SystemMessageBuilder::new();
-        builder.drain_background(&queue);
-        assert!(builder.finish().is_none());
-    }
-
-    #[test]
-    fn session_start_direct_only() {
-        let queue = NotificationQueueSink::new(Severity::Warn);
-
-        let mut builder = SystemMessageBuilder::new();
-        builder.push_direct(Severity::Warn, "config: invalid TOML on line 12");
-        builder.drain_background(&queue);
-        let result = builder.finish().expect("should have direct");
-        assert_eq!(result, "[warn] config: invalid TOML on line 12");
-        assert!(!result.contains("background"));
-    }
-
-    #[test]
-    fn session_start_direct_and_background() {
-        let queue = NotificationQueueSink::new(Severity::Warn);
-        queue.handle(&make_event(
-            Severity::Error,
-            "python-lsp crashed during previous teardown",
-            Some("pylsp"),
-        ));
-
-        let mut builder = SystemMessageBuilder::new();
-        builder.push_direct(
-            Severity::Error,
-            "config: removed `inherit` field — run `catenary doctor`",
-        );
-        builder.drain_background(&queue);
-        let result = builder.finish().expect("should have both");
-        assert!(result.starts_with("[err] config: removed `inherit` field"));
-        assert!(result.contains("─── background ───"));
-        assert!(result.contains("[err] python-lsp crashed"));
-    }
-
-    #[test]
-    fn stop_allow_drains() {
-        let queue = NotificationQueueSink::new(Severity::Warn);
-        queue.handle(&make_event(Severity::Warn, "ra offline", Some("ra")));
-
-        // Simulate allow: drain background.
-        let mut builder = SystemMessageBuilder::new();
-        builder.drain_background(&queue);
-        let result = builder.finish().expect("should drain");
-        assert!(result.contains("[warn] ra offline"));
-        assert!(queue.is_empty());
-    }
-
-    #[test]
-    fn stop_block_preserves_queue() {
-        let queue = NotificationQueueSink::new(Severity::Warn);
-        queue.handle(&make_event(Severity::Warn, "ra offline", Some("ra")));
-
-        // Simulate block: don't drain.
-        assert_eq!(queue.len(), 1, "queue should be preserved when blocking");
-    }
-
-    #[test]
-    fn dedup_persists_across_blocked_cycle() {
-        let queue = NotificationQueueSink::new(Severity::Warn);
-
-        // First cycle: enqueue, block (no drain).
-        queue.handle(&make_event(Severity::Warn, "ra offline", Some("ra")));
-        assert_eq!(queue.len(), 1);
-
-        // Second cycle: same message enqueued again (dedup rejects).
-        queue.handle(&make_event(Severity::Warn, "ra offline", Some("ra")));
-        assert_eq!(queue.len(), 1, "dedup should reject duplicate");
-
-        // Allow: drain.
-        let mut builder = SystemMessageBuilder::new();
-        builder.drain_background(&queue);
-        let result = builder.finish().expect("should have one entry");
-        // Header + 1 notification = 2 lines total.
-        let line_count = result.lines().count();
-        assert_eq!(
-            line_count, 2,
-            "expected header + 1 notification, got: {result}"
-        );
-    }
-
-    #[test]
-    fn pre_post_tool_hooks_do_not_drain() {
-        let queue = NotificationQueueSink::new(Severity::Warn);
-        queue.handle(&make_event(Severity::Warn, "offline", Some("ra")));
-        queue.handle(&make_event(Severity::Error, "crashed", Some("pylsp")));
-
-        // Simulate 4 PreToolUse fires — no drain, queue untouched.
-        for _ in 0..4 {
-            assert_eq!(queue.len(), 2, "queue should be untouched by pre/post tool");
-        }
     }
 }
