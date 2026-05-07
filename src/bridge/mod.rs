@@ -5,6 +5,8 @@
 pub mod cwd_stash;
 /// Diagnostics pipeline for PostToolUse hook requests.
 pub mod diagnostics_server;
+/// Cross-session per-root editing guardrail.
+pub mod editing_guardrail;
 /// In-memory editing state manager.
 pub mod editing_manager;
 /// Glob tool handler: unified file/directory/pattern browsing.
@@ -25,6 +27,7 @@ pub mod session;
 pub mod tool_server;
 
 pub use diagnostics_server::DiagnosticsServer;
+pub use editing_guardrail::EditingGuardrail;
 pub use editing_manager::EditingManager;
 pub use handler::McpRouter;
 pub use hook_router::HookRouter;

@@ -297,6 +297,9 @@ impl ToolHandler for McpRouter {
             }
 
             let files = self.session.editing.drain_all_and_clear();
+            if let Some(guardrail) = &self.session.editing_guardrail {
+                guardrail.release_all(&self.session.instance_id);
+            }
             let entry_id = parent_id.unwrap_or(0);
             let output = self.session.runtime.block_on(
                 self.session

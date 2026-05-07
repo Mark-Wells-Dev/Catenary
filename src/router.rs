@@ -18,6 +18,7 @@ use anyhow::{Context, Result, anyhow};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error, info, warn};
 
+use crate::bridge::EditingGuardrail;
 use crate::bridge::HookRouter;
 use crate::bridge::McpRouter;
 use crate::bridge::is_catenary_tool;
@@ -316,6 +317,10 @@ struct HookDispatchContext {
     logging: LoggingServer,
     /// Root tracker for refcount-aware root management across sessions.
     root_tracker: Option<RootTracker>,
+    /// Cross-session per-root editing guardrail. Shared with all
+    /// per-session `Session` instances to prevent concurrent editing
+    /// in the same workspace root.
+    editing_guardrail: Arc<EditingGuardrail>,
 }
 
 /// Tracks per-contributor workspace root sets for reference counting.
@@ -649,6 +654,10 @@ impl SessionManager {
         let correlation = self.correlation.clone();
         let lsp = self.lsp.clone();
         let root_tracker = self.root_tracker.clone();
+        let editing_guardrail = self
+            .hook_ctx
+            .as_ref()
+            .map(|ctx| ctx.editing_guardrail.clone());
         let db_conn = self.db_conn.clone();
 
         count.fetch_add(1, Ordering::Relaxed);
@@ -708,6 +717,7 @@ impl SessionManager {
                 let correlation_cleanup = correlation.clone();
                 let sessions_cleanup = sessions_for_callback.clone();
                 let lsp_cleanup = lsp.clone();
+                let guardrail_cleanup = editing_guardrail.clone();
 
                 let result = tokio::task::spawn_blocking(move || {
                     let _entered = span_for_blocking.enter();
@@ -867,6 +877,13 @@ impl SessionManager {
                                 .remove(sid.as_str());
                         }
 
+                        // Release any editing guardrail locks held by
+                        // this session (crash-safety: prevents stuck
+                        // locks if the agent dies mid-edit).
+                        if let Some(ref guardrail) = guardrail_cleanup {
+                            guardrail.release_all(sid);
+                        }
+
                         // Clean up correlation state.
                         correlation_cleanup
                             .session_connections
@@ -944,6 +961,7 @@ impl SessionManager {
             conn,
             logging: self.logging.clone(),
             root_tracker: Some(root_tracker),
+            editing_guardrail: Arc::new(EditingGuardrail::new()),
         });
         self
     }
@@ -1226,7 +1244,11 @@ fn get_or_create_router(ctx: &HookDispatchContext, session_id: &str) -> Arc<Hook
                 session_id, "creating session",
             );
             let session_id_arc: Arc<str> = session_id.into();
-            let session = Arc::new(Session::new_for_daemon(&ctx.primary, session_id_arc));
+            let session = Arc::new(Session::new_for_daemon(
+                &ctx.primary,
+                session_id_arc,
+                Some(ctx.editing_guardrail.clone()),
+            ));
             let router = Arc::new(HookRouter::new(
                 session.clone(),
                 ctx.conn.clone(),
@@ -1338,6 +1360,10 @@ async fn handle_hook_dispatch(
     // a new session just to immediately clean it up.
     if method == "session-end/cleanup" {
         let id = ctx.logging.next_id();
+
+        // Release editing guardrail locks (idempotent if MCP
+        // disconnect already ran).
+        ctx.editing_guardrail.release_all(&session_id);
 
         if let Some(ref tracker) = ctx.root_tracker {
             let transcript_key = format!("transcript:{session_id}");

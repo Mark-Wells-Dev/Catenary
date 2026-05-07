@@ -15,6 +15,7 @@ use tokio::sync::RwLock;
 
 use super::cwd_stash::CwdStash;
 use super::diagnostics_server::DiagnosticsServer;
+use super::editing_guardrail::EditingGuardrail;
 use super::editing_manager::EditingManager;
 use super::file_tools::GlobServer;
 use super::filesystem_manager::FilesystemManager;
@@ -140,6 +141,12 @@ pub struct Session {
     pub diagnostics: Arc<DiagnosticsServer>,
     /// In-memory editing state (`start_editing`/`done_editing` lifecycle).
     pub editing: EditingManager,
+    /// Cross-session per-root editing guardrail (daemon mode only).
+    ///
+    /// `None` in single-session mode. When present, `start_editing`
+    /// checks this guardrail before entering editing mode, and
+    /// `done_editing` / session cleanup release all held locks.
+    pub editing_guardrail: Option<Arc<EditingGuardrail>>,
     /// Pending host-CLI cwd for grep/glob relative-pattern resolution.
     pub cwd_stash: CwdStash,
     /// LSP client manager (also owns document manager).
@@ -272,6 +279,7 @@ impl Session {
             glob,
             diagnostics,
             editing: EditingManager::new(),
+            editing_guardrail: None,
             cwd_stash: CwdStash::new(),
             client_manager,
             fs_manager,
@@ -299,7 +307,11 @@ impl Session {
     /// tracing sink — per-session notification routing is added in a later
     /// phase. Until then, the per-session queue stays empty on drain.
     #[must_use]
-    pub fn new_for_daemon(primary: &Self, session_id: Arc<str>) -> Self {
+    pub fn new_for_daemon(
+        primary: &Self,
+        session_id: Arc<str>,
+        editing_guardrail: Option<Arc<EditingGuardrail>>,
+    ) -> Self {
         let threshold = primary
             .config
             .notifications
@@ -359,6 +371,7 @@ impl Session {
             },
             diagnostics: primary.diagnostics.clone(),
             editing: EditingManager::new(),
+            editing_guardrail,
             cwd_stash: CwdStash::new(),
             client_manager: primary.client_manager.clone(),
             fs_manager: primary.fs_manager.clone(),
@@ -396,6 +409,16 @@ impl Session {
     #[must_use]
     pub fn is_within_roots(&self, path: &Path) -> bool {
         self.fs_manager.resolve_root(path).is_some()
+    }
+
+    /// Returns the workspace root containing the given path, if any.
+    ///
+    /// Longest-prefix match against known roots. Used by the editing
+    /// guardrail to lock the specific root being edited rather than
+    /// all session roots.
+    #[must_use]
+    pub fn resolve_root(&self, path: &Path) -> Option<PathBuf> {
+        self.fs_manager.resolve_root(path)
     }
 
     /// Returns `true` if the path has known LSP coverage for diagnostics.

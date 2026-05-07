@@ -622,6 +622,8 @@ impl HookRouter {
         agent_id: &str,
     ) -> Option<HookResult> {
         // start_editing: enter editing mode and allow unconditionally.
+        // The cross-session guardrail is checked lazily at Edit/Write
+        // time (below), when the file path reveals the actual root.
         if is_catenary_tool(tool_name, "start_editing") {
             let _ = self.session.editing.start_editing(session_id, agent_id);
             return None;
@@ -630,9 +632,21 @@ impl HookRouter {
         let agent_editing = self.session.editing.is_editing(session_id, agent_id);
 
         if agent_editing {
-            if is_allowed_during_editing(tool_name)
+            if is_edit_tool(tool_name) {
+                // Check cross-session guardrail on the file's root.
+                // Locks are acquired lazily per-root, so only roots
+                // with actual edits are locked.
+                if let Some(guardrail) = &self.session.editing_guardrail
+                    && let Some(root) = file_path
+                        .map(Path::new)
+                        .and_then(|p| self.session.resolve_root(p))
+                    && let Err(msg) = guardrail.try_acquire(&root, &self.session.instance_id)
+                {
+                    return Some(HookResult::Deny(msg));
+                }
+                None
+            } else if is_allowed_during_editing(tool_name)
                 || is_read_tool(tool_name)
-                || is_edit_tool(tool_name)
                 || (is_bash_tool(tool_name) && command.is_some_and(is_filesystem_only_bash))
             {
                 None
@@ -701,6 +715,9 @@ impl HookRouter {
             // Agent was told to call done_editing but didn't. Clear stale
             // state rather than leaving it for SessionStart/GC cleanup.
             self.session.editing.done_editing(session_id, agent_id);
+            if let Some(guardrail) = &self.session.editing_guardrail {
+                guardrail.release_all(&self.session.instance_id);
+            }
             return None;
         }
 
@@ -716,8 +733,13 @@ impl HookRouter {
     /// Clear stale editing state on session start/resume.
     ///
     /// Returns the count of cleared entries, or `None` if nothing was cleared.
+    /// Also releases any cross-session editing guardrail locks held by
+    /// this session.
     fn handle_clear_editing(&self) -> Option<HookResult> {
         let count = self.session.editing.clear_all();
+        if let Some(guardrail) = &self.session.editing_guardrail {
+            guardrail.release_all(&self.session.instance_id);
+        }
 
         if count > 0 {
             Some(HookResult::Cleared(count))
