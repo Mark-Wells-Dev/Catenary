@@ -1365,14 +1365,14 @@ fn test_grep_alternation() -> Result<()> {
     Ok(())
 }
 
-/// Budget-driven tier demotion: broad pattern exceeding `budget` at tier 1
-/// demotes to tier 2 structure heatmap with no LSP enrichment.
+/// Budget-driven paging: broad pattern exceeding `budget` produces
+/// multiple pages with `[page N/M]` header instead of tier demotion.
 #[test]
 fn test_grep_enrichment_threshold_broad() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
-    // Create many unique symbols to exceed tier 1 budget
+    // Create many unique symbols to exceed budget on a single page
     let mut content = String::new();
     for i in 0..30 {
         use std::fmt::Write;
@@ -1386,7 +1386,7 @@ fn test_grep_enrichment_threshold_broad() -> Result<()> {
     let test_file = dir.path().join(format!("many.{MOCK_LANG_A}"));
     std::fs::write(&test_file, &content)?;
 
-    // Small budget forces tier demotion
+    // Small budget forces paging
     let config_path = dir.path().join("config.toml");
     let mockls_bin = env!("CARGO_BIN_EXE_mockls");
     std::fs::write(
@@ -1424,21 +1424,23 @@ fn test_grep_enrichment_threshold_broad() -> Result<()> {
         .as_str()
         .context("Missing text for broad search")?;
 
-    // Tier 2: structure heatmap — no LSP enrichment sections
+    // Should have page header indicating multiple pages
     assert!(
-        !text.contains("calls:") && !text.contains("refs:"),
-        "Tier 2 should have no enrichment sections, got: {text}"
+        text.starts_with("[page 1/"),
+        "Expected [page 1/N] header, got: {text}"
     );
     // Should still contain results
     assert!(
         text.contains("zz_broad"),
         "Expected results present, got: {text}"
     );
-    // Should reference the file
-    let expected_file = format!("many.{MOCK_LANG_A}");
+    // Should not contain all 30 symbols (truncated to page)
+    let sym_count = (0..30)
+        .filter(|i| text.contains(&format!("zz_broad_{i}")))
+        .count();
     assert!(
-        text.contains(&expected_file),
-        "Expected file reference, got: {text}"
+        sym_count < 30,
+        "Expected paged output (not all 30 symbols), got {sym_count}"
     );
 
     Ok(())
@@ -1778,7 +1780,7 @@ fn test_grep_enrichment_incoming_calls() -> Result<()> {
         .as_str()
         .context("Missing text for incoming calls")?;
 
-    // Enrichment runs and tier 1 renders the result
+    // Enrichment runs and renders the result
     assert!(
         text.contains("callee_fn"),
         "Expected callee_fn in output, got:\n{text}"
@@ -1826,7 +1828,7 @@ fn test_grep_enrichment_implementations() -> Result<()> {
         .as_str()
         .context("Missing text for implementations")?;
 
-    // Enrichment runs and tier 1 renders the result
+    // Enrichment runs and renders the result
     assert!(
         text.contains("MyStruct"),
         "Expected MyStruct in output, got:\n{text}"
@@ -1871,7 +1873,7 @@ fn test_grep_enrichment_subtypes() -> Result<()> {
         .as_str()
         .context("Missing text for subtypes")?;
 
-    // Enrichment runs and tier 1 renders the result
+    // Enrichment runs and renders the result
     assert!(
         text.contains("Animal"),
         "Expected Animal in output, got:\n{text}"
@@ -2395,11 +2397,11 @@ fn test_glob_parent_id_threading() -> Result<()> {
     Ok(())
 }
 
-// ─── 06b: Tier selection and rendering ──────────────────────────────────
+// ─── 06b: Grep rendering ────────────────────────────────────────────────
 
-/// Tier 2 structure heatmap: names grouped with enclosing structures and spans.
+/// Name grouping: definitions with enclosing structures and spans.
 #[test]
-fn test_grep_tier2_structure_heatmap() -> Result<()> {
+fn test_grep_name_grouping() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
@@ -2452,9 +2454,9 @@ fn test_grep_tier2_structure_heatmap() -> Result<()> {
     Ok(())
 }
 
-/// Tier 2 for no-grammar file: bare hit lines without enclosing structures.
+/// No-grammar file: bare hit lines without enclosing structures.
 #[test]
-fn test_grep_tier2_no_grammar() -> Result<()> {
+fn test_grep_no_grammar() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let file = dir.path().join(format!("data.{MOCK_LANG_A}"));
     std::fs::write(&file, "fn say_hello()\nsay_hello\n")?;
@@ -2493,9 +2495,9 @@ fn test_grep_tier2_no_grammar() -> Result<()> {
     Ok(())
 }
 
-/// Narrow pattern fits tier 2: assert tier 2 output with name groups.
+/// Narrow pattern: name at column 0 with kind label.
 #[test]
-fn test_grep_tier_promotion() -> Result<()> {
+fn test_grep_narrow_pattern() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
@@ -2521,7 +2523,7 @@ fn test_grep_tier_promotion() -> Result<()> {
         .as_str()
         .context("Missing text")?;
 
-    // Tier 1 or 2 format: name at column 0, <Kind> label present
+    // Name at column 0, <Kind> label present
     assert!(
         text.contains("unique_symbol_xyz"),
         "Expected name in output, got:\n{text}"
@@ -2529,12 +2531,6 @@ fn test_grep_tier_promotion() -> Result<()> {
     assert!(
         text.contains("<Function>"),
         "Expected <Function> kind, got:\n{text}"
-    );
-
-    // Not tier 3 bucketed (no wildcard patterns)
-    assert!(
-        !text.contains("_*"),
-        "Expected tier 1 or 2, not tier 3 bucketed, got:\n{text}"
     );
 
     Ok(())
@@ -2695,7 +2691,7 @@ fn test_grep_prepare_rename_priority_chain() -> Result<()> {
 
 /// Enrich a function: `outgoing_calls` and `ref_lines` are populated.
 /// Uses the no-grammar path (mockls, no tree-sitter grammar installed).
-/// Enrichment runs via the pipeline; output is still tier 2.
+/// Enrichment runs via the pipeline.
 #[test]
 fn test_enrich_ungated_function() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -2729,7 +2725,7 @@ fn test_enrich_ungated_function() -> Result<()> {
         .as_str()
         .context("Missing text")?;
 
-    // Tool completes successfully with enrichment running (tier 2 output)
+    // Tool completes successfully with enrichment
     assert!(
         text.contains("callee_fn"),
         "Expected callee_fn in output, got:\n{text}"
@@ -3005,7 +3001,7 @@ fn test_enrich_outgoing_calls() -> Result<()> {
         .as_str()
         .context("Missing text")?;
 
-    // Tier 1 renders enrichment — outgoing calls visible
+    // Enrichment — outgoing calls visible
     assert!(
         text.contains("main_fn"),
         "Expected main_fn in output, got:\n{text}"
@@ -3014,13 +3010,13 @@ fn test_enrich_outgoing_calls() -> Result<()> {
     Ok(())
 }
 
-// ─── SEARCHv2 tier 1 rendering tests (ticket 07b) ──────────────────────
+// ─── SEARCHv2 enriched rendering tests (ticket 07b) ────────────────────
 
 /// Grammar-path enrichment: verify calls appear for simple functions.
 /// Regression test for the document lifecycle bug where `didClose` between
 /// enrichment methods caused mockls to lose pre-indexed state.
 #[test]
-fn test_grep_tier1_grammar_path_calls() -> Result<()> {
+fn test_grep_grammar_path_calls() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
@@ -3064,9 +3060,9 @@ fn test_grep_tier1_grammar_path_calls() -> Result<()> {
     Ok(())
 }
 
-/// Tier 1 enriched: `calls:` section with outgoing calls and `<Function>` labels.
+/// Enriched:`calls:` section with outgoing calls and `<Function>` labels.
 #[test]
-fn test_grep_tier1_enriched() -> Result<()> {
+fn test_grep_enriched() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
@@ -3094,13 +3090,17 @@ fn test_grep_tier1_enriched() -> Result<()> {
         .as_str()
         .context("Missing text")?;
 
-    // Root header followed by name at depth 0
+    // Page header followed by bare root path and name at depth 0
     assert!(
-        text.starts_with("Root: "),
-        "Expected Root: header, got:\n{text}"
+        text.starts_with("[page "),
+        "Expected [page N/M] header, got:\n{text}"
     );
     assert!(
-        text.contains("\ncaller_t1\n"),
+        !text.contains("Root: "),
+        "Should not contain Root: prefix, got:\n{text}"
+    );
+    assert!(
+        text.contains("caller_t1"),
         "Expected caller_t1 name group, got:\n{text}"
     );
     // Grammar path: tree-sitter kind label
@@ -3121,9 +3121,9 @@ fn test_grep_tier1_enriched() -> Result<()> {
     Ok(())
 }
 
-/// Tier 1 type hierarchy: subtypes section present for interface pattern.
+/// Type hierarchy: subtypes section present for interface pattern.
 #[test]
-fn test_grep_tier1_type_hierarchy() -> Result<()> {
+fn test_grep_type_hierarchy() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
@@ -3172,9 +3172,9 @@ fn test_grep_tier1_type_hierarchy() -> Result<()> {
     Ok(())
 }
 
-/// Tier 1 path syntax: `<Struct> Container/<Function> name  path:line`.
+/// Path syntax: `<Struct> Container/<Function> name  path:line`.
 #[test]
-fn test_grep_tier1_path_syntax() -> Result<()> {
+fn test_grep_path_syntax() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
@@ -3215,9 +3215,9 @@ fn test_grep_tier1_path_syntax() -> Result<()> {
     Ok(())
 }
 
-/// Tier 1 refs: lines ascending within file for same-file references.
+/// Refs: lines ascending within file for same-file references.
 #[test]
-fn test_grep_tier1_refs_sort() -> Result<()> {
+fn test_grep_refs_sort() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
@@ -3257,9 +3257,9 @@ fn test_grep_tier1_refs_sort() -> Result<()> {
     Ok(())
 }
 
-/// Tier 1 outgoing calls sorted alphabetically.
+/// Outgoing calls sorted alphabetically.
 #[test]
-fn test_grep_tier1_outgoing_calls_sorted() -> Result<()> {
+fn test_grep_outgoing_calls_sorted() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
@@ -3312,9 +3312,9 @@ fn test_grep_tier1_outgoing_calls_sorted() -> Result<()> {
     Ok(())
 }
 
-/// Tier 1 deprecated: `<Kind, deprecated>` in output.
+/// Deprecated: `<Kind, deprecated>` in output.
 #[test]
-fn test_grep_tier1_deprecated() -> Result<()> {
+fn test_grep_deprecated() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
@@ -3357,13 +3357,13 @@ fn test_grep_tier1_deprecated() -> Result<()> {
     Ok(())
 }
 
-/// Tier 1 demotion to tier 2: too many symbols for tier 1 budget.
+/// Paging: many symbols exceed budget → paged output, not demotion.
 #[test]
-fn test_grep_tier1_demote_to_tier2() -> Result<()> {
+fn test_grep_paged_integration() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
-    // Create many unique symbols to exceed tier 1 budget
+    // Create many unique symbols to exceed budget on a single page
     let mut content = String::new();
     for i in 0..50 {
         use std::fmt::Write;
@@ -3404,23 +3404,52 @@ fn test_grep_tier1_demote_to_tier2() -> Result<()> {
         .as_str()
         .context("Missing text")?;
 
-    // Tier 2 or tier 3 format: bucketed or heatmap (no calls:/refs: sections)
+    // Page header present, multiple pages expected
     assert!(
-        !text.contains("calls:") && !text.contains("refs:"),
-        "Expected demotion (no enrichment sections), got:\n{text}"
+        text.starts_with("[page 1/"),
+        "Expected [page 1/N] header, got:\n{text}"
     );
-    // But should still contain results
+    // Should still contain results
     assert!(
         text.contains("demote_sym"),
         "Expected results present, got:\n{text}"
+    );
+    // Not all 50 symbols on one page
+    let sym_count = (0..50)
+        .filter(|i| text.contains(&format!("demote_sym_{i}")))
+        .count();
+    assert!(
+        sym_count < 50,
+        "Expected paged output (not all 50 symbols), got {sym_count}"
+    );
+
+    // Request page 2
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 6061,
+        "method": "tools/call",
+        "params": {
+            "name": "grep",
+            "arguments": { "pattern": "demote_sym", "page": 2 }
+        }
+    }))?;
+
+    let response2 = bridge.recv()?;
+    let text2 = response2["result"]["content"][0]["text"]
+        .as_str()
+        .context("Missing text page 2")?;
+
+    assert!(
+        text2.starts_with("[page 2/"),
+        "Expected [page 2/N] header, got:\n{text2}"
     );
 
     Ok(())
 }
 
-/// Tier 1 fish-eye: rich symbol (with calls) gets full format, lean gets single line.
+/// Fish-eye: rich symbol (with calls) gets full format, lean gets single line.
 #[test]
-fn test_grep_tier1_fish_eye() -> Result<()> {
+fn test_grep_fish_eye() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
@@ -3472,9 +3501,9 @@ fn test_grep_tier1_fish_eye() -> Result<()> {
     Ok(())
 }
 
-/// Tier 1 property order: calls → impls → supertypes → subtypes → refs.
+/// Property order: calls → impls → supertypes → subtypes → refs.
 #[test]
-fn test_grep_tier1_property_order() -> Result<()> {
+fn test_grep_property_order() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
@@ -3517,9 +3546,9 @@ fn test_grep_tier1_property_order() -> Result<()> {
     Ok(())
 }
 
-/// Tier 1 name grouping: bare name at depth 0, definitions indented below.
+/// Name grouping: bare name at depth 0, definitions indented below.
 #[test]
-fn test_grep_tier1_name_grouping() -> Result<()> {
+fn test_grep_enriched_name_grouping() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
@@ -3546,30 +3575,37 @@ fn test_grep_tier1_name_grouping() -> Result<()> {
         .context("Missing text")?;
 
     let lines: Vec<&str> = text.lines().collect();
-    // First line: Root: header
+    // First line: [page N/M] header
     assert!(
-        !lines.is_empty() && lines[0].starts_with("Root: "),
-        "Expected Root: header in first line, got:\n{text}"
+        !lines.is_empty() && lines[0].starts_with("[page "),
+        "Expected [page N/M] header in first line, got:\n{text}"
     );
-    // Second line: bare name at depth 0 (no leading tab)
+    // Second line: blank (separator after page header)
+    // Third line: bare root path (no Root: prefix)
     assert!(
-        lines.len() > 1 && lines[1].contains("grouped_sym") && !lines[1].starts_with('\t'),
-        "Expected name at depth 0 in second line, got:\n{text}"
+        !text.contains("Root: "),
+        "Should not contain Root: prefix, got:\n{text}"
     );
-    // Third line: definition indented (leading tab)
-    if lines.len() > 2 {
-        assert!(
-            lines[2].starts_with('\t'),
-            "Expected indented definition line, got:\n{text}"
-        );
-    }
+    // Name at depth 0 (no leading tab)
+    assert!(
+        text.contains("\ngrouped_sym\n"),
+        "Expected name at depth 0, got:\n{text}"
+    );
+    // Definition indented (leading tab)
+    let has_indented_def = lines
+        .iter()
+        .any(|l| l.starts_with('\t') && l.contains("grouped_sym"));
+    assert!(
+        has_indented_def,
+        "Expected indented definition line, got:\n{text}"
+    );
 
     Ok(())
 }
 
-/// Tier 1 cross-definition dedup: impl suppressed when listed in struct's impls.
+/// Cross-definition dedup: impl suppressed when listed in struct's impls.
 #[test]
-fn test_grep_tier1_cross_def_dedup() -> Result<()> {
+fn test_grep_cross_def_dedup() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
@@ -3615,10 +3651,10 @@ fn test_grep_tier1_cross_def_dedup() -> Result<()> {
     Ok(())
 }
 
-/// Tier 1 refs dedup: impl lines excluded from `refs:` when in `impls:`.
+/// Refs dedup: impl lines excluded from `refs:` when in `impls:`.
 /// Uses no-grammar path so mockls has all documents open for enrichment.
 #[test]
-fn test_grep_tier1_refs_dedup_labeled() -> Result<()> {
+fn test_grep_refs_dedup_labeled() -> Result<()> {
     let dir = tempfile::tempdir()?;
 
     // struct defined, then a reference on L1. mockls routes implementation
@@ -3676,10 +3712,10 @@ fn test_grep_tier1_refs_dedup_labeled() -> Result<()> {
     Ok(())
 }
 
-/// Tier 1 incoming calls merge: callers appear in `refs:`, not a separate section.
+/// Incoming calls merge: callers appear in `refs:`, not a separate section.
 /// Uses no-grammar path for reliable enrichment.
 #[test]
-fn test_grep_tier1_incoming_calls_merge() -> Result<()> {
+fn test_grep_incoming_calls_merge() -> Result<()> {
     let dir = tempfile::tempdir()?;
 
     // target defined on L0, caller on L1, caller calls target on L2
@@ -3715,10 +3751,10 @@ fn test_grep_tier1_incoming_calls_merge() -> Result<()> {
     Ok(())
 }
 
-/// Tier 1 impls structure: `impls:` has file-grouped entries with tree-sitter spans.
+/// Impls structure: `impls:` has file-grouped entries with tree-sitter spans.
 /// Uses no-grammar path for reliable enrichment.
 #[test]
-fn test_grep_tier1_impls_structure() -> Result<()> {
+fn test_grep_impls_structure() -> Result<()> {
     let dir = tempfile::tempdir()?;
 
     let file = dir.path().join(format!("impls.{MOCK_LANG_A}"));
@@ -3759,9 +3795,9 @@ fn test_grep_tier1_impls_structure() -> Result<()> {
     Ok(())
 }
 
-/// Tier 1 single-line ref: `:hit <Kind> name:line` (no range when start == end).
+/// Single-line ref: `:hit <Kind> name:line` (no range when start == end).
 #[test]
-fn test_grep_tier1_single_line_ref() -> Result<()> {
+fn test_grep_single_line_ref() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 

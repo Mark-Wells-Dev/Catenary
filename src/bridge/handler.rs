@@ -125,10 +125,11 @@ impl ToolHandler for McpRouter {
                      and ripgrep in parallel. Use `|` for alternation (e.g., `foo|bar`). \
                      Scope with `glob` and `exclude` to narrow the file set. Relative \
                      glob patterns resolve against your current working directory.\n\n\
-                     Output fits a {grep_budget}-character budget. Broad queries produce more \
-                     matches than the budget can show at full detail, so the tool reduces \
-                     detail automatically. Narrow your pattern or add a glob to get richer \
-                     results."
+                     Output fits a {grep_budget}-character budget. When results exceed a \
+                     single page, output is truncated with a `[page N/M]` header \u{2014} pass \
+                     `page` to retrieve subsequent pages. Results include enriched navigation \
+                     edges (calls, impls, supertypes, subtypes) when LSP symbol data is \
+                     available, or a structure heatmap otherwise."
                 )),
                 input_schema: serde_json::json!({
                     "type": "object",
@@ -152,6 +153,10 @@ impl ToolHandler for McpRouter {
                         "include_hidden": {
                             "type": "boolean",
                             "description": "Include hidden files (default: false)"
+                        },
+                        "page": {
+                            "type": "integer",
+                            "description": "Page number for paged results (default: 1). Pages re-run the query with deterministic sort order."
                         }
                     },
                     "required": ["pattern"]

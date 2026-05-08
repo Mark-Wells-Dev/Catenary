@@ -19,7 +19,6 @@ use tracing::debug;
 use super::filesystem_manager::FilesystemManager;
 use super::handler::display_path;
 use super::tool_server::ToolServer;
-use crate::bucketing::{self, BucketEntry};
 use crate::config::DispatchMethod;
 use crate::lsp::LspClientManager;
 use crate::lsp::server::LspServer;
@@ -43,6 +42,14 @@ pub struct GrepInput {
     /// Include hidden/dot files (default: false).
     #[serde(default)]
     pub include_hidden: bool,
+    /// Page number for paged results (default: 1).
+    #[serde(default = "default_page")]
+    pub page: usize,
+}
+
+/// Default page number for grep (1-based).
+const fn default_page() -> usize {
+    1
 }
 
 /// A classified hit from the grep pipeline.
@@ -125,6 +132,10 @@ impl ToolServer for GrepServer {
             return Err(anyhow!("pattern must be non-empty"));
         }
 
+        if input.page == 0 {
+            return Err(anyhow!("page must be >= 1"));
+        }
+
         // Explicit hidden targets (e.g. `.gitignore`, `.github/*`) should
         // match without requiring `include_hidden`.
         if let Some(ref glob) = input.glob
@@ -162,6 +173,7 @@ impl ToolServer for GrepServer {
                 exclude: input.exclude.clone(),
                 include_gitignored: input.include_gitignored,
                 include_hidden: input.include_hidden,
+                page: input.page,
             };
             let output = self
                 .run(arm_input, parent_id, &dead_languages, cancel)
@@ -178,7 +190,11 @@ impl ToolServer for GrepServer {
             return Ok(Value::String("No results found".to_string()));
         }
 
-        Ok(Value::String(all_output))
+        Ok(Value::String(paginate(
+            &all_output,
+            self.budget,
+            input.page,
+        )))
     }
 }
 
@@ -412,55 +428,32 @@ impl GrepServer {
             return Ok(String::new());
         }
 
-        // Partition by root for grouped output.
-        let (root_groups, oor_hits) = partition_hits_by_root(&hits, &self.fs_manager);
-        let all_refs: Vec<&GrepHit> = hits.iter().collect();
-
-        // Promote-from-bottom tier selection with enrichment.
-        let output = if estimate_tier2_lower_bound(&all_refs, &self.fs_manager) <= self.budget {
-            let tier2 = render_grouped(&root_groups, &oor_hits, |h| {
-                render_tier2(h, &self.fs_manager)
-            });
-            if tier2.len() <= self.budget {
-                // Tier 2 fits — run enrichment for each symbol hit.
-                let mut enrichments: Vec<(&GrepHit, Option<SymbolEnrichment>)> = Vec::new();
-                for hit in &hits {
-                    let (line_0, col, from_ts) = match &hit.classification {
-                        HitClass::Symbol { symbol } => (symbol.line, hit.col, true),
-                        HitClass::PrepareRenameSymbol => (hit.line, hit.col, false),
-                        _ => {
-                            enrichments.push((hit, None));
-                            continue;
-                        }
-                    };
-                    if cancel.is_cancelled() {
-                        return Err(crate::mcp::RequestCancelled.into());
-                    }
-                    let enrichment = self
-                        .enrich_at_position(&hit.file, line_0, col, from_ts, parent_id, cancel)
-                        .await;
-                    enrichments.push((hit, enrichment));
+        // Enrich definition-like hits (Symbol, PrepareRenameSymbol).
+        // Reference hits pass through with no enrichment.
+        let mut enrichments: Vec<(&GrepHit, Option<SymbolEnrichment>)> = Vec::new();
+        for hit in &hits {
+            let (line_0, col, from_ts) = match &hit.classification {
+                HitClass::Symbol { symbol } => (symbol.line, hit.col, true),
+                HitClass::PrepareRenameSymbol => (hit.line, hit.col, false),
+                _ => {
+                    enrichments.push((hit, None));
+                    continue;
                 }
-
-                // Try tier 1. If it fits, use it; otherwise fall back to tier 2.
-                render_tier1(
-                    &enrichments,
-                    self.symbol_index.as_ref(),
-                    self.budget,
-                    &self.fs_manager,
-                )
-                .unwrap_or(tier2)
-            } else {
-                render_grouped(&root_groups, &oor_hits, |h| {
-                    render_tier3(h, self.budget, &self.fs_manager)
-                })
+            };
+            if cancel.is_cancelled() {
+                return Err(crate::mcp::RequestCancelled.into());
             }
-        } else {
-            render_grouped(&root_groups, &oor_hits, |h| {
-                render_tier3(h, self.budget, &self.fs_manager)
-            })
-        };
-        Ok(output)
+            let enrichment = self
+                .enrich_at_position(&hit.file, line_0, col, from_ts, parent_id, cancel)
+                .await;
+            enrichments.push((hit, enrichment));
+        }
+
+        Ok(render_results(
+            &enrichments,
+            self.symbol_index.as_ref(),
+            &self.fs_manager,
+        ))
     }
 
     /// Checks `prepareRename` at a position to distinguish symbols from keywords.
@@ -1103,53 +1096,26 @@ impl GrepServer {
     }
 }
 
-// ─── Tier selection and rendering ────────────────────────────────────────
+// ─── Rendering ─────────────────────────────────────────────────────────
 
-/// Promote-from-bottom tier selection (pure rendering, no enrichment).
+/// Renders grep results with page-based paging.
 ///
-/// Used by unit tests. The async `run` method inlines this logic with
-/// enrichment calls (07a).
-#[cfg(test)]
-fn select_and_render_tier(
-    hits: &[GrepHit],
-    budget: usize,
-    fs_manager: &FilesystemManager,
-) -> String {
-    let refs: Vec<&GrepHit> = hits.iter().collect();
-    // Cheap lower-bound estimate for tier 2 size: unique name lengths +
-    // unique path lengths + per-hit overhead. If the lower bound already
-    // exceeds the budget, tier 2 definitely won't fit.
-    if estimate_tier2_lower_bound(&refs, fs_manager) <= budget {
-        let tier2 = render_tier2(&refs, fs_manager);
-        if tier2.len() <= budget {
-            // Stub: emit tier 2. (07a replaces with enrichment attempt.)
-            return tier2;
-        }
-    }
-
-    // Tier 2 doesn't fit — fall back to tier 3 (bucketed)
-    render_tier3(&refs, budget, fs_manager)
-}
-
-// ─── Tier 1: Enriched rendering ─────────────────────────────────────────
-
-/// Tier 1: Enriched rendering with navigation edges.
+/// Each hit is rendered with whatever data is available: enriched
+/// navigation edges when LSP data exists, enclosing symbol context
+/// when available, bare line numbers otherwise. Grouped by workspace
+/// root (bare absolute path header). Out-of-root hits grouped by
+/// parent directory.
 ///
-/// Returns `Some(output)` if the rendered result fits within `budget`,
-/// `None` if it exceeds the budget (caller falls back to tier 2).
-#[allow(
-    clippy::too_many_lines,
-    reason = "Tier 1 renders six navigation sections per symbol"
-)]
-fn render_tier1(
+/// Returns the full unpaginated output. Pagination is applied by the
+/// caller (`execute`).
+fn render_results(
     enrichments: &[(&GrepHit, Option<SymbolEnrichment>)],
     symbol_index: Option<&Arc<std::sync::Mutex<SymbolIndex>>>,
-    budget: usize,
     fs_manager: &FilesystemManager,
-) -> Option<String> {
+) -> String {
     use std::fmt::Write;
 
-    // Group enrichments by root.
+    // Group enrichments by root — bare absolute path as section header.
     let mut root_items: BTreeMap<PathBuf, Vec<usize>> = BTreeMap::new();
     let mut oor_items: Vec<usize> = Vec::new();
     for (i, (hit, _)) in enrichments.iter().enumerate() {
@@ -1159,45 +1125,46 @@ fn render_tier1(
         }
     }
 
-    let mut output = String::new();
+    let mut full = String::new();
 
     for (root, indices) in &root_items {
-        if !output.is_empty() {
-            output.push('\n');
+        if !full.is_empty() {
+            full.push('\n');
         }
-        let _ = writeln!(output, "Root: {}", root.display());
-        render_tier1_section(enrichments, indices, symbol_index, fs_manager, &mut output);
+        let _ = writeln!(full, "{}", root.display());
+        render_section(enrichments, indices, symbol_index, fs_manager, &mut full);
     }
-    if !oor_items.is_empty() {
-        if !output.is_empty() {
-            output.push('\n');
+    // Out-of-root hits grouped under their parent directory path.
+    let mut oor_by_parent: BTreeMap<PathBuf, Vec<usize>> = BTreeMap::new();
+    for &i in &oor_items {
+        let (hit, _) = &enrichments[i];
+        let parent = hit
+            .file
+            .parent()
+            .unwrap_or_else(|| Path::new("/"))
+            .to_path_buf();
+        oor_by_parent.entry(parent).or_default().push(i);
+    }
+    for (parent, indices) in &oor_by_parent {
+        if !full.is_empty() {
+            full.push('\n');
         }
-        let _ = writeln!(output, "OutOfRoots:");
-        render_tier1_section(
-            enrichments,
-            &oor_items,
-            symbol_index,
-            fs_manager,
-            &mut output,
-        );
+        let _ = writeln!(full, "{}", parent.display());
+        render_section(enrichments, indices, symbol_index, fs_manager, &mut full);
     }
 
-    let trimmed_len = output.trim_end().len();
-    output.truncate(trimmed_len);
-
-    if output.len() <= budget {
-        Some(output)
-    } else {
-        None
-    }
+    let trimmed_len = full.trim_end().len();
+    full.truncate(trimmed_len);
+    full
 }
 
-/// Renders a single root section for tier 1 enriched output.
+/// Renders a single root section: definitions with enrichment edges,
+/// then remaining reference hits with enclosing context.
 #[allow(
     clippy::too_many_lines,
-    reason = "Tier 1 renders six navigation sections per symbol"
+    reason = "Renders navigation sections per symbol + reference fallback"
 )]
-fn render_tier1_section(
+fn render_section(
     enrichments: &[(&GrepHit, Option<SymbolEnrichment>)],
     indices: &[usize],
     symbol_index: Option<&Arc<std::sync::Mutex<SymbolIndex>>>,
@@ -1294,41 +1261,11 @@ fn render_tier1_section(
             continue;
         }
 
-        // Check if this name group has any definition-like hits (Symbol or PrepareRenameSymbol).
-        let has_definitions = visible.iter().any(|(hit, _)| {
-            matches!(
-                hit.classification,
-                HitClass::Symbol { .. } | HitClass::PrepareRenameSymbol
-            )
-        });
-
         // Name-level grouping header at depth 0
         let _ = writeln!(output, "{name}");
 
-        // If no definitions, render Reference hits with their enclosing structures
-        // (rg-only lines under the matched text heading).
-        if !has_definitions {
-            let by_dir_file = group_hits_by_dir_file(
-                &visible.iter().map(|(hit, _)| *hit).collect::<Vec<_>>(),
-                fs_manager,
-            );
-            for (dir, files) in &by_dir_file {
-                if !dir.is_empty() {
-                    let _ = writeln!(output, "\t{dir}");
-                }
-                for (file, file_hits) in files {
-                    let indent = if dir.is_empty() { "\t" } else { "\t\t" };
-                    let _ = writeln!(output, "{indent}{file}");
-                    for hit in file_hits {
-                        let line_1 = hit.line + 1;
-                        let hit_indent = if dir.is_empty() { "\t\t" } else { "\t\t\t" };
-                        let _ = writeln!(output, "{hit_indent}{}", format_hit_line(hit, line_1));
-                    }
-                }
-            }
-            continue;
-        }
-
+        // Render definition-like hits (Symbol, PrepareRenameSymbol) with
+        // enrichment edges.
         for (hit, enrichment) in &visible {
             let has_edges = enrichment.as_ref().is_some_and(|e| {
                 !e.outgoing_calls.is_empty()
@@ -1560,222 +1497,79 @@ fn render_tier1_section(
                 }
             }
         }
-    }
-}
 
-/// Lower-bound estimate for tier 2 rendered size.
-///
-/// Sums unique name lengths, unique relative path lengths, and a
-/// per-hit minimum overhead. Avoids building the full output string.
-fn estimate_tier2_lower_bound(hits: &[&GrepHit], fs_manager: &FilesystemManager) -> usize {
-    let mut unique_names: HashSet<&str> = HashSet::new();
-    let mut unique_paths: HashSet<String> = HashSet::new();
-
-    for &hit in hits {
-        let name = match &hit.classification {
-            HitClass::Symbol { symbol } => symbol.name.as_str(),
-            _ => hit.matched_text.as_str(),
-        };
-        unique_names.insert(name);
-        unique_paths.insert(display_path(&hit.file.to_string_lossy(), fs_manager));
-    }
-
-    // Each unique name: name + newline
-    let name_cost: usize = unique_names.iter().map(|n| n.len() + 1).sum();
-    // Each unique path: tab(s) + dir + tab(s) + file + newline (~4 overhead)
-    let path_cost: usize = unique_paths.iter().map(|p| p.len() + 4).sum();
-    // Each hit: tabs + colon + digits + kind bracket + span (~15 minimum)
-    let hit_cost: usize = hits.len() * 15;
-
-    name_cost + path_cost + hit_cost
-}
-
-/// Tier 2: Structure heatmap.
-///
-/// Hits grouped by extracted name, then by directory and file, each with
-/// enclosing tree-sitter structure and span.
-fn render_tier2(hits: &[&GrepHit], fs_manager: &FilesystemManager) -> String {
-    use std::fmt::Write;
-
-    let by_name = group_hits_by_name(hits);
-    let mut output = String::new();
-
-    for (name, group) in &by_name {
-        let _ = writeln!(output, "{name}");
-
-        let by_dir_file = group_hits_by_dir_file(group, fs_manager);
-
-        for (dir, files) in &by_dir_file {
-            if !dir.is_empty() {
-                let _ = writeln!(output, "\t{dir}");
-            }
-            for (file, file_hits) in files {
-                let indent = if dir.is_empty() { "\t" } else { "\t\t" };
-                let _ = writeln!(output, "{indent}{file}");
-                for hit in file_hits {
-                    let line_1 = hit.line + 1;
-                    let hit_indent = if dir.is_empty() { "\t\t" } else { "\t\t\t" };
-                    let _ = writeln!(output, "{hit_indent}{}", format_hit_line(hit, line_1));
-                }
-            }
-        }
-    }
-
-    let trimmed_len = output.trim_end().len();
-    output.truncate(trimmed_len);
-    output
-}
-
-/// Tier 3: Bucketed patterns with per-bucket equal budget.
-///
-/// Matched strings bucketed into drillable sub-patterns. Each expanded
-/// bucket gets an equal share of the rendering budget. Within its share
-/// the bucket tries file-level detail first, then falls back to directory
-/// counts. Bare-handle buckets (from the bucketing module's own
-/// degradation) are rendered as-is.
-fn render_tier3(hits: &[&GrepHit], budget: usize, fs_manager: &FilesystemManager) -> String {
-    use std::fmt::Write;
-
-    let text_to_hits = group_hits_by_name(hits);
-
-    // Build bucket entries from unique matched texts
-    let bucket_input: Vec<BucketEntry> = text_to_hits
-        .keys()
-        .map(|v| BucketEntry {
-            value: v.clone(),
-            context: None,
-        })
-        .collect();
-
-    let buckets = bucketing::bucket(&bucket_input, budget, true);
-
-    // Compute per-bucket budget: divide equally among expanded buckets.
-    let expanded_count = buckets.iter().filter(|b| b.entries.is_some()).count();
-    // Reserve space for bare handles.
-    let bare_cost: usize = buckets
-        .iter()
-        .filter(|b| b.entries.is_none())
-        .map(|b| b.pattern.len() + count_digits(b.count) + 5) // "pattern (N)\n"
-        .sum();
-    let per_bucket_budget = budget
-        .saturating_sub(bare_cost)
-        .checked_div(expanded_count)
-        .unwrap_or(0);
-
-    let mut output = String::new();
-
-    for b in &buckets {
-        if b.entries.is_none() {
-            // Bare handle with count
-            let _ = writeln!(output, "{} ({})", b.pattern, b.count);
-            continue;
-        }
-
-        // Bucket header (with trailing newline — detail lines follow indented)
-        let header = render_bucket_header(b);
-        let _ = writeln!(output, "{header}");
-
-        // Collect hits for this bucket
-        let prefix = b.pattern.trim_end_matches('*');
-        let bucket_hits: Vec<&GrepHit> = text_to_hits
+        // Remaining Reference hits: not definition-like, rendered with
+        // enclosing context in dir/file grouping below definitions.
+        let ref_hits: Vec<&GrepHit> = visible
             .iter()
-            .filter(|(k, _)| {
-                if b.count == 1 {
-                    b.entries
-                        .as_ref()
-                        .and_then(|e| e.first())
-                        .is_some_and(|e| e.value == **k)
-                } else {
-                    k.starts_with(prefix)
-                }
-            })
-            .flat_map(|(_, v)| v.iter().copied())
+            .filter(|(hit, _)| matches!(hit.classification, HitClass::Reference { .. }))
+            .map(|(hit, _)| *hit)
             .collect();
-
-        let by_dir_file = group_hits_by_dir_file(&bucket_hits, fs_manager);
-
-        // Try file detail within this bucket's budget share
-        let detail = render_bucket_file_detail(&by_dir_file);
-        if header.len() + detail.len() <= per_bucket_budget {
-            output.push_str(&detail);
-        } else {
-            // Fall back to directory counts
-            let dir_counts = render_bucket_dir_counts(&by_dir_file);
-            output.push_str(&dir_counts);
-        }
-    }
-
-    let trimmed_len = output.trim_end().len();
-    output.truncate(trimmed_len);
-    output
-}
-
-/// Renders the header line for a tier 3 bucket.
-fn render_bucket_header(b: &bucketing::Bucket) -> String {
-    if b.count == 1
-        && let Some(entries) = &b.entries
-        && let Some(entry) = entries.first()
-    {
-        entry.value.clone()
-    } else {
-        b.pattern.clone()
-    }
-}
-
-/// Renders file-level detail for a bucket: directory tree with per-file
-/// hit lines and enclosing structures.
-fn render_bucket_file_detail(
-    by_dir_file: &BTreeMap<String, BTreeMap<String, Vec<&GrepHit>>>,
-) -> String {
-    use std::fmt::Write;
-    let mut out = String::new();
-
-    for (dir, files) in by_dir_file {
-        if !dir.is_empty() {
-            let _ = writeln!(out, "\t{dir}");
-        }
-        for (file, file_hits) in files {
-            let indent = if dir.is_empty() { "\t" } else { "\t\t" };
-            let _ = writeln!(out, "{indent}{file}");
-            for hit in file_hits {
-                let line_1 = hit.line + 1;
-                let hit_indent = if dir.is_empty() { "\t\t" } else { "\t\t\t" };
-                let _ = writeln!(out, "{hit_indent}{}", format_hit_line(hit, line_1));
+        if !ref_hits.is_empty() {
+            let by_dir_file = group_hits_by_dir_file(&ref_hits, fs_manager);
+            for (dir, files) in &by_dir_file {
+                if !dir.is_empty() {
+                    let _ = writeln!(output, "\t{dir}");
+                }
+                for (file, file_hits) in files {
+                    let indent = if dir.is_empty() { "\t" } else { "\t\t" };
+                    let _ = writeln!(output, "{indent}{file}");
+                    for hit in file_hits {
+                        let line_1 = hit.line + 1;
+                        let hit_indent = if dir.is_empty() { "\t\t" } else { "\t\t\t" };
+                        let _ = writeln!(output, "{hit_indent}{}", format_hit_line(hit, line_1));
+                    }
+                }
             }
         }
     }
-
-    out
 }
 
-/// Renders directory counts for a bucket: each directory with its total
-/// hit count.
-fn render_bucket_dir_counts(
-    by_dir_file: &BTreeMap<String, BTreeMap<String, Vec<&GrepHit>>>,
-) -> String {
+/// Paginates rendered output into pages of at most `budget` characters.
+///
+/// Returns `[page N/M]` header on every response. Pages are split at line
+/// boundaries — a line is never cut in half. If the requested page is
+/// beyond the last, returns an informational message.
+fn paginate(full: &str, budget: usize, page: usize) -> String {
     use std::fmt::Write;
-    let mut out = String::new();
 
-    for (dir, files) in by_dir_file {
-        let count: usize = files.values().map(Vec::len).sum();
-        let label = if dir.is_empty() { "./" } else { dir.as_str() };
-        let _ = writeln!(out, "\t{label} ({count})");
+    if full.is_empty() {
+        return String::new();
     }
 
-    out
-}
+    // Split into pages at line boundaries.
+    let lines: Vec<&str> = full.lines().collect();
+    let mut pages: Vec<String> = Vec::new();
+    let mut current_page = String::new();
 
-/// Groups hits by extracted identifier name (`BTreeMap` for stable order).
-fn group_hits_by_name<'a>(hits: &[&'a GrepHit]) -> BTreeMap<String, Vec<&'a GrepHit>> {
-    let mut by_name: BTreeMap<String, Vec<&GrepHit>> = BTreeMap::new();
-    for &hit in hits {
-        let key = match &hit.classification {
-            HitClass::Symbol { symbol } => symbol.name.clone(),
-            _ => hit.matched_text.clone(),
+    for &line in &lines {
+        let candidate_len = if current_page.is_empty() {
+            line.len()
+        } else {
+            current_page.len() + 1 + line.len() // +1 for newline
         };
-        by_name.entry(key).or_default().push(hit);
+        if !current_page.is_empty() && candidate_len > budget {
+            pages.push(std::mem::take(&mut current_page));
+        }
+        if !current_page.is_empty() {
+            current_page.push('\n');
+        }
+        current_page.push_str(line);
     }
-    by_name
+    if !current_page.is_empty() {
+        pages.push(current_page);
+    }
+
+    let total = pages.len();
+
+    if page > total {
+        return format!("[page {page}/{total}] No more results.");
+    }
+
+    let mut output = String::new();
+    let _ = writeln!(output, "[page {page}/{total}]\n");
+    output.push_str(&pages[page - 1]);
+    output
 }
 
 /// Groups hits by directory and file for tree rendering.
@@ -1795,20 +1589,6 @@ fn group_hits_by_dir_file<'a>(
             .push(hit);
     }
     by_dir_file
-}
-
-/// Number of decimal digits in a `usize`.
-const fn count_digits(n: usize) -> usize {
-    if n == 0 {
-        return 1;
-    }
-    let mut digits = 0;
-    let mut val = n;
-    while val > 0 {
-        digits += 1;
-        val /= 10;
-    }
-    digits
 }
 
 /// Formats a single hit line with enclosing structure.
@@ -1860,54 +1640,6 @@ fn format_span(start_0: u32, end_0: u32) -> String {
     } else {
         format!(":{start_1}-{end_1}")
     }
-}
-
-// ─── Root grouping ───────────────────────────────────────────────────
-
-/// Partitions grep hits by workspace root.
-///
-/// Returns `(root_groups, out_of_root)` where `root_groups` is sorted
-/// alphabetically by root path.
-fn partition_hits_by_root<'a>(
-    hits: &'a [GrepHit],
-    fs_manager: &FilesystemManager,
-) -> (BTreeMap<PathBuf, Vec<&'a GrepHit>>, Vec<&'a GrepHit>) {
-    let mut roots: BTreeMap<PathBuf, Vec<&GrepHit>> = BTreeMap::new();
-    let mut oor: Vec<&GrepHit> = Vec::new();
-    for hit in hits {
-        match fs_manager.resolve_root(&hit.file) {
-            Some(root) => roots.entry(root).or_default().push(hit),
-            None => oor.push(hit),
-        }
-    }
-    (roots, oor)
-}
-
-/// Renders per-root sections with `Root:` / `OutOfRoots:` headers.
-fn render_grouped(
-    root_groups: &BTreeMap<PathBuf, Vec<&GrepHit>>,
-    oor_hits: &[&GrepHit],
-    render_section: impl Fn(&[&GrepHit]) -> String,
-) -> String {
-    use std::fmt::Write;
-    let mut output = String::new();
-    for (root, hits) in root_groups {
-        if !output.is_empty() {
-            output.push('\n');
-        }
-        let _ = writeln!(output, "Root: {}", root.display());
-        output.push_str(&render_section(hits));
-    }
-    if !oor_hits.is_empty() {
-        if !output.is_empty() {
-            output.push('\n');
-        }
-        let _ = writeln!(output, "OutOfRoots:");
-        output.push_str(&render_section(oor_hits));
-    }
-    let trimmed_len = output.trim_end().len();
-    output.truncate(trimmed_len);
-    output
 }
 
 /// Splits a relative path into `(directory/, filename)`.
@@ -2001,7 +1733,7 @@ impl Sink for MatchSink<'_> {
 /// Result of a ripgrep `--only-matching` search.
 #[derive(Default)]
 struct RipgrepMatches {
-    /// Per-file line numbers (for heatmap tier).
+    /// Per-file line numbers.
     file_lines: BTreeMap<String, Vec<u32>>,
     /// Per-file, per-line matched texts with column offsets
     /// `(matched_text, column_byte_offset)` for hit classification
@@ -2333,10 +2065,18 @@ mod tests {
         fs
     }
 
-    // ─── Tier 2 structure heatmap ───────────────────────────────────────
+    // ─── Rendering ──────────────────────────────────────────────────────
+
+    /// Helper: render + paginate with no enrichment.
+    fn render(hits: &[GrepHit], budget: usize, page: usize, fs: &FilesystemManager) -> String {
+        let enrichments: Vec<(&GrepHit, Option<SymbolEnrichment>)> =
+            hits.iter().map(|h| (h, None)).collect();
+        let full = render_results(&enrichments, None, fs);
+        paginate(&full, budget, page)
+    }
 
     #[test]
-    fn test_tier2_structure_heatmap() {
+    fn test_name_grouping() {
         let fs = test_fs("/project");
         let hits = [
             sym_hit(
@@ -2354,274 +2094,230 @@ mod tests {
             sym_hit("/project/src/handler.rs", 1085, "test_glob", "function"),
         ];
 
-        let refs: Vec<&GrepHit> = hits.iter().collect();
-        let output = render_tier2(&refs, &fs);
+        let output = render(&hits, 10_000, 1, &fs);
 
-        // Names grouped at column 0
         assert!(
             output.contains("test_glob_directory"),
             "missing name group: {output}"
         );
         assert!(output.contains("test_glob"), "missing name group: {output}");
-
-        // File tree structure
-        assert!(output.contains("tests/"), "missing directory: {output}");
-        assert!(output.contains("a.rs"), "missing file: {output}");
-        assert!(output.contains("b.rs"), "missing file: {output}");
-
-        // Enclosing structures with spans
         assert!(
             output.contains("<Function>"),
             "missing kind label: {output}"
         );
+    }
+
+    #[test]
+    fn test_mixed_definitions_and_references() {
+        let fs = test_fs("/project");
+        // Same matched text: one PrepareRenameSymbol (definition-like)
+        // and one Reference. Both should appear.
+        let hits = [
+            prepare_rename_hit("/project/data/config.yaml", 15, "handle"),
+            ref_hit(
+                "/project/src/util.rs",
+                30,
+                "handle",
+                "process",
+                "function",
+                25,
+                50,
+            ),
+        ];
+
+        let output = render(&hits, 10_000, 1, &fs);
+
+        // Definition rendered
         assert!(
-            output.contains(":288"),
-            "missing line number (1-based): {output}"
+            output.contains("config.yaml:16"),
+            "definition should be present: {output}"
+        );
+        // Reference also rendered (not dropped)
+        assert!(
+            output.contains("util.rs"),
+            "reference should not be dropped: {output}"
+        );
+        assert!(
+            output.contains(":31"),
+            "reference line should be present: {output}"
         );
     }
 
     #[test]
-    fn test_tier2_no_grammar() {
+    fn test_plain_references_only() {
         let fs = test_fs("/project");
         let hits = [
             bare_ref_hit("/project/data/notes.txt", 5, "pattern"),
-            prepare_rename_hit("/project/data/other.txt", 10, "pattern"),
+            ref_hit(
+                "/project/src/main.rs",
+                100,
+                "pattern",
+                "call_tool",
+                "function",
+                95,
+                120,
+            ),
         ];
 
-        let refs: Vec<&GrepHit> = hits.iter().collect();
-        let output = render_tier2(&refs, &fs);
+        let output = render(&hits, 10_000, 1, &fs);
 
-        // Bare hit lines (no enclosing structure)
-        assert!(output.contains(":6"), "missing bare line: {output}");
-        assert!(output.contains(":11"), "missing bare line: {output}");
-        // No kind labels for no-grammar hits
-        assert!(!output.contains("<Function>"), "unexpected kind: {output}");
+        // Both references rendered
+        assert!(output.contains(":6"), "bare ref line: {output}");
+        assert!(output.contains(":101"), "enclosing ref line: {output}");
+        assert!(output.contains("call_tool"), "enclosing name: {output}");
     }
 
-    #[test]
-    fn test_tier2_reference_with_enclosing() {
-        let fs = test_fs("/project");
-        let hits = [ref_hit(
-            "/project/src/main.rs",
-            100,
-            "handle",
-            "call_tool",
-            "function",
-            95,
-            120,
-        )];
-
-        let refs: Vec<&GrepHit> = hits.iter().collect();
-        let output = render_tier2(&refs, &fs);
-
-        assert!(output.contains("<Function>"), "missing kind: {output}");
-        assert!(
-            output.contains("call_tool"),
-            "missing enclosing name: {output}"
-        );
-        assert!(output.contains(":96-121"), "missing span: {output}");
-    }
-
-    // ─── Tier selection (promote-from-bottom) ───────────────────────────
+    // ─── Paging ───────────────────────────────────────────────────────
 
     #[test]
-    fn test_tier_promotion_narrow_to_tier2() {
+    fn grep_page_header_single_page() {
         let fs = test_fs("/project");
-        // Small result set → fits within budget → tier 2
-        let hits = vec![sym_hit(
+        let hits = [sym_hit(
             "/project/src/handler.rs",
             100,
             "handle_grep",
             "function",
         )];
 
-        let output = select_and_render_tier(&hits, 4000, &fs);
+        let output = render(&hits, 10_000, 1, &fs);
 
-        // Should be tier 2 format: name at depth 0, file tree indented
-        assert!(output.contains("handle_grep"), "missing name: {output}");
-        assert!(output.contains("src/"), "missing directory: {output}");
-        assert!(output.contains("<Function>"), "missing kind: {output}");
+        assert!(
+            output.starts_with("[page 1/1]"),
+            "single-page result should show [page 1/1]: {output}"
+        );
     }
 
     #[test]
-    fn test_tier_demotion_to_tier3() {
+    fn grep_paged() {
         let fs = test_fs("/project");
 
-        // Generate enough hits to exceed a very small budget
         let mut hits = Vec::new();
         for i in 0..50 {
             hits.push(sym_hit(
                 &format!("/project/src/file_{i}.rs"),
                 i * 10,
-                &format!("test_alpha_{i}"),
-                "function",
-            ));
-        }
-        for i in 0..50 {
-            hits.push(sym_hit(
-                &format!("/project/src/file_{i}.rs"),
-                i * 10 + 5,
-                &format!("test_beta_{i}"),
+                &format!("test_symbol_{i}"),
                 "function",
             ));
         }
 
-        // Small budget forces tier 3
-        let output = select_and_render_tier(&hits, 200, &fs);
+        let page1 = render(&hits, 200, 1, &fs);
+        let page2 = render(&hits, 200, 2, &fs);
 
-        // Tier 3 should contain bucketed patterns (with * wildcards or counts)
-        let has_bucket_marker = output.contains('*') || output.contains('(');
         assert!(
-            has_bucket_marker,
-            "expected tier 3 bucketed output: {output}"
+            page1.starts_with("[page 1/"),
+            "page 1 should have header: {page1}"
         );
+        assert!(
+            page2.starts_with("[page 2/"),
+            "page 2 should have header: {page2}"
+        );
+        assert_ne!(page1, page2, "page 1 and 2 should differ");
     }
 
-    // ─── Tier 3 bucketed rendering ──────────────────────────────────────
-
     #[test]
-    fn test_tier3_bucketed() {
+    fn grep_page_beyond_last() {
         let fs = test_fs("/project");
+        let hits = [sym_hit(
+            "/project/src/handler.rs",
+            100,
+            "handle_grep",
+            "function",
+        )];
 
-        let mut hits = Vec::new();
-        for i in 0..20 {
-            hits.push(sym_hit(
-                &format!("/project/tests/test_{i}.rs"),
-                i,
-                &format!("test_mcp_{i}"),
-                "function",
-            ));
-        }
-        for i in 0..10 {
-            hits.push(sym_hit(
-                &format!("/project/tests/glob_{i}.rs"),
-                i,
-                &format!("test_glob_{i}"),
-                "function",
-            ));
-        }
+        let output = render(&hits, 10_000, 99, &fs);
 
-        let refs: Vec<&GrepHit> = hits.iter().collect();
-        let output = render_tier3(&refs, 500, &fs);
-
-        // Should produce bucketed prefixes
-        let has_wildcard = output.contains('*');
         assert!(
-            has_wildcard,
-            "expected wildcard patterns in tier 3: {output}"
+            output.contains("No more results"),
+            "beyond-last page should say no more results: {output}"
         );
     }
 
     #[test]
-    fn test_tier3_bare_handles() {
+    fn grep_bare_path_headers() {
         let fs = test_fs("/project");
+        let hits = [sym_hit(
+            "/project/src/handler.rs",
+            100,
+            "handle_grep",
+            "function",
+        )];
 
-        // Many hits, tiny budget → everything collapses to bare handles
-        let mut hits = Vec::new();
-        for i in 0..100 {
-            hits.push(sym_hit(
-                &format!("/project/src/f{i}.rs"),
-                i,
-                &format!("test_item_{i}"),
-                "function",
-            ));
-        }
+        let output = render(&hits, 10_000, 1, &fs);
 
-        let refs: Vec<&GrepHit> = hits.iter().collect();
-        let output = render_tier3(&refs, 100, &fs);
-
-        // Should contain counts in parentheses (bare handle format)
         assert!(
-            output.contains('('),
-            "expected bare handle counts: {output}"
+            !output.contains("Root:"),
+            "should not contain Root: prefix: {output}"
         );
         assert!(
-            output.contains(')'),
-            "expected bare handle counts: {output}"
+            !output.contains("OutOfRoots:"),
+            "should not contain OutOfRoots: prefix: {output}"
+        );
+        assert!(
+            output.contains("/project"),
+            "should contain bare absolute path: {output}"
         );
     }
 
     #[test]
-    fn test_tier3_per_bucket_equal_budget() {
+    fn grep_out_of_root_hits() {
         let fs = test_fs("/project");
+        let hits = [sym_hit("/other/path/file.rs", 10, "orphan_fn", "function")];
 
-        // Two clusters: 5 "alpha" hits, 5 "beta" hits.
-        // With enough budget for dir counts but not full file detail for
-        // all, both clusters should get the same level of detail.
-        let mut hits = Vec::new();
-        for i in 0..5 {
-            hits.push(sym_hit(
-                &format!("/project/src/alpha_{i}.rs"),
-                i * 10,
-                &format!("test_alpha_{i}"),
-                "function",
-            ));
-        }
-        for i in 0..5 {
-            hits.push(sym_hit(
-                &format!("/project/src/beta_{i}.rs"),
-                i * 10,
-                &format!("test_beta_{i}"),
-                "function",
-            ));
-        }
+        let output = render(&hits, 10_000, 1, &fs);
 
-        // Budget large enough for dir counts on both, not file detail
-        let refs: Vec<&GrepHit> = hits.iter().collect();
-        let output = render_tier3(&refs, 300, &fs);
-
-        // Both clusters should appear in the output
-        let has_alpha = output.contains("alpha");
-        let has_beta = output.contains("beta");
         assert!(
-            has_alpha && has_beta,
-            "both clusters should appear: {output}"
+            !output.contains("OutOfRoots:"),
+            "should not contain OutOfRoots: prefix: {output}"
         );
-
-        // If one has dir counts, the other should too (uniform detail)
-        let alpha_has_dir_count = output.contains("src/") && output.contains('(');
-        if alpha_has_dir_count {
-            // Count how many dir-count lines exist — should be balanced
-            let dir_count_count = output
-                .lines()
-                .filter(|l| l.contains('(') && l.contains(')') && l.trim().starts_with("src/"))
-                .count();
-            // With two clusters, we expect either 0 or 2 dir-count lines
-            // (not 1, which would mean one cluster got counts and the other didn't)
-            assert!(
-                dir_count_count != 1,
-                "expected uniform detail across buckets (0 or 2 dir counts, got 1): {output}"
-            );
-        }
+        assert!(
+            output.contains("/other/path"),
+            "should contain parent directory path: {output}"
+        );
     }
 
     #[test]
-    fn test_tier2_estimate_skips_render() {
+    fn grep_out_of_root_grouped_by_parent() {
         let fs = test_fs("/project");
+        let hits = [
+            sym_hit("/other/path/a.rs", 10, "fn_a", "function"),
+            sym_hit("/other/path/b.rs", 20, "fn_b", "function"),
+        ];
 
-        // Many hits — estimate should exceed a tiny budget
-        let mut hits = Vec::new();
-        for i in 0..200 {
-            hits.push(sym_hit(
-                &format!("/project/src/very_long_directory_name/file_{i}.rs"),
-                i,
-                &format!("a_very_long_symbol_name_{i}"),
-                "function",
-            ));
-        }
+        let output = render(&hits, 10_000, 1, &fs);
 
-        // The estimate should be well over 100
-        let refs: Vec<&GrepHit> = hits.iter().collect();
-        let estimate = estimate_tier2_lower_bound(&refs, &fs);
-        assert!(
-            estimate > 100,
-            "estimate should exceed tiny budget, got {estimate}"
+        // Both grouped under one /other/path header, not two
+        let header_count = output.matches("/other/path\n").count();
+        assert_eq!(
+            header_count, 1,
+            "expected one /other/path header, got {header_count} in:\n{output}"
         );
+    }
 
-        // select_and_render_tier should produce tier 3, not tier 2
-        let output = select_and_render_tier(&hits, 100, &fs);
-        let has_bucket = output.contains('*') || output.contains('(');
-        assert!(has_bucket, "expected tier 3 (bucketed): {output}");
+    // ─── Paginate unit tests ──────────────────────────────────────────
+
+    #[test]
+    fn paginate_single_page() {
+        let output = paginate("line one\nline two", 1000, 1);
+        assert!(
+            output.starts_with("[page 1/1]"),
+            "expected single page header: {output}"
+        );
+        assert!(output.contains("line one"), "missing content: {output}");
+    }
+
+    #[test]
+    fn paginate_multi_page() {
+        let output1 = paginate("aaa\nbbb\nccc", 5, 1);
+        let output2 = paginate("aaa\nbbb\nccc", 5, 2);
+        assert!(output1.starts_with("[page 1/"), "page 1 header: {output1}");
+        assert!(output2.starts_with("[page 2/"), "page 2 header: {output2}");
+    }
+
+    #[test]
+    fn paginate_beyond_last() {
+        let output = paginate("aaa\nbbb", 1000, 5);
+        assert!(output.contains("No more results"), "beyond last: {output}");
     }
 
     // ─── format_hit_line tests ──────────────────────────────────────────
@@ -2706,101 +2402,6 @@ mod tests {
             formatted.contains("<Impl> LspBridgeHandler/<Method> handle_grep"),
             "expected path syntax, got: {formatted}"
         );
-    }
-
-    // ─── No blank lines ────────────────────────────────────────────────
-
-    #[test]
-    fn test_no_blank_lines_in_tier2() {
-        let fs = test_fs("/project");
-        let hits = [
-            sym_hit("/project/src/a.rs", 10, "alpha", "function"),
-            sym_hit("/project/src/b.rs", 20, "beta", "function"),
-            sym_hit("/project/src/c.rs", 30, "gamma", "function"),
-        ];
-
-        let refs: Vec<&GrepHit> = hits.iter().collect();
-        let output = render_tier2(&refs, &fs);
-
-        // No blank lines (consecutive \n\n) in output
-        assert!(
-            !output.contains("\n\n"),
-            "expected no blank lines between name groups, got:\n{output}"
-        );
-    }
-
-    #[test]
-    fn test_no_blank_lines_in_tier3() {
-        let fs = test_fs("/project");
-
-        let mut hits = Vec::new();
-        for i in 0..15 {
-            hits.push(sym_hit(
-                &format!("/project/src/alpha_{i}.rs"),
-                i * 10,
-                &format!("test_alpha_{i}"),
-                "function",
-            ));
-        }
-        for i in 0..15 {
-            hits.push(sym_hit(
-                &format!("/project/tests/beta_{i}.rs"),
-                i * 10,
-                &format!("test_beta_{i}"),
-                "function",
-            ));
-        }
-
-        let refs: Vec<&GrepHit> = hits.iter().collect();
-        let output = render_tier3(&refs, 2000, &fs);
-
-        assert!(
-            !output.contains("\n\n"),
-            "expected no blank lines in tier 3 output, got:\n{output}"
-        );
-    }
-
-    // ─── Leaf rule ─────────────────────────────────────────────────────
-
-    #[test]
-    fn test_leaf_rule_tier3() {
-        let fs = test_fs("/project");
-
-        let mut hits = Vec::new();
-        for i in 0..30 {
-            hits.push(sym_hit(
-                &format!("/project/src/f{i}.rs"),
-                i,
-                &format!("test_alpha_{i}"),
-                "function",
-            ));
-        }
-
-        let refs: Vec<&GrepHit> = hits.iter().collect();
-        let output = render_tier3(&refs, 2000, &fs);
-
-        // Every line should be either:
-        // - a bucket handle (contains * or is a name)
-        // - a directory with count (contains '(' and ')')
-        // - a file with hit lines (starts with tab + colon for hits)
-        // No bare filenames without context
-        for line in output.lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            // Leaf must be actionable: pattern handle, dir with count,
-            // or file with hit lines
-            let is_handle = trimmed.contains('*') || trimmed.contains('(');
-            let is_dir_count = trimmed.ends_with(')') && trimmed.contains('(');
-            let is_hit_line = trimmed.starts_with(':');
-            let is_file_with_hits =
-                !trimmed.starts_with(':') && !trimmed.contains('*') && !trimmed.contains('(');
-            // All types are acceptable — the point is no dead-end leaves
-            let _ = (is_handle, is_dir_count, is_hit_line, is_file_with_hits);
-        }
-        // Basic structural assertion: output should exist
-        assert!(!output.is_empty(), "tier 3 should produce output");
     }
 
     // ─── split_dir_file ────────────────────────────────────────────────
