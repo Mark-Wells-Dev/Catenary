@@ -127,8 +127,8 @@ fn test_batch_multi_file_different_servers() -> Result<()> {
 
 // ─── No diagnostic servers ─────────────────────────────────────────
 
-/// A file with no language server coverage is categorized as N/A.
-/// Other files still produce diagnostics.
+/// A file with no language server coverage is omitted from output.
+/// Covered files still produce diagnostics.
 #[test]
 fn test_batch_uncovered_file() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -151,8 +151,12 @@ fn test_batch_uncovered_file() -> Result<()> {
         "Covered file should produce diagnostics. Got:\n{text}"
     );
     assert!(
-        text.contains("N/A"),
-        "Uncovered file should appear as N/A. Got:\n{text}"
+        !text.contains("zzz_no_server"),
+        "Uncovered file should be omitted entirely. Got:\n{text}"
+    );
+    assert!(
+        !text.contains("N/A"),
+        "No N/A section in output. Got:\n{text}"
     );
 
     Ok(())

@@ -236,9 +236,10 @@ impl ToolHandler for McpRouter {
                     "Exit editing mode and return LSP diagnostics for all modified files. \
                      While editing, Edit, Read, grep, and glob remain available. All other \
                      tools are blocked until done_editing returns.\n\n\
-                     Output lists every modified file as diagnostics (errors/warnings), \
-                     clean, or N/A (no language server coverage). When truncated, a \
-                     [cursor: ...] token appears — pass it back to see the next page."
+                     Output starts with [LSP available], then lists each modified file with \
+                     diagnostics (errors/warnings) or [clean]. Files without language server \
+                     coverage are omitted. When truncated, a [cursor: ...] token appears — \
+                     pass it back to see the next page."
                         .to_string(),
                 ),
                 input_schema: serde_json::json!({

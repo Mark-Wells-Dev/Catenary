@@ -601,7 +601,7 @@ fn test_diagnostics_per_server_min_severity() -> Result<()> {
 }
 
 /// Language-level `diagnostics = false`: no servers contribute diagnostics,
-/// output is `[no language server]`.
+/// file is omitted from output entirely.
 #[test]
 fn test_diagnostics_no_servers() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -629,10 +629,18 @@ fn test_diagnostics_no_servers() -> Result<()> {
 
     let text = bridge.call_diagnostics(file.to_str().context("path")?)?;
 
-    // All servers suppressed at language level
+    // All servers suppressed — file omitted, only status header remains
     assert!(
-        text.contains("N/A"),
-        "Language-level diagnostics=false should produce N/A. Got:\n{text}"
+        text.contains("[LSP available]"),
+        "Should show LSP available header. Got:\n{text}"
+    );
+    assert!(
+        !text.contains("N/A"),
+        "No N/A section in output. Got:\n{text}"
+    );
+    assert!(
+        !text.contains(&format!("test.{MOCK_LANG_A}")),
+        "Suppressed file should be omitted. Got:\n{text}"
     );
 
     Ok(())

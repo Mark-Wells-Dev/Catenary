@@ -34,14 +34,14 @@ struct DiagnosticsCache {
     per_page: usize,
     files: BTreeMap<String, CachedFile>,
     clean: Vec<TrackedEntry>,
-    uncovered: Vec<TrackedEntry>,
 }
 
 /// Per-file cached entries for paging.
 struct CachedFile {
     display: String,
-    /// Owning workspace root, or `None` for out-of-root files.
-    root: Option<PathBuf>,
+    /// Grouping root: workspace root, or parent directory for
+    /// single-file-server files outside all roots.
+    root: PathBuf,
     /// All formatted entries, combined across all servers in
     /// server-name order.
     entries: Vec<String>,
@@ -51,7 +51,9 @@ struct CachedFile {
 #[derive(Clone)]
 struct TrackedEntry {
     display: String,
-    root: Option<PathBuf>,
+    /// Grouping root: workspace root, or parent directory for
+    /// single-file-server files outside all roots.
+    root: PathBuf,
 }
 
 /// Handles `PostToolUse` hook requests: file-change notification with LSP
@@ -117,7 +119,6 @@ impl DiagnosticsServer {
 
         // ── Phase 1: resolve + canonicalize ────────────────────────
         let mut canonical_paths: Vec<PathBuf> = Vec::new();
-        let mut uncovered: Vec<TrackedEntry> = Vec::new();
 
         // Server → list of canonical paths.
         // Keyed by server name for stable (alphabetical) iteration order.
@@ -131,27 +132,16 @@ impl DiagnosticsServer {
             // Resolve to absolute if needed (drain_all_and_clear
             // already returns absolute paths, but be defensive).
             let Ok(path) = resolve_path(&file_str) else {
-                uncovered.push(TrackedEntry {
-                    display: self.display_rel(&file_str),
-                    root: self.fs.resolve_root(file),
-                });
                 continue;
             };
 
             let Ok(canonical) = validator.validate_read(&path) else {
-                uncovered.push(TrackedEntry {
-                    display: self.display_rel(&file_str),
-                    root: self.fs.resolve_root(&path),
-                });
                 continue;
             };
 
+            // Files without LSP coverage are omitted from the output.
             let clients = self.client_manager.diagnostic_servers(&canonical).await;
             if clients.is_empty() {
-                uncovered.push(TrackedEntry {
-                    display: self.display_rel(&canonical.to_string_lossy()),
-                    root: self.fs.resolve_root(&canonical),
-                });
                 continue;
             }
 
@@ -192,7 +182,7 @@ impl DiagnosticsServer {
             if !has_any {
                 clean.push(TrackedEntry {
                     display: display.clone(),
-                    root: self.fs.resolve_root(std::path::Path::new(key)),
+                    root: self.resolve_root_or_parent(std::path::Path::new(key)),
                 });
                 continue;
             }
@@ -206,7 +196,7 @@ impl DiagnosticsServer {
                 key.clone(),
                 CachedFile {
                     display: display.clone(),
-                    root: self.fs.resolve_root(std::path::Path::new(key)),
+                    root: self.resolve_root_or_parent(std::path::Path::new(key)),
                     entries: all_entries,
                 },
             );
@@ -219,7 +209,7 @@ impl DiagnosticsServer {
             if !file_results.contains_key(&key) {
                 clean.push(TrackedEntry {
                     display: self.display_rel(&key),
-                    root: self.fs.resolve_root(cp),
+                    root: self.resolve_root_or_parent(cp),
                 });
             }
         }
@@ -228,7 +218,6 @@ impl DiagnosticsServer {
             per_page,
             files: cached_files,
             clean: clean.clone(),
-            uncovered: uncovered.clone(),
         };
 
         let output = format_page(&cache, 1);
@@ -523,11 +512,20 @@ impl DiagnosticsServer {
         client.set_parent_id(None);
     }
 
-    /// Makes a path relative to the owning workspace root, for display.
+    /// Makes a path relative to its grouping root, for display.
+    ///
+    /// Files within a workspace root are shown relative to that root.
+    /// Files outside all roots (single-file servers) are shown as the
+    /// bare filename — the parent directory becomes the section header.
     fn display_rel(&self, file: &str) -> String {
         let path = std::path::Path::new(file);
         self.fs.resolve_root(path).map_or_else(
-            || file.to_string(),
+            || {
+                path.file_name().map_or_else(
+                    || file.to_string(),
+                    |name| name.to_string_lossy().to_string(),
+                )
+            },
             |root| {
                 path.strip_prefix(&root).map_or_else(
                     |_| file.to_string(),
@@ -535,6 +533,17 @@ impl DiagnosticsServer {
                 )
             },
         )
+    }
+
+    /// Returns the grouping root for a file path.
+    ///
+    /// Workspace root when available, otherwise the file's parent
+    /// directory (for single-file-server files outside all roots).
+    fn resolve_root_or_parent(&self, path: &std::path::Path) -> PathBuf {
+        self.fs.resolve_root(path).unwrap_or_else(|| {
+            path.parent()
+                .map_or_else(|| PathBuf::from("/"), PathBuf::from)
+        })
     }
 
     /// Returns a formatted page of cached diagnostics.
@@ -774,10 +783,14 @@ fn decode_cursor(token: &str) -> Option<usize> {
 
 /// Formats a page of diagnostics from the cache.
 ///
-/// Groups output by workspace root with `Root:` / `OutOfRoots:` headers.
-/// Appends `[cursor: ...]` at the end when more entries remain,
-/// matching the pattern used by Catenary's grep and glob tools.
-#[allow(clippy::too_many_lines, reason = "Root-grouped formatting pipeline")]
+/// Output starts with `[LSP available]`, followed by bare root-path
+/// section headers. Files without LSP coverage are omitted. Clean
+/// files are listed inline with `[clean]`. Appends `[cursor: ...]`
+/// when more entries remain.
+///
+/// When a root contains a single file, the root and filename are
+/// collapsed into one path (e.g. `/tmp/scratch.sh`). Multi-file
+/// roots get a directory header with indented file entries beneath.
 fn format_page(cache: &DiagnosticsCache, page: usize) -> String {
     use std::fmt::Write;
 
@@ -785,13 +798,10 @@ fn format_page(cache: &DiagnosticsCache, page: usize) -> String {
     let start = (page - 1) * per_page;
     let mut has_more = false;
 
-    // Per-root collected data.
-    let mut root_diags: BTreeMap<&PathBuf, String> = BTreeMap::new();
+    // Per-root: diagnostic file entries collected without indentation
+    // so the render pass can choose single-file vs multi-file layout.
+    let mut root_diag_files: BTreeMap<&PathBuf, Vec<(&str, String)>> = BTreeMap::new();
     let mut root_clean: BTreeMap<&PathBuf, Vec<&str>> = BTreeMap::new();
-    let mut root_uncovered: BTreeMap<&PathBuf, Vec<&str>> = BTreeMap::new();
-    let mut oor_diags = String::new();
-    let mut oor_clean: Vec<&str> = Vec::new();
-    let mut oor_uncovered: Vec<&str> = Vec::new();
 
     for cached in cache.files.values() {
         let end = cached.entries.len().min(start + per_page);
@@ -800,98 +810,91 @@ fn format_page(cache: &DiagnosticsCache, page: usize) -> String {
         }
         let page_entries = &cached.entries[start..end];
         if page_entries.is_empty() {
-            match &cached.root {
-                Some(r) => root_clean.entry(r).or_default().push(&cached.display),
-                None => oor_clean.push(&cached.display),
-            }
+            root_clean
+                .entry(&cached.root)
+                .or_default()
+                .push(&cached.display);
             continue;
         }
 
-        let diags = cached
-            .root
-            .as_ref()
-            .map_or(&mut oor_diags, |r| root_diags.entry(r).or_default());
-        _ = writeln!(diags, "{}:", cached.display);
+        let mut content = String::new();
         for entry in page_entries {
             for line in entry.lines() {
-                _ = writeln!(diags, "\t{line}");
+                _ = writeln!(content, "{line}");
             }
         }
         let remaining = cached.entries.len() - end;
         if remaining > 0 {
             has_more = true;
-            _ = writeln!(diags, "\t... {remaining} more");
+            _ = writeln!(content, "... {remaining} more");
         }
+
+        root_diag_files
+            .entry(&cached.root)
+            .or_default()
+            .push((&cached.display, content));
     }
 
     if page == 1 {
         for entry in &cache.clean {
-            match &entry.root {
-                Some(r) => root_clean.entry(r).or_default().push(&entry.display),
-                None => oor_clean.push(&entry.display),
-            }
-        }
-        for entry in &cache.uncovered {
-            match &entry.root {
-                Some(r) => root_uncovered.entry(r).or_default().push(&entry.display),
-                None => oor_uncovered.push(&entry.display),
-            }
+            root_clean
+                .entry(&entry.root)
+                .or_default()
+                .push(&entry.display);
         }
     }
 
     // Collect all roots with any content.
     let mut all_roots: BTreeSet<&PathBuf> = BTreeSet::new();
-    all_roots.extend(root_diags.keys());
+    all_roots.extend(root_diag_files.keys());
     all_roots.extend(root_clean.keys());
-    all_roots.extend(root_uncovered.keys());
 
     let mut output = String::new();
 
-    for root in &all_roots {
-        if !output.is_empty() {
-            output.push('\n');
-        }
-        _ = writeln!(output, "Root: {}", root.display());
-        if let Some(diags) = root_diags.get(root) {
-            output.push_str(diags);
-        }
-        if let Some(clean) = root_clean.get(root)
-            && !clean.is_empty()
-        {
-            _ = writeln!(output, "clean:");
-            for f in clean {
-                _ = writeln!(output, "\t{f}");
-            }
-        }
-        if let Some(uncov) = root_uncovered.get(root)
-            && !uncov.is_empty()
-        {
-            _ = writeln!(output, "N/A:");
-            for f in uncov {
-                _ = writeln!(output, "\t{f}");
-            }
-        }
+    if page == 1 {
+        _ = writeln!(output, "[LSP available]");
     }
 
-    let has_oor = !oor_diags.is_empty() || !oor_clean.is_empty() || !oor_uncovered.is_empty();
-    if has_oor {
-        if !output.is_empty() {
-            output.push('\n');
-        }
-        _ = writeln!(output, "OutOfRoots:");
-        if !oor_diags.is_empty() {
-            output.push_str(&oor_diags);
-        }
-        if !oor_clean.is_empty() {
-            _ = writeln!(output, "clean:");
-            for f in &oor_clean {
-                _ = writeln!(output, "\t{f}");
+    for root in &all_roots {
+        let diag_count = root_diag_files.get(root).map_or(0, Vec::len);
+        let clean_count = root_clean.get(root).map_or(0, Vec::len);
+        let total = diag_count + clean_count;
+        let collapsed = total == 1;
+
+        output.push('\n');
+
+        if collapsed {
+            // Single file: merge root and filename into one path.
+            if let Some(files) = root_diag_files.get(root) {
+                for (display, content) in files {
+                    _ = writeln!(output, "{}:", root.join(display).display());
+                    for line in content.lines() {
+                        _ = writeln!(output, "\t{line}");
+                    }
+                }
             }
-        }
-        if !oor_uncovered.is_empty() {
-            _ = writeln!(output, "N/A:");
-            for f in &oor_uncovered {
-                _ = writeln!(output, "\t{f}");
+            if let Some(clean) = root_clean.get(root) {
+                for f in clean {
+                    _ = writeln!(output, "{}", root.join(f).display());
+                    _ = writeln!(output, "\t[clean]");
+                }
+            }
+        } else {
+            // Multiple files: directory header with indented entries.
+            _ = writeln!(output, "{}", root.display());
+            if let Some(files) = root_diag_files.get(root) {
+                for (display, content) in files {
+                    _ = writeln!(output, "\t{display}:");
+                    for line in content.lines() {
+                        _ = writeln!(output, "\t\t{line}");
+                    }
+                }
+            }
+            if let Some(clean) = root_clean.get(root) {
+                for f in clean {
+                    _ = writeln!(output, "\t{f}");
+                    _ = writeln!(output, "\t\t[clean]");
+                }
             }
         }
     }
@@ -939,7 +942,7 @@ mod tests {
             "/test/file.rs".to_string(),
             CachedFile {
                 display: "file.rs".to_string(),
-                root: Some(PathBuf::from("/test")),
+                root: PathBuf::from("/test"),
                 entries,
             },
         );
@@ -947,7 +950,6 @@ mod tests {
             per_page,
             files,
             clean: Vec::new(),
-            uncovered: Vec::new(),
         }
     }
 
@@ -956,9 +958,10 @@ mod tests {
         let entries = vec![":1:1 [error] test: msg".to_string()];
         let cache = make_cache(entries, 50);
         let output = format_page(&cache, 1);
-        assert!(output.contains("Root: /test"), "output: {output}");
-        assert!(output.contains("file.rs:"), "output: {output}");
-        assert!(output.contains(":1:1 [error]"), "output: {output}");
+        assert!(output.starts_with("[LSP available]\n"), "output: {output}");
+        // Single file under root → collapsed path.
+        assert!(output.contains("/test/file.rs:"), "output: {output}");
+        assert!(output.contains("\t:1:1 [error]"), "output: {output}");
         assert!(!output.contains("[cursor:"), "output: {output}");
     }
 
@@ -969,7 +972,9 @@ mod tests {
             .collect();
         let cache = make_cache(entries, 3);
         let output = format_page(&cache, 1);
-        assert!(output.contains("Root: /test"), "output: {output}");
+        assert!(output.starts_with("[LSP available]\n"), "output: {output}");
+        // Single file → collapsed path.
+        assert!(output.contains("/test/file.rs:"), "output: {output}");
         assert!(output.contains("2 more"), "output: {output}");
         assert!(output.contains("[cursor: d2]"), "output: {output}");
         assert!(!output.contains("msg 3"), "output: {output}");
@@ -997,30 +1002,24 @@ mod tests {
     }
 
     #[test]
-    fn format_page_clean_and_uncovered_on_page1_only() {
-        let root = PathBuf::from("/test");
+    fn format_page_clean_on_page1_only() {
         let cache = DiagnosticsCache {
             per_page: 50,
             files: BTreeMap::new(),
             clean: vec![TrackedEntry {
                 display: "clean.rs".to_string(),
-                root: Some(root.clone()),
-            }],
-            uncovered: vec![TrackedEntry {
-                display: "other.txt".to_string(),
-                root: Some(root),
+                root: PathBuf::from("/test"),
             }],
         };
         let page1 = format_page(&cache, 1);
-        assert!(page1.contains("Root: /test"), "page1: {page1}");
-        assert!(page1.contains("clean:"), "page1: {page1}");
-        assert!(page1.contains("\tclean.rs"), "page1: {page1}");
-        assert!(page1.contains("N/A:"), "page1: {page1}");
-        assert!(page1.contains("\tother.txt"), "page1: {page1}");
+        assert!(page1.starts_with("[LSP available]\n"), "page1: {page1}");
+        // Single file → collapsed path with [clean].
+        assert!(page1.contains("/test/clean.rs\n"), "page1: {page1}");
+        assert!(page1.contains("\t[clean]"), "page1: {page1}");
+        assert!(!page1.contains("N/A:"), "page1: {page1}");
 
         let page2 = format_page(&cache, 2);
         assert!(!page2.contains("clean"), "page2: {page2}");
-        assert!(!page2.contains("N/A"), "page2: {page2}");
     }
 
     #[test]
@@ -1030,7 +1029,7 @@ mod tests {
             "/alpha/src/lib.rs".to_string(),
             CachedFile {
                 display: "src/lib.rs".to_string(),
-                root: Some(PathBuf::from("/alpha")),
+                root: PathBuf::from("/alpha"),
                 entries: vec![":1:1 [error] test: alpha error".to_string()],
             },
         );
@@ -1038,7 +1037,7 @@ mod tests {
             "/beta/src/lib.rs".to_string(),
             CachedFile {
                 display: "src/lib.rs".to_string(),
-                root: Some(PathBuf::from("/beta")),
+                root: PathBuf::from("/beta"),
                 entries: vec![":5:1 [warning] test: beta warning".to_string()],
             },
         );
@@ -1047,48 +1046,85 @@ mod tests {
             files,
             clean: vec![TrackedEntry {
                 display: "src/main.rs".to_string(),
-                root: Some(PathBuf::from("/alpha")),
+                root: PathBuf::from("/alpha"),
             }],
-            uncovered: Vec::new(),
         };
         let output = format_page(&cache, 1);
-        // Roots appear alphabetically.
-        let alpha_pos = output.find("Root: /alpha").expect("missing /alpha");
-        let beta_pos = output.find("Root: /beta").expect("missing /beta");
+        // /alpha has 2 files (diag + clean) → expanded with directory header.
+        let alpha_pos = output.find("\n/alpha\n").expect("missing /alpha header");
+        assert!(output.contains("\tsrc/lib.rs:"), "output: {output}");
+        assert!(output.contains("\t\t:1:1 [error]"), "output: {output}");
+        assert!(output.contains("\tsrc/main.rs\n"), "output: {output}");
+        assert!(output.contains("\t\t[clean]"), "output: {output}");
+        // /beta has 1 file → collapsed into single path.
+        let beta_pos = output
+            .find("\n/beta/src/lib.rs:")
+            .expect("missing /beta collapsed path");
         assert!(alpha_pos < beta_pos, "output: {output}");
-        assert!(output.contains("alpha error"), "output: {output}");
         assert!(output.contains("beta warning"), "output: {output}");
-        // Clean under alpha root.
-        assert!(output.contains("clean:"), "output: {output}");
-        assert!(output.contains("\tsrc/main.rs"), "output: {output}");
+        assert!(!output.contains("Root:"), "output: {output}");
     }
 
     #[test]
-    fn format_page_out_of_root() {
+    fn format_page_single_file_server() {
         let mut files = BTreeMap::new();
         files.insert(
-            "/tmp/scratch.rs".to_string(),
+            "/tmp/scratch.sh".to_string(),
             CachedFile {
-                display: "/tmp/scratch.rs".to_string(),
-                root: None,
-                entries: vec![":3:1 [warning] test: oor warning".to_string()],
+                display: "scratch.sh".to_string(),
+                root: PathBuf::from("/tmp"),
+                entries: vec![":3:1 [warning] test: standalone warning".to_string()],
             },
         );
         let cache = DiagnosticsCache {
             per_page: 50,
             files,
             clean: Vec::new(),
-            uncovered: vec![TrackedEntry {
-                display: "/tmp/notes.txt".to_string(),
-                root: None,
+        };
+        let output = format_page(&cache, 1);
+        assert!(output.starts_with("[LSP available]\n"), "output: {output}");
+        // Single file → collapsed path.
+        assert!(output.contains("/tmp/scratch.sh:"), "output: {output}");
+        assert!(output.contains("\t:3:1 [warning]"), "output: {output}");
+        assert!(output.contains("standalone warning"), "output: {output}");
+        assert!(!output.contains("OutOfRoots:"), "output: {output}");
+        assert!(!output.contains("Root:"), "output: {output}");
+        assert!(!output.contains("N/A:"), "output: {output}");
+    }
+
+    #[test]
+    fn diagnostics_lsp_available_header() {
+        let entries = vec![":1:1 [error] test: msg".to_string()];
+        let cache = make_cache(entries, 50);
+        let output = format_page(&cache, 1);
+        // First line is the status header.
+        assert!(output.starts_with("[LSP available]\n"), "output: {output}");
+        // Bare path, no prefix.
+        assert!(output.contains("/test/file.rs:"), "output: {output}");
+        assert!(!output.contains("Root:"), "output: {output}");
+        // Page 2 does not repeat the header.
+        let page2 = format_page(&cache, 2);
+        assert!(!page2.contains("[LSP available]"), "page2: {page2}");
+    }
+
+    #[test]
+    fn diagnostics_omit_uncovered() {
+        // Cache with only clean files, no uncovered field at all.
+        let cache = DiagnosticsCache {
+            per_page: 50,
+            files: BTreeMap::new(),
+            clean: vec![TrackedEntry {
+                display: "lib.rs".to_string(),
+                root: PathBuf::from("/project"),
             }],
         };
         let output = format_page(&cache, 1);
-        assert!(output.contains("OutOfRoots:"), "output: {output}");
-        assert!(output.contains("oor warning"), "output: {output}");
-        assert!(output.contains("N/A:"), "output: {output}");
-        assert!(output.contains("\t/tmp/notes.txt"), "output: {output}");
-        assert!(!output.contains("Root:"), "output: {output}");
+        // No N/A or OutOfRoots sections.
+        assert!(!output.contains("N/A"), "output: {output}");
+        assert!(!output.contains("OutOfRoots"), "output: {output}");
+        // Single file → collapsed path with [clean].
+        assert!(output.contains("/project/lib.rs\n"), "output: {output}");
+        assert!(output.contains("\t[clean]"), "output: {output}");
     }
 
     // ── enclosing symbol tests ────────────────────────────────────
