@@ -13,6 +13,7 @@ use super::path_security::PathValidator;
 use crate::lsp::settle::{IdleDetector, SettleResult, await_idle};
 use crate::lsp::state::ServerLifecycle;
 use crate::lsp::{LspClient, LspClientManager};
+use crate::symbol_index::SymbolIndex;
 use anyhow::{Result, anyhow};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -59,6 +60,8 @@ pub struct DiagnosticsServer {
     client_manager: Arc<LspClientManager>,
     path_validator: Arc<RwLock<PathValidator>>,
     fs: Arc<FilesystemManager>,
+    /// Symbol index for enclosing-symbol annotation on diagnostics.
+    symbol_index: Option<Arc<std::sync::Mutex<SymbolIndex>>>,
     /// Cached full diagnostics from the last batch run, for paging.
     cache: std::sync::Mutex<Option<DiagnosticsCache>>,
 }
@@ -69,11 +72,13 @@ impl DiagnosticsServer {
         client_manager: Arc<LspClientManager>,
         path_validator: Arc<RwLock<PathValidator>>,
         fs: Arc<FilesystemManager>,
+        symbol_index: Option<Arc<std::sync::Mutex<SymbolIndex>>>,
     ) -> Self {
         Self {
             client_manager,
             path_validator,
             fs,
+            symbol_index,
             cache: std::sync::Mutex::new(None),
         }
     }
@@ -465,6 +470,22 @@ impl DiagnosticsServer {
 
             let filter = crate::filter::get_filter(&server_command);
 
+            // Populate symbol index if needed — the file is already open
+            // on this server, so documentSymbol is a single request.
+            if let Some(ref idx_arc) = self.symbol_index {
+                let needs = idx_arc.lock().is_ok_and(|idx| !idx.has_symbols_for(path));
+                if needs
+                    && client.server().supports_document_symbols()
+                    && let Ok(response) = client.document_symbols(uri).await
+                    && let Ok(idx) = idx_arc.lock()
+                {
+                    let _ = idx.populate_from_document_symbols(path, &response);
+                }
+            }
+
+            let enclosing_symbols =
+                resolve_enclosing_symbols(self.symbol_index.as_ref(), path, &diagnostics);
+
             let entries = format_diagnostics_entries(
                 &diagnostics,
                 &fixes,
@@ -472,6 +493,7 @@ impl DiagnosticsServer {
                 &server_command,
                 server_version.as_deref(),
                 &lang_id,
+                &enclosing_symbols,
             );
 
             let key = path.to_string_lossy().to_string();
@@ -615,6 +637,38 @@ async fn collect_quick_fixes(
     futures::future::join_all(futures).await
 }
 
+/// Resolves the innermost enclosing symbol name for each diagnostic.
+///
+/// Returns a vec parallel to `diagnostics`. Each entry is `Some(name)` when
+/// a symbol encloses the diagnostic's start line, `None` otherwise.
+/// Returns an empty vec when the symbol index is unavailable.
+fn resolve_enclosing_symbols(
+    symbol_index: Option<&Arc<std::sync::Mutex<SymbolIndex>>>,
+    file_path: &std::path::Path,
+    diagnostics: &[Value],
+) -> Vec<Option<String>> {
+    let Some(index_arc) = symbol_index else {
+        return Vec::new();
+    };
+    let Ok(index) = index_arc.lock() else {
+        return Vec::new();
+    };
+    if !index.has_symbols_for(file_path) {
+        return Vec::new();
+    }
+    diagnostics
+        .iter()
+        .map(|d| {
+            let line_0 = crate::lsp::extract::diagnostic_range(d).map(|r| r.start.line)?;
+            index
+                .find_enclosing(file_path, line_0)
+                .ok()
+                .flatten()
+                .map(|sym| sym.name)
+        })
+        .collect()
+}
+
 /// Formats diagnostics as individual entry strings.
 ///
 /// Each entry contains the line/column, severity, message, and optional
@@ -625,6 +679,11 @@ async fn collect_quick_fixes(
 /// `fixes` is parallel to `diagnostics` — each entry contains the titles of
 /// quick-fix code actions for that diagnostic. Pass an empty slice when no
 /// fixes were collected.
+///
+/// `enclosing_symbols` is parallel to `diagnostics` — each entry is the
+/// name of the innermost enclosing symbol (from `SymbolIndex`), or `None`
+/// when no symbol encloses the diagnostic. Pass an empty slice when the
+/// symbol index is unavailable.
 pub(crate) fn format_diagnostics_entries(
     diagnostics: &[Value],
     fixes: &[Vec<String>],
@@ -632,6 +691,7 @@ pub(crate) fn format_diagnostics_entries(
     server_command: &str,
     server_version: Option<&str>,
     language_id: &str,
+    enclosing_symbols: &[Option<String>],
 ) -> Vec<String> {
     diagnostics
         .iter()
@@ -680,6 +740,12 @@ pub(crate) fn format_diagnostics_entries(
             } else {
                 format!(":{line}:{col} [{severity}] {source_str}({code}): {message}")
             };
+
+            // Append enclosing symbol context
+            if let Some(Some(name)) = enclosing_symbols.get(i) {
+                use std::fmt::Write;
+                let _ = write!(result, " (in {name})");
+            }
 
             // Append indented fix lines
             if let Some(fix_titles) = fixes.get(i) {
@@ -848,6 +914,7 @@ fn format_page(cache: &DiagnosticsCache, page: usize) -> String {
 )]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     // ── cursor encode/decode tests ──────────────────────────────
 
@@ -1022,5 +1089,156 @@ mod tests {
         assert!(output.contains("N/A:"), "output: {output}");
         assert!(output.contains("\t/tmp/notes.txt"), "output: {output}");
         assert!(!output.contains("Root:"), "output: {output}");
+    }
+
+    // ── enclosing symbol tests ────────────────────────────────────
+
+    fn make_diag(line: u32, col: u32, severity: u8, msg: &str) -> Value {
+        serde_json::json!({
+            "range": {
+                "start": { "line": line, "character": col },
+                "end": { "line": line, "character": col + 1 }
+            },
+            "severity": severity,
+            "source": "test",
+            "message": msg
+        })
+    }
+
+    fn make_symbol_index(entries: &[(&str, &str, &str, u32, u32)]) -> SymbolIndex {
+        let idx = SymbolIndex::new().expect("symbol index creation");
+        let path = Path::new("/test/file.rs");
+        let symbols: Vec<serde_json::Value> = entries
+            .iter()
+            .map(|(name, kind_str, _scope, start, end)| {
+                let kind_num = match *kind_str {
+                    "function" => 12,
+                    "method" => 6,
+                    "struct" => 23,
+                    "module" => 2,
+                    _ => 0,
+                };
+                serde_json::json!({
+                    "name": name,
+                    "kind": kind_num,
+                    "range": {
+                        "start": { "line": start, "character": 0 },
+                        "end": { "line": end, "character": 0 }
+                    },
+                    "selectionRange": {
+                        "start": { "line": start, "character": 0 },
+                        "end": { "line": start, "character": name.len() }
+                    }
+                })
+            })
+            .collect();
+        let arr = serde_json::Value::Array(symbols);
+        idx.populate_from_document_symbols(path, &arr)
+            .expect("populate symbols");
+        idx
+    }
+
+    #[test]
+    fn diagnostic_with_enclosing_symbol() {
+        let diags = vec![make_diag(15, 5, 2, "unused variable")];
+        let filter = crate::filter::get_filter("");
+        let symbols = vec![Some("my_function".to_string())];
+        let entries =
+            format_diagnostics_entries(&diags, &[], filter, "test", None, "rust", &symbols);
+        assert_eq!(entries.len(), 1);
+        assert!(
+            entries[0].ends_with("(in my_function)"),
+            "entry: {}",
+            entries[0]
+        );
+    }
+
+    #[test]
+    fn diagnostic_nested_symbol() {
+        // Outer: struct at lines 0-100, inner: method at lines 10-20
+        let idx = SymbolIndex::new().expect("symbol index creation");
+        let path = Path::new("/test/file.rs");
+        let symbols = serde_json::json!([
+            {
+                "name": "MyStruct",
+                "kind": 23,
+                "range": {
+                    "start": { "line": 0, "character": 0 },
+                    "end": { "line": 100, "character": 0 }
+                },
+                "selectionRange": {
+                    "start": { "line": 0, "character": 0 },
+                    "end": { "line": 0, "character": 8 }
+                },
+                "children": [
+                    {
+                        "name": "my_method",
+                        "kind": 6,
+                        "range": {
+                            "start": { "line": 10, "character": 0 },
+                            "end": { "line": 20, "character": 0 }
+                        },
+                        "selectionRange": {
+                            "start": { "line": 10, "character": 0 },
+                            "end": { "line": 10, "character": 9 }
+                        }
+                    }
+                ]
+            }
+        ]);
+        idx.populate_from_document_symbols(path, &symbols)
+            .expect("populate");
+        let index = Some(Arc::new(std::sync::Mutex::new(idx)));
+
+        let diags = vec![make_diag(15, 0, 1, "type mismatch")];
+        let resolved = resolve_enclosing_symbols(index.as_ref(), path, &diags);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(
+            resolved[0].as_deref(),
+            Some("my_method"),
+            "should pick innermost symbol, not MyStruct"
+        );
+    }
+
+    #[test]
+    fn diagnostic_no_symbol_index() {
+        let diags = vec![make_diag(5, 0, 2, "warning msg")];
+        let resolved = resolve_enclosing_symbols(None, Path::new("/test/file.rs"), &diags);
+        assert!(resolved.is_empty());
+    }
+
+    #[test]
+    fn diagnostic_file_scope() {
+        // Symbol at lines 10-20, diagnostic at line 0 (outside any symbol)
+        let idx = make_symbol_index(&[("some_fn", "function", "", 10, 20)]);
+        let index = Some(Arc::new(std::sync::Mutex::new(idx)));
+        let path = Path::new("/test/file.rs");
+
+        let diags = vec![make_diag(0, 0, 2, "file-level warning")];
+        let resolved = resolve_enclosing_symbols(index.as_ref(), path, &diags);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(
+            resolved[0], None,
+            "file-scope diagnostic should have no symbol"
+        );
+    }
+
+    #[test]
+    fn diagnostic_format_unchanged_without_symbols() {
+        let diags = vec![make_diag(10, 5, 1, "some error")];
+        let filter = crate::filter::get_filter("");
+
+        let with_empty = format_diagnostics_entries(&diags, &[], filter, "test", None, "rust", &[]);
+        let with_none =
+            format_diagnostics_entries(&diags, &[], filter, "test", None, "rust", &[None]);
+        assert_eq!(
+            with_empty, with_none,
+            "empty slice and None should produce same output"
+        );
+        assert!(
+            !with_empty[0].contains("(in "),
+            "no symbol suffix: {}",
+            with_empty[0]
+        );
     }
 }

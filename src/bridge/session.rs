@@ -242,6 +242,7 @@ impl Session {
             client_manager.clone(),
             path_validator.clone(),
             fs_manager.clone(),
+            symbol_index.clone(),
         ));
 
         let grep = GrepServer {
