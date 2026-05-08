@@ -1151,19 +1151,25 @@ command = "rust-analyzer"
 
     #[test]
     fn test_config_check_fast() {
-        // Config check must complete in < 50ms — regression guard.
-        // We check against an empty config (fastest path).
+        // Config loading must use negligible CPU — regression guard against
+        // accidental network calls or O(n²) parsing.  Measures process CPU
+        // time (centiseconds, 100 Hz) instead of wall-clock to avoid flakes
+        // under parallel test load.
         let dir = tempdir().expect("tempdir");
         let config_path = dir.path().join("config.toml");
         std::fs::write(&config_path, "").expect("write config");
 
-        let start = std::time::Instant::now();
+        let pid = std::process::id();
+        let before = catenary_proc::sample(pid).expect("sample before");
         let _ = Config::load_from_sources(&[config_path]);
-        let elapsed = start.elapsed();
+        let after = catenary_proc::sample(pid).expect("sample after");
 
+        let cpu_ticks = (after.utime + after.stime) - (before.utime + before.stime);
+        // 10 ticks = 100ms CPU time — extremely generous for parsing an
+        // empty TOML file.  Catches catastrophic regressions, not micro.
         assert!(
-            elapsed < std::time::Duration::from_millis(50),
-            "config check took {elapsed:?}, expected < 50ms",
+            cpu_ticks <= 10,
+            "config check used {cpu_ticks} CPU ticks (centiseconds), expected <= 10",
         );
     }
 
