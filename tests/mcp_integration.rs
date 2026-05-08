@@ -3121,6 +3121,91 @@ fn test_grep_enriched() -> Result<()> {
     Ok(())
 }
 
+/// Enrichment cache: second grep for the same pattern returns identical
+/// enriched output. The first call populates the cache; the second hits it.
+#[test]
+fn test_grep_enrichment_cache_hit() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().to_str().context("root path")?;
+
+    let file = dir.path().join(format!("cache.{MOCK_LANG_A}"));
+    std::fs::write(
+        &file,
+        "fn callee_cache\nfn caller_cache {\ncallee_cache\n}\n",
+    )?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let mut bridge = BridgeProcess::spawn_with_grammar(&[&lsp], root, install_mock_grammar)?;
+    bridge.initialize()?;
+
+    // First grep — populates cache.
+    let text1 = bridge.call_tool_text("grep", &json!({ "pattern": "caller_cache" }))?;
+
+    // Sanity: first call produces enriched output.
+    assert!(
+        text1.contains("calls:"),
+        "First grep should be enriched, got:\n{text1}"
+    );
+
+    // Second grep — should hit cache and produce identical output.
+    let text2 = bridge.call_tool_text("grep", &json!({ "pattern": "caller_cache" }))?;
+
+    assert_eq!(
+        text1, text2,
+        "Second grep should match first (cache hit).\nFirst:\n{text1}\nSecond:\n{text2}"
+    );
+
+    Ok(())
+}
+
+/// Out-of-root grep via absolute glob: enrichment works but is not cached.
+/// Files outside workspace roots reach `enrich_at_position` through absolute
+/// glob override. `resolve_root` returns `None`, so the enrichment cache is
+/// bypassed. Second call must still return correct results (no stale state).
+#[test]
+fn test_grep_enrichment_cache_skip_out_of_root() -> Result<()> {
+    let root_dir = tempfile::tempdir()?;
+    let root = root_dir.path().to_str().context("root path")?;
+    let oor_dir = tempfile::tempdir()?;
+
+    // Put a file in the workspace root (triggers server startup).
+    let root_file = root_dir.path().join(format!("root.{MOCK_LANG_A}"));
+    std::fs::write(&root_file, "fn root_fn\n")?;
+
+    // Put a file outside workspace roots.
+    let oor_file = oor_dir.path().join(format!("outside.{MOCK_LANG_A}"));
+    std::fs::write(&oor_file, "fn callee_oor\nfn caller_oor {\ncallee_oor\n}\n")?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let mut bridge = BridgeProcess::spawn_with_grammar(&[&lsp], root, install_mock_grammar)?;
+    bridge.initialize()?;
+
+    // Grep with absolute glob targeting the out-of-root directory.
+    let abs_glob = format!("{}/**", oor_dir.path().display());
+    let text1 = bridge.call_tool_text(
+        "grep",
+        &json!({ "pattern": "caller_oor", "glob": abs_glob }),
+    )?;
+
+    assert!(
+        text1.contains("caller_oor"),
+        "Out-of-root grep should find hits, got:\n{text1}"
+    );
+
+    // Second call — must still work (no stale cache, no crash).
+    let text2 = bridge.call_tool_text(
+        "grep",
+        &json!({ "pattern": "caller_oor", "glob": abs_glob }),
+    )?;
+
+    assert!(
+        text2.contains("caller_oor"),
+        "Second out-of-root grep should still find hits, got:\n{text2}"
+    );
+
+    Ok(())
+}
+
 /// Type hierarchy: subtypes section present for interface pattern.
 #[test]
 fn test_grep_type_hierarchy() -> Result<()> {

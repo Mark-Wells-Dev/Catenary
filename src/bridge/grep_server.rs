@@ -23,7 +23,9 @@ use crate::config::DispatchMethod;
 use crate::lsp::LspClientManager;
 use crate::lsp::server::LspServer;
 use crate::source::Source;
-use crate::symbol_index::{Symbol, SymbolIndex, format_symbol_kind};
+use crate::symbol_index::{
+    CallEdge, Symbol, SymbolEnrichment, SymbolIndex, TypeEdge, format_symbol_kind,
+};
 
 /// Input for grep tool.
 #[derive(Debug, Deserialize)]
@@ -71,43 +73,6 @@ enum HitClass {
     PrepareRenameSymbol,
     /// Keyword filtered out via `prepareRename` (will be dropped).
     Keyword,
-}
-
-/// Enrichment data for a single symbol from LSP queries.
-pub(super) struct SymbolEnrichment {
-    /// Reference lines grouped by file path (0-based line numbers).
-    pub ref_lines: HashMap<String, HashSet<u32>>,
-    /// Incoming call edges (callers of this symbol).
-    pub incoming_calls: Vec<CallEdge>,
-    /// Outgoing call edges (callees of this symbol).
-    pub outgoing_calls: Vec<CallEdge>,
-    /// Implementation locations: `(file_path, line_0)`.
-    pub implementations: Vec<(String, u32)>,
-    /// Supertype edges.
-    pub supertypes: Vec<TypeEdge>,
-    /// Subtype edges.
-    pub subtypes: Vec<TypeEdge>,
-}
-
-/// A call hierarchy edge (caller or callee).
-pub(super) struct CallEdge {
-    pub name: String,
-    pub kind: u32,
-    pub container: Option<String>,
-    pub file: String,
-    pub line: u32,
-    pub deprecated: bool,
-}
-
-/// A type hierarchy edge (supertype or subtype).
-pub(super) struct TypeEdge {
-    pub name: String,
-    pub kind: u32,
-    /// Container name from LSP `detail` field.
-    pub container: Option<String>,
-    pub file: String,
-    pub line: u32,
-    pub deprecated: bool,
 }
 
 /// Grep tool server: ripgrep + tree-sitter index pipeline with LSP enrichment.
@@ -541,6 +506,16 @@ impl GrepServer {
         parent_id: Option<i64>,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Option<SymbolEnrichment> {
+        // Check the enrichment cache for workspace-rooted files.
+        let resolved_root = self.fs_manager.resolve_root(path);
+        if resolved_root.is_some()
+            && let Some(ref idx_arc) = self.symbol_index
+            && let Ok(mut idx) = idx_arc.lock()
+            && let Some(cached) = idx.get_enrichment(path, line_0, col, &self.fs_manager)
+        {
+            return Some(cached);
+        }
+
         // If !from_ts, check prepareRename first. Null → keyword, return None.
         if !from_ts
             && !self
@@ -661,14 +636,25 @@ impl GrepServer {
             return None;
         }
 
-        Some(SymbolEnrichment {
+        let enrichment = SymbolEnrichment {
             ref_lines,
             incoming_calls,
             outgoing_calls,
             implementations,
             supertypes,
             subtypes,
-        })
+        };
+
+        // Store in the enrichment cache for workspace-rooted files.
+        if let Some(root) = resolved_root
+            && let Some(ref idx_arc) = self.symbol_index
+            && let Ok(mut idx) = idx_arc.lock()
+        {
+            let generation = self.fs_manager.root_generation(&root);
+            idx.cache_enrichment(path, line_0, col, root, generation, enrichment.clone());
+        }
+
+        Some(enrichment)
     }
 
     /// Fetches references via priority chain dispatch.

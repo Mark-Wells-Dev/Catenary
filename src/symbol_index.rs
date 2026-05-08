@@ -193,14 +193,86 @@ pub const fn symbol_kind_to_string(kind: u32) -> &'static str {
     }
 }
 
+/// Cached enrichment result for a symbol position.
+///
+/// Wraps `SymbolEnrichment` with the root and generation counter at
+/// cache time for staleness checking against [`FilesystemManager::root_generation`].
+struct CachedEnrichment {
+    /// The enrichment data.
+    enrichment: SymbolEnrichment,
+    /// Workspace root this position belongs to.
+    root: PathBuf,
+    /// Generation counter at cache time.
+    generation: u64,
+}
+
+/// Enrichment data for a single symbol from LSP queries.
+///
+/// Shared between [`GrepServer`] (producer) and the enrichment cache.
+#[derive(Clone)]
+pub(crate) struct SymbolEnrichment {
+    /// Reference lines grouped by file path (0-based line numbers).
+    pub ref_lines: HashMap<String, HashSet<u32>>,
+    /// Incoming call edges (callers of this symbol).
+    pub incoming_calls: Vec<CallEdge>,
+    /// Outgoing call edges (callees of this symbol).
+    pub outgoing_calls: Vec<CallEdge>,
+    /// Implementation locations: `(file_path, line_0)`.
+    pub implementations: Vec<(String, u32)>,
+    /// Supertype edges.
+    pub supertypes: Vec<TypeEdge>,
+    /// Subtype edges.
+    pub subtypes: Vec<TypeEdge>,
+}
+
+/// A call hierarchy edge (caller or callee).
+#[derive(Clone)]
+pub(crate) struct CallEdge {
+    /// Symbol name.
+    pub name: String,
+    /// LSP `SymbolKind` numeric value.
+    pub kind: u32,
+    /// Container name (enclosing scope).
+    pub container: Option<String>,
+    /// File path.
+    pub file: String,
+    /// 0-based line number.
+    pub line: u32,
+    /// Whether the symbol has a `Deprecated` tag.
+    pub deprecated: bool,
+}
+
+/// A type hierarchy edge (supertype or subtype).
+#[derive(Clone)]
+pub(crate) struct TypeEdge {
+    /// Symbol name.
+    pub name: String,
+    /// LSP `SymbolKind` numeric value.
+    pub kind: u32,
+    /// Container name from LSP `detail` field.
+    pub container: Option<String>,
+    /// File path.
+    pub file: String,
+    /// 0-based line number.
+    pub line: u32,
+    /// Whether the symbol has a `Deprecated` tag.
+    pub deprecated: bool,
+}
+
 /// Workspace-wide symbol index backed by in-memory `SQLite`.
 ///
 /// Populated lazily from `textDocument/documentSymbol` LSP responses.
 /// The symbol index is ephemeral — built during a session, discarded
 /// on session end. No dependency on the persistent session database.
+///
+/// Also caches per-position enrichment results (references, call
+/// hierarchy, implementations, type hierarchy) with per-root generation
+/// counter invalidation.
 pub struct SymbolIndex {
     /// In-memory connection for symbol reads and writes.
     conn: Connection,
+    /// Per-position enrichment cache: `(file, line, col)` → cached result.
+    enrichment_cache: HashMap<(PathBuf, u32, u32), CachedEnrichment>,
 }
 
 impl SymbolIndex {
@@ -246,7 +318,10 @@ impl SymbolIndex {
         )
         .context("failed to register REGEXP function")?;
 
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            enrichment_cache: HashMap::new(),
+        })
     }
 
     /// Populates the index for a file from a `documentSymbol` LSP response.
@@ -621,6 +696,54 @@ impl SymbolIndex {
 
         Ok(result)
     }
+
+    /// Returns a cached enrichment result if the generation still matches.
+    ///
+    /// Checks the per-root generation counter against the current value from
+    /// `FilesystemManager`. Returns `None` on miss or stale generation
+    /// (evicts the stale entry). Returns a clone because a stale hit requires
+    /// mutable access to evict the entry.
+    pub(crate) fn get_enrichment(
+        &mut self,
+        file: &Path,
+        line: u32,
+        col: u32,
+        fs_manager: &super::bridge::filesystem_manager::FilesystemManager,
+    ) -> Option<SymbolEnrichment> {
+        let key = (file.to_path_buf(), line, col);
+        let entry = self.enrichment_cache.get(&key)?;
+        let current_gen = fs_manager.root_generation(&entry.root);
+        if entry.generation == current_gen {
+            Some(entry.enrichment.clone())
+        } else {
+            self.enrichment_cache.remove(&key);
+            None
+        }
+    }
+
+    /// Stores an enrichment result in the cache.
+    ///
+    /// Records the current root generation from `FilesystemManager` so that
+    /// future lookups can detect staleness.
+    pub(crate) fn cache_enrichment(
+        &mut self,
+        file: &Path,
+        line: u32,
+        col: u32,
+        root: PathBuf,
+        generation: u64,
+        enrichment: SymbolEnrichment,
+    ) {
+        let key = (file.to_path_buf(), line, col);
+        self.enrichment_cache.insert(
+            key,
+            CachedEnrichment {
+                enrichment,
+                root,
+                generation,
+            },
+        );
+    }
 }
 
 /// Recursively flattens a `DocumentSymbol` JSON node into [`Symbol`] rows.
@@ -860,5 +983,125 @@ mod tests {
     fn test_no_symbols_for_unknown_file() {
         let index = SymbolIndex::new().expect("create index");
         assert!(!index.has_symbols_for(std::path::Path::new("/unknown/file.rs")));
+    }
+
+    /// Helper: builds a minimal `SymbolEnrichment` for cache tests.
+    fn dummy_enrichment() -> super::SymbolEnrichment {
+        super::SymbolEnrichment {
+            ref_lines: std::collections::HashMap::from([(
+                "/test/other.rs".to_string(),
+                std::collections::HashSet::from([10, 20]),
+            )]),
+            incoming_calls: vec![super::CallEdge {
+                name: "caller".to_string(),
+                kind: 12,
+                container: None,
+                file: "/test/caller.rs".to_string(),
+                line: 5,
+                deprecated: false,
+            }],
+            outgoing_calls: Vec::new(),
+            implementations: vec![("/test/impl.rs".to_string(), 42)],
+            supertypes: Vec::new(),
+            subtypes: Vec::new(),
+        }
+    }
+
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    #[test]
+    fn enrichment_cache_hit() {
+        let mut index = SymbolIndex::new().expect("create index");
+        let fs = crate::bridge::filesystem_manager::FilesystemManager::new();
+        let root = std::path::PathBuf::from("/workspace");
+        let file = std::path::Path::new("/workspace/src/main.rs");
+
+        // Cache an enrichment at generation 0.
+        index.cache_enrichment(file, 10, 5, root, 0, dummy_enrichment());
+
+        // Should hit — generation matches (both 0).
+        let hit = index.get_enrichment(file, 10, 5, &fs);
+        assert!(hit.is_some(), "expected cache hit");
+        let enrichment = hit.expect("just checked");
+        assert_eq!(enrichment.implementations.len(), 1);
+        assert_eq!(enrichment.incoming_calls.len(), 1);
+    }
+
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    #[test]
+    fn enrichment_cache_generation_miss() {
+        let mut index = SymbolIndex::new().expect("create index");
+        let fs = crate::bridge::filesystem_manager::FilesystemManager::new();
+        let root = std::path::PathBuf::from("/workspace");
+        let file = std::path::Path::new("/workspace/src/main.rs");
+
+        // Cache at generation 5 — but FilesystemManager returns 0 (no bumps).
+        index.cache_enrichment(file, 10, 5, root, 5, dummy_enrichment());
+
+        // Should miss — stale generation.
+        let miss = index.get_enrichment(file, 10, 5, &fs);
+        assert!(miss.is_none(), "expected cache miss on stale generation");
+
+        // Entry should have been evicted.
+        assert!(
+            index.enrichment_cache.is_empty(),
+            "stale entry should be evicted"
+        );
+    }
+
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    #[test]
+    fn enrichment_cache_root_scoped() {
+        let dir_a = tempfile::tempdir().expect("tempdir a");
+        let dir_b = tempfile::tempdir().expect("tempdir b");
+        let file_a = dir_a.path().join("lib.rs");
+        let file_b = dir_b.path().join("lib.rs");
+        std::fs::write(&file_a, "fn a() {}\n").expect("write a");
+        std::fs::write(&file_b, "fn b() {}\n").expect("write b");
+
+        let fs = crate::bridge::filesystem_manager::FilesystemManager::new();
+        fs.set_roots(vec![dir_a.path().to_path_buf(), dir_b.path().to_path_buf()]);
+        fs.seed();
+
+        let mut index = SymbolIndex::new().expect("create index");
+
+        // Cache entries in both roots at generation 0.
+        index.cache_enrichment(
+            &file_a,
+            1,
+            0,
+            dir_a.path().to_path_buf(),
+            0,
+            dummy_enrichment(),
+        );
+        index.cache_enrichment(
+            &file_b,
+            1,
+            0,
+            dir_b.path().to_path_buf(),
+            0,
+            dummy_enrichment(),
+        );
+
+        // Modify file in root A — bumps generation for root A only.
+        std::fs::write(&file_a, "fn a_changed() {}\n").expect("write a changed");
+        let time = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2_000_000);
+        let times = std::fs::FileTimes::new().set_modified(time);
+        std::fs::File::options()
+            .write(true)
+            .open(&file_a)
+            .expect("open for set_mtime")
+            .set_times(times)
+            .expect("set_times");
+        let _ = fs.diff();
+
+        // Root A entry should be stale, root B should survive.
+        assert!(
+            index.get_enrichment(&file_a, 1, 0, &fs).is_none(),
+            "root A should be stale after diff"
+        );
+        assert!(
+            index.get_enrichment(&file_b, 1, 0, &fs).is_some(),
+            "root B should survive"
+        );
     }
 }

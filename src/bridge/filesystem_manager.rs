@@ -261,6 +261,10 @@ pub struct FilesystemManager {
     roots: std::sync::Mutex<Vec<PathBuf>>,
     classification: ClassificationTables,
     per_root_classification: std::sync::Mutex<HashMap<PathBuf, ClassificationTables>>,
+    /// Per-root generation counter, bumped by [`diff()`](Self::diff) when
+    /// changes are detected in a root. Used by [`SymbolIndex`] enrichment
+    /// cache for invalidation.
+    root_generations: std::sync::Mutex<HashMap<PathBuf, u64>>,
 }
 
 /// Cache entry storing classification results keyed by mtime.
@@ -279,6 +283,7 @@ impl Default for FilesystemManager {
             roots: std::sync::Mutex::new(Vec::new()),
             classification: ClassificationTables::default(),
             per_root_classification: std::sync::Mutex::new(HashMap::new()),
+            root_generations: std::sync::Mutex::new(HashMap::new()),
         }
     }
 }
@@ -301,6 +306,7 @@ impl FilesystemManager {
             roots: std::sync::Mutex::new(Vec::new()),
             classification,
             per_root_classification: std::sync::Mutex::new(HashMap::new()),
+            root_generations: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -656,6 +662,26 @@ impl FilesystemManager {
             cache.remove(key);
         }
 
+        // Bump generation counter for each root that has changes.
+        if !changes.is_empty() {
+            let roots_snapshot = self
+                .roots
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let mut changed_roots = HashSet::new();
+            for change in &changes {
+                if let Some(root) = resolve_root_in(&roots_snapshot, &change.path) {
+                    changed_roots.insert(root);
+                }
+            }
+            if let Ok(mut gens) = self.root_generations.lock() {
+                for root in changed_roots {
+                    *gens.entry(root).or_insert(0) += 1;
+                }
+            }
+        }
+
         changes
     }
 
@@ -692,6 +718,21 @@ impl FilesystemManager {
                 }
             }
         }
+    }
+
+    /// Returns the current generation counter for a root.
+    ///
+    /// The generation starts at 0 and is bumped by [`diff()`](Self::diff)
+    /// each time changes are detected in the root. Used by the enrichment
+    /// cache in [`SymbolIndex`] for staleness checks.
+    #[must_use]
+    pub fn root_generation(&self, root: &Path) -> u64 {
+        self.root_generations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(root)
+            .copied()
+            .unwrap_or(0)
     }
 }
 
@@ -1828,5 +1869,59 @@ mod tests {
             !changes.iter().any(|c| c.path.ends_with("a.rs")),
             "existing root files should not appear, got: {changes:?}",
         );
+    }
+
+    #[test]
+    fn diff_bumps_generation_for_changed_roots() {
+        let dir_a = tempfile::tempdir().expect("tempdir a");
+        let dir_b = tempfile::tempdir().expect("tempdir b");
+        let file_a = dir_a.path().join("a.rs");
+        let file_b = dir_b.path().join("b.rs");
+        std::fs::write(&file_a, "fn a() {}\n").expect("write a");
+        std::fs::write(&file_b, "fn b() {}\n").expect("write b");
+        set_mtime(&file_a, 1_000_000);
+        set_mtime(&file_b, 1_000_000);
+
+        let mgr = FilesystemManager::new();
+        mgr.set_roots(vec![dir_a.path().to_path_buf(), dir_b.path().to_path_buf()]);
+        mgr.seed();
+
+        // Both roots start at generation 0.
+        assert_eq!(mgr.root_generation(dir_a.path()), 0);
+        assert_eq!(mgr.root_generation(dir_b.path()), 0);
+
+        // No changes yet — diff should not bump.
+        let changes = mgr.diff();
+        assert!(changes.is_empty());
+        assert_eq!(mgr.root_generation(dir_a.path()), 0);
+        assert_eq!(mgr.root_generation(dir_b.path()), 0);
+
+        // Modify file in root A only.
+        std::fs::write(&file_a, "fn a_modified() {}\n").expect("write a modified");
+        set_mtime(&file_a, 2_000_000);
+        let changes = mgr.diff();
+        assert!(!changes.is_empty(), "should detect change");
+        assert_eq!(
+            mgr.root_generation(dir_a.path()),
+            1,
+            "root A generation should bump"
+        );
+        assert_eq!(
+            mgr.root_generation(dir_b.path()),
+            0,
+            "root B generation should not bump"
+        );
+
+        // Another change in root A.
+        std::fs::write(&file_a, "fn a_again() {}\n").expect("write a again");
+        set_mtime(&file_a, 3_000_000);
+        let _ = mgr.diff();
+        assert_eq!(mgr.root_generation(dir_a.path()), 2);
+
+        // Change in root B.
+        std::fs::write(&file_b, "fn b_modified() {}\n").expect("write b modified");
+        set_mtime(&file_b, 2_000_000);
+        let _ = mgr.diff();
+        assert_eq!(mgr.root_generation(dir_b.path()), 1);
     }
 }
