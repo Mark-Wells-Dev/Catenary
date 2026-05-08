@@ -20,6 +20,15 @@ use super::{
 /// Embedded default classification config (lowest-priority layer).
 const DEFAULT_LANGUAGES: &str = include_str!("../../defaults/languages.toml");
 
+/// Embedded default server definitions (lowest-priority layer).
+///
+/// Parsed separately from `DEFAULT_LANGUAGES` because
+/// `deserialize_source` rejects `[server.*]`-only configs (migration
+/// guard for old user configs). Built-in server defs are merged into
+/// `config.server` before any user/project config, so user entries
+/// with the same key completely replace the built-in default.
+pub const DEFAULT_SERVERS: &str = include_str!("../../defaults/servers.toml");
+
 /// TOML deserialization target for a single config source.
 ///
 /// Each TOML file is deserialized into this struct. The `commands` field
@@ -106,15 +115,23 @@ pub fn config_sources() -> Vec<PathBuf> {
 /// Load configuration from an explicit list of file paths.
 ///
 /// Sources are merged in order (later overrides earlier):
-/// 1. Embedded default config (`defaults/languages.toml`)
-/// 2. User/project/explicit files (the `sources` parameter)
-/// 3. Environment variable overrides
+/// 1. Embedded default server definitions (`defaults/servers.toml`)
+/// 2. Embedded default language config (`defaults/languages.toml`)
+/// 3. User/project/explicit files (the `sources` parameter)
+/// 4. Environment variable overrides
 ///
 /// Validation is applied after merging.
 pub fn load_from_sources(sources: &[PathBuf]) -> Result<Config> {
     let mut config = Config::default();
 
-    // Load embedded default classification config (lowest priority).
+    // Load embedded default server definitions (lowest priority).
+    let default_servers = parse_server_defaults(DEFAULT_SERVERS)
+        .context("Failed to parse embedded default server config")?;
+    for (key, value) in default_servers {
+        config.server.insert(key, value);
+    }
+
+    // Load embedded default classification config (includes server bindings).
     let defaults =
         deserialize_source(DEFAULT_LANGUAGES).context("Failed to parse embedded default config")?;
     merge(&mut config, defaults);
@@ -309,6 +326,21 @@ fn has_old_commands_format(raw: &toml::Value) -> bool {
             .is_some_and(|d| d.values().any(toml::Value::is_str))
 }
 
+/// Parse a `[server.*]` TOML document into a map of server definitions.
+///
+/// Used for the embedded `defaults/servers.toml` which contains only
+/// `[server.*]` entries. This bypasses `deserialize_source` which
+/// rejects server-only configs as the old deprecated format.
+fn parse_server_defaults(contents: &str) -> Result<HashMap<String, ServerDef>> {
+    #[derive(Deserialize)]
+    struct ServerOnly {
+        #[serde(default)]
+        server: HashMap<String, ServerDef>,
+    }
+    let parsed: ServerOnly = toml::from_str(contents).context("Failed to parse server TOML")?;
+    Ok(parsed.server)
+}
+
 /// Merge a raw config layer into the resolved config. Later values override.
 ///
 /// # Merge strategies
@@ -407,7 +439,7 @@ pub(super) fn parse_server_specs(val: &str) -> Vec<(String, ServerDef, LanguageC
                         ..ServerDef::default()
                     },
                     LanguageConfig {
-                        servers: vec![ServerBinding::new(server_name)],
+                        servers: Some(vec![ServerBinding::new(server_name)]),
                         ..LanguageConfig::default()
                     },
                 ));

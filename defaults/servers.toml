@@ -1,0 +1,149 @@
+# Built-in server definitions.
+#
+# Loaded as the lowest-priority config layer. User and project
+# `[server.*]` entries completely replace the built-in default for
+# that name — no merging.
+#
+# Names follow Decision 011 (server naming convention):
+#   1. Server has its own name  → use as-is  (rust-analyzer, gopls)
+#   2. Named {name}-language-server → shorten to {name}-ls  (bash-ls)
+#   3. Runtime-embedded  → {lang}-ls  (julia-ls, r-ls)
+#
+# Only `command` and `args` are defined here. `initialization_options`,
+# `settings`, `env`, and other fields are user preferences.
+
+# ── Own name ─────────────────────────────────────────────────────
+
+[server.rust-analyzer]
+command = "rustup"
+args = ["run", "stable", "rust-analyzer"]
+
+[server.gopls]
+command = "gopls"
+
+[server.clangd]
+command = "clangd"
+
+[server.zls]
+command = "zls"
+
+[server.pyright]
+command = "pyright-langserver"
+args = ["--stdio"]
+
+[server.taplo]
+command = "taplo"
+args = ["lsp", "stdio"]
+
+[server.marksman]
+command = "marksman"
+args = ["server"]
+
+[server.intelephense]
+command = "intelephense"
+args = ["--stdio"]
+
+[server.vscode-css]
+command = "vscode-css-language-server"
+args = ["--stdio"]
+
+[server.vscode-html]
+command = "vscode-html-language-server"
+args = ["--stdio"]
+
+[server.vscode-json]
+command = "vscode-json-language-server"
+args = ["--stdio"]
+
+[server.vscode-eslint]
+command = "vscode-eslint-language-server"
+args = ["--stdio"]
+
+# ── {name}-ls ────────────────────────────────────────────────────
+
+[server.bash-ls]
+command = "bash-language-server"
+args = ["start"]
+
+[server.haskell-ls]
+command = "haskell-language-server-wrapper"
+args = ["--lsp"]
+
+[server.typescript-ls]
+command = "typescript-language-server"
+args = ["--stdio"]
+
+[server.lua-ls]
+command = "lua-language-server"
+
+[server.vim-ls]
+command = "vim-language-server"
+args = ["--stdio"]
+
+[server.yaml-ls]
+command = "yaml-language-server"
+args = ["--stdio"]
+
+[server.ansible-ls]
+command = "ansible-language-server"
+args = ["--stdio"]
+
+[server.cmake-ls]
+command = "cmake-language-server"
+
+[server.sql-ls]
+command = "sql-language-server"
+args = ["up", "--method", "stdio"]
+
+[server.docker-ls]
+command = "docker-langserver"
+args = ["--stdio"]
+
+[server.csharp-ls]
+command = "csharp-ls"
+
+[server.fsautocomplete]
+command = "fsautocomplete"
+args = ["--adaptive-lsp-server-enabled"]
+
+[server.kotlin-ls]
+command = "kotlin-language-server"
+
+[server.ocamllsp]
+command = "ocamllsp"
+
+[server.elm-ls]
+command = "elm-language-server"
+args = ["--stdio"]
+
+[server.svelte-ls]
+command = "svelteserver"
+args = ["--stdio"]
+
+[server.nil]
+command = "nil"
+
+[server.terraform-ls]
+command = "terraform-ls"
+args = ["serve"]
+
+[server.sourcekit-lsp]
+command = "sourcekit-lsp"
+
+[server.metals]
+command = "metals"
+
+[server.dart-ls]
+command = "dart"
+args = ["language-server"]
+
+# ── Runtime-embedded ─────────────────────────────────────────────
+
+[server.julia-ls]
+command = "julia"
+args = ["--startup-file=no", "--history-file=no", "-e",
+        "using LanguageServer; runserver()"]
+
+[server.r-ls]
+command = "R"
+args = ["--slave", "-e", "languageserver::run()"]

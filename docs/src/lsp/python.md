@@ -30,22 +30,19 @@ npm install -g pyright
 
 ## Config
 
-Add to `~/.config/catenary/config.toml`:
+Catenary ships a built-in definition for pyright — no `[server.*]`
+config is needed. If `pyright-langserver` is on PATH, it works
+automatically.
+
+To customise settings, add to `~/.config/catenary/config.toml`:
 
 ```toml
-[server.python]
-command = "pyright-langserver"
-args = ["--stdio"]
-
-[server.python.settings.python]
+[server.pyright.settings.python]
 pythonPath = "/usr/bin/python3"
 
-[server.python.settings.python.analysis]
+[server.pyright.settings.python.analysis]
 exclude = ["**/target", "**/node_modules"]
 extraPaths = []
-
-[language.python]
-servers = ["python"]
 ```
 
 ## Settings

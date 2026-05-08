@@ -733,12 +733,12 @@ fn test_doctor_single_server_not_found() -> Result<()> {
         "should report unknown server, got:\n{stdout}"
     );
     assert!(
-        stdout.contains("Available servers:"),
-        "should list available servers, got:\n{stdout}"
+        stdout.contains("Configured servers:"),
+        "should list configured servers, got:\n{stdout}"
     );
     assert!(
         stdout.contains("mockls-test"),
-        "should include mockls-test in available servers, got:\n{stdout}"
+        "should include mockls-test in configured servers, got:\n{stdout}"
     );
 
     assert!(

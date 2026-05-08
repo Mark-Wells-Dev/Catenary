@@ -310,7 +310,7 @@ impl LspClientManager {
             let Some(lang_config) = self.config.resolve_language(lang) else {
                 continue;
             };
-            let bindings: Vec<ServerBinding> = lang_config.servers.clone();
+            let bindings: Vec<ServerBinding> = lang_config.servers().to_vec();
 
             for binding in &bindings {
                 let Some(first_root) = roots.first() else {
@@ -581,7 +581,7 @@ impl LspClientManager {
             .single_file_failures
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        lang_config.servers.iter().any(|binding| {
+        lang_config.servers().iter().any(|binding| {
             let Some(def) = self.config.server.get(&binding.name) else {
                 return false;
             };
@@ -807,7 +807,7 @@ impl LspClientManager {
             let clients = self.clients.lock().await;
             let mut result = Vec::new();
 
-            for binding in &lang_config.servers {
+            for binding in lang_config.servers() {
                 if method.is_some_and(|m| binding.is_method_disabled(m)) {
                     continue;
                 }
@@ -832,7 +832,7 @@ impl LspClientManager {
                 result.push(client);
             }
 
-            if result.is_empty() && !lang_config.servers.is_empty() {
+            if result.is_empty() && !lang_config.servers().is_empty() {
                 info!(
                     source = Source::LspDispatch.as_str(),
                     language = lang_id.as_str(),
@@ -845,7 +845,7 @@ impl LspClientManager {
 
         // Tier 3: single-file servers for unrooted files.
         let mut result = Vec::new();
-        for binding in &lang_config.servers {
+        for binding in lang_config.servers() {
             if method.is_some_and(|m| binding.is_method_disabled(m)) {
                 continue;
             }
@@ -904,14 +904,14 @@ impl LspClientManager {
             if let Some(root) = self.fs.resolve_root(path) {
                 // Tiers 1–2: rooted file.
                 lang_config
-                    .servers
+                    .servers()
                     .iter()
                     .filter_map(|binding| find_instance(&clients, &lang_id, &binding.name, &root))
                     .collect()
             } else {
                 // Tier 3: single-file servers.
                 lang_config
-                    .servers
+                    .servers()
                     .iter()
                     .filter_map(|binding| {
                         let sf_key = InstanceKey::new(
@@ -1452,7 +1452,7 @@ impl LspClientManager {
                 // Resolve marker root once per language — all servers
                 // share the same markers.
                 let resolved = self.resolve_server_root(path, &lang, &root);
-                for binding in &lang_config.servers {
+                for binding in lang_config.servers() {
                     if find_instance(&active, &lang, &binding.name, &resolved).is_none() {
                         to_spawn.insert((lang.clone(), binding.name.clone(), resolved.clone()));
                     }
@@ -1973,7 +1973,7 @@ mod tests {
             .resolve_language(lang)
             .ok_or_else(|| anyhow!("No LSP server configured for language '{lang}'"))?;
         let server_name = &lang_config
-            .servers
+            .servers()
             .first()
             .ok_or_else(|| anyhow!("No servers configured for language '{lang}'"))?
             .name;
@@ -2014,7 +2014,7 @@ mod tests {
         language.insert(
             MOCK_LANG_A.to_string(),
             LanguageConfig {
-                servers: vec![ServerBinding::new(server_name)],
+                servers: Some(vec![ServerBinding::new(server_name)]),
                 ..LanguageConfig::default()
             },
         );
@@ -2046,7 +2046,7 @@ mod tests {
         language.insert(
             MOCK_LANG_A.to_string(),
             LanguageConfig {
-                servers: vec![ServerBinding::new(server_name)],
+                servers: Some(vec![ServerBinding::new(server_name)]),
                 ..LanguageConfig::default()
             },
         );
@@ -2085,7 +2085,10 @@ mod tests {
         language.insert(
             MOCK_LANG_A.to_string(),
             LanguageConfig {
-                servers: vec![ServerBinding::new(server_a), ServerBinding::new(server_b)],
+                servers: Some(vec![
+                    ServerBinding::new(server_a),
+                    ServerBinding::new(server_b),
+                ]),
                 ..LanguageConfig::default()
             },
         );
@@ -2124,7 +2127,10 @@ mod tests {
         language.insert(
             MOCK_LANG_A.to_string(),
             LanguageConfig {
-                servers: vec![ServerBinding::new(server_a), ServerBinding::new(server_b)],
+                servers: Some(vec![
+                    ServerBinding::new(server_a),
+                    ServerBinding::new(server_b),
+                ]),
                 ..LanguageConfig::default()
             },
         );
@@ -2166,10 +2172,10 @@ mod tests {
         language.insert(
             MOCK_LANG_A.to_string(),
             LanguageConfig {
-                servers: vec![
+                servers: Some(vec![
                     ServerBinding::new(server_ws),
                     ServerBinding::new(server_legacy),
-                ],
+                ]),
                 ..LanguageConfig::default()
             },
         );
@@ -2352,7 +2358,7 @@ mod tests {
         language.insert(
             MOCK_LANG_A.to_string(),
             LanguageConfig {
-                servers: vec![ServerBinding::new(server_name)],
+                servers: Some(vec![ServerBinding::new(server_name)]),
                 ..LanguageConfig::default()
             },
         );
@@ -2510,7 +2516,7 @@ mod tests {
         let server_name = config
             .resolve_language(MOCK_LANG_A)
             .expect("lang config")
-            .servers[0]
+            .servers()[0]
             .name
             .clone();
 
@@ -2521,7 +2527,7 @@ mod tests {
         pc.language.insert(
             MOCK_LANG_A.to_string(),
             LanguageConfig {
-                servers: vec![ServerBinding::new(server_name)],
+                servers: Some(vec![ServerBinding::new(server_name)]),
                 ..LanguageConfig::default()
             },
         );
@@ -3129,7 +3135,7 @@ mod tests {
         language.insert(
             MOCK_LANG_A.to_string(),
             LanguageConfig {
-                servers: vec![ServerBinding::new(server_name)],
+                servers: Some(vec![ServerBinding::new(server_name)]),
                 ..LanguageConfig::default()
             },
         );
@@ -3185,7 +3191,7 @@ mod tests {
         language.insert(
             MOCK_LANG_A.to_string(),
             LanguageConfig {
-                servers: vec![ServerBinding::new(server_name)],
+                servers: Some(vec![ServerBinding::new(server_name)]),
                 ..LanguageConfig::default()
             },
         );
@@ -3240,7 +3246,7 @@ mod tests {
         language.insert(
             MOCK_LANG_A.to_string(),
             LanguageConfig {
-                servers: vec![ServerBinding::new(server_name)],
+                servers: Some(vec![ServerBinding::new(server_name)]),
                 ..LanguageConfig::default()
             },
         );
@@ -3327,11 +3333,11 @@ mod tests {
         language.insert(
             MOCK_LANG_A.to_string(),
             LanguageConfig {
-                servers: vec![ServerBinding {
+                servers: Some(vec![ServerBinding {
                     name: server_name,
                     diagnostics: true,
                     disabled_methods: vec![DispatchMethod::References],
-                }],
+                }]),
                 ..LanguageConfig::default()
             },
         );
@@ -3470,7 +3476,7 @@ mod tests {
         let bindings: Vec<String> = config
             .resolve_language(MOCK_LANG_A)
             .expect("lang config")
-            .servers
+            .servers()
             .iter()
             .map(|b| b.name.clone())
             .collect();
@@ -3506,7 +3512,7 @@ mod tests {
         let bindings: Vec<String> = config
             .resolve_language(MOCK_LANG_A)
             .expect("lang config")
-            .servers
+            .servers()
             .iter()
             .map(|b| b.name.clone())
             .collect();
@@ -3546,7 +3552,7 @@ mod tests {
         let bindings: Vec<String> = config
             .resolve_language(MOCK_LANG_A)
             .expect("lang config")
-            .servers
+            .servers()
             .iter()
             .map(|b| b.name.clone())
             .collect();
@@ -3625,7 +3631,7 @@ mod tests {
         let bindings: Vec<String> = config
             .resolve_language(MOCK_LANG_A)
             .expect("lang config")
-            .servers
+            .servers()
             .iter()
             .map(|b| b.name.clone())
             .collect();
@@ -3671,7 +3677,7 @@ mod tests {
         let bindings: Vec<String> = config
             .resolve_language(MOCK_LANG_A)
             .expect("lang config")
-            .servers
+            .servers()
             .iter()
             .map(|b| b.name.clone())
             .collect();
@@ -3948,7 +3954,7 @@ mod tests {
         let bindings: Vec<String> = config
             .resolve_language(MOCK_LANG_A)
             .expect("lang config")
-            .servers
+            .servers()
             .iter()
             .map(|b| b.name.clone())
             .collect();
@@ -4095,7 +4101,7 @@ mod tests {
         pc.language.insert(
             "rust".to_string(),
             LanguageConfig {
-                servers: vec![ServerBinding::new("rust-analyzer")],
+                servers: Some(vec![ServerBinding::new("rust-analyzer")]),
                 ..LanguageConfig::default()
             },
         );
@@ -4467,7 +4473,7 @@ mod tests {
         let server_name = config
             .resolve_language(MOCK_LANG_A)
             .expect("lang config")
-            .servers[0]
+            .servers()[0]
             .name
             .clone();
 
@@ -4478,7 +4484,7 @@ mod tests {
         pc.language.insert(
             MOCK_LANG_A.to_string(),
             LanguageConfig {
-                servers: vec![ServerBinding::new(server_name.clone())],
+                servers: Some(vec![ServerBinding::new(server_name.clone())]),
                 ..LanguageConfig::default()
             },
         );
@@ -4517,7 +4523,7 @@ mod tests {
         config.language.insert(
             MOCK_LANG_A.to_string(),
             LanguageConfig {
-                servers: vec![ServerBinding::new(server_name.clone())],
+                servers: Some(vec![ServerBinding::new(server_name.clone())]),
                 ..LanguageConfig::default()
             },
         );
@@ -4529,7 +4535,7 @@ mod tests {
         pc.language.insert(
             MOCK_LANG_A.to_string(),
             LanguageConfig {
-                servers: vec![ServerBinding::new(server_name.clone())],
+                servers: Some(vec![ServerBinding::new(server_name.clone())]),
                 ..LanguageConfig::default()
             },
         );
@@ -4579,7 +4585,7 @@ mod tests {
         let server_name = config
             .resolve_language(MOCK_LANG_A)
             .expect("lang config")
-            .servers[0]
+            .servers()[0]
             .name
             .clone();
 
@@ -4627,7 +4633,7 @@ mod tests {
         let server_name = config
             .resolve_language(MOCK_LANG_A)
             .expect("lang config")
-            .servers[0]
+            .servers()[0]
             .name
             .clone();
 
@@ -4670,7 +4676,7 @@ mod tests {
         let server_name = config
             .resolve_language(MOCK_LANG_A)
             .expect("lang config")
-            .servers[0]
+            .servers()[0]
             .name
             .clone();
 
@@ -4718,7 +4724,7 @@ mod tests {
         let server_name = config
             .resolve_language(MOCK_LANG_A)
             .expect("lang config")
-            .servers[0]
+            .servers()[0]
             .name
             .clone();
 
@@ -4733,7 +4739,7 @@ mod tests {
         pc.language.insert(
             MOCK_LANG_A.to_string(),
             LanguageConfig {
-                servers: vec![ServerBinding::new(server_name.clone())],
+                servers: Some(vec![ServerBinding::new(server_name.clone())]),
                 ..LanguageConfig::default()
             },
         );
@@ -4792,7 +4798,7 @@ mod tests {
         let server_name = config
             .resolve_language(MOCK_LANG_A)
             .expect("lang config")
-            .servers[0]
+            .servers()[0]
             .name
             .clone();
 
@@ -4811,7 +4817,7 @@ mod tests {
         pc.language.insert(
             MOCK_LANG_A.to_string(),
             LanguageConfig {
-                servers: vec![ServerBinding::new(server_name.clone())],
+                servers: Some(vec![ServerBinding::new(server_name.clone())]),
                 ..LanguageConfig::default()
             },
         );
@@ -4856,7 +4862,7 @@ mod tests {
         let server_name = config
             .resolve_language(MOCK_LANG_A)
             .expect("lang config")
-            .servers[0]
+            .servers()[0]
             .name
             .clone();
 
@@ -4910,7 +4916,7 @@ mod tests {
         let server_name = config
             .resolve_language(MOCK_LANG_A)
             .expect("lang config")
-            .servers[0]
+            .servers()[0]
             .name
             .clone();
 
@@ -4925,7 +4931,7 @@ mod tests {
         pc.language.insert(
             MOCK_LANG_A.to_string(),
             LanguageConfig {
-                servers: vec![ServerBinding::new(server_name.clone())],
+                servers: Some(vec![ServerBinding::new(server_name.clone())]),
                 ..LanguageConfig::default()
             },
         );
@@ -4982,7 +4988,7 @@ mod tests {
         language.insert(
             MOCK_LANG_A.to_string(),
             LanguageConfig {
-                servers: vec![ServerBinding::new(server_name)],
+                servers: Some(vec![ServerBinding::new(server_name)]),
                 ..LanguageConfig::default()
             },
         );
@@ -5019,7 +5025,7 @@ mod tests {
         language.insert(
             MOCK_LANG_A.to_string(),
             LanguageConfig {
-                servers: vec![ServerBinding::new(server_name)],
+                servers: Some(vec![ServerBinding::new(server_name)]),
                 ..LanguageConfig::default()
             },
         );
@@ -5042,7 +5048,7 @@ mod tests {
         let server_name = config
             .resolve_language(MOCK_LANG_A)
             .expect("lang config")
-            .servers[0]
+            .servers()[0]
             .name
             .clone();
 
@@ -5077,7 +5083,7 @@ mod tests {
         let server_name = config
             .resolve_language(MOCK_LANG_A)
             .expect("lang config")
-            .servers[0]
+            .servers()[0]
             .name
             .clone();
 
@@ -5109,7 +5115,7 @@ mod tests {
         let server_name = config
             .resolve_language(MOCK_LANG_A)
             .expect("lang config")
-            .servers[0]
+            .servers()[0]
             .name
             .clone();
 
@@ -5141,7 +5147,7 @@ mod tests {
         let server_name = config
             .resolve_language(MOCK_LANG_A)
             .expect("lang config")
-            .servers[0]
+            .servers()[0]
             .name
             .clone();
 
@@ -5210,7 +5216,7 @@ mod tests {
         let server_name = config
             .resolve_language(MOCK_LANG_A)
             .expect("lang config")
-            .servers[0]
+            .servers()[0]
             .name
             .clone();
 
@@ -5312,7 +5318,7 @@ mod tests {
             config.language.insert(
                 lang.to_string(),
                 LanguageConfig {
-                    servers: vec![ServerBinding::new(name.clone())],
+                    servers: Some(vec![ServerBinding::new(name.clone())]),
                     ..LanguageConfig::default()
                 },
             );
@@ -5372,7 +5378,7 @@ mod tests {
         config.language.insert(
             MOCK_LANG_A.to_string(),
             LanguageConfig {
-                servers: vec![ServerBinding::new(server_name)],
+                servers: Some(vec![ServerBinding::new(server_name)]),
                 ..LanguageConfig::default()
             },
         );

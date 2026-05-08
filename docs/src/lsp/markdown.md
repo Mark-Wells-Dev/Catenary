@@ -32,16 +32,8 @@ choco install marksman
 
 ## Config
 
-Add to `~/.config/catenary/config.toml`:
-
-```toml
-[server.marksman]
-command = "marksman"
-args = ["server"]
-
-[language.markdown]
-servers = ["marksman"]
-```
+Catenary ships a built-in definition for `marksman` — no `[server.*]`
+config is needed. If `marksman` is on PATH, it works automatically.
 
 ## Notes
 

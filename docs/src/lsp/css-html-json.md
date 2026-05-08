@@ -24,33 +24,10 @@ npm install -g vscode-langservers-extracted
 
 ## Config
 
-Add to `~/.config/catenary/config.toml`:
-
-```toml
-[server.vscode-css]
-command = "vscode-css-language-server"
-args = ["--stdio"]
-
-[server.vscode-html]
-command = "vscode-html-language-server"
-args = ["--stdio"]
-
-[server.vscode-json]
-command = "vscode-json-language-server"
-args = ["--stdio"]
-
-[language.css]
-servers = ["vscode-css"]
-
-[language.scss]
-servers = ["vscode-css"]
-
-[language.html]
-servers = ["vscode-html"]
-
-[language.json]
-servers = ["vscode-json"]
-```
+Catenary ships built-in definitions for `vscode-css`, `vscode-html`,
+and `vscode-json` — no `[server.*]` config is needed. If the binaries
+are on PATH, they work automatically for CSS, SCSS, Less, HTML, JSON,
+and JSONC files.
 
 ## What's Included
 

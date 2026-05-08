@@ -13,21 +13,14 @@ Pkg.add("LanguageServer")
 
 ## Config
 
-Add to `~/.config/catenary/config.toml`:
-
-```toml
-[server.julia-ls]
-command = "julia"
-args = ["--startup-file=no", "--history-file=no", "-e", "using LanguageServer; runserver()"]
-
-[language.julia]
-servers = ["julia-ls"]
-```
+Catenary ships a built-in definition for `julia-ls` — no `[server.*]`
+config is needed. If `julia` is on PATH and `LanguageServer.jl` is
+installed, it works automatically.
 
 ## Notes
 
 - The server starts a Julia process, which has some startup time
-- `--startup-file=no` and `--history-file=no` speed up startup
+- The built-in uses `--startup-file=no` and `--history-file=no` for faster startup
 - First run on a project may take time to load packages and index
 - Works best with projects that have a `Project.toml`
 
@@ -40,15 +33,12 @@ using PackageCompiler
 create_sysimage([:LanguageServer], sysimage_path="languageserver.so")
 ```
 
-Then use:
+Then override the built-in default:
 
 ```toml
 [server.julia-ls]
 command = "julia"
 args = ["--sysimage=/path/to/languageserver.so", "-e", "using LanguageServer; runserver()"]
-
-[language.julia]
-servers = ["julia-ls"]
 ```
 
 ## Links

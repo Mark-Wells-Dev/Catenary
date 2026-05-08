@@ -77,9 +77,9 @@ fields (`extensions`, `filenames`, `shebangs`) without repeating them.
 For nested structures:
 
 - **Scalars replace.** `command`, `args`, `min_severity`, `diagnostics`.
-- **Tables deep-merge by key.** A project `[server.rust]` with only
-  `settings` inherits `command` and `args` from the user's
-  `[server.rust]`.
+- **Tables deep-merge by key.** A project `[server.rust-analyzer]` with
+  only `settings` inherits `command` and `args` from the user's (or
+  built-in) `[server.rust-analyzer]`.
 - **Arrays replace.** `servers`, `file_patterns`, `extensions`,
   `filenames`, `shebangs`, and array-valued settings entries. No
   concatenation, no deduplication.
@@ -207,18 +207,18 @@ instance for each root, with its own process and its own settings.
 ```toml
 # Root A: .catenary.toml
 [language.rust]
-servers = ["rust"]
+servers = ["rust-analyzer"]
 
-[server.rust.settings.rust-analyzer]
+[server.rust-analyzer.settings.rust-analyzer]
 cargo.target = "x86_64-unknown-linux-gnu"
 ```
 
 ```toml
 # Root B: .catenary.toml
 [language.rust]
-servers = ["rust"]
+servers = ["rust-analyzer"]
 
-[server.rust.settings.rust-analyzer]
+[server.rust-analyzer.settings.rust-analyzer]
 cargo.target = "aarch64-unknown-linux-gnu"
 ```
 

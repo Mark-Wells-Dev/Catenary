@@ -73,7 +73,7 @@ pub async fn run_doctor(project_root: &Path, nocolor: bool, show_diff: bool) -> 
     let referenced: HashSet<&str> = config
         .language
         .values()
-        .flat_map(|lc| lc.servers.iter().map(|b| b.name.as_str()))
+        .flat_map(|lc| lc.servers().iter().map(|b| b.name.as_str()))
         .collect();
     let mut unreferenced: Vec<&str> = config
         .server
@@ -201,7 +201,7 @@ pub async fn run_doctor(project_root: &Path, nocolor: bool, show_diff: bool) -> 
     // Build sorted list of (language, server_name) pairs
     let mut lang_entries: Vec<(&str, &str)> = Vec::new();
     for (lang, lc) in &config.language {
-        if let Some(binding) = lc.servers.first() {
+        if let Some(binding) = lc.servers().first() {
             lang_entries.push((lang.as_str(), binding.name.as_str()));
         }
     }
@@ -313,7 +313,7 @@ pub async fn run_doctor_single(
         );
         let mut available: Vec<&str> = merged_config.server.keys().map(String::as_str).collect();
         available.sort_unstable();
-        println!("Available servers:");
+        println!("Configured servers:");
         for name in &available {
             println!("  {name}");
         }
@@ -335,7 +335,7 @@ pub async fn run_doctor_single(
     // Find languages that bind to this server and show their markers.
     let mut shown_markers = false;
     for (lang_name, lang_config) in &merged_config.language {
-        if lang_config.servers.iter().any(|b| b.name == server_name)
+        if lang_config.servers().iter().any(|b| b.name == server_name)
             && let Some(markers) = lang_config.active_markers()
         {
             if !shown_markers {
@@ -674,12 +674,12 @@ fn doctor_check_project_config(
                 let referenced_by_project = pc
                     .language
                     .values()
-                    .any(|lc| lc.servers.iter().any(|b| b.name == *server_name));
+                    .any(|lc| lc.servers().iter().any(|b| b.name == *server_name));
 
                 let referenced_by_user = user_config
                     .language
                     .values()
-                    .any(|lc| lc.servers.iter().any(|b| b.name == *server_name));
+                    .any(|lc| lc.servers().iter().any(|b| b.name == *server_name));
 
                 if !referenced_by_project && !referenced_by_user {
                     println!(
@@ -695,7 +695,7 @@ fn doctor_check_project_config(
             // Server ref validation — project language refs must resolve
             // against the combined (user + project) server set.
             for (lang_key, lang_config) in &pc.language {
-                for binding in &lang_config.servers {
+                for binding in lang_config.servers() {
                     if !pc.server.contains_key(&binding.name)
                         && !user_config.server.contains_key(&binding.name)
                     {

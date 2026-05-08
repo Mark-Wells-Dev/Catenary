@@ -18,7 +18,9 @@ use serde::Deserialize;
 
 pub use commands::{BuildContext, BuildGuidance, CommandsConfig, GuidanceEntry, ResolvedCommands};
 pub use language::{DispatchMethod, LanguageConfig, ServerBinding};
-pub use parse::{ProjectConfig, SERVER_DEF_KEYS, config_sources, load_project_config};
+pub use parse::{
+    DEFAULT_SERVERS, ProjectConfig, SERVER_DEF_KEYS, config_sources, load_project_config,
+};
 pub use server::ServerDef;
 
 /// Notification delivery configuration.
@@ -481,7 +483,7 @@ servers = ["rust-analyzer"]
                 .get("rust")
                 .expect("rust language config")
                 .servers,
-            vec![ServerBinding::new("rust-analyzer")],
+            Some(vec![ServerBinding::new("rust-analyzer")]),
         );
 
         Ok(())
@@ -538,8 +540,7 @@ servers = ["clangd"]
         let config = Config::load_from_sources(&[config_path])?;
 
         assert!(config.language.contains_key("rust"));
-        assert_eq!(config.server.len(), 2);
-
+        // User defs override built-in defaults — verify the overrides took effect.
         let ra = config
             .server
             .get("rust-analyzer")
@@ -730,13 +731,17 @@ servers = ["tsserver"]
         let resolved = config
             .resolve_language("typescript")
             .expect("should resolve");
-        assert_eq!(resolved.servers, vec![ServerBinding::new("tsserver")]);
+        assert_eq!(resolved.servers, Some(vec![ServerBinding::new("tsserver")]));
 
-        // typescriptreact exists from defaults (classification-only, no servers)
+        // typescriptreact exists from defaults with built-in server binding
         let tsx = config
             .resolve_language("typescriptreact")
             .expect("should exist from defaults");
-        assert!(tsx.servers.is_empty());
+        assert_eq!(
+            tsx.servers,
+            Some(vec![ServerBinding::new("typescript-ls")]),
+            "TSX should have built-in typescript-ls binding"
+        );
 
         // Truly unconfigured language returns None
         assert!(config.resolve_language("brainfuck").is_none());
@@ -754,8 +759,15 @@ servers = ["tsserver"]
         assert_eq!(config.log_retention_days, 7);
         // Default classification entries are loaded
         assert!(!config.language.is_empty());
-        // No server definitions from defaults
-        assert!(config.server.is_empty());
+        // Built-in server definitions are loaded
+        assert!(
+            !config.server.is_empty(),
+            "built-in server defaults should be loaded"
+        );
+        assert!(
+            config.server.contains_key("rust-analyzer"),
+            "rust-analyzer should be in built-in defaults"
+        );
 
         Ok(())
     }
@@ -835,13 +847,16 @@ servers = ["clangd"]
 
         // Language entries
         let rust = config.language.get("rust").expect("rust config");
-        assert_eq!(rust.servers, vec![ServerBinding::new("rust-analyzer")]);
+        assert_eq!(
+            rust.servers,
+            Some(vec![ServerBinding::new("rust-analyzer")])
+        );
 
         let c = config.language.get("c").expect("c config");
-        assert_eq!(c.servers, vec![ServerBinding::new("clangd")]);
+        assert_eq!(c.servers, Some(vec![ServerBinding::new("clangd")]));
 
         let cpp = config.language.get("cpp").expect("cpp config");
-        assert_eq!(cpp.servers, vec![ServerBinding::new("clangd")]);
+        assert_eq!(cpp.servers, Some(vec![ServerBinding::new("clangd")]));
 
         Ok(())
     }
@@ -962,9 +977,10 @@ servers = ["nonexistent-server"]
     }
 
     #[test]
-    fn test_concrete_empty_servers_with_classification_ok() -> anyhow::Result<()> {
-        // Entry with classification (from defaults merge) and empty servers
-        // is valid — classification-only entry.
+    fn test_explicit_empty_servers_clears_builtin() -> anyhow::Result<()> {
+        // User writes `servers = []` to actively clear the built-in
+        // server binding for a language. The `Some([])` from deserialization
+        // replaces the default `Some(["rust-analyzer"])` during merge.
         let dir = tempdir()?;
         let config_path = dir.path().join("config.toml");
 
@@ -976,12 +992,13 @@ servers = []
 ",
         )?;
 
-        // After merge with defaults, rust has classification from defaults
-        // and empty servers from the user config (empty preserves default's
-        // empty servers, which is fine since defaults don't have servers).
         let config = Config::load_from_sources(&[config_path])?;
         let rust = config.language.get("rust").expect("rust config");
-        assert!(rust.servers.is_empty());
+        assert_eq!(
+            rust.servers,
+            Some(vec![]),
+            "explicit servers = [] should clear built-in binding"
+        );
         assert!(rust.extensions.is_some());
 
         Ok(())
@@ -1010,7 +1027,7 @@ servers = ["tsserver"]
         let resolved = config
             .resolve_language("typescript")
             .expect("should resolve");
-        assert_eq!(resolved.servers, vec![ServerBinding::new("tsserver")]);
+        assert_eq!(resolved.servers, Some(vec![ServerBinding::new("tsserver")]));
 
         let server = config.server.get("tsserver").expect("tsserver def");
         assert_eq!(server.min_severity.as_deref(), Some("warning"));
@@ -1027,7 +1044,7 @@ servers = ["tsserver"]
         assert_eq!(lang, "rust");
         assert_eq!(server_def.command, "rust-analyzer");
         assert_eq!(server_def.args, vec!["--log-level", "info"]);
-        assert_eq!(lang_config.servers, vec![ServerBinding::new("rust")]);
+        assert_eq!(lang_config.servers, Some(vec![ServerBinding::new("rust")]));
     }
 
     #[test]
@@ -1077,7 +1094,7 @@ servers = ["tsserver"]
         let resolved = config
             .resolve_language("typescript")
             .expect("should resolve");
-        assert_eq!(resolved.servers, vec![ServerBinding::new("tsserver")]);
+        assert_eq!(resolved.servers, Some(vec![ServerBinding::new("tsserver")]));
 
         // Unconfigured language returns None
         assert!(config.resolve_language("unknown").is_none());
@@ -1266,9 +1283,9 @@ servers = ["foo"]
 
         let config = Config::load_from_sources(&[path])?;
         let lc = config.language.get("test").expect("test language");
-        assert_eq!(lc.servers.len(), 1);
-        assert_eq!(lc.servers[0].name, "foo");
-        assert!(lc.servers[0].diagnostics);
+        assert_eq!(lc.servers().len(), 1);
+        assert_eq!(lc.servers()[0].name, "foo");
+        assert!(lc.servers()[0].diagnostics);
 
         Ok(())
     }
@@ -1290,9 +1307,9 @@ servers = [{ name = "foo", diagnostics = false }]
 
         let config = Config::load_from_sources(&[path])?;
         let lc = config.language.get("test").expect("test language");
-        assert_eq!(lc.servers.len(), 1);
-        assert_eq!(lc.servers[0].name, "foo");
-        assert!(!lc.servers[0].diagnostics);
+        assert_eq!(lc.servers().len(), 1);
+        assert_eq!(lc.servers()[0].name, "foo");
+        assert!(!lc.servers()[0].diagnostics);
 
         Ok(())
     }
@@ -1317,17 +1334,17 @@ servers = ["alpha", { name = "beta", diagnostics = false }]
 
         let config = Config::load_from_sources(&[path])?;
         let lc = config.language.get("test").expect("test language");
-        assert_eq!(lc.servers.len(), 2);
+        assert_eq!(lc.servers().len(), 2);
         assert_eq!(
             lc.servers,
-            vec![
+            Some(vec![
                 ServerBinding::new("alpha"),
                 ServerBinding {
                     name: "beta".to_string(),
                     diagnostics: false,
                     disabled_methods: Vec::new(),
                 },
-            ],
+            ]),
         );
 
         Ok(())
@@ -1375,13 +1392,13 @@ servers = [{ name = "alpha", disabled_methods = ["textDocument/references"] }]
 
         let config = Config::load_from_sources(&[path])?;
         let lc = config.language.get("test").expect("test language");
-        assert_eq!(lc.servers.len(), 1);
+        assert_eq!(lc.servers().len(), 1);
         assert_eq!(
-            lc.servers[0].disabled_methods,
+            lc.servers()[0].disabled_methods,
             vec![DispatchMethod::References]
         );
-        assert!(lc.servers[0].is_method_disabled(DispatchMethod::References));
-        assert!(!lc.servers[0].is_method_disabled(DispatchMethod::Implementation));
+        assert!(lc.servers()[0].is_method_disabled(DispatchMethod::References));
+        assert!(!lc.servers()[0].is_method_disabled(DispatchMethod::Implementation));
 
         Ok(())
     }
@@ -1453,7 +1470,7 @@ servers = ["foo"]
 
         let config = Config::load_from_sources(&[path])?;
         let lc = config.language.get("test").expect("test language");
-        assert!(lc.servers[0].disabled_methods.is_empty());
+        assert!(lc.servers()[0].disabled_methods.is_empty());
 
         Ok(())
     }
@@ -1507,14 +1524,14 @@ diagnostics = false
     fn test_diagnostics_enabled_and_logic() {
         // language true, binding true → true
         let lc = LanguageConfig {
-            servers: vec![ServerBinding::new("s")],
+            servers: Some(vec![ServerBinding::new("s")]),
             ..LanguageConfig::default()
         };
         assert!(lc.diagnostics_enabled("s"));
 
         // language false, binding true → false
         let lc = LanguageConfig {
-            servers: vec![ServerBinding::new("s")],
+            servers: Some(vec![ServerBinding::new("s")]),
             diagnostics: false,
             ..LanguageConfig::default()
         };
@@ -1522,22 +1539,22 @@ diagnostics = false
 
         // language true, binding false → false
         let lc = LanguageConfig {
-            servers: vec![ServerBinding {
+            servers: Some(vec![ServerBinding {
                 name: "s".to_string(),
                 diagnostics: false,
                 disabled_methods: Vec::new(),
-            }],
+            }]),
             ..LanguageConfig::default()
         };
         assert!(!lc.diagnostics_enabled("s"));
 
         // language false, binding false → false
         let lc = LanguageConfig {
-            servers: vec![ServerBinding {
+            servers: Some(vec![ServerBinding {
                 name: "s".to_string(),
                 diagnostics: false,
                 disabled_methods: Vec::new(),
-            }],
+            }]),
             diagnostics: false,
             ..LanguageConfig::default()
         };
@@ -1547,7 +1564,7 @@ diagnostics = false
     #[test]
     fn test_diagnostics_enabled_unknown_server() {
         let lc = LanguageConfig {
-            servers: vec![ServerBinding::new("known")],
+            servers: Some(vec![ServerBinding::new("known")]),
             ..LanguageConfig::default()
         };
         assert!(!lc.diagnostics_enabled("unknown"));
@@ -1559,9 +1576,9 @@ diagnostics = false
         assert_eq!(results.len(), 1);
 
         let (_, _, lang_config) = &results[0];
-        assert_eq!(lang_config.servers.len(), 1);
-        assert_eq!(lang_config.servers[0].name, "rust");
-        assert!(lang_config.servers[0].diagnostics);
+        assert_eq!(lang_config.servers().len(), 1);
+        assert_eq!(lang_config.servers()[0].name, "rust");
+        assert!(lang_config.servers()[0].diagnostics);
     }
 
     #[test]
@@ -1655,7 +1672,10 @@ servers = ["rust-analyzer"]
         let config = Config::load_from_sources(&[path])?;
         let rust = config.language.get("rust").expect("rust config");
         // servers comes from user config
-        assert_eq!(rust.servers, vec![ServerBinding::new("rust-analyzer")]);
+        assert_eq!(
+            rust.servers,
+            Some(vec![ServerBinding::new("rust-analyzer")])
+        );
         // extensions inherited from defaults
         assert_eq!(
             rust.extensions.as_deref(),
@@ -1837,8 +1857,8 @@ extensions = ["xyz"]
             lc.filenames.as_deref(),
             Some(["TestFile"].map(str::to_string).as_slice()),
         );
-        // servers preserved (overlay had empty servers)
-        assert_eq!(lc.servers, vec![ServerBinding::new("foo")]);
+        // servers preserved (overlay didn't mention servers — None preserves)
+        assert_eq!(lc.servers, Some(vec![ServerBinding::new("foo")]));
 
         Ok(())
     }
@@ -2338,6 +2358,132 @@ servers = ["my-custom-server"]
             custom.root_markers.is_none(),
             "unknown languages should not get default root_markers",
         );
+        Ok(())
+    }
+
+    // ── Built-in server defaults ────────────────────────────────────
+
+    #[test]
+    fn test_builtin_server_resolves() -> anyhow::Result<()> {
+        // servers = ["gopls"] with no user [server.gopls] should resolve
+        // to the built-in definition.
+        let config = Config::load_from_sources(&[])?;
+        let go = config.language.get("go").expect("go language config");
+        assert_eq!(go.servers, Some(vec![ServerBinding::new("gopls")]));
+        let gopls = config.server.get("gopls").expect("gopls server def");
+        assert_eq!(gopls.command, "gopls");
+        Ok(())
+    }
+
+    #[test]
+    fn test_user_server_overrides_builtin() -> anyhow::Result<()> {
+        // User [server.rust-analyzer] with custom command completely
+        // replaces the built-in.
+        let dir = tempdir()?;
+        let config_path = dir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[server.rust-analyzer]
+command = "rust-analyzer"
+
+[language.rust]
+servers = ["rust-analyzer"]
+"#,
+        )?;
+
+        let config = Config::load_from_sources(&[config_path])?;
+        let ra = config
+            .server
+            .get("rust-analyzer")
+            .expect("rust-analyzer server def");
+        assert_eq!(ra.command, "rust-analyzer", "user command should win");
+        assert!(ra.args.is_empty(), "built-in args should NOT be inherited");
+        Ok(())
+    }
+
+    #[test]
+    fn test_builtin_no_merge() -> anyhow::Result<()> {
+        // User defines [server.rust-analyzer] with only command — built-in
+        // args are NOT inherited.
+        let dir = tempdir()?;
+        let config_path = dir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[server.rust-analyzer]
+command = "rust-analyzer"
+
+[language.rust]
+servers = ["rust-analyzer"]
+"#,
+        )?;
+
+        let config = Config::load_from_sources(&[config_path])?;
+        let ra = config
+            .server
+            .get("rust-analyzer")
+            .expect("rust-analyzer server def");
+        assert_eq!(ra.command, "rust-analyzer");
+        assert!(
+            ra.args.is_empty(),
+            "user override with no args should not inherit built-in args",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_unknown_server_errors() {
+        // servers = ["nonexistent"] with no definition anywhere produces
+        // a validation error.
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[language.custom]
+extensions = ["xyz"]
+servers = ["nonexistent"]
+"#,
+        )
+        .expect("write config");
+
+        let result = Config::load_from_sources(&[config_path]);
+        assert!(result.is_err());
+        let err = format!("{:#}", result.expect_err("should error"));
+        assert!(
+            err.contains("nonexistent"),
+            "error should mention undefined server: {err}",
+        );
+    }
+
+    #[test]
+    fn test_builtin_servers_all_have_command() -> anyhow::Result<()> {
+        // Every built-in server def must have a non-empty command.
+        let config = Config::load_from_sources(&[])?;
+        for (name, def) in &config.server {
+            assert!(
+                !def.command.is_empty(),
+                "built-in server '{name}' has an empty command",
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_builtin_language_servers_resolve() -> anyhow::Result<()> {
+        // Every default language with a servers list should have all
+        // referenced servers available.
+        let config = Config::load_from_sources(&[])?;
+        for (lang, lang_config) in &config.language {
+            for binding in lang_config.servers() {
+                assert!(
+                    config.server.contains_key(&binding.name),
+                    "language '{lang}' references server '{}' which is not defined",
+                    binding.name,
+                );
+            }
+        }
         Ok(())
     }
 }

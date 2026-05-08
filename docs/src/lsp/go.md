@@ -28,15 +28,8 @@ go install golang.org/x/tools/gopls@latest
 
 ## Config
 
-Add to `~/.config/catenary/config.toml`:
-
-```toml
-[server.gopls]
-command = "gopls"
-
-[language.go]
-servers = ["gopls"]
-```
+Catenary ships a built-in definition for `gopls` — no `[server.*]`
+config is needed. If `gopls` is on PATH, it works automatically.
 
 ## Notes
 

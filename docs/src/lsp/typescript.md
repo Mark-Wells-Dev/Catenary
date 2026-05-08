@@ -22,16 +22,10 @@ npm install -g typescript typescript-language-server
 
 ## Config
 
-Add to `~/.config/catenary/config.toml`:
-
-```toml
-[server.tsserver]
-command = "typescript-language-server"
-args = ["--stdio"]
-
-[language.typescript]
-servers = ["tsserver"]
-```
+Catenary ships a built-in definition for `typescript-ls` — no
+`[server.*]` config is needed. If `typescript-language-server` is on
+PATH, it works automatically for TypeScript, JavaScript, TSX, and JSX
+files.
 
 ## Notes
 

@@ -204,6 +204,20 @@ impl<'de> Deserialize<'de> for ServerBinding {
     }
 }
 
+/// Deserializes a `servers` key as `Some(Vec<ServerBinding>)` when
+/// present, relying on `#[serde(default)]` to produce `None` when absent.
+///
+/// This distinguishes "key not mentioned" (`None`, preserve earlier layer)
+/// from "key explicitly set to empty" (`Some([])`, clear).
+fn deserialize_servers_option<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<ServerBinding>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Vec::<ServerBinding>::deserialize(deserializer).map(Some)
+}
+
 /// Per-language configuration for how Catenary handles a language.
 ///
 /// Each entry references one or more server definitions from `[server.*]`
@@ -215,7 +229,12 @@ impl<'de> Deserialize<'de> for ServerBinding {
 pub struct LanguageConfig {
     /// Ordered list of server bindings (references `[server.*]` entries).
     /// Order defines dispatch priority.
-    pub servers: Vec<ServerBinding>,
+    ///
+    /// `None` means the entry did not specify a `servers` key — merge
+    /// preserves the earlier layer's value. `Some([])` means the entry
+    /// explicitly cleared the list. `Some([...])` replaces.
+    #[serde(default, deserialize_with = "deserialize_servers_option")]
+    pub servers: Option<Vec<ServerBinding>>,
 
     /// Whether to deliver diagnostics for this language.
     /// Defaults to `true`. AND with per-binding `diagnostics`
@@ -267,7 +286,7 @@ pub struct LanguageConfig {
 impl Default for LanguageConfig {
     fn default() -> Self {
         Self {
-            servers: Vec::new(),
+            servers: None,
             diagnostics: true,
             extensions: None,
             filenames: None,
@@ -281,12 +300,12 @@ impl Default for LanguageConfig {
 impl LanguageConfig {
     /// Merges another config layer into this one (field-level).
     ///
-    /// - `servers`: non-empty overlay replaces, empty preserves.
+    /// - `servers`: `Some` replaces (even `Some([])`), `None` preserves.
     /// - `diagnostics`: overlay always replaces (cannot distinguish
     ///   absent from default in serde without `Option`).
     /// - `extensions`/`filenames`/`shebangs`: `Some` replaces, `None` preserves.
     pub fn merge(&mut self, other: Self) {
-        if !other.servers.is_empty() {
+        if other.servers.is_some() {
             self.servers = other.servers;
         }
         self.diagnostics = other.diagnostics;
@@ -346,6 +365,12 @@ impl LanguageConfig {
         Ok(())
     }
 
+    /// Returns the server bindings, or an empty slice if none are configured.
+    #[must_use]
+    pub fn servers(&self) -> &[ServerBinding] {
+        self.servers.as_deref().unwrap_or_default()
+    }
+
     /// Returns `true` if this entry has any classification fields set.
     #[must_use]
     pub const fn has_classification(&self) -> bool {
@@ -364,7 +389,7 @@ impl LanguageConfig {
     pub fn diagnostics_enabled(&self, server_name: &str) -> bool {
         self.diagnostics
             && self
-                .servers
+                .servers()
                 .iter()
                 .find(|b| b.name == server_name)
                 .is_some_and(|b| b.diagnostics)

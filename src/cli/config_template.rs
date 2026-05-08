@@ -2,6 +2,10 @@
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
 //! Config template generation for `catenary config`.
+//!
+//! The built-in server defaults section is generated at runtime from
+//! [`crate::config::DEFAULT_SERVERS`] so it stays current across
+//! releases.
 
 #![allow(clippy::print_stdout, reason = "CLI tool needs to output to stdout")]
 
@@ -156,8 +160,53 @@ const TEMPLATE: &str = r#"# Catenary recommended config
 "#;
 
 /// Print the recommended config template to stdout.
+///
+/// Appends a built-in server defaults reference section generated from
+/// the embedded `defaults/servers.toml`.
 pub fn print_template() {
     print!("{TEMPLATE}");
+    print!("{}", generate_defaults_section());
+}
+
+/// Generate a commented-out reference section listing all built-in
+/// server defaults.
+///
+/// Each `[server.*]` entry from `defaults/servers.toml` is rendered as
+/// a comment block so users can discover canonical names and override
+/// selectively.
+fn generate_defaults_section() -> String {
+    use std::fmt::Write;
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "\n# ── Built-in Server Defaults ──────────────────────────────────"
+    );
+    let _ = writeln!(
+        out,
+        "# Catenary ships default definitions for these servers. Reference"
+    );
+    let _ = writeln!(
+        out,
+        "# one by name in a [language.*] servers list and it works without"
+    );
+    let _ = writeln!(
+        out,
+        "# a [server.*] entry. To override, uncomment and modify."
+    );
+
+    for line in crate::config::DEFAULT_SERVERS.lines() {
+        if line.is_empty() {
+            let _ = writeln!(out, "#");
+        } else if line.starts_with('#') {
+            // Preserve original comment lines (section headers).
+            let _ = writeln!(out, "# {line}");
+        } else {
+            let _ = writeln!(out, "# {line}");
+        }
+    }
+
+    out
 }
 
 #[cfg(test)]
@@ -255,5 +304,65 @@ mod tests {
             TEMPLATE.contains("guidance.build"),
             "template should contain build guidance group",
         );
+    }
+
+    #[test]
+    fn template_defaults_section_contains_all_servers() {
+        let section = generate_defaults_section();
+        // Every [server.*] key from defaults/servers.toml must appear.
+        let expected = [
+            "rust-analyzer",
+            "gopls",
+            "clangd",
+            "zls",
+            "pyright",
+            "taplo",
+            "marksman",
+            "intelephense",
+            "vscode-css",
+            "vscode-html",
+            "vscode-json",
+            "vscode-eslint",
+            "bash-ls",
+            "haskell-ls",
+            "typescript-ls",
+            "lua-ls",
+            "vim-ls",
+            "yaml-ls",
+            "ansible-ls",
+            "cmake-ls",
+            "sql-ls",
+            "docker-ls",
+            "csharp-ls",
+            "fsautocomplete",
+            "kotlin-ls",
+            "ocamllsp",
+            "elm-ls",
+            "svelte-ls",
+            "nil",
+            "terraform-ls",
+            "sourcekit-lsp",
+            "metals",
+            "dart-ls",
+            "julia-ls",
+            "r-ls",
+        ];
+        for name in expected {
+            assert!(
+                section.contains(name),
+                "defaults section should contain server '{name}'",
+            );
+        }
+    }
+
+    #[test]
+    fn template_defaults_section_all_commented() {
+        let section = generate_defaults_section();
+        for line in section.lines() {
+            assert!(
+                line.is_empty() || line.starts_with('#'),
+                "defaults section line should be a comment: {line:?}",
+            );
+        }
     }
 }

@@ -24,16 +24,9 @@ npm install -g typescript typescript-language-server
 
 ## Config
 
-Add to `~/.config/catenary/config.toml`:
-
-```toml
-[server.tsserver]
-command = "typescript-language-server"
-args = ["--stdio"]
-
-[language.javascript]
-servers = ["tsserver"]
-```
+Catenary ships a built-in definition for `typescript-ls` — no
+`[server.*]` config is needed. If `typescript-language-server` is on
+PATH, it works automatically.
 
 ## Notes
 
@@ -44,13 +37,8 @@ servers = ["tsserver"]
 
 ## JSX / React
 
-JSX is handled automatically. Configure `javascriptreact` with the
-same server to get full coverage for `.jsx` files:
-
-```toml
-[language.javascriptreact]
-servers = ["tsserver"]
-```
+JSX is handled automatically. The built-in defaults bind `typescript-ls`
+to `javascriptreact` for `.jsx` files.
 
 ## Links
 

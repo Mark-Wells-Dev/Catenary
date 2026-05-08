@@ -1075,7 +1075,7 @@ mod tests {
         config.language.insert(
             SF_LANG.to_string(),
             LanguageConfig {
-                servers: vec![ServerBinding::new(SF_SERVER.to_string())],
+                servers: Some(vec![ServerBinding::new(SF_SERVER.to_string())]),
                 ..LanguageConfig::default()
             },
         );

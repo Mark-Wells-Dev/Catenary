@@ -54,6 +54,12 @@ Want to add a language?
 
 ## Config
 
+Catenary ships a built-in definition for `your-server-name` — no
+`[server.*]` config is needed. If `your-server-binary` is on PATH,
+it works automatically.
+
+<!-- OR, if the server is not in the built-in defaults: -->
+
 Add to `~/.config/catenary/config.toml`:
 
 ```toml

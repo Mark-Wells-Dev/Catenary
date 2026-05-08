@@ -24,16 +24,9 @@ npm install -g intelephense
 
 ## Config
 
-Add to `~/.config/catenary/config.toml`:
-
-```toml
-[server.intelephense]
-command = "intelephense"
-args = ["--stdio"]
-
-[language.php]
-servers = ["intelephense"]
-```
+Catenary ships a built-in definition for `intelephense` — no
+`[server.*]` config is needed. If `intelephense` is on PATH, it works
+automatically.
 
 ## Notes
 

@@ -19,7 +19,7 @@ pub fn validate(config: &Config) -> Vec<String> {
         // Entries that have servers OR no classification are expected to
         // have a non-empty servers list.  Classification-only entries
         // (from the default config) are valid without servers.
-        if lang_config.servers.is_empty() && !lang_config.has_classification() {
+        if lang_config.servers().is_empty() && !lang_config.has_classification() {
             errors.push(format!(
                 "Language '{key}' has no `servers` and no classification fields — \
                  every language entry must specify a servers list or classification"
@@ -27,7 +27,7 @@ pub fn validate(config: &Config) -> Vec<String> {
         }
 
         // Validate server references
-        for binding in &lang_config.servers {
+        for binding in lang_config.servers() {
             if !config.server.contains_key(&binding.name) {
                 errors.push(format!(
                     "Language '{key}' references server '{}', \
@@ -130,12 +130,12 @@ pub fn warn_orphan_project_servers(
         let referenced_by_project = project
             .language
             .values()
-            .any(|lc| lc.servers.iter().any(|b| b.name == *server_name));
+            .any(|lc| lc.servers().iter().any(|b| b.name == *server_name));
 
         let referenced_by_user = user_config
             .language
             .values()
-            .any(|lc| lc.servers.iter().any(|b| b.name == *server_name));
+            .any(|lc| lc.servers().iter().any(|b| b.name == *server_name));
 
         if !referenced_by_project && !referenced_by_user {
             tracing::warn!(
@@ -217,7 +217,7 @@ mod tests {
         project.language.insert(
             "custom".to_string(),
             LanguageConfig {
-                servers: vec![ServerBinding::new("my-server")],
+                servers: Some(vec![ServerBinding::new("my-server")]),
                 ..LanguageConfig::default()
             },
         );
@@ -246,7 +246,7 @@ mod tests {
         language.insert(
             "rust".to_string(),
             LanguageConfig {
-                servers: vec![ServerBinding::new("rust-analyzer")],
+                servers: Some(vec![ServerBinding::new("rust-analyzer")]),
                 ..LanguageConfig::default()
             },
         );

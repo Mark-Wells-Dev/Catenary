@@ -3,7 +3,7 @@
 Catenary loads configuration from multiple sources, in order of priority
 (last wins):
 
-1. **Defaults**: `log_retention_days = 7`.
+1. **Built-in defaults**: Server definitions (`defaults/servers.toml`) and language classification with server bindings (`defaults/languages.toml`). Common language servers work without any config — if the binary is on PATH, Catenary uses it.
 2. **User config**: `~/.config/catenary/config.toml`.
 3. **Project config**: `.catenary.toml` in each workspace root. Discovered when roots are added (at startup or via `/add-dir`). Scoped to `[language.*]`, `[server.*]`, and `[commands]` — other sections are user-level.
 4. **Explicit file**: `--config <path>`.
@@ -23,46 +23,51 @@ args = ["arg1", "arg2"]
 servers = ["<name>"]
 ```
 
+### Built-in Defaults
+
+Catenary ships built-in definitions for ~25 common language servers. If
+the server binary is on PATH and the language has a default binding, LSP
+intelligence works without any `[server.*]` or `[language.*]` config.
+
+Run `catenary config` to see the full list of built-in servers.
+
+A user-defined `[server.X]` completely replaces the built-in default for
+`X` — no merging. If you define `[server.rust-analyzer]`, your definition
+is used and the built-in is ignored entirely.
+
 ### Example
 
-```toml
-[server.rust]
-command = "rust-analyzer"
+The built-in defaults cover the basics. You only need config for
+customisation — `initialization_options`, `settings`, `env`, etc.:
 
-[server.rust.initialization_options]
+```toml
+# Override the built-in rust-analyzer with custom options
+[server.rust-analyzer]
+env = { CLIPPY_DISABLE_DOCS_LINKS = "1" }
+
+[server.rust-analyzer.initialization_options]
 check.command = "clippy"
 cargo.features = "all"
 diagnostics.disabled = ["inactive-code"]
 
-[server.python]
-command = "pyright-langserver"
-args = ["--stdio"]
-
-[server.python.settings.python]
+# Override pyright with workspace settings
+[server.pyright.settings.python]
 pythonPath = "/usr/bin/python3"
 
-[server.python.settings.python.analysis]
+[server.pyright.settings.python.analysis]
 exclude = ["**/target", "**/node_modules"]
 extraPaths = []
+```
 
-[server.tsserver]
-command = "typescript-language-server"
-args = ["--stdio"]
+To define a server from scratch (or one without a built-in default):
 
-[server.gopls]
-command = "gopls"
+```toml
+[server.phpactor]
+command = "phpactor"
+args = ["language-server"]
 
-[language.rust]
-servers = ["rust"]
-
-[language.python]
-servers = ["python"]
-
-[language.typescript]
-servers = ["tsserver"]
-
-[language.go]
-servers = ["gopls"]
+[language.php]
+servers = ["phpactor"]
 ```
 
 ### Initialization Options
@@ -71,7 +76,7 @@ Server-specific options passed during the LSP `initialize` request.
 These go on the `[server.*]` entry:
 
 ```toml
-[server.rust.initialization_options]
+[server.rust-analyzer.initialization_options]
 check.command = "clippy"
 cargo.features = "all"
 ```
@@ -87,21 +92,17 @@ the server expects — Catenary matches the `section` path from each
 request and returns the corresponding subtree.
 
 ```toml
-[server.python]
-command = "pyright-langserver"
-args = ["--stdio"]
-
-[server.python.settings.python]
+[server.pyright.settings.python]
 pythonPath = "/usr/bin/python3"
 
-[server.python.settings.python.analysis]
+[server.pyright.settings.python.analysis]
 exclude = ["**/target", "**/node_modules"]
 extraPaths = []
 ```
 
 When pyright sends `workspace/configuration` with
 `{ "items": [{ "section": "python.analysis" }] }`, Catenary returns
-`{ "exclude": ["**/target", ...], "extraPaths": [] }`.
+the matching subtree from `[server.pyright.settings]`.
 
 Items with no matching path receive `{}`.
 
@@ -371,8 +372,8 @@ directories, or any workspace where LSP is pure overhead.
 Project config is deep-merged with user config at the key level:
 
 - **Scalars replace** — `command`, `args`, `min_severity`.
-- **Tables deep-merge by key** — a project `[server.rust]` with just
-  `settings` inherits `command` and `args` from the user's `[server.rust]`.
+- **Tables deep-merge by key** — a project `[server.rust-analyzer]` with just
+  `settings` inherits `command` and `args` from the user's (or built-in) `[server.rust-analyzer]`.
 - **Arrays replace** — `servers`, `file_patterns`, `extensions`,
   `filenames`, `shebangs`.
 
@@ -382,28 +383,28 @@ Override rust-analyzer settings for a specific project:
 
 ```toml
 # .catenary.toml (in project root)
-[server.rust.settings.rust-analyzer]
+[server.rust-analyzer.settings.rust-analyzer]
 check.targets = ["aarch64-unknown-linux-gnu"]
 cargo.features = ["embedded"]
 ```
 
-This merges with the user's `[server.rust]` definition — the project
-inherits `command`, `args`, and `initialization_options` from user config,
-and overrides only the `settings` subtree.
+This merges with the built-in (or user-defined) `[server.rust-analyzer]`
+definition — the project inherits `command`, `args`, and
+`initialization_options`, and overrides only the `settings` subtree.
 
 ### Tier Promotion
 
 Adding a `[language.*]` entry in project config promotes that language
 to a project-scoped server instance — a separate process bound to this
-root. Without a `[language.*]` entry, the user's shared server instance
-serves this root with `scopeUri`-merged settings.
+root. Without a `[language.*]` entry, the shared server instance serves
+this root with `scopeUri`-merged settings.
 
 ```toml
 # .catenary.toml — promotes rust to a project-scoped instance
 [language.rust]
-servers = ["rust"]
+servers = ["rust-analyzer"]
 
-[server.rust.settings.rust-analyzer]
+[server.rust-analyzer.settings.rust-analyzer]
 cargo.features = ["embedded"]
 ```
 

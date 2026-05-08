@@ -35,9 +35,7 @@ command = "termux-language-server"
 args = ["--stdio"]
 file_patterns = ["PKGBUILD", "*.ebuild", "*.eclass"]
 
-[server.bash-ls]
-command = "bash-language-server"
-args = ["start"]
+# bash-ls is built-in — no [server.bash-ls] needed
 
 [language.shellscript]
 servers = ["termux-ls", "bash-ls"]
