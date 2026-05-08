@@ -799,3 +799,270 @@ fn test_doctor_no_args_unchanged() -> Result<()> {
     );
     Ok(())
 }
+
+// ── catenary doctor parallel probing ──────────────────────────
+
+#[test]
+fn test_doctor_parallel_all_ready() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let config_dir = tmp.path().join("catenary");
+    std::fs::create_dir_all(&config_dir)?;
+
+    let mockls_bin = env!("CARGO_BIN_EXE_mockls");
+    std::fs::write(
+        config_dir.join("config.toml"),
+        format!(
+            "[server.alpha-server]\n\
+             command = \"{mockls_bin}\"\n\
+             args = [\"alpha\"]\n\n\
+             [server.beta-server]\n\
+             command = \"{mockls_bin}\"\n\
+             args = [\"beta\"]\n\n\
+             [server.gamma-server]\n\
+             command = \"{mockls_bin}\"\n\
+             args = [\"gamma\"]\n\n\
+             [language.alpha]\n\
+             servers = [\"alpha-server\"]\n\n\
+             [language.beta]\n\
+             servers = [\"beta-server\"]\n\n\
+             [language.gamma]\n\
+             servers = [\"gamma-server\"]\n"
+        ),
+    )?;
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
+    isolate_env(&mut cmd, tmp.path().to_str().context("tempdir path")?);
+    cmd.args(["doctor", "--nocolor"]);
+
+    let output = cmd.output().context("Failed to run catenary doctor")?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // All three should report ready
+    assert!(
+        stdout.contains("alpha-server")
+            && stdout.contains("beta-server")
+            && stdout.contains("gamma-server"),
+        "all server names should appear, got:\n{stdout}"
+    );
+
+    // Count ready markers
+    let ready_count = stdout.matches("ready").count();
+    assert!(
+        ready_count >= 3,
+        "all 3 servers should be ready, found {ready_count} ready markers, got:\n{stdout}"
+    );
+
+    // Languages section should cross-reference
+    assert!(
+        stdout.contains("Languages:"),
+        "should show Languages section, got:\n{stdout}"
+    );
+
+    assert!(
+        output.status.success(),
+        "doctor should exit 0, got: {}",
+        output.status
+    );
+    Ok(())
+}
+
+#[test]
+fn test_doctor_parallel_one_fails() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let config_dir = tmp.path().join("catenary");
+    std::fs::create_dir_all(&config_dir)?;
+
+    let mockls_bin = env!("CARGO_BIN_EXE_mockls");
+    std::fs::write(
+        config_dir.join("config.toml"),
+        format!(
+            "[server.good-server]\n\
+             command = \"{mockls_bin}\"\n\
+             args = [\"test\"]\n\n\
+             [server.bad-server]\n\
+             command = \"nonexistent-binary-xyz-12345\"\n\
+             args = []\n\n\
+             [language.good]\n\
+             servers = [\"good-server\"]\n\n\
+             [language.bad]\n\
+             servers = [\"bad-server\"]\n"
+        ),
+    )?;
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
+    isolate_env(&mut cmd, tmp.path().to_str().context("tempdir path")?);
+    cmd.args(["doctor", "--nocolor"]);
+
+    let output = cmd.output().context("Failed to run catenary doctor")?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Good server should show ready
+    assert!(
+        stdout.contains("good-server") && stdout.contains("ready"),
+        "good-server should be ready, got:\n{stdout}"
+    );
+
+    // Bad server should show command not found
+    assert!(
+        stdout.contains("bad-server") && stdout.contains("command not found"),
+        "bad-server should show command not found, got:\n{stdout}"
+    );
+
+    assert!(
+        output.status.success(),
+        "doctor should exit 0 even with failures, got: {}",
+        output.status
+    );
+    Ok(())
+}
+
+#[test]
+fn test_doctor_output_sorted() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let config_dir = tmp.path().join("catenary");
+    std::fs::create_dir_all(&config_dir)?;
+
+    let mockls_bin = env!("CARGO_BIN_EXE_mockls");
+    // Names chosen to verify alphabetical ordering regardless of completion order
+    std::fs::write(
+        config_dir.join("config.toml"),
+        format!(
+            "[server.zulu-server]\n\
+             command = \"{mockls_bin}\"\n\
+             args = [\"zulu\"]\n\n\
+             [server.alpha-server]\n\
+             command = \"{mockls_bin}\"\n\
+             args = [\"alpha\"]\n\n\
+             [server.mike-server]\n\
+             command = \"{mockls_bin}\"\n\
+             args = [\"mike\"]\n\n\
+             [language.zulu]\n\
+             servers = [\"zulu-server\"]\n\n\
+             [language.alpha]\n\
+             servers = [\"alpha-server\"]\n\n\
+             [language.mike]\n\
+             servers = [\"mike-server\"]\n"
+        ),
+    )?;
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
+    isolate_env(&mut cmd, tmp.path().to_str().context("tempdir path")?);
+    cmd.args(["doctor", "--nocolor"]);
+
+    let output = cmd.output().context("Failed to run catenary doctor")?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Find positions of each server name in output
+    let alpha_pos = stdout
+        .find("alpha-server")
+        .context("alpha-server not found")?;
+    let mike_pos = stdout
+        .find("mike-server")
+        .context("mike-server not found")?;
+    let zulu_pos = stdout
+        .find("zulu-server")
+        .context("zulu-server not found")?;
+
+    assert!(
+        alpha_pos < mike_pos && mike_pos < zulu_pos,
+        "servers should appear in alphabetical order: alpha({alpha_pos}) < mike({mike_pos}) < zulu({zulu_pos})"
+    );
+
+    assert!(output.status.success());
+    Ok(())
+}
+
+#[test]
+fn test_doctor_parallel_timeout() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let config_dir = tmp.path().join("catenary");
+    std::fs::create_dir_all(&config_dir)?;
+
+    let mockls_bin = env!("CARGO_BIN_EXE_mockls");
+    std::fs::write(
+        config_dir.join("config.toml"),
+        format!(
+            "[server.fast-server]\n\
+             command = \"{mockls_bin}\"\n\
+             args = [\"fast\"]\n\n\
+             [server.hanging-server]\n\
+             command = \"{mockls_bin}\"\n\
+             args = [\"hang\", \"--hang-on\", \"initialize\"]\n\n\
+             [language.fast]\n\
+             servers = [\"fast-server\"]\n\n\
+             [language.hang]\n\
+             servers = [\"hanging-server\"]\n"
+        ),
+    )?;
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
+    isolate_env(&mut cmd, tmp.path().to_str().context("tempdir path")?);
+    cmd.args(["doctor", "--nocolor"]);
+    // Use a short timeout for testing (3 seconds instead of 5 minutes)
+    cmd.env("CATENARY_DOCTOR_TIMEOUT_SECS", "3");
+
+    let output = cmd.output().context("Failed to run catenary doctor")?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Fast server should complete normally
+    assert!(
+        stdout.contains("fast-server") && stdout.contains("ready"),
+        "fast-server should be ready, got:\n{stdout}"
+    );
+
+    // Hanging server should show timeout
+    assert!(
+        stdout.contains("hanging-server") && stdout.contains("initialize timed out"),
+        "hanging-server should show timed out, got:\n{stdout}"
+    );
+
+    assert!(
+        output.status.success(),
+        "doctor should exit 0 even with timeouts, got: {}",
+        output.status
+    );
+    Ok(())
+}
+
+#[test]
+fn test_doctor_piped_no_ansi() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let config_dir = tmp.path().join("catenary");
+    std::fs::create_dir_all(&config_dir)?;
+
+    let mockls_bin = env!("CARGO_BIN_EXE_mockls");
+    std::fs::write(
+        config_dir.join("config.toml"),
+        format!(
+            "[server.mockls-pipe]\n\
+             command = \"{mockls_bin}\"\n\
+             args = [\"test\"]\n\n\
+             [language.test]\n\
+             servers = [\"mockls-pipe\"]\n"
+        ),
+    )?;
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
+    isolate_env(&mut cmd, tmp.path().to_str().context("tempdir path")?);
+    cmd.args(["doctor", "--nocolor"]);
+    // stdout is piped (not a TTY) — this is the default for Command::output()
+
+    let output = cmd.output().context("Failed to run catenary doctor")?;
+    let stdout_bytes = &output.stdout;
+
+    // No ANSI escape sequences should be present (ESC = 0x1B)
+    assert!(
+        !stdout_bytes.contains(&0x1B),
+        "piped output should contain no ANSI escape sequences"
+    );
+
+    // Should still contain the server result
+    let stdout = String::from_utf8_lossy(stdout_bytes);
+    assert!(
+        stdout.contains("mockls-pipe") && stdout.contains("ready"),
+        "piped output should still show server results, got:\n{stdout}"
+    );
+
+    assert!(output.status.success());
+    Ok(())
+}

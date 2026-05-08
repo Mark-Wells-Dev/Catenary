@@ -6,11 +6,13 @@
 #![allow(clippy::print_stdout, reason = "CLI tool needs to output to stdout")]
 #![allow(clippy::print_stderr, reason = "CLI tool needs to output to stderr")]
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::io::{Write, stdout};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Result;
+use crossterm::tty::IsTty;
 
 use crate::cli::ColorConfig;
 use crate::lsp;
@@ -26,6 +28,191 @@ const CONSTRAINED_BASH_MIGRATION: &str = "Command filtering is now built into `c
      Remove the constrained_bash.py hook from your settings and use \
      `[commands]` in your Catenary config instead. \
      Run `catenary config` to generate a recommended template.";
+
+/// Default per-server timeout for the initialize probe (5 minutes).
+///
+/// Julia's `LanguageServer.jl` compiles on first run and can take minutes
+/// without a precompiled sysimage. 5 minutes is generous enough to avoid
+/// false negatives for legitimately slow servers.
+///
+/// Override with `CATENARY_DOCTOR_TIMEOUT_SECS` for testing.
+fn probe_timeout() -> Duration {
+    std::env::var("CATENARY_DOCTOR_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map_or_else(|| Duration::from_mins(5), Duration::from_secs)
+}
+
+/// Threshold after which a still-pending server gets a slow-startup hint.
+const SLOW_HINT_DELAY: Duration = Duration::from_secs(5);
+
+/// Result of probing a single server.
+struct ServerProbeResult {
+    /// Server name (sorted key).
+    name: String,
+    /// Status line to display (without the name prefix).
+    status: ProbeStatus,
+    /// Extracted capabilities (empty on failure).
+    capabilities: Vec<&'static str>,
+    /// `file_patterns` from the server definition (for the status suffix).
+    file_patterns: Vec<String>,
+}
+
+/// Outcome of a server probe.
+enum ProbeStatus {
+    /// Server initialized successfully.
+    Ready,
+    /// Binary not found on `$PATH`.
+    BinaryNotFound(String),
+    /// Process spawn failed.
+    SpawnFailed(String),
+    /// Initialize request failed.
+    InitializeFailed(String),
+    /// Initialize timed out after [`probe_timeout()`].
+    TimedOut,
+}
+
+impl ServerProbeResult {
+    /// Format the status line (everything after the name column).
+    fn format_status(&self, colors: &ColorConfig) -> String {
+        match &self.status {
+            ProbeStatus::Ready => {
+                let status = if self.file_patterns.is_empty() {
+                    "✓ ready".to_string()
+                } else {
+                    format!(
+                        "✓ ready  file_patterns: [{}]",
+                        self.file_patterns
+                            .iter()
+                            .map(|p| format!("\"{p}\""))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    )
+                };
+                colors.green(&status)
+            }
+            ProbeStatus::BinaryNotFound(cmd) => colors.red(&format!("✗ {cmd}: command not found")),
+            ProbeStatus::SpawnFailed(e) => colors.red(&format!("✗ spawn failed: {e}")),
+            ProbeStatus::InitializeFailed(e) => colors.red(&format!("✗ initialize failed: {e}")),
+            ProbeStatus::TimedOut => colors.red("✗ initialize timed out"),
+        }
+    }
+}
+
+/// Polling interval for the work-gate monitor (matches `settle.rs`).
+const WORK_GATE_POLL: Duration = Duration::from_millis(50);
+
+/// Probe a single server: binary check → spawn → initialize → capabilities → shutdown.
+///
+/// If `work_started_tx` is `Some`, spawns a work-gate monitor that polls
+/// the server's process tree and sends the server name on the channel
+/// once cumulative CPU ticks advance from the pre-initialize baseline.
+/// This lets the caller defer slow-startup hints until the server has
+/// actually been scheduled CPU time, avoiding false hints under contention.
+async fn probe_server(
+    name: String,
+    command: String,
+    args: Vec<String>,
+    initialization_options: Option<serde_json::Value>,
+    env: Option<HashMap<String, String>>,
+    file_patterns: Vec<String>,
+    work_started_tx: Option<tokio::sync::mpsc::Sender<String>>,
+) -> ServerProbeResult {
+    if !binary_exists(&command) {
+        return ServerProbeResult {
+            name,
+            status: ProbeStatus::BinaryNotFound(command),
+            capabilities: Vec::new(),
+            file_patterns,
+        };
+    }
+
+    let args_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let spawn_result = lsp::LspClient::spawn_quiet(
+        &command,
+        &args_refs,
+        &name,
+        &name,
+        crate::logging::LoggingServer::new(),
+        env.as_ref(),
+    );
+
+    let mut client = match spawn_result {
+        Ok(client) => client,
+        Err(e) => {
+            return ServerProbeResult {
+                name,
+                status: ProbeStatus::SpawnFailed(e.to_string()),
+                capabilities: Vec::new(),
+                file_patterns,
+            };
+        }
+    };
+
+    // Spawn work-gate monitor: detect when the server actually gets CPU time.
+    let gate_cancel = tokio_util::sync::CancellationToken::new();
+    if let Some(tx) = work_started_tx {
+        let server = std::sync::Arc::clone(client.server());
+        let baseline_ticks = server.sample_tree().map_or(0, |s| s.cumulative_ticks);
+        let gate_name = name.clone();
+        let cancel = gate_cancel.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = tokio::time::sleep(WORK_GATE_POLL) => {}
+                    () = cancel.cancelled() => return,
+                }
+                let advanced = server
+                    .sample_tree()
+                    .is_some_and(|s| s.cumulative_ticks > baseline_ticks);
+                if advanced {
+                    let _ = tx.send(gate_name).await;
+                    return;
+                }
+            }
+        });
+    }
+
+    let init_result = tokio::time::timeout(
+        probe_timeout(),
+        client.initialize(&[], initialization_options),
+    )
+    .await;
+
+    gate_cancel.cancel();
+
+    match init_result {
+        Ok(Ok(result)) => {
+            let tools =
+                extract_capabilities(&result["capabilities"], client.supports_type_hierarchy());
+            let _ = client.shutdown().await;
+            ServerProbeResult {
+                name,
+                status: ProbeStatus::Ready,
+                capabilities: tools,
+                file_patterns,
+            }
+        }
+        Ok(Err(e)) => {
+            let _ = client.shutdown().await;
+            ServerProbeResult {
+                name,
+                status: ProbeStatus::InitializeFailed(e.to_string()),
+                capabilities: Vec::new(),
+                file_patterns,
+            }
+        }
+        Err(_) => {
+            let _ = client.shutdown().await;
+            ServerProbeResult {
+                name,
+                status: ProbeStatus::TimedOut,
+                capabilities: Vec::new(),
+                file_patterns,
+            }
+        }
+    }
+}
 
 /// Run the doctor command: check all configured language servers.
 ///
@@ -117,81 +304,160 @@ pub async fn run_doctor(project_root: &Path, nocolor: bool, show_diff: bool) -> 
     }
 
     // ── Servers section ──────────────────────────────────────────────
-    // Spawn each unique server once, collect capabilities.
-    let mut server_names: Vec<&str> = config.server.keys().map(String::as_str).collect();
+    // Spawn all server probes concurrently, updating lines in-place.
+    let mut server_names: Vec<String> = config.server.keys().cloned().collect();
     server_names.sort_unstable();
 
-    let max_server_width = server_names.iter().map(|n| n.len()).max().unwrap_or(10);
+    let max_server_width = server_names.iter().map(String::len).max().unwrap_or(10);
+
+    let is_tty = stdout().is_tty();
 
     println!("{}:", colors.bold("Servers"));
-    let mut server_capabilities: std::collections::HashMap<&str, Vec<&'static str>> =
-        std::collections::HashMap::new();
+
+    // Build index: server name → line offset (distance from bottom).
+    // Binary-not-found servers are printed immediately and excluded from
+    // the pending set.
+    let mut pending_names: Vec<String> = Vec::new();
+    let mut immediate_results: Vec<ServerProbeResult> = Vec::new();
+
     for name in &server_names {
-        let server_def = &config.server[*name];
-        let command = server_def.command.as_str();
-        let name_display = format!("  {name:<max_server_width$}");
-
-        if !binary_exists(command) {
-            println!(
-                "{name_display}  {}",
-                colors.red(&format!("✗ {command}: command not found")),
-            );
-            continue;
+        let server_def = &config.server[name.as_str()];
+        if binary_exists(&server_def.command) {
+            pending_names.push(name.clone());
+        } else {
+            immediate_results.push(ServerProbeResult {
+                name: name.clone(),
+                status: ProbeStatus::BinaryNotFound(server_def.command.clone()),
+                capabilities: Vec::new(),
+                file_patterns: server_def.file_patterns.clone(),
+            });
         }
+    }
 
-        let args_refs: Vec<&str> = server_def.args.iter().map(String::as_str).collect();
-        let spawn_result = lsp::LspClient::spawn_quiet(
-            command,
-            &args_refs,
-            name,
-            name,
-            crate::logging::LoggingServer::new(),
-            server_def.env.as_ref(),
-        );
+    // Print binary-not-found results immediately
+    for result in &immediate_results {
+        let name_display = format!("  {:<max_server_width$}", result.name);
+        println!("{name_display}  {}", result.format_status(&colors));
+    }
 
-        let mut client = match spawn_result {
-            Ok(client) => client,
-            Err(e) => {
-                println!(
-                    "{name_display}  {}",
-                    colors.red(&format!("✗ spawn failed: {e}")),
-                );
-                continue;
-            }
-        };
+    // Print pending lines and spawn concurrent probes
+    if is_tty {
+        // Print all pending lines with ⏳ status
+        for name in &pending_names {
+            let name_display = format!("  {name:<max_server_width$}");
+            println!("{name_display}  ⏳ checking...");
+        }
+    }
 
-        match client
-            .initialize(&[], server_def.initialization_options.clone())
-            .await
-        {
-            Ok(result) => {
-                let tools =
-                    extract_capabilities(&result["capabilities"], client.supports_type_hierarchy());
-                let status = if server_def.file_patterns.is_empty() {
-                    "✓ ready".to_string()
-                } else {
-                    format!(
-                        "✓ ready  file_patterns: [{}]",
-                        server_def
-                            .file_patterns
-                            .iter()
-                            .map(|p| format!("\"{p}\""))
-                            .collect::<Vec<_>>()
-                            .join(", "),
-                    )
-                };
-                println!("{name_display}  {}", colors.green(&status));
-                server_capabilities.insert(name, tools);
-            }
-            Err(e) => {
-                println!(
-                    "{name_display}  {}",
-                    colors.red(&format!("✗ initialize failed: {e}")),
-                );
+    // Spawn probes into a JoinSet.
+    // TTY mode gets a work-gate channel so hint timers start only after
+    // the server has actually consumed CPU time.
+    let pending_count = pending_names.len();
+    let (work_tx, mut work_rx) = tokio::sync::mpsc::channel::<String>(pending_count.max(1));
+
+    let mut join_set = tokio::task::JoinSet::new();
+    for name in &pending_names {
+        let server_def = &config.server[name.as_str()];
+        let tx = if is_tty { Some(work_tx.clone()) } else { None };
+        join_set.spawn(probe_server(
+            name.clone(),
+            server_def.command.clone(),
+            server_def.args.clone(),
+            server_def.initialization_options.clone(),
+            server_def.env.clone(),
+            server_def.file_patterns.clone(),
+            tx,
+        ));
+    }
+    drop(work_tx); // Drop the original sender
+
+    // Collect results, updating lines in-place (TTY) or batching (piped).
+    let mut completed: HashMap<String, ServerProbeResult> = HashMap::new();
+    let mut slow_hinted: HashSet<String> = HashSet::new();
+
+    if is_tty && pending_count > 0 {
+        // Per-server hint deadlines, started when the work gate fires.
+        let mut hint_deadlines: HashMap<String, tokio::time::Instant> = HashMap::new();
+
+        while completed.len() < pending_count {
+            // Find the earliest pending hint deadline.
+            let next_deadline = hint_deadlines
+                .iter()
+                .filter(|(n, _)| !completed.contains_key(*n) && !slow_hinted.contains(*n))
+                .map(|(_, &d)| d)
+                .min();
+
+            tokio::select! {
+                Some(join_result) = join_set.join_next() => {
+                    if let Ok(result) = join_result {
+                        update_server_line(
+                            &result,
+                            &pending_names,
+                            pending_count,
+                            max_server_width,
+                            &colors,
+                        );
+                        completed.insert(result.name.clone(), result);
+                    }
+                }
+                Some(name) = work_rx.recv() => {
+                    // Work gate fired — server has consumed CPU time.
+                    // Start the per-server hint timer from now.
+                    hint_deadlines.insert(
+                        name,
+                        tokio::time::Instant::now() + SLOW_HINT_DELAY,
+                    );
+                }
+                () = async {
+                    match next_deadline {
+                        Some(d) => tokio::time::sleep_until(d).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    // Fire hints for all servers past their deadline.
+                    let now = tokio::time::Instant::now();
+                    for (name, deadline) in &hint_deadlines {
+                        if *deadline <= now
+                            && !completed.contains_key(name)
+                            && slow_hinted.insert(name.clone())
+                        {
+                            update_server_line_raw(
+                                name,
+                                "⏳ checking... (slow — see your language server's docs)",
+                                &pending_names,
+                                pending_count,
+                                max_server_width,
+                            );
+                        }
+                    }
+                }
             }
         }
+    } else {
+        // Non-TTY: collect all results, then print sequentially.
+        while let Some(join_result) = join_set.join_next().await {
+            if let Ok(result) = join_result {
+                completed.insert(result.name.clone(), result);
+            }
+        }
+        // Print in sorted order
+        for name in &pending_names {
+            if let Some(result) = completed.get(name) {
+                let name_display = format!("  {name:<max_server_width$}");
+                println!("{name_display}  {}", result.format_status(&colors));
+            }
+        }
+    }
 
-        let _ = client.shutdown().await;
+    // Build the capabilities map from all results
+    let mut server_capabilities: HashMap<&str, Vec<&'static str>> = HashMap::new();
+    for result in immediate_results.iter().chain(completed.values()) {
+        if !result.capabilities.is_empty() {
+            // Borrow the name from server_names (which lives long enough)
+            if let Some(name_ref) = server_names.iter().find(|n| **n == result.name) {
+                server_capabilities.insert(name_ref.as_str(), result.capabilities.clone());
+            }
+        }
     }
 
     // ── Languages section ────────────────────────────────────────────
@@ -822,6 +1088,82 @@ fn collect_suggestions(
     }
 
     suggestions
+}
+
+/// Update a server's status line in-place using crossterm cursor movement.
+///
+/// Moves the cursor up to the target line, clears it, prints the new status,
+/// and moves back down. Only called when stdout is a TTY.
+fn update_server_line(
+    result: &ServerProbeResult,
+    pending_names: &[String],
+    pending_count: usize,
+    max_server_width: usize,
+    colors: &ColorConfig,
+) {
+    let status = result.format_status(colors);
+    overwrite_line(
+        &result.name,
+        &status,
+        pending_names,
+        pending_count,
+        max_server_width,
+    );
+}
+
+/// Update a server's status line with a raw string (no `ServerProbeResult`).
+///
+/// Used for the slow-startup hint update.
+fn update_server_line_raw(
+    name: &str,
+    status: &str,
+    pending_names: &[String],
+    pending_count: usize,
+    max_server_width: usize,
+) {
+    overwrite_line(name, status, pending_names, pending_count, max_server_width);
+}
+
+/// Overwrite a server's line in-place via crossterm cursor movement.
+///
+/// `pending_names` defines the line order; `pending_count` is the total
+/// number of pending lines. The cursor is assumed to sit on the line
+/// immediately after the last pending line.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "server count will never exceed u16::MAX"
+)]
+fn overwrite_line(
+    name: &str,
+    status: &str,
+    pending_names: &[String],
+    pending_count: usize,
+    max_server_width: usize,
+) {
+    let Some(idx) = pending_names.iter().position(|n| n == name) else {
+        return;
+    };
+    // Lines are printed top-to-bottom, cursor is after the last line.
+    // Line at index `idx` is `pending_count - 1 - idx` lines above the cursor.
+    let lines_up = (pending_count - 1 - idx) as u16;
+    let name_display = format!("  {name:<max_server_width$}");
+
+    let mut out = stdout();
+    if lines_up > 0 {
+        let _ = crossterm::execute!(out, crossterm::cursor::MoveUp(lines_up));
+    }
+    let _ = crossterm::execute!(
+        out,
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::CurrentLine),
+    );
+    // \r to return to column 0 after Clear
+    let _ = write!(out, "\r{name_display}  {status}");
+    if lines_up > 0 {
+        let _ = crossterm::execute!(out, crossterm::cursor::MoveDown(lines_up));
+    }
+    // Return to column 0 on the bottom line
+    let _ = write!(out, "\r");
+    let _ = out.flush();
 }
 
 /// Checks whether a binary can be found on `$PATH`.
