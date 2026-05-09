@@ -726,10 +726,10 @@ impl tracing::field::Visit for FieldVisitor {
 
 /// Shared logging test helpers.
 ///
-/// Available in both unit tests (`cfg(test)`) and integration tests
-/// (`--features mockls`) so they share a single schema definition and
-/// query helpers.
-#[cfg(any(test, feature = "mockls"))]
+/// Gated on `feature = "mockls"` so both in-crate unit tests and
+/// integration tests (which compile with `--features mockls`) share a
+/// single schema definition and query helpers.
+#[cfg(feature = "mockls")]
 #[doc(hidden)]
 #[allow(
     clippy::expect_used,
