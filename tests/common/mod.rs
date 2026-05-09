@@ -26,7 +26,10 @@ use serde_json::{Value, json};
 /// given root so the process uses the test's tempdir instead of
 /// `~/.config`, `~/.local/state`, or `~/.local/share`. Clears all
 /// `CATENARY_*` env vars that could leak from the user's shell and
-/// override test-specific settings.
+/// override test-specific settings. Clears `PATH` so built-in server
+/// defaults (julia-language-server, cmake-language-server, etc.) fail
+/// the binary check immediately instead of spawning real processes.
+/// Tests that need specific binaries use absolute paths.
 ///
 /// All integration test subprocesses (bridge, `catenary install`, etc.)
 /// must call this. Callers set `CATENARY_SERVERS`, `CATENARY_ROOTS`, or
@@ -35,6 +38,7 @@ pub fn isolate_env(cmd: &mut Command, root: &str) {
     cmd.env("XDG_CONFIG_HOME", root);
     cmd.env("XDG_STATE_HOME", root);
     cmd.env("XDG_DATA_HOME", root);
+    cmd.env("PATH", "");
     cmd.env_remove("CATENARY_STATE_DIR");
     cmd.env_remove("CATENARY_DATA_DIR");
     cmd.env_remove("CATENARY_CONFIG");
@@ -544,12 +548,11 @@ pub struct ServerProcess {
 impl ServerProcess {
     pub fn spawn() -> Result<Self> {
         let state_dir = tempfile::tempdir().context("Failed to create state tempdir")?;
+        let state_home = state_dir.path().to_str().context("state dir path")?;
 
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
+        isolate_env(&mut cmd, state_home);
         cmd.env("CATENARY_ROOTS", ".");
-        cmd.env("XDG_CONFIG_HOME", state_dir.path());
-        cmd.env("CATENARY_STATE_DIR", state_dir.path());
-        cmd.env_remove("CATENARY_CONFIG");
 
         let stderr_path = state_dir.path().join("server_stderr.log");
         let stderr_file =
