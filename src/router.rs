@@ -2005,18 +2005,22 @@ mod tests {
         let mcp_path = mcp_socket_in(dir.path());
 
         let manager = Arc::new(bind_in(dir.path()));
+        let shutdown = manager.shutdown_token();
         let m = Arc::clone(&manager);
         tokio::spawn(async move {
             let _ = m.accept_loop().await;
         });
 
-        let _stream = tokio::net::UnixStream::connect(&mcp_path)
+        let stream = tokio::net::UnixStream::connect(&mcp_path)
             .await
             .expect("connect");
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         assert_eq!(manager.connection_count(), 1);
+
+        drop(stream);
+        shutdown.cancel();
     }
 
     #[tokio::test]
@@ -2025,12 +2029,13 @@ mod tests {
         let mcp_path = mcp_socket_in(dir.path());
 
         let manager = Arc::new(bind_in(dir.path()));
+        let shutdown = manager.shutdown_token();
         let m = Arc::clone(&manager);
         tokio::spawn(async move {
             let _ = m.accept_loop().await;
         });
 
-        let _streams: Vec<_> = {
+        let streams: Vec<_> = {
             let mut v = Vec::new();
             for _ in 0..3 {
                 v.push(
@@ -2045,6 +2050,9 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         assert_eq!(manager.connection_count(), 3);
+
+        drop(streams);
+        shutdown.cancel();
     }
 
     #[tokio::test]
@@ -2233,6 +2241,7 @@ mod tests {
         let mcp_path = mcp_socket_in(dir.path());
 
         let manager = Arc::new(bind_in(dir.path()));
+        let shutdown = manager.shutdown_token();
         let m = Arc::clone(&manager);
         tokio::spawn(async move {
             let _ = m.accept_loop().await;
@@ -2248,7 +2257,6 @@ mod tests {
             }));
         }
 
-        #[allow(clippy::collection_is_never_read, reason = "held for Drop")]
         let mut streams = Vec::new();
         for handle in handles {
             streams.push(handle.await.expect("task").expect("connect"));
@@ -2256,6 +2264,9 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(manager.connection_count(), 5);
+
+        drop(streams);
+        shutdown.cancel();
     }
 
     // ── Hook socket tests ────────────────────────────────────────────
@@ -2279,6 +2290,7 @@ mod tests {
         let hook_path = hook_socket_in(dir.path());
 
         let manager = Arc::new(bind_in(dir.path()));
+        let shutdown = manager.shutdown_token();
         let m = Arc::clone(&manager);
         tokio::spawn(async move {
             let _ = m.accept_loop().await;
@@ -2287,6 +2299,8 @@ mod tests {
         let _stream = tokio::net::UnixStream::connect(&hook_path)
             .await
             .expect("connect to hook socket");
+
+        shutdown.cancel();
     }
 
     #[tokio::test]
@@ -2296,6 +2310,7 @@ mod tests {
         let hook_path = hook_socket_in(dir.path());
 
         let manager = Arc::new(bind_in(dir.path()));
+        let shutdown = manager.shutdown_token();
         let m = Arc::clone(&manager);
         tokio::spawn(async move {
             let _ = m.accept_loop().await;
@@ -2307,13 +2322,16 @@ mod tests {
             tokio::net::UnixStream::connect(&hook_path),
         );
 
-        let _mcp_stream = mcp_result.expect("connect to MCP socket");
+        let mcp_stream = mcp_result.expect("connect to MCP socket");
         let _hook_stream = hook_result.expect("connect to hook socket");
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // Only MCP connections are tracked.
         assert_eq!(manager.connection_count(), 1);
+
+        drop(mcp_stream);
+        shutdown.cancel();
     }
 
     #[tokio::test]
@@ -2324,6 +2342,7 @@ mod tests {
         let hook_path = hook_socket_in(dir.path());
 
         let manager = Arc::new(bind_in(dir.path()));
+        let shutdown = manager.shutdown_token();
         let m = Arc::clone(&manager);
         tokio::spawn(async move {
             let _ = m.accept_loop().await;
@@ -2350,6 +2369,8 @@ mod tests {
         let mut line = String::new();
         buf_reader.read_line(&mut line).await.expect("read");
         assert_eq!(line.trim(), "", "passthrough should return empty response");
+
+        shutdown.cancel();
     }
 
     // ── Per-connection MCP stack tests ────────────────────────────────
@@ -2460,6 +2481,7 @@ mod tests {
         let mcp_path = mcp_socket_in(dir.path());
 
         let manager = Arc::new(bind_echo(dir.path()));
+        let shutdown = manager.shutdown_token();
         let m = Arc::clone(&manager);
         tokio::spawn(async move {
             let _ = m.accept_loop().await;
@@ -2490,6 +2512,9 @@ mod tests {
             "expected result in initialize response, got: {response}",
         );
         assert_eq!(response["result"]["serverInfo"]["name"], "catenary");
+
+        drop(stream);
+        shutdown.cancel();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2498,6 +2523,7 @@ mod tests {
         let mcp_path = mcp_socket_in(dir.path());
 
         let manager = Arc::new(bind_echo(dir.path()));
+        let shutdown = manager.shutdown_token();
         let m = Arc::clone(&manager);
         tokio::spawn(async move {
             let _ = m.accept_loop().await;
@@ -2536,6 +2562,9 @@ mod tests {
         let tools = response["result"]["tools"].as_array().expect("tools array");
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["name"], "echo");
+
+        drop(stream);
+        shutdown.cancel();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2544,6 +2573,7 @@ mod tests {
         let mcp_path = mcp_socket_in(dir.path());
 
         let manager = Arc::new(bind_echo(dir.path()));
+        let shutdown = manager.shutdown_token();
         let m = Arc::clone(&manager);
         tokio::spawn(async move {
             let _ = m.accept_loop().await;
@@ -2563,6 +2593,8 @@ mod tests {
             0,
             "connection should be cleaned up after disconnect"
         );
+
+        shutdown.cancel();
     }
 
     // ── Lifecycle tests ─────────────────────────────────────────────
@@ -2784,6 +2816,7 @@ mod tests {
         let hook_path = hook_socket_in(dir.path());
 
         let manager = Arc::new(bind_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
         assert_eq!(manager.session_count(), 0, "no sessions initially");
 
         let m = Arc::clone(&manager);
@@ -2803,6 +2836,8 @@ mod tests {
             1,
             "session 'abc' should exist in registry"
         );
+
+        shutdown.cancel();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2811,6 +2846,7 @@ mod tests {
         let hook_path = hook_socket_in(dir.path());
 
         let manager = Arc::new(bind_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
         let m = Arc::clone(&manager);
         tokio::spawn(async move {
             let _ = m.accept_loop().await;
@@ -2833,6 +2869,8 @@ mod tests {
             2,
             "should have two independent sessions"
         );
+
+        shutdown.cancel();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2841,6 +2879,7 @@ mod tests {
         let hook_path = hook_socket_in(dir.path());
 
         let manager = Arc::new(bind_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
         let m = Arc::clone(&manager);
         tokio::spawn(async move {
             let _ = m.accept_loop().await;
@@ -2883,6 +2922,8 @@ mod tests {
             matches!(envelope.result, Some(crate::hook::HookResult::Deny(_))),
             "session B should deny Edit (not editing), got: {envelope:?}"
         );
+
+        shutdown.cancel();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2891,6 +2932,7 @@ mod tests {
         let hook_path = hook_socket_in(dir.path());
 
         let manager = Arc::new(bind_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
         let m = Arc::clone(&manager);
         tokio::spawn(async move {
             let _ = m.accept_loop().await;
@@ -2923,6 +2965,8 @@ mod tests {
         drop(sessions);
         assert_eq!(router_a.turn(), 2, "session A should have turn 2");
         assert_eq!(router_b.turn(), 1, "session B should have turn 1");
+
+        shutdown.cancel();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2931,6 +2975,7 @@ mod tests {
         let hook_path = hook_socket_in(dir.path());
 
         let manager = Arc::new(bind_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
         let m = Arc::clone(&manager);
         tokio::spawn(async move {
             let _ = m.accept_loop().await;
@@ -2950,6 +2995,8 @@ mod tests {
             "",
             "subagent hook should pass through (empty response)"
         );
+
+        shutdown.cancel();
     }
 
     // ── Version handshake tests ──────────────────────────────────────
@@ -3196,12 +3243,13 @@ mod tests {
         let mcp_path = mcp_socket_in(dir.path());
 
         let manager = Arc::new(bind_echo_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
         let m = Arc::clone(&manager);
         tokio::spawn(async move {
             let _ = m.accept_loop().await;
         });
 
-        let _stream = correlate_session(&hook_path, &mcp_path, "abc").await;
+        let stream = correlate_session(&hook_path, &mcp_path, "abc").await;
 
         // Allow the spawn_blocking MCP task to process tools/call.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -3210,6 +3258,9 @@ mod tests {
             manager.session_has_connection("abc"),
             "session 'abc' should have a bound MCP connection",
         );
+
+        drop(stream);
+        shutdown.cancel();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3219,6 +3270,7 @@ mod tests {
         let mcp_path = mcp_socket_in(dir.path());
 
         let manager = Arc::new(bind_echo_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
         let m = Arc::clone(&manager);
         tokio::spawn(async move {
             let _ = m.accept_loop().await;
@@ -3242,6 +3294,9 @@ mod tests {
             manager.session_has_connection("abc"),
             "binding should remain 'abc' after second tools/call",
         );
+
+        drop(stream);
+        shutdown.cancel();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3251,13 +3306,14 @@ mod tests {
         let mcp_path = mcp_socket_in(dir.path());
 
         let manager = Arc::new(bind_echo_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
         let m = Arc::clone(&manager);
         tokio::spawn(async move {
             let _ = m.accept_loop().await;
         });
 
         // Correlate session "abc".
-        let _stream = correlate_session(&hook_path, &mcp_path, "abc").await;
+        let stream = correlate_session(&hook_path, &mcp_path, "abc").await;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // Send another `PreToolUse` for the same session. It should not
@@ -3274,7 +3330,9 @@ mod tests {
             !manager.has_pending_correlation(),
             "already-resolved session should not create a pending entry",
         );
-        drop(manager);
+
+        drop(stream);
+        shutdown.cancel();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3284,15 +3342,16 @@ mod tests {
         let mcp_path = mcp_socket_in(dir.path());
 
         let manager = Arc::new(bind_echo_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
         let m = Arc::clone(&manager);
         tokio::spawn(async move {
             let _ = m.accept_loop().await;
         });
 
         // Correlate "abc" first, then "def".
-        let _s1 = correlate_session(&hook_path, &mcp_path, "abc").await;
+        let s1 = correlate_session(&hook_path, &mcp_path, "abc").await;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let _s2 = correlate_session(&hook_path, &mcp_path, "def").await;
+        let s2 = correlate_session(&hook_path, &mcp_path, "def").await;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         assert!(
@@ -3303,7 +3362,10 @@ mod tests {
             manager.session_has_connection("def"),
             "session 'def' should be correlated",
         );
-        drop(manager);
+
+        drop(s1);
+        drop(s2);
+        shutdown.cancel();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3312,6 +3374,7 @@ mod tests {
         let hook_path = hook_socket_in(dir.path());
 
         let manager = Arc::new(bind_echo_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
         let m = Arc::clone(&manager);
         tokio::spawn(async move {
             let _ = m.accept_loop().await;
@@ -3349,7 +3412,7 @@ mod tests {
             "serialization lock should be available after timeout",
         );
         drop(permit);
-        drop(manager);
+        shutdown.cancel();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3359,6 +3422,7 @@ mod tests {
         let mcp_path = mcp_socket_in(dir.path());
 
         let manager = Arc::new(bind_echo_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
         let m = Arc::clone(&manager);
         tokio::spawn(async move {
             let _ = m.accept_loop().await;
@@ -3378,14 +3442,16 @@ mod tests {
         *manager.correlation.pending.lock().expect("lock") = None;
 
         // Now re-correlate the same session.
-        let _stream = correlate_session(&hook_path, &mcp_path, "re-corr").await;
+        let stream = correlate_session(&hook_path, &mcp_path, "re-corr").await;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         assert!(
             manager.session_has_connection("re-corr"),
             "session should re-correlate after timeout",
         );
-        drop(manager);
+
+        drop(stream);
+        shutdown.cancel();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3394,6 +3460,7 @@ mod tests {
         let hook_path = hook_socket_in(dir.path());
 
         let manager = Arc::new(bind_echo_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
         let m = Arc::clone(&manager);
         tokio::spawn(async move {
             let _ = m.accept_loop().await;
@@ -3412,7 +3479,8 @@ mod tests {
             !manager.has_pending_correlation(),
             "non-Catenary tool should not trigger correlation",
         );
-        drop(manager);
+
+        shutdown.cancel();
     }
 
     // ── Root refcounting tests ────────────────────────────────────────
@@ -3524,6 +3592,7 @@ mod tests {
         let mcp_path = mcp_socket_in(dir.path());
 
         let manager = Arc::new(bind_echo_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
         let m = Arc::clone(&manager);
         tokio::spawn(async move {
             let _ = m.accept_loop().await;
@@ -3553,6 +3622,8 @@ mod tests {
             !manager.session_has_connection("cleanup-sess"),
             "correlation should be cleaned up",
         );
+
+        shutdown.cancel();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3562,13 +3633,14 @@ mod tests {
         let mcp_path = mcp_socket_in(dir.path());
 
         let manager = Arc::new(bind_echo_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
         let m = Arc::clone(&manager);
         tokio::spawn(async move {
             let _ = m.accept_loop().await;
         });
 
         // Correlate two sessions.
-        let _s1 = correlate_session(&hook_path, &mcp_path, "sess-keep").await;
+        let s1 = correlate_session(&hook_path, &mcp_path, "sess-keep").await;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let s2 = correlate_session(&hook_path, &mcp_path, "sess-drop").await;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -3592,6 +3664,9 @@ mod tests {
             !manager.session_has_connection("sess-drop"),
             "dropped session should be cleaned up",
         );
+
+        drop(s1);
+        shutdown.cancel();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3601,6 +3676,7 @@ mod tests {
         let mcp_path = mcp_socket_in(dir.path());
 
         let manager = Arc::new(bind_echo_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
         let m = Arc::clone(&manager);
         tokio::spawn(async move {
             let _ = m.accept_loop().await;
@@ -3640,6 +3716,8 @@ mod tests {
             tracker.global_roots().is_empty(),
             "global roots should be empty",
         );
+
+        shutdown.cancel();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3649,13 +3727,14 @@ mod tests {
         let mcp_path = mcp_socket_in(dir.path());
 
         let manager = Arc::new(bind_echo_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
         let m = Arc::clone(&manager);
         tokio::spawn(async move {
             let _ = m.accept_loop().await;
         });
 
         // Correlate two sessions.
-        let _s1 = correlate_session(&hook_path, &mcp_path, "ws-keep").await;
+        let s1 = correlate_session(&hook_path, &mcp_path, "ws-keep").await;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let s2 = correlate_session(&hook_path, &mcp_path, "ws-drop").await;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -3712,6 +3791,9 @@ mod tests {
             !global.contains(&exclusive),
             "/exclusive should not be in global roots",
         );
+
+        drop(s1);
+        shutdown.cancel();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3720,6 +3802,7 @@ mod tests {
         let hook_path = hook_socket_in(dir.path());
 
         let manager = Arc::new(bind_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
         let m = Arc::clone(&manager);
         tokio::spawn(async move {
             let _ = m.accept_loop().await;
@@ -3758,5 +3841,7 @@ mod tests {
             0,
             "never-correlated session should be removed on session end",
         );
+
+        shutdown.cancel();
     }
 }
