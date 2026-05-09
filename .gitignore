@@ -10,3 +10,4 @@ target/
 *.log
 __pycache__/
 *.pyc
+mutants.out/
