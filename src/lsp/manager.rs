@@ -4408,6 +4408,11 @@ mod tests {
         let result = find_instance(&clients, "rust", "ra", Path::new("/project"));
         assert!(result.is_some());
         assert!(Arc::ptr_eq(&result.expect("found"), &root_client));
+
+        // Explicit cleanup: drop clients before runtime shutdown to
+        // ensure mockls child processes are killed promptly.
+        drop(clients);
+        drop(root_client);
         Ok(())
     }
 
@@ -4432,6 +4437,9 @@ mod tests {
         let result = find_instance(&clients, "rust", "ra", Path::new("/project"));
         assert!(result.is_some());
         assert!(Arc::ptr_eq(&result.expect("found"), &ws_client));
+
+        drop(clients);
+        drop(ws_client);
         Ok(())
     }
 
@@ -4460,6 +4468,9 @@ mod tests {
         let result = find_instance(&clients, "rust", "ra", Path::new("/project"));
         assert!(result.is_some());
         assert!(Arc::ptr_eq(&result.expect("found"), &root_client));
+
+        drop(clients);
+        drop(root_client);
         Ok(())
     }
 
