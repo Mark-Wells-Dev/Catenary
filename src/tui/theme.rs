@@ -142,6 +142,13 @@ fn detect_terminal_bg() -> Option<(u8, u8, u8)> {
 
     use catenary_proc::ProcessMonitor;
 
+    // Background process groups receive SIGTTIN when reading from the
+    // terminal, which stops the entire process group. Bail out early
+    // to avoid stopping the test binary under cargo-mutants.
+    if !catenary_proc::is_foreground_process_group() {
+        return None;
+    }
+
     // Open /dev/tty directly to avoid contention with crossterm's stdin.
     let mut tty = std::fs::OpenOptions::new()
         .read(true)

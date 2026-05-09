@@ -327,6 +327,39 @@ pub fn set_parent_death_signal(cmd: &mut std::process::Command) {
 #[cfg(not(target_os = "linux"))]
 pub fn set_parent_death_signal(_cmd: &mut std::process::Command) {}
 
+/// Returns `true` if the calling process is in the foreground process
+/// group of its controlling terminal.
+///
+/// A process in a background group that reads from `/dev/tty` receives
+/// `SIGTTIN`, which stops the entire process group. Call this before
+/// terminal I/O to avoid stopping the process under cargo-mutants or
+/// other tools that run tests in background process groups.
+///
+/// Returns `false` if there is no controlling terminal or the query fails.
+#[cfg(unix)]
+#[must_use]
+pub fn is_foreground_process_group() -> bool {
+    // SAFETY: tcgetpgrp and getpgrp are async-signal-safe POSIX functions
+    // with no preconditions. tcgetpgrp returns -1 on error (no tty).
+    unsafe {
+        let fg_pgid = libc::tcgetpgrp(libc::STDIN_FILENO);
+        if fg_pgid == -1 {
+            return false;
+        }
+        fg_pgid == libc::getpgrp()
+    }
+}
+
+/// Returns `true` if the calling process is in the foreground process
+/// group of its controlling terminal.
+///
+/// Always returns `false` on non-Unix platforms.
+#[cfg(not(unix))]
+#[must_use]
+pub const fn is_foreground_process_group() -> bool {
+    false
+}
+
 /// Assign a child process to a kill-on-close Job Object so it is
 /// terminated when the parent exits.
 ///
