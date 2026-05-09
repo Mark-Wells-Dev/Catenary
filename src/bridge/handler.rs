@@ -177,10 +177,11 @@ impl ToolHandler for McpRouter {
                      with symbols. Relative paths resolve against your current working \
                      directory. Always shows outline-level symbols (structs, classes, enums, \
                      interfaces, modules, constants).\n\n\
-                     Output fits a {glob_budget}-character budget. Large directories are \
-                     bucketed into drillable glob patterns. Files over {outline_threshold} \
-                     lines include a defensive outline \u{2014} a map of top-level symbols with \
-                     line ranges. Single files always include the outline regardless of size."
+                     Output fits a {glob_budget}-character page. Broad patterns produce paged \
+                     results \u{2014} refine the pattern or use `page` to continue. Files over \
+                     {outline_threshold} lines include a defensive outline \u{2014} a map of \
+                     top-level symbols with line ranges. Single files always include the \
+                     outline regardless of size."
                 )),
                 input_schema: serde_json::json!({
                     "type": "object",
@@ -189,13 +190,13 @@ impl ToolHandler for McpRouter {
                             "type": "string",
                             "description": "A file path, directory path, or glob pattern (e.g., 'src/', 'src/main.rs', '**/*.rs')"
                         },
+                        "page": {
+                            "type": "integer",
+                            "description": "Page number for paged results (default: 1). Pages re-run the query with deterministic sort order."
+                        },
                         "exclude": {
                             "type": "string",
                             "description": "Glob pattern to exclude from results"
-                        },
-                        "cursor": {
-                            "type": "string",
-                            "description": "Continuation token from previous result"
                         },
                         "include_gitignored": {
                             "type": "boolean",

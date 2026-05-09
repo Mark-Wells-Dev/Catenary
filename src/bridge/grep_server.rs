@@ -127,6 +127,13 @@ impl ToolServer for GrepServer {
             }
         }
 
+        // Relative glob param → cwd context header.
+        let cwd = input
+            .glob
+            .as_ref()
+            .filter(|g| !PathBuf::from(g).is_absolute())
+            .and_then(|_| std::env::current_dir().ok());
+
         // Split top-level alternation into independent arms
         let arms = split_alternation(&input.pattern);
 
@@ -141,7 +148,13 @@ impl ToolServer for GrepServer {
                 page: input.page,
             };
             let output = self
-                .run(arm_input, parent_id, &dead_languages, cancel)
+                .run(
+                    arm_input,
+                    parent_id,
+                    &dead_languages,
+                    cancel,
+                    cwd.as_deref(),
+                )
                 .await?;
             if !output.is_empty() {
                 if !all_output.is_empty() {
@@ -224,6 +237,7 @@ impl GrepServer {
         parent_id: Option<i64>,
         dead_languages: &HashSet<String>,
         cancel: &tokio_util::sync::CancellationToken,
+        cwd: Option<&Path>,
     ) -> Result<String> {
         debug!("Grep request: pattern={}", input.pattern);
 
@@ -418,6 +432,7 @@ impl GrepServer {
             &enrichments,
             self.symbol_index.as_ref(),
             &self.fs_manager,
+            cwd,
         ))
     }
 
@@ -1089,8 +1104,8 @@ impl GrepServer {
 /// Each hit is rendered with whatever data is available: enriched
 /// navigation edges when LSP data exists, enclosing symbol context
 /// when available, bare line numbers otherwise. Grouped by workspace
-/// root (bare absolute path header). Out-of-root hits grouped by
-/// parent directory.
+/// root (bare absolute path header) for absolute patterns, or under
+/// a `cwd = …` context header for relative glob scoping.
 ///
 /// Returns the full unpaginated output. Pagination is applied by the
 /// caller (`execute`).
@@ -1098,45 +1113,74 @@ fn render_results(
     enrichments: &[(&GrepHit, Option<SymbolEnrichment>)],
     symbol_index: Option<&Arc<std::sync::Mutex<SymbolIndex>>>,
     fs_manager: &FilesystemManager,
+    cwd: Option<&Path>,
 ) -> String {
     use std::fmt::Write;
 
-    // Group enrichments by root — bare absolute path as section header.
-    let mut root_items: BTreeMap<PathBuf, Vec<usize>> = BTreeMap::new();
-    let mut oor_items: Vec<usize> = Vec::new();
-    for (i, (hit, _)) in enrichments.iter().enumerate() {
-        match fs_manager.resolve_root(&hit.file) {
-            Some(root) => root_items.entry(root).or_default().push(i),
-            None => oor_items.push(i),
-        }
-    }
-
     let mut full = String::new();
 
-    for (root, indices) in &root_items {
-        if !full.is_empty() {
-            full.push('\n');
+    if let Some(cwd) = cwd {
+        // Relative glob: one section, cwd context header, cwd-relative paths.
+        let _ = writeln!(full, "cwd = {}", cwd.display());
+        let all_indices: Vec<usize> = (0..enrichments.len()).collect();
+        render_section(
+            enrichments,
+            &all_indices,
+            symbol_index,
+            fs_manager,
+            &mut full,
+            Some(cwd),
+        );
+    } else {
+        // Absolute / no glob: group by workspace root.
+        let mut root_items: BTreeMap<PathBuf, Vec<usize>> = BTreeMap::new();
+        let mut oor_items: Vec<usize> = Vec::new();
+        for (i, (hit, _)) in enrichments.iter().enumerate() {
+            match fs_manager.resolve_root(&hit.file) {
+                Some(root) => root_items.entry(root).or_default().push(i),
+                None => oor_items.push(i),
+            }
         }
-        let _ = writeln!(full, "{}", root.display());
-        render_section(enrichments, indices, symbol_index, fs_manager, &mut full);
-    }
-    // Out-of-root hits grouped under their parent directory path.
-    let mut oor_by_parent: BTreeMap<PathBuf, Vec<usize>> = BTreeMap::new();
-    for &i in &oor_items {
-        let (hit, _) = &enrichments[i];
-        let parent = hit
-            .file
-            .parent()
-            .unwrap_or_else(|| Path::new("/"))
-            .to_path_buf();
-        oor_by_parent.entry(parent).or_default().push(i);
-    }
-    for (parent, indices) in &oor_by_parent {
-        if !full.is_empty() {
-            full.push('\n');
+
+        for (root, indices) in &root_items {
+            if !full.is_empty() {
+                full.push('\n');
+            }
+            let _ = writeln!(full, "{}", root.display());
+            render_section(
+                enrichments,
+                indices,
+                symbol_index,
+                fs_manager,
+                &mut full,
+                None,
+            );
         }
-        let _ = writeln!(full, "{}", parent.display());
-        render_section(enrichments, indices, symbol_index, fs_manager, &mut full);
+        // Out-of-root hits grouped under their parent directory path.
+        let mut oor_by_parent: BTreeMap<PathBuf, Vec<usize>> = BTreeMap::new();
+        for &i in &oor_items {
+            let (hit, _) = &enrichments[i];
+            let parent = hit
+                .file
+                .parent()
+                .unwrap_or_else(|| Path::new("/"))
+                .to_path_buf();
+            oor_by_parent.entry(parent).or_default().push(i);
+        }
+        for (parent, indices) in &oor_by_parent {
+            if !full.is_empty() {
+                full.push('\n');
+            }
+            let _ = writeln!(full, "{}", parent.display());
+            render_section(
+                enrichments,
+                indices,
+                symbol_index,
+                fs_manager,
+                &mut full,
+                None,
+            );
+        }
     }
 
     let trimmed_len = full.trim_end().len();
@@ -1156,8 +1200,21 @@ fn render_section(
     symbol_index: Option<&Arc<std::sync::Mutex<SymbolIndex>>>,
     fs_manager: &FilesystemManager,
     output: &mut String,
+    cwd: Option<&Path>,
 ) {
     use std::fmt::Write;
+
+    // Path display: cwd-relative when cwd is set, root-relative otherwise.
+    let rel = |file: &str| -> String {
+        cwd.map_or_else(
+            || display_path(file, fs_manager),
+            |base| {
+                Path::new(file)
+                    .strip_prefix(base)
+                    .map_or_else(|_| file.to_string(), |r| r.to_string_lossy().to_string())
+            },
+        )
+    };
 
     // Step 1: Group by bare name at depth 0.
     let mut by_name: BTreeMap<String, Vec<(&GrepHit, &Option<SymbolEnrichment>)>> = BTreeMap::new();
@@ -1247,8 +1304,10 @@ fn render_section(
             continue;
         }
 
-        // Name-level grouping header at depth 0
-        let _ = writeln!(output, "{name}");
+        // Blank line between name groups.
+        if !output.is_empty() && !output.ends_with('\n') {
+            output.push('\n');
+        }
 
         // Render definition-like hits (Symbol, PrepareRenameSymbol) with
         // enrichment edges.
@@ -1262,7 +1321,7 @@ fn render_section(
                     || !e.incoming_calls.is_empty()
             });
 
-            let rel_path = display_path(&hit.file.to_string_lossy(), fs_manager);
+            let rel_path = rel(&hit.file.to_string_lossy());
 
             // Definition line — only Symbol and PrepareRenameSymbol hits
             match &hit.classification {
@@ -1276,14 +1335,11 @@ fn render_section(
                             format!("<{}> {}/", format_symbol_kind(sk), sn)
                         });
                     let line_1 = symbol.line + 1;
-                    let _ = writeln!(
-                        output,
-                        "\t{scope_prefix}<{kind}> {name}  {rel_path}:{line_1}"
-                    );
+                    let _ = writeln!(output, "{scope_prefix}<{kind}> {name}  {rel_path}:{line_1}");
                 }
                 HitClass::PrepareRenameSymbol => {
                     let line_1 = hit.line + 1;
-                    let _ = writeln!(output, "\t{name}  {rel_path}:{line_1}");
+                    let _ = writeln!(output, "{name}  {rel_path}:{line_1}");
                 }
                 _ => continue,
             }
@@ -1314,7 +1370,7 @@ fn render_section(
 
             // calls: section — outgoing calls sorted alphabetically
             if !enrichment.outgoing_calls.is_empty() {
-                let _ = writeln!(output, "\t\tcalls:");
+                let _ = writeln!(output, "\tcalls:");
                 let mut calls: Vec<&CallEdge> = enrichment.outgoing_calls.iter().collect();
                 calls.sort_by(|a, b| a.name.cmp(&b.name));
                 for c in &calls {
@@ -1335,11 +1391,11 @@ fn render_section(
                             });
                         format!("{ck}{cn}/")
                     });
-                    let c_rel = display_path(&c.file, fs_manager);
+                    let c_rel = rel(&c.file);
                     let line_1 = c.line + 1;
                     let _ = writeln!(
                         output,
-                        "\t\t\t{container_prefix}<{kind_label}{depr}> {}  {c_rel}:{line_1}",
+                        "\t\t{container_prefix}<{kind_label}{depr}> {}  {c_rel}:{line_1}",
                         c.name
                     );
                 }
@@ -1347,7 +1403,7 @@ fn render_section(
 
             // impls: section — grouped by file (alphabetical)
             if !enrichment.implementations.is_empty() {
-                let _ = writeln!(output, "\t\timpls:");
+                let _ = writeln!(output, "\timpls:");
                 let mut by_file: BTreeMap<String, Vec<u32>> = BTreeMap::new();
                 for (f, l) in &enrichment.implementations {
                     by_file.entry(f.clone()).or_default().push(*l);
@@ -1355,8 +1411,8 @@ fn render_section(
                 for (file, lines) in &by_file {
                     let mut lines = lines.clone();
                     lines.sort_unstable();
-                    let f_rel = display_path(file, fs_manager);
-                    let _ = writeln!(output, "\t\t\t{f_rel}");
+                    let f_rel = rel(file);
+                    let _ = writeln!(output, "\t\t{f_rel}");
                     for line_0 in &lines {
                         let line_1 = line_0 + 1;
                         // Look up enclosing structure from symbol_index
@@ -1373,14 +1429,14 @@ fn render_section(
                                 let span = format_span(enc.line, enc.end_line);
                                 format!(" <{ek}> {}{span}", enc.name)
                             });
-                        let _ = writeln!(output, "\t\t\t\t:{line_1}{enc_str}");
+                        let _ = writeln!(output, "\t\t\t:{line_1}{enc_str}");
                     }
                 }
             }
 
             // supertypes: section
             if !enrichment.supertypes.is_empty() {
-                let _ = writeln!(output, "\t\tsupertypes:");
+                let _ = writeln!(output, "\tsupertypes:");
                 for t in &enrichment.supertypes {
                     let kind_label = crate::symbol_index::lsp_kind_label(t.kind);
                     let depr = if t.deprecated { ", deprecated" } else { "" };
@@ -1388,11 +1444,11 @@ fn render_section(
                         .container
                         .as_ref()
                         .map_or_else(String::new, |cn| format!("{cn}/"));
-                    let t_rel = display_path(&t.file, fs_manager);
+                    let t_rel = rel(&t.file);
                     let line_1 = t.line + 1;
                     let _ = writeln!(
                         output,
-                        "\t\t\t{container_prefix}<{kind_label}{depr}> {}  {t_rel}:{line_1}",
+                        "\t\t{container_prefix}<{kind_label}{depr}> {}  {t_rel}:{line_1}",
                         t.name
                     );
                 }
@@ -1400,7 +1456,7 @@ fn render_section(
 
             // subtypes: section
             if !enrichment.subtypes.is_empty() {
-                let _ = writeln!(output, "\t\tsubtypes:");
+                let _ = writeln!(output, "\tsubtypes:");
                 for t in &enrichment.subtypes {
                     let kind_label = crate::symbol_index::lsp_kind_label(t.kind);
                     let depr = if t.deprecated { ", deprecated" } else { "" };
@@ -1408,11 +1464,11 @@ fn render_section(
                         .container
                         .as_ref()
                         .map_or_else(String::new, |cn| format!("{cn}/"));
-                    let t_rel = display_path(&t.file, fs_manager);
+                    let t_rel = rel(&t.file);
                     let line_1 = t.line + 1;
                     let _ = writeln!(
                         output,
-                        "\t\t\t{container_prefix}<{kind_label}{depr}> {}  {t_rel}:{line_1}",
+                        "\t\t{container_prefix}<{kind_label}{depr}> {}  {t_rel}:{line_1}",
                         t.name
                     );
                 }
@@ -1460,10 +1516,10 @@ fn render_section(
             }
 
             if !ref_entries.is_empty() {
-                let _ = writeln!(output, "\t\trefs:");
+                let _ = writeln!(output, "\trefs:");
                 for (file, lines) in &ref_entries {
-                    let f_rel = display_path(file, fs_manager);
-                    let _ = writeln!(output, "\t\t\t{f_rel}");
+                    let f_rel = rel(file);
+                    let _ = writeln!(output, "\t\t{f_rel}");
                     for (&line_0, enc) in lines {
                         let line_1 = line_0 + 1;
                         let enc_str = enc.as_ref().map_or_else(String::new, |enc| {
@@ -1478,7 +1534,7 @@ fn render_section(
                             let span = format_span(enc.line, enc.end_line);
                             format!(" {scope_prefix}<{ek}> {}{span}", enc.name)
                         });
-                        let _ = writeln!(output, "\t\t\t\t:{line_1}{enc_str}");
+                        let _ = writeln!(output, "\t\t\t:{line_1}{enc_str}");
                     }
                 }
             }
@@ -1492,17 +1548,17 @@ fn render_section(
             .map(|(hit, _)| *hit)
             .collect();
         if !ref_hits.is_empty() {
-            let by_dir_file = group_hits_by_dir_file(&ref_hits, fs_manager);
+            let by_dir_file = group_hits_by_dir_file(&ref_hits, fs_manager, cwd);
             for (dir, files) in &by_dir_file {
                 if !dir.is_empty() {
-                    let _ = writeln!(output, "\t{dir}");
+                    let _ = writeln!(output, "{dir}");
                 }
                 for (file, file_hits) in files {
-                    let indent = if dir.is_empty() { "\t" } else { "\t\t" };
+                    let indent = if dir.is_empty() { "" } else { "\t" };
                     let _ = writeln!(output, "{indent}{file}");
                     for hit in file_hits {
                         let line_1 = hit.line + 1;
-                        let hit_indent = if dir.is_empty() { "\t\t" } else { "\t\t\t" };
+                        let hit_indent = if dir.is_empty() { "\t" } else { "\t\t" };
                         let _ = writeln!(output, "{hit_indent}{}", format_hit_line(hit, line_1));
                     }
                 }
@@ -1562,11 +1618,20 @@ fn paginate(full: &str, budget: usize, page: usize) -> String {
 fn group_hits_by_dir_file<'a>(
     hits: &[&'a GrepHit],
     fs_manager: &FilesystemManager,
+    cwd: Option<&Path>,
 ) -> BTreeMap<String, BTreeMap<String, Vec<&'a GrepHit>>> {
     let mut by_dir_file: BTreeMap<String, BTreeMap<String, Vec<&GrepHit>>> = BTreeMap::new();
     for hit in hits {
-        let rel = display_path(&hit.file.to_string_lossy(), fs_manager);
-        let (dir, file) = split_dir_file(&rel);
+        let display = cwd.map_or_else(
+            || display_path(&hit.file.to_string_lossy(), fs_manager),
+            |base| {
+                hit.file.strip_prefix(base).map_or_else(
+                    |_| hit.file.to_string_lossy().to_string(),
+                    |r| r.to_string_lossy().to_string(),
+                )
+            },
+        );
+        let (dir, file) = split_dir_file(&display);
         by_dir_file
             .entry(dir)
             .or_default()
@@ -1608,10 +1673,13 @@ fn format_hit_line(hit: &GrepHit, line_1: u32) -> String {
                     format!("<{}> {}/", format_symbol_kind(sk), sn)
                 });
             let span = format_span(enc.line, enc.end_line);
-            format!(":{line_1} {scope_prefix}<{enc_kind}> {}{span}", enc.name)
+            format!(
+                ":{line_1} {}  {scope_prefix}<{enc_kind}> {}{span}",
+                hit.matched_text, enc.name
+            )
         }
         HitClass::Reference { enclosing: None } | HitClass::PrepareRenameSymbol => {
-            format!(":{line_1}")
+            format!(":{line_1} {}", hit.matched_text)
         }
         HitClass::Keyword => String::new(),
     }
@@ -1692,6 +1760,7 @@ impl Sink for MatchSink<'_> {
                 continue;
             }
             if let Ok(text) = std::str::from_utf8(&line_bytes[m]) {
+                let expanded = expand_match_to_token(line_bytes, m.start(), m.end());
                 let col = u32::try_from(m.start()).unwrap_or(0);
                 self.local
                     .file_line_texts
@@ -1699,7 +1768,7 @@ impl Sink for MatchSink<'_> {
                     .or_default()
                     .entry(line_num)
                     .or_default()
-                    .push((text.to_string(), col));
+                    .push((expanded.unwrap_or_else(|| text.to_string()), col));
             }
             at = m.end();
         }
@@ -1804,6 +1873,69 @@ fn split_alternation(pattern: &str) -> Vec<String> {
         arms.push(pattern.to_string());
     }
     arms
+}
+
+// ─── Match expansion ────────────────────────────────────────────────────
+
+/// Returns `true` if a byte is a token delimiter.
+///
+/// Token delimiters are whitespace and common punctuation that separate
+/// identifiers in source code. The match text is expanded to the nearest
+/// delimiters on each side so reference hits show the full token, not a
+/// regex substring (e.g. `Configuration` instead of `Config`).
+const fn is_token_delimiter(b: u8) -> bool {
+    matches!(
+        b,
+        b' ' | b'\t'
+            | b'\n'
+            | b'\r'
+            | b'('
+            | b')'
+            | b'['
+            | b']'
+            | b'<'
+            | b'>'
+            | b'{'
+            | b'}'
+            | b','
+            | b';'
+            | b':'
+            | b'.'
+            | b'='
+            | b'+'
+            | b'-'
+            | b'*'
+            | b'/'
+            | b'!'
+            | b'?'
+            | b'&'
+            | b'|'
+            | b'^'
+            | b'~'
+            | b'#'
+            | b'@'
+            | b'%'
+            | b'"'
+            | b'\''
+            | b'`'
+    )
+}
+
+/// Expands a regex match span to token boundaries within a line.
+///
+/// Walks left from `start` and right from `end` until a delimiter or
+/// line boundary is reached. Returns the expanded substring, or `None`
+/// if the bytes aren't valid UTF-8.
+fn expand_match_to_token(line: &[u8], start: usize, end: usize) -> Option<String> {
+    let mut lo = start;
+    while lo > 0 && !is_token_delimiter(line[lo - 1]) {
+        lo -= 1;
+    }
+    let mut hi = end;
+    while hi < line.len() && !is_token_delimiter(line[hi]) {
+        hi += 1;
+    }
+    std::str::from_utf8(&line[lo..hi]).ok().map(str::to_string)
 }
 
 // ─── LSP JSON extraction helpers ────────────────────────────────────────
@@ -2057,7 +2189,7 @@ mod tests {
     fn render(hits: &[GrepHit], budget: usize, page: usize, fs: &FilesystemManager) -> String {
         let enrichments: Vec<(&GrepHit, Option<SymbolEnrichment>)> =
             hits.iter().map(|h| (h, None)).collect();
-        let full = render_results(&enrichments, None, fs);
+        let full = render_results(&enrichments, None, fs, None);
         paginate(&full, budget, page)
     }
 

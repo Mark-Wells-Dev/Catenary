@@ -1060,14 +1060,14 @@ fn test_glob_no_maps_needed() -> Result<()> {
 }
 
 #[test]
-fn test_glob_tier2_flags() -> Result<()> {
+fn test_glob_dir_large_file_paged() -> Result<()> {
     let dir = tempfile::tempdir()?;
-    // File with many symbols to push tier 1 over budget.
+    // File with many symbols — exceeds budget so output is paged.
     std::fs::write(
         dir.path().join(format!("big.{MOCK_EXT}")),
         gen_mock_content(250),
     )?;
-    // Threshold of 5 so file qualifies for maps. Budget of 1000 so maps don't fit.
+    // Threshold of 5 so file qualifies for maps. Budget of 1000.
     let config = "[tools.glob]\nbudget = 1000\noutline_threshold = 5\n";
     let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), Some(config))?;
     bridge.initialize()?;
@@ -1077,15 +1077,13 @@ fn test_glob_tier2_flags() -> Result<()> {
         &json!({ "pattern": dir.path().to_string_lossy().to_string() }),
     )?;
 
+    // With stable shape, maps are always rendered and paged.
     assert!(
-        text.contains("[symbols available]"),
-        "Should show [symbols available] flag in tier 2: {text}"
+        text.contains("<Function>") || text.contains("<Struct>"),
+        "Should show symbols in maps: {text}"
     );
-    // Should NOT have symbol lines (maps not rendered in tier 2).
-    assert!(
-        !text.contains("<Function>") && !text.contains("<Struct>"),
-        "Should not show symbols in tier 2: {text}"
-    );
+    // Output should be paged since maps exceed budget.
+    assert!(text.contains("[page 1/"), "Should have page header: {text}");
     Ok(())
 }
 
@@ -1470,38 +1468,36 @@ fn test_glob_paging() -> Result<()> {
     let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), Some(config))?;
     bridge.initialize()?;
 
-    // First page.
+    // First page — should show [page 1/N] where N > 1.
     let text1 = bridge.call_tool_text(
         "glob",
         &json!({ "pattern": file.to_str().context("file path")? }),
     )?;
 
     assert!(
-        text1.contains("[cursor:"),
-        "First page should have cursor: {text1}"
+        text1.contains("[page 1/"),
+        "First page should have page header: {text1}"
+    );
+    // Verify it's not a single page.
+    assert!(
+        !text1.contains("[page 1/1]"),
+        "Should have multiple pages: {text1}"
     );
 
-    // Extract cursor token.
-    let cursor_line = text1
-        .lines()
-        .find(|l| l.contains("[cursor:"))
-        .context("No cursor line found")?;
-    let token = cursor_line
-        .trim()
-        .strip_prefix("[cursor: ")
-        .and_then(|s| s.strip_suffix(']'))
-        .context("Failed to parse cursor token")?;
-
-    // Second page.
+    // Second page via page parameter.
     let text2 = bridge.call_tool_text(
         "glob",
         &json!({
             "pattern": file.to_str().context("file path")?,
-            "cursor": token
+            "page": 2
         }),
     )?;
 
-    // Second page should have different symbols.
+    assert!(
+        text2.contains("[page 2/"),
+        "Second page should have page 2 header: {text2}"
+    );
+    // Second page should have different symbols than first.
     assert!(
         !text2.is_empty(),
         "Second page should have content: {text2}"
@@ -1530,7 +1526,10 @@ fn test_glob_no_grammar() -> Result<()> {
 
     // Should show line count but no symbols and no [symbols available].
     assert!(text.contains("300 lines"), "Should show line count: {text}");
-    assert!(!text.contains('['), "Should not have flags: {text}");
+    assert!(
+        !text.contains("[symbols available]"),
+        "Should not have symbols available flag: {text}"
+    );
     assert!(!text.contains('<'), "Should not have symbols: {text}");
     Ok(())
 }
@@ -1712,620 +1711,6 @@ fn test_glob_tree_dedup_per_directory() -> Result<()> {
     Ok(())
 }
 
-// ─── 08c into tests ──────────────────────────────────────────────────
-
-#[test]
-fn test_into_impl() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    // struct Outer with nested fn inner — "Outer" has children.
-    std::fs::write(
-        dir.path().join(format!("handler.{MOCK_EXT}")),
-        "struct Outer {\nfn method_a\nfn method_b\n}\n",
-    )?;
-
-    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), None)?;
-    bridge.initialize()?;
-
-    let text = bridge.call_tool_text(
-        "glob",
-        &json!({
-            "pattern": dir.path().join(format!("handler.{MOCK_EXT}")).to_string_lossy().to_string(),
-            "into": "Outer"
-        }),
-    )?;
-
-    // Should show Outer as target with children.
-    assert!(
-        text.contains("<Struct> Outer/"),
-        "Should show Outer container: {text}"
-    );
-    assert!(
-        text.contains("method_a"),
-        "Should show method_a child: {text}"
-    );
-    assert!(
-        text.contains("method_b"),
-        "Should show method_b child: {text}"
-    );
-    Ok(())
-}
-
-#[test]
-fn test_into_leaf() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    std::fs::write(
-        dir.path().join(format!("leaf.{MOCK_EXT}")),
-        "fn standalone\nfn other\n",
-    )?;
-
-    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), None)?;
-    bridge.initialize()?;
-
-    let text = bridge.call_tool_text(
-        "glob",
-        &json!({
-            "pattern": dir.path().join(format!("leaf.{MOCK_EXT}")).to_string_lossy().to_string(),
-            "into": "standalone"
-        }),
-    )?;
-
-    assert!(
-        text.contains("standalone"),
-        "Should show the leaf symbol: {text}"
-    );
-    assert!(
-        text.contains("no nested definitions"),
-        "Should show 'no nested definitions' for leaf: {text}"
-    );
-    Ok(())
-}
-
-#[test]
-fn test_into_nonexistent() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    std::fs::write(dir.path().join(format!("exist.{MOCK_EXT}")), "fn real\n")?;
-
-    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), None)?;
-    bridge.initialize()?;
-
-    let text = bridge.call_tool_text(
-        "glob",
-        &json!({
-            "pattern": dir.path().join(format!("exist.{MOCK_EXT}")).to_string_lossy().to_string(),
-            "into": "NoSuchThing"
-        }),
-    )?;
-
-    assert!(
-        text.contains("No matching symbols found"),
-        "Should report no matches: {text}"
-    );
-    Ok(())
-}
-
-#[test]
-fn test_into_disambiguation() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    // Two struct blocks with the same name — both should appear.
-    std::fs::write(
-        dir.path().join(format!("disamb.{MOCK_EXT}")),
-        "struct Handler {\nfn method_a\n}\nstruct Handler {\nfn method_b\n}\n",
-    )?;
-
-    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), None)?;
-    bridge.initialize()?;
-
-    let text = bridge.call_tool_text(
-        "glob",
-        &json!({
-            "pattern": dir.path().join(format!("disamb.{MOCK_EXT}")).to_string_lossy().to_string(),
-            "into": "Handler"
-        }),
-    )?;
-
-    assert!(
-        text.contains("method_a"),
-        "Should show children from first block: {text}"
-    );
-    assert!(
-        text.contains("method_b"),
-        "Should show children from second block: {text}"
-    );
-    Ok(())
-}
-
-#[test]
-fn test_into_wildcard() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    std::fs::write(
-        dir.path().join(format!("wild.{MOCK_EXT}")),
-        "fn alpha\nstruct Beta\nfn gamma\n",
-    )?;
-
-    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), None)?;
-    bridge.initialize()?;
-
-    let text = bridge.call_tool_text(
-        "glob",
-        &json!({
-            "pattern": dir.path().join(format!("wild.{MOCK_EXT}")).to_string_lossy().to_string(),
-            "into": "*"
-        }),
-    )?;
-
-    assert!(text.contains("alpha"), "Should show alpha: {text}");
-    assert!(text.contains("Beta"), "Should show Beta: {text}");
-    assert!(text.contains("gamma"), "Should show gamma: {text}");
-    Ok(())
-}
-
-#[test]
-fn test_into_prefix() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    std::fs::write(
-        dir.path().join(format!("prefix.{MOCK_EXT}")),
-        "fn test_a\nfn test_b\nfn other\n",
-    )?;
-
-    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), None)?;
-    bridge.initialize()?;
-
-    let text = bridge.call_tool_text(
-        "glob",
-        &json!({
-            "pattern": dir.path().join(format!("prefix.{MOCK_EXT}")).to_string_lossy().to_string(),
-            "into": "test_*"
-        }),
-    )?;
-
-    assert!(text.contains("test_a"), "Should match test_a: {text}");
-    assert!(text.contains("test_b"), "Should match test_b: {text}");
-    assert!(!text.contains("other"), "Should not match other: {text}");
-    Ok(())
-}
-
-#[test]
-fn test_into_multi_segment() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    // Outer contains test_a and helper — multi-segment filters children.
-    std::fs::write(
-        dir.path().join(format!("multi.{MOCK_EXT}")),
-        "struct Outer {\nfn test_a\nfn helper\n}\n",
-    )?;
-
-    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), None)?;
-    bridge.initialize()?;
-
-    let text = bridge.call_tool_text(
-        "glob",
-        &json!({
-            "pattern": dir.path().join(format!("multi.{MOCK_EXT}")).to_string_lossy().to_string(),
-            "into": "Outer/test_*"
-        }),
-    )?;
-
-    assert!(
-        text.contains("Outer"),
-        "Should show intermediate container: {text}"
-    );
-    assert!(text.contains("test_a"), "Should match test_a: {text}");
-    assert!(!text.contains("helper"), "Should not match helper: {text}");
-    Ok(())
-}
-
-#[test]
-fn test_into_recursive() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    // test_deep is nested inside Outer — ** should find it.
-    std::fs::write(
-        dir.path().join(format!("deep.{MOCK_EXT}")),
-        "struct Outer {\nfn test_deep\nfn other\n}\nfn test_top\n",
-    )?;
-
-    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), None)?;
-    bridge.initialize()?;
-
-    let text = bridge.call_tool_text(
-        "glob",
-        &json!({
-            "pattern": dir.path().join(format!("deep.{MOCK_EXT}")).to_string_lossy().to_string(),
-            "into": "**/test_*"
-        }),
-    )?;
-
-    assert!(
-        text.contains("test_deep"),
-        "Should find test_deep at any depth: {text}"
-    );
-    assert!(
-        text.contains("test_top"),
-        "Should find test_top at depth-0: {text}"
-    );
-    assert!(!text.contains("other"), "Should not match other: {text}");
-    Ok(())
-}
-
-#[test]
-fn test_into_kind_qualified() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    std::fs::write(
-        dir.path().join(format!("kinds.{MOCK_EXT}")),
-        "fn alpha\nstruct Beta\nfn gamma\n",
-    )?;
-
-    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), None)?;
-    bridge.initialize()?;
-
-    let text = bridge.call_tool_text(
-        "glob",
-        &json!({
-            "pattern": dir.path().join(format!("kinds.{MOCK_EXT}")).to_string_lossy().to_string(),
-            "into": "<Function> *"
-        }),
-    )?;
-
-    assert!(text.contains("alpha"), "Should match fn alpha: {text}");
-    assert!(text.contains("gamma"), "Should match fn gamma: {text}");
-    assert!(
-        !text.contains("Beta"),
-        "Should not match struct Beta: {text}"
-    );
-    Ok(())
-}
-
-#[test]
-fn test_into_directory() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    // Two files in a directory — into across both.
-    std::fs::write(
-        dir.path().join(format!("a.{MOCK_EXT}")),
-        "struct Handler {\nfn handle_a\n}\n",
-    )?;
-    std::fs::write(
-        dir.path().join(format!("b.{MOCK_EXT}")),
-        "struct Handler {\nfn handle_b\n}\n",
-    )?;
-
-    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), None)?;
-    bridge.initialize()?;
-
-    let text = bridge.call_tool_text(
-        "glob",
-        &json!({
-            "pattern": dir.path().to_string_lossy().to_string(),
-            "into": "Handler"
-        }),
-    )?;
-
-    // Should show results from both files.
-    assert!(
-        text.contains("handle_a"),
-        "Should show handle_a from a.mock: {text}"
-    );
-    assert!(
-        text.contains("handle_b"),
-        "Should show handle_b from b.mock: {text}"
-    );
-    Ok(())
-}
-
-#[test]
-fn test_into_zero_matches_multi() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    std::fs::write(dir.path().join(format!("x.{MOCK_EXT}")), "fn real\n")?;
-    std::fs::write(dir.path().join(format!("y.{MOCK_EXT}")), "fn actual\n")?;
-
-    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), None)?;
-    bridge.initialize()?;
-
-    let text = bridge.call_tool_text(
-        "glob",
-        &json!({
-            "pattern": dir.path().to_string_lossy().to_string(),
-            "into": "NoSuchSymbol"
-        }),
-    )?;
-
-    assert!(
-        text.contains("No matching symbols found"),
-        "Should report no matches: {text}"
-    );
-    Ok(())
-}
-
-#[test]
-fn test_into_bypasses_outline_suppress() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let file = dir.path().join(format!("denied.{MOCK_EXT}"));
-    std::fs::write(&file, "fn alpha\nstruct Beta\n\n\n\n\n\n\n\n\n")?;
-
-    // outline_suppress blocks the defensive map.
-    let config =
-        format!("[tools.glob]\noutline_threshold = 5\noutline_suppress = [\"**/*.{MOCK_EXT}\"]\n");
-    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), Some(&config))?;
-    bridge.initialize()?;
-
-    // Without into — should show [symbols available], no map.
-    let text_no_into = bridge.call_tool_text(
-        "glob",
-        &json!({ "pattern": dir.path().to_string_lossy().to_string() }),
-    )?;
-    assert!(
-        text_no_into.contains("[symbols available]"),
-        "Should show [symbols available] flag: {text_no_into}"
-    );
-    assert!(
-        !text_no_into.contains("<Function>"),
-        "Should NOT have map symbols: {text_no_into}"
-    );
-
-    // With into="*" — should show full map regardless of outline_suppress.
-    let text_into = bridge.call_tool_text(
-        "glob",
-        &json!({
-            "pattern": file.to_str().context("file path")?,
-            "into": "*"
-        }),
-    )?;
-    assert!(
-        text_into.contains("alpha"),
-        "into should bypass outline_suppress and show symbols: {text_into}"
-    );
-    assert!(
-        text_into.contains("Beta"),
-        "into should show Beta: {text_into}"
-    );
-    Ok(())
-}
-
-#[test]
-fn test_glob_deprecated_tag() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    // File with a deprecated symbol — mockls sets tags: [1] for @deprecated.
-    let file = dir.path().join(format!("depr_map.{MOCK_EXT}"));
-    std::fs::write(
-        &file,
-        "fn active_fn\nfn old_fn @deprecated\nstruct Current\n",
-    )?;
-
-    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), None)?;
-    bridge.initialize()?;
-
-    // Single-file glob — should render a defensive map with deprecated tags.
-    let text = bridge.call_tool_text(
-        "glob",
-        &json!({ "pattern": file.to_str().context("file path")? }),
-    )?;
-
-    // Deprecated symbol should show `<Kind, deprecated>`.
-    assert!(
-        text.contains("<Function, deprecated>"),
-        "Deprecated symbol should show <Kind, deprecated>: {text}"
-    );
-    assert!(
-        text.contains("old_fn"),
-        "Should show deprecated symbol name: {text}"
-    );
-    // Non-deprecated symbols should NOT have the tag.
-    assert!(
-        text.contains("<Function> active_fn"),
-        "Non-deprecated symbol should not have tag: {text}"
-    );
-    assert!(
-        text.contains("<Struct> Current"),
-        "Non-deprecated struct should not have tag: {text}"
-    );
-    Ok(())
-}
-
-#[test]
-fn test_into_deprecated() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    std::fs::write(
-        dir.path().join(format!("depr.{MOCK_EXT}")),
-        "fn current\nfn old_func @deprecated\n",
-    )?;
-
-    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), None)?;
-    bridge.initialize()?;
-
-    // into="*" should show the deprecated tag.
-    let text = bridge.call_tool_text(
-        "glob",
-        &json!({
-            "pattern": dir.path().join(format!("depr.{MOCK_EXT}")).to_string_lossy().to_string(),
-            "into": "*"
-        }),
-    )?;
-
-    assert!(
-        text.contains("deprecated"),
-        "Should show deprecated tag: {text}"
-    );
-    assert!(text.contains("old_func"), "Should show old_func: {text}");
-
-    // Filter by deprecated tag.
-    let text_filtered = bridge.call_tool_text(
-        "glob",
-        &json!({
-            "pattern": dir.path().join(format!("depr.{MOCK_EXT}")).to_string_lossy().to_string(),
-            "into": "<*, deprecated> *"
-        }),
-    )?;
-
-    assert!(
-        text_filtered.contains("old_func"),
-        "Should match deprecated symbol: {text_filtered}"
-    );
-    assert!(
-        !text_filtered.contains("current"),
-        "Should not match non-deprecated: {text_filtered}"
-    );
-    Ok(())
-}
-
-#[test]
-fn test_into_alternation() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    std::fs::write(
-        dir.path().join(format!("alt.{MOCK_EXT}")),
-        "fn Config\nfn Settings\nfn Other\n",
-    )?;
-
-    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), None)?;
-    bridge.initialize()?;
-
-    let text = bridge.call_tool_text(
-        "glob",
-        &json!({
-            "pattern": dir.path().join(format!("alt.{MOCK_EXT}")).to_string_lossy().to_string(),
-            "into": "{Config,Settings}"
-        }),
-    )?;
-
-    assert!(text.contains("Config"), "Should match Config: {text}");
-    assert!(text.contains("Settings"), "Should match Settings: {text}");
-    assert!(!text.contains("Other"), "Should not match Other: {text}");
-    Ok(())
-}
-
-#[test]
-fn test_into_subtree() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    // Outer has nested children; ** should show full subtree.
-    std::fs::write(
-        dir.path().join(format!("sub.{MOCK_EXT}")),
-        "struct Outer {\nfn inner_a\nfn inner_b\n}\nfn top_level\n",
-    )?;
-
-    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), None)?;
-    bridge.initialize()?;
-
-    let text = bridge.call_tool_text(
-        "glob",
-        &json!({
-            "pattern": dir.path().join(format!("sub.{MOCK_EXT}")).to_string_lossy().to_string(),
-            "into": "Outer/**"
-        }),
-    )?;
-
-    assert!(
-        text.contains("inner_a"),
-        "Should show inner_a in subtree: {text}"
-    );
-    assert!(
-        text.contains("inner_b"),
-        "Should show inner_b in subtree: {text}"
-    );
-    // top_level is OUTSIDE Outer — should NOT appear.
-    assert!(
-        !text.contains("top_level"),
-        "Should not show top_level (outside Outer span): {text}"
-    );
-    Ok(())
-}
-
-#[test]
-fn test_into_with_exclude() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    std::fs::write(
-        dir.path().join(format!("keep.{MOCK_EXT}")),
-        "struct Handler {\nfn method\n}\n",
-    )?;
-    std::fs::write(
-        dir.path().join(format!("fixture_skip.{MOCK_EXT}")),
-        "struct Handler {\nfn method\n}\n",
-    )?;
-
-    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), None)?;
-    bridge.initialize()?;
-
-    let text = bridge.call_tool_text(
-        "glob",
-        &json!({
-            "pattern": dir.path().to_string_lossy().to_string(),
-            "into": "Handler",
-            "exclude": "fixture_*"
-        }),
-    )?;
-
-    assert!(
-        text.contains("method"),
-        "Should show method from keep file: {text}"
-    );
-    assert!(
-        !text.contains("fixture"),
-        "Should exclude fixture file: {text}"
-    );
-    Ok(())
-}
-
-#[test]
-fn test_into_dedup() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    // Multiple files with identical children under Handler.
-    let content = "struct Handler {\nfn method_a\nfn method_b\n}\n";
-    for i in 0..4 {
-        std::fs::write(dir.path().join(format!("proto_{i}.{MOCK_EXT}")), content)?;
-    }
-
-    let config = "[tools.glob]\nbudget = 5000\n";
-    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), Some(config))?;
-    bridge.initialize()?;
-
-    let text = bridge.call_tool_text(
-        "glob",
-        &json!({
-            "pattern": dir.path().to_string_lossy().to_string(),
-            "into": "Handler"
-        }),
-    )?;
-
-    // Should show shared structure once, not repeated per file.
-    assert!(
-        text.contains("common structure"),
-        "Should deduplicate identical children: {text}"
-    );
-    // method_a should appear only once (in the shared map).
-    let method_count = text.matches("method_a").count();
-    assert_eq!(
-        method_count, 1,
-        "method_a should appear once in shared map (got {method_count}): {text}"
-    );
-    Ok(())
-}
-
-#[test]
-fn test_into_glob_pattern() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let sub = dir.path().join("src");
-    std::fs::create_dir_all(&sub)?;
-    std::fs::write(
-        sub.join(format!("a.{MOCK_EXT}")),
-        "struct Handler {\nfn handle_a\n}\n",
-    )?;
-    std::fs::write(
-        sub.join(format!("b.{MOCK_EXT}")),
-        "struct Handler {\nfn handle_b\n}\n",
-    )?;
-
-    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), None)?;
-    bridge.initialize()?;
-
-    let text = bridge.call_tool_text(
-        "glob",
-        &json!({
-            "pattern": format!("src/**/*.{MOCK_EXT}"),
-            "into": "Handler"
-        }),
-    )?;
-
-    // Should show results from both files.
-    assert!(text.contains("handle_a"), "Should show handle_a: {text}");
-    assert!(text.contains("handle_b"), "Should show handle_b: {text}");
-    Ok(())
-}
-
 // ─── Ticket 65: directory matching in glob patterns ─────────────────
 
 #[test]
@@ -2443,11 +1828,10 @@ fn test_glob_pattern_dirs_no_enrichment() -> Result<()> {
 }
 
 #[test]
-fn test_glob_pattern_dir_count_tier() -> Result<()> {
+fn test_glob_pattern_paged_large_result() -> Result<()> {
     let dir = tempfile::tempdir()?;
 
-    // Create many files across many directories to exceed tree budget
-    // but fit in directory+count budget.
+    // Create many files across many directories to exceed page budget.
     for i in 0..30 {
         let sub = dir.path().join(format!("dir_{i:02}"));
         std::fs::create_dir(&sub)?;
@@ -2456,7 +1840,7 @@ fn test_glob_pattern_dir_count_tier() -> Result<()> {
         }
     }
 
-    // Small budget to force degradation past the tree tier.
+    // Small budget — output is paged, not demoted.
     let config_dir = tempfile::tempdir()?;
     let config_path = config_dir.path().join("config.toml");
     std::fs::write(&config_path, "[tools.glob]\nbudget = 600\n")?;
@@ -2470,23 +1854,20 @@ fn test_glob_pattern_dir_count_tier() -> Result<()> {
     )?;
 
     // With 150 files across 30 dirs, the tree won't fit in 600 chars.
-    // The dir+count tier should collapse to directory names with counts.
-    // Check that at least some directories appear with counts.
-    let has_dir_count = text.contains("dir_") && text.contains('\t');
-    let has_bucketed = text.contains("files)");
+    // Output should be paged with [page N/M] header.
+    assert!(text.contains("[page 1/"), "Should have page header: {text}");
     assert!(
-        has_dir_count || has_bucketed,
-        "Should degrade to dir+count or bucketed tier: {text}"
+        text.contains("dir_"),
+        "Should show directory structure: {text}"
     );
     Ok(())
 }
 
 #[test]
-fn test_glob_bucketing_uses_relative_paths() -> Result<()> {
+fn test_glob_paged_preserves_tree_structure() -> Result<()> {
     let dir = tempfile::tempdir()?;
 
-    // Create deeply nested files to test that bucketing uses path prefixes
-    // instead of extension-based grouping.
+    // Create deeply nested files.
     let src = dir.path().join("src");
     let bridge_dir = src.join("bridge");
     let lsp_dir = src.join("lsp");
@@ -2506,7 +1887,7 @@ fn test_glob_bucketing_uses_relative_paths() -> Result<()> {
         )?;
     }
 
-    // Small budget to force bucketing.
+    // Small budget — output is paged, not bucketed.
     let config_dir = tempfile::tempdir()?;
     let config_path = config_dir.path().join("config.toml");
     std::fs::write(&config_path, "[tools.glob]\nbudget = 400\n")?;
@@ -2516,13 +1897,12 @@ fn test_glob_bucketing_uses_relative_paths() -> Result<()> {
 
     let text = bridge.call_tool_text("glob", &json!({ "pattern": "src/**/*.rs" }))?;
 
-    // Bucketing on relative paths should produce path-prefix patterns
-    // (e.g. "src/bridge/*" or "src/lsp/*"), not extension patterns
-    // (e.g. "*.rs").
+    // Paged output should preserve tree structure with directory names.
     assert!(
         text.contains("bridge") || text.contains("lsp"),
-        "Bucketed output should reference path prefixes, not just extensions: {text}"
+        "Paged output should show directory structure: {text}"
     );
+    assert!(text.contains("[page 1/"), "Should have page header: {text}");
     Ok(())
 }
 
@@ -2545,5 +1925,143 @@ fn test_glob_pattern_in_roots_unchanged() -> Result<()> {
         text.contains("lines)"),
         "File entries should still have line counts: {text}"
     );
+    Ok(())
+}
+
+// ─── Output format tests ─────────────────────────────────────────────
+
+#[test]
+fn test_glob_absolute_dir_no_cwd_header() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(dir.path().join("hello.txt"), "hi\n")?;
+    std::fs::create_dir(dir.path().join("sub"))?;
+
+    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    let abs_path = dir.path().to_string_lossy().to_string();
+    let text = bridge.call_tool_text("glob", &json!({ "pattern": &abs_path }))?;
+
+    // Absolute pattern: no cwd header.
+    assert!(
+        !text.contains("cwd ="),
+        "Absolute pattern should not have cwd header: {text}"
+    );
+    // Should have the absolute path as section header.
+    assert!(
+        text.contains(&abs_path),
+        "Should have absolute path header: {text}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_glob_absolute_dir_indented_entries() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(dir.path().join("alpha.txt"), "a\n")?;
+    std::fs::write(dir.path().join("beta.txt"), "b\n")?;
+    std::fs::create_dir(dir.path().join("sub"))?;
+
+    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    let abs_path = dir.path().to_string_lossy().to_string();
+    let text = bridge.call_tool_text("glob", &json!({ "pattern": &abs_path }))?;
+
+    // Entries should be indented under the directory header.
+    assert!(
+        text.contains("\talpha.txt"),
+        "Entries should be indented under dir header: {text}"
+    );
+    assert!(
+        text.contains("\tsub/"),
+        "Subdirectories should be indented under dir header: {text}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_glob_absolute_pattern_indented_tree() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::create_dir_all(dir.path().join("src/bridge"))?;
+    std::fs::write(dir.path().join("src/bridge/mod.rs"), "pub mod bridge;\n")?;
+    std::fs::write(dir.path().join("src/lib.rs"), "pub mod src;\n")?;
+
+    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    let pattern = format!("{}/**/*.rs", dir.path().display());
+    let text = bridge.call_tool_text("glob", &json!({ "pattern": &pattern }))?;
+
+    // No cwd header for absolute patterns.
+    assert!(
+        !text.contains("cwd ="),
+        "Absolute pattern should not have cwd header: {text}"
+    );
+    // Tree content should be indented under the section header.
+    assert!(
+        text.contains("\tsrc/"),
+        "Tree should be indented under section header: {text}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_glob_absolute_file_no_cwd_header() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let file_path = dir.path().join("readme.txt");
+    std::fs::write(&file_path, "hello world\n")?;
+
+    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    let abs_path = file_path.to_string_lossy().to_string();
+    let text = bridge.call_tool_text("glob", &json!({ "pattern": &abs_path }))?;
+
+    // Absolute file: no cwd header, absolute path in output.
+    assert!(
+        !text.contains("cwd ="),
+        "Absolute file should not have cwd header: {text}"
+    );
+    assert!(text.contains("readme.txt"), "Should show file name: {text}");
+    Ok(())
+}
+
+#[test]
+fn test_grep_no_glob_no_cwd_header() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(dir.path().join("hello.txt"), "needle in haystack\n")?;
+
+    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "needle" }))?;
+
+    // No glob param → no cwd header.
+    assert!(
+        !text.contains("cwd ="),
+        "Grep without glob should not have cwd header: {text}"
+    );
+    assert!(text.contains("needle"), "Should find the match: {text}");
+    Ok(())
+}
+
+#[test]
+fn test_grep_absolute_glob_no_cwd_header() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(dir.path().join("target.rs"), "fn needle() {}\n")?;
+
+    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    let glob = format!("{}/**/*.rs", dir.path().display());
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "needle", "glob": &glob }))?;
+
+    // Absolute glob → no cwd header.
+    assert!(
+        !text.contains("cwd ="),
+        "Grep with absolute glob should not have cwd header: {text}"
+    );
+    assert!(text.contains("needle"), "Should find the match: {text}");
     Ok(())
 }

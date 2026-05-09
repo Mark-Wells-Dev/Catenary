@@ -3671,19 +3671,11 @@ fn test_grep_enriched_name_grouping() -> Result<()> {
         !text.contains("Root: "),
         "Should not contain Root: prefix, got:\n{text}"
     );
-    // Name at depth 0 (no leading tab)
-    assert!(
-        text.contains("\ngrouped_sym\n"),
-        "Expected name at depth 0, got:\n{text}"
-    );
-    // Definition indented (leading tab)
-    let has_indented_def = lines
+    // Definition at depth 0 (no name header, no leading tab)
+    let has_def = lines
         .iter()
-        .any(|l| l.starts_with('\t') && l.contains("grouped_sym"));
-    assert!(
-        has_indented_def,
-        "Expected indented definition line, got:\n{text}"
-    );
+        .any(|l| !l.starts_with('\t') && l.contains("<Function>") && l.contains("grouped_sym"));
+    assert!(has_def, "Expected definition at depth 0, got:\n{text}");
 
     Ok(())
 }
@@ -3724,13 +3716,12 @@ fn test_grep_cross_def_dedup() -> Result<()> {
         text.contains("<Struct> Dedup_t1"),
         "Expected struct definition, got:\n{text}"
     );
-    // The name should appear only once as a group header at depth 0
-    let name_headers: Vec<&str> = text.lines().filter(|l| *l == "Dedup_t1").collect();
-    assert_eq!(
-        name_headers.len(),
-        1,
-        "Expected one name header, got {} in:\n{text}",
-        name_headers.len()
+    // No standalone name header — definition line carries the name.
+    let bare_name_lines: Vec<&str> = text.lines().filter(|l| *l == "Dedup_t1").collect();
+    assert!(
+        bare_name_lines.is_empty(),
+        "Expected no bare name header, got {} in:\n{text}",
+        bare_name_lines.len()
     );
 
     Ok(())
