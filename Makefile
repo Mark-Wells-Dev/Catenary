@@ -75,7 +75,7 @@ deny:
 # Run mutation testing. Expensive — use before releases, not on every commit.
 # Pass T= to scope to specific modules, e.g.: make mutants T=command_filter
 mutants:
-	@cargo mutants $(if $(T),--package catenary -F $(T),) --timeout 60 --jobs 4 -- --features mockls
+	@cargo mutants $(if $(T),--package catenary -F $(T),) --timeout 60 --jobs 4 --features mockls
 
 # Run tests. Pass T= to filter, N= to repeat, e.g.: make test T=json_diagnostics N=5
 # Prefix with ! to exclude: make test T=\!flaky_test
