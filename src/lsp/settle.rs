@@ -227,16 +227,7 @@ pub async fn await_idle(
         }
 
         // Budget tracking
-        let mut interval_cputime: u64 = 0;
-        for ts in &snapshot.samples {
-            let cputime = ts.delta_utime + ts.delta_stime;
-            interval_cputime += if cputime == 0 && ts.delta_pfc > 0 {
-                1
-            } else {
-                cputime
-            };
-        }
-        cumulative_cputime += interval_cputime;
+        cumulative_cputime += interval_cost(&snapshot);
         if cumulative_cputime >= CPUTIME_BUDGET {
             debug!("idle_detector: budget exhausted ({cumulative_cputime} centiseconds)");
             return SettleResult::BudgetExhausted;
@@ -250,36 +241,59 @@ pub async fn await_idle(
     }
 }
 
+/// Computes the CPU-time cost of a single polling interval.
+///
+/// Each process contributes `delta_utime + delta_stime` centiseconds.
+/// Processes with zero CPU time but nonzero page faults are charged a
+/// minimum of 1 centisecond (they were scheduled but didn't accumulate
+/// a full tick).
+#[allow(
+    clippy::similar_names,
+    reason = "delta_utime/delta_stime are standard counter names"
+)]
+fn interval_cost(snapshot: &catenary_proc::TreeSnapshot) -> u64 {
+    let mut cost: u64 = 0;
+    for ts in &snapshot.samples {
+        let cputime = ts.delta_utime + ts.delta_stime;
+        cost += if cputime == 0 && ts.delta_pfc > 0 {
+            1
+        } else {
+            cputime
+        };
+    }
+    cost
+}
+
+/// Pure root-death detection logic — determines whether the root process
+/// is gone based on a PID and snapshot alone.
+fn root_state(
+    root_pid: Option<u32>,
+    snapshot: &catenary_proc::TreeSnapshot,
+) -> Option<SettleResult> {
+    if snapshot.process_count == 0 || snapshot.samples.is_empty() {
+        return Some(SettleResult::RootDied);
+    }
+
+    let Some(root_pid) = root_pid else {
+        return Some(SettleResult::RootDied);
+    };
+
+    match snapshot.samples.iter().find(|s| s.pid == root_pid) {
+        Some(root) if root.state == ProcessState::Dead => Some(SettleResult::RootDied),
+        None => Some(SettleResult::RootDied),
+        _ => None,
+    }
+}
+
 /// Checks whether the root process has died and transitions lifecycle.
 fn check_root_death(
     server: &LspServer,
     snapshot: &catenary_proc::TreeSnapshot,
 ) -> Option<SettleResult> {
-    // Empty snapshot → root is gone
-    if snapshot.process_count == 0 || snapshot.samples.is_empty() {
-        debug!("idle_detector: root process gone (empty snapshot)");
-        server.set_lifecycle(ServerLifecycle::Dead);
-        return Some(SettleResult::RootDied);
-    }
-
-    let Some(root_pid) = server.pid() else {
-        server.set_lifecycle(ServerLifecycle::Dead);
-        return Some(SettleResult::RootDied);
-    };
-
-    match snapshot.samples.iter().find(|s| s.pid == root_pid) {
-        Some(root) if root.state == ProcessState::Dead => {
-            debug!("idle_detector: root process is zombie/dead");
-            server.set_lifecycle(ServerLifecycle::Dead);
-            Some(SettleResult::RootDied)
-        }
-        None => {
-            debug!("idle_detector: root PID not in snapshot");
-            server.set_lifecycle(ServerLifecycle::Dead);
-            Some(SettleResult::RootDied)
-        }
-        _ => None,
-    }
+    let result = root_state(server.pid(), snapshot)?;
+    debug!("idle_detector: root process gone");
+    server.set_lifecycle(ServerLifecycle::Dead);
+    Some(result)
 }
 
 // ── Profiling loop ───────────────────────────────────────────────────
@@ -551,6 +565,174 @@ mod tests {
             },
         ]);
         assert!(detector.check(&snap3));
+    }
+
+    #[test]
+    fn pfc_only_activity_detects_work() {
+        let mut detector = IdleDetector::after_activity(0);
+
+        // Page faults only (no CPU time) — should still count as activity
+        let pfc_only = make_snapshot(vec![TreeSample {
+            pid: 100,
+            ppid: 1,
+            delta_utime: 0,
+            delta_stime: 0,
+            delta_pfc: 5,
+            state: ProcessState::Running,
+        }]);
+        assert!(
+            !detector.check(&pfc_only),
+            "pfc-only should register activity"
+        );
+
+        // Now quiet — idle
+        let quiet = make_snapshot(vec![quiet_sample(100)]);
+        assert!(detector.check(&quiet));
+    }
+
+    // ── interval_cost unit tests ──────────────────────────────────────
+
+    #[test]
+    fn interval_cost_sums_cputime() {
+        let snapshot = make_snapshot(vec![
+            TreeSample {
+                pid: 1,
+                ppid: 0,
+                delta_utime: 10,
+                delta_stime: 3,
+                delta_pfc: 0,
+                state: ProcessState::Running,
+            },
+            TreeSample {
+                pid: 2,
+                ppid: 1,
+                delta_utime: 5,
+                delta_stime: 2,
+                delta_pfc: 0,
+                state: ProcessState::Running,
+            },
+        ]);
+        assert_eq!(interval_cost(&snapshot), 20);
+    }
+
+    #[test]
+    fn interval_cost_pfc_only_charges_minimum() {
+        let snapshot = make_snapshot(vec![TreeSample {
+            pid: 1,
+            ppid: 0,
+            delta_utime: 0,
+            delta_stime: 0,
+            delta_pfc: 50,
+            state: ProcessState::Running,
+        }]);
+        assert_eq!(interval_cost(&snapshot), 1);
+    }
+
+    #[test]
+    fn interval_cost_zero_activity() {
+        let snapshot = make_snapshot(vec![quiet_sample(1)]);
+        assert_eq!(interval_cost(&snapshot), 0);
+    }
+
+    #[test]
+    fn interval_cost_mixed_processes() {
+        let snapshot = make_snapshot(vec![
+            // CPU active: contributes 7
+            TreeSample {
+                pid: 1,
+                ppid: 0,
+                delta_utime: 4,
+                delta_stime: 3,
+                delta_pfc: 100,
+                state: ProcessState::Running,
+            },
+            // PFC only: contributes 1
+            TreeSample {
+                pid: 2,
+                ppid: 1,
+                delta_utime: 0,
+                delta_stime: 0,
+                delta_pfc: 20,
+                state: ProcessState::Running,
+            },
+            // Idle: contributes 0
+            quiet_sample(3),
+        ]);
+        assert_eq!(interval_cost(&snapshot), 8);
+    }
+
+    // ── root_state unit tests ─────────────────────────────────────────
+
+    #[test]
+    fn root_state_empty_snapshot() {
+        let snapshot = TreeSnapshot {
+            samples: Vec::new(),
+            process_count: 0,
+            cumulative_ticks: 0,
+        };
+        assert_eq!(root_state(Some(1), &snapshot), Some(SettleResult::RootDied));
+    }
+
+    #[test]
+    fn root_state_no_pid() {
+        let snapshot = make_snapshot(vec![active_sample(100)]);
+        assert_eq!(root_state(None, &snapshot), Some(SettleResult::RootDied));
+    }
+
+    #[test]
+    fn root_state_healthy_root() {
+        let snapshot = make_snapshot(vec![quiet_sample(100)]);
+        assert_eq!(root_state(Some(100), &snapshot), None);
+    }
+
+    #[test]
+    fn root_state_dead_root() {
+        let snapshot = make_snapshot(vec![TreeSample {
+            pid: 100,
+            ppid: 1,
+            delta_utime: 0,
+            delta_stime: 0,
+            delta_pfc: 0,
+            state: ProcessState::Dead,
+        }]);
+        assert_eq!(
+            root_state(Some(100), &snapshot),
+            Some(SettleResult::RootDied)
+        );
+    }
+
+    #[test]
+    fn root_state_pid_missing_from_snapshot() {
+        let snapshot = make_snapshot(vec![quiet_sample(200)]);
+        assert_eq!(
+            root_state(Some(100), &snapshot),
+            Some(SettleResult::RootDied)
+        );
+    }
+
+    #[test]
+    fn root_state_empty_samples_nonzero_count() {
+        // Defensive: process_count disagrees with samples length
+        let snapshot = TreeSnapshot {
+            samples: Vec::new(),
+            process_count: 5,
+            cumulative_ticks: 0,
+        };
+        assert_eq!(root_state(Some(1), &snapshot), Some(SettleResult::RootDied));
+    }
+
+    #[test]
+    fn root_state_zero_count_with_samples() {
+        // Defensive: process_count is 0 but samples exist
+        let snapshot = TreeSnapshot {
+            samples: vec![quiet_sample(100)],
+            process_count: 0,
+            cumulative_ticks: 0,
+        };
+        assert_eq!(
+            root_state(Some(100), &snapshot),
+            Some(SettleResult::RootDied)
+        );
     }
 
     // ── await_idle integration tests (no real server) ───────────────
