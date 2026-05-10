@@ -3,6 +3,7 @@
 This file serves as the single point of truth for AI agents (Claude, Gemini, etc.) working on the Catenary project.
 
 ## Project Grounding
+
 - **Project Goal:** High-performance multiplexing bridge between MCP and LSP.
 - **Repository:** `TwoWells/Catenary` on GitHub.
 - **Config:** `@./Cargo.toml`
@@ -53,6 +54,7 @@ find-references, rename, and search without shell-based text scanning.
 - `docs/src/` — full documentation source.
 
 ## Coding Standards
+
 - **Edition:** Rust 2024.
 - **Safety:** `unsafe` code is strictly forbidden (`forbid(unsafe_code)`).
 - **Error Handling:** Use `anyhow` for application logic and `thiserror` for library errors.
@@ -64,6 +66,7 @@ find-references, rename, and search without shell-based text scanning.
 - **Dependencies:** Must pass `cargo machete` (no unused dependencies).
 
 ## Quality Standards
+
 - **License Compliance:** All new dependencies MUST have permissive licenses (MIT, Apache-2.0, etc.) as specified in `@./deny.toml`. Catenary is dual-licensed under AGPL-3.0-or-later and a commercial license.
 - **Documentation:** All public APIs must have documentation comments.
 - **Testing:**
@@ -72,23 +75,24 @@ find-references, rename, and search without shell-based text scanning.
   - Integration test subprocesses (bridge, `catenary install`, etc.) must call `isolate_env(&mut cmd, root)` **before** setting any `CATENARY_*` env vars. `isolate_env` clears all inherited `CATENARY_*` and `XDG_*` vars, then sets `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, and `XDG_DATA_HOME` to the test's tempdir. Callers then set `CATENARY_SERVERS`, `CATENARY_ROOTS`, or `CATENARY_CONFIG` after the call — these overwrite the cleared values. Without `isolate_env`, subprocesses inherit the user's shell environment, writing to `~/.config`, `~/.local/state`, or `~/.local/share` and causing races between parallel tests and across worktrees.
 
 ## Development Commands
-- **Build:** `cargo build`
+
 - **Check (full):** `make check` — format, lint, deny, machete, and test in one pass.
 - **Test (all):** `make test`
 - **Test (filtered):** `make test T=<filter>` — run only tests matching the filter (e.g., `make test T=json_diagnostics`).
 - **Test (repeat):** `make test T=<filter> N=<count>` — stress-test by repeating N times (e.g., `make test T=flaky_test N=5`).
-- **Lint:** `cargo clippy`
-- **Format:** `cargo fmt`
 - **Mutation testing:** `make mutants` — pre-release only. Pass `T=<module>` to scope (e.g., `make mutants T=command_filter`).
 
 ## Release Workflow
+
 Versioning and releases are managed via the `Makefile`.
+
 - **Patch Release:** `make release-patch` (e.g., 0.1.0 -> 0.1.1)
 - **Minor Release:** `make release-minor` (e.g., 0.1.0 -> 0.2.0)
 - **Major Release:** `make release-major` (e.g., 0.1.0 -> 1.0.0)
 - **Custom Version:** `make release V=x.y.z`
 
 These commands automatically:
+
 1. Verify the working tree is clean and on `main`.
 2. Run `cargo update` to ensure `Cargo.lock` is fresh.
 3. Bump versions in `Cargo.toml` and `.claude-plugin/marketplace.json`.
@@ -105,7 +109,9 @@ from the latest `v*` tag, so any docs changes on `main` only reach
 every push to `main`.
 
 ### Pre-release checklist
+
 Before running `make release-*`:
+
 1. Ensure `git push` has been run so local `main` matches `origin/main`.
 2. Run `make mutants` and address any surviving mutants (for major releases).
 
