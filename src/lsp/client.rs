@@ -1154,6 +1154,17 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn supports_capabilities_disabled_by_flags() -> Result<()> {
+        let (mut client, _dir) = spawn_and_init(&["--no-rename", "--no-type-hierarchy"]).await?;
+
+        assert!(!client.supports_rename());
+        assert!(!client.supports_type_hierarchy());
+
+        client.shutdown().await?;
+        Ok(())
+    }
+
     // ── require_capability tests ────────────────────────────────────
 
     #[tokio::test]

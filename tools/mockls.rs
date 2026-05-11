@@ -151,6 +151,14 @@ struct Args {
     #[arg(long)]
     no_code_actions: bool,
 
+    /// Omit `renameProvider` from capabilities.
+    #[arg(long)]
+    no_rename: bool,
+
+    /// Omit `typeHierarchyProvider` from capabilities.
+    #[arg(long)]
+    no_type_hierarchy: bool,
+
     /// Return multiple quickfix actions per diagnostic.
     #[arg(long)]
     multi_fix: bool,
@@ -778,11 +786,15 @@ impl MockServer {
             "documentSymbolProvider": true,
             "workspaceSymbolProvider": workspace_symbol_value,
             "callHierarchyProvider": true,
-            "typeHierarchyProvider": true,
-            "renameProvider": { "prepareProvider": true },
             "textDocumentSync": text_doc_sync
         });
 
+        if !self.args.no_type_hierarchy {
+            capabilities["typeHierarchyProvider"] = serde_json::json!(true);
+        }
+        if !self.args.no_rename {
+            capabilities["renameProvider"] = serde_json::json!({ "prepareProvider": true });
+        }
         if !self.args.no_code_actions {
             capabilities["codeActionProvider"] = serde_json::json!(true);
         }
@@ -2365,6 +2377,8 @@ mod tests {
             flycheck_ticks: None,
             scan_roots: false,
             no_code_actions: false,
+            no_rename: false,
+            no_type_hierarchy: false,
             multi_fix: false,
             resolve_provider: false,
             no_empty_query: false,
