@@ -686,9 +686,15 @@ impl Drop for Connection {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "tests use expect for readable assertions"
+)]
 mod tests {
     use super::*;
+    use crate::logging::LoggingServer;
     use crate::logging::test_support::{query_all_messages, setup_logging};
+    use std::time::Duration;
 
     /// Verify that `emit_lsp_event` routes each tracing level to the
     /// correct macro, producing DB rows with the expected level string.
@@ -806,5 +812,60 @@ mod tests {
         assert_eq!(notif.method, "$/cancelRequest");
         assert_eq!(notif.jsonrpc, "2.0");
         assert_eq!(notif.params, serde_json::json!({"id": 42}));
+    }
+
+    /// Locates the mockls binary relative to the test binary.
+    fn mockls_bin() -> std::path::PathBuf {
+        let mut path = std::env::current_exe().expect("current_exe");
+        path.pop(); // deps/
+        path.pop(); // debug/
+        path.push("mockls");
+        assert!(
+            path.exists(),
+            "mockls not found at {} — build with --features mockls",
+            path.display()
+        );
+        path
+    }
+
+    /// Drop must kill the child process. Without `start_kill()` in Drop,
+    /// the child is orphaned and the reader loop never sees EOF.
+    #[tokio::test]
+    async fn drop_kills_child_process() {
+        let server = std::sync::Arc::new(super::super::server::LspServer::new(
+            "test".to_string(),
+            "test-server".to_string(),
+            None,
+            std::collections::HashMap::new(),
+        ));
+        let logging = LoggingServer::new();
+        let bin = mockls_bin();
+        let (conn, _stderr) = Connection::new(
+            bin.to_str().expect("mockls path is UTF-8"),
+            &["test"],
+            std::process::Stdio::null(),
+            None,
+            &server,
+            "test".to_string(),
+            logging,
+            "test-server",
+        )
+        .expect("mockls should spawn");
+
+        let alive = conn.alive_flag();
+        assert!(alive.load(Ordering::SeqCst), "should be alive before drop");
+
+        // Drop kills the child; reader loop sees EOF and sets alive=false.
+        // With the mutant (drop replaced with ()), the child is orphaned
+        // and alive stays true.
+        drop(conn);
+
+        // Yield to let the reader loop process EOF.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert!(
+            !alive.load(Ordering::SeqCst),
+            "child should be dead after Connection drop"
+        );
     }
 }
