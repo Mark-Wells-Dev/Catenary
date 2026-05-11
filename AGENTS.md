@@ -81,6 +81,7 @@ find-references, rename, and search without shell-based text scanning.
 - **Test (filtered):** `make test T=<filter>` — run only tests matching the filter (e.g., `make test T=json_diagnostics`).
 - **Test (repeat):** `make test T=<filter> N=<count>` — stress-test by repeating N times (e.g., `make test T=flaky_test N=5`).
 - **Mutation testing:** `make mutants` — pre-release only. Pass `T=<module>` to scope (e.g., `make mutants T=command_filter`).
+- **Stop mutation testing:** `make mutants-stop` — kills cargo-mutants and all child processes. **Never use `pkill cargo-mutants`** — it kills only the parent, orphaning test binaries that run without timeout or memory limits. An orphaned mutant test binary caused a 41.8GB OOM that crashed the GPU driver.
 
 ## Release Workflow
 

@@ -5,7 +5,7 @@
 #   make release-major   # 0.5.5 -> 1.0.0
 #   make release V=0.6.0 # explicit version
 
-.PHONY: bench bench-test build-release check deny machete mdbook mutants rustdoc test test-ignored release release-patch release-minor release-major publish tag-current
+.PHONY: bench bench-test build-release check deny machete mdbook mutants mutants-stop rustdoc test test-ignored release release-patch release-minor release-major publish tag-current
 
 # Get current version from Cargo.toml
 CURRENT_VERSION := $(shell grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
@@ -76,6 +76,15 @@ deny:
 # Pass T= to scope to specific modules, e.g.: make mutants T=command_filter
 mutants:
 	@mkdir -p $(CURDIR)/../.catenary-mutants-tmp && TMPDIR=$(CURDIR)/../.catenary-mutants-tmp cargo mutants $(if $(T),--package catenary-mcp -F $(T),) --timeout 1200 --jobs 8 --features mockls
+
+# Kill a running cargo-mutants and all its children (test binaries, mockls, etc.).
+# Plain `pkill cargo-mutants` leaves orphaned children that run without a timeout.
+mutants-stop:
+	@if pgid=$$(ps -o pgid= -p $$(pgrep -x cargo-mutants 2>/dev/null | head -1) 2>/dev/null | tr -d ' '); then \
+	  kill -- -$$pgid 2>/dev/null && echo "Killed process group $$pgid"; \
+	else \
+	  echo "No cargo-mutants process found"; \
+	fi
 
 # Run tests. Pass T= to filter, N= to repeat, e.g.: make test T=json_diagnostics N=5
 # Prefix with ! to exclude: make test T=\!flaky_test
