@@ -119,6 +119,7 @@ const REQUEST_THRESHOLD: u64 = 1000;
 /// semantics.
 pub struct Connection {
     child: Child,
+    pid: Option<u32>,
     stdin: Arc<Mutex<ChildStdin>>,
     pending: Arc<Mutex<HashMap<RequestId, PendingRequest>>>,
     alive: Arc<AtomicBool>,
@@ -163,11 +164,12 @@ impl Connection {
             .spawn()
             .with_context(|| format!("Failed to spawn LSP server: {program}"))?;
 
-        if let Some(pid) = child.id() {
+        let pid = child.id();
+        if let Some(pid) = pid {
             catenary_proc::register_child_process(pid);
         }
 
-        let monitor = child.id().and_then(catenary_proc::ProcessMonitor::new);
+        let monitor = pid.and_then(catenary_proc::ProcessMonitor::new);
 
         let stdin = child
             .stdin
@@ -199,6 +201,7 @@ impl Connection {
         Ok((
             Self {
                 child,
+                pid,
                 stdin,
                 pending,
                 alive,
@@ -413,9 +416,9 @@ impl Connection {
         self.monitor.lock().ok()?.as_mut()?.sample()
     }
 
-    /// PID of the server process.
-    pub fn pid(&self) -> Option<u32> {
-        self.child.id()
+    /// PID of the server process, captured at spawn time.
+    pub const fn pid(&self) -> Option<u32> {
+        self.pid
     }
 
     /// Sends `$/cancelRequest` to the LSP server for a pending request.
