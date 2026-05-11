@@ -1019,13 +1019,35 @@ impl LspClient {
 )]
 mod tests {
     use super::*;
+    use crate::logging::test_support::setup_logging;
     use crate::lsp::state::ServerLifecycle;
     use crate::lsp::test_support::mockls_bin;
+    use std::sync::{Arc, Mutex};
 
     const MOCK_LANG: &str = "tCl1x";
 
     fn test_logging() -> LoggingServer {
         LoggingServer::new()
+    }
+
+    /// Poll DB until a stderr message appears, returning its payload.
+    async fn poll_stderr_payload(db: &Arc<Mutex<rusqlite::Connection>>) -> Option<String> {
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let c = db.lock().expect("lock");
+            let result: Result<String, _> = c.query_row(
+                "SELECT payload FROM messages \
+                 WHERE type = 'lsp' AND method = 'stderr' \
+                 LIMIT 1",
+                [],
+                |row| row.get(0),
+            );
+            drop(c);
+            if let Ok(payload) = result {
+                return Some(payload);
+            }
+        }
+        None
     }
 
     /// Spawn mockls and initialize with defaults.
@@ -1348,6 +1370,109 @@ mod tests {
 
         // Reset to a fresh token so shutdown works
         client.set_cancel_token(CancellationToken::new());
+        client.shutdown().await?;
+        Ok(())
+    }
+
+    // ── spawn_stderr_reader tests ───────────────────────────────────
+
+    #[tokio::test]
+    async fn stderr_capture_recorded_in_db() -> Result<()> {
+        let (logging, db, _guard) = setup_logging();
+
+        let dir = tempfile::tempdir()?;
+        let bin = mockls_bin();
+        let bin_str = bin.to_str().expect("mockls path is UTF-8");
+
+        let mut client = LspClient::spawn(
+            bin_str,
+            &[MOCK_LANG, "--stderr-message", "unit_stderr_test_line"],
+            MOCK_LANG,
+            MOCK_LANG,
+            logging,
+            None,
+            HashMap::new(),
+            None,
+        )?;
+        client.initialize(&[dir.path().to_path_buf()], None).await?;
+
+        let payload = poll_stderr_payload(&db)
+            .await
+            .expect("stderr event should appear in DB");
+        assert!(
+            payload.contains("unit_stderr_test_line"),
+            "payload should contain the stderr text, got: {payload}"
+        );
+        assert!(
+            !payload.contains("truncated"),
+            "short line should not be truncated"
+        );
+
+        client.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stderr_line_at_boundary_not_truncated() -> Result<()> {
+        let (logging, db, _guard) = setup_logging();
+
+        let dir = tempfile::tempdir()?;
+        let bin = mockls_bin();
+        let bin_str = bin.to_str().expect("mockls path is UTF-8");
+
+        let mut client = LspClient::spawn(
+            bin_str,
+            &[MOCK_LANG, "--stderr-length", "4096"],
+            MOCK_LANG,
+            MOCK_LANG,
+            logging,
+            None,
+            HashMap::new(),
+            None,
+        )?;
+        client.initialize(&[dir.path().to_path_buf()], None).await?;
+
+        let payload = poll_stderr_payload(&db)
+            .await
+            .expect("stderr event should appear in DB");
+        assert!(
+            !payload.contains("truncated"),
+            "4096-char line should NOT be truncated"
+        );
+
+        client.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stderr_line_above_boundary_truncated() -> Result<()> {
+        let (logging, db, _guard) = setup_logging();
+
+        let dir = tempfile::tempdir()?;
+        let bin = mockls_bin();
+        let bin_str = bin.to_str().expect("mockls path is UTF-8");
+
+        let mut client = LspClient::spawn(
+            bin_str,
+            &[MOCK_LANG, "--stderr-length", "5000"],
+            MOCK_LANG,
+            MOCK_LANG,
+            logging,
+            None,
+            HashMap::new(),
+            None,
+        )?;
+        client.initialize(&[dir.path().to_path_buf()], None).await?;
+
+        let payload = poll_stderr_payload(&db)
+            .await
+            .expect("stderr event should appear in DB");
+        assert!(
+            payload.contains("truncated"),
+            "5000-char line should be truncated, got len: {}",
+            payload.len()
+        );
+
         client.shutdown().await?;
         Ok(())
     }

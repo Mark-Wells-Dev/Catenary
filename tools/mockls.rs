@@ -208,6 +208,11 @@ struct Args {
     #[arg(long)]
     stderr_message: Option<String>,
 
+    /// Write a line of N repeated 'x' characters to stderr after
+    /// `initialized`. Used to test truncation boundaries.
+    #[arg(long)]
+    stderr_length: Option<usize>,
+
     /// Include the value of the named environment variable in the
     /// `serverInfo.version` field of the initialize response.
     /// Used to verify that per-server `env` config reaches the process.
@@ -591,6 +596,10 @@ impl MockServer {
             "initialized" => {
                 if let Some(ref msg) = self.args.stderr_message {
                     let _ = writeln!(std::io::stderr(), "{msg}");
+                }
+                if let Some(n) = self.args.stderr_length {
+                    let line: String = "x".repeat(n);
+                    let _ = writeln!(std::io::stderr(), "{line}");
                 }
                 if let Some(busy_ms) = self.args.cpu_on_initialized {
                     let start = std::time::Instant::now();
@@ -2388,6 +2397,7 @@ mod tests {
             report_open_count: false,
             reject_null_workspace: false,
             stderr_message: None,
+            stderr_length: None,
             report_env: None,
         }
     }
