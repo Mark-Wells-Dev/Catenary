@@ -216,10 +216,10 @@ impl Connection {
 
     /// Send a request and wait for the response with failure detection.
     ///
-    /// Uses CPU-tick failure detection instead of wall-clock timeout.
-    /// Falls back to a 30-second wall-clock timeout when the process
-    /// monitor is unavailable (e.g., mockls in tests).
-    /// Retries on `ContentModified` (-32801) or `RequestCancelled` (-32800).
+    /// Uses CPU-tick failure detection via [`ProcessMonitor`](catenary_proc::ProcessMonitor).
+    /// When the monitor is unavailable, falls back to reader-loop death
+    /// detection (`is_alive`). Retries on `ContentModified` (-32801) or
+    /// `RequestCancelled` (-32800).
     ///
     /// If `cancel` is triggered (MCP client cancelled the tool call),
     /// sends `$/cancelRequest` to the LSP server and returns
@@ -283,7 +283,6 @@ impl Connection {
             // Wait for response: select on rx + failure detection timer
             let response = {
                 let mut rx = rx;
-                let wall_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
                 let mut budget = i64::try_from(REQUEST_THRESHOLD).unwrap_or(1000);
 
                 loop {
@@ -334,13 +333,6 @@ impl Connection {
                                 break Err(anyhow!(
                                     "[{}] request '{method}' failed \
                                      (server stuck)",
-                                    self.language
-                                ));
-                            }
-                            if tokio::time::Instant::now() >= wall_deadline {
-                                self.pending.lock().await.remove(&id);
-                                break Err(anyhow!(
-                                    "[{}] request '{method}' timed out",
                                     self.language
                                 ));
                             }
