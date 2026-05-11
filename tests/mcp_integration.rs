@@ -2631,7 +2631,10 @@ fn test_grep_no_blank_lines() -> Result<()> {
 fn test_grep_prepare_rename_priority_chain() -> Result<()> {
     let mockls_bin = env!("CARGO_BIN_EXE_mockls");
     let mut bridge = BridgeProcess::spawn_with_config(|root| {
-        std::fs::write(root.join(format!("chain.{MOCK_LANG_A}")), "fn chain_symbol\nchain_symbol\n")?;
+        std::fs::write(
+            root.join(format!("chain.{MOCK_LANG_A}")),
+            "fn chain_symbol\nchain_symbol\n",
+        )?;
         let config_path = root.join("config.toml");
         std::fs::write(
             &config_path,

@@ -588,7 +588,10 @@ fn test_glob_tier2_file_listing() -> Result<()> {
 fn test_glob_budget_small() -> Result<()> {
     let mut bridge = BridgeProcess::spawn_with_config(|root| {
         for i in 0..40 {
-            std::fs::write(root.join(format!("test_item_{i:03}.txt")), format!("line {i}\n"))?;
+            std::fs::write(
+                root.join(format!("test_item_{i:03}.txt")),
+                format!("line {i}\n"),
+            )?;
         }
         let config_path = root.join("config.toml");
         std::fs::write(&config_path, "[tools.glob]\nbudget = 1000\n")?;
@@ -768,10 +771,16 @@ fn test_glob_separator_bucketing() -> Result<()> {
     // Use a small budget to force bucketing.
     let mut bridge2 = BridgeProcess::spawn_with_config(|root| {
         for i in 0..5 {
-            std::fs::write(root.join(format!("test_grep_{i}.rs")), format!("fn test_{i}() {{}}\n"))?;
+            std::fs::write(
+                root.join(format!("test_grep_{i}.rs")),
+                format!("fn test_{i}() {{}}\n"),
+            )?;
         }
         for i in 0..5 {
-            std::fs::write(root.join(format!("test_glob_{i}.rs")), format!("fn test_{i}() {{}}\n"))?;
+            std::fs::write(
+                root.join(format!("test_glob_{i}.rs")),
+                format!("fn test_{i}() {{}}\n"),
+            )?;
         }
         let config_path = root.join("config.toml");
         std::fs::write(&config_path, "[tools.glob]\nbudget = 1000\n")?;
@@ -1855,10 +1864,16 @@ fn test_glob_paged_preserves_tree_structure() -> Result<()> {
         std::fs::create_dir_all(&bridge_dir)?;
         std::fs::create_dir_all(&lsp_dir)?;
         for i in 0..20 {
-            std::fs::write(bridge_dir.join(format!("handler_{i}.rs")), format!("fn handle_{i}() {{}}\n"))?;
+            std::fs::write(
+                bridge_dir.join(format!("handler_{i}.rs")),
+                format!("fn handle_{i}() {{}}\n"),
+            )?;
         }
         for i in 0..20 {
-            std::fs::write(lsp_dir.join(format!("client_{i}.rs")), format!("struct Client{i};\n"))?;
+            std::fs::write(
+                lsp_dir.join(format!("client_{i}.rs")),
+                format!("struct Client{i};\n"),
+            )?;
         }
         let config_path = root.join("config.toml");
         std::fs::write(&config_path, "[tools.glob]\nbudget = 400\n")?;

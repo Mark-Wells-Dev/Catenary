@@ -111,9 +111,7 @@ impl BridgeProcess {
     /// Creates a fresh tempdir for the workspace root. `setup` receives the
     /// root path, populates it with test files, and returns the config path.
     /// The tempdir lives as long as this `BridgeProcess`.
-    pub fn spawn_with_config(
-        setup: impl FnOnce(&Path) -> Result<PathBuf>,
-    ) -> Result<Self> {
+    pub fn spawn_with_config(setup: impl FnOnce(&Path) -> Result<PathBuf>) -> Result<Self> {
         let root_dir = tempfile::tempdir().context("Failed to create root dir")?;
         let config_path = setup(root_dir.path())?;
         let mut proc = Self::spawn_with(|cmd| {

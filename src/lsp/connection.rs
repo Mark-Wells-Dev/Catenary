@@ -679,3 +679,99 @@ impl Drop for Connection {
         let _ = self.child.start_kill();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::logging::test_support::{query_all_messages, setup_logging};
+
+    /// Verify that `emit_lsp_event` routes each tracing level to the
+    /// correct macro, producing DB rows with the expected level string.
+    #[test]
+    fn emit_lsp_event_routes_levels_correctly() {
+        let (_logging, db, _guard) = setup_logging();
+
+        emit_lsp_event(
+            tracing::Level::ERROR,
+            "test-server",
+            "test/error",
+            1,
+            None,
+            "{}",
+            "error msg",
+        );
+        emit_lsp_event(
+            tracing::Level::WARN,
+            "test-server",
+            "test/warn",
+            2,
+            None,
+            "{}",
+            "warn msg",
+        );
+        emit_lsp_event(
+            tracing::Level::INFO,
+            "test-server",
+            "test/info",
+            3,
+            None,
+            "{}",
+            "info msg",
+        );
+        emit_lsp_event(
+            tracing::Level::DEBUG,
+            "test-server",
+            "test/debug",
+            4,
+            None,
+            "{}",
+            "debug msg",
+        );
+
+        let msgs = query_all_messages(&db);
+        assert_eq!(msgs.len(), 4, "expected 4 events, got {}", msgs.len());
+
+        assert_eq!(msgs[0].level, "error", "ERROR event stored as error");
+        assert_eq!(msgs[0].method, "test/error");
+
+        assert_eq!(msgs[1].level, "warn", "WARN event stored as warn");
+        assert_eq!(msgs[1].method, "test/warn");
+
+        assert_eq!(msgs[2].level, "info", "INFO event stored as info");
+        assert_eq!(msgs[2].method, "test/info");
+
+        assert_eq!(msgs[3].level, "debug", "DEBUG event stored as debug");
+        assert_eq!(msgs[3].method, "test/debug");
+    }
+
+    /// Verify that `emit_lsp_event` propagates `parent_id` when present.
+    #[test]
+    fn emit_lsp_event_propagates_parent_id() {
+        let (_logging, db, _guard) = setup_logging();
+
+        emit_lsp_event(
+            tracing::Level::INFO,
+            "test-server",
+            "test/method",
+            10,
+            Some(5),
+            "{}",
+            "with parent",
+        );
+        emit_lsp_event(
+            tracing::Level::INFO,
+            "test-server",
+            "test/method",
+            11,
+            None,
+            "{}",
+            "no parent",
+        );
+
+        let msgs = query_all_messages(&db);
+        assert_eq!(msgs.len(), 2);
+
+        assert_eq!(msgs[0].parent_id, Some(5), "parent_id should be present");
+        assert_eq!(msgs[1].parent_id, None, "parent_id should be absent");
+    }
+}

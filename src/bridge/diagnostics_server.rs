@@ -10,9 +10,9 @@
 
 use super::filesystem_manager::FilesystemManager;
 use super::path_security::PathValidator;
+use crate::lsp::server::LspServer;
 use crate::lsp::settle::{IdleDetector, SettleResult, await_idle};
 use crate::lsp::state::ServerLifecycle;
-use crate::lsp::server::LspServer;
 use crate::lsp::{LspClient, LspClientManager};
 use crate::symbol_index::SymbolIndex;
 use anyhow::{Result, anyhow};
@@ -330,8 +330,14 @@ impl DiagnosticsServer {
         let server_name = client.server_name().to_string();
         let cancel = CancellationToken::new();
 
-        if !settle_after(&server, post_open_baseline, cancel.clone(), &server_name, "post-open")
-            .await
+        if !settle_after(
+            &server,
+            post_open_baseline,
+            cancel.clone(),
+            &server_name,
+            "post-open",
+        )
+        .await
             || matches!(
                 client.lifecycle(),
                 ServerLifecycle::Failed | ServerLifecycle::Dead
@@ -564,11 +570,9 @@ impl DiagnosticsServer {
 /// baseline. Returns 0 if the tree monitor is unavailable.
 async fn sample_baseline(server: &Arc<LspServer>) -> u64 {
     let s = Arc::clone(server);
-    tokio::task::spawn_blocking(move || {
-        s.sample_tree().map_or(0, |snap| snap.cumulative_ticks)
-    })
-    .await
-    .unwrap_or(0)
+    tokio::task::spawn_blocking(move || s.sample_tree().map_or(0, |snap| snap.cumulative_ticks))
+        .await
+        .unwrap_or(0)
 }
 
 /// Settles after a stimulus using [`IdleDetector::after_activity`].

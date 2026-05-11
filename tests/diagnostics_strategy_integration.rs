@@ -475,7 +475,10 @@ fn test_pull_downgrade_with_push() -> Result<()> {
 fn test_diagnostics_multi_server_concatenation() -> Result<()> {
     let mockls_bin = env!("CARGO_BIN_EXE_mockls");
     let mut bridge = BridgeProcess::spawn_with_config(|root| {
-        std::fs::write(root.join(format!("test.{MOCK_LANG_A}")), "line one\nline two\n")?;
+        std::fs::write(
+            root.join(format!("test.{MOCK_LANG_A}")),
+            "line one\nline two\n",
+        )?;
         let config_path = root.join("config.toml");
         std::fs::write(
             &config_path,
