@@ -75,7 +75,7 @@ deny:
 # Run mutation testing. Expensive — use before releases, not on every commit.
 # Pass T= to scope to specific modules, e.g.: make mutants T=command_filter
 mutants:
-	@mkdir -p $(CURDIR)/../.catenary-mutants-tmp && ulimit -v 4194304 && TMPDIR=$(CURDIR)/../.catenary-mutants-tmp cargo mutants $(if $(T),--package catenary-mcp -F $(T),) --timeout 1200 --jobs 8 --features mockls
+	@mkdir -p $(CURDIR)/../.catenary-mutants-tmp && ulimit -v 16777216 && TMPDIR=$$(realpath $(CURDIR)/../.catenary-mutants-tmp) cargo mutants $(if $(T),--package catenary-mcp -F $(T),) --timeout 1200 --jobs 8 --features mockls
 
 # Kill a running cargo-mutants and all its children (test binaries, mockls, etc.).
 # Plain `pkill cargo-mutants` leaves orphaned children that run without a timeout.
