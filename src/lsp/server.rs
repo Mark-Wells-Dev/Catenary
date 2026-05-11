@@ -1030,6 +1030,7 @@ fn resolve_section(settings: Option<&Value>, section: Option<&str>) -> Value {
 mod tests {
     use super::super::instance_key::Scope;
     use super::*;
+    use crate::logging::LoggingServer;
     use serde_json::json;
     use std::time::Duration;
 
@@ -2327,5 +2328,60 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(100), notified)
             .await
             .expect("state_notify should fire on lifecycle change");
+    }
+
+    // ── Mutant audit: delegation methods with real Connection ────
+
+    /// Helper: creates an `LspServer` with a real `Connection` backed by
+    /// a `cat` subprocess. The process blocks on stdin, keeping it alive
+    /// long enough to test `pid()`, `alive_flag()`, and `sample_tree()`.
+    fn server_with_connection() -> Arc<LspServer> {
+        let server = Arc::new(test_server());
+        let logging = LoggingServer::new();
+        let (conn, _stderr) = Connection::new(
+            "cat",
+            &[],
+            std::process::Stdio::null(),
+            None,
+            &server,
+            "test".to_string(),
+            logging,
+            "test-server",
+        )
+        .expect("cat should spawn");
+        server.set_connection(conn);
+        server
+    }
+
+    #[tokio::test]
+    async fn pid_returns_process_id_with_connection() {
+        let server = server_with_connection();
+        let pid = server.pid();
+        assert!(pid.is_some(), "pid should be Some with a live connection");
+        assert!(pid.expect("just checked") > 0);
+    }
+
+    #[tokio::test]
+    async fn alive_flag_returns_flag_with_connection() {
+        let server = server_with_connection();
+        let flag = server.alive_flag();
+        assert!(
+            flag.is_some(),
+            "alive_flag should be Some with a connection"
+        );
+        assert!(
+            flag.expect("just checked").load(Ordering::SeqCst),
+            "alive flag should be true for a live process"
+        );
+    }
+
+    #[tokio::test]
+    async fn sample_tree_returns_snapshot_with_connection() {
+        let server = server_with_connection();
+        let snapshot = server.sample_tree();
+        assert!(
+            snapshot.is_some(),
+            "sample_tree should return Some with a live process"
+        );
     }
 }
