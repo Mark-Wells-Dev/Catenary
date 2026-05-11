@@ -28,6 +28,40 @@ pub mod state;
 /// Small local types for LSP concepts.
 pub(crate) mod types;
 
+/// Shared test helpers for LSP unit tests.
+///
+/// Gated on `feature = "mockls"` so in-crate unit tests and integration
+/// tests share the same helpers.
+#[cfg(feature = "mockls")]
+#[doc(hidden)]
+#[allow(
+    clippy::expect_used,
+    clippy::missing_panics_doc,
+    clippy::must_use_candidate,
+    missing_docs,
+    reason = "test-only module, doc lints are noise"
+)]
+pub mod test_support {
+    use std::path::PathBuf;
+
+    /// Locates the mockls binary relative to the test binary.
+    ///
+    /// Test binaries live in `target/debug/deps/`; mockls lives in
+    /// `target/debug/`. Navigate up from the test binary to find it.
+    pub fn mockls_bin() -> PathBuf {
+        let mut path = std::env::current_exe().expect("current_exe");
+        path.pop(); // binary name → deps/
+        path.pop(); // deps/ → debug/
+        path.push("mockls");
+        assert!(
+            path.exists(),
+            "mockls not found at {} — build with --features mockls",
+            path.display()
+        );
+        path
+    }
+}
+
 pub use client::LspClient;
 pub use instance_key::{InstanceKey, Scope};
 pub use manager::LspClientManager;

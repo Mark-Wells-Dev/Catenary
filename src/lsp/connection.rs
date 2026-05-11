@@ -814,20 +814,6 @@ mod tests {
         assert_eq!(notif.params, serde_json::json!({"id": 42}));
     }
 
-    /// Locates the mockls binary relative to the test binary.
-    fn mockls_bin() -> std::path::PathBuf {
-        let mut path = std::env::current_exe().expect("current_exe");
-        path.pop(); // deps/
-        path.pop(); // debug/
-        path.push("mockls");
-        assert!(
-            path.exists(),
-            "mockls not found at {} — build with --features mockls",
-            path.display()
-        );
-        path
-    }
-
     /// Drop must kill the child process. Without `start_kill()` in Drop,
     /// the child is orphaned and the reader loop never sees EOF.
     #[tokio::test]
@@ -839,7 +825,7 @@ mod tests {
             std::collections::HashMap::new(),
         ));
         let logging = LoggingServer::new();
-        let bin = mockls_bin();
+        let bin = crate::lsp::test_support::mockls_bin();
         let (conn, _stderr) = Connection::new(
             bin.to_str().expect("mockls path is UTF-8"),
             &["test"],

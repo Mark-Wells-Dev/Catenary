@@ -2332,29 +2332,12 @@ mod tests {
 
     // ── Mutant audit: delegation methods with real Connection ────
 
-    /// Locates the mockls binary relative to the test binary.
-    ///
-    /// Test binaries live in `target/debug/deps/`; mockls lives in
-    /// `target/debug/`. Navigate up from the test binary to find it.
-    fn mockls_bin() -> std::path::PathBuf {
-        let mut path = std::env::current_exe().expect("current_exe");
-        path.pop(); // binary name → deps/
-        path.pop(); // deps/ → debug/
-        path.push("mockls");
-        assert!(
-            path.exists(),
-            "mockls not found at {} — build with --features mockls",
-            path.display()
-        );
-        path
-    }
-
     /// Helper: creates an `LspServer` with a real `Connection` backed by
     /// mockls. Cross-platform (mockls is a Rust binary built by this crate).
     fn server_with_connection() -> Arc<LspServer> {
         let server = Arc::new(test_server());
         let logging = LoggingServer::new();
-        let bin = mockls_bin();
+        let bin = crate::lsp::test_support::mockls_bin();
         let (conn, _stderr) = Connection::new(
             bin.to_str().expect("mockls path is UTF-8"),
             &["test"],
