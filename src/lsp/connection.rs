@@ -97,6 +97,17 @@ fn emit_lsp_event(
     }
 }
 
+/// Whether an LSP error code indicates a retriable condition.
+///
+/// - `-32801` (`ContentModified`): file changed during request.
+/// - `-32800` (`RequestCancelled`): server cancelled the request.
+///
+/// Both are transient — the request may succeed on retry after the
+/// server settles.
+const fn is_retriable_lsp_error(code: i64) -> bool {
+    code == -32801 || code == -32800
+}
+
 /// Poll interval for failure detection sampling.
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
@@ -339,8 +350,7 @@ impl Connection {
             }?;
 
             if let Some(error) = response.error {
-                // Check for ContentModified (-32801) or RequestCancelled (-32800)
-                if error.code == -32801 || error.code == -32800 {
+                if is_retriable_lsp_error(error.code) {
                     debug!("LSP request '{}' cancelled/modified, retrying...", method,);
                     tokio::select! {
                         () = server.state_notify().notified() => {}
@@ -773,5 +783,23 @@ mod tests {
 
         assert_eq!(msgs[0].parent_id, Some(5), "parent_id should be present");
         assert_eq!(msgs[1].parent_id, None, "parent_id should be absent");
+    }
+
+    #[test]
+    fn is_retriable_lsp_error_matches_content_modified() {
+        assert!(is_retriable_lsp_error(-32801));
+    }
+
+    #[test]
+    fn is_retriable_lsp_error_matches_request_cancelled() {
+        assert!(is_retriable_lsp_error(-32800));
+    }
+
+    #[test]
+    fn is_retriable_lsp_error_rejects_other_codes() {
+        assert!(!is_retriable_lsp_error(0));
+        assert!(!is_retriable_lsp_error(-32700));
+        assert!(!is_retriable_lsp_error(32801));
+        assert!(!is_retriable_lsp_error(32800));
     }
 }
