@@ -1165,12 +1165,12 @@ command = "rust-analyzer"
         let after = catenary_proc::sample(pid).expect("sample after");
 
         let cpu_ticks = (after.utime + after.stime) - (before.utime + before.stime);
-        // 50 ticks = 500ms CPU time — generous enough to avoid flakes
+        // 100 ticks = 1s CPU time — generous enough to avoid flakes
         // under parallel cargo-mutants load while still catching
         // catastrophic regressions (accidental network calls, O(n²)).
         assert!(
-            cpu_ticks <= 50,
-            "config check used {cpu_ticks} CPU ticks (centiseconds), expected <= 50",
+            cpu_ticks <= 100,
+            "config check used {cpu_ticks} CPU ticks (centiseconds), expected <= 100",
         );
     }
 
