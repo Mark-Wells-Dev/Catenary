@@ -12,6 +12,7 @@ use super::filesystem_manager::FilesystemManager;
 use super::path_security::PathValidator;
 use crate::lsp::settle::{IdleDetector, SettleResult, await_idle};
 use crate::lsp::state::ServerLifecycle;
+use crate::lsp::server::LspServer;
 use crate::lsp::{LspClient, LspClientManager};
 use crate::symbol_index::SymbolIndex;
 use anyhow::{Result, anyhow};
@@ -259,7 +260,10 @@ impl DiagnosticsServer {
         // which triggers re-indexing — opening files while that is
         // in progress can produce transient false-positive diagnostics
         // that persist in the push cache.
-        {
+        //
+        // After settling, sample baseline ticks for post-open
+        // activity detection (the server is confirmed idle here).
+        let post_open_baseline = {
             let client = client_mutex.lock().await;
             if matches!(
                 client.lifecycle(),
@@ -280,7 +284,9 @@ impl DiagnosticsServer {
             if result == SettleResult::RootDied {
                 return;
             }
-        }
+
+            sample_baseline(&server).await
+        };
 
         // ── Open all files ─────────────────────────────────────────
         let mut opened_uris: Vec<(PathBuf, String)> = Vec::new();
@@ -324,14 +330,8 @@ impl DiagnosticsServer {
         let server_name = client.server_name().to_string();
         let cancel = CancellationToken::new();
 
-        let pre_detector = IdleDetector::unconditional();
-        let pre_result = await_idle(&server, pre_detector, cancel.clone()).await;
-        debug!(
-            server = %server_name,
-            "batch idle result: {pre_result:?}",
-        );
-
-        if pre_result == SettleResult::RootDied
+        if !settle_after(&server, post_open_baseline, cancel.clone(), &server_name, "post-open")
+            .await
             || matches!(
                 client.lifecycle(),
                 ServerLifecycle::Failed | ServerLifecycle::Dead
@@ -353,14 +353,7 @@ impl DiagnosticsServer {
 
         // ── didSave all ────────────────────────────────────────────
         if client.wants_did_save() {
-            let baseline_ticks = {
-                let s = Arc::clone(&server);
-                tokio::task::spawn_blocking(move || {
-                    s.sample_tree().map_or(0, |snap| snap.cumulative_ticks)
-                })
-                .await
-                .unwrap_or(0)
-            };
+            let baseline = sample_baseline(&server).await;
 
             let mut save_failed = false;
             for (_, uri) in &opened_uris {
@@ -380,14 +373,7 @@ impl DiagnosticsServer {
                 return;
             }
 
-            let post_detector = IdleDetector::after_activity(baseline_ticks);
-            let post_result = await_idle(&server, post_detector, cancel).await;
-            debug!(
-                server = %server_name,
-                "batch post-didSave idle result: {post_result:?}",
-            );
-
-            if post_result == SettleResult::RootDied
+            if !settle_after(&server, baseline, cancel, &server_name, "post-didSave").await
                 || matches!(
                     client.lifecycle(),
                     ServerLifecycle::Failed | ServerLifecycle::Dead
@@ -572,6 +558,37 @@ impl DiagnosticsServer {
             *guard = None;
         }
     }
+}
+
+/// Samples cumulative ticks for use as an [`IdleDetector::after_activity`]
+/// baseline. Returns 0 if the tree monitor is unavailable.
+async fn sample_baseline(server: &Arc<LspServer>) -> u64 {
+    let s = Arc::clone(server);
+    tokio::task::spawn_blocking(move || {
+        s.sample_tree().map_or(0, |snap| snap.cumulative_ticks)
+    })
+    .await
+    .unwrap_or(0)
+}
+
+/// Settles after a stimulus using [`IdleDetector::after_activity`].
+///
+/// Returns `true` if the server settled normally, `false` if the root
+/// process died (caller should close files and bail).
+async fn settle_after(
+    server: &Arc<LspServer>,
+    baseline: u64,
+    cancel: CancellationToken,
+    server_name: &str,
+    label: &str,
+) -> bool {
+    let detector = IdleDetector::after_activity(baseline);
+    let result = await_idle(server, detector, cancel).await;
+    debug!(
+        server = %server_name,
+        "batch {label} idle result: {result:?}",
+    );
+    result != SettleResult::RootDied
 }
 
 /// Resolves a file path to an absolute path.

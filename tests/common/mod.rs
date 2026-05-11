@@ -671,17 +671,19 @@ impl Drop for ServerProcess {
 
 // ── IPC helpers ──────────────────────────────────────────────────────
 
-/// Sends a one-shot IPC request to the hook server. Ignores the response.
-pub fn ipc_request(socket_path: &Path, request: &Value) -> Result<()> {
+/// Sends a one-shot IPC request to the hook server. Returns the response.
+pub fn ipc_request(socket_path: &Path, request: &Value) -> Result<String> {
     use std::io::Read as _;
     let mut stream =
         std::os::unix::net::UnixStream::connect(socket_path).context("connect to notify socket")?;
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     writeln!(stream, "{request}").context("write to notify socket")?;
     stream.shutdown(std::net::Shutdown::Write)?;
     let mut response = String::new();
-    let _ = stream.read_to_string(&mut response);
-    Ok(())
+    stream
+        .read_to_string(&mut response)
+        .context("read from notify socket")?;
+    Ok(response)
 }
 
 /// Builds a `CATENARY_SERVERS` spec for [`BridgeProcess::spawn`] using mockls.
