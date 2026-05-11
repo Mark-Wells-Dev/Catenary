@@ -302,7 +302,9 @@ impl Connection {
                             // MCP client cancelled the tool call.
                             // Send $/cancelRequest and clean up.
                             self.pending.lock().await.remove(&id);
-                            self.send_cancel_request(&id).await;
+                            let notif = Self::cancel_notification(&id);
+                            let _ = self.send_message(&notif).await;
+                            debug!("[{}] sent $/cancelRequest for {:?}", self.language, id);
                             break Err(RequestCancelled.into());
                         }
                         () = tokio::time::sleep(POLL_INTERVAL) => {
@@ -421,15 +423,13 @@ impl Connection {
         self.pid
     }
 
-    /// Sends `$/cancelRequest` to the LSP server for a pending request.
-    async fn send_cancel_request(&self, id: &RequestId) {
-        let notification = super::protocol::NotificationMessage {
+    /// Build a `$/cancelRequest` notification for the given request ID.
+    fn cancel_notification(id: &RequestId) -> super::protocol::NotificationMessage {
+        super::protocol::NotificationMessage {
             jsonrpc: "2.0".to_string(),
             method: "$/cancelRequest".to_string(),
             params: serde_json::json!({"id": id}),
-        };
-        let _ = self.send_message(&notification).await;
-        debug!("[{}] sent $/cancelRequest for {:?}", self.language, id);
+        }
     }
 
     /// Send a JSON-RPC message with Content-Length header.
@@ -796,5 +796,15 @@ mod tests {
         assert!(!is_retriable_lsp_error(-32700));
         assert!(!is_retriable_lsp_error(32801));
         assert!(!is_retriable_lsp_error(32800));
+    }
+
+    #[test]
+    fn cancel_notification_structure() {
+        let id = RequestId::Number(42);
+        let notif = Connection::cancel_notification(&id);
+
+        assert_eq!(notif.method, "$/cancelRequest");
+        assert_eq!(notif.jsonrpc, "2.0");
+        assert_eq!(notif.params, serde_json::json!({"id": 42}));
     }
 }
