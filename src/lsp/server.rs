@@ -1031,6 +1031,7 @@ mod tests {
     use super::super::instance_key::Scope;
     use super::*;
     use crate::logging::LoggingServer;
+    use crate::logging::test_support::{query_all_messages, setup_logging};
     use serde_json::json;
     use std::time::Duration;
 
@@ -1136,6 +1137,46 @@ mod tests {
 
         server.set_lifecycle(ServerLifecycle::Dead);
         assert_eq!(server.lifecycle(), ServerLifecycle::Dead);
+    }
+
+    #[test]
+    fn set_lifecycle_warns_on_first_terminal_transition_only() {
+        let (_logging, db, _guard) = setup_logging();
+
+        // Server needs a scope so key() returns Some — required for
+        // the warn branch.
+        let server = LspServer::new(
+            "rust".to_string(),
+            "rust-analyzer".to_string(),
+            None,
+            HashMap::new(),
+        );
+        server.set_scope(Scope::Workspace);
+
+        // Non-terminal → terminal: should emit warn
+        server.set_lifecycle(ServerLifecycle::Healthy);
+        server.set_lifecycle(ServerLifecycle::Dead);
+
+        let warn_count = query_all_messages(&db)
+            .iter()
+            .filter(|m| m.level == "warn")
+            .count();
+        assert_eq!(
+            warn_count, 1,
+            "expected exactly one warn on first terminal transition"
+        );
+
+        // Terminal → terminal: should NOT emit another warn
+        server.set_lifecycle(ServerLifecycle::Dead);
+
+        let warn_count = query_all_messages(&db)
+            .iter()
+            .filter(|m| m.level == "warn")
+            .count();
+        assert_eq!(
+            warn_count, 1,
+            "no additional warn on terminal-to-terminal transition"
+        );
     }
 
     #[test]
