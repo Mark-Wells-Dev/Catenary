@@ -1011,3 +1011,333 @@ impl LspClient {
         }
     }
 }
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "tests use expect for readable assertions"
+)]
+mod tests {
+    use super::*;
+    use crate::lsp::state::ServerLifecycle;
+    use crate::lsp::test_support::mockls_bin;
+
+    const MOCK_LANG: &str = "tCl1x";
+
+    fn test_logging() -> LoggingServer {
+        LoggingServer::new()
+    }
+
+    /// Spawn mockls and initialize with defaults.
+    async fn spawn_and_init(extra_args: &[&str]) -> Result<(LspClient, tempfile::TempDir)> {
+        let dir = tempfile::tempdir()?;
+        let bin = mockls_bin();
+        let bin_str = bin.to_str().expect("mockls path is UTF-8");
+        let mut args = vec![MOCK_LANG];
+        args.extend_from_slice(extra_args);
+        let mut client = LspClient::spawn(
+            bin_str,
+            &args,
+            MOCK_LANG,
+            MOCK_LANG,
+            test_logging(),
+            None,
+            HashMap::new(),
+            None,
+        )?;
+        client.initialize(&[dir.path().to_path_buf()], None).await?;
+        Ok((client, dir))
+    }
+
+    // ── Accessor tests after initialize ─────────────────────────────
+
+    #[tokio::test]
+    async fn accessors_after_initialize() -> Result<()> {
+        let (mut client, _dir) = spawn_and_init(&[]).await?;
+
+        // encoding defaults to utf-16
+        assert_eq!(client.encoding(), "utf-16");
+
+        // language and server_name reflect spawn arguments
+        assert_eq!(client.language(), MOCK_LANG);
+        assert_eq!(client.server_name(), MOCK_LANG);
+
+        // server_command is the mockls binary path
+        assert!(
+            client.server_command().contains("mockls"),
+            "server_command should contain mockls, got: {}",
+            client.server_command()
+        );
+
+        // capabilities should have hoverProvider (mockls default)
+        assert!(
+            client.capabilities().get("hoverProvider").is_some(),
+            "capabilities should include hoverProvider"
+        );
+
+        // pid should be Some (server is running)
+        assert!(client.pid().is_some(), "server pid should be available");
+
+        // server_version is None when mockls doesn't report serverInfo
+        assert_eq!(client.server_version(), None);
+
+        // wants_did_save is false without --advertise-save
+        assert!(!client.wants_did_save());
+
+        // lifecycle should be Probing after initialize
+        assert_eq!(client.lifecycle(), ServerLifecycle::Probing);
+
+        client.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn accessors_with_server_info() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let bin = mockls_bin();
+        let bin_str = bin.to_str().expect("mockls path is UTF-8");
+
+        let mut env = HashMap::new();
+        env.insert("CATENARY_TEST_VER".to_string(), "1.2.3".to_string());
+
+        let mut client = LspClient::spawn(
+            bin_str,
+            &[
+                MOCK_LANG,
+                "--report-env",
+                "CATENARY_TEST_VER",
+                "--advertise-save",
+            ],
+            MOCK_LANG,
+            MOCK_LANG,
+            test_logging(),
+            None,
+            HashMap::new(),
+            Some(&env),
+        )?;
+        client.initialize(&[dir.path().to_path_buf()], None).await?;
+
+        assert_eq!(client.server_version(), Some("1.2.3"));
+        assert!(client.wants_did_save());
+
+        client.shutdown().await?;
+        Ok(())
+    }
+
+    // ── Capability query tests ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn supports_capabilities_default_mockls() -> Result<()> {
+        let (mut client, _dir) = spawn_and_init(&[]).await?;
+
+        // mockls advertises these by default
+        assert!(client.supports_rename());
+        assert!(client.supports_type_hierarchy());
+
+        // mockls does NOT advertise these without flags
+        assert!(!client.supports_pull_diagnostics());
+        assert!(!client.supports_workspace_symbol_resolve());
+
+        client.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn supports_capabilities_with_flags() -> Result<()> {
+        let (mut client, _dir) =
+            spawn_and_init(&["--pull-diagnostics", "--resolve-provider"]).await?;
+
+        assert!(client.supports_pull_diagnostics());
+        assert!(client.supports_workspace_symbol_resolve());
+
+        client.shutdown().await?;
+        Ok(())
+    }
+
+    // ── require_capability tests ────────────────────────────────────
+
+    #[tokio::test]
+    async fn require_capability_passes_when_supported() -> Result<()> {
+        let (mut client, _dir) = spawn_and_init(&[]).await?;
+
+        // rename is supported by default in mockls
+        assert!(
+            client
+                .require_capability("textDocument/rename", LspServer::supports_rename)
+                .is_ok()
+        );
+
+        client.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn require_capability_errors_when_unsupported() -> Result<()> {
+        let (mut client, _dir) = spawn_and_init(&[]).await?;
+
+        // pull diagnostics not supported without --pull-diagnostics
+        let err = client
+            .require_capability(
+                "textDocument/diagnostic",
+                LspServer::supports_pull_diagnostics,
+            )
+            .expect_err("should error when capability is unsupported");
+        assert!(
+            err.to_string().contains("does not support"),
+            "error should mention missing support: {err}"
+        );
+
+        client.shutdown().await?;
+        Ok(())
+    }
+
+    // ── open_document version tracking ──────────────────────────────
+
+    #[tokio::test]
+    async fn open_document_version_tracking() -> Result<()> {
+        let (mut client, _dir) = spawn_and_init(&[]).await?;
+
+        // First open → (true, 1)
+        let (first, version) = client.open_document("file:///a.rs");
+        assert!(first, "first open should return true");
+        assert_eq!(version, 1);
+
+        // Same URI again → (false, 2)
+        let (first, version) = client.open_document("file:///a.rs");
+        assert!(!first, "second open should return false");
+        assert_eq!(version, 2);
+
+        // Third open → (false, 3)
+        let (first, version) = client.open_document("file:///a.rs");
+        assert!(!first, "third open should return false");
+        assert_eq!(version, 3);
+
+        // Different URI → (true, 1)
+        let (first, version) = client.open_document("file:///b.rs");
+        assert!(first, "first open of different URI should return true");
+        assert_eq!(version, 1);
+
+        client.shutdown().await?;
+        Ok(())
+    }
+
+    // ── run_health_probe tests ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn health_probe_transitions_probing_to_healthy() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let script = dir.path().join(format!("probe.{MOCK_LANG}"));
+        std::fs::write(&script, "fn hello\nhello\n")?;
+
+        let (mut client, _dir) = spawn_and_init(&[]).await?;
+        assert_eq!(client.lifecycle(), ServerLifecycle::Probing);
+
+        let uri = format!("file://{}", script.display());
+        client
+            .did_open(&uri, MOCK_LANG, 1, "fn hello\nhello\n")
+            .await?;
+
+        let result = client.run_health_probe(&uri).await;
+        assert!(result, "health probe should return true");
+        assert_eq!(client.lifecycle(), ServerLifecycle::Healthy);
+
+        client.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn health_probe_skips_when_already_healthy() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let script = dir.path().join(format!("probe.{MOCK_LANG}"));
+        std::fs::write(&script, "fn hello\nhello\n")?;
+
+        let (mut client, _dir) = spawn_and_init(&[]).await?;
+
+        let uri = format!("file://{}", script.display());
+        client
+            .did_open(&uri, MOCK_LANG, 1, "fn hello\nhello\n")
+            .await?;
+
+        // First probe → Healthy
+        assert!(client.run_health_probe(&uri).await);
+        assert_eq!(client.lifecycle(), ServerLifecycle::Healthy);
+
+        // Second probe on Healthy → returns true, no state change
+        assert!(client.run_health_probe(&uri).await);
+        assert_eq!(client.lifecycle(), ServerLifecycle::Healthy);
+
+        client.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn health_probe_returns_false_on_dead() -> Result<()> {
+        let (mut client, _dir) = spawn_and_init(&[]).await?;
+
+        // Force lifecycle to Dead
+        client.server.set_lifecycle(ServerLifecycle::Dead);
+
+        let result = client.run_health_probe("file:///fake.rs").await;
+        assert!(!result, "health probe should return false when Dead");
+
+        client.shutdown().await?;
+        Ok(())
+    }
+
+    // ── wait_ready tests ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn wait_ready_returns_true_when_probing() -> Result<()> {
+        let (mut client, _dir) = spawn_and_init(&[]).await?;
+        assert_eq!(client.lifecycle(), ServerLifecycle::Probing);
+
+        let ready = client.wait_ready().await;
+        assert!(ready, "wait_ready should return true for Probing");
+
+        client.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wait_ready_returns_false_on_failed() -> Result<()> {
+        let (mut client, _dir) = spawn_and_init(&[]).await?;
+
+        client.server.set_lifecycle(ServerLifecycle::Failed);
+
+        let ready = client.wait_ready().await;
+        assert!(!ready, "wait_ready should return false for Failed");
+
+        client.shutdown().await?;
+        Ok(())
+    }
+
+    // ── set_cancel_token test ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn set_cancel_token_causes_request_cancellation() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let script = dir.path().join(format!("cancel.{MOCK_LANG}"));
+        std::fs::write(&script, "fn hello\nhello\n")?;
+
+        let (mut client, _dir) = spawn_and_init(&[]).await?;
+
+        let uri = format!("file://{}", script.display());
+        client
+            .did_open(&uri, MOCK_LANG, 1, "fn hello\nhello\n")
+            .await?;
+
+        // Set a pre-cancelled token
+        let token = CancellationToken::new();
+        token.cancel();
+        client.set_cancel_token(token);
+
+        // Request should fail because the token is already cancelled
+        let result = client.definition(&uri, 1, 0).await;
+        assert!(result.is_err(), "request with cancelled token should fail");
+
+        // Reset to a fresh token so shutdown works
+        client.set_cancel_token(CancellationToken::new());
+        client.shutdown().await?;
+        Ok(())
+    }
+}
