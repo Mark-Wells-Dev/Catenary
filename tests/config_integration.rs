@@ -13,7 +13,9 @@
 
 mod common;
 
-use anyhow::{Context, Result};
+use std::path::{Path, PathBuf};
+
+use anyhow::Result;
 use serde_json::json;
 
 use common::BridgeProcess;
@@ -21,8 +23,8 @@ use common::BridgeProcess;
 const MOCK_LANG_A: &str = "yX4Za";
 const MOCK_LANG_B: &str = "d5apI";
 
-/// Create a temp config.toml that uses mockls for mock.
-fn write_mockls_config(dir: &std::path::Path) -> Result<std::path::PathBuf> {
+/// Write a mockls config.toml into the given directory and return its path.
+fn write_mockls_config(dir: &Path) -> Result<PathBuf> {
     let mockls_bin = env!("CARGO_BIN_EXE_mockls");
     let config_path = dir.join("config.toml");
     std::fs::write(
@@ -40,16 +42,12 @@ fn write_mockls_config(dir: &std::path::Path) -> Result<std::path::PathBuf> {
 
 #[test]
 fn test_config_loading() -> Result<()> {
-    let root_dir = std::env::current_dir()?;
-    let tmp = tempfile::tempdir()?;
-    let config_path = write_mockls_config(tmp.path())?;
-    let root = root_dir.to_str().context("root path")?;
-
-    // Spawn catenary using ONLY the config file (no CATENARY_SERVERS)
-    let mut bridge = BridgeProcess::spawn_with_config(&config_path, root)?;
+    let mut bridge = BridgeProcess::spawn_with_config(|root| {
+        std::fs::write(root.join(format!("test.{MOCK_LANG_A}")), "echo hello\n")?;
+        write_mockls_config(root)
+    })?;
     bridge.initialize()?;
 
-    // Test search (verifies the server is functional)
     let result = bridge.call_tool("grep", &json!({ "pattern": "echo" }))?;
     assert!(
         result["isError"].is_null() || result["isError"] == false,
@@ -60,17 +58,13 @@ fn test_config_loading() -> Result<()> {
 
 #[test]
 fn test_config_override() -> Result<()> {
-    let root_dir = std::env::current_dir()?;
-    let tmp = tempfile::tempdir()?;
-    let config_path = write_mockls_config(tmp.path())?;
-    let root = root_dir.to_str().context("root path")?;
-
-    // Config provides MOCK_LANG_A (mockls), env provides MOCK_LANG_B (also mockls)
     let lsp_b = common::mockls_lsp_arg(MOCK_LANG_B, "");
-    let mut bridge = BridgeProcess::spawn_with_config_and_servers(&config_path, &[&lsp_b], root)?;
+    let mut bridge = BridgeProcess::spawn_with_config_and_servers(&[&lsp_b], |root| {
+        std::fs::write(root.join(format!("test.{MOCK_LANG_A}")), "echo hello\n")?;
+        write_mockls_config(root)
+    })?;
     bridge.initialize()?;
 
-    // Test search (CLI arg merged mockls for toml) - should work
     let result = bridge.call_tool("grep", &json!({ "pattern": "echo" }))?;
     assert!(
         result["isError"].is_null() || result["isError"] == false,

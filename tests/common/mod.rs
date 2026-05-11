@@ -64,6 +64,8 @@ pub struct BridgeProcess {
     /// Internal tempdir for XDG state/config isolation.
     /// `None` when using a shared (externally-owned) state dir.
     _state_dir: Option<tempfile::TempDir>,
+    /// Isolated workspace root dir, owned by this process.
+    root_dir: Option<tempfile::TempDir>,
 }
 
 impl BridgeProcess {
@@ -104,31 +106,43 @@ impl BridgeProcess {
         )
     }
 
-    /// Spawns using a TOML config file instead of `CATENARY_SERVERS`.
+    /// Spawns using a TOML config file with an isolated workspace root.
     ///
-    /// Required for multi-server-per-language tests where each server
-    /// needs different flags or different `min_severity` settings.
-    pub fn spawn_with_config(config_path: &Path, root: &str) -> Result<Self> {
-        Self::spawn_with(|cmd| {
-            cmd.env("CATENARY_CONFIG", config_path);
-            cmd.env("CATENARY_ROOTS", root);
-        })
+    /// Creates a fresh tempdir for the workspace root. `setup` receives the
+    /// root path, populates it with test files, and returns the config path.
+    /// The tempdir lives as long as this `BridgeProcess`.
+    pub fn spawn_with_config(
+        setup: impl FnOnce(&Path) -> Result<PathBuf>,
+    ) -> Result<Self> {
+        let root_dir = tempfile::tempdir().context("Failed to create root dir")?;
+        let config_path = setup(root_dir.path())?;
+        let mut proc = Self::spawn_with(|cmd| {
+            cmd.env("CATENARY_CONFIG", &config_path);
+            cmd.env("CATENARY_ROOTS", root_dir.path());
+        })?;
+        proc.root_dir = Some(root_dir);
+        Ok(proc)
     }
 
     /// Spawns using a TOML config file with additional `CATENARY_SERVERS`
-    /// entries merged at runtime.
+    /// entries merged at runtime. Creates an isolated workspace root like
+    /// [`spawn_with_config`].
     pub fn spawn_with_config_and_servers(
-        config_path: &Path,
         lsp_commands: &[&str],
-        root: &str,
+        setup: impl FnOnce(&Path) -> Result<PathBuf>,
     ) -> Result<Self> {
-        Self::spawn_with(|cmd| {
-            cmd.env("CATENARY_CONFIG", config_path);
-            if !lsp_commands.is_empty() {
-                cmd.env("CATENARY_SERVERS", lsp_commands.join(";"));
+        let root_dir = tempfile::tempdir().context("Failed to create root dir")?;
+        let config_path = setup(root_dir.path())?;
+        let servers = lsp_commands.join(";");
+        let mut proc = Self::spawn_with(|cmd| {
+            cmd.env("CATENARY_CONFIG", &config_path);
+            if !servers.is_empty() {
+                cmd.env("CATENARY_SERVERS", &servers);
             }
-            cmd.env("CATENARY_ROOTS", root);
-        })
+            cmd.env("CATENARY_ROOTS", root_dir.path());
+        })?;
+        proc.root_dir = Some(root_dir);
+        Ok(proc)
     }
 
     /// Spawns using an externally-owned state directory.
@@ -165,13 +179,18 @@ impl BridgeProcess {
             stderr_log: Some(stderr_path),
             state_home,
             _state_dir: None,
+            root_dir: None,
         })
     }
 
     /// Shared spawn: creates state dir, isolates env, lets `configure`
     /// set `CATENARY_*` vars (after `isolate_env` cleared them), then
     /// redirects stderr and starts the process.
-    fn spawn_with(configure: impl FnOnce(&mut Command)) -> Result<Self> {
+    ///
+    /// Prefer `spawn_with_config` for config-based tests — it creates
+    /// an isolated workspace root automatically. Use this directly only
+    /// when you need a custom root layout (e.g. root marker tests).
+    pub fn spawn_with(configure: impl FnOnce(&mut Command)) -> Result<Self> {
         Self::spawn_with_setup(configure, |_| Ok(()))
     }
 
@@ -215,6 +234,7 @@ impl BridgeProcess {
             stderr_log: Some(stderr_path),
             state_home,
             _state_dir: Some(state_dir),
+            root_dir: None,
         })
     }
 
@@ -503,6 +523,17 @@ impl BridgeProcess {
     /// Returns the state home directory path.
     pub fn state_home(&self) -> &str {
         &self.state_home
+    }
+
+    /// Returns the isolated workspace root path.
+    ///
+    /// Only available when spawned via `spawn_with_config` or
+    /// `spawn_with_config_and_servers`.
+    pub fn root_path(&self) -> &Path {
+        self.root_dir
+            .as_ref()
+            .expect("root_path() requires spawn_with_config")
+            .path()
     }
 }
 

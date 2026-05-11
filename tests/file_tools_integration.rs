@@ -586,27 +586,19 @@ fn test_glob_tier2_file_listing() -> Result<()> {
 
 #[test]
 fn test_glob_budget_small() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-
-    // Create enough files to test budget pressure.
-    for i in 0..40 {
-        std::fs::write(
-            dir.path().join(format!("test_item_{i:03}.txt")),
-            format!("line {i}\n"),
-        )?;
-    }
-
-    // Write a config with a very small glob budget.
-    let config_dir = tempfile::tempdir()?;
-    let config_path = config_dir.path().join("config.toml");
-    std::fs::write(&config_path, "[tools.glob]\nbudget = 1000\n")?;
-
-    let mut bridge = BridgeProcess::spawn_with_config(&config_path, &dir.path().to_string_lossy())?;
+    let mut bridge = BridgeProcess::spawn_with_config(|root| {
+        for i in 0..40 {
+            std::fs::write(root.join(format!("test_item_{i:03}.txt")), format!("line {i}\n"))?;
+        }
+        let config_path = root.join("config.toml");
+        std::fs::write(&config_path, "[tools.glob]\nbudget = 1000\n")?;
+        Ok(config_path)
+    })?;
     bridge.initialize()?;
 
     let text = bridge.call_tool_text(
         "glob",
-        &json!({ "pattern": dir.path().to_string_lossy().to_string() }),
+        &json!({ "pattern": bridge.root_path().to_string_lossy().to_string() }),
     )?;
 
     // With small budget, output should be compact.
@@ -774,19 +766,22 @@ fn test_glob_separator_bucketing() -> Result<()> {
     bridge.initialize()?;
 
     // Use a small budget to force bucketing.
-    // We can't change the budget without a config file, so create enough
-    // files or use a config.
-    let config_dir = tempfile::tempdir()?;
-    let config_path = config_dir.path().join("config.toml");
-    std::fs::write(&config_path, "[tools.glob]\nbudget = 1000\n")?;
-
-    let mut bridge2 =
-        BridgeProcess::spawn_with_config(&config_path, &dir.path().to_string_lossy())?;
+    let mut bridge2 = BridgeProcess::spawn_with_config(|root| {
+        for i in 0..5 {
+            std::fs::write(root.join(format!("test_grep_{i}.rs")), format!("fn test_{i}() {{}}\n"))?;
+        }
+        for i in 0..5 {
+            std::fs::write(root.join(format!("test_glob_{i}.rs")), format!("fn test_{i}() {{}}\n"))?;
+        }
+        let config_path = root.join("config.toml");
+        std::fs::write(&config_path, "[tools.glob]\nbudget = 1000\n")?;
+        Ok(config_path)
+    })?;
     bridge2.initialize()?;
 
     let text = bridge2.call_tool_text(
         "glob",
-        &json!({ "pattern": dir.path().to_string_lossy().to_string() }),
+        &json!({ "pattern": bridge2.root_path().to_string_lossy().to_string() }),
     )?;
 
     // With a small budget and separator-based filenames, bucketing should
@@ -1536,26 +1531,19 @@ fn test_glob_no_grammar() -> Result<()> {
 
 #[test]
 fn test_glob_budget_minimum() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    for i in 0..40 {
-        std::fs::write(
-            dir.path().join(format!("item_{i:03}.txt")),
-            format!("line {i}\n"),
-        )?;
-    }
-
-    // Budget below minimum of 1000 should be clamped.
-    let config = "[tools.glob]\nbudget = 500\n";
-    let config_dir = tempfile::tempdir()?;
-    let config_path = config_dir.path().join("config.toml");
-    std::fs::write(&config_path, config)?;
-
-    let mut bridge = BridgeProcess::spawn_with_config(&config_path, &dir.path().to_string_lossy())?;
+    let mut bridge = BridgeProcess::spawn_with_config(|root| {
+        for i in 0..40 {
+            std::fs::write(root.join(format!("item_{i:03}.txt")), format!("line {i}\n"))?;
+        }
+        let config_path = root.join("config.toml");
+        std::fs::write(&config_path, "[tools.glob]\nbudget = 500\n")?;
+        Ok(config_path)
+    })?;
     bridge.initialize()?;
 
     let text = bridge.call_tool_text(
         "glob",
-        &json!({ "pattern": dir.path().to_string_lossy().to_string() }),
+        &json!({ "pattern": bridge.root_path().to_string_lossy().to_string() }),
     )?;
 
     // Output should fit within clamped budget (1000) + tolerance.
@@ -1829,28 +1817,23 @@ fn test_glob_pattern_dirs_no_enrichment() -> Result<()> {
 
 #[test]
 fn test_glob_pattern_paged_large_result() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-
-    // Create many files across many directories to exceed page budget.
-    for i in 0..30 {
-        let sub = dir.path().join(format!("dir_{i:02}"));
-        std::fs::create_dir(&sub)?;
-        for j in 0..5 {
-            std::fs::write(sub.join(format!("file_{j}.txt")), format!("line {j}\n"))?;
+    let mut bridge = BridgeProcess::spawn_with_config(|root| {
+        for i in 0..30 {
+            let sub = root.join(format!("dir_{i:02}"));
+            std::fs::create_dir(&sub)?;
+            for j in 0..5 {
+                std::fs::write(sub.join(format!("file_{j}.txt")), format!("line {j}\n"))?;
+            }
         }
-    }
-
-    // Small budget — output is paged, not demoted.
-    let config_dir = tempfile::tempdir()?;
-    let config_path = config_dir.path().join("config.toml");
-    std::fs::write(&config_path, "[tools.glob]\nbudget = 600\n")?;
-
-    let mut bridge = BridgeProcess::spawn_with_config(&config_path, &dir.path().to_string_lossy())?;
+        let config_path = root.join("config.toml");
+        std::fs::write(&config_path, "[tools.glob]\nbudget = 600\n")?;
+        Ok(config_path)
+    })?;
     bridge.initialize()?;
 
     let text = bridge.call_tool_text(
         "glob",
-        &json!({ "pattern": format!("{}/**/*.txt", dir.path().display()) }),
+        &json!({ "pattern": format!("{}/**/*.txt", bridge.root_path().display()) }),
     )?;
 
     // With 150 files across 30 dirs, the tree won't fit in 600 chars.
@@ -1865,34 +1848,22 @@ fn test_glob_pattern_paged_large_result() -> Result<()> {
 
 #[test]
 fn test_glob_paged_preserves_tree_structure() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-
-    // Create deeply nested files.
-    let src = dir.path().join("src");
-    let bridge_dir = src.join("bridge");
-    let lsp_dir = src.join("lsp");
-    std::fs::create_dir_all(&bridge_dir)?;
-    std::fs::create_dir_all(&lsp_dir)?;
-
-    for i in 0..20 {
-        std::fs::write(
-            bridge_dir.join(format!("handler_{i}.rs")),
-            format!("fn handle_{i}() {{}}\n"),
-        )?;
-    }
-    for i in 0..20 {
-        std::fs::write(
-            lsp_dir.join(format!("client_{i}.rs")),
-            format!("struct Client{i};\n"),
-        )?;
-    }
-
-    // Small budget — output is paged, not bucketed.
-    let config_dir = tempfile::tempdir()?;
-    let config_path = config_dir.path().join("config.toml");
-    std::fs::write(&config_path, "[tools.glob]\nbudget = 400\n")?;
-
-    let mut bridge = BridgeProcess::spawn_with_config(&config_path, &dir.path().to_string_lossy())?;
+    let mut bridge = BridgeProcess::spawn_with_config(|root| {
+        let src = root.join("src");
+        let bridge_dir = src.join("bridge");
+        let lsp_dir = src.join("lsp");
+        std::fs::create_dir_all(&bridge_dir)?;
+        std::fs::create_dir_all(&lsp_dir)?;
+        for i in 0..20 {
+            std::fs::write(bridge_dir.join(format!("handler_{i}.rs")), format!("fn handle_{i}() {{}}\n"))?;
+        }
+        for i in 0..20 {
+            std::fs::write(lsp_dir.join(format!("client_{i}.rs")), format!("struct Client{i};\n"))?;
+        }
+        let config_path = root.join("config.toml");
+        std::fs::write(&config_path, "[tools.glob]\nbudget = 400\n")?;
+        Ok(config_path)
+    })?;
     bridge.initialize()?;
 
     let text = bridge.call_tool_text("glob", &json!({ "pattern": "src/**/*.rs" }))?;

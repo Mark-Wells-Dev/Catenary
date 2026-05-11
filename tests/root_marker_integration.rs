@@ -79,7 +79,10 @@ fn test_marker_at_workspace_root_eager_spawn() -> Result<()> {
     let tmp = tempfile::tempdir()?;
     let config_path = write_marker_config(tmp.path(), &["project.marker"])?;
     let root = ws.to_str().context("root")?;
-    let mut bridge = BridgeProcess::spawn_with_config(&config_path, root)?;
+    let mut bridge = BridgeProcess::spawn_with(|cmd| {
+        cmd.env("CATENARY_CONFIG", &config_path);
+        cmd.env("CATENARY_ROOTS", root);
+    })?;
     bridge.initialize()?;
 
     let result = bridge.call_tool("grep", &json!({ "pattern": "echo" }))?;
@@ -110,7 +113,10 @@ fn test_marker_in_subdir_lazy_spawn_via_grep() -> Result<()> {
     let tmp = tempfile::tempdir()?;
     let config_path = write_marker_config(tmp.path(), &["project.marker"])?;
     let root = ws.to_str().context("root")?;
-    let mut bridge = BridgeProcess::spawn_with_config(&config_path, root)?;
+    let mut bridge = BridgeProcess::spawn_with(|cmd| {
+        cmd.env("CATENARY_CONFIG", &config_path);
+        cmd.env("CATENARY_ROOTS", root);
+    })?;
     bridge.initialize()?;
 
     // Grep should trigger lazy spawn and find the file.
@@ -149,7 +155,10 @@ fn test_two_subroots_separate_instances() -> Result<()> {
     let tmp = tempfile::tempdir()?;
     let config_path = write_marker_config(tmp.path(), &["project.marker"])?;
     let root = ws.to_str().context("root")?;
-    let mut bridge = BridgeProcess::spawn_with_config(&config_path, root)?;
+    let mut bridge = BridgeProcess::spawn_with(|cmd| {
+        cmd.env("CATENARY_CONFIG", &config_path);
+        cmd.env("CATENARY_ROOTS", root);
+    })?;
     bridge.initialize()?;
 
     // Grep should find files from both sub-roots.
@@ -179,7 +188,10 @@ fn test_diagnostics_in_subroot() -> Result<()> {
     let tmp = tempfile::tempdir()?;
     let config_path = write_marker_config(tmp.path(), &["project.marker"])?;
     let root = ws.to_str().context("root")?;
-    let mut bridge = BridgeProcess::spawn_with_config(&config_path, root)?;
+    let mut bridge = BridgeProcess::spawn_with(|cmd| {
+        cmd.env("CATENARY_CONFIG", &config_path);
+        cmd.env("CATENARY_ROOTS", root);
+    })?;
     bridge.initialize()?;
 
     // done_editing triggers ensure_clients_for_paths → lazy spawn.
@@ -210,7 +222,10 @@ fn test_empty_markers_disables_resolution() -> Result<()> {
     let tmp = tempfile::tempdir()?;
     let config_path = write_no_marker_config(tmp.path())?;
     let root = ws.to_str().context("root")?;
-    let mut bridge = BridgeProcess::spawn_with_config(&config_path, root)?;
+    let mut bridge = BridgeProcess::spawn_with(|cmd| {
+        cmd.env("CATENARY_CONFIG", &config_path);
+        cmd.env("CATENARY_ROOTS", root);
+    })?;
     bridge.initialize()?;
 
     // Server should be spawned at workspace root (eager), grep works.
@@ -250,7 +265,10 @@ fn test_nested_markers_nearest_wins() -> Result<()> {
     let tmp = tempfile::tempdir()?;
     let config_path = write_marker_config(tmp.path(), &["project.marker"])?;
     let root = ws.to_str().context("root")?;
-    let mut bridge = BridgeProcess::spawn_with_config(&config_path, root)?;
+    let mut bridge = BridgeProcess::spawn_with(|cmd| {
+        cmd.env("CATENARY_CONFIG", &config_path);
+        cmd.env("CATENARY_ROOTS", root);
+    })?;
     bridge.initialize()?;
 
     // Grep should find files from both levels.

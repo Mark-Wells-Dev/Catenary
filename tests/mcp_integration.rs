@@ -1369,38 +1369,31 @@ fn test_grep_alternation() -> Result<()> {
 /// multiple pages with `[page N/M]` header instead of tier demotion.
 #[test]
 fn test_grep_enrichment_threshold_broad() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let root = dir.path().to_str().context("root path")?;
-
-    // Create many unique symbols to exceed budget on a single page
-    let mut content = String::new();
-    for i in 0..30 {
-        use std::fmt::Write;
-        let _ = writeln!(content, "fn zz_broad_{i}");
-    }
-    // Add references so rg finds hits
-    for i in 0..30 {
-        use std::fmt::Write;
-        let _ = writeln!(content, "zz_broad_{i}");
-    }
-    let test_file = dir.path().join(format!("many.{MOCK_LANG_A}"));
-    std::fs::write(&test_file, &content)?;
-
-    // Small budget forces paging
-    let config_path = dir.path().join("config.toml");
     let mockls_bin = env!("CARGO_BIN_EXE_mockls");
-    std::fs::write(
-        &config_path,
-        format!(
-            "[tools.grep]\nbudget = 200\n\n\
-             [server.mockls]\n\
-             command = \"{mockls_bin}\"\n\
-             args = [\"{MOCK_LANG_A}\", \"--scan-roots\"]\n\n\
-             [language.{MOCK_LANG_A}]\nservers = [\"mockls\"]\n"
-        ),
-    )?;
-
-    let mut bridge = BridgeProcess::spawn_with_config(&config_path, root)?;
+    let mut bridge = BridgeProcess::spawn_with_config(|root| {
+        let mut content = String::new();
+        for i in 0..30 {
+            use std::fmt::Write;
+            let _ = writeln!(content, "fn zz_broad_{i}");
+        }
+        for i in 0..30 {
+            use std::fmt::Write;
+            let _ = writeln!(content, "zz_broad_{i}");
+        }
+        std::fs::write(root.join(format!("many.{MOCK_LANG_A}")), &content)?;
+        let config_path = root.join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[tools.grep]\nbudget = 200\n\n\
+                 [server.mockls]\n\
+                 command = \"{mockls_bin}\"\n\
+                 args = [\"{MOCK_LANG_A}\", \"--scan-roots\"]\n\n\
+                 [language.{MOCK_LANG_A}]\nservers = [\"mockls\"]\n"
+            ),
+        )?;
+        Ok(config_path)
+    })?;
     install_mock_grammar(bridge.state_home())?;
     bridge.initialize()?;
 
@@ -2636,30 +2629,25 @@ fn test_grep_no_blank_lines() -> Result<()> {
 /// `prepare_rename_check` priority chain fallthrough.
 #[test]
 fn test_grep_prepare_rename_priority_chain() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let root = dir.path().to_str().context("root path")?;
-
-    let file = dir.path().join(format!("chain.{MOCK_LANG_A}"));
-    std::fs::write(&file, "fn chain_symbol\nchain_symbol\n")?;
-
-    // Config with two servers: first fails on prepareRename, second works
     let mockls_bin = env!("CARGO_BIN_EXE_mockls");
-    let config_path = dir.path().join("config.toml");
-    std::fs::write(
-        &config_path,
-        format!(
-            "[server.mockls-fail]\n\
-             command = \"{mockls_bin}\"\n\
-             args = [\"{MOCK_LANG_A}\", \"--scan-roots\", \"--fail-on\", \"textDocument/prepareRename\"]\n\n\
-             [server.mockls-ok]\n\
-             command = \"{mockls_bin}\"\n\
-             args = [\"{MOCK_LANG_A}\", \"--scan-roots\"]\n\n\
-             [language.{MOCK_LANG_A}]\n\
-             servers = [\"mockls-fail\", \"mockls-ok\"]\n"
-        ),
-    )?;
-
-    let mut bridge = BridgeProcess::spawn_with_config(&config_path, root)?;
+    let mut bridge = BridgeProcess::spawn_with_config(|root| {
+        std::fs::write(root.join(format!("chain.{MOCK_LANG_A}")), "fn chain_symbol\nchain_symbol\n")?;
+        let config_path = root.join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[server.mockls-fail]\n\
+                 command = \"{mockls_bin}\"\n\
+                 args = [\"{MOCK_LANG_A}\", \"--scan-roots\", \"--fail-on\", \"textDocument/prepareRename\"]\n\n\
+                 [server.mockls-ok]\n\
+                 command = \"{mockls_bin}\"\n\
+                 args = [\"{MOCK_LANG_A}\", \"--scan-roots\"]\n\n\
+                 [language.{MOCK_LANG_A}]\n\
+                 servers = [\"mockls-fail\", \"mockls-ok\"]\n"
+            ),
+        )?;
+        Ok(config_path)
+    })?;
     bridge.initialize()?;
 
     bridge.send(&json!({
@@ -3445,32 +3433,27 @@ fn test_grep_deprecated() -> Result<()> {
 /// Paging: many symbols exceed budget → paged output, not demotion.
 #[test]
 fn test_grep_paged_integration() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let root = dir.path().to_str().context("root path")?;
-
-    // Create many unique symbols to exceed budget on a single page
-    let mut content = String::new();
-    for i in 0..50 {
-        use std::fmt::Write;
-        let _ = writeln!(content, "fn demote_sym_{i}");
-    }
-    let file = dir.path().join(format!("demote.{MOCK_LANG_A}"));
-    std::fs::write(&file, &content)?;
-
-    let config_path = dir.path().join("config.toml");
     let mockls_bin = env!("CARGO_BIN_EXE_mockls");
-    std::fs::write(
-        &config_path,
-        format!(
-            "[tools.grep]\nbudget = 200\n\n\
-             [server.mockls]\n\
-             command = \"{mockls_bin}\"\n\
-             args = [\"{MOCK_LANG_A}\", \"--scan-roots\"]\n\n\
-             [language.{MOCK_LANG_A}]\nservers = [\"mockls\"]\n"
-        ),
-    )?;
-
-    let mut bridge = BridgeProcess::spawn_with_config(&config_path, root)?;
+    let mut bridge = BridgeProcess::spawn_with_config(|root| {
+        let mut content = String::new();
+        for i in 0..50 {
+            use std::fmt::Write;
+            let _ = writeln!(content, "fn demote_sym_{i}");
+        }
+        std::fs::write(root.join(format!("demote.{MOCK_LANG_A}")), &content)?;
+        let config_path = root.join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[tools.grep]\nbudget = 200\n\n\
+                 [server.mockls]\n\
+                 command = \"{mockls_bin}\"\n\
+                 args = [\"{MOCK_LANG_A}\", \"--scan-roots\"]\n\n\
+                 [language.{MOCK_LANG_A}]\nservers = [\"mockls\"]\n"
+            ),
+        )?;
+        Ok(config_path)
+    })?;
     install_mock_grammar(bridge.state_home())?;
     bridge.initialize()?;
 

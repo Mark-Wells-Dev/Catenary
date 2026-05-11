@@ -473,31 +473,28 @@ fn test_pull_downgrade_with_push() -> Result<()> {
 /// filters, and formats its own diagnostics.
 #[test]
 fn test_diagnostics_multi_server_concatenation() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let root = dir.path().to_str().context("root path")?;
-
-    let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
-    std::fs::write(&file, "line one\nline two\n")?;
-
     let mockls_bin = env!("CARGO_BIN_EXE_mockls");
-    let config_path = dir.path().join("config.toml");
-    std::fs::write(
-        &config_path,
-        format!(
-            "[server.mockls-a]\n\
-             command = \"{mockls_bin}\"\n\
-             args = [\"{MOCK_LANG_A}\"]\n\n\
-             [server.mockls-b]\n\
-             command = \"{mockls_bin}\"\n\
-             args = [\"{MOCK_LANG_A}\"]\n\n\
-             [language.{MOCK_LANG_A}]\n\
-             servers = [\"mockls-a\", \"mockls-b\"]\n"
-        ),
-    )?;
-
-    let mut bridge = BridgeProcess::spawn_with_config(&config_path, root)?;
+    let mut bridge = BridgeProcess::spawn_with_config(|root| {
+        std::fs::write(root.join(format!("test.{MOCK_LANG_A}")), "line one\nline two\n")?;
+        let config_path = root.join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[server.mockls-a]\n\
+                 command = \"{mockls_bin}\"\n\
+                 args = [\"{MOCK_LANG_A}\"]\n\n\
+                 [server.mockls-b]\n\
+                 command = \"{mockls_bin}\"\n\
+                 args = [\"{MOCK_LANG_A}\"]\n\n\
+                 [language.{MOCK_LANG_A}]\n\
+                 servers = [\"mockls-a\", \"mockls-b\"]\n"
+            ),
+        )?;
+        Ok(config_path)
+    })?;
     bridge.initialize()?;
 
+    let file = bridge.root_path().join(format!("test.{MOCK_LANG_A}"));
     let text = bridge.call_diagnostics(file.to_str().context("path")?)?;
 
     // Both servers publish "mock diagnostic" — the output should contain
@@ -520,31 +517,28 @@ fn test_diagnostics_multi_server_concatenation() -> Result<()> {
 /// server's diagnostics appear.
 #[test]
 fn test_diagnostics_one_server_suppressed() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let root = dir.path().to_str().context("root path")?;
-
-    let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
-    std::fs::write(&file, "echo hello\n")?;
-
     let mockls_bin = env!("CARGO_BIN_EXE_mockls");
-    let config_path = dir.path().join("config.toml");
-    std::fs::write(
-        &config_path,
-        format!(
-            "[server.mockls-diag]\n\
-             command = \"{mockls_bin}\"\n\
-             args = [\"{MOCK_LANG_A}\"]\n\n\
-             [server.mockls-nodiag]\n\
-             command = \"{mockls_bin}\"\n\
-             args = [\"{MOCK_LANG_A}\"]\n\n\
-             [language.{MOCK_LANG_A}]\n\
-             servers = [\"mockls-diag\", {{ name = \"mockls-nodiag\", diagnostics = false }}]\n"
-        ),
-    )?;
-
-    let mut bridge = BridgeProcess::spawn_with_config(&config_path, root)?;
+    let mut bridge = BridgeProcess::spawn_with_config(|root| {
+        std::fs::write(root.join(format!("test.{MOCK_LANG_A}")), "echo hello\n")?;
+        let config_path = root.join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[server.mockls-diag]\n\
+                 command = \"{mockls_bin}\"\n\
+                 args = [\"{MOCK_LANG_A}\"]\n\n\
+                 [server.mockls-nodiag]\n\
+                 command = \"{mockls_bin}\"\n\
+                 args = [\"{MOCK_LANG_A}\"]\n\n\
+                 [language.{MOCK_LANG_A}]\n\
+                 servers = [\"mockls-diag\", {{ name = \"mockls-nodiag\", diagnostics = false }}]\n"
+            ),
+        )?;
+        Ok(config_path)
+    })?;
     bridge.initialize()?;
 
+    let file = bridge.root_path().join(format!("test.{MOCK_LANG_A}"));
     let text = bridge.call_diagnostics(file.to_str().context("path")?)?;
 
     // Only one server contributes diagnostics
@@ -561,32 +555,29 @@ fn test_diagnostics_one_server_suppressed() -> Result<()> {
 /// diagnostics pass through.
 #[test]
 fn test_diagnostics_per_server_min_severity() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let root = dir.path().to_str().context("root path")?;
-
-    let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
-    std::fs::write(&file, "echo hello\n")?;
-
     let mockls_bin = env!("CARGO_BIN_EXE_mockls");
-    let config_path = dir.path().join("config.toml");
-    std::fs::write(
-        &config_path,
-        format!(
-            "[server.mockls-strict]\n\
-             command = \"{mockls_bin}\"\n\
-             args = [\"{MOCK_LANG_A}\"]\n\
-             min_severity = \"error\"\n\n\
-             [server.mockls-lax]\n\
-             command = \"{mockls_bin}\"\n\
-             args = [\"{MOCK_LANG_A}\"]\n\n\
-             [language.{MOCK_LANG_A}]\n\
-             servers = [\"mockls-strict\", \"mockls-lax\"]\n"
-        ),
-    )?;
-
-    let mut bridge = BridgeProcess::spawn_with_config(&config_path, root)?;
+    let mut bridge = BridgeProcess::spawn_with_config(|root| {
+        std::fs::write(root.join(format!("test.{MOCK_LANG_A}")), "echo hello\n")?;
+        let config_path = root.join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[server.mockls-strict]\n\
+                 command = \"{mockls_bin}\"\n\
+                 args = [\"{MOCK_LANG_A}\"]\n\
+                 min_severity = \"error\"\n\n\
+                 [server.mockls-lax]\n\
+                 command = \"{mockls_bin}\"\n\
+                 args = [\"{MOCK_LANG_A}\"]\n\n\
+                 [language.{MOCK_LANG_A}]\n\
+                 servers = [\"mockls-strict\", \"mockls-lax\"]\n"
+            ),
+        )?;
+        Ok(config_path)
+    })?;
     bridge.initialize()?;
 
+    let file = bridge.root_path().join(format!("test.{MOCK_LANG_A}"));
     let text = bridge.call_diagnostics(file.to_str().context("path")?)?;
 
     // mockls emits severity 2 (warning). mockls-strict filters it out,
@@ -604,29 +595,26 @@ fn test_diagnostics_per_server_min_severity() -> Result<()> {
 /// file is omitted from output entirely.
 #[test]
 fn test_diagnostics_no_servers() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let root = dir.path().to_str().context("root path")?;
-
-    let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
-    std::fs::write(&file, "echo hello\n")?;
-
     let mockls_bin = env!("CARGO_BIN_EXE_mockls");
-    let config_path = dir.path().join("config.toml");
-    std::fs::write(
-        &config_path,
-        format!(
-            "[server.mockls-only]\n\
-             command = \"{mockls_bin}\"\n\
-             args = [\"{MOCK_LANG_A}\"]\n\n\
-             [language.{MOCK_LANG_A}]\n\
-             diagnostics = false\n\
-             servers = [\"mockls-only\"]\n"
-        ),
-    )?;
-
-    let mut bridge = BridgeProcess::spawn_with_config(&config_path, root)?;
+    let mut bridge = BridgeProcess::spawn_with_config(|root| {
+        std::fs::write(root.join(format!("test.{MOCK_LANG_A}")), "echo hello\n")?;
+        let config_path = root.join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[server.mockls-only]\n\
+                 command = \"{mockls_bin}\"\n\
+                 args = [\"{MOCK_LANG_A}\"]\n\n\
+                 [language.{MOCK_LANG_A}]\n\
+                 diagnostics = false\n\
+                 servers = [\"mockls-only\"]\n"
+            ),
+        )?;
+        Ok(config_path)
+    })?;
     bridge.initialize()?;
 
+    let file = bridge.root_path().join(format!("test.{MOCK_LANG_A}"));
     let text = bridge.call_diagnostics(file.to_str().context("path")?)?;
 
     // All servers suppressed — file omitted, only status header remains
@@ -650,31 +638,28 @@ fn test_diagnostics_no_servers() -> Result<()> {
 /// still collected (graceful degradation per §13).
 #[test]
 fn test_diagnostics_one_server_dies() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let root = dir.path().to_str().context("root path")?;
-
-    let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
-    std::fs::write(&file, "echo hello\n")?;
-
     let mockls_bin = env!("CARGO_BIN_EXE_mockls");
-    let config_path = dir.path().join("config.toml");
-    std::fs::write(
-        &config_path,
-        format!(
-            "[server.mockls-crash]\n\
-             command = \"{mockls_bin}\"\n\
-             args = [\"{MOCK_LANG_A}\", \"--drop-after\", \"3\"]\n\n\
-             [server.mockls-stable]\n\
-             command = \"{mockls_bin}\"\n\
-             args = [\"{MOCK_LANG_A}\"]\n\n\
-             [language.{MOCK_LANG_A}]\n\
-             servers = [\"mockls-crash\", \"mockls-stable\"]\n"
-        ),
-    )?;
-
-    let mut bridge = BridgeProcess::spawn_with_config(&config_path, root)?;
+    let mut bridge = BridgeProcess::spawn_with_config(|root| {
+        std::fs::write(root.join(format!("test.{MOCK_LANG_A}")), "echo hello\n")?;
+        let config_path = root.join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[server.mockls-crash]\n\
+                 command = \"{mockls_bin}\"\n\
+                 args = [\"{MOCK_LANG_A}\", \"--drop-after\", \"3\"]\n\n\
+                 [server.mockls-stable]\n\
+                 command = \"{mockls_bin}\"\n\
+                 args = [\"{MOCK_LANG_A}\"]\n\n\
+                 [language.{MOCK_LANG_A}]\n\
+                 servers = [\"mockls-crash\", \"mockls-stable\"]\n"
+            ),
+        )?;
+        Ok(config_path)
+    })?;
     bridge.initialize()?;
 
+    let file = bridge.root_path().join(format!("test.{MOCK_LANG_A}"));
     let text = bridge.call_diagnostics(file.to_str().context("path")?)?;
 
     // mockls-crash dies after 3 responses (initialize response +
