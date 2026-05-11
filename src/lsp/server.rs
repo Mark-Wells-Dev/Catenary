@@ -1031,6 +1031,7 @@ mod tests {
     use super::super::instance_key::Scope;
     use super::*;
     use serde_json::json;
+    use std::time::Duration;
 
     fn test_server() -> LspServer {
         LspServer::new(
@@ -1458,6 +1459,7 @@ mod tests {
         let server = test_server();
         assert!(!server.sends_progress());
         assert_eq!(server.lifecycle(), ServerLifecycle::Initializing);
+        assert_eq!(server.in_progress_count(), 0);
 
         // Begin
         server.on_notification(
@@ -1469,6 +1471,7 @@ mod tests {
         );
         assert!(server.sends_progress());
         assert_eq!(server.lifecycle(), ServerLifecycle::Busy(1));
+        assert_eq!(server.in_progress_count(), 1);
 
         // Second begin (overlapping token)
         server.on_notification(
@@ -1479,6 +1482,7 @@ mod tests {
             }),
         );
         assert_eq!(server.lifecycle(), ServerLifecycle::Busy(2));
+        assert_eq!(server.in_progress_count(), 2);
 
         // End first
         server.on_notification(
@@ -1489,6 +1493,7 @@ mod tests {
             }),
         );
         assert_eq!(server.lifecycle(), ServerLifecycle::Busy(1));
+        assert_eq!(server.in_progress_count(), 1);
 
         // End second — transitions to Healthy
         server.on_notification(
@@ -1499,6 +1504,7 @@ mod tests {
             }),
         );
         assert_eq!(server.lifecycle(), ServerLifecycle::Healthy);
+        assert_eq!(server.in_progress_count(), 0);
     }
 
     #[test]
@@ -2181,5 +2187,145 @@ mod tests {
 
         server.on_shutdown();
         assert!(!server.wants_did_change_configuration());
+    }
+
+    // ── Mutant audit: supports_diagnostics OR logic ──────────────
+
+    #[test]
+    fn supports_diagnostics_text_document_sync_only() {
+        // textDocumentSync present, no diagnosticProvider → should still
+        // support diagnostics (push via publishDiagnostics).
+        let server = server_with_caps(json!({ "textDocumentSync": { "openClose": true } }));
+        assert!(!server.supports_pull_diagnostics());
+        assert!(server.supports_diagnostics());
+    }
+
+    #[test]
+    fn supports_diagnostics_pull_only() {
+        // diagnosticProvider present, no textDocumentSync → supports diagnostics
+        let server = server_with_caps(json!({ "diagnosticProvider": {} }));
+        assert!(server.supports_pull_diagnostics());
+        assert!(server.supports_diagnostics());
+    }
+
+    #[test]
+    fn supports_diagnostics_neither() {
+        let server = server_with_caps(json!({}));
+        assert!(!server.supports_diagnostics());
+    }
+
+    // ── Mutant audit: publishes_version tracking ─────────────────
+
+    #[test]
+    fn publish_diagnostics_without_version_does_not_set_flag() {
+        let server = test_server();
+        server.on_notification(
+            "textDocument/publishDiagnostics",
+            &json!({
+                "uri": "file:///test.rs",
+                "diagnostics": []
+            }),
+        );
+        assert!(!server.publishes_version.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn publish_diagnostics_with_version_sets_flag_and_notifies() {
+        let server = test_server();
+        assert!(!server.publishes_version.load(Ordering::SeqCst));
+
+        // Register waiter before the first versioned diagnostic
+        let notified = server.capability_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        server.on_notification(
+            "textDocument/publishDiagnostics",
+            &json!({
+                "uri": "file:///test.rs",
+                "version": 1,
+                "diagnostics": []
+            }),
+        );
+        assert!(server.publishes_version.load(Ordering::SeqCst));
+
+        // capability_notify should fire on first versioned diagnostic
+        tokio::time::timeout(Duration::from_millis(100), notified)
+            .await
+            .expect("capability_notify should fire on first versioned diagnostic");
+    }
+
+    // ── Mutant audit: capability_notify on first progress begin ──
+
+    #[tokio::test]
+    async fn capability_notify_fires_on_first_progress_begin() {
+        let server = test_server();
+        let notified = server.capability_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        // First begin should fire capability_notify
+        server.on_notification(
+            "$/progress",
+            &json!({
+                "token": "tok-1",
+                "value": { "kind": "begin", "title": "Test", "percentage": 0 }
+            }),
+        );
+
+        tokio::time::timeout(Duration::from_millis(100), notified)
+            .await
+            .expect("capability_notify should fire on first progress begin");
+    }
+
+    #[tokio::test]
+    async fn capability_notify_does_not_fire_on_second_progress_begin() {
+        let server = test_server();
+
+        // First begin — consumes the notification
+        server.on_notification(
+            "$/progress",
+            &json!({
+                "token": "tok-1",
+                "value": { "kind": "begin", "title": "First", "percentage": 0 }
+            }),
+        );
+
+        // Register waiter AFTER first begin
+        let notified = server.capability_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        // Second begin — should NOT fire capability_notify
+        server.on_notification(
+            "$/progress",
+            &json!({
+                "token": "tok-2",
+                "value": { "kind": "begin", "title": "Second", "percentage": 0 }
+            }),
+        );
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), notified)
+                .await
+                .is_err(),
+            "capability_notify should not fire on second begin"
+        );
+    }
+
+    // ── Mutant audit: state_notify returns internal notifier ─────
+
+    #[tokio::test]
+    async fn state_notify_fires_on_lifecycle_change() {
+        let server = test_server();
+        let notified = server.state_notify().notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        server.set_lifecycle(ServerLifecycle::Healthy);
+
+        tokio::time::timeout(Duration::from_millis(100), notified)
+            .await
+            .expect("state_notify should fire on lifecycle change");
     }
 }
