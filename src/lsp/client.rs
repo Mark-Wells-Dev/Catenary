@@ -1476,4 +1476,327 @@ mod tests {
         client.shutdown().await?;
         Ok(())
     }
+
+    // ── Document operations + request tests ────────────────────────
+
+    /// Verifies that `did_open` delivers the document to the server.
+    ///
+    /// If `did_open` were a no-op, the server would not know about the
+    /// file and `definition` would return null.
+    #[tokio::test]
+    async fn did_open_delivers_document_to_server() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let script = dir.path().join(format!("open.{MOCK_LANG}"));
+        std::fs::write(&script, "fn hello\nhello\n")?;
+
+        let (mut client, _dir) = spawn_and_init(&[]).await?;
+
+        let uri = format!("file://{}", script.display());
+        client
+            .did_open(&uri, MOCK_LANG, 1, "fn hello\nhello\n")
+            .await?;
+
+        // definition depends on the document being open in mockls
+        let result = client.definition(&uri, 1, 0).await?;
+        assert!(
+            result.get("uri").is_some(),
+            "definition should return a location with uri, got: {result}"
+        );
+
+        client.shutdown().await?;
+        Ok(())
+    }
+
+    /// Verifies that `did_save` and `did_close` reach the server.
+    ///
+    /// Uses mockls `--notification-log` to confirm the notifications
+    /// were delivered, not silently dropped.
+    #[tokio::test]
+    async fn did_save_and_close_reach_server() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let log_path = dir.path().join("notif.jsonl");
+        let log_str = log_path.to_str().expect("path is UTF-8");
+        let script = dir.path().join(format!("save.{MOCK_LANG}"));
+        std::fs::write(&script, "fn hello\n")?;
+
+        let (mut client, _dir) =
+            spawn_and_init(&["--advertise-save", "--notification-log", log_str]).await?;
+
+        let uri = format!("file://{}", script.display());
+        client.did_open(&uri, MOCK_LANG, 1, "fn hello\n").await?;
+        client.did_save(&uri).await?;
+        client.did_close(&uri).await?;
+        client.shutdown().await?;
+
+        let log = std::fs::read_to_string(&log_path)?;
+        let methods: Vec<String> = log
+            .lines()
+            .filter_map(|line| {
+                serde_json::from_str::<Value>(line)
+                    .ok()
+                    .and_then(|v| v.get("method")?.as_str().map(String::from))
+            })
+            .collect();
+
+        assert!(
+            methods.contains(&"textDocument/didOpen".to_string()),
+            "notification log should contain didOpen: {methods:?}"
+        );
+        assert!(
+            methods.contains(&"textDocument/didSave".to_string()),
+            "notification log should contain didSave: {methods:?}"
+        );
+        assert!(
+            methods.contains(&"textDocument/didClose".to_string()),
+            "notification log should contain didClose: {methods:?}"
+        );
+
+        Ok(())
+    }
+
+    /// Verifies that `did_change_watched_files` delivers file change events.
+    #[tokio::test]
+    async fn did_change_watched_files_reaches_server() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let log_path = dir.path().join("notif.jsonl");
+        let log_str = log_path.to_str().expect("path is UTF-8");
+
+        let (mut client, _dir) = spawn_and_init(&["--notification-log", log_str]).await?;
+
+        client
+            .did_change_watched_files(&[("file:///test.rs", 1)])
+            .await?;
+        client.shutdown().await?;
+
+        let log = std::fs::read_to_string(&log_path)?;
+        assert!(
+            log.contains("workspace/didChangeWatchedFiles"),
+            "notification log should contain didChangeWatchedFiles: {log}"
+        );
+
+        Ok(())
+    }
+
+    /// Verifies that `definition` returns a real location, not a default.
+    #[tokio::test]
+    async fn definition_returns_location() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let script = dir.path().join(format!("def.{MOCK_LANG}"));
+        std::fs::write(&script, "fn hello\nhello\n")?;
+
+        let (mut client, _dir) = spawn_and_init(&[]).await?;
+
+        let uri = format!("file://{}", script.display());
+        client
+            .did_open(&uri, MOCK_LANG, 1, "fn hello\nhello\n")
+            .await?;
+
+        let result = client.definition(&uri, 1, 0).await?;
+        assert_eq!(
+            result.get("uri").and_then(Value::as_str),
+            Some(uri.as_str()),
+            "definition should point back to the same file"
+        );
+        assert!(
+            result.get("range").is_some(),
+            "definition should include a range"
+        );
+
+        client.shutdown().await?;
+        Ok(())
+    }
+
+    /// Verifies that `prepare_rename` returns a range for renameable symbols.
+    #[tokio::test]
+    async fn prepare_rename_returns_range() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let script = dir.path().join(format!("rename.{MOCK_LANG}"));
+        std::fs::write(&script, "fn hello\nhello\n")?;
+
+        let (mut client, _dir) = spawn_and_init(&[]).await?;
+
+        let uri = format!("file://{}", script.display());
+        client
+            .did_open(&uri, MOCK_LANG, 1, "fn hello\nhello\n")
+            .await?;
+
+        // "hello" on line 1 is a renameable identifier (not a keyword)
+        let result = client.prepare_rename(&uri, 1, 0).await?;
+        assert!(
+            result.get("range").is_some(),
+            "prepare_rename should return a range for identifiers, got: {result}"
+        );
+
+        client.shutdown().await?;
+        Ok(())
+    }
+
+    /// Verifies that `workspace_symbols` returns matching symbols.
+    #[tokio::test]
+    async fn workspace_symbols_returns_results() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let script = dir.path().join(format!("sym.{MOCK_LANG}"));
+        std::fs::write(&script, "fn my_func\nconst MY_CONST\n")?;
+
+        let (mut client, _dir) = spawn_and_init(&[]).await?;
+
+        let uri = format!("file://{}", script.display());
+        client
+            .did_open(&uri, MOCK_LANG, 1, "fn my_func\nconst MY_CONST\n")
+            .await?;
+
+        let result = client.workspace_symbols("my_func").await?;
+        let symbols = result.as_array().expect("workspace_symbols returns array");
+        assert!(!symbols.is_empty(), "workspace_symbols should find my_func");
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.get("name").and_then(Value::as_str) == Some("my_func")),
+            "workspace_symbols should contain my_func: {result}"
+        );
+
+        client.shutdown().await?;
+        Ok(())
+    }
+
+    /// Verifies that `outgoing_calls` returns call targets.
+    #[tokio::test]
+    async fn outgoing_calls_returns_targets() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let script = dir.path().join(format!("calls.{MOCK_LANG}"));
+        let content = "fn caller\n  callee\nfn callee\n";
+        std::fs::write(&script, content)?;
+
+        let (mut client, _dir) = spawn_and_init(&[]).await?;
+
+        let uri = format!("file://{}", script.display());
+        client.did_open(&uri, MOCK_LANG, 1, content).await?;
+
+        // Prepare call hierarchy for "caller" on line 0
+        let prep = client.prepare_call_hierarchy(&uri, 0, 3).await?;
+        let items = prep.as_array().expect("prepare returns array");
+        assert!(
+            !items.is_empty(),
+            "prepare_call_hierarchy should return items"
+        );
+
+        let result = client.outgoing_calls(&items[0]).await?;
+        let calls = result.as_array().expect("outgoing_calls returns array");
+        assert!(
+            !calls.is_empty(),
+            "outgoing_calls from caller should find callee"
+        );
+        assert!(
+            calls.iter().any(|c| c
+                .get("to")
+                .and_then(|t| t.get("name"))
+                .and_then(Value::as_str)
+                == Some("callee")),
+            "outgoing_calls should contain callee: {result}"
+        );
+
+        client.shutdown().await?;
+        Ok(())
+    }
+
+    /// Verifies that `prepare_type_hierarchy` returns hierarchy items.
+    #[tokio::test]
+    async fn prepare_type_hierarchy_returns_items() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let script = dir.path().join(format!("hier.{MOCK_LANG}"));
+        let content = "interface Animal\nclass Dog : Animal\n";
+        std::fs::write(&script, content)?;
+
+        let (mut client, _dir) = spawn_and_init(&[]).await?;
+
+        let uri = format!("file://{}", script.display());
+        client.did_open(&uri, MOCK_LANG, 1, content).await?;
+
+        let result = client.prepare_type_hierarchy(&uri, 0, 10).await?;
+        let items = result.as_array().expect("type hierarchy returns array");
+        assert!(
+            !items.is_empty(),
+            "prepare_type_hierarchy should return items"
+        );
+        assert_eq!(
+            items[0].get("name").and_then(Value::as_str),
+            Some("Animal"),
+            "type hierarchy item should be named Animal"
+        );
+
+        client.shutdown().await?;
+        Ok(())
+    }
+
+    /// Verifies that `code_action` returns quickfix actions.
+    #[tokio::test]
+    async fn code_action_returns_actions() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let script = dir.path().join(format!("action.{MOCK_LANG}"));
+        std::fs::write(&script, "let x\n")?;
+
+        let (mut client, _dir) = spawn_and_init(&[]).await?;
+
+        let uri = format!("file://{}", script.display());
+        client.did_open(&uri, MOCK_LANG, 1, "let x\n").await?;
+
+        let diagnostic = json!({
+            "range": {
+                "start": { "line": 0, "character": 0 },
+                "end": { "line": 0, "character": 1 }
+            },
+            "severity": 2,
+            "source": "mockls",
+            "message": "test error"
+        });
+
+        let result = client.code_action(&uri, 0, 0, 0, 1, &[diagnostic]).await?;
+        let actions = result.as_array().expect("code_action returns array");
+        assert!(
+            actions
+                .iter()
+                .any(|a| a.get("kind").and_then(Value::as_str) == Some("quickfix")),
+            "code_action should include a quickfix: {result}"
+        );
+
+        client.shutdown().await?;
+        Ok(())
+    }
+
+    /// Verifies that `get_diagnostics` returns cached diagnostics.
+    ///
+    /// mockls publishes diagnostics on `didOpen`. We poll until they
+    /// appear in the cache, then verify `get_diagnostics` returns them.
+    #[tokio::test]
+    async fn get_diagnostics_returns_cached() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let script = dir.path().join(format!("diag.{MOCK_LANG}"));
+        std::fs::write(&script, "let x\n")?;
+
+        let (mut client, _dir) = spawn_and_init(&[]).await?;
+
+        let uri = format!("file://{}", script.display());
+        client.did_open(&uri, MOCK_LANG, 1, "let x\n").await?;
+
+        // Poll until diagnostics arrive (mockls publishes on didOpen)
+        let mut found = false;
+        for _ in 0..50 {
+            let diags = client.get_diagnostics(&uri);
+            if !diags.is_empty() {
+                found = true;
+                assert!(
+                    diags
+                        .iter()
+                        .any(|d| d.get("source").and_then(Value::as_str) == Some("mockls")),
+                    "diagnostics should come from mockls: {diags:?}"
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(found, "diagnostics should appear in cache after didOpen");
+
+        client.shutdown().await?;
+        Ok(())
+    }
 }
