@@ -1761,4 +1761,105 @@ mod tests {
             "should fall back to ~/.config path when config_dir is None",
         );
     }
+
+    // ── probe_timeout tests ─────────────────────────────────────────
+
+    #[test]
+    fn probe_timeout_default_is_five_minutes() {
+        // Assumes CATENARY_DOCTOR_TIMEOUT_SECS is not set in the test
+        // environment. The default is 5 minutes (300 seconds).
+        let timeout = probe_timeout();
+        assert_eq!(
+            timeout,
+            Duration::from_mins(5),
+            "default probe timeout should be 5 minutes",
+        );
+    }
+
+    // ── extract_capabilities tests ──────────────────────────────────
+
+    #[test]
+    fn extract_capabilities_hover() {
+        let caps = serde_json::json!({"hoverProvider": true});
+        let result = extract_capabilities(&caps, false);
+        assert!(
+            result.contains(&"hover"),
+            "should include hover capability, got: {result:?}",
+        );
+    }
+
+    #[test]
+    fn extract_capabilities_definition() {
+        let caps = serde_json::json!({"definitionProvider": true});
+        let result = extract_capabilities(&caps, false);
+        assert!(
+            result.contains(&"definition"),
+            "should include definition capability, got: {result:?}",
+        );
+    }
+
+    #[test]
+    fn extract_capabilities_empty_when_none() {
+        let caps = serde_json::json!({});
+        let result = extract_capabilities(&caps, false);
+        assert!(result.is_empty(), "empty caps should yield nothing");
+    }
+
+    #[test]
+    fn extract_capabilities_ignores_null_values() {
+        // LSP servers may explicitly set a capability to null.
+        let caps = serde_json::json!({"hoverProvider": null});
+        let result = extract_capabilities(&caps, false);
+        assert!(
+            !result.contains(&"hover"),
+            "null provider should not be included",
+        );
+    }
+
+    // ── binary_exists / resolve_binary tests ────────────────────────
+
+    #[test]
+    fn binary_exists_finds_known_binary() {
+        // "sh" should exist on any Unix system.
+        assert!(binary_exists("sh"));
+    }
+
+    #[test]
+    fn binary_exists_rejects_nonexistent() {
+        assert!(!binary_exists("catenary_nonexistent_binary_xyz"));
+    }
+
+    #[test]
+    fn resolve_binary_finds_known_binary() {
+        let result = resolve_binary("sh");
+        assert!(result.is_some(), "should resolve 'sh'");
+    }
+
+    #[test]
+    fn resolve_binary_returns_none_for_nonexistent() {
+        assert!(resolve_binary("catenary_nonexistent_binary_xyz").is_none());
+    }
+
+    // ── normalize_json / pretty_json tests ──────────────────────────
+
+    #[test]
+    fn normalize_json_canonicalizes() {
+        let input = r#"{ "b": 2, "a": 1 }"#;
+        let result = normalize_json(input);
+        // Should be parseable as valid JSON.
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&result).is_ok(),
+            "normalized JSON should be valid, got: {result}",
+        );
+    }
+
+    #[test]
+    fn pretty_json_formats_readably() {
+        let input = r#"{"a":1,"b":2}"#;
+        let result = pretty_json(input);
+        assert!(
+            result.contains('\n'),
+            "pretty JSON should be multi-line, got: {result}",
+        );
+    }
 }
