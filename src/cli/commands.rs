@@ -1202,4 +1202,158 @@ mod tests {
         assert_eq!(format_bytes(1536), "1.5 KB");
         assert_eq!(format_bytes(2_621_440), "2.5 MB");
     }
+
+    // ── format_sql_value tests ──────────────────────────────────────
+
+    #[test]
+    fn format_sql_value_null() {
+        assert_eq!(
+            format_sql_value(&rusqlite::types::Value::Null),
+            "NULL",
+        );
+    }
+
+    #[test]
+    fn format_sql_value_integer() {
+        assert_eq!(
+            format_sql_value(&rusqlite::types::Value::Integer(42)),
+            "42",
+        );
+    }
+
+    #[test]
+    fn format_sql_value_real() {
+        assert_eq!(
+            format_sql_value(&rusqlite::types::Value::Real(1.5)),
+            "1.5",
+        );
+    }
+
+    #[test]
+    fn format_sql_value_text() {
+        assert_eq!(
+            format_sql_value(&rusqlite::types::Value::Text("hello".into())),
+            "hello",
+        );
+    }
+
+    #[test]
+    fn format_sql_value_blob() {
+        let result = format_sql_value(&rusqlite::types::Value::Blob(vec![1, 2, 3]));
+        assert!(result.contains('3'), "should contain byte count");
+        assert!(result.contains("blob"), "should indicate blob type");
+    }
+
+    // ── resolve_session_id tests ────────────────────────────────────
+
+    #[test]
+    fn resolve_session_id_by_row_number() -> anyhow::Result<()> {
+        let (_dir, _path, conn) = test_db();
+        insert_dead_session(&conn, "resolve-row-1", "/tmp/ws1");
+        insert_dead_session(&conn, "resolve-row-2", "/tmp/ws2");
+
+        // Row 1 should return the first session
+        let s = resolve_session_id(&conn, "1")?;
+        assert_eq!(s.id, "resolve-row-1");
+
+        // Row 2 should return the second session
+        let s = resolve_session_id(&conn, "2")?;
+        assert_eq!(s.id, "resolve-row-2");
+
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_session_id_row_zero_falls_through() {
+        let (_dir, _path, conn) = test_db();
+        insert_dead_session(&conn, "resolve-zero", "/tmp/ws");
+
+        // Row 0 is invalid — should not match any session.
+        // "0" could also be an ID prefix, but no session starts with "0".
+        let result = resolve_session_id(&conn, "0");
+        assert!(result.is_err(), "row 0 should not match");
+    }
+
+    #[test]
+    fn resolve_session_id_row_out_of_range() {
+        let (_dir, _path, conn) = test_db();
+        insert_dead_session(&conn, "resolve-oor", "/tmp/ws");
+
+        // Row 99 is out of range and not a valid ID prefix.
+        let result = resolve_session_id(&conn, "99");
+        assert!(result.is_err(), "out-of-range row should error");
+    }
+
+    #[test]
+    fn resolve_session_id_by_prefix() -> anyhow::Result<()> {
+        let (_dir, _path, conn) = test_db();
+        insert_dead_session(&conn, "abc123", "/tmp/ws");
+
+        let s = resolve_session_id(&conn, "abc")?;
+        assert_eq!(s.id, "abc123");
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_session_id_numeric_id_fallback() -> anyhow::Result<()> {
+        let (_dir, _path, conn) = test_db();
+        // Session ID that looks numeric but is larger than the row count.
+        insert_dead_session(&conn, "999def", "/tmp/ws");
+
+        // "999" as a row number would be out of range (only 1 session).
+        // But "999" as an ID prefix should match "999def".
+        let s = resolve_session_id(&conn, "999")?;
+        assert_eq!(s.id, "999def");
+        Ok(())
+    }
+
+    // ── find_session tests ──────────────────────────────────────────
+
+    #[test]
+    fn find_session_exact_match() -> anyhow::Result<()> {
+        let (_dir, _path, conn) = test_db();
+        insert_dead_session(&conn, "exact-match-id", "/tmp/ws");
+
+        let s = find_session(&conn, "exact-match-id")?;
+        assert_eq!(s.id, "exact-match-id");
+        Ok(())
+    }
+
+    #[test]
+    fn find_session_prefix_match() -> anyhow::Result<()> {
+        let (_dir, _path, conn) = test_db();
+        insert_dead_session(&conn, "prefix-abc123", "/tmp/ws");
+
+        let s = find_session(&conn, "prefix-abc")?;
+        assert_eq!(s.id, "prefix-abc123");
+        Ok(())
+    }
+
+    #[test]
+    fn find_session_no_match() {
+        let (_dir, _path, conn) = test_db();
+        insert_dead_session(&conn, "some-session", "/tmp/ws");
+
+        let err = find_session(&conn, "nonexistent").expect_err("should fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("No session found"),
+            "error should say 'No session found', got: {msg}",
+        );
+    }
+
+    #[test]
+    fn find_session_ambiguous_match() {
+        let (_dir, _path, conn) = test_db();
+        insert_dead_session(&conn, "ambig-001", "/tmp/ws1");
+        insert_dead_session(&conn, "ambig-002", "/tmp/ws2");
+
+        // "ambig" matches both — should error with disambiguation message.
+        let err = find_session(&conn, "ambig").expect_err("should fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("more complete session ID"),
+            "error should ask for more specific ID, got: {msg}",
+        );
+    }
 }
