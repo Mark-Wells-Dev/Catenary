@@ -1356,4 +1356,103 @@ mod tests {
             "error should ask for more specific ID, got: {msg}",
         );
     }
+
+    // ── format_duration_ago tests ───────────────────────────────────
+
+    #[test]
+    fn format_duration_ago_hours() {
+        let ts = Utc::now() - chrono::Duration::hours(2) - chrono::Duration::minutes(15);
+        let result = format_duration_ago(ts);
+        assert!(result.contains("2h"), "should show hours, got: {result}");
+        assert!(
+            result.contains("15m"),
+            "should show remaining minutes, got: {result}",
+        );
+        assert!(result.ends_with("ago"), "should end with 'ago'");
+    }
+
+    #[test]
+    fn format_duration_ago_minutes_only() {
+        let ts = Utc::now() - chrono::Duration::minutes(5);
+        let result = format_duration_ago(ts);
+        assert!(result.contains("5m"), "should show minutes, got: {result}");
+        assert!(
+            !result.contains('h'),
+            "should NOT show hours for <1h, got: {result}",
+        );
+        assert!(result.ends_with("ago"));
+    }
+
+    #[test]
+    fn format_duration_ago_seconds_only() {
+        let ts = Utc::now() - chrono::Duration::seconds(30);
+        let result = format_duration_ago(ts);
+        assert!(result.contains("30s"), "should show seconds, got: {result}");
+        assert!(
+            !result.contains('m'),
+            "should NOT show minutes for <1m, got: {result}",
+        );
+        assert!(result.ends_with("ago"));
+    }
+
+    // ── extract_message_summary tests ───────────────────────────────
+
+    #[test]
+    fn extract_summary_with_method() {
+        let colors = ColorConfig::new(true);
+        let payload = serde_json::json!({
+            "method": "textDocument/hover",
+            "id": 5
+        });
+        let result = extract_message_summary(&payload, &colors);
+        assert!(
+            result.contains("textDocument/hover"),
+            "should contain method, got: {result}",
+        );
+        assert!(result.contains("#5"), "should contain request id, got: {result}");
+    }
+
+    #[test]
+    fn extract_summary_result_without_method() {
+        let colors = ColorConfig::new(true);
+        let payload = serde_json::json!({ "result": null, "id": 3 });
+        let result = extract_message_summary(&payload, &colors);
+        assert!(
+            result.contains("result"),
+            "should indicate result, got: {result}",
+        );
+    }
+
+    #[test]
+    fn extract_summary_error_without_method() {
+        let colors = ColorConfig::new(true);
+        let payload = serde_json::json!({ "error": { "code": -1 }, "id": 7 });
+        let result = extract_message_summary(&payload, &colors);
+        assert!(
+            result.contains("error"),
+            "should indicate error, got: {result}",
+        );
+    }
+
+    #[test]
+    fn extract_summary_tools_call_with_name() {
+        let colors = ColorConfig::new(true);
+        let payload = serde_json::json!({
+            "method": "tools/call",
+            "id": 1,
+            "params": {
+                "name": "grep",
+                "arguments": { "file_path": "/src/main.rs" }
+            }
+        });
+        let result = extract_message_summary(&payload, &colors);
+        assert!(
+            result.contains("grep"),
+            "should contain tool name, got: {result}",
+        );
+        assert!(
+            result.contains("main.rs"),
+            "should contain file basename, got: {result}",
+        );
+    }
 }
