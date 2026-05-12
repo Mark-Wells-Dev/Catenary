@@ -262,6 +262,23 @@ mod tests {
         assert_eq!(config.blue("test"), "test");
         assert_eq!(config.red("test"), "test");
         assert_eq!(config.cyan("test"), "test");
+        assert_eq!(config.yellow("test"), "test");
+        assert_eq!(config.bold("test"), "test");
+        assert_eq!(config.dim("test"), "test");
+    }
+
+    // ── HostFormat tests ────────────────────────────────────────────
+
+    #[test]
+    fn host_format_edit_tool_names() {
+        assert_eq!(HostFormat::Claude.edit_tool(), "Edit");
+        assert_eq!(HostFormat::Gemini.edit_tool(), "write_file");
+    }
+
+    #[test]
+    fn host_format_read_tool_names() {
+        assert_eq!(HostFormat::Claude.read_tool(), "Read");
+        assert_eq!(HostFormat::Gemini.read_tool(), "read_file");
     }
 
     #[test]
