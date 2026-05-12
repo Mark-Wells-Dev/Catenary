@@ -2259,4 +2259,177 @@ mod tests {
         let denial = check_command("cargo build", &rules, None).expect("cargo should be denied");
         assert_eq!(denial.reason, DenialReason::NotAllowed);
     }
+
+    // ── mask_quotes boundary tests ──────────────────────────────────
+
+    #[test]
+    fn mask_quotes_escaped_double_quote() {
+        // Backslash-escaped double quote inside a double-quoted string.
+        // The \" should NOT close the quoted region.
+        let input = r#"echo "he said \"hello\" today""#;
+        let result = mask_quotes(input);
+        // "echo " is unquoted — should be preserved.
+        assert!(result.starts_with("echo "), "unquoted prefix preserved");
+        // Everything inside the quotes should be masked (spaces).
+        // The word "hello" is inside quotes — must NOT appear.
+        assert!(
+            !result.contains("hello"),
+            "escaped quote content should be masked, got: {result}",
+        );
+        // "today" is inside the outer quotes (between \" and closing ").
+        assert!(
+            !result.contains("today"),
+            "content after escaped quote should still be masked, got: {result}",
+        );
+        assert_eq!(result.len(), input.len(), "length must be preserved");
+    }
+
+    #[test]
+    fn mask_quotes_unterminated_double_quote() {
+        // Unterminated double quote — should mask to end without panic.
+        let input = r#"echo "unterminated"#;
+        let result = mask_quotes(input);
+        assert!(result.starts_with("echo "), "unquoted prefix preserved");
+        assert!(!result.contains("unterminated"), "quoted content masked");
+        assert_eq!(result.len(), input.len());
+    }
+
+    #[test]
+    fn mask_quotes_unterminated_single_quote() {
+        let input = "echo 'unterminated";
+        let result = mask_quotes(input);
+        assert!(result.starts_with("echo "), "unquoted prefix preserved");
+        assert!(!result.contains("unterminated"), "quoted content masked");
+        assert_eq!(result.len(), input.len());
+    }
+
+    #[test]
+    fn mask_quotes_backslash_at_end_of_double_quote() {
+        // Backslash as the last char inside double quotes.
+        let input = r#"echo "test\""#;
+        let result = mask_quotes(input);
+        assert!(result.starts_with("echo "), "unquoted prefix preserved");
+        assert!(!result.contains("test"), "quoted content masked");
+        assert_eq!(result.len(), input.len());
+    }
+
+    // ── pipe_split boundary tests ───────────────────────────────────
+
+    #[test]
+    fn pipe_split_trailing_pipe() {
+        // Pipe as the last character — tests bounds check on bytes[i+1].
+        let parts = pipe_split("echo foo |");
+        assert_eq!(parts, vec!["echo foo", ""]);
+    }
+
+    #[test]
+    fn pipe_split_leading_pipe() {
+        // Pipe at position 0 — tests i > 0 guard in backward || check.
+        let parts = pipe_split("| grep foo");
+        assert_eq!(parts, vec!["", "grep foo"]);
+    }
+
+    #[test]
+    fn pipe_split_triple_pipe() {
+        // ||| = || followed by |. The third | is the second of || in
+        // backward check, so it should be skipped (not a bare pipe).
+        let parts = pipe_split("a ||| b");
+        assert_eq!(parts, vec!["a ||| b"]);
+    }
+
+    #[test]
+    fn pipe_split_pipe_then_trailing_whitespace() {
+        // Pipe followed by trailing whitespace — tests the whitespace
+        // skip loop's bounds check (i < n vs i <= n).
+        let parts = pipe_split("echo foo |   ");
+        assert_eq!(parts, vec!["echo foo", ""]);
+    }
+
+    // ── is_unresolvable_cd_target tests ─────────────────────────────
+
+    #[test]
+    fn unresolvable_cd_dollar_var() {
+        assert!(is_unresolvable_cd_target("$HOME"));
+    }
+
+    #[test]
+    fn unresolvable_cd_backtick() {
+        assert!(is_unresolvable_cd_target("`pwd`"));
+    }
+
+    #[test]
+    fn unresolvable_cd_command_subst() {
+        assert!(is_unresolvable_cd_target("foo$(bar)"));
+    }
+
+    #[test]
+    fn unresolvable_cd_tilde_user() {
+        // ~user (not ~ or ~/path) is unresolvable.
+        assert!(is_unresolvable_cd_target("~otheruser"));
+    }
+
+    #[test]
+    fn resolvable_cd_tilde_alone() {
+        assert!(!is_unresolvable_cd_target("~"));
+    }
+
+    #[test]
+    fn resolvable_cd_tilde_slash() {
+        assert!(!is_unresolvable_cd_target("~/projects"));
+    }
+
+    #[test]
+    fn resolvable_cd_relative_path() {
+        assert!(!is_unresolvable_cd_target("src/lib"));
+    }
+
+    #[test]
+    fn resolvable_cd_absolute_path() {
+        assert!(!is_unresolvable_cd_target("/usr/bin"));
+    }
+
+    // ── resolve_cd_target tests ─────────────────────────────────────
+
+    #[test]
+    fn resolve_cd_dollar_preserves_cwd() {
+        let cwd = std::path::Path::new("/current");
+        assert_eq!(
+            resolve_cd_target("$VAR", Some(cwd)),
+            Some(std::path::PathBuf::from("/current")),
+        );
+    }
+
+    #[test]
+    fn resolve_cd_backtick_preserves_cwd() {
+        let cwd = std::path::Path::new("/current");
+        assert_eq!(
+            resolve_cd_target("`cmd`", Some(cwd)),
+            Some(std::path::PathBuf::from("/current")),
+        );
+    }
+
+    #[test]
+    fn resolve_cd_command_subst_preserves_cwd() {
+        let cwd = std::path::Path::new("/current");
+        assert_eq!(
+            resolve_cd_target("$(cmd)", Some(cwd)),
+            Some(std::path::PathBuf::from("/current")),
+        );
+    }
+
+    #[test]
+    fn resolve_cd_absolute_path() {
+        assert_eq!(
+            resolve_cd_target("/usr/bin", Some(std::path::Path::new("/tmp"))),
+            Some(std::path::PathBuf::from("/usr/bin")),
+        );
+    }
+
+    #[test]
+    fn resolve_cd_relative_resolves_against_cwd() {
+        assert_eq!(
+            resolve_cd_target("src", Some(std::path::Path::new("/project"))),
+            Some(std::path::PathBuf::from("/project/src")),
+        );
+    }
 }
