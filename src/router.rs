@@ -3844,4 +3844,277 @@ mod tests {
 
         shutdown.cancel();
     }
+
+    // ── Function-level tests (mutant audit 03-07) ─────────────────
+
+    /// `mcp_socket_path` returns a deterministic path inside `state_dir`.
+    #[test]
+    fn test_mcp_socket_path_structure() {
+        let path = mcp_socket_path();
+        assert!(
+            path.ends_with("catenary/catenary.sock"),
+            "mcp_socket_path should end with catenary/catenary.sock, got: {}",
+            path.display()
+        );
+    }
+
+    /// `is_correlation_trigger` returns true for Catenary `PreToolUse` hooks.
+    #[test]
+    fn test_is_correlation_trigger_catenary_tools() {
+        // Direct tool names
+        let pre = |name: &str| {
+            let raw = serde_json::json!({"tool_name": name});
+            is_correlation_trigger("pre-tool/editing-state", &raw)
+        };
+
+        assert!(pre("grep"), "grep should trigger");
+        assert!(pre("glob"), "glob should trigger");
+        assert!(pre("start_editing"), "start_editing should trigger");
+        assert!(pre("done_editing"), "done_editing should trigger");
+
+        // MCP-qualified names
+        assert!(pre("mcp_catenary_grep"), "mcp_catenary_grep should trigger");
+        assert!(
+            pre("mcp__plugin_catenary_catenary__glob"),
+            "mcp qualified glob should trigger"
+        );
+    }
+
+    /// `is_correlation_trigger` returns false for non-Catenary tools.
+    #[test]
+    fn test_is_correlation_trigger_non_catenary() {
+        let raw = serde_json::json!({"tool_name": "Edit"});
+        assert!(
+            !is_correlation_trigger("pre-tool/editing-state", &raw),
+            "non-Catenary tool should not trigger",
+        );
+    }
+
+    /// `is_correlation_trigger` returns false for non-PreToolUse methods.
+    #[test]
+    fn test_is_correlation_trigger_wrong_method() {
+        let raw = serde_json::json!({"tool_name": "grep"});
+        assert!(
+            !is_correlation_trigger("post-tool/editing-state", &raw),
+            "PostToolUse should not trigger"
+        );
+        assert!(
+            !is_correlation_trigger("pre-agent/turn-start", &raw),
+            "PreAgent should not trigger"
+        );
+    }
+
+    /// `parse_root_uris` extracts canonical paths from file:// URIs.
+    #[test]
+    fn test_parse_root_uris_valid() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root_path = dir.path().to_path_buf();
+        let canonical = root_path.canonicalize().expect("canonicalize");
+        let uri = format!("file://{}", root_path.display());
+
+        let roots = vec![crate::mcp::Root {
+            uri,
+            name: Some("test".to_string()),
+        }];
+        let result = parse_root_uris(&roots);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], canonical);
+    }
+
+    /// `parse_root_uris` skips non-file:// URIs.
+    #[test]
+    fn test_parse_root_uris_non_file() {
+        let roots = vec![crate::mcp::Root {
+            uri: "https://example.com".to_string(),
+            name: Some("remote".to_string()),
+        }];
+        let result = parse_root_uris(&roots);
+        assert!(result.is_empty(), "non-file URIs should be skipped");
+    }
+
+    /// `parse_root_uris` skips paths that fail to canonicalize.
+    #[test]
+    fn test_parse_root_uris_nonexistent() {
+        let roots = vec![crate::mcp::Root {
+            uri: "file:///nonexistent/path/that/does/not/exist".to_string(),
+            name: None,
+        }];
+        let result = parse_root_uris(&roots);
+        assert!(result.is_empty(), "nonexistent paths should be skipped");
+    }
+
+    /// `session_for_fd` returns `None` when no correlation exists.
+    #[tokio::test]
+    async fn test_session_for_fd_uncorrelated() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manager = bind_in(dir.path());
+
+        assert!(
+            manager.session_for_fd(42).is_none(),
+            "uncorrelated fd should return None"
+        );
+    }
+
+    /// `session_for_fd` returns the session ID after correlation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_session_for_fd_after_correlation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let hook_path = hook_socket_in(dir.path());
+        let mcp_path = mcp_socket_in(dir.path());
+
+        let manager = Arc::new(bind_echo_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        let stream = correlate_session(&hook_path, &mcp_path, "test-sess").await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Find the fd that was correlated
+        let corr_sessions = manager
+            .correlation
+            .connection_sessions
+            .lock()
+            .expect("lock");
+        let (&fd, session_id) = corr_sessions
+            .iter()
+            .next()
+            .expect("should have a correlated fd");
+        assert_eq!(session_id, "test-sess");
+        drop(corr_sessions);
+
+        // session_for_fd should return the session ID
+        let result = manager.session_for_fd(fd);
+        assert_eq!(
+            result.as_deref(),
+            Some("test-sess"),
+            "session_for_fd should return the correlated session"
+        );
+
+        drop(stream);
+        shutdown.cancel();
+    }
+
+    /// `CorrelatingHandler::list_tools` delegates to the inner handler.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_correlating_handler_list_tools_delegates() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mcp_path = mcp_socket_in(dir.path());
+
+        let manager = Arc::new(bind_echo(dir.path()));
+        let shutdown = manager.shutdown_token();
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        let stream = std::os::unix::net::UnixStream::connect(&mcp_path).expect("connect");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("set timeout");
+
+        let _ = mcp_roundtrip(
+            &stream,
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": {"name": "test", "version": "0.1"}
+                }
+            }),
+        );
+
+        let response = mcp_roundtrip(
+            &stream,
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/list"
+            }),
+        );
+
+        let tools = response["result"]["tools"].as_array().expect("tools array");
+        assert!(
+            !tools.is_empty(),
+            "list_tools should delegate to inner handler, not return empty"
+        );
+        assert_eq!(tools[0]["name"], "echo", "should contain echo tool");
+
+        drop(stream);
+        shutdown.cancel();
+    }
+
+    /// Correlation creates a pending entry that is consumed on `tools/call`.
+    ///
+    /// Verifies the full flow: `PreToolUse` creates pending, `tools/call`
+    /// resolves it and binds the connection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_correlation_pending_consumed_on_tools_call() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let hook_path = hook_socket_in(dir.path());
+        let mcp_path = mcp_socket_in(dir.path());
+
+        let manager = Arc::new(bind_echo_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        // Send PreToolUse for a Catenary tool — creates pending entry.
+        let req = serde_json::json!({
+            "method": "pre-tool/editing-state",
+            "tool_name": "mcp_catenary_grep",
+            "agent_id": "",
+            "session_id": "pending-test"
+        });
+        let _ = hook_roundtrip(&hook_path, &req).await;
+        assert!(
+            manager.has_pending_correlation(),
+            "pending entry should exist after PreToolUse"
+        );
+
+        // MCP connect + tools/call resolves the pending entry.
+        let stream = std::os::unix::net::UnixStream::connect(&mcp_path).expect("connect");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("set timeout");
+        let _ = mcp_roundtrip(
+            &stream,
+            &serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": {"name": "test", "version": "0.1"}
+                }
+            }),
+        );
+        let _ = mcp_roundtrip(
+            &stream,
+            &serde_json::json!({
+                "jsonrpc": "2.0", "id": 2,
+                "method": "tools/call",
+                "params": {"name": "echo"}
+            }),
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !manager.has_pending_correlation(),
+            "pending entry should be consumed after tools/call"
+        );
+        assert!(
+            manager.session_has_connection("pending-test"),
+            "session should be bound"
+        );
+
+        drop(stream);
+        shutdown.cancel();
+    }
 }
