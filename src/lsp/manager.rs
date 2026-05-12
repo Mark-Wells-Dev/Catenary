@@ -5723,4 +5723,403 @@ mod tests {
         lc.compile_markers().expect("compile");
         assert!(lc.compiled_markers.is_empty());
     }
+
+    // ── Manager operations tests (mutant audit 03-06) ──────────────
+
+    /// `project_commands` returns commands from loaded project configs.
+    #[test]
+    fn test_project_commands_returns_loaded() {
+        let manager = LspClientManager::new(test_config(), test_logging(), test_fs());
+
+        // No project configs loaded → empty
+        assert!(
+            manager.project_commands().is_empty(),
+            "should be empty with no project configs"
+        );
+
+        // Load a project config with commands
+        let pc = crate::config::ProjectConfig {
+            commands: Some(crate::config::CommandsConfig::default()),
+            ..crate::config::ProjectConfig::default()
+        };
+        let root = PathBuf::from("/project");
+        manager
+            .project_configs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(root.clone(), pc);
+
+        let cmds = manager.project_commands();
+        assert_eq!(cmds.len(), 1, "should have one entry");
+        assert!(cmds.contains_key(&root), "should contain the project root");
+    }
+
+    /// `project_commands` omits roots without a `[commands]` section.
+    #[test]
+    fn test_project_commands_omits_no_commands() {
+        let manager = LspClientManager::new(test_config(), test_logging(), test_fs());
+
+        let pc = crate::config::ProjectConfig::default(); // commands = None
+        let root = PathBuf::from("/project");
+        manager
+            .project_configs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(root, pc);
+
+        assert!(
+            manager.project_commands().is_empty(),
+            "roots without commands should be omitted"
+        );
+    }
+
+    /// `rooted_clients` includes rooted servers (not just single-file).
+    #[tokio::test]
+    async fn test_rooted_clients_includes_rooted() -> Result<()> {
+        let manager = LspClientManager::new(
+            mockls_config(),
+            test_logging(),
+            test_fs_with_roots(&["/tmp"]),
+        );
+
+        let _ = ensure_first_server(&manager, MOCK_LANG_A).await?;
+        let rooted = manager.rooted_clients().await;
+        assert_eq!(
+            rooted.len(),
+            1,
+            "rooted_clients should include the spawned server"
+        );
+
+        let key = rooted.keys().next().expect("one key");
+        assert_eq!(key.language_id, MOCK_LANG_A);
+        assert!(
+            matches!(key.scope, Scope::Root(_)),
+            "scope should be Root, got {:?}",
+            key.scope
+        );
+
+        Ok(())
+    }
+
+    /// `shutdown_instance` removes the server from the client map.
+    #[tokio::test]
+    async fn test_shutdown_instance_removes_from_map() -> Result<()> {
+        let manager = LspClientManager::new(
+            mockls_config(),
+            test_logging(),
+            test_fs_with_roots(&["/tmp"]),
+        );
+
+        let client = ensure_first_server(&manager, MOCK_LANG_A).await?;
+        assert_eq!(manager.clients().await.len(), 1);
+
+        let key = client.lock().await.server().key().expect("key");
+        manager.shutdown_instance(&key).await;
+
+        assert!(
+            manager.clients().await.is_empty(),
+            "client should be removed after shutdown_instance"
+        );
+        Ok(())
+    }
+
+    /// `shutdown_all` empties the client map.
+    #[tokio::test]
+    async fn test_shutdown_all_empties_map() -> Result<()> {
+        let manager = LspClientManager::new(
+            mockls_config(),
+            test_logging(),
+            test_fs_with_roots(&["/tmp"]),
+        );
+
+        let _ = ensure_first_server(&manager, MOCK_LANG_A).await?;
+        assert!(!manager.clients().await.is_empty());
+
+        manager.shutdown_all().await;
+
+        assert!(
+            manager.clients().await.is_empty(),
+            "all clients should be removed after shutdown_all"
+        );
+        Ok(())
+    }
+
+    /// `effective_server_def` applies `file_patterns` override from project config.
+    #[test]
+    fn test_effective_server_def_file_patterns_override() {
+        let mut config = test_config_raw();
+        config.server.insert(
+            "rust-analyzer".to_string(),
+            ServerDef {
+                command: "rust-analyzer".to_string(),
+                file_patterns: vec!["*.rs".to_string()],
+                ..ServerDef::default()
+            },
+        );
+
+        let manager = LspClientManager::new(config, test_logging(), test_fs());
+        let root = PathBuf::from("/project");
+
+        // Project config with non-empty file_patterns → override
+        let mut pc = crate::config::ProjectConfig::default();
+        pc.server.insert(
+            "rust-analyzer".to_string(),
+            ServerDef {
+                command: String::new(),
+                file_patterns: vec!["*.py".to_string()],
+                ..ServerDef::default()
+            },
+        );
+        manager
+            .project_configs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(root.clone(), pc);
+
+        let merged = manager
+            .effective_server_def("rust-analyzer", &root)
+            .expect("should exist");
+        assert_eq!(
+            merged.file_patterns,
+            vec!["*.py"],
+            "project file_patterns should override user"
+        );
+    }
+
+    /// `effective_server_def` preserves user `file_patterns` when project has empty.
+    #[test]
+    fn test_effective_server_def_empty_file_patterns_no_override() {
+        let mut config = test_config_raw();
+        config.server.insert(
+            "rust-analyzer".to_string(),
+            ServerDef {
+                command: "rust-analyzer".to_string(),
+                file_patterns: vec!["*.rs".to_string()],
+                ..ServerDef::default()
+            },
+        );
+
+        let manager = LspClientManager::new(config, test_logging(), test_fs());
+        let root = PathBuf::from("/project");
+
+        // Project config with empty file_patterns → should NOT override
+        let mut pc = crate::config::ProjectConfig::default();
+        pc.server.insert(
+            "rust-analyzer".to_string(),
+            ServerDef {
+                command: String::new(),
+                ..ServerDef::default()
+            },
+        );
+        manager
+            .project_configs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(root.clone(), pc);
+
+        let merged = manager
+            .effective_server_def("rust-analyzer", &root)
+            .expect("should exist");
+        assert_eq!(
+            merged.file_patterns,
+            vec!["*.rs"],
+            "user file_patterns should be preserved when project has empty"
+        );
+    }
+
+    /// `set_per_root_classification` feeds non-empty tables to `FilesystemManager`.
+    #[test]
+    fn test_set_per_root_classification_non_empty() {
+        let root = PathBuf::from("/project");
+        let fs = test_fs_with_roots(&["/project"]);
+        let manager = LspClientManager::new(test_config(), test_logging(), Arc::clone(&fs));
+
+        let mut pc = crate::config::ProjectConfig::default();
+        pc.language.insert(
+            "custom".to_string(),
+            LanguageConfig {
+                extensions: Some(vec!["xyz".to_string()]),
+                ..LanguageConfig::default()
+            },
+        );
+        manager
+            .project_configs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(root.clone(), pc);
+
+        manager.set_per_root_classification(&[root]);
+
+        // Verify: a file with .xyz extension under this root should resolve
+        // to the "custom" language via per-root classification.
+        let lang = fs.language_id(Path::new("/project/test.xyz"));
+        assert_eq!(
+            lang.as_deref(),
+            Some("custom"),
+            "per-root classification should map .xyz to custom"
+        );
+    }
+
+    /// `set_per_root_classification` skips empty tables.
+    #[test]
+    fn test_set_per_root_classification_empty_skipped() {
+        let fs = test_fs_with_roots(&["/project"]);
+        let manager = LspClientManager::new(test_config(), test_logging(), Arc::clone(&fs));
+
+        let root = PathBuf::from("/project");
+        // No classification fields → empty tables
+        let pc = crate::config::ProjectConfig::default();
+        manager
+            .project_configs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(root.clone(), pc);
+
+        manager.set_per_root_classification(&[root]);
+
+        // No per-root classification should have been set,
+        // so language_id should return None for unknown extensions.
+        let lang = fs.language_id(Path::new("/project/test.xyz"));
+        assert!(
+            lang.is_none(),
+            "empty classification tables should not be set"
+        );
+    }
+
+    /// `wait_ready_for_path` actually waits for server readiness.
+    #[tokio::test]
+    async fn test_wait_ready_for_path_waits() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
+        std::fs::write(&file, "")?;
+
+        let manager = LspClientManager::new(
+            mockls_config(),
+            test_logging(),
+            test_fs_with_roots(&[dir.path().to_str().expect("utf8")]),
+        );
+
+        let _ = ensure_first_server(&manager, MOCK_LANG_A).await?;
+
+        // wait_ready_for_path should not return until server is ready
+        manager.wait_ready_for_path(&file).await;
+
+        // After waiting, the server should be in Probing or Healthy state
+        let clients = manager.clients().await;
+        let (_, client) = clients.iter().next().expect("should have client");
+        let lifecycle = client.lock().await.lifecycle();
+        assert!(
+            lifecycle == crate::lsp::state::ServerLifecycle::Probing
+                || lifecycle == crate::lsp::state::ServerLifecycle::Healthy,
+            "server should be Probing or Healthy after wait_ready, got {lifecycle:?}"
+        );
+        Ok(())
+    }
+
+    /// `exclude_project_roots_from_workspace` skips non-workspace instances.
+    #[tokio::test]
+    async fn test_exclude_project_roots_skips_non_workspace() -> Result<()> {
+        // Legacy (non-workspace) servers should not get workspace folder
+        // removal notifications — exclude_project_roots_from_workspace
+        // returns early for non-Workspace scope.
+        let manager = LspClientManager::new(
+            mockls_config(),
+            test_logging(),
+            test_fs_with_roots(&["/tmp"]),
+        );
+
+        let client = ensure_first_server(&manager, MOCK_LANG_A).await?;
+        assert!(!client.lock().await.supports_workspace_folders());
+
+        let key = client.lock().await.server().key().expect("key");
+        let server_name = &key.server;
+        // This should be a no-op (returns early because scope is Root, not Workspace)
+        manager
+            .exclude_project_roots_from_workspace(
+                &client,
+                &key,
+                MOCK_LANG_A,
+                server_name,
+                &[PathBuf::from("/tmp")],
+            )
+            .await;
+
+        // Server should still be alive and unaffected
+        assert!(client.lock().await.is_alive());
+        Ok(())
+    }
+
+    /// `notify_workspace_servers_sync` notifies workspace-capable servers
+    /// about folder additions.
+    #[tokio::test]
+    async fn test_notify_workspace_servers_sends_adds() -> Result<()> {
+        let manager = LspClientManager::new(
+            mockls_workspace_folders_config(),
+            test_logging(),
+            test_fs_with_roots(&["/tmp"]),
+        );
+
+        let client = ensure_first_server(&manager, MOCK_LANG_A).await?;
+        assert!(client.lock().await.supports_workspace_folders());
+
+        // Add a new root — notification should succeed (no error)
+        manager
+            .notify_workspace_servers_sync(&[PathBuf::from("/var")], &[])
+            .await;
+
+        // Server is still alive after notification
+        assert!(
+            client.lock().await.is_alive(),
+            "server should be alive after workspace sync"
+        );
+        Ok(())
+    }
+
+    /// `notify_workspace_servers_sync` skips dead/non-workspace servers.
+    #[tokio::test]
+    async fn test_notify_workspace_servers_skips_legacy() -> Result<()> {
+        let manager = LspClientManager::new(
+            mockls_config(),
+            test_logging(),
+            test_fs_with_roots(&["/tmp"]),
+        );
+
+        let _ = ensure_first_server(&manager, MOCK_LANG_A).await?;
+
+        // Legacy server should not receive workspace folder notifications
+        // — this should be a no-op.
+        manager
+            .notify_workspace_servers_sync(&[PathBuf::from("/var")], &[])
+            .await;
+
+        // Server still alive
+        let clients = manager.clients().await;
+        assert!(!clients.is_empty());
+        Ok(())
+    }
+
+    /// `cleanup_root_settings_for_removed` skips non-workspace instances.
+    #[tokio::test]
+    async fn test_cleanup_root_settings_skips_legacy() -> Result<()> {
+        // Legacy (root-scoped) servers should NOT be processed by cleanup.
+        let manager = LspClientManager::new(
+            mockls_config(),
+            test_logging(),
+            test_fs_with_roots(&["/tmp"]),
+        );
+
+        let client = ensure_first_server(&manager, MOCK_LANG_A).await?;
+        let key = client.lock().await.server().key().expect("key");
+        assert!(matches!(key.scope, Scope::Root(_)));
+
+        // Empty list is a no-op, so use a non-empty list.
+        // With only legacy servers, this should skip all of them.
+        manager
+            .cleanup_root_settings_for_removed(&[PathBuf::from("/tmp")])
+            .await;
+
+        // Server unaffected
+        assert!(client.lock().await.is_alive());
+        Ok(())
+    }
 }
