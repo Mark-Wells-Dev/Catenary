@@ -1814,4 +1814,78 @@ message_default = "custom: {BUILD}"
         let (errors, _) = validate(&config);
         assert!(errors.is_empty(), "build group should be valid: {errors:?}");
     }
+
+    // ── GuidanceGroup::is_build tests ───────────────────────────────
+
+    #[test]
+    fn is_build_with_message_is_false() {
+        let g = GuidanceGroup {
+            message: Some("custom message".into()),
+            ..GuidanceGroup::default()
+        };
+        assert!(!g.is_build(), "group with 'message' is not build-style");
+    }
+
+    #[test]
+    fn is_build_with_message_default() {
+        let g = GuidanceGroup {
+            message_default: Some("default".into()),
+            ..GuidanceGroup::default()
+        };
+        assert!(g.is_build(), "message_default alone should be build-style");
+    }
+
+    #[test]
+    fn is_build_with_message_default_absent() {
+        let g = GuidanceGroup {
+            message_default_absent: Some("absent".into()),
+            ..GuidanceGroup::default()
+        };
+        assert!(g.is_build());
+    }
+
+    #[test]
+    fn is_build_with_message_noproject() {
+        let g = GuidanceGroup {
+            message_noproject: Some("no project".into()),
+            ..GuidanceGroup::default()
+        };
+        assert!(g.is_build());
+    }
+
+    #[test]
+    fn is_build_with_message_project() {
+        let g = GuidanceGroup {
+            message_project: Some("project".into()),
+            ..GuidanceGroup::default()
+        };
+        assert!(g.is_build());
+    }
+
+    #[test]
+    fn is_build_with_message_project_absent() {
+        let g = GuidanceGroup {
+            message_project_absent: Some("absent".into()),
+            ..GuidanceGroup::default()
+        };
+        assert!(g.is_build());
+    }
+
+    #[test]
+    fn is_build_with_message_cwd_unknown() {
+        let g = GuidanceGroup {
+            message_cwd_unknown: Some("unknown".into()),
+            ..GuidanceGroup::default()
+        };
+        assert!(g.is_build());
+    }
+
+    #[test]
+    fn is_build_empty_is_false() {
+        let g = GuidanceGroup::default();
+        assert!(
+            !g.is_build(),
+            "empty group with no fields is not build-style",
+        );
+    }
 }

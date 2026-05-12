@@ -2493,4 +2493,95 @@ servers = ["nonexistent"]
         }
         Ok(())
     }
+
+    // ── default_diagnostics_per_page tests ──────────────────────────
+
+    #[test]
+    fn diagnostics_per_page_default_is_50() {
+        assert_eq!(default_diagnostics_per_page(), 50);
+    }
+
+    // ── clamp_budgets tests ─────────────────────────────────────────
+
+    #[test]
+    fn clamp_budgets_leaves_valid_values() {
+        let mut tc = ToolsConfig {
+            grep: GrepConfig { budget: 4000 },
+            glob: GlobConfig { budget: 2000, ..GlobConfig::default() },
+            diagnostics_per_page: 50,
+        };
+        tc.clamp_budgets();
+        assert_eq!(tc.grep.budget, 4000);
+        assert_eq!(tc.glob.budget, 2000);
+        assert_eq!(tc.diagnostics_per_page, 50);
+    }
+
+    #[test]
+    fn clamp_budgets_raises_below_minimum() {
+        let mut tc = ToolsConfig {
+            grep: GrepConfig { budget: 500 },
+            glob: GlobConfig { budget: 100, ..GlobConfig::default() },
+            diagnostics_per_page: 0,
+        };
+        tc.clamp_budgets();
+        assert_eq!(tc.grep.budget, 2000, "grep budget should clamp to 2000");
+        assert_eq!(tc.glob.budget, 1000, "glob budget should clamp to 1000");
+        assert_eq!(tc.diagnostics_per_page, 1, "diagnostics should clamp to 1");
+    }
+
+    #[test]
+    fn clamp_budgets_at_exact_minimum_is_noop() {
+        let mut tc = ToolsConfig {
+            grep: GrepConfig { budget: 2000 },
+            glob: GlobConfig { budget: 1000, ..GlobConfig::default() },
+            diagnostics_per_page: 1,
+        };
+        tc.clamp_budgets();
+        assert_eq!(tc.grep.budget, 2000, "at minimum should stay");
+        assert_eq!(tc.glob.budget, 1000, "at minimum should stay");
+        assert_eq!(tc.diagnostics_per_page, 1, "at minimum should stay");
+    }
+
+    // ── DispatchMethod tests ────────────────────────────────────────
+
+    #[test]
+    fn dispatch_method_as_str_all_variants() {
+        use crate::config::language::DispatchMethod;
+        assert_eq!(DispatchMethod::References.as_str(), "textDocument/references");
+        assert_eq!(DispatchMethod::DocumentSymbol.as_str(), "textDocument/documentSymbol");
+        assert_eq!(DispatchMethod::Rename.as_str(), "textDocument/rename");
+        assert_eq!(DispatchMethod::Implementation.as_str(), "textDocument/implementation");
+        assert_eq!(DispatchMethod::CallHierarchy.as_str(), "textDocument/prepareCallHierarchy");
+        assert_eq!(DispatchMethod::TypeHierarchy.as_str(), "textDocument/prepareTypeHierarchy");
+    }
+
+    #[test]
+    fn dispatch_method_deserialize_all_variants() -> anyhow::Result<()> {
+        use crate::config::language::DispatchMethod;
+
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            method: DispatchMethod,
+        }
+
+        let methods = [
+            ("textDocument/references", DispatchMethod::References),
+            ("textDocument/documentSymbol", DispatchMethod::DocumentSymbol),
+            ("textDocument/rename", DispatchMethod::Rename),
+            ("textDocument/implementation", DispatchMethod::Implementation),
+            ("textDocument/prepareCallHierarchy", DispatchMethod::CallHierarchy),
+            ("textDocument/prepareTypeHierarchy", DispatchMethod::TypeHierarchy),
+        ];
+
+        for (input, expected) in methods {
+            let toml_str = format!("method = \"{input}\"");
+            let parsed: Wrapper = toml::from_str(&toml_str)?;
+            assert_eq!(
+                parsed.method.as_str(),
+                expected.as_str(),
+                "deserialize '{input}' should produce correct variant",
+            );
+        }
+        Ok(())
+    }
 }
