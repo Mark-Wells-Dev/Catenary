@@ -1741,19 +1741,15 @@ impl Sink for MatchSink<'_> {
         let Some(line_num) = mat
             .line_number()
             .and_then(|n| u32::try_from(n).ok())
-            .filter(|&n| n > 0)
         else {
             return Ok(true);
         };
 
         let line_bytes = mat.bytes();
 
-        // Extract each individual match from the line (--only-matching equivalent)
+        // Extract each individual match from the line (--only-matching equivalent).
         let mut at = 0;
-        while at < line_bytes.len() {
-            let Ok(Some(m)) = self.matcher.find_at(line_bytes, at) else {
-                break;
-            };
+        while let Ok(Some(m)) = self.matcher.find_at(line_bytes, at) {
             if m.start() == m.end() {
                 // Zero-width match — advance to avoid infinite loop
                 at = m.end() + 1;
@@ -2538,5 +2534,408 @@ mod tests {
             split_dir_file("handler.rs"),
             (String::new(), "handler.rs".to_string())
         );
+    }
+
+    // ─── is_token_delimiter ─────────────────────────────────────────────
+
+    #[test]
+    fn token_delimiter_whitespace_and_punctuation() {
+        for &b in b" \t\n\r()[]<>{},;:.=+-*/!?&|^~#@%\"'`" {
+            assert!(
+                is_token_delimiter(b),
+                "expected delimiter for {:?}",
+                b as char
+            );
+        }
+    }
+
+    #[test]
+    fn token_delimiter_identifier_chars_are_not_delimiters() {
+        for &b in b"aZ09_" {
+            assert!(
+                !is_token_delimiter(b),
+                "expected non-delimiter for {:?}",
+                b as char
+            );
+        }
+    }
+
+    // ─── expand_match_to_token ──────────────────────────────────────────
+
+    #[test]
+    fn expand_match_mid_token() {
+        let line = b"  hello_world  ";
+        let result = expand_match_to_token(line, 3, 8);
+        assert_eq!(result.as_deref(), Some("hello_world"));
+    }
+
+    #[test]
+    fn expand_match_at_line_start() {
+        let line = b"Config = value";
+        let result = expand_match_to_token(line, 0, 3); // "Con"
+        assert_eq!(result.as_deref(), Some("Config"));
+    }
+
+    #[test]
+    fn expand_match_at_line_end() {
+        let line = b"let x = Config";
+        let result = expand_match_to_token(line, 10, 14);
+        assert_eq!(result.as_deref(), Some("Config"));
+    }
+
+    #[test]
+    fn expand_match_full_token_between_delimiters() {
+        let line = b"(Config)";
+        let result = expand_match_to_token(line, 1, 7);
+        assert_eq!(result.as_deref(), Some("Config"));
+    }
+
+    #[test]
+    fn expand_match_entire_line_is_token() {
+        let line = b"Configuration";
+        let result = expand_match_to_token(line, 0, 6); // "Config" → "Configuration"
+        assert_eq!(result.as_deref(), Some("Configuration"));
+    }
+
+    #[test]
+    fn expand_match_delimiters_on_both_sides() {
+        let line = b"foo.bar.baz";
+        let result = expand_match_to_token(line, 4, 7); // "bar"
+        assert_eq!(result.as_deref(), Some("bar"));
+    }
+
+    // ─── extract_location_path ──────────────────────────────────────────
+
+    #[test]
+    fn extract_location_path_valid() {
+        let loc = serde_json::json!({
+            "uri": "file:///home/user/project/src/main.rs",
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 5}}
+        });
+        assert_eq!(
+            extract_location_path(&loc),
+            Some("/home/user/project/src/main.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_location_path_non_file_uri() {
+        let loc = serde_json::json!({"uri": "untitled:Untitled-1"});
+        assert_eq!(extract_location_path(&loc), None);
+    }
+
+    #[test]
+    fn extract_location_path_missing_uri() {
+        let loc = serde_json::json!({"range": {"start": {"line": 0}}});
+        assert_eq!(extract_location_path(&loc), None);
+    }
+
+    // ─── extract_start_line ─────────────────────────────────────────────
+
+    #[test]
+    fn extract_start_line_valid() {
+        let loc = serde_json::json!({
+            "range": {"start": {"line": 42, "character": 0}, "end": {"line": 50, "character": 0}}
+        });
+        assert_eq!(extract_start_line(&loc), Some(42));
+    }
+
+    #[test]
+    fn extract_start_line_zero() {
+        let loc = serde_json::json!({
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 5}}
+        });
+        assert_eq!(extract_start_line(&loc), Some(0));
+    }
+
+    #[test]
+    fn extract_start_line_missing_range() {
+        let loc = serde_json::json!({"uri": "file:///foo.rs"});
+        assert_eq!(extract_start_line(&loc), None);
+    }
+
+    // ─── extract_call_edge ──────────────────────────────────────────────
+
+    #[test]
+    fn extract_call_edge_full() {
+        let item = serde_json::json!({
+            "name": "my_function",
+            "kind": 12,
+            "detail": "MyModule",
+            "uri": "file:///project/src/lib.rs",
+            "range": {"start": {"line": 10, "character": 4}, "end": {"line": 20, "character": 1}}
+        });
+        let edge = extract_call_edge(&item).expect("should parse call edge");
+        assert_eq!(edge.name, "my_function");
+        assert_eq!(edge.kind, 12);
+        assert_eq!(edge.container.as_deref(), Some("MyModule"));
+        assert_eq!(edge.file, "/project/src/lib.rs");
+        assert_eq!(edge.line, 10);
+        assert!(!edge.deprecated);
+    }
+
+    #[test]
+    fn extract_call_edge_deprecated_tag() {
+        let item = serde_json::json!({
+            "name": "old_fn",
+            "kind": 12,
+            "uri": "file:///project/src/lib.rs",
+            "range": {"start": {"line": 5, "character": 0}, "end": {"line": 5, "character": 10}},
+            "tags": [1]
+        });
+        let edge = extract_call_edge(&item).expect("should parse");
+        assert!(edge.deprecated, "tag [1] marks deprecated");
+        assert_eq!(edge.container, None);
+    }
+
+    #[test]
+    fn extract_call_edge_non_deprecated_tags() {
+        let item = serde_json::json!({
+            "name": "fn_with_tags",
+            "kind": 6,
+            "uri": "file:///project/src/lib.rs",
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 5}},
+            "tags": [2, 3]
+        });
+        let edge = extract_call_edge(&item).expect("should parse");
+        assert!(!edge.deprecated, "tags [2,3] are not deprecated");
+    }
+
+    #[test]
+    fn extract_call_edge_missing_name() {
+        let item = serde_json::json!({
+            "kind": 12,
+            "uri": "file:///project/src/lib.rs",
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 5}}
+        });
+        assert!(extract_call_edge(&item).is_none());
+    }
+
+    // ─── extract_type_edge ──────────────────────────────────────────────
+
+    #[test]
+    fn extract_type_edge_full() {
+        let item = serde_json::json!({
+            "name": "MyTrait",
+            "kind": 11,
+            "detail": "my_crate",
+            "uri": "file:///project/src/traits.rs",
+            "range": {"start": {"line": 20, "character": 0}, "end": {"line": 30, "character": 1}}
+        });
+        let edge = extract_type_edge(&item).expect("should parse type edge");
+        assert_eq!(edge.name, "MyTrait");
+        assert_eq!(edge.kind, 11);
+        assert_eq!(edge.container.as_deref(), Some("my_crate"));
+        assert_eq!(edge.file, "/project/src/traits.rs");
+        assert_eq!(edge.line, 20);
+        assert!(!edge.deprecated);
+    }
+
+    #[test]
+    fn extract_type_edge_deprecated_tag() {
+        let item = serde_json::json!({
+            "name": "OldType",
+            "kind": 5,
+            "uri": "file:///project/src/types.rs",
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 5, "character": 1}},
+            "tags": [1]
+        });
+        let edge = extract_type_edge(&item).expect("should parse");
+        assert!(edge.deprecated, "tag [1] marks deprecated");
+    }
+
+    #[test]
+    fn extract_type_edge_non_deprecated_tags() {
+        let item = serde_json::json!({
+            "name": "TypeWithTags",
+            "kind": 5,
+            "uri": "file:///project/src/types.rs",
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 5}},
+            "tags": [2]
+        });
+        let edge = extract_type_edge(&item).expect("should parse");
+        assert!(!edge.deprecated, "tag [2] is not deprecated");
+    }
+
+    #[test]
+    fn extract_type_edge_missing_uri() {
+        let item = serde_json::json!({
+            "name": "Orphan",
+            "kind": 5,
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 5}}
+        });
+        assert!(extract_type_edge(&item).is_none());
+    }
+
+    // ─── CollectOnDrop ──────────────────────────────────────────────────
+
+    #[test]
+    fn collect_on_drop_pushes_non_empty() {
+        let collected = Arc::new(std::sync::Mutex::new(Vec::<ThreadMatches>::new()));
+        {
+            let mut state = CollectOnDrop {
+                local: ThreadMatches::default(),
+                collected: Arc::clone(&collected),
+            };
+            state
+                .local
+                .file_lines
+                .entry("test.rs".to_string())
+                .or_default()
+                .push(1);
+        }
+        let vec = collected.lock().expect("lock");
+        assert_eq!(vec.len(), 1, "non-empty local should be pushed on drop");
+        assert!(vec[0].file_lines.contains_key("test.rs"));
+        drop(vec);
+    }
+
+    #[test]
+    fn collect_on_drop_skips_empty() {
+        let collected = Arc::new(std::sync::Mutex::new(Vec::<ThreadMatches>::new()));
+        {
+            let _state = CollectOnDrop {
+                local: ThreadMatches::default(),
+                collected: Arc::clone(&collected),
+            };
+        }
+        let vec = collected.lock().expect("lock");
+        assert!(vec.is_empty(), "empty local should not be pushed");
+        drop(vec);
+    }
+
+    // ─── RipgrepMatches::merge ──────────────────────────────────────────
+
+    #[test]
+    fn merge_combines_thread_matches() {
+        let mut t1 = ThreadMatches::default();
+        t1.file_lines
+            .entry("a.rs".to_string())
+            .or_default()
+            .push(1);
+        t1.file_line_texts
+            .entry("a.rs".to_string())
+            .or_default()
+            .entry(1)
+            .or_default()
+            .push(("foo".to_string(), 0));
+
+        let mut t2 = ThreadMatches::default();
+        t2.file_lines
+            .entry("a.rs".to_string())
+            .or_default()
+            .push(5);
+        t2.file_lines
+            .entry("b.rs".to_string())
+            .or_default()
+            .push(10);
+
+        let merged = RipgrepMatches::merge(vec![t1, t2]);
+
+        let a_lines = &merged.file_lines["a.rs"];
+        assert!(a_lines.contains(&1), "a.rs should have line 1");
+        assert!(a_lines.contains(&5), "a.rs should have line 5");
+        let b_lines = &merged.file_lines["b.rs"];
+        assert!(b_lines.contains(&10), "b.rs should have line 10");
+        let a_texts = &merged.file_line_texts["a.rs"][&1];
+        assert_eq!(a_texts[0].0, "foo");
+    }
+
+    #[test]
+    fn merge_empty_parts_returns_empty() {
+        let merged = RipgrepMatches::merge(vec![]);
+        assert!(merged.file_lines.is_empty());
+        assert!(merged.file_line_texts.is_empty());
+    }
+
+    // ─── MatchSink::matched ─────────────────────────────────────────────
+
+    #[test]
+    fn match_sink_collects_hits_with_line_numbers() {
+        let matcher = RegexMatcherBuilder::new()
+            .case_insensitive(true)
+            .build("Config")
+            .expect("valid regex");
+        let mut local = ThreadMatches::default();
+        let content = b"let x = Config::new();\nother line\nConfig again\n";
+        {
+            let mut sink = MatchSink {
+                matcher: &matcher,
+                path: "test.rs",
+                local: &mut local,
+            };
+            Searcher::new()
+                .search_slice(&matcher, content, &mut sink)
+                .expect("search should succeed");
+        }
+
+        let lines = &local.file_lines["test.rs"];
+        assert!(lines.contains(&1), "line 1 should match: {lines:?}");
+        assert!(lines.contains(&3), "line 3 should match: {lines:?}");
+        assert!(!lines.contains(&2), "line 2 should not match: {lines:?}");
+
+        let texts = &local.file_line_texts["test.rs"];
+        let line1_texts = &texts[&1];
+        assert!(
+            line1_texts.iter().any(|(t, _)| t.contains("Config")),
+            "matched text should contain Config: {line1_texts:?}"
+        );
+    }
+
+    #[test]
+    fn match_sink_records_column_offset() {
+        let matcher = RegexMatcherBuilder::new()
+            .build("world")
+            .expect("valid regex");
+        let mut local = ThreadMatches::default();
+        let content = b"hello world\n";
+        {
+            let mut sink = MatchSink {
+                matcher: &matcher,
+                path: "test.rs",
+                local: &mut local,
+            };
+            Searcher::new()
+                .search_slice(&matcher, content, &mut sink)
+                .expect("search ok");
+        }
+        let texts = &local.file_line_texts["test.rs"][&1];
+        let (_, col) = &texts[0];
+        assert_eq!(*col, 6, "column offset should be 6, got {col}");
+    }
+
+    #[test]
+    fn match_sink_captures_real_match_after_zero_width() {
+        // Pattern `b?` matches empty string at offset 0 (zero-width),
+        // then "b" at offset 1 (real match). The zero-width advance
+        // (`at = m.end() + 1`) must skip past offset 0 so the real
+        // match at offset 1 is found.
+        let matcher = RegexMatcherBuilder::new()
+            .build("b?")
+            .expect("valid regex");
+        let mut local = ThreadMatches::default();
+        let content = b"abc\n";
+        {
+            let mut sink = MatchSink {
+                matcher: &matcher,
+                path: "test.rs",
+                local: &mut local,
+            };
+            Searcher::new()
+                .search_slice(&matcher, content, &mut sink)
+                .expect("search ok");
+        }
+        let texts = &local.file_line_texts["test.rs"][&1];
+        assert!(
+            texts.iter().any(|(t, _)| t.contains('b')),
+            "real match 'b' after zero-width should be captured: {texts:?}"
+        );
+    }
+
+    // ─── default_page ───────────────────────────────────────────────────
+
+    #[test]
+    fn default_page_is_one() {
+        assert_eq!(default_page(), 1);
     }
 }
