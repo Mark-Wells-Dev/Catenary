@@ -1061,4 +1061,293 @@ mod tests {
         assert_eq!(prepared["tool_input"]["file_path"], "/src/lib.rs");
         assert_eq!(prepared["tool_input"]["old_string"], "line1…");
     }
+
+    // ── format_deny tests ────────────────────────────────────────────
+
+    #[test]
+    fn format_deny_claude_structure() -> Result<()> {
+        let output = format_deny("command not allowed", HostFormat::Claude);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).context("should produce valid JSON")?;
+        assert_eq!(
+            parsed["hookSpecificOutput"]["permissionDecision"],
+            "deny",
+        );
+        assert_eq!(
+            parsed["hookSpecificOutput"]["permissionDecisionReason"],
+            "command not allowed",
+        );
+        assert_eq!(
+            parsed["hookSpecificOutput"]["hookEventName"],
+            "PreToolUse",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn format_deny_gemini_structure() -> Result<()> {
+        let output = format_deny("not on allowlist", HostFormat::Gemini);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).context("should produce valid JSON")?;
+        assert_eq!(parsed["decision"], "deny");
+        assert_eq!(parsed["reason"], "not on allowlist");
+        // Gemini format should NOT have hookSpecificOutput.hookEventName
+        assert!(parsed["hookSpecificOutput"].is_null());
+        Ok(())
+    }
+
+    // ── format_stop_block tests ──────────────────────────────────────
+
+    #[test]
+    fn format_stop_block_claude_structure() -> Result<()> {
+        let output = format_stop_block("files still in editing state", HostFormat::Claude);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).context("should produce valid JSON")?;
+        assert_eq!(parsed["decision"], "block");
+        assert_eq!(parsed["reason"], "files still in editing state");
+        Ok(())
+    }
+
+    #[test]
+    fn format_stop_block_gemini_structure() -> Result<()> {
+        let output = format_stop_block("editing not released", HostFormat::Gemini);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).context("should produce valid JSON")?;
+        assert_eq!(parsed["decision"], "retry");
+        assert_eq!(parsed["reason"], "editing not released");
+        Ok(())
+    }
+
+    // ── extract_file_path tests ──────────────────────────────────────
+
+    #[test]
+    fn extract_file_path_absolute() {
+        let json = serde_json::json!({
+            "tool_input": { "file_path": "/home/user/project/src/main.rs" }
+        });
+        assert_eq!(
+            extract_file_path(&json),
+            Some("/home/user/project/src/main.rs".to_string()),
+        );
+    }
+
+    #[test]
+    fn extract_file_path_file_key() {
+        let json = serde_json::json!({
+            "tool_input": { "file": "/tmp/test.py" }
+        });
+        assert_eq!(
+            extract_file_path(&json),
+            Some("/tmp/test.py".to_string()),
+        );
+    }
+
+    #[test]
+    fn extract_file_path_relative_with_cwd() {
+        let json = serde_json::json!({
+            "cwd": "/home/user/project",
+            "tool_input": { "file_path": "src/main.rs" }
+        });
+        let result = extract_file_path(&json).expect("should resolve relative path");
+        assert_eq!(result, "/home/user/project/src/main.rs");
+    }
+
+    #[test]
+    fn extract_file_path_missing_tool_input() {
+        let json = serde_json::json!({});
+        assert!(extract_file_path(&json).is_none());
+    }
+
+    #[test]
+    fn extract_file_path_missing_file_keys() {
+        let json = serde_json::json!({
+            "tool_input": { "command": "ls" }
+        });
+        assert!(extract_file_path(&json).is_none());
+    }
+
+    #[test]
+    fn extract_file_path_prefers_file_path_over_file() {
+        let json = serde_json::json!({
+            "tool_input": {
+                "file_path": "/preferred/path.rs",
+                "file": "/fallback/path.rs"
+            }
+        });
+        assert_eq!(
+            extract_file_path(&json),
+            Some("/preferred/path.rs".to_string()),
+        );
+    }
+
+    // ── notify_error tests ───────────────────────────────────────────
+
+    #[test]
+    fn notify_error_includes_message_and_bug_url() -> Result<()> {
+        let output = notify_error("socket connection failed", HostFormat::Claude);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).context("should produce valid JSON")?;
+        let sys_msg = parsed["systemMessage"]
+            .as_str()
+            .expect("systemMessage should be a string");
+        assert!(
+            sys_msg.contains("socket connection failed"),
+            "should contain the error message",
+        );
+        assert!(
+            sys_msg.contains(BUG_REPORT_URL),
+            "should contain the bug report URL",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn notify_error_gemini_format() -> Result<()> {
+        let output = notify_error("diagnostics skipped", HostFormat::Gemini);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).context("should produce valid JSON")?;
+        let sys_msg = parsed["systemMessage"]
+            .as_str()
+            .expect("systemMessage should be a string");
+        assert!(sys_msg.contains("diagnostics skipped"));
+        assert!(sys_msg.contains(BUG_REPORT_URL));
+        Ok(())
+    }
+
+    // ── ipc_exchange tests ───────────────────────────────────────────
+
+    /// Mock stream for testing `ipc_exchange` without real IPC.
+    struct MockStream {
+        read_buf: std::io::Cursor<Vec<u8>>,
+        write_buf: Vec<u8>,
+    }
+
+    impl MockStream {
+        fn new(response: &[u8]) -> Self {
+            Self {
+                read_buf: std::io::Cursor::new(response.to_vec()),
+                write_buf: Vec::new(),
+            }
+        }
+    }
+
+    impl std::io::Read for MockStream {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.read_buf.read(buf)
+        }
+    }
+
+    impl std::io::Write for MockStream {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.write_buf.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn ipc_exchange_reads_response_lines() {
+        let stream = MockStream::new(b"first response\nsecond response\n");
+        let request = serde_json::json!({"method": "test"});
+        let lines = ipc_exchange(stream, &request);
+        assert_eq!(lines, vec!["first response", "second response"]);
+    }
+
+    #[test]
+    fn ipc_exchange_stops_at_empty_line() {
+        let stream = MockStream::new(b"data line\n\nignored\n");
+        let request = serde_json::json!({"method": "test"});
+        let lines = ipc_exchange(stream, &request);
+        assert_eq!(lines, vec!["data line"]);
+    }
+
+    #[test]
+    fn ipc_exchange_empty_response_returns_empty_vec() {
+        let stream = MockStream::new(b"");
+        let request = serde_json::json!({"method": "test"});
+        let lines = ipc_exchange(stream, &request);
+        assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn ipc_exchange_writes_json_with_trailing_newline() {
+        let mut stream = MockStream::new(b"");
+        let request = serde_json::json!({"method": "test-req", "id": 1});
+        // Need to keep a reference to check writes, so use a raw pointer trick.
+        // Actually, let's just verify it doesn't panic — the write correctness
+        // is implicitly tested by the read tests (server receives valid JSON).
+        let _ = ipc_exchange(&mut stream, &request);
+        let written = String::from_utf8_lossy(&stream.write_buf);
+        assert!(written.contains("test-req"), "should write the request JSON");
+        assert!(written.ends_with('\n'), "should end with newline delimiter");
+    }
+
+    // ── find_project_config tests ────────────────────────────────────
+
+    #[test]
+    fn find_project_config_walks_up_to_parent() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let subdir = root.path().join("src").join("nested");
+        std::fs::create_dir_all(&subdir).expect("create subdirs");
+        std::fs::write(
+            root.path().join(".catenary.toml"),
+            "[language.rust]\nservers = [\"rust-analyzer\"]\n",
+        )
+        .expect("write config");
+
+        let result = find_project_config(&subdir);
+        let (found_root, config) = result.expect("should find config at parent");
+        assert_eq!(found_root, root.path());
+        assert!(
+            config.language.contains_key("rust"),
+            "should parse language config",
+        );
+    }
+
+    #[test]
+    fn find_project_config_returns_none_when_absent() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let subdir = root.path().join("deep").join("dir");
+        std::fs::create_dir_all(&subdir).expect("create subdirs");
+        // No .catenary.toml anywhere in the tree.
+        assert!(find_project_config(&subdir).is_none());
+    }
+
+    #[test]
+    fn find_project_config_finds_at_cwd() {
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            root.path().join(".catenary.toml"),
+            "[language.python]\nservers = [\"pyright\"]\n",
+        )
+        .expect("write config");
+
+        let result = find_project_config(root.path());
+        let (found_root, _config) = result.expect("should find config at cwd");
+        assert_eq!(found_root, root.path());
+    }
+
+    // ── notify_connect tests ─────────────────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn notify_connect_returns_stream_for_valid_socket() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock_path = dir.path().join("test.sock");
+        let _listener =
+            std::os::unix::net::UnixListener::bind(&sock_path).expect("bind listener");
+
+        let stream = notify_connect(&sock_path);
+        assert!(stream.is_some(), "should connect to a valid socket");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn notify_connect_returns_none_for_missing_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock_path = dir.path().join("nonexistent.sock");
+        assert!(notify_connect(&sock_path).is_none());
+    }
 }
