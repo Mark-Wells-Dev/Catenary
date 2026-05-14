@@ -1,0 +1,8 @@
+# cargo-mutants configuration
+# https://mutants.rs/mutants-toml.html
+
+# Terminal I/O that opens /dev/tty in raw mode. Mutations in the safety
+# guards (foreground process group check, timeout logic, raw mode restore)
+# can hang the process group via SIGTTIN or make the load-aware timeout
+# loop run forever.
+exclude_re = ["detect_terminal_bg"]

@@ -404,149 +404,274 @@ mod tests {
     #[test]
     fn test_theme_construction() {
         let theme = Theme::new();
-        // border_focused has no DIM modifier
         assert!(!theme.border_focused.add_modifier.contains(Modifier::DIM));
-        // border_unfocused has DIM modifier
         assert!(theme.border_unfocused.add_modifier.contains(Modifier::DIM));
     }
 
-    // ── HSL color math tests ─────────────────────────────────────────────
+    // ── rgb_to_hsl tests ────────────────────────────────────────────────
 
-    #[test]
-    fn test_rgb_to_hsl_black() {
-        let (h, s, l) = rgb_to_hsl(0, 0, 0);
-        assert!((h - 0.0).abs() < 0.01);
-        assert!((s - 0.0).abs() < 0.01);
-        assert!((l - 0.0).abs() < 0.01);
+    /// Assert HSL values within a tight tolerance (0.001).
+    fn assert_hsl(actual: (f64, f64, f64), expected: (f64, f64, f64), label: &str) {
+        let eps = 0.001;
+        assert!(
+            (actual.0 - expected.0).abs() < eps,
+            "{label}: hue {:.4} != {:.4}",
+            actual.0,
+            expected.0,
+        );
+        assert!(
+            (actual.1 - expected.1).abs() < eps,
+            "{label}: sat {:.4} != {:.4}",
+            actual.1,
+            expected.1,
+        );
+        assert!(
+            (actual.2 - expected.2).abs() < eps,
+            "{label}: light {:.4} != {:.4}",
+            actual.2,
+            expected.2,
+        );
     }
 
     #[test]
-    fn test_rgb_to_hsl_white() {
-        let (h, s, l) = rgb_to_hsl(255, 255, 255);
-        assert!((h - 0.0).abs() < 0.01);
-        assert!((s - 0.0).abs() < 0.01);
-        assert!((l - 1.0).abs() < 0.01);
+    fn test_rgb_to_hsl_achromatic() {
+        assert_hsl(rgb_to_hsl(0, 0, 0), (0.0, 0.0, 0.0), "black");
+        assert_hsl(rgb_to_hsl(255, 255, 255), (0.0, 0.0, 1.0), "white");
+        assert_hsl(
+            rgb_to_hsl(128, 128, 128),
+            (0.0, 0.0, 128.0 / 255.0),
+            "mid-gray",
+        );
     }
 
     #[test]
-    fn test_rgb_to_hsl_pure_red() {
-        let (h, s, l) = rgb_to_hsl(255, 0, 0);
-        assert!((h - 0.0).abs() < 0.01);
-        assert!((s - 1.0).abs() < 0.01);
-        assert!((l - 0.5).abs() < 0.01);
+    fn test_rgb_to_hsl_primaries() {
+        assert_hsl(rgb_to_hsl(255, 0, 0), (0.0, 1.0, 0.5), "red");
+        assert_hsl(rgb_to_hsl(0, 255, 0), (120.0, 1.0, 0.5), "green");
+        assert_hsl(rgb_to_hsl(0, 0, 255), (240.0, 1.0, 0.5), "blue");
     }
 
     #[test]
+    fn test_rgb_to_hsl_secondaries() {
+        assert_hsl(rgb_to_hsl(255, 255, 0), (60.0, 1.0, 0.5), "yellow");
+        assert_hsl(rgb_to_hsl(0, 255, 255), (180.0, 1.0, 0.5), "cyan");
+        // Magenta exercises negative hue correction: sector = -1, hue = -60 → 300.
+        assert_hsl(rgb_to_hsl(255, 0, 255), (300.0, 1.0, 0.5), "magenta");
+    }
+
+    #[test]
+    fn test_rgb_to_hsl_hue_sectors_non_unit_delta() {
+        // Colors where delta != 1.0 to exercise division arithmetic in
+        // each hue sector. With delta=1 the `/delta` is identity and
+        // mutations like `/ with *` or `/ with %` go undetected.
+        // Red-max: (200, 100, 50) → hue ≈ 20
+        let (h, s, l) = rgb_to_hsl(200, 100, 50);
+        assert!((h - 20.0).abs() < 0.5, "red-max hue: {h}");
+        assert!(s > 0.5, "red-max saturation: {s}");
+        assert!((l - 0.490).abs() < 0.01, "red-max lightness: {l}");
+
+        // Green-max: (50, 200, 100) → hue ≈ 140
+        let (h, s, l) = rgb_to_hsl(50, 200, 100);
+        assert!((h - 140.0).abs() < 0.5, "green-max hue: {h}");
+        assert!(s > 0.5, "green-max saturation: {s}");
+        assert!((l - 0.490).abs() < 0.01, "green-max lightness: {l}");
+
+        // Blue-max: (100, 50, 200) → hue ≈ 260
+        let (h, s, l) = rgb_to_hsl(100, 50, 200);
+        assert!((h - 260.0).abs() < 0.5, "blue-max hue: {h}");
+        assert!(s > 0.5, "blue-max saturation: {s}");
+        assert!((l - 0.490).abs() < 0.01, "blue-max lightness: {l}");
+    }
+
+    #[test]
+    fn test_rgb_to_hsl_light_gt_half() {
+        // Exercises the else saturation branch: delta / (2.0 - max - min).
+        let (h, s, l) = rgb_to_hsl(200, 100, 100);
+        assert!((h - 0.0).abs() < 0.5, "hue should be ~0 (reddish): {h}");
+        assert!((s - 0.476).abs() < 0.01, "saturation: {s}");
+        assert!((l - 0.588).abs() < 0.01, "lightness: {l}");
+    }
+
+    // ── hsl_to_rgb tests ────────────────────────────────────────────────
+
+    #[test]
+    fn test_hsl_to_rgb_achromatic() {
+        assert_eq!(hsl_to_rgb(0.0, 0.0, 0.0), (0, 0, 0), "black");
+        assert_eq!(hsl_to_rgb(0.0, 0.0, 1.0), (255, 255, 255), "white");
+        let (r, g, b) = hsl_to_rgb(0.0, 0.0, 0.5);
+        assert_eq!(r, g, "mid-gray r==g");
+        assert_eq!(g, b, "mid-gray g==b");
+        assert_eq!(r, 128, "mid-gray value");
+    }
+
+    #[test]
+    fn test_hsl_to_rgb_primaries() {
+        assert_eq!(hsl_to_rgb(0.0, 1.0, 0.5), (255, 0, 0), "red");
+        assert_eq!(hsl_to_rgb(120.0, 1.0, 0.5), (0, 255, 0), "green");
+        assert_eq!(hsl_to_rgb(240.0, 1.0, 0.5), (0, 0, 255), "blue");
+    }
+
+    #[test]
+    fn test_hsl_to_rgb_secondaries() {
+        assert_eq!(hsl_to_rgb(60.0, 1.0, 0.5), (255, 255, 0), "yellow");
+        assert_eq!(hsl_to_rgb(180.0, 1.0, 0.5), (0, 255, 255), "cyan");
+        assert_eq!(hsl_to_rgb(300.0, 1.0, 0.5), (255, 0, 255), "magenta");
+    }
+
+    // ── Roundtrip tests ─────────────────────────────────────────────────
+
+    /// Assert RGB roundtrip through HSL preserves values within ±1.
     #[allow(
         clippy::many_single_char_names,
-        reason = "r/g/b/h/s/l are standard color math notation"
+        reason = "r/g/b are standard color notation"
     )]
-    fn test_hsl_roundtrip_dark_gray() {
-        let (r, g, b) = (30u8, 30, 30);
+    fn assert_roundtrip(r: u8, g: u8, b: u8, label: &str) {
         let (h, s, l) = rgb_to_hsl(r, g, b);
         let (r2, g2, b2) = hsl_to_rgb(h, s, l);
-        assert!((i16::from(r) - i16::from(r2)).abs() <= 1);
-        assert!((i16::from(g) - i16::from(g2)).abs() <= 1);
-        assert!((i16::from(b) - i16::from(b2)).abs() <= 1);
+        assert!(
+            (i16::from(r) - i16::from(r2)).abs() <= 1
+                && (i16::from(g) - i16::from(g2)).abs() <= 1
+                && (i16::from(b) - i16::from(b2)).abs() <= 1,
+            "{label}: ({r},{g},{b}) → hsl({h:.2},{s:.4},{l:.4}) → ({r2},{g2},{b2})",
+        );
     }
 
     #[test]
-    #[allow(
-        clippy::many_single_char_names,
-        reason = "r/g/b/h/s/l are standard color math notation"
-    )]
-    fn test_hsl_roundtrip_color() {
-        // Teal-ish: rgb(50, 130, 180)
-        let (r, g, b) = (50u8, 130, 180);
-        let (h, s, l) = rgb_to_hsl(r, g, b);
-        let (r2, g2, b2) = hsl_to_rgb(h, s, l);
-        assert!((i16::from(r) - i16::from(r2)).abs() <= 1);
-        assert!((i16::from(g) - i16::from(g2)).abs() <= 1);
-        assert!((i16::from(b) - i16::from(b2)).abs() <= 1);
+    fn test_hsl_roundtrip_achromatic() {
+        assert_roundtrip(30, 30, 30, "dark gray");
+        assert_roundtrip(192, 192, 192, "light gray");
     }
+
+    #[test]
+    fn test_hsl_roundtrip_light_lt_half() {
+        // Teal: light ≈ 0.45, exercises falling branch for G channel.
+        assert_roundtrip(50, 130, 180, "teal");
+        // Warm brown: light ≈ 0.49, exercises rising branch for G with
+        // non-zero p_val (tc ≈ 0.056 in [0, 1/6)).
+        assert_roundtrip(153, 85, 51, "warm brown");
+    }
+
+    #[test]
+    fn test_hsl_roundtrip_light_gt_half() {
+        // Exercises the else q_val branch: light.mul_add(-sat, light + sat).
+        assert_roundtrip(200, 100, 100, "light red");
+        assert_roundtrip(100, 200, 150, "light green");
+        assert_roundtrip(100, 100, 200, "light blue");
+    }
+
+    #[test]
+    fn test_hsl_roundtrip_non_unit_delta() {
+        // All three hue sectors with delta != 1, non-zero p_val.
+        assert_roundtrip(200, 100, 50, "orange (red-max)");
+        assert_roundtrip(50, 200, 100, "green-teal (green-max)");
+        assert_roundtrip(100, 50, 200, "violet (blue-max)");
+    }
+
+    #[test]
+    fn test_hsl_roundtrip_negative_hue() {
+        // Magenta needs the hue < 0 → hue + 360 correction.
+        assert_roundtrip(255, 0, 255, "magenta");
+        assert_roundtrip(200, 50, 180, "pink-magenta");
+    }
+
+    // ── selection_bg tests ──────────────────────────────────────────────
 
     #[test]
     fn test_selection_bg_dark_background_lightens() {
-        // Typical dark terminal: rgb(26, 26, 26), L ≈ 0.10
+        // Achromatic dark: rgb(26,26,26) → L≈0.102, shifted to L≈0.302.
         let Color::Rgb(r, g, b) = selection_bg_from_terminal(26, 26, 26) else {
             unreachable!("selection_bg_from_terminal always returns Color::Rgb");
         };
-        // Should be noticeably lighter.
-        assert!(r > 26, "red channel should increase: {r}");
-        assert!(g > 26, "green channel should increase: {g}");
-        assert!(b > 26, "blue channel should increase: {b}");
+        assert_eq!((r, g, b), (77, 77, 77), "dark achromatic shift");
     }
 
     #[test]
     fn test_selection_bg_light_background_darkens() {
-        // Light terminal: rgb(240, 240, 240), L ≈ 0.94
+        // Achromatic light: rgb(240,240,240) → L≈0.941, shifted to L≈0.741.
         let Color::Rgb(r, g, b) = selection_bg_from_terminal(240, 240, 240) else {
             unreachable!("selection_bg_from_terminal always returns Color::Rgb");
         };
-        // Should be noticeably darker.
-        assert!(r < 240, "red channel should decrease: {r}");
-        assert!(g < 240, "green channel should decrease: {g}");
-        assert!(b < 240, "blue channel should decrease: {b}");
+        assert_eq!((r, g, b), (189, 189, 189), "light achromatic shift");
     }
 
     #[test]
     fn test_selection_bg_preserves_hue() {
-        // Blueish dark bg: rgb(20, 20, 40)
+        // Blueish dark: rgb(20,20,40) → hue=240, dark → lightens.
         let Color::Rgb(r, g, b) = selection_bg_from_terminal(20, 20, 40) else {
             unreachable!("selection_bg_from_terminal always returns Color::Rgb");
         };
-        // Blue channel should still be the dominant one.
-        assert!(b >= r, "blue should still dominate: r={r} b={b}");
-        assert!(b >= g, "blue should still dominate: g={g} b={b}");
+        assert!(b > r, "blue should dominate: r={r} g={g} b={b}");
+        assert!(b > g, "blue should dominate: r={r} g={g} b={b}");
+        assert_eq!((r, g, b), (54, 54, 108), "blueish dark shift");
+    }
+
+    #[test]
+    fn test_selection_bg_clamps_lightness() {
+        // Near-black: L≈0, shift +0.2 stays in [0,1].
+        let Color::Rgb(r, g, b) = selection_bg_from_terminal(0, 0, 0) else {
+            unreachable!("selection_bg_from_terminal always returns Color::Rgb");
+        };
+        assert_eq!((r, g, b), (51, 51, 51), "black shifted to L=0.2");
+
+        // Near-white: L≈1, shift −0.2 stays in [0,1].
+        let Color::Rgb(r, g, b) = selection_bg_from_terminal(255, 255, 255) else {
+            unreachable!("selection_bg_from_terminal always returns Color::Rgb");
+        };
+        assert_eq!((r, g, b), (204, 204, 204), "white shifted to L=0.8");
     }
 
     // ── OSC parsing tests ────────────────────────────────────────────────
 
     #[test]
     fn test_parse_osc11_response_4digit() {
-        // Typical response: ESC ] 11 ; rgb:1a1a/1a1a/1a1a BEL
         let response = b"\x1b]11;rgb:1a1a/1a1a/1a1a\x07";
-        let result = parse_osc11_response(response);
-        assert_eq!(result, Some((0x1a, 0x1a, 0x1a)));
+        assert_eq!(parse_osc11_response(response), Some((0x1a, 0x1a, 0x1a)));
     }
 
     #[test]
     fn test_parse_osc11_response_2digit() {
         let response = b"\x1b]11;rgb:1a/1a/1a\x07";
-        let result = parse_osc11_response(response);
-        assert_eq!(result, Some((0x1a, 0x1a, 0x1a)));
+        assert_eq!(parse_osc11_response(response), Some((0x1a, 0x1a, 0x1a)));
     }
 
     #[test]
     fn test_parse_osc11_response_st_terminator() {
-        // ST terminator: ESC \
         let response = b"\x1b]11;rgb:ffff/0000/8080\x1b\\";
-        let result = parse_osc11_response(response);
-        assert_eq!(result, Some((0xff, 0x00, 0x80)));
+        assert_eq!(parse_osc11_response(response), Some((0xff, 0x00, 0x80)));
     }
 
     #[test]
     fn test_parse_osc11_garbage() {
-        let response = b"not a valid response";
-        assert!(parse_osc11_response(response).is_none());
+        assert!(parse_osc11_response(b"not a valid response").is_none());
     }
 
     #[test]
-    fn test_parse_osc_channel_variants() {
+    fn test_parse_osc_channel_all_lengths() {
+        // 1-digit: scale ×17
+        assert_eq!(parse_osc_channel("0"), Some(0x00));
+        assert_eq!(parse_osc_channel("f"), Some(0xff));
+        assert_eq!(parse_osc_channel("8"), Some(0x88));
+        // 2-digit: use directly
         assert_eq!(parse_osc_channel("ff"), Some(0xff));
+        assert_eq!(parse_osc_channel("00"), Some(0x00));
+        assert_eq!(parse_osc_channel("80"), Some(0x80));
+        // 3-digit: shift >>4 (high 8 bits of 12-bit value)
+        assert_eq!(parse_osc_channel("1a1"), Some(0x1a));
+        assert_eq!(parse_osc_channel("fff"), Some(0xff));
+        assert_eq!(parse_osc_channel("000"), Some(0x00));
+        // 4-digit: shift >>8 (high byte of 16-bit value)
         assert_eq!(parse_osc_channel("ffff"), Some(0xff));
         assert_eq!(parse_osc_channel("0000"), Some(0x00));
         assert_eq!(parse_osc_channel("8080"), Some(0x80));
-        assert_eq!(parse_osc_channel("f"), Some(0xff));
-        assert_eq!(parse_osc_channel("0"), Some(0x00));
+        // 0 and 5+ digits: None
+        assert_eq!(parse_osc_channel(""), None);
+        assert_eq!(parse_osc_channel("12345"), None);
     }
 
     #[test]
     fn test_theme_detect_fallback() {
-        // Theme::detect() should not panic even if the terminal doesn't
-        // support OSC 11 (e.g., in CI). It falls back to Theme::new().
+        // In CI, detect_terminal_bg() returns None → falls back to Theme::new().
         let theme = Theme::detect();
-        // Selection style should be set (either Rgb bg or REVERSED fallback).
         let _ = theme.selection;
     }
 }
