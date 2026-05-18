@@ -85,15 +85,12 @@ impl BridgeProcess {
         })
     }
 
-    /// Spawns with `CATENARY_SERVERS`, a single workspace root, and the
-    /// mock grammar pre-installed before the bridge starts. This avoids
-    /// the race between `TsIndex::build()` and post-spawn grammar
-    /// installation — the grammar is guaranteed to be available when the
-    /// tree-sitter index is built during startup.
-    pub fn spawn_with_grammar(
+    /// Spawns with `CATENARY_SERVERS`, a single workspace root, and a
+    /// pre-start setup callback for state directory initialization.
+    pub fn spawn_with_pre_start(
         lsp_commands: &[&str],
         root: &str,
-        grammar_setup: impl FnOnce(&str) -> Result<()>,
+        pre_start: impl FnOnce(&str) -> Result<()>,
     ) -> Result<Self> {
         Self::spawn_with_setup(
             |cmd| {
@@ -102,7 +99,7 @@ impl BridgeProcess {
                 }
                 cmd.env("CATENARY_ROOTS", root);
             },
-            grammar_setup,
+            pre_start,
         )
     }
 

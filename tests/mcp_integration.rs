@@ -591,18 +591,6 @@ fn test_no_roots_request_without_capability() -> Result<()> {
 // These tests use mockls instead of real language servers, so they always
 // run regardless of installed toolchains.
 
-/// No-op: grammar installation removed. Symbols come from
-/// `documentSymbol` via mockls. Kept as a callback for
-/// `spawn_with_grammar` compatibility.
-#[allow(
-    clippy::unnecessary_wraps,
-    clippy::missing_const_for_fn,
-    reason = "callback signature requires Result"
-)]
-fn install_mock_grammar(_state_home: &str) -> Result<()> {
-    Ok(())
-}
-
 #[test]
 #[allow(
     clippy::too_many_lines,
@@ -1394,7 +1382,7 @@ fn test_grep_enrichment_threshold_broad() -> Result<()> {
         )?;
         Ok(config_path)
     })?;
-    install_mock_grammar(bridge.state_home())?;
+
     bridge.initialize()?;
 
     bridge.send(&json!({
@@ -1875,20 +1863,20 @@ fn test_grep_enrichment_subtypes() -> Result<()> {
     Ok(())
 }
 
-/// Tree-sitter index finds methods inside impl blocks with correct kind
+/// Symbol index finds methods inside impl blocks with correct kind
 /// and enclosing scope. No bootstrap or workspace/symbol needed.
 #[test]
-fn test_ts_index_finds_methods() -> Result<()> {
+fn test_symbol_index_finds_methods() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
-    // Struct with a method inside it — tree-sitter should find the method
-    // with kind "method" and the enclosing struct name as scope.
+    // Struct with a method inside it — documentSymbol should find the
+    // method with kind "method" and the enclosing struct name as scope.
     let file = dir.path().join(format!("widget.{MOCK_LANG_A}"));
     std::fs::write(&file, "struct Widget {\nfn widget_method\n}\n")?;
 
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
-    let mut bridge = BridgeProcess::spawn_with_grammar(&[&lsp], root, install_mock_grammar)?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
     bridge.send(&json!({
@@ -1933,7 +1921,7 @@ fn test_ts_index_finds_methods() -> Result<()> {
 // ─── SEARCHv2 grep pipeline tests (ticket 06a) ─────────────────────────
 
 /// Pattern matching a known symbol — no grammar installed, so the
-/// no-grammar path (prepareRename) identifies symbols.
+/// prepareRename path (no symbol index data) (prepareRename) identifies symbols.
 #[test]
 fn test_grep_basic_hits() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -2211,7 +2199,7 @@ fn test_grep_kind_brackets() -> Result<()> {
     std::fs::write(&file, "fn my_func\nstruct MyStruct\n")?;
 
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
-    let mut bridge = BridgeProcess::spawn_with_grammar(&[&lsp], root, install_mock_grammar)?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
     bridge.send(&json!({
@@ -2259,7 +2247,7 @@ fn test_grep_reference_enclosing() -> Result<()> {
     std::fs::write(&file, "fn outer {\ntarget\n}\n")?;
 
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
-    let mut bridge = BridgeProcess::spawn_with_grammar(&[&lsp], root, install_mock_grammar)?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
     bridge.send(&json!({
@@ -2407,7 +2395,7 @@ fn test_grep_name_grouping() -> Result<()> {
     std::fs::write(&file_b, "fn test_beta {\ntest_alpha\n}\n")?;
 
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
-    let mut bridge = BridgeProcess::spawn_with_grammar(&[&lsp], root, install_mock_grammar)?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
     bridge.send(&json!({
@@ -2447,9 +2435,9 @@ fn test_grep_name_grouping() -> Result<()> {
     Ok(())
 }
 
-/// No-grammar file: bare hit lines without enclosing structures.
+/// Basic grep: definition and reference lines with line numbers.
 #[test]
-fn test_grep_no_grammar() -> Result<()> {
+fn test_grep_basic_output() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let file = dir.path().join(format!("data.{MOCK_LANG_A}"));
     std::fs::write(&file, "fn say_hello()\nsay_hello\n")?;
@@ -2474,7 +2462,7 @@ fn test_grep_no_grammar() -> Result<()> {
         .as_str()
         .context("Missing text")?;
 
-    // No-grammar files still produce output (via prepareRename)
+    // Symbol appears in output with line numbers
     assert!(
         text.contains("say_hello"),
         "Expected symbol in output, got:\n{text}"
@@ -2498,7 +2486,7 @@ fn test_grep_narrow_pattern() -> Result<()> {
     std::fs::write(&file, "fn unique_symbol_xyz\n")?;
 
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
-    let mut bridge = BridgeProcess::spawn_with_grammar(&[&lsp], root, install_mock_grammar)?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
     bridge.send(&json!({
@@ -2540,7 +2528,7 @@ fn test_grep_single_line_structure() -> Result<()> {
     std::fs::write(&file, "fn one_liner\n")?;
 
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
-    let mut bridge = BridgeProcess::spawn_with_grammar(&[&lsp], root, install_mock_grammar)?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
     bridge.send(&json!({
@@ -2581,7 +2569,7 @@ fn test_grep_no_blank_lines() -> Result<()> {
     std::fs::write(&file, "fn alpha_one\nfn beta_two\n")?;
 
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
-    let mut bridge = BridgeProcess::spawn_with_grammar(&[&lsp], root, install_mock_grammar)?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
     bridge.send(&json!({
@@ -2625,7 +2613,7 @@ fn test_grep_no_blank_lines() -> Result<()> {
 ///
 /// Uses two mockls servers for the same language. Server A has
 /// `--fail-on textDocument/prepareRename`; server B works normally.
-/// No grammar installed, so the no-grammar path exercises
+/// No grammar installed, so the prepareRename path (no symbol index data) exercises
 /// `prepare_rename_check` priority chain fallthrough.
 #[test]
 fn test_grep_prepare_rename_priority_chain() -> Result<()> {
@@ -2681,7 +2669,7 @@ fn test_grep_prepare_rename_priority_chain() -> Result<()> {
 // ─── SEARCHv2 enrichment tests (ticket 07a) ───────────────────────────
 
 /// Enrich a function: `outgoing_calls` and `ref_lines` are populated.
-/// Uses the no-grammar path (mockls, no tree-sitter grammar installed).
+/// Uses the prepareRename path (no symbol index data) (mockls, no tree-sitter grammar installed).
 /// Enrichment runs via the pipeline.
 #[test]
 fn test_enrich_ungated_function() -> Result<()> {
@@ -2726,7 +2714,7 @@ fn test_enrich_ungated_function() -> Result<()> {
 }
 
 /// Enrich a type: implementations, supertypes, subtypes are populated.
-/// Uses the no-grammar path.
+/// Uses the prepareRename path (no symbol index data).
 #[test]
 fn test_enrich_ungated_type() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -2770,11 +2758,11 @@ fn test_enrich_ungated_type() -> Result<()> {
     Ok(())
 }
 
-/// Symbol-identified enrichment: `documentSymbol`-identified symbol
-/// skips `prepareRename`. Uses matching extension so the server can
-/// provide `documentSymbol` data.
+/// Symbol index path: `documentSymbol`-identified symbol skips
+/// `prepareRename`. mockls provides `documentSymbol` data for files
+/// with recognized declaration keywords.
 #[test]
-fn test_enrich_from_ts_true() -> Result<()> {
+fn test_enrich_symbol_index_path() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
@@ -2783,7 +2771,7 @@ fn test_enrich_from_ts_true() -> Result<()> {
     std::fs::write(&file, "fn my_symbol\n")?;
 
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
-    let mut bridge = BridgeProcess::spawn_with_grammar(&[&lsp], root, install_mock_grammar)?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
     bridge.send(&json!({
@@ -2800,13 +2788,13 @@ fn test_enrich_from_ts_true() -> Result<()> {
     let result = &response["result"];
     assert!(
         result["isError"].is_null() || result["isError"] == false,
-        "enrich from_ts=true should succeed: {response:?}"
+        "enrich symbol index path should succeed: {response:?}"
     );
     let text = result["content"][0]["text"]
         .as_str()
         .context("Missing text")?;
 
-    // documentSymbol identified the symbol — enrichment runs without prepareRename
+    // Symbol index identified the symbol — enrichment runs without prepareRename
     assert!(
         text.contains("my_symbol"),
         "Expected my_symbol in output, got:\n{text}"
@@ -2819,10 +2807,10 @@ fn test_enrich_from_ts_true() -> Result<()> {
     Ok(())
 }
 
-/// `from_ts=false` on a symbol: prepareRename returns range, enrichment proceeds.
-/// No grammar installed, so the no-grammar path exercises prepareRename.
+/// `prepareRename` path on a symbol: file has `documentSymbol` definitions,
+/// so the symbol index classifies the hit. Enrichment proceeds.
 #[test]
-fn test_enrich_from_ts_false_symbol() -> Result<()> {
+fn test_enrich_prepare_rename_symbol() -> Result<()> {
     let dir = tempfile::tempdir()?;
 
     let file = dir.path().join(format!("sym.{MOCK_LANG_A}"));
@@ -2847,7 +2835,7 @@ fn test_enrich_from_ts_false_symbol() -> Result<()> {
     let result = &response["result"];
     assert!(
         result["isError"].is_null() || result["isError"] == false,
-        "enrich from_ts=false symbol should succeed: {response:?}"
+        "enrich prepare_rename symbol should succeed: {response:?}"
     );
     let text = result["content"][0]["text"]
         .as_str()
@@ -2862,7 +2850,7 @@ fn test_enrich_from_ts_false_symbol() -> Result<()> {
     // references, so impls section may absorb refs via dedup).
     assert!(
         text.contains("impls:") || text.contains("refs:"),
-        "Expected enrichment section from no-grammar path, got:\n{text}"
+        "Expected enrichment section, got:\n{text}"
     );
 
     Ok(())
@@ -2873,7 +2861,7 @@ fn test_enrich_from_ts_false_symbol() -> Result<()> {
 /// is classified as a symbol definition (the line has a symbol), so
 /// the symbol appears in output rather than being filtered.
 #[test]
-fn test_enrich_from_ts_false_keyword() -> Result<()> {
+fn test_enrich_prepare_rename_keyword() -> Result<()> {
     let dir = tempfile::tempdir()?;
 
     // File with a function definition — `documentSymbol` will report
@@ -2912,7 +2900,7 @@ fn test_enrich_from_ts_false_keyword() -> Result<()> {
     Ok(())
 }
 
-/// Keyword-only matches filtered on no-grammar path.
+/// Keyword-only matches filtered on prepareRename path (no symbol index data).
 /// When the symbol index has no data for a file (no `documentSymbol`
 /// definitions), hits go through `prepare_rename_check`. mockls returns
 /// null for declaration keywords (`fn`, `struct`, etc.), which
@@ -2923,7 +2911,7 @@ fn test_keyword_filtered_no_grammar() -> Result<()> {
 
     // File with no declaration-keyword-at-line-start patterns, so
     // mockls's `documentSymbol` returns empty → symbol index has no
-    // data for this file → no-grammar path → `prepare_rename_check`.
+    // data for this file → prepareRename path (no symbol index data) → `prepare_rename_check`.
     // The `fn` keyword appears mid-line, not as a definition.
     let file = dir.path().join(format!("kw_filter.{MOCK_LANG_A}"));
     std::fs::write(&file, "just some fn keyword\nanother fn here\n")?;
@@ -3075,7 +3063,7 @@ fn test_grep_grammar_path_calls() -> Result<()> {
     std::fs::write(&file, "fn helper_gp\nfn main_gp {\nhelper_gp\n}\n")?;
 
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
-    let mut bridge = BridgeProcess::spawn_with_grammar(&[&lsp], root, install_mock_grammar)?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
     bridge.send(&json!({
@@ -3093,7 +3081,7 @@ fn test_grep_grammar_path_calls() -> Result<()> {
         .as_str()
         .context("Missing text")?;
 
-    // Grammar path: tree-sitter kind label present
+    // Symbol index: kind label present
     assert!(
         text.contains("<Function> main_gp"),
         "Expected <Function> main_gp, got:\n{text}"
@@ -3123,7 +3111,7 @@ fn test_grep_enriched() -> Result<()> {
     std::fs::write(&file, "fn callee_t1\nfn caller_t1 {\ncallee_t1\n}\n")?;
 
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
-    let mut bridge = BridgeProcess::spawn_with_grammar(&[&lsp], root, install_mock_grammar)?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
     bridge.send(&json!({
@@ -3154,7 +3142,7 @@ fn test_grep_enriched() -> Result<()> {
         text.contains("caller_t1"),
         "Expected caller_t1 name group, got:\n{text}"
     );
-    // Grammar path: tree-sitter kind label
+    // Symbol index: kind label
     assert!(
         text.contains("<Function>"),
         "Expected <Function> kind label, got:\n{text}"
@@ -3186,7 +3174,7 @@ fn test_grep_enrichment_cache_hit() -> Result<()> {
     )?;
 
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
-    let mut bridge = BridgeProcess::spawn_with_grammar(&[&lsp], root, install_mock_grammar)?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
     // First grep — populates cache.
@@ -3228,7 +3216,7 @@ fn test_grep_enrichment_cache_skip_out_of_root() -> Result<()> {
     std::fs::write(&oor_file, "fn callee_oor\nfn caller_oor {\ncallee_oor\n}\n")?;
 
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
-    let mut bridge = BridgeProcess::spawn_with_grammar(&[&lsp], root, install_mock_grammar)?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
     // Grep with absolute glob targeting the out-of-root directory.
@@ -3272,7 +3260,7 @@ fn test_grep_type_hierarchy() -> Result<()> {
     )?;
 
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
-    let mut bridge = BridgeProcess::spawn_with_grammar(&[&lsp], root, install_mock_grammar)?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
     bridge.send(&json!({
@@ -3294,7 +3282,7 @@ fn test_grep_type_hierarchy() -> Result<()> {
         text.contains("Vehicle_t1"),
         "Expected Vehicle_t1 in output, got:\n{text}"
     );
-    // Grammar path: tree-sitter kind label
+    // Symbol index: kind label
     assert!(
         text.contains("<Struct>"),
         "Expected <Struct> kind label, got:\n{text}"
@@ -3324,7 +3312,7 @@ fn test_grep_path_syntax() -> Result<()> {
     std::fs::write(&file, "struct Container_ps {\nfn inner_ps\n}\n")?;
 
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
-    let mut bridge = BridgeProcess::spawn_with_grammar(&[&lsp], root, install_mock_grammar)?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
     bridge.send(&json!({
@@ -3371,7 +3359,7 @@ fn test_grep_refs_sort() -> Result<()> {
     )?;
 
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
-    let mut bridge = BridgeProcess::spawn_with_grammar(&[&lsp], root, install_mock_grammar)?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
     bridge.send(&json!({
@@ -3418,7 +3406,7 @@ fn test_grep_outgoing_calls_sorted() -> Result<()> {
     )?;
 
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
-    let mut bridge = BridgeProcess::spawn_with_grammar(&[&lsp], root, install_mock_grammar)?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
     bridge.send(&json!({
@@ -3436,7 +3424,7 @@ fn test_grep_outgoing_calls_sorted() -> Result<()> {
         .as_str()
         .context("Missing text")?;
 
-    // Grammar path: tree-sitter kind label
+    // Symbol index: kind label
     assert!(
         text.contains("<Function>"),
         "Expected <Function> kind label, got:\n{text}"
@@ -3478,7 +3466,7 @@ fn test_grep_deprecated() -> Result<()> {
     )?;
 
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
-    let mut bridge = BridgeProcess::spawn_with_grammar(&[&lsp], root, install_mock_grammar)?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
     bridge.send(&json!({
@@ -3496,7 +3484,7 @@ fn test_grep_deprecated() -> Result<()> {
         .as_str()
         .context("Missing text")?;
 
-    // Grammar path: tree-sitter kind label
+    // Symbol index: kind label
     assert!(
         text.contains("<Struct>"),
         "Expected <Struct> kind label in output, got:\n{text}"
@@ -3533,7 +3521,7 @@ fn test_grep_paged_integration() -> Result<()> {
         )?;
         Ok(config_path)
     })?;
-    install_mock_grammar(bridge.state_home())?;
+
     bridge.initialize()?;
 
     bridge.send(&json!({
@@ -3608,7 +3596,7 @@ fn test_grep_fish_eye() -> Result<()> {
     )?;
 
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
-    let mut bridge = BridgeProcess::spawn_with_grammar(&[&lsp], root, install_mock_grammar)?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
     bridge.send(&json!({
@@ -3626,7 +3614,7 @@ fn test_grep_fish_eye() -> Result<()> {
         .as_str()
         .context("Missing text")?;
 
-    // Grammar path: tree-sitter kind labels on both rich and lean symbols
+    // Symbol index: kind labels on both rich and lean symbols
     assert!(
         text.contains("<Function>"),
         "Expected <Function> kind labels, got:\n{text}"
@@ -3662,7 +3650,7 @@ fn test_grep_property_order() -> Result<()> {
     )?;
 
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
-    let mut bridge = BridgeProcess::spawn_with_grammar(&[&lsp], root, install_mock_grammar)?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
     bridge.send(&json!({
@@ -3703,7 +3691,7 @@ fn test_grep_enriched_name_grouping() -> Result<()> {
     std::fs::write(&file, "fn grouped_sym\n")?;
 
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
-    let mut bridge = BridgeProcess::spawn_with_grammar(&[&lsp], root, install_mock_grammar)?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
     bridge.send(&json!({
@@ -3755,7 +3743,7 @@ fn test_grep_cross_def_dedup() -> Result<()> {
     std::fs::write(&file, "struct Dedup_t1\nDedup_t1\n")?;
 
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
-    let mut bridge = BridgeProcess::spawn_with_grammar(&[&lsp], root, install_mock_grammar)?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
     bridge.send(&json!({
@@ -3790,7 +3778,7 @@ fn test_grep_cross_def_dedup() -> Result<()> {
 }
 
 /// Refs dedup: impl lines excluded from `refs:` when in `impls:`.
-/// Uses no-grammar path so mockls has all documents open for enrichment.
+/// Uses prepareRename path (no symbol index data) so mockls has all documents open for enrichment.
 #[test]
 fn test_grep_refs_dedup_labeled() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -3851,7 +3839,7 @@ fn test_grep_refs_dedup_labeled() -> Result<()> {
 }
 
 /// Incoming calls merge: callers appear in `refs:`, not a separate section.
-/// Uses no-grammar path for reliable enrichment.
+/// Uses prepareRename path (no symbol index data) for reliable enrichment.
 #[test]
 fn test_grep_incoming_calls_merge() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -3895,7 +3883,7 @@ fn test_grep_incoming_calls_merge() -> Result<()> {
 }
 
 /// Impls structure: `impls:` has file-grouped entries with tree-sitter spans.
-/// Uses no-grammar path for reliable enrichment.
+/// Uses prepareRename path (no symbol index data) for reliable enrichment.
 #[test]
 fn test_grep_impls_structure() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -3953,7 +3941,7 @@ fn test_grep_single_line_ref() -> Result<()> {
     std::fs::write(&file, "fn target_sl\nfn user_sl\ntarget_sl\n")?;
 
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
-    let mut bridge = BridgeProcess::spawn_with_grammar(&[&lsp], root, install_mock_grammar)?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
     bridge.send(&json!({

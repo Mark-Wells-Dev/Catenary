@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
-//! Grep tool: ripgrep + tree-sitter index pipeline with LSP enrichment.
+//! Grep tool: ripgrep + symbol index pipeline with LSP enrichment.
 
 use super::session::ResolvedGlob;
 use anyhow::{Result, anyhow};
@@ -63,19 +63,19 @@ struct GrepHit {
     classification: HitClass,
 }
 
-/// Classification of a ripgrep hit against the tree-sitter index.
+/// Classification of a ripgrep hit against the symbol index.
 enum HitClass {
-    /// rg hit at a tree-sitter definition line.
+    /// rg hit at a symbol index definition line.
     Symbol { symbol: Symbol },
     /// rg hit at a non-definition line, with optional enclosing structure.
     Reference { enclosing: Option<Symbol> },
-    /// Symbol identified via `prepareRename` (no-grammar path).
+    /// Symbol identified via `prepareRename` (no symbol index data for file).
     PrepareRenameSymbol,
     /// Keyword filtered out via `prepareRename` (will be dropped).
     Keyword,
 }
 
-/// Grep tool server: ripgrep + tree-sitter index pipeline with LSP enrichment.
+/// Grep tool server: ripgrep + symbol index pipeline with LSP enrichment.
 pub struct GrepServer {
     pub(super) client_manager: Arc<LspClientManager>,
     pub(super) fs_manager: Arc<FilesystemManager>,
@@ -229,7 +229,7 @@ impl GrepServer {
         }
     }
 
-    /// Grep pipeline: ripgrep + symbol index + hit classification.
+    /// Grep pipeline: ripgrep + `documentSymbol` index + hit classification.
     #[allow(clippy::too_many_lines, reason = "Core grep orchestration")]
     async fn run(
         &self,
@@ -289,28 +289,28 @@ impl GrepServer {
         self.ensure_symbols(&rg_paths).await;
 
         // Step 3: Symbol index query.
-        let (ts_symbols, grammar_files) = if let Some(ref index_mutex) = self.symbol_index {
+        let (indexed_symbols, indexed_files) = if let Some(ref index_mutex) = self.symbol_index {
             let index = index_mutex
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let re_pattern = format!("(?i){}", &input.pattern);
-            let ts_syms = index
+            let idx_syms = index
                 .query(&re_pattern, Some(&rg_paths))
                 .unwrap_or_default();
-            let gf: HashSet<String> = rg_paths
+            let if_set: HashSet<String> = rg_paths
                 .iter()
                 .filter(|p| index.has_symbols_for(p))
                 .map(|p| p.to_string_lossy().to_string())
                 .collect();
             drop(index);
-            (ts_syms, gf)
+            (idx_syms, if_set)
         } else {
             (Vec::new(), HashSet::new())
         };
 
         // Build lookup: (file_path, line) → Symbol for definitions
         let mut def_lookup: HashMap<(String, u32), Symbol> = HashMap::new();
-        for (path, sym) in &ts_symbols {
+        for (path, sym) in &indexed_symbols {
             let path_str = path.to_string_lossy().to_string();
             def_lookup.insert((path_str, sym.line), sym.clone());
         }
@@ -320,14 +320,14 @@ impl GrepServer {
 
         for (file_str, line_map) in &rg.file_line_texts {
             let file_path = PathBuf::from(file_str);
-            let has_grammar = grammar_files.contains(file_str);
+            let has_symbols = indexed_files.contains(file_str);
 
             for (&line_1, texts) in line_map {
                 let line_0 = line_1 - 1;
                 let matched_text = texts.first().map(|(t, _)| t.clone()).unwrap_or_default();
                 let col = texts.first().map_or(0, |(_, c)| *c);
 
-                if has_grammar {
+                if has_symbols {
                     // Check if this line is a definition
                     if let Some(sym) = def_lookup.get(&(file_str.clone(), line_0)) {
                         hits.push(GrepHit {
@@ -358,7 +358,7 @@ impl GrepServer {
                         });
                     }
                 } else {
-                    // No grammar — check if the language server is alive
+                    // No symbol index data — check if the language server is alive
                     let lang = self.fs_manager.language_id(&file_path);
                     let server_dead = lang
                         .as_ref()
@@ -411,7 +411,7 @@ impl GrepServer {
         // Reference hits pass through with no enrichment.
         let mut enrichments: Vec<(&GrepHit, Option<SymbolEnrichment>)> = Vec::new();
         for hit in &hits {
-            let (line_0, col, from_ts) = match &hit.classification {
+            let (line_0, col, from_index) = match &hit.classification {
                 HitClass::Symbol { symbol } => (symbol.line, hit.col, true),
                 HitClass::PrepareRenameSymbol => (hit.line, hit.col, false),
                 _ => {
@@ -423,7 +423,7 @@ impl GrepServer {
                 return Err(crate::mcp::RequestCancelled.into());
             }
             let enrichment = self
-                .enrich_at_position(&hit.file, line_0, col, from_ts, parent_id, cancel)
+                .enrich_at_position(&hit.file, line_0, col, from_index, parent_id, cancel)
                 .await;
             enrichments.push((hit, enrichment));
         }
@@ -501,8 +501,8 @@ impl GrepServer {
     ///
     /// Sends all enrichment queries (references, call hierarchy, implementations,
     /// type hierarchy) for every symbol. The server decides what returns results.
-    /// When `from_ts` is false (no-grammar path), calls `prepareRename` first
-    /// to filter keywords.
+    /// When `from_index` is false (hit not identified by symbol index), calls
+    /// `prepareRename` first to filter keywords.
     ///
     /// Opens the document once on the union of all capability-filtered servers,
     /// runs all four enrichment methods (skipping their per-method open/close),
@@ -517,7 +517,7 @@ impl GrepServer {
         path: &Path,
         line_0: u32,
         col: u32,
-        from_ts: bool,
+        from_index: bool,
         parent_id: Option<i64>,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Option<SymbolEnrichment> {
@@ -531,8 +531,8 @@ impl GrepServer {
             return Some(cached);
         }
 
-        // If !from_ts, check prepareRename first. Null → keyword, return None.
-        if !from_ts
+        // If not from symbol index, check prepareRename first. Null → keyword, return None.
+        if !from_index
             && !self
                 .prepare_rename_check(path, line_0, col, parent_id, cancel)
                 .await

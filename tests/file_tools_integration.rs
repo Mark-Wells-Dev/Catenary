@@ -979,7 +979,7 @@ const MOCK_EXT: &str = "mock";
 /// Helper: spawns bridge with mockls for `.mock` files and optional config.
 fn spawn_with_mockls_and_config(root: &str, config_toml: Option<&str>) -> Result<BridgeProcess> {
     let lsp = common::mockls_lsp_arg("mock", "");
-    BridgeProcess::spawn_with_grammar(&[&lsp], root, |state_home| {
+    BridgeProcess::spawn_with_pre_start(&[&lsp], root, |state_home| {
         if let Some(toml) = config_toml {
             let config_dir = std::path::PathBuf::from(state_home).join("catenary");
             std::fs::create_dir_all(&config_dir)?;
