@@ -745,13 +745,6 @@ fn format_scope_pair(
     let label = tool_name.unwrap_or(&req.method);
     let name = segment_tool_name(label, position);
 
-    // Line count metrics only for completed tool calls (Only/Last positions).
-    let line_count = if has_metrics && tool_name.is_some() {
-        extract_line_count(resp)
-    } else {
-        None
-    };
-
     let (icon, icon_style, name_text, meta) = match &outcome {
         PairOutcome::Cancelled => {
             let meta = if has_metrics {
@@ -779,6 +772,7 @@ fn format_scope_pair(
         }
         PairOutcome::Success => {
             let meta = if has_metrics {
+                let line_count = tool_name.and_then(|_| extract_line_count(resp));
                 let metrics = format_tool_metrics(line_count, &timing);
                 format!(" ({metrics}, {children_label})")
             } else {
@@ -954,12 +948,6 @@ pub fn format_scope_plain(
                 .and_then(|_| extract_tool_arguments(req))
                 .map_or(String::new(), |a| format!(" {a}"));
 
-            let line_count = if has_metrics && tool_name.is_some() {
-                extract_line_count(resp)
-            } else {
-                None
-            };
-
             match &outcome {
                 PairOutcome::Cancelled => {
                     if has_metrics {
@@ -984,6 +972,7 @@ pub fn format_scope_plain(
                 }
                 PairOutcome::Success => {
                     if has_metrics {
+                        let line_count = tool_name.and_then(|_| extract_line_count(resp));
                         let metrics = format_tool_metrics(line_count, &timing);
                         format!("{prefix}{name} ({metrics}, {children_label}){args_suffix}")
                     } else {
