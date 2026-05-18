@@ -60,8 +60,8 @@ fn mask_quotes(s: &str) -> String {
 
     while i < n {
         if bytes[i] == b'\'' {
-            let j = memchr::memchr(b'\'', &bytes[i + 1..]).map_or(n - 1, |offset| i + 1 + offset);
-            i = j + 1;
+            // Skip to after the closing quote, or to end if unterminated.
+            i = memchr::memchr(b'\'', &bytes[i + 1..]).map_or(n, |offset| i + 2 + offset);
         } else if bytes[i] == b'"' {
             let mut j = i + 1;
             while j < n && bytes[j] != b'"' {
