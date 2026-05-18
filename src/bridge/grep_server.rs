@@ -2171,6 +2171,17 @@ mod tests {
         fs
     }
 
+    fn empty_enrichment() -> SymbolEnrichment {
+        SymbolEnrichment {
+            ref_lines: HashMap::new(),
+            incoming_calls: Vec::new(),
+            outgoing_calls: Vec::new(),
+            implementations: Vec::new(),
+            supertypes: Vec::new(),
+            subtypes: Vec::new(),
+        }
+    }
+
     // ─── Rendering ──────────────────────────────────────────────────────
 
     /// Helper: render + paginate with no enrichment.
@@ -2267,10 +2278,13 @@ mod tests {
 
         let output = render(&hits, 10_000, 1, &fs);
 
-        // Both references rendered
+        // Both references rendered with 1-based lines
         assert!(output.contains(":6"), "bare ref line: {output}");
         assert!(output.contains(":101"), "enclosing ref line: {output}");
         assert!(output.contains("call_tool"), "enclosing name: {output}");
+        // Directory headers present for non-empty dirs
+        assert!(output.contains("data/\n"), "data dir header: {output}");
+        assert!(output.contains("src/\n"), "src dir header: {output}");
     }
 
     // ─── Paging ───────────────────────────────────────────────────────
@@ -2400,6 +2414,286 @@ mod tests {
         );
     }
 
+    // ─── Enrichment rendering ─────────────────────────────────────────
+
+    #[test]
+    fn render_enriched_calls_only() {
+        let fs = test_fs("/project");
+        let hit = sym_hit("/project/src/lib.rs", 10, "MyStruct", "struct");
+        let mut enrichment = empty_enrichment();
+        enrichment.outgoing_calls.push(CallEdge {
+            name: "helper".to_string(),
+            kind: 12,
+            container: None,
+            file: "/project/src/util.rs".to_string(),
+            line: 5,
+            deprecated: false,
+        });
+
+        let enrichments = vec![(&hit, Some(enrichment))];
+        let full = render_results(&enrichments, None, &fs, None);
+
+        assert!(
+            full.starts_with("/project\n<"),
+            "no blank line between root header and definition: {full:?}"
+        );
+        assert!(
+            full.contains("<Struct> MyStruct  src/lib.rs:11"),
+            "definition with 1-based line: {full}"
+        );
+        assert!(full.contains("\tcalls:\n"), "calls header: {full}");
+        assert!(
+            full.contains("<Fn> helper  src/util.rs:6"),
+            "call edge with 1-based line: {full}"
+        );
+    }
+
+    #[test]
+    fn render_enriched_impls_only() {
+        let fs = test_fs("/project");
+        let hit = sym_hit("/project/src/lib.rs", 10, "MyTrait", "interface");
+        let mut enrichment = empty_enrichment();
+        enrichment
+            .implementations
+            .push(("/project/src/impl.rs".to_string(), 30));
+
+        let enrichments = vec![(&hit, Some(enrichment))];
+        let full = render_results(&enrichments, None, &fs, None);
+
+        assert!(full.contains("\timpls:\n"), "impls header: {full}");
+        assert!(full.contains("\t\tsrc/impl.rs\n"), "impl file: {full}");
+        assert!(full.contains("\t\t\t:31"), "impl 1-based line: {full}");
+    }
+
+    #[test]
+    fn render_enriched_supertypes_only() {
+        let fs = test_fs("/project");
+        let hit = sym_hit("/project/src/lib.rs", 10, "MyStruct", "struct");
+        let mut enrichment = empty_enrichment();
+        enrichment.supertypes.push(TypeEdge {
+            name: "BaseTrait".to_string(),
+            kind: 11,
+            container: None,
+            file: "/project/src/traits.rs".to_string(),
+            line: 20,
+            deprecated: false,
+        });
+
+        let enrichments = vec![(&hit, Some(enrichment))];
+        let full = render_results(&enrichments, None, &fs, None);
+
+        assert!(
+            full.contains("\tsupertypes:\n"),
+            "supertypes header: {full}"
+        );
+        assert!(
+            full.contains("<Iface> BaseTrait  src/traits.rs:21"),
+            "supertype with 1-based line: {full}"
+        );
+    }
+
+    #[test]
+    fn render_enriched_subtypes_only() {
+        let fs = test_fs("/project");
+        let hit = sym_hit("/project/src/lib.rs", 10, "MyTrait", "interface");
+        let mut enrichment = empty_enrichment();
+        enrichment.subtypes.push(TypeEdge {
+            name: "SubStruct".to_string(),
+            kind: 23,
+            container: None,
+            file: "/project/src/sub.rs".to_string(),
+            line: 15,
+            deprecated: false,
+        });
+
+        let enrichments = vec![(&hit, Some(enrichment))];
+        let full = render_results(&enrichments, None, &fs, None);
+
+        assert!(full.contains("\tsubtypes:\n"), "subtypes header: {full}");
+        assert!(
+            full.contains("<Struct> SubStruct  src/sub.rs:16"),
+            "subtype with 1-based line: {full}"
+        );
+    }
+
+    #[test]
+    fn render_enriched_refs_from_ref_lines_only() {
+        let fs = test_fs("/project");
+        let hit = sym_hit("/project/src/lib.rs", 10, "MyStruct", "struct");
+        let mut enrichment = empty_enrichment();
+        enrichment
+            .ref_lines
+            .insert("/project/src/main.rs".to_string(), HashSet::from([20]));
+
+        let enrichments = vec![(&hit, Some(enrichment))];
+        let full = render_results(&enrichments, None, &fs, None);
+
+        assert!(full.contains("\trefs:\n"), "refs header: {full}");
+        assert!(full.contains("\t\tsrc/main.rs\n"), "ref file: {full}");
+        assert!(full.contains("\t\t\t:21"), "ref 1-based line: {full}");
+    }
+
+    #[test]
+    fn render_enriched_refs_from_incoming_calls_only() {
+        let fs = test_fs("/project");
+        let hit = sym_hit("/project/src/lib.rs", 10, "MyStruct", "struct");
+        let mut enrichment = empty_enrichment();
+        enrichment.incoming_calls.push(CallEdge {
+            name: "caller_fn".to_string(),
+            kind: 12,
+            container: None,
+            file: "/project/src/caller.rs".to_string(),
+            line: 50,
+            deprecated: false,
+        });
+
+        let enrichments = vec![(&hit, Some(enrichment))];
+        let full = render_results(&enrichments, None, &fs, None);
+
+        assert!(full.contains("\trefs:\n"), "refs header: {full}");
+        assert!(
+            full.contains("\t\tsrc/caller.rs\n"),
+            "incoming call file: {full}"
+        );
+        assert!(
+            full.contains("\t\t\t:51"),
+            "incoming call 1-based line: {full}"
+        );
+    }
+
+    #[test]
+    fn render_cross_def_dedup_suppresses_dominated() {
+        let fs = test_fs("/project");
+        // A has outgoing call to B's location — B is dominated
+        let hit_a = sym_hit("/project/src/lib.rs", 10, "FnA", "function");
+        let mut enrichment_a = empty_enrichment();
+        enrichment_a.outgoing_calls.push(CallEdge {
+            name: "FnB".to_string(),
+            kind: 12,
+            container: None,
+            file: "/project/src/util.rs".to_string(),
+            line: 20,
+            deprecated: false,
+        });
+        // B at the dominated location, no enrichment
+        let hit_b = sym_hit("/project/src/util.rs", 20, "FnB", "function");
+
+        let enrichments = vec![(&hit_a, Some(enrichment_a)), (&hit_b, None)];
+        let full = render_results(&enrichments, None, &fs, None);
+
+        // A rendered as definition with calls section
+        assert!(
+            full.contains("<Function> FnA  src/lib.rs:11"),
+            "FnA definition: {full}"
+        );
+        assert!(full.contains("\tcalls:\n"), "calls section: {full}");
+        // B suppressed as standalone definition (still in A's calls section)
+        let standalone_b = full
+            .lines()
+            .filter(|l| l.starts_with("<Function> FnB"))
+            .count();
+        assert_eq!(
+            standalone_b, 0,
+            "FnB should be suppressed as standalone: {full}"
+        );
+    }
+
+    #[test]
+    fn render_multiple_roots_separated_by_blank_line() {
+        let fs = FilesystemManager::new();
+        fs.set_roots(vec![
+            PathBuf::from("/project1"),
+            PathBuf::from("/project2"),
+        ]);
+        let hits = [
+            sym_hit("/project1/src/a.rs", 5, "fn_a", "function"),
+            sym_hit("/project2/src/b.rs", 15, "fn_b", "function"),
+        ];
+
+        let enrichments: Vec<(&GrepHit, Option<SymbolEnrichment>)> =
+            hits.iter().map(|h| (h, None)).collect();
+        let full = render_results(&enrichments, None, &fs, None);
+
+        assert!(
+            !full.starts_with('\n'),
+            "no leading newline: {full:?}"
+        );
+        assert!(
+            full.contains("/project1\n"),
+            "first root header: {full}"
+        );
+        assert!(
+            full.contains("/project2\n"),
+            "second root header: {full}"
+        );
+        assert!(
+            full.contains("\n\n/project2"),
+            "blank line between root sections: {full:?}"
+        );
+    }
+
+    #[test]
+    fn render_oor_sections_separated_by_blank_line() {
+        let fs = test_fs("/project");
+        let hits = [
+            sym_hit("/other/dir1/a.rs", 5, "fn_a", "function"),
+            sym_hit("/other/dir2/b.rs", 15, "fn_b", "function"),
+        ];
+
+        let enrichments: Vec<(&GrepHit, Option<SymbolEnrichment>)> =
+            hits.iter().map(|h| (h, None)).collect();
+        let full = render_results(&enrichments, None, &fs, None);
+
+        assert!(
+            full.contains("/other/dir1\n"),
+            "first oor parent: {full}"
+        );
+        assert!(
+            full.contains("/other/dir2\n"),
+            "second oor parent: {full}"
+        );
+        assert!(
+            full.contains("\n\n/other/dir2"),
+            "blank line between oor sections: {full:?}"
+        );
+    }
+
+    #[test]
+    fn render_groups_by_symbol_name_not_matched_text() {
+        let fs = test_fs("/project");
+        // matched_text differs from symbol.name (partial ripgrep match)
+        let hit = GrepHit {
+            file: PathBuf::from("/project/src/lib.rs"),
+            line: 10,
+            col: 0,
+            matched_text: "MyStr".to_string(),
+            classification: HitClass::Symbol {
+                symbol: Symbol {
+                    name: "MyStruct".to_string(),
+                    kind: "struct".to_string(),
+                    line: 10,
+                    end_line: 20,
+                    scope: None,
+                    scope_kind: None,
+                    deprecated: false,
+                },
+            },
+        };
+
+        let enrichments: Vec<(&GrepHit, Option<SymbolEnrichment>)> =
+            vec![(&hit, None)];
+        let full = render_results(&enrichments, None, &fs, None);
+
+        assert!(
+            full.contains("<Struct> MyStruct"),
+            "should use symbol.name for display: {full}"
+        );
+        assert!(
+            !full.contains("<Struct> MyStr "),
+            "should not use matched_text for display: {full}"
+        );
+    }
+
     // ─── Paginate unit tests ──────────────────────────────────────────
 
     #[test]
@@ -2417,13 +2711,49 @@ mod tests {
         let output1 = paginate("aaa\nbbb\nccc", 5, 1);
         let output2 = paginate("aaa\nbbb\nccc", 5, 2);
         assert!(output1.starts_with("[page 1/"), "page 1 header: {output1}");
+        assert!(output1.contains("aaa"), "page 1 content: {output1}");
+        assert!(!output1.contains("bbb"), "page 1 excludes page 2: {output1}");
         assert!(output2.starts_with("[page 2/"), "page 2 header: {output2}");
+        assert!(output2.contains("bbb"), "page 2 content: {output2}");
+        assert!(!output2.contains("ccc"), "page 2 excludes page 3: {output2}");
     }
 
     #[test]
     fn paginate_beyond_last() {
         let output = paginate("aaa\nbbb", 1000, 5);
         assert!(output.contains("No more results"), "beyond last: {output}");
+    }
+
+    #[test]
+    fn paginate_splits_over_budget_not_at_boundary() {
+        // "aaaa" + "\n" + "bbbb" = 9 chars total.
+        // Budget 9: candidate_len == budget → no split (> not >=).
+        // Budget 8: candidate_len > budget → split into two pages.
+        let text = "aaaa\nbbbb";
+
+        // At budget: single page (verifies > not >=)
+        let at = paginate(text, 9, 1);
+        assert!(
+            at.starts_with("[page 1/1]"),
+            "budget=len should be single page: {at}"
+        );
+        assert!(at.contains("aaaa"), "page has first line: {at}");
+        assert!(at.contains("bbbb"), "page has second line: {at}");
+
+        // Over budget: two pages (verifies newline counted in budget)
+        let over1 = paginate(text, 8, 1);
+        let over2 = paginate(text, 8, 2);
+        assert!(
+            over1.starts_with("[page 1/2]"),
+            "page 1 of 2: {over1}"
+        );
+        assert!(over1.contains("aaaa"), "page 1 content: {over1}");
+        assert!(!over1.contains("bbbb"), "page 1 excludes page 2: {over1}");
+        assert!(
+            over2.starts_with("[page 2/2]"),
+            "page 2 of 2: {over2}"
+        );
+        assert!(over2.contains("bbbb"), "page 2 content: {over2}");
     }
 
     // ─── format_hit_line tests ──────────────────────────────────────────
