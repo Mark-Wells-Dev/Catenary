@@ -562,7 +562,11 @@ mod tests {
 
         // Open a fresh connection for the tail (it takes ownership).
         let tail_conn = crate::db::open_at(&path)?;
-        let mut tail = crate::session::tail_messages_new_with_conn(tail_conn, "ds-tail-1", true)?;
+        let mut tail: Box<dyn MessageTail> = Box::new(crate::session::tail_messages_new_with_conn(
+            tail_conn,
+            "ds-tail-1",
+            true,
+        )?);
 
         // No new messages since tail was created after any existing messages
         // (tail_messages_new starts from the current end).
@@ -633,6 +637,62 @@ mod tests {
         assert!(ids.contains(&"alive-1".to_string()));
         assert!(ids.contains(&"alive-2".to_string()));
         assert!(!ids.contains(&"dead-1".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn test_sqlite_data_source_active_languages() -> Result<()> {
+        let (_dir, path, conn) = test_db();
+        let write_conn = crate::db::open_and_migrate_at(&path)?;
+        insert_session(&write_conn, "ds-lang-1", "/tmp/test-ds-lang");
+        insert_test_message(&write_conn, "ds-lang-1");
+
+        let ds = SqliteDataSource::with_conn(conn);
+        let rows = ds.list_sessions()?;
+        let row = rows
+            .iter()
+            .find(|r| r.info.id == "ds-lang-1")
+            .expect("session should exist");
+        assert_eq!(
+            row.languages,
+            vec!["rust-analyzer".to_string()],
+            "active_languages_for should return the server from LSP messages"
+        );
+
+        ds.delete_session("ds-lang-1")?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_mock_create_message_tail_filters_debug() -> Result<()> {
+        let mut tail_messages = VecDeque::new();
+        let mut debug_msg = make_message("textDocument/hover");
+        debug_msg.level = "debug".to_string();
+        let info_msg = make_message("textDocument/definition");
+        tail_messages.push_back(debug_msg);
+        tail_messages.push_back(info_msg);
+
+        let mut map = HashMap::new();
+        map.insert("sess-1".to_string(), tail_messages);
+
+        let ds = MockDataSource {
+            sessions: vec![],
+            messages: HashMap::new(),
+            tail_messages: map,
+        };
+
+        let mut tail = ds.create_message_tail("sess-1", false)?;
+        let first = tail.try_next_message()?;
+        assert!(first.is_some(), "should have one non-debug message");
+        let msg = first.expect("checked above");
+        assert_eq!(
+            msg.method, "textDocument/definition",
+            "non-debug message should be the one returned"
+        );
+
+        let second = tail.try_next_message()?;
+        assert!(second.is_none(), "debug message should have been filtered");
+
         Ok(())
     }
 

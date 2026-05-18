@@ -452,6 +452,42 @@ mod tests {
     }
 
     #[test]
+    fn test_tool_icon_grep_uses_search_icon() {
+        let config = IconConfig {
+            preset: IconPreset::Nerd,
+            ..IconConfig::default()
+        };
+        let icons = IconSet::from_config(config);
+        assert_eq!(
+            tool_icon("grep", &icons),
+            icons.tool_search,
+            "grep should map to tool_search icon"
+        );
+        assert_ne!(
+            icons.tool_search, icons.tool_default,
+            "Nerd preset search and default icons must differ for this test"
+        );
+    }
+
+    #[test]
+    fn test_tool_icon_glob_uses_glob_icon() {
+        let config = IconConfig {
+            preset: IconPreset::Nerd,
+            ..IconConfig::default()
+        };
+        let icons = IconSet::from_config(config);
+        assert_eq!(
+            tool_icon("glob", &icons),
+            icons.tool_glob,
+            "glob should map to tool_glob icon"
+        );
+        assert_ne!(
+            icons.tool_glob, icons.tool_default,
+            "Nerd preset glob and default icons must differ for this test"
+        );
+    }
+
+    #[test]
     fn test_glyph_families_distinct() {
         for preset in [IconPreset::Unicode, IconPreset::Nerd, IconPreset::Emoji] {
             let config = IconConfig {

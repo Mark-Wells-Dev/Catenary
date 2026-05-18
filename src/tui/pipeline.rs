@@ -1420,4 +1420,44 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn test_scope_collapse_self_referencing_parent_id() {
+        // A message whose parent_id equals its own request_id (self-referencing).
+        // This happens when a non-adjacent MCP response becomes a Single —
+        // its request_id matches the original request, and its parent_id
+        // also references that same correlation ID.
+        // The nesting loop's `idx != k` guard must prevent self-nesting,
+        // or the scope is silently lost.
+        let messages = vec![
+            make_message_with_id_parent(1, "mcp", "tools/call", "catenary", Some(500), Some(500)),
+            make_message_with_id_parent(
+                2,
+                "lsp",
+                "workspace/symbol",
+                "rust-analyzer",
+                Some(501),
+                Some(500),
+            ),
+        ];
+        let merged = pair_merge(&messages);
+        let scoped = scope_collapse(merged, &messages);
+
+        assert_eq!(scoped.len(), 1, "expected 1 scope, got: {scoped:?}");
+        match &scoped[0] {
+            DisplayEntry::Scope {
+                parent,
+                children,
+                position,
+            } => {
+                assert!(
+                    matches!(*parent.as_ref(), DisplayEntry::Single { index: 0, .. }),
+                    "parent should be Single(0)"
+                );
+                assert_eq!(children.len(), 1, "should have 1 child");
+                assert_eq!(*position, SegmentPosition::Only);
+            }
+            other => panic!("expected Scope, got {other:?}"),
+        }
+    }
 }

@@ -775,4 +775,250 @@ mod tests {
             "expected 'hover timeout' in liftup, got: {content}"
         );
     }
+
+    // ── 15. Suggestion cycle — Shift+Tab direction ─────────────────────
+
+    #[test]
+    fn test_filter_suggestion_cycle_shift_tab() {
+        let mut f = FilterState::new(FilterScope::Local(0));
+        for s in &["hover ok", "hover error", "search"] {
+            for c in s.chars() {
+                f.push_char(c);
+            }
+            f.submit();
+        }
+
+        for c in "hov".chars() {
+            f.push_char(c);
+        }
+
+        // Matches (most recent first): ["hover error", "hover ok"].
+        let matches = f.matching_entries();
+        assert_eq!(matches.len(), 2);
+
+        // Shift+Tab (delta +1): enters at oldest match (index count-1 = 1).
+        f.cycle_suggestion(1);
+        assert_eq!(f.suggestion_index, Some(1));
+        assert_eq!(f.effective_input(), "hover ok");
+
+        // Shift+Tab again: moves to most recent (index 0).
+        f.cycle_suggestion(1);
+        assert_eq!(f.suggestion_index, Some(0));
+        assert_eq!(f.effective_input(), "hover error");
+
+        // Shift+Tab again: wraps back to null (no suggestion).
+        f.cycle_suggestion(1);
+        assert_eq!(f.suggestion_index, None);
+        assert_eq!(f.effective_input(), "hov");
+    }
+
+    // ── 16. Render guard — boundary width ──────────────────────────────
+
+    #[test]
+    fn test_render_filter_bar_boundary_width() {
+        let theme = test_theme();
+        let mut f = FilterState::new(FilterScope::Local(0));
+        f.push_char('x');
+
+        // Width 10 is the minimum — should render.
+        let backend = TestBackend::new(10, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal creation");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_filter_bar(&f, area, frame.buffer_mut(), &theme);
+            })
+            .expect("draw");
+
+        let buf = terminal.backend().buffer().clone();
+        let content = buffer_to_string(&buf);
+        assert!(
+            content.contains("Filter:"),
+            "width=10 should render filter bar, got: {content}"
+        );
+    }
+
+    // ── 17. Render guard — too narrow, no render ───────────────────────
+
+    #[test]
+    fn test_render_filter_bar_too_narrow_no_render() {
+        let theme = test_theme();
+        let mut f = FilterState::new(FilterScope::Local(0));
+        f.push_char('x');
+
+        // Width 5 < 10, height 1 — should not render (guard returns early).
+        let backend = TestBackend::new(5, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal creation");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_filter_bar(&f, area, frame.buffer_mut(), &theme);
+            })
+            .expect("draw");
+
+        let buf = terminal.backend().buffer().clone();
+        let content = buffer_to_string(&buf);
+        let non_space = content.replace([' ', '\n'], "");
+        assert!(
+            non_space.is_empty(),
+            "width=5 should produce empty output, got: {content}"
+        );
+    }
+
+    // ── 18. Render guard — multi-row still renders ─────────────────────
+
+    #[test]
+    fn test_render_filter_bar_multi_row_renders() {
+        let theme = test_theme();
+        let mut f = FilterState::new(FilterScope::Local(0));
+        f.push_char('x');
+
+        // Height 2: should still render (height >= 1 is valid).
+        let backend = TestBackend::new(60, 2);
+        let mut terminal = Terminal::new(backend).expect("terminal creation");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_filter_bar(&f, area, frame.buffer_mut(), &theme);
+            })
+            .expect("draw");
+
+        let buf = terminal.backend().buffer().clone();
+        let content = buffer_to_string(&buf);
+        assert!(
+            content.contains("Filter:"),
+            "height=2 should still render filter bar, got: {content}"
+        );
+    }
+
+    // ── 19. Hint gap arithmetic — precise width boundary ───────────────
+
+    #[test]
+    fn test_render_filter_bar_hint_gap_respected() {
+        let theme = test_theme();
+        let mut f = FilterState::new(FilterScope::Local(0));
+        for c in "hov".chars() {
+            f.push_char(c);
+        }
+
+        // left_width = "Filter: " (8) + "hov" (3) + "▏" (1) = 12
+        // hint_width = "Esc cancel" = 10
+        // gap = 1
+        // Minimum width for hint: 12 + 1 + 10 = 23
+
+        // Width 22: no room for gap — hint should NOT appear.
+        let backend = TestBackend::new(22, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal creation");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_filter_bar(&f, area, frame.buffer_mut(), &theme);
+            })
+            .expect("draw");
+
+        let buf = terminal.backend().buffer().clone();
+        let content = buffer_to_string(&buf);
+        assert!(
+            !content.contains("Esc cancel"),
+            "width=22 should not have room for hint, got: {content}"
+        );
+
+        // Width 23: exactly enough room — hint SHOULD appear.
+        let backend = TestBackend::new(23, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal creation");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_filter_bar(&f, area, frame.buffer_mut(), &theme);
+            })
+            .expect("draw");
+
+        let buf = terminal.backend().buffer().clone();
+        let content = buffer_to_string(&buf);
+        assert!(
+            content.contains("Esc cancel"),
+            "width=23 should have room for hint, got: {content}"
+        );
+    }
+
+    // ── 20. Liftup renders with height 1 ──────────────────────────────
+
+    #[test]
+    fn test_render_filter_liftup_height_1() {
+        let theme = test_theme();
+        let mut f = FilterState::new(FilterScope::Local(0));
+        for c in "hover".chars() {
+            f.push_char(c);
+        }
+        f.submit();
+
+        for c in "hov".chars() {
+            f.push_char(c);
+        }
+
+        // Height 1: should render exactly 1 entry.
+        let backend = TestBackend::new(40, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal creation");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_filter_liftup(&f, area, frame.buffer_mut(), &theme);
+            })
+            .expect("draw");
+
+        let buf = terminal.backend().buffer().clone();
+        let content = buffer_to_string(&buf);
+        assert!(
+            content.contains("hover"),
+            "height=1 should render 1 entry, got: {content}"
+        );
+    }
+
+    // ── 21. Liftup selection marker ────────────────────────────────────
+
+    #[test]
+    fn test_render_filter_liftup_selection_marker() {
+        let theme = test_theme();
+        let mut f = FilterState::new(FilterScope::Local(0));
+        for s in &["hover ok", "hover error"] {
+            for c in s.chars() {
+                f.push_char(c);
+            }
+            f.submit();
+        }
+
+        for c in "hover".chars() {
+            f.push_char(c);
+        }
+
+        // Select the first suggestion (index 0 = "hover error", most recent).
+        f.cycle_suggestion(-1);
+        assert_eq!(f.suggestion_index, Some(0));
+
+        let backend = TestBackend::new(40, 3);
+        let mut terminal = Terminal::new(backend).expect("terminal creation");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_filter_liftup(&f, area, frame.buffer_mut(), &theme);
+            })
+            .expect("draw");
+
+        let buf = terminal.backend().buffer().clone();
+        let content = buffer_to_string(&buf);
+
+        // Entries render bottom-aligned: row 0 = "hover ok" (unselected),
+        // row 1 = "hover error" (selected with ▐ prefix).
+        let rows: Vec<&str> = content.lines().collect();
+        assert!(
+            rows[0].starts_with("  "),
+            "unselected entry should have space prefix, got: {:?}",
+            rows[0]
+        );
+        assert!(
+            rows[1].starts_with('\u{2590}'),
+            "selected entry should have \u{2590} prefix, got: {:?}",
+            rows[1]
+        );
+    }
 }
