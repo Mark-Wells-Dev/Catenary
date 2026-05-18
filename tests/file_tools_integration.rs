@@ -2051,3 +2051,65 @@ fn test_grep_absolute_glob_no_cwd_header() -> Result<()> {
     assert!(text.contains("needle"), "Should find the match: {text}");
     Ok(())
 }
+
+/// Grep with a relative glob should produce a `cwd =` context header
+/// so the agent knows how to interpret the relative paths.
+#[test]
+fn test_grep_relative_glob_has_cwd_header() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let sub = dir.path().join("src");
+    std::fs::create_dir(&sub)?;
+    std::fs::write(sub.join("main.rs"), "fn cwd_target() {}\n")?;
+
+    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text(
+        "grep",
+        &json!({ "pattern": "cwd_target", "glob": "src/**/*.rs" }),
+    )?;
+
+    assert!(
+        text.contains("cwd ="),
+        "Relative glob should produce cwd header: {text}"
+    );
+    assert!(
+        text.contains("cwd_target"),
+        "Should find the match: {text}"
+    );
+    Ok(())
+}
+
+/// Grep with top-level alternation `foo|bar` should return results
+/// from both arms, separated by a newline.
+#[test]
+fn test_grep_alternation_both_arms_present() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(dir.path().join("a.txt"), "alpha_unique_arm\n")?;
+    std::fs::write(dir.path().join("b.txt"), "beta_unique_arm\n")?;
+
+    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text(
+        "grep",
+        &json!({ "pattern": "alpha_unique_arm|beta_unique_arm" }),
+    )?;
+
+    assert!(
+        text.contains("alpha_unique_arm"),
+        "First alternation arm should be present: {text}"
+    );
+    assert!(
+        text.contains("beta_unique_arm"),
+        "Second alternation arm should be present: {text}"
+    );
+    // Verify no leading blank line before content (catches separator inversion)
+    let content_start = text.find(']').expect("page header bracket") + 1;
+    let after_header = &text[content_start..];
+    assert!(
+        !after_header.starts_with("\n\n\n"),
+        "Should not have extra blank lines before content: {text:?}"
+    );
+    Ok(())
+}

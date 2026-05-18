@@ -2659,6 +2659,32 @@ mod tests {
     }
 
     #[test]
+    fn render_results_cwd_relative_paths_and_header() {
+        let fs = test_fs("/project");
+        let hit = sym_hit("/project/src/lib.rs", 10, "MyStruct", "struct");
+        let enrichments: Vec<(&GrepHit, Option<SymbolEnrichment>)> =
+            vec![(&hit, None)];
+        let full = render_results(&enrichments, None, &fs, Some(Path::new("/project")));
+
+        // cwd header present with the path
+        assert!(
+            full.starts_with("cwd = /project\n"),
+            "cwd header should be first line: {full:?}"
+        );
+        // Relative path used (no root grouping header)
+        assert!(
+            full.contains("src/lib.rs:11"),
+            "path should be cwd-relative: {full}"
+        );
+        // No root grouping header — cwd mode uses a single flat section.
+        // A standalone root header would be a line containing only the path.
+        assert!(
+            !full.lines().any(|l| l == "/project"),
+            "should not have standalone root header in cwd mode: {full}"
+        );
+    }
+
+    #[test]
     fn render_groups_by_symbol_name_not_matched_text() {
         let fs = test_fs("/project");
         // matched_text differs from symbol.name (partial ripgrep match)
