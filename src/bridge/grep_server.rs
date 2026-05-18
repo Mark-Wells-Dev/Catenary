@@ -566,17 +566,17 @@ impl GrepServer {
             )
             .await;
 
-        let mut all_servers = Vec::new();
-        for server in ref_servers
-            .iter()
-            .chain(call_servers.iter())
-            .chain(impl_servers.iter())
-            .chain(type_servers.iter())
-        {
-            if !all_servers.iter().any(|s| Arc::ptr_eq(s, server)) {
-                all_servers.push(Arc::clone(server));
-            }
-        }
+        let all_servers = {
+            let mut seen = HashSet::new();
+            ref_servers
+                .iter()
+                .chain(call_servers.iter())
+                .chain(impl_servers.iter())
+                .chain(type_servers.iter())
+                .filter(|s| seen.insert(Arc::as_ptr(s)))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
 
         // Open the document once on each server.
         let mut uri_opt: Option<String> = None;
