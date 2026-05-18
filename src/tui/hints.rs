@@ -235,9 +235,76 @@ mod tests {
         let buf = terminal.backend().buffer().clone();
         let content = buffer_to_string(&buf);
 
-        // Should contain hint keys.
+        // Should contain hint keys and separators.
         assert!(content.contains('q'), "expected 'q' hint key in: {content}");
         assert!(content.contains('?'), "expected '?' hint key in: {content}");
+        assert!(
+            content.contains('\u{2571}'),
+            "expected separator ╱ at this width: {content}"
+        );
+        // Border fill should be present at left edge.
+        assert!(
+            content.starts_with('\u{2500}'),
+            "left edge should be border line ─: {content}"
+        );
+        // Corner at right edge.
+        assert!(
+            content.trim_end().ends_with('\u{2518}'),
+            "right edge should be corner ┘: {content}"
+        );
+    }
+
+    #[test]
+    fn test_hints_render_narrow_border_only() {
+        let theme = Theme::new();
+        // Width 5: hint_budget = 0, degrade_hints returns empty → border only.
+        let backend = TestBackend::new(5, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal creation");
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                render_hints(area, f.buffer_mut(), &theme, false, false, false, false);
+            })
+            .expect("draw");
+
+        let buf = terminal.backend().buffer().clone();
+        let content = buffer_to_string(&buf);
+
+        // Should have border line and corner, no hint keys.
+        assert!(
+            !content.contains('q'),
+            "no hints at narrow width: {content}"
+        );
+        assert!(
+            content.contains('\u{2500}'),
+            "should have border line ─: {content}"
+        );
+        assert!(
+            content.trim_end().ends_with('\u{2518}'),
+            "should end with corner ┘: {content}"
+        );
+    }
+
+    #[test]
+    fn test_hints_render_too_narrow() {
+        let theme = Theme::new();
+        // Width 3: below minimum 4, renders nothing.
+        let backend = TestBackend::new(3, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal creation");
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                render_hints(area, f.buffer_mut(), &theme, false, false, false, false);
+            })
+            .expect("draw");
+
+        let buf = terminal.backend().buffer().clone();
+        let content = buffer_to_string(&buf);
+
+        assert!(
+            !content.contains('\u{2500}'),
+            "width < 4 should render nothing: {content}"
+        );
     }
 
     #[test]
@@ -358,5 +425,33 @@ mod tests {
             !content.contains("[debug]"),
             "no '[debug]' indicator by default: {content}"
         );
+    }
+
+    // ── Width calculation tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_hints_width_with_separators() {
+        // Empty.
+        assert_eq!(hints_width_with_separators(&[]), 0);
+        // Single hint: no separators, just content.
+        let one = vec![("q", "\u{2718}")]; // "q ✘" = 3 cols
+        assert_eq!(hints_width_with_separators(&one), 3);
+        // Two hints: content + 1 separator (3 cols: " ╱ ").
+        let two = vec![("q", "\u{2718}"), ("?", "")]; // 3 + 1 + 3 = 7
+        assert_eq!(hints_width_with_separators(&two), 7);
+        // Three hints.
+        let three = vec![("q", "\u{2718}"), ("?", ""), ("f", "\u{2591}")]; // 3+1+3 + 3+3 = 13
+        assert_eq!(hints_width_with_separators(&three), 13);
+    }
+
+    #[test]
+    fn test_hints_width_spaced() {
+        assert_eq!(hints_width_spaced(&[]), 0);
+        let one = vec![("q", "\u{2718}")]; // 3 cols, no spaces
+        assert_eq!(hints_width_spaced(&one), 3);
+        let two = vec![("q", "\u{2718}"), ("?", "")]; // 3 + 1 + 1 = 5
+        assert_eq!(hints_width_spaced(&two), 5);
+        let three = vec![("q", "\u{2718}"), ("?", ""), ("f", "\u{2591}")]; // 3+1+3 + 1+1 = 9
+        assert_eq!(hints_width_spaced(&three), 9);
     }
 }

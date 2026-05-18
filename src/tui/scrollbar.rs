@@ -512,11 +512,33 @@ mod tests {
     }
 
     #[test]
-    fn test_fractional_block_lower() {
+    fn test_fractional_block_lower_all_arms() {
         assert_eq!(fractional_block_lower(0), ' ');
         assert_eq!(fractional_block_lower(1), '▁');
+        assert_eq!(fractional_block_lower(2), '▂');
+        assert_eq!(fractional_block_lower(3), '▃');
         assert_eq!(fractional_block_lower(4), '▄');
+        assert_eq!(fractional_block_lower(5), '▅');
+        assert_eq!(fractional_block_lower(6), '▆');
+        assert_eq!(fractional_block_lower(7), '▇');
         assert_eq!(fractional_block_lower(8), '█');
+        // Out of range → space.
+        assert_eq!(fractional_block_lower(9), ' ');
+        assert_eq!(fractional_block_lower(255), ' ');
+    }
+
+    #[test]
+    fn test_fractional_block_upper() {
+        // Full block: eighths >= 8 → ('█', false).
+        assert_eq!(fractional_block_upper(8), ('█', false));
+        assert_eq!(fractional_block_upper(9), ('█', false));
+        // Empty: eighths == 0 → (' ', false).
+        assert_eq!(fractional_block_upper(0), (' ', false));
+        // Partial: uses lower(8-n) with color swap.
+        assert_eq!(fractional_block_upper(1), ('▇', true)); // lower(7)
+        assert_eq!(fractional_block_upper(2), ('▆', true)); // lower(6)
+        assert_eq!(fractional_block_upper(4), ('▄', true)); // lower(4)
+        assert_eq!(fractional_block_upper(7), ('▁', true)); // lower(1)
     }
 
     #[test]
@@ -700,6 +722,247 @@ mod tests {
         );
         // Leading space at x=37 → miss.
         assert_eq!(overflow_hit_test(37, 9, content_area, &counts), None);
+    }
+
+    #[test]
+    fn test_render_scrollbar_multi_cell_thumb() {
+        // 50% viewport → thumb spans ~5 cells. Position at midpoint.
+        let metrics = ScrollMetrics {
+            content_length: 100,
+            viewport_length: 50,
+            position: 25, // 50% through scrollable range
+        };
+        let track_area = Rect::new(0, 0, 1, 10);
+
+        let backend = TestBackend::new(1, 10);
+        let mut terminal = Terminal::new(backend).expect("terminal creation");
+        terminal
+            .draw(|f| {
+                render_scrollbar(
+                    &metrics,
+                    track_area,
+                    f.buffer_mut(),
+                    Color::White,
+                    Color::DarkGray,
+                );
+            })
+            .expect("draw");
+
+        let buf = terminal.backend().buffer().clone();
+        let thumb = compute_thumb(&metrics, 10).expect("should have thumb");
+
+        // Cells before thumb should be empty track.
+        if thumb.start_cell > 0 {
+            assert_eq!(
+                buf[(0, 0)].symbol(),
+                " ",
+                "cell before thumb should be empty track"
+            );
+        }
+
+        // Middle cells of the thumb should be full blocks.
+        let mid = u16::midpoint(thumb.start_cell, thumb.end_cell);
+        if mid > thumb.start_cell && mid < thumb.end_cell {
+            assert_eq!(
+                buf[(0, mid)].symbol(),
+                "█",
+                "middle cell of multi-cell thumb should be full block"
+            );
+        }
+
+        // Cells after thumb should be empty track.
+        if thumb.end_cell < 9 {
+            assert_eq!(
+                buf[(0, 9)].symbol(),
+                " ",
+                "cell after thumb should be empty track"
+            );
+        }
+    }
+
+    #[test]
+    fn test_render_scrollbar_thumb_not_at_zero() {
+        // Thumb at the bottom — verifies row < start_cell renders empty track.
+        let metrics = ScrollMetrics {
+            content_length: 100,
+            viewport_length: 10,
+            position: 80,
+        };
+        let track_area = Rect::new(0, 0, 1, 10);
+
+        let backend = TestBackend::new(1, 10);
+        let mut terminal = Terminal::new(backend).expect("terminal creation");
+        terminal
+            .draw(|f| {
+                render_scrollbar(
+                    &metrics,
+                    track_area,
+                    f.buffer_mut(),
+                    Color::White,
+                    Color::DarkGray,
+                );
+            })
+            .expect("draw");
+
+        let buf = terminal.backend().buffer().clone();
+        let thumb = compute_thumb(&metrics, 10).expect("should have thumb");
+
+        // Thumb should be near the bottom (start_cell > 0).
+        assert!(
+            thumb.start_cell > 0,
+            "thumb should not start at cell 0: {thumb:?}"
+        );
+
+        // Top of track should be empty (before thumb).
+        assert_eq!(
+            buf[(0, 0)].symbol(),
+            " ",
+            "top should be empty track when thumb is near bottom"
+        );
+
+        // The thumb cell itself should not be empty.
+        assert_ne!(
+            buf[(0, thumb.start_cell)].symbol(),
+            " ",
+            "thumb cell should have content"
+        );
+    }
+
+    #[test]
+    fn test_render_scrollbar_per_cell_characters() {
+        // Engineered to produce fractional edges on distinct cells.
+        // content=100, viewport=20, position=11, track=20:
+        //   thumb: start_cell=2 start_eighth=1, end_cell=6 end_eighth=0
+        //   cell 0-1: track (' ')
+        //   cell 2: top partial, fill=7 → '▇' (lower block)
+        //   cell 3-5: fully inside → '█'
+        //   cell 6: bottom partial, fill=1 → fractional_block_upper(1) = '▇' (swapped)
+        //   cell 7-19: track (' ')
+        let metrics = ScrollMetrics {
+            content_length: 100,
+            viewport_length: 20,
+            position: 11,
+        };
+        let track_area = Rect::new(0, 0, 1, 20);
+
+        let backend = TestBackend::new(1, 20);
+        let mut terminal = Terminal::new(backend).expect("terminal creation");
+        terminal
+            .draw(|f| {
+                render_scrollbar(
+                    &metrics,
+                    track_area,
+                    f.buffer_mut(),
+                    Color::White,
+                    Color::DarkGray,
+                );
+            })
+            .expect("draw");
+
+        let buf = terminal.backend().buffer().clone();
+        let thumb = compute_thumb(&metrics, 20).expect("should have thumb");
+
+        // Verify the thumb has fractional edges on separate cells.
+        assert_ne!(
+            thumb.start_cell, thumb.end_cell,
+            "need multi-cell thumb: {thumb:?}"
+        );
+        assert!(thumb.start_eighth > 0, "need fractional start: {thumb:?}");
+
+        // Track before thumb.
+        assert_eq!(buf[(0, 0)].symbol(), " ", "cell 0: track");
+        assert_eq!(buf[(0, 1)].symbol(), " ", "cell 1: track");
+
+        // Top partial cell: fill = 8 - start_eighth = 7 → '▇'.
+        assert_eq!(
+            buf[(0, thumb.start_cell)].symbol(),
+            "▇",
+            "start cell: top partial 7/8"
+        );
+
+        // Interior cells: full block.
+        for row in (thumb.start_cell + 1)..thumb.end_cell {
+            assert_eq!(
+                buf[(0, row)].symbol(),
+                "█",
+                "cell {row}: fully inside thumb"
+            );
+        }
+
+        // Bottom partial cell: fill = end_eighth + 1 → fractional_block_upper.
+        let bottom_fill = thumb.end_eighth + 1;
+        let (expected_char, _) = fractional_block_upper(bottom_fill);
+        assert_eq!(
+            buf[(0, thumb.end_cell)].symbol(),
+            expected_char.to_string(),
+            "end cell: bottom partial"
+        );
+
+        // Track after thumb.
+        assert_eq!(
+            buf[(0, thumb.end_cell + 1)].symbol(),
+            " ",
+            "cell after thumb: track"
+        );
+    }
+
+    #[test]
+    fn test_render_overflow_counts_zero_dimensions() {
+        let counts = OverflowCounts {
+            above: 10,
+            below: 10,
+        };
+        let style = Style::default();
+
+        // Zero width — should not panic or render.
+        let backend = TestBackend::new(1, 10);
+        let mut terminal = Terminal::new(backend).expect("terminal creation");
+        terminal
+            .draw(|f| {
+                let area = Rect::new(0, 0, 0, 10);
+                render_overflow_counts(&counts, area, f.buffer_mut(), style);
+            })
+            .expect("draw");
+
+        // Zero height — should not panic or render.
+        let backend = TestBackend::new(40, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal creation");
+        terminal
+            .draw(|f| {
+                let area = Rect::new(0, 0, 40, 0);
+                render_overflow_counts(&counts, area, f.buffer_mut(), style);
+            })
+            .expect("draw");
+    }
+
+    #[test]
+    fn test_overflow_hit_test_at_right_boundary() {
+        let content_area = Rect::new(0, 0, 40, 10);
+        let counts = OverflowCounts { above: 5, below: 5 };
+        let right = content_area.x + content_area.width; // = 40
+
+        // x == right should be a miss (x < right, not <=).
+        assert_eq!(
+            overflow_hit_test(right, 0, content_area, &counts),
+            None,
+            "x at right boundary should miss"
+        );
+    }
+
+    #[test]
+    fn test_overflow_hit_test_zero_dimensions() {
+        let counts = OverflowCounts { above: 5, below: 5 };
+
+        // Zero width.
+        assert_eq!(
+            overflow_hit_test(0, 0, Rect::new(0, 0, 0, 10), &counts),
+            None,
+        );
+        // Zero height.
+        assert_eq!(
+            overflow_hit_test(0, 0, Rect::new(0, 0, 40, 0), &counts),
+            None,
+        );
     }
 
     #[test]
