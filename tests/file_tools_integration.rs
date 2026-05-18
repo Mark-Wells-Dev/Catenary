@@ -2073,10 +2073,7 @@ fn test_grep_relative_glob_has_cwd_header() -> Result<()> {
         text.contains("cwd ="),
         "Relative glob should produce cwd header: {text}"
     );
-    assert!(
-        text.contains("cwd_target"),
-        "Should find the match: {text}"
-    );
+    assert!(text.contains("cwd_target"), "Should find the match: {text}");
     Ok(())
 }
 

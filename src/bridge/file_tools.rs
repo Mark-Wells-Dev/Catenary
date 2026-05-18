@@ -1694,13 +1694,315 @@ mod tests {
         let mut tier2 = String::new();
         node.render_plain(&mut tier2, 0, None, 200, &[], &FilesystemManager::new());
 
-        assert!(
-            tier2.contains("main.rs"),
-            "tier2 should contain main.rs: {tier2}"
+        // Files sorted alphabetically with exact format.
+        assert_eq!(
+            tier2, "lib.rs  (5 lines)\nmain.rs  (10 lines)\n",
+            "render_plain should produce sorted file listing with line counts"
         );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn test_render_plain_nested_indentation() {
+        let mut node = DirNode::new();
+
+        node.insert(
+            &["sub", "inner.rs"],
+            FileNode {
+                name: "inner.rs".to_string(),
+                abs_path: PathBuf::from("/test/sub/inner.rs"),
+                line_count: Some(3),
+                binary_size: None,
+                is_gitignored: false,
+                is_snapshot: false,
+            },
+        );
+        node.insert(
+            &["top.rs"],
+            FileNode {
+                name: "top.rs".to_string(),
+                abs_path: PathBuf::from("/test/top.rs"),
+                line_count: Some(5),
+                binary_size: None,
+                is_gitignored: false,
+                is_snapshot: false,
+            },
+        );
+
+        let mut out = String::new();
+        node.render_plain(&mut out, 0, None, 200, &[], &FilesystemManager::new());
+
+        // Dirs at depth 0 (no tab), nested files at depth 1 (one tab).
+        assert_eq!(
+            out, "sub/\n\tinner.rs  (3 lines)\ntop.rs  (5 lines)\n",
+            "nested directory should increase indentation depth"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn test_compute_plain_flags_symbols_available() {
+        let idx = SymbolIndex::new().expect("create index");
+        let path = PathBuf::from("/test/big.rs");
+
+        idx.populate_from_document_symbols(
+            &path,
+            &serde_json::json!([{
+                "name": "foo",
+                "kind": 12,
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 2, "character": 1 } },
+                "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 6 } }
+            }]),
+        )
+        .expect("populate");
+
+        let file = FileNode {
+            name: "big.rs".to_string(),
+            abs_path: path,
+            line_count: Some(200),
+            binary_size: None,
+            is_gitignored: false,
+            is_snapshot: false,
+        };
+        let fs = FilesystemManager::new();
+
+        // Above threshold, symbols exist, not rendered, not snapshot.
+        let flags = compute_plain_flags(&file, Some(&idx), 100, &[], &fs, false);
+        assert_eq!(flags, vec!["symbols available"]);
+
+        // map_rendered = true suppresses the flag.
+        let flags = compute_plain_flags(&file, Some(&idx), 100, &[], &fs, true);
         assert!(
-            tier2.contains("lib.rs"),
-            "tier2 should contain lib.rs: {tier2}"
+            !flags.contains(&"symbols available"),
+            "map_rendered should suppress flag: {flags:?}"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn test_compute_plain_flags_snapshot_suppresses() {
+        let idx = SymbolIndex::new().expect("create index");
+        let path = PathBuf::from("/test/snap.rs");
+
+        idx.populate_from_document_symbols(
+            &path,
+            &serde_json::json!([{
+                "name": "bar",
+                "kind": 12,
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 1, "character": 1 } },
+                "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 6 } }
+            }]),
+        )
+        .expect("populate");
+
+        let file = FileNode {
+            name: "snap.rs".to_string(),
+            abs_path: path,
+            line_count: Some(200),
+            binary_size: None,
+            is_gitignored: false,
+            is_snapshot: true,
+        };
+        let fs = FilesystemManager::new();
+
+        let flags = compute_plain_flags(&file, Some(&idx), 100, &[], &fs, false);
+        assert!(
+            !flags.contains(&"symbols available"),
+            "snapshot should suppress symbols available: {flags:?}"
+        );
+        assert_eq!(flags, vec!["snapshot"]);
+    }
+
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn test_compute_plain_flags_below_threshold() {
+        let idx = SymbolIndex::new().expect("create index");
+        let path = PathBuf::from("/test/small.rs");
+
+        idx.populate_from_document_symbols(
+            &path,
+            &serde_json::json!([{
+                "name": "tiny",
+                "kind": 12,
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 1, "character": 1 } },
+                "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 7 } }
+            }]),
+        )
+        .expect("populate");
+
+        let file = FileNode {
+            name: "small.rs".to_string(),
+            abs_path: path,
+            line_count: Some(50),
+            binary_size: None,
+            is_gitignored: false,
+            is_snapshot: false,
+        };
+        let fs = FilesystemManager::new();
+
+        // Below threshold, no suppress → no flag.
+        let flags = compute_plain_flags(&file, Some(&idx), 100, &[], &fs, false);
+        assert!(
+            flags.is_empty(),
+            "below threshold should have no flags: {flags:?}"
+        );
+    }
+
+    #[test]
+    fn test_compute_plain_flags_gitignored() {
+        let file = FileNode {
+            name: "debug.log".to_string(),
+            abs_path: PathBuf::from("/test/debug.log"),
+            line_count: Some(10),
+            binary_size: None,
+            is_gitignored: true,
+            is_snapshot: false,
+        };
+        let fs = FilesystemManager::new();
+
+        let flags = compute_plain_flags(&file, None, 200, &[], &fs, false);
+        assert_eq!(flags, vec!["gitignored"]);
+    }
+
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn test_compute_plain_flags_suppressed_below_threshold() {
+        let idx = SymbolIndex::new().expect("create index");
+        let path = PathBuf::from("/test/suppressed.rs");
+
+        idx.populate_from_document_symbols(
+            &path,
+            &serde_json::json!([{
+                "name": "func",
+                "kind": 12,
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 1, "character": 1 } },
+                "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 7 } }
+            }]),
+        )
+        .expect("populate");
+
+        let file = FileNode {
+            name: "suppressed.rs".to_string(),
+            abs_path: path,
+            line_count: Some(50), // below threshold
+            binary_size: None,
+            is_gitignored: false,
+            is_snapshot: false,
+        };
+        let fs = FilesystemManager::new();
+
+        // Below threshold BUT outline_suppress matches → flag via || branch.
+        let suppress = vec![
+            Glob::new("**/*.rs")
+                .expect("compile glob")
+                .compile_matcher(),
+        ];
+        let flags = compute_plain_flags(&file, Some(&idx), 100, &suppress, &fs, false);
+        assert_eq!(
+            flags,
+            vec!["symbols available"],
+            "suppressed file below threshold should still have flag"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn test_render_enriched_symbols_available_flag() {
+        let idx = SymbolIndex::new().expect("create index");
+
+        // File A: has symbols in outline → gets individual map.
+        let path_a = PathBuf::from("/test/a.rs");
+        idx.populate_from_document_symbols(
+            &path_a,
+            &serde_json::json!([{
+                "name": "foo",
+                "kind": 12,
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 2, "character": 1 } },
+                "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 6 } }
+            }]),
+        )
+        .expect("populate a");
+
+        // File B: has symbols in index but NOT in outline.
+        let path_b = PathBuf::from("/test/b.rs");
+        idx.populate_from_document_symbols(
+            &path_b,
+            &serde_json::json!([{
+                "name": "bar",
+                "kind": 12,
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 1, "character": 1 } },
+                "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 6 } }
+            }]),
+        )
+        .expect("populate b");
+
+        let mut node = DirNode::new();
+        node.insert(
+            &["a.rs"],
+            FileNode {
+                name: "a.rs".to_string(),
+                abs_path: path_a.clone(),
+                line_count: Some(10),
+                binary_size: None,
+                is_gitignored: false,
+                is_snapshot: false,
+            },
+        );
+        node.insert(
+            &["b.rs"],
+            FileNode {
+                name: "b.rs".to_string(),
+                abs_path: path_b.clone(),
+                line_count: Some(5),
+                binary_size: None,
+                is_gitignored: false,
+                is_snapshot: false,
+            },
+        );
+
+        // Outline only includes a.rs — b.rs is non-eligible.
+        let mut outline = HashMap::new();
+        outline.insert(
+            path_a.clone(),
+            vec![Symbol {
+                name: "foo".to_string(),
+                kind: "function".to_string(),
+                line: 0,
+                end_line: 2,
+                scope: None,
+                scope_kind: None,
+                deprecated: false,
+            }],
+        );
+
+        let children_sets = HashMap::new();
+        let sa_paths: HashSet<PathBuf> = [path_a, path_b].into();
+
+        let mut out = String::new();
+        node.render_enriched(&mut out, 0, &outline, &children_sets, &sa_paths, &idx);
+
+        // a.rs should have its symbol map rendered.
+        assert!(
+            out.contains("<Function> foo"),
+            "a.rs should have symbol in map: {out:?}"
+        );
+        // b.rs should show [symbols available] (in sa_paths, not in outline).
+        let b_line = out
+            .lines()
+            .find(|l| l.contains("b.rs"))
+            .expect("b.rs in output");
+        assert!(
+            b_line.contains("[symbols available]"),
+            "b.rs should have [symbols available]: {b_line}"
+        );
+        // a.rs header should NOT have [symbols available] (it has a map).
+        let a_line = out
+            .lines()
+            .find(|l| l.contains("a.rs"))
+            .expect("a.rs in output");
+        assert!(
+            !a_line.contains("[symbols available]"),
+            "a.rs with map should not have [symbols available]: {a_line}"
         );
     }
 

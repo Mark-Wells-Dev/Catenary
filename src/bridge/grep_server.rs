@@ -1730,10 +1730,7 @@ impl Sink for MatchSink<'_> {
     type Error = std::io::Error;
 
     fn matched(&mut self, _searcher: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, Self::Error> {
-        let Some(line_num) = mat
-            .line_number()
-            .and_then(|n| u32::try_from(n).ok())
-        else {
+        let Some(line_num) = mat.line_number().and_then(|n| u32::try_from(n).ok()) else {
             return Ok(true);
         };
 
@@ -2601,10 +2598,7 @@ mod tests {
     #[test]
     fn render_multiple_roots_separated_by_blank_line() {
         let fs = FilesystemManager::new();
-        fs.set_roots(vec![
-            PathBuf::from("/project1"),
-            PathBuf::from("/project2"),
-        ]);
+        fs.set_roots(vec![PathBuf::from("/project1"), PathBuf::from("/project2")]);
         let hits = [
             sym_hit("/project1/src/a.rs", 5, "fn_a", "function"),
             sym_hit("/project2/src/b.rs", 15, "fn_b", "function"),
@@ -2614,18 +2608,9 @@ mod tests {
             hits.iter().map(|h| (h, None)).collect();
         let full = render_results(&enrichments, None, &fs, None);
 
-        assert!(
-            !full.starts_with('\n'),
-            "no leading newline: {full:?}"
-        );
-        assert!(
-            full.contains("/project1\n"),
-            "first root header: {full}"
-        );
-        assert!(
-            full.contains("/project2\n"),
-            "second root header: {full}"
-        );
+        assert!(!full.starts_with('\n'), "no leading newline: {full:?}");
+        assert!(full.contains("/project1\n"), "first root header: {full}");
+        assert!(full.contains("/project2\n"), "second root header: {full}");
         assert!(
             full.contains("\n\n/project2"),
             "blank line between root sections: {full:?}"
@@ -2644,14 +2629,8 @@ mod tests {
             hits.iter().map(|h| (h, None)).collect();
         let full = render_results(&enrichments, None, &fs, None);
 
-        assert!(
-            full.contains("/other/dir1\n"),
-            "first oor parent: {full}"
-        );
-        assert!(
-            full.contains("/other/dir2\n"),
-            "second oor parent: {full}"
-        );
+        assert!(full.contains("/other/dir1\n"), "first oor parent: {full}");
+        assert!(full.contains("/other/dir2\n"), "second oor parent: {full}");
         assert!(
             full.contains("\n\n/other/dir2"),
             "blank line between oor sections: {full:?}"
@@ -2662,8 +2641,7 @@ mod tests {
     fn render_results_cwd_relative_paths_and_header() {
         let fs = test_fs("/project");
         let hit = sym_hit("/project/src/lib.rs", 10, "MyStruct", "struct");
-        let enrichments: Vec<(&GrepHit, Option<SymbolEnrichment>)> =
-            vec![(&hit, None)];
+        let enrichments: Vec<(&GrepHit, Option<SymbolEnrichment>)> = vec![(&hit, None)];
         let full = render_results(&enrichments, None, &fs, Some(Path::new("/project")));
 
         // cwd header present with the path
@@ -2706,8 +2684,7 @@ mod tests {
             },
         };
 
-        let enrichments: Vec<(&GrepHit, Option<SymbolEnrichment>)> =
-            vec![(&hit, None)];
+        let enrichments: Vec<(&GrepHit, Option<SymbolEnrichment>)> = vec![(&hit, None)];
         let full = render_results(&enrichments, None, &fs, None);
 
         assert!(
@@ -2738,10 +2715,16 @@ mod tests {
         let output2 = paginate("aaa\nbbb\nccc", 5, 2);
         assert!(output1.starts_with("[page 1/"), "page 1 header: {output1}");
         assert!(output1.contains("aaa"), "page 1 content: {output1}");
-        assert!(!output1.contains("bbb"), "page 1 excludes page 2: {output1}");
+        assert!(
+            !output1.contains("bbb"),
+            "page 1 excludes page 2: {output1}"
+        );
         assert!(output2.starts_with("[page 2/"), "page 2 header: {output2}");
         assert!(output2.contains("bbb"), "page 2 content: {output2}");
-        assert!(!output2.contains("ccc"), "page 2 excludes page 3: {output2}");
+        assert!(
+            !output2.contains("ccc"),
+            "page 2 excludes page 3: {output2}"
+        );
     }
 
     #[test]
@@ -2769,16 +2752,10 @@ mod tests {
         // Over budget: two pages (verifies newline counted in budget)
         let over1 = paginate(text, 8, 1);
         let over2 = paginate(text, 8, 2);
-        assert!(
-            over1.starts_with("[page 1/2]"),
-            "page 1 of 2: {over1}"
-        );
+        assert!(over1.starts_with("[page 1/2]"), "page 1 of 2: {over1}");
         assert!(over1.contains("aaaa"), "page 1 content: {over1}");
         assert!(!over1.contains("bbbb"), "page 1 excludes page 2: {over1}");
-        assert!(
-            over2.starts_with("[page 2/2]"),
-            "page 2 of 2: {over2}"
-        );
+        assert!(over2.starts_with("[page 2/2]"), "page 2 of 2: {over2}");
         assert!(over2.contains("bbbb"), "page 2 content: {over2}");
     }
 
@@ -3157,10 +3134,7 @@ mod tests {
     #[test]
     fn merge_combines_thread_matches() {
         let mut t1 = ThreadMatches::default();
-        t1.file_lines
-            .entry("a.rs".to_string())
-            .or_default()
-            .push(1);
+        t1.file_lines.entry("a.rs".to_string()).or_default().push(1);
         t1.file_line_texts
             .entry("a.rs".to_string())
             .or_default()
@@ -3169,10 +3143,7 @@ mod tests {
             .push(("foo".to_string(), 0));
 
         let mut t2 = ThreadMatches::default();
-        t2.file_lines
-            .entry("a.rs".to_string())
-            .or_default()
-            .push(5);
+        t2.file_lines.entry("a.rs".to_string()).or_default().push(5);
         t2.file_lines
             .entry("b.rs".to_string())
             .or_default()
@@ -3258,9 +3229,7 @@ mod tests {
         // then "b" at offset 1 (real match). The zero-width advance
         // (`at = m.end() + 1`) must skip past offset 0 so the real
         // match at offset 1 is found.
-        let matcher = RegexMatcherBuilder::new()
-            .build("b?")
-            .expect("valid regex");
+        let matcher = RegexMatcherBuilder::new().build("b?").expect("valid regex");
         let mut local = ThreadMatches::default();
         let content = b"abc\n";
         {
