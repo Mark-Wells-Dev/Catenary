@@ -2933,6 +2933,43 @@ fn test_keyword_filtered_no_grammar() -> Result<()> {
     Ok(())
 }
 
+/// `PrepareRename` enrichment path: file has no `documentSymbol` definitions
+/// (no recognized declaration keywords at line start), so hits go through
+/// `prepare_rename_check` classification. Symbols that pass get enrichment
+/// (refs, impls) via `enrich_at_position`.
+#[test]
+fn test_enrich_prepare_rename_path() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    // No `fn`/`struct`/etc. at line start → mockls returns empty
+    // documentSymbol → symbol index empty → prepareRename path.
+    // `myTarget` is a renameable word (not a keyword), so it passes
+    // prepare_rename_check and gets enrichment.
+    let file = dir.path().join(format!("pr_enrich.{MOCK_LANG_A}"));
+    std::fs::write(&file, "call myTarget here\nuse myTarget again\n")?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let root = dir.path().to_str().context("root path")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "myTarget" }))?;
+
+    assert!(
+        text.contains("myTarget"),
+        "Expected myTarget in output, got:\n{text}"
+    );
+    // Enrichment should run: mockls returns references for myTarget
+    // (all occurrences across documents). At minimum, impls or refs
+    // section should be present.
+    assert!(
+        text.contains("impls:") || text.contains("refs:"),
+        "Expected enrichment section on prepareRename path, got:\n{text}"
+    );
+
+    Ok(())
+}
+
 /// Deprecated subtype: TypeEdge.deprecated is set from tags.
 /// Enrichment runs for the interface; mockls returns deprecated subtypes
 /// when the declaration line contains @deprecated.

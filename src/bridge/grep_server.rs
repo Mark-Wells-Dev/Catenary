@@ -411,9 +411,9 @@ impl GrepServer {
         // Reference hits pass through with no enrichment.
         let mut enrichments: Vec<(&GrepHit, Option<SymbolEnrichment>)> = Vec::new();
         for hit in &hits {
-            let (line_0, col, from_index) = match &hit.classification {
-                HitClass::Symbol { symbol } => (symbol.line, hit.col, true),
-                HitClass::PrepareRenameSymbol => (hit.line, hit.col, false),
+            let (line_0, col) = match &hit.classification {
+                HitClass::Symbol { symbol } => (symbol.line, hit.col),
+                HitClass::PrepareRenameSymbol => (hit.line, hit.col),
                 _ => {
                     enrichments.push((hit, None));
                     continue;
@@ -423,7 +423,7 @@ impl GrepServer {
                 return Err(crate::mcp::RequestCancelled.into());
             }
             let enrichment = self
-                .enrich_at_position(&hit.file, line_0, col, from_index, parent_id, cancel)
+                .enrich_at_position(&hit.file, line_0, col, parent_id, cancel)
                 .await;
             enrichments.push((hit, enrichment));
         }
@@ -501,8 +501,10 @@ impl GrepServer {
     ///
     /// Sends all enrichment queries (references, call hierarchy, implementations,
     /// type hierarchy) for every symbol. The server decides what returns results.
-    /// When `from_index` is false (hit not identified by symbol index), calls
-    /// `prepareRename` first to filter keywords.
+    ///
+    /// Callers are responsible for keyword filtering before calling this method
+    /// — `GrepServer::run` uses `prepare_rename_check` during hit classification
+    /// and only passes confirmed symbols here.
     ///
     /// Opens the document once on the union of all capability-filtered servers,
     /// runs all four enrichment methods (skipping their per-method open/close),
@@ -517,7 +519,6 @@ impl GrepServer {
         path: &Path,
         line_0: u32,
         col: u32,
-        from_index: bool,
         parent_id: Option<i64>,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Option<SymbolEnrichment> {
@@ -529,15 +530,6 @@ impl GrepServer {
             && let Some(cached) = idx.get_enrichment(path, line_0, col, &self.fs_manager)
         {
             return Some(cached);
-        }
-
-        // If not from symbol index, check prepareRename first. Null → keyword, return None.
-        if !from_index
-            && !self
-                .prepare_rename_check(path, line_0, col, parent_id, cancel)
-                .await
-        {
-            return None;
         }
 
         // Collect the union of servers across all enrichment capabilities.
