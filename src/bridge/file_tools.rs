@@ -2107,4 +2107,747 @@ mod tests {
         let sub = node.dirs.get("sub").expect("sub dir should exist");
         assert_eq!(sub.files.len(), 1, "nested file should remain");
     }
+
+    // ─── is_enrichment_eligible_entry ────────────────────────────────
+
+    fn make_glob_entry(
+        name: &str,
+        abs_path: &Path,
+        is_dir: bool,
+        line_count: Option<usize>,
+    ) -> GlobEntry {
+        GlobEntry {
+            name: name.to_string(),
+            abs_path: abs_path.to_path_buf(),
+            is_dir,
+            line_count,
+            binary_size: None,
+            is_symlink: false,
+            symlink_target: None,
+            is_broken_symlink: false,
+            is_gitignored: false,
+            is_snapshot: false,
+        }
+    }
+
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn test_enrichment_eligible_entry_all_conditions() {
+        let idx = SymbolIndex::new().expect("create index");
+        let path = PathBuf::from("/test/eligible.rs");
+
+        idx.populate_from_document_symbols(
+            &path,
+            &serde_json::json!([{
+                "name": "foo",
+                "kind": 12,
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 5, "character": 1 } },
+                "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 6 } }
+            }]),
+        )
+        .expect("populate");
+
+        let entry = make_glob_entry("eligible.rs", &path, false, Some(200));
+        let fs = FilesystemManager::new();
+
+        // All conditions met → eligible.
+        assert!(
+            is_enrichment_eligible_entry(&entry, 100, &[], &idx, &fs),
+            "should be eligible when all conditions met"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn test_enrichment_eligible_entry_dir_excluded() {
+        let idx = SymbolIndex::new().expect("create index");
+        let path = PathBuf::from("/test/dir");
+
+        idx.populate_from_document_symbols(
+            &path,
+            &serde_json::json!([{
+                "name": "sym",
+                "kind": 12,
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 1, "character": 1 } },
+                "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 6 } }
+            }]),
+        )
+        .expect("populate");
+
+        let entry = make_glob_entry("dir", &path, true, Some(200));
+        let fs = FilesystemManager::new();
+
+        assert!(
+            !is_enrichment_eligible_entry(&entry, 100, &[], &idx, &fs),
+            "directories should not be enrichment eligible"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn test_enrichment_eligible_entry_broken_symlink_excluded() {
+        let idx = SymbolIndex::new().expect("create index");
+        let path = PathBuf::from("/test/broken.rs");
+
+        idx.populate_from_document_symbols(
+            &path,
+            &serde_json::json!([{
+                "name": "sym",
+                "kind": 12,
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 1, "character": 1 } },
+                "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 6 } }
+            }]),
+        )
+        .expect("populate");
+
+        let mut entry = make_glob_entry("broken.rs", &path, false, Some(200));
+        entry.is_broken_symlink = true;
+        let fs = FilesystemManager::new();
+
+        assert!(
+            !is_enrichment_eligible_entry(&entry, 100, &[], &idx, &fs),
+            "broken symlinks should not be enrichment eligible"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn test_enrichment_eligible_entry_snapshot_excluded() {
+        let idx = SymbolIndex::new().expect("create index");
+        let path = PathBuf::from("/test/snap.rs");
+
+        idx.populate_from_document_symbols(
+            &path,
+            &serde_json::json!([{
+                "name": "sym",
+                "kind": 12,
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 1, "character": 1 } },
+                "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 6 } }
+            }]),
+        )
+        .expect("populate");
+
+        let mut entry = make_glob_entry("snap.rs", &path, false, Some(200));
+        entry.is_snapshot = true;
+        let fs = FilesystemManager::new();
+
+        assert!(
+            !is_enrichment_eligible_entry(&entry, 100, &[], &idx, &fs),
+            "snapshot files should not be enrichment eligible"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn test_enrichment_eligible_entry_below_threshold() {
+        let idx = SymbolIndex::new().expect("create index");
+        let path = PathBuf::from("/test/small.rs");
+
+        idx.populate_from_document_symbols(
+            &path,
+            &serde_json::json!([{
+                "name": "sym",
+                "kind": 12,
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 1, "character": 1 } },
+                "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 6 } }
+            }]),
+        )
+        .expect("populate");
+
+        // line_count (50) < threshold (100) → not eligible
+        let entry = make_glob_entry("small.rs", &path, false, Some(50));
+        let fs = FilesystemManager::new();
+
+        assert!(
+            !is_enrichment_eligible_entry(&entry, 100, &[], &idx, &fs),
+            "file below threshold should not be enrichment eligible"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn test_enrichment_eligible_entry_at_threshold_boundary() {
+        let idx = SymbolIndex::new().expect("create index");
+        let path = PathBuf::from("/test/boundary.rs");
+
+        idx.populate_from_document_symbols(
+            &path,
+            &serde_json::json!([{
+                "name": "sym",
+                "kind": 12,
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 1, "character": 1 } },
+                "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 6 } }
+            }]),
+        )
+        .expect("populate");
+
+        // line_count == threshold → eligible (>= check)
+        let entry = make_glob_entry("boundary.rs", &path, false, Some(100));
+        let fs = FilesystemManager::new();
+
+        assert!(
+            is_enrichment_eligible_entry(&entry, 100, &[], &idx, &fs),
+            "file at exact threshold should be eligible"
+        );
+
+        // line_count one below threshold → not eligible
+        let entry_below = make_glob_entry("boundary.rs", &path, false, Some(99));
+        assert!(
+            !is_enrichment_eligible_entry(&entry_below, 100, &[], &idx, &fs),
+            "file one below threshold should not be eligible"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn test_enrichment_eligible_entry_no_symbols() {
+        let idx = SymbolIndex::new().expect("create index");
+        let path = PathBuf::from("/test/no_syms.rs");
+        // Don't populate any symbols for this path.
+
+        let entry = make_glob_entry("no_syms.rs", &path, false, Some(200));
+        let fs = FilesystemManager::new();
+
+        assert!(
+            !is_enrichment_eligible_entry(&entry, 100, &[], &idx, &fs),
+            "file without symbols should not be enrichment eligible"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn test_enrichment_eligible_entry_suppressed() {
+        let idx = SymbolIndex::new().expect("create index");
+        let path = PathBuf::from("/test/suppressed.rs");
+
+        idx.populate_from_document_symbols(
+            &path,
+            &serde_json::json!([{
+                "name": "sym",
+                "kind": 12,
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 1, "character": 1 } },
+                "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 6 } }
+            }]),
+        )
+        .expect("populate");
+
+        let entry = make_glob_entry("suppressed.rs", &path, false, Some(200));
+        let suppress = vec![
+            Glob::new("**/*.rs")
+                .expect("compile glob")
+                .compile_matcher(),
+        ];
+        let fs = FilesystemManager::new();
+
+        assert!(
+            !is_enrichment_eligible_entry(&entry, 100, &suppress, &idx, &fs),
+            "suppressed file should not be enrichment eligible"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn test_enrichment_eligible_entry_no_line_count() {
+        let idx = SymbolIndex::new().expect("create index");
+        let path = PathBuf::from("/test/no_lc.rs");
+
+        idx.populate_from_document_symbols(
+            &path,
+            &serde_json::json!([{
+                "name": "sym",
+                "kind": 12,
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 1, "character": 1 } },
+                "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 6 } }
+            }]),
+        )
+        .expect("populate");
+
+        // line_count = None → is_some_and fails → not eligible
+        let entry = make_glob_entry("no_lc.rs", &path, false, None);
+        let fs = FilesystemManager::new();
+
+        assert!(
+            !is_enrichment_eligible_entry(&entry, 100, &[], &idx, &fs),
+            "file with no line count should not be enrichment eligible"
+        );
+    }
+
+    // ─── has_symbols_available ───────────────────────────────────────
+
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn test_has_symbols_available_with_symbols() {
+        let idx = SymbolIndex::new().expect("create index");
+        let path = PathBuf::from("/test/has_syms.rs");
+
+        idx.populate_from_document_symbols(
+            &path,
+            &serde_json::json!([{
+                "name": "foo",
+                "kind": 12,
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 1, "character": 1 } },
+                "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 6 } }
+            }]),
+        )
+        .expect("populate");
+
+        assert!(
+            has_symbols_available(&path, Some(&idx)),
+            "should return true when symbols exist"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn test_has_symbols_available_without_symbols() {
+        let idx = SymbolIndex::new().expect("create index");
+        let path = PathBuf::from("/test/no_syms.rs");
+
+        assert!(
+            !has_symbols_available(&path, Some(&idx)),
+            "should return false when no symbols"
+        );
+    }
+
+    #[test]
+    fn test_has_symbols_available_no_index() {
+        let path = PathBuf::from("/test/any.rs");
+
+        assert!(
+            !has_symbols_available(&path, None),
+            "should return false with no index"
+        );
+    }
+
+    // ─── is_outline_suppressed ──────────────────────────────────────
+
+    #[test]
+    fn test_outline_suppressed_empty_list() {
+        let path = PathBuf::from("/test/file.rs");
+        let fs = FilesystemManager::new();
+
+        assert!(
+            !is_outline_suppressed(&path, &[], &fs),
+            "empty suppression list should not suppress"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn test_outline_suppressed_matching_pattern() {
+        let path = PathBuf::from("/test/file.rs");
+        let suppress = vec![
+            Glob::new("**/*.rs")
+                .expect("compile glob")
+                .compile_matcher(),
+        ];
+        let fs = FilesystemManager::new();
+
+        assert!(
+            is_outline_suppressed(&path, &suppress, &fs),
+            "matching pattern should suppress"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn test_outline_suppressed_non_matching_pattern() {
+        let path = PathBuf::from("/test/file.rs");
+        let suppress = vec![
+            Glob::new("**/*.py")
+                .expect("compile glob")
+                .compile_matcher(),
+        ];
+        let fs = FilesystemManager::new();
+
+        assert!(
+            !is_outline_suppressed(&path, &suppress, &fs),
+            "non-matching pattern should not suppress"
+        );
+    }
+
+    // ─── render_symbol_line ─────────────────────────────────────────
+
+    #[test]
+    fn test_render_symbol_line_basic() {
+        let sym = Symbol {
+            name: "my_func".to_string(),
+            kind: "function".to_string(),
+            line: 9,
+            end_line: 19,
+            scope: None,
+            scope_kind: None,
+            deprecated: false,
+        };
+
+        let mut out = String::new();
+        render_symbol_line(&mut out, &sym, None, "\t");
+
+        assert_eq!(out, "\t:10-20 <Function> my_func\n");
+    }
+
+    #[test]
+    fn test_render_symbol_line_with_children() {
+        let sym = Symbol {
+            name: "MyStruct".to_string(),
+            kind: "struct".to_string(),
+            line: 0,
+            end_line: 10,
+            scope: None,
+            scope_kind: None,
+            deprecated: false,
+        };
+
+        let children: HashSet<String> = ["MyStruct".to_string()].into();
+        let mut out = String::new();
+        render_symbol_line(&mut out, &sym, Some(&children), "\t");
+
+        assert_eq!(out, "\t:1-11 <Struct> MyStruct/\n");
+    }
+
+    #[test]
+    fn test_render_symbol_line_deprecated() {
+        let sym = Symbol {
+            name: "old_fn".to_string(),
+            kind: "function".to_string(),
+            line: 4,
+            end_line: 6,
+            scope: None,
+            scope_kind: None,
+            deprecated: true,
+        };
+
+        let mut out = String::new();
+        render_symbol_line(&mut out, &sym, None, "");
+
+        assert_eq!(out, ":5-7 <Function, deprecated> old_fn\n");
+    }
+
+    #[test]
+    fn test_render_symbol_line_not_in_children_set() {
+        let sym = Symbol {
+            name: "standalone".to_string(),
+            kind: "function".to_string(),
+            line: 0,
+            end_line: 5,
+            scope: None,
+            scope_kind: None,
+            deprecated: false,
+        };
+
+        // Children set exists but doesn't contain this symbol.
+        let children: HashSet<String> = ["OtherThing".to_string()].into();
+        let mut out = String::new();
+        render_symbol_line(&mut out, &sym, Some(&children), "");
+
+        // No trailing slash since not in children set.
+        assert_eq!(out, ":1-6 <Function> standalone\n");
+    }
+
+    // ─── make_fingerprint ───────────────────────────────────────────
+
+    #[test]
+    fn test_make_fingerprint_produces_sorted_pairs() {
+        let syms = vec![
+            Symbol {
+                name: "beta".to_string(),
+                kind: "struct".to_string(),
+                line: 5,
+                end_line: 10,
+                scope: None,
+                scope_kind: None,
+                deprecated: false,
+            },
+            Symbol {
+                name: "alpha".to_string(),
+                kind: "function".to_string(),
+                line: 0,
+                end_line: 3,
+                scope: None,
+                scope_kind: None,
+                deprecated: false,
+            },
+        ];
+
+        let fp = make_fingerprint(&syms);
+
+        // Sorted by (kind, name): ("function", "alpha") before ("struct", "beta").
+        assert_eq!(fp, "function\x00alpha\x01struct\x00beta");
+    }
+
+    #[test]
+    fn test_make_fingerprint_identical_for_same_symbols() {
+        let syms_a = vec![
+            Symbol {
+                name: "foo".to_string(),
+                kind: "function".to_string(),
+                line: 0,
+                end_line: 5,
+                scope: None,
+                scope_kind: None,
+                deprecated: false,
+            },
+            Symbol {
+                name: "Bar".to_string(),
+                kind: "struct".to_string(),
+                line: 10,
+                end_line: 20,
+                scope: None,
+                scope_kind: None,
+                deprecated: false,
+            },
+        ];
+
+        // Same kinds/names but different line numbers.
+        let syms_b = vec![
+            Symbol {
+                name: "foo".to_string(),
+                kind: "function".to_string(),
+                line: 3,
+                end_line: 8,
+                scope: None,
+                scope_kind: None,
+                deprecated: false,
+            },
+            Symbol {
+                name: "Bar".to_string(),
+                kind: "struct".to_string(),
+                line: 15,
+                end_line: 25,
+                scope: None,
+                scope_kind: None,
+                deprecated: false,
+            },
+        ];
+
+        assert_eq!(
+            make_fingerprint(&syms_a),
+            make_fingerprint(&syms_b),
+            "same symbols at different lines should have identical fingerprints"
+        );
+    }
+
+    // ─── is_enrichment_eligible (pattern tree) ────────────────────────
+
+    /// Generates a string with `n` lines for tests that need files of a
+    /// specific line count.
+    fn gen_lines(n: usize) -> String {
+        "x\n".repeat(n)
+    }
+
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn test_enrichment_eligible_regular_file() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("big.rs");
+        // 200 lines to exceed threshold of 100.
+        std::fs::write(&path, gen_lines(200)).expect("write file");
+
+        let idx = SymbolIndex::new().expect("create index");
+        idx.populate_from_document_symbols(
+            &path,
+            &serde_json::json!([{
+                "name": "sym",
+                "kind": 12,
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 1, "character": 1 } },
+                "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 6 } }
+            }]),
+        )
+        .expect("populate");
+
+        let fs = FilesystemManager::new();
+        let matched = vec![(path.clone(), dir.path().to_path_buf(), false)];
+
+        assert!(
+            is_enrichment_eligible(&path, &matched, 100, &[], &idx, &fs),
+            "regular file above threshold with symbols should be eligible"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn test_enrichment_eligible_snapshot_file() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("handler.catenary_snapshot_5.rs");
+        std::fs::write(&path, gen_lines(200)).expect("write file");
+
+        let idx = SymbolIndex::new().expect("create index");
+        idx.populate_from_document_symbols(
+            &path,
+            &serde_json::json!([{
+                "name": "sym",
+                "kind": 12,
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 1, "character": 1 } },
+                "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 6 } }
+            }]),
+        )
+        .expect("populate");
+
+        let fs = FilesystemManager::new();
+        let matched = vec![(path.clone(), dir.path().to_path_buf(), false)];
+
+        assert!(
+            !is_enrichment_eligible(&path, &matched, 100, &[], &idx, &fs),
+            "snapshot file should not be enrichment eligible"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn test_enrichment_eligible_below_threshold() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("small.rs");
+        // 10 lines, below threshold of 100.
+        std::fs::write(&path, gen_lines(10)).expect("write file");
+
+        let idx = SymbolIndex::new().expect("create index");
+        idx.populate_from_document_symbols(
+            &path,
+            &serde_json::json!([{
+                "name": "sym",
+                "kind": 12,
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 1, "character": 1 } },
+                "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 6 } }
+            }]),
+        )
+        .expect("populate");
+
+        let fs = FilesystemManager::new();
+        let matched = vec![(path.clone(), dir.path().to_path_buf(), false)];
+
+        assert!(
+            !is_enrichment_eligible(&path, &matched, 100, &[], &idx, &fs),
+            "file below threshold should not be eligible"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn test_enrichment_eligible_no_symbols() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("no_syms.rs");
+        std::fs::write(&path, gen_lines(200)).expect("write file");
+
+        let idx = SymbolIndex::new().expect("create index");
+        // Don't populate symbols.
+        let fs = FilesystemManager::new();
+        let matched = vec![(path.clone(), dir.path().to_path_buf(), false)];
+
+        assert!(
+            !is_enrichment_eligible(&path, &matched, 100, &[], &idx, &fs),
+            "file without symbols should not be eligible"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn test_enrichment_eligible_suppressed() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("denied.rs");
+        std::fs::write(&path, gen_lines(200)).expect("write file");
+
+        let idx = SymbolIndex::new().expect("create index");
+        idx.populate_from_document_symbols(
+            &path,
+            &serde_json::json!([{
+                "name": "sym",
+                "kind": 12,
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 1, "character": 1 } },
+                "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 6 } }
+            }]),
+        )
+        .expect("populate");
+
+        let suppress = vec![
+            Glob::new("**/*.rs")
+                .expect("compile glob")
+                .compile_matcher(),
+        ];
+        let fs = FilesystemManager::new();
+        let matched = vec![(path.clone(), dir.path().to_path_buf(), false)];
+
+        assert!(
+            !is_enrichment_eligible(&path, &matched, 100, &suppress, &idx, &fs),
+            "suppressed file should not be eligible"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn test_enrichment_eligible_at_threshold_boundary() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("boundary.rs");
+        // Exactly 100 lines for threshold of 100.
+        std::fs::write(&path, gen_lines(100)).expect("write file");
+
+        let idx = SymbolIndex::new().expect("create index");
+        idx.populate_from_document_symbols(
+            &path,
+            &serde_json::json!([{
+                "name": "sym",
+                "kind": 12,
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 1, "character": 1 } },
+                "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 6 } }
+            }]),
+        )
+        .expect("populate");
+
+        let fs = FilesystemManager::new();
+        let matched = vec![(path.clone(), dir.path().to_path_buf(), false)];
+
+        assert!(
+            is_enrichment_eligible(&path, &matched, 100, &[], &idx, &fs),
+            "file at exact threshold should be eligible"
+        );
+
+        // One line below threshold.
+        let path_below = dir.path().join("below.rs");
+        std::fs::write(&path_below, gen_lines(99)).expect("write file");
+
+        idx.populate_from_document_symbols(
+            &path_below,
+            &serde_json::json!([{
+                "name": "sym",
+                "kind": 12,
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 1, "character": 1 } },
+                "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 6 } }
+            }]),
+        )
+        .expect("populate");
+
+        let matched_below = vec![(path_below.clone(), dir.path().to_path_buf(), false)];
+        assert!(
+            !is_enrichment_eligible(&path_below, &matched_below, 100, &[], &idx, &fs),
+            "file one below threshold should not be eligible"
+        );
+    }
+
+    #[test]
+    fn test_make_fingerprint_differs_for_different_symbols() {
+        let syms_a = vec![Symbol {
+            name: "foo".to_string(),
+            kind: "function".to_string(),
+            line: 0,
+            end_line: 5,
+            scope: None,
+            scope_kind: None,
+            deprecated: false,
+        }];
+
+        let syms_b = vec![Symbol {
+            name: "bar".to_string(),
+            kind: "function".to_string(),
+            line: 0,
+            end_line: 5,
+            scope: None,
+            scope_kind: None,
+            deprecated: false,
+        }];
+
+        assert_ne!(
+            make_fingerprint(&syms_a),
+            make_fingerprint(&syms_b),
+            "different symbols should have different fingerprints"
+        );
+    }
 }

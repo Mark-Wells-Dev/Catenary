@@ -2052,6 +2052,130 @@ fn test_grep_absolute_glob_no_cwd_header() -> Result<()> {
     Ok(())
 }
 
+// ─── Pattern + gitignored tests ─────────────────────────────────────
+
+/// Glob pattern should exclude gitignored files by default.
+#[test]
+fn test_glob_pattern_excludes_gitignored_by_default() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    Command::new("git")
+        .args(["init"])
+        .current_dir(dir.path())
+        .output()
+        .context("git init")?;
+
+    std::fs::write(dir.path().join(".gitignore"), "*.log\n")?;
+    std::fs::write(dir.path().join("app.rs"), "fn main() {}\n")?;
+    std::fs::write(dir.path().join("debug.log"), "log data\n")?;
+
+    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    // Pattern mode (glob), not directory mode.
+    let text = bridge.call_tool_text(
+        "glob",
+        &json!({ "pattern": format!("{}/*", dir.path().display()) }),
+    )?;
+
+    assert!(
+        text.contains("app.rs"),
+        "Should show non-ignored file: {text}"
+    );
+    assert!(
+        !text.contains("debug.log"),
+        "Should exclude gitignored file by default: {text}"
+    );
+    Ok(())
+}
+
+/// Glob pattern with `include_gitignored: true` should show gitignored
+/// files and mark them with the `[gitignored]` flag.
+#[test]
+fn test_glob_pattern_gitignored_flag() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    Command::new("git")
+        .args(["init"])
+        .current_dir(dir.path())
+        .output()
+        .context("git init")?;
+
+    std::fs::write(dir.path().join(".gitignore"), "*.log\n")?;
+    std::fs::write(dir.path().join("app.rs"), "fn main() {}\n")?;
+    std::fs::write(dir.path().join("debug.log"), "log data\n")?;
+
+    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    // Pattern mode with include_gitignored.
+    let text = bridge.call_tool_text(
+        "glob",
+        &json!({
+            "pattern": format!("{}/*", dir.path().display()),
+            "include_gitignored": true,
+            "include_hidden": true
+        }),
+    )?;
+
+    assert!(
+        text.contains("debug.log"),
+        "Should show gitignored file: {text}"
+    );
+
+    // The gitignored flag should be on the .log file, not on app.rs.
+    let log_line = text.lines().find(|l| l.contains("debug.log")).unwrap_or("");
+    assert!(
+        log_line.contains("[gitignored]"),
+        "debug.log should have [gitignored] flag: {log_line}"
+    );
+
+    let app_line = text.lines().find(|l| l.contains("app.rs")).unwrap_or("");
+    assert!(
+        !app_line.contains("gitignored"),
+        "app.rs should NOT have gitignored flag: {app_line}"
+    );
+    Ok(())
+}
+
+/// Pattern enrichment with mockls verifies that eligible files in a
+/// pattern tree get defensive maps rendered.
+#[test]
+fn test_glob_pattern_enrichment() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let src = dir.path().join("src");
+    std::fs::create_dir(&src)?;
+
+    // Big file above threshold.
+    std::fs::write(
+        src.join(format!("handler.{MOCK_EXT}")),
+        "fn process\nstruct Config\n\n\n\n\n\n\n\n\n",
+    )?;
+    // Small file below threshold.
+    std::fs::write(src.join(format!("util.{MOCK_EXT}")), "fn helper\n")?;
+
+    let config = "[tools.glob]\noutline_threshold = 5\nbudget = 5000\n";
+    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), Some(config))?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text(
+        "glob",
+        &json!({ "pattern": format!("src/**/*.{MOCK_EXT}") }),
+    )?;
+
+    // Big file should have enriched map symbols.
+    assert!(
+        text.contains("<Function>") || text.contains("<Struct>"),
+        "Pattern tree should have enriched symbols for large file: {text}"
+    );
+    // Small file should appear but without symbols.
+    assert!(
+        text.contains(&format!("util.{MOCK_EXT}")),
+        "Should list small file: {text}"
+    );
+    Ok(())
+}
+
 /// Grep with a relative glob should produce a `cwd =` context header
 /// so the agent knows how to interpret the relative paths.
 #[test]
