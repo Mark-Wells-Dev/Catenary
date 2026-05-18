@@ -1057,6 +1057,32 @@ mod tests {
         assert_eq!(format_ago(ts), "2h ago");
     }
 
+    #[test]
+    fn test_format_ago_boundaries() {
+        // Exactly 60s → minutes bucket, not "60s ago".
+        let ts = Utc::now() - TimeDelta::seconds(60);
+        assert_eq!(format_ago(ts), "1m ago");
+        // Exactly 3600s → hours bucket, not "60m ago".
+        let ts = Utc::now() - TimeDelta::seconds(3600);
+        assert_eq!(format_ago(ts), "1h ago");
+        // Exactly 86400s → days bucket, not "24h ago".
+        let ts = Utc::now() - TimeDelta::seconds(86400);
+        assert_eq!(format_ago(ts), "1d ago");
+    }
+
+    #[test]
+    fn test_format_duration_short() {
+        assert_eq!(format_duration_short(0), "0.0s");
+        assert_eq!(format_duration_short(500), "0.5s");
+        assert_eq!(format_duration_short(3200), "3.2s");
+        assert_eq!(format_duration_short(9999), "10.0s");
+        // Exactly 10000ms → integer format, not "10.0s".
+        assert_eq!(format_duration_short(10_000), "10s");
+        assert_eq!(format_duration_short(45_000), "45s");
+        // Negative clamped to 0.
+        assert_eq!(format_duration_short(-100), "0.0s");
+    }
+
     // ── Message formatter tests ─────────────────────────────────────────
 
     #[test]
@@ -1283,6 +1309,37 @@ mod tests {
             plain.contains("$/progress"),
             "empty value should fall back to method name"
         );
+    }
+
+    #[test]
+    fn test_progress_suffix_bare_report() {
+        // A "report" with no title, message, or percentage should return None,
+        // not "done" (which is only for "end" kind).
+        let payload = serde_json::json!({"value": {"kind": "report"}});
+        assert_eq!(progress_suffix(&payload), None);
+    }
+
+    #[test]
+    fn test_format_progress_detail_equal_percentages() {
+        // When first == last, should show single percentage, not a range.
+        let detail = format_progress_detail(3, Some(42), Some(42));
+        assert_eq!(detail, "3 messages, 42%");
+        assert!(
+            !detail.contains('\u{2192}'),
+            "equal percentages should not show arrow: {detail}"
+        );
+    }
+
+    #[test]
+    fn test_format_progress_detail_single_percentage() {
+        // Only first percentage present.
+        assert_eq!(format_progress_detail(2, Some(10), None), "2 messages, 10%");
+        // Only last percentage present.
+        assert_eq!(format_progress_detail(2, None, Some(90)), "2 messages, 90%");
+        // Neither present.
+        assert_eq!(format_progress_detail(2, None, None), "2 messages");
+        // Singular.
+        assert_eq!(format_progress_detail(1, None, None), "1 message");
     }
 
     // ── Collapsed rendering tests ────────────────────────────────────────
@@ -1815,10 +1872,53 @@ mod tests {
             "LSP error should show ✘ icon: {text}"
         );
         assert!(
+            text.contains("[rust-analyzer]"),
+            "LSP error should show server name: {text}"
+        );
+        assert!(
             text.contains("Method not found"),
             "should contain error message: {text}"
         );
-        assert!(!text.contains("<->"), "should not contain arrow: {text}");
+    }
+
+    #[test]
+    fn test_format_pair_lsp_cancelled() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let request = make_message("lsp", "textDocument/hover", "rust-analyzer");
+        let response = make_message("lsp", "notifications/cancelled", "rust-analyzer");
+        let line = format_pair_styled(&request, &response, &icons, &theme);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.contains("[rust-analyzer]"),
+            "LSP cancelled should show server name: {text}"
+        );
+        assert!(text.contains("cancelled"), "should show cancelled: {text}");
+
+        let plain = format_pair_plain(&request, &response);
+        assert!(
+            plain.contains("[rust-analyzer]"),
+            "plain LSP cancelled should show server name: {plain}"
+        );
+    }
+
+    #[test]
+    fn test_format_pair_mcp_non_tool_error() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let request = make_message("mcp", "resources/list", "catenary");
+        let response = make_message_with_payload(
+            "mcp",
+            "resources/list",
+            "catenary",
+            serde_json::json!({"error": {"code": -32601, "message": "Not supported"}}),
+        );
+        let line = format_pair_styled(&request, &response, &icons, &theme);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.contains("[mcp]"),
+            "MCP non-tool error should show [mcp] prefix: {text}"
+        );
     }
 
     #[test]
@@ -2363,6 +2463,65 @@ mod tests {
         assert!(
             first_text.contains("pattern"),
             "First segment should still show arguments: {first_text}"
+        );
+    }
+
+    // ── Scope plain formatter tests ───────────────────────────────────
+
+    #[test]
+    fn test_format_scope_plain_mcp_tool() {
+        let request = make_message_with_payload(
+            "mcp",
+            "tools/call",
+            "catenary",
+            serde_json::json!({"params": {"name": "grep", "arguments": {"pattern": "foo"}}}),
+        );
+        let response = make_message_with_payload(
+            "mcp",
+            "tools/call",
+            "catenary",
+            serde_json::json!({"result": {"content": [{"type": "text", "text": "a\nb\nc"}]}}),
+        );
+        let messages = vec![request, response];
+        let parent = DisplayEntry::Paired {
+            request_index: 0,
+            response_index: 1,
+            parent_id: None,
+        };
+        let plain = format_scope_plain(&parent, 5, SegmentPosition::Only, &messages);
+        assert!(
+            plain.contains("grep"),
+            "MCP tool scope should show tool name: {plain}"
+        );
+        assert!(
+            plain.contains("3 lines"),
+            "Only position should show line count: {plain}"
+        );
+        assert!(
+            plain.contains("5 children"),
+            "should show child count: {plain}"
+        );
+    }
+
+    #[test]
+    fn test_format_scope_plain_lsp() {
+        let request = make_message("lsp", "textDocument/hover", "rust-analyzer");
+        let mut response = make_message("lsp", "textDocument/hover", "rust-analyzer");
+        response.payload = serde_json::json!({"result": null});
+        let messages = vec![request, response];
+        let parent = DisplayEntry::Paired {
+            request_index: 0,
+            response_index: 1,
+            parent_id: None,
+        };
+        let plain = format_scope_plain(&parent, 3, SegmentPosition::Only, &messages);
+        assert!(
+            plain.contains("[rust-analyzer]"),
+            "LSP scope should show server name: {plain}"
+        );
+        assert!(
+            plain.contains("textDocument/hover"),
+            "LSP scope should show method: {plain}"
         );
     }
 
