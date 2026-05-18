@@ -272,9 +272,11 @@ impl DirNode {
                 }
             } else {
                 // Non-eligible file: flags only.
-                let has_map = outline.contains_key(&file.abs_path);
+                // Files reaching this branch are NOT in `outline` (those
+                // go through eligible → file_to_group/individual_files),
+                // so we only need the sa_paths check.
                 let mut flags = Vec::new();
-                if sa_paths.contains(&file.abs_path) && !has_map {
+                if sa_paths.contains(&file.abs_path) {
                     flags.push("symbols available");
                 }
                 if file.is_gitignored {
@@ -2004,6 +2006,14 @@ mod tests {
             !a_line.contains("[symbols available]"),
             "a.rs with map should not have [symbols available]: {a_line}"
         );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn test_default_page_deserialization() {
+        let input: GlobInput =
+            serde_json::from_value(serde_json::json!({"pattern": "*.rs"})).expect("deserialize");
+        assert_eq!(input.page, 1, "default page should be 1");
     }
 
     #[test]
