@@ -2858,6 +2858,12 @@ fn test_enrich_from_ts_false_symbol() -> Result<()> {
         text.contains("enrichable_sym"),
         "Expected enrichable_sym in output, got:\n{text}"
     );
+    // Enrichment should produce edges (mockls routes implementation to
+    // references, so impls section may absorb refs via dedup).
+    assert!(
+        text.contains("impls:") || text.contains("refs:"),
+        "Expected enrichment section from no-grammar path, got:\n{text}"
+    );
 
     Ok(())
 }
@@ -2906,6 +2912,39 @@ fn test_enrich_from_ts_false_keyword() -> Result<()> {
     Ok(())
 }
 
+/// Keyword-only matches filtered on no-grammar path.
+/// When the symbol index has no data for a file (no `documentSymbol`
+/// definitions), hits go through `prepare_rename_check`. mockls returns
+/// null for declaration keywords (`fn`, `struct`, etc.), which
+/// `prepare_rename_check` interprets as keyword → filtered from output.
+#[test]
+fn test_keyword_filtered_no_grammar() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    // File with no declaration-keyword-at-line-start patterns, so
+    // mockls's `documentSymbol` returns empty → symbol index has no
+    // data for this file → no-grammar path → `prepare_rename_check`.
+    // The `fn` keyword appears mid-line, not as a definition.
+    let file = dir.path().join(format!("kw_filter.{MOCK_LANG_A}"));
+    std::fs::write(&file, "just some fn keyword\nanother fn here\n")?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let root = dir.path().to_str().context("root path")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "fn" }))?;
+
+    // `fn` is a declaration keyword — mockls's prepareRename returns
+    // null at the keyword position. All hits should be filtered.
+    assert!(
+        text.contains("No results found"),
+        "Expected keyword hits to be filtered, got:\n{text}"
+    );
+
+    Ok(())
+}
+
 /// Deprecated subtype: TypeEdge.deprecated is set from tags.
 /// Enrichment runs for the interface; mockls returns deprecated subtypes
 /// when the declaration line contains @deprecated.
@@ -2948,6 +2987,15 @@ fn test_enrich_deprecated_type_edge() -> Result<()> {
     assert!(
         text.contains("Shape"),
         "Expected Shape in output, got:\n{text}"
+    );
+    // Subtypes section should contain the deprecated subtype
+    assert!(
+        text.contains("subtypes:"),
+        "Expected subtypes: section from fetch_type_hierarchy, got:\n{text}"
+    );
+    assert!(
+        text.contains("OldSquare"),
+        "Expected OldSquare in subtypes section, got:\n{text}"
     );
 
     Ok(())
@@ -2996,6 +3044,18 @@ fn test_enrich_outgoing_calls() -> Result<()> {
     assert!(
         text.contains("main_fn"),
         "Expected main_fn in output, got:\n{text}"
+    );
+    assert!(
+        text.contains("calls:"),
+        "Expected calls: section for outgoing calls, got:\n{text}"
+    );
+    assert!(
+        text.contains("helper_a"),
+        "Expected helper_a in calls section, got:\n{text}"
+    );
+    assert!(
+        text.contains("helper_b"),
+        "Expected helper_b in calls section, got:\n{text}"
     );
 
     Ok(())
@@ -3244,6 +3304,11 @@ fn test_grep_type_hierarchy() -> Result<()> {
         text.contains("subtypes:"),
         "Expected subtypes: section, got:\n{text}"
     );
+    // Subtype name should appear within the subtypes section
+    assert!(
+        text.contains("Car_t1"),
+        "Expected Car_t1 in subtypes section, got:\n{text}"
+    );
 
     Ok(())
 }
@@ -3329,6 +3394,12 @@ fn test_grep_refs_sort() -> Result<()> {
         text.contains("<Function>") && text.contains("sorted_sym"),
         "Expected enriched output, got:\n{text}"
     );
+    // References section: mockls returns references for sorted_sym
+    // across all occurrences in the document.
+    assert!(
+        text.contains("refs:"),
+        "Expected refs: section from fetch_references, got:\n{text}"
+    );
 
     Ok(())
 }
@@ -3384,6 +3455,11 @@ fn test_grep_outgoing_calls_sorted() -> Result<()> {
             assert!(a < b, "Expected alpha before beta in calls, got:\n{text}");
         }
     }
+    // Call edges should carry kind labels from mockls
+    assert!(
+        text.contains("<Function>") && text.contains("alpha_callee"),
+        "Expected <Function> alpha_callee in calls, got:\n{text}"
+    );
 
     Ok(())
 }
@@ -3809,6 +3885,11 @@ fn test_grep_incoming_calls_merge() -> Result<()> {
         !text.contains("callers:"),
         "Expected no callers: section (merged into refs), got:\n{text}"
     );
+    // Incoming calls should have been merged into refs section
+    assert!(
+        text.contains("refs:"),
+        "Expected refs: section with merged incoming calls, got:\n{text}"
+    );
 
     Ok(())
 }
@@ -3842,17 +3923,20 @@ fn test_grep_impls_structure() -> Result<()> {
         .as_str()
         .context("Missing text")?;
 
-    // mockls routes implementation to references. If impls section exists,
-    // it should have file-grouped entries with `:line` format.
-    if text.contains("impls:") {
-        let impls_start = text.find("impls:").context("impls")?;
-        let impls_section = &text[impls_start..];
-        // Should contain a file path and at least one `:line` entry
-        assert!(
-            impls_section.contains(&format!("impls.{MOCK_LANG_A}")) || impls_section.contains(':'),
-            "impls section should have file-grouped entries, got:\n{text}"
-        );
-    }
+    // mockls routes textDocument/implementation to handle_references
+    // (same word-search logic), so fetch_implementations returns
+    // locations for ImplStr. The impls section must be present.
+    assert!(
+        text.contains("impls:"),
+        "Expected impls: section from fetch_implementations, got:\n{text}"
+    );
+    let impls_start = text.find("impls:").context("impls")?;
+    let impls_section = &text[impls_start..];
+    // Should contain a file path and at least one `:line` entry
+    assert!(
+        impls_section.contains(&format!("impls.{MOCK_LANG_A}")) || impls_section.contains(':'),
+        "impls section should have file-grouped entries, got:\n{text}"
+    );
 
     Ok(())
 }
