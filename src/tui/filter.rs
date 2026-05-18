@@ -158,12 +158,9 @@ impl FilterState {
             if let Some(saved) = self.saved_input.take() {
                 self.input = saved;
             }
-        } else if new_pos < 0 {
-            // At oldest — clamp.
-            self.history_cursor = Some(0);
-            self.input = self.history[0].clone();
         } else {
-            let idx = new_pos as usize;
+            // Clamp at oldest (0) to handle negative overshoot.
+            let idx = new_pos.max(0) as usize;
             self.history_cursor = Some(idx);
             self.input = self.history[idx].clone();
         }

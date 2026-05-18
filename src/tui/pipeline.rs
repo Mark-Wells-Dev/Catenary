@@ -375,34 +375,30 @@ pub fn scope_collapse(
 /// run and pass through as-is. Takes ownership to avoid cloning scope trees.
 #[must_use]
 pub fn run_collapse(entries: Vec<DisplayEntry>, messages: &[SessionMessage]) -> Vec<DisplayEntry> {
+    /// Active run of consecutive same-category singles.
+    struct RunState {
+        key: String,
+        start: usize,
+        end: usize,
+        count: usize,
+    }
+
     let mut result = Vec::with_capacity(entries.len());
+    let mut current_run: Option<RunState> = None;
 
-    // Current run state.
-    let mut run_key: Option<String> = None;
-    let mut run_start: usize = 0;
-    let mut run_end: usize = 0;
-    let mut run_count: usize = 0;
-
-    let flush = |result: &mut Vec<DisplayEntry>,
-                 key: &Option<String>,
-                 start: usize,
-                 end: usize,
-                 count: usize,
-                 msgs: &[SessionMessage]| {
-        if key.is_none() || count == 0 {
-            return;
-        }
-        let parent_id = msgs[start].parent_id;
-        if count == 1 {
+    let flush = |result: &mut Vec<DisplayEntry>, run: Option<RunState>, msgs: &[SessionMessage]| {
+        let Some(run) = run else { return };
+        let parent_id = msgs[run.start].parent_id;
+        if run.count == 1 {
             result.push(DisplayEntry::Single {
-                index: start,
+                index: run.start,
                 parent_id,
             });
         } else {
             result.push(DisplayEntry::Collapsed {
-                start_index: start,
-                end_index: end,
-                count,
+                start_index: run.start,
+                end_index: run.end,
+                count: run.count,
                 parent_id,
             });
         }
@@ -415,31 +411,26 @@ pub fn run_collapse(entries: Vec<DisplayEntry>, messages: &[SessionMessage]) -> 
                 parent_id: _,
             } => {
                 let key = category::collapse_key(&messages[index]);
-                if let Some(ref k) = key
-                    && let Some(ref rk) = run_key
-                    && k == rk
-                {
-                    // Extend current run.
-                    run_end = index;
-                    run_count += 1;
+                let extends = key
+                    .as_ref()
+                    .is_some_and(|k| current_run.as_ref().is_some_and(|r| k == &r.key));
+
+                if extends {
+                    if let Some(run) = current_run.as_mut() {
+                        run.end = index;
+                        run.count += 1;
+                    }
                 } else {
                     // Flush previous run, start new one.
-                    flush(
-                        &mut result,
-                        &run_key,
-                        run_start,
-                        run_end,
-                        run_count,
-                        messages,
-                    );
-                    if key.is_some() {
-                        run_key = key;
-                        run_start = index;
-                        run_end = index;
-                        run_count = 1;
+                    flush(&mut result, current_run.take(), messages);
+                    if let Some(k) = key {
+                        current_run = Some(RunState {
+                            key: k,
+                            start: index,
+                            end: index,
+                            count: 1,
+                        });
                     } else {
-                        run_key = None;
-                        run_count = 0;
                         result.push(DisplayEntry::Single {
                             index,
                             parent_id: messages[index].parent_id,
@@ -451,30 +442,14 @@ pub fn run_collapse(entries: Vec<DisplayEntry>, messages: &[SessionMessage]) -> 
             | DisplayEntry::Collapsed { .. }
             | DisplayEntry::Scope { .. } => {
                 // Flush any pending run, then emit as-is.
-                flush(
-                    &mut result,
-                    &run_key,
-                    run_start,
-                    run_end,
-                    run_count,
-                    messages,
-                );
-                run_key = None;
-                run_count = 0;
+                flush(&mut result, current_run.take(), messages);
                 result.push(entry);
             }
         }
     }
 
     // Flush trailing run.
-    flush(
-        &mut result,
-        &run_key,
-        run_start,
-        run_end,
-        run_count,
-        messages,
-    );
+    flush(&mut result, current_run.take(), messages);
 
     result
 }
