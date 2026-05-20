@@ -20,6 +20,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
@@ -32,6 +33,7 @@ struct ServerDiagnostics {
 
 /// Cached diagnostics for paging beyond page 1.
 struct DiagnosticsCache {
+    generation: u64,
     per_page: usize,
     files: BTreeMap<String, CachedFile>,
     clean: Vec<TrackedEntry>,
@@ -81,6 +83,12 @@ pub struct DiagnosticsServer {
     fs: Arc<FilesystemManager>,
     /// Symbol index for enclosing-symbol annotation on diagnostics.
     symbol_index: Option<Arc<std::sync::Mutex<SymbolIndex>>>,
+    /// Monotonic generation counter for cursor validity.
+    ///
+    /// Incremented on each `process_files_batched` and `clear_cache`.
+    /// Embedded in cursor tokens so stale cursors from previous
+    /// batches are structurally rejected.
+    generation: AtomicU64,
     /// Cached full diagnostics from the last batch run, for paging.
     cache: std::sync::Mutex<Option<DiagnosticsCache>>,
 }
@@ -98,6 +106,7 @@ impl DiagnosticsServer {
             path_validator,
             fs,
             symbol_index,
+            generation: AtomicU64::new(0),
             cache: std::sync::Mutex::new(None),
         }
     }
@@ -113,10 +122,6 @@ impl DiagnosticsServer {
     /// Cross-file diagnostics (e.g., a renamed type that breaks
     /// importers) are correct because every server sees the complete
     /// final state before producing diagnostics.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "Batch pipeline steps are sequential and cannot be split"
-    )]
     #[allow(
         clippy::type_complexity,
         reason = "Server grouping map is local and self-documenting"
@@ -186,6 +191,24 @@ impl DiagnosticsServer {
         }
 
         // ── Phase 3: classify, build cache, and format page 1 ──
+        let output = self.build_cache_and_format(&canonical_paths, &file_results);
+
+        // ── Phase 4: mark_current ─────────────────────────────────
+        self.fs.mark_current(&canonical_paths);
+
+        output
+    }
+
+    /// Classifies files from server results, builds the paging cache,
+    /// and returns the formatted page-1 output.
+    ///
+    /// Bumps the generation counter so cursors from previous batches
+    /// are structurally rejected.
+    fn build_cache_and_format(
+        &self,
+        canonical_paths: &[PathBuf],
+        file_results: &BTreeMap<String, (String, Vec<ServerDiagnostics>)>,
+    ) -> String {
         let per_page = {
             let config = self.client_manager.config();
             config.tools.as_ref().map_or(50, |t| t.diagnostics_per_page)
@@ -194,7 +217,7 @@ impl DiagnosticsServer {
         let mut cached_files: BTreeMap<String, CachedFile> = BTreeMap::new();
         let mut clean: Vec<TrackedEntry> = Vec::new();
 
-        for cp in &canonical_paths {
+        for cp in canonical_paths {
             let key = cp.to_string_lossy().to_string();
             let segments = file_results.get(&key).map(|(_, segs)| segs.as_slice());
             let display = file_results
@@ -219,7 +242,9 @@ impl DiagnosticsServer {
             }
         }
 
+        let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
         let cache = DiagnosticsCache {
+            generation,
             per_page,
             files: cached_files,
             clean,
@@ -227,13 +252,9 @@ impl DiagnosticsServer {
 
         let output = format_page(&cache, 1);
 
-        // Store cache for subsequent pages.
         if let Ok(mut guard) = self.cache.lock() {
             *guard = Some(cache);
         }
-
-        // ── Phase 4: mark_current ─────────────────────────────────
-        self.fs.mark_current(&canonical_paths);
 
         output
     }
@@ -582,9 +603,12 @@ impl DiagnosticsServer {
     ///
     /// Returns `None` if the cursor is invalid or the cache is empty.
     pub fn get_cursor(&self, token: &str) -> Option<String> {
-        let page = decode_cursor(token)?;
+        let (generation, page) = decode_cursor(token)?;
         let guard = self.cache.lock().ok()?;
         let cache = guard.as_ref()?;
+        if cache.generation != generation {
+            return None;
+        }
         let result = format_page(cache, page);
         drop(guard);
         Some(result)
@@ -595,6 +619,7 @@ impl DiagnosticsServer {
     /// Called on `start_editing` so that stale pages from a previous
     /// batch cannot be served during the new editing session.
     pub fn clear_cache(&self) {
+        self.generation.fetch_add(1, Ordering::Relaxed);
         if let Ok(mut guard) = self.cache.lock() {
             *guard = None;
         }
@@ -849,14 +874,18 @@ pub(crate) fn format_diagnostics_entries(
 
 // ─── Cursor-based paging ──────────────────────────────────────────────
 
-/// Encodes an opaque cursor token from a 1-based page number.
-fn encode_cursor(page: usize) -> String {
-    format!("d{page}")
+/// Encodes an opaque cursor token from a generation and 1-based page number.
+fn encode_cursor(generation: u64, page: usize) -> String {
+    format!("d{generation}.{page}")
 }
 
-/// Decodes an opaque cursor token to a 1-based page number.
-fn decode_cursor(token: &str) -> Option<usize> {
-    token.strip_prefix('d')?.parse().ok()
+/// Decodes an opaque cursor token to a `(generation, page)` pair.
+fn decode_cursor(token: &str) -> Option<(u64, usize)> {
+    let rest = token.strip_prefix('d')?;
+    let (generation_str, page_str) = rest.split_once('.')?;
+    let generation = generation_str.parse().ok()?;
+    let page = page_str.parse().ok()?;
+    Some((generation, page))
 }
 
 /// Formats a page of diagnostics from the cache.
@@ -978,7 +1007,11 @@ fn format_page(cache: &DiagnosticsCache, page: usize) -> String {
     }
 
     if has_more {
-        _ = writeln!(output, "[cursor: {}]", encode_cursor(page + 1));
+        _ = writeln!(
+            output,
+            "[cursor: {}]",
+            encode_cursor(cache.generation, page + 1)
+        );
     }
 
     if output.is_empty() && page > 1 {
@@ -1001,8 +1034,14 @@ mod tests {
 
     #[test]
     fn cursor_round_trip() {
-        assert_eq!(decode_cursor(&encode_cursor(2)), Some(2));
-        assert_eq!(decode_cursor(&encode_cursor(100)), Some(100));
+        assert_eq!(decode_cursor(&encode_cursor(1, 2)), Some((1, 2)));
+        assert_eq!(decode_cursor(&encode_cursor(5, 100)), Some((5, 100)));
+    }
+
+    #[test]
+    fn cursor_encode_format() {
+        assert_eq!(encode_cursor(3, 2), "d3.2");
+        assert_eq!(encode_cursor(0, 1), "d0.1");
     }
 
     #[test]
@@ -1010,6 +1049,56 @@ mod tests {
         assert_eq!(decode_cursor(""), None);
         assert_eq!(decode_cursor("g5"), None); // glob cursor, not diag
         assert_eq!(decode_cursor("abc"), None);
+        assert_eq!(decode_cursor("d5"), None); // old format, missing dot
+        assert_eq!(decode_cursor("d.5"), None); // missing generation
+        assert_eq!(decode_cursor("d1."), None); // missing page
+        assert_eq!(decode_cursor("d1.abc"), None); // non-numeric page
+    }
+
+    #[test]
+    fn get_cursor_correct_generation_returns_page() {
+        let cache = make_cache(
+            vec![
+                ":1:1 [error] test: msg 0".to_string(),
+                ":2:1 [error] test: msg 1".to_string(),
+            ],
+            1,
+        );
+        // Cache has generation 1, cursor requests gen 1 page 2.
+        let output = format_page(&cache, 2);
+        assert!(output.contains("msg 1"), "output: {output}");
+        // Verify cursor encodes correctly for this generation.
+        let page1 = format_page(&cache, 1);
+        assert!(page1.contains("[cursor: d1.2]"), "page1: {page1}");
+    }
+
+    #[test]
+    fn get_cursor_wrong_generation_returns_none() {
+        // Cursor from generation 1, but cache is at generation 2.
+        let mut cache = make_cache(vec![":1:1 [error] test: msg".to_string()], 50);
+        cache.generation = 2;
+        // Token encodes generation 1 — mismatch should be detectable.
+        let token = encode_cursor(1, 2);
+        let (cursor_gen, _page) = decode_cursor(&token).expect("valid token");
+        assert_ne!(cursor_gen, cache.generation, "generations should differ");
+    }
+
+    #[test]
+    fn clear_cache_invalidates_cursors() {
+        // Simulate: batch produces generation 1 cursor, clear_cache bumps.
+        let counter = AtomicU64::new(1);
+        let cursor = encode_cursor(counter.load(Ordering::Relaxed), 2);
+
+        // Simulate clear_cache: bump generation.
+        counter.fetch_add(1, Ordering::Relaxed);
+        let new_generation = counter.load(Ordering::Relaxed);
+
+        // Old cursor's generation no longer matches.
+        let (cursor_gen, _) = decode_cursor(&cursor).expect("valid token");
+        assert_ne!(
+            cursor_gen, new_generation,
+            "old cursor should not match new generation"
+        );
     }
 
     // ── classify_file tests ─────────────────────────────────────
@@ -1093,6 +1182,7 @@ mod tests {
             },
         );
         DiagnosticsCache {
+            generation: 1,
             per_page,
             files,
             clean: Vec::new(),
@@ -1122,7 +1212,7 @@ mod tests {
         // Single file → collapsed path.
         assert!(output.contains("/test/file.rs:"), "output: {output}");
         assert!(output.contains("2 more"), "output: {output}");
-        assert!(output.contains("[cursor: d2]"), "output: {output}");
+        assert!(output.contains("[cursor: d1.2]"), "output: {output}");
         assert!(!output.contains("msg 3"), "output: {output}");
     }
 
@@ -1150,6 +1240,7 @@ mod tests {
     #[test]
     fn format_page_clean_on_page1_only() {
         let cache = DiagnosticsCache {
+            generation: 1,
             per_page: 50,
             files: BTreeMap::new(),
             clean: vec![TrackedEntry {
@@ -1188,6 +1279,7 @@ mod tests {
             },
         );
         let cache = DiagnosticsCache {
+            generation: 1,
             per_page: 50,
             files,
             clean: vec![TrackedEntry {
@@ -1223,6 +1315,7 @@ mod tests {
             },
         );
         let cache = DiagnosticsCache {
+            generation: 1,
             per_page: 50,
             files,
             clean: Vec::new(),
@@ -1257,6 +1350,7 @@ mod tests {
     fn diagnostics_omit_uncovered() {
         // Cache with only clean files, no uncovered field at all.
         let cache = DiagnosticsCache {
+            generation: 1,
             per_page: 50,
             files: BTreeMap::new(),
             clean: vec![TrackedEntry {
