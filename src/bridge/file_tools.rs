@@ -839,68 +839,32 @@ impl GlobServer {
             return Ok("No matches found".to_string());
         }
 
-        // Build sections. Relative patterns: one tree relative to cwd.
-        // Absolute patterns: per-search-root sections.
-        let sections = if let Some(cwd) = cwd {
-            // Single tree with paths relative to cwd.
-            let mut node = DirNode::new();
-            let mut files = Vec::new();
-            for (abs_path, _, gitignored, is_dir) in &matched_entries {
-                let rel = abs_path.strip_prefix(cwd).unwrap_or(abs_path);
-                let rel_str = rel.to_string_lossy();
-                let components: Vec<&str> = rel_str.split('/').collect();
-                Self::insert_entry(
-                    &mut node,
-                    &mut files,
-                    abs_path,
-                    cwd,
-                    *gitignored,
-                    *is_dir,
-                    &components,
-                    self,
-                );
-            }
-            node.prune_dir_dupes();
-            vec![GlobSection {
-                root: cwd.to_path_buf(),
-                node,
-                files,
-            }]
+        // Build tree. Relative patterns: paths relative to cwd.
+        // Absolute patterns: paths relative to the (single) override root.
+        let tree_root = if let Some(cwd) = cwd {
+            cwd.to_path_buf()
         } else {
-            // Per-search-root sections.
-            let mut grouped: BTreeMap<&PathBuf, Vec<&(PathBuf, PathBuf, bool, bool)>> =
-                BTreeMap::new();
-            for entry in &matched_entries {
-                grouped.entry(&entry.1).or_default().push(entry);
-            }
-            let mut sections = Vec::new();
-            for (root, entries) in &grouped {
-                let mut node = DirNode::new();
-                let mut files = Vec::new();
-                for (abs_path, _, gitignored, is_dir) in entries.iter().copied() {
-                    let rel = abs_path.strip_prefix(root).unwrap_or(abs_path);
-                    let rel_str = rel.to_string_lossy();
-                    let components: Vec<&str> = rel_str.split('/').collect();
-                    Self::insert_entry(
-                        &mut node,
-                        &mut files,
-                        abs_path,
-                        root,
-                        *gitignored,
-                        *is_dir,
-                        &components,
-                        self,
-                    );
-                }
-                node.prune_dir_dupes();
-                sections.push(GlobSection {
-                    root: (*root).clone(),
-                    node,
-                    files,
-                });
-            }
-            sections
+            search_roots[0].clone()
         };
+
+        let mut node = DirNode::new();
+        let mut files: Vec<(PathBuf, PathBuf, bool)> = Vec::new();
+        for (abs_path, _, gitignored, is_dir) in &matched_entries {
+            let rel = abs_path.strip_prefix(&tree_root).unwrap_or(abs_path);
+            let rel_str = rel.to_string_lossy();
+            let components: Vec<&str> = rel_str.split('/').collect();
+            Self::insert_entry(
+                &mut node,
+                &mut files,
+                abs_path,
+                &tree_root,
+                *gitignored,
+                *is_dir,
+                &components,
+                self,
+            );
+        }
+        node.prune_dir_dupes();
 
         // Populate symbol index for matched files (not directories).
         let file_paths: Vec<PathBuf> = matched_entries
@@ -913,7 +877,7 @@ impl GlobServer {
             .await;
         self.ensure_symbols(&file_paths).await;
 
-        // Per-section rendering: enriched (maps) where LSP available, plain (flags) otherwise.
+        // Render: enriched (maps) where LSP available, plain (flags) otherwise.
         let ts_guard = self.symbol_index.as_ref().and_then(|m| m.lock().ok());
         let ts_ref = ts_guard.as_deref();
 
@@ -924,67 +888,60 @@ impl GlobServer {
             let _ = writeln!(full, "cwd = {}", cwd.display());
         }
 
-        for (i, s) in sections.iter().enumerate() {
-            if i > 0 {
-                full.push('\n');
-            }
+        // For absolute patterns, the root path is the section header.
+        if cwd.is_none() {
+            let _ = writeln!(full, "{}", tree_root.display());
+        }
 
-            // For absolute patterns, each section gets a header.
-            if cwd.is_none() {
-                let _ = writeln!(full, "{}", s.root.display());
-            }
-
-            // Try enriched rendering for this section.
-            let base_depth = usize::from(cwd.is_none());
-            let mut section_content = String::new();
-            if let Some(idx) = ts_ref {
-                let group_abs: Vec<PathBuf> = s.files.iter().map(|(p, _, _)| p.clone()).collect();
-                let eligible: Vec<&Path> = group_abs
-                    .iter()
-                    .filter(|p| {
-                        is_enrichment_eligible(
-                            p,
-                            &s.files,
-                            self.outline_threshold,
-                            &self.outline_suppress,
-                            idx,
-                            &self.fs_manager,
-                        )
-                    })
-                    .map(PathBuf::as_path)
-                    .collect();
-
-                if !eligible.is_empty()
-                    && let Ok(outline) = idx.query_outline_batch(&eligible)
-                    && !outline.is_empty()
-                {
-                    let children_sets = build_children_sets(idx, &eligible);
-                    let sa_paths = build_sa_paths(&s.files, idx);
-                    s.node.render_enriched(
-                        &mut section_content,
-                        base_depth,
-                        &outline,
-                        &children_sets,
-                        &sa_paths,
+        let base_depth = usize::from(cwd.is_none());
+        let mut section_content = String::new();
+        if let Some(idx) = ts_ref {
+            let group_abs: Vec<PathBuf> = files.iter().map(|(p, _, _)| p.clone()).collect();
+            let eligible: Vec<&Path> = group_abs
+                .iter()
+                .filter(|p| {
+                    is_enrichment_eligible(
+                        p,
+                        &files,
+                        self.outline_threshold,
+                        &self.outline_suppress,
                         idx,
-                    );
-                }
-            }
+                        &self.fs_manager,
+                    )
+                })
+                .map(PathBuf::as_path)
+                .collect();
 
-            // Fall back to plain if enriched produced nothing.
-            if section_content.is_empty() {
-                s.node.render_plain(
+            if !eligible.is_empty()
+                && let Ok(outline) = idx.query_outline_batch(&eligible)
+                && !outline.is_empty()
+            {
+                let children_sets = build_children_sets(idx, &eligible);
+                let sa_paths = build_sa_paths(&files, idx);
+                node.render_enriched(
                     &mut section_content,
                     base_depth,
-                    ts_ref,
-                    self.outline_threshold,
-                    &self.outline_suppress,
-                    &self.fs_manager,
+                    &outline,
+                    &children_sets,
+                    &sa_paths,
+                    idx,
                 );
             }
-
-            full.push_str(&section_content);
         }
+
+        // Fall back to plain if enriched produced nothing.
+        if section_content.is_empty() {
+            node.render_plain(
+                &mut section_content,
+                base_depth,
+                ts_ref,
+                self.outline_threshold,
+                &self.outline_suppress,
+                &self.fs_manager,
+            );
+        }
+
+        full.push_str(&section_content);
 
         Ok(paginate(&full, self.budget, page))
     }
@@ -1611,15 +1568,6 @@ fn paginate(full: &str, budget: usize, page: usize) -> String {
         out.push('\n');
     }
     out
-}
-
-// ─── Root-grouped assembly ───────────────────────────────────────────
-
-/// Per-root tree and metadata for glob pattern rendering.
-struct GlobSection {
-    root: PathBuf,
-    node: DirNode,
-    files: Vec<(PathBuf, PathBuf, bool)>,
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────
