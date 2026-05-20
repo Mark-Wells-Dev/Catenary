@@ -57,6 +57,22 @@ struct TrackedEntry {
     root: PathBuf,
 }
 
+/// Classification outcome for a single file in the batch pipeline.
+///
+/// Makes the three-way decision explicit: each category is a distinct
+/// variant rather than an implicit negated-boolean branch across
+/// separate loops.
+#[derive(Debug, PartialEq, Eq)]
+enum FileOutcome {
+    /// At least one server returned diagnostic entries.
+    HasDiagnostics(Vec<String>),
+    /// All servers returned empty diagnostics — file is clean.
+    Clean,
+    /// File was validated but absent from server results (server died
+    /// during the pipeline before producing results).
+    NoResults,
+}
+
 /// Handles `PostToolUse` hook requests: file-change notification with LSP
 /// diagnostics collection and formatting.
 pub struct DiagnosticsServer {
@@ -169,7 +185,7 @@ impl DiagnosticsServer {
                 .await;
         }
 
-        // ── Phase 3: build cache and format page 1 ──────────────
+        // ── Phase 3: classify, build cache, and format page 1 ──
         let per_page = {
             let config = self.client_manager.config();
             config.tools.as_ref().map_or(50, |t| t.diagnostics_per_page)
@@ -178,47 +194,35 @@ impl DiagnosticsServer {
         let mut cached_files: BTreeMap<String, CachedFile> = BTreeMap::new();
         let mut clean: Vec<TrackedEntry> = Vec::new();
 
-        for (key, (display, segments)) in &file_results {
-            let has_any = segments.iter().any(|s| !s.entries.is_empty());
-            if !has_any {
-                clean.push(TrackedEntry {
-                    display: display.clone(),
-                    root: self.resolve_root_or_parent(std::path::Path::new(key)),
-                });
-                continue;
-            }
-
-            let mut all_entries: Vec<String> = Vec::new();
-            for seg in segments {
-                all_entries.extend(seg.entries.iter().cloned());
-            }
-
-            cached_files.insert(
-                key.clone(),
-                CachedFile {
-                    display: display.clone(),
-                    root: self.resolve_root_or_parent(std::path::Path::new(key)),
-                    entries: all_entries,
-                },
-            );
-        }
-
-        // Files that were validated but had no server results (all
-        // servers died during pipeline) — treat as clean.
         for cp in &canonical_paths {
             let key = cp.to_string_lossy().to_string();
-            if !file_results.contains_key(&key) {
-                clean.push(TrackedEntry {
-                    display: self.display_rel(&key),
-                    root: self.resolve_root_or_parent(cp),
-                });
+            let segments = file_results.get(&key).map(|(_, segs)| segs.as_slice());
+            let display = file_results
+                .get(&key)
+                .map_or_else(|| self.display_rel(&key), |(d, _)| d.clone());
+            let root = self.resolve_root_or_parent(cp);
+
+            match classify_file(segments) {
+                FileOutcome::HasDiagnostics(entries) => {
+                    cached_files.insert(
+                        key,
+                        CachedFile {
+                            display,
+                            root,
+                            entries,
+                        },
+                    );
+                }
+                FileOutcome::Clean | FileOutcome::NoResults => {
+                    clean.push(TrackedEntry { display, root });
+                }
             }
         }
 
         let cache = DiagnosticsCache {
             per_page,
             files: cached_files,
-            clean: clean.clone(),
+            clean,
         };
 
         let output = format_page(&cache, 1);
@@ -607,6 +611,28 @@ pub(crate) fn resolve_path(file: &str) -> Result<PathBuf> {
     }
 }
 
+/// Classifies a file based on its server diagnostics results.
+///
+/// - `Some(segments)` with any non-empty entries → [`FileOutcome::HasDiagnostics`]
+/// - `Some(segments)` with all entries empty → [`FileOutcome::Clean`]
+/// - `None` (no server produced results) → [`FileOutcome::NoResults`]
+fn classify_file(segments: Option<&[ServerDiagnostics]>) -> FileOutcome {
+    let Some(segments) = segments else {
+        return FileOutcome::NoResults;
+    };
+
+    let entries: Vec<String> = segments
+        .iter()
+        .flat_map(|s| s.entries.iter().cloned())
+        .collect();
+
+    if entries.is_empty() {
+        FileOutcome::Clean
+    } else {
+        FileOutcome::HasDiagnostics(entries)
+    }
+}
+
 /// Collects quick-fix titles for each diagnostic from the LSP server.
 ///
 /// Returns a `Vec` parallel to `diagnostics` — each entry contains the
@@ -953,6 +979,74 @@ mod tests {
         assert_eq!(decode_cursor(""), None);
         assert_eq!(decode_cursor("g5"), None); // glob cursor, not diag
         assert_eq!(decode_cursor("abc"), None);
+    }
+
+    // ── classify_file tests ─────────────────────────────────────
+
+    #[test]
+    fn classify_file_with_diagnostics() {
+        let segments = vec![ServerDiagnostics {
+            entries: vec![":1:1 [error] test: msg".to_string()],
+        }];
+        assert_eq!(
+            classify_file(Some(&segments)),
+            FileOutcome::HasDiagnostics(vec![":1:1 [error] test: msg".to_string()]),
+        );
+    }
+
+    #[test]
+    fn classify_file_empty_entries_is_clean() {
+        let segments = vec![ServerDiagnostics { entries: vec![] }];
+        assert_eq!(classify_file(Some(&segments)), FileOutcome::Clean);
+    }
+
+    #[test]
+    fn classify_file_no_results() {
+        assert_eq!(classify_file(None), FileOutcome::NoResults);
+    }
+
+    #[test]
+    fn classify_file_multi_server_merges_entries() {
+        let segments = vec![
+            ServerDiagnostics {
+                entries: vec![":1:1 [error] server-a: msg".to_string()],
+            },
+            ServerDiagnostics {
+                entries: vec![":2:1 [warning] server-b: msg".to_string()],
+            },
+        ];
+        assert_eq!(
+            classify_file(Some(&segments)),
+            FileOutcome::HasDiagnostics(vec![
+                ":1:1 [error] server-a: msg".to_string(),
+                ":2:1 [warning] server-b: msg".to_string(),
+            ]),
+        );
+    }
+
+    #[test]
+    fn classify_file_some_servers_empty() {
+        // One server has entries, one doesn't → HasDiagnostics.
+        let segments = vec![
+            ServerDiagnostics { entries: vec![] },
+            ServerDiagnostics {
+                entries: vec![":1:1 [error] test: msg".to_string()],
+            },
+        ];
+        assert_eq!(
+            classify_file(Some(&segments)),
+            FileOutcome::HasDiagnostics(vec![":1:1 [error] test: msg".to_string()]),
+        );
+    }
+
+    #[test]
+    fn classify_file_all_servers_empty_is_clean() {
+        // Multiple servers, all empty → Clean.
+        let segments = vec![
+            ServerDiagnostics { entries: vec![] },
+            ServerDiagnostics { entries: vec![] },
+        ];
+        assert_eq!(classify_file(Some(&segments)), FileOutcome::Clean);
     }
 
     // ── format_page tests ─────────────────────────────────────────
