@@ -493,7 +493,7 @@ impl DiagnosticsServer {
             // Populate symbol index if needed — the file is already open
             // on this server, so documentSymbol is a single request.
             if let Some(ref idx_arc) = self.symbol_index {
-                let needs = idx_arc.lock().is_ok_and(|idx| !idx.has_symbols_for(path));
+                let needs = idx_arc.lock().is_ok_and(|idx| idx.needs_population(path));
                 if needs
                     && client.server().supports_document_symbols()
                     && let Ok(response) = client.document_symbols(uri).await

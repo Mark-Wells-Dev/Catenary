@@ -384,6 +384,20 @@ impl SymbolIndex {
         Ok(())
     }
 
+    /// Returns `true` if the file needs symbol population (no cached symbols).
+    #[must_use]
+    pub fn needs_population(&self, path: &Path) -> bool {
+        !self.has_symbols_for(path)
+    }
+
+    /// Returns paths from the input that need symbol population (no cached symbols).
+    ///
+    /// Encapsulates the "has no symbols" check so callers filter with
+    /// `idx.needs_symbols(files)` instead of inverting `has_symbols_for`.
+    pub fn needs_symbols<'a>(&self, paths: &'a [PathBuf]) -> Vec<&'a PathBuf> {
+        paths.iter().filter(|p| self.needs_population(p)).collect()
+    }
+
     /// Returns `true` if the file has any rows in the `symbols` table.
     #[must_use]
     pub fn has_symbols_for(&self, path: &Path) -> bool {
@@ -983,6 +997,53 @@ mod tests {
     fn test_no_symbols_for_unknown_file() {
         let index = SymbolIndex::new().expect("create index");
         assert!(!index.has_symbols_for(std::path::Path::new("/unknown/file.rs")));
+    }
+
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    #[test]
+    fn needs_symbols_returns_unpopulated_paths() {
+        let index = SymbolIndex::new().expect("create index");
+
+        let symbols = serde_json::json!([{
+            "name": "foo",
+            "kind": 12,
+            "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 2, "character": 1 } },
+            "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 6 } }
+        }]);
+
+        let populated = std::path::PathBuf::from("/test/populated.rs");
+        let missing_a = std::path::PathBuf::from("/test/missing_a.rs");
+        let missing_b = std::path::PathBuf::from("/test/missing_b.rs");
+
+        index
+            .populate_from_document_symbols(&populated, &symbols)
+            .expect("populate");
+
+        let all = vec![populated.clone(), missing_a.clone(), missing_b.clone()];
+        let need = index.needs_symbols(&all);
+        assert_eq!(need.len(), 2, "only unpopulated paths: {need:?}");
+        assert!(need.contains(&&missing_a));
+        assert!(need.contains(&&missing_b));
+
+        // Populated path alone returns empty.
+        assert!(
+            index
+                .needs_symbols(std::slice::from_ref(&populated))
+                .is_empty()
+        );
+
+        // All unpopulated returns all.
+        assert_eq!(index.needs_symbols(&[missing_a, missing_b]).len(), 2);
+
+        // Single-path convenience: needs_population.
+        assert!(
+            !index.needs_population(&populated),
+            "populated file should not need population"
+        );
+        assert!(
+            index.needs_population(std::path::Path::new("/test/unknown.rs")),
+            "unknown file should need population"
+        );
     }
 
     /// Helper: builds a minimal `SymbolEnrichment` for cache tests.

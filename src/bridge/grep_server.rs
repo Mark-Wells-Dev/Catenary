@@ -178,58 +178,6 @@ impl ToolServer for GrepServer {
 }
 
 impl GrepServer {
-    /// Ensures the symbol index is populated for the given files.
-    ///
-    /// For each file without cached symbols, opens the document on the
-    /// server, requests `documentSymbol`, and feeds the response to the
-    /// index.
-    ///
-    /// Not deduplicated against concurrent callers — if parallel MCP tool
-    /// calls request the same file, both will do the LSP round-trip. The
-    /// index write is serialized by `Mutex` so the result is correct, just
-    /// redundant. To optimize: add a `pending: Mutex<HashSet<PathBuf>>` to
-    /// `SymbolIndex` and skip files already in-flight.
-    async fn ensure_symbols(&self, files: &[PathBuf]) {
-        let Some(ref idx_arc) = self.symbol_index else {
-            return;
-        };
-        let needs_populate: Vec<PathBuf> = {
-            let Ok(idx) = idx_arc.lock() else { return };
-            files
-                .iter()
-                .filter(|p| p.is_file() && !idx.has_symbols_for(p))
-                .cloned()
-                .collect()
-        };
-
-        for path in &needs_populate {
-            let servers = self
-                .client_manager
-                .get_servers(
-                    path,
-                    LspServer::supports_document_symbols,
-                    Some(DispatchMethod::DocumentSymbol),
-                )
-                .await;
-            let Some(server) = servers.first() else {
-                continue;
-            };
-            let Ok(uri) = self
-                .client_manager
-                .open_document_on(path, server, None)
-                .await
-            else {
-                continue;
-            };
-            let Ok(response) = server.lock().await.document_symbols(&uri).await else {
-                continue;
-            };
-            if let Ok(idx) = idx_arc.lock() {
-                let _ = idx.populate_from_document_symbols(path, &response);
-            }
-        }
-    }
-
     /// Grep pipeline: ripgrep + `documentSymbol` index + hit classification.
     #[allow(clippy::too_many_lines, reason = "Core grep orchestration")]
     async fn run(
@@ -287,7 +235,7 @@ impl GrepServer {
             .await;
 
         // Step 2b: Populate symbol index for matched files.
-        self.ensure_symbols(&rg_paths).await;
+        super::ensure_symbols(self.symbol_index.as_ref(), &self.client_manager, &rg_paths).await;
 
         // Step 3: Symbol index query.
         let (indexed_symbols, indexed_files) = if let Some(ref index_mutex) = self.symbol_index {

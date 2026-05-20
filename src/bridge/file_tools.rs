@@ -29,9 +29,7 @@ use super::handler::{expand_tilde, resolve_path};
 use super::pagination::{format_page_header, paginate};
 use super::session::ResolvedGlob;
 use super::tool_server::ToolServer;
-use crate::config::DispatchMethod;
 use crate::lsp::LspClientManager;
-use crate::lsp::server::LspServer;
 use crate::symbol_index::{Symbol, SymbolIndex, format_symbol_kind};
 
 /// Input for the `glob` tool.
@@ -409,7 +407,12 @@ impl ToolServer for GlobServer {
             self.client_manager
                 .ensure_and_wait_for_paths(std::slice::from_ref(&path))
                 .await;
-            self.ensure_symbols(std::slice::from_ref(&path)).await;
+            super::ensure_symbols(
+                self.symbol_index.as_ref(),
+                &self.client_manager,
+                std::slice::from_ref(&path),
+            )
+            .await;
             self.handle_glob_file(&path, page, cwd.as_deref())
         } else if path.is_dir() {
             self.handle_glob_dir(&path, &input, exclude.as_ref(), page, cwd.as_deref())
@@ -424,58 +427,6 @@ impl ToolServer for GlobServer {
 }
 
 impl GlobServer {
-    /// Ensures the symbol index is populated for the given files.
-    ///
-    /// For each file without cached symbols, opens the document on the
-    /// server, requests `documentSymbol`, and feeds the response to the
-    /// index.
-    ///
-    /// Not deduplicated against concurrent callers — if parallel MCP tool
-    /// calls request the same file, both will do the LSP round-trip. The
-    /// index write is serialized by `Mutex` so the result is correct, just
-    /// redundant. To optimize: add a `pending: Mutex<HashSet<PathBuf>>` to
-    /// `SymbolIndex` and skip files already in-flight.
-    async fn ensure_symbols(&self, files: &[PathBuf]) {
-        let Some(ref idx_arc) = self.symbol_index else {
-            return;
-        };
-        let needs_populate: Vec<PathBuf> = {
-            let Ok(idx) = idx_arc.lock() else { return };
-            files
-                .iter()
-                .filter(|p| p.is_file() && !idx.has_symbols_for(p))
-                .cloned()
-                .collect()
-        };
-
-        for path in &needs_populate {
-            let servers = self
-                .client_manager
-                .get_servers(
-                    path,
-                    LspServer::supports_document_symbols,
-                    Some(DispatchMethod::DocumentSymbol),
-                )
-                .await;
-            let Some(server) = servers.first() else {
-                continue;
-            };
-            let Ok(uri) = self
-                .client_manager
-                .open_document_on(path, server, None)
-                .await
-            else {
-                continue;
-            };
-            let Ok(response) = server.lock().await.document_symbols(&uri).await else {
-                continue;
-            };
-            if let Ok(idx) = idx_arc.lock() {
-                let _ = idx.populate_from_document_symbols(path, &response);
-            }
-        }
-    }
-
     /// Single file: header with defensive map (if symbols available).
     ///
     /// Single files bypass `outline_threshold` — they get a map unless the
@@ -710,7 +661,12 @@ impl GlobServer {
         self.client_manager
             .ensure_and_wait_for_paths(&file_paths)
             .await;
-        self.ensure_symbols(&file_paths).await;
+        super::ensure_symbols(
+            self.symbol_index.as_ref(),
+            &self.client_manager,
+            &file_paths,
+        )
+        .await;
 
         let ts_guard = self.symbol_index.as_ref().and_then(|m| m.lock().ok());
 
@@ -876,7 +832,12 @@ impl GlobServer {
         self.client_manager
             .ensure_and_wait_for_paths(&file_paths)
             .await;
-        self.ensure_symbols(&file_paths).await;
+        super::ensure_symbols(
+            self.symbol_index.as_ref(),
+            &self.client_manager,
+            &file_paths,
+        )
+        .await;
 
         // Render: enriched (maps) where LSP available, plain (flags) otherwise.
         let ts_guard = self.symbol_index.as_ref().and_then(|m| m.lock().ok());
