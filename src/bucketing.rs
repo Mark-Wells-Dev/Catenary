@@ -628,6 +628,16 @@ mod tests {
                 );
             }
         }
+        // All entries share "item_" separator prefix → single bucket collapsed
+        // to bare handle.
+        assert_eq!(buckets.len(), 1);
+        assert_eq!(buckets[0].pattern, "item_*");
+        assert_eq!(buckets[0].count, 100);
+        assert!(
+            rendered_size(&buckets) <= 50,
+            "rendered size {} should not exceed budget 50",
+            rendered_size(&buckets)
+        );
     }
 
     #[test]
@@ -736,9 +746,9 @@ mod tests {
                 }]),
             },
         ];
-        let size = rendered_size(&buckets);
-        assert!(size > 0, "rendered size should be positive");
-        assert!(size < 100, "rendered size should be reasonable, got {size}");
+        // Bare handle: "test_*" (6) + count_digits(5) (1) + 4 = 11
+        // Single entry: "data.json" (9) + no context (0) + 1 = 10
+        assert_eq!(rendered_size(&buckets), 21);
     }
 
     #[test]
@@ -799,6 +809,12 @@ mod tests {
                 .iter()
                 .map(|b| (&b.pattern, b.count))
                 .collect::<Vec<_>>()
+        );
+        // After merging, rendered size should not exceed the budget.
+        assert!(
+            rendered_size(&buckets) <= 200,
+            "rendered size {} should not exceed budget 200",
+            rendered_size(&buckets)
         );
     }
 
@@ -885,5 +901,227 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Helper function unit tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_count_digits() {
+        assert_eq!(count_digits(0), 1);
+        assert_eq!(count_digits(1), 1);
+        assert_eq!(count_digits(9), 1);
+        assert_eq!(count_digits(10), 2);
+        assert_eq!(count_digits(99), 2);
+        assert_eq!(count_digits(100), 3);
+        assert_eq!(count_digits(1000), 4);
+    }
+
+    #[test]
+    fn test_shared_prefix_len() {
+        assert_eq!(shared_prefix_len("abc", "abd"), 2);
+        assert_eq!(shared_prefix_len("abc", "xyz"), 0);
+        assert_eq!(shared_prefix_len("abc", "abc"), 3);
+        assert_eq!(shared_prefix_len("", "abc"), 0);
+        assert_eq!(shared_prefix_len("abc", ""), 0);
+    }
+
+    #[test]
+    fn test_bucket_rendered_size_with_context() {
+        // Single entry with context exercises the count == 1 match guard
+        // and the context size arithmetic.
+        let single = Bucket {
+            pattern: "file.rs".to_owned(),
+            count: 1,
+            entries: Some(vec![BucketEntry {
+                value: "file.rs".to_owned(),
+                context: Some("mod utils".to_owned()),
+            }]),
+        };
+        // value (7) + context (9) + ": " (2) + newline (1) = 19
+        assert_eq!(bucket_rendered_size(&single), 19);
+
+        // Expanded multi-entry with mixed context.
+        let expanded = Bucket {
+            pattern: "grp_*".to_owned(),
+            count: 2,
+            entries: Some(vec![
+                BucketEntry {
+                    value: "grp_a".to_owned(),
+                    context: Some("x".to_owned()),
+                },
+                BucketEntry {
+                    value: "grp_b".to_owned(),
+                    context: None,
+                },
+            ]),
+        };
+        // header: "grp_*" (5) + count_digits(2) (1) + 4 = 10
+        // entry 1: "grp_a" (5) + "x" (1) + 2 + 2 = 10
+        // entry 2: "grp_b" (5) + 0 + 2 = 7
+        // total: 10 + 10 + 7 = 27
+        assert_eq!(bucket_rendered_size(&expanded), 27);
+    }
+
+    // ------------------------------------------------------------------
+    // merge_closest_pair unit tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_merge_closest_pair_basic() {
+        let mut buckets = vec![
+            Bucket {
+                pattern: "abc*".to_owned(),
+                count: 3,
+                entries: None,
+            },
+            Bucket {
+                pattern: "abd*".to_owned(),
+                count: 2,
+                entries: None,
+            },
+        ];
+        merge_closest_pair(&mut buckets);
+        assert_eq!(buckets.len(), 1);
+        assert_eq!(buckets[0].pattern, "ab*");
+        assert_eq!(buckets[0].count, 5);
+    }
+
+    #[test]
+    fn test_merge_selects_longest_shared_prefix() {
+        let mut buckets = vec![
+            Bucket {
+                pattern: "aaa*".to_owned(),
+                count: 1,
+                entries: None,
+            },
+            Bucket {
+                pattern: "bbb*".to_owned(),
+                count: 1,
+                entries: None,
+            },
+            Bucket {
+                pattern: "bbc*".to_owned(),
+                count: 1,
+                entries: None,
+            },
+        ];
+        merge_closest_pair(&mut buckets);
+        // "bbb" and "bbc" share "bb" (2 chars) > "aaa"/"bbb" share "" (0 chars).
+        assert_eq!(buckets.len(), 2);
+        assert_eq!(buckets[0].pattern, "aaa*");
+        assert_eq!(buckets[1].pattern, "bb*");
+        assert_eq!(buckets[1].count, 2);
+    }
+
+    // ------------------------------------------------------------------
+    // collapse_to_budget boundary tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_collapse_preserves_at_budget() {
+        // When rendered_size == budget, no collapse should happen.
+        let mut buckets = vec![Bucket {
+            pattern: "a*".to_owned(),
+            count: 2,
+            entries: Some(vec![
+                BucketEntry {
+                    value: "a1".to_owned(),
+                    context: None,
+                },
+                BucketEntry {
+                    value: "a2".to_owned(),
+                    context: None,
+                },
+            ]),
+        }];
+        // header (2+1+4=7) + entry (2+2=4) + entry (2+2=4) = 15
+        let budget = rendered_size(&buckets);
+        assert_eq!(budget, 15);
+        collapse_to_budget(&mut buckets, budget);
+        assert!(
+            buckets[0].entries.is_some(),
+            "should not collapse when rendered_size equals budget"
+        );
+    }
+
+    #[test]
+    fn test_collapse_preserves_single_entry_buckets() {
+        let mut buckets = vec![
+            Bucket {
+                pattern: "only.rs".to_owned(),
+                count: 1,
+                entries: Some(vec![BucketEntry {
+                    value: "only.rs".to_owned(),
+                    context: None,
+                }]),
+            },
+            Bucket {
+                pattern: "test_*".to_owned(),
+                count: 3,
+                entries: Some(vec![
+                    BucketEntry {
+                        value: "test_a".to_owned(),
+                        context: None,
+                    },
+                    BucketEntry {
+                        value: "test_b".to_owned(),
+                        context: None,
+                    },
+                    BucketEntry {
+                        value: "test_c".to_owned(),
+                        context: None,
+                    },
+                ]),
+            },
+        ];
+        // Force collapse of test_* but not tight enough to merge.
+        collapse_to_budget(&mut buckets, 20);
+        assert!(
+            buckets
+                .iter()
+                .any(|b| b.count == 1 && b.entries.is_some()),
+            "single-entry bucket should not be collapsed"
+        );
+    }
+
+    #[test]
+    fn test_collapse_phase2_preserves_at_budget() {
+        // All bare handles, total rendered_size == budget, > MIN_BUCKETS count.
+        // Phase 2 should not merge.
+        let mut buckets: Vec<Bucket> = (0..12)
+            .map(|i| Bucket {
+                pattern: format!("{i:02}*"),
+                count: 2,
+                entries: None,
+            })
+            .collect();
+        let budget = rendered_size(&buckets);
+        collapse_to_budget(&mut buckets, budget);
+        assert_eq!(
+            buckets.len(),
+            12,
+            "should not merge when rendered_size equals budget"
+        );
+    }
+
+    #[test]
+    fn test_collapse_respects_min_buckets_floor() {
+        // Many bare handles with impossibly tight budget — merging must stop
+        // at MIN_BUCKETS even though the budget is never satisfied.
+        let mut buckets: Vec<Bucket> = ('a'..='z')
+            .map(|c| Bucket {
+                pattern: format!("{c}*"),
+                count: 2,
+                entries: None,
+            })
+            .collect();
+        collapse_to_budget(&mut buckets, 1);
+        assert_eq!(
+            buckets.len(),
+            MIN_BUCKETS,
+            "merging should stop at MIN_BUCKETS floor"
+        );
     }
 }
