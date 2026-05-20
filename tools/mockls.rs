@@ -1924,13 +1924,19 @@ impl MockServer {
 
         write_framed(&self.writer, &json);
 
-        self.response_count += 1;
-
-        if let Some(max) = self.args.drop_after
-            && self.response_count >= max
-        {
+        if self.check_drop_after() {
             std::process::exit(1);
         }
+    }
+
+    /// Increment the response counter and return whether `drop_after`
+    /// has been reached. Extracted so the counter logic is testable
+    /// without triggering `process::exit`.
+    fn check_drop_after(&mut self) -> bool {
+        self.response_count += 1;
+        self.args
+            .drop_after
+            .is_some_and(|max| self.response_count >= max)
     }
 }
 
@@ -4721,6 +4727,79 @@ const PI: f64
         assert_eq!(
             result["location"]["range"]["start"]["line"], 1,
             "beta should be on line 1"
+        );
+    }
+
+    // ── Tests: structural mutant kills ─────────────────────────────
+
+    /// Extracted `check_drop_after` makes the response counter testable
+    /// without hitting `process::exit`. Kills `replace += with *=`.
+    #[test]
+    fn test_check_drop_after_triggers_on_threshold() {
+        let (writer, _) = buffer_writer();
+        let mut args = default_args();
+        args.drop_after = Some(3);
+        let mut server = MockServer::new(args, writer);
+
+        assert!(!server.check_drop_after(), "count=1, below threshold");
+        assert!(!server.check_drop_after(), "count=2, below threshold");
+        assert!(server.check_drop_after(), "count=3, should trigger");
+        // Past threshold: still true
+        assert!(server.check_drop_after(), "count=4, past threshold");
+    }
+
+    /// Without `drop_after`, `check_drop_after` always returns false.
+    #[test]
+    fn test_check_drop_after_no_limit() {
+        let (writer, _) = buffer_writer();
+        let mut server = MockServer::new(default_args(), writer);
+
+        for _ in 0..10 {
+            assert!(
+                !server.check_drop_after(),
+                "Should never trigger without drop_after"
+            );
+        }
+    }
+
+    /// Notification log uses different JSON shapes for watched-files vs
+    /// other notifications. Kills `replace == with !=` on the method check.
+    #[test]
+    fn test_notification_log_records_method_and_uri() {
+        let log_path = std::env::temp_dir().join(format!(
+            "mockls_test_notif_log_{}.jsonl",
+            std::process::id()
+        ));
+        let log_str = log_path.to_str().expect("valid temp path");
+
+        let mut args = default_args();
+        args.notification_log = Some(log_str.to_string());
+        let uri = "file:///tmp/test.yX4Za";
+
+        let mut input = frame(&initialize_request(1));
+        input.extend(frame(&did_open_notification(uri, "fn hello\n")));
+        input.extend(frame(&shutdown_request(2)));
+
+        run_server_with(args, &input);
+
+        let log_content = std::fs::read_to_string(&log_path).expect("read notification log");
+        let _ = std::fs::remove_file(&log_path);
+
+        // didOpen should be logged with "uri" field (not "changes")
+        let did_open_line = log_content
+            .lines()
+            .find(|l| l.contains("didOpen"))
+            .expect("didOpen entry in notification log");
+        let entry: Value =
+            serde_json::from_str(did_open_line).expect("valid JSON in notification log");
+        assert_eq!(entry["method"], "textDocument/didOpen");
+        assert_eq!(
+            entry["uri"], uri,
+            "didOpen should have uri field, not changes"
+        );
+        assert!(
+            entry.get("changes").is_none(),
+            "didOpen should not have changes field"
         );
     }
 }
