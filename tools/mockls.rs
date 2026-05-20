@@ -977,14 +977,10 @@ impl MockServer {
             }
         }
 
-        // Fall back to first occurrence in current document
-        for (line_idx, line_text) in content.lines().enumerate() {
-            if let Some(col_idx) = line_text.find(&word) {
-                return Some(location_json(uri, line_idx, col_idx, col_idx + word.len()));
-            }
-        }
-
-        // Cross-file fallback: first occurrence in any other document
+        // Cross-file fallback: first occurrence in any other document.
+        // Checked before current-doc because a cross-file match is more
+        // likely to be the real definition than re-finding the word at
+        // the cursor position.
         for (doc_uri, doc_content) in &self.documents {
             if doc_uri == uri {
                 continue;
@@ -998,6 +994,13 @@ impl MockServer {
                         col_idx + word.len(),
                     ));
                 }
+            }
+        }
+
+        // Last resort: first occurrence in current document
+        for (line_idx, line_text) in content.lines().enumerate() {
+            if let Some(col_idx) = line_text.find(&word) {
+                return Some(location_json(uri, line_idx, col_idx, col_idx + word.len()));
             }
         }
 
@@ -2609,6 +2612,11 @@ mod tests {
         let result = &def["result"];
         assert_eq!(result["uri"], uri);
         assert_eq!(result["range"]["start"]["line"], 0);
+        assert_eq!(result["range"]["start"]["character"], 0);
+        assert_eq!(
+            result["range"]["end"]["character"], 10,
+            "end = col_idx + \"fn my_func\".len()"
+        );
     }
 
     #[test]
@@ -2898,6 +2906,11 @@ const PI: f64
             "Type definition should point to the file with struct Foo"
         );
         assert_eq!(result["range"]["start"]["line"], 0);
+        assert_eq!(result["range"]["start"]["character"], 0);
+        assert_eq!(
+            result["range"]["end"]["character"], 10,
+            "end = col_idx + \"struct Foo\".len()"
+        );
     }
 
     #[test]
@@ -2928,6 +2941,11 @@ const PI: f64
             "Definition should point to the file with fn helper()"
         );
         assert_eq!(result["range"]["start"]["line"], 0);
+        assert_eq!(result["range"]["start"]["character"], 0);
+        assert_eq!(
+            result["range"]["end"]["character"], 9,
+            "end = col_idx + \"fn helper\".len()"
+        );
     }
 
     #[test]
@@ -3044,6 +3062,11 @@ const PI: f64
             def_a["result"]["uri"], uri_defs,
             "Import in a.yX4Za should resolve to defs.yX4Za"
         );
+        assert_eq!(def_a["result"]["range"]["start"]["character"], 0);
+        assert_eq!(
+            def_a["result"]["range"]["end"]["character"], 9,
+            "end = col_idx + \"fn helper\".len()"
+        );
 
         // b.yX4Za: cross-file fallback also resolves to defs.yX4Za
         let def_b = messages
@@ -3054,6 +3077,11 @@ const PI: f64
         assert_eq!(
             def_b["result"]["uri"], uri_defs,
             "Fallback in b.yX4Za should resolve to defs.yX4Za"
+        );
+        assert_eq!(def_b["result"]["range"]["start"]["character"], 0);
+        assert_eq!(
+            def_b["result"]["range"]["end"]["character"], 9,
+            "end = col_idx + \"fn helper\".len()"
         );
     }
 
@@ -3330,6 +3358,612 @@ const PI: f64
             type_items[0]["tags"],
             serde_json::json!([1]),
             "TypeHierarchyItem should have DEPRECATED tag"
+        );
+    }
+
+    // ── Request builder helpers ──────────────────────────────────────
+
+    fn references_request(id: u64, uri: &str, line: u64, character: u64) -> String {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "textDocument/references",
+            "params": {
+                "textDocument": { "uri": uri },
+                "position": { "line": line, "character": character },
+                "context": { "includeDeclaration": true }
+            }
+        })
+        .to_string()
+    }
+
+    fn prepare_rename_request(id: u64, uri: &str, line: u64, character: u64) -> String {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "textDocument/prepareRename",
+            "params": {
+                "textDocument": { "uri": uri },
+                "position": { "line": line, "character": character }
+            }
+        })
+        .to_string()
+    }
+
+    fn incoming_calls_request(id: u64, item: &Value) -> String {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "callHierarchy/incomingCalls",
+            "params": { "item": item }
+        })
+        .to_string()
+    }
+
+    fn code_action_request(id: u64, uri: &str, diagnostics: &[Value]) -> String {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "textDocument/codeAction",
+            "params": {
+                "textDocument": { "uri": uri },
+                "range": {
+                    "start": { "line": 0, "character": 0 },
+                    "end": { "line": 0, "character": 1 }
+                },
+                "context": { "diagnostics": diagnostics }
+            }
+        })
+        .to_string()
+    }
+
+    fn pull_diagnostics_request(id: u64, uri: &str) -> String {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "textDocument/diagnostic",
+            "params": {
+                "textDocument": { "uri": uri }
+            }
+        })
+        .to_string()
+    }
+
+    fn workspace_symbol_resolve_request(id: u64, item: &Value) -> String {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "workspaceSymbol/resolve",
+            "params": item
+        })
+        .to_string()
+    }
+
+    // ── New tests: untested handler functions ────────────────────────
+
+    #[test]
+    fn test_prepare_rename_response() {
+        let uri = "file:///tmp/rename.yX4Za";
+        // "fn my_func" — 'fn' at col 0-1, space at 2, 'my_func' at col 3-9
+        let text = "fn my_func\n";
+
+        let mut input = frame(&initialize_request(1));
+        input.extend(frame(&did_open_notification(uri, text)));
+        // prepareRename on 'my_func' at (0, 5)
+        input.extend(frame(&prepare_rename_request(2, uri, 0, 5)));
+        // prepareRename on 'fn' keyword at (0, 0) — should return null
+        input.extend(frame(&prepare_rename_request(3, uri, 0, 0)));
+        input.extend(frame(&shutdown_request(4)));
+
+        let messages = run_server_with(default_args(), &input);
+
+        // Symbol rename: should return range and placeholder
+        let rename_sym = messages
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(2))
+            .expect("prepareRename response with id=2");
+        assert!(rename_sym["error"].is_null(), "Expected no error");
+        let result = &rename_sym["result"];
+        assert!(result.is_object(), "Expected result object for symbol");
+        assert_eq!(result["placeholder"], "my_func");
+        assert_eq!(result["range"]["start"]["line"], 0);
+        assert_eq!(result["range"]["start"]["character"], 3);
+        assert_eq!(result["range"]["end"]["line"], 0);
+        assert_eq!(result["range"]["end"]["character"], 10);
+
+        // Keyword rename: should return null result
+        let rename_kw = messages
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(3))
+            .expect("prepareRename response with id=3");
+        assert!(
+            rename_kw["error"].is_null(),
+            "Expected no error for keyword"
+        );
+        assert!(
+            rename_kw["result"].is_null(),
+            "Keyword 'fn' should return null result"
+        );
+    }
+
+    #[test]
+    fn test_references_response() {
+        let uri_a = "file:///tmp/defs.yX4Za";
+        let text_a = "fn target()\n";
+        let uri_b = "file:///tmp/usage.yX4Za";
+        // "target" appears at col 0 on line 0 and col 5 on line 1
+        let text_b = "target\ncall target here\n";
+
+        let mut input = frame(&initialize_request(1));
+        input.extend(frame(&did_open_notification(uri_a, text_a)));
+        input.extend(frame(&did_open_notification(uri_b, text_b)));
+        // References on 'target' in uri_b, line 0
+        input.extend(frame(&references_request(2, uri_b, 0, 0)));
+        input.extend(frame(&shutdown_request(3)));
+
+        let messages = run_server_with(default_args(), &input);
+
+        let refs = messages
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(2))
+            .expect("references response with id=2");
+        assert!(refs["error"].is_null(), "Expected no error");
+        let locations = refs["result"].as_array().expect("result array");
+
+        // Should find "target" in multiple places across both files
+        assert!(
+            locations.len() >= 3,
+            "Expected at least 3 references (1 in defs, 2 in usage), got {}",
+            locations.len()
+        );
+
+        // Verify character positions are plausible (not zero from Default)
+        // uri_a line 0: "fn target()" — "target" at col 3
+        let a_refs: Vec<&Value> = locations.iter().filter(|l| l["uri"] == uri_a).collect();
+        assert!(!a_refs.is_empty(), "Should have references in defs file");
+        let a_ref = &a_refs[0];
+        assert_eq!(a_ref["range"]["start"]["character"], 3);
+        assert_eq!(
+            a_ref["range"]["end"]["character"], 9,
+            "end = 3 + \"target\".len()"
+        );
+
+        // uri_b line 1: "call target here" — "target" at col 5
+        let b_line1_refs: Vec<&Value> = locations
+            .iter()
+            .filter(|l| l["uri"] == uri_b && l["range"]["start"]["line"] == 1)
+            .collect();
+        assert!(
+            !b_line1_refs.is_empty(),
+            "Should have reference on line 1 of usage"
+        );
+        assert_eq!(b_line1_refs[0]["range"]["start"]["character"], 5);
+        assert_eq!(
+            b_line1_refs[0]["range"]["end"]["character"], 11,
+            "end = 5 + \"target\".len()"
+        );
+    }
+
+    #[test]
+    fn test_incoming_calls_response() {
+        let uri = "file:///tmp/calls.yX4Za";
+        // callee defined on line 0, caller defined on line 1, caller calls callee on line 2
+        let text = "fn callee()\nfn caller()\n    callee\n";
+
+        let mut input = frame(&initialize_request(1));
+        input.extend(frame(&did_open_notification(uri, text)));
+        // prepareCallHierarchy on 'callee' (line 0, character 3)
+        input.extend(frame(&prepare_call_hierarchy_request(2, uri, 0, 3)));
+        input.extend(frame(&shutdown_request(99)));
+
+        let messages = run_server_with(default_args(), &input);
+
+        let prepare = messages
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(2))
+            .expect("prepareCallHierarchy response");
+        let items = prepare["result"].as_array().expect("result array");
+        assert_eq!(items[0]["name"], "callee");
+
+        // Now request incoming calls
+        let callee_item = &items[0];
+        let mut input2 = frame(&initialize_request(10));
+        input2.extend(frame(&did_open_notification(uri, text)));
+        input2.extend(frame(&incoming_calls_request(11, callee_item)));
+        input2.extend(frame(&shutdown_request(99)));
+
+        let messages2 = run_server_with(default_args(), &input2);
+
+        let incoming = messages2
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(11))
+            .expect("incomingCalls response with id=11");
+        assert!(incoming["error"].is_null(), "Expected no error");
+        let calls = incoming["result"].as_array().expect("result array");
+        assert_eq!(calls.len(), 1, "Expected 1 incoming call from caller");
+        assert_eq!(calls[0]["from"]["name"], "caller");
+        assert_eq!(calls[0]["from"]["kind"], 12); // Function
+
+        let from_ranges = calls[0]["fromRanges"].as_array().expect("fromRanges");
+        assert!(!from_ranges.is_empty());
+        assert_eq!(from_ranges[0]["start"]["line"], 2, "Call site is on line 2");
+    }
+
+    // ── New tests: match arm dispatch coverage ──────────────────────
+
+    #[test]
+    fn test_code_action_response() {
+        let uri = "file:///tmp/test.yX4Za";
+        let text = "fn hello\n";
+
+        let mut input = frame(&initialize_request(1));
+        input.extend(frame(&did_open_notification(uri, text)));
+        input.extend(frame(&code_action_request(2, uri, &[])));
+        input.extend(frame(&shutdown_request(3)));
+
+        let messages = run_server_with(default_args(), &input);
+
+        let action = messages
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(2))
+            .expect("codeAction response");
+        assert!(action["error"].is_null(), "Expected no error");
+        let result = action["result"].as_array().expect("result array");
+        assert!(
+            result.iter().any(|a| a["kind"] == "refactor"),
+            "Should include refactor action"
+        );
+    }
+
+    #[test]
+    fn test_pull_diagnostics_response() {
+        let mut args = default_args();
+        args.pull_diagnostics = true;
+        let uri = "file:///tmp/test.yX4Za";
+        let text = "fn hello\n";
+
+        let mut input = frame(&initialize_request(1));
+        input.extend(frame(&did_open_notification(uri, text)));
+        input.extend(frame(&pull_diagnostics_request(2, uri)));
+        input.extend(frame(&shutdown_request(3)));
+
+        let messages = run_server_with(args, &input);
+
+        let diag = messages
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(2))
+            .expect("diagnostic response");
+        assert!(diag["error"].is_null(), "Expected no error");
+        let result = &diag["result"];
+        assert_eq!(result["kind"], "full");
+        let items = result["items"].as_array().expect("items array");
+        assert!(!items.is_empty(), "Expected at least one diagnostic item");
+        assert_eq!(items[0]["source"], "mockls");
+    }
+
+    #[test]
+    fn test_pull_diagnostics_fail_pull() {
+        let mut args = default_args();
+        args.pull_diagnostics = true;
+        args.fail_pull = true;
+        let uri = "file:///tmp/test.yX4Za";
+        let text = "fn hello\n";
+
+        let mut input = frame(&initialize_request(1));
+        input.extend(frame(&did_open_notification(uri, text)));
+        input.extend(frame(&pull_diagnostics_request(2, uri)));
+        input.extend(frame(&shutdown_request(3)));
+
+        let messages = run_server_with(args, &input);
+
+        let diag = messages
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(2))
+            .expect("diagnostic response");
+        assert!(diag["error"].is_object(), "Should fail with --fail-pull");
+        assert_eq!(diag["error"]["code"], -32603);
+    }
+
+    #[test]
+    fn test_workspace_symbol_resolve_response() {
+        let mut args = default_args();
+        args.resolve_provider = true;
+        let uri = "file:///tmp/test.yX4Za";
+        let text = "fn my_func\n";
+
+        // Construct an unresolved workspace symbol item (URI only, no range)
+        let unresolved_item = serde_json::json!({
+            "name": "my_func",
+            "kind": 12,
+            "location": { "uri": uri }
+        });
+
+        let mut input = frame(&initialize_request(1));
+        input.extend(frame(&did_open_notification(uri, text)));
+        input.extend(frame(&workspace_symbol_resolve_request(
+            2,
+            &unresolved_item,
+        )));
+        input.extend(frame(&shutdown_request(3)));
+
+        let messages = run_server_with(args, &input);
+
+        let resolved = messages
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(2))
+            .expect("resolve response");
+        assert!(resolved["error"].is_null(), "Expected no error");
+        let result = &resolved["result"];
+        assert!(
+            result["location"]["range"].is_object(),
+            "Resolved symbol should have location with range"
+        );
+        assert_eq!(result["name"], "my_func");
+    }
+
+    // ── New tests: handle_request logic ─────────────────────────────
+
+    #[test]
+    fn test_fail_on_specific_method() {
+        let mut args = default_args();
+        args.fail_on = vec!["textDocument/hover".to_string()];
+        let uri = "file:///tmp/test.yX4Za";
+        let text = "fn hello\n";
+
+        let mut input = frame(&initialize_request(1));
+        input.extend(frame(&did_open_notification(uri, text)));
+        // Hover should fail
+        input.extend(frame(&hover_request(2, uri, 0, 3)));
+        // Definition should succeed
+        input.extend(frame(&definition_request(3, uri, 0, 3)));
+        input.extend(frame(&shutdown_request(4)));
+
+        let messages = run_server_with(args, &input);
+
+        let hover = messages
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(2))
+            .expect("hover response");
+        assert!(
+            hover["error"].is_object(),
+            "Hover should fail when in fail_on"
+        );
+        assert_eq!(hover["error"]["code"], -32603);
+
+        let def = messages
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(3))
+            .expect("definition response");
+        assert!(
+            def["error"].is_null(),
+            "Definition should succeed when not in fail_on"
+        );
+    }
+
+    #[test]
+    fn test_hang_on_specific_method() {
+        let mut args = default_args();
+        args.hang_on = vec!["textDocument/hover".to_string()];
+        let uri = "file:///tmp/test.yX4Za";
+        let text = "fn hello\n";
+
+        let mut input = frame(&initialize_request(1));
+        input.extend(frame(&did_open_notification(uri, text)));
+        input.extend(frame(&hover_request(2, uri, 0, 3)));
+        input.extend(frame(&definition_request(3, uri, 0, 3)));
+        input.extend(frame(&shutdown_request(4)));
+
+        let messages = run_server_with(args, &input);
+
+        // Hover should NOT have a response (hung)
+        let hover = messages
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(2));
+        assert!(hover.is_none(), "Hover should not respond when hung");
+
+        // Definition should still work
+        let def = messages
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(3))
+            .expect("definition response");
+        assert!(
+            def["error"].is_null(),
+            "Definition should succeed when not in hang_on"
+        );
+    }
+
+    #[test]
+    fn test_content_modified_once_retry() {
+        let mut args = default_args();
+        args.content_modified_once = true;
+        let uri = "file:///tmp/test.yX4Za";
+        let text = "fn hello\nhello\n";
+
+        let mut input = frame(&initialize_request(1));
+        input.extend(frame(&did_open_notification(uri, text)));
+        // First definition request — should get ContentModified error
+        input.extend(frame(&definition_request(2, uri, 1, 0)));
+        // Second definition request — should succeed
+        input.extend(frame(&definition_request(3, uri, 1, 0)));
+        input.extend(frame(&shutdown_request(4)));
+
+        let messages = run_server_with(args, &input);
+
+        let first = messages
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(2))
+            .expect("first definition response");
+        assert!(
+            first["error"].is_object(),
+            "First definition should return ContentModified error"
+        );
+        assert_eq!(first["error"]["code"], -32801);
+
+        let second = messages
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(3))
+            .expect("second definition response");
+        assert!(
+            second["error"].is_null(),
+            "Second definition should succeed after ContentModified"
+        );
+        assert_eq!(second["result"]["uri"], uri);
+    }
+
+    #[test]
+    fn test_reject_null_workspace_both_null() {
+        let mut args = default_args();
+        args.reject_null_workspace = true;
+
+        let init = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "processId": null,
+                "capabilities": {},
+                "rootUri": null
+            }
+        })
+        .to_string();
+
+        let mut input = frame(&init);
+        input.extend(frame(&shutdown_request(2)));
+        let messages = run_server_with(args, &input);
+
+        let resp = &messages[0];
+        assert!(resp["error"].is_object(), "Should reject null workspace");
+        assert_eq!(resp["error"]["code"], -32002);
+    }
+
+    /// When rootUri is null but workspaceFolders are present, the server
+    /// should accept. This distinguishes `&&` from `||` in the guard.
+    #[test]
+    fn test_reject_null_workspace_folders_present() {
+        let mut args = default_args();
+        args.reject_null_workspace = true;
+
+        let init = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "processId": null,
+                "capabilities": {},
+                "rootUri": null,
+                "workspaceFolders": [{"uri": "file:///tmp/test", "name": "test"}]
+            }
+        })
+        .to_string();
+
+        let mut input = frame(&init);
+        input.extend(frame(&shutdown_request(2)));
+        let messages = run_server_with(args, &input);
+
+        let resp = &messages[0];
+        assert!(
+            resp["error"].is_null(),
+            "Should accept when workspaceFolders are present even if rootUri is null"
+        );
+    }
+
+    // ── New tests: import resolution and cross-file logic ───────────
+
+    /// When two files define the same symbol, import resolution should
+    /// prefer the file matching the import source fragment. This kills
+    /// the `delete !` mutant in the import URI check.
+    #[test]
+    fn test_definition_import_resolution_priority() {
+        let uri_defs = "file:///tmp/defs.yX4Za";
+        let text_defs = "fn helper()\n";
+        let uri_alt = "file:///tmp/alt.yX4Za";
+        let text_alt = "fn helper()\n"; // Same definition in different file
+        let uri_a = "file:///tmp/a.yX4Za";
+        let text_a = "from defs import helper\nhelper\n";
+
+        let mut input = frame(&initialize_request(1));
+        input.extend(frame(&did_open_notification(uri_defs, text_defs)));
+        input.extend(frame(&did_open_notification(uri_alt, text_alt)));
+        input.extend(frame(&did_open_notification(uri_a, text_a)));
+        input.extend(frame(&definition_request(2, uri_a, 1, 0)));
+        input.extend(frame(&shutdown_request(3)));
+
+        let messages = run_server_with(default_args(), &input);
+
+        let def = messages
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(2))
+            .expect("definition response");
+        assert!(def["error"].is_null());
+        assert_eq!(
+            def["result"]["uri"], uri_defs,
+            "Import should resolve to defs.yX4Za, not alt.yX4Za"
+        );
+    }
+
+    // ── New tests: definition first-occurrence fallbacks ────────────
+
+    /// When no def pattern matches anywhere, definition should prefer
+    /// a cross-file first-occurrence over the current-doc cursor position.
+    #[test]
+    fn test_definition_cross_file_first_occurrence_fallback() {
+        let uri_a = "file:///tmp/lib.yX4Za";
+        let text_a = "greet someone\n"; // "greet" at col 0
+        let uri_b = "file:///tmp/main.yX4Za";
+        let text_b = "call greet\n"; // cursor here, "greet" at col 5
+
+        let mut input = frame(&initialize_request(1));
+        input.extend(frame(&did_open_notification(uri_a, text_a)));
+        input.extend(frame(&did_open_notification(uri_b, text_b)));
+        // Definition on "greet" in uri_b at (0, 5)
+        input.extend(frame(&definition_request(2, uri_b, 0, 5)));
+        input.extend(frame(&shutdown_request(3)));
+
+        let messages = run_server_with(default_args(), &input);
+
+        let def = messages
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(2))
+            .expect("definition response");
+        assert!(def["error"].is_null());
+        assert_eq!(
+            def["result"]["uri"], uri_a,
+            "Cross-file first-occurrence should be preferred over current-doc"
+        );
+        assert_eq!(def["result"]["range"]["start"]["character"], 0);
+        assert_eq!(
+            def["result"]["range"]["end"]["character"], 5,
+            "end = 0 + \"greet\".len()"
+        );
+    }
+
+    /// When no other file contains the word, definition falls back to
+    /// the first occurrence in the current document.
+    #[test]
+    fn test_definition_current_doc_first_occurrence_fallback() {
+        let uri = "file:///tmp/test.yX4Za";
+        // "unknown" has no def pattern; first occurrence is at line 0, col 5
+        let text = "call unknown here\nunknown again\n";
+
+        let mut input = frame(&initialize_request(1));
+        input.extend(frame(&did_open_notification(uri, text)));
+        // Definition on "unknown" at (1, 0)
+        input.extend(frame(&definition_request(2, uri, 1, 0)));
+        input.extend(frame(&shutdown_request(3)));
+
+        let messages = run_server_with(default_args(), &input);
+
+        let def = messages
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(2))
+            .expect("definition response");
+        assert!(def["error"].is_null());
+        assert_eq!(def["result"]["uri"], uri);
+        assert_eq!(def["result"]["range"]["start"]["line"], 0);
+        assert_eq!(def["result"]["range"]["start"]["character"], 5);
+        assert_eq!(
+            def["result"]["range"]["end"]["character"], 12,
+            "end = 5 + \"unknown\".len()"
         );
     }
 }
