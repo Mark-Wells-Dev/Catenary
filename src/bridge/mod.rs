@@ -19,6 +19,8 @@ mod grep_server;
 mod handler;
 /// Application dispatch for hook requests.
 mod hook_router;
+/// Shared page-based output pagination.
+mod pagination;
 /// Path validation for LSP-aware operations and config file protection.
 pub mod path_security;
 /// Shared container for tool servers and cross-tool infrastructure.

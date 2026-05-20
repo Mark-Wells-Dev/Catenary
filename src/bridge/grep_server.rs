@@ -18,6 +18,7 @@ use tracing::debug;
 
 use super::filesystem_manager::FilesystemManager;
 use super::handler::display_path;
+use super::pagination::paginate;
 use super::tool_server::ToolServer;
 use crate::config::DispatchMethod;
 use crate::lsp::LspClientManager;
@@ -1559,53 +1560,6 @@ fn render_section(
     }
 }
 
-/// Paginates rendered output into pages of at most `budget` characters.
-///
-/// Returns `[page N/M]` header on every response. Pages are split at line
-/// boundaries — a line is never cut in half. If the requested page is
-/// beyond the last, returns an informational message.
-fn paginate(full: &str, budget: usize, page: usize) -> String {
-    use std::fmt::Write;
-
-    if full.is_empty() {
-        return String::new();
-    }
-
-    // Split into pages at line boundaries.
-    let lines: Vec<&str> = full.lines().collect();
-    let mut pages: Vec<String> = Vec::new();
-    let mut current_page = String::new();
-
-    for &line in &lines {
-        let candidate_len = if current_page.is_empty() {
-            line.len()
-        } else {
-            current_page.len() + 1 + line.len() // +1 for newline
-        };
-        if !current_page.is_empty() && candidate_len > budget {
-            pages.push(std::mem::take(&mut current_page));
-        }
-        if !current_page.is_empty() {
-            current_page.push('\n');
-        }
-        current_page.push_str(line);
-    }
-    if !current_page.is_empty() {
-        pages.push(current_page);
-    }
-
-    let total = pages.len();
-
-    if page > total {
-        return format!("[page {page}/{total}] No more results.");
-    }
-
-    let mut output = String::new();
-    let _ = writeln!(output, "[page {page}/{total}]\n");
-    output.push_str(&pages[page - 1]);
-    output
-}
-
 /// Groups hits by directory and file for tree rendering.
 fn group_hits_by_dir_file<'a>(
     hits: &[&'a GrepHit],
@@ -2333,7 +2287,7 @@ mod tests {
     }
 
     #[test]
-    fn grep_page_beyond_last() {
+    fn grep_page_beyond_last_clamps() {
         let fs = test_fs("/project");
         let hits = [sym_hit(
             "/project/src/handler.rs",
@@ -2344,9 +2298,14 @@ mod tests {
 
         let output = render(&hits, 10_000, 99, &fs);
 
+        // Beyond-last clamps to last page and still shows content.
         assert!(
-            output.contains("No more results"),
-            "beyond-last page should say no more results: {output}"
+            output.starts_with("[page 1/1]"),
+            "beyond-last should clamp to last page: {output}"
+        );
+        assert!(
+            output.contains("handle_grep"),
+            "clamped page should contain content: {output}"
         );
     }
 
@@ -2728,20 +2687,25 @@ mod tests {
     }
 
     #[test]
-    fn paginate_beyond_last() {
+    fn paginate_beyond_last_clamps() {
         let output = paginate("aaa\nbbb", 1000, 5);
-        assert!(output.contains("No more results"), "beyond last: {output}");
+        // Beyond-last clamps to last page and shows content.
+        assert!(
+            output.starts_with("[page 1/1]"),
+            "beyond-last should clamp: {output}"
+        );
+        assert!(output.contains("aaa"), "clamped page has content: {output}");
     }
 
     #[test]
     fn paginate_splits_over_budget_not_at_boundary() {
-        // "aaaa" + "\n" + "bbbb" = 9 chars total.
-        // Budget 9: candidate_len == budget → no split (> not >=).
-        // Budget 8: candidate_len > budget → split into two pages.
+        // "aaaa" (4 chars + 1 newline = 5) + "bbbb" (4 + 1 = 5) = 10 budget chars.
+        // Budget 10: both fit → single page (verifies > not >=).
+        // Budget 9: second line pushes to 10 > 9 → split.
         let text = "aaaa\nbbbb";
 
         // At budget: single page (verifies > not >=)
-        let at = paginate(text, 9, 1);
+        let at = paginate(text, 10, 1);
         assert!(
             at.starts_with("[page 1/1]"),
             "budget=len should be single page: {at}"
@@ -2750,8 +2714,8 @@ mod tests {
         assert!(at.contains("bbbb"), "page has second line: {at}");
 
         // Over budget: two pages (verifies newline counted in budget)
-        let over1 = paginate(text, 8, 1);
-        let over2 = paginate(text, 8, 2);
+        let over1 = paginate(text, 9, 1);
+        let over2 = paginate(text, 9, 2);
         assert!(over1.starts_with("[page 1/2]"), "page 1 of 2: {over1}");
         assert!(over1.contains("aaaa"), "page 1 content: {over1}");
         assert!(!over1.contains("bbbb"), "page 1 excludes page 2: {over1}");

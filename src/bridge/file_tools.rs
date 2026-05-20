@@ -26,6 +26,7 @@ use std::sync::{Arc, Mutex};
 
 use super::filesystem_manager::{FilesystemManager, format_file_size};
 use super::handler::{expand_tilde, resolve_path};
+use super::pagination::{format_page_header, paginate};
 use super::session::ResolvedGlob;
 use super::tool_server::ToolServer;
 use crate::config::DispatchMethod;
@@ -1518,58 +1519,6 @@ fn render_entry_line(out: &mut String, entry: &GlobEntry, flags: &[&str], indent
     }
 }
 
-// ─── Page-based paging ───────────────────────────────────────────────
-
-/// Formats the page header: `[page N/M]\n\n`.
-fn format_page_header(page: usize, total: usize) -> String {
-    format!("[page {page}/{total}]\n\n")
-}
-
-/// Splits full output into pages and returns the requested page with a header.
-///
-/// Pages are split at line boundaries so no line is broken mid-way.
-/// The budget is the maximum character count per page (excluding the header).
-fn paginate(full: &str, budget: usize, page: usize) -> String {
-    let lines: Vec<&str> = full.lines().collect();
-    if lines.is_empty() {
-        return format_page_header(1, 1);
-    }
-
-    // Build pages by accumulating lines until budget is hit.
-    let mut pages: Vec<(usize, usize)> = Vec::new(); // (start_line, end_line) exclusive
-    let mut start = 0;
-    let mut current_len = 0;
-
-    for (i, line) in lines.iter().enumerate() {
-        let line_len = line.len() + 1; // +1 for newline
-        if current_len > 0 && current_len + line_len > budget {
-            pages.push((start, i));
-            start = i;
-            current_len = 0;
-        }
-        current_len += line_len;
-    }
-    // Final page.
-    if start < lines.len() {
-        pages.push((start, lines.len()));
-    }
-
-    let total = pages.len();
-    let idx = (page.max(1) - 1).min(total.saturating_sub(1));
-
-    if idx >= pages.len() {
-        return format!("[page {page}/{total}]\n\nNo more results.");
-    }
-
-    let (s, e) = pages[idx];
-    let mut out = format_page_header(idx + 1, total);
-    for &line in &lines[s..e] {
-        out.push_str(line);
-        out.push('\n');
-    }
-    out
-}
-
 // ─── Helpers ──────────────────────────────────────────────────────────
 
 /// Builds per-file children sets from the tree-sitter index.
@@ -1962,48 +1911,6 @@ mod tests {
         let input: GlobInput =
             serde_json::from_value(serde_json::json!({"pattern": "*.rs"})).expect("deserialize");
         assert_eq!(input.page, 1, "default page should be 1");
-    }
-
-    #[test]
-    fn test_paginate_single_page() {
-        let content = "line 1\nline 2\nline 3\n";
-        let result = paginate(content, 5000, 1);
-        assert!(
-            result.starts_with("[page 1/1]"),
-            "single-page result should show [page 1/1]: {result}"
-        );
-        assert!(
-            result.contains("line 1"),
-            "should contain content: {result}"
-        );
-    }
-
-    #[test]
-    fn test_paginate_multi_page() {
-        // Each line is ~7 chars. Budget of 20 should give ~3 lines per page.
-        let content = "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\n";
-        let result = paginate(content, 20, 1);
-        assert!(
-            result.contains("[page 1/"),
-            "should have page header: {result}"
-        );
-        // Page 2 should have different content.
-        let page2 = paginate(content, 20, 2);
-        assert!(
-            page2.contains("[page 2/"),
-            "page 2 should have page header: {page2}"
-        );
-    }
-
-    #[test]
-    fn test_paginate_beyond_last() {
-        let content = "line 1\nline 2\n";
-        let result = paginate(content, 5000, 99);
-        // Should clamp to last page.
-        assert!(
-            result.contains("line 1"),
-            "beyond-last should show last page: {result}"
-        );
     }
 
     #[test]
@@ -2796,6 +2703,660 @@ mod tests {
             make_fingerprint(&syms_a),
             make_fingerprint(&syms_b),
             "different symbols should have different fingerprints"
+        );
+    }
+
+    // ─── compute_dedup ─────────────────────────────────────────────
+
+    fn make_symbol(name: &str, kind: &str, line: u32, end_line: u32) -> Symbol {
+        Symbol {
+            name: name.to_string(),
+            kind: kind.to_string(),
+            line,
+            end_line,
+            scope: None,
+            scope_kind: None,
+            deprecated: false,
+        }
+    }
+
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn test_compute_dedup_shared_and_individual() {
+        let idx = SymbolIndex::new().expect("create index");
+
+        let path_a = PathBuf::from("/test/a.rs");
+        let path_b = PathBuf::from("/test/b.rs");
+        let path_c = PathBuf::from("/test/c.rs");
+
+        // a.rs and b.rs have identical symbols (same kind+name → same fingerprint).
+        let sym_foo_a = make_symbol("foo", "function", 0, 5);
+        let sym_foo_b = make_symbol("foo", "function", 3, 8);
+        // c.rs has a different symbol.
+        let sym_bar = make_symbol("bar", "struct", 0, 10);
+
+        let mut outline: HashMap<PathBuf, Vec<Symbol>> = HashMap::new();
+        outline.insert(path_a.clone(), vec![sym_foo_a]);
+        outline.insert(path_b.clone(), vec![sym_foo_b]);
+        outline.insert(path_c.clone(), vec![sym_bar]);
+
+        let items = vec![
+            MapItem {
+                name: "a.rs",
+                abs_path: &path_a,
+                line_count: Some(10),
+            },
+            MapItem {
+                name: "b.rs",
+                abs_path: &path_b,
+                line_count: Some(15),
+            },
+            MapItem {
+                name: "c.rs",
+                abs_path: &path_c,
+                line_count: Some(20),
+            },
+        ];
+
+        let (shared, individual) = compute_dedup(&items, &outline, &idx);
+
+        // a.rs and b.rs share the same fingerprint → one shared group.
+        assert_eq!(shared.len(), 1, "should have 1 shared group");
+        let (group_indices, bounding) = &shared[0];
+        assert_eq!(
+            group_indices.len(),
+            2,
+            "shared group should contain 2 items"
+        );
+        // Both indices should refer to items 0 and 1 (a.rs and b.rs).
+        assert!(
+            group_indices.contains(&0) && group_indices.contains(&1),
+            "shared group should contain a.rs (0) and b.rs (1): {group_indices:?}"
+        );
+
+        // Bounding should have one symbol with min/max across both files.
+        assert_eq!(bounding.len(), 1, "should have 1 bounding symbol");
+        assert_eq!(bounding[0].name, "foo");
+        assert_eq!(bounding[0].kind, "function");
+        assert_eq!(bounding[0].min_line, 0, "min_line should be min(0, 3)");
+        assert_eq!(
+            bounding[0].max_end_line, 8,
+            "max_end_line should be max(5, 8)"
+        );
+
+        // c.rs has a unique fingerprint → individual.
+        assert_eq!(individual.len(), 1, "should have 1 individual");
+        assert_eq!(individual[0], 2, "individual should be c.rs (index 2)");
+    }
+
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn test_compute_dedup_all_unique() {
+        let idx = SymbolIndex::new().expect("create index");
+
+        let path_a = PathBuf::from("/test/a.rs");
+        let path_b = PathBuf::from("/test/b.rs");
+
+        let mut outline: HashMap<PathBuf, Vec<Symbol>> = HashMap::new();
+        outline.insert(path_a.clone(), vec![make_symbol("foo", "function", 0, 5)]);
+        outline.insert(path_b.clone(), vec![make_symbol("bar", "function", 0, 5)]);
+
+        let items = vec![
+            MapItem {
+                name: "a.rs",
+                abs_path: &path_a,
+                line_count: Some(10),
+            },
+            MapItem {
+                name: "b.rs",
+                abs_path: &path_b,
+                line_count: Some(10),
+            },
+        ];
+
+        let (shared, individual) = compute_dedup(&items, &outline, &idx);
+
+        assert!(shared.is_empty(), "no shared groups when all unique");
+        assert_eq!(individual.len(), 2, "both should be individual");
+    }
+
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn test_compute_dedup_bounding_uses_kind_and_name() {
+        // When computing bounding ranges, only symbols matching BOTH kind and
+        // name should contribute. If the `&&` were replaced with `||`, unrelated
+        // symbols would contaminate the bounding range.
+        let idx = SymbolIndex::new().expect("create index");
+
+        let path_a = PathBuf::from("/test/a.rs");
+        let path_b = PathBuf::from("/test/b.rs");
+
+        // Both files have function "foo" and struct "baz" (same fingerprint).
+        // In file B, "baz" has a wider range.
+        let mut outline: HashMap<PathBuf, Vec<Symbol>> = HashMap::new();
+        outline.insert(
+            path_a.clone(),
+            vec![
+                make_symbol("foo", "function", 0, 5),
+                make_symbol("baz", "struct", 10, 20),
+            ],
+        );
+        outline.insert(
+            path_b.clone(),
+            vec![
+                make_symbol("foo", "function", 2, 4),
+                make_symbol("baz", "struct", 8, 25),
+            ],
+        );
+
+        let items = vec![
+            MapItem {
+                name: "a.rs",
+                abs_path: &path_a,
+                line_count: Some(30),
+            },
+            MapItem {
+                name: "b.rs",
+                abs_path: &path_b,
+                line_count: Some(30),
+            },
+        ];
+
+        let (shared, _) = compute_dedup(&items, &outline, &idx);
+
+        assert_eq!(shared.len(), 1);
+        let (_, bounding) = &shared[0];
+        assert_eq!(bounding.len(), 2, "should have 2 bounding symbols");
+
+        // Find "foo" bounding — should use min(0,2)=0, max(5,4)=5.
+        let foo = bounding.iter().find(|b| b.name == "foo").expect("foo");
+        assert_eq!(foo.min_line, 0, "foo min_line = min(0, 2)");
+        assert_eq!(foo.max_end_line, 5, "foo max_end_line = max(5, 4)");
+
+        // Find "baz" bounding — should use min(10,8)=8, max(20,25)=25.
+        let baz = bounding.iter().find(|b| b.name == "baz").expect("baz");
+        assert_eq!(baz.min_line, 8, "baz min_line = min(10, 8)");
+        assert_eq!(baz.max_end_line, 25, "baz max_end_line = max(20, 25)");
+    }
+
+    // ─── render_shared_group ───────────────────────────────────────
+
+    #[test]
+    fn test_render_shared_group_output_format() {
+        let items = vec![
+            MapItem {
+                name: "alpha.rs",
+                abs_path: Path::new("/test/alpha.rs"),
+                line_count: Some(100),
+            },
+            MapItem {
+                name: "beta.rs",
+                abs_path: Path::new("/test/beta.rs"),
+                line_count: None,
+            },
+        ];
+
+        let bounding = vec![BoundingSymbol {
+            name: "foo".to_string(),
+            kind: "function".to_string(),
+            min_line: 2,
+            max_end_line: 9,
+            has_children: false,
+        }];
+
+        let mut out = String::new();
+        render_shared_group(&mut out, &items, &[0, 1], &bounding, "", "\t");
+
+        // File with line count shows "(N lines)".
+        assert!(
+            out.contains("alpha.rs  (100 lines)"),
+            "should show line count for alpha: {out:?}"
+        );
+        // File without line count shows just the name.
+        assert!(
+            out.contains("beta.rs\n"),
+            "should show name only for beta: {out:?}"
+        );
+        // Header line.
+        assert!(
+            out.contains("common structure (ranges are bounding):"),
+            "should have common structure header: {out:?}"
+        );
+        // Symbol line: 0-based to 1-based conversion.
+        assert!(
+            out.contains("\t:3-10 <Function> foo\n"),
+            "should show bounding symbol with 1-based lines: {out:?}"
+        );
+    }
+
+    #[test]
+    fn test_render_shared_group_with_children() {
+        let items = vec![MapItem {
+            name: "a.rs",
+            abs_path: Path::new("/test/a.rs"),
+            line_count: Some(50),
+        }];
+
+        let bounding = vec![BoundingSymbol {
+            name: "MyStruct".to_string(),
+            kind: "struct".to_string(),
+            min_line: 0,
+            max_end_line: 20,
+            has_children: true,
+        }];
+
+        let mut out = String::new();
+        render_shared_group(&mut out, &items, &[0], &bounding, "", "\t");
+
+        assert!(
+            out.contains("<Struct> MyStruct/\n"),
+            "children should produce trailing slash: {out:?}"
+        );
+    }
+
+    // ─── compute_entry_flags ───────────────────────────────────────
+
+    #[test]
+    fn test_compute_entry_flags_broken_symlink() {
+        let mut entry = make_glob_entry("link.rs", Path::new("/test/link.rs"), false, Some(100));
+        entry.is_broken_symlink = true;
+        let fs = FilesystemManager::new();
+
+        let flags = compute_entry_flags(&entry, None, 100, &[], &fs, false);
+        assert_eq!(
+            flags,
+            vec!["broken"],
+            "broken symlink should return [broken]"
+        );
+    }
+
+    #[test]
+    fn test_compute_entry_flags_snapshot() {
+        let mut entry = make_glob_entry("snap.rs", Path::new("/test/snap.rs"), false, Some(200));
+        entry.is_snapshot = true;
+        let fs = FilesystemManager::new();
+
+        let flags = compute_entry_flags(&entry, None, 100, &[], &fs, false);
+        assert_eq!(flags, vec!["snapshot"], "snapshot should return [snapshot]");
+    }
+
+    #[test]
+    fn test_compute_entry_flags_empty_when_no_conditions() {
+        let entry = make_glob_entry("plain.rs", Path::new("/test/plain.rs"), false, Some(50));
+        let fs = FilesystemManager::new();
+
+        let flags = compute_entry_flags(&entry, None, 100, &[], &fs, false);
+        assert!(flags.is_empty(), "no conditions met → empty: {flags:?}");
+    }
+
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn test_compute_entry_flags_symbols_available_not_rendered() {
+        let idx = SymbolIndex::new().expect("create index");
+        let path = PathBuf::from("/test/big.rs");
+
+        idx.populate_from_document_symbols(
+            &path,
+            &serde_json::json!([{
+                "name": "sym",
+                "kind": 12,
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 5, "character": 1 } },
+                "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 6 } }
+            }]),
+        )
+        .expect("populate");
+
+        let entry = make_glob_entry("big.rs", &path, false, Some(200));
+        let fs = FilesystemManager::new();
+
+        // !map_rendered + has symbols + above threshold → symbols available.
+        let flags = compute_entry_flags(&entry, Some(&idx), 100, &[], &fs, false);
+        assert_eq!(
+            flags,
+            vec!["symbols available"],
+            "above threshold with symbols should flag: {flags:?}"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn test_compute_entry_flags_symbols_available_rendered_suppressed() {
+        let idx = SymbolIndex::new().expect("create index");
+        let path = PathBuf::from("/test/suppressed.rs");
+
+        idx.populate_from_document_symbols(
+            &path,
+            &serde_json::json!([{
+                "name": "sym",
+                "kind": 12,
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 5, "character": 1 } },
+                "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 6 } }
+            }]),
+        )
+        .expect("populate");
+
+        let entry = make_glob_entry("suppressed.rs", &path, false, Some(200));
+        let suppress = vec![
+            Glob::new("**/*.rs")
+                .expect("compile glob")
+                .compile_matcher(),
+        ];
+        let fs = FilesystemManager::new();
+
+        // map_rendered + has symbols + suppressed → symbols available.
+        let flags = compute_entry_flags(&entry, Some(&idx), 100, &suppress, &fs, true);
+        assert_eq!(
+            flags,
+            vec!["symbols available"],
+            "map_rendered + suppressed should flag: {flags:?}"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn test_compute_entry_flags_not_rendered_below_threshold() {
+        let idx = SymbolIndex::new().expect("create index");
+        let path = PathBuf::from("/test/small.rs");
+
+        idx.populate_from_document_symbols(
+            &path,
+            &serde_json::json!([{
+                "name": "sym",
+                "kind": 12,
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 1, "character": 1 } },
+                "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 6 } }
+            }]),
+        )
+        .expect("populate");
+
+        // Below threshold, not rendered → no symbols available flag.
+        let entry = make_glob_entry("small.rs", &path, false, Some(50));
+        let fs = FilesystemManager::new();
+
+        let flags = compute_entry_flags(&entry, Some(&idx), 100, &[], &fs, false);
+        assert!(
+            flags.is_empty(),
+            "below threshold should not flag: {flags:?}"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn test_compute_entry_flags_rendered_not_suppressed() {
+        let idx = SymbolIndex::new().expect("create index");
+        let path = PathBuf::from("/test/rendered.rs");
+
+        idx.populate_from_document_symbols(
+            &path,
+            &serde_json::json!([{
+                "name": "sym",
+                "kind": 12,
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 5, "character": 1 } },
+                "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 6 } }
+            }]),
+        )
+        .expect("populate");
+
+        // map_rendered but NOT suppressed → no flag.
+        let entry = make_glob_entry("rendered.rs", &path, false, Some(200));
+        let fs = FilesystemManager::new();
+
+        let flags = compute_entry_flags(&entry, Some(&idx), 100, &[], &fs, true);
+        assert!(
+            flags.is_empty(),
+            "map_rendered without suppress should not flag: {flags:?}"
+        );
+    }
+
+    #[test]
+    fn test_compute_entry_flags_gitignored() {
+        let mut entry = make_glob_entry("debug.log", Path::new("/test/debug.log"), false, Some(10));
+        entry.is_gitignored = true;
+        let fs = FilesystemManager::new();
+
+        let flags = compute_entry_flags(&entry, None, 200, &[], &fs, false);
+        assert_eq!(flags, vec!["gitignored"]);
+    }
+
+    #[test]
+    fn test_compute_entry_flags_broken_early_return() {
+        // Broken symlink returns ["broken"] even if gitignored or snapshot.
+        let mut entry = make_glob_entry("link.rs", Path::new("/test/link.rs"), false, Some(100));
+        entry.is_broken_symlink = true;
+        entry.is_gitignored = true;
+        let fs = FilesystemManager::new();
+
+        let flags = compute_entry_flags(&entry, None, 100, &[], &fs, false);
+        assert_eq!(
+            flags,
+            vec!["broken"],
+            "broken early return should not include gitignored: {flags:?}"
+        );
+    }
+
+    #[test]
+    fn test_compute_entry_flags_snapshot_early_return() {
+        // Snapshot returns ["snapshot"] even if gitignored.
+        let mut entry = make_glob_entry("snap.rs", Path::new("/test/snap.rs"), false, Some(200));
+        entry.is_snapshot = true;
+        entry.is_gitignored = true;
+        let fs = FilesystemManager::new();
+
+        let flags = compute_entry_flags(&entry, None, 100, &[], &fs, false);
+        assert_eq!(
+            flags,
+            vec!["snapshot"],
+            "snapshot early return should not include gitignored: {flags:?}"
+        );
+    }
+
+    // ─── render_entry_line ─────────────────────────────────────────
+
+    #[test]
+    fn test_render_entry_line_regular_file_with_lines() {
+        let entry = make_glob_entry("main.rs", Path::new("/test/main.rs"), false, Some(42));
+
+        let mut out = String::new();
+        render_entry_line(&mut out, &entry, &[], "");
+
+        assert_eq!(out, "main.rs  (42 lines)\n");
+    }
+
+    #[test]
+    fn test_render_entry_line_with_flags() {
+        let entry = make_glob_entry("main.rs", Path::new("/test/main.rs"), false, Some(42));
+
+        let mut out = String::new();
+        render_entry_line(&mut out, &entry, &["symbols available"], "");
+
+        assert_eq!(out, "main.rs  (42 lines) [symbols available]\n");
+    }
+
+    #[test]
+    fn test_render_entry_line_broken_symlink() {
+        let mut entry = make_glob_entry("broken.rs", Path::new("/test/broken.rs"), false, Some(10));
+        entry.is_broken_symlink = true;
+        entry.symlink_target = Some("/nonexistent".to_string());
+
+        let mut out = String::new();
+        render_entry_line(&mut out, &entry, &["broken"], "");
+
+        assert_eq!(out, "broken.rs -> /nonexistent [broken]\n");
+    }
+
+    #[test]
+    fn test_render_entry_line_snapshot() {
+        let mut entry = make_glob_entry("snap.rs", Path::new("/test/snap.rs"), false, Some(10));
+        entry.is_snapshot = true;
+
+        let mut out = String::new();
+        render_entry_line(&mut out, &entry, &["snapshot"], "");
+
+        assert_eq!(out, "snap.rs [snapshot]\n");
+    }
+
+    #[test]
+    fn test_render_entry_line_symlink_with_lines() {
+        let mut entry = make_glob_entry("link.rs", Path::new("/test/link.rs"), false, Some(50));
+        entry.is_symlink = true;
+        entry.symlink_target = Some("/real/file.rs".to_string());
+
+        let mut out = String::new();
+        render_entry_line(&mut out, &entry, &[], "");
+
+        assert_eq!(out, "link.rs -> /real/file.rs  (50 lines)\n");
+    }
+
+    #[test]
+    fn test_render_entry_line_binary() {
+        let mut entry = make_glob_entry("data.bin", Path::new("/test/data.bin"), false, None);
+        entry.binary_size = Some("1.5 MB".to_string());
+
+        let mut out = String::new();
+        render_entry_line(&mut out, &entry, &[], "");
+
+        assert_eq!(out, "data.bin  (1.5 MB)\n");
+    }
+
+    #[test]
+    fn test_render_entry_line_no_size_no_lines() {
+        let entry = make_glob_entry("empty", Path::new("/test/empty"), false, None);
+
+        let mut out = String::new();
+        render_entry_line(&mut out, &entry, &[], "");
+
+        assert_eq!(out, "empty\n");
+    }
+
+    #[test]
+    fn test_render_entry_line_indented() {
+        let entry = make_glob_entry("nested.rs", Path::new("/test/nested.rs"), false, Some(10));
+
+        let mut out = String::new();
+        render_entry_line(&mut out, &entry, &[], "\t");
+
+        assert_eq!(out, "\tnested.rs  (10 lines)\n");
+    }
+
+    // ─── build_children_sets ───────────────────────────────────────
+
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn test_build_children_sets_with_scoped_symbols() {
+        let idx = SymbolIndex::new().expect("create index");
+        let path = PathBuf::from("/test/has_scope.rs");
+
+        // Symbol "method" with scope "MyStruct".
+        idx.populate_from_document_symbols(
+            &path,
+            &serde_json::json!([
+                {
+                    "name": "MyStruct",
+                    "kind": 23,
+                    "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 20, "character": 1 } },
+                    "selectionRange": { "start": { "line": 0, "character": 7 }, "end": { "line": 0, "character": 15 } },
+                    "children": [{
+                        "name": "method",
+                        "kind": 12,
+                        "range": { "start": { "line": 2, "character": 4 }, "end": { "line": 5, "character": 5 } },
+                        "selectionRange": { "start": { "line": 2, "character": 7 }, "end": { "line": 2, "character": 13 } }
+                    }]
+                }
+            ]),
+        )
+        .expect("populate");
+
+        let files: Vec<&Path> = vec![path.as_path()];
+        let result = build_children_sets(&idx, &files);
+
+        assert!(
+            result.contains_key(&path),
+            "should have entry for file with scoped symbols"
+        );
+        let cs = &result[&path];
+        assert!(
+            cs.contains("MyStruct"),
+            "children set should contain the scope name: {cs:?}"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn test_build_children_sets_no_scoped_symbols() {
+        let idx = SymbolIndex::new().expect("create index");
+        let path = PathBuf::from("/test/no_scope.rs");
+
+        // Top-level symbol with no children/scope.
+        idx.populate_from_document_symbols(
+            &path,
+            &serde_json::json!([{
+                "name": "standalone",
+                "kind": 12,
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 5, "character": 1 } },
+                "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 13 } }
+            }]),
+        )
+        .expect("populate");
+
+        let files: Vec<&Path> = vec![path.as_path()];
+        let result = build_children_sets(&idx, &files);
+
+        assert!(
+            !result.contains_key(&path),
+            "file without scoped symbols should not appear in result"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn test_build_children_sets_multiple_files() {
+        let idx = SymbolIndex::new().expect("create index");
+
+        let path_a = PathBuf::from("/test/a.rs");
+        let path_b = PathBuf::from("/test/b.rs");
+
+        // File A has scoped symbol.
+        idx.populate_from_document_symbols(
+            &path_a,
+            &serde_json::json!([
+                {
+                    "name": "Container",
+                    "kind": 23,
+                    "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 10, "character": 1 } },
+                    "selectionRange": { "start": { "line": 0, "character": 7 }, "end": { "line": 0, "character": 16 } },
+                    "children": [{
+                        "name": "inner",
+                        "kind": 12,
+                        "range": { "start": { "line": 1, "character": 4 }, "end": { "line": 3, "character": 5 } },
+                        "selectionRange": { "start": { "line": 1, "character": 7 }, "end": { "line": 1, "character": 12 } }
+                    }]
+                }
+            ]),
+        )
+        .expect("populate a");
+
+        // File B has no scoped symbols.
+        idx.populate_from_document_symbols(
+            &path_b,
+            &serde_json::json!([{
+                "name": "top",
+                "kind": 12,
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 2, "character": 1 } },
+                "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 6 } }
+            }]),
+        )
+        .expect("populate b");
+
+        let files: Vec<&Path> = vec![path_a.as_path(), path_b.as_path()];
+        let result = build_children_sets(&idx, &files);
+
+        assert!(
+            result.contains_key(&path_a),
+            "file A with scoped symbols should be in result"
+        );
+        assert!(
+            !result.contains_key(&path_b),
+            "file B without scoped symbols should not be in result"
         );
     }
 }
