@@ -2532,6 +2532,23 @@ mod tests {
         assert_eq!(caps["definitionProvider"], true);
         assert_eq!(caps["referencesProvider"], true);
         assert_eq!(caps["documentSymbolProvider"], true);
+        assert_eq!(
+            caps["typeHierarchyProvider"], true,
+            "typeHierarchyProvider should be present by default"
+        );
+        assert!(
+            caps["renameProvider"].is_object(),
+            "renameProvider should be present by default"
+        );
+        assert_eq!(caps["renameProvider"]["prepareProvider"], true);
+        assert_eq!(
+            caps["callHierarchyProvider"], true,
+            "callHierarchyProvider should be present by default"
+        );
+        assert_eq!(
+            caps["codeActionProvider"], true,
+            "codeActionProvider should be present by default"
+        );
     }
 
     #[test]
@@ -3964,6 +3981,746 @@ const PI: f64
         assert_eq!(
             def["result"]["range"]["end"]["character"], 12,
             "end = 5 + \"unknown\".len()"
+        );
+    }
+
+    // ── Notification helper builders ───────────────────────────────
+
+    fn did_change_notification(uri: &str, text: &str, version: i32) -> String {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didChange",
+            "params": {
+                "textDocument": { "uri": uri, "version": version },
+                "contentChanges": [{ "text": text }]
+            }
+        })
+        .to_string()
+    }
+
+    fn did_save_notification(uri: &str) -> String {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didSave",
+            "params": {
+                "textDocument": { "uri": uri }
+            }
+        })
+        .to_string()
+    }
+
+    fn did_close_notification(uri: &str) -> String {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didClose",
+            "params": {
+                "textDocument": { "uri": uri }
+            }
+        })
+        .to_string()
+    }
+
+    fn initialized_notification() -> String {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "initialized",
+            "params": {}
+        })
+        .to_string()
+    }
+
+    fn document_symbol_request(id: u64, uri: &str) -> String {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "textDocument/documentSymbol",
+            "params": { "textDocument": { "uri": uri } }
+        })
+        .to_string()
+    }
+
+    fn workspace_symbol_request(id: u64, query: &str) -> String {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "workspace/symbol",
+            "params": { "query": query }
+        })
+        .to_string()
+    }
+
+    fn workspace_folders_change(added: &[(&str, &str)], removed: &[(&str, &str)]) -> String {
+        let added_json: Vec<Value> = added
+            .iter()
+            .map(|(uri, name)| serde_json::json!({"uri": uri, "name": name}))
+            .collect();
+        let removed_json: Vec<Value> = removed
+            .iter()
+            .map(|(uri, name)| serde_json::json!({"uri": uri, "name": name}))
+            .collect();
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "workspace/didChangeWorkspaceFolders",
+            "params": {
+                "event": {
+                    "added": added_json,
+                    "removed": removed_json
+                }
+            }
+        })
+        .to_string()
+    }
+
+    // ── Tests: notification dispatch ───────────────────────────────
+
+    #[test]
+    fn test_did_change_updates_content_and_publishes_diagnostics() {
+        let uri = "file:///tmp/test.yX4Za";
+        let text_v1 = "fn hello\n";
+        let text_v2 = "fn goodbye\nfn extra_line\n";
+
+        let mut input = frame(&initialize_request(1));
+        input.extend(frame(&did_open_notification(uri, text_v1)));
+        input.extend(frame(&did_change_notification(uri, text_v2, 2)));
+        // Hover on 'goodbye' (line 0, col 3) — only valid after didChange
+        input.extend(frame(&hover_request(2, uri, 0, 3)));
+        input.extend(frame(&shutdown_request(3)));
+
+        let messages = run_server_with(default_args(), &input);
+
+        // Verify content was updated via hover
+        let hover = messages
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(2))
+            .expect("hover response");
+        let value = hover["result"]["contents"]["value"].as_str().unwrap_or("");
+        assert!(
+            value.contains("goodbye"),
+            "didChange should update content, got: {value}"
+        );
+
+        // Verify diagnostics published from both didOpen and didChange
+        let diag_count = messages
+            .iter()
+            .filter(|m| {
+                m.get("method").and_then(Value::as_str) == Some("textDocument/publishDiagnostics")
+            })
+            .count();
+        assert!(
+            diag_count >= 2,
+            "Expected diagnostics from both didOpen and didChange, got {diag_count}"
+        );
+
+        // Verify the latest diagnostic reflects the updated line count
+        let last_diag = messages
+            .iter()
+            .rfind(|m| {
+                m.get("method").and_then(Value::as_str) == Some("textDocument/publishDiagnostics")
+            })
+            .expect("at least one diagnostic");
+        let msg = last_diag["params"]["diagnostics"][0]["message"]
+            .as_str()
+            .unwrap_or("");
+        assert!(
+            msg.contains("2 lines"),
+            "After didChange, diagnostic should reflect 2 lines, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_did_save_publishes_diagnostics() {
+        let mut args = default_args();
+        args.advertise_save = true;
+        args.diagnostics_on_save = true;
+        let uri = "file:///tmp/test.yX4Za";
+        let text = "fn hello\n";
+
+        let mut input = frame(&initialize_request(1));
+        input.extend(frame(&did_open_notification(uri, text)));
+        input.extend(frame(&did_save_notification(uri)));
+        input.extend(frame(&shutdown_request(2)));
+
+        let messages = run_server_with(args, &input);
+
+        // With diagnostics_on_save, didOpen should NOT publish diagnostics,
+        // but didSave should.
+        let diags: Vec<&Value> = messages
+            .iter()
+            .filter(|m| {
+                m.get("method").and_then(Value::as_str) == Some("textDocument/publishDiagnostics")
+            })
+            .collect();
+
+        assert_eq!(
+            diags.len(),
+            1,
+            "Expected exactly 1 diagnostic (from didSave, not didOpen)"
+        );
+        assert_eq!(diags[0]["params"]["uri"], uri);
+    }
+
+    #[test]
+    fn test_did_close_removes_document() {
+        let uri = "file:///tmp/test.yX4Za";
+        let text = "fn hello\n";
+
+        let mut input = frame(&initialize_request(1));
+        input.extend(frame(&did_open_notification(uri, text)));
+        // Hover should work before close
+        input.extend(frame(&hover_request(2, uri, 0, 3)));
+        input.extend(frame(&did_close_notification(uri)));
+        // Hover should return null after close (document removed)
+        input.extend(frame(&hover_request(3, uri, 0, 3)));
+        input.extend(frame(&shutdown_request(4)));
+
+        let messages = run_server_with(default_args(), &input);
+
+        let hover1 = messages
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(2))
+            .expect("first hover response");
+        assert!(
+            hover1["result"].is_object(),
+            "Hover before close should have result"
+        );
+
+        let hover2 = messages
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(3))
+            .expect("second hover response");
+        assert!(
+            hover2["result"].is_null(),
+            "Hover after close should be null"
+        );
+    }
+
+    #[test]
+    fn test_workspace_folder_remove_cleans_documents() {
+        let mut args = default_args();
+        args.workspace_folders = true;
+        args.scan_roots = true;
+
+        let uri = "file:///tmp/folder_a/test.yX4Za";
+        let text = "fn hello\n";
+
+        let mut input = frame(&initialize_request(1));
+        input.extend(frame(&did_open_notification(uri, text)));
+        // Verify document is accessible
+        input.extend(frame(&hover_request(2, uri, 0, 3)));
+        // Remove the workspace folder containing the document
+        input.extend(frame(&workspace_folders_change(
+            &[],
+            &[("file:///tmp/folder_a", "folder_a")],
+        )));
+        // Verify document is gone
+        input.extend(frame(&hover_request(3, uri, 0, 3)));
+        input.extend(frame(&shutdown_request(4)));
+
+        let messages = run_server_with(args, &input);
+
+        let hover1 = messages
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(2))
+            .expect("first hover response");
+        assert!(
+            hover1["result"].is_object(),
+            "Hover before folder remove should work"
+        );
+
+        let hover2 = messages
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(3))
+            .expect("second hover response");
+        assert!(
+            hover2["result"].is_null(),
+            "Hover after folder remove should be null"
+        );
+    }
+
+    // ── Tests: diagnostics flag combinations ───────────────────────
+
+    #[test]
+    fn test_diagnostics_on_save_suppresses_did_open() {
+        let mut args = default_args();
+        args.diagnostics_on_save = true;
+        let uri = "file:///tmp/test.yX4Za";
+        let text = "fn hello\n";
+
+        let mut input = frame(&initialize_request(1));
+        input.extend(frame(&did_open_notification(uri, text)));
+        input.extend(frame(&shutdown_request(2)));
+
+        let messages = run_server_with(args, &input);
+
+        let has_diag = messages.iter().any(|m| {
+            m.get("method").and_then(Value::as_str) == Some("textDocument/publishDiagnostics")
+        });
+        assert!(
+            !has_diag,
+            "diagnostics_on_save should suppress didOpen diagnostics"
+        );
+    }
+
+    #[test]
+    fn test_no_push_diagnostics_suppresses_all() {
+        let mut args = default_args();
+        args.no_push_diagnostics = true;
+        let uri = "file:///tmp/test.yX4Za";
+        let text = "fn hello\n";
+
+        let mut input = frame(&initialize_request(1));
+        input.extend(frame(&did_open_notification(uri, text)));
+        input.extend(frame(&did_change_notification(uri, "fn world\n", 2)));
+        input.extend(frame(&shutdown_request(2)));
+
+        let messages = run_server_with(args, &input);
+
+        let has_diag = messages.iter().any(|m| {
+            m.get("method").and_then(Value::as_str) == Some("textDocument/publishDiagnostics")
+        });
+        assert!(
+            !has_diag,
+            "no_push_diagnostics should suppress all push diagnostics"
+        );
+    }
+
+    #[test]
+    fn test_publish_version_in_diagnostics() {
+        let mut args = default_args();
+        args.publish_version = true;
+        let uri = "file:///tmp/test.yX4Za";
+        let text = "fn hello\n";
+
+        let mut input = frame(&initialize_request(1));
+        input.extend(frame(&did_open_notification(uri, text)));
+        input.extend(frame(&shutdown_request(2)));
+
+        let messages = run_server_with(args, &input);
+
+        let diag = messages
+            .iter()
+            .find(|m| {
+                m.get("method").and_then(Value::as_str) == Some("textDocument/publishDiagnostics")
+            })
+            .expect("publishDiagnostics notification");
+
+        assert!(
+            diag["params"].get("version").is_some(),
+            "publish_version should include version field"
+        );
+        assert_eq!(
+            diag["params"]["version"], 1,
+            "Version should match didOpen version"
+        );
+    }
+
+    #[test]
+    fn test_report_open_count_in_diagnostics() {
+        let mut args = default_args();
+        args.report_open_count = true;
+        let uri_a = "file:///tmp/a.yX4Za";
+        let uri_b = "file:///tmp/b.yX4Za";
+
+        let mut input = frame(&initialize_request(1));
+        input.extend(frame(&did_open_notification(uri_a, "line1\n")));
+        input.extend(frame(&did_open_notification(uri_b, "line1\nline2\n")));
+        input.extend(frame(&shutdown_request(2)));
+
+        let messages = run_server_with(args, &input);
+
+        let diags: Vec<&Value> = messages
+            .iter()
+            .filter(|m| {
+                m.get("method").and_then(Value::as_str) == Some("textDocument/publishDiagnostics")
+            })
+            .collect();
+
+        // After opening b, diagnostics should be re-published for both
+        let has_both = diags.iter().any(|d| d["params"]["uri"] == uri_a)
+            && diags.iter().any(|d| d["params"]["uri"] == uri_b);
+        assert!(
+            has_both,
+            "report_open_count should re-publish for all open documents"
+        );
+
+        // The latest diagnostic for b should include "2 open"
+        let b_diag = diags
+            .iter()
+            .rfind(|d| d["params"]["uri"] == uri_b)
+            .expect("diagnostic for b");
+        let msg = b_diag["params"]["diagnostics"][0]["message"]
+            .as_str()
+            .unwrap_or("");
+        assert!(
+            msg.contains("2 open"),
+            "Should report 2 open files, got: {msg}"
+        );
+    }
+
+    // ── Tests: initialize capability flags ─────────────────────────
+
+    #[test]
+    fn test_initialize_no_type_hierarchy_flag() {
+        let mut args = default_args();
+        args.no_type_hierarchy = true;
+
+        let mut input = frame(&initialize_request(1));
+        input.extend(frame(&shutdown_request(2)));
+
+        let messages = run_server_with(args, &input);
+        let caps = &messages[0]["result"]["capabilities"];
+        assert!(
+            caps.get("typeHierarchyProvider").is_none() || caps["typeHierarchyProvider"].is_null(),
+            "no_type_hierarchy should exclude typeHierarchyProvider"
+        );
+    }
+
+    #[test]
+    fn test_initialize_no_rename_flag() {
+        let mut args = default_args();
+        args.no_rename = true;
+
+        let mut input = frame(&initialize_request(1));
+        input.extend(frame(&shutdown_request(2)));
+
+        let messages = run_server_with(args, &input);
+        let caps = &messages[0]["result"]["capabilities"];
+        assert!(
+            caps.get("renameProvider").is_none() || caps["renameProvider"].is_null(),
+            "no_rename should exclude renameProvider"
+        );
+    }
+
+    #[test]
+    fn test_initialize_pull_diagnostics_capability() {
+        let mut args = default_args();
+        args.pull_diagnostics = true;
+
+        let mut input = frame(&initialize_request(1));
+        input.extend(frame(&shutdown_request(2)));
+
+        let messages = run_server_with(args, &input);
+        let caps = &messages[0]["result"]["capabilities"];
+        assert!(
+            caps["diagnosticProvider"].is_object(),
+            "pull_diagnostics should advertise diagnosticProvider"
+        );
+    }
+
+    // ── Tests: progress and lifecycle notifications ────────────────
+
+    #[test]
+    fn test_progress_on_change_sends_progress_tokens() {
+        let mut args = default_args();
+        args.progress_on_change = true;
+        let uri = "file:///tmp/test.yX4Za";
+        let text = "fn hello\n";
+
+        let mut input = frame(&initialize_request(1));
+        input.extend(frame(&did_open_notification(uri, text)));
+        input.extend(frame(&did_change_notification(uri, "fn world\n", 2)));
+        input.extend(frame(&shutdown_request(2)));
+
+        let messages = run_server_wait(args, &input, 300);
+
+        let has_create = messages.iter().any(|m| {
+            m.get("method").and_then(Value::as_str) == Some("window/workDoneProgress/create")
+        });
+        assert!(has_create, "progress_on_change should send progress create");
+
+        let has_begin = messages.iter().any(|m| {
+            m.get("method").and_then(Value::as_str) == Some("$/progress")
+                && m["params"]["value"]["kind"] == "begin"
+                && m["params"]["value"]["title"] == "Checking"
+        });
+        assert!(has_begin, "progress_on_change should send Checking begin");
+
+        let has_end = messages.iter().any(|m| {
+            m.get("method").and_then(Value::as_str) == Some("$/progress")
+                && m["params"]["value"]["kind"] == "end"
+        });
+        assert!(has_end, "progress_on_change should send progress end");
+    }
+
+    #[test]
+    fn test_register_file_watchers_on_initialized() {
+        let mut args = default_args();
+        args.register_file_watchers = true;
+
+        let mut input = frame(&initialize_request(1));
+        input.extend(frame(&initialized_notification()));
+        input.extend(frame(&shutdown_request(2)));
+
+        let messages = run_server_with(args, &input);
+
+        let register = messages
+            .iter()
+            .find(|m| m.get("method").and_then(Value::as_str) == Some("client/registerCapability"))
+            .expect("Should send registerCapability for file watchers");
+
+        let registrations = register["params"]["registrations"]
+            .as_array()
+            .expect("registrations array");
+        assert_eq!(
+            registrations[0]["method"],
+            "workspace/didChangeWatchedFiles"
+        );
+        let watchers = registrations[0]["registerOptions"]["watchers"]
+            .as_array()
+            .expect("watchers array");
+        assert_eq!(watchers[0]["globPattern"], "**/*");
+    }
+
+    #[test]
+    fn test_send_configuration_request_after_initialize() {
+        let mut args = default_args();
+        args.send_configuration_request = true;
+
+        let mut input = frame(&initialize_request(1));
+        input.extend(frame(&shutdown_request(2)));
+
+        let messages = run_server_with(args, &input);
+
+        let config_req = messages
+            .iter()
+            .find(|m| m.get("method").and_then(Value::as_str) == Some("workspace/configuration"))
+            .expect("Should send workspace/configuration request");
+
+        let items = config_req["params"]["items"]
+            .as_array()
+            .expect("items array");
+        assert_eq!(items[0]["section"], "mockls");
+    }
+
+    #[test]
+    fn test_flycheck_publishes_diagnostics_and_progress() {
+        let mut args = default_args();
+        args.advertise_save = true;
+        args.flycheck_command = Some("true".to_string());
+        let uri = "file:///tmp/test.yX4Za";
+        let text = "fn hello\n";
+
+        let mut input = frame(&initialize_request(1));
+        input.extend(frame(&did_open_notification(uri, text)));
+        input.extend(frame(&did_save_notification(uri)));
+        input.extend(frame(&shutdown_request(2)));
+
+        // Wait for the flycheck thread to complete
+        let messages = run_server_wait(args, &input, 500);
+
+        // didOpen publishes one, flycheck publishes another
+        let diag_count = messages
+            .iter()
+            .filter(|m| {
+                m.get("method").and_then(Value::as_str) == Some("textDocument/publishDiagnostics")
+            })
+            .count();
+        assert!(
+            diag_count >= 2,
+            "Expected diagnostics from both didOpen and flycheck, got {diag_count}"
+        );
+
+        let has_flycheck_begin = messages.iter().any(|m| {
+            m.get("method").and_then(Value::as_str) == Some("$/progress")
+                && m["params"]["value"]["kind"] == "begin"
+                && m["params"]["value"]["title"] == "Flycheck"
+        });
+        assert!(has_flycheck_begin, "Flycheck should send progress begin");
+    }
+
+    // ── Tests: document and workspace symbols ──────────────────────
+
+    #[test]
+    fn test_document_symbols_response() {
+        let uri = "file:///tmp/test.yX4Za";
+        let text = "fn my_func\nstruct MyStruct\n";
+
+        let mut input = frame(&initialize_request(1));
+        input.extend(frame(&did_open_notification(uri, text)));
+        input.extend(frame(&document_symbol_request(2, uri)));
+        input.extend(frame(&shutdown_request(3)));
+
+        let messages = run_server_with(default_args(), &input);
+
+        let resp = messages
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(2))
+            .expect("documentSymbol response");
+        assert!(resp["error"].is_null(), "Expected no error");
+        let symbols = resp["result"].as_array().expect("result array");
+        assert!(symbols.len() >= 2, "Expected at least 2 symbols");
+
+        let names: Vec<&str> = symbols.iter().filter_map(|s| s["name"].as_str()).collect();
+        assert!(names.contains(&"my_func"), "Should contain my_func");
+        assert!(names.contains(&"MyStruct"), "Should contain MyStruct");
+
+        let func = symbols
+            .iter()
+            .find(|s| s["name"] == "my_func")
+            .expect("my_func symbol");
+        assert_eq!(func["kind"], 12, "fn → Function(12)");
+        assert!(func["range"].is_object(), "Symbol should have range");
+        assert!(
+            func["selectionRange"].is_object(),
+            "Symbol should have selectionRange"
+        );
+    }
+
+    #[test]
+    fn test_workspace_symbols_response() {
+        let uri = "file:///tmp/test.yX4Za";
+        let text = "fn my_func\nstruct MyStruct\n";
+
+        let mut input = frame(&initialize_request(1));
+        input.extend(frame(&did_open_notification(uri, text)));
+        input.extend(frame(&workspace_symbol_request(2, "")));
+        input.extend(frame(&shutdown_request(3)));
+
+        let messages = run_server_with(default_args(), &input);
+
+        let resp = messages
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(2))
+            .expect("workspace/symbol response");
+        assert!(resp["error"].is_null(), "Expected no error");
+        let symbols = resp["result"].as_array().expect("result array");
+        assert!(symbols.len() >= 2, "Expected at least 2 symbols");
+
+        let names: Vec<&str> = symbols.iter().filter_map(|s| s["name"].as_str()).collect();
+        assert!(names.contains(&"my_func"), "Should contain my_func");
+        assert!(names.contains(&"MyStruct"), "Should contain MyStruct");
+
+        // Workspace symbols should have location with uri and range
+        let func = symbols
+            .iter()
+            .find(|s| s["name"] == "my_func")
+            .expect("my_func symbol");
+        assert!(
+            func["location"].is_object(),
+            "Workspace symbol should have location"
+        );
+        assert_eq!(func["location"]["uri"], uri);
+        assert!(
+            func["location"]["range"].is_object(),
+            "Workspace symbol location should have range"
+        );
+    }
+
+    #[test]
+    fn test_workspace_symbols_query_filter() {
+        let uri = "file:///tmp/test.yX4Za";
+        let text = "fn alpha\nfn beta\nstruct Gamma\n";
+
+        let mut input = frame(&initialize_request(1));
+        input.extend(frame(&did_open_notification(uri, text)));
+        input.extend(frame(&workspace_symbol_request(2, "alpha")));
+        input.extend(frame(&shutdown_request(3)));
+
+        let messages = run_server_with(default_args(), &input);
+
+        let resp = messages
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(2))
+            .expect("workspace/symbol response");
+        let symbols = resp["result"].as_array().expect("result array");
+        assert_eq!(
+            symbols.len(),
+            1,
+            "Query 'alpha' should return exactly 1 symbol"
+        );
+        assert_eq!(symbols[0]["name"], "alpha");
+    }
+
+    #[test]
+    fn test_workspace_symbols_no_empty_query() {
+        let mut args = default_args();
+        args.no_empty_query = true;
+        let uri = "file:///tmp/test.yX4Za";
+        let text = "fn my_func\n";
+
+        let mut input = frame(&initialize_request(1));
+        input.extend(frame(&did_open_notification(uri, text)));
+        input.extend(frame(&workspace_symbol_request(2, "")));
+        input.extend(frame(&shutdown_request(3)));
+
+        let messages = run_server_with(args, &input);
+
+        let resp = messages
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(2))
+            .expect("workspace/symbol response");
+        let symbols = resp["result"].as_array().expect("result array");
+        assert!(
+            symbols.is_empty(),
+            "no_empty_query should return empty for empty query"
+        );
+    }
+
+    #[test]
+    fn test_workspace_symbols_resolve_provider_uri_only() {
+        let mut args = default_args();
+        args.resolve_provider = true;
+        let uri = "file:///tmp/test.yX4Za";
+        let text = "fn my_func\n";
+
+        let mut input = frame(&initialize_request(1));
+        input.extend(frame(&did_open_notification(uri, text)));
+        input.extend(frame(&workspace_symbol_request(2, "")));
+        input.extend(frame(&shutdown_request(3)));
+
+        let messages = run_server_with(args, &input);
+
+        let resp = messages
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(2))
+            .expect("workspace/symbol response");
+        let symbols = resp["result"].as_array().expect("result array");
+        assert!(!symbols.is_empty(), "Should return symbols");
+
+        // With resolve_provider, location should have URI but no range
+        let sym = &symbols[0];
+        assert_eq!(sym["location"]["uri"], uri);
+        assert!(
+            sym["location"].get("range").is_none() || sym["location"]["range"].is_null(),
+            "resolve_provider should omit range from workspace/symbol"
+        );
+    }
+
+    #[test]
+    fn test_workspace_symbol_resolve_finds_correct_symbol() {
+        let mut args = default_args();
+        args.resolve_provider = true;
+        let uri = "file:///tmp/test.yX4Za";
+        let text = "fn alpha\nfn beta\n";
+
+        let unresolved = serde_json::json!({
+            "name": "beta",
+            "kind": 12,
+            "location": { "uri": uri }
+        });
+
+        let mut input = frame(&initialize_request(1));
+        input.extend(frame(&did_open_notification(uri, text)));
+        input.extend(frame(&workspace_symbol_resolve_request(2, &unresolved)));
+        input.extend(frame(&shutdown_request(3)));
+
+        let messages = run_server_with(args, &input);
+
+        let resp = messages
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(2))
+            .expect("resolve response");
+        assert!(resp["error"].is_null(), "Expected no error");
+        let result = &resp["result"];
+        assert_eq!(result["name"], "beta");
+        assert!(
+            result["location"]["range"].is_object(),
+            "Resolved symbol should have range"
+        );
+        // beta is on line 1
+        assert_eq!(
+            result["location"]["range"]["start"]["line"], 1,
+            "beta should be on line 1"
         );
     }
 }
