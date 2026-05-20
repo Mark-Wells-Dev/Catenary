@@ -1170,7 +1170,10 @@ mod tests {
         assert!(names.contains(&"alpha"));
         assert!(names.contains(&"Beta"));
         assert!(names.contains(&"gamma"));
-        assert!(!names.contains(&"delta"), "delta is in file B, should be excluded");
+        assert!(
+            !names.contains(&"delta"),
+            "delta is in file B, should be excluded"
+        );
 
         // Filter to file B only.
         let filtered_b = index
@@ -1317,13 +1320,7 @@ mod tests {
 
         // WithinSpan(0, 5) covers only alpha (line 0).
         let narrow = index
-            .query_scoped(
-                &[path_a],
-                &ScopeFilter::WithinSpan(0, 5),
-                "*",
-                None,
-                false,
-            )
+            .query_scoped(&[path_a], &ScopeFilter::WithinSpan(0, 5), "*", None, false)
             .expect("narrow span");
         let narrow_syms = narrow.get(path_a).expect("file A");
         assert_eq!(narrow_syms.len(), 1);

@@ -1207,26 +1207,17 @@ mod tests {
 
     #[test]
     fn format_sql_value_null() {
-        assert_eq!(
-            format_sql_value(&rusqlite::types::Value::Null),
-            "NULL",
-        );
+        assert_eq!(format_sql_value(&rusqlite::types::Value::Null), "NULL",);
     }
 
     #[test]
     fn format_sql_value_integer() {
-        assert_eq!(
-            format_sql_value(&rusqlite::types::Value::Integer(42)),
-            "42",
-        );
+        assert_eq!(format_sql_value(&rusqlite::types::Value::Integer(42)), "42",);
     }
 
     #[test]
     fn format_sql_value_real() {
-        assert_eq!(
-            format_sql_value(&rusqlite::types::Value::Real(1.5)),
-            "1.5",
-        );
+        assert_eq!(format_sql_value(&rusqlite::types::Value::Real(1.5)), "1.5",);
     }
 
     #[test]
@@ -1409,7 +1400,10 @@ mod tests {
             result.contains("textDocument/hover"),
             "should contain method, got: {result}",
         );
-        assert!(result.contains("#5"), "should contain request id, got: {result}");
+        assert!(
+            result.contains("#5"),
+            "should contain request id, got: {result}"
+        );
     }
 
     #[test]

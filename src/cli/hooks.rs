@@ -1069,18 +1069,12 @@ mod tests {
         let output = format_deny("command not allowed", HostFormat::Claude);
         let parsed: serde_json::Value =
             serde_json::from_str(&output).context("should produce valid JSON")?;
-        assert_eq!(
-            parsed["hookSpecificOutput"]["permissionDecision"],
-            "deny",
-        );
+        assert_eq!(parsed["hookSpecificOutput"]["permissionDecision"], "deny",);
         assert_eq!(
             parsed["hookSpecificOutput"]["permissionDecisionReason"],
             "command not allowed",
         );
-        assert_eq!(
-            parsed["hookSpecificOutput"]["hookEventName"],
-            "PreToolUse",
-        );
+        assert_eq!(parsed["hookSpecificOutput"]["hookEventName"], "PreToolUse",);
         Ok(())
     }
 
@@ -1136,10 +1130,7 @@ mod tests {
         let json = serde_json::json!({
             "tool_input": { "file": "/tmp/test.py" }
         });
-        assert_eq!(
-            extract_file_path(&json),
-            Some("/tmp/test.py".to_string()),
-        );
+        assert_eq!(extract_file_path(&json), Some("/tmp/test.py".to_string()),);
     }
 
     #[test]
@@ -1280,7 +1271,10 @@ mod tests {
         // is implicitly tested by the read tests (server receives valid JSON).
         let _ = ipc_exchange(&mut stream, &request);
         let written = String::from_utf8_lossy(&stream.write_buf);
-        assert!(written.contains("test-req"), "should write the request JSON");
+        assert!(
+            written.contains("test-req"),
+            "should write the request JSON"
+        );
         assert!(written.ends_with('\n'), "should end with newline delimiter");
     }
 
@@ -1336,8 +1330,7 @@ mod tests {
     fn notify_connect_returns_stream_for_valid_socket() {
         let dir = tempfile::tempdir().expect("tempdir");
         let sock_path = dir.path().join("test.sock");
-        let _listener =
-            std::os::unix::net::UnixListener::bind(&sock_path).expect("bind listener");
+        let _listener = std::os::unix::net::UnixListener::bind(&sock_path).expect("bind listener");
 
         let stream = notify_connect(&sock_path);
         assert!(stream.is_some(), "should connect to a valid socket");

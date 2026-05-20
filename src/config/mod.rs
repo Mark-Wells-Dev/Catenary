@@ -2507,7 +2507,10 @@ servers = ["nonexistent"]
     fn clamp_budgets_leaves_valid_values() {
         let mut tc = ToolsConfig {
             grep: GrepConfig { budget: 4000 },
-            glob: GlobConfig { budget: 2000, ..GlobConfig::default() },
+            glob: GlobConfig {
+                budget: 2000,
+                ..GlobConfig::default()
+            },
             diagnostics_per_page: 50,
         };
         tc.clamp_budgets();
@@ -2520,7 +2523,10 @@ servers = ["nonexistent"]
     fn clamp_budgets_raises_below_minimum() {
         let mut tc = ToolsConfig {
             grep: GrepConfig { budget: 500 },
-            glob: GlobConfig { budget: 100, ..GlobConfig::default() },
+            glob: GlobConfig {
+                budget: 100,
+                ..GlobConfig::default()
+            },
             diagnostics_per_page: 0,
         };
         tc.clamp_budgets();
@@ -2533,7 +2539,10 @@ servers = ["nonexistent"]
     fn clamp_budgets_at_exact_minimum_is_noop() {
         let mut tc = ToolsConfig {
             grep: GrepConfig { budget: 2000 },
-            glob: GlobConfig { budget: 1000, ..GlobConfig::default() },
+            glob: GlobConfig {
+                budget: 1000,
+                ..GlobConfig::default()
+            },
             diagnostics_per_page: 1,
         };
         tc.clamp_budgets();
@@ -2547,12 +2556,27 @@ servers = ["nonexistent"]
     #[test]
     fn dispatch_method_as_str_all_variants() {
         use crate::config::language::DispatchMethod;
-        assert_eq!(DispatchMethod::References.as_str(), "textDocument/references");
-        assert_eq!(DispatchMethod::DocumentSymbol.as_str(), "textDocument/documentSymbol");
+        assert_eq!(
+            DispatchMethod::References.as_str(),
+            "textDocument/references"
+        );
+        assert_eq!(
+            DispatchMethod::DocumentSymbol.as_str(),
+            "textDocument/documentSymbol"
+        );
         assert_eq!(DispatchMethod::Rename.as_str(), "textDocument/rename");
-        assert_eq!(DispatchMethod::Implementation.as_str(), "textDocument/implementation");
-        assert_eq!(DispatchMethod::CallHierarchy.as_str(), "textDocument/prepareCallHierarchy");
-        assert_eq!(DispatchMethod::TypeHierarchy.as_str(), "textDocument/prepareTypeHierarchy");
+        assert_eq!(
+            DispatchMethod::Implementation.as_str(),
+            "textDocument/implementation"
+        );
+        assert_eq!(
+            DispatchMethod::CallHierarchy.as_str(),
+            "textDocument/prepareCallHierarchy"
+        );
+        assert_eq!(
+            DispatchMethod::TypeHierarchy.as_str(),
+            "textDocument/prepareTypeHierarchy"
+        );
     }
 
     #[test]
@@ -2566,11 +2590,23 @@ servers = ["nonexistent"]
 
         let methods = [
             ("textDocument/references", DispatchMethod::References),
-            ("textDocument/documentSymbol", DispatchMethod::DocumentSymbol),
+            (
+                "textDocument/documentSymbol",
+                DispatchMethod::DocumentSymbol,
+            ),
             ("textDocument/rename", DispatchMethod::Rename),
-            ("textDocument/implementation", DispatchMethod::Implementation),
-            ("textDocument/prepareCallHierarchy", DispatchMethod::CallHierarchy),
-            ("textDocument/prepareTypeHierarchy", DispatchMethod::TypeHierarchy),
+            (
+                "textDocument/implementation",
+                DispatchMethod::Implementation,
+            ),
+            (
+                "textDocument/prepareCallHierarchy",
+                DispatchMethod::CallHierarchy,
+            ),
+            (
+                "textDocument/prepareTypeHierarchy",
+                DispatchMethod::TypeHierarchy,
+            ),
         ];
 
         for (input, expected) in methods {

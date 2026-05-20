@@ -909,9 +909,7 @@ mod tests {
         // At depth 1 the algorithm hits the target (MIN_BUCKETS). Each node
         // is count=1, terminal=false, children non-empty — the pattern must
         // be a wildcard ("a*") not a bare prefix ("a").
-        let input = entries(&[
-            "ax", "bx", "cx", "dx", "ex", "fx", "gx", "hx", "ix", "jx",
-        ]);
+        let input = entries(&["ax", "bx", "cx", "dx", "ex", "fx", "gx", "hx", "ix", "jx"]);
         let buckets = bucket_trie(&input, 10_000);
         assert_eq!(buckets.len(), MIN_BUCKETS);
         for b in &buckets {
@@ -1099,9 +1097,7 @@ mod tests {
         // Force collapse of test_* but not tight enough to merge.
         collapse_to_budget(&mut buckets, 20);
         assert!(
-            buckets
-                .iter()
-                .any(|b| b.count == 1 && b.entries.is_some()),
+            buckets.iter().any(|b| b.count == 1 && b.entries.is_some()),
             "single-entry bucket should not be collapsed"
         );
     }
