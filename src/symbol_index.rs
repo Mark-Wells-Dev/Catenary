@@ -815,7 +815,10 @@ fn flatten_document_symbol(
 
 #[cfg(test)]
 mod tests {
-    use super::{EnrichmentCategory, SymbolIndex, categorize, format_symbol_kind, lsp_kind_label};
+    use super::{
+        EnrichmentCategory, ScopeFilter, SymbolIndex, categorize, format_symbol_kind,
+        lsp_kind_label, symbol_kind_to_string,
+    };
 
     #[test]
     fn test_format_symbol_kind() {
@@ -835,10 +838,68 @@ mod tests {
 
     #[test]
     fn test_lsp_kind_label() {
-        assert_eq!(lsp_kind_label(12), "Fn");
-        assert_eq!(lsp_kind_label(11), "Iface");
+        assert_eq!(lsp_kind_label(1), "File");
         assert_eq!(lsp_kind_label(2), "Mod");
+        assert_eq!(lsp_kind_label(3), "Ns");
+        assert_eq!(lsp_kind_label(4), "Pkg");
+        assert_eq!(lsp_kind_label(5), "Class");
+        assert_eq!(lsp_kind_label(6), "Method");
+        assert_eq!(lsp_kind_label(7), "Prop");
+        assert_eq!(lsp_kind_label(8), "Field");
+        assert_eq!(lsp_kind_label(9), "Ctor");
+        assert_eq!(lsp_kind_label(10), "Enum");
+        assert_eq!(lsp_kind_label(11), "Iface");
+        assert_eq!(lsp_kind_label(12), "Fn");
+        assert_eq!(lsp_kind_label(13), "Var");
+        assert_eq!(lsp_kind_label(14), "Const");
+        assert_eq!(lsp_kind_label(15), "Str");
+        assert_eq!(lsp_kind_label(16), "Num");
+        assert_eq!(lsp_kind_label(17), "Bool");
+        assert_eq!(lsp_kind_label(18), "Array");
+        assert_eq!(lsp_kind_label(19), "Obj");
+        assert_eq!(lsp_kind_label(20), "Key");
+        assert_eq!(lsp_kind_label(21), "Null");
+        assert_eq!(lsp_kind_label(22), "Member");
+        assert_eq!(lsp_kind_label(23), "Struct");
+        assert_eq!(lsp_kind_label(24), "Event");
+        assert_eq!(lsp_kind_label(25), "Op");
+        assert_eq!(lsp_kind_label(26), "TypeParam");
+        assert_eq!(lsp_kind_label(0), "Sym");
+        assert_eq!(lsp_kind_label(27), "Sym");
         assert_eq!(lsp_kind_label(999), "Sym");
+    }
+
+    #[test]
+    fn test_symbol_kind_to_string() {
+        assert_eq!(symbol_kind_to_string(1), "file");
+        assert_eq!(symbol_kind_to_string(2), "module");
+        assert_eq!(symbol_kind_to_string(3), "namespace");
+        assert_eq!(symbol_kind_to_string(4), "package");
+        assert_eq!(symbol_kind_to_string(5), "class");
+        assert_eq!(symbol_kind_to_string(6), "method");
+        assert_eq!(symbol_kind_to_string(7), "property");
+        assert_eq!(symbol_kind_to_string(8), "field");
+        assert_eq!(symbol_kind_to_string(9), "constructor");
+        assert_eq!(symbol_kind_to_string(10), "enum");
+        assert_eq!(symbol_kind_to_string(11), "interface");
+        assert_eq!(symbol_kind_to_string(12), "function");
+        assert_eq!(symbol_kind_to_string(13), "variable");
+        assert_eq!(symbol_kind_to_string(14), "constant");
+        assert_eq!(symbol_kind_to_string(15), "string");
+        assert_eq!(symbol_kind_to_string(16), "number");
+        assert_eq!(symbol_kind_to_string(17), "boolean");
+        assert_eq!(symbol_kind_to_string(18), "array");
+        assert_eq!(symbol_kind_to_string(19), "object");
+        assert_eq!(symbol_kind_to_string(20), "key");
+        assert_eq!(symbol_kind_to_string(21), "null");
+        assert_eq!(symbol_kind_to_string(22), "member");
+        assert_eq!(symbol_kind_to_string(23), "struct");
+        assert_eq!(symbol_kind_to_string(24), "event");
+        assert_eq!(symbol_kind_to_string(25), "operator");
+        assert_eq!(symbol_kind_to_string(26), "type_parameter");
+        assert_eq!(symbol_kind_to_string(0), "unknown");
+        assert_eq!(symbol_kind_to_string(27), "unknown");
+        assert_eq!(symbol_kind_to_string(999), "unknown");
     }
 
     #[allow(clippy::expect_used, reason = "test assertions")]
@@ -1044,6 +1105,354 @@ mod tests {
             index.needs_population(std::path::Path::new("/test/unknown.rs")),
             "unknown file should need population"
         );
+    }
+
+    /// Helper: builds a two-file index for multi-file query tests.
+    ///
+    /// File A (`/test/a.rs`): `alpha` (function, lines 0–5), `Beta` (struct, lines 10–20)
+    ///   with child `gamma` (method, lines 12–18).
+    /// File B (`/test/b.rs`): `delta` (function, lines 0–3).
+    #[allow(clippy::expect_used, reason = "test helper")]
+    fn two_file_index() -> SymbolIndex {
+        let index = SymbolIndex::new().expect("create index");
+
+        let syms_a = serde_json::json!([
+            {
+                "name": "alpha",
+                "kind": 12,
+                "range": { "start": { "line": 0 }, "end": { "line": 5 } },
+                "selectionRange": { "start": { "line": 0 }, "end": { "line": 0 } }
+            },
+            {
+                "name": "Beta",
+                "kind": 23,
+                "range": { "start": { "line": 10 }, "end": { "line": 20 } },
+                "selectionRange": { "start": { "line": 10 }, "end": { "line": 10 } },
+                "children": [{
+                    "name": "gamma",
+                    "kind": 6,
+                    "range": { "start": { "line": 12 }, "end": { "line": 18 } },
+                    "selectionRange": { "start": { "line": 12 }, "end": { "line": 12 } }
+                }]
+            }
+        ]);
+        let syms_b = serde_json::json!([
+            {
+                "name": "delta",
+                "kind": 12,
+                "range": { "start": { "line": 0 }, "end": { "line": 3 } },
+                "selectionRange": { "start": { "line": 0 }, "end": { "line": 0 } }
+            }
+        ]);
+
+        index
+            .populate_from_document_symbols(std::path::Path::new("/test/a.rs"), &syms_a)
+            .expect("populate a");
+        index
+            .populate_from_document_symbols(std::path::Path::new("/test/b.rs"), &syms_b)
+            .expect("populate b");
+        index
+    }
+
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    #[test]
+    fn query_with_file_filter() {
+        let index = two_file_index();
+        let path_a = std::path::PathBuf::from("/test/a.rs");
+        let path_b = std::path::PathBuf::from("/test/b.rs");
+
+        // Filter to file A only — should return alpha, Beta, gamma but not delta.
+        let filtered = index
+            .query(".*", Some(std::slice::from_ref(&path_a)))
+            .expect("query filtered");
+        let names: Vec<&str> = filtered.iter().map(|(_, s)| s.name.as_str()).collect();
+        assert_eq!(filtered.len(), 3, "file A has 3 symbols: {names:?}");
+        assert!(names.contains(&"alpha"));
+        assert!(names.contains(&"Beta"));
+        assert!(names.contains(&"gamma"));
+        assert!(!names.contains(&"delta"), "delta is in file B, should be excluded");
+
+        // Filter to file B only.
+        let filtered_b = index
+            .query(".*", Some(std::slice::from_ref(&path_b)))
+            .expect("query filtered b");
+        assert_eq!(filtered_b.len(), 1);
+        assert_eq!(filtered_b[0].1.name, "delta");
+
+        // Filtered to A should be fewer than all.
+        let all = index.query(".*", None).expect("query all");
+        assert!(filtered.len() < all.len());
+
+        // Empty file list falls through to unfiltered branch.
+        let empty_filter = index.query(".*", Some(&[])).expect("query empty filter");
+        assert_eq!(empty_filter.len(), all.len());
+    }
+
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    #[test]
+    fn find_enclosing_returns_tightest_span() {
+        let index = two_file_index();
+        let path = std::path::Path::new("/test/a.rs");
+
+        // Line 15 is inside gamma (12–18) which is inside Beta (10–20).
+        // find_enclosing should return gamma (tightest span).
+        let enc = index
+            .find_enclosing(path, 15)
+            .expect("query")
+            .expect("should find enclosing");
+        assert_eq!(enc.name, "gamma");
+        assert_eq!(enc.kind, "method");
+        assert_eq!(enc.line, 12);
+        assert_eq!(enc.end_line, 18);
+        assert_eq!(enc.scope.as_deref(), Some("Beta"));
+        assert!(!enc.deprecated);
+
+        // Line 3 is inside alpha (0–5).
+        let enc_alpha = index
+            .find_enclosing(path, 3)
+            .expect("query")
+            .expect("should find alpha");
+        assert_eq!(enc_alpha.name, "alpha");
+
+        // Line 25 is outside all symbols.
+        let none = index.find_enclosing(path, 25).expect("query");
+        assert!(none.is_none(), "no symbol at line 25");
+    }
+
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    #[test]
+    fn find_enclosing_deprecated_flag() {
+        let index = SymbolIndex::new().expect("create index");
+        let symbols = serde_json::json!([{
+            "name": "old_fn",
+            "kind": 12,
+            "tags": [1],
+            "range": { "start": { "line": 0 }, "end": { "line": 5 } },
+            "selectionRange": { "start": { "line": 0 }, "end": { "line": 0 } }
+        }]);
+        let path = std::path::Path::new("/test/dep.rs");
+        index
+            .populate_from_document_symbols(path, &symbols)
+            .expect("populate");
+
+        let enc = index
+            .find_enclosing(path, 2)
+            .expect("query")
+            .expect("should find");
+        assert!(enc.deprecated, "deprecated flag should be true");
+    }
+
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    #[test]
+    fn query_outline_batch_returns_top_level_only() {
+        let index = two_file_index();
+        let path_a = std::path::Path::new("/test/a.rs");
+        let path_b = std::path::Path::new("/test/b.rs");
+
+        let outlines = index
+            .query_outline_batch(&[path_a, path_b])
+            .expect("outline batch");
+
+        // File A: alpha and Beta are top-level; gamma is nested (scope = "Beta").
+        let a_syms = outlines.get(path_a).expect("file A present");
+        let a_names: Vec<&str> = a_syms.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(a_syms.len(), 2, "top-level only: {a_names:?}");
+        assert_eq!(a_syms[0].name, "alpha", "ordered by line");
+        assert_eq!(a_syms[1].name, "Beta");
+        assert!(a_syms[0].scope.is_none(), "alpha has no scope");
+
+        // File B: delta is top-level.
+        let b_syms = outlines.get(path_b).expect("file B present");
+        assert_eq!(b_syms.len(), 1);
+        assert_eq!(b_syms[0].name, "delta");
+
+        // Empty input returns empty map.
+        let empty = index.query_outline_batch(&[]).expect("empty");
+        assert!(empty.is_empty());
+    }
+
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    #[test]
+    fn query_scoped_children_of() {
+        let index = two_file_index();
+        let path_a = std::path::Path::new("/test/a.rs");
+
+        // ChildrenOf("Beta") should return gamma.
+        let result = index
+            .query_scoped(
+                &[path_a],
+                &ScopeFilter::ChildrenOf("Beta"),
+                "*",
+                None,
+                false,
+            )
+            .expect("children of");
+        let syms = result.get(path_a).expect("file A");
+        assert_eq!(syms.len(), 1);
+        assert_eq!(syms[0].name, "gamma");
+        assert_eq!(syms[0].kind, "method");
+    }
+
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    #[test]
+    fn query_scoped_within_span() {
+        let index = two_file_index();
+        let path_a = std::path::Path::new("/test/a.rs");
+
+        // WithinSpan(10, 20) covers Beta (line 10) and gamma (line 12).
+        let result = index
+            .query_scoped(
+                &[path_a],
+                &ScopeFilter::WithinSpan(10, 20),
+                "*",
+                None,
+                false,
+            )
+            .expect("within span");
+        let syms = result.get(path_a).expect("file A");
+        let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(syms.len(), 2, "Beta + gamma in span: {names:?}");
+        assert_eq!(syms[0].name, "Beta");
+        assert_eq!(syms[1].name, "gamma");
+
+        // WithinSpan(0, 5) covers only alpha (line 0).
+        let narrow = index
+            .query_scoped(
+                &[path_a],
+                &ScopeFilter::WithinSpan(0, 5),
+                "*",
+                None,
+                false,
+            )
+            .expect("narrow span");
+        let narrow_syms = narrow.get(path_a).expect("file A");
+        assert_eq!(narrow_syms.len(), 1);
+        assert_eq!(narrow_syms[0].name, "alpha");
+    }
+
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    #[test]
+    fn query_scoped_with_kind_filter() {
+        let index = two_file_index();
+        let path_a = std::path::Path::new("/test/a.rs");
+
+        // AnyDepth + kind "function" should return alpha only (not Beta/gamma).
+        let result = index
+            .query_scoped(
+                &[path_a],
+                &ScopeFilter::AnyDepth,
+                "*",
+                Some("function"),
+                false,
+            )
+            .expect("kind filter");
+        let syms = result.get(path_a).expect("file A");
+        assert_eq!(syms.len(), 1);
+        assert_eq!(syms[0].name, "alpha");
+    }
+
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    #[test]
+    fn query_scoped_top_level() {
+        let index = two_file_index();
+        let path_a = std::path::Path::new("/test/a.rs");
+
+        // TopLevel should return alpha and Beta but not gamma.
+        let result = index
+            .query_scoped(&[path_a], &ScopeFilter::TopLevel, "*", None, false)
+            .expect("top level");
+        let syms = result.get(path_a).expect("file A");
+        let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(syms.len(), 2, "top-level: {names:?}");
+        assert!(names.contains(&"alpha"));
+        assert!(names.contains(&"Beta"));
+    }
+
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    #[test]
+    fn query_scoped_name_glob() {
+        let index = two_file_index();
+        let path_a = std::path::Path::new("/test/a.rs");
+
+        // Name glob "al*" should match only alpha.
+        let result = index
+            .query_scoped(&[path_a], &ScopeFilter::AnyDepth, "al*", None, false)
+            .expect("name glob");
+        let syms = result.get(path_a).expect("file A");
+        assert_eq!(syms.len(), 1);
+        assert_eq!(syms[0].name, "alpha");
+
+        // ChildrenOf("Beta") with name glob "g*" should match gamma.
+        let child_glob = index
+            .query_scoped(
+                &[path_a],
+                &ScopeFilter::ChildrenOf("Beta"),
+                "g*",
+                None,
+                false,
+            )
+            .expect("child glob");
+        let child_syms = child_glob.get(path_a).expect("file A");
+        assert_eq!(child_syms.len(), 1);
+        assert_eq!(child_syms[0].name, "gamma");
+
+        // ChildrenOf("Beta") with non-matching glob — empty.
+        let no_match = index
+            .query_scoped(
+                &[path_a],
+                &ScopeFilter::ChildrenOf("Beta"),
+                "zzz*",
+                None,
+                false,
+            )
+            .expect("no match glob");
+        assert!(
+            !no_match.contains_key(path_a),
+            "no symbols match zzz* under Beta"
+        );
+    }
+
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    #[test]
+    fn query_scoped_deprecated_only() {
+        let index = SymbolIndex::new().expect("create index");
+        let symbols = serde_json::json!([
+            {
+                "name": "old_fn",
+                "kind": 12,
+                "tags": [1],
+                "range": { "start": { "line": 0 }, "end": { "line": 5 } },
+                "selectionRange": { "start": { "line": 0 }, "end": { "line": 0 } }
+            },
+            {
+                "name": "new_fn",
+                "kind": 12,
+                "range": { "start": { "line": 10 }, "end": { "line": 15 } },
+                "selectionRange": { "start": { "line": 10 }, "end": { "line": 10 } }
+            }
+        ]);
+        let path = std::path::Path::new("/test/dep.rs");
+        index
+            .populate_from_document_symbols(path, &symbols)
+            .expect("populate");
+
+        let result = index
+            .query_scoped(&[path], &ScopeFilter::AnyDepth, "*", None, true)
+            .expect("deprecated only");
+        let syms = result.get(path).expect("file");
+        assert_eq!(syms.len(), 1);
+        assert_eq!(syms[0].name, "old_fn");
+        assert!(syms[0].deprecated);
+    }
+
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    #[test]
+    fn query_scoped_empty_files() {
+        let index = two_file_index();
+        let result = index
+            .query_scoped(&[], &ScopeFilter::AnyDepth, "*", None, false)
+            .expect("empty files");
+        assert!(result.is_empty());
     }
 
     /// Helper: builds a minimal `SymbolEnrichment` for cache tests.
