@@ -695,6 +695,12 @@ impl LspClient {
         self.server.supports_type_hierarchy()
     }
 
+    /// Returns whether the server advertises `codeActionProvider`.
+    #[must_use]
+    pub fn supports_code_action(&self) -> bool {
+        self.server.supports_code_action()
+    }
+
     /// Prepares call hierarchy for a position.
     ///
     /// # Errors
@@ -1155,6 +1161,7 @@ mod tests {
         // mockls advertises these by default
         assert!(client.supports_rename());
         assert!(client.supports_type_hierarchy());
+        assert!(client.supports_code_action());
 
         // mockls does NOT advertise these without flags
         assert!(!client.supports_pull_diagnostics());
@@ -1178,10 +1185,12 @@ mod tests {
 
     #[tokio::test]
     async fn supports_capabilities_disabled_by_flags() -> Result<()> {
-        let (mut client, _dir) = spawn_and_init(&["--no-rename", "--no-type-hierarchy"]).await?;
+        let (mut client, _dir) =
+            spawn_and_init(&["--no-rename", "--no-type-hierarchy", "--no-code-actions"]).await?;
 
         assert!(!client.supports_rename());
         assert!(!client.supports_type_hierarchy());
+        assert!(!client.supports_code_action());
 
         client.shutdown().await?;
         Ok(())

@@ -242,15 +242,8 @@ impl DiagnosticsServer {
     ///
     /// Opens all files, settles, runs health probe if needed,
     /// sends didSave, settles again, retrieves diagnostics per file,
-    /// and closes all files.
-    #[allow(
-        clippy::significant_drop_tightening,
-        reason = "Client lock held across pipeline for exclusive access"
-    )]
-    #[allow(
-        clippy::too_many_lines,
-        reason = "Pipeline steps are sequential and cannot be split"
-    )]
+    /// and closes all files. Cleanup runs once regardless of
+    /// bail-outs.
     async fn run_server_batch(
         &self,
         client_mutex: &Arc<Mutex<LspClient>>,
@@ -258,41 +251,69 @@ impl DiagnosticsServer {
         entry_id: i64,
         file_results: &mut BTreeMap<String, (String, Vec<ServerDiagnostics>)>,
     ) {
-        // ── Settle before opens ───────────────────────────────────
-        // Wait for the server to go idle before sending didOpen.
-        // notify_file_changes() may have sent didChangeWatchedFiles
-        // which triggers re-indexing — opening files while that is
-        // in progress can produce transient false-positive diagnostics
-        // that persist in the push cache.
-        //
-        // After settling, sample baseline ticks for post-open
-        // activity detection (the server is confirmed idle here).
-        let post_open_baseline = {
-            let client = client_mutex.lock().await;
-            if matches!(
-                client.lifecycle(),
-                ServerLifecycle::Failed | ServerLifecycle::Dead
-            ) {
-                return;
-            }
-            let server = client.server().clone();
-            let server_name = client.server_name().to_string();
-            drop(client);
-
-            let detector = IdleDetector::unconditional();
-            let result = await_idle(&server, detector, CancellationToken::new()).await;
-            debug!(
-                server = %server_name,
-                "batch pre-open idle result: {result:?}",
-            );
-            if result == SettleResult::RootDied {
-                return;
-            }
-
-            sample_baseline(&server).await
+        let Some(baseline) = self.pre_open_settle(client_mutex).await else {
+            return;
         };
 
-        // ── Open all files ─────────────────────────────────────────
+        let opened = self.open_files(client_mutex, paths, entry_id).await;
+        if opened.is_empty() {
+            return;
+        }
+
+        // Settle + save + retrieve. Any bail → skip retrieve, still close.
+        if self
+            .settle_and_save(client_mutex, &opened, baseline)
+            .await
+            .is_ok()
+        {
+            self.retrieve_diagnostics(client_mutex, &opened, file_results)
+                .await;
+        }
+
+        self.close_all(client_mutex, &opened).await;
+    }
+
+    /// Settles the server before opening files.
+    ///
+    /// Waits for the server to go idle (e.g. after
+    /// `didChangeWatchedFiles` triggers re-indexing), then samples
+    /// baseline ticks for post-open activity detection.
+    ///
+    /// Returns `None` if the server is dead or dies during settle.
+    async fn pre_open_settle(&self, client_mutex: &Arc<Mutex<LspClient>>) -> Option<u64> {
+        let client = client_mutex.lock().await;
+        if matches!(
+            client.lifecycle(),
+            ServerLifecycle::Failed | ServerLifecycle::Dead
+        ) {
+            return None;
+        }
+        let server = client.server().clone();
+        let server_name = client.server_name().to_string();
+        drop(client);
+
+        let detector = IdleDetector::unconditional();
+        let result = await_idle(&server, detector, CancellationToken::new()).await;
+        debug!(
+            server = %server_name,
+            "batch pre-open idle result: {result:?}",
+        );
+        if result == SettleResult::RootDied {
+            return None;
+        }
+
+        Some(sample_baseline(&server).await)
+    }
+
+    /// Opens all files on the server, collecting their URIs.
+    ///
+    /// Files that fail to open are logged and skipped.
+    async fn open_files(
+        &self,
+        client_mutex: &Arc<Mutex<LspClient>>,
+        paths: &[PathBuf],
+        entry_id: i64,
+    ) -> Vec<(PathBuf, String)> {
         let mut opened_uris: Vec<(PathBuf, String)> = Vec::new();
 
         for path in paths {
@@ -313,21 +334,36 @@ impl DiagnosticsServer {
             }
         }
 
-        if opened_uris.is_empty() {
-            return;
-        }
+        opened_uris
+    }
 
-        // ── Settle after all opens ─────────────────────────────────
+    /// Settles after opens, runs health probe, and sends `didSave`.
+    ///
+    /// Returns `Ok(())` when the server is ready for retrieval, or
+    /// `Err(())` if the server died or a critical step failed (caller
+    /// should skip retrieval but still close documents).
+    ///
+    /// The client lock is held across settle calls so that no other
+    /// operation can send requests to the server between stimulus and
+    /// idle detection — interleaved traffic would restart activity
+    /// and invalidate the settle.
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "Lock held across settle to prevent interleaved requests"
+    )]
+    async fn settle_and_save(
+        &self,
+        client_mutex: &Arc<Mutex<LspClient>>,
+        opened_uris: &[(PathBuf, String)],
+        post_open_baseline: u64,
+    ) -> Result<(), ()> {
         let client = client_mutex.lock().await;
 
         if matches!(
             client.lifecycle(),
             ServerLifecycle::Failed | ServerLifecycle::Dead
         ) {
-            // Close whatever we opened and bail.
-            drop(client);
-            self.close_all(client_mutex, &opened_uris).await;
-            return;
+            return Err(());
         }
 
         let server = client.server().clone();
@@ -347,40 +383,28 @@ impl DiagnosticsServer {
                 ServerLifecycle::Failed | ServerLifecycle::Dead
             )
         {
-            drop(client);
-            self.close_all(client_mutex, &opened_uris).await;
-            return;
+            return Err(());
         }
 
-        // ── Health probe ───────────────────────────────────────────
+        // ── Health probe ──────────────────────────────────────────
         if client.lifecycle() == ServerLifecycle::Probing
             && !client.run_health_probe(&opened_uris[0].1).await
         {
-            drop(client);
-            self.close_all(client_mutex, &opened_uris).await;
-            return;
+            return Err(());
         }
 
-        // ── didSave all ────────────────────────────────────────────
+        // ── didSave all ───────────────────────────────────────────
         if client.wants_did_save() {
             let baseline = sample_baseline(&server).await;
 
-            let mut save_failed = false;
-            for (_, uri) in &opened_uris {
+            for (_, uri) in opened_uris {
                 if let Err(e) = client.did_save(uri).await {
                     warn!(
                         server = %server_name,
                         "batch didSave failed: {e}",
                     );
-                    save_failed = true;
-                    break;
+                    return Err(());
                 }
-            }
-
-            if save_failed {
-                drop(client);
-                self.close_all(client_mutex, &opened_uris).await;
-                return;
             }
 
             if !settle_after(&server, baseline, cancel, &server_name, "post-didSave").await
@@ -389,22 +413,33 @@ impl DiagnosticsServer {
                     ServerLifecycle::Failed | ServerLifecycle::Dead
                 )
             {
-                drop(client);
-                self.close_all(client_mutex, &opened_uris).await;
-                return;
+                return Err(());
             }
         }
 
-        // ── Retrieve diagnostics per file ──────────────────────────
+        Ok(())
+    }
+
+    /// Retrieves diagnostics for each opened file on the server.
+    ///
+    /// Collects push-cached or pull diagnostics, applies severity
+    /// filters, fetches quick-fix code actions, populates the symbol
+    /// index, and formats entries into `file_results`.
+    async fn retrieve_diagnostics(
+        &self,
+        client_mutex: &Arc<Mutex<LspClient>>,
+        opened_uris: &[(PathBuf, String)],
+        file_results: &mut BTreeMap<String, (String, Vec<ServerDiagnostics>)>,
+    ) {
+        let client = client_mutex.lock().await;
+
         let server_command = client.server_command().to_string();
+        let server_name = client.server_name().to_string();
         let server_version = client.server_version().map(str::to_string);
         let lang_id = client.language().to_string();
-        let has_code_actions = client
-            .capabilities()
-            .get("codeActionProvider")
-            .is_some_and(|v| !v.is_null());
+        let has_code_actions = client.supports_code_action();
 
-        for (path, uri) in &opened_uris {
+        for (path, uri) in opened_uris {
             let diagnostics = {
                 let cached = client.get_diagnostics(uri);
                 if !cached.is_empty() {
@@ -489,10 +524,6 @@ impl DiagnosticsServer {
                 .1
                 .push(ServerDiagnostics { entries });
         }
-
-        // ── Close all ──────────────────────────────────────────────
-        drop(client);
-        self.close_all(client_mutex, &opened_uris).await;
     }
 
     /// Closes all opened documents on a server and clears `parent_id`.
