@@ -1203,6 +1203,9 @@ mod tests {
         let entries =
             format_diagnostics_entries(&diags, &[], filter, "test", None, "rust", &symbols);
         assert_eq!(entries.len(), 1);
+        // 0-indexed (15, 5) → 1-indexed (16, 6)
+        assert!(entries[0].starts_with(":16:6 "), "line/col: {}", entries[0]);
+        assert!(entries[0].contains("[warning]"), "severity: {}", entries[0]);
         assert!(
             entries[0].ends_with("(in my_function)"),
             "entry: {}",
@@ -1281,6 +1284,66 @@ mod tests {
     }
 
     #[test]
+    fn format_diagnostics_entries_all_severity_labels() {
+        let filter = crate::filter::get_filter("");
+        for (sev, label) in [(1, "error"), (2, "warning"), (3, "info"), (4, "hint")] {
+            let diags = vec![make_diag(0, 0, sev, "msg")];
+            let entries =
+                format_diagnostics_entries(&diags, &[], filter, "test", None, "rust", &[]);
+            assert_eq!(entries.len(), 1, "severity {sev}");
+            assert!(
+                entries[0].contains(&format!("[{label}]")),
+                "severity {sev}: {}",
+                entries[0]
+            );
+        }
+    }
+
+    #[test]
+    fn format_diagnostics_entries_with_code() {
+        let diag = serde_json::json!({
+            "range": {
+                "start": { "line": 3, "character": 7 },
+                "end": { "line": 3, "character": 10 }
+            },
+            "severity": 1,
+            "source": "rustc",
+            "code": "E0308",
+            "message": "mismatched types"
+        });
+        let filter = crate::filter::get_filter("");
+        let entries = format_diagnostics_entries(&[diag], &[], filter, "test", None, "rust", &[]);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].starts_with(":4:8 "), "line/col: {}", entries[0]);
+        assert!(
+            entries[0].contains("rustc(E0308)"),
+            "source(code): {}",
+            entries[0]
+        );
+    }
+
+    #[test]
+    fn resolve_path_absolute_unchanged() {
+        let result = resolve_path("/some/absolute/path").expect("should resolve");
+        assert_eq!(result, PathBuf::from("/some/absolute/path"));
+    }
+
+    #[test]
+    fn resolve_path_relative_prepends_cwd() {
+        let result = resolve_path("relative/file.rs").expect("should resolve");
+        assert!(
+            result.is_absolute(),
+            "result should be absolute: {}",
+            result.display()
+        );
+        assert!(
+            result.ends_with("relative/file.rs"),
+            "result should end with relative path: {}",
+            result.display()
+        );
+    }
+
+    #[test]
     fn diagnostic_format_unchanged_without_symbols() {
         let diags = vec![make_diag(10, 5, 1, "some error")];
         let filter = crate::filter::get_filter("");
@@ -1291,6 +1354,22 @@ mod tests {
         assert_eq!(
             with_empty, with_none,
             "empty slice and None should produce same output"
+        );
+        // 0-indexed (10, 5) → 1-indexed (11, 6)
+        assert!(
+            with_empty[0].starts_with(":11:6 "),
+            "line/col: {}",
+            with_empty[0]
+        );
+        assert!(
+            with_empty[0].contains("[error]"),
+            "severity: {}",
+            with_empty[0]
+        );
+        assert!(
+            with_empty[0].contains("some error"),
+            "message: {}",
+            with_empty[0]
         );
         assert!(
             !with_empty[0].contains("(in "),
