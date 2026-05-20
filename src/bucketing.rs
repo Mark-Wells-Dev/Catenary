@@ -903,6 +903,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_trie_non_terminal_prefix_uses_wildcard() {
+        // 10 entries each with a unique 1-char prefix followed by a suffix.
+        // At depth 1 the algorithm hits the target (MIN_BUCKETS). Each node
+        // is count=1, terminal=false, children non-empty — the pattern must
+        // be a wildcard ("a*") not a bare prefix ("a").
+        let input = entries(&[
+            "ax", "bx", "cx", "dx", "ex", "fx", "gx", "hx", "ix", "jx",
+        ]);
+        let buckets = bucket_trie(&input, 10_000);
+        assert_eq!(buckets.len(), MIN_BUCKETS);
+        for b in &buckets {
+            assert!(
+                b.pattern.ends_with('*'),
+                "non-terminal prefix bucket should use wildcard, got {:?}",
+                b.pattern
+            );
+        }
+    }
+
     // ------------------------------------------------------------------
     // Helper function unit tests
     // ------------------------------------------------------------------
