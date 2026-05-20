@@ -184,19 +184,6 @@ struct SessionRow {
     db_alive: bool,
 }
 
-/// List all sessions (active and inactive).
-///
-/// Opens a database connection internally. For explicit connection
-/// management, use [`list_sessions_with_conn`].
-///
-/// # Errors
-///
-/// Returns an error if the database cannot be opened or queried.
-pub fn list_sessions() -> Result<Vec<(SessionInfo, bool)>> {
-    let conn = crate::db::open_and_migrate()?;
-    list_sessions_with_conn(&conn)
-}
-
 /// List all sessions using an existing database connection.
 ///
 /// Returns a list of sessions and their status (true = active, false = dead).
@@ -276,19 +263,6 @@ pub fn list_sessions_with_conn(conn: &Connection) -> Result<Vec<(SessionInfo, bo
     }
 
     Ok(sessions)
-}
-
-/// Get a specific session by ID.
-///
-/// Opens a database connection internally. For explicit connection
-/// management, use [`get_session_with_conn`].
-///
-/// # Errors
-///
-/// Returns an error if the database cannot be opened or queried.
-pub fn get_session(id: &str) -> Result<Option<(SessionInfo, bool)>> {
-    let conn = crate::db::open_and_migrate()?;
-    get_session_with_conn(&conn, id)
 }
 
 /// Get a specific session by ID using an existing database connection.
@@ -455,7 +429,7 @@ pub fn tail_messages_new_with_conn(
             [id],
             |row| row.get(0),
         )
-        .unwrap_or(0);
+        .context("failed to read message high-water mark")?;
 
     Ok(SqliteMessageTail {
         conn,
@@ -463,19 +437,6 @@ pub fn tail_messages_new_with_conn(
         last_id,
         include_debug,
     })
-}
-
-/// Get active languages for a session by reading its events.
-///
-/// Opens a database connection internally. For explicit connection
-/// management, use [`active_languages_with_conn`].
-///
-/// # Errors
-///
-/// Returns an error if the database cannot be opened or queried.
-pub fn active_languages(id: &str) -> Result<Vec<String>> {
-    let conn = crate::db::open_and_migrate()?;
-    active_languages_with_conn(&conn, id)
 }
 
 /// Get active languages for a session using an existing database connection.
@@ -503,23 +464,6 @@ pub fn active_languages_with_conn(conn: &Connection, id: &str) -> Result<Vec<Str
 }
 
 /// Remove dead sessions older than the configured retention period.
-///
-/// Opens a database connection internally. For explicit connection
-/// management, use [`prune_sessions_with_conn`].
-///
-/// # Errors
-///
-/// Returns an error if the database cannot be opened or queried.
-pub fn prune_sessions(retention_days: i64) -> Result<usize> {
-    if retention_days < 0 {
-        return Ok(0);
-    }
-    let conn = crate::db::open_and_migrate()?;
-    prune_sessions_with_conn(&conn, retention_days)
-}
-
-/// Remove dead sessions older than the configured retention period
-/// using an existing database connection.
 ///
 /// - `retention_days == -1`: retain forever (no-op).
 /// - `retention_days == 0`: remove all dead sessions regardless of age.
@@ -576,20 +520,6 @@ pub fn prune_sessions_with_conn(conn: &Connection, retention_days: i64) -> Resul
 }
 
 /// Delete a session and all its associated data.
-///
-/// Opens a database connection internally. For explicit connection
-/// management, use [`delete_session_data_with_conn`].
-///
-/// # Errors
-///
-/// Returns an error if the database cannot be opened or the delete fails.
-pub fn delete_session_data(id: &str) -> Result<()> {
-    let conn = crate::db::open_and_migrate()?;
-    delete_session_data_with_conn(&conn, id)
-}
-
-/// Delete a session and all its associated data using an existing database
-/// connection.
 ///
 /// # Errors
 ///
@@ -841,8 +771,12 @@ mod tests {
         let (_, alive) = found.expect("session should exist after marking dead");
         assert!(!alive);
 
-        // Clean up
+        // Clean up and verify deletion actually removes the session.
         delete_session_data_with_conn(&conn, "s-test")?;
+        assert!(
+            get_session_with_conn(&conn, "s-test")?.is_none(),
+            "session should be gone after delete_session_data_with_conn"
+        );
 
         Ok(())
     }
@@ -1039,7 +973,8 @@ mod tests {
         insert_dead_session(&conn, "prune-recent", "/tmp/prune-recent", None);
         insert_dead_session(&conn, "prune-old", "/tmp/prune-old", Some(10));
 
-        let _ = prune_sessions_with_conn(&conn, 7)?;
+        let removed = prune_sessions_with_conn(&conn, 7)?;
+        assert_eq!(removed, 1, "should prune exactly one old session");
         assert!(
             get_session_with_conn(&conn, "prune-recent")?.is_some(),
             "recent dead session should survive prune"
@@ -1052,7 +987,8 @@ mod tests {
 
         // -- retention=0 removes all dead --
         insert_dead_session(&conn, "prune-zero", "/tmp/prune-zero", None);
-        let _ = prune_sessions_with_conn(&conn, 0)?;
+        let removed = prune_sessions_with_conn(&conn, 0)?;
+        assert_eq!(removed, 1, "should prune the one dead session");
         assert!(
             get_session_with_conn(&conn, "prune-zero")?.is_none(),
             "dead session should be removed with retention=0"
@@ -1347,6 +1283,86 @@ mod tests {
         let msg = tail.try_next_message()?;
         assert!(msg.is_some(), "info messages should pass Info threshold");
         assert_eq!(msg.expect("verified Some").method, "textDocument/hover");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_sessions_dir_not_empty() {
+        let dir = sessions_dir();
+        assert!(
+            dir.ends_with("catenary/sessions"),
+            "sessions_dir should end with catenary/sessions, got: {dir:?}"
+        );
+    }
+
+    #[test]
+    fn test_tail_gc_recovery_after_message_deletion() -> Result<()> {
+        let (_dir, path, conn) = test_db();
+
+        conn.execute(
+            "INSERT INTO sessions (id, pid, display_name, started_at) \
+                 VALUES ('s1', 1, 'test', '2026-01-01T00:00:00Z')",
+            [],
+        )?;
+
+        // Insert three messages.
+        let id1 = insert_test_message(
+            &conn,
+            "s1",
+            "lsp",
+            "initialize",
+            "ra",
+            "catenary",
+            None,
+            None,
+            "{}",
+        );
+        insert_test_message(
+            &conn,
+            "s1",
+            "lsp",
+            "textDocument/hover",
+            "ra",
+            "catenary",
+            None,
+            None,
+            "{}",
+        );
+        insert_test_message(
+            &conn,
+            "s1",
+            "lsp",
+            "textDocument/definition",
+            "ra",
+            "catenary",
+            None,
+            None,
+            "{}",
+        );
+
+        // Open tail — last_id advances to MAX(id) = id3.
+        let tail_conn = crate::db::open_at(&path)?;
+        let mut tail = tail_messages_new_with_conn(tail_conn, "s1", true)?;
+
+        // Delete messages 2 and 3, leaving only message 1.
+        // Simulates GC deleting rows past the high-water mark.
+        conn.execute(
+            "DELETE FROM messages WHERE session_id = 's1' AND id > ?1",
+            [id1],
+        )?;
+
+        // First poll: no rows match `id > last_id`. GC recovery detects
+        // MAX(id) < last_id and resets last_id to 0.
+        assert!(tail.try_next_message()?.is_none());
+
+        // Second poll: should find message 1 after the reset.
+        let msg = tail.try_next_message()?;
+        assert!(
+            msg.is_some(),
+            "GC recovery should reset last_id so surviving message is found"
+        );
+        assert_eq!(msg.expect("verified Some").method, "initialize");
 
         Ok(())
     }
