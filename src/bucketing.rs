@@ -95,23 +95,6 @@ pub fn bucket_separators(input: &[BucketEntry], budget: usize) -> Vec<Bucket> {
 
     let mut buckets = groups_to_buckets(&groups, input);
 
-    // Evenness check: if one bucket holds > 80% of entries and we have more
-    // than 2 groups, try a shallower split.
-    if buckets.len() > 2 {
-        let max_count = buckets.iter().map(|b| b.count).max().unwrap_or(0);
-        let threshold = (input.len() * 4) / 5; // 80%
-        if max_count > threshold {
-            let shallow = group_by_separator_prefix_depth(input, 1);
-            if shallow.len() > 1 {
-                let shallow_buckets = groups_to_buckets(&shallow, input);
-                let shallow_max = shallow_buckets.iter().map(|b| b.count).max().unwrap_or(0);
-                if shallow_max < max_count {
-                    buckets = shallow_buckets;
-                }
-            }
-        }
-    }
-
     collapse_to_budget(&mut buckets, budget);
     buckets
 }
@@ -155,22 +138,6 @@ fn group_by_separator_prefix(input: &[BucketEntry]) -> BTreeMap<String, Vec<usiz
     prefix_map
 }
 
-/// Group by separator prefix at a specific maximum depth (number of separator
-/// segments to use).
-fn group_by_separator_prefix_depth(
-    input: &[BucketEntry],
-    max_segments: usize,
-) -> BTreeMap<String, Vec<usize>> {
-    let mut prefix_map: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-
-    for (i, entry) in input.iter().enumerate() {
-        let prefix = prefix_at_depth(&entry.value, max_segments);
-        prefix_map.entry(prefix).or_default().push(i);
-    }
-
-    prefix_map
-}
-
 /// Find the longest separator-boundary prefix of `value` shared with either
 /// sorted neighbor. Only needs to check left and right because sorted order
 /// guarantees that the longest shared prefix is with an adjacent entry.
@@ -196,20 +163,6 @@ fn longest_neighbor_separator_prefix(
     }
 
     // No shared separator prefix — this entry stands alone.
-    value.to_owned()
-}
-
-/// Extract prefix up to the Nth separator boundary.
-fn prefix_at_depth(value: &str, max_segments: usize) -> String {
-    let mut count = 0;
-    for (i, c) in value.char_indices() {
-        if SEPARATORS.contains(&c) {
-            count += 1;
-            if count >= max_segments {
-                return value[..=i].to_owned();
-            }
-        }
-    }
     value.to_owned()
 }
 
@@ -323,22 +276,16 @@ pub fn bucket_trie(input: &[BucketEntry], budget: usize) -> Vec<Bucket> {
         root.insert(&entry.value);
     }
 
-    // Build initial buckets by walking the trie in BFS order and deciding
-    // whether to expand or collapse each node.
+    // Progressively expand the trie deeper until we reach the target bucket
+    // count or exhaust the trie. The depth bound is checked before expansion
+    // so the boundary (depth == max_depth) is the last useful expansion.
+    let max_depth = input.iter().map(|e| e.value.len()).max().unwrap_or(0);
     let mut buckets: Vec<(String, usize)> = Vec::new();
-    expand_trie_node(&root, String::new(), &mut buckets, budget);
-
-    // Enforce minimum bucket count by progressively expanding deeper.
     let target = MIN_BUCKETS.min(input.len());
     let mut depth = 1;
-    while buckets.len() < target {
+    while buckets.len() < target && depth <= max_depth {
         buckets.clear();
         force_expand_depth(&root, String::new(), &mut buckets, depth);
-        // If expanding deeper didn't add any new buckets, the trie is
-        // exhausted (all leaves reached). Break to avoid an infinite loop.
-        if depth > input.iter().map(|e| e.value.len()).max().unwrap_or(0) {
-            break;
-        }
         depth += 1;
     }
 
@@ -369,73 +316,6 @@ pub fn bucket_trie(input: &[BucketEntry], budget: usize) -> Vec<Bucket> {
     result
 }
 
-/// Recursively decide whether to expand or collapse a trie node.
-fn expand_trie_node(
-    node: &TrieNode,
-    prefix: String,
-    buckets: &mut Vec<(String, usize)>,
-    budget: usize,
-) {
-    if node.children.is_empty() {
-        // Leaf: emit as-is.
-        let pattern = if node.terminal {
-            prefix
-        } else {
-            format!("{prefix}*")
-        };
-        buckets.push((pattern, node.count));
-        return;
-    }
-
-    // Compute current CV (treating this node as one collapsed bucket alongside
-    // existing buckets).
-    let current_counts: Vec<usize> = buckets
-        .iter()
-        .map(|(_, c)| *c)
-        .chain(std::iter::once(node.count))
-        .collect();
-
-    // Compute hypothetical CV if we expand this node's children.
-    let child_counts: Vec<usize> = node
-        .children
-        .values()
-        .map(|c| c.count)
-        .chain(if node.terminal { Some(1) } else { None })
-        .collect();
-
-    let expanded_counts: Vec<usize> = buckets
-        .iter()
-        .map(|(_, c)| *c)
-        .chain(child_counts.iter().copied())
-        .collect();
-
-    // Check budget: each expanded child costs ~20 chars.
-    let expanded_cost: usize = child_counts.len() * 20;
-    let within_budget = expanded_cost <= budget.saturating_sub(rendered_size_estimate(buckets));
-
-    let cv_improves = cv(&expanded_counts) < cv(&current_counts);
-
-    if within_budget && cv_improves && child_counts.len() > 1 {
-        // Expand: recurse into children.
-        for (&c, child) in &node.children {
-            let mut child_prefix = prefix.clone();
-            child_prefix.push(c);
-            expand_trie_node(child, child_prefix, buckets, budget);
-        }
-        if node.terminal {
-            buckets.push((prefix, 1));
-        }
-    } else {
-        // Collapse: emit this subtree as one bucket.
-        let pattern = if node.count == 1 && node.terminal && node.children.is_empty() {
-            prefix
-        } else {
-            format!("{prefix}*")
-        };
-        buckets.push((pattern, node.count));
-    }
-}
-
 /// Force-expand to a given depth to ensure minimum bucket count.
 fn force_expand_depth(
     node: &TrieNode,
@@ -461,14 +341,6 @@ fn force_expand_depth(
     if node.terminal {
         buckets.push((prefix, 1));
     }
-}
-
-/// Quick estimate of rendered size for trie expansion budget checks.
-fn rendered_size_estimate(buckets: &[(String, usize)]) -> usize {
-    buckets
-        .iter()
-        .map(|(p, c)| p.len() + count_digits(*c) + 6)
-        .sum()
 }
 
 // ---------------------------------------------------------------------------
@@ -592,29 +464,6 @@ const fn count_digits(n: usize) -> usize {
     digits
 }
 
-/// Coefficient of variation: stddev / mean. Returns `f64::MAX` for
-/// empty or zero-mean input.
-fn cv(counts: &[usize]) -> f64 {
-    if counts.is_empty() {
-        return f64::MAX;
-    }
-    #[allow(clippy::cast_precision_loss, reason = "bucket counts are small")]
-    let n = counts.len() as f64;
-    #[allow(clippy::cast_precision_loss, reason = "bucket counts are small")]
-    let sum: f64 = counts.iter().map(|&c| c as f64).sum();
-    let mean = sum / n;
-    if mean == 0.0 {
-        return f64::MAX;
-    }
-    #[allow(clippy::cast_precision_loss, reason = "bucket counts are small")]
-    let variance: f64 = counts
-        .iter()
-        .map(|&c| (c as f64 - mean).powi(2))
-        .sum::<f64>()
-        / n;
-    variance.sqrt() / mean
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -694,32 +543,6 @@ mod tests {
     }
 
     #[test]
-    fn test_separator_evenness() {
-        // One group has 90% of entries — should trigger the evenness check.
-        let owned: Vec<String> = (0..18)
-            .map(|i| format!("test_a_{i}"))
-            .chain((0..2).map(|i| format!("test_b_{i}")))
-            .collect();
-        let input: Vec<BucketEntry> = owned
-            .iter()
-            .map(|v| BucketEntry {
-                value: v.clone(),
-                context: None,
-            })
-            .collect();
-        let buckets = bucket_separators(&input, 10_000);
-        assert!(
-            buckets.len() >= 2,
-            "expected evenness check to produce at least 2 buckets, got {}: {:?}",
-            buckets.len(),
-            buckets
-                .iter()
-                .map(|b| (&b.pattern, b.count))
-                .collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
     fn test_trie_basic() {
         let input = entries(&[
             "alpha",
@@ -739,21 +562,22 @@ mod tests {
     }
 
     #[test]
-    fn test_trie_cv_improvement() {
+    fn test_trie_even_prefixes() {
         // Two clear prefixes: "aaa*" (3) and "bbb*" (3) — perfectly even.
         let input = entries(&["aaa1", "aaa2", "aaa3", "bbb1", "bbb2", "bbb3"]);
         let buckets = bucket_trie(&input, 10_000);
-        assert!(
-            buckets.len() >= 2,
-            "splitting should happen when CV improves, got {}: {:?}",
+        assert_eq!(
+            buckets.len(),
+            6,
+            "6 unique entries should each get their own bucket, got {}: {:?}",
             buckets.len(),
             buckets.iter().map(|b| &b.pattern).collect::<Vec<_>>()
         );
     }
 
     #[test]
-    fn test_trie_cv_no_improvement() {
-        // One huge cluster, one tiny — CV may not improve on expansion.
+    fn test_trie_skewed_prefixes() {
+        // One huge cluster, one tiny — trie must still split into enough buckets.
         let mut values: Vec<String> = (0..50).map(|i| format!("a{i:03}")).collect();
         values.push("b1".to_owned());
         let input: Vec<BucketEntry> = values
@@ -765,13 +589,19 @@ mod tests {
             .collect();
         let buckets = bucket_trie(&input, 10_000);
         assert!(
-            buckets.len() >= 2,
-            "expected at least 2 buckets, got {}: {:?}",
+            buckets.len() >= MIN_BUCKETS,
+            "expected at least {MIN_BUCKETS} buckets, got {}: {:?}",
             buckets.len(),
             buckets
                 .iter()
                 .map(|b| (&b.pattern, b.count))
                 .collect::<Vec<_>>()
+        );
+        // "b1" must appear as its own bucket, not merged into the "a*" cluster.
+        assert!(
+            buckets.iter().any(|b| b.pattern == "b1"),
+            "expected standalone 'b1' bucket: {:?}",
+            buckets.iter().map(|b| &b.pattern).collect::<Vec<_>>()
         );
     }
 
@@ -970,5 +800,90 @@ mod tests {
                 .map(|b| (&b.pattern, b.count))
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn test_trie_stops_at_target() {
+        // 11 entries where force_expand at depth 2 gives exactly MIN_BUCKETS
+        // buckets: "a0" has 2 children (x,y) while "a1"-"a9" have 1 each.
+        // Depth 3 would give 11 buckets. The algorithm must stop at the target.
+        let input = entries(&[
+            "a0x", "a0y", "a1x", "a2x", "a3x", "a4x", "a5x", "a6x", "a7x", "a8x", "a9x",
+        ]);
+        let buckets = bucket_trie(&input, 10_000);
+        assert_eq!(
+            buckets.len(),
+            MIN_BUCKETS,
+            "should stop at MIN_BUCKETS={MIN_BUCKETS}, got {}: {:?}",
+            buckets.len(),
+            buckets
+                .iter()
+                .map(|b| (&b.pattern, b.count))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_trie_needs_max_depth() {
+        // "a" (length 1) and "ab" (length 2). The trie needs expansion at
+        // depth == max_entry_length to separate them into individual buckets.
+        let input = entries(&["a", "ab"]);
+        let buckets = bucket_trie(&input, 10_000);
+        assert_eq!(
+            buckets.len(),
+            2,
+            "should produce 2 buckets at max depth, got {}: {:?}",
+            buckets.len(),
+            buckets
+                .iter()
+                .map(|b| (&b.pattern, b.count))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            buckets.iter().any(|b| b.pattern == "a"),
+            "expected bare 'a' bucket: {:?}",
+            buckets.iter().map(|b| &b.pattern).collect::<Vec<_>>()
+        );
+        assert!(
+            buckets.iter().any(|b| b.pattern == "ab"),
+            "expected bare 'ab' bucket: {:?}",
+            buckets.iter().map(|b| &b.pattern).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_trie_exhausted() {
+        // All identical entries — the trie can never produce enough buckets.
+        let input: Vec<BucketEntry> = (0..5)
+            .map(|_| BucketEntry {
+                value: "ab".to_owned(),
+                context: None,
+            })
+            .collect();
+        let buckets = bucket_trie(&input, 10_000);
+        assert_eq!(
+            buckets.len(),
+            1,
+            "identical entries should produce 1 bucket"
+        );
+        assert_eq!(buckets[0].count, 5);
+    }
+
+    #[test]
+    fn test_trie_wildcard_on_multi_entry_buckets() {
+        // "ab" and "abc" share a prefix — the bucket at the 'b' node
+        // must use a wildcard pattern ("ab*") even though 'b' is terminal.
+        let input = entries(&["ab", "abc", "xy"]);
+        let buckets = bucket_trie(&input, 10_000);
+        for b in &buckets {
+            if b.count > 1 {
+                assert!(
+                    b.pattern.ends_with('*'),
+                    "multi-entry bucket should have wildcard pattern, got {:?} (count {})",
+                    b.pattern,
+                    b.count
+                );
+            }
+        }
     }
 }
