@@ -11,8 +11,54 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
-use super::degradation::degrade_hints;
 use super::theme::Theme;
+
+/// All navigation hints in display order.
+const ALL_HINTS: [(&str, &str); 5] = [
+    ("z", "\u{2550}"), // ═
+    ("v", "\u{2592}"), // ▒
+    ("f", "\u{2591}"), // ░
+    ("?", ""),
+    ("q", "\u{2718}"), // ✘
+];
+
+/// Return the navigation hints that fit in the given width.
+///
+/// Degradation order:
+/// 1. All 5 hints with `╱` separators.
+/// 2. All 5 hints, space-separated.
+/// 3. Drop `z ═`.
+/// 4. Drop `v ▒`.
+/// 5. Drop `f ░`.
+/// 6. Drop `?`.
+/// 7. Drop `q ✘`.
+/// 8. Empty (border only).
+#[must_use]
+fn degrade_hints(max_width: u16) -> Vec<(&'static str, &'static str)> {
+    let max = max_width as usize;
+    let all = ALL_HINTS.to_vec();
+
+    // Level 1: all hints with separators.
+    if hints_width_with_separators(&all) <= max {
+        return all;
+    }
+
+    // Level 2: all hints, space-separated.
+    if hints_width_spaced(&all) <= max {
+        return all;
+    }
+
+    // Levels 3–7: progressively drop hints from the front.
+    for drop_count in 1..=4 {
+        let remaining = ALL_HINTS[drop_count..].to_vec();
+        if hints_width_spaced(&remaining) <= max {
+            return remaining;
+        }
+    }
+
+    // Level 8: empty.
+    Vec::new()
+}
 
 /// Render navigation hints into a 1-row area at the bottom of the grid.
 ///

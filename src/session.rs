@@ -629,26 +629,6 @@ pub(crate) mod test_support {
             ..message(r#type, method, server)
         }
     }
-
-    /// Build a `SessionMessage` with explicit `id`, `request_id`, `parent_id`, and payload.
-    #[must_use]
-    pub fn message_with_ids_payload(
-        id: i64,
-        r#type: &str,
-        method: &str,
-        server: &str,
-        request_id: Option<i64>,
-        parent_id: Option<i64>,
-        payload: serde_json::Value,
-    ) -> SessionMessage {
-        SessionMessage {
-            id,
-            request_id,
-            parent_id,
-            payload,
-            ..message(r#type, method, server)
-        }
-    }
 }
 
 #[cfg(test)]
