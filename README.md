@@ -160,7 +160,7 @@ Catenary provides diagnostics via the `PostToolUse` hook.
 
 ## Documentation
 
-Full documentation at **[twowells.github.io/catenary](https://twowells.github.io/Catenary/)**
+Full documentation at **[twowells.github.io/Catenary](https://twowells.github.io/Catenary/)**
 
 - **[Installation](https://twowells.github.io/Catenary/stable/installation.html)** — Setup for Claude Code, Gemini CLI, and other clients
 - **[Configuration](https://twowells.github.io/Catenary/stable/configuration.html)** — Language servers, settings, icons
