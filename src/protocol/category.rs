@@ -163,6 +163,20 @@ mod tests {
         assert_eq!(lsp_category("custom/unknownMethod"), "unknown");
     }
 
+    #[test]
+    fn lsp_category_workspace_methods() {
+        assert_eq!(lsp_category("workspace/configuration"), "workspace");
+        assert_eq!(
+            lsp_category("workspace/didChangeConfiguration"),
+            "workspace"
+        );
+        assert_eq!(lsp_category("workspace/didChangeWatchedFiles"), "workspace");
+        assert_eq!(
+            lsp_category("workspace/didChangeWorkspaceFolders"),
+            "workspace"
+        );
+    }
+
     // ── MCP category ────────────────────────────────────────────────────
 
     #[test]
@@ -173,6 +187,17 @@ mod tests {
     #[test]
     fn mcp_category_initialize() {
         assert_eq!(mcp_category("initialize"), "init");
+    }
+
+    #[test]
+    fn mcp_category_roots() {
+        assert_eq!(mcp_category("roots/list"), "roots");
+        assert_eq!(mcp_category("notifications/roots/list_changed"), "roots");
+    }
+
+    #[test]
+    fn mcp_category_cancelled() {
+        assert_eq!(mcp_category("notifications/cancelled"), "cancelled");
     }
 
     // ── Hook category ───────────────────────────────────────────────────

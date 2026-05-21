@@ -553,4 +553,11 @@ mod tests {
         assert_eq!(params.reason.as_deref(), Some("user cancelled"));
         Ok(())
     }
+
+    #[test]
+    fn jsonrpc_error_codes_are_spec_values() {
+        assert_eq!(METHOD_NOT_FOUND, -32601);
+        assert_eq!(INTERNAL_ERROR, -32603);
+        assert_eq!(REQUEST_CANCELLED, -32800);
+    }
 }

@@ -1381,6 +1381,56 @@ mod tests {
     }
 
     #[test]
+    fn record_u64_routes_request_id_and_parent_id() {
+        let server = LoggingServer::new();
+        let sink = Arc::new(RecorderSink::default());
+        with_subscriber(server.clone(), || {
+            server.activate(vec![sink.clone()]);
+            tracing::info!(request_id = 42_u64, parent_id = 7_u64, "u64 ids");
+        });
+        let events = sink.snapshot();
+        assert_eq!(events.len(), 1);
+        let e = &events[0];
+        assert_eq!(
+            e.request_id,
+            Some(42),
+            "request_id should be extracted from u64"
+        );
+        assert_eq!(
+            e.parent_id,
+            Some(7),
+            "parent_id should be extracted from u64"
+        );
+    }
+
+    #[test]
+    fn span_field_visitor_record_debug_extracts_session_id() {
+        let server = LoggingServer::new();
+        let sink = Arc::new(RecorderSink::default());
+        with_subscriber(server.clone(), || {
+            server.activate(vec![sink.clone()]);
+
+            // Pass session_id via Debug format (?value syntax) to exercise
+            // SpanFieldVisitor::record_debug instead of record_str.
+            let sid = String::from("debug-sess");
+            let span = tracing::info_span!("test", session_id = ?sid);
+            let _guard = span.enter();
+            tracing::warn!("inside debug-fmt span");
+        });
+        let events = sink.snapshot();
+        assert_eq!(events.len(), 1);
+        // Debug format wraps in quotes: "debug-sess"
+        assert!(
+            events[0]
+                .session_id
+                .as_deref()
+                .is_some_and(|s| s.contains("debug-sess")),
+            "session_id should propagate from Debug-formatted span field, got: {:?}",
+            events[0].session_id
+        );
+    }
+
+    #[test]
     fn session_id_from_span_propagates_to_event() {
         let server = LoggingServer::new();
         let sink = Arc::new(RecorderSink::default());

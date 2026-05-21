@@ -381,6 +381,7 @@ mod tests {
         router.record_affinity("s1", "rust-analyzer");
 
         assert!(!router.affinity_for("s1").is_empty());
+        assert_eq!(router.session_count(), 1, "session should be registered");
 
         router.remove_session("s1");
 
@@ -485,5 +486,36 @@ mod tests {
     fn drain_unknown_session_returns_empty() {
         let router = NotificationRouter::new(Severity::Warn);
         assert!(router.drain("nonexistent").is_empty());
+    }
+
+    #[test]
+    fn drain_includes_overflow_sentinel() {
+        let router = NotificationRouter::new(Severity::Warn);
+        router.register_session("s1");
+
+        // Fill past CAP (100) with distinct messages. Dedup keys include
+        // `server`, so varying it ensures each event is unique.
+        for i in 0..=super::CAP {
+            router.handle(&make_event(
+                Severity::Warn,
+                "overflow",
+                Some(&format!("server-{i}")),
+                Some("s1"),
+            ));
+        }
+
+        let drained = router.drain("s1");
+        // CAP events kept + 1 overflow sentinel appended by drain.
+        assert_eq!(
+            drained.len(),
+            super::CAP + 1,
+            "should have CAP events + overflow sentinel"
+        );
+        let sentinel = &drained[super::CAP];
+        assert!(
+            sentinel.message.contains("dropped"),
+            "sentinel should mention dropped count, got: {:?}",
+            sentinel.message
+        );
     }
 }

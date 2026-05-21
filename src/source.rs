@@ -117,3 +117,56 @@ impl fmt::Display for ParseSourceError {
 }
 
 impl std::error::Error for ParseSourceError {}
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unwrap_used,
+    reason = "tests use expect/unwrap for readable assertions"
+)]
+mod tests {
+    use super::*;
+
+    /// Every variant round-trips through `Display` → `FromStr`.
+    #[test]
+    fn all_variants_round_trip() {
+        let variants = [
+            Source::ConfigParse,
+            Source::ConfigValidation,
+            Source::DaemonDispatch,
+            Source::DaemonLifecycle,
+            Source::HookDispatch,
+            Source::LoggingBootstrap,
+            Source::LspDispatch,
+            Source::LspLifecycle,
+            Source::LspLogging,
+            Source::LspStderr,
+            Source::McpDispatch,
+        ];
+        for variant in variants {
+            let s = variant.as_str();
+            let parsed: Source = s.parse().unwrap_or_else(|e| {
+                panic!("failed to parse {s:?}: {e}");
+            });
+            assert_eq!(parsed, variant, "round-trip failed for {s:?}");
+        }
+    }
+
+    #[test]
+    fn from_str_rejects_unknown() {
+        let err = "bogus.source".parse::<Source>().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("bogus.source"),
+            "error should mention the input, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_source_error_display_includes_value() {
+        let err = ParseSourceError("foo.bar".to_string());
+        let display = format!("{err}");
+        assert_eq!(display, r#"unknown source: "foo.bar""#);
+    }
+}

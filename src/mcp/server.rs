@@ -1440,6 +1440,25 @@ mod tests {
     }
 
     #[test]
+    fn test_cancelled_notification_handled_without_panic() {
+        // notifications/cancelled arriving after the tool call completed
+        // should be silently accepted (not fall through to unknown).
+        let mut server = McpServer::new(TestHandler, LoggingServer::new());
+
+        let notification = Notification {
+            jsonrpc: "2.0".to_string(),
+            method: "notifications/cancelled".to_string(),
+            params: Some(serde_json::json!({"requestId": 99})),
+        };
+        // Should not set should_fetch_roots or any other flag — it's a no-op.
+        server.handle_notification(&notification);
+        assert!(
+            !server.should_fetch_roots,
+            "cancelled should not trigger roots fetch"
+        );
+    }
+
+    #[test]
     fn test_list_changed_honored_without_capability() -> Result<()> {
         let mut server = McpServer::new(TestHandler, LoggingServer::new());
         // Initialize WITHOUT roots capability
@@ -2026,5 +2045,94 @@ mod tests {
         assert_eq!(roots[0].uri, "file:///tmp/via_turn_boundary");
         drop(roots);
         Ok(())
+    }
+
+    // ── run() loop tests ────────────────────────────────────────────
+
+    /// Build newline-delimited JSON bytes from a slice of messages,
+    /// suitable as synthetic stdin for `run()`.
+    fn synthetic_stdin(messages: &[serde_json::Value]) -> std::io::Cursor<Vec<u8>> {
+        let mut buf = Vec::new();
+        for msg in messages {
+            buf.extend_from_slice(serde_json::to_string(msg).expect("serialize").as_bytes());
+            buf.push(b'\n');
+        }
+        std::io::Cursor::new(buf)
+    }
+
+    #[test]
+    fn on_tools_call_fires_only_for_tools_call() -> Result<()> {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let call_count = Arc::new(AtomicU32::new(0));
+        let counter = call_count.clone();
+
+        let mut server = McpServer::new(TestHandler, LoggingServer::new());
+        server.on_tools_call = Some(Box::new(move || {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }));
+
+        // Sequence: initialize → initialized → ping → tools/call.
+        // Only tools/call should trigger the callback.
+        let stdin = synthetic_stdin(&[
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": {"name": "test", "version": "1.0"}
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0", "method": "notifications/initialized"
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 2, "method": "ping"
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                "params": {"name": "test_tool", "arguments": {}}
+            }),
+        ]);
+
+        let mut writer: Vec<u8> = Vec::new();
+        server.run(stdin, &mut writer)?;
+
+        assert_eq!(
+            call_count.load(Ordering::Relaxed),
+            1,
+            "callback should fire exactly once (for tools/call only)"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reader_loop_cancellation_requires_notification() {
+        // A message with method "notifications/cancelled" AND an "id"
+        // field is a malformed request, not a notification. The reader
+        // loop must NOT trigger cancellation for it.
+        let cancel_map: CancelMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let token = CancellationToken::new();
+        cancel_map
+            .lock()
+            .expect("lock")
+            .insert(RequestId::Number(42), token.clone());
+
+        // Malformed: has both "method": "notifications/cancelled" AND "id".
+        let bad_line = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "notifications/cancelled",
+            "params": {"requestId": 42}
+        });
+
+        let stdin = synthetic_stdin(&[bad_line]);
+        let (tx, _rx) = std::sync::mpsc::channel::<String>();
+        McpServer::<TestHandler>::reader_loop(stdin, &tx, &cancel_map);
+
+        assert!(
+            !token.is_cancelled(),
+            "should NOT trigger cancellation when id is present (request, not notification)"
+        );
     }
 }
