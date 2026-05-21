@@ -84,8 +84,18 @@ fn self_cpu_ticks() -> u64 {
 #[cfg(target_os = "linux")]
 fn linux_self_ticks() -> Option<u64> {
     let contents = std::fs::read_to_string("/proc/self/stat").ok()?;
-    let after_comm = contents.rfind(')')? + 1;
-    let fields: Vec<&str> = contents[after_comm..].split_whitespace().collect();
+    parse_stat_cpu_ticks(&contents)
+}
+
+/// Parse utime + stime from a `/proc/[pid]/stat` line.
+///
+/// The format is: `pid (comm) state field3 field4 ... field13(utime) field14(stime) ...`
+/// Fields are numbered from 0 after the comm-closing `)`. `rfind(')')` handles
+/// comm names containing spaces or parentheses.
+#[cfg(target_os = "linux")]
+fn parse_stat_cpu_ticks(stat_line: &str) -> Option<u64> {
+    let after_comm = stat_line.rfind(')')? + 1;
+    let fields: Vec<&str> = stat_line[after_comm..].split_whitespace().collect();
     let utime: u64 = fields.get(11)?.parse().ok()?;
     let stime: u64 = fields.get(12)?.parse().ok()?;
     Some(utime + stime)
@@ -116,5 +126,62 @@ mod tests {
             after > before,
             "Ticks should advance after CPU work: before={before}, after={after}"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_self_ticks_returns_some() {
+        let result = linux_self_ticks();
+        assert!(
+            result.is_some(),
+            "/proc/self/stat should be readable on Linux"
+        );
+    }
+
+    // Real /proc/self/stat format (field positions from proc(5)):
+    //   pid (comm) state ppid pgrp session tty tpgid flags
+    //   minflt cminflt majflt cmajflt utime stime cutime cstime ...
+    //   Fields after ')': 0=state .. 11=utime 12=stime
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_stat_extracts_utime_plus_stime() {
+        let stat = "12345 (mockc) S 1 12345 12345 0 -1 4194304 \
+                    100 0 0 0 42 7 0 0 20 0 1 0 1000 1000000 100 \
+                    18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0";
+        assert_eq!(parse_stat_cpu_ticks(stat), Some(49)); // 42 + 7
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_stat_comm_with_spaces() {
+        let stat = "12345 (my app) S 1 12345 12345 0 -1 4194304 \
+                    100 0 0 0 10 5 0 0 20 0 1 0 1000 1000000 100 \
+                    18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0";
+        assert_eq!(parse_stat_cpu_ticks(stat), Some(15)); // 10 + 5
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_stat_comm_with_parens() {
+        // rfind(')') must find the *last* closing paren
+        let stat = "12345 (app(1)) S 1 12345 12345 0 -1 4194304 \
+                    100 0 0 0 20 3 0 0 20 0 1 0 1000 1000000 100 \
+                    18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0";
+        assert_eq!(parse_stat_cpu_ticks(stat), Some(23)); // 20 + 3
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_stat_no_closing_paren() {
+        assert_eq!(parse_stat_cpu_ticks("12345 (mockc S 1"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_stat_too_few_fields() {
+        // Only state through minflt — missing utime/stime
+        let stat = "12345 (mockc) S 1 12345 12345 0 -1 4194304 100 0 0 0";
+        assert_eq!(parse_stat_cpu_ticks(stat), None);
     }
 }

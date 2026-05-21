@@ -5360,10 +5360,7 @@ const PI: f64
     fn test_extract_word_exact_values() {
         let content = "fn hello_world()\nfoo bar";
         // Middle of underscore name
-        assert_eq!(
-            extract_word(content, 0, 5),
-            Some("hello_world".to_string())
-        );
+        assert_eq!(extract_word(content, 0, 5), Some("hello_world".to_string()));
         // Start of line (keyword)
         assert_eq!(extract_word(content, 0, 0), Some("fn".to_string()));
         // Second line, second word
@@ -5441,10 +5438,7 @@ const PI: f64
         let content = "let my_var: My_Type\nconst MY_CONST: Some_Type\n";
         let types = extract_types(content);
         assert_eq!(types.get("my_var").map(String::as_str), Some("My_Type"));
-        assert_eq!(
-            types.get("MY_CONST").map(String::as_str),
-            Some("Some_Type")
-        );
+        assert_eq!(types.get("MY_CONST").map(String::as_str), Some("Some_Type"));
         assert_eq!(types.len(), 2);
 
         // No type annotation → empty
@@ -5463,9 +5457,7 @@ const PI: f64
         let symbols = extract_symbols(content);
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0]["name"], "Outer");
-        let children = symbols[0]["children"]
-            .as_array()
-            .expect("children array");
+        let children = symbols[0]["children"].as_array().expect("children array");
         assert_eq!(children.len(), 1);
         assert_eq!(children[0]["name"], "inner");
         assert_eq!(children[0]["kind"], 12);
