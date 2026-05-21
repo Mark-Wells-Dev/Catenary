@@ -5323,4 +5323,191 @@ const PI: f64
             "NewImpl should not have DEPRECATED tag"
         );
     }
+
+    // ── Tests: utility function unit tests ────────────────────────
+
+    #[test]
+    fn test_extract_position_valid_and_missing() {
+        let valid = serde_json::json!({
+            "textDocument": { "uri": "file:///tmp/test.rs" },
+            "position": { "line": 5, "character": 10 }
+        });
+        assert_eq!(
+            extract_position(&valid),
+            Some(("file:///tmp/test.rs", 5, 10))
+        );
+
+        // Missing textDocument → None
+        let no_td = serde_json::json!({ "position": { "line": 0, "character": 0 } });
+        assert_eq!(extract_position(&no_td), None);
+
+        // Missing position → None
+        let no_pos = serde_json::json!({ "textDocument": { "uri": "file:///x" } });
+        assert_eq!(extract_position(&no_pos), None);
+    }
+
+    #[test]
+    fn test_location_json_all_fields() {
+        let loc = location_json("file:///tmp/test.rs", 3, 5, 10);
+        assert_eq!(loc["uri"], "file:///tmp/test.rs");
+        assert_eq!(loc["range"]["start"]["line"], 3);
+        assert_eq!(loc["range"]["start"]["character"], 5);
+        assert_eq!(loc["range"]["end"]["line"], 3);
+        assert_eq!(loc["range"]["end"]["character"], 10);
+    }
+
+    #[test]
+    fn test_extract_word_exact_values() {
+        let content = "fn hello_world()\nfoo bar";
+        // Middle of underscore name
+        assert_eq!(
+            extract_word(content, 0, 5),
+            Some("hello_world".to_string())
+        );
+        // Start of line (keyword)
+        assert_eq!(extract_word(content, 0, 0), Some("fn".to_string()));
+        // Second line, second word
+        assert_eq!(extract_word(content, 1, 4), Some("bar".to_string()));
+
+        // Boundary: col == len → None
+        assert_eq!(extract_word("hello", 0, 5), None);
+        // Boundary: col == len-1 → word
+        assert_eq!(extract_word("hello", 0, 4), Some("hello".to_string()));
+        // Non-existent line
+        assert_eq!(extract_word("hello", 1, 0), None);
+
+        // Leading non-word chars: verify start offset arithmetic
+        assert_eq!(
+            extract_word("  hello_world  ", 0, 2),
+            Some("hello_world".to_string())
+        );
+        // Non-word char at col → None
+        assert_eq!(extract_word("a b", 0, 1), None);
+    }
+
+    #[test]
+    fn test_extract_symbol_name_keyword_and_direct() {
+        let content = "fn my_func()\nstruct MyStruct";
+        // Cursor on keyword → resolve to following name
+        assert_eq!(
+            extract_symbol_name(content, 0, 0),
+            Some("my_func".to_string())
+        );
+        assert_eq!(
+            extract_symbol_name(content, 1, 0),
+            Some("MyStruct".to_string())
+        );
+        // Cursor directly on name → return name
+        assert_eq!(
+            extract_symbol_name(content, 0, 3),
+            Some("my_func".to_string())
+        );
+    }
+
+    #[test]
+    fn test_find_enclosing_function_cases() {
+        // Basic: find enclosing fn with underscore name
+        let content = "fn my_outer()\n    let x = 1\n";
+        assert_eq!(
+            find_enclosing_function(content, 1),
+            Some(("my_outer".to_string(), 0))
+        );
+
+        // Nearest: inner shadows outer
+        let content2 = "fn outer()\nfn inner()\n    body\n";
+        assert_eq!(
+            find_enclosing_function(content2, 2),
+            Some(("inner".to_string(), 1))
+        );
+
+        // None: line 0 has nothing above it
+        assert_eq!(find_enclosing_function("let x = 1\nfn foo()\n", 0), None);
+    }
+
+    #[test]
+    fn test_is_word_char_coverage() {
+        assert!(is_word_char(b'a'));
+        assert!(is_word_char(b'Z'));
+        assert!(is_word_char(b'0'));
+        assert!(is_word_char(b'_'));
+        assert!(!is_word_char(b' '));
+        assert!(!is_word_char(b'+'));
+        assert!(!is_word_char(b'('));
+    }
+
+    #[test]
+    fn test_extract_types_edge_cases() {
+        // Underscore in both name and type — kills `== → !=` on `_` checks
+        let content = "let my_var: My_Type\nconst MY_CONST: Some_Type\n";
+        let types = extract_types(content);
+        assert_eq!(types.get("my_var").map(String::as_str), Some("My_Type"));
+        assert_eq!(
+            types.get("MY_CONST").map(String::as_str),
+            Some("Some_Type")
+        );
+        assert_eq!(types.len(), 2);
+
+        // No type annotation → empty
+        let empty = extract_types("let x\nfn foo\n");
+        assert!(empty.is_empty());
+
+        // Verifies `colon_pos + 2` arithmetic
+        let single = extract_types("let x: Foo\n");
+        assert_eq!(single.get("x").map(String::as_str), Some("Foo"));
+    }
+
+    #[test]
+    fn test_extract_symbols_hierarchy_and_ranges() {
+        // Hierarchy: brace block creates parent/child
+        let content = "struct Outer {\n    fn inner()\n}\n";
+        let symbols = extract_symbols(content);
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0]["name"], "Outer");
+        let children = symbols[0]["children"]
+            .as_array()
+            .expect("children array");
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0]["name"], "inner");
+        assert_eq!(children[0]["kind"], 12);
+
+        // Indent arithmetic: verify range and selectionRange
+        // "    fn indented()" → indent=4, prefix_len=3, name_len=8
+        let indented = extract_symbols("    fn indented()\n");
+        assert_eq!(indented.len(), 1);
+        let sym = &indented[0];
+        assert_eq!(sym["range"]["start"]["character"], 4);
+        assert_eq!(sym["selectionRange"]["start"]["character"], 7); // 4 + 3
+        assert_eq!(sym["selectionRange"]["end"]["character"], 15); // 7 + 8
+
+        // Underscore names — kills `|| → &&` and `== → !=` on `_`
+        let underscore = extract_symbols("fn my_func\nlet my_var\n");
+        let names: Vec<&str> = underscore
+            .iter()
+            .filter_map(|s| s["name"].as_str())
+            .collect();
+        assert!(names.contains(&"my_func"));
+        assert!(names.contains(&"my_var"));
+    }
+
+    #[test]
+    fn test_parse_symbol_line_exhaustive() {
+        assert_eq!(parse_symbol_line("fn foo"), Some((12, 3)));
+        assert_eq!(parse_symbol_line("function foo"), Some((12, 9)));
+        assert_eq!(parse_symbol_line("def foo"), Some((12, 4)));
+        assert_eq!(parse_symbol_line("let x"), Some((13, 4)));
+        assert_eq!(parse_symbol_line("const X"), Some((14, 6)));
+        assert_eq!(parse_symbol_line("var x"), Some((13, 4)));
+        assert_eq!(parse_symbol_line("struct S"), Some((23, 7)));
+        assert_eq!(parse_symbol_line("class C"), Some((5, 6)));
+        assert_eq!(parse_symbol_line("enum E"), Some((10, 5)));
+        assert_eq!(parse_symbol_line("interface I"), Some((11, 10)));
+        assert_eq!(parse_symbol_line("trait T"), Some((11, 6)));
+        assert_eq!(parse_symbol_line("mod m"), Some((2, 4)));
+        assert_eq!(parse_symbol_line("module m"), Some((2, 7)));
+        assert_eq!(parse_symbol_line("type T"), Some((26, 5)));
+        assert_eq!(parse_symbol_line("method m"), Some((6, 7)));
+        assert_eq!(parse_symbol_line("field f"), Some((8, 6)));
+        assert_eq!(parse_symbol_line("unknown"), None);
+        assert_eq!(parse_symbol_line(""), None);
+    }
 }
