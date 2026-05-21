@@ -1133,4 +1133,255 @@ mod tests {
             Some("UserPromptSubmit"),
         );
     }
+
+    // ── IPC server tests ─────────────────────────────────────────────
+
+    use crate::bridge::session::Session;
+    use crate::config::Config;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Open an isolated test database in a tempdir.
+    fn test_db() -> (tempfile::TempDir, std::path::PathBuf, rusqlite::Connection) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("catenary").join("catenary.db");
+        let conn = crate::db::open_and_migrate_at(&path).expect("open test DB");
+        (dir, path, conn)
+    }
+
+    /// Shared test context holding a `HookServer`, the underlying
+    /// `Session`, and all lifetime-bound resources.
+    struct TestHookServer {
+        server: Option<HookServer>,
+        session: Arc<Session>,
+        _db_dir: tempfile::TempDir,
+    }
+
+    /// Create a `HookServer` backed by an in-memory session.
+    ///
+    /// The `Session` has no LSP servers but a functional notification
+    /// router and config version counter — enough to exercise the IPC
+    /// dispatch and root sync paths.
+    fn test_hook_server() -> TestHookServer {
+        let (db_dir, _path, conn) = test_db();
+        let conn = Arc::new(std::sync::Mutex::new(conn));
+
+        conn.lock()
+            .expect("lock")
+            .execute(
+                "INSERT INTO sessions (id, pid, display_name, started_at) \
+                 VALUES ('test-session', 1, 'test', '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .expect("insert session");
+
+        let config = Config::default();
+        let logging = crate::logging::LoggingServer::new();
+        let handle = tokio::runtime::Handle::current();
+        let instance_id: Arc<str> = "test-session".into();
+        let notification_router = Arc::new(
+            crate::logging::notification_router::NotificationRouter::new(
+                crate::logging::Severity::Warn,
+            ),
+        );
+        notification_router.register_session(&instance_id);
+
+        let session = Arc::new(Session::new(
+            config,
+            vec![],
+            logging,
+            conn.clone(),
+            instance_id.clone(),
+            handle,
+            notification_router,
+        ));
+        let server = HookServer::new(session.clone(), conn, instance_id, "test".to_string());
+
+        TestHookServer {
+            server: Some(server),
+            session,
+            _db_dir: db_dir,
+        }
+    }
+
+    /// Create a real directory so `canonicalize` succeeds.
+    fn make_dir(base: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let dir = base.join(name);
+        std::fs::create_dir_all(&dir).expect("create dir");
+        dir.canonicalize().expect("canonicalize")
+    }
+
+    /// Write a transcript JSONL file with the given lines.
+    fn write_transcript(dir: &std::path::Path, lines: &[&str]) -> std::path::PathBuf {
+        let path = dir.join("transcript.jsonl");
+        std::fs::write(&path, lines.join("\n")).expect("write transcript");
+        path
+    }
+
+    /// Send a JSON request through a duplex stream and run
+    /// `handle_connection` on the server side. Returns the response.
+    async fn ipc_exchange(server: &Arc<HookServer>, request: &str) -> String {
+        let (mut client, server_side) = tokio::io::duplex(4096);
+
+        let server_clone = server.clone();
+        let req = format!("{request}\n");
+        let handle = tokio::spawn(async move {
+            server_clone
+                .handle_connection(server_side)
+                .await
+                .expect("handle_connection");
+        });
+
+        client
+            .write_all(req.as_bytes())
+            .await
+            .expect("write request");
+
+        handle.await.expect("join");
+
+        let mut response = String::new();
+        client
+            .read_to_string(&mut response)
+            .await
+            .expect("read response");
+        response
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn start_accepts_and_processes_connection() {
+        let mut ctx = test_hook_server();
+        let server = ctx.server.take().expect("server");
+
+        let sock_dir = tempfile::tempdir().expect("sock_dir");
+        let socket_path = sock_dir.path().join("hook.sock");
+
+        let _handle = server.start(&socket_path).expect("start");
+
+        // Give the listener a moment to bind.
+        tokio::task::yield_now().await;
+
+        let mut stream = tokio::net::UnixStream::connect(&socket_path)
+            .await
+            .expect("connect to hook socket");
+
+        // Send a session-start request (handler returns empty envelope
+        // when there is no editing state and no pending notifications).
+        let request = r#"{"method": "session-start/clear-editing"}"#;
+        stream
+            .write_all(format!("{request}\n").as_bytes())
+            .await
+            .expect("write request");
+        stream.shutdown().await.expect("shutdown write");
+
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .await
+            .expect("read response");
+
+        // handle_connection always writes a trailing newline, even for
+        // empty (allow) responses.
+        assert!(
+            response.ends_with('\n'),
+            "expected response ending with newline, got: {response:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_connection_processes_request() {
+        let ctx = test_hook_server();
+        let server = Arc::new(ctx.server.expect("server"));
+
+        let response = ipc_exchange(&server, r#"{"method": "session-start/clear-editing"}"#).await;
+
+        // handle_connection always writes a trailing newline, even for
+        // empty (allow) responses.
+        assert!(
+            response.ends_with('\n'),
+            "expected response ending with newline, got: {response:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_connection_syncs_transcript_roots() {
+        let ctx = test_hook_server();
+        let server = Arc::new(ctx.server.expect("server"));
+        let session = ctx.session.clone();
+
+        // Verify session starts with no roots.
+        assert!(
+            session.roots().is_empty(),
+            "session should start with no roots"
+        );
+
+        // Create a directory and transcript for /add-dir detection.
+        let work_dir = tempfile::tempdir().expect("work_dir");
+        let new_root = make_dir(work_dir.path(), "project");
+        let line = format!(
+            r#"{{"message":"Added \u001b[1m{}\u001b[22m as a working directory"}}"#,
+            new_root.display()
+        );
+        let transcript = write_transcript(work_dir.path(), &[&line]);
+
+        let request = serde_json::json!({
+            "method": "pre-agent/turn-start",
+            "transcript_path": transcript.to_string_lossy(),
+        })
+        .to_string();
+
+        ipc_exchange(&server, &request).await;
+
+        // sync_roots should have added the transcript-discovered root.
+        let roots = session.roots();
+        assert!(
+            roots.contains(&new_root),
+            "session roots should include transcript root {new_root:?}, got {roots:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_connection_skips_sync_when_no_new_roots() {
+        let ctx = test_hook_server();
+        let server = Arc::new(ctx.server.expect("server"));
+        let session = ctx.session.clone();
+
+        // Pre-populate the session with a root via sync_roots.
+        let work_dir = tempfile::tempdir().expect("work_dir");
+        let existing_root = make_dir(work_dir.path(), "existing");
+        session
+            .sync_roots(vec![existing_root.clone()])
+            .await
+            .expect("initial sync_roots");
+
+        // sync_roots bumps config_version — record the baseline.
+        let version_after_setup = session
+            .config_version
+            .load(std::sync::atomic::Ordering::Acquire);
+
+        // Create a transcript referencing the same root (already present).
+        let line = format!(
+            r#"{{"message":"Added \u001b[1m{}\u001b[22m as a working directory"}}"#,
+            existing_root.display()
+        );
+        let transcript = write_transcript(work_dir.path(), &[&line]);
+
+        let request = serde_json::json!({
+            "method": "pre-agent/turn-start",
+            "transcript_path": transcript.to_string_lossy(),
+        })
+        .to_string();
+
+        ipc_exchange(&server, &request).await;
+
+        // No new roots were added, so sync_roots should NOT have been
+        // called. config_version must remain unchanged.
+        let version_after = session
+            .config_version
+            .load(std::sync::atomic::Ordering::Acquire);
+        assert_eq!(
+            version_after, version_after_setup,
+            "config_version should not change when no new roots are added \
+             (was {version_after_setup}, now {version_after})",
+        );
+    }
 }
