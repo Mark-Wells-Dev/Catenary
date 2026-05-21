@@ -14,4 +14,4 @@ which language server handles which file.
 - [Notifications](notifications.md) — user-facing notifications via `systemMessage`
 - [CLI & Dashboard](cli.md) — monitor sessions and browse events
 - [Tracing Conventions](tracing-conventions.md) — severity guidelines and structured fields
-- [Language Servers](/lsp/README.md) — per-language setup guides
+- [Language Servers](lsp/README.md) — per-language setup guides
