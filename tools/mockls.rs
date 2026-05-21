@@ -12,7 +12,7 @@
 //! `--no-code-actions` omits the `codeActionProvider` capability entirely.
 //! `--multi-fix` returns two quickfix actions per diagnostic.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -287,7 +287,7 @@ impl Write for SharedVecWriter {
 /// Shared state for the mock server.
 struct MockServer {
     args: Args,
-    documents: HashMap<String, String>,
+    documents: BTreeMap<String, String>,
     /// Mock type map: `symbol_name → type_name` extracted from `: TypeName` annotations.
     types: HashMap<String, String>,
     /// Import map: `(document_uri, imported_name) → source_file_fragment`.
@@ -316,7 +316,7 @@ impl MockServer {
 
         Self {
             args,
-            documents: HashMap::new(),
+            documents: BTreeMap::new(),
             types: HashMap::new(),
             imports: HashMap::new(),
             versions: HashMap::new(),
@@ -3167,7 +3167,11 @@ const PI: f64
     #[test]
     fn test_mockls_supertypes() {
         let uri = "file:///tmp/hierarchy.yX4Za";
-        let text = "interface Animal\nclass Dog extends Animal\n";
+        // Trailing " {" after type names kills the `== → !=` mutant
+        // on `*c == '_'` in the `take_while` predicates.
+        // Line 0: "interface Animal {"  (len=18)
+        // Line 1: "class Dog extends Animal {"  (len=26)
+        let text = "interface Animal {\nclass Dog extends Animal {\n";
 
         let mut input = frame(&initialize_request(1));
         input.extend(frame(&did_open_notification(uri, text)));
@@ -3186,6 +3190,13 @@ const PI: f64
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["name"], "Dog");
         assert_eq!(items[0]["kind"], 5); // Class
+        assert_eq!(items[0]["uri"], uri);
+        assert_eq!(items[0]["range"]["start"]["line"], 1);
+        assert_eq!(items[0]["range"]["start"]["character"], 0);
+        assert_eq!(items[0]["range"]["end"]["line"], 1);
+        assert_eq!(items[0]["range"]["end"]["character"], 26);
+        assert_eq!(items[0]["selectionRange"]["start"]["line"], 1);
+        assert_eq!(items[0]["selectionRange"]["end"]["character"], 26);
 
         // Now request supertypes using the prepared item
         let dog_item = &items[0];
@@ -3207,13 +3218,25 @@ const PI: f64
         assert_eq!(parents[0]["kind"], 11); // Interface
         assert_eq!(parents[0]["uri"], uri);
         assert_eq!(parents[0]["range"]["start"]["line"], 0);
+        assert_eq!(parents[0]["range"]["start"]["character"], 0);
+        assert_eq!(parents[0]["range"]["end"]["line"], 0);
+        assert_eq!(parents[0]["range"]["end"]["character"], 18);
+        assert_eq!(parents[0]["selectionRange"]["start"]["line"], 0);
+        assert_eq!(parents[0]["selectionRange"]["end"]["character"], 18);
     }
 
     #[test]
     fn test_mockls_subtypes() {
         let uri = "file:///tmp/hierarchy.yX4Za";
-        // Dog and Cat extend Animal; Car extends Vehicle (should not appear)
-        let text = "interface Animal\nstruct Dog extends Animal\nclass Cat implements Animal\ninterface Vehicle\nclass Car extends Vehicle\n";
+        // Trailing " {" after parent names forces the `take_while`
+        // predicate to stop at ' ', killing the `== → !=` mutant
+        // on `*c == '_'` (which would otherwise over-collect).
+        // Line 0: "interface Animal"              (len=16)
+        // Line 1: "struct Dog extends Animal {"    (len=27)
+        // Line 2: "class Cat implements Animal {"  (len=29)
+        // Line 3: "interface Vehicle"              (len=17)
+        // Line 4: "class Car extends Vehicle {"    (len=27)
+        let text = "interface Animal\nstruct Dog extends Animal {\nclass Cat implements Animal {\ninterface Vehicle\nclass Car extends Vehicle {\n";
 
         let mut input = frame(&initialize_request(1));
         input.extend(frame(&did_open_notification(uri, text)));
@@ -3230,6 +3253,7 @@ const PI: f64
         assert!(prepare["error"].is_null(), "Expected no error");
         let items = prepare["result"].as_array().expect("result array");
         assert_eq!(items[0]["name"], "Animal");
+        assert_eq!(items[0]["kind"], 11); // Interface
 
         // Now request subtypes
         let animal_item = &items[0];
@@ -3248,11 +3272,33 @@ const PI: f64
         let children = subtypes["result"].as_array().expect("result array");
         assert_eq!(children.len(), 2, "Expected exactly 2 subtypes of Animal");
 
-        let names: Vec<&str> = children.iter().filter_map(|c| c["name"].as_str()).collect();
-        assert!(names.contains(&"Dog"), "Expected Dog in subtypes");
-        assert!(names.contains(&"Cat"), "Expected Cat in subtypes");
+        let dog = children
+            .iter()
+            .find(|c| c["name"] == "Dog")
+            .expect("Dog in subtypes");
+        assert_eq!(dog["kind"], 23, "Dog is a struct (kind 23)");
+        assert_eq!(dog["uri"], uri);
+        assert_eq!(dog["range"]["start"]["line"], 1);
+        assert_eq!(dog["range"]["start"]["character"], 0);
+        assert_eq!(dog["range"]["end"]["character"], 27);
+        assert_eq!(dog["selectionRange"]["start"]["line"], 1);
+        assert_eq!(dog["selectionRange"]["end"]["character"], 27);
+
+        let cat = children
+            .iter()
+            .find(|c| c["name"] == "Cat")
+            .expect("Cat in subtypes");
+        assert_eq!(cat["kind"], 5, "Cat is a class (kind 5)");
+        assert_eq!(cat["uri"], uri);
+        assert_eq!(cat["range"]["start"]["line"], 2);
+        assert_eq!(cat["range"]["end"]["character"], 29);
+
+        // Car extends Vehicle, not Animal — must not appear
         assert!(
-            !names.contains(&"Car"),
+            !children
+                .iter()
+                .filter_map(|c| c["name"].as_str())
+                .any(|n| n == "Car"),
             "Car should not be a subtype of Animal"
         );
     }
@@ -3260,6 +3306,9 @@ const PI: f64
     #[test]
     fn test_mockls_outgoing_calls() {
         let uri = "file:///tmp/calls.yX4Za";
+        // Line 0: "fn helper()"  (len=11)
+        // Line 1: "fn caller()"  (len=11)
+        // Line 2: "    helper"   (len=10)
         let text = "fn helper()\nfn caller()\n    helper\n";
 
         let mut input = frame(&initialize_request(1));
@@ -3296,10 +3345,27 @@ const PI: f64
         assert_eq!(calls.len(), 1, "Expected 1 outgoing call");
         assert_eq!(calls[0]["to"]["name"], "helper");
         assert_eq!(calls[0]["to"]["kind"], 12); // Function
+        assert_eq!(calls[0]["to"]["uri"], uri);
+        assert_eq!(
+            calls[0]["to"]["range"]["start"]["line"], 0,
+            "helper is declared on line 0"
+        );
+        assert_eq!(calls[0]["to"]["range"]["start"]["character"], 0);
+        assert_eq!(
+            calls[0]["to"]["range"]["end"]["character"], 11,
+            "end = len(\"fn helper()\")"
+        );
+        assert_eq!(calls[0]["to"]["selectionRange"]["start"]["line"], 0);
+        assert_eq!(calls[0]["to"]["selectionRange"]["end"]["character"], 11);
 
         let from_ranges = calls[0]["fromRanges"].as_array().expect("fromRanges");
-        assert!(!from_ranges.is_empty(), "Expected at least one fromRange");
-        assert_eq!(from_ranges[0]["start"]["line"], 2); // Line where helper is called
+        assert_eq!(from_ranges.len(), 1, "Expected exactly one fromRange");
+        assert_eq!(from_ranges[0]["start"]["line"], 2);
+        assert_eq!(from_ranges[0]["start"]["character"], 0);
+        assert_eq!(
+            from_ranges[0]["end"]["character"], 10,
+            "end = len(\"    helper\")"
+        );
     }
 
     #[test]
@@ -4800,6 +4866,461 @@ const PI: f64
         assert!(
             entry.get("changes").is_none(),
             "didOpen should not have changes field"
+        );
+    }
+
+    // ── Tests: scan_directory + rebuild_imports ────────────────────
+
+    /// `scan_directory` indexes `.{name}` files from disk, skipping
+    /// hidden dirs and non-matching extensions. Exercises both the
+    /// extension filter (`== Some(name)`) and the body itself.
+    #[test]
+    fn test_scan_directory_indexes_matching_files() {
+        let dir = std::env::temp_dir().join(format!("mockls_scan_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".hidden")).expect("create hidden dir");
+        std::fs::create_dir_all(dir.join("sub")).expect("create sub dir");
+
+        // Matching files
+        std::fs::write(dir.join(format!("a.{MOCK_LANG_A}")), "fn alpha()\n").expect("write a.mock");
+        std::fs::write(dir.join(format!("sub/b.{MOCK_LANG_A}")), "fn beta()\n")
+            .expect("write sub/b.mock");
+
+        // Non-matching: wrong extension
+        std::fs::write(dir.join("c.txt"), "fn gamma()\n").expect("write c.txt");
+
+        // Hidden directory: should be skipped
+        std::fs::write(dir.join(format!(".hidden/d.{MOCK_LANG_A}")), "fn delta()\n")
+            .expect("write hidden mock");
+
+        let dir_str = dir.to_str().expect("valid path");
+        let root_uri = format!("file://{dir_str}");
+        let init_req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "processId": null,
+                "capabilities": {},
+                "rootUri": root_uri
+            }
+        })
+        .to_string();
+
+        let ws_sym_req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "workspace/symbol",
+            "params": { "query": "" }
+        })
+        .to_string();
+
+        let mut input = frame(&init_req);
+        input.extend(frame(&ws_sym_req));
+        input.extend(frame(&shutdown_request(99)));
+
+        let mut args = default_args();
+        args.scan_roots = true;
+        let messages = run_server_with(args, &input);
+
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let ws_resp = messages
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(2))
+            .expect("workspace/symbol response with id=2");
+        let syms = ws_resp["result"].as_array().expect("result array");
+
+        let names: Vec<&str> = syms.iter().filter_map(|s| s["name"].as_str()).collect();
+        assert!(
+            names.contains(&"alpha"),
+            "alpha from a.mock should be indexed"
+        );
+        assert!(
+            names.contains(&"beta"),
+            "beta from sub/b.mock should be indexed"
+        );
+        assert!(
+            !names.contains(&"gamma"),
+            "gamma from c.txt (wrong extension) should not be indexed"
+        );
+        assert!(
+            !names.contains(&"delta"),
+            "delta from .hidden/ should not be indexed"
+        );
+    }
+
+    /// `rebuild_imports` populates the import map so that definition
+    /// requests resolve via import scope rather than cross-file fallback.
+    /// `documents` is a `BTreeMap`, so cross-file search visits keys in
+    /// sorted order. The wrong target (`aaa`) sorts before the import
+    /// target (`zzz`), so a no-op `rebuild_imports` deterministically
+    /// resolves to the wrong file.
+    #[test]
+    fn test_rebuild_imports_scoped_resolution() {
+        // Wrong target — sorts first in BTreeMap iteration
+        let uri_wrong = "file:///tmp/aaa.yX4Za";
+        let text_wrong = "fn helper()\n";
+
+        // Correct target — sorts last
+        let uri_right = "file:///tmp/zzz.yX4Za";
+        let text_right = "fn helper()\n";
+
+        // Caller imports from zzz specifically
+        let uri_caller = "file:///tmp/caller.yX4Za";
+        let text_caller = "from zzz import helper\nhelper\n";
+
+        let mut input = frame(&initialize_request(1));
+        input.extend(frame(&did_open_notification(uri_wrong, text_wrong)));
+        input.extend(frame(&did_open_notification(uri_right, text_right)));
+        input.extend(frame(&did_open_notification(uri_caller, text_caller)));
+        // Definition on 'helper' in caller (line 1, col 0)
+        input.extend(frame(&definition_request(2, uri_caller, 1, 0)));
+        input.extend(frame(&shutdown_request(99)));
+
+        let messages = run_server_with(default_args(), &input);
+
+        let def = messages
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(2))
+            .expect("definition response with id=2");
+        assert!(def["error"].is_null(), "Expected no error");
+        assert_eq!(
+            def["result"]["uri"], uri_right,
+            "Import should resolve to zzz, not cross-file fallback to aaa"
+        );
+    }
+
+    // ── Tests: type hierarchy edge cases ──────────────────────────
+
+    /// `handle_type_hierarchy_prepare` maps type keywords to correct
+    /// LSP symbol kinds. Exercises the kind-mapping branches.
+    #[test]
+    fn test_type_hierarchy_prepare_kind_mapping() {
+        let uri = "file:///tmp/kinds.yX4Za";
+        // Line 0: "interface Iface"   kind=11
+        // Line 1: "trait Tr"          kind=11
+        // Line 2: "class Cls"         kind=5
+        // Line 3: "enum En"           kind=10
+        // Line 4: "struct St"         kind=23 (fallback)
+        let text = "interface Iface\ntrait Tr\nclass Cls\nenum En\nstruct St\n";
+
+        let cases: &[(u64, u64, &str, u64)] = &[
+            (0, 10, "Iface", 11), // interface
+            (1, 6, "Tr", 11),     // trait
+            (2, 6, "Cls", 5),     // class
+            (3, 5, "En", 10),     // enum
+            (4, 7, "St", 23),     // struct (fallback kind)
+        ];
+
+        for (line, col, expected_name, expected_kind) in cases {
+            let mut input = frame(&initialize_request(1));
+            input.extend(frame(&did_open_notification(uri, text)));
+            input.extend(frame(&prepare_type_hierarchy_request(2, uri, *line, *col)));
+            input.extend(frame(&shutdown_request(99)));
+
+            let messages = run_server_with(default_args(), &input);
+
+            let resp = messages
+                .iter()
+                .find(|m| m.get("id").and_then(Value::as_u64) == Some(2))
+                .expect("prepareTypeHierarchy response");
+            let items = resp["result"].as_array().expect("result array");
+            assert_eq!(items.len(), 1, "line {line}");
+            assert_eq!(
+                items[0]["name"], *expected_name,
+                "name mismatch on line {line}"
+            );
+            assert_eq!(
+                items[0]["kind"], *expected_kind,
+                "kind mismatch on line {line} for {expected_name}"
+            );
+        }
+    }
+
+    /// Subtypes from multiple documents: `find_type_declaration` must
+    /// locate the parent across files and return correct uri/line/kind.
+    /// Trailing ` {` after type names kills `== → !=` mutants on the
+    /// `take_while` predicates in both the supertypes handler and
+    /// `find_type_declaration`.
+    #[test]
+    fn test_supertypes_cross_file() {
+        // Parent type in one document
+        let uri_base = "file:///tmp/base.yX4Za";
+        let text_base = "trait Serializable {\n";
+
+        // Child type in another document
+        let uri_child = "file:///tmp/child.yX4Za";
+        // Line 0: "class JsonCodec implements Serializable {" (len=42)
+        let text_child = "class JsonCodec implements Serializable {\n";
+
+        let mut input = frame(&initialize_request(1));
+        input.extend(frame(&did_open_notification(uri_base, text_base)));
+        input.extend(frame(&did_open_notification(uri_child, text_child)));
+        // Prepare on "JsonCodec" (line 0, char 6)
+        input.extend(frame(&prepare_type_hierarchy_request(2, uri_child, 0, 6)));
+        input.extend(frame(&shutdown_request(99)));
+
+        let messages = run_server_with(default_args(), &input);
+
+        let prepare = messages
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(2))
+            .expect("prepareTypeHierarchy response");
+        let items = prepare["result"].as_array().expect("result array");
+        assert_eq!(items[0]["name"], "JsonCodec");
+
+        // Request supertypes
+        let codec_item = &items[0];
+        let mut input2 = frame(&initialize_request(10));
+        input2.extend(frame(&did_open_notification(uri_base, text_base)));
+        input2.extend(frame(&did_open_notification(uri_child, text_child)));
+        input2.extend(frame(&supertypes_request(11, codec_item)));
+        input2.extend(frame(&shutdown_request(99)));
+
+        let messages2 = run_server_with(default_args(), &input2);
+
+        let supertypes = messages2
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(11))
+            .expect("supertypes response");
+        let parents = supertypes["result"].as_array().expect("result array");
+        assert_eq!(parents.len(), 1);
+        assert_eq!(parents[0]["name"], "Serializable");
+        assert_eq!(parents[0]["kind"], 11, "trait maps to kind 11");
+        assert_eq!(
+            parents[0]["uri"], uri_base,
+            "parent declaration is in base.yX4Za"
+        );
+        assert_eq!(parents[0]["range"]["start"]["line"], 0);
+        assert_eq!(parents[0]["range"]["start"]["character"], 0);
+        assert_eq!(
+            parents[0]["range"]["end"]["character"], 20,
+            "end = len(\"trait Serializable {{\")"
+        );
+        assert_eq!(parents[0]["selectionRange"]["start"]["line"], 0);
+        assert_eq!(parents[0]["selectionRange"]["end"]["character"], 20);
+    }
+
+    /// Supertypes synthetic entry: when the parent type is not found
+    /// in any document, a synthetic entry is returned with the child's
+    /// location and kind=5.
+    #[test]
+    fn test_supertypes_synthetic_when_parent_missing() {
+        let uri = "file:///tmp/orphan.yX4Za";
+        // Line 0: "class Orphan extends Unknown" (len=28)
+        let text = "class Orphan extends Unknown\n";
+
+        let mut input = frame(&initialize_request(1));
+        input.extend(frame(&did_open_notification(uri, text)));
+        input.extend(frame(&prepare_type_hierarchy_request(2, uri, 0, 6)));
+        input.extend(frame(&shutdown_request(99)));
+
+        let messages = run_server_with(default_args(), &input);
+        let prepare = messages
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(2))
+            .expect("prepare response");
+        let items = prepare["result"].as_array().expect("result array");
+
+        let orphan_item = &items[0];
+        let mut input2 = frame(&initialize_request(10));
+        input2.extend(frame(&did_open_notification(uri, text)));
+        input2.extend(frame(&supertypes_request(11, orphan_item)));
+        input2.extend(frame(&shutdown_request(99)));
+
+        let messages2 = run_server_with(default_args(), &input2);
+        let supertypes = messages2
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(11))
+            .expect("supertypes response");
+        let parents = supertypes["result"].as_array().expect("result array");
+        assert_eq!(parents.len(), 1);
+        assert_eq!(parents[0]["name"], "Unknown");
+        assert_eq!(
+            parents[0]["kind"], 5,
+            "synthetic parent gets default kind 5 (class)"
+        );
+        assert_eq!(parents[0]["uri"], uri, "synthetic parent uses child's URI");
+        assert_eq!(
+            parents[0]["range"]["start"]["line"], 0,
+            "synthetic parent uses child's line"
+        );
+    }
+
+    // ── Tests: outgoing calls edge cases ──────────────────────────
+
+    /// Outgoing calls across files: the callee is defined in a
+    /// different document. Verifies `to.uri` points to the correct
+    /// file and `to.range` reflects the callee's declaration line.
+    ///
+    /// The caller's declaration line mentions "utility" in a comment
+    /// so that `(caller_line * 1)..body_end` (which includes the
+    /// declaration line) produces an extra `fromRange` — killing the
+    /// `replace + with *` mutant on the for-loop range.
+    #[test]
+    fn test_outgoing_calls_cross_file() {
+        let uri_lib = "file:///tmp/lib.yX4Za";
+        // Line 0: "fn utility()"  (len=12)
+        let text_lib = "fn utility()\n";
+
+        let uri_main = "file:///tmp/main.yX4Za";
+        // Line 0: "fn entry() -- utility"  (len=21, mentions callee)
+        // Line 1: "    utility"            (len=11)
+        let text_main = "fn entry() -- utility\n    utility\n";
+
+        let mut input = frame(&initialize_request(1));
+        input.extend(frame(&did_open_notification(uri_lib, text_lib)));
+        input.extend(frame(&did_open_notification(uri_main, text_main)));
+        input.extend(frame(&prepare_call_hierarchy_request(2, uri_main, 0, 3)));
+        input.extend(frame(&shutdown_request(99)));
+
+        let messages = run_server_with(default_args(), &input);
+        let prepare = messages
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(2))
+            .expect("prepareCallHierarchy response");
+        let items = prepare["result"].as_array().expect("result array");
+        assert_eq!(items[0]["name"], "entry");
+
+        let entry_item = &items[0];
+        let mut input2 = frame(&initialize_request(10));
+        input2.extend(frame(&did_open_notification(uri_lib, text_lib)));
+        input2.extend(frame(&did_open_notification(uri_main, text_main)));
+        input2.extend(frame(&outgoing_calls_request(11, entry_item)));
+        input2.extend(frame(&shutdown_request(99)));
+
+        let messages2 = run_server_with(default_args(), &input2);
+        let outgoing = messages2
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(11))
+            .expect("outgoingCalls response");
+        let calls = outgoing["result"].as_array().expect("result array");
+        assert_eq!(calls.len(), 1, "entry calls utility");
+        assert_eq!(calls[0]["to"]["name"], "utility");
+        assert_eq!(
+            calls[0]["to"]["uri"], uri_lib,
+            "utility is defined in lib.yX4Za"
+        );
+        assert_eq!(calls[0]["to"]["range"]["start"]["line"], 0);
+        assert_eq!(
+            calls[0]["to"]["range"]["end"]["character"], 12,
+            "end = len(\"fn utility()\")"
+        );
+        assert_eq!(calls[0]["to"]["selectionRange"]["start"]["character"], 0);
+        assert_eq!(calls[0]["to"]["selectionRange"]["end"]["character"], 12);
+
+        let from_ranges = calls[0]["fromRanges"].as_array().expect("fromRanges");
+        assert_eq!(
+            from_ranges.len(),
+            1,
+            "only the body call site, not the declaration line"
+        );
+        assert_eq!(from_ranges[0]["start"]["line"], 1);
+        assert_eq!(from_ranges[0]["end"]["character"], 11);
+    }
+
+    /// Outgoing calls: the caller's own name must not appear in results
+    /// (even if the body mentions it). Also verifies multiple call sites
+    /// produce multiple fromRanges.
+    #[test]
+    fn test_outgoing_calls_excludes_self_and_multiple_ranges() {
+        let uri = "file:///tmp/multi.yX4Za";
+        // Line 0: "fn worker()"  (len=11)
+        // Line 1: "fn boss()"    (len=9)
+        // Line 2: "    worker"   (len=10) — first call
+        // Line 3: "    boss"     (len=8) — recursive mention (should be excluded)
+        // Line 4: "    worker"   (len=10) — second call
+        let text = "fn worker()\nfn boss()\n    worker\n    boss\n    worker\n";
+
+        let mut input = frame(&initialize_request(1));
+        input.extend(frame(&did_open_notification(uri, text)));
+        input.extend(frame(&prepare_call_hierarchy_request(2, uri, 1, 3)));
+        input.extend(frame(&shutdown_request(99)));
+
+        let messages = run_server_with(default_args(), &input);
+        let prepare = messages
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(2))
+            .expect("prepare response");
+        let items = prepare["result"].as_array().expect("result array");
+        assert_eq!(items[0]["name"], "boss");
+
+        let boss_item = &items[0];
+        let mut input2 = frame(&initialize_request(10));
+        input2.extend(frame(&did_open_notification(uri, text)));
+        input2.extend(frame(&outgoing_calls_request(11, boss_item)));
+        input2.extend(frame(&shutdown_request(99)));
+
+        let messages2 = run_server_with(default_args(), &input2);
+        let outgoing = messages2
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(11))
+            .expect("outgoingCalls response");
+        let calls = outgoing["result"].as_array().expect("result array");
+        assert_eq!(calls.len(), 1, "only worker, not boss (self-exclusion)");
+        assert_eq!(calls[0]["to"]["name"], "worker");
+
+        let from_ranges = calls[0]["fromRanges"].as_array().expect("fromRanges");
+        assert_eq!(from_ranges.len(), 2, "worker called twice from boss body");
+        assert_eq!(from_ranges[0]["start"]["line"], 2);
+        assert_eq!(from_ranges[1]["start"]["line"], 4);
+    }
+
+    /// Deprecated tags propagate through type hierarchy subtypes and
+    /// outgoing calls. Exercises the `@deprecated` annotation checks
+    /// in `handle_type_hierarchy_subtypes` and `handle_outgoing_calls`.
+    #[test]
+    fn test_deprecated_propagation_subtypes_and_calls() {
+        let uri = "file:///tmp/dep.yX4Za";
+        // Line 0: "interface Base"
+        // Line 1: "class OldImpl implements Base @deprecated"  (len=41)
+        // Line 2: "class NewImpl implements Base"              (len=29)
+        let text = "interface Base\nclass OldImpl implements Base @deprecated\nclass NewImpl implements Base\n";
+
+        let mut input = frame(&initialize_request(1));
+        input.extend(frame(&did_open_notification(uri, text)));
+        input.extend(frame(&prepare_type_hierarchy_request(2, uri, 0, 10)));
+        input.extend(frame(&shutdown_request(99)));
+
+        let messages = run_server_with(default_args(), &input);
+        let prepare = messages
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(2))
+            .expect("prepare response");
+        let items = prepare["result"].as_array().expect("result array");
+
+        let base_item = &items[0];
+        let mut input2 = frame(&initialize_request(10));
+        input2.extend(frame(&did_open_notification(uri, text)));
+        input2.extend(frame(&subtypes_request(11, base_item)));
+        input2.extend(frame(&shutdown_request(99)));
+
+        let messages2 = run_server_with(default_args(), &input2);
+        let subtypes = messages2
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(11))
+            .expect("subtypes response");
+        let children = subtypes["result"].as_array().expect("result array");
+        assert_eq!(children.len(), 2);
+
+        let old_impl = children
+            .iter()
+            .find(|c| c["name"] == "OldImpl")
+            .expect("OldImpl");
+        assert_eq!(
+            old_impl["tags"],
+            serde_json::json!([1]),
+            "OldImpl should have DEPRECATED tag"
+        );
+
+        let new_impl = children
+            .iter()
+            .find(|c| c["name"] == "NewImpl")
+            .expect("NewImpl");
+        assert!(
+            new_impl.get("tags").is_none() || new_impl["tags"].is_null(),
+            "NewImpl should not have DEPRECATED tag"
         );
     }
 }
