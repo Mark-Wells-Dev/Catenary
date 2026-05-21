@@ -3,8 +3,8 @@
 
 //! Interactive TUI for monitoring sessions and tailing events.
 //!
-//! Placeholder for the v2 rewrite: renders a centered message and
-//! quits on `q`.
+//! Renders a unified chronological message stream with per-session hex
+//! badges, scrolling, severity toggle, and a scrollbar.
 
 pub mod app;
 pub mod category;
@@ -35,16 +35,13 @@ use crossterm::terminal::{
 use notify::Watcher;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Layout};
-use ratatui::style::{Color, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
 use tracing::info;
 
 use crate::config::IconConfig;
 
 use self::data::SqliteDataSource;
 use self::icons::IconSet;
+use self::stream::render_stream;
 use self::theme::Theme;
 
 /// Tick interval for the event loop.
@@ -149,38 +146,21 @@ fn run_with_data_and_watcher(
     result
 }
 
-/// Main event loop — placeholder renders centered message, quits on `q`.
+/// Main event loop — renders unified message stream, handles input.
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App<'_>,
-    _wal_rx: Option<&mpsc::Receiver<()>>,
+    wal_rx: Option<&mpsc::Receiver<()>>,
 ) -> Result<()> {
     let mut last_tick = Instant::now();
 
     loop {
+        let viewport_height = terminal.size()?.height as usize;
+        app.stream.apply_auto_scroll(viewport_height);
+
         terminal.draw(|f| {
             let area = f.area();
-
-            let vertical = Layout::vertical([
-                Constraint::Fill(1),
-                Constraint::Length(1),
-                Constraint::Fill(1),
-            ])
-            .split(area);
-
-            let horizontal =
-                Layout::horizontal([Constraint::Fill(1), Constraint::Min(0), Constraint::Fill(1)])
-                    .split(vertical[1]);
-
-            let block = Block::default().borders(Borders::ALL);
-            f.render_widget(block, area);
-
-            let text = Line::from(vec![
-                Span::styled("TUI v2: ", Style::default().fg(Color::Yellow)),
-                Span::raw("not yet implemented"),
-            ]);
-            let paragraph = Paragraph::new(text);
-            f.render_widget(paragraph, horizontal[1]);
+            render_stream(&app.stream, area, f.buffer_mut(), app.theme, app.icons);
         })?;
 
         if app.quit {
@@ -193,12 +173,42 @@ fn run_loop(
 
         if event::poll(timeout)?
             && let Event::Key(key) = event::read()?
-            && key.code == KeyCode::Char('q')
         {
-            app.quit = true;
+            match key.code {
+                KeyCode::Char('q') => app.quit = true,
+                KeyCode::Char('d') => {
+                    app.level_threshold.toggle();
+                    let _ = app.reload_messages();
+                }
+                KeyCode::Char('j') | KeyCode::Down => {
+                    app.stream.scroll_down(1, viewport_height);
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    app.stream.scroll_up(1);
+                }
+                KeyCode::PageDown => {
+                    app.stream.scroll_down(viewport_height / 2, viewport_height);
+                }
+                KeyCode::PageUp => {
+                    app.stream.scroll_up(viewport_height / 2);
+                }
+                KeyCode::Home => {
+                    app.stream.scroll_position = 0;
+                    app.stream.auto_scroll = false;
+                }
+                KeyCode::End => {
+                    app.stream.pin_to_bottom(viewport_height);
+                }
+                _ => {}
+            }
         }
 
         if last_tick.elapsed() >= TICK_INTERVAL {
+            // Drain WAL notification channel (coalesce multiple signals).
+            if let Some(rx) = wal_rx {
+                while rx.try_recv().is_ok() {}
+            }
+            app.drain_tail();
             last_tick = Instant::now();
         }
     }

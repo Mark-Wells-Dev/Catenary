@@ -42,6 +42,8 @@ pub struct SessionInfo {
 pub struct SessionMessage {
     /// Unique message ID (autoincrement primary key).
     pub id: i64,
+    /// Session that produced this message.
+    pub session_id: String,
     /// Protocol boundary: `mcp`, `lsp`, or `hook`.
     pub r#type: String,
     /// Tracing severity: `debug`, `info`, `warn`, or `error`.
@@ -134,6 +136,7 @@ impl SqliteMessageTail {
                     serde_json::from_str(&payload).context("invalid message payload")?;
                 Ok(Some(SessionMessage {
                     id,
+                    session_id: self.session_id.clone(),
                     r#type,
                     level,
                     method,
@@ -382,6 +385,66 @@ pub fn monitor_messages_with_conn(
         {
             messages.push(SessionMessage {
                 id,
+                session_id: session_id.to_string(),
+                r#type,
+                level,
+                method,
+                server,
+                client,
+                request_id,
+                parent_id,
+                timestamp: timestamp.with_timezone(&Utc),
+                payload,
+            });
+        }
+    }
+
+    Ok(messages)
+}
+
+/// Load all messages across all sessions, ordered by id.
+///
+/// When `include_debug` is false, messages with `level = 'debug'` are
+/// excluded from the result set.
+///
+/// # Errors
+///
+/// Returns an error if the database cannot be queried.
+pub fn monitor_all_messages_with_conn(
+    conn: &Connection,
+    include_debug: bool,
+) -> Result<Vec<SessionMessage>> {
+    let query = if include_debug {
+        "SELECT id, session_id, timestamp, type, level, method, server, client, \
+         request_id, parent_id, payload FROM messages ORDER BY id"
+    } else {
+        "SELECT id, session_id, timestamp, type, level, method, server, client, \
+         request_id, parent_id, payload FROM messages \
+         WHERE level != 'debug' ORDER BY id"
+    };
+    let mut stmt = conn.prepare(query)?;
+    let mut rows = stmt.query([])?;
+    let mut messages = Vec::new();
+
+    while let Some(row) = rows.next()? {
+        let id: i64 = row.get(0)?;
+        let session_id: String = row.get(1)?;
+        let ts: String = row.get(2)?;
+        let r#type: String = row.get(3)?;
+        let level: String = row.get(4)?;
+        let method: String = row.get(5)?;
+        let server: String = row.get(6)?;
+        let client: String = row.get(7)?;
+        let request_id: Option<i64> = row.get(8)?;
+        let parent_id: Option<i64> = row.get(9)?;
+        let payload_str: String = row.get(10)?;
+
+        if let Ok(timestamp) = DateTime::parse_from_rfc3339(&ts)
+            && let Ok(payload) = serde_json::from_str::<serde_json::Value>(&payload_str)
+        {
+            messages.push(SessionMessage {
+                id,
+                session_id,
                 r#type,
                 level,
                 method,
@@ -434,6 +497,136 @@ pub fn tail_messages_new_with_conn(
     Ok(SqliteMessageTail {
         conn,
         session_id: id.to_string(),
+        last_id,
+        include_debug,
+    })
+}
+
+/// Polls the `messages` table for new rows across all sessions.
+pub struct SqliteAllMessageTail {
+    conn: Connection,
+    last_id: i64,
+    include_debug: bool,
+}
+
+impl SqliteAllMessageTail {
+    /// Read the next message if available.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reading from the database fails.
+    pub fn try_next_message(&mut self) -> Result<Option<SessionMessage>> {
+        let query = if self.include_debug {
+            "SELECT id, session_id, timestamp, type, level, method, server, client, \
+             request_id, parent_id, payload FROM messages \
+             WHERE id > ?1 ORDER BY id LIMIT 1"
+        } else {
+            "SELECT id, session_id, timestamp, type, level, method, server, client, \
+             request_id, parent_id, payload FROM messages \
+             WHERE id > ?1 AND level != 'debug' ORDER BY id LIMIT 1"
+        };
+
+        let result = self
+            .conn
+            .query_row(query, rusqlite::params![self.last_id], |row| {
+                let id: i64 = row.get(0)?;
+                let session_id: String = row.get(1)?;
+                let ts: String = row.get(2)?;
+                let r#type: String = row.get(3)?;
+                let level: String = row.get(4)?;
+                let method: String = row.get(5)?;
+                let server: String = row.get(6)?;
+                let client: String = row.get(7)?;
+                let request_id: Option<i64> = row.get(8)?;
+                let parent_id: Option<i64> = row.get(9)?;
+                let payload: String = row.get(10)?;
+                Ok((
+                    id, session_id, ts, r#type, level, method, server, client, request_id,
+                    parent_id, payload,
+                ))
+            });
+
+        match result {
+            Ok((
+                id,
+                session_id,
+                ts,
+                r#type,
+                level,
+                method,
+                server,
+                client,
+                request_id,
+                parent_id,
+                payload,
+            )) => {
+                self.last_id = id;
+                let timestamp = DateTime::parse_from_rfc3339(&ts)
+                    .with_context(|| format!("invalid message timestamp: {ts}"))?
+                    .with_timezone(&Utc);
+                let payload: serde_json::Value =
+                    serde_json::from_str(&payload).context("invalid message payload")?;
+                Ok(Some(SessionMessage {
+                    id,
+                    session_id,
+                    r#type,
+                    level,
+                    method,
+                    server,
+                    client,
+                    request_id,
+                    parent_id,
+                    timestamp,
+                    payload,
+                }))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                let max_id: Option<i64> = self
+                    .conn
+                    .query_row("SELECT MAX(id) FROM messages", [], |row| row.get(0))
+                    .ok()
+                    .flatten();
+
+                if let Some(max) = max_id
+                    && max < self.last_id
+                {
+                    self.last_id = 0;
+                }
+
+                Ok(None)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+/// Tail all new messages across all sessions (starts from current end).
+///
+/// # Errors
+///
+/// Returns an error if the database cannot be opened or queried.
+pub fn tail_all_messages_new(include_debug: bool) -> Result<SqliteAllMessageTail> {
+    let conn = crate::db::open()?;
+    tail_all_messages_new_with_conn(conn, include_debug)
+}
+
+/// Tail all new messages using an existing database connection.
+///
+/// # Errors
+///
+/// Returns an error if the database cannot be queried.
+pub fn tail_all_messages_new_with_conn(
+    conn: Connection,
+    include_debug: bool,
+) -> Result<SqliteAllMessageTail> {
+    let last_id: i64 = conn
+        .query_row("SELECT COALESCE(MAX(id), 0) FROM messages", [], |row| {
+            row.get(0)
+        })
+        .context("failed to read message high-water mark")?;
+
+    Ok(SqliteAllMessageTail {
+        conn,
         last_id,
         include_debug,
     })
@@ -580,12 +773,14 @@ pub(crate) mod test_support {
 
     /// Build a `SessionMessage` with sensible defaults.
     ///
-    /// `level` defaults to `"info"`, `request_id`/`parent_id` to `None`,
-    /// `client` to `"catenary"`, `payload` to `{}`.
+    /// `level` defaults to `"info"`, `session_id` to `"test"`,
+    /// `request_id`/`parent_id` to `None`, `client` to `"catenary"`,
+    /// `payload` to `{}`.
     #[must_use]
     pub fn message(r#type: &str, method: &str, server: &str) -> SessionMessage {
         SessionMessage {
             id: 0,
+            session_id: "test".to_string(),
             r#type: r#type.to_string(),
             level: "info".to_string(),
             method: method.to_string(),

@@ -12,7 +12,7 @@ use std::collections::VecDeque;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 
-use crate::session::{self, SessionInfo, SessionMessage, SqliteMessageTail};
+use crate::session::{self, SessionInfo, SessionMessage, SqliteAllMessageTail, SqliteMessageTail};
 
 /// Collected session row: info, liveness, and active language servers.
 pub struct SessionRow {
@@ -79,6 +79,23 @@ pub trait DataSource {
     ///
     /// Returns an error if the query fails.
     fn list_alive_session_ids(&self) -> Result<Vec<String>>;
+
+    /// Load all historical messages across all sessions.
+    ///
+    /// When `include_debug` is false, messages with `level = "debug"` are
+    /// excluded from the result set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be queried.
+    fn monitor_all_messages(&self, include_debug: bool) -> Result<Vec<SessionMessage>>;
+
+    /// Create a tail reader for new messages across all sessions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the tail cannot be created.
+    fn create_all_message_tail(&self, include_debug: bool) -> Result<Box<dyn MessageTail>>;
 }
 
 /// Tail reader abstraction for streaming new messages.
@@ -92,6 +109,12 @@ pub trait MessageTail: Send {
 }
 
 impl MessageTail for SqliteMessageTail {
+    fn try_next_message(&mut self) -> Result<Option<SessionMessage>> {
+        self.try_next_message()
+    }
+}
+
+impl MessageTail for SqliteAllMessageTail {
     fn try_next_message(&mut self) -> Result<Option<SessionMessage>> {
         self.try_next_message()
     }
@@ -265,6 +288,15 @@ impl DataSource for SqliteDataSource {
         }
         Ok(ids)
     }
+
+    fn monitor_all_messages(&self, include_debug: bool) -> Result<Vec<SessionMessage>> {
+        session::monitor_all_messages_with_conn(&self.conn, include_debug)
+    }
+
+    fn create_all_message_tail(&self, include_debug: bool) -> Result<Box<dyn MessageTail>> {
+        let tail = session::tail_all_messages_new(include_debug)?;
+        Ok(Box::new(tail))
+    }
 }
 
 /// Query active languages for a session from its messages.
@@ -370,6 +402,24 @@ impl DataSource for MockDataSource {
             .filter(|r| r.alive)
             .map(|r| r.info.id.clone())
             .collect())
+    }
+
+    fn monitor_all_messages(&self, include_debug: bool) -> Result<Vec<SessionMessage>> {
+        let mut all: Vec<SessionMessage> = self.messages.values().flatten().cloned().collect();
+        if !include_debug {
+            all.retain(|m| m.level != "debug");
+        }
+        all.sort_by_key(|m| m.id);
+        Ok(all)
+    }
+
+    fn create_all_message_tail(&self, include_debug: bool) -> Result<Box<dyn MessageTail>> {
+        let mut all: VecDeque<SessionMessage> =
+            self.tail_messages.values().flatten().cloned().collect();
+        if !include_debug {
+            all.retain(|m| m.level != "debug");
+        }
+        Ok(Box::new(MockMessageTail { messages: all }))
     }
 }
 
