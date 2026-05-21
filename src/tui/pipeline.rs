@@ -378,6 +378,7 @@ pub fn run_collapse(entries: Vec<DisplayEntry>, messages: &[SessionMessage]) -> 
     /// Active run of consecutive same-category singles.
     struct RunState {
         key: String,
+        session_id: String,
         start: usize,
         end: usize,
         count: usize,
@@ -411,9 +412,12 @@ pub fn run_collapse(entries: Vec<DisplayEntry>, messages: &[SessionMessage]) -> 
                 parent_id: _,
             } => {
                 let key = category::collapse_key(&messages[index]);
-                let extends = key
-                    .as_ref()
-                    .is_some_and(|k| current_run.as_ref().is_some_and(|r| k == &r.key));
+                let session_id = &messages[index].session_id;
+                let extends = key.as_ref().is_some_and(|k| {
+                    current_run
+                        .as_ref()
+                        .is_some_and(|r| k == &r.key && session_id == &r.session_id)
+                });
 
                 if extends {
                     if let Some(run) = current_run.as_mut() {
@@ -426,6 +430,7 @@ pub fn run_collapse(entries: Vec<DisplayEntry>, messages: &[SessionMessage]) -> 
                     if let Some(k) = key {
                         current_run = Some(RunState {
                             key: k,
+                            session_id: session_id.clone(),
                             start: index,
                             end: index,
                             count: 1,
@@ -1434,5 +1439,76 @@ mod tests {
             }
             other => panic!("expected Scope, got {other:?}"),
         }
+    }
+
+    // ── Session boundary tests ────────────────────────────────────────
+
+    #[test]
+    fn test_run_collapse_session_boundary() {
+        // Two sessions produce consecutive same-category progress messages.
+        // Without session boundary awareness, these would incorrectly fold
+        // into a single collapsed group.
+        let mut messages = vec![
+            make_progress_message("rust-analyzer", "ra/indexing"),
+            make_progress_message("rust-analyzer", "ra/indexing"),
+            make_progress_message("rust-analyzer", "ra/indexing"),
+            make_progress_message("rust-analyzer", "ra/indexing"),
+        ];
+        messages[0].session_id = "session-a".to_string();
+        messages[1].session_id = "session-a".to_string();
+        messages[2].session_id = "session-b".to_string();
+        messages[3].session_id = "session-b".to_string();
+
+        let entries = pair_merge(&messages);
+        let collapsed = run_collapse(entries, &messages);
+        assert_eq!(
+            collapsed.len(),
+            2,
+            "session boundary should split into 2 collapsed groups: {collapsed:?}"
+        );
+        assert_eq!(
+            collapsed[0],
+            DisplayEntry::Collapsed {
+                start_index: 0,
+                end_index: 1,
+                count: 2,
+                parent_id: None,
+            }
+        );
+        assert_eq!(
+            collapsed[1],
+            DisplayEntry::Collapsed {
+                start_index: 2,
+                end_index: 3,
+                count: 2,
+                parent_id: None,
+            }
+        );
+    }
+
+    #[test]
+    fn test_run_collapse_same_session_still_collapses() {
+        // Same session, same key — should collapse as before.
+        let mut messages = vec![
+            make_progress_message("rust-analyzer", "ra/indexing"),
+            make_progress_message("rust-analyzer", "ra/indexing"),
+            make_progress_message("rust-analyzer", "ra/indexing"),
+        ];
+        for msg in &mut messages {
+            msg.session_id = "session-x".to_string();
+        }
+
+        let entries = pair_merge(&messages);
+        let collapsed = run_collapse(entries, &messages);
+        assert_eq!(collapsed.len(), 1);
+        assert_eq!(
+            collapsed[0],
+            DisplayEntry::Collapsed {
+                start_index: 0,
+                end_index: 2,
+                count: 3,
+                parent_id: None,
+            }
+        );
     }
 }

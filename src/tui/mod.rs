@@ -181,10 +181,13 @@ fn run_loop(
                     let _ = app.reload_messages();
                 }
                 KeyCode::Char('j') | KeyCode::Down => {
-                    app.stream.scroll_down(1, viewport_height);
+                    app.stream.cursor_down(1, viewport_height);
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
-                    app.stream.scroll_up(1);
+                    app.stream.cursor_up(1);
+                }
+                KeyCode::Enter => {
+                    app.stream.toggle_expansion();
                 }
                 KeyCode::PageDown => {
                     app.stream.scroll_down(viewport_height / 2, viewport_height);
@@ -194,6 +197,7 @@ fn run_loop(
                 }
                 KeyCode::Home => {
                     app.stream.scroll_position = 0;
+                    app.stream.cursor = 0;
                     app.stream.auto_scroll = false;
                 }
                 KeyCode::End => {
