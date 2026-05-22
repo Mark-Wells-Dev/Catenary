@@ -352,6 +352,10 @@ impl ToolHandler for McpRouter {
             Err(e) => Err(e),
         }
     }
+
+    fn scope_parent_id(&self) -> Option<i64> {
+        self.session.scope_id_stash.peek()
+    }
 }
 
 #[cfg(test)]

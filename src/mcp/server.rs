@@ -128,6 +128,16 @@ pub trait ToolHandler: Send + Sync {
         parent_id: Option<i64>,
         cancel: &CancellationToken,
     ) -> Result<CallToolResult>;
+
+    /// Returns the scope parent ID for the current tool call, if any.
+    ///
+    /// The scope parent ID is the correlation ID of the pre-tool hook
+    /// that opened this tool call's scope. Used by [`McpServer`] to set
+    /// `parent_id` on the incoming `tools/call` protocol event, linking
+    /// it to the pre-tool hook in the scope tree.
+    fn scope_parent_id(&self) -> Option<i64> {
+        None
+    }
 }
 
 /// Delegates to the inner handler, enabling shared ownership across
@@ -145,6 +155,10 @@ impl<T: ToolHandler + ?Sized> ToolHandler for Arc<T> {
         cancel: &CancellationToken,
     ) -> Result<CallToolResult> {
         (**self).call_tool(name, arguments, parent_id, cancel)
+    }
+
+    fn scope_parent_id(&self) -> Option<i64> {
+        (**self).scope_parent_id()
     }
 }
 
@@ -288,8 +302,11 @@ impl<H: ToolHandler> McpServer<H> {
             trace!("Received: {}", line);
 
             // Log incoming message and extract request ID for
-            // cancellation pre-registration.
-            let (correlation_id, method, mcp_request_id) =
+            // cancellation pre-registration. For `tools/call`, the
+            // incoming event is deferred until after the `on_tools_call`
+            // callback resolves sandwich correlation, so `scope_parent_id`
+            // can be read from the handler.
+            let (correlation_id, method, mcp_request_id, json_payload) =
                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
                     let method = json
                         .get("method")
@@ -297,15 +314,18 @@ impl<H: ToolHandler> McpServer<H> {
                         .unwrap_or("response")
                         .to_string();
                     let id = self.logging.next_id();
-                    emit_mcp_event(
-                        mcp_method_level(&method),
-                        &self.client_name,
-                        &method,
-                        id.0,
-                        None,
-                        &json.to_string(),
-                        "incoming",
-                    );
+                    let payload = json.to_string();
+                    if method != "tools/call" {
+                        emit_mcp_event(
+                            mcp_method_level(&method),
+                            &self.client_name,
+                            &method,
+                            id.0,
+                            None,
+                            &payload,
+                            "incoming",
+                        );
+                    }
                     // Extract request ID for requests (has both `id` and `method`).
                     let rid = if json.get("method").is_some() {
                         json.get("id")
@@ -313,9 +333,9 @@ impl<H: ToolHandler> McpServer<H> {
                     } else {
                         None
                     };
-                    (id.0, method, rid)
+                    (id.0, method, rid, payload)
                 } else {
-                    (0, String::new(), None)
+                    (0, String::new(), None, String::new())
                 };
 
             self.current_correlation_id = correlation_id;
@@ -323,10 +343,20 @@ impl<H: ToolHandler> McpServer<H> {
             // Run the pre-dispatch callback (correlation + flag
             // bridging) BEFORE the roots refresh check so a bridged
             // flag is visible to this iteration.
-            if method == "tools/call"
-                && let Some(cb) = &self.on_tools_call
-            {
-                cb();
+            if method == "tools/call" {
+                if let Some(cb) = &self.on_tools_call {
+                    cb();
+                }
+                // Emit the deferred incoming event with scope parent_id.
+                emit_mcp_event(
+                    mcp_method_level(&method),
+                    &self.client_name,
+                    &method,
+                    correlation_id,
+                    self.handler.scope_parent_id(),
+                    &json_payload,
+                    "incoming",
+                );
             }
 
             // Check for turn-boundary roots refresh BEFORE dispatch.
@@ -1531,6 +1561,11 @@ mod tests {
     /// Simulate the `run()` loop for a single message: mint a correlation
     /// ID, emit the incoming MCP event, set `current_correlation_id`, and
     /// dispatch.
+    ///
+    /// Mirrors `run()`: for `tools/call`, the incoming event is emitted
+    /// after the `on_tools_call` callback (deferred) with
+    /// `scope_parent_id` from the handler; for all other methods, the
+    /// event is emitted immediately with `parent_id = None`.
     fn simulate_incoming(
         server: &mut McpServer<TestHandler>,
         line: &str,
@@ -1543,15 +1578,28 @@ mod tests {
             .unwrap_or("response")
             .to_string();
         let id = server.logging.next_id();
-        emit_mcp_event(
-            mcp_method_level(&method),
-            &server.client_name,
-            &method,
-            id.0,
-            None,
-            &json.to_string(),
-            "incoming",
-        );
+        let payload = json.to_string();
+        if method == "tools/call" {
+            emit_mcp_event(
+                mcp_method_level(&method),
+                &server.client_name,
+                &method,
+                id.0,
+                server.handler.scope_parent_id(),
+                &payload,
+                "incoming",
+            );
+        } else {
+            emit_mcp_event(
+                mcp_method_level(&method),
+                &server.client_name,
+                &method,
+                id.0,
+                None,
+                &payload,
+                "incoming",
+            );
+        }
         server.current_correlation_id = id.0;
         server.dispatch_message(line, writer, id.0, &method)?;
         Ok(id.0)
@@ -1630,6 +1678,122 @@ mod tests {
             msgs[1].request_id,
             Some(correlation_id),
             "response request_id should point to the incoming request"
+        );
+        Ok(())
+    }
+
+    /// Handler that reports a fixed scope parent ID.
+    struct ScopedHandler(std::sync::Mutex<Option<i64>>);
+
+    impl ToolHandler for ScopedHandler {
+        fn list_tools(&self) -> Vec<Tool> {
+            vec![Tool {
+                name: "test_tool".to_string(),
+                title: None,
+                description: None,
+                input_schema: serde_json::json!({"type": "object", "properties": {}}),
+                annotations: None,
+            }]
+        }
+
+        fn call_tool(
+            &self,
+            _name: &str,
+            _arguments: Option<serde_json::Value>,
+            _parent_id: Option<i64>,
+            _cancel: &CancellationToken,
+        ) -> Result<CallToolResult> {
+            Ok(CallToolResult::text("ok"))
+        }
+
+        fn scope_parent_id(&self) -> Option<i64> {
+            *self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+    }
+
+    #[test]
+    fn tools_call_request_gets_scope_parent_id() -> Result<()> {
+        let (logging, conn, _guard) = setup_logging();
+        let handler = ScopedHandler(std::sync::Mutex::new(Some(42)));
+        let mut server = McpServer::new(handler, logging);
+
+        let request = Request {
+            jsonrpc: "2.0".to_string(),
+            id: RequestId::Number(1),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({
+                "name": "test_tool",
+                "arguments": {}
+            })),
+        };
+
+        let json: serde_json::Value = serde_json::from_str(&serde_json::to_string(&request)?)?;
+        let method = "tools/call";
+        let id = server.logging.next_id();
+        let payload = json.to_string();
+        emit_mcp_event(
+            mcp_method_level(method),
+            &server.client_name,
+            method,
+            id.0,
+            server.handler.scope_parent_id(),
+            &payload,
+            "incoming",
+        );
+        server.current_correlation_id = id.0;
+        let mut writer: Vec<u8> = Vec::new();
+        server.dispatch_message(&serde_json::to_string(&request)?, &mut writer, id.0, method)?;
+
+        let msgs = mcp_messages(&conn);
+        assert!(
+            msgs.len() >= 2,
+            "should have request + response, got {}",
+            msgs.len()
+        );
+        assert_eq!(
+            msgs[0].parent_id,
+            Some(42),
+            "tools/call request should have scope parent_id from handler"
+        );
+        assert_eq!(
+            msgs[1].parent_id,
+            Some(id.0),
+            "tools/call response parent_id should pair-merge with own request_id"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tools_call_request_no_scope_has_no_parent() -> Result<()> {
+        let (logging, conn, _guard) = setup_logging();
+        let mut server = McpServer::new(TestHandler, logging);
+
+        let request = Request {
+            jsonrpc: "2.0".to_string(),
+            id: RequestId::Number(1),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({
+                "name": "test_tool",
+                "arguments": {}
+            })),
+        };
+
+        let line = serde_json::to_string(&request)?;
+        let mut writer: Vec<u8> = Vec::new();
+        simulate_incoming(&mut server, &line, &mut writer)?;
+
+        let msgs = mcp_messages(&conn);
+        assert!(
+            msgs.len() >= 2,
+            "should have request + response, got {}",
+            msgs.len()
+        );
+        assert!(
+            msgs[0].parent_id.is_none(),
+            "tools/call request with no scope should have parent_id = None"
         );
         Ok(())
     }

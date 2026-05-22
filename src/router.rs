@@ -279,6 +279,39 @@ impl ToolHandler for CorrelatingHandler {
         // Not yet correlated — use the shared handler.
         self.inner.call_tool(name, arguments, parent_id, cancel)
     }
+
+    fn scope_parent_id(&self) -> Option<i64> {
+        // Fast path: cached session from a previous call_tool.
+        if let Some((_, session)) = self
+            .cached
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            return session.scope_id_stash.peek();
+        }
+
+        // Slow path: look up via correlation state.
+        let session_id = self
+            .correlation
+            .connection_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&self.fd)
+            .cloned();
+
+        if let Some(sid) = session_id
+            && let Some(entry) = self
+                .sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&sid)
+        {
+            return entry.session.scope_id_stash.peek();
+        }
+
+        None
+    }
 }
 
 // ── Session registry ───────────────────────────────────────────────
@@ -1538,13 +1571,21 @@ async fn handle_hook_dispatch(
     // Determine level from outcome and hook category.
     let level = hook_outcome_level(&method, &envelope);
 
+    // For post-tool hooks, read and clear the scope parent ID so
+    // the request event links back to the pre-tool scope root.
+    let request_parent_id = if method.starts_with("post-tool") {
+        router.session.scope_id_stash.take()
+    } else {
+        None
+    };
+
     // Log incoming hook request (deferred — uses outcome-determined level).
     emit_hook_event(
         level,
         &session_id,
         &method,
         id.0,
-        None,
+        request_parent_id,
         &raw.to_string(),
         "incoming hook",
     );

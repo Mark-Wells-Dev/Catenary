@@ -447,13 +447,21 @@ impl HookServer {
         // Hook allows (empty response) → debug, hook blocks/diagnostics → info.
         let level = Self::hook_outcome_level(&method, &envelope);
 
+        // For post-tool hooks, read and clear the scope parent ID so
+        // the request event links back to the pre-tool scope root.
+        let request_parent_id = if method.starts_with("post-tool") {
+            self.router.session.scope_id_stash.take()
+        } else {
+            None
+        };
+
         // Log incoming hook request (deferred — uses outcome-determined level)
         emit_hook_event(
             level,
             &self.router.client_name,
             &method,
             id.0,
-            None,
+            request_parent_id,
             &raw.to_string(),
             "incoming hook",
         );

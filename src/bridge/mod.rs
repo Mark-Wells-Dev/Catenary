@@ -23,6 +23,8 @@ mod hook_router;
 mod pagination;
 /// Path validation for LSP-aware operations and config file protection.
 pub mod path_security;
+/// Scope parent ID stash for hook → MCP → hook parent_id propagation.
+pub mod scope_id_stash;
 /// Shared container for tool servers and cross-tool infrastructure.
 pub mod session;
 /// Transformation layer trait between protocol boundaries and LSP.

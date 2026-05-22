@@ -22,6 +22,7 @@ use super::filesystem_manager::FilesystemManager;
 use super::grep_server::GrepServer;
 use super::handler::expand_tilde;
 use super::path_security::PathValidator;
+use super::scope_id_stash::ScopeIdStash;
 use crate::config::Config;
 use crate::logging::LoggingServer;
 use crate::logging::notification_router::NotificationRouter;
@@ -148,6 +149,10 @@ pub struct Session {
     pub editing_guardrail: Option<Arc<EditingGuardrail>>,
     /// Pending host-CLI cwd for grep/glob relative-pattern resolution.
     pub cwd_stash: CwdStash,
+    /// Scope parent ID stashed by the pre-tool hook for the upcoming
+    /// MCP `tools/call` and post-tool hook events. Peeked (not consumed)
+    /// by the MCP server; taken and cleared by the post-tool hook.
+    pub scope_id_stash: ScopeIdStash,
     /// LSP client manager (also owns document manager).
     pub(super) client_manager: Arc<LspClientManager>,
     /// File classification and root resolution.
@@ -282,6 +287,7 @@ impl Session {
             editing: EditingManager::new(),
             editing_guardrail: None,
             cwd_stash: CwdStash::new(),
+            scope_id_stash: ScopeIdStash::new(),
             client_manager,
             fs_manager,
             path_validator,
@@ -365,6 +371,7 @@ impl Session {
             editing: EditingManager::new(),
             editing_guardrail,
             cwd_stash: CwdStash::new(),
+            scope_id_stash: ScopeIdStash::new(),
             client_manager: primary.client_manager.clone(),
             fs_manager: primary.fs_manager.clone(),
             path_validator: primary.path_validator.clone(),

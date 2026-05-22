@@ -440,7 +440,7 @@ impl HookRouter {
     /// `systemMessage` from the notification queue drain. The queue is drained
     /// only at stationary points (`SessionStart`, `Stop`/`AfterAgent` when allowing).
     #[allow(clippy::too_many_lines, reason = "match arms are sequential and flat")]
-    pub(crate) fn dispatch(&self, request: HookRequest, _entry_id: i64) -> DispatchResult {
+    pub(crate) fn dispatch(&self, request: HookRequest, entry_id: i64) -> DispatchResult {
         match request {
             HookRequest::PreAgent {
                 transcript_path,
@@ -497,6 +497,10 @@ impl HookRouter {
                     session_id.as_deref(),
                     &agent_id,
                 );
+                // Stash the scope parent ID so the MCP tools/call and
+                // post-tool hook events can reference this pre-tool hook
+                // as their scope root.
+                self.session.scope_id_stash.stash(entry_id);
                 // Stash the host CLI's cwd for the upcoming MCP grep/glob
                 // call, but only when the tool is allowed (denied tools
                 // won't produce an MCP call, so stashing would leave a
@@ -2031,6 +2035,51 @@ mod tests {
             router.session.cwd_stash.take().is_none(),
             "missing cwd should not stash"
         );
+    }
+
+    // ── Scope ID stash tests ───────────────────────────────────────────
+
+    #[test]
+    fn dispatch_pre_tool_stashes_scope_id() {
+        let router = test_router();
+        router.dispatch(
+            crate::hook::HookRequest::PreTool {
+                tool_name: "mcp_catenary_grep".to_string(),
+                file_path: None,
+                command: None,
+                agent_id: String::new(),
+                session_id: None,
+                cwd: None,
+            },
+            99,
+        );
+        assert_eq!(
+            router.session.scope_id_stash.peek(),
+            Some(99),
+            "pre-tool should stash entry_id as scope parent"
+        );
+    }
+
+    #[test]
+    fn dispatch_pre_tool_scope_id_survives_take_cycle() {
+        let router = test_router();
+        // Pre-tool stashes.
+        router.dispatch(
+            crate::hook::HookRequest::PreTool {
+                tool_name: "mcp_catenary_grep".to_string(),
+                file_path: None,
+                command: None,
+                agent_id: String::new(),
+                session_id: None,
+                cwd: None,
+            },
+            10,
+        );
+        // Peek (MCP handler) does not consume.
+        assert_eq!(router.session.scope_id_stash.peek(), Some(10));
+        // Take (post-tool hook) clears.
+        assert_eq!(router.session.scope_id_stash.take(), Some(10));
+        assert!(router.session.scope_id_stash.peek().is_none());
     }
 
     // ── Transcript root sync tests ────────────────────────────────────
