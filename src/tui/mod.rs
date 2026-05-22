@@ -7,13 +7,12 @@
 //! badges, scrolling, severity toggle, and a scrollbar.
 
 pub mod app;
-pub mod category;
 pub mod data;
 pub mod filter;
 pub mod format;
 pub mod hints;
 pub mod icons;
-pub mod pipeline;
+pub mod scope;
 pub mod scrollbar;
 pub mod sidebar;
 pub mod stream;

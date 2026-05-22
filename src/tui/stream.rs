@@ -1,24 +1,24 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
-//! Unified message stream with hex badges, pipeline, and scrolling.
+//! Unified message stream with hex badges, scope lifecycle, and scrolling.
 //!
 //! The stream is the primary view surface for TUI v2: a full-width,
-//! scrollable, chronological list of processed display entries from
-//! the pipeline, prefixed with per-session hex badges and expandable
-//! scope/collapsed groups with tree-drawing characters.
+//! scrollable, chronological list of scopes and standalone messages,
+//! prefixed with per-session hex badges. Each MCP tool call is a scope
+//! that opens on pre-tool hook arrival, streams children live, and
+//! auto-collapses to a summary line when the post-tool hook signals
+//! completion.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 
-use super::format::{
-    format_collapsed_styled, format_message_styled, format_pair_styled, format_scope_styled,
-};
+use super::format::{format_message_styled, format_scope_header_styled};
 use super::icons::IconSet;
-use super::pipeline::{self, DisplayEntry};
+use super::scope::{Scope, ScopeState, StreamEntry};
 use super::scrollbar::{self, ScrollMetrics};
 use super::theme::Theme;
 use crate::session::SessionMessage;
@@ -70,8 +70,7 @@ impl HexBadgeMap {
     /// Look up an already-assigned badge without allocating.
     ///
     /// Returns `"??"` if the session has no badge (should not happen in
-    /// normal operation — badges are assigned in [`StreamState::new`] and
-    /// [`StreamState::append`]).
+    /// normal operation — badges are assigned during message routing).
     #[must_use]
     pub fn get(&self, session_id: &str) -> String {
         self.map
@@ -103,13 +102,12 @@ impl Default for HexBadgeMap {
 
 /// A single terminal row in the flattened display list.
 ///
-/// The stream viewport renders display rows, not raw messages or
-/// pipeline entries. Expansion state determines which rows exist.
+/// The stream viewport renders display rows, not raw entries.
+/// Scope expansion state determines which rows exist.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DisplayRow {
-    /// A top-level pipeline entry (collapsed by default for runs,
-    /// expanded by default for scopes).
-    Entry(usize),
+    /// A scope header line (tool name, state, child count).
+    ScopeHeader(usize),
     /// A child within an expanded scope, rendered with tree chars.
     ScopeChild {
         /// Index into `StreamState::entries` for the parent scope.
@@ -119,32 +117,18 @@ pub enum DisplayRow {
         /// Whether this is the last child (for `└─` vs `├─`).
         is_last: bool,
     },
-    /// An individual message within an expanded collapsed run.
-    ExpandedMessage {
-        /// Index into `StreamState::entries` for the collapsed run.
-        entry_idx: usize,
-        /// Index into `StreamState::messages` for this individual message.
-        msg_idx: usize,
-        /// Whether this is the last message in the run.
-        is_last: bool,
-    },
+    /// A standalone message not belonging to any scope.
+    Standalone(usize),
 }
 
 // ── Stream state ──────────────────────────────────────────────────────
 
-/// Scroll, cursor, pipeline, and viewport state for the message stream.
+/// Scroll, cursor, scope routing, and viewport state for the message stream.
 pub struct StreamState {
-    /// All messages in chronological order.
-    pub messages: Vec<SessionMessage>,
-    /// Pipeline-processed display entries.
-    pub entries: Vec<DisplayEntry>,
+    /// All stream entries (scopes and standalone messages) in chronological order.
+    pub entries: Vec<StreamEntry>,
     /// Flattened display rows for rendering.
     pub display_rows: Vec<DisplayRow>,
-    /// Expansion toggle set. Contains `expansion_index()` values for
-    /// entries whose default state has been inverted:
-    /// - Scopes default expanded → toggled = collapsed (header only)
-    /// - Collapsed runs default collapsed → toggled = expanded (children)
-    pub toggled: HashSet<usize>,
     /// Index of the first visible row in the viewport.
     pub scroll_position: usize,
     /// Whether auto-scroll is active (viewport pinned to bottom).
@@ -153,59 +137,126 @@ pub struct StreamState {
     pub cursor: usize,
     /// Hex badge assignment for session IDs.
     pub badges: HexBadgeMap,
+    /// `scope_id` → entries index for direct scope children (MCP req/resp, post-hook).
+    scope_id_map: HashMap<i64, usize>,
+    /// MCP correlation ID → entries index for LSP child routing.
+    mcp_corr_map: HashMap<i64, usize>,
+    /// Session ID → entries index of the currently active (open) scope.
+    active_scope: HashMap<String, usize>,
 }
 
 impl StreamState {
-    /// Create a new stream state with the given messages.
+    /// Create a new stream state by replaying historical messages through routing.
     #[must_use]
     pub fn new(messages: Vec<SessionMessage>) -> Self {
-        let mut badges = HexBadgeMap::new();
-        for msg in &messages {
-            badges.badge(&msg.session_id);
-        }
         let mut state = Self {
-            messages,
             entries: Vec::new(),
             display_rows: Vec::new(),
-            toggled: HashSet::new(),
             scroll_position: 0,
             auto_scroll: true,
             cursor: 0,
-            badges,
+            badges: HexBadgeMap::new(),
+            scope_id_map: HashMap::new(),
+            mcp_corr_map: HashMap::new(),
+            active_scope: HashMap::new(),
         };
-        state.rebuild_pipeline();
+        for msg in messages {
+            state.route_message(msg);
+        }
+        state.rebuild_display_rows();
         state
     }
 
-    /// Append new messages from a tail reader, then rebuild the pipeline.
+    /// Append new messages from a tail reader, routing each into scopes.
     pub fn append(&mut self, messages: Vec<SessionMessage>) {
-        for msg in &messages {
-            self.badges.badge(&msg.session_id);
+        for msg in messages {
+            self.route_message(msg);
         }
-        self.messages.extend(messages);
-        self.rebuild_pipeline();
-    }
-
-    /// Run the display pipeline: pair merge → scope collapse → run collapse.
-    pub fn rebuild_pipeline(&mut self) {
-        let merged = pipeline::pair_merge(&self.messages);
-        let scoped = pipeline::scope_collapse(merged, &self.messages);
-        self.entries = pipeline::run_collapse(scoped, &self.messages);
         self.rebuild_display_rows();
     }
 
-    /// Flatten entries into display rows based on expansion state.
+    /// Route a single message into the scope model.
+    ///
+    /// Creates, updates, or closes scopes based on message type and
+    /// `parent_id` relationships. Messages that don't belong to any
+    /// scope become standalone entries.
+    fn route_message(&mut self, msg: SessionMessage) {
+        self.badges.badge(&msg.session_id);
+
+        // 1. Pre-tool hook → create new scope.
+        if msg.r#type == "hook" && msg.parent_id.is_none() && msg.method.starts_with("pre-tool/") {
+            // Abandon any active scope for this session.
+            if let Some(&idx) = self.active_scope.get(&msg.session_id)
+                && let StreamEntry::Scope(scope) = &mut self.entries[idx]
+                && scope.is_active()
+            {
+                scope.abandon();
+            }
+            let idx = self.entries.len();
+            let scope_id = msg.request_id.unwrap_or(msg.id);
+            self.scope_id_map.insert(scope_id, idx);
+            self.active_scope.insert(msg.session_id.clone(), idx);
+            self.entries
+                .push(StreamEntry::Scope(Box::new(Scope::new(msg))));
+            return;
+        }
+
+        // 2. Route by parent_id.
+        if let Some(pid) = msg.parent_id {
+            // Check scope_id_map — direct scope children (MCP req/resp, post-hook).
+            if let Some(&idx) = self.scope_id_map.get(&pid)
+                && let StreamEntry::Scope(scope) = &mut self.entries[idx]
+            {
+                // Post-tool hook → close scope.
+                if msg.r#type == "hook" && msg.method.starts_with("post-tool/") {
+                    let session = scope.session_id.clone();
+                    scope.close(msg);
+                    // Only clear active_scope if it still points to this scope.
+                    if self.active_scope.get(&session) == Some(&idx) {
+                        self.active_scope.remove(&session);
+                    }
+                    return;
+                }
+                // MCP tools/call → request or response.
+                if msg.r#type == "mcp" && msg.method == "tools/call" {
+                    if scope.request.is_none() {
+                        if let Some(corr_id) = msg.request_id {
+                            self.mcp_corr_map.insert(corr_id, idx);
+                        }
+                        scope.attach_request(msg);
+                    } else {
+                        scope.attach_response(msg);
+                    }
+                    return;
+                }
+                // Generic child of the scope (e.g., hook child).
+                scope.children.push(msg);
+                return;
+            }
+
+            // Check mcp_corr_map — LSP children of the tool call.
+            if let Some(&idx) = self.mcp_corr_map.get(&pid)
+                && let StreamEntry::Scope(scope) = &mut self.entries[idx]
+            {
+                scope.children.push(msg);
+                return;
+            }
+        }
+
+        // 3. Standalone message (no matching scope).
+        self.entries.push(StreamEntry::Standalone(msg));
+    }
+
+    /// Flatten entries into display rows based on scope expansion state.
     fn rebuild_display_rows(&mut self) {
         self.display_rows.clear();
         for (i, entry) in self.entries.iter().enumerate() {
-            let exp_key = entry.expansion_index();
             match entry {
-                DisplayEntry::Scope { children, .. } => {
-                    self.display_rows.push(DisplayRow::Entry(i));
-                    // Scopes default expanded; toggled = collapsed.
-                    if !self.toggled.contains(&exp_key) {
-                        let len = children.len();
-                        for (ci, _) in children.iter().enumerate() {
+                StreamEntry::Scope(scope) => {
+                    self.display_rows.push(DisplayRow::ScopeHeader(i));
+                    if scope.is_expanded() {
+                        let len = scope.children.len();
+                        for ci in 0..len {
                             self.display_rows.push(DisplayRow::ScopeChild {
                                 entry_idx: i,
                                 child_idx: ci,
@@ -214,29 +265,8 @@ impl StreamState {
                         }
                     }
                 }
-                DisplayEntry::Collapsed {
-                    start_index,
-                    end_index,
-                    ..
-                } => {
-                    // Collapsed runs default collapsed; toggled = expanded.
-                    if self.toggled.contains(&exp_key) {
-                        self.display_rows.push(DisplayRow::Entry(i));
-                        let start = *start_index;
-                        let end = *end_index;
-                        for msg_idx in start..=end {
-                            self.display_rows.push(DisplayRow::ExpandedMessage {
-                                entry_idx: i,
-                                msg_idx,
-                                is_last: msg_idx == end,
-                            });
-                        }
-                    } else {
-                        self.display_rows.push(DisplayRow::Entry(i));
-                    }
-                }
-                DisplayEntry::Single { .. } | DisplayEntry::Paired { .. } => {
-                    self.display_rows.push(DisplayRow::Entry(i));
+                StreamEntry::Standalone(_) => {
+                    self.display_rows.push(DisplayRow::Standalone(i));
                 }
             }
         }
@@ -323,37 +353,25 @@ impl StreamState {
         }
     }
 
-    /// Toggle expansion state on the entry at the cursor position.
+    /// Toggle expansion state on the scope at the cursor position.
     ///
-    /// Scopes toggle between showing/hiding children. Collapsed runs
-    /// toggle between summary and individual messages. Singles and pairs
-    /// are not expandable. Resets expansion on scroll-to-bottom.
+    /// Closed/abandoned scopes toggle between summary (header only) and
+    /// expanded (header + children). Active scopes are always expanded.
+    /// Standalone messages are not expandable.
     pub fn toggle_expansion(&mut self) {
         let Some(row) = self.display_rows.get(self.cursor) else {
             return;
         };
         let entry_idx = match row {
-            DisplayRow::Entry(idx) => *idx,
-            DisplayRow::ScopeChild { entry_idx, .. }
-            | DisplayRow::ExpandedMessage { entry_idx, .. } => *entry_idx,
+            DisplayRow::ScopeHeader(idx) | DisplayRow::ScopeChild { entry_idx: idx, .. } => *idx,
+            DisplayRow::Standalone(_) => return,
         };
-        let Some(entry) = self.entries.get(entry_idx) else {
-            return;
-        };
-        // Only Scope and Collapsed entries are expandable.
-        if !matches!(
-            entry,
-            DisplayEntry::Scope { .. } | DisplayEntry::Collapsed { .. }
-        ) {
-            return;
+        if let StreamEntry::Scope(scope) = &mut self.entries[entry_idx]
+            && matches!(scope.state, ScopeState::Closed | ScopeState::Abandoned)
+        {
+            scope.user_expanded = !scope.user_expanded;
+            self.rebuild_display_rows();
         }
-        let exp_key = entry.expansion_index();
-        if self.toggled.contains(&exp_key) {
-            self.toggled.remove(&exp_key);
-        } else {
-            self.toggled.insert(exp_key);
-        }
-        self.rebuild_display_rows();
     }
 
     /// Return [`ScrollMetrics`] for the scrollbar.
@@ -376,59 +394,14 @@ const TREE_END: &str = "└─ ";
 /// Blank indent matching the badge width ("XX ").
 const BADGE_INDENT: &str = "   ";
 
-/// Get the session ID for a display entry's primary message.
-fn entry_session_id<'a>(entry: &DisplayEntry, messages: &'a [SessionMessage]) -> &'a str {
-    match entry {
-        DisplayEntry::Single { index, .. } => &messages[*index].session_id,
-        DisplayEntry::Paired { request_index, .. } => &messages[*request_index].session_id,
-        DisplayEntry::Collapsed { start_index, .. } => &messages[*start_index].session_id,
-        DisplayEntry::Scope { parent, .. } => entry_session_id(parent, messages),
-    }
-}
-
-/// Build a styled [`Line`] for any display entry.
-fn render_entry_line(
-    entry: &DisplayEntry,
-    messages: &[SessionMessage],
-    icons: &IconSet,
-    theme: &Theme,
-) -> Line<'static> {
-    match entry {
-        DisplayEntry::Single { index, .. } => {
-            format_message_styled(&messages[*index], icons, theme)
-        }
-        DisplayEntry::Paired {
-            request_index,
-            response_index,
-            ..
-        } => format_pair_styled(
-            &messages[*request_index],
-            &messages[*response_index],
-            icons,
-            theme,
-        ),
-        DisplayEntry::Collapsed {
-            start_index,
-            end_index,
-            count,
-            ..
-        } => format_collapsed_styled(messages, *start_index, *end_index, *count, icons, theme),
-        DisplayEntry::Scope {
-            parent,
-            children,
-            position,
-        } => format_scope_styled(parent, children.len(), *position, messages, icons, theme),
-    }
-}
-
 // ── Rendering ─────────────────────────────────────────────────────────
 
 /// Render the message stream into the given area.
 ///
 /// Each entry line: `XX <formatted content>` where `XX` is the hex
-/// badge. Scope/collapsed children use tree-drawing characters with
-/// indentation instead of a badge. The scrollbar occupies the rightmost
-/// column. The cursor row is highlighted.
+/// badge. Scope children use tree-drawing characters with indentation
+/// instead of a badge. The scrollbar occupies the rightmost column.
+/// The cursor row is highlighted.
 ///
 /// Call [`StreamState::apply_auto_scroll`] before rendering to update
 /// the scroll position — this function is read-only.
@@ -514,11 +487,12 @@ fn render_display_row(
     theme: &Theme,
 ) -> Line<'static> {
     match row {
-        DisplayRow::Entry(entry_idx) => {
-            let entry = &state.entries[*entry_idx];
-            let session_id = entry_session_id(entry, &state.messages);
-            let badge = state.badges.get(session_id);
-            let styled = render_entry_line(entry, &state.messages, icons, theme);
+        DisplayRow::ScopeHeader(entry_idx) => {
+            let StreamEntry::Scope(scope) = &state.entries[*entry_idx] else {
+                return Line::from("");
+            };
+            let badge = state.badges.get(&scope.session_id);
+            let styled = format_scope_header_styled(scope, icons, theme);
             let mut spans = Vec::with_capacity(styled.spans.len() + 1);
             spans.push(Span::styled(format!("{badge} "), theme.accent));
             spans.extend(styled.spans);
@@ -529,28 +503,26 @@ fn render_display_row(
             child_idx,
             is_last,
         } => {
-            let entry = &state.entries[*entry_idx];
-            let DisplayEntry::Scope { children, .. } = entry else {
+            let StreamEntry::Scope(scope) = &state.entries[*entry_idx] else {
                 return Line::from("");
             };
-            let child = &children[*child_idx];
+            let child = &scope.children[*child_idx];
             let tree_char = if *is_last { TREE_END } else { TREE_MID };
-            let styled = render_entry_line(child, &state.messages, icons, theme);
+            let styled = format_message_styled(child, icons, theme);
             let mut spans = Vec::with_capacity(styled.spans.len() + 2);
             spans.push(Span::styled(BADGE_INDENT.to_string(), theme.muted));
             spans.push(Span::styled(tree_char.to_string(), theme.muted));
             spans.extend(styled.spans);
             Line::from(spans)
         }
-        DisplayRow::ExpandedMessage {
-            msg_idx, is_last, ..
-        } => {
-            let msg = &state.messages[*msg_idx];
-            let tree_char = if *is_last { TREE_END } else { TREE_MID };
+        DisplayRow::Standalone(entry_idx) => {
+            let StreamEntry::Standalone(msg) = &state.entries[*entry_idx] else {
+                return Line::from("");
+            };
+            let badge = state.badges.get(&msg.session_id);
             let styled = format_message_styled(msg, icons, theme);
-            let mut spans = Vec::with_capacity(styled.spans.len() + 2);
-            spans.push(Span::styled(BADGE_INDENT.to_string(), theme.muted));
-            spans.push(Span::styled(tree_char.to_string(), theme.muted));
+            let mut spans = Vec::with_capacity(styled.spans.len() + 1);
+            spans.push(Span::styled(format!("{badge} "), theme.accent));
             spans.extend(styled.spans);
             Line::from(spans)
         }
@@ -562,7 +534,8 @@ fn render_display_row(
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
-    reason = "tests use expect for readable assertions"
+    clippy::panic,
+    reason = "tests use expect/panic for readable assertions"
 )]
 mod tests {
     use super::*;
@@ -588,6 +561,80 @@ mod tests {
             session_id: session_id.to_string(),
             ..test_support::message_with_ids(id, r#type, method, server, request_id, parent_id)
         }
+    }
+
+    /// Build a pre-tool hook message that creates a scope.
+    fn pre_hook(session_id: &str, scope_id: i64) -> SessionMessage {
+        make_message_with_ids(
+            session_id,
+            100 + scope_id,
+            "hook",
+            "pre-tool/editing-state",
+            "",
+            Some(scope_id),
+            None,
+        )
+    }
+
+    /// Build an MCP request that attaches to a scope.
+    fn mcp_request(session_id: &str, scope_id: i64, tool: &str) -> SessionMessage {
+        let corr_id = scope_id + 1000;
+        SessionMessage {
+            payload: serde_json::json!({"params": {"name": tool}}),
+            ..make_message_with_ids(
+                session_id,
+                200 + scope_id,
+                "mcp",
+                "tools/call",
+                "catenary",
+                Some(corr_id),
+                Some(scope_id),
+            )
+        }
+    }
+
+    /// Build an MCP response for a scope.
+    fn mcp_response(session_id: &str, scope_id: i64) -> SessionMessage {
+        let corr_id = scope_id + 1000;
+        SessionMessage {
+            payload: serde_json::json!({"result": {"content": [{"type": "text", "text": "ok"}]}}),
+            ..make_message_with_ids(
+                session_id,
+                300 + scope_id,
+                "mcp",
+                "tools/call",
+                "catenary",
+                Some(corr_id),
+                Some(scope_id),
+            )
+        }
+    }
+
+    /// Build a post-tool hook that closes a scope.
+    fn post_hook(session_id: &str, scope_id: i64) -> SessionMessage {
+        make_message_with_ids(
+            session_id,
+            400 + scope_id,
+            "hook",
+            "post-tool/diagnostics",
+            "",
+            Some(scope_id + 2000),
+            Some(scope_id),
+        )
+    }
+
+    /// Build an LSP child message of an MCP tool call.
+    fn lsp_child(session_id: &str, scope_id: i64, method: &str) -> SessionMessage {
+        let mcp_corr_id = scope_id + 1000;
+        make_message_with_ids(
+            session_id,
+            500 + scope_id,
+            "lsp",
+            method,
+            "rust-analyzer",
+            Some(mcp_corr_id + 100),
+            Some(mcp_corr_id),
+        )
     }
 
     // ── Hex badge tests ───────────────────────────────────────────────
@@ -656,7 +703,264 @@ mod tests {
         assert_eq!(badges.badge("s1"), "01"); // unaffected
     }
 
-    // ── Stream state tests ────────────────────────────────────────────
+    // ── Scope routing tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_scope_full_lifecycle() {
+        let messages = vec![
+            pre_hook("s1", 1),
+            mcp_request("s1", 1, "grep"),
+            lsp_child("s1", 1, "workspace/symbol"),
+            lsp_child("s1", 1, "textDocument/references"),
+            mcp_response("s1", 1),
+            post_hook("s1", 1),
+        ];
+        let state = StreamState::new(messages);
+
+        // Should produce one scope entry.
+        assert_eq!(state.entries.len(), 1, "expected 1 scope");
+        let StreamEntry::Scope(scope) = &state.entries[0] else {
+            panic!("expected Scope entry");
+        };
+        assert_eq!(scope.state, ScopeState::Closed);
+        assert!(scope.request.is_some());
+        assert!(scope.response.is_some());
+        assert!(scope.post_hook.is_some());
+        assert_eq!(scope.children.len(), 2);
+        // Closed scope: collapsed to header only.
+        assert_eq!(state.display_rows.len(), 1);
+    }
+
+    #[test]
+    fn test_scope_open_expanded() {
+        let messages = vec![
+            pre_hook("s1", 1),
+            mcp_request("s1", 1, "grep"),
+            lsp_child("s1", 1, "workspace/symbol"),
+        ];
+        let state = StreamState::new(messages);
+
+        assert_eq!(state.entries.len(), 1);
+        let StreamEntry::Scope(scope) = &state.entries[0] else {
+            panic!("expected Scope entry");
+        };
+        assert_eq!(scope.state, ScopeState::Open);
+        // Open scope: header + 1 child = 2 rows.
+        assert_eq!(state.display_rows.len(), 2);
+    }
+
+    #[test]
+    fn test_scope_settling_expanded() {
+        let messages = vec![
+            pre_hook("s1", 1),
+            mcp_request("s1", 1, "grep"),
+            lsp_child("s1", 1, "workspace/symbol"),
+            mcp_response("s1", 1),
+        ];
+        let state = StreamState::new(messages);
+
+        let StreamEntry::Scope(scope) = &state.entries[0] else {
+            panic!("expected Scope entry");
+        };
+        assert_eq!(scope.state, ScopeState::Settling);
+        // Settling: still expanded (header + 1 child).
+        assert_eq!(state.display_rows.len(), 2);
+    }
+
+    #[test]
+    fn test_scope_abandoned_on_new_prehook() {
+        let messages = vec![
+            pre_hook("s1", 1),
+            mcp_request("s1", 1, "grep"),
+            lsp_child("s1", 1, "workspace/symbol"),
+            // New pre-tool hook for same session without closing old scope.
+            pre_hook("s1", 2),
+            mcp_request("s1", 2, "glob"),
+        ];
+        let state = StreamState::new(messages);
+
+        assert_eq!(state.entries.len(), 2);
+        let StreamEntry::Scope(scope1) = &state.entries[0] else {
+            panic!("expected first scope");
+        };
+        assert_eq!(scope1.state, ScopeState::Abandoned);
+        assert!(!scope1.is_expanded(), "abandoned scope should be collapsed");
+
+        let StreamEntry::Scope(scope2) = &state.entries[1] else {
+            panic!("expected second scope");
+        };
+        assert_eq!(scope2.state, ScopeState::Open);
+    }
+
+    #[test]
+    fn test_standalone_messages() {
+        let messages = vec![
+            make_message("s1", "textDocument/hover"),
+            make_message("s1", "textDocument/definition"),
+        ];
+        let state = StreamState::new(messages);
+
+        assert_eq!(state.entries.len(), 2);
+        assert!(matches!(state.entries[0], StreamEntry::Standalone(_)));
+        assert!(matches!(state.entries[1], StreamEntry::Standalone(_)));
+        assert_eq!(state.display_rows.len(), 2);
+    }
+
+    #[test]
+    fn test_mixed_scopes_and_standalones() {
+        let messages = vec![
+            make_message("s1", "initialize"), // standalone
+            pre_hook("s1", 1),
+            mcp_request("s1", 1, "grep"),
+            lsp_child("s1", 1, "workspace/symbol"),
+            mcp_response("s1", 1),
+            post_hook("s1", 1),
+            make_message("s1", "shutdown"), // standalone
+        ];
+        let state = StreamState::new(messages);
+
+        assert_eq!(state.entries.len(), 3, "standalone + scope + standalone");
+        assert!(matches!(state.entries[0], StreamEntry::Standalone(_)));
+        assert!(matches!(state.entries[1], StreamEntry::Scope(_)));
+        assert!(matches!(state.entries[2], StreamEntry::Standalone(_)));
+        // Closed scope = 1 row, 2 standalones = 2 rows, total 3.
+        assert_eq!(state.display_rows.len(), 3);
+    }
+
+    #[test]
+    fn test_two_sessions_independent_scopes() {
+        let messages = vec![
+            pre_hook("s1", 1),
+            mcp_request("s1", 1, "grep"),
+            pre_hook("s2", 2),
+            mcp_request("s2", 2, "glob"),
+            lsp_child("s1", 1, "workspace/symbol"),
+            lsp_child("s2", 2, "textDocument/references"),
+            mcp_response("s1", 1),
+            post_hook("s1", 1),
+        ];
+        let state = StreamState::new(messages);
+
+        assert_eq!(state.entries.len(), 2);
+        // Scope 1 is closed, scope 2 is open.
+        let StreamEntry::Scope(s1) = &state.entries[0] else {
+            panic!("expected scope 1");
+        };
+        assert_eq!(s1.state, ScopeState::Closed);
+        assert_eq!(s1.children.len(), 1);
+
+        let StreamEntry::Scope(s2) = &state.entries[1] else {
+            panic!("expected scope 2");
+        };
+        assert_eq!(s2.state, ScopeState::Open);
+        assert_eq!(s2.children.len(), 1);
+    }
+
+    #[test]
+    fn test_append_routes_incrementally() {
+        let mut state = StreamState::new(vec![pre_hook("s1", 1), mcp_request("s1", 1, "grep")]);
+        assert_eq!(state.entries.len(), 1);
+
+        state.append(vec![
+            lsp_child("s1", 1, "workspace/symbol"),
+            mcp_response("s1", 1),
+            post_hook("s1", 1),
+        ]);
+
+        let StreamEntry::Scope(scope) = &state.entries[0] else {
+            panic!("expected scope");
+        };
+        assert_eq!(scope.state, ScopeState::Closed);
+        assert_eq!(scope.children.len(), 1);
+        // Closed: header only.
+        assert_eq!(state.display_rows.len(), 1);
+    }
+
+    // ── Expansion toggle tests ──────────────────────────────────────
+
+    #[test]
+    fn test_toggle_closed_scope_expands() {
+        let messages = vec![
+            pre_hook("s1", 1),
+            mcp_request("s1", 1, "grep"),
+            lsp_child("s1", 1, "workspace/symbol"),
+            lsp_child("s1", 1, "textDocument/references"),
+            mcp_response("s1", 1),
+            post_hook("s1", 1),
+        ];
+        let mut state = StreamState::new(messages);
+        // Closed: header only.
+        assert_eq!(state.display_rows.len(), 1);
+
+        // Toggle: expand.
+        state.toggle_expansion();
+        assert_eq!(
+            state.display_rows.len(),
+            3,
+            "expanded scope: header + 2 children"
+        );
+
+        // Toggle: collapse.
+        state.toggle_expansion();
+        assert_eq!(state.display_rows.len(), 1);
+    }
+
+    #[test]
+    fn test_toggle_open_scope_noop() {
+        let messages = vec![
+            pre_hook("s1", 1),
+            mcp_request("s1", 1, "grep"),
+            lsp_child("s1", 1, "workspace/symbol"),
+        ];
+        let mut state = StreamState::new(messages);
+        // Open scope: header + 1 child = 2 rows.
+        assert_eq!(state.display_rows.len(), 2);
+
+        // Toggle on open scope: no-op.
+        state.toggle_expansion();
+        assert_eq!(
+            state.display_rows.len(),
+            2,
+            "open scope cannot be collapsed"
+        );
+    }
+
+    #[test]
+    fn test_toggle_on_child_toggles_parent() {
+        let messages = vec![
+            pre_hook("s1", 1),
+            mcp_request("s1", 1, "grep"),
+            lsp_child("s1", 1, "workspace/symbol"),
+            lsp_child("s1", 1, "textDocument/references"),
+            mcp_response("s1", 1),
+            post_hook("s1", 1),
+        ];
+        let mut state = StreamState::new(messages);
+        // Expand closed scope first.
+        state.toggle_expansion();
+        assert_eq!(state.display_rows.len(), 3);
+
+        // Move cursor to a child row and toggle.
+        state.cursor = 1;
+        state.toggle_expansion();
+        assert_eq!(
+            state.display_rows.len(),
+            1,
+            "toggling on child should collapse parent"
+        );
+    }
+
+    #[test]
+    fn test_toggle_standalone_noop() {
+        let messages = vec![make_message("s1", "textDocument/hover")];
+        let mut state = StreamState::new(messages);
+        assert_eq!(state.display_rows.len(), 1);
+
+        state.toggle_expansion();
+        assert_eq!(state.display_rows.len(), 1, "standalone not expandable");
+    }
+
+    // ── Scroll / cursor tests ────────────────────────────────────────
 
     #[test]
     fn test_stream_state_auto_scroll() {
@@ -664,10 +968,8 @@ mod tests {
             .map(|i| make_message("s1", &format!("method-{i}")))
             .collect();
         let state = StreamState::new(messages);
-
         assert!(state.auto_scroll);
-        // Auto-scroll pins to bottom.
-        assert_eq!(state.scroll_position, 0); // not yet pinned — render does it
+        assert_eq!(state.scroll_position, 0);
     }
 
     #[test]
@@ -680,7 +982,7 @@ mod tests {
 
         state.cursor_up(3);
         assert!(!state.auto_scroll);
-        assert_eq!(state.cursor, 16); // pin_to_bottom → cursor=19, then 19-3=16
+        assert_eq!(state.cursor, 16);
     }
 
     #[test]
@@ -717,142 +1019,6 @@ mod tests {
         assert_eq!(metrics.content_length, 30);
         assert_eq!(metrics.viewport_length, 10);
         assert_eq!(metrics.position, 20);
-    }
-
-    // ── Pipeline wiring tests ────────────────────────────────────────
-
-    #[test]
-    fn test_pipeline_produces_entries() {
-        let messages = vec![
-            make_message("s1", "textDocument/hover"),
-            make_message("s1", "textDocument/definition"),
-        ];
-        let state = StreamState::new(messages);
-        assert_eq!(state.entries.len(), 2);
-        assert_eq!(state.display_rows.len(), 2);
-    }
-
-    #[test]
-    fn test_scope_default_expanded() {
-        // MCP parent + LSP child → scope entry, default expanded.
-        let messages = vec![
-            make_message_with_ids("s1", 1, "mcp", "tools/call", "catenary", Some(500), None),
-            make_message_with_ids(
-                "s1",
-                2,
-                "lsp",
-                "workspace/symbol",
-                "rust-analyzer",
-                Some(501),
-                Some(500),
-            ),
-        ];
-        let state = StreamState::new(messages);
-        // Pipeline: pair_merge produces 2 singles, scope_collapse groups them.
-        assert_eq!(state.entries.len(), 1, "expected 1 scope entry");
-        // Scope default expanded: header + 1 child = 2 display rows.
-        assert_eq!(
-            state.display_rows.len(),
-            2,
-            "scope should be expanded by default"
-        );
-        assert_eq!(state.display_rows[0], DisplayRow::Entry(0));
-        assert_eq!(
-            state.display_rows[1],
-            DisplayRow::ScopeChild {
-                entry_idx: 0,
-                child_idx: 0,
-                is_last: true,
-            }
-        );
-    }
-
-    #[test]
-    fn test_toggle_scope_collapses() {
-        let messages = vec![
-            make_message_with_ids("s1", 1, "mcp", "tools/call", "catenary", Some(500), None),
-            make_message_with_ids(
-                "s1",
-                2,
-                "lsp",
-                "workspace/symbol",
-                "rust-analyzer",
-                Some(501),
-                Some(500),
-            ),
-            make_message_with_ids(
-                "s1",
-                3,
-                "lsp",
-                "textDocument/references",
-                "rust-analyzer",
-                Some(502),
-                Some(500),
-            ),
-        ];
-        let mut state = StreamState::new(messages);
-        // Default: header + 2 children = 3 rows.
-        assert_eq!(state.display_rows.len(), 3);
-
-        // Toggle: collapse the scope.
-        state.toggle_expansion();
-        assert_eq!(
-            state.display_rows.len(),
-            1,
-            "scope should collapse to header only"
-        );
-
-        // Toggle again: re-expand.
-        state.toggle_expansion();
-        assert_eq!(state.display_rows.len(), 3, "scope should re-expand");
-    }
-
-    #[test]
-    fn test_toggle_collapsed_run_expands() {
-        let messages = vec![
-            SessionMessage {
-                session_id: "s1".to_string(),
-                ..test_support::message_with_payload(
-                    "lsp",
-                    "$/progress",
-                    "rust-analyzer",
-                    serde_json::json!({"token": "ra/indexing"}),
-                )
-            },
-            SessionMessage {
-                session_id: "s1".to_string(),
-                ..test_support::message_with_payload(
-                    "lsp",
-                    "$/progress",
-                    "rust-analyzer",
-                    serde_json::json!({"token": "ra/indexing"}),
-                )
-            },
-            SessionMessage {
-                session_id: "s1".to_string(),
-                ..test_support::message_with_payload(
-                    "lsp",
-                    "$/progress",
-                    "rust-analyzer",
-                    serde_json::json!({"token": "ra/indexing"}),
-                )
-            },
-        ];
-        let mut state = StreamState::new(messages);
-        // Default: collapsed = 1 summary row.
-        assert_eq!(state.display_rows.len(), 1);
-
-        // Toggle: expand to header + 3 individual messages.
-        state.toggle_expansion();
-        assert_eq!(
-            state.display_rows.len(),
-            4,
-            "expanded collapsed run: header + 3 messages"
-        );
-
-        // Toggle again: collapse back.
-        state.toggle_expansion();
-        assert_eq!(state.display_rows.len(), 1);
     }
 
     // ── Render tests ──────────────────────────────────────────────────
@@ -925,26 +1091,12 @@ mod tests {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
 
+        // Open scope with 2 children shows tree chars.
         let messages = vec![
-            make_message_with_ids("s1", 1, "mcp", "tools/call", "catenary", Some(500), None),
-            make_message_with_ids(
-                "s1",
-                2,
-                "lsp",
-                "workspace/symbol",
-                "rust-analyzer",
-                Some(501),
-                Some(500),
-            ),
-            make_message_with_ids(
-                "s1",
-                3,
-                "lsp",
-                "textDocument/references",
-                "rust-analyzer",
-                Some(502),
-                Some(500),
-            ),
+            pre_hook("s1", 1),
+            mcp_request("s1", 1, "grep"),
+            lsp_child("s1", 1, "workspace/symbol"),
+            lsp_child("s1", 1, "textDocument/references"),
         ];
         let state = StreamState::new(messages);
 
