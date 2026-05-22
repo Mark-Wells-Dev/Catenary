@@ -287,6 +287,11 @@ impl DiagnosticsServer {
             .await
             .is_ok()
         {
+            // Drain any in-flight publishDiagnostics still in the stdio
+            // pipe buffer before reading the diagnostic cache.
+            let server = client_mutex.lock().await.server().clone();
+            drain_pipe(&server).await;
+
             self.retrieve_diagnostics(client_mutex, &opened, file_results)
                 .await;
         }
@@ -653,6 +658,28 @@ async fn settle_after(
         "batch {label} idle result: {result:?}",
     );
     result != SettleResult::RootDied
+}
+
+/// Drains in-flight notifications from the stdout pipe buffer after
+/// settle.
+///
+/// The settle detector sees the server process tree go idle when CPU
+/// deltas reach zero. But the server's final notifications may still
+/// be in the kernel pipe buffer — the `write` syscall completed (so
+/// CPU shows idle) but the reader loop hasn't processed the bytes yet.
+///
+/// Injects a sentinel response into the pipe's write end (kept from
+/// spawn time) and waits for the reader loop to deliver it. FIFO pipe
+/// ordering guarantees that every preceding byte — including any final
+/// `publishDiagnostics` — has been processed when the sentinel arrives.
+///
+/// Without this, `retrieve_diagnostics` can read stale diagnostics
+/// from an intermediate analysis phase (e.g., rust-analyzer's
+/// fast-check results that are later clobbered by fly-check).
+async fn drain_pipe(server: &LspServer) {
+    if let Err(e) = server.drain().await {
+        debug!("drain_pipe: {e}");
+    }
 }
 
 /// Resolves a file path to an absolute path.

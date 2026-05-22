@@ -10,8 +10,8 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStderr, ChildStdin, Command};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{ChildStderr, ChildStdin, Command};
 use tokio::sync::{Mutex, oneshot};
 use tracing::{debug, info};
 
@@ -118,7 +118,6 @@ const REQUEST_THRESHOLD: u64 = 1000;
 /// correlation. Knows about JSON-RPC framing but nothing about LSP
 /// semantics.
 pub struct Connection {
-    child: Child,
     pid: Option<u32>,
     stdin: Arc<Mutex<ChildStdin>>,
     pending: Arc<Mutex<HashMap<RequestId, PendingRequest>>>,
@@ -129,6 +128,20 @@ pub struct Connection {
     logging: LoggingServer,
     server_name: String,
     monitor: std::sync::Mutex<Option<catenary_proc::ProcessMonitor>>,
+    /// Write end of the stdout pipe, for injecting drain sentinels.
+    ///
+    /// Created at spawn time by `os_pipe::pipe()` and `try_clone()`.
+    /// One copy goes to the child as its stdout; this copy stays with
+    /// [`Connection`] so [`Self::drain`] can write a sentinel response
+    /// that the reader loop picks up in FIFO order.
+    ///
+    /// Wrapped in `Arc` so the child-exit task can close it when the
+    /// server dies — necessary because the extra write fd would
+    /// otherwise prevent EOF detection on the reader loop.
+    drain_writer: Arc<std::sync::Mutex<Option<os_pipe::PipeWriter>>>,
+    /// Signals the child-exit task to kill the server process.
+    /// Fired in [`Drop`] so the task can call [`Child::start_kill`].
+    kill_token: CancellationToken,
     _reader_handle: tokio::task::JoinHandle<()>,
 }
 
@@ -151,10 +164,18 @@ impl Connection {
         logging: LoggingServer,
         server_name: &str,
     ) -> Result<(Self, Option<ChildStderr>)> {
+        // Create the stdout pipe ourselves so we can keep the write end
+        // for drain sentinel injection. The child gets one copy of the
+        // write end (as its stdout); we keep the other for `drain()`.
+        let (pipe_reader, pipe_writer) = os_pipe::pipe().context("Failed to create stdout pipe")?;
+        let drain_writer = pipe_writer
+            .try_clone()
+            .context("Failed to clone stdout pipe writer")?;
+
         let mut cmd = Command::new(program);
         cmd.args(args)
             .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
+            .stdout(pipe_writer)
             .stderr(stderr);
         if let Some(env) = env {
             cmd.envs(env);
@@ -175,10 +196,14 @@ impl Connection {
             .stdin
             .take()
             .ok_or_else(|| anyhow!("stdin not captured"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow!("stdout not captured"))?;
+
+        // Convert the pipe read end to a tokio async reader.
+        // Unix: epoll-backed Receiver (zero-copy wakeup).
+        // Windows: threadpool-backed File (anonymous pipes don't
+        //   support IOCP, same as ChildStdout internally).
+        let stdout =
+            to_async_reader(pipe_reader).context("Failed to register stdout pipe with tokio")?;
+
         let child_stderr = child.stderr.take();
 
         let stdin = Arc::new(Mutex::new(stdin));
@@ -198,9 +223,30 @@ impl Connection {
             server_name.to_string(),
         ));
 
+        let drain_writer = Arc::new(std::sync::Mutex::new(Some(drain_writer)));
+
+        // Background task: owns the Child handle. Waits for either
+        // natural exit or a kill signal (from Drop), then closes the
+        // drain write end so the reader loop sees EOF.
+        let kill_token = CancellationToken::new();
+        {
+            let drain_for_close = drain_writer.clone();
+            let kill = kill_token.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = child.wait() => {}
+                    () = kill.cancelled() => {
+                        let _ = child.start_kill();
+                    }
+                }
+                *drain_for_close
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            });
+        }
+
         Ok((
             Self {
-                child,
                 pid,
                 stdin,
                 pending,
@@ -211,6 +257,8 @@ impl Connection {
                 logging,
                 server_name: server_name.to_string(),
                 monitor: std::sync::Mutex::new(monitor),
+                drain_writer,
+                kill_token,
                 _reader_handle: reader_handle,
             },
             child_stderr,
@@ -423,6 +471,71 @@ impl Connection {
         self.pid
     }
 
+    /// Ensures all bytes currently in the stdout pipe have been read
+    /// and dispatched by the reader loop.
+    ///
+    /// Writes a synthetic JSON-RPC response into the pipe's write end
+    /// (kept from spawn time) with a unique request ID. A matching
+    /// oneshot is registered in `pending` beforehand. Because the pipe
+    /// is FIFO, the reader loop must process every preceding byte —
+    /// including any final `publishDiagnostics` notifications from the
+    /// server — before it reaches the sentinel.
+    ///
+    /// Returns `Ok(())` when the sentinel has been consumed. Fails if
+    /// the pipe write end is unavailable (server already dropped) or the
+    /// reader loop has exited.
+    pub async fn drain(&self) -> Result<()> {
+        let id = RequestId::Number(self.next_id.fetch_add(1, Ordering::SeqCst));
+
+        // Register the oneshot BEFORE writing the sentinel so the
+        // reader loop finds the entry when it processes the response.
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut pending = self.pending.lock().await;
+            pending.insert(
+                id.clone(),
+                PendingRequest {
+                    method: "drain".to_string(),
+                    correlation_id: 0,
+                    sender: tx,
+                },
+            );
+        }
+
+        let response = super::protocol::ResponseMessage {
+            jsonrpc: "2.0".to_string(),
+            id: Some(id.clone()),
+            result: Some(serde_json::Value::Null),
+            error: None,
+        };
+        let body = serde_json::to_string(&response)?;
+        let msg = format!("Content-Length: {}\r\n\r\n{body}", body.len());
+
+        // Write the sentinel. The payload is <200 bytes into a 64 KB
+        // kernel pipe buffer — the write syscall cannot block. The
+        // std::sync::Mutex guard is dropped before the await below.
+        let write_ok = {
+            use std::io::Write;
+            let mut guard = self
+                .drain_writer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.as_mut().is_some_and(|writer| {
+                writer.write_all(msg.as_bytes()).is_ok() && writer.flush().is_ok()
+            })
+        };
+
+        if !write_ok {
+            self.pending.lock().await.remove(&id);
+            return Err(anyhow!("drain: stdout pipe write end unavailable"));
+        }
+
+        // Wait for the reader loop to process the sentinel.
+        rx.await
+            .map_err(|_| anyhow!("drain: reader loop closed before processing sentinel"))?;
+        Ok(())
+    }
+
     /// Build a `$/cancelRequest` notification for the given request ID.
     fn cancel_notification(id: &RequestId) -> super::protocol::NotificationMessage {
         super::protocol::NotificationMessage {
@@ -451,12 +564,12 @@ impl Connection {
         clippy::too_many_lines,
         reason = "Internal task requires sequential message parsing and dispatch"
     )]
-    async fn reader_loop(
+    async fn reader_loop<R: AsyncRead + Unpin>(
         stdin: Arc<Mutex<ChildStdin>>,
         pending: Arc<Mutex<HashMap<RequestId, PendingRequest>>>,
         alive: Arc<AtomicBool>,
         server: Weak<LspServer>,
-        stdout: tokio::process::ChildStdout,
+        stdout: R,
         logging: LoggingServer,
         server_name: String,
     ) {
@@ -647,16 +760,20 @@ impl Connection {
                     {
                         let mut pending = pending.lock().await;
                         if let Some(req) = pending.remove(id) {
-                            let resp_level = lsp_category_level(lsp_category(&req.method));
-                            emit_lsp_event(
-                                resp_level,
-                                &server_name,
-                                &req.method,
-                                req.correlation_id,
-                                Some(req.correlation_id),
-                                &value.to_string(),
-                                "incoming response",
-                            );
+                            // Drain sentinels are internal markers, not
+                            // LSP traffic — skip protocol logging.
+                            if req.method != "drain" {
+                                let resp_level = lsp_category_level(lsp_category(&req.method));
+                                emit_lsp_event(
+                                    resp_level,
+                                    &server_name,
+                                    &req.method,
+                                    req.correlation_id,
+                                    Some(req.correlation_id),
+                                    &value.to_string(),
+                                    "incoming response",
+                                );
+                            }
                             let _ = req.sender.send(response);
                         } else {
                             debug!("Received response for unknown request id: {:?}", id);
@@ -679,10 +796,49 @@ impl Connection {
 
 impl Drop for Connection {
     fn drop(&mut self) {
-        // We can't await a graceful LSP shutdown here because drop is sync.
-        // But we MUST ensure the child process doesn't become a zombie.
-        let _ = self.child.start_kill();
+        // Close the drain write end so the reader loop sees EOF.
+        *self
+            .drain_writer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        // Signal the child-exit task to kill the server process.
+        // The task calls `start_kill()` on the Child it owns.
+        self.kill_token.cancel();
+        // Synchronous fallback: if the runtime is shutting down and
+        // the task can't run, kill by PID directly.
+        if let Some(pid) = self.pid {
+            catenary_proc::kill_process(pid);
+        }
     }
+}
+
+// ── Platform-specific pipe reader conversion ──────────────────────────
+
+/// Converts an `os_pipe::PipeReader` to a tokio `AsyncRead`.
+///
+/// On Unix, uses `tokio::net::unix::pipe::Receiver` (epoll/kqueue).
+/// On other platforms, uses `tokio::fs::File` (threadpool-backed —
+/// anonymous pipes don't support overlapped I/O on Windows).
+#[cfg(unix)]
+fn to_async_reader(
+    pipe: os_pipe::PipeReader,
+) -> std::io::Result<impl AsyncRead + Unpin + Send + 'static> {
+    use std::os::fd::OwnedFd;
+    let fd: OwnedFd = pipe.into();
+    tokio::net::unix::pipe::Receiver::from_owned_fd(fd)
+}
+
+/// Converts an `os_pipe::PipeReader` to a tokio `AsyncRead`.
+///
+/// Threadpool-backed: each `read()` dispatches to a blocking thread.
+/// This matches how `tokio::process::ChildStdout` works on Windows
+/// (anonymous pipes don't support overlapped I/O / IOCP).
+#[cfg(not(unix))]
+fn to_async_reader(
+    pipe: os_pipe::PipeReader,
+) -> std::io::Result<impl AsyncRead + Unpin + Send + 'static> {
+    let file: std::fs::File = pipe.into();
+    Ok(tokio::fs::File::from_std(file))
 }
 
 #[cfg(test)]

@@ -444,6 +444,30 @@ pub fn register_child_process(pid: u32) {
 #[cfg(not(target_os = "windows"))]
 pub const fn register_child_process(_pid: u32) {}
 
+/// Send `SIGKILL` to a process by PID.
+///
+/// Best-effort: returns silently if the process doesn't exist or the
+/// signal cannot be delivered (e.g., permission denied). Used as a
+/// synchronous fallback in `Drop` impls where async child-reap tasks
+/// may not run (runtime shutdown).
+#[cfg(unix)]
+pub fn kill_process(pid: u32) {
+    // SAFETY: `kill` is a POSIX function. Sending SIGKILL to a valid
+    // PID is well-defined; sending to a nonexistent PID returns ESRCH
+    // which we ignore.
+    #[allow(unsafe_code, reason = "libc::kill is the POSIX signal API")]
+    #[allow(clippy::cast_possible_wrap, reason = "PID fits in i32")]
+    unsafe {
+        libc::kill(pid.cast_signed(), libc::SIGKILL);
+    }
+}
+
+/// Send `SIGKILL` to a process by PID.
+///
+/// No-op on non-Unix, non-Windows platforms.
+#[cfg(not(any(unix, windows)))]
+pub const fn kill_process(_pid: u32) {}
+
 // ─── Linux ──────────────────────────────────────────────────────────────
 
 #[cfg(target_os = "linux")]

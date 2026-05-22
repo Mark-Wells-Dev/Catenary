@@ -597,6 +597,22 @@ impl LspServer {
         self.connection().map(Connection::alive_flag)
     }
 
+    /// Drains the stdout pipe so all buffered server messages have
+    /// been processed by the reader loop.
+    ///
+    /// See [`Connection::drain`] for the mechanism.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection is not established or the
+    /// drain fails.
+    pub async fn drain(&self) -> anyhow::Result<()> {
+        self.connection()
+            .ok_or_else(|| anyhow::anyhow!("connection not established"))?
+            .drain()
+            .await
+    }
+
     // ── Process tree ─────────────────────────────────────────────
 
     /// Samples the process tree via the tree monitor.
