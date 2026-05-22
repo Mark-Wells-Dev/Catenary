@@ -499,8 +499,12 @@ impl HookRouter {
                 );
                 // Stash the scope parent ID so the MCP tools/call and
                 // post-tool hook events can reference this pre-tool hook
-                // as their scope root.
-                self.session.scope_id_stash.stash(entry_id);
+                // as their scope root. Only when the tool is allowed —
+                // denied tools produce no MCP call or post-tool hook to
+                // consume the stash.
+                if result.is_none() {
+                    self.session.scope_id_stash.stash(entry_id);
+                }
                 // Stash the host CLI's cwd for the upcoming MCP grep/glob
                 // call, but only when the tool is allowed (denied tools
                 // won't produce an MCP call, so stashing would leave a
@@ -2080,6 +2084,29 @@ mod tests {
         // Take (post-tool hook) clears.
         assert_eq!(router.session.scope_id_stash.take(), Some(10));
         assert!(router.session.scope_id_stash.peek().is_none());
+    }
+
+    #[test]
+    fn dispatch_pre_tool_denied_does_not_stash_scope_id() {
+        let router = test_router();
+        // Enter editing mode so non-allowed tools are denied.
+        router.handle_enforce_editing(START_EDITING, None, None, None, "");
+
+        router.dispatch(
+            crate::hook::HookRequest::PreTool {
+                tool_name: "Bash".to_string(),
+                file_path: None,
+                command: None,
+                agent_id: String::new(),
+                session_id: None,
+                cwd: None,
+            },
+            42,
+        );
+        assert!(
+            router.session.scope_id_stash.peek().is_none(),
+            "denied tools should not stash scope_id"
+        );
     }
 
     // ── Transcript root sync tests ────────────────────────────────────

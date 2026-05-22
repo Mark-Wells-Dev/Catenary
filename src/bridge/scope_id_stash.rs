@@ -64,7 +64,7 @@ impl ScopeIdStash {
             slot = match result {
                 Ok((guard, wait)) => {
                     if wait.timed_out() {
-                        tracing::warn!(
+                        tracing::debug!(
                             source = crate::source::Source::HookDispatch.as_str(),
                             "scope_id stash timeout \u{2014} overwriting unconsumed entry",
                         );
