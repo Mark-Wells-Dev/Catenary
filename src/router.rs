@@ -180,6 +180,40 @@ impl CorrelationState {
     }
 }
 
+// ── Session identity extraction ────────────────────────────────
+
+/// Extracts injected session identity fields from tool arguments.
+///
+/// Removes `_session_id` and `_cwd` from the arguments map and returns
+/// them separately alongside the cleaned arguments. Fields injected by
+/// the `PreToolUse` hook via `updatedInput` (Claude Code) or
+/// `tool_input` merge (Gemini CLI).
+#[cfg(unix)]
+fn extract_session_fields(
+    arguments: Option<serde_json::Value>,
+) -> (Option<String>, Option<PathBuf>, Option<serde_json::Value>) {
+    let Some(serde_json::Value::Object(mut map)) = arguments else {
+        return (None, None, arguments);
+    };
+
+    let session_id = map.remove("_session_id").and_then(|v| match v {
+        serde_json::Value::String(s) => Some(s),
+        _ => None,
+    });
+    let cwd = map.remove("_cwd").and_then(|v| match v {
+        serde_json::Value::String(s) => Some(PathBuf::from(s)),
+        _ => None,
+    });
+
+    let clean = if map.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(map))
+    };
+
+    (session_id, cwd, clean)
+}
+
 /// Per-connection tool handler that dispatches to the correct session
 /// after correlation.
 ///
@@ -220,6 +254,41 @@ impl CorrelatingHandler {
             self.roots_refresh.store(true, Ordering::Release);
         }
     }
+
+    /// Binds this MCP connection to a session and returns the session.
+    ///
+    /// Sets `connection_sessions[fd] = session_id`,
+    /// `session_connections[session_id] = fd`, and registers the
+    /// per-connection roots refresh flag. Records `session_id` on
+    /// the current tracing span.
+    ///
+    /// Returns `None` if the session is not in the registry (hasn't
+    /// been created by a hook dispatch yet).
+    fn bind_and_lookup(&self, session_id: &str) -> Option<Arc<Session>> {
+        self.correlation
+            .connection_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(self.fd, session_id.to_string());
+        self.correlation
+            .session_connections
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session_id.to_string(), self.fd);
+        self.correlation
+            .roots_refresh_flags
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session_id.to_string(), self.roots_refresh.clone());
+
+        tracing::Span::current().record("session_id", session_id);
+
+        self.sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .map(|entry| entry.session.clone())
+    }
 }
 
 #[cfg(unix)]
@@ -228,6 +297,7 @@ impl ToolHandler for CorrelatingHandler {
         self.inner.list_tools()
     }
 
+    #[allow(clippy::too_many_lines, reason = "sequential routing priorities")]
     fn call_tool(
         &self,
         name: &str,
@@ -235,18 +305,57 @@ impl ToolHandler for CorrelatingHandler {
         parent_id: Option<i64>,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> anyhow::Result<crate::mcp::CallToolResult> {
-        // Fast path: already have a cached per-session handler.
+        // Extract injected session identity fields before routing.
+        let (session_id_arg, cwd_arg, clean_args) = extract_session_fields(arguments);
+
+        // Priority 1: _session_id in arguments (per-call routing).
+        // Injected by PreToolUse hook via updatedInput (Claude Code) or
+        // tool_input merge (Gemini CLI).
+        if let Some(ref sid) = session_id_arg {
+            if let Some(session) = self.bind_and_lookup(sid) {
+                // Resolve cwd from injected arguments — bypasses
+                // the cwd_stash. Discard any stash entry placed by
+                // the hook dispatch to prevent it from leaking into
+                // the next tool call.
+                let mut params = clean_args.unwrap_or(serde_json::Value::Null);
+                if let Some(ref cwd) = cwd_arg {
+                    let _ = session.cwd_stash.take();
+                    crate::bridge::resolve_params_against_cwd(name, &mut params, cwd);
+                }
+                self.bridge_roots_refresh(&session);
+                let router = McpRouter::new(session.clone());
+                let result = router.call_tool(name, Some(params), parent_id, cancel);
+                *self
+                    .cached
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((router, session));
+                return result;
+            }
+            // Session not in registry yet — fall through to existing paths.
+            debug!(
+                source = Source::DaemonDispatch.as_str(),
+                session_id = sid.as_str(),
+                "injected _session_id not found in registry, falling through",
+            );
+        }
+
+        // Priority 2: cached handler (from previous call).
         if let Some((handler, session)) = self
             .cached
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
         {
+            let mut params = clean_args.unwrap_or(serde_json::Value::Null);
+            if let Some(ref cwd) = cwd_arg {
+                let _ = session.cwd_stash.take();
+                crate::bridge::resolve_params_against_cwd(name, &mut params, cwd);
+            }
             self.bridge_roots_refresh(session);
-            return handler.call_tool(name, arguments, parent_id, cancel);
+            return handler.call_tool(name, Some(params), parent_id, cancel);
         }
 
-        // Check if this connection has been correlated.
+        // Priority 3: sandwich correlation (existing path).
         let session_id = self
             .correlation
             .connection_sessions
@@ -256,7 +365,6 @@ impl ToolHandler for CorrelatingHandler {
             .cloned();
 
         if let Some(sid) = session_id {
-            // Look up the per-session Session and cache a McpRouter.
             let session = self
                 .sessions
                 .lock()
@@ -265,9 +373,14 @@ impl ToolHandler for CorrelatingHandler {
                 .map(|entry| entry.session.clone());
 
             if let Some(session) = session {
+                let mut params = clean_args.unwrap_or(serde_json::Value::Null);
+                if let Some(ref cwd) = cwd_arg {
+                    let _ = session.cwd_stash.take();
+                    crate::bridge::resolve_params_against_cwd(name, &mut params, cwd);
+                }
                 self.bridge_roots_refresh(&session);
                 let router = McpRouter::new(session.clone());
-                let result = router.call_tool(name, arguments, parent_id, cancel);
+                let result = router.call_tool(name, Some(params), parent_id, cancel);
                 *self
                     .cached
                     .lock()
@@ -277,7 +390,7 @@ impl ToolHandler for CorrelatingHandler {
         }
 
         // Not yet correlated — use the shared handler.
-        self.inner.call_tool(name, arguments, parent_id, cancel)
+        self.inner.call_tool(name, clean_args, parent_id, cancel)
     }
 
     fn scope_parent_id(&self) -> Option<i64> {
@@ -2026,6 +2139,95 @@ mod tests {
                 sources.push(src);
             }
         }
+    }
+
+    // ── extract_session_fields tests ─────────────────────────────
+
+    #[test]
+    fn extract_fields_with_session_id_and_cwd() {
+        let args = serde_json::json!({
+            "pattern": "foo",
+            "_session_id": "abc-123",
+            "_cwd": "/home/user/project"
+        });
+        let (sid, cwd, clean) = extract_session_fields(Some(args));
+        assert_eq!(sid.as_deref(), Some("abc-123"));
+        assert_eq!(cwd, Some(PathBuf::from("/home/user/project")));
+        let clean = clean.expect("should have remaining fields");
+        assert_eq!(clean["pattern"], "foo");
+        assert!(clean.get("_session_id").is_none());
+        assert!(clean.get("_cwd").is_none());
+    }
+
+    #[test]
+    fn extract_fields_session_id_only() {
+        let args = serde_json::json!({
+            "pattern": "bar",
+            "_session_id": "xyz"
+        });
+        let (sid, cwd, clean) = extract_session_fields(Some(args));
+        assert_eq!(sid.as_deref(), Some("xyz"));
+        assert!(cwd.is_none());
+        let clean = clean.expect("should have remaining fields");
+        assert_eq!(clean["pattern"], "bar");
+    }
+
+    #[test]
+    fn extract_fields_no_injected_fields() {
+        let args = serde_json::json!({"pattern": "baz"});
+        let (sid, cwd, clean) = extract_session_fields(Some(args));
+        assert!(sid.is_none());
+        assert!(cwd.is_none());
+        let clean = clean.expect("should have remaining fields");
+        assert_eq!(clean["pattern"], "baz");
+    }
+
+    #[test]
+    fn extract_fields_only_injected_returns_none_clean() {
+        let args = serde_json::json!({
+            "_session_id": "abc",
+            "_cwd": "/tmp"
+        });
+        let (sid, cwd, clean) = extract_session_fields(Some(args));
+        assert_eq!(sid.as_deref(), Some("abc"));
+        assert_eq!(cwd, Some(PathBuf::from("/tmp")));
+        assert!(
+            clean.is_none(),
+            "empty map after stripping should return None"
+        );
+    }
+
+    #[test]
+    fn extract_fields_null_arguments() {
+        let (sid, cwd, clean) = extract_session_fields(None);
+        assert!(sid.is_none());
+        assert!(cwd.is_none());
+        assert!(clean.is_none());
+    }
+
+    #[test]
+    fn extract_fields_non_object_passthrough() {
+        let args = serde_json::json!("a string");
+        let (sid, cwd, clean) = extract_session_fields(Some(args.clone()));
+        assert!(sid.is_none());
+        assert!(cwd.is_none());
+        assert_eq!(clean, Some(args));
+    }
+
+    #[test]
+    fn extract_fields_wrong_type_ignored() {
+        let args = serde_json::json!({
+            "_session_id": 42,
+            "_cwd": true,
+            "pattern": "ok"
+        });
+        let (sid, cwd, clean) = extract_session_fields(Some(args));
+        assert!(sid.is_none(), "non-string _session_id should be ignored");
+        assert!(cwd.is_none(), "non-string _cwd should be ignored");
+        // Non-string injected fields are removed from the map but
+        // produce None — they don't pass through to the tool.
+        let clean = clean.expect("should have remaining fields");
+        assert_eq!(clean["pattern"], "ok");
     }
 
     // ── Tests ──────────────────────────────────────────────────────

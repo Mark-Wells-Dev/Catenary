@@ -130,6 +130,64 @@ fn format_stop_block(reason: &str, format: HostFormat) -> String {
     }
 }
 
+/// Format a `PreToolUse` allow response with session identity injection.
+///
+/// Injects `_session_id` and `_cwd` into the tool arguments so the daemon
+/// can route the MCP `tools/call` to the correct session without the
+/// sandwich serialization semaphore.
+///
+/// Returns `None` if `session_id` is missing from the hook payload (the
+/// daemon can't route without it, so injection is pointless).
+fn format_allow_with_injection(
+    hook_json: &serde_json::Value,
+    format: HostFormat,
+) -> Option<String> {
+    let session_id = hook_json.get("session_id").and_then(|v| v.as_str())?;
+
+    match format {
+        HostFormat::Claude => {
+            // `updatedInput` replaces the entire input — echo all original
+            // fields plus the injected ones.
+            let mut updated = hook_json
+                .get("tool_input")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            if let Some(obj) = updated.as_object_mut() {
+                obj.insert("_session_id".to_string(), serde_json::json!(session_id));
+                if let Some(cwd) = hook_json.get("cwd").and_then(|v| v.as_str()) {
+                    obj.insert("_cwd".to_string(), serde_json::json!(cwd));
+                }
+            }
+            Some(
+                serde_json::json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "allow",
+                        "updatedInput": updated
+                    }
+                })
+                .to_string(),
+            )
+        }
+        HostFormat::Gemini => {
+            // `tool_input` merges with the original — only injected fields.
+            let mut inject = serde_json::Map::new();
+            inject.insert("_session_id".to_string(), serde_json::json!(session_id));
+            if let Some(cwd) = hook_json.get("cwd").and_then(|v| v.as_str()) {
+                inject.insert("_cwd".to_string(), serde_json::json!(cwd));
+            }
+            Some(
+                serde_json::json!({
+                    "hookSpecificOutput": {
+                        "tool_input": serde_json::Value::Object(inject)
+                    }
+                })
+                .to_string(),
+            )
+        }
+    }
+}
+
 /// Extract `agent_id` from hook payload. Defaults to empty string (main agent).
 fn extract_agent_id(hook_json: &serde_json::Value) -> &str {
     hook_json
@@ -525,45 +583,58 @@ pub fn run_pre_tool(format: HostFormat) {
     }
 
     // ── Editing state enforcement (IPC to daemon / session) ──────
-    let Some(stream) = hook_connect(&hook_json) else {
-        return;
-    };
+    let denied = hook_connect(&hook_json).is_some_and(|stream| {
+        let file_path = extract_file_path(&hook_json);
+        let agent_id = extract_agent_id(&hook_json);
+        let session_id = hook_json.get("session_id").and_then(|v| v.as_str());
+        let shell_cmd = extract_shell_command(&hook_json, tool_name, format);
 
-    let file_path = extract_file_path(&hook_json);
-    let agent_id = extract_agent_id(&hook_json);
-    let session_id = hook_json.get("session_id").and_then(|v| v.as_str());
-    let shell_cmd = extract_shell_command(&hook_json, tool_name, format);
+        let mut request = serde_json::json!({
+            "method": "pre-tool/editing-state",
+            "tool_name": tool_name,
+            "agent_id": agent_id,
+        });
+        if let Some(path) = &file_path {
+            request["file_path"] = serde_json::json!(path);
+        }
+        if let Some(cmd) = &shell_cmd {
+            request["command"] = serde_json::json!(cmd);
+        }
+        if let Some(sid) = session_id {
+            request["session_id"] = serde_json::json!(sid);
+        }
+        // Pass the host CLI's cwd for Catenary grep/glob so the session
+        // can resolve relative patterns against the agent's working directory.
+        if is_catenary_grep_or_glob(tool_name)
+            && let Some(c) = hook_json.get("cwd").and_then(|v| v.as_str())
+        {
+            request["cwd"] = serde_json::json!(c);
+        }
+        request["host_payload"] = prepare_host_payload(&hook_json);
 
-    let mut request = serde_json::json!({
-        "method": "pre-tool/editing-state",
-        "tool_name": tool_name,
-        "agent_id": agent_id,
+        let lines = ipc_exchange(stream, &request);
+
+        if let Some(line) = lines.first()
+            && let Ok(envelope) = serde_json::from_str::<crate::hook::HookResponseEnvelope>(line)
+            && let Some(crate::hook::HookResult::Deny(reason)) = &envelope.result
+        {
+            print!("{}", format_deny(reason, format));
+            true
+        } else {
+            false
+        }
     });
-    if let Some(path) = &file_path {
-        request["file_path"] = serde_json::json!(path);
-    }
-    if let Some(cmd) = &shell_cmd {
-        request["command"] = serde_json::json!(cmd);
-    }
-    if let Some(sid) = session_id {
-        request["session_id"] = serde_json::json!(sid);
-    }
-    // Pass the host CLI's cwd for Catenary grep/glob so the session
-    // can resolve relative patterns against the agent's working directory.
-    if is_catenary_grep_or_glob(tool_name)
-        && let Some(c) = hook_json.get("cwd").and_then(|v| v.as_str())
-    {
-        request["cwd"] = serde_json::json!(c);
-    }
-    request["host_payload"] = prepare_host_payload(&hook_json);
 
-    let lines = ipc_exchange(stream, &request);
-
-    if let Some(line) = lines.first()
-        && let Ok(envelope) = serde_json::from_str::<crate::hook::HookResponseEnvelope>(line)
-        && let Some(crate::hook::HookResult::Deny(reason)) = &envelope.result
+    // ── Session identity injection ─────────────────────────────────
+    // For allowed Catenary tool calls, inject _session_id and _cwd into
+    // the tool arguments via updatedInput (Claude Code) or tool_input
+    // merge (Gemini CLI). The daemon uses these fields to route the MCP
+    // tools/call to the correct session without sandwich serialization.
+    if !denied
+        && is_any_catenary_tool(tool_name)
+        && let Some(response) = format_allow_with_injection(&hook_json, format)
     {
-        print!("{}", format_deny(reason, format));
+        print!("{response}");
     }
 }
 
@@ -737,6 +808,18 @@ fn ipc_check_command(
 fn is_catenary_grep_or_glob(tool_name: &str) -> bool {
     use crate::bridge::is_catenary_tool;
     is_catenary_tool(tool_name, "grep") || is_catenary_tool(tool_name, "glob")
+}
+
+/// Returns `true` if the tool name is any Catenary MCP tool.
+///
+/// Matches grep, glob, `start_editing`, and `done_editing` in bare
+/// and MCP-qualified forms.
+fn is_any_catenary_tool(tool_name: &str) -> bool {
+    use crate::bridge::is_catenary_tool;
+    is_catenary_tool(tool_name, "grep")
+        || is_catenary_tool(tool_name, "glob")
+        || is_catenary_tool(tool_name, "start_editing")
+        || is_catenary_tool(tool_name, "done_editing")
 }
 
 /// Extract the shell command string from hook JSON for Bash-like tools.
@@ -958,6 +1041,114 @@ mod tests {
         assert!(!is_catenary_grep_or_glob("Bash"));
         assert!(!is_catenary_grep_or_glob("start_editing"));
         assert!(!is_catenary_grep_or_glob("mcp_catenary_start_editing"));
+    }
+
+    // ── is_any_catenary_tool tests ──────────────────────────────────
+
+    #[test]
+    fn any_catenary_tool_matches_all_tools() {
+        assert!(is_any_catenary_tool("grep"));
+        assert!(is_any_catenary_tool("glob"));
+        assert!(is_any_catenary_tool("start_editing"));
+        assert!(is_any_catenary_tool("done_editing"));
+        // MCP-qualified names
+        assert!(is_any_catenary_tool("mcp__plugin_catenary_catenary__grep"));
+        assert!(is_any_catenary_tool("mcp_catenary_done_editing"));
+    }
+
+    #[test]
+    fn any_catenary_tool_rejects_non_catenary() {
+        assert!(!is_any_catenary_tool("Edit"));
+        assert!(!is_any_catenary_tool("Bash"));
+        assert!(!is_any_catenary_tool("Read"));
+        assert!(!is_any_catenary_tool("ToolSearch"));
+    }
+
+    // ── format_allow_with_injection tests ────────────────────────────
+
+    #[test]
+    fn inject_claude_includes_updated_input() -> Result<()> {
+        let hook_json = serde_json::json!({
+            "session_id": "abc-123",
+            "cwd": "/home/user/project",
+            "tool_input": { "pattern": "foo" }
+        });
+        let output =
+            format_allow_with_injection(&hook_json, HostFormat::Claude).expect("should inject");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).context("should produce valid JSON")?;
+
+        assert_eq!(parsed["hookSpecificOutput"]["permissionDecision"], "allow",);
+        assert_eq!(parsed["hookSpecificOutput"]["hookEventName"], "PreToolUse",);
+        let updated = &parsed["hookSpecificOutput"]["updatedInput"];
+        assert_eq!(updated["pattern"], "foo", "original field preserved");
+        assert_eq!(updated["_session_id"], "abc-123");
+        assert_eq!(updated["_cwd"], "/home/user/project");
+        Ok(())
+    }
+
+    #[test]
+    fn inject_gemini_uses_tool_input_merge() -> Result<()> {
+        let hook_json = serde_json::json!({
+            "session_id": "xyz-789",
+            "cwd": "/workspace",
+            "tool_input": { "pattern": "bar" }
+        });
+        let output =
+            format_allow_with_injection(&hook_json, HostFormat::Gemini).expect("should inject");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).context("should produce valid JSON")?;
+
+        let tool_input = &parsed["hookSpecificOutput"]["tool_input"];
+        assert_eq!(tool_input["_session_id"], "xyz-789");
+        assert_eq!(tool_input["_cwd"], "/workspace");
+        // Gemini merge — original fields are NOT echoed.
+        assert!(tool_input.get("pattern").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn inject_missing_session_id_returns_none() {
+        let hook_json = serde_json::json!({
+            "cwd": "/home/user/project",
+            "tool_input": { "pattern": "foo" }
+        });
+        assert!(format_allow_with_injection(&hook_json, HostFormat::Claude).is_none());
+    }
+
+    #[test]
+    fn inject_missing_cwd_omits_cwd() -> Result<()> {
+        let hook_json = serde_json::json!({
+            "session_id": "no-cwd",
+            "tool_input": {}
+        });
+        let output =
+            format_allow_with_injection(&hook_json, HostFormat::Claude).expect("should inject");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).context("should produce valid JSON")?;
+
+        let updated = &parsed["hookSpecificOutput"]["updatedInput"];
+        assert_eq!(updated["_session_id"], "no-cwd");
+        assert!(
+            updated.get("_cwd").is_none(),
+            "should not inject _cwd when cwd is absent"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn inject_missing_tool_input_creates_empty() -> Result<()> {
+        let hook_json = serde_json::json!({
+            "session_id": "empty-input"
+        });
+        let output =
+            format_allow_with_injection(&hook_json, HostFormat::Claude).expect("should inject");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).context("should produce valid JSON")?;
+
+        let updated = &parsed["hookSpecificOutput"]["updatedInput"];
+        assert_eq!(updated["_session_id"], "empty-input");
+        Ok(())
     }
 
     // ── Host payload truncation tests ─────────────────────────────────
