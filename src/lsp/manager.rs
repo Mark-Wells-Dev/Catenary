@@ -991,8 +991,10 @@ impl LspClientManager {
 
     /// Shared spawn implementation.
     ///
-    /// When `project_scoped` is true, uses `effective_server_def` and
-    /// forces `Scope::Root(root)` regardless of capabilities.
+    /// Scope selection: `project_scoped` forces `Scope::Root(root)`,
+    /// otherwise capability-driven (`Scope::Workspace` when the server
+    /// supports workspace folders, `Scope::Root` otherwise). Root
+    /// markers resolve paths but do not influence scope.
     async fn spawn_inner(
         &self,
         server_name: &str,
@@ -1016,13 +1018,7 @@ impl LspClientManager {
                 .clone()
         };
 
-        let marker_scoped = !project_scoped
-            && self
-                .config
-                .resolve_language(lang)
-                .and_then(LanguageConfig::active_markers)
-                .is_some();
-        let force_root = project_scoped || marker_scoped;
+        let force_root = project_scoped;
 
         let roots = self.fs.roots();
         let mut clients = self.clients.lock().await;
@@ -1030,9 +1026,9 @@ impl LspClientManager {
         // Double-check: another task may have spawned this server
         // while we waited.
         //
-        // Project-scoped and marker-scoped spawns only check the exact
-        // Root(root) key — a workspace instance must NOT prevent
-        // spawning the isolated instance.
+        // Project-scoped spawns only check the exact Root(root) key —
+        // a workspace instance must NOT prevent spawning the isolated
+        // instance.
         let existing = if force_root {
             let root_key = InstanceKey::new(
                 lang.to_string(),
@@ -1074,9 +1070,9 @@ impl LspClientManager {
             self.collect_per_root_settings(server_name, &roots)
         };
 
-        // Marker-scoped instances are initialized with only their
-        // resolved root — the server sees only the sub-root.
-        let init_roots = if marker_scoped {
+        // Project-scoped instances are initialized with only their
+        // resolved root — the server sees only that root.
+        let init_roots = if project_scoped {
             vec![root.to_path_buf()]
         } else {
             roots
@@ -1102,9 +1098,8 @@ impl LspClientManager {
             .initialize(&init_roots, server_def.initialization_options.clone())
             .await?;
 
-        // Project-scoped and marker-scoped instances always get
-        // Scope::Root regardless of capabilities — they are isolated
-        // to their specific root.
+        // Project-scoped instances always get Scope::Root regardless
+        // of capabilities — they are isolated to their specific root.
         let scope = if force_root {
             Scope::Root(root.to_path_buf())
         } else if client.supports_workspace_folders() {
@@ -1278,18 +1273,11 @@ impl LspClientManager {
         root: &Path,
     ) -> Result<Arc<Mutex<LspClient>>> {
         let project_scoped = self.is_project_scoped(lang, root);
-        let marker_scoped = !project_scoped
-            && self
-                .config
-                .resolve_language(lang)
-                .and_then(LanguageConfig::active_markers)
-                .is_some();
-        let force_root = project_scoped || marker_scoped;
+        let force_root = project_scoped;
 
         // Fast path: check for an existing instance. Project-scoped
-        // and marker-scoped roots only check the exact Root(root) key
-        // — a workspace instance must not prevent spawning the
-        // isolated instance.
+        // roots only check the exact Root(root) key — a workspace
+        // instance must not prevent spawning the isolated instance.
         {
             let clients = self.clients.lock().await;
             let existing = if force_root {
@@ -1627,10 +1615,10 @@ impl LspClientManager {
                     if marker_set.is_some_and(|(m, c)| !dir_has_marker(root, m, c)) {
                         continue;
                     }
-                    // Workspace-capable + non-project-scoped + no markers:
-                    // already covered by the workspace instance (folder add
+                    // Workspace-capable + non-project-scoped: already
+                    // covered by the workspace instance (folder add
                     // sent in sync_roots).
-                    if (self.is_project_scoped(lang, root) || !is_workspace || marker_set.is_some())
+                    if (self.is_project_scoped(lang, root) || !is_workspace)
                         && let Err(e) = self.ensure_server(lang, server_name, root).await
                     {
                         warn!(
@@ -6120,6 +6108,215 @@ mod tests {
 
         // Server unaffected
         assert!(client.lock().await.is_alive());
+        Ok(())
+    }
+
+    // ── Marker / scope decoupling tests ─────────────────────────────
+
+    /// Config with workspace-folder-capable server AND root markers.
+    fn mockls_workspace_folders_markers_config(markers: Vec<String>) -> Arc<Config> {
+        let bin = mockls_bin();
+        let server_name = format!("mockls-{MOCK_LANG_A}-wfm");
+        let mut server = HashMap::new();
+        server.insert(
+            server_name.clone(),
+            ServerDef {
+                command: bin.to_string_lossy().to_string(),
+                args: vec![MOCK_LANG_A.to_string(), "--workspace-folders".to_string()],
+                ..ServerDef::default()
+            },
+        );
+        let mut language = HashMap::new();
+        language.insert(
+            MOCK_LANG_A.to_string(),
+            LanguageConfig {
+                servers: Some(vec![ServerBinding::new(server_name)]),
+                root_markers: Some(markers),
+                ..LanguageConfig::default()
+            },
+        );
+        Arc::new(Config {
+            language,
+            server,
+            log_retention_days: 7,
+            notifications: None,
+            icons: None,
+            tui: None,
+            tools: None,
+            resolved_commands: None,
+        })
+    }
+
+    /// Config with legacy (no workspace folders) server AND root markers.
+    fn mockls_legacy_markers_config(markers: Vec<String>) -> Arc<Config> {
+        let bin = mockls_bin();
+        let server_name = format!("mockls-{MOCK_LANG_A}-lm");
+        let mut server = HashMap::new();
+        server.insert(
+            server_name.clone(),
+            ServerDef {
+                command: bin.to_string_lossy().to_string(),
+                args: vec![MOCK_LANG_A.to_string()],
+                ..ServerDef::default()
+            },
+        );
+        let mut language = HashMap::new();
+        language.insert(
+            MOCK_LANG_A.to_string(),
+            LanguageConfig {
+                servers: Some(vec![ServerBinding::new(server_name)]),
+                root_markers: Some(markers),
+                ..LanguageConfig::default()
+            },
+        );
+        Arc::new(Config {
+            language,
+            server,
+            log_retention_days: 7,
+            notifications: None,
+            icons: None,
+            tui: None,
+            tools: None,
+            resolved_commands: None,
+        })
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::similar_names,
+        reason = "root_a/root_b are intentionally parallel"
+    )]
+    async fn test_marker_workspace_capable_consolidates() -> Result<()> {
+        // Two roots with markers + workspace-folder-capable server →
+        // one instance with Scope::Workspace.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root_a = dir.path().join("project_a");
+        let root_b = dir.path().join("project_b");
+        std::fs::create_dir_all(&root_a).expect("mkdir a");
+        std::fs::create_dir_all(&root_b).expect("mkdir b");
+        std::fs::write(root_a.join("Cargo.toml"), "").expect("marker a");
+        std::fs::write(root_b.join("Cargo.toml"), "").expect("marker b");
+
+        let config = mockls_workspace_folders_markers_config(vec!["Cargo.toml".into()]);
+        let root_a_str = root_a.to_str().expect("path a");
+        let root_b_str = root_b.to_str().expect("path b");
+        let manager = LspClientManager::new(
+            config,
+            test_logging(),
+            test_fs_with_roots(&[root_a_str, root_b_str]),
+        );
+
+        let client = ensure_first_server(&manager, MOCK_LANG_A).await?;
+        assert!(client.lock().await.supports_workspace_folders());
+
+        let clients = manager.clients().await;
+        assert_eq!(clients.len(), 1, "Should consolidate into one instance");
+        let key = clients.keys().next().expect("key");
+        assert_eq!(
+            key.scope,
+            Scope::Workspace,
+            "Marker-configured workspace-capable server should use Scope::Workspace"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::similar_names,
+        reason = "root_a/root_b are intentionally parallel"
+    )]
+    async fn test_marker_no_workspace_folders_isolates() -> Result<()> {
+        // Two roots with markers + legacy server (no workspace folders)
+        // → two instances with Scope::Root each.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root_a = dir.path().join("project_a");
+        let root_b = dir.path().join("project_b");
+        std::fs::create_dir_all(&root_a).expect("mkdir a");
+        std::fs::create_dir_all(&root_b).expect("mkdir b");
+        std::fs::write(root_a.join("Cargo.toml"), "").expect("marker a");
+        std::fs::write(root_b.join("Cargo.toml"), "").expect("marker b");
+
+        let config = mockls_legacy_markers_config(vec!["Cargo.toml".into()]);
+        let root_a_str = root_a.to_str().expect("path a");
+        let root_b_str = root_b.to_str().expect("path b");
+        let manager = LspClientManager::new(
+            config,
+            test_logging(),
+            test_fs_with_roots(&[root_a_str, root_b_str]),
+        );
+
+        let server_name = &manager
+            .config
+            .resolve_language(MOCK_LANG_A)
+            .expect("lang config")
+            .servers()
+            .first()
+            .expect("binding")
+            .name;
+
+        // Spawn for both roots.
+        manager
+            .ensure_server(MOCK_LANG_A, server_name, &root_a)
+            .await?;
+        manager
+            .ensure_server(MOCK_LANG_A, server_name, &root_b)
+            .await?;
+
+        let clients = manager.clients().await;
+        assert_eq!(clients.len(), 2, "Legacy server should have two instances");
+        for key in clients.keys() {
+            assert!(
+                matches!(&key.scope, Scope::Root(_)),
+                "Each instance should be Scope::Root, got {:?}",
+                key.scope,
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_sync_roots_marker_resolved_folder_uri() -> Result<()> {
+        // Start with one root, add a second mid-session. Workspace-capable
+        // server with markers should NOT spawn a second instance — the new
+        // root is covered by the existing Scope::Workspace instance via
+        // didChangeWorkspaceFolders.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root_a = dir.path().join("project_a");
+        let root_b = dir.path().join("project_b");
+        std::fs::create_dir_all(&root_a).expect("mkdir a");
+        std::fs::create_dir_all(&root_b).expect("mkdir b");
+        std::fs::write(root_a.join("Cargo.toml"), "").expect("marker a");
+        std::fs::write(root_b.join("Cargo.toml"), "").expect("marker b");
+        // Create a file so detect_workspace_languages finds the language.
+        std::fs::write(root_b.join("file.yX4Za"), "").expect("file b");
+
+        let config = mockls_workspace_folders_markers_config(vec!["Cargo.toml".into()]);
+        let root_a_str = root_a.to_str().expect("path a");
+        let manager =
+            LspClientManager::new(config, test_logging(), test_fs_with_roots(&[root_a_str]));
+
+        let client = ensure_first_server(&manager, MOCK_LANG_A).await?;
+        assert!(client.lock().await.supports_workspace_folders());
+        assert_eq!(manager.clients().await.len(), 1);
+
+        // Add second root mid-session.
+        manager
+            .sync_roots(vec![root_a.clone(), root_b.clone()])
+            .await?;
+
+        // Still one instance — the new root was added via workspace
+        // folders, not by spawning a separate server.
+        let clients = manager.clients().await;
+        assert_eq!(
+            clients.len(),
+            1,
+            "Should still have one instance after adding root"
+        );
+        let key = clients.keys().next().expect("key");
+        assert_eq!(key.scope, Scope::Workspace);
+
         Ok(())
     }
 }
