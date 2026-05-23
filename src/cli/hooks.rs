@@ -501,15 +501,13 @@ pub fn run_pre_tool(format: HostFormat) {
         .unwrap_or("");
 
     // ── Root management commands ─────────────────────────────────
-    // Intercept `catenary add-root` / `catenary rm-root` shell commands
-    // and forward to the daemon as IPC root management requests.
-    if let Some(shell_cmd) = extract_shell_command(&hook_json, tool_name, format)
-        && let Some(root_method) = extract_root_command(&shell_cmd, &hook_json)
+    // Recognize `catenary add-root` / `catenary rm-root` and allow
+    // them through without hitting the command filter. The CLI
+    // command handles the actual root management via daemon IPC —
+    // no session identity needed since "hook" is a shared contributor.
+    if let Some(ref shell_cmd) = extract_shell_command(&hook_json, tool_name, format)
+        && is_root_command(shell_cmd)
     {
-        if let Some(stream) = hook_connect(&hook_json) {
-            let _ = ipc_exchange(stream, &root_method);
-        }
-        // Allow the command to proceed — the CLI will print confirmation.
         return;
     }
 
@@ -777,49 +775,15 @@ fn extract_shell_command(
         .map(String::from)
 }
 
-/// Recognizes `catenary add-root <path>` and `catenary rm-root <path>`
-/// in a shell command string.
+/// Returns `true` if the shell command is a `catenary add-root` or
+/// `catenary rm-root` invocation.
 ///
-/// Returns a JSON IPC request for the daemon if the command matches.
-/// The path is resolved to absolute using the hook payload's `cwd`.
-fn extract_root_command(
-    shell_cmd: &str,
-    hook_json: &serde_json::Value,
-) -> Option<serde_json::Value> {
+/// These are Catenary's own management commands — they bypass the
+/// command filter allowlist. The CLI command handles root management
+/// directly via daemon IPC.
+fn is_root_command(shell_cmd: &str) -> bool {
     let trimmed = shell_cmd.trim();
-    let (method, rest) = if let Some(rest) = trimmed.strip_prefix("catenary add-root") {
-        ("pre-tool/add-root", rest)
-    } else if let Some(rest) = trimmed.strip_prefix("catenary rm-root") {
-        ("pre-tool/rm-root", rest)
-    } else {
-        return None;
-    };
-
-    let path_arg = rest.trim();
-    if path_arg.is_empty() {
-        return None;
-    }
-
-    // Resolve to absolute path.
-    let abs_path = if std::path::Path::new(path_arg).is_absolute() {
-        PathBuf::from(path_arg)
-    } else {
-        let cwd = hook_json.get("cwd").and_then(|v| v.as_str()).map_or_else(
-            || std::env::current_dir().unwrap_or_default(),
-            PathBuf::from,
-        );
-        cwd.join(path_arg)
-    };
-
-    let session_id = hook_json.get("session_id").and_then(|v| v.as_str());
-    let mut request = serde_json::json!({
-        "method": method,
-        "path": abs_path.display().to_string(),
-    });
-    if let Some(sid) = session_id {
-        request["session_id"] = serde_json::json!(sid);
-    }
-    Some(request)
+    trimmed.starts_with("catenary add-root") || trimmed.starts_with("catenary rm-root")
 }
 
 // ── Formatting helpers ──────────────────────────────────────────────────
@@ -1402,65 +1366,28 @@ mod tests {
         assert!(notify_connect(&sock_path).is_none());
     }
 
-    // ── extract_root_command tests ──────────────────────────────────
+    // ── is_root_command tests ─────────────────────────────────────
 
     #[test]
-    fn extract_root_command_add_root_absolute() {
-        let hook_json = serde_json::json!({
-            "session_id": "sess-1",
-            "cwd": "/home/user/project"
-        });
-        let result = extract_root_command("catenary add-root /tmp/new-root", &hook_json);
-        let req = result.expect("should match add-root");
-        assert_eq!(req["method"], "pre-tool/add-root");
-        assert_eq!(req["path"], "/tmp/new-root");
-        assert_eq!(req["session_id"], "sess-1");
+    fn is_root_command_add_root() {
+        assert!(is_root_command("catenary add-root /tmp/project"));
     }
 
     #[test]
-    fn extract_root_command_rm_root_absolute() {
-        let hook_json = serde_json::json!({
-            "session_id": "sess-2"
-        });
-        let result = extract_root_command("catenary rm-root /tmp/old-root", &hook_json);
-        let req = result.expect("should match rm-root");
-        assert_eq!(req["method"], "pre-tool/rm-root");
-        assert_eq!(req["path"], "/tmp/old-root");
+    fn is_root_command_rm_root() {
+        assert!(is_root_command("catenary rm-root /tmp/project"));
     }
 
     #[test]
-    fn extract_root_command_relative_path() {
-        let hook_json = serde_json::json!({
-            "cwd": "/home/user/project"
-        });
-        let result = extract_root_command("catenary add-root subdir", &hook_json);
-        let req = result.expect("should match add-root with relative path");
-        assert_eq!(req["method"], "pre-tool/add-root");
-        assert_eq!(req["path"], "/home/user/project/subdir");
+    fn is_root_command_with_whitespace() {
+        assert!(is_root_command("  catenary add-root /tmp/root  "));
     }
 
     #[test]
-    fn extract_root_command_no_path_returns_none() {
-        let hook_json = serde_json::json!({});
-        assert!(extract_root_command("catenary add-root", &hook_json).is_none());
-        assert!(extract_root_command("catenary rm-root", &hook_json).is_none());
-    }
-
-    #[test]
-    fn extract_root_command_non_matching_returns_none() {
-        let hook_json = serde_json::json!({});
-        assert!(extract_root_command("catenary doctor", &hook_json).is_none());
-        assert!(extract_root_command("ls -la", &hook_json).is_none());
-        assert!(extract_root_command("catenary stop", &hook_json).is_none());
-    }
-
-    #[test]
-    fn extract_root_command_with_whitespace() {
-        let hook_json = serde_json::json!({
-            "cwd": "/home/user"
-        });
-        let result = extract_root_command("  catenary add-root /tmp/root  ", &hook_json);
-        let req = result.expect("should handle leading/trailing whitespace");
-        assert_eq!(req["path"], "/tmp/root");
+    fn is_root_command_non_matching() {
+        assert!(!is_root_command("catenary doctor"));
+        assert!(!is_root_command("ls -la"));
+        assert!(!is_root_command("catenary stop"));
+        assert!(!is_root_command("catenary start_editing"));
     }
 }

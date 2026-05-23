@@ -1509,18 +1509,15 @@ async fn handle_hook_dispatch(
 
     // ── Root management ──────────────────────────────────────────
     //
-    // `pre-tool/add-root` and `pre-tool/rm-root` are sent by the
-    // PreToolUse hook when an agent runs `catenary add-root` or
-    // `catenary rm-root` via the host's shell tool.
+    // `add-root/run` and `rm-root/run` are sent by the CLI commands
+    // (`catenary add-root`, `catenary rm-root`). The PreToolUse hook
+    // only bypasses the command filter — no hook-side IPC needed
+    // since "hook" is a shared contributor with no session identity.
     //
-    // `add-root/run` and `rm-root/run` are sent by the direct CLI
-    // commands (`catenary add-root`, `catenary rm-root`).
-    //
-    // Both paths perform the same root tracker mutation. Handled
-    // before `get_or_create_router` because root management is a
-    // daemon-level concern (RootTracker), not a per-session router
-    // concern.
-    if method == "pre-tool/add-root" || method == "add-root/run" {
+    // Handled before `get_or_create_router` because root management
+    // is a daemon-level concern (RootTracker), not a per-session
+    // router concern.
+    if method == "add-root/run" {
         let id = ctx.logging.next_id();
         let response = if let Some(path_str) = raw.get("path").and_then(|v| v.as_str()) {
             let path = PathBuf::from(path_str);
@@ -1571,7 +1568,7 @@ async fn handle_hook_dispatch(
         return Ok(());
     }
 
-    if method == "pre-tool/rm-root" || method == "rm-root/run" {
+    if method == "rm-root/run" {
         let id = ctx.logging.next_id();
         let response = if let Some(path_str) = raw.get("path").and_then(|v| v.as_str()) {
             let path = PathBuf::from(path_str);
