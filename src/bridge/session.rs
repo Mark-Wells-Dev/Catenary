@@ -13,7 +13,6 @@ use std::sync::Arc;
 use tokio::runtime::Handle;
 use tokio::sync::RwLock;
 
-use super::cwd_stash::CwdStash;
 use super::diagnostics_server::DiagnosticsServer;
 use super::editing_guardrail::EditingGuardrail;
 use super::editing_manager::EditingManager;
@@ -22,7 +21,6 @@ use super::filesystem_manager::FilesystemManager;
 use super::grep_server::GrepServer;
 use super::handler::expand_tilde;
 use super::path_security::PathValidator;
-use super::scope_id_stash::ScopeIdStash;
 use crate::config::Config;
 use crate::logging::LoggingServer;
 use crate::logging::notification_router::NotificationRouter;
@@ -147,12 +145,6 @@ pub struct Session {
     /// checks this guardrail before entering editing mode, and
     /// `done_editing` / session cleanup release all held locks.
     pub editing_guardrail: Option<Arc<EditingGuardrail>>,
-    /// Pending host-CLI cwd for grep/glob relative-pattern resolution.
-    pub cwd_stash: CwdStash,
-    /// Scope parent ID stashed by the pre-tool hook for the upcoming
-    /// MCP `tools/call` and post-tool hook events. Peeked (not consumed)
-    /// by the MCP server; taken and cleared by the post-tool hook.
-    pub scope_id_stash: ScopeIdStash,
     /// LSP client manager (also owns document manager).
     pub(super) client_manager: Arc<LspClientManager>,
     /// File classification and root resolution.
@@ -175,15 +167,6 @@ pub struct Session {
     /// Set by `HookRouter` on `PreAgent` dispatch, cleared by `McpServer`
     /// run loop. Triggers a `roots/list` poll at the next turn boundary.
     pub roots_refresh_requested: Arc<std::sync::atomic::AtomicBool>,
-    /// Transcript file path, stashed by `HookRouter` on `PreAgent` dispatch.
-    /// Read by [`scan_transcript`] for `/add-dir` root detection.
-    pub transcript_path: std::sync::Mutex<Option<PathBuf>>,
-    /// Byte offset for incremental transcript scanning.
-    pub transcript_offset: std::sync::atomic::AtomicU64,
-    /// Cumulative set of roots discovered from the transcript.
-    /// Written by the eager scan (`PreAgent`), read by `on_roots_changed`
-    /// to prevent `fetch_roots` from overwriting them.
-    pub transcript_roots: std::sync::Mutex<Vec<PathBuf>>,
 }
 
 impl Session {
@@ -286,8 +269,6 @@ impl Session {
             diagnostics,
             editing: EditingManager::new(),
             editing_guardrail: None,
-            cwd_stash: CwdStash::new(),
-            scope_id_stash: ScopeIdStash::new(),
             client_manager,
             fs_manager,
             path_validator,
@@ -297,9 +278,6 @@ impl Session {
             instance_id,
             runtime,
             roots_refresh_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            transcript_path: std::sync::Mutex::new(None),
-            transcript_offset: std::sync::atomic::AtomicU64::new(0),
-            transcript_roots: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -370,8 +348,6 @@ impl Session {
             diagnostics: primary.diagnostics.clone(),
             editing: EditingManager::new(),
             editing_guardrail,
-            cwd_stash: CwdStash::new(),
-            scope_id_stash: ScopeIdStash::new(),
             client_manager: primary.client_manager.clone(),
             fs_manager: primary.fs_manager.clone(),
             path_validator: primary.path_validator.clone(),
@@ -381,9 +357,6 @@ impl Session {
             instance_id: session_id,
             runtime: primary.runtime.clone(),
             roots_refresh_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            transcript_path: std::sync::Mutex::new(None),
-            transcript_offset: std::sync::atomic::AtomicU64::new(0),
-            transcript_roots: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -464,22 +437,6 @@ impl Session {
     /// Spawns LSP servers for languages detected in the workspace.
     pub async fn spawn_all(&self) {
         self.client_manager.spawn_all().await;
-    }
-
-    /// Merges stored transcript roots into the given root set.
-    ///
-    /// Appends any transcript-discovered roots that aren't already present.
-    /// Used by the `on_roots_changed` callback to prevent `fetch_roots`
-    /// from overwriting transcript-discovered roots with a `roots/list`
-    /// response that omits `/add-dir` roots.
-    pub fn merge_transcript_roots(&self, paths: &mut Vec<PathBuf>) {
-        if let Ok(stored) = self.transcript_roots.lock() {
-            for root in stored.iter() {
-                if !paths.contains(root) {
-                    paths.push(root.clone());
-                }
-            }
-        }
     }
 
     /// Synchronizes workspace roots with a new set.
@@ -715,87 +672,5 @@ mod tests {
         // When strip_prefix fails, falls back to matching the full path.
         // A bare filename matches *.txt.
         assert!(rg.is_match(Path::new("notes.txt"), Path::new("/nonexistent")));
-    }
-
-    // ── merge_transcript_roots ────────────────────────────────────────
-
-    fn make_session() -> (tempfile::TempDir, tokio::runtime::Runtime, Session) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db_path = dir.path().join("catenary").join("catenary.db");
-        let conn = crate::db::open_and_migrate_at(&db_path).expect("open test DB");
-        let conn = Arc::new(std::sync::Mutex::new(conn));
-        let logging = crate::logging::LoggingServer::new();
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let instance_id: Arc<str> = "test".into();
-        let notification_router = Arc::new(
-            crate::logging::notification_router::NotificationRouter::new(
-                crate::logging::Severity::Warn,
-            ),
-        );
-        let session = Session::new(
-            Config::default(),
-            vec![],
-            logging,
-            conn,
-            instance_id,
-            runtime.handle().clone(),
-            notification_router,
-        );
-        (dir, runtime, session)
-    }
-
-    #[test]
-    fn merge_transcript_roots_adds_missing() {
-        let (_dir, _rt, session) = make_session();
-        let root_a = PathBuf::from("/tmp/a");
-        let root_b = PathBuf::from("/tmp/b");
-
-        // Pre-populate transcript roots with root_b.
-        session
-            .transcript_roots
-            .lock()
-            .expect("lock")
-            .push(root_b.clone());
-
-        // MCP roots only has root_a.
-        let mut paths = vec![root_a.clone()];
-        session.merge_transcript_roots(&mut paths);
-
-        assert_eq!(paths.len(), 2);
-        assert_eq!(paths[0], root_a);
-        assert_eq!(paths[1], root_b);
-    }
-
-    #[test]
-    fn merge_transcript_roots_deduplicates() {
-        let (_dir, _rt, session) = make_session();
-        let root = PathBuf::from("/tmp/shared");
-
-        // Transcript roots has the same root as MCP roots.
-        session
-            .transcript_roots
-            .lock()
-            .expect("lock")
-            .push(root.clone());
-
-        let mut paths = vec![root.clone()];
-        session.merge_transcript_roots(&mut paths);
-
-        // No duplicate added.
-        assert_eq!(paths, vec![root]);
-    }
-
-    #[test]
-    fn merge_transcript_roots_empty_stored() {
-        let (_dir, _rt, session) = make_session();
-
-        let mut paths = vec![PathBuf::from("/tmp/mcp_root")];
-        session.merge_transcript_roots(&mut paths);
-
-        // No change when transcript_roots is empty.
-        assert_eq!(paths.len(), 1);
     }
 }

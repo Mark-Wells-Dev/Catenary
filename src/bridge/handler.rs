@@ -75,7 +75,7 @@ pub(super) fn display_path(file: &str, fs: &FilesystemManager) -> String {
     )
 }
 
-/// Resolve relative pattern parameters against the host CLI's cwd.
+/// Resolve relative pattern parameters against the given directory.
 ///
 /// For grep: resolves `glob` and `exclude` params.
 /// For glob: resolves `pattern` param.
@@ -83,7 +83,7 @@ pub(super) fn display_path(file: &str, fs: &FilesystemManager) -> String {
 /// A pattern is considered relative (and therefore resolved) when it does
 /// not start with `/` or `~` after tilde expansion. Absolute patterns are
 /// left unchanged.
-fn resolve_params_against_cwd(tool: &str, params: &mut Value, cwd: &Path) {
+fn resolve_params_against_dir(tool: &str, params: &mut Value, cwd: &Path) {
     match tool {
         "grep" => {
             resolve_param(params, "glob", cwd);
@@ -241,21 +241,15 @@ impl ToolHandler for McpRouter {
         // ToolServer dispatch: grep, glob
         let mut params = arguments.unwrap_or(Value::Null);
 
-        // Resolve relative patterns against an explicit directory (from
-        // the tool arguments) or the host CLI's working directory
-        // (stashed by the PreToolUse hook). `directory` takes precedence;
-        // `cwd_stash` is the backward-compatible fallback (deleted in
-        // ticket 08). Always drain the stash to prevent 5-second Condvar
-        // timeouts when consecutive calls provide `directory`.
-        let stash_cwd = self.session.cwd_stash.take();
-        let cwd = params
+        // Resolve relative patterns against the explicit `directory`
+        // parameter from the tool arguments.
+        let dir = params
             .get("directory")
             .and_then(Value::as_str)
-            .map(|d| PathBuf::from(expand_tilde(d)))
-            .or(stash_cwd);
+            .map(|d| PathBuf::from(expand_tilde(d)));
 
-        if let Some(cwd) = &cwd {
-            resolve_params_against_cwd(name, &mut params, cwd);
+        if let Some(dir) = &dir {
+            resolve_params_against_dir(name, &mut params, dir);
         }
 
         // `directory` is not a tool-server parameter — strip before dispatch.
@@ -283,10 +277,6 @@ impl ToolHandler for McpRouter {
             }
             Err(e) => Err(e),
         }
-    }
-
-    fn scope_parent_id(&self) -> Option<String> {
-        self.session.scope_id_stash.peek()
     }
 }
 
@@ -342,7 +332,7 @@ mod tests {
             "exclude": "tests/**"
         });
         let cwd = Path::new("/project");
-        resolve_params_against_cwd("grep", &mut params, cwd);
+        resolve_params_against_dir("grep", &mut params, cwd);
         assert_eq!(params["glob"].as_str(), Some("/project/src/**/*.rs"));
         assert_eq!(params["exclude"].as_str(), Some("/project/tests/**"));
         // pattern is not resolved for grep
@@ -353,7 +343,7 @@ mod tests {
     fn resolve_glob_resolves_pattern() {
         let mut params = serde_json::json!({"pattern": "src/"});
         let cwd = Path::new("/project");
-        resolve_params_against_cwd("glob", &mut params, cwd);
+        resolve_params_against_dir("glob", &mut params, cwd);
         assert_eq!(params["pattern"].as_str(), Some("/project/src/"));
     }
 
@@ -361,7 +351,7 @@ mod tests {
     fn resolve_glob_does_not_resolve_exclude() {
         let mut params = serde_json::json!({"pattern": "/abs/path", "exclude": "test_*"});
         let cwd = Path::new("/project");
-        resolve_params_against_cwd("glob", &mut params, cwd);
+        resolve_params_against_dir("glob", &mut params, cwd);
         // pattern is absolute → unchanged
         assert_eq!(params["pattern"].as_str(), Some("/abs/path"));
         // exclude is NOT resolved for glob (not in scope per ticket)
@@ -372,7 +362,7 @@ mod tests {
     fn resolve_unknown_tool_is_noop() {
         let mut params = serde_json::json!({"pattern": "relative"});
         let cwd = Path::new("/project");
-        resolve_params_against_cwd("start_editing", &mut params, cwd);
+        resolve_params_against_dir("start_editing", &mut params, cwd);
         assert_eq!(params["pattern"].as_str(), Some("relative"));
     }
 
@@ -388,7 +378,7 @@ mod tests {
             .and_then(Value::as_str)
             .map(|d| PathBuf::from(expand_tilde(d)));
         if let Some(cwd) = &cwd {
-            resolve_params_against_cwd("grep", &mut params, cwd);
+            resolve_params_against_dir("grep", &mut params, cwd);
         }
         if let Some(obj) = params.as_object_mut() {
             obj.remove("directory");
@@ -411,7 +401,7 @@ mod tests {
             .and_then(Value::as_str)
             .map(|d| PathBuf::from(expand_tilde(d)));
         if let Some(cwd) = &cwd {
-            resolve_params_against_cwd("glob", &mut params, cwd);
+            resolve_params_against_dir("glob", &mut params, cwd);
         }
         if let Some(obj) = params.as_object_mut() {
             obj.remove("directory");
@@ -420,44 +410,6 @@ mod tests {
         assert!(
             params.get("directory").is_none(),
             "directory should be stripped before dispatch"
-        );
-    }
-
-    #[test]
-    fn directory_takes_precedence_over_cwd_stash() {
-        use crate::bridge::cwd_stash::CwdStash;
-
-        let stash = CwdStash::new();
-        stash.stash(PathBuf::from("/from/stash"));
-
-        let mut params = serde_json::json!({
-            "pattern": "TODO",
-            "directory": "/from/directory",
-            "glob": "src/**/*.rs"
-        });
-        // Always drain the stash first (matches call_tool behavior).
-        let stash_cwd = stash.take();
-        let cwd = params
-            .get("directory")
-            .and_then(Value::as_str)
-            .map(|d| PathBuf::from(expand_tilde(d)))
-            .or(stash_cwd);
-        if let Some(cwd) = &cwd {
-            resolve_params_against_cwd("grep", &mut params, cwd);
-        }
-        if let Some(obj) = params.as_object_mut() {
-            obj.remove("directory");
-        }
-        assert_eq!(
-            params["glob"].as_str(),
-            Some("/from/directory/src/**/*.rs"),
-            "directory param should win over cwd_stash"
-        );
-        // Stash was drained eagerly to prevent Condvar timeouts.
-        assert_eq!(
-            stash.take(),
-            None,
-            "cwd_stash should be drained even when directory is provided"
         );
     }
 }

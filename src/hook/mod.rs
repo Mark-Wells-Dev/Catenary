@@ -29,7 +29,6 @@ use tracing::{debug, info};
 use crate::bridge::HookRouter;
 use crate::bridge::session::Session;
 use crate::protocol::category::hook_category;
-use crate::source::Source;
 
 /// Emit a hook protocol event at the given tracing level.
 ///
@@ -106,10 +105,6 @@ pub(crate) enum HookRequest {
     /// Turn boundary signal (fires at each user prompt / agent turn start).
     #[serde(rename = "pre-agent/turn-start")]
     PreAgent {
-        /// Path to the host CLI's transcript file (Claude Code only).
-        /// Used for transcript-based `/add-dir` root detection.
-        #[serde(default)]
-        transcript_path: Option<String>,
         /// Host CLI session ID. Used by the daemon to route the hook
         /// to the correct per-session `HookRouter`.
         #[serde(default)]
@@ -137,10 +132,6 @@ pub(crate) enum HookRequest {
         /// Host CLI session ID (Claude Code / Gemini CLI UUID).
         #[serde(default)]
         session_id: Option<String>,
-        /// Host CLI working directory. Stashed for Catenary grep/glob
-        /// calls so the MCP handler can resolve relative patterns.
-        #[serde(default)]
-        cwd: Option<String>,
     },
 
     /// Enter editing mode via CLI command (`catenary start_editing`).
@@ -453,33 +444,6 @@ impl HookServer {
 
         let result = self.router.dispatch(request, id.0);
 
-        // Apply transcript-discovered roots before responding to the hook.
-        // Runs async in the hook server task — sync_roots is the single
-        // serialization point for root updates.
-        if !result.add_roots.is_empty() {
-            let session = &self.router.session;
-            let mut current = session.roots();
-            let before = current.len();
-            for root in &result.add_roots {
-                if !current.contains(root) {
-                    current.push(root.clone());
-                }
-            }
-            let added = current.len() - before;
-            if added > 0 {
-                debug!(
-                    source = Source::HookDispatch.as_str(),
-                    added, "transcript root sync: syncing new roots",
-                );
-                if let Err(e) = session.sync_roots(current).await {
-                    debug!(
-                        source = Source::HookDispatch.as_str(),
-                        "transcript root sync failed: {e}",
-                    );
-                }
-            }
-        }
-
         let envelope = HookResponseEnvelope {
             result: result.result,
             system_message: result.system_message,
@@ -494,24 +458,13 @@ impl HookServer {
         // Hook allows (empty response) → debug, hook blocks/diagnostics → info.
         let level = Self::hook_outcome_level(&method, &envelope);
 
-        // For post-tool hooks, read and clear the scope parent ID so
-        // the request event links back to the pre-tool scope root.
-        // For pre-tool hooks, read the scope UUID from the dispatch result.
-        let request_parent_id = if method.starts_with("post-tool") {
-            self.router.session.scope_id_stash.take()
-        } else if method.starts_with("pre-tool") {
-            self.router.session.scope_id_stash.peek()
-        } else {
-            None
-        };
-
         // Log incoming hook request (deferred — uses outcome-determined level)
         emit_hook_event(
             level,
             &self.router.client_name,
             &method,
             id.0,
-            request_parent_id.as_deref(),
+            None,
             &raw.to_string(),
             "incoming hook",
         );
@@ -602,28 +555,10 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines, reason = "one assertion per variant")]
     fn test_hook_request_tagged_deserialization() {
-        // pre-agent/turn-start (no transcript_path, no session_id)
+        // pre-agent/turn-start (no session_id)
         let json = r#"{"method": "pre-agent/turn-start"}"#;
         let req: HookRequest = serde_json::from_str(json).expect("turn-start");
-        assert!(matches!(
-            req,
-            HookRequest::PreAgent {
-                transcript_path: None,
-                session_id: None,
-            }
-        ));
-
-        // pre-agent/turn-start with transcript_path
-        let json =
-            r#"{"method": "pre-agent/turn-start", "transcript_path": "/tmp/transcript.jsonl"}"#;
-        let req: HookRequest = serde_json::from_str(json).expect("turn-start with transcript");
-        assert!(matches!(
-            req,
-            HookRequest::PreAgent {
-                transcript_path: Some(ref p),
-                session_id: None,
-            } if p == "/tmp/transcript.jsonl"
-        ));
+        assert!(matches!(req, HookRequest::PreAgent { session_id: None }));
 
         // pre-agent/turn-start with session_id
         let json = r#"{"method": "pre-agent/turn-start", "session_id": "sess-123"}"#;
@@ -631,7 +566,6 @@ mod tests {
         assert!(matches!(
             req,
             HookRequest::PreAgent {
-                transcript_path: None,
                 session_id: Some(ref s),
             } if s == "sess-123"
         ));
@@ -645,7 +579,6 @@ mod tests {
             command,
             agent_id,
             session_id,
-            cwd,
         } = req
         else {
             unreachable!("expected PreTool");
@@ -655,7 +588,6 @@ mod tests {
         assert!(command.is_none());
         assert_eq!(agent_id, "");
         assert_eq!(session_id.as_deref(), Some("abc123"));
-        assert!(cwd.is_none());
 
         // pre-tool/editing-state with command (Bash tool)
         let json = r#"{"method": "pre-tool/editing-state", "tool_name": "Bash", "command": "rm -rf target/", "agent_id": ""}"#;
@@ -664,14 +596,6 @@ mod tests {
             unreachable!("expected PreTool");
         };
         assert_eq!(command.as_deref(), Some("rm -rf target/"));
-
-        // pre-tool/editing-state with cwd (grep/glob cwd resolution)
-        let json = r#"{"method": "pre-tool/editing-state", "tool_name": "mcp__plugin_catenary_catenary__grep", "agent_id": "", "cwd": "/home/user/project"}"#;
-        let req: HookRequest = serde_json::from_str(json).expect("editing-state with cwd");
-        let HookRequest::PreTool { cwd, .. } = req else {
-            unreachable!("expected PreTool");
-        };
-        assert_eq!(cwd.as_deref(), Some("/home/user/project"));
 
         // post-tool/diagnostics with optional fields
         let json =
@@ -1178,13 +1102,7 @@ mod tests {
             }
         }"#;
         let req: HookRequest = serde_json::from_str(json).expect("should deserialize");
-        assert!(matches!(
-            req,
-            HookRequest::PreAgent {
-                transcript_path: None,
-                session_id: None,
-            }
-        ));
+        assert!(matches!(req, HookRequest::PreAgent { session_id: None }));
 
         // The raw Value retains host_payload for protocol logging.
         let raw: serde_json::Value = serde_json::from_str(json).expect("parse raw");
@@ -1255,11 +1173,10 @@ mod tests {
         (dir, path, conn)
     }
 
-    /// Shared test context holding a `HookServer`, the underlying
-    /// `Session`, and all lifetime-bound resources.
+    /// Shared test context holding a `HookServer` and all lifetime-bound
+    /// resources.
     struct TestHookServer {
         server: Option<HookServer>,
-        session: Arc<Session>,
         _db_dir: tempfile::TempDir,
     }
 
@@ -1301,27 +1218,12 @@ mod tests {
             handle,
             notification_router,
         ));
-        let server = HookServer::new(session.clone(), conn, instance_id, "test".to_string());
+        let server = HookServer::new(session, conn, instance_id, "test".to_string());
 
         TestHookServer {
             server: Some(server),
-            session,
             _db_dir: db_dir,
         }
-    }
-
-    /// Create a real directory so `canonicalize` succeeds.
-    fn make_dir(base: &std::path::Path, name: &str) -> std::path::PathBuf {
-        let dir = base.join(name);
-        std::fs::create_dir_all(&dir).expect("create dir");
-        dir.canonicalize().expect("canonicalize")
-    }
-
-    /// Write a transcript JSONL file with the given lines.
-    fn write_transcript(dir: &std::path::Path, lines: &[&str]) -> std::path::PathBuf {
-        let path = dir.join("transcript.jsonl");
-        std::fs::write(&path, lines.join("\n")).expect("write transcript");
-        path
     }
 
     /// Send a JSON request through a duplex stream and run
@@ -1406,89 +1308,6 @@ mod tests {
         assert!(
             response.ends_with('\n'),
             "expected response ending with newline, got: {response:?}",
-        );
-    }
-
-    #[tokio::test]
-    async fn handle_connection_syncs_transcript_roots() {
-        let ctx = test_hook_server();
-        let server = Arc::new(ctx.server.expect("server"));
-        let session = ctx.session.clone();
-
-        // Verify session starts with no roots.
-        assert!(
-            session.roots().is_empty(),
-            "session should start with no roots"
-        );
-
-        // Create a directory and transcript for /add-dir detection.
-        let work_dir = tempfile::tempdir().expect("work_dir");
-        let new_root = make_dir(work_dir.path(), "project");
-        let line = format!(
-            r#"{{"message":"Added \u001b[1m{}\u001b[22m as a working directory"}}"#,
-            new_root.display()
-        );
-        let transcript = write_transcript(work_dir.path(), &[&line]);
-
-        let request = serde_json::json!({
-            "method": "pre-agent/turn-start",
-            "transcript_path": transcript.to_string_lossy(),
-        })
-        .to_string();
-
-        ipc_exchange(&server, &request).await;
-
-        // sync_roots should have added the transcript-discovered root.
-        let roots = session.roots();
-        assert!(
-            roots.contains(&new_root),
-            "session roots should include transcript root {new_root:?}, got {roots:?}",
-        );
-    }
-
-    #[tokio::test]
-    async fn handle_connection_skips_sync_when_no_new_roots() {
-        let ctx = test_hook_server();
-        let server = Arc::new(ctx.server.expect("server"));
-        let session = ctx.session.clone();
-
-        // Pre-populate the session with a root via sync_roots.
-        let work_dir = tempfile::tempdir().expect("work_dir");
-        let existing_root = make_dir(work_dir.path(), "existing");
-        session
-            .sync_roots(vec![existing_root.clone()])
-            .await
-            .expect("initial sync_roots");
-
-        // sync_roots bumps config_version — record the baseline.
-        let version_after_setup = session
-            .config_version
-            .load(std::sync::atomic::Ordering::Acquire);
-
-        // Create a transcript referencing the same root (already present).
-        let line = format!(
-            r#"{{"message":"Added \u001b[1m{}\u001b[22m as a working directory"}}"#,
-            existing_root.display()
-        );
-        let transcript = write_transcript(work_dir.path(), &[&line]);
-
-        let request = serde_json::json!({
-            "method": "pre-agent/turn-start",
-            "transcript_path": transcript.to_string_lossy(),
-        })
-        .to_string();
-
-        ipc_exchange(&server, &request).await;
-
-        // No new roots were added, so sync_roots should NOT have been
-        // called. config_version must remain unchanged.
-        let version_after = session
-            .config_version
-            .load(std::sync::atomic::Ordering::Acquire);
-        assert_eq!(
-            version_after, version_after_setup,
-            "config_version should not change when no new roots are added \
-             (was {version_after_setup}, now {version_after})",
         );
     }
 }

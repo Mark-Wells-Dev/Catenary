@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
-/// Pending CWD stash for grep/glob relative-pattern resolution.
-pub mod cwd_stash;
 /// Diagnostics pipeline for PostToolUse hook requests.
 pub mod diagnostics_server;
 /// Cross-session per-root editing guardrail.
@@ -23,8 +21,6 @@ mod hook_router;
 mod pagination;
 /// Path validation for LSP-aware operations and config file protection.
 pub mod path_security;
-/// Scope parent ID stash for hook → MCP → hook parent_id propagation.
-pub mod scope_id_stash;
 /// Shared container for tool servers and cross-tool infrastructure.
 pub mod session;
 /// Transformation layer trait between protocol boundaries and LSP.

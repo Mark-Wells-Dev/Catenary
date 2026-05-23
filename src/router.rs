@@ -280,39 +280,6 @@ impl ToolHandler for CorrelatingHandler {
         // Not yet correlated — use the shared handler.
         self.inner.call_tool(name, arguments, parent_id, cancel)
     }
-
-    fn scope_parent_id(&self) -> Option<String> {
-        // Fast path: cached session from a previous call_tool.
-        if let Some((_, session)) = self
-            .cached
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-        {
-            return session.scope_id_stash.peek();
-        }
-
-        // Slow path: look up via correlation state.
-        let session_id = self
-            .correlation
-            .connection_sessions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&self.fd)
-            .cloned();
-
-        if let Some(sid) = session_id
-            && let Some(entry) = self
-                .sessions
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(&sid)
-        {
-            return entry.session.scope_id_stash.peek();
-        }
-
-        None
-    }
 }
 
 // ── Session registry ───────────────────────────────────────────────
@@ -331,10 +298,10 @@ struct SessionEntry {
 ///
 /// When set on [`SessionManager`], hook connections are routed to
 /// per-`session_id` [`Session`] + [`HookRouter`] pairs. Each session
-/// has independent editing state, CWD stash, transcript state, and
-/// turn counter. Heavy resources (`LspClientManager`, config, logging)
-/// are shared via `Arc` from the daemon's primary session. When absent,
-/// hooks receive passthrough responses (allow everything).
+/// has independent editing state and turn counter. Heavy resources
+/// (`LspClientManager`, config, logging) are shared via `Arc` from the
+/// daemon's primary session. When absent, hooks receive passthrough
+/// responses (allow everything).
 #[cfg(unix)]
 #[derive(Clone)]
 struct HookDispatchContext {
@@ -403,7 +370,7 @@ fn spawn_handoff_timeout(slot: Arc<std::sync::Mutex<Option<HandoffContext>>>) {
 
 /// Tracks per-contributor workspace root sets for reference counting.
 ///
-/// Each MCP connection and transcript scan contributes a set of roots
+/// Each MCP connection and CLI command contributes a set of roots
 /// keyed by a contributor string. The global root set (union of all
 /// contributors) is synced to the shared [`crate::lsp::LspClientManager`]
 /// after each mutation. When a contributor is removed (MCP disconnect),
@@ -412,7 +379,7 @@ fn spawn_handoff_timeout(slot: Arc<std::sync::Mutex<Option<HandoffContext>>>) {
 ///
 /// Contributor keys:
 /// - `"mcp:{fd}"` — roots from MCP `roots/list` for a connection
-/// - `"transcript:{session_id}"` — roots from `/add-dir` transcript scan
+/// - `"hook"` — roots from `catenary add-root` CLI commands
 #[cfg(unix)]
 #[derive(Clone)]
 struct RootTracker {
@@ -952,8 +919,8 @@ impl SessionManager {
                 //    delivers socket EOF). Handles fd-scoped state
                 //    (MCP roots, correlation mappings) and, for
                 //    correlated sessions, also cleans up session-scoped
-                //    state (transcript roots, session registry) as a
-                //    crash-safety fallback.
+                //    state (session registry) as a crash-safety
+                //    fallback.
                 //
                 // 2. **SessionEnd hook** (`handle_hook_dispatch`) —
                 //    best-effort (host CLI may be killed before the
@@ -961,11 +928,10 @@ impl SessionManager {
                 //    For never-correlated sessions, this is the
                 //    primary cleanup path.
                 //
-                // The transcript root removal and session registry
-                // cleanup overlap intentionally: if SessionEnd ran
-                // first, the removals here are no-ops. If the host
-                // was killed and SessionEnd never fired, this path
-                // catches the leak.
+                // The session registry cleanup overlaps intentionally:
+                // if SessionEnd ran first, the removal here is a no-op.
+                // If the host was killed and SessionEnd never fired,
+                // this path catches the leak.
                 if let Some(ref tracker) = tracker_cleanup {
                     let mcp_key = format!("mcp:{fd}");
                     tracker.remove_contributor(&mcp_key);
@@ -978,11 +944,6 @@ impl SessionManager {
                         .remove(&fd);
 
                     if let Some(ref sid) = session_id {
-                        // Crash-safety fallback: also remove session-
-                        // scoped state in case SessionEnd never fired.
-                        let transcript_key = format!("transcript:{sid}");
-                        tracker.remove_contributor(&transcript_key);
-
                         if let Some(ref sessions) = sessions_cleanup {
                             sessions
                                 .lock()
@@ -1349,10 +1310,9 @@ async fn handle_hook_connection(
 /// Looks up or creates a per-session [`Session`] + [`HookRouter`] pair.
 ///
 /// Each `session_id` gets its own `Session` (via
-/// [`Session::new_for_daemon`]) with independent editing state, CWD
-/// stash, transcript state, and notification queue. The `HookRouter`
-/// wraps the per-session `Session` with its own turn counter and
-/// debounce state.
+/// [`Session::new_for_daemon`]) with independent editing state and
+/// notification queue. The `HookRouter` wraps the per-session `Session`
+/// with its own turn counter and debounce state.
 ///
 /// Registers the session with the shared [`crate::logging::notification_router::NotificationRouter`]
 /// so `warn!()` / `error!()` events carrying this `session_id` in
@@ -1395,10 +1355,9 @@ fn get_or_create_router(ctx: &HookDispatchContext, session_id: &str) -> Arc<Hook
 ///
 /// Reads the JSON request, extracts `session_id` for routing, looks up
 /// (or creates) the per-session [`HookRouter`], dispatches the request,
-/// handles transcript root syncing, logs the protocol pair, and writes
-/// the response. For `PreToolUse` hooks on Catenary tools, enters the
-/// sandwich correlation path to bind the next MCP `tools/call` to this
-/// session.
+/// logs the protocol pair, and writes the response. For `PreToolUse`
+/// hooks on Catenary tools, enters the sandwich correlation path to bind
+/// the next MCP `tools/call` to this session.
 #[cfg(unix)]
 #[allow(clippy::too_many_lines, reason = "sequential protocol steps")]
 async fn handle_hook_dispatch(
@@ -1500,9 +1459,6 @@ async fn handle_hook_dispatch(
         ctx.primary.notification_router.remove_session(&session_id);
 
         if let Some(ref tracker) = ctx.root_tracker {
-            let transcript_key = format!("transcript:{session_id}");
-            tracker.remove_contributor(&transcript_key);
-
             // Remove the session from the registry. For correlated
             // sessions, the MCP disconnect path also does this (crash-
             // safety fallback) — whichever runs first wins, the
@@ -1853,50 +1809,6 @@ async fn handle_hook_dispatch(
         flag.store(true, Ordering::Release);
     }
 
-    // Apply transcript-discovered roots before responding.
-    if !result.add_roots.is_empty() {
-        if let Some(ref tracker) = ctx.root_tracker {
-            // Daemon mode: route through refcount tracker so
-            // multi-session root sets stay isolated.
-            let transcript_key = format!("transcript:{session_id}");
-            tracker.add_roots(&transcript_key, &result.add_roots);
-            let global = tracker.global_roots();
-            debug!(
-                source = Source::DaemonDispatch.as_str(),
-                added = result.add_roots.len(),
-                "transcript root sync: syncing new roots",
-            );
-            if let Err(e) = router.session.sync_roots(global).await {
-                debug!(
-                    source = Source::DaemonDispatch.as_str(),
-                    "transcript root sync failed: {e}",
-                );
-            }
-        } else {
-            let session = &router.session;
-            let mut current = session.roots();
-            let before = current.len();
-            for root in &result.add_roots {
-                if !current.contains(root) {
-                    current.push(root.clone());
-                }
-            }
-            let added = current.len() - before;
-            if added > 0 {
-                debug!(
-                    source = Source::DaemonDispatch.as_str(),
-                    added, "transcript root sync: syncing new roots",
-                );
-                if let Err(e) = session.sync_roots(current).await {
-                    debug!(
-                        source = Source::DaemonDispatch.as_str(),
-                        "transcript root sync failed: {e}",
-                    );
-                }
-            }
-        }
-    }
-
     let envelope = HookResponseEnvelope {
         result: result.result,
         system_message: result.system_message,
@@ -1910,24 +1822,13 @@ async fn handle_hook_dispatch(
     // Determine level from outcome and hook category.
     let level = hook_outcome_level(&method, &envelope);
 
-    // For post-tool hooks, read and clear the scope parent ID so
-    // the request event links back to the pre-tool scope root.
-    // For pre-tool hooks, peek the scope UUID from the dispatch result.
-    let request_parent_id = if method.starts_with("post-tool") {
-        router.session.scope_id_stash.take()
-    } else if method.starts_with("pre-tool") {
-        router.session.scope_id_stash.peek()
-    } else {
-        None
-    };
-
     // Log incoming hook request (deferred — uses outcome-determined level).
     emit_hook_event(
         level,
         &session_id,
         &method,
         id.0,
-        request_parent_id.as_deref(),
+        None,
         &raw.to_string(),
         "incoming hook",
     );
@@ -4456,55 +4357,6 @@ mod tests {
         );
 
         drop(s1);
-        shutdown.cancel();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn session_end_cleans_up_transcript_roots() {
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let hook_path = hook_socket_in(dir.path());
-
-        let manager = Arc::new(bind_with_session(dir.path()));
-        let shutdown = manager.shutdown_token();
-        let m = Arc::clone(&manager);
-        tokio::spawn(async move {
-            let _ = m.accept_loop().await;
-        });
-
-        // Create session via PreAgent (never correlated — no MCP connection).
-        let req = serde_json::json!({
-            "method": "pre-agent/turn-start",
-            "session_id": "end-sess"
-        });
-        let _ = hook_roundtrip(&hook_path, &req).await;
-        assert_eq!(manager.session_count(), 1, "session should exist");
-
-        // Simulate transcript roots added by the session.
-        let tracker = manager.root_tracker.as_ref().expect("tracker");
-        tracker.add_roots("transcript:end-sess", &[PathBuf::from("/transcript/root")]);
-        assert_eq!(tracker.refcount(Path::new("/transcript/root")), 1,);
-
-        // Send session-end hook.
-        let req = serde_json::json!({
-            "method": "session-end/cleanup",
-            "session_id": "end-sess"
-        });
-        let _ = hook_roundtrip(&hook_path, &req).await;
-
-        // Transcript roots should be cleaned up.
-        assert_eq!(
-            tracker.refcount(Path::new("/transcript/root")),
-            0,
-            "transcript roots should be removed after session end",
-        );
-
-        // Never-correlated session should be removed from registry.
-        assert_eq!(
-            manager.session_count(),
-            0,
-            "never-correlated session should be removed on session end",
-        );
-
         shutdown.cancel();
     }
 
