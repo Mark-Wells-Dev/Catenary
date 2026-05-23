@@ -186,13 +186,6 @@ enum HookCommand {
         #[arg(long, value_enum)]
         format: HostFormat,
     },
-    /// Post-tool: file-change notification with diagnostics (`PostToolUse` / `AfterTool`).
-    #[command(name = "post-tool")]
-    PostTool {
-        /// Output format: "claude" or "gemini".
-        #[arg(long, value_enum)]
-        format: HostFormat,
-    },
     /// Post-agent: force `done_editing` before agent finishes (`Stop` / `AfterAgent`).
     #[command(name = "post-agent")]
     PostAgent {
@@ -273,7 +266,6 @@ fn main() -> Result<()> {
             match command {
                 HookCommand::PreAgent { format } => cli::hooks::run_pre_agent(format),
                 HookCommand::PreTool { format } => cli::hooks::run_pre_tool(format),
-                HookCommand::PostTool { format } => cli::hooks::run_post_tool(format),
                 HookCommand::PostAgent { format } => cli::hooks::run_post_agent(format),
                 HookCommand::SessionStart { format } => cli::hooks::run_session_start(format),
                 HookCommand::SessionEnd { format: _ } => cli::hooks::run_session_end(),
@@ -797,17 +789,6 @@ mod tests {
             unreachable!("expected Hook command");
         };
         assert!(matches!(command, HookCommand::PreTool { .. }));
-    }
-
-    #[test]
-    fn test_cli_hook_post_tool() {
-        use clap::Parser;
-        let args = Args::try_parse_from(["catenary", "hook", "post-tool", "--format=claude"]);
-        let args = args.expect("hook post-tool should parse");
-        let Some(Command::Hook { command }) = args.command else {
-            unreachable!("expected Hook command");
-        };
-        assert!(matches!(command, HookCommand::PostTool { .. }));
     }
 
     #[test]

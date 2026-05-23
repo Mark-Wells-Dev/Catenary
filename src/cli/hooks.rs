@@ -14,7 +14,6 @@
 //! Function names mirror the hook lifecycle:
 //! - `run_pre_agent` — root sync (`UserPromptSubmit` / `BeforeAgent`)
 //! - `run_pre_tool` — editing state enforcement (`PreToolUse` / `BeforeTool`)
-//! - `run_post_tool` — diagnostics (`PostToolUse` / `AfterTool`)
 //! - `run_post_agent` — force `done_editing` (`Stop` / `AfterAgent`)
 //! - `run_session_start` — clear stale editing state (`SessionStart`)
 
@@ -382,66 +381,6 @@ pub fn run_post_agent(format: HostFormat) {
             print!("{}", format_system_message(sys_msg, format));
         }
     }
-}
-
-/// Run diagnostics after reading or editing (`PostToolUse` / `AfterTool` hook handler).
-///
-/// Reads hook JSON from stdin, finds the session for the file's workspace,
-/// connects to the IPC socket, and returns diagnostics for the model's
-/// context. Emits `systemMessage` JSON on infrastructure errors so the user
-/// sees failures in their terminal.
-///
-/// For `done_editing`, sends a `post-tool/done-editing` IPC request instead
-/// of the per-file `post-tool/diagnostics` — the server drains accumulated
-/// files and returns batch diagnostics.
-pub fn run_post_tool(format: HostFormat) {
-    let Ok(stdin_data) = std::io::read_to_string(std::io::stdin()) else {
-        return;
-    };
-    let Ok(hook_json) = serde_json::from_str::<serde_json::Value>(&stdin_data) else {
-        return;
-    };
-
-    let tool_name = hook_json
-        .get("tool_name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
-    // Per-file diagnostics: requires a file path.
-    let Some(file_path) = extract_file_path(&hook_json) else {
-        print!(
-            "{}",
-            notify_error(
-                "missing file path in hook input — diagnostics skipped",
-                format,
-            )
-        );
-        return;
-    };
-
-    let Some(stream) = hook_connect(&hook_json) else {
-        return;
-    };
-
-    let agent_id = extract_agent_id(&hook_json);
-    let session_id = hook_json.get("session_id").and_then(|v| v.as_str());
-
-    let mut request = serde_json::json!({
-        "method": "post-tool/diagnostics",
-        "file": file_path,
-        "agent_id": agent_id,
-    });
-    if !tool_name.is_empty() {
-        request["tool"] = serde_json::json!(tool_name);
-    }
-    if let Some(sid) = session_id {
-        request["session_id"] = serde_json::json!(sid);
-    }
-    request["host_payload"] = prepare_host_payload(&hook_json);
-
-    // Response is unused — the server only accumulates file paths
-    // during editing mode. Diagnostics are returned by `done_editing`.
-    let _ = ipc_exchange(stream, &request);
 }
 
 /// Signal turn start (`UserPromptSubmit` / `BeforeAgent` hook handler).
@@ -899,43 +838,6 @@ fn handle_done_editing_hook(hook_json: &serde_json::Value, format: HostFormat) {
     }
 }
 
-// ── Formatting helpers ──────────────────────────────────────────────────
-
-/// GitHub issues URL for user-facing bug report suggestions.
-const BUG_REPORT_URL: &str = "https://github.com/TwoWells/Catenary/issues";
-
-/// Format an internal error for the user via `systemMessage`, with a bug
-/// report link appended.
-///
-/// The error is shown to the user in their terminal but not injected into
-/// the model's context — the model cannot act on internal Catenary failures.
-fn notify_error(message: &str, format: HostFormat) -> String {
-    let full =
-        format!("Catenary: {message}. If this persists, please file a bug: {BUG_REPORT_URL}");
-    format_error(&full, format)
-}
-
-/// Format an internal error for the user via `systemMessage`.
-///
-/// The error is shown to the user in their terminal but not injected into
-/// the model's context — the model cannot act on internal Catenary failures.
-fn format_error(message: &str, format: HostFormat) -> String {
-    match format {
-        HostFormat::Claude => serde_json::json!({
-            "hookSpecificOutput": {
-                "hookEventName": "PostToolUse",
-            },
-            "systemMessage": message
-        })
-        .to_string(),
-        HostFormat::Gemini => serde_json::json!({
-            "hookSpecificOutput": {},
-            "systemMessage": message
-        })
-        .to_string(),
-    }
-}
-
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
@@ -944,30 +846,6 @@ fn format_error(message: &str, format: HostFormat) -> String {
 mod tests {
     use super::*;
     use anyhow::{Context, Result};
-
-    #[test]
-    fn test_format_error_claude() -> Result<()> {
-        let output = format_error("Catenary: database unavailable", HostFormat::Claude);
-        let parsed: serde_json::Value =
-            serde_json::from_str(&output).context("should produce valid JSON")?;
-
-        assert_eq!(parsed["systemMessage"], "Catenary: database unavailable");
-        assert_eq!(parsed["hookSpecificOutput"]["hookEventName"], "PostToolUse");
-        assert!(parsed["hookSpecificOutput"]["additionalContext"].is_null());
-        Ok(())
-    }
-
-    #[test]
-    fn test_format_error_gemini() -> Result<()> {
-        let output = format_error("Catenary: database unavailable", HostFormat::Gemini);
-        let parsed: serde_json::Value =
-            serde_json::from_str(&output).context("should produce valid JSON")?;
-
-        assert_eq!(parsed["systemMessage"], "Catenary: database unavailable");
-        assert!(parsed["hookSpecificOutput"]["hookEventName"].is_null());
-        assert!(parsed["hookSpecificOutput"]["additionalContext"].is_null());
-        Ok(())
-    }
 
     #[test]
     fn test_format_system_message_claude() -> Result<()> {
@@ -1272,40 +1150,6 @@ mod tests {
             extract_file_path(&json),
             Some("/preferred/path.rs".to_string()),
         );
-    }
-
-    // ── notify_error tests ───────────────────────────────────────────
-
-    #[test]
-    fn notify_error_includes_message_and_bug_url() -> Result<()> {
-        let output = notify_error("socket connection failed", HostFormat::Claude);
-        let parsed: serde_json::Value =
-            serde_json::from_str(&output).context("should produce valid JSON")?;
-        let sys_msg = parsed["systemMessage"]
-            .as_str()
-            .expect("systemMessage should be a string");
-        assert!(
-            sys_msg.contains("socket connection failed"),
-            "should contain the error message",
-        );
-        assert!(
-            sys_msg.contains(BUG_REPORT_URL),
-            "should contain the bug report URL",
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn notify_error_gemini_format() -> Result<()> {
-        let output = notify_error("diagnostics skipped", HostFormat::Gemini);
-        let parsed: serde_json::Value =
-            serde_json::from_str(&output).context("should produce valid JSON")?;
-        let sys_msg = parsed["systemMessage"]
-            .as_str()
-            .expect("systemMessage should be a string");
-        assert!(sys_msg.contains("diagnostics skipped"));
-        assert!(sys_msg.contains(BUG_REPORT_URL));
-        Ok(())
     }
 
     // ── ipc_exchange tests ───────────────────────────────────────────

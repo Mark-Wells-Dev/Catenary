@@ -171,24 +171,6 @@ pub(crate) enum HookRequest {
         format: Option<String>,
     },
 
-    /// LSP diagnostics for a changed file.
-    #[serde(rename = "post-tool/diagnostics")]
-    PostTool {
-        /// Absolute path to the changed file.
-        file: String,
-        /// Name of the host CLI tool that triggered the hook.
-        /// Used for file accumulation during editing mode and logged
-        /// in the payload for monitor visibility.
-        #[serde(default)]
-        tool: Option<String>,
-        /// Agent ID (empty string for the main agent).
-        #[serde(default)]
-        agent_id: String,
-        /// Host CLI session ID (Claude Code / Gemini CLI UUID).
-        #[serde(default)]
-        session_id: Option<String>,
-    },
-
     /// Force `done_editing` before the agent stops.
     #[serde(rename = "post-agent/require-release")]
     PostAgent {
@@ -503,8 +485,8 @@ impl HookServer {
 pub(crate) fn hook_outcome_level(method: &str, envelope: &HookResponseEnvelope) -> tracing::Level {
     let category = hook_category(method);
     match category {
-        // diagnostics / lifecycle: non-empty result → info, empty → debug
-        "diagnostics" | "lifecycle" => {
+        // lifecycle: non-empty result → info, empty → debug
+        "lifecycle" => {
             if envelope.result.is_some() {
                 tracing::Level::INFO
             } else {
@@ -596,24 +578,6 @@ mod tests {
             unreachable!("expected PreTool");
         };
         assert_eq!(command.as_deref(), Some("rm -rf target/"));
-
-        // post-tool/diagnostics with optional fields
-        let json =
-            r#"{"method": "post-tool/diagnostics", "file": "/tmp/test.rs", "tool": "Write"}"#;
-        let req: HookRequest = serde_json::from_str(json).expect("diagnostics");
-        let HookRequest::PostTool { file, tool, .. } = req else {
-            unreachable!("expected PostTool");
-        };
-        assert_eq!(file, "/tmp/test.rs");
-        assert_eq!(tool.as_deref(), Some("Write"));
-
-        // post-tool/diagnostics without optional fields
-        let json = r#"{"method": "post-tool/diagnostics", "file": "/tmp/test.rs"}"#;
-        let req: HookRequest = serde_json::from_str(json).expect("diagnostics minimal");
-        let HookRequest::PostTool { tool, .. } = req else {
-            unreachable!("expected PostTool");
-        };
-        assert!(tool.is_none());
 
         // post-agent/require-release (without session_id — backward compat)
         let json =
@@ -758,11 +722,11 @@ mod tests {
         emit_hook_event(
             tracing::Level::INFO,
             "claude-code",
-            "post-tool/diagnostics",
+            "pre-tool/editing-state",
             id.0,
             None,
             &serde_json::json!({
-                "method": "post-tool/diagnostics",
+                "method": "pre-tool/editing-state",
                 "file": "/tmp/test.rs",
                 "tool": "Write"
             })
@@ -772,7 +736,7 @@ mod tests {
 
         let rows = hook_messages(&conn);
         assert!(!rows.is_empty(), "should have at least the hook row");
-        assert_eq!(rows[0].method, "post-tool/diagnostics");
+        assert_eq!(rows[0].method, "pre-tool/editing-state");
         assert_eq!(rows[0].client, "claude-code");
     }
 
@@ -786,11 +750,11 @@ mod tests {
         emit_hook_event(
             tracing::Level::INFO,
             "claude-code",
-            "post-tool/diagnostics",
+            "pre-tool/editing-state",
             id.0,
             None,
             &serde_json::json!({
-                "method": "post-tool/diagnostics",
+                "method": "pre-tool/editing-state",
                 "file": "/tmp/test.rs"
             })
             .to_string(),
@@ -802,7 +766,7 @@ mod tests {
         emit_hook_event(
             tracing::Level::INFO,
             "claude-code",
-            "post-tool/diagnostics",
+            "pre-tool/editing-state",
             id.0,
             Some(&parent_str),
             &serde_json::json!({"content": "[clean]"}).to_string(),
@@ -869,7 +833,7 @@ mod tests {
         emit_hook_event(
             tracing::Level::DEBUG,
             "test",
-            "post-tool/diagnostics",
+            "pre-tool/editing-state",
             id.0,
             None,
             "{}",
@@ -889,7 +853,7 @@ mod tests {
         emit_hook_event(
             tracing::Level::INFO,
             "test",
-            "post-tool/diagnostics",
+            "pre-tool/editing-state",
             id.0,
             None,
             "{}",
@@ -909,7 +873,7 @@ mod tests {
         emit_hook_event(
             tracing::Level::WARN,
             "test",
-            "post-tool/diagnostics",
+            "pre-tool/editing-state",
             id.0,
             None,
             "{}",
@@ -929,7 +893,7 @@ mod tests {
         emit_hook_event(
             tracing::Level::ERROR,
             "test",
-            "post-tool/diagnostics",
+            "pre-tool/editing-state",
             id.0,
             None,
             "{}",
@@ -1055,24 +1019,6 @@ mod tests {
         };
         let level = HookServer::hook_outcome_level("pre-tool/editing-state", &env);
         assert_eq!(level, tracing::Level::INFO);
-    }
-
-    #[test]
-    fn hook_diagnostics_result_emits_at_info() {
-        let env = HookResponseEnvelope {
-            result: Some(HookResult::Cleared(1)),
-            system_message: None,
-        };
-        let level = HookServer::hook_outcome_level("post-tool/diagnostics", &env);
-        assert_eq!(level, tracing::Level::INFO);
-    }
-
-    #[test]
-    fn hook_diagnostics_clean_emits_at_debug() {
-        // Clean diagnostics return no result (empty response)
-        let env = HookResponseEnvelope::default();
-        let level = HookServer::hook_outcome_level("post-tool/diagnostics", &env);
-        assert_eq!(level, tracing::Level::DEBUG);
     }
 
     #[test]

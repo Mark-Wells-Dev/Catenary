@@ -45,9 +45,9 @@ pub fn mcp_socket_path() -> PathBuf {
 /// The path is deterministic: `$XDG_STATE_HOME/catenary/catenary-hooks.sock`
 /// (or platform equivalent via [`crate::db::state_dir`]).
 ///
-/// Hook CLI processes (`catenary hook pre-tool`, `post-tool`, etc.) connect
-/// to this socket instead of discovering a per-session socket. The
-/// `session_id` is sent in the hook payload — routing happens daemon-side.
+/// Hook CLI processes (`catenary hook pre-tool`, etc.) connect to this
+/// socket instead of discovering a per-session socket. The `session_id`
+/// is sent in the hook payload — routing happens daemon-side.
 #[must_use]
 pub fn hook_socket_path() -> PathBuf {
     crate::db::state_dir()
@@ -3266,10 +3266,10 @@ mod tests {
         });
 
         // Hook with non-empty agent_id should pass through without
-        // triggering diagnostics or editing enforcement.
+        // triggering editing enforcement.
         let req = serde_json::json!({
-            "method": "post-tool/diagnostics",
-            "file": "/tmp/test.rs",
+            "method": "pre-tool/editing-state",
+            "tool_name": "Read",
             "agent_id": "sub-agent-1",
             "session_id": "sess-1"
         });
@@ -3390,11 +3390,11 @@ mod tests {
         });
         let _ = hook_roundtrip(&hook_path, &req).await;
 
-        // Accumulate a file via post-tool hook.
+        // Accumulate a file via pre-tool hook (file tracking).
         let req = serde_json::json!({
-            "method": "post-tool/diagnostics",
-            "file": "/tmp/nonexistent_file.rs",
-            "tool": "Edit",
+            "method": "pre-tool/editing-state",
+            "tool_name": "Edit",
+            "file_path": "/tmp/nonexistent_file.rs",
             "agent_id": "",
             "session_id": "sess-1"
         });
@@ -4410,8 +4410,8 @@ mod tests {
     fn test_is_correlation_trigger_wrong_method() {
         let raw = serde_json::json!({"tool_name": "grep"});
         assert!(
-            !is_correlation_trigger("post-tool/editing-state", &raw),
-            "PostToolUse should not trigger"
+            !is_correlation_trigger("post-agent/require-release", &raw),
+            "PostAgent should not trigger"
         );
         assert!(
             !is_correlation_trigger("pre-agent/turn-start", &raw),

@@ -93,15 +93,13 @@ pub fn mcp_category(method: &str) -> &'static str {
 /// Categorize a hook method.
 ///
 /// Matches on the namespace prefix (before the `/`). The IPC
-/// socket carries three kinds of traffic:
-/// - `pre-tool/*`, `post-tool/*`, `pre-agent/*`, `post-agent/*`,
+/// socket carries two kinds of traffic:
+/// - `pre-tool/*`, `pre-agent/*`, `post-agent/*`,
 ///   `session-start/*`, `session-end/*` — hook lifecycle events
 /// - `tool/*` — CLI commands (agent-invoked via shell tool)
-/// - `post-tool/diagnostics` — diagnostics results
 #[must_use]
 pub fn hook_category(method: &str) -> &'static str {
     match method.split('/').next().unwrap_or(method) {
-        "post-tool" => "diagnostics",
         "tool" => "tool",
         "pre-tool" | "pre-agent" | "post-agent" | "session-start" | "session-end" => "lifecycle",
         _ => "unknown",
@@ -207,8 +205,6 @@ mod tests {
 
     #[test]
     fn hook_category_methods() {
-        // diagnostics
-        assert_eq!(hook_category("post-tool/diagnostics"), "diagnostics");
         // tool (CLI commands)
         assert_eq!(hook_category("tool/done-editing"), "tool");
         assert_eq!(hook_category("tool/start-editing"), "tool");

@@ -407,27 +407,6 @@ impl HookRouter {
                 let host_format = format.as_deref().and_then(parse_host_format);
                 self.handle_check_command(&command, cwd.as_deref(), host_format)
             }
-            HookRequest::PostTool {
-                file,
-                tool,
-                agent_id,
-                session_id,
-            } => {
-                self.store_client_session_id(session_id.as_deref());
-                debug!(
-                    source = Source::HookDispatch.as_str(),
-                    "Hook: processing file {file}"
-                );
-                DispatchResult {
-                    result: self.handle_file_accumulation(
-                        &file,
-                        session_id.as_deref(),
-                        &agent_id,
-                        tool.as_deref(),
-                    ),
-                    system_message: None,
-                }
-            }
             HookRequest::PostAgent {
                 agent_id,
                 session_id,
@@ -1580,33 +1559,6 @@ mod tests {
             session_id: Some("test-session".to_string()),
             fields: serde_json::Map::new(),
         }
-    }
-
-    #[test]
-    fn dispatch_post_tool_does_not_drain() {
-        let router = test_router();
-        crate::logging::Sink::handle(
-            router.session.notification_router.as_ref(),
-            &make_notify_event("server offline", "ra"),
-        );
-
-        let result = router.dispatch(
-            crate::hook::HookRequest::PostTool {
-                file: "/tmp/test.rs".to_string(),
-                tool: Some("Edit".to_string()),
-                agent_id: String::new(),
-                session_id: None,
-            },
-            0,
-        );
-        assert!(
-            result.system_message.is_none(),
-            "post-tool should not drain"
-        );
-        assert_eq!(
-            router.session.notification_router.queue_len("test-session"),
-            1
-        );
     }
 
     // ── Turn counter tests ────────────────────────────────────────────

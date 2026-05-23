@@ -36,28 +36,6 @@
         ]
       }
     ],
-    "AfterTool": [
-      {
-        "matcher": "read_file|write_file",
-        "hooks": [
-          {
-            "name": "catenary-notify",
-            "type": "command",
-            "command": "catenary hook post-tool --format=gemini"
-          }
-        ]
-      },
-      {
-        "matcher": "mcp.*catenary.*done_editing",
-        "hooks": [
-          {
-            "name": "catenary-done-editing",
-            "type": "command",
-            "command": "catenary hook post-tool --format=gemini"
-          }
-        ]
-      }
-    ],
     "AfterAgent": [
       {
         "matcher": "",

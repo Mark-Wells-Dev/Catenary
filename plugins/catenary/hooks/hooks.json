@@ -34,17 +34,6 @@
         ]
       }
     ],
-    "PostToolUse": [
-      {
-        "matcher": "Edit|Write|NotebookEdit",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "catenary hook post-tool --format=claude"
-          }
-        ]
-      }
-    ],
     "Stop": [
       {
         "matcher": "",

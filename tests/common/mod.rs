@@ -395,13 +395,13 @@ impl BridgeProcess {
             }),
         )?;
 
-        // Accumulate file via PostToolUse
+        // Accumulate file via PreToolUse file tracking
         ipc_request(
             &socket_path,
             &json!({
-                "method": "post-tool/diagnostics",
-                "file": file,
-                "tool": "Edit",
+                "method": "pre-tool/editing-state",
+                "tool_name": "Edit",
+                "file_path": file,
                 "agent_id": ""
             }),
         )?;
@@ -441,14 +441,14 @@ impl BridgeProcess {
             }),
         )?;
 
-        // Accumulate all files via PostToolUse
+        // Accumulate all files via PreToolUse file tracking
         for file in files {
             ipc_request(
                 &socket_path,
                 &json!({
-                    "method": "post-tool/diagnostics",
-                    "file": file,
-                    "tool": "Edit",
+                    "method": "pre-tool/editing-state",
+                    "tool_name": "Edit",
+                    "file_path": file,
                     "agent_id": ""
                 }),
             )?;
