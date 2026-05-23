@@ -1508,6 +1508,17 @@ async fn handle_hook_dispatch(
         return Ok(());
     }
 
+    // ── Start editing confirmation ────────────────────────────────
+    //
+    // `start-editing/confirm` is sent by `catenary start_editing`
+    // after the PreToolUse hook has already entered editing mode.
+    // The CLI command just needs a confirmation response.
+    if method == "start-editing/confirm" {
+        writer.write_all(b"{\"status\":\"ok\"}\n").await?;
+        writer.shutdown().await?;
+        return Ok(());
+    }
+
     // ── Root management ──────────────────────────────────────────
     //
     // `add-root/run` and `rm-root/run` are sent by the CLI commands

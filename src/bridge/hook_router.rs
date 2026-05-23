@@ -538,6 +538,21 @@ impl HookRouter {
                     add_roots: Vec::new(),
                 }
             }
+            HookRequest::PreToolStartEditing {
+                agent_id,
+                session_id,
+            } => {
+                self.store_client_session_id(session_id.as_deref());
+                let _ = self
+                    .session
+                    .editing
+                    .start_editing(session_id.as_deref(), &agent_id);
+                DispatchResult {
+                    result: None,
+                    system_message: None,
+                    add_roots: Vec::new(),
+                }
+            }
             HookRequest::CheckCommand {
                 command,
                 cwd,
@@ -1005,6 +1020,63 @@ mod tests {
         assert!(
             result.is_none(),
             "expected None after clear, got {result:?}"
+        );
+    }
+
+    // ── PreToolStartEditing dispatch tests ─────────────────────────────
+
+    #[test]
+    fn dispatch_start_editing_cli_enters_editing() {
+        let router = test_router();
+        assert!(!router.session.editing.is_editing(None, ""));
+
+        let result = router.dispatch(
+            crate::hook::HookRequest::PreToolStartEditing {
+                agent_id: String::new(),
+                session_id: None,
+            },
+            0,
+        );
+        assert!(result.result.is_none(), "start_editing should allow");
+        assert!(
+            router.session.editing.is_editing(None, ""),
+            "should be in editing mode after dispatch"
+        );
+    }
+
+    #[test]
+    fn dispatch_start_editing_cli_with_agent_id() {
+        let router = test_router();
+        let result = router.dispatch(
+            crate::hook::HookRequest::PreToolStartEditing {
+                agent_id: "sub-agent".to_string(),
+                session_id: None,
+            },
+            0,
+        );
+        assert!(result.result.is_none());
+        assert!(router.session.editing.is_editing(None, "sub-agent"));
+        assert!(!router.session.editing.is_editing(None, ""));
+    }
+
+    #[test]
+    fn dispatch_start_editing_cli_then_edit_allowed() {
+        let (router, root) = test_router_with_root();
+        // Enter editing via the CLI path.
+        router.dispatch(
+            crate::hook::HookRequest::PreToolStartEditing {
+                agent_id: String::new(),
+                session_id: None,
+            },
+            0,
+        );
+
+        // Edit tool should now be allowed.
+        let in_root = format!("{}/src/main.rs", root.display());
+        let result = router.handle_enforce_editing("Edit", Some(&in_root), None, None, "");
+        assert!(
+            result.is_none(),
+            "Edit should be allowed after start_editing CLI, got {result:?}"
         );
     }
 

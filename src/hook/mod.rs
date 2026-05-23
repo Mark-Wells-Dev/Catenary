@@ -143,6 +143,21 @@ pub(crate) enum HookRequest {
         cwd: Option<String>,
     },
 
+    /// Enter editing mode via CLI command (`catenary start_editing`).
+    ///
+    /// Sent by the `PreToolUse` hook when the agent runs
+    /// `catenary start_editing` via the host's shell tool. The daemon
+    /// enters editing mode for the session.
+    #[serde(rename = "pre-tool/start-editing")]
+    PreToolStartEditing {
+        /// Agent ID (empty string for the main agent).
+        #[serde(default)]
+        agent_id: String,
+        /// Host CLI session ID (Claude Code / Gemini CLI UUID).
+        #[serde(default)]
+        session_id: Option<String>,
+    },
+
     /// Session-side command check with debounce.
     ///
     /// Evaluates the shell command against the merged allowlist (user
@@ -681,6 +696,27 @@ mod tests {
             unreachable!("expected SessionStart");
         };
         assert_eq!(session_id.as_deref(), Some("uuid-123"));
+
+        // pre-tool/start-editing
+        let json = r#"{"method": "pre-tool/start-editing", "agent_id": "sub-1", "session_id": "sess-xyz"}"#;
+        let req: HookRequest = serde_json::from_str(json).expect("start-editing");
+        let HookRequest::PreToolStartEditing {
+            agent_id,
+            session_id,
+        } = req
+        else {
+            unreachable!("expected PreToolStartEditing");
+        };
+        assert_eq!(agent_id, "sub-1");
+        assert_eq!(session_id.as_deref(), Some("sess-xyz"));
+
+        // pre-tool/start-editing minimal (defaults)
+        let json = r#"{"method": "pre-tool/start-editing"}"#;
+        let req: HookRequest = serde_json::from_str(json).expect("start-editing minimal");
+        assert!(matches!(
+            req,
+            HookRequest::PreToolStartEditing { agent_id, session_id: None } if agent_id.is_empty()
+        ));
 
         // pre-tool/check-command
         let json = r#"{"method": "pre-tool/check-command", "command": "cargo test", "cwd": "/project", "session_id": "abc123", "format": "claude"}"#;

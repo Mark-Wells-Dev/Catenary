@@ -139,6 +139,10 @@ enum Command {
         session: Option<String>,
     },
 
+    /// Enter editing mode. Invoke via the host's shell tool.
+    #[command(name = "start_editing")]
+    StartEditing,
+
     /// Add a workspace root. Invoke via the host's shell tool.
     #[command(name = "add-root")]
     AddRoot {
@@ -299,6 +303,10 @@ fn main() -> Result<()> {
             let conn = catenary_mcp::db::open_and_migrate()?;
             cli::commands::run_gc(&conn, older_than.as_deref(), dead, session.as_deref())
         }
+        #[cfg(unix)]
+        Some(Command::StartEditing) => build_runtime()?.block_on(run_start_editing()),
+        #[cfg(not(unix))]
+        Some(Command::StartEditing) => Err(anyhow::anyhow!("daemon mode requires Unix")),
         #[cfg(unix)]
         Some(Command::AddRoot { path }) => {
             build_runtime()?.block_on(run_root_command(path, "add-root/run"))
@@ -587,6 +595,54 @@ async fn run_stop() -> Result<()> {
     Ok(())
 }
 
+/// Confirms editing mode is active on the running daemon.
+///
+/// Connects to the daemon's hook socket and sends a status query.
+/// The actual state transition happens in the `PreToolUse` hook — this
+/// command only prints confirmation for the agent's stdout.
+///
+/// # Errors
+///
+/// Returns an error if no daemon is running.
+#[cfg(unix)]
+async fn run_start_editing() -> Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let hook_path = catenary_mcp::router::hook_socket_path();
+
+    let stream = tokio::net::UnixStream::connect(&hook_path)
+        .await
+        .context("no daemon running — start a Catenary session first")?;
+
+    let (reader, mut writer) = stream.into_split();
+    let request = serde_json::json!({"method": "start-editing/confirm"});
+    let mut payload = serde_json::to_string(&request)?;
+    payload.push('\n');
+    writer.write_all(payload.as_bytes()).await?;
+
+    let mut buf_reader = BufReader::new(reader);
+    let mut line = String::new();
+    buf_reader.read_line(&mut line).await?;
+
+    let response: serde_json::Value = serde_json::from_str(line.trim()).unwrap_or_default();
+    let status = response
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("ok");
+
+    if status == "ok" {
+        println!("editing mode active");
+    } else {
+        let msg = response
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unexpected response");
+        anyhow::bail!("{msg}");
+    }
+
+    Ok(())
+}
+
 /// Sends an add-root or rm-root request to the running daemon.
 ///
 /// Canonicalizes the path, connects to the daemon's hook socket, and
@@ -740,6 +796,16 @@ mod tests {
         let args = Args::try_parse_from(["catenary", "config"]);
         let args = args.expect("config subcommand should parse");
         assert!(matches!(args.command, Some(Command::Config)));
+    }
+
+    // ── CLI start_editing subcommand test ─────────────────────────
+
+    #[test]
+    fn test_cli_start_editing() {
+        use clap::Parser;
+        let args = Args::try_parse_from(["catenary", "start_editing"]);
+        let args = args.expect("start_editing should parse");
+        assert!(matches!(args.command, Some(Command::StartEditing)));
     }
 
     // ── CLI root management subcommand tests ─────────────────────
