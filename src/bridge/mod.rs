@@ -39,7 +39,6 @@ pub use editing_guardrail::EditingGuardrail;
 pub use editing_manager::EditingManager;
 pub use handler::McpRouter;
 pub use hook_router::HookRouter;
-pub(crate) use hook_router::is_catenary_tool;
 pub use path_security::PathValidator;
 pub use tool_server::ToolServer;
 

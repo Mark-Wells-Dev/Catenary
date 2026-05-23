@@ -167,12 +167,6 @@ pub type ClientInfoCallback = Box<dyn Fn(&str, &str) + Send + Sync>;
 /// Callback invoked when MCP roots are received or updated.
 pub type RootsChangedCallback = Box<dyn Fn(Vec<Root>) -> Result<()> + Send + Sync>;
 
-/// Callback invoked before each `tools/call` dispatch.
-///
-/// Used by the daemon's sandwich correlation to bind MCP connections
-/// to sessions on their first tool call.
-pub type ToolsCallCallback = Box<dyn Fn() + Send + Sync>;
-
 /// An MCP server implementation.
 #[allow(
     clippy::struct_excessive_bools,
@@ -206,9 +200,6 @@ pub struct McpServer<H: ToolHandler> {
     /// `HookRouter` on `PreAgent` dispatch (turn boundary), cleared
     /// by this run loop after triggering `fetch_roots`.
     roots_refresh: Option<Arc<AtomicBool>>,
-    /// Optional callback invoked before each `tools/call` dispatch.
-    /// Used by daemon sandwich correlation.
-    on_tools_call: Option<ToolsCallCallback>,
     /// UUID minted per `tools/call` dispatch for LSP event correlation.
     /// Set in the run loop before dispatch, read by `handle_tools_call`.
     current_call_uuid: Option<String>,
@@ -231,7 +222,6 @@ impl<H: ToolHandler> McpServer<H> {
             current_correlation_id: 0,
             cancel_map: Arc::new(std::sync::Mutex::new(HashMap::new())),
             roots_refresh: None,
-            on_tools_call: None,
             current_call_uuid: None,
         }
     }
@@ -259,16 +249,6 @@ impl<H: ToolHandler> McpServer<H> {
     #[must_use]
     pub fn on_roots_refresh(mut self, flag: Arc<AtomicBool>) -> Self {
         self.roots_refresh = Some(flag);
-        self
-    }
-
-    /// Set a callback invoked before each `tools/call` dispatch.
-    ///
-    /// Used by the daemon's sandwich correlation to bind MCP
-    /// connections to sessions on their first tool call.
-    #[must_use]
-    pub fn on_tools_call(mut self, callback: ToolsCallCallback) -> Self {
-        self.on_tools_call = Some(callback);
         self
     }
 
@@ -305,11 +285,8 @@ impl<H: ToolHandler> McpServer<H> {
             trace!("Received: {}", line);
 
             // Log incoming message and extract request ID for
-            // cancellation pre-registration. For `tools/call`, the
-            // incoming event is deferred until after the `on_tools_call`
-            // callback resolves sandwich correlation, so `scope_parent_id`
-            // can be read from the handler.
-            let (correlation_id, method, mcp_request_id, json_payload) =
+            // cancellation pre-registration.
+            let (correlation_id, method, mcp_request_id) =
                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
                     let method = json
                         .get("method")
@@ -318,17 +295,27 @@ impl<H: ToolHandler> McpServer<H> {
                         .to_string();
                     let id = self.logging.next_id();
                     let payload = json.to_string();
-                    if method != "tools/call" {
-                        emit_mcp_event(
-                            mcp_method_level(&method),
-                            &self.client_name,
-                            &method,
-                            id.0,
-                            None,
-                            &payload,
-                            "incoming",
-                        );
-                    }
+
+                    // For tools/call, mint a UUID that groups the incoming
+                    // MCP event and all child LSP events in the TUI.
+                    let parent_id = if method == "tools/call" {
+                        let uuid = uuid::Uuid::new_v4().to_string();
+                        self.current_call_uuid = Some(uuid.clone());
+                        Some(uuid)
+                    } else {
+                        None
+                    };
+
+                    emit_mcp_event(
+                        mcp_method_level(&method),
+                        &self.client_name,
+                        &method,
+                        id.0,
+                        parent_id.as_deref(),
+                        &payload,
+                        "incoming",
+                    );
+
                     // Extract request ID for requests (has both `id` and `method`).
                     let rid = if json.get("method").is_some() {
                         json.get("id")
@@ -336,35 +323,12 @@ impl<H: ToolHandler> McpServer<H> {
                     } else {
                         None
                     };
-                    (id.0, method, rid, payload)
+                    (id.0, method, rid)
                 } else {
-                    (0, String::new(), None, String::new())
+                    (0, String::new(), None)
                 };
 
             self.current_correlation_id = correlation_id;
-
-            // Run the pre-dispatch callback (correlation + flag
-            // bridging) BEFORE the roots refresh check so a bridged
-            // flag is visible to this iteration.
-            if method == "tools/call" {
-                if let Some(cb) = &self.on_tools_call {
-                    cb();
-                }
-                // Mint a UUID for this tool call. LSP events and the
-                // incoming MCP event share this parent_id, grouping
-                // them together in the TUI.
-                let call_uuid = uuid::Uuid::new_v4().to_string();
-                self.current_call_uuid = Some(call_uuid.clone());
-                emit_mcp_event(
-                    mcp_method_level(&method),
-                    &self.client_name,
-                    &method,
-                    correlation_id,
-                    Some(&call_uuid),
-                    &json_payload,
-                    "incoming",
-                );
-            }
 
             // Check for turn-boundary roots refresh BEFORE dispatch.
             // This guarantees tool calls execute against current roots:
@@ -1571,10 +1535,9 @@ mod tests {
     /// ID, emit the incoming MCP event, set `current_correlation_id`, and
     /// dispatch.
     ///
-    /// Mirrors `run()`: for `tools/call`, the incoming event is emitted
-    /// after the `on_tools_call` callback (deferred) with
-    /// `scope_parent_id` from the handler; for all other methods, the
-    /// event is emitted immediately with `parent_id = None`.
+    /// Mirrors `run()`: for `tools/call`, a UUID is minted as the
+    /// `parent_id` to group LSP events; for all other methods,
+    /// `parent_id` is `None`.
     fn simulate_incoming<H: ToolHandler>(
         server: &mut McpServer<H>,
         line: &str,
@@ -2223,52 +2186,6 @@ mod tests {
             buf.push(b'\n');
         }
         std::io::Cursor::new(buf)
-    }
-
-    #[test]
-    fn on_tools_call_fires_only_for_tools_call() -> Result<()> {
-        use std::sync::atomic::{AtomicU32, Ordering};
-
-        let call_count = Arc::new(AtomicU32::new(0));
-        let counter = call_count.clone();
-
-        let mut server = McpServer::new(TestHandler, LoggingServer::new());
-        server.on_tools_call = Some(Box::new(move || {
-            counter.fetch_add(1, Ordering::Relaxed);
-        }));
-
-        // Sequence: initialize → initialized → ping → tools/call.
-        // Only tools/call should trigger the callback.
-        let stdin = synthetic_stdin(&[
-            serde_json::json!({
-                "jsonrpc": "2.0", "id": 1, "method": "initialize",
-                "params": {
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {},
-                    "clientInfo": {"name": "test", "version": "1.0"}
-                }
-            }),
-            serde_json::json!({
-                "jsonrpc": "2.0", "method": "notifications/initialized"
-            }),
-            serde_json::json!({
-                "jsonrpc": "2.0", "id": 2, "method": "ping"
-            }),
-            serde_json::json!({
-                "jsonrpc": "2.0", "id": 3, "method": "tools/call",
-                "params": {"name": "test_tool", "arguments": {}}
-            }),
-        ]);
-
-        let mut writer: Vec<u8> = Vec::new();
-        server.run(stdin, &mut writer)?;
-
-        assert_eq!(
-            call_count.load(Ordering::Relaxed),
-            1,
-            "callback should fire exactly once (for tools/call only)"
-        );
-        Ok(())
     }
 
     #[test]
