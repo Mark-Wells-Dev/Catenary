@@ -1,9 +1,7 @@
-@./AGENTS.md
-
 ## Catenary Editing Workflow
 
 Run `catenary start_editing` before editing files.
-Edit files normally using the host's edit tool.
+Edit files normally using the Edit tool.
 Run `catenary done_editing` after editing to see diagnostics.
 
 ## Workspace Roots

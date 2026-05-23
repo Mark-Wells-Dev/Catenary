@@ -1,5 +1,3 @@
-@./AGENTS.md
-
 ## Catenary Editing Workflow
 
 Run `catenary start_editing` before editing files.

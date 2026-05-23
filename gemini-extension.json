@@ -4,6 +4,7 @@
   "version": "1.6.1",
   "description": "High-performance multiplexing bridge between MCP and LSP servers.",
   "publisher": "TwoWells",
+  "contextFileName": "GEMINI.md",
   "mcpServers": {
     "catenary": {
       "command": "catenary"
