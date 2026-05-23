@@ -503,7 +503,7 @@ pub async fn run_doctor(project_root: &Path, nocolor: bool, show_diff: bool) -> 
     println!("{}:", colors.bold("Hooks"));
     check_claude_hooks(&colors, show_diff);
     check_gemini_hooks(&colors, show_diff);
-    check_antigravity_hooks(&colors, show_diff);
+    check_antigravity_hooks(&colors, show_diff, project_root);
     check_path_binary(&colors);
 
     // Legacy script migration warnings
@@ -1438,35 +1438,55 @@ fn check_gemini_hooks(colors: &ColorConfig, show_diff: bool) {
 }
 
 /// Check Antigravity CLI plugin hooks against the embedded expected hooks.
-fn check_antigravity_hooks(colors: &ColorConfig, show_diff: bool) {
+///
+/// Searches three discovery paths (first match wins):
+/// 1. `<project_root>/.agents/plugins/catenary/` (workspace)
+/// 2. `<project_root>/_agents/plugins/catenary/` (workspace)
+/// 3. `~/.gemini/config/plugins/catenary/` (global)
+fn check_antigravity_hooks(colors: &ColorConfig, show_diff: bool, project_root: &Path) {
     let label = format!("{:<14}", "Antigravity");
-    let Ok(home_str) = std::env::var("HOME") else {
-        println!(
-            "  {label}{}",
-            colors.dim("- cannot determine home directory"),
-        );
-        return;
-    };
-    let home = PathBuf::from(home_str);
 
-    // Look for the Antigravity plugin directory.
-    // Antigravity stores global plugins under ~/.gemini/config/plugins/.
-    let plugin_dir = home.join(".gemini/config/plugins/catenary");
-    if !plugin_dir.is_dir() {
+    let resolved_root = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf());
+
+    // Workspace-level paths (relative to --root).
+    let workspace_candidates = [
+        resolved_root.join(".agents/plugins/catenary"),
+        resolved_root.join("_agents/plugins/catenary"),
+    ];
+
+    // Global path.
+    let global_candidate = std::env::var("HOME")
+        .ok()
+        .map(|h| PathBuf::from(h).join(".gemini/config/plugins/catenary"));
+
+    let (plugin_dir, scope) = workspace_candidates
+        .iter()
+        .find(|p| p.is_dir())
+        .map(|p| (p.clone(), "workspace"))
+        .or_else(|| {
+            global_candidate
+                .filter(|p| p.is_dir())
+                .map(|p| (p, "global"))
+        })
+        .unzip();
+
+    let Some(plugin_dir) = plugin_dir else {
         println!("  {label}{}", colors.dim("- not installed"));
         return;
-    }
-
-    let spacer = " ".repeat(20);
+    };
+    let scope = scope.unwrap_or("unknown");
+    let scope_col = format!("{scope:<20}");
 
     let hooks_path = plugin_dir.join("hooks.json");
     match std::fs::read_to_string(&hooks_path) {
         Ok(installed) => {
             if normalize_json(&installed) == normalize_json(ANTIGRAVITY_HOOKS_EXPECTED) {
-                println!("  {label}{spacer}{}", colors.green("✓ hooks match"));
+                println!("  {label}{scope_col}{}", colors.green("✓ hooks match"));
             } else {
                 println!(
-                    "  {label}{spacer}{}",
+                    "  {label}{scope_col}{}",
                     colors.red("✗ stale hooks (reinstall plugin)"),
                 );
                 if show_diff {
@@ -1481,7 +1501,7 @@ fn check_antigravity_hooks(colors: &ColorConfig, show_diff: bool) {
         }
         Err(_) => {
             println!(
-                "  {label}{spacer}{}",
+                "  {label}{scope_col}{}",
                 colors.yellow("? hooks.json not found"),
             );
         }
