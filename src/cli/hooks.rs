@@ -1463,6 +1463,14 @@ mod tests {
     }
 
     #[test]
+    fn catenary_command_with_home_path_prefix() {
+        assert!(is_catenary_command(
+            "/home/user/.local/bin/catenary start_editing",
+            &["start_editing"],
+        ));
+    }
+
+    #[test]
     fn catenary_command_relative_path_prefix() {
         assert!(is_catenary_command(
             "./catenary start_editing",
