@@ -500,6 +500,19 @@ pub fn run_pre_tool(format: HostFormat) {
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
+    // ── Root management commands ─────────────────────────────────
+    // Intercept `catenary add-root` / `catenary rm-root` shell commands
+    // and forward to the daemon as IPC root management requests.
+    if let Some(shell_cmd) = extract_shell_command(&hook_json, tool_name, format)
+        && let Some(root_method) = extract_root_command(&shell_cmd, &hook_json)
+    {
+        if let Some(stream) = hook_connect(&hook_json) {
+            let _ = ipc_exchange(stream, &root_method);
+        }
+        // Allow the command to proceed — the CLI will print confirmation.
+        return;
+    }
+
     // ── Command filter ──────────────────────────────────────────
     // Try session-side check first (full multi-root merged config).
     // Fall back to client-side check (user config + cwd's project
@@ -762,6 +775,51 @@ fn extract_shell_command(
         .and_then(|ti| ti.get("command"))
         .and_then(|c| c.as_str())
         .map(String::from)
+}
+
+/// Recognizes `catenary add-root <path>` and `catenary rm-root <path>`
+/// in a shell command string.
+///
+/// Returns a JSON IPC request for the daemon if the command matches.
+/// The path is resolved to absolute using the hook payload's `cwd`.
+fn extract_root_command(
+    shell_cmd: &str,
+    hook_json: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let trimmed = shell_cmd.trim();
+    let (method, rest) = if let Some(rest) = trimmed.strip_prefix("catenary add-root") {
+        ("pre-tool/add-root", rest)
+    } else if let Some(rest) = trimmed.strip_prefix("catenary rm-root") {
+        ("pre-tool/rm-root", rest)
+    } else {
+        return None;
+    };
+
+    let path_arg = rest.trim();
+    if path_arg.is_empty() {
+        return None;
+    }
+
+    // Resolve to absolute path.
+    let abs_path = if std::path::Path::new(path_arg).is_absolute() {
+        PathBuf::from(path_arg)
+    } else {
+        let cwd = hook_json.get("cwd").and_then(|v| v.as_str()).map_or_else(
+            || std::env::current_dir().unwrap_or_default(),
+            PathBuf::from,
+        );
+        cwd.join(path_arg)
+    };
+
+    let session_id = hook_json.get("session_id").and_then(|v| v.as_str());
+    let mut request = serde_json::json!({
+        "method": method,
+        "path": abs_path.display().to_string(),
+    });
+    if let Some(sid) = session_id {
+        request["session_id"] = serde_json::json!(sid);
+    }
+    Some(request)
 }
 
 // ── Formatting helpers ──────────────────────────────────────────────────
@@ -1342,5 +1400,67 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let sock_path = dir.path().join("nonexistent.sock");
         assert!(notify_connect(&sock_path).is_none());
+    }
+
+    // ── extract_root_command tests ──────────────────────────────────
+
+    #[test]
+    fn extract_root_command_add_root_absolute() {
+        let hook_json = serde_json::json!({
+            "session_id": "sess-1",
+            "cwd": "/home/user/project"
+        });
+        let result = extract_root_command("catenary add-root /tmp/new-root", &hook_json);
+        let req = result.expect("should match add-root");
+        assert_eq!(req["method"], "pre-tool/add-root");
+        assert_eq!(req["path"], "/tmp/new-root");
+        assert_eq!(req["session_id"], "sess-1");
+    }
+
+    #[test]
+    fn extract_root_command_rm_root_absolute() {
+        let hook_json = serde_json::json!({
+            "session_id": "sess-2"
+        });
+        let result = extract_root_command("catenary rm-root /tmp/old-root", &hook_json);
+        let req = result.expect("should match rm-root");
+        assert_eq!(req["method"], "pre-tool/rm-root");
+        assert_eq!(req["path"], "/tmp/old-root");
+    }
+
+    #[test]
+    fn extract_root_command_relative_path() {
+        let hook_json = serde_json::json!({
+            "cwd": "/home/user/project"
+        });
+        let result = extract_root_command("catenary add-root subdir", &hook_json);
+        let req = result.expect("should match add-root with relative path");
+        assert_eq!(req["method"], "pre-tool/add-root");
+        assert_eq!(req["path"], "/home/user/project/subdir");
+    }
+
+    #[test]
+    fn extract_root_command_no_path_returns_none() {
+        let hook_json = serde_json::json!({});
+        assert!(extract_root_command("catenary add-root", &hook_json).is_none());
+        assert!(extract_root_command("catenary rm-root", &hook_json).is_none());
+    }
+
+    #[test]
+    fn extract_root_command_non_matching_returns_none() {
+        let hook_json = serde_json::json!({});
+        assert!(extract_root_command("catenary doctor", &hook_json).is_none());
+        assert!(extract_root_command("ls -la", &hook_json).is_none());
+        assert!(extract_root_command("catenary stop", &hook_json).is_none());
+    }
+
+    #[test]
+    fn extract_root_command_with_whitespace() {
+        let hook_json = serde_json::json!({
+            "cwd": "/home/user"
+        });
+        let result = extract_root_command("  catenary add-root /tmp/root  ", &hook_json);
+        let req = result.expect("should handle leading/trailing whitespace");
+        assert_eq!(req["path"], "/tmp/root");
     }
 }

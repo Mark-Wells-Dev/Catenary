@@ -139,6 +139,20 @@ enum Command {
         session: Option<String>,
     },
 
+    /// Add a workspace root. Invoke via the host's shell tool.
+    #[command(name = "add-root")]
+    AddRoot {
+        /// Path to add as a workspace root.
+        path: PathBuf,
+    },
+
+    /// Remove a workspace root. Invoke via the host's shell tool.
+    #[command(name = "rm-root")]
+    RmRoot {
+        /// Path to remove from workspace roots.
+        path: PathBuf,
+    },
+
     /// Run as the Catenary daemon (internal, spawned by bridge proxy).
     #[command(hide = true)]
     Daemon,
@@ -285,6 +299,18 @@ fn main() -> Result<()> {
             let conn = catenary_mcp::db::open_and_migrate()?;
             cli::commands::run_gc(&conn, older_than.as_deref(), dead, session.as_deref())
         }
+        #[cfg(unix)]
+        Some(Command::AddRoot { path }) => {
+            build_runtime()?.block_on(run_root_command(path, "add-root/run"))
+        }
+        #[cfg(not(unix))]
+        Some(Command::AddRoot { .. }) => Err(anyhow::anyhow!("daemon mode requires Unix")),
+        #[cfg(unix)]
+        Some(Command::RmRoot { path }) => {
+            build_runtime()?.block_on(run_root_command(path, "rm-root/run"))
+        }
+        #[cfg(not(unix))]
+        Some(Command::RmRoot { .. }) => Err(anyhow::anyhow!("daemon mode requires Unix")),
         #[cfg(unix)]
         Some(Command::Daemon) => run_daemon(),
         #[cfg(not(unix))]
@@ -561,6 +587,77 @@ async fn run_stop() -> Result<()> {
     Ok(())
 }
 
+/// Sends an add-root or rm-root request to the running daemon.
+///
+/// Canonicalizes the path, connects to the daemon's hook socket, and
+/// prints the result. If no daemon is running, prints an error and
+/// exits non-zero.
+///
+/// # Errors
+///
+/// Returns an error if the path cannot be canonicalized or the daemon
+/// request fails.
+#[cfg(unix)]
+async fn run_root_command(path: PathBuf, method: &str) -> Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("cannot resolve path: {}", path.display()))?;
+
+    let hook_path = catenary_mcp::router::hook_socket_path();
+
+    let stream = tokio::net::UnixStream::connect(&hook_path)
+        .await
+        .context("no daemon running")?;
+
+    let (reader, mut writer) = stream.into_split();
+    let request = serde_json::json!({
+        "method": method,
+        "path": canonical.display().to_string(),
+    });
+    let mut payload = serde_json::to_string(&request)?;
+    payload.push('\n');
+    writer.write_all(payload.as_bytes()).await?;
+
+    let mut buf_reader = BufReader::new(reader);
+    let mut line = String::new();
+    buf_reader.read_line(&mut line).await?;
+
+    let response: serde_json::Value = serde_json::from_str(line.trim()).unwrap_or_default();
+    let status = response
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+
+    match status {
+        "ok" => {
+            let verb = if method.starts_with("add") {
+                "added"
+            } else {
+                "removed"
+            };
+            println!("{verb} root: {}", canonical.display());
+        }
+        "not_found" => {
+            let msg = response
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("root not found in hook-managed roots");
+            println!("{msg}");
+        }
+        _ => {
+            let msg = response
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unexpected response");
+            anyhow::bail!("{msg}");
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
@@ -643,5 +740,29 @@ mod tests {
         let args = Args::try_parse_from(["catenary", "config"]);
         let args = args.expect("config subcommand should parse");
         assert!(matches!(args.command, Some(Command::Config)));
+    }
+
+    // ── CLI root management subcommand tests ─────────────────────
+
+    #[test]
+    fn test_cli_add_root() {
+        use clap::Parser;
+        let args = Args::try_parse_from(["catenary", "add-root", "/tmp/project"]);
+        let args = args.expect("add-root should parse");
+        let Some(Command::AddRoot { path }) = args.command else {
+            unreachable!("expected AddRoot command");
+        };
+        assert_eq!(path, PathBuf::from("/tmp/project"));
+    }
+
+    #[test]
+    fn test_cli_rm_root() {
+        use clap::Parser;
+        let args = Args::try_parse_from(["catenary", "rm-root", "/tmp/project"]);
+        let args = args.expect("rm-root should parse");
+        let Some(Command::RmRoot { path }) = args.command else {
+            unreachable!("expected RmRoot command");
+        };
+        assert_eq!(path, PathBuf::from("/tmp/project"));
     }
 }

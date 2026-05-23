@@ -410,6 +410,30 @@ impl RootTracker {
             .remove(contributor);
     }
 
+    /// Removes a single root from a contributor's set.
+    ///
+    /// Returns `true` if the root was present and removed, `false` if
+    /// the contributor or root was not found.
+    #[allow(
+        clippy::option_if_let_else,
+        reason = "map_or causes double-borrow on the Mutex guard"
+    )]
+    fn remove_root(&self, contributor: &str, root: &Path) -> bool {
+        let mut map = self
+            .contributors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(roots) = map.get_mut(contributor) {
+            let removed = roots.remove(root);
+            if roots.is_empty() {
+                map.remove(contributor);
+            }
+            removed
+        } else {
+            false
+        }
+    }
+
     /// Returns the union of all contributors' root sets.
     fn global_roots(&self) -> Vec<PathBuf> {
         let map = self
@@ -1479,6 +1503,133 @@ async fn handle_hook_dispatch(
         );
 
         writer.write_all(b"\n").await?;
+        writer.shutdown().await?;
+        return Ok(());
+    }
+
+    // ── Root management ──────────────────────────────────────────
+    //
+    // `pre-tool/add-root` and `pre-tool/rm-root` are sent by the
+    // PreToolUse hook when an agent runs `catenary add-root` or
+    // `catenary rm-root` via the host's shell tool.
+    //
+    // `add-root/run` and `rm-root/run` are sent by the direct CLI
+    // commands (`catenary add-root`, `catenary rm-root`).
+    //
+    // Both paths perform the same root tracker mutation. Handled
+    // before `get_or_create_router` because root management is a
+    // daemon-level concern (RootTracker), not a per-session router
+    // concern.
+    if method == "pre-tool/add-root" || method == "add-root/run" {
+        let id = ctx.logging.next_id();
+        let response = if let Some(path_str) = raw.get("path").and_then(|v| v.as_str()) {
+            let path = PathBuf::from(path_str);
+            let canonical = path.canonicalize().unwrap_or(path);
+            if let Some(ref tracker) = ctx.root_tracker {
+                tracker.add_roots("hook", std::slice::from_ref(&canonical));
+                let global = tracker.global_roots();
+                if let Err(e) = ctx.primary.sync_roots(global).await {
+                    debug!(
+                        source = Source::DaemonDispatch.as_str(),
+                        "root sync after add-root failed: {e}",
+                    );
+                }
+                info!(
+                    source = Source::DaemonDispatch.as_str(),
+                    path = %canonical.display(),
+                    "added root via hook contributor",
+                );
+            }
+            serde_json::json!({"status": "ok", "path": canonical.display().to_string()})
+        } else {
+            serde_json::json!({"status": "error", "message": "missing path"})
+        };
+
+        emit_hook_event(
+            tracing::Level::DEBUG,
+            &session_id,
+            &method,
+            id.0,
+            None,
+            &raw.to_string(),
+            "incoming hook",
+        );
+        emit_hook_event(
+            tracing::Level::DEBUG,
+            &session_id,
+            &method,
+            id.0,
+            Some(id.0),
+            &response.to_string(),
+            "outgoing hook response",
+        );
+
+        let mut payload = serde_json::to_vec(&response)?;
+        payload.push(b'\n');
+        writer.write_all(&payload).await?;
+        writer.shutdown().await?;
+        return Ok(());
+    }
+
+    if method == "pre-tool/rm-root" || method == "rm-root/run" {
+        let id = ctx.logging.next_id();
+        let response = if let Some(path_str) = raw.get("path").and_then(|v| v.as_str()) {
+            let path = PathBuf::from(path_str);
+            let canonical = path.canonicalize().unwrap_or(path);
+            if let Some(ref tracker) = ctx.root_tracker {
+                let removed = tracker.remove_root("hook", &canonical);
+                if removed {
+                    let global = tracker.global_roots();
+                    if let Err(e) = ctx.primary.sync_roots(global).await {
+                        debug!(
+                            source = Source::DaemonDispatch.as_str(),
+                            "root sync after rm-root failed: {e}",
+                        );
+                    }
+                    info!(
+                        source = Source::DaemonDispatch.as_str(),
+                        path = %canonical.display(),
+                        "removed root from hook contributor",
+                    );
+                    serde_json::json!({"status": "ok", "path": canonical.display().to_string()})
+                } else {
+                    serde_json::json!({
+                        "status": "not_found",
+                        "message": format!(
+                            "root not found in hook-managed roots: {}",
+                            canonical.display()
+                        )
+                    })
+                }
+            } else {
+                serde_json::json!({"status": "error", "message": "no root tracker"})
+            }
+        } else {
+            serde_json::json!({"status": "error", "message": "missing path"})
+        };
+
+        emit_hook_event(
+            tracing::Level::DEBUG,
+            &session_id,
+            &method,
+            id.0,
+            None,
+            &raw.to_string(),
+            "incoming hook",
+        );
+        emit_hook_event(
+            tracing::Level::DEBUG,
+            &session_id,
+            &method,
+            id.0,
+            Some(id.0),
+            &response.to_string(),
+            "outgoing hook response",
+        );
+
+        let mut payload = serde_json::to_vec(&response)?;
+        payload.push(b'\n');
+        writer.write_all(&payload).await?;
         writer.shutdown().await?;
         return Ok(());
     }
@@ -3624,6 +3775,98 @@ mod tests {
         tracker.remove_contributor("mcp:99");
 
         assert_eq!(tracker.global_roots().len(), 1);
+    }
+
+    #[test]
+    fn remove_root_from_hook_contributor() {
+        let tracker = RootTracker::new();
+        tracker.add_roots("hook", &[PathBuf::from("/foo"), PathBuf::from("/bar")]);
+
+        assert!(
+            tracker.remove_root("hook", Path::new("/foo")),
+            "should return true when root was present",
+        );
+        let global = tracker.global_roots();
+        assert_eq!(global.len(), 1);
+        assert!(global.contains(&PathBuf::from("/bar")));
+        assert!(!global.contains(&PathBuf::from("/foo")));
+    }
+
+    #[test]
+    fn remove_root_last_entry_removes_contributor() {
+        let tracker = RootTracker::new();
+        tracker.add_roots("hook", &[PathBuf::from("/only")]);
+
+        assert!(tracker.remove_root("hook", Path::new("/only")));
+        assert!(
+            tracker.global_roots().is_empty(),
+            "global roots should be empty after removing last root",
+        );
+        // Verify the contributor key is fully removed.
+        assert_eq!(
+            tracker.refcount(Path::new("/only")),
+            0,
+            "refcount should be 0",
+        );
+    }
+
+    #[test]
+    fn remove_root_nonexistent_returns_false() {
+        let tracker = RootTracker::new();
+        tracker.add_roots("hook", &[PathBuf::from("/foo")]);
+
+        assert!(
+            !tracker.remove_root("hook", Path::new("/missing")),
+            "should return false for missing root",
+        );
+        assert_eq!(tracker.global_roots().len(), 1);
+    }
+
+    #[test]
+    fn remove_root_nonexistent_contributor_returns_false() {
+        let tracker = RootTracker::new();
+        tracker.set_roots("mcp:10", vec![PathBuf::from("/foo")]);
+
+        assert!(
+            !tracker.remove_root("hook", Path::new("/foo")),
+            "should return false for nonexistent contributor",
+        );
+        assert_eq!(tracker.global_roots().len(), 1);
+    }
+
+    #[test]
+    fn rm_root_removes_only_hook_roots() {
+        let tracker = RootTracker::new();
+        // Root is provided by both MCP and hook contributors.
+        tracker.set_roots("mcp:10", vec![PathBuf::from("/shared")]);
+        tracker.add_roots("hook", &[PathBuf::from("/shared")]);
+        assert_eq!(tracker.refcount(Path::new("/shared")), 2);
+
+        // rm-root removes only the hook entry.
+        tracker.remove_root("hook", Path::new("/shared"));
+        assert_eq!(
+            tracker.refcount(Path::new("/shared")),
+            1,
+            "MCP contributor should still hold the root",
+        );
+        let global = tracker.global_roots();
+        assert!(
+            global.contains(&PathBuf::from("/shared")),
+            "root should persist (MCP still holds it)",
+        );
+    }
+
+    #[test]
+    fn add_root_hook_contributor() {
+        let tracker = RootTracker::new();
+        tracker.set_roots("mcp:10", vec![PathBuf::from("/existing")]);
+
+        tracker.add_roots("hook", &[PathBuf::from("/new_root")]);
+
+        let global = tracker.global_roots();
+        assert_eq!(global.len(), 2);
+        assert!(global.contains(&PathBuf::from("/existing")));
+        assert!(global.contains(&PathBuf::from("/new_root")));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
