@@ -20,10 +20,9 @@
 pub trait ToolServer: Send + Sync {
     /// Execute the tool with the given parameters.
     ///
-    /// `parent_id` is the database `id` of the entry-point protocol
-    /// message that triggered this execution. Implementations pass it
-    /// through to `LspClient` request methods so LSP messages are
-    /// correlated with their triggering MCP/hook request.
+    /// `parent_id` is a UUID minted per `tools/call` dispatch.
+    /// Implementations pass it through to `LspClient` request methods
+    /// so LSP messages are correlated with their triggering MCP request.
     ///
     /// `cancel` is triggered when the MCP client sends
     /// `notifications/cancelled` for the owning tool call.
@@ -37,7 +36,7 @@ pub trait ToolServer: Send + Sync {
     async fn execute(
         &self,
         params: &serde_json::Value,
-        parent_id: Option<i64>,
+        parent_id: Option<&str>,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> anyhow::Result<serde_json::Value>;
 }

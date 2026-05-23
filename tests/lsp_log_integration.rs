@@ -143,9 +143,9 @@ async fn test_lsp_log_parent_id() -> Result<()> {
         .did_open(&uri, MOCK_LANG_A, 1, "let MY_VAR\n")
         .await?;
 
-    // Use a correlation ID value as parent (simulating an MCP tool call context)
-    let parent_id = 42_i64;
-    client.set_parent_id(Some(parent_id));
+    // Use a UUID as parent (simulating an MCP tool call context)
+    let parent_id = "scope-42".to_string();
+    client.set_parent_id(Some(parent_id.clone()));
 
     let _def = client.definition(&uri, 0, 4).await?;
 
@@ -162,9 +162,12 @@ async fn test_lsp_log_parent_id() -> Result<()> {
     );
 
     // Request carries the MCP parent_id
-    assert_eq!(def_msgs[0].parent_id, Some(parent_id));
+    assert_eq!(def_msgs[0].parent_id.as_deref(), Some(parent_id.as_str()));
     // Response parent_id is the correlation ID (self-referential pair)
-    assert_eq!(def_msgs[1].parent_id, def_msgs[1].request_id);
+    assert_eq!(
+        def_msgs[1].parent_id.as_deref(),
+        def_msgs[1].request_id.map(|r| r.to_string()).as_deref(),
+    );
 
     Ok(())
 }

@@ -46,7 +46,7 @@ fn emit_mcp_event(
     client_name: &str,
     method: &str,
     request_id: i64,
-    parent_id: Option<i64>,
+    parent_id: Option<&str>,
     payload: &str,
     msg: &str,
 ) {
@@ -108,9 +108,8 @@ pub trait ToolHandler: Send + Sync {
 
     /// Handles a tool call and returns the result.
     ///
-    /// `parent_id` is the database ID of the incoming MCP message that
-    /// triggered this call. Implementations forward it to
-    /// [`ToolServer::execute`](super::super::bridge::ToolServer::execute)
+    /// `parent_id` is a UUID minted per `tools/call` dispatch. Implementations
+    /// forward it to [`ToolServer::execute`](super::super::bridge::ToolServer::execute)
     /// so LSP messages are correlated with the triggering MCP request
     /// in the monitor.
     ///
@@ -125,17 +124,17 @@ pub trait ToolHandler: Send + Sync {
         &self,
         name: &str,
         arguments: Option<serde_json::Value>,
-        parent_id: Option<i64>,
+        parent_id: Option<String>,
         cancel: &CancellationToken,
     ) -> Result<CallToolResult>;
 
     /// Returns the scope parent ID for the current tool call, if any.
     ///
-    /// The scope parent ID is the correlation ID of the pre-tool hook
-    /// that opened this tool call's scope. Used by [`McpServer`] to set
-    /// `parent_id` on the incoming `tools/call` protocol event, linking
-    /// it to the pre-tool hook in the scope tree.
-    fn scope_parent_id(&self) -> Option<i64> {
+    /// The scope parent ID is the UUID of the pre-tool hook that opened
+    /// this tool call's scope. Used by [`McpServer`] to set `parent_id`
+    /// on the incoming `tools/call` protocol event, linking it to the
+    /// pre-tool hook in the scope tree.
+    fn scope_parent_id(&self) -> Option<String> {
         None
     }
 }
@@ -151,13 +150,13 @@ impl<T: ToolHandler + ?Sized> ToolHandler for Arc<T> {
         &self,
         name: &str,
         arguments: Option<serde_json::Value>,
-        parent_id: Option<i64>,
+        parent_id: Option<String>,
         cancel: &CancellationToken,
     ) -> Result<CallToolResult> {
         (**self).call_tool(name, arguments, parent_id, cancel)
     }
 
-    fn scope_parent_id(&self) -> Option<i64> {
+    fn scope_parent_id(&self) -> Option<String> {
         (**self).scope_parent_id()
     }
 }
@@ -348,12 +347,13 @@ impl<H: ToolHandler> McpServer<H> {
                     cb();
                 }
                 // Emit the deferred incoming event with scope parent_id.
+                let scope_pid = self.handler.scope_parent_id();
                 emit_mcp_event(
                     mcp_method_level(&method),
                     &self.client_name,
                     &method,
                     correlation_id,
-                    self.handler.scope_parent_id(),
+                    scope_pid.as_deref(),
                     &json_payload,
                     "incoming",
                 );
@@ -535,12 +535,13 @@ impl<H: ToolHandler> McpServer<H> {
         trace!("Sending: {}", response_json);
 
         if let Some(rid) = request_id {
+            let parent_str = rid.to_string();
             emit_mcp_event(
                 mcp_method_level(method),
                 &self.client_name,
                 method,
                 rid,
-                Some(rid),
+                Some(&parent_str),
                 &response_json,
                 "outgoing response",
             );
@@ -727,7 +728,7 @@ impl<H: ToolHandler> McpServer<H> {
             .and_then(|map| map.get(&request.id).cloned())
             .unwrap_or_default();
 
-        let parent_id = Some(self.current_correlation_id);
+        let parent_id = Some(self.current_correlation_id.to_string());
         let result = self
             .handler
             .call_tool(&params.name, params.arguments, parent_id, &cancel);
@@ -862,12 +863,13 @@ impl<H: ToolHandler> McpServer<H> {
                 if response.id == request_id {
                     // Log the response with request_id pointing to the outbound request
                     if let Ok(resp_json) = serde_json::to_value(&response) {
+                        let parent_str = outbound_id.0.to_string();
                         emit_mcp_event(
                             mcp_method_level("roots/list"),
                             &self.client_name,
                             "roots/list",
                             outbound_id.0,
-                            Some(outbound_id.0),
+                            Some(&parent_str),
                             &resp_json.to_string(),
                             "incoming response",
                         );
@@ -983,7 +985,7 @@ mod tests {
             &self,
             name: &str,
             _arguments: Option<serde_json::Value>,
-            _parent_id: Option<i64>,
+            _parent_id: Option<String>,
             _cancel: &CancellationToken,
         ) -> Result<CallToolResult> {
             match name {
@@ -1300,7 +1302,7 @@ mod tests {
                 &self,
                 _name: &str,
                 _arguments: Option<serde_json::Value>,
-                _parent_id: Option<i64>,
+                _parent_id: Option<String>,
                 cancel: &CancellationToken,
             ) -> Result<CallToolResult> {
                 // Immediately pre-cancel the token to simulate a race.
@@ -1580,12 +1582,13 @@ mod tests {
         let id = server.logging.next_id();
         let payload = json.to_string();
         if method == "tools/call" {
+            let scope_pid = server.handler.scope_parent_id();
             emit_mcp_event(
                 mcp_method_level(&method),
                 &server.client_name,
                 &method,
                 id.0,
-                server.handler.scope_parent_id(),
+                scope_pid.as_deref(),
                 &payload,
                 "incoming",
             );
@@ -1640,9 +1643,9 @@ mod tests {
             "response request_id should point to the incoming request"
         );
         assert_eq!(
-            msgs[1].parent_id,
-            Some(correlation_id),
-            "response parent_id should match request_id"
+            msgs[1].parent_id.as_deref(),
+            Some(correlation_id.to_string().as_str()),
+            "response parent_id should match request_id (stringified)"
         );
         Ok(())
     }
@@ -1683,7 +1686,7 @@ mod tests {
     }
 
     /// Handler that reports a fixed scope parent ID.
-    struct ScopedHandler(std::sync::Mutex<Option<i64>>);
+    struct ScopedHandler(std::sync::Mutex<Option<String>>);
 
     impl ToolHandler for ScopedHandler {
         fn list_tools(&self) -> Vec<Tool> {
@@ -1700,24 +1703,24 @@ mod tests {
             &self,
             _name: &str,
             _arguments: Option<serde_json::Value>,
-            _parent_id: Option<i64>,
+            _parent_id: Option<String>,
             _cancel: &CancellationToken,
         ) -> Result<CallToolResult> {
             Ok(CallToolResult::text("ok"))
         }
 
-        fn scope_parent_id(&self) -> Option<i64> {
-            *self
-                .0
+        fn scope_parent_id(&self) -> Option<String> {
+            self.0
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
         }
     }
 
     #[test]
     fn tools_call_request_gets_scope_parent_id() -> Result<()> {
         let (logging, conn, _guard) = setup_logging();
-        let handler = ScopedHandler(std::sync::Mutex::new(Some(42)));
+        let handler = ScopedHandler(std::sync::Mutex::new(Some("scope-42".to_string())));
         let mut server = McpServer::new(handler, logging);
 
         let request = Request {
@@ -1734,12 +1737,13 @@ mod tests {
         let method = "tools/call";
         let id = server.logging.next_id();
         let payload = json.to_string();
+        let scope_pid = server.handler.scope_parent_id();
         emit_mcp_event(
             mcp_method_level(method),
             &server.client_name,
             method,
             id.0,
-            server.handler.scope_parent_id(),
+            scope_pid.as_deref(),
             &payload,
             "incoming",
         );
@@ -1754,13 +1758,13 @@ mod tests {
             msgs.len()
         );
         assert_eq!(
-            msgs[0].parent_id,
-            Some(42),
+            msgs[0].parent_id.as_deref(),
+            Some("scope-42"),
             "tools/call request should have scope parent_id from handler"
         );
         assert_eq!(
-            msgs[1].parent_id,
-            Some(id.0),
+            msgs[1].parent_id.as_deref(),
+            Some(&id.0.to_string() as &str),
             "tools/call response parent_id should pair-merge with own request_id"
         );
         Ok(())

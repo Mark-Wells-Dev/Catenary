@@ -34,8 +34,8 @@ pub enum ScopeState {
 /// Scopes are the primary display unit in the stream. Open scopes render
 /// expanded with live children; closed scopes collapse to a summary line.
 pub struct Scope {
-    /// Scope identity — the pre-tool hook's correlation ID.
-    pub scope_id: i64,
+    /// Scope identity — the pre-tool hook's scope UUID.
+    pub scope_id: String,
     /// Session that owns this scope.
     pub session_id: String,
     /// The pre-tool hook that opened this scope.
@@ -61,7 +61,7 @@ impl Scope {
     /// starts in `Opening` state, waiting for the MCP request.
     #[must_use]
     pub fn new(pre_hook: SessionMessage) -> Self {
-        let scope_id = pre_hook.request_id.unwrap_or(pre_hook.id);
+        let scope_id = pre_hook.parent_id.clone().unwrap_or_default();
         let session_id = pre_hook.session_id.clone();
         Self {
             scope_id,
@@ -179,6 +179,7 @@ mod tests {
     fn pre_hook(scope_id: i64, session_id: &str) -> SessionMessage {
         SessionMessage {
             session_id: session_id.to_string(),
+            parent_id: Some(format!("scope-{scope_id}")),
             ..test_support::message_with_ids(
                 100 + scope_id,
                 "hook",
@@ -308,9 +309,10 @@ mod tests {
     }
 
     #[test]
-    fn scope_id_from_request_id() {
-        let hook = pre_hook(42, "s1");
+    fn scope_id_from_parent_id() {
+        let mut hook = pre_hook(42, "s1");
+        hook.parent_id = Some("scope-uuid-42".to_string());
         let scope = Scope::new(hook);
-        assert_eq!(scope.scope_id, 42);
+        assert_eq!(scope.scope_id, "scope-uuid-42");
     }
 }

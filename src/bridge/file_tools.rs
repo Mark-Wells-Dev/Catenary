@@ -355,7 +355,7 @@ impl ToolServer for GlobServer {
     async fn execute(
         &self,
         params: &serde_json::Value,
-        _parent_id: Option<i64>,
+        _parent_id: Option<&str>,
         _cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<serde_json::Value> {
         let mut input: GlobInput = serde_json::from_value(params.clone())

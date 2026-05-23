@@ -190,7 +190,7 @@ mod tests {
                  server      TEXT NOT NULL,
                  client      TEXT NOT NULL,
                  request_id  INTEGER,
-                 parent_id   INTEGER,
+                 parent_id   TEXT,
                  payload     TEXT NOT NULL
              );",
         )
@@ -203,7 +203,7 @@ mod tests {
         method: Option<&str>,
         server: Option<&str>,
         request_id: Option<i64>,
-        parent_id: Option<i64>,
+        parent_id: Option<&str>,
         payload: Option<&str>,
     ) -> LogEvent<'static> {
         LogEvent {
@@ -215,7 +215,7 @@ mod tests {
             server: server.map(str::to_string),
             client: None,
             request_id,
-            parent_id,
+            parent_id: parent_id.map(str::to_string),
             source: None,
             language: None,
             payload: payload.map(str::to_string),
@@ -251,7 +251,7 @@ mod tests {
         server: String,
         client: String,
         request_id: Option<i64>,
-        parent_id: Option<i64>,
+        parent_id: Option<String>,
         payload: String,
     }
 
@@ -434,14 +434,14 @@ mod tests {
             Some("hover"),
             None,
             Some(42),
-            Some(7),
+            Some("scope-7"),
             None,
         ));
 
         let rows = read_rows(&db);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].request_id, Some(42));
-        assert_eq!(rows[0].parent_id, Some(7));
+        assert_eq!(rows[0].parent_id.as_deref(), Some("scope-7"));
     }
 
     #[test]
@@ -469,13 +469,13 @@ mod tests {
         let sink = MessageDbSink::new(db.clone(), "sess-1".into());
         let mut event = make_trace_event(Severity::Error, "test", "correlated");
         event.request_id = Some(42);
-        event.parent_id = Some(7);
+        event.parent_id = Some("scope-7".to_string());
         sink.handle(&event);
 
         let rows = read_rows(&db);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].request_id, Some(42));
-        assert_eq!(rows[0].parent_id, Some(7));
+        assert_eq!(rows[0].parent_id.as_deref(), Some("scope-7"));
     }
 
     // ── Payload tests ────────────────────────────────────────────────

@@ -44,8 +44,8 @@ pub struct LspClient {
     /// Populated after `initialize()` completes; `None` if the server
     /// did not report a version.
     server_version: Option<String>,
-    /// Parent message ID for causation tracking (set before tool dispatch).
-    parent_id: Option<i64>,
+    /// Parent message UUID for causation tracking (set before tool dispatch).
+    parent_id: Option<String>,
     /// Cancellation token for the current MCP tool call.
     cancel: CancellationToken,
     /// Per-client document state: URI → version.
@@ -246,7 +246,7 @@ impl LspClient {
     ///
     /// All subsequent requests and notifications will carry this parent ID
     /// until it is changed or cleared.
-    pub const fn set_parent_id(&mut self, parent_id: Option<i64>) {
+    pub fn set_parent_id(&mut self, parent_id: Option<String>) {
         self.parent_id = parent_id;
     }
 
@@ -274,7 +274,7 @@ impl LspClient {
     async fn request(&self, method: &str, params: Value) -> Result<Value> {
         let result = self
             .server
-            .request(method, params, self.parent_id, &self.cancel)
+            .request(method, params, self.parent_id.as_deref(), &self.cancel)
             .await?;
         self.server.try_transition_probing_to_healthy();
         Ok(result)
@@ -282,7 +282,9 @@ impl LspClient {
 
     /// Sends a notification (no response expected).
     async fn notify(&self, method: &str, params: Value) -> Result<()> {
-        self.server.notify(method, params, self.parent_id).await
+        self.server
+            .notify(method, params, self.parent_id.as_deref())
+            .await
     }
 
     /// Runs the health probe: sends `documentSymbol` to verify the server

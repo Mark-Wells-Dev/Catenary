@@ -126,7 +126,11 @@ impl DiagnosticsServer {
         clippy::type_complexity,
         reason = "Server grouping map is local and self-documenting"
     )]
-    pub async fn process_files_batched(&self, files: &[PathBuf], entry_id: i64) -> String {
+    pub async fn process_files_batched(
+        &self,
+        files: &[PathBuf],
+        parent_id: Option<&str>,
+    ) -> String {
         if files.is_empty() {
             return "[clean]\n".to_string();
         }
@@ -186,7 +190,7 @@ impl DiagnosticsServer {
         let mut file_results: BTreeMap<String, (String, Vec<ServerDiagnostics>)> = BTreeMap::new();
 
         for (client_mutex, paths) in server_groups.values() {
-            self.run_server_batch(client_mutex, paths, entry_id, &mut file_results)
+            self.run_server_batch(client_mutex, paths, parent_id, &mut file_results)
                 .await;
         }
 
@@ -269,14 +273,14 @@ impl DiagnosticsServer {
         &self,
         client_mutex: &Arc<Mutex<LspClient>>,
         paths: &[PathBuf],
-        entry_id: i64,
+        parent_id: Option<&str>,
         file_results: &mut BTreeMap<String, (String, Vec<ServerDiagnostics>)>,
     ) {
         let Some(baseline) = self.pre_open_settle(client_mutex).await else {
             return;
         };
 
-        let opened = self.open_files(client_mutex, paths, entry_id).await;
+        let opened = self.open_files(client_mutex, paths, parent_id).await;
         if opened.is_empty() {
             return;
         }
@@ -338,14 +342,14 @@ impl DiagnosticsServer {
         &self,
         client_mutex: &Arc<Mutex<LspClient>>,
         paths: &[PathBuf],
-        entry_id: i64,
+        parent_id: Option<&str>,
     ) -> Vec<(PathBuf, String)> {
         let mut opened_uris: Vec<(PathBuf, String)> = Vec::new();
 
         for path in paths {
             match self
                 .client_manager
-                .open_document_on(path, client_mutex, Some(entry_id))
+                .open_document_on(path, client_mutex, parent_id.map(str::to_string))
                 .await
             {
                 Ok(uri) => opened_uris.push((path.clone(), uri)),

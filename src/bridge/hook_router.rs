@@ -440,7 +440,7 @@ impl HookRouter {
     /// `systemMessage` from the notification queue drain. The queue is drained
     /// only at stationary points (`SessionStart`, `Stop`/`AfterAgent` when allowing).
     #[allow(clippy::too_many_lines, reason = "match arms are sequential and flat")]
-    pub(crate) fn dispatch(&self, request: HookRequest, entry_id: i64) -> DispatchResult {
+    pub(crate) fn dispatch(&self, request: HookRequest, _entry_id: i64) -> DispatchResult {
         match request {
             HookRequest::PreAgent {
                 transcript_path,
@@ -510,13 +510,14 @@ impl HookRouter {
                         Some(&tool_name),
                     );
                 }
-                // Stash the scope parent ID so the MCP tools/call and
+                // Stash the scope parent UUID so the MCP tools/call and
                 // post-tool hook events can reference this pre-tool hook
                 // as their scope root. Only when the tool is allowed —
                 // denied tools produce no MCP call or post-tool hook to
                 // consume the stash.
                 if result.is_none() {
-                    self.session.scope_id_stash.stash(entry_id);
+                    let scope_uuid = uuid::Uuid::new_v4().to_string();
+                    self.session.scope_id_stash.stash(scope_uuid);
                 }
                 // Stash the host CLI's cwd for the upcoming MCP grep/glob
                 // call, but only when the tool is allowed (denied tools
@@ -2149,10 +2150,9 @@ mod tests {
             },
             99,
         );
-        assert_eq!(
-            router.session.scope_id_stash.peek(),
-            Some(99),
-            "pre-tool should stash entry_id as scope parent"
+        assert!(
+            router.session.scope_id_stash.peek().is_some(),
+            "pre-tool should stash scope UUID as scope parent"
         );
     }
 
@@ -2172,9 +2172,11 @@ mod tests {
             10,
         );
         // Peek (MCP handler) does not consume.
-        assert_eq!(router.session.scope_id_stash.peek(), Some(10));
+        let peeked = router.session.scope_id_stash.peek();
+        assert!(peeked.is_some(), "peek should return the stashed UUID");
         // Take (post-tool hook) clears.
-        assert_eq!(router.session.scope_id_stash.take(), Some(10));
+        let taken = router.session.scope_id_stash.take();
+        assert_eq!(taken, peeked, "take should return the same UUID as peek");
         assert!(router.session.scope_id_stash.peek().is_none());
     }
 

@@ -42,7 +42,7 @@ fn emit_lsp_event(
     server_name: &str,
     method: &str,
     request_id: i64,
-    parent_id: Option<i64>,
+    parent_id: Option<&str>,
     payload: &str,
     msg: &str,
 ) {
@@ -283,7 +283,7 @@ impl Connection {
         &self,
         method: &str,
         params: serde_json::Value,
-        parent_id: Option<i64>,
+        parent_id: Option<&str>,
         cancel: &CancellationToken,
     ) -> Result<serde_json::Value> {
         let server = self
@@ -425,7 +425,7 @@ impl Connection {
         &self,
         method: &str,
         params: serde_json::Value,
-        parent_id: Option<i64>,
+        parent_id: Option<&str>,
     ) -> Result<()> {
         let notification = super::protocol::NotificationMessage {
             jsonrpc: "2.0".to_string(),
@@ -652,12 +652,13 @@ impl Connection {
 
                         // Log outbound response (same level as request)
                         if let Ok(response_json) = serde_json::to_value(&response) {
+                            let parent_str = inbound_id.0.to_string();
                             emit_lsp_event(
                                 tracing::Level::DEBUG,
                                 &server_name,
                                 method,
                                 inbound_id.0,
-                                Some(inbound_id.0),
+                                Some(&parent_str),
                                 &response_json.to_string(),
                                 "outgoing server response",
                             );
@@ -764,12 +765,13 @@ impl Connection {
                             // LSP traffic — skip protocol logging.
                             if req.method != "drain" {
                                 let resp_level = lsp_category_level(lsp_category(&req.method));
+                                let parent_str = req.correlation_id.to_string();
                                 emit_lsp_event(
                                     resp_level,
                                     &server_name,
                                     &req.method,
                                     req.correlation_id,
-                                    Some(req.correlation_id),
+                                    Some(&parent_str),
                                     &value.to_string(),
                                     "incoming response",
                                 );
@@ -921,7 +923,7 @@ mod tests {
             "test-server",
             "test/method",
             10,
-            Some(5),
+            Some("scope-5"),
             "{}",
             "with parent",
         );
@@ -938,7 +940,11 @@ mod tests {
         let msgs = query_all_messages(&db);
         assert_eq!(msgs.len(), 2);
 
-        assert_eq!(msgs[0].parent_id, Some(5), "parent_id should be present");
+        assert_eq!(
+            msgs[0].parent_id.as_deref(),
+            Some("scope-5"),
+            "parent_id should be present"
+        );
         assert_eq!(msgs[1].parent_id, None, "parent_id should be absent");
     }
 

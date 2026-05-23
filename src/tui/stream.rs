@@ -137,10 +137,10 @@ pub struct StreamState {
     pub cursor: usize,
     /// Hex badge assignment for session IDs.
     pub badges: HexBadgeMap,
-    /// `scope_id` → entries index for direct scope children (MCP req/resp, post-hook).
-    scope_id_map: HashMap<i64, usize>,
-    /// MCP correlation ID → entries index for LSP child routing.
-    mcp_corr_map: HashMap<i64, usize>,
+    /// `scope_id` (UUID) → entries index for direct scope children (MCP req/resp, post-hook).
+    scope_id_map: HashMap<String, usize>,
+    /// MCP correlation ID (stringified) → entries index for LSP child routing.
+    mcp_corr_map: HashMap<String, usize>,
     /// Session ID → entries index of the currently active (open) scope.
     active_scope: HashMap<String, usize>,
 }
@@ -184,7 +184,7 @@ impl StreamState {
         self.badges.badge(&msg.session_id);
 
         // 1. Pre-tool hook → create new scope.
-        if msg.r#type == "hook" && msg.parent_id.is_none() && msg.method.starts_with("pre-tool/") {
+        if msg.r#type == "hook" && msg.method.starts_with("pre-tool/") && msg.parent_id.is_some() {
             // Abandon any active scope for this session.
             if let Some(&idx) = self.active_scope.get(&msg.session_id)
                 && let StreamEntry::Scope(scope) = &mut self.entries[idx]
@@ -193,7 +193,7 @@ impl StreamState {
                 scope.abandon();
             }
             let idx = self.entries.len();
-            let scope_id = msg.request_id.unwrap_or(msg.id);
+            let scope_id = msg.parent_id.clone().unwrap_or_default();
             self.scope_id_map.insert(scope_id, idx);
             self.active_scope.insert(msg.session_id.clone(), idx);
             self.entries
@@ -202,9 +202,9 @@ impl StreamState {
         }
 
         // 2. Route by parent_id.
-        if let Some(pid) = msg.parent_id {
+        if let Some(ref pid) = msg.parent_id {
             // Check scope_id_map — direct scope children (MCP req/resp, post-hook).
-            if let Some(&idx) = self.scope_id_map.get(&pid)
+            if let Some(&idx) = self.scope_id_map.get(pid.as_str())
                 && let StreamEntry::Scope(scope) = &mut self.entries[idx]
             {
                 // Post-tool hook → close scope.
@@ -221,7 +221,7 @@ impl StreamState {
                 if msg.r#type == "mcp" && msg.method == "tools/call" {
                     if scope.request.is_none() {
                         if let Some(corr_id) = msg.request_id {
-                            self.mcp_corr_map.insert(corr_id, idx);
+                            self.mcp_corr_map.insert(corr_id.to_string(), idx);
                         }
                         scope.attach_request(msg);
                     } else {
@@ -235,7 +235,7 @@ impl StreamState {
             }
 
             // Check mcp_corr_map — LSP children of the tool call.
-            if let Some(&idx) = self.mcp_corr_map.get(&pid)
+            if let Some(&idx) = self.mcp_corr_map.get(pid.as_str())
                 && let StreamEntry::Scope(scope) = &mut self.entries[idx]
             {
                 scope.children.push(msg);
@@ -565,7 +565,7 @@ mod tests {
 
     /// Build a pre-tool hook message that creates a scope.
     fn pre_hook(session_id: &str, scope_id: i64) -> SessionMessage {
-        make_message_with_ids(
+        let mut msg = make_message_with_ids(
             session_id,
             100 + scope_id,
             "hook",
@@ -573,13 +573,16 @@ mod tests {
             "",
             Some(scope_id),
             None,
-        )
+        );
+        // Pre-tool hooks carry a scope UUID as parent_id.
+        msg.parent_id = Some(format!("scope-{scope_id}"));
+        msg
     }
 
     /// Build an MCP request that attaches to a scope.
     fn mcp_request(session_id: &str, scope_id: i64, tool: &str) -> SessionMessage {
         let corr_id = scope_id + 1000;
-        SessionMessage {
+        let mut msg = SessionMessage {
             payload: serde_json::json!({"params": {"name": tool}}),
             ..make_message_with_ids(
                 session_id,
@@ -588,15 +591,17 @@ mod tests {
                 "tools/call",
                 "catenary",
                 Some(corr_id),
-                Some(scope_id),
+                None,
             )
-        }
+        };
+        msg.parent_id = Some(format!("scope-{scope_id}"));
+        msg
     }
 
     /// Build an MCP response for a scope.
     fn mcp_response(session_id: &str, scope_id: i64) -> SessionMessage {
         let corr_id = scope_id + 1000;
-        SessionMessage {
+        let mut msg = SessionMessage {
             payload: serde_json::json!({"result": {"content": [{"type": "text", "text": "ok"}]}}),
             ..make_message_with_ids(
                 session_id,
@@ -605,22 +610,26 @@ mod tests {
                 "tools/call",
                 "catenary",
                 Some(corr_id),
-                Some(scope_id),
+                None,
             )
-        }
+        };
+        msg.parent_id = Some(format!("scope-{scope_id}"));
+        msg
     }
 
     /// Build a post-tool hook that closes a scope.
     fn post_hook(session_id: &str, scope_id: i64) -> SessionMessage {
-        make_message_with_ids(
+        let mut msg = make_message_with_ids(
             session_id,
             400 + scope_id,
             "hook",
             "post-tool/diagnostics",
             "",
             Some(scope_id + 2000),
-            Some(scope_id),
-        )
+            None,
+        );
+        msg.parent_id = Some(format!("scope-{scope_id}"));
+        msg
     }
 
     /// Build an LSP child message of an MCP tool call.

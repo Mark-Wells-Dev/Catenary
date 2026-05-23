@@ -163,8 +163,8 @@ async fn lsp_request_scope_chain() -> Result<()> {
         .await?;
 
     // Simulate an MCP tool call context by setting parent_id.
-    let mcp_correlation = server.next_id();
-    client.set_parent_id(Some(mcp_correlation.0));
+    let mcp_parent = "scope-mcp".to_string();
+    client.set_parent_id(Some(mcp_parent.clone()));
 
     let _def = client.definition(&uri, 0, 4).await?;
 
@@ -182,9 +182,9 @@ async fn lsp_request_scope_chain() -> Result<()> {
 
     // Request carries the MCP parent_id.
     assert_eq!(
-        def_msgs[0].parent_id,
-        Some(mcp_correlation.0),
-        "request parent_id should be the MCP correlation ID"
+        def_msgs[0].parent_id.as_deref(),
+        Some(mcp_parent.as_str()),
+        "request parent_id should be the MCP parent UUID"
     );
 
     // Both carry the same request_id (pair-merge key).

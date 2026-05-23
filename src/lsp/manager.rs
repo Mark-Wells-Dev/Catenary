@@ -1328,7 +1328,7 @@ impl LspClientManager {
         &self,
         path: &Path,
         client: &Arc<Mutex<LspClient>>,
-        parent_id: Option<i64>,
+        parent_id: Option<String>,
     ) -> Result<String> {
         let canonical = path.canonicalize()?;
         let uri = crate::lsp::lang::path_to_uri(&canonical);

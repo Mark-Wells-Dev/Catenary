@@ -397,7 +397,7 @@ fn run_daemon_main() -> Result<()> {
             &self,
             _name: &str,
             _arguments: Option<serde_json::Value>,
-            _parent_id: Option<i64>,
+            _parent_id: Option<String>,
             _cancel: &tokio_util::sync::CancellationToken,
         ) -> Result<catenary_mcp::mcp::CallToolResult> {
             Err(anyhow::anyhow!("Catenary is disabled for this workspace"))

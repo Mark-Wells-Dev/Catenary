@@ -88,7 +88,7 @@ impl ToolServer for GrepServer {
     async fn execute(
         &self,
         params: &serde_json::Value,
-        parent_id: Option<i64>,
+        parent_id: Option<&str>,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<serde_json::Value> {
         let mut input: GrepInput = serde_json::from_value(params.clone())
@@ -183,7 +183,7 @@ impl GrepServer {
     async fn run(
         &self,
         input: GrepInput,
-        parent_id: Option<i64>,
+        parent_id: Option<&str>,
         dead_languages: &HashSet<String>,
         cancel: &tokio_util::sync::CancellationToken,
         cwd: Option<&Path>,
@@ -398,7 +398,7 @@ impl GrepServer {
         path: &Path,
         line_0: u32,
         col: u32,
-        parent_id: Option<i64>,
+        parent_id: Option<&str>,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> bool {
         let servers = self
@@ -417,14 +417,14 @@ impl GrepServer {
 
             let Ok(uri) = self
                 .client_manager
-                .open_document_on(path, client_mutex, parent_id)
+                .open_document_on(path, client_mutex, parent_id.map(str::to_string))
                 .await
             else {
                 continue;
             };
 
             let mut client = client_mutex.lock().await;
-            client.set_parent_id(parent_id);
+            client.set_parent_id(parent_id.map(str::to_string));
             client.set_cancel_token(cancel.clone());
             let response = client.prepare_rename(&uri, line_0, col).await;
             client.close_tracked_document(&uri).await;
@@ -468,7 +468,7 @@ impl GrepServer {
         path: &Path,
         line_0: u32,
         col: u32,
-        parent_id: Option<i64>,
+        parent_id: Option<&str>,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Option<SymbolEnrichment> {
         // Check the enrichment cache for workspace-rooted files.
@@ -533,7 +533,7 @@ impl GrepServer {
         for server in &all_servers {
             match self
                 .client_manager
-                .open_document_on(path, server, parent_id)
+                .open_document_on(path, server, parent_id.map(str::to_string))
                 .await
             {
                 Ok(u) => {
@@ -623,7 +623,7 @@ impl GrepServer {
         path: &Path,
         line_0: u32,
         col: u32,
-        parent_id: Option<i64>,
+        parent_id: Option<&str>,
         pre_opened_uri: Option<&str>,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> HashMap<String, HashSet<u32>> {
@@ -647,7 +647,7 @@ impl GrepServer {
             } else {
                 let Ok(u) = self
                     .client_manager
-                    .open_document_on(path, client_mutex, parent_id)
+                    .open_document_on(path, client_mutex, parent_id.map(str::to_string))
                     .await
                 else {
                     continue;
@@ -657,7 +657,7 @@ impl GrepServer {
             };
 
             let mut client = client_mutex.lock().await;
-            client.set_parent_id(parent_id);
+            client.set_parent_id(parent_id.map(str::to_string));
             client.set_cancel_token(cancel.clone());
             let result = client.references(uri, line_0, col, true).await;
             if pre_opened_uri.is_none() {
@@ -700,7 +700,7 @@ impl GrepServer {
         path: &Path,
         line_0: u32,
         col: u32,
-        parent_id: Option<i64>,
+        parent_id: Option<&str>,
         pre_opened_uri: Option<&str>,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> (Vec<CallEdge>, Vec<CallEdge>) {
@@ -724,7 +724,7 @@ impl GrepServer {
             } else {
                 let Ok(u) = self
                     .client_manager
-                    .open_document_on(path, client_mutex, parent_id)
+                    .open_document_on(path, client_mutex, parent_id.map(str::to_string))
                     .await
                 else {
                     continue;
@@ -734,7 +734,7 @@ impl GrepServer {
             };
 
             let mut client = client_mutex.lock().await;
-            client.set_parent_id(parent_id);
+            client.set_parent_id(parent_id.map(str::to_string));
             client.set_cancel_token(cancel.clone());
             let prepare = client.prepare_call_hierarchy(uri, line_0, col).await;
             let result = match prepare {
@@ -787,7 +787,7 @@ impl GrepServer {
         path: &Path,
         line_0: u32,
         col: u32,
-        parent_id: Option<i64>,
+        parent_id: Option<&str>,
         pre_opened_uri: Option<&str>,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Vec<(String, u32)> {
@@ -811,7 +811,7 @@ impl GrepServer {
             } else {
                 let Ok(u) = self
                     .client_manager
-                    .open_document_on(path, client_mutex, parent_id)
+                    .open_document_on(path, client_mutex, parent_id.map(str::to_string))
                     .await
                 else {
                     continue;
@@ -821,7 +821,7 @@ impl GrepServer {
             };
 
             let mut client = client_mutex.lock().await;
-            client.set_parent_id(parent_id);
+            client.set_parent_id(parent_id.map(str::to_string));
             client.set_cancel_token(cancel.clone());
             let result = client.implementation(uri, line_0, col).await;
             if pre_opened_uri.is_none() {
@@ -863,7 +863,7 @@ impl GrepServer {
         path: &Path,
         line_0: u32,
         col: u32,
-        parent_id: Option<i64>,
+        parent_id: Option<&str>,
         pre_opened_uri: Option<&str>,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> (Vec<TypeEdge>, Vec<TypeEdge>) {
@@ -887,7 +887,7 @@ impl GrepServer {
             } else {
                 let Ok(u) = self
                     .client_manager
-                    .open_document_on(path, client_mutex, parent_id)
+                    .open_document_on(path, client_mutex, parent_id.map(str::to_string))
                     .await
                 else {
                     continue;
@@ -897,7 +897,7 @@ impl GrepServer {
             };
 
             let mut client = client_mutex.lock().await;
-            client.set_parent_id(parent_id);
+            client.set_parent_id(parent_id.map(str::to_string));
             client.set_cancel_token(cancel.clone());
             let prepare = client.prepare_type_hierarchy(uri, line_0, col).await;
             let result = match prepare {

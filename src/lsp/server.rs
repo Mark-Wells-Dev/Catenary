@@ -555,7 +555,7 @@ impl LspServer {
         &self,
         method: &str,
         params: Value,
-        parent_id: Option<i64>,
+        parent_id: Option<&str>,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<Value> {
         self.connection()
@@ -570,7 +570,7 @@ impl LspServer {
     ///
     /// Returns an error if the connection is not established or the
     /// notification fails.
-    pub async fn notify(&self, method: &str, params: Value, parent_id: Option<i64>) -> Result<()> {
+    pub async fn notify(&self, method: &str, params: Value, parent_id: Option<&str>) -> Result<()> {
         self.connection()
             .ok_or_else(|| anyhow::anyhow!("connection not established"))?
             .notify(method, params, parent_id)

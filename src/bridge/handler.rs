@@ -279,7 +279,7 @@ impl ToolHandler for McpRouter {
         &self,
         name: &str,
         arguments: Option<serde_json::Value>,
-        parent_id: Option<i64>,
+        parent_id: Option<String>,
         cancel: &CancellationToken,
     ) -> Result<CallToolResult> {
         // Editing tools: no-op triggers. The PreToolUse hook enters editing
@@ -315,11 +315,10 @@ impl ToolHandler for McpRouter {
             if let Some(guardrail) = &self.session.editing_guardrail {
                 guardrail.release_all(&self.session.instance_id);
             }
-            let entry_id = parent_id.unwrap_or(0);
             let output = self.session.runtime.block_on(
                 self.session
                     .diagnostics
-                    .process_files_batched(&files, entry_id),
+                    .process_files_batched(&files, parent_id.as_deref()),
             );
 
             return Ok(CallToolResult::text(output));
@@ -355,15 +354,16 @@ impl ToolHandler for McpRouter {
             obj.remove("directory");
         }
 
+        let pid_ref = parent_id.as_deref();
         let result = match name {
             "grep" => self
                 .session
                 .runtime
-                .block_on(self.session.grep.execute(&params, parent_id, cancel)),
+                .block_on(self.session.grep.execute(&params, pid_ref, cancel)),
             "glob" => self
                 .session
                 .runtime
-                .block_on(self.session.glob.execute(&params, parent_id, cancel)),
+                .block_on(self.session.glob.execute(&params, pid_ref, cancel)),
             _ => return Err(anyhow!("Unknown tool: {name}")),
         };
 
@@ -376,7 +376,7 @@ impl ToolHandler for McpRouter {
         }
     }
 
-    fn scope_parent_id(&self) -> Option<i64> {
+    fn scope_parent_id(&self) -> Option<String> {
         self.session.scope_id_stash.peek()
     }
 }

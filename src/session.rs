@@ -59,10 +59,10 @@ pub struct SessionMessage {
     /// adjacent messages with equal non-`None` `request_id`. Not a
     /// foreign key into this table's `id` column.
     pub request_id: Option<i64>,
-    /// Causation link. References the `request_id` of the message that
-    /// caused this one (e.g., an LSP request's `parent_id` is the MCP
-    /// tool call's `request_id`). Not a foreign key into `id`.
-    pub parent_id: Option<i64>,
+    /// Causation link. UUID string minted at scope boundaries (pre-tool
+    /// hook dispatch, MCP `tools/call` dispatch) or a stringified
+    /// `request_id` for pair-merge. Not a foreign key into `id`.
+    pub parent_id: Option<String>,
     /// When the message was logged.
     pub timestamp: DateTime<Utc>,
     /// Raw protocol JSON, untouched.
@@ -118,7 +118,7 @@ impl SqliteMessageTail {
                 let server: String = row.get(5)?;
                 let client: String = row.get(6)?;
                 let request_id: Option<i64> = row.get(7)?;
-                let parent_id: Option<i64> = row.get(8)?;
+                let parent_id: Option<String> = row.get(8)?;
                 let payload: String = row.get(9)?;
                 Ok((
                     id, ts, r#type, level, method, server, client, request_id, parent_id, payload,
@@ -377,7 +377,7 @@ pub fn monitor_messages_with_conn(
         let server: String = row.get(5)?;
         let client: String = row.get(6)?;
         let request_id: Option<i64> = row.get(7)?;
-        let parent_id: Option<i64> = row.get(8)?;
+        let parent_id: Option<String> = row.get(8)?;
         let payload_str: String = row.get(9)?;
 
         if let Ok(timestamp) = DateTime::parse_from_rfc3339(&ts)
@@ -436,7 +436,7 @@ pub fn monitor_all_messages_with_conn(
         let server: String = row.get(6)?;
         let client: String = row.get(7)?;
         let request_id: Option<i64> = row.get(8)?;
-        let parent_id: Option<i64> = row.get(9)?;
+        let parent_id: Option<String> = row.get(9)?;
         let payload_str: String = row.get(10)?;
 
         if let Ok(timestamp) = DateTime::parse_from_rfc3339(&ts)
@@ -538,7 +538,7 @@ impl SqliteAllMessageTail {
                 let server: String = row.get(6)?;
                 let client: String = row.get(7)?;
                 let request_id: Option<i64> = row.get(8)?;
-                let parent_id: Option<i64> = row.get(9)?;
+                let parent_id: Option<String> = row.get(9)?;
                 let payload: String = row.get(10)?;
                 Ok((
                     id, session_id, ts, r#type, level, method, server, client, request_id,
@@ -820,7 +820,7 @@ pub(crate) mod test_support {
         SessionMessage {
             id,
             request_id,
-            parent_id,
+            parent_id: parent_id.map(|v| v.to_string()),
             ..message(r#type, method, server)
         }
     }

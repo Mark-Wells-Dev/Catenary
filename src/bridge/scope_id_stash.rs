@@ -25,7 +25,7 @@ const STASH_TIMEOUT: Duration = Duration::from_secs(5);
 /// blocks until the first is cleared by [`Self::take`], preventing scope
 /// mismatch when tool calls overlap (e.g. subagent concurrency).
 pub struct ScopeIdStash {
-    slot: Mutex<Option<i64>>,
+    slot: Mutex<Option<String>>,
     consumed: Condvar,
 }
 
@@ -50,7 +50,7 @@ impl ScopeIdStash {
     /// If a previous scope ID is still pending, blocks until it is cleared
     /// by [`Self::take`] or [`STASH_TIMEOUT`] expires. On timeout the stale
     /// entry is overwritten and a warning is logged.
-    pub fn stash(&self, scope_id: i64) {
+    pub fn stash(&self, scope_id: String) {
         let mut slot = self
             .slot
             .lock()
@@ -82,18 +82,18 @@ impl ScopeIdStash {
     ///
     /// Returns `None` if nothing was stashed (e.g. no pre-tool hook fired,
     /// or the tool was invoked without host CLI integration).
-    pub fn peek(&self) -> Option<i64> {
-        *self
-            .slot
+    pub fn peek(&self) -> Option<String> {
+        self.slot
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Take the stashed scope ID, clearing the slot.
     ///
     /// Returns `None` if nothing was stashed. Wakes any blocked
     /// [`Self::stash`] call.
-    pub fn take(&self) -> Option<i64> {
+    pub fn take(&self) -> Option<String> {
         let id = self
             .slot
             .lock()
@@ -115,17 +115,17 @@ mod tests {
     #[test]
     fn stash_and_peek() {
         let stash = ScopeIdStash::new();
-        stash.stash(42);
-        assert_eq!(stash.peek(), Some(42));
+        stash.stash("scope-42".to_string());
+        assert_eq!(stash.peek().as_deref(), Some("scope-42"));
         // Peek does not consume.
-        assert_eq!(stash.peek(), Some(42));
+        assert_eq!(stash.peek().as_deref(), Some("scope-42"));
     }
 
     #[test]
     fn stash_and_take() {
         let stash = ScopeIdStash::new();
-        stash.stash(42);
-        assert_eq!(stash.take(), Some(42));
+        stash.stash("scope-42".to_string());
+        assert_eq!(stash.take().as_deref(), Some("scope-42"));
     }
 
     #[test]
@@ -143,7 +143,7 @@ mod tests {
     #[test]
     fn take_clears_slot() {
         let stash = ScopeIdStash::new();
-        stash.stash(1);
+        stash.stash("s1".to_string());
         let _ = stash.take();
         assert!(stash.take().is_none());
         assert!(stash.peek().is_none());
@@ -152,12 +152,12 @@ mod tests {
     #[test]
     fn stash_blocks_until_taken() {
         let stash = Arc::new(ScopeIdStash::new());
-        stash.stash(10);
+        stash.stash("first".to_string());
 
         let stash2 = Arc::clone(&stash);
         let handle = std::thread::spawn(move || {
-            // This should block until 10 is taken.
-            stash2.stash(20);
+            // This should block until "first" is taken.
+            stash2.stash("second".to_string());
         });
 
         // Give the spawned thread time to block.
@@ -165,18 +165,18 @@ mod tests {
 
         // Take the first entry — unblocks the spawned thread.
         let first = stash.take();
-        assert_eq!(first, Some(10));
+        assert_eq!(first.as_deref(), Some("first"));
 
         handle.join().expect("stash thread should finish");
 
-        assert_eq!(stash.peek(), Some(20));
-        assert_eq!(stash.take(), Some(20));
+        assert_eq!(stash.peek().as_deref(), Some("second"));
+        assert_eq!(stash.take().as_deref(), Some("second"));
     }
 
     #[test]
     fn stash_without_prior_entry_does_not_block() {
         let stash = ScopeIdStash::new();
-        stash.stash(99);
-        assert_eq!(stash.take(), Some(99));
+        stash.stash("s99".to_string());
+        assert_eq!(stash.take().as_deref(), Some("s99"));
     }
 }

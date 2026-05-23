@@ -232,7 +232,7 @@ impl ToolHandler for CorrelatingHandler {
         &self,
         name: &str,
         arguments: Option<serde_json::Value>,
-        parent_id: Option<i64>,
+        parent_id: Option<String>,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> anyhow::Result<crate::mcp::CallToolResult> {
         // Fast path: already have a cached per-session handler.
@@ -280,7 +280,7 @@ impl ToolHandler for CorrelatingHandler {
         self.inner.call_tool(name, arguments, parent_id, cancel)
     }
 
-    fn scope_parent_id(&self) -> Option<i64> {
+    fn scope_parent_id(&self) -> Option<String> {
         // Fast path: cached session from a previous call_tool.
         if let Some((_, session)) = self
             .cached
@@ -1492,12 +1492,13 @@ async fn handle_hook_dispatch(
             &raw.to_string(),
             "incoming hook",
         );
+        let parent_str = id.0.to_string();
         emit_hook_event(
             tracing::Level::DEBUG,
             &session_id,
             &method,
             id.0,
-            Some(id.0),
+            Some(&parent_str),
             "",
             "outgoing hook response",
         );
@@ -1721,8 +1722,11 @@ async fn handle_hook_dispatch(
 
     // For post-tool hooks, read and clear the scope parent ID so
     // the request event links back to the pre-tool scope root.
+    // For pre-tool hooks, peek the scope UUID from the dispatch result.
     let request_parent_id = if method.starts_with("post-tool") {
         router.session.scope_id_stash.take()
+    } else if method.starts_with("pre-tool") {
+        router.session.scope_id_stash.peek()
     } else {
         None
     };
@@ -1733,18 +1737,19 @@ async fn handle_hook_dispatch(
         &session_id,
         &method,
         id.0,
-        request_parent_id,
+        request_parent_id.as_deref(),
         &raw.to_string(),
         "incoming hook",
     );
 
     // Log outgoing hook response.
+    let response_parent_str = id.0.to_string();
     emit_hook_event(
         level,
         &session_id,
         &method,
         id.0,
-        Some(id.0),
+        Some(&response_parent_str),
         &response,
         "outgoing hook response",
     );
@@ -2108,7 +2113,7 @@ mod tests {
             &self,
             _name: &str,
             _arguments: Option<serde_json::Value>,
-            _parent_id: Option<i64>,
+            _parent_id: Option<String>,
             _cancel: &tokio_util::sync::CancellationToken,
         ) -> anyhow::Result<crate::mcp::CallToolResult> {
             Err(anyhow::anyhow!("not implemented"))
@@ -2581,7 +2586,7 @@ mod tests {
             &self,
             _name: &str,
             _arguments: Option<serde_json::Value>,
-            _parent_id: Option<i64>,
+            _parent_id: Option<String>,
             _cancel: &tokio_util::sync::CancellationToken,
         ) -> anyhow::Result<crate::mcp::CallToolResult> {
             Ok(crate::mcp::CallToolResult::text("echo"))

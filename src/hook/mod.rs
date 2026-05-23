@@ -41,7 +41,7 @@ pub(crate) fn emit_hook_event(
     client_name: &str,
     method: &str,
     request_id: i64,
-    parent_id: Option<i64>,
+    parent_id: Option<&str>,
     payload: &str,
     msg: &str,
 ) {
@@ -449,8 +449,11 @@ impl HookServer {
 
         // For post-tool hooks, read and clear the scope parent ID so
         // the request event links back to the pre-tool scope root.
+        // For pre-tool hooks, read the scope UUID from the dispatch result.
         let request_parent_id = if method.starts_with("post-tool") {
             self.router.session.scope_id_stash.take()
+        } else if method.starts_with("pre-tool") {
+            self.router.session.scope_id_stash.peek()
         } else {
             None
         };
@@ -461,18 +464,19 @@ impl HookServer {
             &self.router.client_name,
             &method,
             id.0,
-            request_parent_id,
+            request_parent_id.as_deref(),
             &raw.to_string(),
             "incoming hook",
         );
 
         // Log outgoing hook response
+        let response_parent_str = id.0.to_string();
         emit_hook_event(
             level,
             &self.router.client_name,
             &method,
             id.0,
-            Some(id.0),
+            Some(&response_parent_str),
             &response,
             "outgoing hook response",
         );
@@ -777,12 +781,13 @@ mod tests {
         );
 
         // Outgoing response
+        let parent_str = id.0.to_string();
         emit_hook_event(
             tracing::Level::INFO,
             "claude-code",
             "post-tool/diagnostics",
             id.0,
-            Some(id.0),
+            Some(&parent_str),
             &serde_json::json!({"content": "[clean]"}).to_string(),
             "outgoing hook response",
         );
@@ -798,7 +803,7 @@ mod tests {
         assert_eq!(rows[1].request_id, Some(id.0));
         // Response has parent_id pointing back
         assert!(rows[0].parent_id.is_none());
-        assert_eq!(rows[1].parent_id, Some(id.0));
+        assert_eq!(rows[1].parent_id.as_deref(), Some(parent_str.as_str()));
     }
 
     #[test]
@@ -816,12 +821,13 @@ mod tests {
             "incoming hook",
         );
 
+        let parent_str = id.0.to_string();
         emit_hook_event(
             tracing::Level::INFO,
             "host",
             "pre-agent/turn-start",
             id.0,
-            Some(id.0),
+            Some(&parent_str),
             "",
             "outgoing hook response",
         );

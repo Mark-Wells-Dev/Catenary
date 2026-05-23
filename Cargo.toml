@@ -68,6 +68,7 @@ tokio-util = "0.7"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 unicode-width = "0.2"
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 

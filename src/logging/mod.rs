@@ -155,8 +155,9 @@ pub struct LogEvent<'a> {
     pub client: Option<String>,
     /// In-process monotonic correlation ID.
     pub request_id: Option<i64>,
-    /// Parent correlation ID (causation).
-    pub parent_id: Option<i64>,
+    /// Parent correlation ID (causation). UUID string minted at scope
+    /// boundaries (pre-tool hook dispatch, MCP `tools/call` dispatch).
+    pub parent_id: Option<String>,
     /// Subsystem emitting the event (e.g., `"lsp.lifecycle"`).
     pub source: Option<String>,
     /// Language ID when relevant.
@@ -187,7 +188,7 @@ struct OwnedEvent {
     server: Option<String>,
     client: Option<String>,
     request_id: Option<i64>,
-    parent_id: Option<i64>,
+    parent_id: Option<String>,
     source: Option<String>,
     language: Option<String>,
     payload: Option<String>,
@@ -206,7 +207,7 @@ impl OwnedEvent {
             server: self.server.clone(),
             client: self.client.clone(),
             request_id: self.request_id,
-            parent_id: self.parent_id,
+            parent_id: self.parent_id.clone(),
             source: self.source.clone(),
             language: self.language.clone(),
             payload: self.payload.clone(),
@@ -604,7 +605,7 @@ struct FieldVisitor {
     server: Option<String>,
     client: Option<String>,
     request_id: Option<i64>,
-    parent_id: Option<i64>,
+    parent_id: Option<String>,
     source: Option<String>,
     language: Option<String>,
     payload: Option<String>,
@@ -622,6 +623,7 @@ impl FieldVisitor {
             "client" => self.client = Some(value),
             "source" => self.source = Some(value),
             "language" => self.language = Some(value),
+            "parent_id" => self.parent_id = Some(value),
             "payload" => self.payload = Some(value),
             "session_id" => self.session_id = Some(value),
             _ => {
@@ -688,7 +690,6 @@ impl tracing::field::Visit for FieldVisitor {
     fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
         match field.name() {
             "request_id" => self.request_id = Some(value),
-            "parent_id" => self.parent_id = Some(value),
             name => {
                 self.fields
                     .insert(name.to_string(), serde_json::Value::Number(value.into()));
@@ -697,20 +698,13 @@ impl tracing::field::Visit for FieldVisitor {
     }
 
     fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
-        // request_id / parent_id accept u64 but store as i64. Values
-        // exceeding i64::MAX fall through to the generic map.
-        if let Ok(as_i64) = i64::try_from(value) {
-            match field.name() {
-                "request_id" => {
-                    self.request_id = Some(as_i64);
-                    return;
-                }
-                "parent_id" => {
-                    self.parent_id = Some(as_i64);
-                    return;
-                }
-                _ => {}
-            }
+        // request_id accepts u64 but stores as i64. Values exceeding
+        // i64::MAX fall through to the generic map.
+        if let Ok(as_i64) = i64::try_from(value)
+            && field.name() == "request_id"
+        {
+            self.request_id = Some(as_i64);
+            return;
         }
         self.fields.insert(
             field.name().to_string(),
@@ -755,7 +749,7 @@ pub mod test_support {
         pub method: String,
         pub client: String,
         pub request_id: Option<i64>,
-        pub parent_id: Option<i64>,
+        pub parent_id: Option<String>,
     }
 
     /// Create an in-memory DB with `sessions` and `messages` table schema.
@@ -780,7 +774,7 @@ pub mod test_support {
                  server      TEXT NOT NULL,
                  client      TEXT NOT NULL,
                  request_id  INTEGER,
-                 parent_id   INTEGER,
+                 parent_id   TEXT,
                  payload     TEXT NOT NULL
              );",
         )
@@ -909,7 +903,7 @@ mod tests {
         server: Option<String>,
         client: Option<String>,
         request_id: Option<i64>,
-        parent_id: Option<i64>,
+        parent_id: Option<String>,
         source: Option<String>,
         language: Option<String>,
         payload: Option<String>,
@@ -936,7 +930,7 @@ mod tests {
                     server: event.server.clone(),
                     client: event.client.clone(),
                     request_id: event.request_id,
-                    parent_id: event.parent_id,
+                    parent_id: event.parent_id.clone(),
                     source: event.source.clone(),
                     language: event.language.clone(),
                     payload: event.payload.clone(),
@@ -1152,7 +1146,7 @@ mod tests {
                 server = "rust-analyzer",
                 client = "claude-code",
                 request_id = 7_i64,
-                parent_id = 3_i64,
+                parent_id = "scope-3",
                 source = crate::source::Source::LspDispatch.as_str(),
                 language = "rust",
                 payload = "{}",
@@ -1167,7 +1161,7 @@ mod tests {
         assert_eq!(e.server.as_deref(), Some("rust-analyzer"));
         assert_eq!(e.client.as_deref(), Some("claude-code"));
         assert_eq!(e.request_id, Some(7));
-        assert_eq!(e.parent_id, Some(3));
+        assert_eq!(e.parent_id.as_deref(), Some("scope-3"));
         assert_eq!(
             e.source.as_deref(),
             Some(crate::source::Source::LspDispatch.as_str())
@@ -1381,12 +1375,12 @@ mod tests {
     }
 
     #[test]
-    fn record_u64_routes_request_id_and_parent_id() {
+    fn record_u64_routes_request_id() {
         let server = LoggingServer::new();
         let sink = Arc::new(RecorderSink::default());
         with_subscriber(server.clone(), || {
             server.activate(vec![sink.clone()]);
-            tracing::info!(request_id = 42_u64, parent_id = 7_u64, "u64 ids");
+            tracing::info!(request_id = 42_u64, parent_id = "scope-7", "u64 ids");
         });
         let events = sink.snapshot();
         assert_eq!(events.len(), 1);
@@ -1397,9 +1391,9 @@ mod tests {
             "request_id should be extracted from u64"
         );
         assert_eq!(
-            e.parent_id,
-            Some(7),
-            "parent_id should be extracted from u64"
+            e.parent_id.as_deref(),
+            Some("scope-7"),
+            "parent_id should be extracted as string"
         );
     }
 
