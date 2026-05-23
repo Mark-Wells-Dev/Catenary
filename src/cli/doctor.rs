@@ -1450,8 +1450,8 @@ fn check_antigravity_hooks(colors: &ColorConfig, show_diff: bool) {
     let home = PathBuf::from(home_str);
 
     // Look for the Antigravity plugin directory.
-    // Antigravity stores plugins under ~/.antigravity/plugins/.
-    let plugin_dir = home.join(".antigravity/plugins/catenary");
+    // Antigravity stores global plugins under ~/.gemini/config/plugins/.
+    let plugin_dir = home.join(".gemini/config/plugins/catenary");
     if !plugin_dir.is_dir() {
         println!("  {label}{}", colors.dim("- not installed"));
         return;

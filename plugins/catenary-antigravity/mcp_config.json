@@ -1,6 +1,8 @@
 {
-  "catenary": {
-    "command": "catenary",
-    "args": []
+  "mcpServers": {
+    "catenary": {
+      "command": "catenary",
+      "args": []
+    }
   }
 }

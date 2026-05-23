@@ -105,14 +105,9 @@ fn format_deny(reason: &str, format: HostFormat) -> String {
             }
         })
         .to_string(),
-        HostFormat::Gemini => serde_json::json!({
+        HostFormat::Gemini | HostFormat::Antigravity => serde_json::json!({
             "decision": "deny",
             "reason": reason
-        })
-        .to_string(),
-        HostFormat::Antigravity => serde_json::json!({
-            "decision": "deny",
-            "message": reason
         })
         .to_string(),
     }
@@ -132,8 +127,8 @@ fn format_stop_block(reason: &str, format: HostFormat) -> String {
         })
         .to_string(),
         HostFormat::Antigravity => serde_json::json!({
-            "decision": "block",
-            "message": reason
+            "decision": "continue",
+            "reason": reason
         })
         .to_string(),
     }
@@ -777,7 +772,8 @@ fn extract_shell_command(
         // Antigravity CLI: toolCall.args
         .or_else(|| hook_json.get("toolCall").and_then(|tc| tc.get("args")));
     tool_input
-        .and_then(|ti| ti.get("command"))
+        // Claude Code / Gemini CLI: "command"; Antigravity CLI: "CommandLine"
+        .and_then(|ti| ti.get("command").or_else(|| ti.get("CommandLine")))
         .and_then(|c| c.as_str())
         .map(String::from)
 }
@@ -1595,13 +1591,11 @@ mod tests {
             serde_json::from_str(&output).context("should produce valid JSON")?;
         assert_eq!(parsed["decision"], "deny");
         assert_eq!(
-            parsed["message"],
+            parsed["reason"],
             "run `catenary start_editing` before editing",
         );
         // Antigravity format should NOT have hookSpecificOutput
         assert!(parsed["hookSpecificOutput"].is_null());
-        // Antigravity uses "message" not "reason"
-        assert!(parsed["reason"].is_null());
         Ok(())
     }
 
@@ -1622,7 +1616,7 @@ mod tests {
             "workspacePaths": ["/home/user/project"],
             "toolCall": {
                 "name": "run_command",
-                "args": { "command": "catenary start_editing" }
+                "args": { "CommandLine": "catenary start_editing" }
             }
         });
         let tool_name = extract_tool_name(&json);
@@ -1638,8 +1632,8 @@ mod tests {
         let output = format_stop_block("files still in editing state", HostFormat::Antigravity);
         let parsed: serde_json::Value =
             serde_json::from_str(&output).context("should produce valid JSON")?;
-        assert_eq!(parsed["decision"], "block");
-        assert_eq!(parsed["message"], "files still in editing state");
+        assert_eq!(parsed["decision"], "continue");
+        assert_eq!(parsed["reason"], "files still in editing state");
         Ok(())
     }
 
@@ -1721,7 +1715,7 @@ mod tests {
         let json = serde_json::json!({
             "toolCall": {
                 "name": "run_command",
-                "args": { "command": "make test" }
+                "args": { "CommandLine": "make test" }
             }
         });
         assert_eq!(
