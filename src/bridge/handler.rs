@@ -123,8 +123,8 @@ impl ToolHandler for McpRouter {
                 description: Some(format!(
                     "Search for a pattern across the workspace. Queries the LSP symbol index \
                      and ripgrep in parallel. Use `|` for alternation (e.g., `foo|bar`). \
-                     Scope with `glob` and `exclude` to narrow the file set. Relative \
-                     glob patterns resolve against your current working directory.\n\n\
+                     Scope with `glob` and `exclude` to narrow the file set. Pass `directory` \
+                     to set the search root for relative patterns.\n\n\
                      Output fits a {grep_budget}-character budget. When results exceed a \
                      single page, output is truncated with a `[page N/M]` header \u{2014} pass \
                      `page` to retrieve subsequent pages. Results include enriched navigation \
@@ -137,6 +137,10 @@ impl ToolHandler for McpRouter {
                         "pattern": {
                             "type": "string",
                             "description": "Regex pattern to search for (supports | for alternation)"
+                        },
+                        "directory": {
+                            "type": "string",
+                            "description": "Directory to search in (absolute path). Relative glob/exclude patterns resolve against this."
                         },
                         "glob": {
                             "type": "string",
@@ -174,8 +178,8 @@ impl ToolHandler for McpRouter {
                 description: Some(format!(
                     "Browse the workspace. Auto-detects intent: file path \u{2192} symbol outline, \
                      directory path \u{2192} listing with symbols, glob pattern \u{2192} matching files \
-                     with symbols. Relative paths resolve against your current working \
-                     directory. Always shows outline-level symbols (structs, classes, enums, \
+                     with symbols. Pass `directory` to set the base for relative patterns. \
+                     Always shows outline-level symbols (structs, classes, enums, \
                      interfaces, modules, constants).\n\n\
                      Output fits a {glob_budget}-character page. Broad patterns produce paged \
                      results \u{2014} refine the pattern or use `page` to continue. Files over \
@@ -189,6 +193,10 @@ impl ToolHandler for McpRouter {
                         "pattern": {
                             "type": "string",
                             "description": "A file path, directory path, or glob pattern (e.g., 'src/', 'src/main.rs', '**/*.rs')"
+                        },
+                        "directory": {
+                            "type": "string",
+                            "description": "Directory to search in (absolute path). Relative patterns resolve against this."
                         },
                         "page": {
                             "type": "integer",
@@ -325,11 +333,26 @@ impl ToolHandler for McpRouter {
         // ToolServer dispatch: grep, glob
         let mut params = arguments.unwrap_or(Value::Null);
 
-        // Resolve relative patterns against the host CLI's working
-        // directory (stashed by the PreToolUse hook). Absolute patterns
-        // and tilde-prefixed patterns pass through unchanged.
-        if let Some(cwd) = self.session.cwd_stash.take() {
-            resolve_params_against_cwd(name, &mut params, &cwd);
+        // Resolve relative patterns against an explicit directory (from
+        // the tool arguments) or the host CLI's working directory
+        // (stashed by the PreToolUse hook). `directory` takes precedence;
+        // `cwd_stash` is the backward-compatible fallback (deleted in
+        // ticket 08). Always drain the stash to prevent 5-second Condvar
+        // timeouts when consecutive calls provide `directory`.
+        let stash_cwd = self.session.cwd_stash.take();
+        let cwd = params
+            .get("directory")
+            .and_then(Value::as_str)
+            .map(|d| PathBuf::from(expand_tilde(d)))
+            .or(stash_cwd);
+
+        if let Some(cwd) = &cwd {
+            resolve_params_against_cwd(name, &mut params, cwd);
+        }
+
+        // `directory` is not a tool-server parameter — strip before dispatch.
+        if let Some(obj) = params.as_object_mut() {
+            obj.remove("directory");
         }
 
         let result = match name {
@@ -442,5 +465,90 @@ mod tests {
         let cwd = Path::new("/project");
         resolve_params_against_cwd("start_editing", &mut params, cwd);
         assert_eq!(params["pattern"].as_str(), Some("relative"));
+    }
+
+    #[test]
+    fn grep_with_directory_resolves_relative_glob() {
+        let mut params = serde_json::json!({
+            "pattern": "TODO",
+            "directory": "/search/root",
+            "glob": "src/**/*.rs"
+        });
+        let cwd = params
+            .get("directory")
+            .and_then(Value::as_str)
+            .map(|d| PathBuf::from(expand_tilde(d)));
+        if let Some(cwd) = &cwd {
+            resolve_params_against_cwd("grep", &mut params, cwd);
+        }
+        if let Some(obj) = params.as_object_mut() {
+            obj.remove("directory");
+        }
+        assert_eq!(params["glob"].as_str(), Some("/search/root/src/**/*.rs"));
+        assert!(
+            params.get("directory").is_none(),
+            "directory should be stripped before dispatch"
+        );
+    }
+
+    #[test]
+    fn glob_with_directory_resolves_relative_pattern() {
+        let mut params = serde_json::json!({
+            "pattern": "src/",
+            "directory": "/workspace"
+        });
+        let cwd = params
+            .get("directory")
+            .and_then(Value::as_str)
+            .map(|d| PathBuf::from(expand_tilde(d)));
+        if let Some(cwd) = &cwd {
+            resolve_params_against_cwd("glob", &mut params, cwd);
+        }
+        if let Some(obj) = params.as_object_mut() {
+            obj.remove("directory");
+        }
+        assert_eq!(params["pattern"].as_str(), Some("/workspace/src/"));
+        assert!(
+            params.get("directory").is_none(),
+            "directory should be stripped before dispatch"
+        );
+    }
+
+    #[test]
+    fn directory_takes_precedence_over_cwd_stash() {
+        use crate::bridge::cwd_stash::CwdStash;
+
+        let stash = CwdStash::new();
+        stash.stash(PathBuf::from("/from/stash"));
+
+        let mut params = serde_json::json!({
+            "pattern": "TODO",
+            "directory": "/from/directory",
+            "glob": "src/**/*.rs"
+        });
+        // Always drain the stash first (matches call_tool behavior).
+        let stash_cwd = stash.take();
+        let cwd = params
+            .get("directory")
+            .and_then(Value::as_str)
+            .map(|d| PathBuf::from(expand_tilde(d)))
+            .or(stash_cwd);
+        if let Some(cwd) = &cwd {
+            resolve_params_against_cwd("grep", &mut params, cwd);
+        }
+        if let Some(obj) = params.as_object_mut() {
+            obj.remove("directory");
+        }
+        assert_eq!(
+            params["glob"].as_str(),
+            Some("/from/directory/src/**/*.rs"),
+            "directory param should win over cwd_stash"
+        );
+        // Stash was drained eagerly to prevent Condvar timeouts.
+        assert_eq!(
+            stash.take(),
+            None,
+            "cwd_stash should be drained even when directory is provided"
+        );
     }
 }
