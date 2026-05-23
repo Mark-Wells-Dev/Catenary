@@ -2311,31 +2311,30 @@ fn test_grep_parent_id_threading() -> Result<()> {
         rusqlite::Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .context("open test database")?;
 
-    // Find the correlation ID of the tools/call MCP request.
-    // MCP events now use in-process monotonic correlation IDs stored in
-    // the `request_id` column (not the DB autoincrement `id`).
-    let tool_call_corr_id: i64 = conn
+    // Find the parent_id (call UUID) on the tools/call MCP event.
+    // This UUID is shared with LSP messages from the grep pipeline.
+    let call_uuid: String = conn
         .query_row(
-            "SELECT request_id FROM messages \
+            "SELECT parent_id FROM messages \
              WHERE type = 'mcp' AND method = 'tools/call' \
-             AND request_id IS NOT NULL LIMIT 1",
+             AND parent_id IS NOT NULL LIMIT 1",
             [],
             |row| row.get(0),
         )
-        .context("find tools/call correlation ID")?;
+        .context("find tools/call parent_id (call UUID)")?;
 
     // LSP messages from the grep pipeline should carry this parent_id
     let lsp_with_parent: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM messages WHERE type = 'lsp' AND parent_id = ?1",
-            [tool_call_corr_id],
+            [&call_uuid],
             |row| row.get(0),
         )
         .context("count LSP messages with parent_id")?;
 
     assert!(
         lsp_with_parent > 0,
-        "Expected LSP messages with parent_id={tool_call_corr_id} from grep, found 0"
+        "Expected LSP messages with parent_id={call_uuid} from grep, found 0"
     );
 
     Ok(())

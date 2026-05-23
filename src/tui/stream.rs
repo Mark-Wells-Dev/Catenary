@@ -201,9 +201,32 @@ impl StreamState {
             return;
         }
 
-        // 2. Route by parent_id.
+        // 2. MCP tools/call → route to active scope for this session.
+        //    The MCP event's parent_id is a call UUID (not the scope UUID),
+        //    so it doesn't match scope_id_map. Route via session's active scope.
+        if msg.r#type == "mcp"
+            && msg.method == "tools/call"
+            && let Some(&idx) = self.active_scope.get(&msg.session_id)
+            && let StreamEntry::Scope(scope) = &mut self.entries[idx]
+            && scope.is_active()
+        {
+            if scope.request.is_none() {
+                // Register the MCP event's parent_id (call UUID) so
+                // LSP children with the same parent_id route here.
+                if let Some(ref call_pid) = msg.parent_id {
+                    self.mcp_corr_map.insert(call_pid.clone(), idx);
+                }
+                scope.attach_request(msg);
+            } else {
+                scope.attach_response(msg);
+            }
+            return;
+        }
+
+        // 3. Route by parent_id.
         if let Some(ref pid) = msg.parent_id {
-            // Check scope_id_map — direct scope children (MCP req/resp, post-hook).
+            // Check scope_id_map — scope children keyed by scope UUID
+            // (post-hook and other hook events share the scope UUID).
             if let Some(&idx) = self.scope_id_map.get(pid.as_str())
                 && let StreamEntry::Scope(scope) = &mut self.entries[idx]
             {
@@ -214,18 +237,6 @@ impl StreamState {
                     // Only clear active_scope if it still points to this scope.
                     if self.active_scope.get(&session) == Some(&idx) {
                         self.active_scope.remove(&session);
-                    }
-                    return;
-                }
-                // MCP tools/call → request or response.
-                if msg.r#type == "mcp" && msg.method == "tools/call" {
-                    if scope.request.is_none() {
-                        if let Some(corr_id) = msg.request_id {
-                            self.mcp_corr_map.insert(corr_id.to_string(), idx);
-                        }
-                        scope.attach_request(msg);
-                    } else {
-                        scope.attach_response(msg);
                     }
                     return;
                 }
@@ -594,7 +605,9 @@ mod tests {
                 None,
             )
         };
-        msg.parent_id = Some(format!("scope-{scope_id}"));
+        // MCP events carry a call UUID as parent_id (distinct from the
+        // scope UUID). LSP children share this value.
+        msg.parent_id = Some(format!("call-{scope_id}"));
         msg
     }
 
@@ -613,7 +626,7 @@ mod tests {
                 None,
             )
         };
-        msg.parent_id = Some(format!("scope-{scope_id}"));
+        msg.parent_id = Some(format!("call-{scope_id}"));
         msg
     }
 
@@ -635,15 +648,18 @@ mod tests {
     /// Build an LSP child message of an MCP tool call.
     fn lsp_child(session_id: &str, scope_id: i64, method: &str) -> SessionMessage {
         let mcp_corr_id = scope_id + 1000;
-        make_message_with_ids(
+        let mut msg = make_message_with_ids(
             session_id,
             500 + scope_id,
             "lsp",
             method,
             "rust-analyzer",
             Some(mcp_corr_id + 100),
-            Some(mcp_corr_id),
-        )
+            None,
+        );
+        // LSP children share the MCP event's call UUID as parent_id.
+        msg.parent_id = Some(format!("call-{scope_id}"));
+        msg
     }
 
     // ── Hex badge tests ───────────────────────────────────────────────

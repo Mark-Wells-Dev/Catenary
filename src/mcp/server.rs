@@ -209,6 +209,9 @@ pub struct McpServer<H: ToolHandler> {
     /// Optional callback invoked before each `tools/call` dispatch.
     /// Used by daemon sandwich correlation.
     on_tools_call: Option<ToolsCallCallback>,
+    /// UUID minted per `tools/call` dispatch for LSP event correlation.
+    /// Set in the run loop before dispatch, read by `handle_tools_call`.
+    current_call_uuid: Option<String>,
 }
 
 impl<H: ToolHandler> McpServer<H> {
@@ -229,6 +232,7 @@ impl<H: ToolHandler> McpServer<H> {
             cancel_map: Arc::new(std::sync::Mutex::new(HashMap::new())),
             roots_refresh: None,
             on_tools_call: None,
+            current_call_uuid: None,
         }
     }
 
@@ -346,14 +350,17 @@ impl<H: ToolHandler> McpServer<H> {
                 if let Some(cb) = &self.on_tools_call {
                     cb();
                 }
-                // Emit the deferred incoming event with scope parent_id.
-                let scope_pid = self.handler.scope_parent_id();
+                // Mint a UUID for this tool call. LSP events and the
+                // incoming MCP event share this parent_id, grouping
+                // them together in the TUI.
+                let call_uuid = uuid::Uuid::new_v4().to_string();
+                self.current_call_uuid = Some(call_uuid.clone());
                 emit_mcp_event(
                     mcp_method_level(&method),
                     &self.client_name,
                     &method,
                     correlation_id,
-                    scope_pid.as_deref(),
+                    Some(&call_uuid),
                     &json_payload,
                     "incoming",
                 );
@@ -708,7 +715,7 @@ impl<H: ToolHandler> McpServer<H> {
         Ok(Response::success(request.id, result)?)
     }
 
-    fn handle_tools_call(&self, request: Request) -> Result<Response> {
+    fn handle_tools_call(&mut self, request: Request) -> Result<Response> {
         let params: CallToolParams = request
             .params
             .map(serde_json::from_value)
@@ -728,7 +735,7 @@ impl<H: ToolHandler> McpServer<H> {
             .and_then(|map| map.get(&request.id).cloned())
             .unwrap_or_default();
 
-        let parent_id = Some(self.current_correlation_id.to_string());
+        let parent_id = self.current_call_uuid.take();
         let result = self
             .handler
             .call_tool(&params.name, params.arguments, parent_id, &cancel);
@@ -1568,8 +1575,8 @@ mod tests {
     /// after the `on_tools_call` callback (deferred) with
     /// `scope_parent_id` from the handler; for all other methods, the
     /// event is emitted immediately with `parent_id = None`.
-    fn simulate_incoming(
-        server: &mut McpServer<TestHandler>,
+    fn simulate_incoming<H: ToolHandler>(
+        server: &mut McpServer<H>,
         line: &str,
         writer: &mut Vec<u8>,
     ) -> Result<i64> {
@@ -1582,13 +1589,14 @@ mod tests {
         let id = server.logging.next_id();
         let payload = json.to_string();
         if method == "tools/call" {
-            let scope_pid = server.handler.scope_parent_id();
+            let call_uuid = uuid::Uuid::new_v4().to_string();
+            server.current_call_uuid = Some(call_uuid.clone());
             emit_mcp_event(
                 mcp_method_level(&method),
                 &server.client_name,
                 &method,
                 id.0,
-                scope_pid.as_deref(),
+                Some(&call_uuid),
                 &payload,
                 "incoming",
             );
@@ -1718,7 +1726,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_call_request_gets_scope_parent_id() -> Result<()> {
+    fn tools_call_request_gets_call_uuid() -> Result<()> {
         let (logging, conn, _guard) = setup_logging();
         let handler = ScopedHandler(std::sync::Mutex::new(Some("scope-42".to_string())));
         let mut server = McpServer::new(handler, logging);
@@ -1733,23 +1741,9 @@ mod tests {
             })),
         };
 
-        let json: serde_json::Value = serde_json::from_str(&serde_json::to_string(&request)?)?;
-        let method = "tools/call";
-        let id = server.logging.next_id();
-        let payload = json.to_string();
-        let scope_pid = server.handler.scope_parent_id();
-        emit_mcp_event(
-            mcp_method_level(method),
-            &server.client_name,
-            method,
-            id.0,
-            scope_pid.as_deref(),
-            &payload,
-            "incoming",
-        );
-        server.current_correlation_id = id.0;
+        let line = serde_json::to_string(&request)?;
         let mut writer: Vec<u8> = Vec::new();
-        server.dispatch_message(&serde_json::to_string(&request)?, &mut writer, id.0, method)?;
+        simulate_incoming(&mut server, &line, &mut writer)?;
 
         let msgs = mcp_messages(&conn);
         assert!(
@@ -1757,15 +1751,16 @@ mod tests {
             "should have request + response, got {}",
             msgs.len()
         );
-        assert_eq!(
-            msgs[0].parent_id.as_deref(),
-            Some("scope-42"),
-            "tools/call request should have scope parent_id from handler"
+        // The incoming tools/call event gets a call UUID as parent_id
+        // (minted per dispatch), not the scope UUID from the handler.
+        assert!(
+            msgs[0].parent_id.is_some(),
+            "tools/call request should have a call UUID parent_id"
         );
-        assert_eq!(
-            msgs[1].parent_id.as_deref(),
-            Some(&id.0.to_string() as &str),
-            "tools/call response parent_id should pair-merge with own request_id"
+        // Response parent_id is the stringified request_id (pair-merge).
+        assert!(
+            msgs[1].parent_id.is_some(),
+            "tools/call response should have parent_id for pair-merge"
         );
         Ok(())
     }
@@ -1795,9 +1790,11 @@ mod tests {
             "should have request + response, got {}",
             msgs.len()
         );
+        // Every tools/call gets a minted call UUID as parent_id,
+        // regardless of whether a scope exists.
         assert!(
-            msgs[0].parent_id.is_none(),
-            "tools/call request with no scope should have parent_id = None"
+            msgs[0].parent_id.is_some(),
+            "tools/call request should always have a call UUID parent_id"
         );
         Ok(())
     }
