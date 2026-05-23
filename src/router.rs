@@ -1552,12 +1552,13 @@ async fn handle_hook_dispatch(
             &raw.to_string(),
             "incoming hook",
         );
+        let parent_str = id.0.to_string();
         emit_hook_event(
             tracing::Level::DEBUG,
             &session_id,
             &method,
             id.0,
-            Some(id.0),
+            Some(&parent_str),
             &response.to_string(),
             "outgoing hook response",
         );
@@ -1615,12 +1616,13 @@ async fn handle_hook_dispatch(
             &raw.to_string(),
             "incoming hook",
         );
+        let parent_str = id.0.to_string();
         emit_hook_event(
             tracing::Level::DEBUG,
             &session_id,
             &method,
             id.0,
-            Some(id.0),
+            Some(&parent_str),
             &response.to_string(),
             "outgoing hook response",
         );
