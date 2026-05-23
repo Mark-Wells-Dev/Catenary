@@ -1,3 +1,9 @@
+---
+description: >
+  Catenary editing workflow and workspace management. Use before
+  editing files to get LSP diagnostics afterward.
+---
+
 ## Catenary Editing Workflow
 
 Run `catenary start_editing` before editing files.
