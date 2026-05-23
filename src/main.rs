@@ -268,7 +268,7 @@ fn main() -> Result<()> {
                 HookCommand::PreTool { format } => cli::hooks::run_pre_tool(format),
                 HookCommand::PostAgent { format } => cli::hooks::run_post_agent(format),
                 HookCommand::SessionStart { format } => cli::hooks::run_session_start(format),
-                HookCommand::SessionEnd { format: _ } => cli::hooks::run_session_end(),
+                HookCommand::SessionEnd { format } => cli::hooks::run_session_end(format),
             }
             Ok(())
         }

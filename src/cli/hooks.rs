@@ -134,46 +134,45 @@ fn format_stop_block(reason: &str, format: HostFormat) -> String {
     }
 }
 
-/// Extract `session_id` from hook payload, checking host-specific field names.
+/// Extract session ID from hook payload.
 ///
-/// Claude Code and Gemini CLI use `session_id`; Antigravity CLI uses
-/// `conversationId`.
-fn extract_session_id(hook_json: &serde_json::Value) -> Option<&str> {
-    hook_json
-        .get("session_id")
-        .or_else(|| hook_json.get("conversationId"))
-        .and_then(|v| v.as_str())
+/// Each host uses a different field name for the session identifier.
+fn extract_session_id(hook_json: &serde_json::Value, format: HostFormat) -> Option<&str> {
+    match format {
+        HostFormat::Claude | HostFormat::Gemini => hook_json.get("session_id"),
+        HostFormat::Antigravity => hook_json.get("conversationId"),
+    }
+    .and_then(|v| v.as_str())
 }
 
-/// Extract working directory from hook payload, checking host-specific field names.
+/// Extract working directory from hook payload.
 ///
-/// Claude Code and Gemini CLI use `cwd`; Antigravity CLI uses
-/// `workspacePaths` (array, first entry used).
-fn extract_cwd_str(hook_json: &serde_json::Value) -> Option<&str> {
-    hook_json.get("cwd").and_then(|v| v.as_str()).or_else(|| {
-        hook_json
+/// Each host uses a different field name and shape for the working directory.
+fn extract_cwd_str(hook_json: &serde_json::Value, format: HostFormat) -> Option<&str> {
+    match format {
+        HostFormat::Claude | HostFormat::Gemini => hook_json.get("cwd").and_then(|v| v.as_str()),
+        HostFormat::Antigravity => hook_json
             .get("workspacePaths")
             .and_then(|v| v.as_array())
             .and_then(|a| a.first())
-            .and_then(|v| v.as_str())
-    })
+            .and_then(|v| v.as_str()),
+    }
 }
 
-/// Extract tool name from hook payload, checking host-specific field names.
+/// Extract tool name from hook payload.
 ///
-/// Claude Code and Gemini CLI use `tool_name`; Antigravity CLI uses
-/// `toolCall.name`.
-fn extract_tool_name(hook_json: &serde_json::Value) -> &str {
-    hook_json
-        .get("tool_name")
-        .and_then(|v| v.as_str())
-        .or_else(|| {
-            hook_json
-                .get("toolCall")
-                .and_then(|tc| tc.get("name"))
-                .and_then(|v| v.as_str())
-        })
-        .unwrap_or("")
+/// Each host uses a different field path for the tool name.
+fn extract_tool_name(hook_json: &serde_json::Value, format: HostFormat) -> &str {
+    match format {
+        HostFormat::Claude | HostFormat::Gemini => {
+            hook_json.get("tool_name").and_then(|v| v.as_str())
+        }
+        HostFormat::Antigravity => hook_json
+            .get("toolCall")
+            .and_then(|tc| tc.get("name"))
+            .and_then(|v| v.as_str()),
+    }
+    .unwrap_or("")
 }
 
 /// Extract `agent_id` from hook payload. Defaults to empty string (main agent).
@@ -184,30 +183,27 @@ fn extract_agent_id(hook_json: &serde_json::Value) -> &str {
         .unwrap_or("")
 }
 
-/// Extracts the file path from hook JSON, checking host-specific field names.
+/// Extracts the file path from hook JSON.
 ///
-/// Claude Code / Gemini CLI: `tool_input.file_path` or `tool_input.file`.
-/// Antigravity CLI: `toolCall.args.TargetFile`.
-fn extract_file_path(hook_json: &serde_json::Value) -> Option<String> {
-    // Claude Code / Gemini CLI
-    let file_path = hook_json
-        .get("tool_input")
-        .and_then(|ti| ti.get("file_path").or_else(|| ti.get("file")))
-        .and_then(|fp| fp.as_str())
-        // Antigravity CLI
-        .or_else(|| {
-            hook_json
-                .get("toolCall")
-                .and_then(|tc| tc.get("args"))
-                .and_then(|a| a.get("TargetFile"))
-                .and_then(|fp| fp.as_str())
-        })?;
+/// Each host uses a different field path for the edited file.
+fn extract_file_path(hook_json: &serde_json::Value, format: HostFormat) -> Option<String> {
+    let file_path = match format {
+        HostFormat::Claude | HostFormat::Gemini => hook_json
+            .get("tool_input")
+            .and_then(|ti| ti.get("file_path").or_else(|| ti.get("file")))
+            .and_then(|fp| fp.as_str()),
+        HostFormat::Antigravity => hook_json
+            .get("toolCall")
+            .and_then(|tc| tc.get("args"))
+            .and_then(|a| a.get("TargetFile"))
+            .and_then(|fp| fp.as_str()),
+    }?;
 
     // Resolve to absolute path
     let abs_path = if std::path::Path::new(file_path).is_absolute() {
         PathBuf::from(file_path)
     } else {
-        let cwd = extract_cwd_str(hook_json).map_or_else(
+        let cwd = extract_cwd_str(hook_json, format).map_or_else(
             || std::env::current_dir().unwrap_or_default(),
             PathBuf::from,
         );
@@ -313,7 +309,7 @@ pub fn run_session_start(format: HostFormat) {
         return;
     };
 
-    let session_id = extract_session_id(&hook_json);
+    let session_id = extract_session_id(&hook_json, format);
     let mut request = serde_json::json!({"method": "session-start/clear-editing"});
     if let Some(sid) = session_id {
         request["session_id"] = serde_json::json!(sid);
@@ -352,7 +348,7 @@ pub fn run_session_start(format: HostFormat) {
 /// the session's root contributions from the refcount tracker.
 /// Best effort — the host CLI will not wait for completion and
 /// ignores all flow-control fields.
-pub fn run_session_end() {
+pub fn run_session_end(format: HostFormat) {
     let Ok(stdin_data) = std::io::read_to_string(std::io::stdin()) else {
         return;
     };
@@ -364,7 +360,7 @@ pub fn run_session_end() {
         return;
     };
 
-    let session_id = extract_session_id(&hook_json);
+    let session_id = extract_session_id(&hook_json, format);
     let mut request = serde_json::json!({"method": "session-end/cleanup"});
     if let Some(sid) = session_id {
         request["session_id"] = serde_json::json!(sid);
@@ -415,7 +411,7 @@ pub fn run_post_agent(format: HostFormat) {
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     let agent_id = extract_agent_id(&hook_json);
-    let session_id = extract_session_id(&hook_json);
+    let session_id = extract_session_id(&hook_json, format);
 
     let mut request = serde_json::json!({
         "method": "post-agent/require-release",
@@ -464,7 +460,7 @@ pub fn run_pre_agent(format: HostFormat) {
             "method": "pre-agent/turn-start",
             "host_payload": prepare_host_payload(&hook_json),
         });
-        if let Some(sid) = extract_session_id(&hook_json) {
+        if let Some(sid) = extract_session_id(&hook_json, format) {
             request["session_id"] = serde_json::json!(sid);
         }
         let _ = ipc_exchange(stream, &request);
@@ -490,7 +486,7 @@ pub fn run_pre_tool(format: HostFormat) {
         return;
     };
 
-    let tool_name = extract_tool_name(&hook_json);
+    let tool_name = extract_tool_name(&hook_json, format);
 
     // ── Catenary CLI commands ────────────────────────────────────
     // Recognize Catenary subcommands invoked via the host's shell
@@ -541,8 +537,9 @@ pub fn run_pre_tool(format: HostFormat) {
             return;
         }
         // IPC failed or session unreachable — try client-side.
-        if let Some((denial, resolved)) = check_shell_command(&hook_json, &shell_cmd) {
-            let build_hint = resolve_client_build_hint(&hook_json, &denial.command, &resolved);
+        if let Some((denial, resolved)) = check_shell_command(&hook_json, &shell_cmd, format) {
+            let build_hint =
+                resolve_client_build_hint(&hook_json, &denial.command, &resolved, format);
             let reason = crate::cli::command_filter::format_denial_full(
                 &denial.command,
                 &resolved,
@@ -560,9 +557,9 @@ pub fn run_pre_tool(format: HostFormat) {
         return;
     };
 
-    let file_path = extract_file_path(&hook_json);
+    let file_path = extract_file_path(&hook_json, format);
     let agent_id = extract_agent_id(&hook_json);
-    let session_id = extract_session_id(&hook_json);
+    let session_id = extract_session_id(&hook_json, format);
     let shell_cmd = extract_shell_command(&hook_json, tool_name, format);
 
     let mut request = serde_json::json!({
@@ -603,6 +600,7 @@ pub fn run_pre_tool(format: HostFormat) {
 fn check_shell_command(
     hook_json: &serde_json::Value,
     cmd: &str,
+    format: HostFormat,
 ) -> Option<(
     crate::cli::command_filter::Denial,
     crate::config::ResolvedCommands,
@@ -618,7 +616,7 @@ fn check_shell_command(
     // typically a subdirectory of the workspace root.
     // This covers the common single-root case and "agent is in the right
     // directory" case. Multi-root coverage requires the session-side check.
-    let cwd = extract_cwd_str(hook_json).map(PathBuf::from);
+    let cwd = extract_cwd_str(hook_json, format).map(PathBuf::from);
     if let Some(ref cwd_path) = cwd
         && let Some((root, pc)) = find_project_config(cwd_path)
     {
@@ -645,6 +643,7 @@ fn resolve_client_build_hint(
     hook_json: &serde_json::Value,
     denied_cmd: &str,
     resolved: &crate::config::ResolvedCommands,
+    format: HostFormat,
 ) -> Option<String> {
     let lookup = denied_cmd.split_whitespace().next().unwrap_or(denied_cmd);
     let crate::config::GuidanceEntry::Build(bg) = resolved.guidance_for(lookup)? else {
@@ -656,7 +655,7 @@ fn resolve_client_build_hint(
         .map(|p| p.display().to_string());
     let user_path_str = user_config_path.as_deref().unwrap_or("user config");
 
-    let cwd = extract_cwd_str(hook_json).map(PathBuf::from);
+    let cwd = extract_cwd_str(hook_json, format).map(PathBuf::from);
     let project = cwd.as_deref().and_then(find_project_config);
     let proj_path = project
         .as_ref()
@@ -718,8 +717,8 @@ fn ipc_check_command(
 ) -> Option<String> {
     let stream = hook_connect(hook_json)?;
 
-    let cwd = extract_cwd_str(hook_json);
-    let session_id = extract_session_id(hook_json);
+    let cwd = extract_cwd_str(hook_json, format);
+    let session_id = extract_session_id(hook_json, format);
 
     let format_str = match format {
         HostFormat::Claude => "claude",
@@ -839,7 +838,7 @@ fn handle_start_editing_hook(hook_json: &serde_json::Value, format: HostFormat) 
     };
 
     let agent_id = extract_agent_id(hook_json);
-    let session_id = extract_session_id(hook_json);
+    let session_id = extract_session_id(hook_json, format);
 
     let mut request = serde_json::json!({
         "method": "pre-tool/start-editing",
@@ -872,7 +871,7 @@ fn handle_done_editing_hook(hook_json: &serde_json::Value, format: HostFormat) {
     };
 
     let agent_id = extract_agent_id(hook_json);
-    let session_id = extract_session_id(hook_json);
+    let session_id = extract_session_id(hook_json, format);
 
     let mut request = serde_json::json!({
         "method": "pre-tool/done-editing",
@@ -1156,7 +1155,7 @@ mod tests {
             "tool_input": { "file_path": "/home/user/project/src/main.rs" }
         });
         assert_eq!(
-            extract_file_path(&json),
+            extract_file_path(&json, HostFormat::Claude),
             Some("/home/user/project/src/main.rs".to_string()),
         );
     }
@@ -1166,7 +1165,10 @@ mod tests {
         let json = serde_json::json!({
             "tool_input": { "file": "/tmp/test.py" }
         });
-        assert_eq!(extract_file_path(&json), Some("/tmp/test.py".to_string()),);
+        assert_eq!(
+            extract_file_path(&json, HostFormat::Gemini),
+            Some("/tmp/test.py".to_string()),
+        );
     }
 
     #[test]
@@ -1175,14 +1177,15 @@ mod tests {
             "cwd": "/home/user/project",
             "tool_input": { "file_path": "src/main.rs" }
         });
-        let result = extract_file_path(&json).expect("should resolve relative path");
+        let result =
+            extract_file_path(&json, HostFormat::Claude).expect("should resolve relative path");
         assert_eq!(result, "/home/user/project/src/main.rs");
     }
 
     #[test]
     fn extract_file_path_missing_tool_input() {
         let json = serde_json::json!({});
-        assert!(extract_file_path(&json).is_none());
+        assert!(extract_file_path(&json, HostFormat::Claude).is_none());
     }
 
     #[test]
@@ -1190,7 +1193,7 @@ mod tests {
         let json = serde_json::json!({
             "tool_input": { "command": "ls" }
         });
-        assert!(extract_file_path(&json).is_none());
+        assert!(extract_file_path(&json, HostFormat::Claude).is_none());
     }
 
     #[test]
@@ -1202,7 +1205,7 @@ mod tests {
             }
         });
         assert_eq!(
-            extract_file_path(&json),
+            extract_file_path(&json, HostFormat::Claude),
             Some("/preferred/path.rs".to_string()),
         );
     }
@@ -1549,7 +1552,10 @@ mod tests {
                 "args": { "TargetFile": "/src/main.rs" }
             }
         });
-        assert_eq!(extract_session_id(&json), Some("conv-abc-123"));
+        assert_eq!(
+            extract_session_id(&json, HostFormat::Antigravity),
+            Some("conv-abc-123"),
+        );
     }
 
     #[test]
@@ -1562,7 +1568,10 @@ mod tests {
                 "args": { "TargetFile": "/src/main.rs" }
             }
         });
-        assert_eq!(extract_file_path(&json), Some("/src/main.rs".to_string()),);
+        assert_eq!(
+            extract_file_path(&json, HostFormat::Antigravity),
+            Some("/src/main.rs".to_string()),
+        );
     }
 
     #[test]
@@ -1576,7 +1585,7 @@ mod tests {
             }
         });
         assert_eq!(
-            extract_file_path(&json),
+            extract_file_path(&json, HostFormat::Antigravity),
             Some("/home/user/project/src/main.rs".to_string()),
         );
     }
@@ -1619,7 +1628,7 @@ mod tests {
                 "args": { "CommandLine": "catenary start_editing" }
             }
         });
-        let tool_name = extract_tool_name(&json);
+        let tool_name = extract_tool_name(&json, HostFormat::Antigravity);
         assert_eq!(tool_name, "run_command");
         assert_eq!(
             extract_shell_command(&json, tool_name, HostFormat::Antigravity),
@@ -1651,19 +1660,26 @@ mod tests {
     #[test]
     fn extract_session_id_claude() {
         let json = serde_json::json!({ "session_id": "claude-sess-1" });
-        assert_eq!(extract_session_id(&json), Some("claude-sess-1"));
+        assert_eq!(
+            extract_session_id(&json, HostFormat::Claude),
+            Some("claude-sess-1"),
+        );
     }
 
     #[test]
     fn extract_session_id_antigravity() {
         let json = serde_json::json!({ "conversationId": "ag-conv-1" });
-        assert_eq!(extract_session_id(&json), Some("ag-conv-1"));
+        assert_eq!(
+            extract_session_id(&json, HostFormat::Antigravity),
+            Some("ag-conv-1"),
+        );
     }
 
     #[test]
     fn extract_session_id_missing() {
         let json = serde_json::json!({});
-        assert!(extract_session_id(&json).is_none());
+        assert!(extract_session_id(&json, HostFormat::Claude).is_none());
+        assert!(extract_session_id(&json, HostFormat::Antigravity).is_none());
     }
 
     // ── extract_cwd_str tests ─────────────────────────────────────────
@@ -1671,19 +1687,26 @@ mod tests {
     #[test]
     fn extract_cwd_str_claude() {
         let json = serde_json::json!({ "cwd": "/home/user/project" });
-        assert_eq!(extract_cwd_str(&json), Some("/home/user/project"));
+        assert_eq!(
+            extract_cwd_str(&json, HostFormat::Claude),
+            Some("/home/user/project"),
+        );
     }
 
     #[test]
     fn extract_cwd_str_antigravity() {
         let json = serde_json::json!({ "workspacePaths": ["/home/user/project", "/other"] });
-        assert_eq!(extract_cwd_str(&json), Some("/home/user/project"));
+        assert_eq!(
+            extract_cwd_str(&json, HostFormat::Antigravity),
+            Some("/home/user/project"),
+        );
     }
 
     #[test]
     fn extract_cwd_str_missing() {
         let json = serde_json::json!({});
-        assert!(extract_cwd_str(&json).is_none());
+        assert!(extract_cwd_str(&json, HostFormat::Claude).is_none());
+        assert!(extract_cwd_str(&json, HostFormat::Antigravity).is_none());
     }
 
     // ── extract_tool_name tests ───────────────────────────────────────
@@ -1691,7 +1714,7 @@ mod tests {
     #[test]
     fn extract_tool_name_claude() {
         let json = serde_json::json!({ "tool_name": "Edit" });
-        assert_eq!(extract_tool_name(&json), "Edit");
+        assert_eq!(extract_tool_name(&json, HostFormat::Claude), "Edit");
     }
 
     #[test]
@@ -1699,13 +1722,17 @@ mod tests {
         let json = serde_json::json!({
             "toolCall": { "name": "write_to_file" }
         });
-        assert_eq!(extract_tool_name(&json), "write_to_file");
+        assert_eq!(
+            extract_tool_name(&json, HostFormat::Antigravity),
+            "write_to_file",
+        );
     }
 
     #[test]
     fn extract_tool_name_missing() {
         let json = serde_json::json!({});
-        assert_eq!(extract_tool_name(&json), "");
+        assert_eq!(extract_tool_name(&json, HostFormat::Claude), "");
+        assert_eq!(extract_tool_name(&json, HostFormat::Antigravity), "");
     }
 
     // ── Antigravity shell command tests ────────────────────────────────
