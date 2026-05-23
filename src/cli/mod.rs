@@ -23,6 +23,8 @@ pub enum HostFormat {
     Claude,
     /// Gemini CLI hooks (`AfterTool` / `BeforeTool`).
     Gemini,
+    /// Antigravity CLI hooks (`PreToolUse` / `Stop`).
+    Antigravity,
 }
 
 impl HostFormat {
@@ -31,7 +33,7 @@ impl HostFormat {
     pub const fn read_tool(self) -> &'static str {
         match self {
             Self::Claude => "Read",
-            Self::Gemini => "read_file",
+            Self::Gemini | Self::Antigravity => "read_file",
         }
     }
 
@@ -41,6 +43,7 @@ impl HostFormat {
         match self {
             Self::Claude => "Edit",
             Self::Gemini => "write_file",
+            Self::Antigravity => "write_to_file",
         }
     }
 }
@@ -273,12 +276,14 @@ mod tests {
     fn host_format_edit_tool_names() {
         assert_eq!(HostFormat::Claude.edit_tool(), "Edit");
         assert_eq!(HostFormat::Gemini.edit_tool(), "write_file");
+        assert_eq!(HostFormat::Antigravity.edit_tool(), "write_to_file");
     }
 
     #[test]
     fn host_format_read_tool_names() {
         assert_eq!(HostFormat::Claude.read_tool(), "Read");
         assert_eq!(HostFormat::Gemini.read_tool(), "read_file");
+        assert_eq!(HostFormat::Antigravity.read_tool(), "read_file");
     }
 
     #[test]

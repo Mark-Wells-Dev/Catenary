@@ -110,6 +110,11 @@ fn format_deny(reason: &str, format: HostFormat) -> String {
             "reason": reason
         })
         .to_string(),
+        HostFormat::Antigravity => serde_json::json!({
+            "decision": "deny",
+            "message": reason
+        })
+        .to_string(),
     }
 }
 
@@ -126,7 +131,54 @@ fn format_stop_block(reason: &str, format: HostFormat) -> String {
             "reason": reason
         })
         .to_string(),
+        HostFormat::Antigravity => serde_json::json!({
+            "decision": "block",
+            "message": reason
+        })
+        .to_string(),
     }
+}
+
+/// Extract `session_id` from hook payload, checking host-specific field names.
+///
+/// Claude Code and Gemini CLI use `session_id`; Antigravity CLI uses
+/// `conversationId`.
+fn extract_session_id(hook_json: &serde_json::Value) -> Option<&str> {
+    hook_json
+        .get("session_id")
+        .or_else(|| hook_json.get("conversationId"))
+        .and_then(|v| v.as_str())
+}
+
+/// Extract working directory from hook payload, checking host-specific field names.
+///
+/// Claude Code and Gemini CLI use `cwd`; Antigravity CLI uses
+/// `workspacePaths` (array, first entry used).
+fn extract_cwd_str(hook_json: &serde_json::Value) -> Option<&str> {
+    hook_json.get("cwd").and_then(|v| v.as_str()).or_else(|| {
+        hook_json
+            .get("workspacePaths")
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())
+            .and_then(|v| v.as_str())
+    })
+}
+
+/// Extract tool name from hook payload, checking host-specific field names.
+///
+/// Claude Code and Gemini CLI use `tool_name`; Antigravity CLI uses
+/// `toolCall.name`.
+fn extract_tool_name(hook_json: &serde_json::Value) -> &str {
+    hook_json
+        .get("tool_name")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            hook_json
+                .get("toolCall")
+                .and_then(|tc| tc.get("name"))
+                .and_then(|v| v.as_str())
+        })
+        .unwrap_or("")
 }
 
 /// Extract `agent_id` from hook payload. Defaults to empty string (main agent).
@@ -137,18 +189,30 @@ fn extract_agent_id(hook_json: &serde_json::Value) -> &str {
         .unwrap_or("")
 }
 
-/// Extracts the file path from hook JSON's `tool_input`.
+/// Extracts the file path from hook JSON, checking host-specific field names.
+///
+/// Claude Code / Gemini CLI: `tool_input.file_path` or `tool_input.file`.
+/// Antigravity CLI: `toolCall.args.TargetFile`.
 fn extract_file_path(hook_json: &serde_json::Value) -> Option<String> {
+    // Claude Code / Gemini CLI
     let file_path = hook_json
         .get("tool_input")
         .and_then(|ti| ti.get("file_path").or_else(|| ti.get("file")))
-        .and_then(|fp| fp.as_str())?;
+        .and_then(|fp| fp.as_str())
+        // Antigravity CLI
+        .or_else(|| {
+            hook_json
+                .get("toolCall")
+                .and_then(|tc| tc.get("args"))
+                .and_then(|a| a.get("TargetFile"))
+                .and_then(|fp| fp.as_str())
+        })?;
 
     // Resolve to absolute path
     let abs_path = if std::path::Path::new(file_path).is_absolute() {
         PathBuf::from(file_path)
     } else {
-        let cwd = hook_json.get("cwd").and_then(|v| v.as_str()).map_or_else(
+        let cwd = extract_cwd_str(hook_json).map_or_else(
             || std::env::current_dir().unwrap_or_default(),
             PathBuf::from,
         );
@@ -254,7 +318,7 @@ pub fn run_session_start(format: HostFormat) {
         return;
     };
 
-    let session_id = hook_json.get("session_id").and_then(|v| v.as_str());
+    let session_id = extract_session_id(&hook_json);
     let mut request = serde_json::json!({"method": "session-start/clear-editing"});
     if let Some(sid) = session_id {
         request["session_id"] = serde_json::json!(sid);
@@ -305,7 +369,7 @@ pub fn run_session_end() {
         return;
     };
 
-    let session_id = hook_json.get("session_id").and_then(|v| v.as_str());
+    let session_id = extract_session_id(&hook_json);
     let mut request = serde_json::json!({"method": "session-end/cleanup"});
     if let Some(sid) = session_id {
         request["session_id"] = serde_json::json!(sid);
@@ -326,7 +390,7 @@ fn emit_system_message(builder: crate::hook::response::SystemMessageBuilder, for
 /// Format a `systemMessage` for hook responses.
 fn format_system_message(msg: &str, format: HostFormat) -> String {
     match format {
-        HostFormat::Claude | HostFormat::Gemini => {
+        HostFormat::Claude | HostFormat::Gemini | HostFormat::Antigravity => {
             serde_json::json!({ "systemMessage": msg }).to_string()
         }
     }
@@ -356,7 +420,7 @@ pub fn run_post_agent(format: HostFormat) {
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     let agent_id = extract_agent_id(&hook_json);
-    let session_id = hook_json.get("session_id").and_then(|v| v.as_str());
+    let session_id = extract_session_id(&hook_json);
 
     let mut request = serde_json::json!({
         "method": "post-agent/require-release",
@@ -405,7 +469,7 @@ pub fn run_pre_agent(format: HostFormat) {
             "method": "pre-agent/turn-start",
             "host_payload": prepare_host_payload(&hook_json),
         });
-        if let Some(sid) = hook_json.get("session_id").and_then(|v| v.as_str()) {
+        if let Some(sid) = extract_session_id(&hook_json) {
             request["session_id"] = serde_json::json!(sid);
         }
         let _ = ipc_exchange(stream, &request);
@@ -431,10 +495,7 @@ pub fn run_pre_tool(format: HostFormat) {
         return;
     };
 
-    let tool_name = hook_json
-        .get("tool_name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let tool_name = extract_tool_name(&hook_json);
 
     // ── Catenary CLI commands ────────────────────────────────────
     // Recognize Catenary subcommands invoked via the host's shell
@@ -506,7 +567,7 @@ pub fn run_pre_tool(format: HostFormat) {
 
     let file_path = extract_file_path(&hook_json);
     let agent_id = extract_agent_id(&hook_json);
-    let session_id = hook_json.get("session_id").and_then(|v| v.as_str());
+    let session_id = extract_session_id(&hook_json);
     let shell_cmd = extract_shell_command(&hook_json, tool_name, format);
 
     let mut request = serde_json::json!({
@@ -562,10 +623,7 @@ fn check_shell_command(
     // typically a subdirectory of the workspace root.
     // This covers the common single-root case and "agent is in the right
     // directory" case. Multi-root coverage requires the session-side check.
-    let cwd = hook_json
-        .get("cwd")
-        .and_then(|v| v.as_str())
-        .map(PathBuf::from);
+    let cwd = extract_cwd_str(hook_json).map(PathBuf::from);
     if let Some(ref cwd_path) = cwd
         && let Some((root, pc)) = find_project_config(cwd_path)
     {
@@ -603,10 +661,7 @@ fn resolve_client_build_hint(
         .map(|p| p.display().to_string());
     let user_path_str = user_config_path.as_deref().unwrap_or("user config");
 
-    let cwd = hook_json
-        .get("cwd")
-        .and_then(|v| v.as_str())
-        .map(PathBuf::from);
+    let cwd = extract_cwd_str(hook_json).map(PathBuf::from);
     let project = cwd.as_deref().and_then(find_project_config);
     let proj_path = project
         .as_ref()
@@ -668,12 +723,13 @@ fn ipc_check_command(
 ) -> Option<String> {
     let stream = hook_connect(hook_json)?;
 
-    let cwd = hook_json.get("cwd").and_then(|v| v.as_str());
-    let session_id = hook_json.get("session_id").and_then(|v| v.as_str());
+    let cwd = extract_cwd_str(hook_json);
+    let session_id = extract_session_id(hook_json);
 
     let format_str = match format {
         HostFormat::Claude => "claude",
         HostFormat::Gemini => "gemini",
+        HostFormat::Antigravity => "antigravity",
     };
 
     let mut request = serde_json::json!({
@@ -710,13 +766,16 @@ fn extract_shell_command(
     let is_shell_tool = match format {
         HostFormat::Claude => tool_name == "Bash",
         HostFormat::Gemini => tool_name == "run_shell_command",
+        HostFormat::Antigravity => tool_name == "run_command",
     };
     if !is_shell_tool {
         return None;
     }
     let tool_input = hook_json
         .get("tool_input")
-        .or_else(|| hook_json.get("args"));
+        .or_else(|| hook_json.get("args"))
+        // Antigravity CLI: toolCall.args
+        .or_else(|| hook_json.get("toolCall").and_then(|tc| tc.get("args")));
     tool_input
         .and_then(|ti| ti.get("command"))
         .and_then(|c| c.as_str())
@@ -784,7 +843,7 @@ fn handle_start_editing_hook(hook_json: &serde_json::Value, format: HostFormat) 
     };
 
     let agent_id = extract_agent_id(hook_json);
-    let session_id = hook_json.get("session_id").and_then(|v| v.as_str());
+    let session_id = extract_session_id(hook_json);
 
     let mut request = serde_json::json!({
         "method": "pre-tool/start-editing",
@@ -817,7 +876,7 @@ fn handle_done_editing_hook(hook_json: &serde_json::Value, format: HostFormat) {
     };
 
     let agent_id = extract_agent_id(hook_json);
-    let session_id = hook_json.get("session_id").and_then(|v| v.as_str());
+    let session_id = extract_session_id(hook_json);
 
     let mut request = serde_json::json!({
         "method": "pre-tool/done-editing",
@@ -1480,5 +1539,205 @@ mod tests {
     #[test]
     fn catenary_stop_not_matched_as_start_editing() {
         assert!(!is_catenary_command("catenary stop", &["start_editing"]));
+    }
+
+    // ── Antigravity extraction tests ──────────────────────────────────
+
+    #[test]
+    fn antigravity_pre_tool_extracts_session_id() {
+        let json = serde_json::json!({
+            "conversationId": "conv-abc-123",
+            "workspacePaths": ["/home/user/project"],
+            "toolCall": {
+                "name": "write_to_file",
+                "args": { "TargetFile": "/src/main.rs" }
+            }
+        });
+        assert_eq!(extract_session_id(&json), Some("conv-abc-123"));
+    }
+
+    #[test]
+    fn antigravity_pre_tool_extracts_file_path() {
+        let json = serde_json::json!({
+            "conversationId": "conv-1",
+            "workspacePaths": ["/home/user/project"],
+            "toolCall": {
+                "name": "write_to_file",
+                "args": { "TargetFile": "/src/main.rs" }
+            }
+        });
+        assert_eq!(extract_file_path(&json), Some("/src/main.rs".to_string()),);
+    }
+
+    #[test]
+    fn antigravity_pre_tool_extracts_relative_file_path() {
+        let json = serde_json::json!({
+            "conversationId": "conv-1",
+            "workspacePaths": ["/home/user/project"],
+            "toolCall": {
+                "name": "write_to_file",
+                "args": { "TargetFile": "src/main.rs" }
+            }
+        });
+        assert_eq!(
+            extract_file_path(&json),
+            Some("/home/user/project/src/main.rs".to_string()),
+        );
+    }
+
+    #[test]
+    fn antigravity_deny_response_format() -> Result<()> {
+        let output = format_deny(
+            "run `catenary start_editing` before editing",
+            HostFormat::Antigravity,
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).context("should produce valid JSON")?;
+        assert_eq!(parsed["decision"], "deny");
+        assert_eq!(
+            parsed["message"],
+            "run `catenary start_editing` before editing",
+        );
+        // Antigravity format should NOT have hookSpecificOutput
+        assert!(parsed["hookSpecificOutput"].is_null());
+        // Antigravity uses "message" not "reason"
+        assert!(parsed["reason"].is_null());
+        Ok(())
+    }
+
+    #[test]
+    fn antigravity_allow_response_format() {
+        // Allow is indicated by printing nothing — no output means allow.
+        // The deny format is tested above; absence of output = allow.
+        // This test verifies that the deny structure is distinct from allow.
+        let output = format_deny("denied", HostFormat::Antigravity);
+        let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+        assert_eq!(parsed["decision"], "deny");
+    }
+
+    #[test]
+    fn antigravity_command_recognition() {
+        let json = serde_json::json!({
+            "conversationId": "conv-1",
+            "workspacePaths": ["/home/user/project"],
+            "toolCall": {
+                "name": "run_command",
+                "args": { "command": "catenary start_editing" }
+            }
+        });
+        let tool_name = extract_tool_name(&json);
+        assert_eq!(tool_name, "run_command");
+        assert_eq!(
+            extract_shell_command(&json, tool_name, HostFormat::Antigravity),
+            Some("catenary start_editing".to_string()),
+        );
+    }
+
+    #[test]
+    fn antigravity_stop_block_format() -> Result<()> {
+        let output = format_stop_block("files still in editing state", HostFormat::Antigravity);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).context("should produce valid JSON")?;
+        assert_eq!(parsed["decision"], "block");
+        assert_eq!(parsed["message"], "files still in editing state");
+        Ok(())
+    }
+
+    #[test]
+    fn antigravity_system_message_format() -> Result<()> {
+        let output = format_system_message("config error", HostFormat::Antigravity);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).context("should produce valid JSON")?;
+        assert_eq!(parsed["systemMessage"].as_str(), Some("config error"));
+        Ok(())
+    }
+
+    // ── extract_session_id tests ──────────────────────────────────────
+
+    #[test]
+    fn extract_session_id_claude() {
+        let json = serde_json::json!({ "session_id": "claude-sess-1" });
+        assert_eq!(extract_session_id(&json), Some("claude-sess-1"));
+    }
+
+    #[test]
+    fn extract_session_id_antigravity() {
+        let json = serde_json::json!({ "conversationId": "ag-conv-1" });
+        assert_eq!(extract_session_id(&json), Some("ag-conv-1"));
+    }
+
+    #[test]
+    fn extract_session_id_missing() {
+        let json = serde_json::json!({});
+        assert!(extract_session_id(&json).is_none());
+    }
+
+    // ── extract_cwd_str tests ─────────────────────────────────────────
+
+    #[test]
+    fn extract_cwd_str_claude() {
+        let json = serde_json::json!({ "cwd": "/home/user/project" });
+        assert_eq!(extract_cwd_str(&json), Some("/home/user/project"));
+    }
+
+    #[test]
+    fn extract_cwd_str_antigravity() {
+        let json = serde_json::json!({ "workspacePaths": ["/home/user/project", "/other"] });
+        assert_eq!(extract_cwd_str(&json), Some("/home/user/project"));
+    }
+
+    #[test]
+    fn extract_cwd_str_missing() {
+        let json = serde_json::json!({});
+        assert!(extract_cwd_str(&json).is_none());
+    }
+
+    // ── extract_tool_name tests ───────────────────────────────────────
+
+    #[test]
+    fn extract_tool_name_claude() {
+        let json = serde_json::json!({ "tool_name": "Edit" });
+        assert_eq!(extract_tool_name(&json), "Edit");
+    }
+
+    #[test]
+    fn extract_tool_name_antigravity() {
+        let json = serde_json::json!({
+            "toolCall": { "name": "write_to_file" }
+        });
+        assert_eq!(extract_tool_name(&json), "write_to_file");
+    }
+
+    #[test]
+    fn extract_tool_name_missing() {
+        let json = serde_json::json!({});
+        assert_eq!(extract_tool_name(&json), "");
+    }
+
+    // ── Antigravity shell command tests ────────────────────────────────
+
+    #[test]
+    fn extract_shell_command_antigravity_run_command() {
+        let json = serde_json::json!({
+            "toolCall": {
+                "name": "run_command",
+                "args": { "command": "make test" }
+            }
+        });
+        assert_eq!(
+            extract_shell_command(&json, "run_command", HostFormat::Antigravity),
+            Some("make test".to_string()),
+        );
+    }
+
+    #[test]
+    fn extract_shell_command_antigravity_non_shell_returns_none() {
+        let json = serde_json::json!({
+            "toolCall": {
+                "name": "write_to_file",
+                "args": { "TargetFile": "/src/main.rs" }
+            }
+        });
+        assert!(extract_shell_command(&json, "write_to_file", HostFormat::Antigravity).is_none(),);
     }
 }

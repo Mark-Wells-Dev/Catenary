@@ -24,6 +24,7 @@ fn parse_host_format(s: &str) -> Option<crate::cli::HostFormat> {
     match s {
         "claude" => Some(crate::cli::HostFormat::Claude),
         "gemini" => Some(crate::cli::HostFormat::Gemini),
+        "antigravity" => Some(crate::cli::HostFormat::Antigravity),
         _ => None,
     }
 }
@@ -32,11 +33,19 @@ fn parse_host_format(s: &str) -> Option<crate::cli::HostFormat> {
 
 /// Returns `true` if the tool is an edit tool that requires `start_editing`.
 ///
-/// Checks all known edit tool names across host CLIs (Claude Code and Gemini CLI).
+/// Checks all known edit tool names across host CLIs (Claude Code, Gemini CLI,
+/// and Antigravity CLI).
 fn is_edit_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "Edit" | "Write" | "NotebookEdit" | "write_file" | "replace"
+        "Edit"
+            | "Write"
+            | "NotebookEdit"
+            | "write_file"
+            | "replace"
+            | "write_to_file"
+            | "replace_file_content"
+            | "multi_replace_file_content"
     )
 }
 
@@ -47,9 +56,9 @@ fn is_read_tool(tool_name: &str) -> bool {
     matches!(tool_name, "Read" | "NotebookRead" | "read_file")
 }
 
-/// Returns `true` if the tool is a shell tool (Bash or `run_shell_command`).
+/// Returns `true` if the tool is a shell tool (Bash, `run_shell_command`, or `run_command`).
 fn is_bash_tool(tool_name: &str) -> bool {
-    matches!(tool_name, "Bash" | "run_shell_command")
+    matches!(tool_name, "Bash" | "run_shell_command" | "run_command")
 }
 
 /// Filesystem-manipulation commands allowed during editing mode.
@@ -635,6 +644,10 @@ mod tests {
         // Gemini CLI edit tools
         assert!(is_edit_tool("write_file"));
         assert!(is_edit_tool("replace"));
+        // Antigravity CLI edit tools
+        assert!(is_edit_tool("write_to_file"));
+        assert!(is_edit_tool("replace_file_content"));
+        assert!(is_edit_tool("multi_replace_file_content"));
         // Non-edit tools
         assert!(!is_edit_tool("Read"));
         assert!(!is_edit_tool("Bash"));
@@ -648,6 +661,7 @@ mod tests {
         assert!(is_read_tool("read_file"));
         assert!(!is_read_tool("Edit"));
         assert!(!is_read_tool("Bash"));
+        assert!(!is_read_tool("run_command"));
     }
 
     #[test]
@@ -1093,6 +1107,7 @@ mod tests {
     fn test_is_bash_tool() {
         assert!(is_bash_tool("Bash"));
         assert!(is_bash_tool("run_shell_command"));
+        assert!(is_bash_tool("run_command")); // Antigravity CLI
         assert!(!is_bash_tool("Edit"));
         assert!(!is_bash_tool("Read"));
         assert!(!is_bash_tool("bash")); // case-sensitive

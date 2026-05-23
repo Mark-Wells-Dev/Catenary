@@ -23,6 +23,10 @@ const CLAUDE_HOOKS_EXPECTED: &str = include_str!("../../plugins/catenary/hooks/h
 /// Expected Gemini CLI hooks, embedded at compile time.
 const GEMINI_HOOKS_EXPECTED: &str = include_str!("../../hooks/hooks.json");
 
+/// Expected Antigravity CLI hooks, embedded at compile time.
+const ANTIGRAVITY_HOOKS_EXPECTED: &str =
+    include_str!("../../plugins/catenary-antigravity/hooks.json");
+
 /// Migration guidance for users who still have the legacy Python script configured.
 const CONSTRAINED_BASH_MIGRATION: &str = "Command filtering is now built into `catenary hook pre-tool`. \
      Remove the constrained_bash.py hook from your settings and use \
@@ -499,6 +503,7 @@ pub async fn run_doctor(project_root: &Path, nocolor: bool, show_diff: bool) -> 
     println!("{}:", colors.bold("Hooks"));
     check_claude_hooks(&colors, show_diff);
     check_gemini_hooks(&colors, show_diff);
+    check_antigravity_hooks(&colors, show_diff);
     check_path_binary(&colors);
 
     // Legacy script migration warnings
@@ -1426,6 +1431,57 @@ fn check_gemini_hooks(colors: &ColorConfig, show_diff: bool) {
         Err(_) => {
             println!(
                 "  {label}{ver_col}{}",
+                colors.yellow("? hooks.json not found"),
+            );
+        }
+    }
+}
+
+/// Check Antigravity CLI plugin hooks against the embedded expected hooks.
+fn check_antigravity_hooks(colors: &ColorConfig, show_diff: bool) {
+    let label = format!("{:<14}", "Antigravity");
+    let Ok(home_str) = std::env::var("HOME") else {
+        println!(
+            "  {label}{}",
+            colors.dim("- cannot determine home directory"),
+        );
+        return;
+    };
+    let home = PathBuf::from(home_str);
+
+    // Look for the Antigravity plugin directory.
+    // Antigravity stores plugins under ~/.antigravity/plugins/.
+    let plugin_dir = home.join(".antigravity/plugins/catenary");
+    if !plugin_dir.is_dir() {
+        println!("  {label}{}", colors.dim("- not installed"));
+        return;
+    }
+
+    let spacer = " ".repeat(20);
+
+    let hooks_path = plugin_dir.join("hooks.json");
+    match std::fs::read_to_string(&hooks_path) {
+        Ok(installed) => {
+            if normalize_json(&installed) == normalize_json(ANTIGRAVITY_HOOKS_EXPECTED) {
+                println!("  {label}{spacer}{}", colors.green("✓ hooks match"));
+            } else {
+                println!(
+                    "  {label}{spacer}{}",
+                    colors.red("✗ stale hooks (reinstall plugin)"),
+                );
+                if show_diff {
+                    show_unified_diff(
+                        &pretty_json(&installed),
+                        &pretty_json(ANTIGRAVITY_HOOKS_EXPECTED),
+                        "installed",
+                        "expected",
+                    );
+                }
+            }
+        }
+        Err(_) => {
+            println!(
+                "  {label}{spacer}{}",
                 colors.yellow("? hooks.json not found"),
             );
         }

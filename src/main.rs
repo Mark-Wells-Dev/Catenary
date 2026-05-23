@@ -175,35 +175,35 @@ enum HookCommand {
     /// Pre-agent: signal turn start (`UserPromptSubmit` / `BeforeAgent`).
     #[command(name = "pre-agent")]
     PreAgent {
-        /// Output format: "claude" or "gemini".
+        /// Output format: "claude", "gemini", or "antigravity".
         #[arg(long, value_enum)]
         format: HostFormat,
     },
     /// Pre-tool: editing state enforcement (`PreToolUse` / `BeforeTool`).
     #[command(name = "pre-tool")]
     PreTool {
-        /// Output format: "claude" or "gemini".
+        /// Output format: "claude", "gemini", or "antigravity".
         #[arg(long, value_enum)]
         format: HostFormat,
     },
     /// Post-agent: force `done_editing` before agent finishes (`Stop` / `AfterAgent`).
     #[command(name = "post-agent")]
     PostAgent {
-        /// Output format: "claude" or "gemini".
+        /// Output format: "claude", "gemini", or "antigravity".
         #[arg(long, value_enum)]
         format: HostFormat,
     },
     /// `SessionStart`: clear stale editing state.
     #[command(name = "session-start")]
     SessionStart {
-        /// Output format: "claude" or "gemini".
+        /// Output format: "claude", "gemini", or "antigravity".
         #[arg(long, value_enum)]
         format: HostFormat,
     },
     /// `SessionEnd`: clean up session state (roots, editing).
     #[command(name = "session-end")]
     SessionEnd {
-        /// Output format: "claude" or "gemini".
+        /// Output format: "claude", "gemini", or "antigravity".
         #[arg(long, value_enum)]
         format: HostFormat,
     },
@@ -822,6 +822,22 @@ mod tests {
             unreachable!("expected Hook command");
         };
         assert!(matches!(command, HookCommand::SessionEnd { .. }));
+    }
+
+    #[test]
+    fn test_cli_hook_antigravity_format() {
+        use clap::Parser;
+        let args = Args::try_parse_from(["catenary", "hook", "pre-tool", "--format=antigravity"]);
+        let args = args.expect("hook pre-tool with antigravity format should parse");
+        let Some(Command::Hook { command }) = args.command else {
+            unreachable!("expected Hook command");
+        };
+        assert!(matches!(
+            command,
+            HookCommand::PreTool {
+                format: HostFormat::Antigravity
+            }
+        ));
     }
 
     #[test]

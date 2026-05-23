@@ -1,0 +1,43 @@
+{
+  "catenary-editing": {
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "catenary hook session-start --format=antigravity"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "write_to_file|replace_file_content|multi_replace_file_content|run_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "catenary hook pre-tool --format=antigravity"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "catenary hook post-agent --format=antigravity"
+      }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "catenary hook session-end --format=antigravity"
+          }
+        ]
+      }
+    ]
+  }
+}
