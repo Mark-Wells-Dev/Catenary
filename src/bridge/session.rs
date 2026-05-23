@@ -164,9 +164,6 @@ pub struct Session {
     pub instance_id: Arc<str>,
     /// Tokio runtime handle for blocking dispatch.
     pub runtime: Handle,
-    /// Set by `HookRouter` on `PreAgent` dispatch, cleared by `McpServer`
-    /// run loop. Triggers a `roots/list` poll at the next turn boundary.
-    pub roots_refresh_requested: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Session {
@@ -277,7 +274,6 @@ impl Session {
             symbol_index,
             instance_id,
             runtime,
-            roots_refresh_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -285,8 +281,8 @@ impl Session {
     ///
     /// Shares heavy resources (`LspClientManager`, `FilesystemManager`,
     /// `SymbolIndex`, config, logging) with the daemon's primary session.
-    /// Creates fresh per-session state: editing manager, CWD stash,
-    /// transcript state, and roots-refresh flag.
+    /// Creates fresh per-session state: editing manager and editing
+    /// guardrail.
     ///
     /// The shared [`NotificationRouter`] handles per-session routing via
     /// the `session_id` tracing span — no per-session sink registration
@@ -356,7 +352,6 @@ impl Session {
             symbol_index: primary.symbol_index.clone(),
             instance_id: session_id,
             runtime: primary.runtime.clone(),
-            roots_refresh_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 

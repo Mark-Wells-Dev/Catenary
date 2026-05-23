@@ -325,9 +325,6 @@ impl HookRouter {
                     source = Source::HookDispatch.as_str(),
                     turn, "Hook: turn start"
                 );
-                self.session
-                    .roots_refresh_requested
-                    .store(true, Ordering::Release);
 
                 DispatchResult {
                     result: None,
@@ -1573,27 +1570,6 @@ mod tests {
 
         router.dispatch(crate::hook::HookRequest::PreAgent { session_id: None }, 0);
         assert_eq!(router.turn(), 2);
-    }
-
-    #[test]
-    fn pre_agent_sets_roots_refresh_flag() {
-        let router = test_router();
-        assert!(
-            !router
-                .session
-                .roots_refresh_requested
-                .load(Ordering::Acquire),
-            "flag should start false"
-        );
-
-        router.dispatch(crate::hook::HookRequest::PreAgent { session_id: None }, 0);
-        assert!(
-            router
-                .session
-                .roots_refresh_requested
-                .load(Ordering::Acquire),
-            "flag should be set after PreAgent"
-        );
     }
 
     // ── Command check + debounce tests ────────────────────────────
