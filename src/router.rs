@@ -3269,10 +3269,9 @@ mod tests {
             let _ = m.accept_loop().await;
         });
 
-        // Session A: enter editing mode via start_editing pre-tool hook.
+        // Session A: enter editing mode via CLI start_editing hook.
         let req = serde_json::json!({
-            "method": "pre-tool/editing-state",
-            "tool_name": "mcp_catenary_start_editing",
+            "method": "pre-tool/start-editing",
             "agent_id": "",
             "session_id": "session-a"
         });

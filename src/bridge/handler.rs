@@ -17,8 +17,7 @@ use crate::mcp::{CallToolResult, Tool, ToolHandler};
 
 /// MCP tool call router.
 ///
-/// Routes `tools/call` requests to the appropriate tool server and
-/// handles editing lifecycle (`start_editing`/`done_editing`).
+/// Routes `tools/call` requests to the appropriate tool server.
 /// Implements [`ToolHandler`] to maintain clean dependency direction
 /// between the `mcp` (protocol) and `bridge` (application) modules.
 #[derive(Clone)]
@@ -224,54 +223,6 @@ impl ToolHandler for McpRouter {
                     "openWorldHint": false
                 })),
             },
-            Tool {
-                name: "start_editing".to_string(),
-                title: Some("Catenary: Start Editing".to_string()),
-                description: Some(
-                    "Enter editing mode. Diagnostics are deferred until done_editing is called. \
-                     Call this before using Edit. Takes no arguments."
-                        .to_string(),
-                ),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {},
-                }),
-                annotations: Some(serde_json::json!({
-                    "readOnlyHint": false,
-                    "destructiveHint": false,
-                    "idempotentHint": true,
-                    "openWorldHint": false
-                })),
-            },
-            Tool {
-                name: "done_editing".to_string(),
-                title: Some("Catenary: Done Editing".to_string()),
-                description: Some(
-                    "Exit editing mode and return LSP diagnostics for all modified files. \
-                     While editing, Edit, Read, grep, and glob remain available. All other \
-                     tools are blocked until done_editing returns.\n\n\
-                     Output starts with [LSP available], then lists each modified file with \
-                     diagnostics (errors/warnings) or [clean]. Files without language server \
-                     coverage are omitted. When truncated, a [cursor: ...] token appears — \
-                     pass it back to see the next page."
-                        .to_string(),
-                ),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "cursor": {
-                            "type": "string",
-                            "description": "Continuation token from a previous truncated result.",
-                        }
-                    },
-                }),
-                annotations: Some(serde_json::json!({
-                    "readOnlyHint": true,
-                    "destructiveHint": false,
-                    "idempotentHint": false,
-                    "openWorldHint": false
-                })),
-            },
         ]
     }
 
@@ -282,48 +233,6 @@ impl ToolHandler for McpRouter {
         parent_id: Option<String>,
         cancel: &CancellationToken,
     ) -> Result<CallToolResult> {
-        // Editing tools: no-op triggers. The PreToolUse hook enters editing
-        // mode (start_editing) and the PostToolUse hook exits + runs batch
-        // diagnostics (done_editing). The hooks own the state transitions
-        // because they have the real agent_id from the host CLI.
-        if name == "start_editing" {
-            self.session.diagnostics.clear_cache();
-            return Ok(CallToolResult::text(
-                "editing mode \u{2014} diagnostics deferred until done_editing",
-            ));
-        }
-
-        if name == "done_editing" {
-            let cursor = arguments
-                .as_ref()
-                .and_then(|a| a.get("cursor"))
-                .and_then(serde_json::Value::as_str);
-
-            if let Some(token) = cursor {
-                // Serve from cache — no editing state change, no LSP.
-                let output = self
-                    .session
-                    .diagnostics
-                    .get_cursor(token)
-                    .unwrap_or_else(|| {
-                        "invalid or expired cursor \u{2014} run done_editing first".into()
-                    });
-                return Ok(CallToolResult::text(output));
-            }
-
-            let files = self.session.editing.drain_all_and_clear();
-            if let Some(guardrail) = &self.session.editing_guardrail {
-                guardrail.release_all(&self.session.instance_id);
-            }
-            let output = self.session.runtime.block_on(
-                self.session
-                    .diagnostics
-                    .process_files_batched(&files, parent_id.as_deref()),
-            );
-
-            return Ok(CallToolResult::text(output));
-        }
-
         // Notify servers about filesystem changes before any LSP interaction.
         self.session
             .runtime

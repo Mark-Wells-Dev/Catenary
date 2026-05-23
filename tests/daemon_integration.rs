@@ -552,8 +552,7 @@ fn editing_guardrail_blocks_cross_session() -> Result<()> {
     hook_roundtrip(
         &hook_path,
         &json!({
-            "method": "pre-tool/editing-state",
-            "tool_name": "mcp_catenary_start_editing",
+            "method": "pre-tool/start-editing",
             "agent_id": "",
             "session_id": "session-a"
         }),
@@ -577,8 +576,7 @@ fn editing_guardrail_blocks_cross_session() -> Result<()> {
     hook_roundtrip(
         &hook_path,
         &json!({
-            "method": "pre-tool/editing-state",
-            "tool_name": "mcp_catenary_start_editing",
+            "method": "pre-tool/start-editing",
             "agent_id": "",
             "session_id": "session-b"
         }),

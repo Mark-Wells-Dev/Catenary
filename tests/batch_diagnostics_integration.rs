@@ -164,7 +164,7 @@ fn test_batch_uncovered_file() -> Result<()> {
 
 // ─── Empty batch ────────────────────────────────────────────────────
 
-/// No files accumulated during editing. Returns `[clean]`.
+/// No files accumulated during editing. Returns `[no files modified]`.
 #[test]
 fn test_batch_empty() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -180,8 +180,8 @@ fn test_batch_empty() -> Result<()> {
     let text = bridge.call_diagnostics_multi(&[])?;
 
     assert!(
-        text.contains("[clean]"),
-        "Empty batch should return [clean]. Got: {text}"
+        text.contains("[no files modified]"),
+        "Empty batch should return [no files modified]. Got: {text}"
     );
 
     Ok(())

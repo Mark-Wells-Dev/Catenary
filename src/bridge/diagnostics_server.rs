@@ -20,7 +20,6 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
@@ -31,16 +30,8 @@ struct ServerDiagnostics {
     entries: Vec<String>,
 }
 
-/// Cached diagnostics for paging beyond page 1.
-struct DiagnosticsCache {
-    generation: u64,
-    per_page: usize,
-    files: BTreeMap<String, CachedFile>,
-    clean: Vec<TrackedEntry>,
-}
-
-/// Per-file cached entries for paging.
-struct CachedFile {
+/// File with diagnostics for root-grouped output.
+struct DiagnosticFile {
     display: String,
     /// Grouping root: workspace root, or parent directory for
     /// single-file-server files outside all roots.
@@ -50,9 +41,8 @@ struct CachedFile {
     entries: Vec<String>,
 }
 
-/// Entry with root tracking for root-grouped output.
-#[derive(Clone)]
-struct TrackedEntry {
+/// Clean file entry for root-grouped output.
+struct CleanEntry {
     display: String,
     /// Grouping root: workspace root, or parent directory for
     /// single-file-server files outside all roots.
@@ -83,14 +73,6 @@ pub struct DiagnosticsServer {
     fs: Arc<FilesystemManager>,
     /// Symbol index for enclosing-symbol annotation on diagnostics.
     symbol_index: Option<Arc<std::sync::Mutex<SymbolIndex>>>,
-    /// Monotonic generation counter for cursor validity.
-    ///
-    /// Incremented on each `process_files_batched` and `clear_cache`.
-    /// Embedded in cursor tokens so stale cursors from previous
-    /// batches are structurally rejected.
-    generation: AtomicU64,
-    /// Cached full diagnostics from the last batch run, for paging.
-    cache: std::sync::Mutex<Option<DiagnosticsCache>>,
 }
 
 impl DiagnosticsServer {
@@ -106,8 +88,6 @@ impl DiagnosticsServer {
             path_validator,
             fs,
             symbol_index,
-            generation: AtomicU64::new(0),
-            cache: std::sync::Mutex::new(None),
         }
     }
 
@@ -194,8 +174,8 @@ impl DiagnosticsServer {
                 .await;
         }
 
-        // ── Phase 3: classify, build cache, and format page 1 ──
-        let output = self.build_cache_and_format(&canonical_paths, &file_results);
+        // ── Phase 3: classify and format ─────────────────────────
+        let output = self.format_output(&canonical_paths, &file_results);
 
         // ── Phase 4: mark_current ─────────────────────────────────
         self.fs.mark_current(&canonical_paths);
@@ -203,23 +183,18 @@ impl DiagnosticsServer {
         output
     }
 
-    /// Classifies files from server results, builds the paging cache,
-    /// and returns the formatted page-1 output.
+    /// Classifies files from server results and formats the full output.
     ///
-    /// Bumps the generation counter so cursors from previous batches
-    /// are structurally rejected.
-    fn build_cache_and_format(
+    /// Output starts with `[LSP available]`, followed by root-grouped
+    /// file entries with diagnostics or `[clean]` markers. Root headers
+    /// are collapsed when only one file exists under that root.
+    fn format_output(
         &self,
         canonical_paths: &[PathBuf],
         file_results: &BTreeMap<String, (String, Vec<ServerDiagnostics>)>,
     ) -> String {
-        let per_page = {
-            let config = self.client_manager.config();
-            config.tools.as_ref().map_or(50, |t| t.diagnostics_per_page)
-        };
-
-        let mut cached_files: BTreeMap<String, CachedFile> = BTreeMap::new();
-        let mut clean: Vec<TrackedEntry> = Vec::new();
+        let mut diag_files: Vec<DiagnosticFile> = Vec::new();
+        let mut clean: Vec<CleanEntry> = Vec::new();
 
         for cp in canonical_paths {
             let key = cp.to_string_lossy().to_string();
@@ -231,36 +206,19 @@ impl DiagnosticsServer {
 
             match classify_file(segments) {
                 FileOutcome::HasDiagnostics(entries) => {
-                    cached_files.insert(
-                        key,
-                        CachedFile {
-                            display,
-                            root,
-                            entries,
-                        },
-                    );
+                    diag_files.push(DiagnosticFile {
+                        display,
+                        root,
+                        entries,
+                    });
                 }
                 FileOutcome::Clean | FileOutcome::NoResults => {
-                    clean.push(TrackedEntry { display, root });
+                    clean.push(CleanEntry { display, root });
                 }
             }
         }
 
-        let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
-        let cache = DiagnosticsCache {
-            generation,
-            per_page,
-            files: cached_files,
-            clean,
-        };
-
-        let output = format_page(&cache, 1);
-
-        if let Ok(mut guard) = self.cache.lock() {
-            *guard = Some(cache);
-        }
-
-        output
+        format_diagnostics(&diag_files, &clean)
     }
 
     /// Runs the batched diagnostics lifecycle on a single server.
@@ -602,37 +560,6 @@ impl DiagnosticsServer {
                 .map_or_else(|| PathBuf::from("/"), PathBuf::from)
         })
     }
-
-    /// Returns a formatted page of cached diagnostics.
-    ///
-    /// Page 1 is produced by [`Self::process_files_batched`]. Pages 2+
-    /// are served from the cache built during that call. Returns `None`
-    /// if the cache is empty (no prior `done_editing` call).
-    /// Serves a page of cached diagnostics identified by an opaque cursor.
-    ///
-    /// Returns `None` if the cursor is invalid or the cache is empty.
-    pub fn get_cursor(&self, token: &str) -> Option<String> {
-        let (generation, page) = decode_cursor(token)?;
-        let guard = self.cache.lock().ok()?;
-        let cache = guard.as_ref()?;
-        if cache.generation != generation {
-            return None;
-        }
-        let result = format_page(cache, page);
-        drop(guard);
-        Some(result)
-    }
-
-    /// Clears the diagnostics page cache.
-    ///
-    /// Called on `start_editing` so that stale pages from a previous
-    /// batch cannot be served during the new editing session.
-    pub fn clear_cache(&self) {
-        self.generation.fetch_add(1, Ordering::Relaxed);
-        if let Ok(mut guard) = self.cache.lock() {
-            *guard = None;
-        }
-    }
 }
 
 /// Samples cumulative ticks for use as an [`IdleDetector::after_activity`]
@@ -903,98 +830,40 @@ pub(crate) fn format_diagnostics_entries(
         .collect()
 }
 
-// ─── Cursor-based paging ──────────────────────────────────────────────
-
-/// Encodes an opaque cursor token from a generation and 1-based page number.
-fn encode_cursor(generation: u64, page: usize) -> String {
-    format!("d{generation}.{page}")
-}
-
-/// Decodes an opaque cursor token to a `(generation, page)` pair.
-fn decode_cursor(token: &str) -> Option<(u64, usize)> {
-    let rest = token.strip_prefix('d')?;
-    let (generation_str, page_str) = rest.split_once('.')?;
-    let generation = generation_str.parse().ok()?;
-    let page = page_str.parse().ok()?;
-    Some((generation, page))
-}
-
-/// Formats a page of diagnostics from the cache.
+/// Formats the full diagnostics output.
 ///
 /// Output starts with `[LSP available]`, followed by bare root-path
 /// section headers. Files without LSP coverage are omitted. Clean
-/// files are listed inline with `[clean]`. Appends `[cursor: ...]`
-/// when more entries remain.
+/// files are listed inline with `[clean]`.
 ///
 /// When a root contains a single file, the root and filename are
 /// collapsed into one path (e.g. `/tmp/scratch.sh`). Multi-file
 /// roots get a directory header with indented file entries beneath.
-fn format_page(cache: &DiagnosticsCache, page: usize) -> String {
+fn format_diagnostics(diag_files: &[DiagnosticFile], clean: &[CleanEntry]) -> String {
     use std::fmt::Write;
 
-    let per_page = cache.per_page;
-    let start = (page - 1) * per_page;
-    let mut has_more = false;
-
-    // Per-root: diagnostic file entries collected without indentation
-    // so the render pass can choose single-file vs multi-file layout.
-    let mut root_diag_files: BTreeMap<&PathBuf, Vec<(&str, String)>> = BTreeMap::new();
+    let mut root_diag: BTreeMap<&PathBuf, Vec<(&str, &[String])>> = BTreeMap::new();
     let mut root_clean: BTreeMap<&PathBuf, Vec<&str>> = BTreeMap::new();
 
-    for cached in cache.files.values() {
-        let end = cached.entries.len().min(start + per_page);
-        if start >= cached.entries.len() {
-            continue;
-        }
-        let page_entries = &cached.entries[start..end];
-        if page_entries.is_empty() {
-            root_clean
-                .entry(&cached.root)
-                .or_default()
-                .push(&cached.display);
-            continue;
-        }
-
-        let mut content = String::new();
-        for entry in page_entries {
-            for line in entry.lines() {
-                _ = writeln!(content, "{line}");
-            }
-        }
-        let remaining = cached.entries.len() - end;
-        if remaining > 0 {
-            has_more = true;
-            _ = writeln!(content, "... {remaining} more");
-        }
-
-        root_diag_files
-            .entry(&cached.root)
+    for df in diag_files {
+        root_diag
+            .entry(&df.root)
             .or_default()
-            .push((&cached.display, content));
+            .push((&df.display, &df.entries));
+    }
+    for ce in clean {
+        root_clean.entry(&ce.root).or_default().push(&ce.display);
     }
 
-    if page == 1 {
-        for entry in &cache.clean {
-            root_clean
-                .entry(&entry.root)
-                .or_default()
-                .push(&entry.display);
-        }
-    }
-
-    // Collect all roots with any content.
     let mut all_roots: BTreeSet<&PathBuf> = BTreeSet::new();
-    all_roots.extend(root_diag_files.keys());
+    all_roots.extend(root_diag.keys());
     all_roots.extend(root_clean.keys());
 
     let mut output = String::new();
-
-    if page == 1 {
-        _ = writeln!(output, "[LSP available]");
-    }
+    _ = writeln!(output, "[LSP available]");
 
     for root in &all_roots {
-        let diag_count = root_diag_files.get(root).map_or(0, Vec::len);
+        let diag_count = root_diag.get(root).map_or(0, Vec::len);
         let clean_count = root_clean.get(root).map_or(0, Vec::len);
         let total = diag_count + clean_count;
         let collapsed = total == 1;
@@ -1003,16 +872,18 @@ fn format_page(cache: &DiagnosticsCache, page: usize) -> String {
 
         if collapsed {
             // Single file: merge root and filename into one path.
-            if let Some(files) = root_diag_files.get(root) {
-                for (display, content) in files {
+            if let Some(files) = root_diag.get(root) {
+                for (display, entries) in files {
                     _ = writeln!(output, "{}:", root.join(display).display());
-                    for line in content.lines() {
-                        _ = writeln!(output, "\t{line}");
+                    for entry in *entries {
+                        for line in entry.lines() {
+                            _ = writeln!(output, "\t{line}");
+                        }
                     }
                 }
             }
-            if let Some(clean) = root_clean.get(root) {
-                for f in clean {
+            if let Some(clean_files) = root_clean.get(root) {
+                for f in clean_files {
                     _ = writeln!(output, "{}", root.join(f).display());
                     _ = writeln!(output, "\t[clean]");
                 }
@@ -1020,33 +891,23 @@ fn format_page(cache: &DiagnosticsCache, page: usize) -> String {
         } else {
             // Multiple files: directory header with indented entries.
             _ = writeln!(output, "{}", root.display());
-            if let Some(files) = root_diag_files.get(root) {
-                for (display, content) in files {
+            if let Some(files) = root_diag.get(root) {
+                for (display, entries) in files {
                     _ = writeln!(output, "\t{display}:");
-                    for line in content.lines() {
-                        _ = writeln!(output, "\t\t{line}");
+                    for entry in *entries {
+                        for line in entry.lines() {
+                            _ = writeln!(output, "\t\t{line}");
+                        }
                     }
                 }
             }
-            if let Some(clean) = root_clean.get(root) {
-                for f in clean {
+            if let Some(clean_files) = root_clean.get(root) {
+                for f in clean_files {
                     _ = writeln!(output, "\t{f}");
                     _ = writeln!(output, "\t\t[clean]");
                 }
             }
         }
-    }
-
-    if has_more {
-        _ = writeln!(
-            output,
-            "[cursor: {}]",
-            encode_cursor(cache.generation, page + 1)
-        );
-    }
-
-    if output.is_empty() && page > 1 {
-        output = "no more diagnostics\n".to_string();
     }
 
     output
@@ -1060,77 +921,6 @@ fn format_page(cache: &DiagnosticsCache, page: usize) -> String {
 mod tests {
     use super::*;
     use std::path::Path;
-
-    // ── cursor encode/decode tests ──────────────────────────────
-
-    #[test]
-    fn cursor_round_trip() {
-        assert_eq!(decode_cursor(&encode_cursor(1, 2)), Some((1, 2)));
-        assert_eq!(decode_cursor(&encode_cursor(5, 100)), Some((5, 100)));
-    }
-
-    #[test]
-    fn cursor_encode_format() {
-        assert_eq!(encode_cursor(3, 2), "d3.2");
-        assert_eq!(encode_cursor(0, 1), "d0.1");
-    }
-
-    #[test]
-    fn cursor_decode_invalid() {
-        assert_eq!(decode_cursor(""), None);
-        assert_eq!(decode_cursor("g5"), None); // glob cursor, not diag
-        assert_eq!(decode_cursor("abc"), None);
-        assert_eq!(decode_cursor("d5"), None); // old format, missing dot
-        assert_eq!(decode_cursor("d.5"), None); // missing generation
-        assert_eq!(decode_cursor("d1."), None); // missing page
-        assert_eq!(decode_cursor("d1.abc"), None); // non-numeric page
-    }
-
-    #[test]
-    fn get_cursor_correct_generation_returns_page() {
-        let cache = make_cache(
-            vec![
-                ":1:1 [error] test: msg 0".to_string(),
-                ":2:1 [error] test: msg 1".to_string(),
-            ],
-            1,
-        );
-        // Cache has generation 1, cursor requests gen 1 page 2.
-        let output = format_page(&cache, 2);
-        assert!(output.contains("msg 1"), "output: {output}");
-        // Verify cursor encodes correctly for this generation.
-        let page1 = format_page(&cache, 1);
-        assert!(page1.contains("[cursor: d1.2]"), "page1: {page1}");
-    }
-
-    #[test]
-    fn get_cursor_wrong_generation_returns_none() {
-        // Cursor from generation 1, but cache is at generation 2.
-        let mut cache = make_cache(vec![":1:1 [error] test: msg".to_string()], 50);
-        cache.generation = 2;
-        // Token encodes generation 1 — mismatch should be detectable.
-        let token = encode_cursor(1, 2);
-        let (cursor_gen, _page) = decode_cursor(&token).expect("valid token");
-        assert_ne!(cursor_gen, cache.generation, "generations should differ");
-    }
-
-    #[test]
-    fn clear_cache_invalidates_cursors() {
-        // Simulate: batch produces generation 1 cursor, clear_cache bumps.
-        let counter = AtomicU64::new(1);
-        let cursor = encode_cursor(counter.load(Ordering::Relaxed), 2);
-
-        // Simulate clear_cache: bump generation.
-        counter.fetch_add(1, Ordering::Relaxed);
-        let new_generation = counter.load(Ordering::Relaxed);
-
-        // Old cursor's generation no longer matches.
-        let (cursor_gen, _) = decode_cursor(&cursor).expect("valid token");
-        assert_ne!(
-            cursor_gen, new_generation,
-            "old cursor should not match new generation"
-        );
-    }
 
     // ── classify_file tests ─────────────────────────────────────
 
@@ -1200,125 +990,72 @@ mod tests {
         assert_eq!(classify_file(Some(&segments)), FileOutcome::Clean);
     }
 
-    // ── format_page tests ─────────────────────────────────────────
-
-    fn make_cache(entries: Vec<String>, per_page: usize) -> DiagnosticsCache {
-        let mut files = BTreeMap::new();
-        files.insert(
-            "/test/file.rs".to_string(),
-            CachedFile {
-                display: "file.rs".to_string(),
-                root: PathBuf::from("/test"),
-                entries,
-            },
-        );
-        DiagnosticsCache {
-            generation: 1,
-            per_page,
-            files,
-            clean: Vec::new(),
-        }
-    }
+    // ── format_diagnostics tests ────────────────────────────────────
 
     #[test]
-    fn format_page_single_page_no_cursor() {
-        let entries = vec![":1:1 [error] test: msg".to_string()];
-        let cache = make_cache(entries, 50);
-        let output = format_page(&cache, 1);
+    fn format_single_file_with_diagnostics() {
+        let diag_files = vec![DiagnosticFile {
+            display: "file.rs".to_string(),
+            root: PathBuf::from("/test"),
+            entries: vec![":1:1 [error] test: msg".to_string()],
+        }];
+        let output = format_diagnostics(&diag_files, &[]);
         assert!(output.starts_with("[LSP available]\n"), "output: {output}");
         // Single file under root → collapsed path.
         assert!(output.contains("/test/file.rs:"), "output: {output}");
         assert!(output.contains("\t:1:1 [error]"), "output: {output}");
-        assert!(!output.contains("[cursor:"), "output: {output}");
     }
 
     #[test]
-    fn format_page_truncation_emits_cursor() {
+    fn format_all_entries_shown() {
         let entries: Vec<String> = (0..5)
             .map(|i| format!(":{i}:1 [warning] test: msg {i}"))
             .collect();
-        let cache = make_cache(entries, 3);
-        let output = format_page(&cache, 1);
+        let diag_files = vec![DiagnosticFile {
+            display: "file.rs".to_string(),
+            root: PathBuf::from("/test"),
+            entries,
+        }];
+        let output = format_diagnostics(&diag_files, &[]);
+        // All entries should be present (no paging).
+        for i in 0..5 {
+            assert!(output.contains(&format!("msg {i}")), "output: {output}");
+        }
+    }
+
+    #[test]
+    fn format_clean_file() {
+        let clean = vec![CleanEntry {
+            display: "clean.rs".to_string(),
+            root: PathBuf::from("/test"),
+        }];
+        let output = format_diagnostics(&[], &clean);
         assert!(output.starts_with("[LSP available]\n"), "output: {output}");
-        // Single file → collapsed path.
-        assert!(output.contains("/test/file.rs:"), "output: {output}");
-        assert!(output.contains("2 more"), "output: {output}");
-        assert!(output.contains("[cursor: d1.2]"), "output: {output}");
-        assert!(!output.contains("msg 3"), "output: {output}");
-    }
-
-    #[test]
-    fn format_page_second_page_no_cursor() {
-        let entries: Vec<String> = (0..5)
-            .map(|i| format!(":{i}:1 [warning] test: msg {i}"))
-            .collect();
-        let cache = make_cache(entries, 3);
-        let output = format_page(&cache, 2);
-        assert!(output.contains("msg 3"), "output: {output}");
-        assert!(output.contains("msg 4"), "output: {output}");
-        assert!(!output.contains("msg 0"), "output: {output}");
-        assert!(!output.contains("[cursor:"), "output: {output}");
-    }
-
-    #[test]
-    fn format_page_beyond_last() {
-        let entries = vec![":1:1 [error] test: msg".to_string()];
-        let cache = make_cache(entries, 50);
-        let output = format_page(&cache, 2);
-        assert_eq!(output, "no more diagnostics\n");
-    }
-
-    #[test]
-    fn format_page_clean_on_page1_only() {
-        let cache = DiagnosticsCache {
-            generation: 1,
-            per_page: 50,
-            files: BTreeMap::new(),
-            clean: vec![TrackedEntry {
-                display: "clean.rs".to_string(),
-                root: PathBuf::from("/test"),
-            }],
-        };
-        let page1 = format_page(&cache, 1);
-        assert!(page1.starts_with("[LSP available]\n"), "page1: {page1}");
         // Single file → collapsed path with [clean].
-        assert!(page1.contains("/test/clean.rs\n"), "page1: {page1}");
-        assert!(page1.contains("\t[clean]"), "page1: {page1}");
-        assert!(!page1.contains("N/A:"), "page1: {page1}");
-
-        let page2 = format_page(&cache, 2);
-        assert!(!page2.contains("clean"), "page2: {page2}");
+        assert!(output.contains("/test/clean.rs\n"), "output: {output}");
+        assert!(output.contains("\t[clean]"), "output: {output}");
+        assert!(!output.contains("N/A:"), "output: {output}");
     }
 
     #[test]
-    fn format_page_multi_root_grouping() {
-        let mut files = BTreeMap::new();
-        files.insert(
-            "/alpha/src/lib.rs".to_string(),
-            CachedFile {
+    fn format_multi_root_grouping() {
+        let diag_files = vec![
+            DiagnosticFile {
                 display: "src/lib.rs".to_string(),
                 root: PathBuf::from("/alpha"),
                 entries: vec![":1:1 [error] test: alpha error".to_string()],
             },
-        );
-        files.insert(
-            "/beta/src/lib.rs".to_string(),
-            CachedFile {
+            DiagnosticFile {
                 display: "src/lib.rs".to_string(),
                 root: PathBuf::from("/beta"),
                 entries: vec![":5:1 [warning] test: beta warning".to_string()],
             },
-        );
-        let cache = DiagnosticsCache {
-            generation: 1,
-            per_page: 50,
-            files,
-            clean: vec![TrackedEntry {
-                display: "src/main.rs".to_string(),
-                root: PathBuf::from("/alpha"),
-            }],
-        };
-        let output = format_page(&cache, 1);
+        ];
+        let clean = vec![CleanEntry {
+            display: "src/main.rs".to_string(),
+            root: PathBuf::from("/alpha"),
+        }];
+        let output = format_diagnostics(&diag_files, &clean);
         // /alpha has 2 files (diag + clean) → expanded with directory header.
         let alpha_pos = output.find("\n/alpha\n").expect("missing /alpha header");
         assert!(output.contains("\tsrc/lib.rs:"), "output: {output}");
@@ -1335,23 +1072,13 @@ mod tests {
     }
 
     #[test]
-    fn format_page_single_file_server() {
-        let mut files = BTreeMap::new();
-        files.insert(
-            "/tmp/scratch.sh".to_string(),
-            CachedFile {
-                display: "scratch.sh".to_string(),
-                root: PathBuf::from("/tmp"),
-                entries: vec![":3:1 [warning] test: standalone warning".to_string()],
-            },
-        );
-        let cache = DiagnosticsCache {
-            generation: 1,
-            per_page: 50,
-            files,
-            clean: Vec::new(),
-        };
-        let output = format_page(&cache, 1);
+    fn format_single_file_server() {
+        let diag_files = vec![DiagnosticFile {
+            display: "scratch.sh".to_string(),
+            root: PathBuf::from("/tmp"),
+            entries: vec![":3:1 [warning] test: standalone warning".to_string()],
+        }];
+        let output = format_diagnostics(&diag_files, &[]);
         assert!(output.starts_with("[LSP available]\n"), "output: {output}");
         // Single file → collapsed path.
         assert!(output.contains("/tmp/scratch.sh:"), "output: {output}");
@@ -1363,33 +1090,27 @@ mod tests {
     }
 
     #[test]
-    fn diagnostics_lsp_available_header() {
-        let entries = vec![":1:1 [error] test: msg".to_string()];
-        let cache = make_cache(entries, 50);
-        let output = format_page(&cache, 1);
+    fn format_lsp_available_header() {
+        let diag_files = vec![DiagnosticFile {
+            display: "file.rs".to_string(),
+            root: PathBuf::from("/test"),
+            entries: vec![":1:1 [error] test: msg".to_string()],
+        }];
+        let output = format_diagnostics(&diag_files, &[]);
         // First line is the status header.
         assert!(output.starts_with("[LSP available]\n"), "output: {output}");
         // Bare path, no prefix.
         assert!(output.contains("/test/file.rs:"), "output: {output}");
         assert!(!output.contains("Root:"), "output: {output}");
-        // Page 2 does not repeat the header.
-        let page2 = format_page(&cache, 2);
-        assert!(!page2.contains("[LSP available]"), "page2: {page2}");
     }
 
     #[test]
-    fn diagnostics_omit_uncovered() {
-        // Cache with only clean files, no uncovered field at all.
-        let cache = DiagnosticsCache {
-            generation: 1,
-            per_page: 50,
-            files: BTreeMap::new(),
-            clean: vec![TrackedEntry {
-                display: "lib.rs".to_string(),
-                root: PathBuf::from("/project"),
-            }],
-        };
-        let output = format_page(&cache, 1);
+    fn format_omit_uncovered() {
+        let clean = vec![CleanEntry {
+            display: "lib.rs".to_string(),
+            root: PathBuf::from("/project"),
+        }];
+        let output = format_diagnostics(&[], &clean);
         // No N/A or OutOfRoots sections.
         assert!(!output.contains("N/A"), "output: {output}");
         assert!(!output.contains("OutOfRoots"), "output: {output}");

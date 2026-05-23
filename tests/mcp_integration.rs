@@ -4152,14 +4152,14 @@ fn test_turn_boundary_roots_refresh() -> Result<()> {
     // Send PreAgent hook — sets roots_refresh_requested on the session.
     ipc_request(&socket_path, &json!({"method": "pre-agent/turn-start"}))?;
 
-    // Send PreToolUse hook for the Catenary tool (as the host CLI does
+    // Send PreToolUse hook for a Catenary tool (as the host CLI does
     // before dispatching an MCP tool call). This triggers correlation
     // so the MCP connection is bound to the session.
     ipc_request(
         &socket_path,
         &json!({
             "method": "pre-tool/editing-state",
-            "tool_name": "start_editing",
+            "tool_name": "grep",
             "agent_id": ""
         }),
     )?;
@@ -4171,7 +4171,7 @@ fn test_turn_boundary_roots_refresh() -> Result<()> {
         "jsonrpc": "2.0",
         "id": 500,
         "method": "tools/call",
-        "params": {"name": "start_editing", "arguments": {}}
+        "params": {"name": "grep", "arguments": {"pattern": "nonexistent_xyzzy"}}
     }))?;
 
     // roots/list request comes before the tool response.

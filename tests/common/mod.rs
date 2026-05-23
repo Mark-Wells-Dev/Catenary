@@ -381,22 +381,21 @@ impl BridgeProcess {
         Ok(path)
     }
 
-    /// Enters editing mode, accumulates a file, then calls `done_editing`
-    /// via MCP to retrieve diagnostics from the tool result.
-    pub fn call_diagnostics(&mut self, file: &str) -> Result<String> {
+    /// Enters editing mode, accumulates a file, then runs `done_editing`
+    /// via the handoff protocol to retrieve diagnostics.
+    pub fn call_diagnostics(&self, file: &str) -> Result<String> {
         let socket_path = self.wait_for_hook_socket()?;
 
-        // Enter editing mode via IPC
+        // Enter editing mode via CLI path
         ipc_request(
             &socket_path,
             &json!({
-                "method": "pre-tool/editing-state",
-                "tool_name": "start_editing",
+                "method": "pre-tool/start-editing",
                 "agent_id": ""
             }),
         )?;
 
-        // Accumulate file via IPC
+        // Accumulate file via PostToolUse
         ipc_request(
             &socket_path,
             &json!({
@@ -407,43 +406,42 @@ impl BridgeProcess {
             }),
         )?;
 
-        // Call done_editing via MCP
-        self.send(&json!({
-            "jsonrpc": "2.0",
-            "id": 9000,
-            "method": "tools/call",
-            "params": {
-                "name": "done_editing",
-                "arguments": {}
-            }
-        }))?;
-
-        let response = self.recv()?;
-        let text = response
-            .pointer("/result/content/0/text")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-
-        Ok(text)
-    }
-
-    /// Enters editing mode, accumulates multiple files, then calls
-    /// `done_editing` via MCP to retrieve batched diagnostics.
-    pub fn call_diagnostics_multi(&mut self, files: &[&str]) -> Result<String> {
-        let socket_path = self.wait_for_hook_socket()?;
-
-        // Enter editing mode via IPC
+        // Prepare handoff (drains files, deposits in slot)
         ipc_request(
             &socket_path,
             &json!({
-                "method": "pre-tool/editing-state",
-                "tool_name": "start_editing",
+                "method": "pre-tool/done-editing",
                 "agent_id": ""
             }),
         )?;
 
-        // Accumulate all files via IPC
+        // Run diagnostics via handoff slot
+        let text = ipc_request(
+            &socket_path,
+            &json!({
+                "method": "tool/done-editing"
+            }),
+        )?;
+
+        Ok(text)
+    }
+
+    /// Enters editing mode, accumulates multiple files, then runs
+    /// `done_editing` via the handoff protocol to retrieve batched
+    /// diagnostics.
+    pub fn call_diagnostics_multi(&self, files: &[&str]) -> Result<String> {
+        let socket_path = self.wait_for_hook_socket()?;
+
+        // Enter editing mode via CLI path
+        ipc_request(
+            &socket_path,
+            &json!({
+                "method": "pre-tool/start-editing",
+                "agent_id": ""
+            }),
+        )?;
+
+        // Accumulate all files via PostToolUse
         for file in files {
             ipc_request(
                 &socket_path,
@@ -456,23 +454,22 @@ impl BridgeProcess {
             )?;
         }
 
-        // Call done_editing via MCP
-        self.send(&json!({
-            "jsonrpc": "2.0",
-            "id": 9001,
-            "method": "tools/call",
-            "params": {
-                "name": "done_editing",
-                "arguments": {}
-            }
-        }))?;
+        // Prepare handoff (drains files, deposits in slot)
+        ipc_request(
+            &socket_path,
+            &json!({
+                "method": "pre-tool/done-editing",
+                "agent_id": ""
+            }),
+        )?;
 
-        let response = self.recv()?;
-        let text = response
-            .pointer("/result/content/0/text")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
+        // Run diagnostics via handoff slot
+        let text = ipc_request(
+            &socket_path,
+            &json!({
+                "method": "tool/done-editing"
+            }),
+        )?;
 
         Ok(text)
     }
