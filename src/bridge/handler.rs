@@ -84,7 +84,7 @@ pub(super) fn display_path(file: &str, fs: &FilesystemManager) -> String {
 /// A pattern is considered relative (and therefore resolved) when it does
 /// not start with `/` or `~` after tilde expansion. Absolute patterns are
 /// left unchanged.
-pub fn resolve_params_against_cwd(tool: &str, params: &mut Value, cwd: &Path) {
+fn resolve_params_against_cwd(tool: &str, params: &mut Value, cwd: &Path) {
     match tool {
         "grep" => {
             resolve_param(params, "glob", cwd);
