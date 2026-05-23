@@ -83,21 +83,21 @@ pub(super) fn display_path(file: &str, fs: &FilesystemManager) -> String {
 /// A pattern is considered relative (and therefore resolved) when it does
 /// not start with `/` or `~` after tilde expansion. Absolute patterns are
 /// left unchanged.
-fn resolve_params_against_dir(tool: &str, params: &mut Value, cwd: &Path) {
+fn resolve_params_against_dir(tool: &str, params: &mut Value, dir: &Path) {
     match tool {
         "grep" => {
-            resolve_param(params, "glob", cwd);
-            resolve_param(params, "exclude", cwd);
+            resolve_param(params, "glob", dir);
+            resolve_param(params, "exclude", dir);
         }
         "glob" => {
-            resolve_param(params, "pattern", cwd);
+            resolve_param(params, "pattern", dir);
         }
         _ => {}
     }
 }
 
 /// Resolve a single string parameter to an absolute path if it is relative.
-fn resolve_param(params: &mut Value, key: &str, cwd: &Path) {
+fn resolve_param(params: &mut Value, key: &str, dir: &Path) {
     let Some(val) = params.get(key).and_then(Value::as_str) else {
         return;
     };
@@ -105,7 +105,7 @@ fn resolve_param(params: &mut Value, key: &str, cwd: &Path) {
     if Path::new(&expanded).is_absolute() {
         return;
     }
-    let resolved = cwd.join(&expanded);
+    let resolved = dir.join(&expanded);
     params[key] = Value::String(resolved.to_string_lossy().into_owned());
 }
 
@@ -313,7 +313,7 @@ mod tests {
         assert_eq!(
             params["glob"].as_str(),
             Some("~/projects/*.rs"),
-            "tilde patterns should not be resolved against cwd"
+            "tilde patterns should not be resolved against dir"
         );
     }
 
@@ -331,8 +331,8 @@ mod tests {
             "glob": "src/**/*.rs",
             "exclude": "tests/**"
         });
-        let cwd = Path::new("/project");
-        resolve_params_against_dir("grep", &mut params, cwd);
+        let dir = Path::new("/project");
+        resolve_params_against_dir("grep", &mut params, dir);
         assert_eq!(params["glob"].as_str(), Some("/project/src/**/*.rs"));
         assert_eq!(params["exclude"].as_str(), Some("/project/tests/**"));
         // pattern is not resolved for grep
@@ -342,16 +342,16 @@ mod tests {
     #[test]
     fn resolve_glob_resolves_pattern() {
         let mut params = serde_json::json!({"pattern": "src/"});
-        let cwd = Path::new("/project");
-        resolve_params_against_dir("glob", &mut params, cwd);
+        let dir = Path::new("/project");
+        resolve_params_against_dir("glob", &mut params, dir);
         assert_eq!(params["pattern"].as_str(), Some("/project/src/"));
     }
 
     #[test]
     fn resolve_glob_does_not_resolve_exclude() {
         let mut params = serde_json::json!({"pattern": "/abs/path", "exclude": "test_*"});
-        let cwd = Path::new("/project");
-        resolve_params_against_dir("glob", &mut params, cwd);
+        let dir = Path::new("/project");
+        resolve_params_against_dir("glob", &mut params, dir);
         // pattern is absolute → unchanged
         assert_eq!(params["pattern"].as_str(), Some("/abs/path"));
         // exclude is NOT resolved for glob (not in scope per ticket)
@@ -361,8 +361,8 @@ mod tests {
     #[test]
     fn resolve_unknown_tool_is_noop() {
         let mut params = serde_json::json!({"pattern": "relative"});
-        let cwd = Path::new("/project");
-        resolve_params_against_dir("start_editing", &mut params, cwd);
+        let dir = Path::new("/project");
+        resolve_params_against_dir("start_editing", &mut params, dir);
         assert_eq!(params["pattern"].as_str(), Some("relative"));
     }
 
@@ -373,12 +373,12 @@ mod tests {
             "directory": "/search/root",
             "glob": "src/**/*.rs"
         });
-        let cwd = params
+        let dir = params
             .get("directory")
             .and_then(Value::as_str)
             .map(|d| PathBuf::from(expand_tilde(d)));
-        if let Some(cwd) = &cwd {
-            resolve_params_against_dir("grep", &mut params, cwd);
+        if let Some(dir) = &dir {
+            resolve_params_against_dir("grep", &mut params, dir);
         }
         if let Some(obj) = params.as_object_mut() {
             obj.remove("directory");
@@ -396,12 +396,12 @@ mod tests {
             "pattern": "src/",
             "directory": "/workspace"
         });
-        let cwd = params
+        let dir = params
             .get("directory")
             .and_then(Value::as_str)
             .map(|d| PathBuf::from(expand_tilde(d)));
-        if let Some(cwd) = &cwd {
-            resolve_params_against_dir("glob", &mut params, cwd);
+        if let Some(dir) = &dir {
+            resolve_params_against_dir("glob", &mut params, dir);
         }
         if let Some(obj) = params.as_object_mut() {
             obj.remove("directory");
