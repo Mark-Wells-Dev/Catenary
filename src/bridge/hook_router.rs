@@ -497,6 +497,19 @@ impl HookRouter {
                     session_id.as_deref(),
                     &agent_id,
                 );
+                // File tracking: accumulate when allowed and editing.
+                // Runs alongside PostToolUse accumulation during the
+                // transition period — EditingManager::add_file deduplicates.
+                if result.is_none()
+                    && let Some(ref path) = file_path
+                {
+                    self.handle_file_accumulation(
+                        path,
+                        session_id.as_deref(),
+                        &agent_id,
+                        Some(&tool_name),
+                    );
+                }
                 // Stash the scope parent ID so the MCP tools/call and
                 // post-tool hook events can reference this pre-tool hook
                 // as their scope root. Only when the tool is allowed —
@@ -1938,7 +1951,86 @@ mod tests {
         );
     }
 
-    // ── CWD stash tests ────────────────────────────────────────────��─
+    // ── PreToolUse file tracking tests ──────────────────────────────
+
+    #[test]
+    fn dispatch_pre_tool_edit_accumulates_file() {
+        let (router, root) = test_router_with_root();
+        // Enter editing mode.
+        router.handle_enforce_editing(START_EDITING, None, None, None, "");
+
+        let file = format!("{}/src/main.rs", root.display());
+        router.dispatch(
+            crate::hook::HookRequest::PreTool {
+                tool_name: "Edit".to_string(),
+                file_path: Some(file.clone()),
+                command: None,
+                agent_id: String::new(),
+                session_id: None,
+                cwd: None,
+            },
+            0,
+        );
+
+        let files = router.session.editing.drain_files(None, "");
+        assert_eq!(
+            files,
+            vec![PathBuf::from(&file)],
+            "PreTool for edit tool should accumulate file"
+        );
+    }
+
+    #[test]
+    fn dispatch_pre_tool_denied_does_not_accumulate() {
+        let (router, root) = test_router_with_root();
+        // NOT in editing mode — Edit will be denied.
+        let file = format!("{}/src/main.rs", root.display());
+        let result = router.dispatch(
+            crate::hook::HookRequest::PreTool {
+                tool_name: "Edit".to_string(),
+                file_path: Some(file),
+                command: None,
+                agent_id: String::new(),
+                session_id: None,
+                cwd: None,
+            },
+            0,
+        );
+
+        assert!(
+            matches!(result.result, Some(HookResult::Deny(_))),
+            "Edit outside editing mode should be denied"
+        );
+        // Enter editing to drain (drain_files requires editing state).
+        router.handle_enforce_editing(START_EDITING, None, None, None, "");
+        let files = router.session.editing.drain_files(None, "");
+        assert!(files.is_empty(), "denied edit should not accumulate file");
+    }
+
+    #[test]
+    fn dispatch_pre_tool_non_edit_does_not_accumulate() {
+        let (router, root) = test_router_with_root();
+        // Enter editing mode.
+        router.handle_enforce_editing(START_EDITING, None, None, None, "");
+
+        let file = format!("{}/src/main.rs", root.display());
+        router.dispatch(
+            crate::hook::HookRequest::PreTool {
+                tool_name: "mcp_catenary_grep".to_string(),
+                file_path: Some(file),
+                command: None,
+                agent_id: String::new(),
+                session_id: None,
+                cwd: None,
+            },
+            0,
+        );
+
+        let files = router.session.editing.drain_files(None, "");
+        assert!(files.is_empty(), "non-edit tool should not accumulate file");
+    }
+
+    // ── CWD stash tests ─────────────────────────────────────────────
 
     #[test]
     fn dispatch_pre_tool_grep_stashes_cwd() {
