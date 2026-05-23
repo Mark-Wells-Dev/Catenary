@@ -212,6 +212,38 @@ pub(crate) enum HookRequest {
         stop_hook_active: bool,
     },
 
+    /// Prepare handoff for `catenary done_editing` CLI command.
+    ///
+    /// Sent by the `PreToolUse` hook when the agent runs
+    /// `catenary done_editing` via the host's shell tool. The daemon
+    /// acquires the handoff lock, drains accumulated files, releases
+    /// the editing guardrail, and deposits the file list in the
+    /// handoff slot for the subsequent `done-editing/run` request.
+    #[serde(rename = "pre-tool/done-editing")]
+    PreToolDoneEditingPrepare {
+        /// Agent ID (empty string for the main agent).
+        /// Deserialized from IPC but not consumed — the daemon
+        /// handles preparation at the dispatch level.
+        #[serde(default)]
+        #[allow(
+            dead_code,
+            reason = "deserialized from IPC protocol, consumed by serde"
+        )]
+        agent_id: String,
+        /// Host CLI session ID (Claude Code / Gemini CLI UUID).
+        #[serde(default)]
+        session_id: Option<String>,
+    },
+
+    /// Execute the `done_editing` pipeline and return diagnostics.
+    ///
+    /// Sent by the `catenary done_editing` CLI command after the
+    /// `PreToolUse` hook has prepared the handoff slot. Takes the file
+    /// list from the slot, runs `process_files_batched`, and returns
+    /// formatted diagnostics.
+    #[serde(rename = "tool/done-editing")]
+    DoneEditingRun,
+
     /// Clear stale editing state on session start.
     #[serde(rename = "session-start/clear-editing")]
     SessionStart {
@@ -717,6 +749,31 @@ mod tests {
             req,
             HookRequest::PreToolStartEditing { agent_id, session_id: None } if agent_id.is_empty()
         ));
+
+        // pre-tool/done-editing
+        let json =
+            r#"{"method": "pre-tool/done-editing", "agent_id": "sub-1", "session_id": "sess-abc"}"#;
+        let req: HookRequest = serde_json::from_str(json).expect("pre-tool/done-editing");
+        let HookRequest::PreToolDoneEditingPrepare { session_id, .. } = req else {
+            unreachable!("expected PreToolDoneEditingPrepare");
+        };
+        assert_eq!(session_id.as_deref(), Some("sess-abc"));
+
+        // pre-tool/done-editing minimal (defaults)
+        let json = r#"{"method": "pre-tool/done-editing"}"#;
+        let req: HookRequest = serde_json::from_str(json).expect("pre-tool/done-editing minimal");
+        assert!(matches!(
+            req,
+            HookRequest::PreToolDoneEditingPrepare {
+                session_id: None,
+                ..
+            }
+        ));
+
+        // tool/done-editing
+        let json = r#"{"method": "tool/done-editing"}"#;
+        let req: HookRequest = serde_json::from_str(json).expect("tool/done-editing");
+        assert!(matches!(req, HookRequest::DoneEditingRun));
 
         // pre-tool/check-command
         let json = r#"{"method": "pre-tool/check-command", "command": "cargo test", "cwd": "/project", "session_id": "abc123", "format": "claude"}"#;

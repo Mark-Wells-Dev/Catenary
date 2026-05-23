@@ -92,14 +92,18 @@ pub fn mcp_category(method: &str) -> &'static str {
 
 /// Categorize a hook method.
 ///
-/// Matches on the action suffix (after the last `/`) so categories
-/// work with the full `namespace/action` method strings.
+/// Matches on the namespace prefix (before the `/`). The IPC
+/// socket carries three kinds of traffic:
+/// - `pre-tool/*`, `post-tool/*`, `pre-agent/*`, `post-agent/*`,
+///   `session-start/*`, `session-end/*` — hook lifecycle events
+/// - `tool/*` — CLI commands (agent-invoked via shell tool)
+/// - `post-tool/diagnostics` — diagnostics results
 #[must_use]
 pub fn hook_category(method: &str) -> &'static str {
-    match method.rsplit('/').next().unwrap_or(method) {
-        "diagnostics" => "diagnostics",
-        "turn-start" | "editing-state" | "start-editing" | "check-command" | "require-release"
-        | "clear-editing" => "lifecycle",
+    match method.split('/').next().unwrap_or(method) {
+        "post-tool" => "diagnostics",
+        "tool" => "tool",
+        "pre-tool" | "pre-agent" | "post-agent" | "session-start" | "session-end" => "lifecycle",
         _ => "unknown",
     }
 }
@@ -203,13 +207,24 @@ mod tests {
 
     #[test]
     fn hook_category_methods() {
+        // diagnostics
         assert_eq!(hook_category("post-tool/diagnostics"), "diagnostics");
+        // tool (CLI commands)
+        assert_eq!(hook_category("tool/done-editing"), "tool");
+        assert_eq!(hook_category("tool/start-editing"), "tool");
+        assert_eq!(hook_category("tool/add-root"), "tool");
+        assert_eq!(hook_category("tool/rm-root"), "tool");
+        assert_eq!(hook_category("tool/shutdown"), "tool");
+        // lifecycle (hook events)
         assert_eq!(hook_category("pre-agent/turn-start"), "lifecycle");
         assert_eq!(hook_category("pre-tool/editing-state"), "lifecycle");
         assert_eq!(hook_category("pre-tool/start-editing"), "lifecycle");
+        assert_eq!(hook_category("pre-tool/done-editing"), "lifecycle");
         assert_eq!(hook_category("pre-tool/check-command"), "lifecycle");
         assert_eq!(hook_category("post-agent/require-release"), "lifecycle");
         assert_eq!(hook_category("session-start/clear-editing"), "lifecycle");
+        assert_eq!(hook_category("session-end/cleanup"), "lifecycle");
+        // unknown
         assert_eq!(hook_category("unknown/method"), "unknown");
     }
 

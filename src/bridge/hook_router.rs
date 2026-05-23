@@ -553,6 +553,25 @@ impl HookRouter {
                     add_roots: Vec::new(),
                 }
             }
+            HookRequest::PreToolDoneEditingPrepare { session_id, .. } => {
+                // Handled at the daemon level (router.rs), not here.
+                // This arm exists for exhaustive matching in the
+                // per-session HookServer path.
+                self.store_client_session_id(session_id.as_deref());
+                DispatchResult {
+                    result: None,
+                    system_message: None,
+                    add_roots: Vec::new(),
+                }
+            }
+            HookRequest::DoneEditingRun => {
+                // Handled at the daemon level (router.rs), not here.
+                DispatchResult {
+                    result: None,
+                    system_message: None,
+                    add_roots: Vec::new(),
+                }
+            }
             HookRequest::CheckCommand {
                 command,
                 cwd,

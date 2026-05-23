@@ -13,6 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use tokio_util::sync::CancellationToken;
@@ -136,7 +137,7 @@ struct PendingEntry {
     created_at: std::time::Instant,
     /// Owned semaphore permit — dropped when correlation resolves or
     /// times out, releasing the serialization lock.
-    _permit: tokio::sync::OwnedSemaphorePermit,
+    permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 /// Shared correlation state for sandwich serialization.
@@ -354,6 +355,50 @@ struct HookDispatchContext {
     /// per-session `Session` instances to prevent concurrent editing
     /// in the same workspace root.
     editing_guardrail: Arc<EditingGuardrail>,
+    /// Serialization semaphore (1 permit): only one session can be
+    /// in the `done_editing` handoff window at a time.
+    handoff_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Handoff slot: file list + owned permit deposited by
+    /// `PreToolUse`, consumed by the `done_editing` CLI command.
+    handoff_slot: Arc<std::sync::Mutex<Option<HandoffContext>>>,
+}
+
+/// Handoff context deposited by `pre-tool/done-editing-prepare`
+/// and consumed by `done-editing/run`.
+///
+/// Dropping this struct drops the owned semaphore permit, releasing
+/// the handoff lock.
+struct HandoffContext {
+    /// Accumulated files from the editing session.
+    files: Vec<PathBuf>,
+    /// Owned semaphore permit — dropped when the `HandoffContext`
+    /// is dropped (slot consumed or timeout), releasing the lock.
+    /// Never read directly; held purely for RAII drop semantics.
+    #[allow(dead_code, reason = "RAII guard — held for drop, not read")]
+    permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+/// Spawns a background task that clears the handoff slot after 5 seconds.
+///
+/// Handles the case where the CLI command never connects (e.g., the host
+/// kills the subprocess between `PreToolUse` and command execution).
+/// Dropping the `HandoffContext` drops the owned permit, releasing the
+/// semaphore.
+fn spawn_handoff_timeout(slot: Arc<std::sync::Mutex<Option<HandoffContext>>>) {
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let mut s = slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if s.is_some() {
+            // Dropping the HandoffContext drops the owned permit.
+            *s = None;
+            warn!(
+                source = Source::DaemonDispatch.as_str(),
+                "done_editing handoff timeout — discarding file list",
+            );
+        }
+    });
 }
 
 /// Tracks per-contributor workspace root sets for reference counting.
@@ -1036,6 +1081,8 @@ impl SessionManager {
             logging: self.logging.clone(),
             root_tracker: Some(root_tracker),
             editing_guardrail: Arc::new(EditingGuardrail::new()),
+            handoff_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+            handoff_slot: Arc::new(std::sync::Mutex::new(None)),
         });
         self
     }
@@ -1136,7 +1183,7 @@ fn resolve_correlation(
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(PendingEntry {
         session_id,
-        _permit,
+        permit: _permit,
         ..
     }) = pending.take()
     {
@@ -1164,7 +1211,7 @@ fn resolve_correlation(
         span.record("session_id", &session_id);
 
         resolved.store(true, Ordering::Relaxed);
-        // `_permit` drops here → semaphore released
+        // `permit` drops here → semaphore released
     }
 }
 
@@ -1252,7 +1299,7 @@ fn parse_root_uris(roots: &[crate::mcp::Root]) -> Vec<PathBuf> {
 ///
 /// Reads the JSON request, logs the method for visibility, and sends an
 /// empty response (which means "allow" in the hook protocol). Recognizes
-/// the `"shutdown"` method from `catenary stop` and cancels the daemon
+/// the `"tool/shutdown"` method from `catenary stop` and cancels the daemon
 /// shutdown token. Used when no shared session is configured (test mode).
 #[cfg(unix)]
 async fn handle_hook_connection(
@@ -1275,7 +1322,7 @@ async fn handle_hook_connection(
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
 
-        if method == "shutdown" {
+        if method == "tool/shutdown" {
             info!(
                 source = Source::DaemonLifecycle.as_str(),
                 "shutdown requested via stop command",
@@ -1379,7 +1426,7 @@ async fn handle_hook_dispatch(
         .to_string();
 
     // Handle shutdown from `catenary stop`.
-    if method == "shutdown" {
+    if method == "tool/shutdown" {
         info!(
             source = Source::DaemonLifecycle.as_str(),
             "shutdown requested via stop command",
@@ -1417,7 +1464,7 @@ async fn handle_hook_dispatch(
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(PendingEntry {
             session_id: session_id.clone(),
             created_at: std::time::Instant::now(),
-            _permit: permit,
+            permit,
         });
 
         debug!(
@@ -1513,8 +1560,138 @@ async fn handle_hook_dispatch(
     // `start-editing/confirm` is sent by `catenary start_editing`
     // after the PreToolUse hook has already entered editing mode.
     // The CLI command just needs a confirmation response.
-    if method == "start-editing/confirm" {
+    if method == "tool/start-editing" {
         writer.write_all(b"{\"status\":\"ok\"}\n").await?;
+        writer.shutdown().await?;
+        return Ok(());
+    }
+
+    // ── Done editing handoff: prepare ────────────────────────────
+    //
+    // `pre-tool/done-editing-prepare` is sent by the PreToolUse
+    // hook when the agent runs `catenary done_editing`. Acquires
+    // the handoff lock, drains files, releases the editing guardrail,
+    // and deposits the file list for the subsequent CLI command.
+    if method == "pre-tool/done-editing" {
+        let id = ctx.logging.next_id();
+
+        let router = get_or_create_router(&ctx, &session_id);
+
+        // Acquire the handoff semaphore (blocks if another session
+        // is mid-handoff — holds for milliseconds at most).
+        let permit = ctx
+            .handoff_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow!("handoff semaphore closed"))?;
+
+        // Drain accumulated files from EditingManager.
+        let files = router.session.editing.drain_all_and_clear();
+
+        // Release the editing guardrail.
+        ctx.editing_guardrail.release_all(&session_id);
+
+        // Deposit in the handoff slot.
+        {
+            let mut slot = ctx
+                .handoff_slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *slot = Some(HandoffContext { files, permit });
+        }
+
+        // Spawn timeout to clear the slot if the CLI never connects.
+        spawn_handoff_timeout(ctx.handoff_slot.clone());
+
+        debug!(
+            source = Source::DaemonDispatch.as_str(),
+            session_id = %session_id,
+            "done_editing handoff prepared",
+        );
+
+        emit_hook_event(
+            tracing::Level::DEBUG,
+            &session_id,
+            &method,
+            id.0,
+            None,
+            &raw.to_string(),
+            "incoming hook",
+        );
+        let parent_str = id.0.to_string();
+        emit_hook_event(
+            tracing::Level::DEBUG,
+            &session_id,
+            &method,
+            id.0,
+            Some(&parent_str),
+            "{\"status\":\"ok\"}",
+            "outgoing hook response",
+        );
+
+        writer.write_all(b"{\"status\":\"ok\"}\n").await?;
+        writer.shutdown().await?;
+        return Ok(());
+    }
+
+    // ── Done editing handoff: run ────────────────────────────────
+    //
+    // `done-editing/run` is sent by `catenary done_editing` CLI
+    // command. Takes the file list from the handoff slot, runs
+    // process_files_batched, and returns diagnostics.
+    if method == "tool/done-editing" {
+        let id = ctx.logging.next_id();
+
+        // Take the file list from the handoff slot and release the
+        // permit immediately. The permit must not be held during the
+        // diagnostics pipeline (which may take seconds).
+        let files = {
+            let mut slot = ctx
+                .handoff_slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Destructure HandoffContext — dropping it releases the
+            // owned semaphore permit.
+            slot.take().map(|h| h.files)
+        };
+
+        let response = if let Some(files) = files {
+            if files.is_empty() {
+                "[no files modified]\n".to_string()
+            } else {
+                ctx.primary
+                    .diagnostics
+                    .process_files_batched(&files, None)
+                    .await
+            }
+        } else {
+            // Handoff slot was empty — timeout expired or double-consume.
+            "done_editing handoff expired — no files available\n".to_string()
+        };
+
+        emit_hook_event(
+            tracing::Level::INFO,
+            "cli",
+            &method,
+            id.0,
+            None,
+            &raw.to_string(),
+            "incoming hook",
+        );
+        let parent_str = id.0.to_string();
+        emit_hook_event(
+            tracing::Level::INFO,
+            "cli",
+            &method,
+            id.0,
+            Some(&parent_str),
+            &response,
+            "outgoing hook response",
+        );
+
+        writer.write_all(response.as_bytes()).await?;
+        writer.write_all(b"\n").await?;
         writer.shutdown().await?;
         return Ok(());
     }
@@ -1529,7 +1706,7 @@ async fn handle_hook_dispatch(
     // Handled before `get_or_create_router` because root management
     // is a daemon-level concern (RootTracker), not a per-session
     // router concern.
-    if method == "add-root/run" {
+    if method == "tool/add-root" {
         let id = ctx.logging.next_id();
         let response = if let Some(path_str) = raw.get("path").and_then(|v| v.as_str()) {
             let path = PathBuf::from(path_str);
@@ -1581,7 +1758,7 @@ async fn handle_hook_dispatch(
         return Ok(());
     }
 
-    if method == "rm-root/run" {
+    if method == "tool/rm-root" {
         let id = ctx.logging.next_id();
         let response = if let Some(path_str) = raw.get("path").and_then(|v| v.as_str()) {
             let path = PathBuf::from(path_str);
@@ -2900,7 +3077,7 @@ mod tests {
             .expect("connect to hook socket");
         let (reader, mut writer) = stream.into_split();
 
-        let request = serde_json::json!({"method": "shutdown"});
+        let request = serde_json::json!({"method": "tool/shutdown"});
         let mut payload = serde_json::to_string(&request).expect("serialize");
         payload.push('\n');
         writer.write_all(payload.as_bytes()).await.expect("write");
@@ -3201,6 +3378,194 @@ mod tests {
             line.trim(),
             "",
             "subagent hook should pass through (empty response)"
+        );
+
+        shutdown.cancel();
+    }
+
+    // ── Done editing handoff tests ────────────────────────────────────
+
+    /// Send a hook JSON request and read all response data (may be
+    /// multi-line, unlike `hook_roundtrip` which reads a single line).
+    async fn hook_roundtrip_full(hook_path: &Path, request: &serde_json::Value) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut stream = tokio::net::UnixStream::connect(hook_path)
+            .await
+            .expect("connect to hook socket");
+
+        let mut payload = serde_json::to_string(request).expect("serialize");
+        payload.push('\n');
+        stream.write_all(payload.as_bytes()).await.expect("write");
+        stream.shutdown().await.expect("shutdown write");
+
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .await
+            .expect("read response");
+        response
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn done_editing_handoff_no_files() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let hook_path = hook_socket_in(dir.path());
+
+        let manager = Arc::new(bind_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        // Enter editing mode.
+        let req = serde_json::json!({
+            "method": "pre-tool/start-editing",
+            "agent_id": "",
+            "session_id": "sess-1"
+        });
+        let _ = hook_roundtrip(&hook_path, &req).await;
+
+        // Prepare handoff (no files accumulated).
+        let req = serde_json::json!({
+            "method": "pre-tool/done-editing",
+            "agent_id": "",
+            "session_id": "sess-1"
+        });
+        let line = hook_roundtrip(&hook_path, &req).await;
+        assert!(line.contains("ok"), "prepare should succeed, got: {line}");
+
+        // Execute done_editing/run — should get "no files modified".
+        let req = serde_json::json!({"method": "tool/done-editing"});
+        let response = hook_roundtrip_full(&hook_path, &req).await;
+        assert!(
+            response.contains("no files modified"),
+            "expected 'no files modified', got: {response}",
+        );
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn done_editing_handoff_expired() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let hook_path = hook_socket_in(dir.path());
+
+        let manager = Arc::new(bind_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        // Call done-editing/run without preparing a handoff.
+        let req = serde_json::json!({"method": "tool/done-editing"});
+        let response = hook_roundtrip_full(&hook_path, &req).await;
+        assert!(
+            response.contains("handoff expired"),
+            "expected handoff expired message, got: {response}",
+        );
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn done_editing_handoff_with_accumulated_files() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let hook_path = hook_socket_in(dir.path());
+
+        let manager = Arc::new(bind_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        // Enter editing mode.
+        let req = serde_json::json!({
+            "method": "pre-tool/start-editing",
+            "agent_id": "",
+            "session_id": "sess-1"
+        });
+        let _ = hook_roundtrip(&hook_path, &req).await;
+
+        // Accumulate a file via post-tool hook.
+        let req = serde_json::json!({
+            "method": "post-tool/diagnostics",
+            "file": "/tmp/nonexistent_file.rs",
+            "tool": "Edit",
+            "agent_id": "",
+            "session_id": "sess-1"
+        });
+        let _ = hook_roundtrip(&hook_path, &req).await;
+
+        // Prepare handoff — should drain the accumulated file.
+        let req = serde_json::json!({
+            "method": "pre-tool/done-editing",
+            "agent_id": "",
+            "session_id": "sess-1"
+        });
+        let line = hook_roundtrip(&hook_path, &req).await;
+        assert!(line.contains("ok"), "prepare should succeed, got: {line}");
+
+        // Execute done_editing/run — diagnostics pipeline runs on
+        // the files. Since there's no real LSP server, the output
+        // depends on whether the file exists and has LSP coverage.
+        // The key test: the handoff consumed the files successfully.
+        let req = serde_json::json!({"method": "tool/done-editing"});
+        let response = hook_roundtrip_full(&hook_path, &req).await;
+        // With no LSP servers, process_files_batched returns "[clean]"
+        // for files without coverage. The response should not be the
+        // expired message.
+        assert!(
+            !response.contains("handoff expired"),
+            "handoff should not be expired, got: {response}",
+        );
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn done_editing_handoff_double_consume() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let hook_path = hook_socket_in(dir.path());
+
+        let manager = Arc::new(bind_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        // Enter editing mode and prepare handoff.
+        let req = serde_json::json!({
+            "method": "pre-tool/start-editing",
+            "agent_id": "",
+            "session_id": "sess-1"
+        });
+        let _ = hook_roundtrip(&hook_path, &req).await;
+
+        let req = serde_json::json!({
+            "method": "pre-tool/done-editing",
+            "agent_id": "",
+            "session_id": "sess-1"
+        });
+        let _ = hook_roundtrip(&hook_path, &req).await;
+
+        // First consume should succeed.
+        let req = serde_json::json!({"method": "tool/done-editing"});
+        let response1 = hook_roundtrip_full(&hook_path, &req).await;
+        assert!(
+            !response1.contains("handoff expired"),
+            "first consume should succeed, got: {response1}",
+        );
+
+        // Second consume should see expired slot.
+        let response2 = hook_roundtrip_full(&hook_path, &req).await;
+        assert!(
+            response2.contains("handoff expired"),
+            "second consume should see expired slot, got: {response2}",
         );
 
         shutdown.cancel();

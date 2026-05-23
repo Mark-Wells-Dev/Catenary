@@ -501,14 +501,35 @@ pub fn run_pre_tool(format: HostFormat) {
         .unwrap_or("");
 
     // ── Catenary CLI commands ────────────────────────────────────
-    // Recognize `catenary start_editing`, `catenary add-root`, and
-    // `catenary rm-root`. These bypass the command filter allowlist —
-    // they are Catenary's own commands, not user shell commands.
+    // Recognize Catenary subcommands invoked via the host's shell
+    // tool. Agent-invocable commands bypass the allowlist. Lifecycle
+    // commands (`hook`, `stop`) are unconditionally denied — they
+    // are for host CLI hooks and user use only.
     if let Some(ref shell_cmd) = extract_shell_command(&hook_json, tool_name, format) {
+        // Unconditional deny: `catenary hook` is for host CLI hook
+        // invocation only, `catenary stop` is a user-facing command.
+        // Neither should be invoked by an agent.
+        if is_catenary_command(shell_cmd, &["hook", "stop"]) {
+            print!(
+                "{}",
+                format_deny(
+                    "catenary hook and stop commands are not agent-invocable",
+                    format,
+                )
+            );
+            return;
+        }
         // start_editing: send IPC to daemon to enter editing mode,
         // then allow the command to execute (it prints confirmation).
         if is_catenary_command(shell_cmd, &["start_editing"]) {
             handle_start_editing_hook(&hook_json, format);
+            return;
+        }
+        // done_editing: send IPC to daemon to prepare the handoff
+        // (drain files, release guardrail, deposit in handoff slot),
+        // then allow the command to execute (it retrieves diagnostics).
+        if is_catenary_command(shell_cmd, &["done_editing"]) {
+            handle_done_editing_hook(&hook_json, format);
             return;
         }
         // Root management: allow through without IPC — the CLI
@@ -847,6 +868,39 @@ fn handle_start_editing_hook(hook_json: &serde_json::Value, format: HostFormat) 
 
     let mut request = serde_json::json!({
         "method": "pre-tool/start-editing",
+        "agent_id": agent_id,
+    });
+    if let Some(sid) = session_id {
+        request["session_id"] = serde_json::json!(sid);
+    }
+    request["host_payload"] = prepare_host_payload(hook_json);
+
+    let lines = ipc_exchange(stream, &request);
+
+    if let Some(line) = lines.first()
+        && let Ok(envelope) = serde_json::from_str::<crate::hook::HookResponseEnvelope>(line)
+        && let Some(crate::hook::HookResult::Deny(reason)) = &envelope.result
+    {
+        print!("{}", format_deny(reason, format));
+    }
+}
+
+/// Handle `PreToolUse` for `catenary done_editing`.
+///
+/// Sends `pre-tool/done-editing-prepare` IPC to the daemon to prepare
+/// the handoff: drain accumulated files, release the editing guardrail,
+/// and deposit the file list in the handoff slot. Returns allow (silent)
+/// or deny (prints denial reason to stdout for the host CLI).
+fn handle_done_editing_hook(hook_json: &serde_json::Value, format: HostFormat) {
+    let Some(stream) = hook_connect(hook_json) else {
+        return;
+    };
+
+    let agent_id = extract_agent_id(hook_json);
+    let session_id = hook_json.get("session_id").and_then(|v| v.as_str());
+
+    let mut request = serde_json::json!({
+        "method": "pre-tool/done-editing",
         "agent_id": agent_id,
     });
     if let Some(sid) = session_id {
@@ -1571,5 +1625,67 @@ mod tests {
     #[test]
     fn is_root_command_compound_not_matched() {
         assert!(!is_root_command("echo hello && catenary add-root /tmp"));
+    }
+
+    // ── done_editing command recognition tests ──────────────────────
+
+    #[test]
+    fn catenary_command_done_editing() {
+        assert!(is_catenary_command(
+            "catenary done_editing",
+            &["done_editing"],
+        ));
+    }
+
+    #[test]
+    fn catenary_command_done_editing_with_path_prefix() {
+        assert!(is_catenary_command(
+            "/usr/local/bin/catenary done_editing",
+            &["done_editing"],
+        ));
+    }
+
+    #[test]
+    fn catenary_command_done_editing_with_home_prefix() {
+        assert!(is_catenary_command(
+            "~/.local/bin/catenary done_editing",
+            &["done_editing"],
+        ));
+    }
+
+    #[test]
+    fn catenary_command_done_editing_compound_not_matched() {
+        assert!(!is_catenary_command(
+            "echo hello && catenary done_editing",
+            &["done_editing"],
+        ));
+    }
+
+    // ── unconditional deny tests ────────────────────────────────────
+
+    #[test]
+    fn catenary_hook_subcommand_detected() {
+        assert!(is_catenary_command(
+            "catenary hook pre-tool --format=claude",
+            &["hook", "stop"],
+        ));
+    }
+
+    #[test]
+    fn catenary_stop_subcommand_detected() {
+        assert!(is_catenary_command("catenary stop", &["hook", "stop"]));
+    }
+
+    #[test]
+    fn catenary_hook_with_path_prefix_detected() {
+        assert!(is_catenary_command(
+            "/usr/local/bin/catenary hook post-tool --format=gemini",
+            &["hook", "stop"],
+        ));
+    }
+
+    #[test]
+    fn catenary_stop_not_matched_as_start_editing() {
+        assert!(!is_catenary_command("catenary stop", &["start_editing"]));
     }
 }

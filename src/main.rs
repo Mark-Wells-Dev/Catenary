@@ -143,6 +143,10 @@ enum Command {
     #[command(name = "start_editing")]
     StartEditing,
 
+    /// Exit editing mode and print diagnostics. Invoke via the host's shell tool.
+    #[command(name = "done_editing")]
+    DoneEditing,
+
     /// Add a workspace root. Invoke via the host's shell tool.
     #[command(name = "add-root")]
     AddRoot {
@@ -308,14 +312,18 @@ fn main() -> Result<()> {
         #[cfg(not(unix))]
         Some(Command::StartEditing) => Err(anyhow::anyhow!("daemon mode requires Unix")),
         #[cfg(unix)]
+        Some(Command::DoneEditing) => build_runtime()?.block_on(run_done_editing()),
+        #[cfg(not(unix))]
+        Some(Command::DoneEditing) => Err(anyhow::anyhow!("daemon mode requires Unix")),
+        #[cfg(unix)]
         Some(Command::AddRoot { path }) => {
-            build_runtime()?.block_on(run_root_command(path, "add-root/run"))
+            build_runtime()?.block_on(run_root_command(path, "tool/add-root"))
         }
         #[cfg(not(unix))]
         Some(Command::AddRoot { .. }) => Err(anyhow::anyhow!("daemon mode requires Unix")),
         #[cfg(unix)]
         Some(Command::RmRoot { path }) => {
-            build_runtime()?.block_on(run_root_command(path, "rm-root/run"))
+            build_runtime()?.block_on(run_root_command(path, "tool/rm-root"))
         }
         #[cfg(not(unix))]
         Some(Command::RmRoot { .. }) => Err(anyhow::anyhow!("daemon mode requires Unix")),
@@ -582,7 +590,7 @@ async fn run_stop() -> Result<()> {
     };
 
     let (reader, mut writer) = stream.into_split();
-    let request = serde_json::json!({"method": "shutdown"});
+    let request = serde_json::json!({"method": "tool/shutdown"});
     let mut payload = serde_json::to_string(&request)?;
     payload.push('\n');
     writer.write_all(payload.as_bytes()).await?;
@@ -615,7 +623,7 @@ async fn run_start_editing() -> Result<()> {
         .context("no daemon running — start a Catenary session first")?;
 
     let (reader, mut writer) = stream.into_split();
-    let request = serde_json::json!({"method": "start-editing/confirm"});
+    let request = serde_json::json!({"method": "tool/start-editing"});
     let mut payload = serde_json::to_string(&request)?;
     payload.push('\n');
     writer.write_all(payload.as_bytes()).await?;
@@ -638,6 +646,51 @@ async fn run_start_editing() -> Result<()> {
             .and_then(|v| v.as_str())
             .unwrap_or("unexpected response");
         anyhow::bail!("{msg}");
+    }
+
+    Ok(())
+}
+
+/// Exits editing mode and prints diagnostics to stdout.
+///
+/// Connects to the daemon's hook socket and sends `done-editing/run`.
+/// The `PreToolUse` hook has already prepared the handoff — this command
+/// retrieves the diagnostics and prints them.
+///
+/// # Errors
+///
+/// Returns an error if no daemon is running or the response is invalid.
+#[cfg(unix)]
+async fn run_done_editing() -> Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let hook_path = catenary_mcp::router::hook_socket_path();
+
+    let stream = tokio::net::UnixStream::connect(&hook_path)
+        .await
+        .context("catenary daemon not running")?;
+
+    let (reader, mut writer) = stream.into_split();
+    let request = serde_json::json!({"method": "tool/done-editing"});
+    let mut payload = serde_json::to_string(&request)?;
+    payload.push('\n');
+    writer.write_all(payload.as_bytes()).await?;
+
+    // Read all response lines (diagnostics output may be multi-line).
+    let mut buf_reader = BufReader::new(reader);
+    let mut output = String::new();
+    loop {
+        let mut line = String::new();
+        let n = buf_reader.read_line(&mut line).await?;
+        if n == 0 {
+            break;
+        }
+        output.push_str(&line);
+    }
+
+    let trimmed = output.trim();
+    if !trimmed.is_empty() {
+        println!("{trimmed}");
     }
 
     Ok(())
@@ -806,6 +859,16 @@ mod tests {
         let args = Args::try_parse_from(["catenary", "start_editing"]);
         let args = args.expect("start_editing should parse");
         assert!(matches!(args.command, Some(Command::StartEditing)));
+    }
+
+    // ── CLI done_editing subcommand test ──────────────────────────
+
+    #[test]
+    fn test_cli_done_editing() {
+        use clap::Parser;
+        let args = Args::try_parse_from(["catenary", "done_editing"]);
+        let args = args.expect("done_editing should parse");
+        assert!(matches!(args.command, Some(Command::DoneEditing)));
     }
 
     // ── CLI root management subcommand tests ─────────────────────
