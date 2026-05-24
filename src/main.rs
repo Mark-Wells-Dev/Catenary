@@ -733,7 +733,7 @@ async fn run_root_command(path: PathBuf, method: &str) -> Result<()> {
 
     match status {
         "ok" => {
-            let verb = if method.starts_with("add") {
+            let verb = if method.contains("add-root") {
                 "added"
             } else {
                 "removed"
