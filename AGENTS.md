@@ -4,7 +4,7 @@ This file serves as the single point of truth for AI agents (Claude, Gemini, etc
 
 ## Project Grounding
 
-- **Project Goal:** High-performance multiplexing bridge between MCP and LSP.
+- **Project Goal:** Multi-surface intelligence router — LSP-powered code intelligence for AI agents.
 - **Repository:** `TwoWells/Catenary` on GitHub.
 - **Config:** `@./Cargo.toml`
 - **Dependency Policy:** `@./deny.toml`
@@ -12,32 +12,39 @@ This file serves as the single point of truth for AI agents (Claude, Gemini, etc
 
 ## How Catenary Works
 
-Catenary is an MCP server that gives AI agents LSP-powered code intelligence. It
-multiplexes one or more LSP servers (e.g., rust-analyzer, typescript-language-server)
-behind a single MCP interface, providing hover, go-to-definition, diagnostics,
-find-references, rename, and search without shell-based text scanning.
+Catenary is a multi-surface intelligence router. A single daemon manages a pool
+of LSP servers and exposes them through four decoupled interfaces: MCP (queries),
+hooks (enforcement), CLI (editing lifecycle), and TUI (observability). All
+surfaces share the same LSP server pool. None depends on the others.
 
 ### Core concepts
 
-- **Session:** A running Catenary instance. Each session has a unique ID (opaque
-  string), a PID, and one or more workspace roots. Sessions are discoverable via
-  `catenary list` and monitorable via `catenary monitor <id>`. See `src/session.rs`.
-- **Database:** All session state (sessions, events, workspace roots) is stored in
+- **Daemon:** A single Catenary process per host. Multiple agents connect via
+  Unix domain socket. LSP servers are shared across all sessions. See
+  `src/session.rs`.
+- **Session:** A connected agent. Each session has a unique ID (opaque string)
+  and one or more workspace roots. Sessions are discoverable via `catenary list`
+  and monitorable via `catenary monitor <id>`.
+- **Database:** All state (sessions, events, workspace roots) is stored in
   `~/.local/state/catenary/catenary.db` (SQLite with WAL mode). See `src/db.rs`.
-- **MCP tools:** The tools exposed to agents (search, hover, definition,
-  diagnostics, etc.) are defined in the MCP server. Each tool delegates to one or
-  more LSP servers under the hood.
-- **Hooks:** Catenary integrates with host CLIs (Claude Code, Gemini CLI) via
-  hooks that fire before/after tool use. Hook definitions live in
-  `plugins/catenary/hooks/hooks.json` (Claude Code) and `hooks/hooks.json`
-  (Gemini CLI).
-- **Diagnostics:** The `catenary hook post-tool` command (`src/hook.rs` for the
-  IPC server) runs in PostToolUse hooks after file edits. It connects to the
-  running session's hook socket, sends the changed file path, and returns
-  LSP diagnostics so they appear in the model's context. Diagnostic events are
-  stored in the SQLite database for later querying via `catenary query`.
-- **Root sync:** `catenary hook pre-tool` (PreToolUse, Claude Code only) scans
-  the transcript for `/add-dir` workspace additions and forwards them to the session.
+- **MCP tools:** Stateless query surface — `grep` and `glob`. No session
+  identity, no connection binding. Each tool delegates to one or more LSP servers
+  under the hood.
+- **Hooks:** Catenary registers a single `PreToolUse` hook per host (Claude Code,
+  Gemini CLI, Antigravity CLI). This hook handles editing enforcement, command
+  filtering, and file tracking. Hook definitions live in
+  `plugins/catenary/hooks/hooks.json` (Claude Code), `hooks/hooks.json`
+  (Gemini CLI), and `plugins/catenary-antigravity/hooks.json` (Antigravity CLI).
+- **CLI commands:** Editing lifecycle invoked via the host's shell tool:
+  - `catenary start_editing` — enter editing mode (diagnostics deferred).
+  - `catenary done_editing` — exit editing mode, print LSP diagnostics for all
+    modified files to stdout.
+  - `catenary add-root <path>` / `catenary rm-root <path>` — manage workspace
+    roots.
+- **Diagnostics:** `catenary done_editing` triggers the diagnostics pipeline:
+  batch all modified files, send to LSP servers, collect diagnostics, print to
+  stdout. The agent sees diagnostics in the shell tool output. Diagnostic events
+  are stored in the SQLite database for later querying via `catenary query`.
 - **Logging:** `LoggingServer` is a `tracing_subscriber::Layer` that subscribes
   to every tracing event and dispatches to multiple sinks: notification queue
   (user-facing `systemMessage`), protocol DB (LSP/MCP/hook messages), and trace
