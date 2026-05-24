@@ -1,21 +1,30 @@
 ---
+name: catenary
 description: >
-  Catenary editing workflow and workspace management. Use before
-  editing files to get LSP diagnostics afterward.
+  Catenary uses editing mode to deliver LSP diagnostics. Run
+  `catenary start_editing` via Bash before using Edit/Write. Run
+  `catenary done_editing` via Bash after editing to get diagnostics
+  for all files touched.
 ---
 
-## Catenary Editing Workflow
+## Editing Mode
 
-Run `catenary start_editing` before editing files.
-Edit files normally using the Edit tool.
-Run `catenary done_editing` after editing to see diagnostics.
-
-## Workspace Roots
-
-Run `catenary add-root <path>` to add a workspace root.
-Run `catenary rm-root <path>` to remove a workspace root.
+Edit and Write are denied until `catenary start_editing` is run
+via Bash. During editing mode, Catenary tracks which files the
+agent touches and denies most Bash commands until
+`catenary done_editing` is called. `done_editing` returns
+diagnostics for all files touched during editing.
 
 ## Code Search
 
-Use the `catenary grep` and `catenary glob` MCP tools for code search.
-These are always available and do not require editing mode.
+Catenary's grep and glob MCP tools are stateless and available at
+all times, including during editing mode. They work on any
+directory but results are only LSP-enriched within tracked
+workspace roots.
+
+## Workspace Roots
+
+Add roots with `catenary add-root <path>` via Bash to extend LSP
+coverage to additional directories. Use `catenary rm-root <path>`
+to remove roots added via the CLI — this does not affect roots
+provided by the MCP connection.
