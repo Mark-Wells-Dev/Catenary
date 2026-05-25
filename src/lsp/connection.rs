@@ -984,7 +984,6 @@ mod tests {
             "test".to_string(),
             "test-server".to_string(),
             None,
-            std::collections::HashMap::new(),
         ));
         let logging = LoggingServer::new();
         let bin = crate::lsp::test_support::mockls_bin();

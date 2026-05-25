@@ -204,7 +204,7 @@ fn spawn_handoff_timeout(slot: Arc<std::sync::Mutex<Option<HandoffContext>>>) {
 /// contributors) is synced to the shared [`crate::lsp::LspClientManager`]
 /// after each mutation. When a contributor is removed (MCP disconnect),
 /// its roots leave the union — roots that no other contributor provides
-/// are removed from LSP servers via `didChangeWorkspaceFolders`.
+/// have their per-root server instances shut down.
 ///
 /// Contributor keys:
 /// - `"mcp:{fd}"` — roots from MCP `roots/list` for a connection

@@ -854,16 +854,8 @@ pub mod test_support {
     ) -> anyhow::Result<(crate::lsp::LspClient, tempfile::TempDir)> {
         let dir = tempfile::tempdir()?;
 
-        let mut client = crate::lsp::LspClient::spawn(
-            bin,
-            &[lang],
-            lang,
-            lang,
-            logging,
-            None,
-            std::collections::HashMap::new(),
-            None,
-        )?;
+        let mut client =
+            crate::lsp::LspClient::spawn(bin, &[lang], lang, lang, logging, None, None)?;
 
         client.initialize(&[dir.path().to_path_buf()], None).await?;
         Ok((client, dir))

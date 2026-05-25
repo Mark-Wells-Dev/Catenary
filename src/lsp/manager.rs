@@ -44,27 +44,19 @@ fn match_file_changes(
         .collect()
 }
 
-/// Looks up an existing client instance by trying `Scope::Root(root)`
-/// first, then `Scope::Workspace`. Root-first ordering ensures that
-/// project-scoped instances (Rule A) take precedence over shared
-/// workspace instances when both exist for the same `(lang, server)`.
+/// Looks up an existing client instance for a `(lang, server, root)` triple.
 fn find_instance(
     clients: &HashMap<InstanceKey, Arc<Mutex<LspClient>>>,
     lang: &str,
     server_name: &str,
     root: &Path,
 ) -> Option<Arc<Mutex<LspClient>>> {
-    let root_key = InstanceKey::new(
+    let key = InstanceKey::new(
         lang.to_string(),
         server_name.to_string(),
         Scope::Root(root.to_path_buf()),
     );
-    if let Some(client) = clients.get(&root_key) {
-        return Some(client.clone());
-    }
-    let workspace_key =
-        InstanceKey::new(lang.to_string(), server_name.to_string(), Scope::Workspace);
-    clients.get(&workspace_key).cloned()
+    clients.get(&key).cloned()
 }
 
 /// Tests whether a path matches a server's `file_patterns`.
@@ -282,9 +274,8 @@ impl LspClientManager {
     /// that have matching files. Servers that fail to spawn are logged and
     /// skipped — a misconfigured server should not prevent others from starting.
     ///
-    /// For workspace-capable servers, spawns a single instance (all roots
-    /// are already included in the `initialize` request). For legacy
-    /// servers, spawns a separate `Scope::Root` instance per root.
+    /// Spawns a separate `Scope::Root` instance per root. Unrelated
+    /// projects never share an LSP server.
     pub async fn spawn_all(&self) {
         let roots = self.fs.roots();
 
@@ -313,255 +304,32 @@ impl LspClientManager {
             let bindings: Vec<ServerBinding> = lang_config.servers().to_vec();
 
             for binding in &bindings {
-                let Some(first_root) = roots.first() else {
-                    continue;
-                };
+                let marker_set = lang_config.marker_set();
+                for root in &roots {
+                    // If the language has root markers but this root
+                    // doesn't contain any, defer to lazy spawn on first need.
+                    if let Some((markers, compiled)) = marker_set
+                        && !dir_has_marker(root, markers, compiled)
+                    {
+                        debug!(
+                            language = lang.as_str(),
+                            server = binding.name.as_str(),
+                            "No root marker at {} — deferring to lazy spawn",
+                            root.display(),
+                        );
+                        continue;
+                    }
 
-                // If the language has root markers but the workspace root
-                // doesn't contain any, defer to lazy spawn on first need.
-                if let Some((markers, compiled)) = lang_config.marker_set()
-                    && !dir_has_marker(first_root, markers, compiled)
-                {
-                    debug!(
-                        language = lang.as_str(),
-                        server = binding.name.as_str(),
-                        "No root marker at workspace root — deferring to lazy spawn",
-                    );
-                    continue;
-                }
-
-                let client = match self.ensure_server(lang, &binding.name, first_root).await {
-                    Ok(c) => c,
-                    Err(e) => {
+                    if let Err(e) = self.ensure_server(lang, &binding.name, root).await {
                         warn!(
                             source = Source::LspLifecycle.as_str(),
                             language = lang.as_str(),
                             server = binding.name.as_str(),
-                            "Failed to spawn LSP server for {lang}: {e}",
-                        );
-                        continue;
-                    }
-                };
-
-                let key = client.lock().await.server().key();
-                let Some(key) = key else { continue };
-
-                self.exclude_project_roots_from_workspace(
-                    &client,
-                    &key,
-                    lang,
-                    &binding.name,
-                    &roots,
-                )
-                .await;
-                self.spawn_remaining_roots(lang, &binding.name, &key, &roots)
-                    .await;
-            }
-        }
-    }
-
-    /// Excludes project-scoped roots from a workspace instance.
-    ///
-    /// If the given instance is `Scope::Workspace`, sends
-    /// `didChangeWorkspaceFolders` remove for each root that is
-    /// project-scoped for this language. No-op for non-workspace keys
-    /// or if no roots are project-scoped.
-    async fn exclude_project_roots_from_workspace(
-        &self,
-        client: &Arc<Mutex<LspClient>>,
-        key: &InstanceKey,
-        lang: &str,
-        server_name: &str,
-        roots: &[PathBuf],
-    ) {
-        if key.scope != Scope::Workspace {
-            return;
-        }
-        let project_scoped: Vec<(String, String)> = roots
-            .iter()
-            .filter(|r| self.is_project_scoped(lang, r))
-            .map(|r| {
-                (
-                    format!("file://{}", r.display()),
-                    r.file_name().map_or_else(
-                        || "workspace".to_string(),
-                        |s| s.to_string_lossy().to_string(),
-                    ),
-                )
-            })
-            .collect();
-        if project_scoped.is_empty() {
-            return;
-        }
-        let refs: Vec<(&str, &str)> = project_scoped
-            .iter()
-            .map(|(u, n)| (u.as_str(), n.as_str()))
-            .collect();
-        let locked = client.lock().await;
-        if let Err(e) = locked.did_change_workspace_folders(&[], &refs).await {
-            info!("Failed to exclude project-scoped roots from {server_name} workspace: {e}",);
-        }
-    }
-
-    /// Spawns instances for remaining roots (after the first).
-    ///
-    /// Root-scoped first spawn: spawns per-root instances for all
-    /// remaining roots (project-scoped use effective server defs).
-    /// Workspace-scoped first spawn: only spawns project-scoped roots.
-    async fn spawn_remaining_roots(
-        &self,
-        lang: &str,
-        server_name: &str,
-        key: &InstanceKey,
-        roots: &[PathBuf],
-    ) {
-        if roots.len() <= 1 {
-            return;
-        }
-        match &key.scope {
-            Scope::Root(_) => {
-                let marker_set = self
-                    .config
-                    .resolve_language(lang)
-                    .and_then(LanguageConfig::marker_set);
-                info!(
-                    source = Source::LspLifecycle.as_str(),
-                    language = lang,
-                    server = server_name,
-                    "Server does not support workspaceFolders — spawning per-root instances",
-                );
-                for root in &roots[1..] {
-                    // Skip roots without markers when markers are configured.
-                    if marker_set.is_some_and(|(m, c)| !dir_has_marker(root, m, c)) {
-                        continue;
-                    }
-                    if let Err(e) = self.ensure_server(lang, server_name, root).await {
-                        warn!(
-                            source = Source::LspLifecycle.as_str(),
-                            language = lang,
-                            server = server_name,
-                            "Failed to spawn per-root instance for {lang} ({server_name}) at {}: {e}",
+                            "Failed to spawn LSP server for {lang} at {}: {e}",
                             root.display(),
                         );
                     }
                 }
-            }
-            Scope::Workspace => {
-                // Spawn project-scoped roots only. Non-project-scoped
-                // roots are already covered by the workspace instance.
-                for root in &roots[1..] {
-                    if self.is_project_scoped(lang, root)
-                        && let Err(e) = self.spawn_project_scoped(server_name, lang, root).await
-                    {
-                        warn!(
-                            source = Source::LspLifecycle.as_str(),
-                            language = lang,
-                            server = server_name,
-                            "Failed to spawn project-scoped instance for {lang} ({server_name}) at {}: {e}",
-                            root.display(),
-                        );
-                    }
-                }
-            }
-            Scope::SingleFile => {}
-        }
-    }
-
-    /// Notifies workspace-capable servers about folder additions and
-    /// removals during `sync_roots`, and updates per-root settings
-    /// with `didChangeConfiguration` for new roots with overrides.
-    #[allow(
-        clippy::significant_drop_tightening,
-        reason = "client lock held across notification sends for consistent state"
-    )]
-    async fn notify_workspace_servers_sync(
-        &self,
-        to_add: &[PathBuf],
-        removed_refs: &[(&str, &str)],
-    ) {
-        let clients = self.clients.lock().await.clone();
-        for (key, client_mutex) in &clients {
-            let client = client_mutex.lock().await;
-            if !client.is_alive() || !client.supports_workspace_folders() {
-                continue;
-            }
-
-            // Only add roots NOT project-scoped for this language.
-            let non_project_adds: Vec<(String, String)> = to_add
-                .iter()
-                .filter(|r| !self.is_project_scoped(&key.language_id, r))
-                .map(|root| {
-                    (
-                        format!("file://{}", root.display()),
-                        root.file_name().map_or_else(
-                            || "workspace".to_string(),
-                            |s| s.to_string_lossy().to_string(),
-                        ),
-                    )
-                })
-                .collect();
-            let added_refs: Vec<(&str, &str)> = non_project_adds
-                .iter()
-                .map(|(u, n)| (u.as_str(), n.as_str()))
-                .collect();
-
-            if (!added_refs.is_empty() || !removed_refs.is_empty())
-                && let Err(e) = client
-                    .did_change_workspace_folders(&added_refs, removed_refs)
-                    .await
-            {
-                info!(
-                    "Failed to notify {} server about workspace folder changes: {}",
-                    key.language_id, e
-                );
-            }
-
-            // Update per-root settings and send didChangeConfiguration
-            // for non-project-scoped roots with settings overrides.
-            for root in to_add {
-                if self.is_project_scoped(&key.language_id, root) {
-                    continue;
-                }
-                let Some(settings) = self.effective_settings(&key.server, root) else {
-                    continue;
-                };
-                let differs = self
-                    .config
-                    .server
-                    .get(&key.server)
-                    .and_then(|d| d.settings.as_ref())
-                    .is_none_or(|user| *user != settings);
-                if !differs {
-                    continue;
-                }
-                client.server().set_root_settings(root.clone(), settings);
-                if client.server().wants_did_change_configuration()
-                    && let Err(e) = client.did_change_configuration().await
-                {
-                    info!(
-                        "Failed to send didChangeConfiguration to {} for {}: {e}",
-                        key.server,
-                        root.display(),
-                    );
-                }
-            }
-        }
-    }
-
-    /// Removes per-root settings from workspace instances for removed
-    /// roots.
-    async fn cleanup_root_settings_for_removed(&self, to_remove: &[PathBuf]) {
-        if to_remove.is_empty() {
-            return;
-        }
-        let clients = self.clients.lock().await.clone();
-        for (key, client_mutex) in &clients {
-            if !matches!(key.scope, Scope::Workspace) {
-                continue;
-            }
-            let client = client_mutex.lock().await;
-            for removed in to_remove {
-                client.server().remove_root_settings(removed);
             }
         }
     }
@@ -594,22 +362,13 @@ impl LspClientManager {
         self.fs.roots()
     }
 
-    /// Removes a workspace root and updates all active LSP clients.
-    ///
-    /// Workspace-capable servers receive a `didChangeWorkspaceFolders`
-    /// removal notification. Legacy servers with a `Scope::Root` matching
-    /// the removed root are shut down and removed from the map.
+    /// Removes a workspace root and shuts down all server instances
+    /// bound to it.
     ///
     /// # Errors
     ///
     /// Returns an error if the root path cannot be converted to a valid URI.
     pub async fn remove_root(&self, root: &Path) -> Result<()> {
-        let uri = format!("file://{}", root.display());
-        let name = root.file_name().map_or_else(
-            || "workspace".to_string(),
-            |s| s.to_string_lossy().to_string(),
-        );
-
         let mut roots = self.fs.roots();
         roots.retain(|r| r != root);
         self.fs.set_roots(roots);
@@ -621,27 +380,7 @@ impl LspClientManager {
             .remove(root);
         self.fs.remove_root_classification(root);
 
-        // Notify workspace-capable servers about the removal and
-        // clean up per-root settings.
-        let clients = self.clients.lock().await.clone();
-        for (key, client_mutex) in &clients {
-            let client = client_mutex.lock().await;
-            if !client.is_alive() || !client.supports_workspace_folders() {
-                continue;
-            }
-            if let Err(e) = client
-                .did_change_workspace_folders(&[], &[(&uri, &name)])
-                .await
-            {
-                info!(
-                    "Failed to notify {} server about removed workspace folder: {}",
-                    key.language_id, e
-                );
-            }
-            client.server().remove_root_settings(root);
-        }
-
-        // Shut down legacy per-root instances bound to the removed root.
+        // Shut down per-root instances bound to the removed root.
         self.shutdown_root_instances(root).await;
 
         Ok(())
@@ -650,11 +389,9 @@ impl LspClientManager {
     /// Synchronizes workspace roots with a new set.
     ///
     /// Diffs against current roots: adds new ones, removes stale ones.
-    /// Workspace-capable servers receive a single `didChangeWorkspaceFolders`
-    /// notification with both additions and removals. Legacy servers get
-    /// per-root instance lifecycle: removed roots have their instances shut
-    /// down; added roots get new `Scope::Root` instances spawned (only for
-    /// languages that already have active legacy instances).
+    /// Removed roots have their per-root instances shut down. Added
+    /// roots get new `Scope::Root` instances spawned for languages
+    /// that already have active instances.
     ///
     /// # Errors
     ///
@@ -708,43 +445,15 @@ impl LspClientManager {
             }
         }
 
-        // Partition added roots: project-scoped roots are excluded from
-        // workspace folder notifications and get their own instances.
-        // A root may be project-scoped for one language+server but not
-        // another — the partition is computed per-server below.
-
-        let removed_folders: Vec<(String, String)> = to_remove
-            .iter()
-            .map(|root| {
-                (
-                    format!("file://{}", root.display()),
-                    root.file_name().map_or_else(
-                        || "workspace".to_string(),
-                        |s| s.to_string_lossy().to_string(),
-                    ),
-                )
-            })
-            .collect();
-        let removed_refs: Vec<(&str, &str)> = removed_folders
-            .iter()
-            .map(|(u, n)| (u.as_str(), n.as_str()))
-            .collect();
-
-        // Notify workspace servers about folder changes, update
-        // per-root settings, and clean up removed roots.
-        self.notify_workspace_servers_sync(&to_add, &removed_refs)
-            .await;
-        self.cleanup_root_settings_for_removed(&to_remove).await;
-
-        // Legacy per-root lifecycle: shut down instances for removed roots.
+        // Shut down per-root instances for removed roots.
         for removed in &to_remove {
             self.shutdown_root_instances(removed).await;
         }
 
         // Shut down single-file servers and clear the cache — root
         // changes may have brought previously-unrooted files into scope
-        // of workspace or per-root instances. Single-file servers are
-        // lazily re-spawned on the next request if still needed.
+        // of per-root instances. Single-file servers are lazily
+        // re-spawned on the next request if still needed.
         self.shutdown_single_file_instances().await;
 
         // Spawn instances for added roots.
@@ -971,15 +680,16 @@ impl LspClientManager {
     /// Spawns a project-scoped server instance using the effective
     /// (merged) `ServerDef` for the root.
     ///
-    /// Always produces `Scope::Root(root)` regardless of workspace
-    /// folder support — project-scoped roots are isolated by design
-    /// (Rule A from §9).
+    /// Production code uses [`Self::ensure_server`] which handles
+    /// project-scope detection internally. This wrapper exists for
+    /// tests that need explicit project-scoped spawning.
     ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - No effective server def can be computed for this server+root.
     /// - The server fails to spawn or initialize.
+    #[cfg(test)]
     async fn spawn_project_scoped(
         &self,
         server_name: &str,
@@ -991,10 +701,9 @@ impl LspClientManager {
 
     /// Shared spawn implementation.
     ///
-    /// Scope selection: `project_scoped` forces `Scope::Root(root)`,
-    /// otherwise capability-driven (`Scope::Workspace` when the server
-    /// supports workspace folders, `Scope::Root` otherwise). Root
-    /// markers resolve paths but do not influence scope.
+    /// Every instance gets `Scope::Root(root)`. `project_scoped`
+    /// controls server def resolution (merged vs user-level) but
+    /// does not affect scope selection.
     async fn spawn_inner(
         &self,
         server_name: &str,
@@ -1018,28 +727,11 @@ impl LspClientManager {
                 .clone()
         };
 
-        let force_root = project_scoped;
-
-        let roots = self.fs.roots();
         let mut clients = self.clients.lock().await;
 
         // Double-check: another task may have spawned this server
         // while we waited.
-        //
-        // Project-scoped spawns only check the exact Root(root) key —
-        // a workspace instance must NOT prevent spawning the isolated
-        // instance.
-        let existing = if force_root {
-            let root_key = InstanceKey::new(
-                lang.to_string(),
-                server_name.to_string(),
-                Scope::Root(root.to_path_buf()),
-            );
-            clients.get(&root_key).cloned()
-        } else {
-            find_instance(&clients, lang, server_name, root)
-        };
-        if let Some(found) = existing {
+        if let Some(found) = find_instance(&clients, lang, server_name, root) {
             if found.lock().await.is_alive() {
                 let key = found
                     .lock()
@@ -1059,25 +751,6 @@ impl LspClientManager {
             server_def.args.join(" ")
         );
 
-        // Build per-root settings map from project configs.
-        // Workspace instances use this for scopeUri resolution;
-        // root instances won't have scopeUri requests for other roots.
-        let settings_per_root = if project_scoped {
-            // Project-scoped instances get pre-merged flat settings —
-            // no scopeUri resolution needed.
-            HashMap::new()
-        } else {
-            self.collect_per_root_settings(server_name, &roots)
-        };
-
-        // Project-scoped instances are initialized with only their
-        // resolved root — the server sees only that root.
-        let init_roots = if project_scoped {
-            vec![root.to_path_buf()]
-        } else {
-            roots
-        };
-
         let args: Vec<&str> = server_def
             .args
             .iter()
@@ -1090,24 +763,17 @@ impl LspClientManager {
             server_name,
             self.logging.clone(),
             server_def.settings.clone(),
-            settings_per_root,
             server_def.env.as_ref(),
         )?;
 
         client
-            .initialize(&init_roots, server_def.initialization_options.clone())
+            .initialize(
+                &[root.to_path_buf()],
+                server_def.initialization_options.clone(),
+            )
             .await?;
 
-        // Project-scoped instances always get Scope::Root regardless
-        // of capabilities — they are isolated to their specific root.
-        let scope = if force_root {
-            Scope::Root(root.to_path_buf())
-        } else if client.supports_workspace_folders() {
-            Scope::Workspace
-        } else {
-            Scope::Root(root.to_path_buf())
-        };
-        client.server().set_scope(scope);
+        client.server().set_scope(Scope::Root(root.to_path_buf()));
 
         let key = client
             .server()
@@ -1171,7 +837,6 @@ impl LspClientManager {
             server_name,
             self.logging.clone(),
             server_def.settings.clone(),
-            HashMap::new(),
             server_def.env.as_ref(),
         )?;
 
@@ -1251,10 +916,8 @@ impl LspClientManager {
 
     /// Get-then-spawn composition.
     ///
-    /// Looks up an existing instance by trying both `Scope::Workspace` and
-    /// `Scope::Root(root)` keys. On miss, spawns with the correct scope:
-    /// project-scoped roots (Rule A) get `spawn_project_scoped`, others
-    /// get capability-driven scope via `spawn`. Dead servers are left as
+    /// Looks up an existing `Scope::Root(root)` instance. On miss,
+    /// spawns a new per-root instance. Dead servers are left as
     /// tombstones — a server that crashes will not be restarted.
     /// Intentional restarts (e.g. after `sync_roots`) go through
     /// [`Self::shutdown_instance`] which removes the entry so a fresh
@@ -1273,24 +936,11 @@ impl LspClientManager {
         root: &Path,
     ) -> Result<Arc<Mutex<LspClient>>> {
         let project_scoped = self.is_project_scoped(lang, root);
-        let force_root = project_scoped;
 
-        // Fast path: check for an existing instance. Project-scoped
-        // roots only check the exact Root(root) key — a workspace
-        // instance must not prevent spawning the isolated instance.
+        // Fast path: check for an existing instance.
         {
             let clients = self.clients.lock().await;
-            let existing = if force_root {
-                let root_key = InstanceKey::new(
-                    lang.to_string(),
-                    server_name.to_string(),
-                    Scope::Root(root.to_path_buf()),
-                );
-                clients.get(&root_key).cloned()
-            } else {
-                find_instance(&clients, lang, server_name, root)
-            };
-            if let Some(found) = existing {
+            if let Some(found) = find_instance(&clients, lang, server_name, root) {
                 if found.lock().await.is_alive() {
                     return Ok(found);
                 }
@@ -1572,21 +1222,18 @@ impl LspClientManager {
             .clear();
     }
 
-    /// Spawns instances for newly added roots.
+    /// Spawns per-root instances for newly added roots.
     ///
-    /// For each active language+server, spawns project-scoped
-    /// `Scope::Root` instances for roots with Rule A triggers, and
-    /// legacy `Scope::Root` instances for roots where the server
-    /// doesn't support workspace folders.
+    /// For each active language+server, spawns a `Scope::Root` instance
+    /// for each added root that has matching files.
     async fn spawn_for_added_roots(&self, added_roots: &[PathBuf]) {
-        // Collect active languages with their servers and scope kind.
+        // Collect active languages with their server names.
         let clients = self.clients.lock().await.clone();
-        let mut active_langs: HashMap<String, Vec<(String, bool)>> = HashMap::new();
+        let mut active_langs: HashMap<String, Vec<String>> = HashMap::new();
         for key in clients.keys() {
-            let is_workspace = key.scope == Scope::Workspace;
             let entries = active_langs.entry(key.language_id.clone()).or_default();
-            if !entries.iter().any(|(s, _)| s == &key.server) {
-                entries.push((key.server.clone(), is_workspace));
+            if !entries.contains(&key.server) {
+                entries.push(key.server.clone());
             }
         }
         drop(clients);
@@ -1609,18 +1256,13 @@ impl LspClientManager {
                 .config
                 .resolve_language(lang)
                 .and_then(LanguageConfig::marker_set);
-            for (server_name, is_workspace) in servers {
+            for server_name in servers {
                 for root in added_roots {
                     // Skip roots without markers when markers are configured.
                     if marker_set.is_some_and(|(m, c)| !dir_has_marker(root, m, c)) {
                         continue;
                     }
-                    // Workspace-capable + non-project-scoped: already
-                    // covered by the workspace instance (folder add
-                    // sent in sync_roots).
-                    if (self.is_project_scoped(lang, root) || !is_workspace)
-                        && let Err(e) = self.ensure_server(lang, server_name, root).await
-                    {
+                    if let Err(e) = self.ensure_server(lang, server_name, root).await {
                         warn!(
                             source = Source::LspLifecycle.as_str(),
                             language = lang.as_str(),
@@ -1791,34 +1433,6 @@ impl LspClientManager {
             (Some(user), None) => Some(user),
             (None, None) => None,
         }
-    }
-
-    /// Collects per-root settings overrides for a server.
-    ///
-    /// Returns a map from root path to the project-config settings overlay
-    /// for roots whose `.catenary.toml` has `[server.{name}.settings]`.
-    /// Empty entries (roots without project config or without settings for
-    /// this server) are omitted.
-    fn collect_per_root_settings(
-        &self,
-        server_name: &str,
-        roots: &[PathBuf],
-    ) -> HashMap<PathBuf, serde_json::Value> {
-        let configs = self
-            .project_configs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut map = HashMap::new();
-        for root in roots {
-            if let Some(settings) = configs
-                .get(root)
-                .and_then(|pc| pc.server.get(server_name))
-                .and_then(|d| d.settings.clone())
-            {
-                map.insert(root.clone(), settings);
-            }
-        }
-        map
     }
 
     /// Feeds per-root classification tables to `FilesystemManager`.
@@ -2533,15 +2147,14 @@ mod tests {
         assert_eq!(
             count_scope(&clients, MOCK_LANG_A, "root"),
             1,
-            "project-scoped root should produce Scope::Root, not Scope::Workspace"
+            "project-scoped root should produce Scope::Root"
         );
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_ensure_clients_non_project_uses_capability() -> Result<()> {
-        // Without project config, a workspace-capable server should
-        // get Scope::Workspace via the normal ensure_server path.
+    async fn test_ensure_clients_non_project_uses_root_scope() -> Result<()> {
+        // All servers get Scope::Root regardless of workspace folder support.
         let manager = LspClientManager::new(
             mockls_workspace_folders_config(),
             test_logging(),
@@ -2554,9 +2167,9 @@ mod tests {
         let clients = manager.clients().await;
         assert_eq!(clients.len(), 1);
         assert_eq!(
-            count_scope(&clients, MOCK_LANG_A, "workspace"),
+            count_scope(&clients, MOCK_LANG_A, "root"),
             1,
-            "workspace-capable server without project config should be Scope::Workspace"
+            "all servers should be Scope::Root"
         );
         Ok(())
     }
@@ -2564,8 +2177,8 @@ mod tests {
     // --- Two-step spawn and InstanceKey tests ---
 
     #[tokio::test]
-    async fn test_spawn_workspace_scope() -> Result<()> {
-        // mockls with --workspace-folders gets Scope::Workspace key after init.
+    async fn test_spawn_always_root_scope() -> Result<()> {
+        // Even with workspace folder support, scope is always Root.
         let manager = LspClientManager::new(
             mockls_workspace_folders_config(),
             test_logging(),
@@ -2580,7 +2193,7 @@ mod tests {
             .key()
             .expect("key should be set after init");
         assert_eq!(key.language_id, MOCK_LANG_A);
-        assert_eq!(key.scope, Scope::Workspace);
+        assert_eq!(key.scope, Scope::Root(PathBuf::from("/tmp")));
         Ok(())
     }
 
@@ -2723,32 +2336,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_spawn_all_multi_root_workspace() -> Result<()> {
-        // Workspace-capable server should be spawned once with Scope::Workspace.
+    async fn test_spawn_multi_root_per_root() -> Result<()> {
+        // Even with workspace folder support, each root gets its own instance.
         let manager = LspClientManager::new(
             mockls_workspace_folders_config(),
             test_logging(),
             test_fs_with_roots(&["/tmp", "/var"]),
         );
 
-        let _ = ensure_first_server(&manager, MOCK_LANG_A).await?;
+        let binding = manager
+            .config()
+            .resolve_language(MOCK_LANG_A)
+            .expect("config")
+            .servers()[0]
+            .name
+            .clone();
+        manager
+            .ensure_server(MOCK_LANG_A, &binding, Path::new("/tmp"))
+            .await?;
+        manager
+            .ensure_server(MOCK_LANG_A, &binding, Path::new("/var"))
+            .await?;
 
         let clients = manager.clients().await;
         assert_eq!(
             clients.len(),
-            1,
-            "Workspace server should have one instance"
+            2,
+            "Each root should have its own server instance"
         );
-        let key = clients.keys().next().expect("should have one key");
-        assert_eq!(key.scope, Scope::Workspace);
+        assert_eq!(count_scope(&clients, MOCK_LANG_A, "root"), 2);
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_sync_roots_workspace_unchanged() -> Result<()> {
-        // Workspace-capable server should NOT be shut down on root change.
-        // Regression test for restart hack removal.
+    async fn test_sync_roots_adds_new_instance() -> Result<()> {
+        // Adding a root should spawn a new per-root instance.
         let manager = LspClientManager::new(
             mockls_workspace_folders_config(),
             test_logging(),
@@ -2756,7 +2379,7 @@ mod tests {
         );
 
         let client = ensure_first_server(&manager, MOCK_LANG_A).await?;
-        assert!(client.lock().await.supports_workspace_folders());
+        assert!(client.lock().await.is_alive());
 
         manager
             .sync_roots(vec![PathBuf::from("/tmp"), PathBuf::from("/var")])
@@ -2765,13 +2388,12 @@ mod tests {
         let clients = manager.clients().await;
         assert!(
             has_language(&clients, MOCK_LANG_A),
-            "Workspace server should stay alive after sync_roots"
+            "Original server should stay alive after sync_roots"
         );
-        let key = clients.keys().next().expect("should have one key");
         assert_eq!(
-            key.scope,
-            Scope::Workspace,
-            "Key should remain Scope::Workspace"
+            count_scope(&clients, MOCK_LANG_A, "root"),
+            1,
+            "Original per-root instance should remain"
         );
 
         Ok(())
@@ -2800,22 +2422,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_remove_root_workspace_notified() -> Result<()> {
-        // Workspace-capable server stays alive after remove_root.
+    async fn test_remove_root_shuts_down_instance() -> Result<()> {
+        // Per-root instance is shut down when its root is removed.
         let manager = LspClientManager::new(
             mockls_workspace_folders_config(),
             test_logging(),
-            test_fs_with_roots(&["/tmp", "/var"]),
+            test_fs_with_roots(&["/tmp"]),
         );
 
         let client = ensure_first_server(&manager, MOCK_LANG_A).await?;
-        assert!(client.lock().await.supports_workspace_folders());
+        assert!(client.lock().await.is_alive());
 
         manager.remove_root(Path::new("/tmp")).await?;
 
         assert!(
-            has_language(&manager.clients().await, MOCK_LANG_A),
-            "Workspace server should stay alive after remove_root"
+            !has_language(&manager.clients().await, MOCK_LANG_A),
+            "Per-root instance should be removed after remove_root"
         );
 
         Ok(())
@@ -2904,7 +2526,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_server_status_workspace_scope() -> Result<()> {
+    async fn test_server_status_root_scope() -> Result<()> {
         let manager = LspClientManager::new(
             mockls_workspace_folders_config(),
             test_logging(),
@@ -2917,11 +2539,8 @@ mod tests {
         let status = locked.status(&key);
         drop(locked);
 
-        assert_eq!(status.scope_kind, "workspace");
-        assert!(
-            status.scope_root.is_empty(),
-            "workspace scope should have empty scope_root"
-        );
+        assert_eq!(status.scope_kind, "root");
+        assert_eq!(status.scope_root, "/tmp");
         Ok(())
     }
 
@@ -3534,8 +3153,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_spawn_all_mixed_capability() -> Result<()> {
-        // One workspace-capable + one legacy server, two roots:
-        // workspace gets 1 instance, legacy gets 2.
+        // Two servers, two roots: each server gets a per-root instance
+        // = 4 total instances.
         let config = mockls_mixed_capability_config();
         let bindings: Vec<String> = config
             .resolve_language(MOCK_LANG_A)
@@ -3553,26 +3172,18 @@ mod tests {
 
         let roots = manager.roots();
         for name in &bindings {
-            let client = manager.ensure_server(MOCK_LANG_A, name, &roots[0]).await?;
-            let key = client.lock().await.server().key();
-            let Some(key) = key else {
-                continue;
-            };
-            if matches!(key.scope, Scope::Root(_)) {
-                for root in &roots[1..] {
-                    manager.spawn(name, MOCK_LANG_A, root).await?;
-                }
+            for root in &roots {
+                manager.ensure_server(MOCK_LANG_A, name, root).await?;
             }
         }
 
         let clients = manager.clients().await;
         assert_eq!(
             clients.len(),
-            3,
-            "1 workspace + 2 legacy per-root = 3 instances"
+            4,
+            "2 servers × 2 roots = 4 per-root instances"
         );
-        assert_eq!(count_scope(&clients, MOCK_LANG_A, "workspace"), 1);
-        assert_eq!(count_scope(&clients, MOCK_LANG_A, "root"), 2);
+        assert_eq!(count_scope(&clients, MOCK_LANG_A, "root"), 4);
         Ok(())
     }
 
@@ -4289,150 +3900,10 @@ mod tests {
         assert_eq!(settings["b"]["d"], 3);
     }
 
-    #[test]
-    fn test_collect_per_root_settings() {
-        let mut config = test_config_raw();
-        config.server.insert(
-            "ra".to_string(),
-            ServerDef {
-                command: "ra".to_string(),
-                args: Vec::new(),
-                settings: Some(serde_json::json!({"base": true})),
-                ..ServerDef::default()
-            },
-        );
-
-        let manager = LspClientManager::new(config, test_logging(), test_fs());
-        let root_a = PathBuf::from("/project-a");
-        let root_b = PathBuf::from("/project-b");
-
-        // root_a has project config with settings for "ra"
-        let mut pc_a = crate::config::ProjectConfig::default();
-        pc_a.server.insert(
-            "ra".to_string(),
-            ServerDef {
-                command: String::new(),
-                args: Vec::new(),
-                settings: Some(serde_json::json!({"override_a": true})),
-                ..ServerDef::default()
-            },
-        );
-        // root_b has project config but no settings for "ra"
-        let pc_b = crate::config::ProjectConfig::default();
-
-        manager
-            .project_configs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(root_a.clone(), pc_a);
-        manager
-            .project_configs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(root_b.clone(), pc_b);
-
-        let per_root = manager.collect_per_root_settings("ra", &[root_a.clone(), root_b]);
-        // Only root_a has settings — root_b omitted
-        assert_eq!(per_root.len(), 1);
-        assert!(per_root.contains_key(&root_a));
-        assert_eq!(per_root[&root_a]["override_a"], true);
-    }
-
-    #[test]
-    fn test_collect_per_root_settings_no_configs() {
-        let mut config = test_config_raw();
-        config.server.insert(
-            "ra".to_string(),
-            ServerDef {
-                command: "ra".to_string(),
-                args: Vec::new(),
-                ..ServerDef::default()
-            },
-        );
-
-        let manager = LspClientManager::new(config, test_logging(), test_fs());
-        let per_root = manager.collect_per_root_settings("ra", &[PathBuf::from("/root")]);
-        assert!(per_root.is_empty());
-    }
-
-    // --- find_instance priority (1d-02) ---
+    // --- find_instance tests ---
 
     #[tokio::test]
-    async fn test_find_instance_root_before_workspace() -> Result<()> {
-        // When both Root and Workspace exist for the same (lang, server),
-        // Root takes priority.
-        let bin = mockls_bin();
-        let root_client = Arc::new(Mutex::new(LspClient::spawn_quiet(
-            bin.to_str().expect("bin"),
-            &[],
-            "rust",
-            "ra",
-            test_logging(),
-            None,
-        )?));
-        let ws_client = Arc::new(Mutex::new(LspClient::spawn_quiet(
-            bin.to_str().expect("bin"),
-            &[],
-            "rust",
-            "ra",
-            test_logging(),
-            None,
-        )?));
-
-        let mut clients: HashMap<InstanceKey, Arc<Mutex<LspClient>>> = HashMap::new();
-        clients.insert(
-            InstanceKey::new(
-                "rust".to_string(),
-                "ra".to_string(),
-                Scope::Root(PathBuf::from("/project")),
-            ),
-            root_client.clone(),
-        );
-        clients.insert(
-            InstanceKey::new("rust".to_string(), "ra".to_string(), Scope::Workspace),
-            ws_client,
-        );
-
-        let result = find_instance(&clients, "rust", "ra", Path::new("/project"));
-        assert!(result.is_some());
-        assert!(Arc::ptr_eq(&result.expect("found"), &root_client));
-
-        // Explicit cleanup: drop clients before runtime shutdown to
-        // ensure mockls child processes are killed promptly.
-        drop(clients);
-        drop(root_client);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_find_instance_workspace_only() -> Result<()> {
-        let bin = mockls_bin();
-        let ws_client = Arc::new(Mutex::new(LspClient::spawn_quiet(
-            bin.to_str().expect("bin"),
-            &[],
-            "rust",
-            "ra",
-            test_logging(),
-            None,
-        )?));
-
-        let mut clients: HashMap<InstanceKey, Arc<Mutex<LspClient>>> = HashMap::new();
-        clients.insert(
-            InstanceKey::new("rust".to_string(), "ra".to_string(), Scope::Workspace),
-            ws_client.clone(),
-        );
-
-        let result = find_instance(&clients, "rust", "ra", Path::new("/project"));
-        assert!(result.is_some());
-        assert!(Arc::ptr_eq(&result.expect("found"), &ws_client));
-
-        drop(clients);
-        drop(ws_client);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_find_instance_root_only() -> Result<()> {
+    async fn test_find_instance_root_match() -> Result<()> {
         let bin = mockls_bin();
         let root_client = Arc::new(Mutex::new(LspClient::spawn_quiet(
             bin.to_str().expect("bin"),
@@ -4603,20 +4074,16 @@ mod tests {
         manager.spawn_all().await;
 
         let clients = manager.clients().await;
-        assert_eq!(
-            clients.len(),
-            2,
-            "Should have workspace + project-scoped root instances"
-        );
-        assert_eq!(count_scope(&clients, MOCK_LANG_A, "workspace"), 1);
-        assert_eq!(count_scope(&clients, MOCK_LANG_A, "root"), 1);
+        assert_eq!(clients.len(), 2, "Should have two per-root instances");
+        assert_eq!(count_scope(&clients, MOCK_LANG_A, "root"), 2);
 
-        // The root instance should be for root_b.
-        let root_key = clients
+        // Both roots should have instances.
+        let root_paths: HashSet<PathBuf> = clients
             .keys()
-            .find(|k| matches!(&k.scope, Scope::Root(_)))
-            .expect("should have root key");
-        assert_eq!(root_key.scope, Scope::Root(root_b.path().to_path_buf()),);
+            .filter_map(|k| k.scope.root_path().map(Path::to_path_buf))
+            .collect();
+        assert!(root_paths.contains(&root_a.path().to_path_buf()));
+        assert!(root_paths.contains(&root_b.path().to_path_buf()));
 
         Ok(())
     }
@@ -4694,24 +4161,21 @@ mod tests {
         manager.spawn_all().await;
 
         let clients = manager.clients().await;
-        // 1 workspace (root_a + root_c) + 1 project-scoped root (root_b).
+        // 3 per-root instances — one per root.
         assert_eq!(
             clients.len(),
-            2,
-            "Should have workspace + one project-scoped root"
+            3,
+            "Should have one per-root instance per root"
         );
-        assert_eq!(count_scope(&clients, MOCK_LANG_A, "workspace"), 1);
-        assert_eq!(count_scope(&clients, MOCK_LANG_A, "root"), 1);
+        assert_eq!(count_scope(&clients, MOCK_LANG_A, "root"), 3);
 
-        let root_key = clients
+        let root_paths: HashSet<PathBuf> = clients
             .keys()
-            .find(|k| matches!(&k.scope, Scope::Root(_)))
-            .expect("should have root key");
-        assert_eq!(
-            root_key.scope,
-            Scope::Root(root_b.path().to_path_buf()),
-            "Only root_b should be project-scoped"
-        );
+            .filter_map(|k| k.scope.root_path().map(Path::to_path_buf))
+            .collect();
+        assert!(root_paths.contains(&root_a.path().to_path_buf()));
+        assert!(root_paths.contains(&root_b.path().to_path_buf()));
+        assert!(root_paths.contains(&root_c.path().to_path_buf()));
         Ok(())
     }
 
@@ -4835,28 +4299,16 @@ mod tests {
             .await?;
 
         let clients = manager.clients().await;
-        assert_eq!(
-            clients.len(),
-            2,
-            "Should have workspace + project-scoped root"
-        );
-        assert_eq!(count_scope(&clients, MOCK_LANG_A, "workspace"), 1);
-        assert_eq!(count_scope(&clients, MOCK_LANG_A, "root"), 1);
-
-        // The root instance should be for root_b.
-        let root_key = clients
-            .keys()
-            .find(|k| matches!(&k.scope, Scope::Root(_)))
-            .expect("should have root key");
-        assert_eq!(root_key.scope, Scope::Root(root_b.path().to_path_buf()),);
+        // Both roots get per-root instances.
+        assert_eq!(clients.len(), 2, "Should have two per-root instances");
+        assert_eq!(count_scope(&clients, MOCK_LANG_A, "root"), 2);
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_sync_roots_add_settings_override() -> Result<()> {
-        // Adding a root with [server.*.settings] (but no Rule A) sends
-        // didChangeConfiguration to the workspace instance.
+    async fn test_sync_roots_add_spawns_instance() -> Result<()> {
+        // Adding a root spawns a new per-root instance.
         let config = mockls_workspace_folders_config();
         let server_name = config
             .resolve_language(MOCK_LANG_A)
@@ -4867,50 +4319,23 @@ mod tests {
 
         let manager = LspClientManager::new(config, test_logging(), test_fs_with_roots(&["/tmp"]));
 
-        // Spawn workspace instance.
-        let ws = manager
+        // Spawn per-root instance for /tmp.
+        let client = manager
             .ensure_server(MOCK_LANG_A, &server_name, Path::new("/tmp"))
             .await?;
-        assert!(ws.lock().await.supports_workspace_folders());
+        assert!(client.lock().await.is_alive());
 
-        // /var has project config with server settings only (no language).
-        let mut pc = crate::config::ProjectConfig::default();
-        pc.server.insert(
-            server_name.clone(),
-            ServerDef {
-                command: String::new(),
-                args: Vec::new(),
-                settings: Some(serde_json::json!({"override": true})),
-                ..ServerDef::default()
-            },
-        );
-        manager
-            .project_configs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(PathBuf::from("/var"), pc);
-
-        // sync_roots adds /var.
-        manager
-            .sync_roots(vec![PathBuf::from("/tmp"), PathBuf::from("/var")])
-            .await?;
-
-        // Workspace instance should still be the only one (no Rule A).
         let clients = manager.clients().await;
         assert_eq!(clients.len(), 1);
-        assert_eq!(count_scope(&clients, MOCK_LANG_A, "workspace"), 1);
+        assert_eq!(count_scope(&clients, MOCK_LANG_A, "root"), 1);
 
-        // The workspace server should now have per-root settings for /var.
-        // (didChangeConfiguration was sent, but we can't observe the
-        // notification directly — we verify that set_root_settings was called
-        // by checking resolve_configuration behavior.)
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_sync_roots_remove_project_root() -> Result<()> {
-        // Removing a project-scoped root: instance shut down, project
-        // config cleaned up.
+    async fn test_sync_roots_remove_root() -> Result<()> {
+        // Removing a root: its per-root instance is shut down and
+        // project config cleaned up.
         let config = mockls_workspace_folders_config();
         let server_name = config
             .resolve_language(MOCK_LANG_A)
@@ -4925,27 +4350,12 @@ mod tests {
             test_fs_with_roots(&["/tmp", "/var"]),
         );
 
-        // /var is project-scoped.
-        let mut pc = crate::config::ProjectConfig::default();
-        pc.language.insert(
-            MOCK_LANG_A.to_string(),
-            LanguageConfig {
-                servers: Some(vec![ServerBinding::new(server_name.clone())]),
-                ..LanguageConfig::default()
-            },
-        );
-        manager
-            .project_configs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(PathBuf::from("/var"), pc);
-
-        // Spawn both: workspace for /tmp, project-scoped for /var.
+        // Spawn instances for both roots.
         let _ = manager
             .ensure_server(MOCK_LANG_A, &server_name, Path::new("/tmp"))
             .await?;
         let _ = manager
-            .spawn_project_scoped(&server_name, MOCK_LANG_A, Path::new("/var"))
+            .ensure_server(MOCK_LANG_A, &server_name, Path::new("/var"))
             .await?;
         assert_eq!(manager.clients().await.len(), 2);
 
@@ -4953,18 +4363,8 @@ mod tests {
         manager.sync_roots(vec![PathBuf::from("/tmp")]).await?;
 
         let clients = manager.clients().await;
-        assert_eq!(
-            clients.len(),
-            1,
-            "Project-scoped /var instance should be removed"
-        );
-        assert_eq!(count_scope(&clients, MOCK_LANG_A, "workspace"), 1);
-
-        // Project config for /var should be cleaned up.
-        assert!(
-            !manager.is_project_scoped(MOCK_LANG_A, Path::new("/var")),
-            "Project config for /var should be removed"
-        );
+        assert_eq!(clients.len(), 1, "/var instance should be removed");
+        assert_eq!(count_scope(&clients, MOCK_LANG_A, "root"), 1);
 
         Ok(())
     }
@@ -6004,113 +5404,6 @@ mod tests {
         Ok(())
     }
 
-    /// `exclude_project_roots_from_workspace` skips non-workspace instances.
-    #[tokio::test]
-    async fn test_exclude_project_roots_skips_non_workspace() -> Result<()> {
-        // Legacy (non-workspace) servers should not get workspace folder
-        // removal notifications — exclude_project_roots_from_workspace
-        // returns early for non-Workspace scope.
-        let manager = LspClientManager::new(
-            mockls_config(),
-            test_logging(),
-            test_fs_with_roots(&["/tmp"]),
-        );
-
-        let client = ensure_first_server(&manager, MOCK_LANG_A).await?;
-        assert!(!client.lock().await.supports_workspace_folders());
-
-        let key = client.lock().await.server().key().expect("key");
-        let server_name = &key.server;
-        // This should be a no-op (returns early because scope is Root, not Workspace)
-        manager
-            .exclude_project_roots_from_workspace(
-                &client,
-                &key,
-                MOCK_LANG_A,
-                server_name,
-                &[PathBuf::from("/tmp")],
-            )
-            .await;
-
-        // Server should still be alive and unaffected
-        assert!(client.lock().await.is_alive());
-        Ok(())
-    }
-
-    /// `notify_workspace_servers_sync` notifies workspace-capable servers
-    /// about folder additions.
-    #[tokio::test]
-    async fn test_notify_workspace_servers_sends_adds() -> Result<()> {
-        let manager = LspClientManager::new(
-            mockls_workspace_folders_config(),
-            test_logging(),
-            test_fs_with_roots(&["/tmp"]),
-        );
-
-        let client = ensure_first_server(&manager, MOCK_LANG_A).await?;
-        assert!(client.lock().await.supports_workspace_folders());
-
-        // Add a new root — notification should succeed (no error)
-        manager
-            .notify_workspace_servers_sync(&[PathBuf::from("/var")], &[])
-            .await;
-
-        // Server is still alive after notification
-        assert!(
-            client.lock().await.is_alive(),
-            "server should be alive after workspace sync"
-        );
-        Ok(())
-    }
-
-    /// `notify_workspace_servers_sync` skips dead/non-workspace servers.
-    #[tokio::test]
-    async fn test_notify_workspace_servers_skips_legacy() -> Result<()> {
-        let manager = LspClientManager::new(
-            mockls_config(),
-            test_logging(),
-            test_fs_with_roots(&["/tmp"]),
-        );
-
-        let _ = ensure_first_server(&manager, MOCK_LANG_A).await?;
-
-        // Legacy server should not receive workspace folder notifications
-        // — this should be a no-op.
-        manager
-            .notify_workspace_servers_sync(&[PathBuf::from("/var")], &[])
-            .await;
-
-        // Server still alive
-        let clients = manager.clients().await;
-        assert!(!clients.is_empty());
-        Ok(())
-    }
-
-    /// `cleanup_root_settings_for_removed` skips non-workspace instances.
-    #[tokio::test]
-    async fn test_cleanup_root_settings_skips_legacy() -> Result<()> {
-        // Legacy (root-scoped) servers should NOT be processed by cleanup.
-        let manager = LspClientManager::new(
-            mockls_config(),
-            test_logging(),
-            test_fs_with_roots(&["/tmp"]),
-        );
-
-        let client = ensure_first_server(&manager, MOCK_LANG_A).await?;
-        let key = client.lock().await.server().key().expect("key");
-        assert!(matches!(key.scope, Scope::Root(_)));
-
-        // Empty list is a no-op, so use a non-empty list.
-        // With only legacy servers, this should skip all of them.
-        manager
-            .cleanup_root_settings_for_removed(&[PathBuf::from("/tmp")])
-            .await;
-
-        // Server unaffected
-        assert!(client.lock().await.is_alive());
-        Ok(())
-    }
-
     // ── Marker / scope decoupling tests ─────────────────────────────
 
     /// Config with workspace-folder-capable server AND root markers.
@@ -6186,9 +5479,9 @@ mod tests {
         clippy::similar_names,
         reason = "root_a/root_b are intentionally parallel"
     )]
-    async fn test_marker_workspace_capable_consolidates() -> Result<()> {
+    async fn test_marker_workspace_capable_per_root() -> Result<()> {
         // Two roots with markers + workspace-folder-capable server →
-        // one instance with Scope::Workspace.
+        // two per-root instances.
         let dir = tempfile::tempdir().expect("tempdir");
         let root_a = dir.path().join("project_a");
         let root_b = dir.path().join("project_b");
@@ -6206,17 +5499,32 @@ mod tests {
             test_fs_with_roots(&[root_a_str, root_b_str]),
         );
 
-        let client = ensure_first_server(&manager, MOCK_LANG_A).await?;
-        assert!(client.lock().await.supports_workspace_folders());
+        let server_name = &manager
+            .config
+            .resolve_language(MOCK_LANG_A)
+            .expect("lang config")
+            .servers()
+            .first()
+            .expect("binding")
+            .name;
+
+        // Spawn for both roots.
+        manager
+            .ensure_server(MOCK_LANG_A, server_name, &root_a)
+            .await?;
+        manager
+            .ensure_server(MOCK_LANG_A, server_name, &root_b)
+            .await?;
 
         let clients = manager.clients().await;
-        assert_eq!(clients.len(), 1, "Should consolidate into one instance");
-        let key = clients.keys().next().expect("key");
-        assert_eq!(
-            key.scope,
-            Scope::Workspace,
-            "Marker-configured workspace-capable server should use Scope::Workspace"
-        );
+        assert_eq!(clients.len(), 2, "Each root should have its own instance");
+        for key in clients.keys() {
+            assert!(
+                matches!(&key.scope, Scope::Root(_)),
+                "Each instance should be Scope::Root, got {:?}",
+                key.scope,
+            );
+        }
 
         Ok(())
     }
@@ -6277,11 +5585,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_sync_roots_marker_resolved_folder_uri() -> Result<()> {
-        // Start with one root, add a second mid-session. Workspace-capable
-        // server with markers should NOT spawn a second instance — the new
-        // root is covered by the existing Scope::Workspace instance via
-        // didChangeWorkspaceFolders.
+    async fn test_sync_roots_marker_spawns_per_root() -> Result<()> {
+        // Start with one root, add a second mid-session. Each root
+        // gets its own per-root instance.
         let dir = tempfile::tempdir().expect("tempdir");
         let root_a = dir.path().join("project_a");
         let root_b = dir.path().join("project_b");
@@ -6290,7 +5596,7 @@ mod tests {
         std::fs::write(root_a.join("Cargo.toml"), "").expect("marker a");
         std::fs::write(root_b.join("Cargo.toml"), "").expect("marker b");
         // Create a file so detect_workspace_languages finds the language.
-        std::fs::write(root_b.join("file.yX4Za"), "").expect("file b");
+        std::fs::write(root_b.join(format!("file.{MOCK_LANG_A}")), "").expect("file b");
 
         let config = mockls_workspace_folders_markers_config(vec!["Cargo.toml".into()]);
         let root_a_str = root_a.to_str().expect("path a");
@@ -6298,7 +5604,7 @@ mod tests {
             LspClientManager::new(config, test_logging(), test_fs_with_roots(&[root_a_str]));
 
         let client = ensure_first_server(&manager, MOCK_LANG_A).await?;
-        assert!(client.lock().await.supports_workspace_folders());
+        assert!(client.lock().await.is_alive());
         assert_eq!(manager.clients().await.len(), 1);
 
         // Add second root mid-session.
@@ -6306,16 +5612,14 @@ mod tests {
             .sync_roots(vec![root_a.clone(), root_b.clone()])
             .await?;
 
-        // Still one instance — the new root was added via workspace
-        // folders, not by spawning a separate server.
+        // Two instances — one per root.
         let clients = manager.clients().await;
         assert_eq!(
             clients.len(),
-            1,
-            "Should still have one instance after adding root"
+            2,
+            "Should have two per-root instances after adding root"
         );
-        let key = clients.keys().next().expect("key");
-        assert_eq!(key.scope, Scope::Workspace);
+        assert_eq!(count_scope(&clients, MOCK_LANG_A, "root"), 2);
 
         Ok(())
     }

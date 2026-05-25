@@ -150,7 +150,6 @@ async fn lsp_request_scope_chain() -> Result<()> {
         MOCK_LANG_A,
         server.clone(),
         None,
-        std::collections::HashMap::new(),
         None,
     )?;
     client.initialize(&[dir.path().to_path_buf()], None).await?;
@@ -219,7 +218,6 @@ async fn pair_merge_still_works() -> Result<()> {
         MOCK_LANG_A,
         server.clone(),
         None,
-        std::collections::HashMap::new(),
         None,
     )?;
     client.initialize(&[dir.path().to_path_buf()], None).await?;
@@ -358,7 +356,6 @@ async fn stderr_captured_with_source_and_server() -> Result<()> {
         MOCK_LANG_A,
         server.clone(),
         None,
-        std::collections::HashMap::new(),
         None,
     )?;
     client.initialize(&[dir.path().to_path_buf()], None).await?;

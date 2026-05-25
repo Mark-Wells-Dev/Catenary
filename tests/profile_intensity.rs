@@ -651,7 +651,6 @@ async fn profile_intensity() -> Result<()> {
             def.name.to_string(),
             def.name.to_string(),
             None,
-            std::collections::HashMap::new(),
         ));
         server.set_capabilities(capabilities);
 
@@ -870,7 +869,6 @@ async fn profile_intensity_large() -> Result<()> {
         "rust".to_string(),
         "rust-analyzer".to_string(),
         None,
-        std::collections::HashMap::new(),
     ));
     server.set_capabilities(capabilities);
 

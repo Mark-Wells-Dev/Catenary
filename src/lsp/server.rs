@@ -12,7 +12,6 @@
 use anyhow::Result;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::Notify;
@@ -89,13 +88,6 @@ pub struct LspServer {
 
     // ── Configuration ─────────────────────────────────────────────
     settings: Option<Value>,
-    /// Per-root settings overrides from project configs.
-    ///
-    /// Keyed by workspace root path. Only populated for
-    /// `Scope::Workspace` instances — per-root instances get
-    /// pre-merged flat `settings` instead. Uses `Mutex` to support
-    /// mid-session updates from `sync_roots` without `&mut self`.
-    settings_per_root: Mutex<HashMap<PathBuf, Value>>,
 
     // ── Process tree ──────────────────────────────────────────
     /// Tree monitor for idle detection. Created when the connection is set.
@@ -124,20 +116,10 @@ impl LspServer {
     /// change. The routing scope is set later via [`Self::set_scope`]
     /// after the `initialize` handshake reveals server capabilities.
     ///
-    /// `settings_per_root` carries per-root project config overrides.
-    /// For `Scope::Workspace` instances, this maps root paths to their
-    /// project-specific settings overlays. For `Scope::Root` instances,
-    /// pass an empty map — settings are pre-merged into `settings`.
-    ///
     /// Call [`Self::set_capabilities`] after the `initialize` handshake
     /// to populate capability fields.
     #[must_use]
-    pub fn new(
-        language_id: String,
-        server_name: String,
-        settings: Option<Value>,
-        settings_per_root: HashMap<PathBuf, Value>,
-    ) -> Self {
+    pub fn new(language_id: String, server_name: String, settings: Option<Value>) -> Self {
         Self {
             capabilities: OnceLock::new(),
             supports_pull_diagnostics: AtomicBool::new(false),
@@ -167,7 +149,6 @@ impl LspServer {
             server_name,
             scope: OnceLock::new(),
             settings,
-            settings_per_root: Mutex::new(settings_per_root),
             config_change_registrations: Mutex::new(HashSet::new()),
             tree_monitor: Mutex::new(None),
             file_watchers: Mutex::new(HashMap::new()),
@@ -182,75 +163,11 @@ impl LspServer {
 
     /// Resolves a `workspace/configuration` item.
     ///
-    /// Resolution order for the effective scope:
-    /// 1. Explicit `scopeUri` from the request item.
-    /// 2. Implicit root from `Scope::Root(r)` — root-scoped instances
-    ///    always resolve against their root's project config.
-    /// 3. No scope — returns user defaults.
-    ///
-    /// When a scope is resolved, deep-merges the per-root overlay over
-    /// `settings` (user defaults). Otherwise returns the section
-    /// resolved against `settings` alone.
-    fn resolve_configuration(&self, section: Option<&str>, scope_uri: Option<&str>) -> Value {
-        let per_root = self
-            .settings_per_root
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        if per_root.is_empty() {
-            return resolve_section(self.settings.as_ref(), section);
-        }
-
-        // Determine effective scope path: explicit scopeUri, or
-        // implicit root for Root-scoped instances.
-        let scope_path: &Path = if let Some(uri) = scope_uri {
-            Path::new(uri.strip_prefix("file://").unwrap_or(uri))
-        } else if let Some(Scope::Root(r)) = self.scope() {
-            r
-        } else {
-            return resolve_section(self.settings.as_ref(), section);
-        };
-
-        // Longest-prefix match against settings_per_root keys.
-        let matched = per_root
-            .iter()
-            .filter(|(root, _)| scope_path.starts_with(root))
-            .max_by_key(|(root, _)| root.as_os_str().len());
-
-        let Some((_, root_settings)) = matched else {
-            return resolve_section(self.settings.as_ref(), section);
-        };
-
-        let merged = self.settings.as_ref().map_or_else(
-            || root_settings.clone(),
-            |base| crate::config::merge::deep_merge(base, root_settings),
-        );
-        drop(per_root);
-        resolve_section(Some(&merged), section)
-    }
-
-    /// Adds or updates per-root settings for a workspace root.
-    ///
-    /// Called by the manager when a new root with project config
-    /// settings is added. The server's `on_request` handler will
-    /// use the updated map for subsequent `scopeUri` resolution.
-    pub fn set_root_settings(&self, root: PathBuf, settings: Value) {
-        self.settings_per_root
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(root, settings);
-    }
-
-    /// Removes per-root settings for a workspace root.
-    ///
-    /// Called by the manager when a root is removed. Subsequent
-    /// `scopeUri` resolution for this root will fall back to
-    /// user-level defaults.
-    pub fn remove_root_settings(&self, root: &Path) {
-        self.settings_per_root
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(root);
+    /// Each per-root instance has pre-merged flat settings — no
+    /// per-root overlay resolution needed. Resolves the requested
+    /// section against the instance's settings.
+    fn resolve_configuration(&self, section: Option<&str>, _scope_uri: Option<&str>) -> Value {
+        resolve_section(self.settings.as_ref(), section)
     }
 
     // ── Identity accessors ──────────────────────────────────────────
@@ -1052,12 +969,7 @@ mod tests {
     use std::time::Duration;
 
     fn test_server() -> LspServer {
-        LspServer::new(
-            "test".to_string(),
-            "test-server".to_string(),
-            None,
-            HashMap::new(),
-        )
+        LspServer::new("test".to_string(), "test-server".to_string(), None)
     }
 
     /// Helper: creates an `LspServer` with capabilities already set.
@@ -1071,12 +983,7 @@ mod tests {
 
     #[test]
     fn test_lsp_server_accessors() {
-        let server = LspServer::new(
-            "rust".to_string(),
-            "rust-analyzer".to_string(),
-            None,
-            HashMap::new(),
-        );
+        let server = LspServer::new("rust".to_string(), "rust-analyzer".to_string(), None);
         assert_eq!(server.language_id(), "rust");
         assert_eq!(server.server_name(), "rust-analyzer");
         assert!(server.scope().is_none());
@@ -1087,31 +994,32 @@ mod tests {
         let server = test_server();
         assert!(server.scope().is_none());
 
-        server.set_scope(Scope::Workspace);
-        assert_eq!(server.scope(), Some(&Scope::Workspace));
+        server.set_scope(Scope::Root(std::path::PathBuf::from("/project")));
+        assert_eq!(
+            server.scope(),
+            Some(&Scope::Root(std::path::PathBuf::from("/project")))
+        );
 
         // Second set is a no-op
         server.set_scope(Scope::Root(std::path::PathBuf::from("/other")));
-        assert_eq!(server.scope(), Some(&Scope::Workspace));
+        assert_eq!(
+            server.scope(),
+            Some(&Scope::Root(std::path::PathBuf::from("/project")))
+        );
     }
 
     #[test]
     fn test_lsp_server_key_construction() {
-        let server = LspServer::new(
-            "rust".to_string(),
-            "rust-analyzer".to_string(),
-            None,
-            HashMap::new(),
-        );
+        let server = LspServer::new("rust".to_string(), "rust-analyzer".to_string(), None);
 
         // Before set_scope, key() returns None
         assert!(server.key().is_none());
 
-        server.set_scope(Scope::Workspace);
+        server.set_scope(Scope::Root(std::path::PathBuf::from("/project")));
         let key = server.key().expect("key should be Some after set_scope");
         assert_eq!(key.language_id, "rust");
         assert_eq!(key.server, "rust-analyzer");
-        assert_eq!(key.scope, Scope::Workspace);
+        assert_eq!(key.scope, Scope::Root(std::path::PathBuf::from("/project")));
     }
 
     // ── Capability tests ──────────────────────────────────────────
@@ -1161,13 +1069,8 @@ mod tests {
 
         // Server needs a scope so key() returns Some — required for
         // the warn branch.
-        let server = LspServer::new(
-            "rust".to_string(),
-            "rust-analyzer".to_string(),
-            None,
-            HashMap::new(),
-        );
-        server.set_scope(Scope::Workspace);
+        let server = LspServer::new("rust".to_string(), "rust-analyzer".to_string(), None);
+        server.set_scope(Scope::Root(std::path::PathBuf::from("/project")));
 
         // Non-terminal → terminal: should emit warn
         server.set_lifecycle(ServerLifecycle::Healthy);
@@ -1392,7 +1295,6 @@ mod tests {
             "test".to_string(),
             "test-server".to_string(),
             Some(json!({"mockls": {"key": "value"}})),
-            HashMap::new(),
         );
         let result = server
             .on_request(
@@ -1880,262 +1782,26 @@ mod tests {
     // ── resolve_configuration tests ─────────────────────────────────
 
     #[test]
-    fn resolve_configuration_no_scope_uri() {
+    fn resolve_configuration_returns_settings() {
         let server = LspServer::new(
             "rust".to_string(),
             "ra".to_string(),
             Some(json!({"rust-analyzer": {"check": {"command": "clippy"}}})),
-            HashMap::new(),
         );
         let result = server.resolve_configuration(Some("rust-analyzer"), None);
         assert_eq!(result, json!({"check": {"command": "clippy"}}));
     }
 
     #[test]
-    fn resolve_configuration_scope_uri_matches_root() {
-        let mut per_root = HashMap::new();
-        per_root.insert(
-            PathBuf::from("/root-a"),
-            json!({"rust-analyzer": {"cargo": {"target": "x86_64"}}}),
-        );
+    fn resolve_configuration_ignores_scope_uri() {
         let server = LspServer::new(
             "rust".to_string(),
             "ra".to_string(),
             Some(json!({"rust-analyzer": {"check": {"command": "clippy"}}})),
-            per_root,
         );
-        let result = server.resolve_configuration(Some("rust-analyzer"), Some("file:///root-a"));
-        assert_eq!(result["check"]["command"], "clippy"); // base preserved
-        assert_eq!(result["cargo"]["target"], "x86_64"); // overlay added
-    }
-
-    #[test]
-    fn resolve_configuration_scope_uri_nested_path() {
-        let mut per_root = HashMap::new();
-        per_root.insert(
-            PathBuf::from("/root-a"),
-            json!({"rust-analyzer": {"cargo": {"target": "wasm32"}}}),
-        );
-        let server = LspServer::new(
-            "rust".to_string(),
-            "ra".to_string(),
-            Some(json!({"rust-analyzer": {"check": {"command": "clippy"}}})),
-            per_root,
-        );
-        // scopeUri is a nested file path — should resolve to /root-a via longest-prefix
-        let result =
-            server.resolve_configuration(Some("rust-analyzer"), Some("file:///root-a/src/main.rs"));
-        assert_eq!(result["check"]["command"], "clippy");
-        assert_eq!(result["cargo"]["target"], "wasm32");
-    }
-
-    #[test]
-    fn resolve_configuration_scope_uri_no_match() {
-        let mut per_root = HashMap::new();
-        per_root.insert(
-            PathBuf::from("/root-a"),
-            json!({"rust-analyzer": {"cargo": {"target": "wasm32"}}}),
-        );
-        let server = LspServer::new(
-            "rust".to_string(),
-            "ra".to_string(),
-            Some(json!({"rust-analyzer": {"check": {"command": "clippy"}}})),
-            per_root,
-        );
-        // scopeUri doesn't match any root — user defaults returned
-        let result =
-            server.resolve_configuration(Some("rust-analyzer"), Some("file:///other-root"));
-        assert_eq!(result, json!({"check": {"command": "clippy"}}));
-    }
-
-    #[test]
-    fn resolve_configuration_scope_uri_no_per_root() {
-        let server = LspServer::new(
-            "rust".to_string(),
-            "ra".to_string(),
-            Some(json!({"rust-analyzer": {"check": {"command": "clippy"}}})),
-            HashMap::new(),
-        );
-        // per-root map is empty — user defaults for all scopeUris
+        // scopeUri is ignored — per-root instances have pre-merged flat settings
         let result = server.resolve_configuration(Some("rust-analyzer"), Some("file:///root-a"));
         assert_eq!(result, json!({"check": {"command": "clippy"}}));
-    }
-
-    #[test]
-    fn resolve_configuration_deep_merge() {
-        let mut per_root = HashMap::new();
-        per_root.insert(
-            PathBuf::from("/project"),
-            json!({"ra": {"b": {"d": 3}, "arr": [4, 5]}}),
-        );
-        let server = LspServer::new(
-            "rust".to_string(),
-            "ra".to_string(),
-            Some(json!({"ra": {"a": 1, "b": {"c": 2}, "arr": [1, 2, 3]}})),
-            per_root,
-        );
-        let result = server.resolve_configuration(Some("ra"), Some("file:///project"));
-        assert_eq!(result["a"], 1); // base preserved
-        assert_eq!(result["b"]["c"], 2); // base nested preserved
-        assert_eq!(result["b"]["d"], 3); // overlay added
-        assert_eq!(result["arr"], json!([4, 5])); // arrays replaced
-    }
-
-    #[test]
-    fn resolve_configuration_section_traversal() {
-        let mut per_root = HashMap::new();
-        per_root.insert(
-            PathBuf::from("/project"),
-            json!({"rust-analyzer": {"check": {"extra": true}}}),
-        );
-        let server = LspServer::new(
-            "rust".to_string(),
-            "ra".to_string(),
-            Some(json!({"rust-analyzer": {"check": {"command": "clippy"}}})),
-            per_root,
-        );
-        // Section "rust-analyzer.check" traverses dot-separated path in merged settings
-        let result =
-            server.resolve_configuration(Some("rust-analyzer.check"), Some("file:///project"));
-        assert_eq!(result["command"], "clippy");
-        assert_eq!(result["extra"], true);
-    }
-
-    #[test]
-    fn set_root_settings_mid_session() {
-        let server = LspServer::new(
-            "rust".to_string(),
-            "ra".to_string(),
-            Some(json!({"rust-analyzer": {"base": true}})),
-            HashMap::new(),
-        );
-        // Initially no per-root settings
-        let result = server.resolve_configuration(Some("rust-analyzer"), Some("file:///root"));
-        assert_eq!(result, json!({"base": true}));
-
-        // Add per-root settings mid-session
-        server.set_root_settings(
-            PathBuf::from("/root"),
-            json!({"rust-analyzer": {"added": true}}),
-        );
-        let result = server.resolve_configuration(Some("rust-analyzer"), Some("file:///root"));
-        assert_eq!(result["base"], true);
-        assert_eq!(result["added"], true);
-    }
-
-    #[test]
-    fn remove_root_settings_reverts_to_defaults() {
-        let server = LspServer::new(
-            "rust".to_string(),
-            "ra".to_string(),
-            Some(json!({"ra": {"base": true}})),
-            HashMap::new(),
-        );
-        server.set_root_settings(PathBuf::from("/root"), json!({"ra": {"added": true}}));
-        // Per-root settings are visible
-        let result = server.resolve_configuration(Some("ra"), Some("file:///root"));
-        assert_eq!(result["added"], true);
-
-        // Remove per-root settings — reverts to user defaults
-        server.remove_root_settings(Path::new("/root"));
-        let result = server.resolve_configuration(Some("ra"), Some("file:///root"));
-        assert_eq!(result["base"], true);
-        assert!(result.get("added").is_none());
-    }
-
-    #[test]
-    fn configuration_request_with_scope_uri() {
-        let mut per_root = HashMap::new();
-        per_root.insert(
-            PathBuf::from("/root-a"),
-            json!({"mockls": {"override": true}}),
-        );
-        let server = LspServer::new(
-            "test".to_string(),
-            "test-server".to_string(),
-            Some(json!({"mockls": {"key": "value"}})),
-            per_root,
-        );
-        let result = server
-            .on_request(
-                "workspace/configuration",
-                &json!({"items": [
-                    {"section": "mockls", "scopeUri": "file:///root-a"},
-                    {"section": "mockls"}
-                ]}),
-            )
-            .expect("configuration request should succeed");
-        let arr = result.as_array().expect("should be array");
-        // First item: scoped to /root-a — merged settings
-        assert_eq!(arr[0]["key"], "value");
-        assert_eq!(arr[0]["override"], true);
-        // Second item: no scopeUri — user defaults only
-        assert_eq!(arr[1]["key"], "value");
-        assert!(arr[1].get("override").is_none());
-    }
-
-    // ── Root-scoped implicit scope tests ─────────────────────────
-
-    #[test]
-    fn resolve_configuration_root_scope_implicit() {
-        let mut per_root = HashMap::new();
-        per_root.insert(
-            PathBuf::from("/project"),
-            json!({"ra": {"project_key": true}}),
-        );
-        let server = LspServer::new(
-            "rust".to_string(),
-            "ra".to_string(),
-            Some(json!({"ra": {"user_key": true}})),
-            per_root,
-        );
-        // Set scope to Root — simulates post-init for a legacy server
-        server.set_scope(Scope::Root(PathBuf::from("/project")));
-
-        // No scopeUri — Root-scoped server uses its root implicitly
-        let result = server.resolve_configuration(Some("ra"), None);
-        assert_eq!(result["user_key"], true);
-        assert_eq!(result["project_key"], true);
-    }
-
-    #[test]
-    fn resolve_configuration_workspace_scope_no_implicit() {
-        let mut per_root = HashMap::new();
-        per_root.insert(
-            PathBuf::from("/project"),
-            json!({"ra": {"project_key": true}}),
-        );
-        let server = LspServer::new(
-            "rust".to_string(),
-            "ra".to_string(),
-            Some(json!({"ra": {"user_key": true}})),
-            per_root,
-        );
-        server.set_scope(Scope::Workspace);
-
-        // No scopeUri — Workspace-scoped server has no implicit root
-        let result = server.resolve_configuration(Some("ra"), None);
-        assert_eq!(result["user_key"], true);
-        assert!(result.get("project_key").is_none());
-    }
-
-    #[test]
-    fn resolve_configuration_no_scope_set_yet() {
-        let mut per_root = HashMap::new();
-        per_root.insert(
-            PathBuf::from("/project"),
-            json!({"ra": {"project_key": true}}),
-        );
-        let server = LspServer::new(
-            "rust".to_string(),
-            "ra".to_string(),
-            Some(json!({"ra": {"user_key": true}})),
-            per_root,
-        );
-        // Scope not set (pre-init) — should return user defaults
-        let result = server.resolve_configuration(Some("ra"), None);
-        assert_eq!(result["user_key"], true);
-        assert!(result.get("project_key").is_none());
     }
 
     // ── didChangeConfiguration registration tests ───────────────

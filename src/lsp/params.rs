@@ -108,7 +108,7 @@ pub fn initialize(
                         "properties": ["location.range"]
                     }
                 },
-                "workspaceFolders": true,
+                "workspaceFolders": false,
                 "configuration": true,
                 "didChangeConfiguration": {
                     "dynamicRegistration": true
@@ -173,19 +173,6 @@ pub fn did_save(uri: &str) -> Value {
 }
 
 // ── Workspace ───────────────────────────────────────────────────────
-
-/// Builds `DidChangeWorkspaceFoldersParams`.
-///
-/// `added` and `removed` are slices of `(uri, name)` pairs.
-#[must_use]
-pub fn did_change_workspace_folders(added: &[(&str, &str)], removed: &[(&str, &str)]) -> Value {
-    json!({
-        "event": {
-            "added": folder_array(added),
-            "removed": folder_array(removed)
-        }
-    })
-}
 
 /// Builds `DidChangeConfigurationParams` with empty settings.
 ///
@@ -388,7 +375,7 @@ mod tests {
                             "properties": ["location.range"]
                         }
                     },
-                    "workspaceFolders": true,
+                    "workspaceFolders": false,
                     "configuration": true,
                     "didChangeConfiguration": {
                         "dynamicRegistration": true
@@ -496,22 +483,6 @@ mod tests {
     }
 
     // ── Workspace ───────────────────────────────────────────────────
-
-    #[test]
-    fn did_change_workspace_folders_golden() {
-        let ours =
-            did_change_workspace_folders(&[("file:///new", "new")], &[("file:///old", "old")]);
-
-        assert_eq!(
-            ours,
-            json!({
-                "event": {
-                    "added": [{ "uri": "file:///new", "name": "new" }],
-                    "removed": [{ "uri": "file:///old", "name": "old" }]
-                }
-            })
-        );
-    }
 
     #[test]
     fn did_change_watched_files_golden() {

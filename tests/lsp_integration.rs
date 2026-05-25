@@ -30,7 +30,6 @@ async fn test_mockls_initialize() -> Result<()> {
         MOCK_LANG_A,
         test_logging(),
         None,
-        std::collections::HashMap::new(),
         None,
     )?;
 
@@ -56,7 +55,6 @@ async fn test_mockls_initialize_workspace_folders() -> Result<()> {
         MOCK_LANG_A,
         test_logging(),
         None,
-        std::collections::HashMap::new(),
         None,
     )?;
 
@@ -88,7 +86,6 @@ async fn test_mockls_document_lifecycle() -> Result<()> {
         MOCK_LANG_A,
         test_logging(),
         None,
-        std::collections::HashMap::new(),
         None,
     )?;
 
@@ -129,7 +126,6 @@ async fn test_client_capabilities() -> Result<()> {
         MOCK_LANG_A,
         test_logging(),
         None,
-        std::collections::HashMap::new(),
         None,
     )?;
 
@@ -244,7 +240,6 @@ async fn test_settle_waits_through_busy_to_healthy() -> Result<()> {
         MOCK_LANG_A,
         test_logging(),
         None,
-        std::collections::HashMap::new(),
         None,
     )?;
 
@@ -288,7 +283,6 @@ async fn test_settle_returns_settled_on_quiet_tree() -> Result<()> {
         MOCK_LANG_A,
         test_logging(),
         None,
-        std::collections::HashMap::new(),
         None,
     )?;
 
@@ -330,7 +324,6 @@ async fn test_content_modified_retry() -> Result<()> {
         MOCK_LANG_A,
         test_logging(),
         None,
-        std::collections::HashMap::new(),
         None,
     )?;
 
@@ -373,7 +366,6 @@ async fn test_lifecycle_probing_to_healthy_on_tool_request() -> Result<()> {
         MOCK_LANG_A,
         test_logging(),
         None,
-        std::collections::HashMap::new(),
         None,
     )?;
 
@@ -416,7 +408,6 @@ async fn test_health_probe_transitions_to_healthy() -> Result<()> {
         MOCK_LANG_A,
         test_logging(),
         None,
-        std::collections::HashMap::new(),
         None,
     )?;
 
@@ -454,7 +445,6 @@ async fn test_server_env_passed_to_process() -> Result<()> {
         MOCK_LANG_A,
         test_logging(),
         None,
-        std::collections::HashMap::new(),
         Some(&env),
     )?;
 

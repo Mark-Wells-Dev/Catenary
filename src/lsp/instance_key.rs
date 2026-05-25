@@ -13,17 +13,12 @@ use std::path::{Path, PathBuf};
 /// Routing scope for an LSP server instance.
 ///
 /// Determines how the instance is bound to workspace roots.
-/// `Workspace` and `Root` are the primary variants. `Root` covers
-/// both legacy per-root instances (capability-driven) and
-/// project-scoped instances (Rule A from per-root config).
-/// `SingleFile` in misc 28b (tier 3).
+/// `Root` is the primary variant — every workspace root gets its
+/// own server instance. `SingleFile` in misc 28b (tier 3).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Scope {
-    /// Multi-root capable, shared across roots.
-    Workspace,
-    /// One instance per root — used for both legacy servers
-    /// (no `workspaceFolders` support) and project-scoped
-    /// instances (Rule A: root has `[language.*]` in `.catenary.toml`).
+    /// One instance per root. Unrelated projects never share
+    /// an LSP server — each root is an isolated fault domain.
     Root(PathBuf),
     /// Tier 3 — single-file mode (misc 28b).
     SingleFile,
@@ -36,7 +31,6 @@ impl Scope {
     #[must_use]
     pub const fn kind_str(&self) -> &str {
         match self {
-            Self::Workspace => "workspace",
             Self::Root(_) => "root",
             Self::SingleFile => "single_file",
         }
@@ -44,12 +38,12 @@ impl Scope {
 
     /// Returns the root path for scopes that have one.
     ///
-    /// `Root` carries a path; `Workspace` and `SingleFile` do not.
+    /// `Root` carries a path; `SingleFile` does not.
     #[must_use]
     pub fn root_path(&self) -> Option<&Path> {
         match self {
             Self::Root(p) => Some(p),
-            Self::Workspace | Self::SingleFile => None,
+            Self::SingleFile => None,
         }
     }
 }
@@ -57,7 +51,6 @@ impl Scope {
 impl fmt::Display for Scope {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Workspace => write!(f, "workspace"),
             Self::Root(p) => write!(f, "root({})", p.display()),
             Self::SingleFile => write!(f, "single_file"),
         }
@@ -112,12 +105,12 @@ mod tests {
         let key1 = InstanceKey::new(
             "rust".to_string(),
             "rust-analyzer".to_string(),
-            Scope::Workspace,
+            Scope::Root(PathBuf::from("/project")),
         );
         let key2 = InstanceKey::new(
             "rust".to_string(),
             "rust-analyzer".to_string(),
-            Scope::Workspace,
+            Scope::Root(PathBuf::from("/project")),
         );
         assert_eq!(key1, key2);
 
@@ -129,7 +122,7 @@ mod tests {
         let key3 = InstanceKey::new(
             "python".to_string(),
             "rust-analyzer".to_string(),
-            Scope::Workspace,
+            Scope::Root(PathBuf::from("/project")),
         );
         assert_ne!(key1, key3);
         assert!(!set.contains(&key3));
@@ -138,44 +131,29 @@ mod tests {
         let key4 = InstanceKey::new(
             "rust".to_string(),
             "other-server".to_string(),
-            Scope::Workspace,
+            Scope::Root(PathBuf::from("/project")),
         );
         assert_ne!(key1, key4);
 
-        // Different scope
-        let key5 = InstanceKey::new(
-            "rust".to_string(),
-            "rust-analyzer".to_string(),
-            Scope::Root(PathBuf::from("/project")),
-        );
-        assert_ne!(key1, key5);
-
         // Root vs Root with different paths
-        let key6 = InstanceKey::new(
+        let key5 = InstanceKey::new(
             "rust".to_string(),
             "rust-analyzer".to_string(),
             Scope::Root(PathBuf::from("/other")),
         );
-        assert_ne!(key5, key6);
+        assert_ne!(key1, key5);
 
         // SingleFile scope
-        let key8 = InstanceKey::new(
+        let key6 = InstanceKey::new(
             "rust".to_string(),
             "rust-analyzer".to_string(),
             Scope::SingleFile,
         );
-        assert_ne!(key1, key8);
+        assert_ne!(key1, key6);
     }
 
     #[test]
     fn test_instance_key_display() {
-        let key = InstanceKey::new(
-            "rust".to_string(),
-            "rust-analyzer".to_string(),
-            Scope::Workspace,
-        );
-        assert_eq!(key.to_string(), "rust:rust-analyzer:workspace");
-
         let key = InstanceKey::new(
             "python".to_string(),
             "pyright".to_string(),
@@ -189,7 +167,6 @@ mod tests {
 
     #[test]
     fn test_scope_kind_str() {
-        assert_eq!(Scope::Workspace.kind_str(), "workspace");
         assert_eq!(Scope::Root(PathBuf::from("/r")).kind_str(), "root");
         assert_eq!(Scope::SingleFile.kind_str(), "single_file");
     }
@@ -199,7 +176,6 @@ mod tests {
         let root = Scope::Root(PathBuf::from("/root"));
         assert_eq!(root.root_path(), Some(Path::new("/root")));
 
-        assert_eq!(Scope::Workspace.root_path(), None);
         assert_eq!(Scope::SingleFile.root_path(), None);
     }
 }

@@ -60,15 +60,11 @@ pub struct LspClient {
 impl LspClient {
     /// Spawns the LSP server process and starts the response reader task.
     ///
-    /// `settings_per_root` carries per-root project config overlays for
-    /// `Scope::Workspace` instances. Pass an empty map for `Scope::Root`.
-    ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - The server process cannot be spawned.
     /// - Stdin or stdout cannot be captured.
-    #[allow(clippy::too_many_arguments, reason = "spawn parameters from ServerDef")]
     pub fn spawn(
         program: &str,
         args: &[&str],
@@ -76,7 +72,6 @@ impl LspClient {
         server_name: &str,
         logging: LoggingServer,
         settings: Option<serde_json::Value>,
-        settings_per_root: HashMap<PathBuf, serde_json::Value>,
         env: Option<&HashMap<String, String>>,
     ) -> Result<Self> {
         let (client, child_stderr) = Self::spawn_inner(
@@ -87,7 +82,6 @@ impl LspClient {
             logging,
             Stdio::piped(),
             settings,
-            settings_per_root,
             env,
         )?;
         if let Some(stderr) = child_stderr {
@@ -118,7 +112,6 @@ impl LspClient {
             logging,
             Stdio::null(),
             None,
-            HashMap::new(),
             env,
         )?;
         Ok(client)
@@ -148,7 +141,6 @@ impl LspClient {
             logging,
             Stdio::piped(),
             None,
-            HashMap::new(),
             env,
         )
     }
@@ -165,14 +157,12 @@ impl LspClient {
         logging: LoggingServer,
         stderr: Stdio,
         settings: Option<serde_json::Value>,
-        settings_per_root: HashMap<PathBuf, serde_json::Value>,
         env: Option<&HashMap<String, String>>,
     ) -> Result<(Self, Option<tokio::process::ChildStderr>)> {
         let server = Arc::new(LspServer::new(
             language_id.to_string(),
             server_name.to_string(),
             settings,
-            settings_per_root,
         ));
 
         let (connection, child_stderr) = super::connection::Connection::new(
@@ -531,23 +521,6 @@ impl LspClient {
         self.notify(
             "workspace/didChangeConfiguration",
             params::did_change_configuration(),
-        )
-        .await
-    }
-
-    /// Notifies the LSP server that workspace folders changed.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the notification fails.
-    pub async fn did_change_workspace_folders(
-        &self,
-        added: &[(&str, &str)],
-        removed: &[(&str, &str)],
-    ) -> Result<()> {
-        self.notify(
-            "workspace/didChangeWorkspaceFolders",
-            params::did_change_workspace_folders(added, removed),
         )
         .await
     }
@@ -1072,7 +1045,6 @@ mod tests {
             MOCK_LANG,
             test_logging(),
             None,
-            HashMap::new(),
             None,
         )?;
         client.initialize(&[dir.path().to_path_buf()], None).await?;
@@ -1142,7 +1114,6 @@ mod tests {
             MOCK_LANG,
             test_logging(),
             None,
-            HashMap::new(),
             Some(&env),
         )?;
         client.initialize(&[dir.path().to_path_buf()], None).await?;
@@ -1402,7 +1373,6 @@ mod tests {
             MOCK_LANG,
             logging,
             None,
-            HashMap::new(),
             None,
         )?;
         client.initialize(&[dir.path().to_path_buf()], None).await?;
@@ -1438,7 +1408,6 @@ mod tests {
             MOCK_LANG,
             logging,
             None,
-            HashMap::new(),
             None,
         )?;
         client.initialize(&[dir.path().to_path_buf()], None).await?;
@@ -1470,7 +1439,6 @@ mod tests {
             MOCK_LANG,
             logging,
             None,
-            HashMap::new(),
             None,
         )?;
         client.initialize(&[dir.path().to_path_buf()], None).await?;
