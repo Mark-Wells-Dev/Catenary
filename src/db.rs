@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 /// Current schema version. Bump when adding migrations.
-const SCHEMA_VERSION: u32 = 10;
+const SCHEMA_VERSION: u32 = 11;
 
 /// Resolve the Catenary state directory.
 ///
@@ -139,6 +139,9 @@ pub fn open_and_migrate_at(path: &Path) -> Result<Connection> {
             if version < 10 {
                 migrate_v9_to_v10(&conn)?;
             }
+            if version < 11 {
+                migrate_v10_to_v11(&conn)?;
+            }
         }
     } else {
         create_schema(&conn)?;
@@ -174,7 +177,7 @@ fn create_schema(conn: &Connection) -> Result<()> {
              key   TEXT PRIMARY KEY,
              value TEXT NOT NULL
          );
-         INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '10');
+         INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '11');
 
          CREATE TABLE IF NOT EXISTS sessions (
              id             TEXT PRIMARY KEY,
@@ -215,7 +218,6 @@ fn create_schema(conn: &Connection) -> Result<()> {
              method      TEXT NOT NULL,
              server      TEXT NOT NULL,
              client      TEXT NOT NULL,
-             request_id  INTEGER,
              parent_id   TEXT,
              payload     TEXT NOT NULL,
              created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
@@ -224,7 +226,6 @@ fn create_schema(conn: &Connection) -> Result<()> {
          CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
          CREATE INDEX IF NOT EXISTS idx_messages_type ON messages(type);
          CREATE INDEX IF NOT EXISTS idx_messages_level ON messages(level);
-         CREATE INDEX IF NOT EXISTS idx_messages_request_id ON messages(request_id);
          CREATE INDEX IF NOT EXISTS idx_messages_parent_id ON messages(parent_id);
 
          CREATE TABLE IF NOT EXISTS language_servers (
@@ -610,6 +611,59 @@ fn migrate_v9_to_v10(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Migrates the database from schema version 10 to 11.
+///
+/// Drops the `request_id` column from the `messages` table. Pair-merge is
+/// now handled by `parent_id` (UUID) — both request and response in an
+/// exchange share the same `parent_id`. The monotonic correlation counter
+/// and its column are no longer needed.
+///
+/// # Errors
+///
+/// Returns an error if the table recreation or version update fails.
+fn migrate_v10_to_v11(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "BEGIN IMMEDIATE;
+
+         CREATE TABLE messages_new (
+             id          INTEGER PRIMARY KEY AUTOINCREMENT,
+             session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+             timestamp   TEXT NOT NULL,
+             type        TEXT NOT NULL,
+             level       TEXT NOT NULL DEFAULT 'info',
+             method      TEXT NOT NULL,
+             server      TEXT NOT NULL,
+             client      TEXT NOT NULL,
+             parent_id   TEXT,
+             payload     TEXT NOT NULL,
+             created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+         );
+
+         INSERT INTO messages_new
+             (id, session_id, timestamp, type, level, method, server, client,
+              parent_id, payload, created_at)
+         SELECT
+             id, session_id, timestamp, type, level, method, server, client,
+             parent_id, payload, created_at
+         FROM messages;
+
+         DROP TABLE messages;
+         ALTER TABLE messages_new RENAME TO messages;
+
+         CREATE INDEX idx_messages_session ON messages(session_id);
+         CREATE INDEX idx_messages_type ON messages(type);
+         CREATE INDEX idx_messages_level ON messages(level);
+         CREATE INDEX idx_messages_parent_id ON messages(parent_id);
+
+         UPDATE meta SET value = '11' WHERE key = 'schema_version';
+
+         COMMIT;",
+    )
+    .context("failed to migrate schema from v10 to v11")?;
+
+    Ok(())
+}
+
 /// Reads the current schema version from the `meta` table.
 ///
 /// # Errors
@@ -696,7 +750,7 @@ mod tests {
         let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
 
         let version = current_schema_version(&conn).expect("failed to read schema version");
-        assert_eq!(version, 10, "schema version should be 10");
+        assert_eq!(version, 11, "schema version should be 11");
     }
 
     #[allow(clippy::expect_used, reason = "test assertions")]
@@ -764,7 +818,7 @@ mod tests {
         let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
 
         let version = current_schema_version(&conn).expect("failed to read schema version");
-        assert_eq!(version, 10, "schema version should be 10 after migration");
+        assert_eq!(version, 11, "schema version should be 11 after migration");
 
         for table in &["grammars", "symbols", "file_parse_state"] {
             assert!(
@@ -805,7 +859,7 @@ mod tests {
         let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
 
         let version = current_schema_version(&conn).expect("failed to read schema version");
-        assert_eq!(version, 10, "schema version should be 10 after migration");
+        assert_eq!(version, 11, "schema version should be 11 after migration");
 
         // Verify client_session_id column exists by inserting a row that uses it.
         conn.execute(
@@ -857,7 +911,7 @@ mod tests {
         let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
 
         let version = current_schema_version(&conn).expect("failed to read schema version");
-        assert_eq!(version, 10, "schema version should be 10 after migration");
+        assert_eq!(version, 11, "schema version should be 11 after migration");
 
         assert!(
             table_exists(&conn, "messages"),
@@ -921,7 +975,7 @@ mod tests {
         let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
 
         let version = current_schema_version(&conn).expect("failed to read schema version");
-        assert_eq!(version, 10, "schema version should be 10 after migration");
+        assert_eq!(version, 11, "schema version should be 11 after migration");
 
         // Editing tables should be dropped by v6→v7
         assert!(
@@ -990,7 +1044,7 @@ mod tests {
         let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
 
         let version = current_schema_version(&conn).expect("failed to read schema version");
-        assert_eq!(version, 10, "schema version should be 10 after migration");
+        assert_eq!(version, 11, "schema version should be 11 after migration");
 
         assert!(
             !table_exists(&conn, "editing_state"),
@@ -1058,7 +1112,7 @@ mod tests {
         let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
 
         let version = current_schema_version(&conn).expect("failed to read schema version");
-        assert_eq!(version, 10, "schema version should be 10 after migration");
+        assert_eq!(version, 11, "schema version should be 11 after migration");
 
         // Old data should be gone (table was recreated).
         let count: i64 = conn
@@ -1198,7 +1252,7 @@ mod tests {
 
         let conn = open_and_migrate_at(&path).expect("migration failed");
         let version = current_schema_version(&conn).expect("read version");
-        assert_eq!(version, 10, "schema version should be 10");
+        assert_eq!(version, 11, "schema version should be 11");
 
         // Trace event: type was 'debug' → type='internal', level='debug'
         let (typ, level): (String, String) = conn
@@ -1245,17 +1299,17 @@ mod tests {
 
         let conn = open_and_migrate_at(&path).expect("migration failed");
 
-        // Insert a row with request_id = 99999 (no matching ROWID).
-        // Before the migration this would fail with FK constraint violation.
+        // After full migration, request_id column is gone (v10→v11)
+        // and parent_id is TEXT. Verify the table is usable.
         conn.execute(
             "INSERT INTO messages \
              (session_id, timestamp, type, level, method, server, client, \
-              request_id, parent_id, payload) \
+              parent_id, payload) \
              VALUES ('s1', '2026-01-01T00:00:00Z', 'lsp', 'info', \
-                     'textDocument/hover', 'ra', 'catenary', 99999, 88888, '{}')",
+                     'textDocument/hover', 'ra', 'catenary', 'scope-uuid', '{}')",
             [],
         )
-        .expect("insert with non-matching request_id should succeed after FK drop");
+        .expect("insert after full migration should succeed");
     }
 
     #[allow(clippy::expect_used, reason = "test assertions")]
@@ -1279,32 +1333,17 @@ mod tests {
 
         let conn = open_and_migrate_at(&path).expect("migration failed");
 
-        // Protocol row: data preserved, correlation IDs intact.
-        let (method, server, req_id, par_id, payload): (
-            String,
-            String,
-            Option<i64>,
-            Option<String>,
-            String,
-        ) = conn
+        // Protocol row: data preserved, request_id dropped by v10→v11.
+        let (method, server, par_id, payload): (String, String, Option<String>, String) = conn
             .query_row(
-                "SELECT method, server, request_id, parent_id, payload \
+                "SELECT method, server, parent_id, payload \
                  FROM messages WHERE timestamp = '2026-01-01T00:00:01Z'",
                 [],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                    ))
-                },
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .expect("query protocol row");
         assert_eq!(method, "textDocument/definition");
         assert_eq!(server, "ra");
-        assert_eq!(req_id, Some(42));
         assert_eq!(par_id.as_deref(), Some("10"));
         assert_eq!(payload, "{\"result\":null}");
 
@@ -1376,15 +1415,15 @@ mod tests {
             .expect("query default level");
         assert_eq!(default_level, "info");
 
-        // request_id with non-matching ROWID should succeed (no FK).
+        // parent_id can be any string (UUID).
         conn.execute(
             "INSERT INTO messages \
              (session_id, timestamp, type, method, server, client, \
-              request_id, parent_id, payload) \
+              parent_id, payload) \
              VALUES ('s1', '2026-01-01T00:00:02Z', 'lsp', 'info', \
-                     'textDocument/hover', 'ra', 77777, 66666, '{}')",
+                     'textDocument/hover', 'ra', 'scope-uuid', '{}')",
             [],
         )
-        .expect("non-matching correlation IDs should succeed on fresh schema");
+        .expect("UUID parent_id should succeed on fresh schema");
     }
 }

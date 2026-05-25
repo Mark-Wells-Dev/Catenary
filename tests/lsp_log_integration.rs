@@ -50,16 +50,12 @@ async fn test_lsp_log_request_response() -> Result<()> {
         assert_eq!(m.r#type, "lsp");
     }
 
-    // Both request and response carry the same correlation ID as request_id
+    // Both request and response carry the same parent_id (exchange UUID)
     let request = def_msgs[0];
     let response = def_msgs[1];
-    assert!(
-        request.request_id.is_some(),
-        "request should have a correlation ID as request_id"
-    );
     assert_eq!(
-        response.request_id, request.request_id,
-        "response request_id should match request (pair-merge via correlation ID)"
+        response.parent_id, request.parent_id,
+        "response parent_id should match request"
     );
 
     Ok(())
@@ -163,11 +159,8 @@ async fn test_lsp_log_parent_id() -> Result<()> {
 
     // Request carries the MCP parent_id
     assert_eq!(def_msgs[0].parent_id.as_deref(), Some(parent_id.as_str()));
-    // Response parent_id is the correlation ID (self-referential pair)
-    assert_eq!(
-        def_msgs[1].parent_id.as_deref(),
-        def_msgs[1].request_id.map(|r| r.to_string()).as_deref(),
-    );
+    // Response carries the same parent_id (pair-merge via UUID)
+    assert_eq!(def_msgs[1].parent_id.as_deref(), Some(parent_id.as_str()),);
 
     Ok(())
 }

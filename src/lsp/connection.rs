@@ -25,10 +25,11 @@ use crate::logging::LoggingServer;
 use crate::mcp::RequestCancelled;
 
 /// Tracks an in-flight request so we can annotate the response with
-/// the original method name and causation chain.
+/// the original method name and scope identity.
 struct PendingRequest {
     method: String,
-    correlation_id: i64,
+    /// UUID shared by both request and response events for pair-merge.
+    parent_id: Option<String>,
     sender: oneshot::Sender<ResponseMessage>,
 }
 
@@ -41,7 +42,6 @@ fn emit_lsp_event(
     level: tracing::Level,
     server_name: &str,
     method: &str,
-    request_id: i64,
     parent_id: Option<&str>,
     payload: &str,
     msg: &str,
@@ -53,7 +53,6 @@ fn emit_lsp_event(
             method = method,
             server = server_name,
             client = "catenary",
-            request_id = request_id,
             parent_id = parent_id,
             payload = payload,
             "{msg}"
@@ -65,7 +64,6 @@ fn emit_lsp_event(
             method = method,
             server = server_name,
             client = "catenary",
-            request_id = request_id,
             parent_id = parent_id,
             payload = payload,
             "{msg}"
@@ -77,7 +75,6 @@ fn emit_lsp_event(
             method = method,
             server = server_name,
             client = "catenary",
-            request_id = request_id,
             parent_id = parent_id,
             payload = payload,
             "{msg}"
@@ -89,7 +86,6 @@ fn emit_lsp_event(
             method = method,
             server = server_name,
             client = "catenary",
-            request_id = request_id,
             parent_id = parent_id,
             payload = payload,
             "{msg}"
@@ -125,7 +121,7 @@ pub struct Connection {
     next_id: AtomicI64,
     server: Weak<LspServer>,
     language: String,
-    logging: LoggingServer,
+    _logging: LoggingServer,
     server_name: String,
     monitor: std::sync::Mutex<Option<catenary_proc::ProcessMonitor>>,
     /// Write end of the stdout pipe, for injecting drain sentinels.
@@ -254,7 +250,7 @@ impl Connection {
                 next_id: AtomicI64::new(1),
                 server: weak_server,
                 language,
-                logging,
+                _logging: logging,
                 server_name: server_name.to_string(),
                 monitor: std::sync::Mutex::new(monitor),
                 drain_writer,
@@ -302,14 +298,12 @@ impl Connection {
                 params: params.clone(),
             };
 
-            let correlation_id = self.logging.next_id();
             let level = lsp_category_level(lsp_category(method));
             if let Ok(payload) = serde_json::to_value(&request) {
                 emit_lsp_event(
                     level,
                     &self.server_name,
                     method,
-                    correlation_id.0,
                     parent_id,
                     &payload.to_string(),
                     "outgoing request",
@@ -323,7 +317,7 @@ impl Connection {
                     id.clone(),
                     PendingRequest {
                         method: method.to_string(),
-                        correlation_id: correlation_id.0,
+                        parent_id: parent_id.map(str::to_string),
                         sender: tx,
                     },
                 );
@@ -432,13 +426,11 @@ impl Connection {
             method: method.to_string(),
             params,
         };
-        let correlation_id = self.logging.next_id();
         if let Ok(payload) = serde_json::to_value(&notification) {
             emit_lsp_event(
                 tracing::Level::DEBUG,
                 &self.server_name,
                 method,
-                correlation_id.0,
                 parent_id,
                 &payload.to_string(),
                 "outgoing notification",
@@ -496,7 +488,7 @@ impl Connection {
                 id.clone(),
                 PendingRequest {
                     method: "drain".to_string(),
-                    correlation_id: 0,
+                    parent_id: None,
                     sender: tx,
                 },
             );
@@ -570,7 +562,7 @@ impl Connection {
         alive: Arc<AtomicBool>,
         server: Weak<LspServer>,
         stdout: R,
-        logging: LoggingServer,
+        _logging: LoggingServer,
         server_name: String,
     ) {
         let mut reader = BufReader::new(stdout);
@@ -615,13 +607,12 @@ impl Connection {
                     if let Some(id) = value.get("id") {
                         // Server Request — always debug (server-initiated plumbing)
                         debug!("Received server request: {} (id: {})", method, id);
-                        let inbound_id = logging.next_id();
+                        let exchange_id = uuid::Uuid::new_v4().to_string();
                         emit_lsp_event(
                             tracing::Level::DEBUG,
                             &server_name,
                             method,
-                            inbound_id.0,
-                            None,
+                            Some(&exchange_id),
                             &value.to_string(),
                             "incoming server request",
                         );
@@ -652,13 +643,11 @@ impl Connection {
 
                         // Log outbound response (same level as request)
                         if let Ok(response_json) = serde_json::to_value(&response) {
-                            let parent_str = inbound_id.0.to_string();
                             emit_lsp_event(
                                 tracing::Level::DEBUG,
                                 &server_name,
                                 method,
-                                inbound_id.0,
-                                Some(&parent_str),
+                                Some(&exchange_id),
                                 &response_json.to_string(),
                                 "outgoing server response",
                             );
@@ -677,7 +666,6 @@ impl Connection {
                         }
                     } else {
                         // Notification — level determined by method
-                        let notif_id = logging.next_id();
                         if method == "window/logMessage" {
                             // Server telemetry — always info to stay out of
                             // notification drain (warn threshold). Original
@@ -699,7 +687,6 @@ impl Connection {
                                     method = method,
                                     server = server_name.as_str(),
                                     client = "catenary",
-                                    request_id = notif_id.0,
                                     payload = payload_str.as_str(),
                                     source = crate::source::Source::LspLogging.as_str(),
                                     lsp_level = lsp_level,
@@ -711,7 +698,6 @@ impl Connection {
                                     method = method,
                                     server = server_name.as_str(),
                                     client = "catenary",
-                                    request_id = notif_id.0,
                                     payload = payload_str.as_str(),
                                     source = crate::source::Source::LspLogging.as_str(),
                                     "{server_name}: {text}"
@@ -745,7 +731,6 @@ impl Connection {
                                 notif_level,
                                 &server_name,
                                 method,
-                                notif_id.0,
                                 None,
                                 &value.to_string(),
                                 &msg,
@@ -765,13 +750,11 @@ impl Connection {
                             // LSP traffic — skip protocol logging.
                             if req.method != "drain" {
                                 let resp_level = lsp_category_level(lsp_category(&req.method));
-                                let parent_str = req.correlation_id.to_string();
                                 emit_lsp_event(
                                     resp_level,
                                     &server_name,
                                     &req.method,
-                                    req.correlation_id,
-                                    Some(&parent_str),
+                                    req.parent_id.as_deref(),
                                     &value.to_string(),
                                     "incoming response",
                                 );
@@ -864,7 +847,6 @@ mod tests {
             tracing::Level::ERROR,
             "test-server",
             "test/error",
-            1,
             None,
             "{}",
             "error msg",
@@ -873,7 +855,6 @@ mod tests {
             tracing::Level::WARN,
             "test-server",
             "test/warn",
-            2,
             None,
             "{}",
             "warn msg",
@@ -882,7 +863,6 @@ mod tests {
             tracing::Level::INFO,
             "test-server",
             "test/info",
-            3,
             None,
             "{}",
             "info msg",
@@ -891,7 +871,6 @@ mod tests {
             tracing::Level::DEBUG,
             "test-server",
             "test/debug",
-            4,
             None,
             "{}",
             "debug msg",
@@ -922,7 +901,6 @@ mod tests {
             tracing::Level::INFO,
             "test-server",
             "test/method",
-            10,
             Some("scope-5"),
             "{}",
             "with parent",
@@ -931,7 +909,6 @@ mod tests {
             tracing::Level::INFO,
             "test-server",
             "test/method",
-            11,
             None,
             "{}",
             "no parent",

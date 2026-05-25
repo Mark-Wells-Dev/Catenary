@@ -57,7 +57,7 @@ pub struct Scope {
 impl Scope {
     /// Create a new scope from a pre-tool hook message.
     ///
-    /// The hook's `request_id` becomes the scope identity. The scope
+    /// The hook's `parent_id` becomes the scope identity. The scope
     /// starts in `Opening` state, waiting for the MCP request.
     #[must_use]
     pub fn new(pre_hook: SessionMessage) -> Self {
@@ -179,14 +179,12 @@ mod tests {
     fn pre_hook(scope_id: i64, session_id: &str) -> SessionMessage {
         SessionMessage {
             session_id: session_id.to_string(),
-            parent_id: Some(format!("scope-{scope_id}")),
             ..test_support::message_with_ids(
                 100 + scope_id,
                 "hook",
                 "pre-tool/editing-state",
                 "",
-                Some(scope_id),
-                None,
+                Some(&format!("scope-{scope_id}")),
             )
         }
     }
@@ -200,8 +198,7 @@ mod tests {
                 "mcp",
                 "tools/call",
                 "catenary",
-                Some(scope_id + 1000),
-                Some(scope_id),
+                Some(&format!("call-{scope_id}")),
             )
         }
     }
@@ -214,8 +211,7 @@ mod tests {
                 "mcp",
                 "tools/call",
                 "catenary",
-                Some(scope_id + 1000),
-                Some(scope_id),
+                Some(&format!("call-{scope_id}")),
             )
         }
     }
@@ -228,14 +224,12 @@ mod tests {
                 "hook",
                 "post-tool/diagnostics",
                 "",
-                Some(scope_id + 2000),
-                Some(scope_id),
+                Some(&format!("scope-{scope_id}")),
             )
         }
     }
 
     fn lsp_child(scope_id: i64, session_id: &str, method: &str) -> SessionMessage {
-        let corr_id = scope_id + 1000;
         SessionMessage {
             session_id: session_id.to_string(),
             ..test_support::message_with_ids(
@@ -243,8 +237,7 @@ mod tests {
                 "lsp",
                 method,
                 "rust-analyzer",
-                Some(corr_id + 100),
-                Some(corr_id),
+                Some(&format!("call-{scope_id}")),
             )
         }
     }

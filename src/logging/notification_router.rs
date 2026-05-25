@@ -276,7 +276,6 @@ mod tests {
             method: None,
             server: server.map(str::to_string),
             client: None,
-            request_id: None,
             parent_id: None,
             source: None,
             language: None,

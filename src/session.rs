@@ -54,14 +54,9 @@ pub struct SessionMessage {
     pub server: String,
     /// Client endpoint name.
     pub client: String,
-    /// In-process correlation ID ([`crate::logging::CorrelationId`]).
-    /// Request and response share the same value; pair merge matches
-    /// adjacent messages with equal non-`None` `request_id`. Not a
-    /// foreign key into this table's `id` column.
-    pub request_id: Option<i64>,
-    /// Causation link. UUID string minted at scope boundaries (pre-tool
-    /// hook dispatch, MCP `tools/call` dispatch) or a stringified
-    /// `request_id` for pair-merge. Not a foreign key into `id`.
+    /// Scope/pair identity. UUID string minted at exchange boundaries
+    /// (hook dispatch, MCP `tools/call` dispatch, LSP request/response).
+    /// Both request and response in an exchange share the same value.
     pub parent_id: Option<String>,
     /// When the message was logged.
     pub timestamp: DateTime<Utc>,
@@ -97,11 +92,11 @@ impl SqliteMessageTail {
     pub fn try_next_message(&mut self) -> Result<Option<SessionMessage>> {
         let query = if self.include_debug {
             "SELECT id, timestamp, type, level, method, server, client, \
-             request_id, parent_id, payload FROM messages \
+             parent_id, payload FROM messages \
              WHERE session_id = ?1 AND id > ?2 ORDER BY id LIMIT 1"
         } else {
             "SELECT id, timestamp, type, level, method, server, client, \
-             request_id, parent_id, payload FROM messages \
+             parent_id, payload FROM messages \
              WHERE session_id = ?1 AND id > ?2 AND level != 'debug' \
              ORDER BY id LIMIT 1"
         };
@@ -117,17 +112,16 @@ impl SqliteMessageTail {
                 let method: String = row.get(4)?;
                 let server: String = row.get(5)?;
                 let client: String = row.get(6)?;
-                let request_id: Option<i64> = row.get(7)?;
-                let parent_id: Option<String> = row.get(8)?;
-                let payload: String = row.get(9)?;
+                let parent_id: Option<String> = row.get(7)?;
+                let payload: String = row.get(8)?;
                 Ok((
-                    id, ts, r#type, level, method, server, client, request_id, parent_id, payload,
+                    id, ts, r#type, level, method, server, client, parent_id, payload,
                 ))
             },
         );
 
         match result {
-            Ok((id, ts, r#type, level, method, server, client, request_id, parent_id, payload)) => {
+            Ok((id, ts, r#type, level, method, server, client, parent_id, payload)) => {
                 self.last_id = id;
                 let timestamp = DateTime::parse_from_rfc3339(&ts)
                     .with_context(|| format!("invalid message timestamp: {ts}"))?
@@ -142,7 +136,6 @@ impl SqliteMessageTail {
                     method,
                     server,
                     client,
-                    request_id,
                     parent_id,
                     timestamp,
                     payload,
@@ -357,11 +350,11 @@ pub fn monitor_messages_with_conn(
 ) -> Result<Vec<SessionMessage>> {
     let query = if include_debug {
         "SELECT id, timestamp, type, level, method, server, client, \
-         request_id, parent_id, payload FROM messages \
+         parent_id, payload FROM messages \
          WHERE session_id = ?1 ORDER BY id"
     } else {
         "SELECT id, timestamp, type, level, method, server, client, \
-         request_id, parent_id, payload FROM messages \
+         parent_id, payload FROM messages \
          WHERE session_id = ?1 AND level != 'debug' ORDER BY id"
     };
     let mut stmt = conn.prepare(query)?;
@@ -376,9 +369,8 @@ pub fn monitor_messages_with_conn(
         let method: String = row.get(4)?;
         let server: String = row.get(5)?;
         let client: String = row.get(6)?;
-        let request_id: Option<i64> = row.get(7)?;
-        let parent_id: Option<String> = row.get(8)?;
-        let payload_str: String = row.get(9)?;
+        let parent_id: Option<String> = row.get(7)?;
+        let payload_str: String = row.get(8)?;
 
         if let Ok(timestamp) = DateTime::parse_from_rfc3339(&ts)
             && let Ok(payload) = serde_json::from_str::<serde_json::Value>(&payload_str)
@@ -391,7 +383,6 @@ pub fn monitor_messages_with_conn(
                 method,
                 server,
                 client,
-                request_id,
                 parent_id,
                 timestamp: timestamp.with_timezone(&Utc),
                 payload,
@@ -416,10 +407,10 @@ pub fn monitor_all_messages_with_conn(
 ) -> Result<Vec<SessionMessage>> {
     let query = if include_debug {
         "SELECT id, session_id, timestamp, type, level, method, server, client, \
-         request_id, parent_id, payload FROM messages ORDER BY id"
+         parent_id, payload FROM messages ORDER BY id"
     } else {
         "SELECT id, session_id, timestamp, type, level, method, server, client, \
-         request_id, parent_id, payload FROM messages \
+         parent_id, payload FROM messages \
          WHERE level != 'debug' ORDER BY id"
     };
     let mut stmt = conn.prepare(query)?;
@@ -435,9 +426,8 @@ pub fn monitor_all_messages_with_conn(
         let method: String = row.get(5)?;
         let server: String = row.get(6)?;
         let client: String = row.get(7)?;
-        let request_id: Option<i64> = row.get(8)?;
-        let parent_id: Option<String> = row.get(9)?;
-        let payload_str: String = row.get(10)?;
+        let parent_id: Option<String> = row.get(8)?;
+        let payload_str: String = row.get(9)?;
 
         if let Ok(timestamp) = DateTime::parse_from_rfc3339(&ts)
             && let Ok(payload) = serde_json::from_str::<serde_json::Value>(&payload_str)
@@ -450,7 +440,6 @@ pub fn monitor_all_messages_with_conn(
                 method,
                 server,
                 client,
-                request_id,
                 parent_id,
                 timestamp: timestamp.with_timezone(&Utc),
                 payload,
@@ -518,11 +507,11 @@ impl SqliteAllMessageTail {
     pub fn try_next_message(&mut self) -> Result<Option<SessionMessage>> {
         let query = if self.include_debug {
             "SELECT id, session_id, timestamp, type, level, method, server, client, \
-             request_id, parent_id, payload FROM messages \
+             parent_id, payload FROM messages \
              WHERE id > ?1 ORDER BY id LIMIT 1"
         } else {
             "SELECT id, session_id, timestamp, type, level, method, server, client, \
-             request_id, parent_id, payload FROM messages \
+             parent_id, payload FROM messages \
              WHERE id > ?1 AND level != 'debug' ORDER BY id LIMIT 1"
         };
 
@@ -537,29 +526,15 @@ impl SqliteAllMessageTail {
                 let method: String = row.get(5)?;
                 let server: String = row.get(6)?;
                 let client: String = row.get(7)?;
-                let request_id: Option<i64> = row.get(8)?;
-                let parent_id: Option<String> = row.get(9)?;
-                let payload: String = row.get(10)?;
+                let parent_id: Option<String> = row.get(8)?;
+                let payload: String = row.get(9)?;
                 Ok((
-                    id, session_id, ts, r#type, level, method, server, client, request_id,
-                    parent_id, payload,
+                    id, session_id, ts, r#type, level, method, server, client, parent_id, payload,
                 ))
             });
 
         match result {
-            Ok((
-                id,
-                session_id,
-                ts,
-                r#type,
-                level,
-                method,
-                server,
-                client,
-                request_id,
-                parent_id,
-                payload,
-            )) => {
+            Ok((id, session_id, ts, r#type, level, method, server, client, parent_id, payload)) => {
                 self.last_id = id;
                 let timestamp = DateTime::parse_from_rfc3339(&ts)
                     .with_context(|| format!("invalid message timestamp: {ts}"))?
@@ -574,7 +549,6 @@ impl SqliteAllMessageTail {
                     method,
                     server,
                     client,
-                    request_id,
                     parent_id,
                     timestamp,
                     payload,
@@ -786,7 +760,6 @@ pub(crate) mod test_support {
             method: method.to_string(),
             server: server.to_string(),
             client: "catenary".to_string(),
-            request_id: None,
             parent_id: None,
             timestamp: Utc::now(),
             payload: serde_json::json!({}),
@@ -807,20 +780,18 @@ pub(crate) mod test_support {
         }
     }
 
-    /// Build a `SessionMessage` with explicit `id`, `request_id`, and `parent_id`.
+    /// Build a `SessionMessage` with explicit `id` and `parent_id`.
     #[must_use]
     pub fn message_with_ids(
         id: i64,
         r#type: &str,
         method: &str,
         server: &str,
-        request_id: Option<i64>,
-        parent_id: Option<i64>,
+        parent_id: Option<&str>,
     ) -> SessionMessage {
         SessionMessage {
             id,
-            request_id,
-            parent_id: parent_id.map(|v| v.to_string()),
+            parent_id: parent_id.map(str::to_string),
             ..message(r#type, method, server)
         }
     }
@@ -868,15 +839,14 @@ mod tests {
         method: &str,
         server: &str,
         client: &str,
-        request_id: Option<i64>,
-        parent_id: Option<i64>,
+        parent_id: Option<&str>,
         payload: &str,
     ) -> i64 {
         conn.execute(
             "INSERT INTO messages \
              (session_id, timestamp, type, method, server, client, \
-              request_id, parent_id, payload) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+              parent_id, payload) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             rusqlite::params![
                 session_id,
                 "2026-01-01T00:00:00.000Z",
@@ -884,7 +854,6 @@ mod tests {
                 method,
                 server,
                 client,
-                request_id,
                 parent_id,
                 payload,
             ],
@@ -906,8 +875,8 @@ mod tests {
         conn.execute(
             "INSERT INTO messages \
              (session_id, timestamp, type, level, method, server, client, \
-              request_id, parent_id, payload) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'catenary', NULL, NULL, ?7)",
+              parent_id, payload) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'catenary', NULL, ?7)",
             rusqlite::params![
                 session_id,
                 "2026-01-01T00:00:00.000Z",
@@ -989,7 +958,6 @@ mod tests {
             "rust-analyzer",
             "catenary",
             None,
-            None,
             "{}",
         );
 
@@ -1018,7 +986,6 @@ mod tests {
             "catenary",
             "claude-code",
             None,
-            None,
             "{}",
         );
         insert_test_message(
@@ -1028,7 +995,6 @@ mod tests {
             "post-tool",
             "catenary",
             "claude-code",
-            None,
             None,
             "{}",
         );
@@ -1057,7 +1023,6 @@ mod tests {
             "rust-analyzer",
             "catenary",
             None,
-            None,
             "{}",
         );
         insert_test_message(
@@ -1067,7 +1032,6 @@ mod tests {
             "initialize",
             "pyright",
             "catenary",
-            None,
             None,
             "{}",
         );
@@ -1079,7 +1043,6 @@ mod tests {
             "typescript-language-server",
             "catenary",
             None,
-            None,
             "{}",
         );
         // Duplicate — should not produce a second entry.
@@ -1090,7 +1053,6 @@ mod tests {
             "textDocument/hover",
             "rust-analyzer",
             "catenary",
-            None,
             None,
             "{}",
         );
@@ -1192,7 +1154,6 @@ mod tests {
             "rust-analyzer",
             "catenary",
             None,
-            None,
             r#"{"method":"textDocument/hover"}"#,
         );
         insert_test_message(
@@ -1203,7 +1164,6 @@ mod tests {
             "catenary",
             "claude-code",
             None,
-            None,
             r#"{"name":"grep"}"#,
         );
         insert_test_message(
@@ -1213,7 +1173,6 @@ mod tests {
             "textDocument/definition",
             "typescript-language-server",
             "catenary",
-            None,
             None,
             r#"{"method":"textDocument/hover"}"#,
         );
@@ -1250,7 +1209,6 @@ mod tests {
             "rust-analyzer",
             "catenary",
             None,
-            None,
             "{}",
         );
 
@@ -1272,7 +1230,6 @@ mod tests {
             "textDocument/hover",
             "rust-analyzer",
             "catenary",
-            None,
             None,
             r#"{"result":null}"#,
         );
@@ -1306,7 +1263,6 @@ mod tests {
             "rust-analyzer",
             "catenary",
             None,
-            None,
             "{}",
         );
         insert_test_message(
@@ -1316,7 +1272,6 @@ mod tests {
             "textDocument/definition",
             "typescript-language-server",
             "catenary",
-            None,
             None,
             "{}",
         );
@@ -1328,7 +1283,6 @@ mod tests {
             "tools/call",
             "catenary",
             "claude-code",
-            None,
             None,
             "{}",
         );
@@ -1490,7 +1444,6 @@ mod tests {
             "ra",
             "catenary",
             None,
-            None,
             "{}",
         );
         insert_test_message(
@@ -1501,7 +1454,6 @@ mod tests {
             "ra",
             "catenary",
             None,
-            None,
             "{}",
         );
         insert_test_message(
@@ -1511,7 +1463,6 @@ mod tests {
             "textDocument/definition",
             "ra",
             "catenary",
-            None,
             None,
             "{}",
         );

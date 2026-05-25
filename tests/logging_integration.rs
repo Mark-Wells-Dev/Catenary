@@ -186,19 +186,22 @@ async fn lsp_request_scope_chain() -> Result<()> {
         "request parent_id should be the MCP parent UUID"
     );
 
-    // Both carry the same request_id (pair-merge key).
-    assert!(def_msgs[0].request_id.is_some());
+    // Both carry the same parent_id (pair-merge key).
+    assert!(
+        def_msgs[0].parent_id.is_some(),
+        "request should have parent_id"
+    );
     assert_eq!(
-        def_msgs[0].request_id, def_msgs[1].request_id,
-        "request and response should share request_id"
+        def_msgs[0].parent_id, def_msgs[1].parent_id,
+        "request and response should share parent_id"
     );
 
     drop(guard);
     Ok(())
 }
 
-/// Verify that `pair_merge` semantics are preserved: querying by
-/// `request_id` returns both the request and response rows.
+/// Verify that `pair_merge` semantics are preserved: request and response
+/// share the same `parent_id`. Without a tool-call scope, both are `None`.
 #[tokio::test]
 async fn pair_merge_still_works() -> Result<()> {
     let db = logging_test_db();
@@ -231,7 +234,7 @@ async fn pair_merge_still_works() -> Result<()> {
 
     let _def = client.definition(&uri, 0, 4).await?;
 
-    // Find the definition request's correlation ID.
+    // Find the definition request/response pair.
     let msgs = query_all_messages(&db);
     let def_msgs: Vec<&MsgRow> = msgs
         .iter()
@@ -240,24 +243,11 @@ async fn pair_merge_still_works() -> Result<()> {
 
     assert!(def_msgs.len() >= 2, "expected at least request + response");
 
-    let corr_id = def_msgs[0]
-        .request_id
-        .expect("request should have request_id");
-
-    // Query by request_id — should return both request and response.
-    let pair_count = {
-        let c = db.lock().expect("lock");
-        c.query_row(
-            "SELECT COUNT(*) FROM messages WHERE request_id = ?1",
-            [corr_id],
-            |row| row.get::<_, i64>(0),
-        )
-        .expect("count pair")
-    };
-
+    // Without a tool-call scope, both request and response have
+    // the same parent_id (both None — no scope UUID was provided).
     assert_eq!(
-        pair_count, 2,
-        "pair-merge: request_id {corr_id} should match exactly 2 rows"
+        def_msgs[0].parent_id, def_msgs[1].parent_id,
+        "request and response should share the same parent_id"
     );
 
     drop(guard);

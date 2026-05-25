@@ -143,8 +143,8 @@ struct HookDispatchContext {
     primary: Arc<Session>,
     /// Shared database connection for `HookRouter` DB writes.
     conn: Arc<std::sync::Mutex<rusqlite::Connection>>,
-    /// Logging server for correlation ID minting and sink access.
-    logging: LoggingServer,
+    /// Logging server for sink access.
+    _logging: LoggingServer,
     /// Root tracker for refcount-aware root management across sessions.
     root_tracker: Option<RootTracker>,
     /// Cross-session per-root editing guardrail. Shared with all
@@ -747,7 +747,7 @@ impl SessionManager {
             sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
             primary: session,
             conn,
-            logging: self.logging.clone(),
+            _logging: self.logging.clone(),
             root_tracker: Some(root_tracker),
             editing_guardrail: Arc::new(EditingGuardrail::new()),
             handoff_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -1000,7 +1000,7 @@ async fn handle_hook_dispatch(
     // Short-circuits before get_or_create_router to avoid creating
     // a new session just to immediately clean it up.
     if method == "session-end/cleanup" {
-        let id = ctx.logging.next_id();
+        let scope_id = uuid::Uuid::new_v4().to_string();
 
         // Release editing guardrail locks (idempotent if MCP
         // disconnect already ran).
@@ -1037,18 +1037,15 @@ async fn handle_hook_dispatch(
             tracing::Level::DEBUG,
             &session_id,
             &method,
-            id.0,
-            None,
+            Some(&scope_id),
             &raw.to_string(),
             "incoming hook",
         );
-        let parent_str = id.0.to_string();
         emit_hook_event(
             tracing::Level::DEBUG,
             &session_id,
             &method,
-            id.0,
-            Some(&parent_str),
+            Some(&scope_id),
             "",
             "outgoing hook response",
         );
@@ -1076,7 +1073,7 @@ async fn handle_hook_dispatch(
     // the handoff lock, drains files, releases the editing guardrail,
     // and deposits the file list for the subsequent CLI command.
     if method == "pre-tool/done-editing" {
-        let id = ctx.logging.next_id();
+        let scope_id = uuid::Uuid::new_v4().to_string();
 
         let router = get_or_create_router(&ctx, &session_id);
 
@@ -1117,18 +1114,15 @@ async fn handle_hook_dispatch(
             tracing::Level::DEBUG,
             &session_id,
             &method,
-            id.0,
-            None,
+            Some(&scope_id),
             &raw.to_string(),
             "incoming hook",
         );
-        let parent_str = id.0.to_string();
         emit_hook_event(
             tracing::Level::DEBUG,
             &session_id,
             &method,
-            id.0,
-            Some(&parent_str),
+            Some(&scope_id),
             "{\"status\":\"ok\"}",
             "outgoing hook response",
         );
@@ -1144,7 +1138,7 @@ async fn handle_hook_dispatch(
     // command. Takes the file list from the handoff slot, runs
     // process_files_batched, and returns diagnostics.
     if method == "tool/done-editing" {
-        let id = ctx.logging.next_id();
+        let scope_id = uuid::Uuid::new_v4().to_string();
 
         // Take the file list from the handoff slot and release the
         // permit immediately. The permit must not be held during the
@@ -1177,18 +1171,15 @@ async fn handle_hook_dispatch(
             tracing::Level::INFO,
             "cli",
             &method,
-            id.0,
-            None,
+            Some(&scope_id),
             &raw.to_string(),
             "incoming hook",
         );
-        let parent_str = id.0.to_string();
         emit_hook_event(
             tracing::Level::INFO,
             "cli",
             &method,
-            id.0,
-            Some(&parent_str),
+            Some(&scope_id),
             &response,
             "outgoing hook response",
         );
@@ -1210,7 +1201,7 @@ async fn handle_hook_dispatch(
     // is a daemon-level concern (RootTracker), not a per-session
     // router concern.
     if method == "tool/add-root" {
-        let id = ctx.logging.next_id();
+        let scope_id = uuid::Uuid::new_v4().to_string();
         let response = if let Some(path_str) = raw.get("path").and_then(|v| v.as_str()) {
             let path = PathBuf::from(path_str);
             let canonical = path.canonicalize().unwrap_or(path);
@@ -1238,18 +1229,15 @@ async fn handle_hook_dispatch(
             tracing::Level::DEBUG,
             &session_id,
             &method,
-            id.0,
-            None,
+            Some(&scope_id),
             &raw.to_string(),
             "incoming hook",
         );
-        let parent_str = id.0.to_string();
         emit_hook_event(
             tracing::Level::DEBUG,
             &session_id,
             &method,
-            id.0,
-            Some(&parent_str),
+            Some(&scope_id),
             &response.to_string(),
             "outgoing hook response",
         );
@@ -1262,7 +1250,7 @@ async fn handle_hook_dispatch(
     }
 
     if method == "tool/rm-root" {
-        let id = ctx.logging.next_id();
+        let scope_id = uuid::Uuid::new_v4().to_string();
         let response = if let Some(path_str) = raw.get("path").and_then(|v| v.as_str()) {
             let path = PathBuf::from(path_str);
             let canonical = path.canonicalize().unwrap_or(path);
@@ -1302,18 +1290,15 @@ async fn handle_hook_dispatch(
             tracing::Level::DEBUG,
             &session_id,
             &method,
-            id.0,
-            None,
+            Some(&scope_id),
             &raw.to_string(),
             "incoming hook",
         );
-        let parent_str = id.0.to_string();
         emit_hook_event(
             tracing::Level::DEBUG,
             &session_id,
             &method,
-            id.0,
-            Some(&parent_str),
+            Some(&scope_id),
             &response.to_string(),
             "outgoing hook response",
         );
@@ -1335,13 +1320,13 @@ async fn handle_hook_dispatch(
     );
     let _hook_guard = hook_span.enter();
 
-    // Mint a correlation ID for this request/response pair.
-    let id = ctx.logging.next_id();
+    // Mint a UUID for this request/response pair.
+    let scope_id = uuid::Uuid::new_v4().to_string();
 
     let request: HookRequest =
         serde_json::from_value(raw.clone()).map_err(|e| anyhow!("Invalid hook request: {e}"))?;
 
-    let result = router.dispatch(request, id.0);
+    let result = router.dispatch(request);
 
     let envelope = HookResponseEnvelope {
         result: result.result,
@@ -1361,20 +1346,17 @@ async fn handle_hook_dispatch(
         level,
         &session_id,
         &method,
-        id.0,
-        None,
+        Some(&scope_id),
         &raw.to_string(),
         "incoming hook",
     );
 
-    // Log outgoing hook response.
-    let response_parent_str = id.0.to_string();
+    // Log outgoing hook response — same parent_id as request.
     emit_hook_event(
         level,
         &session_id,
         &method,
-        id.0,
-        Some(&response_parent_str),
+        Some(&scope_id),
         &response,
         "outgoing hook response",
     );

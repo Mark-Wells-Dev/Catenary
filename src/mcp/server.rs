@@ -45,7 +45,6 @@ fn emit_mcp_event(
     level: tracing::Level,
     client_name: &str,
     method: &str,
-    request_id: i64,
     parent_id: Option<&str>,
     payload: &str,
     msg: &str,
@@ -57,7 +56,6 @@ fn emit_mcp_event(
             method = method,
             server = "catenary",
             client = client_name,
-            request_id = request_id,
             parent_id = parent_id,
             payload = payload,
             "{msg}"
@@ -69,7 +67,6 @@ fn emit_mcp_event(
             method = method,
             server = "catenary",
             client = client_name,
-            request_id = request_id,
             parent_id = parent_id,
             payload = payload,
             "{msg}"
@@ -81,7 +78,6 @@ fn emit_mcp_event(
             method = method,
             server = "catenary",
             client = client_name,
-            request_id = request_id,
             parent_id = parent_id,
             payload = payload,
             "{msg}"
@@ -93,7 +89,6 @@ fn emit_mcp_event(
             method = method,
             server = "catenary",
             client = client_name,
-            request_id = request_id,
             parent_id = parent_id,
             payload = payload,
             "{msg}"
@@ -175,7 +170,7 @@ pub type RootsChangedCallback = Box<dyn Fn(Vec<Root>) -> Result<()> + Send + Syn
 pub struct McpServer<H: ToolHandler> {
     handler: H,
     initialized: bool,
-    logging: LoggingServer,
+    _logging: LoggingServer,
     /// Name of the connected MCP client (learned during initialize).
     client_name: String,
     on_client_info: Option<ClientInfoCallback>,
@@ -189,9 +184,9 @@ pub struct McpServer<H: ToolHandler> {
     next_outbound_id: i64,
     /// Callback invoked when roots change.
     on_roots_changed: Option<RootsChangedCallback>,
-    /// Correlation ID of the current incoming message, set per `dispatch_message`.
-    /// Read by `handle_tools_call` to supply `parent_id` to the tool handler.
-    current_correlation_id: i64,
+    /// UUID of the current exchange, set per `dispatch_message`.
+    /// Used to link request and response events with the same `parent_id`.
+    current_exchange_id: Option<String>,
     /// Maps in-flight MCP request IDs to their cancellation tokens.
     /// Shared with the stdin reader thread so `notifications/cancelled`
     /// can trigger cancellation while a tool call blocks the main loop.
@@ -211,7 +206,7 @@ impl<H: ToolHandler> McpServer<H> {
         Self {
             handler,
             initialized: false,
-            logging,
+            _logging: logging,
             client_name: "unknown".to_string(),
             on_client_info: None,
             client_has_roots: false,
@@ -219,7 +214,7 @@ impl<H: ToolHandler> McpServer<H> {
             fetching_roots: false,
             next_outbound_id: 0,
             on_roots_changed: None,
-            current_correlation_id: 0,
+            current_exchange_id: None,
             cancel_map: Arc::new(std::sync::Mutex::new(HashMap::new())),
             roots_refresh: None,
             current_call_uuid: None,
@@ -286,32 +281,27 @@ impl<H: ToolHandler> McpServer<H> {
 
             // Log incoming message and extract request ID for
             // cancellation pre-registration.
-            let (correlation_id, method, mcp_request_id) =
+            let (exchange_id, method, mcp_request_id) =
                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
                     let method = json
                         .get("method")
                         .and_then(|m| m.as_str())
                         .unwrap_or("response")
                         .to_string();
-                    let id = self.logging.next_id();
                     let payload = json.to_string();
 
-                    // For tools/call, mint a UUID that groups the incoming
-                    // MCP event and all child LSP events in the TUI.
-                    let parent_id = if method == "tools/call" {
-                        let uuid = uuid::Uuid::new_v4().to_string();
+                    // Mint a UUID per exchange for pair-merge.
+                    // For tools/call, this also groups child LSP events.
+                    let uuid = uuid::Uuid::new_v4().to_string();
+                    if method == "tools/call" {
                         self.current_call_uuid = Some(uuid.clone());
-                        Some(uuid)
-                    } else {
-                        None
-                    };
+                    }
 
                     emit_mcp_event(
                         mcp_method_level(&method),
                         &self.client_name,
                         &method,
-                        id.0,
-                        parent_id.as_deref(),
+                        Some(&uuid),
                         &payload,
                         "incoming",
                     );
@@ -323,12 +313,12 @@ impl<H: ToolHandler> McpServer<H> {
                     } else {
                         None
                     };
-                    (id.0, method, rid)
+                    (Some(uuid), method, rid)
                 } else {
-                    (0, String::new(), None)
+                    (None, String::new(), None)
                 };
 
-            self.current_correlation_id = correlation_id;
+            self.current_exchange_id.clone_from(&exchange_id);
 
             // Check for turn-boundary roots refresh BEFORE dispatch.
             // This guarantees tool calls execute against current roots:
@@ -342,7 +332,7 @@ impl<H: ToolHandler> McpServer<H> {
             }
 
             if self.should_fetch_roots {
-                let initial = Some((line, correlation_id, method));
+                let initial = Some((line, exchange_id, method));
                 if let Err(e) = self.fetch_roots(&rx, &mut writer, initial) {
                     error!(
                         source = crate::source::Source::McpDispatch.as_str(),
@@ -357,7 +347,7 @@ impl<H: ToolHandler> McpServer<H> {
                 continue;
             }
 
-            self.dispatch_message(&line, &mut writer, correlation_id, &method)?;
+            self.dispatch_message(&line, &mut writer, &method)?;
 
             // Dispatch may have set should_fetch_roots (e.g.,
             // notifications/initialized, notifications/roots/list_changed).
@@ -467,12 +457,11 @@ impl<H: ToolHandler> McpServer<H> {
         &mut self,
         line: &str,
         writer: &mut impl Write,
-        correlation_id: i64,
         method: &str,
     ) -> Result<()> {
         match self.handle_message(line) {
             Ok(Some(response)) => {
-                self.write_response(&response, writer, Some(correlation_id), method)?;
+                self.write_response(&response, writer, method)?;
             }
             Ok(None) => {
                 // Notification, no response needed
@@ -486,7 +475,7 @@ impl<H: ToolHandler> McpServer<H> {
                 // Try to send error response if we can parse the id
                 if let Ok(req) = serde_json::from_str::<Request>(line) {
                     let response = Response::error(req.id, INTERNAL_ERROR, e.to_string());
-                    self.write_response(&response, writer, Some(correlation_id), method)?;
+                    self.write_response(&response, writer, method)?;
                 }
             }
         }
@@ -498,21 +487,20 @@ impl<H: ToolHandler> McpServer<H> {
         &self,
         response: &Response,
         writer: &mut impl Write,
-        request_id: Option<i64>,
         method: &str,
     ) -> Result<()> {
         let response_json =
             serde_json::to_string(response).context("Failed to serialize response")?;
         trace!("Sending: {}", response_json);
 
-        if let Some(rid) = request_id {
-            let parent_str = rid.to_string();
+        // Response carries the same parent_id as the incoming request
+        // (minted per exchange in the run loop).
+        if let Some(ref eid) = self.current_exchange_id {
             emit_mcp_event(
                 mcp_method_level(method),
                 &self.client_name,
                 method,
-                rid,
-                Some(&parent_str),
+                Some(eid),
                 &response_json,
                 "outgoing response",
             );
@@ -734,7 +722,7 @@ impl<H: ToolHandler> McpServer<H> {
     /// the response. Uses `fetching_roots` guard to prevent recursion if
     /// `roots/list_changed` arrives during the fetch.
     ///
-    /// `initial_message` is an already-read message (line, `correlation_id`,
+    /// `initial_message` is an already-read message (line, exchange UUID,
     /// method) that should be buffered behind the roots response. Used by
     /// the turn-boundary refresh path to ensure tool calls execute against
     /// updated roots.
@@ -742,7 +730,7 @@ impl<H: ToolHandler> McpServer<H> {
         &mut self,
         inbox: &std::sync::mpsc::Receiver<String>,
         writer: &mut impl Write,
-        initial_message: Option<(String, i64, String)>,
+        initial_message: Option<(String, Option<String>, String)>,
     ) -> Result<()> {
         if self.fetching_roots {
             debug!("Already fetching roots, skipping");
@@ -761,7 +749,7 @@ impl<H: ToolHandler> McpServer<H> {
         &mut self,
         inbox: &std::sync::mpsc::Receiver<String>,
         writer: &mut impl Write,
-        initial_message: Option<(String, i64, String)>,
+        initial_message: Option<(String, Option<String>, String)>,
     ) -> Result<()> {
         let request_id = self.next_id();
         let request = Request {
@@ -775,15 +763,14 @@ impl<H: ToolHandler> McpServer<H> {
             serde_json::to_string(&request).context("Failed to serialize roots/list request")?;
         trace!("Sending roots/list request: {}", request_json);
 
-        // Log outbound request
-        let outbound_id = self.logging.next_id();
+        // Log outbound request — mint a UUID for this exchange
+        let outbound_uuid = uuid::Uuid::new_v4().to_string();
         if let Ok(json) = serde_json::to_value(&request) {
             emit_mcp_event(
                 mcp_method_level("roots/list"),
                 &self.client_name,
                 "roots/list",
-                outbound_id.0,
-                None,
+                Some(&outbound_uuid),
                 &json.to_string(),
                 "outgoing request",
             );
@@ -796,19 +783,20 @@ impl<H: ToolHandler> McpServer<H> {
         // Buffer interleaved requests (id + method) until roots are applied,
         // so they execute against the updated PathValidator.
         // Notifications are dispatched immediately.
-        let mut buffered: Vec<(String, i64, String)> = Vec::new();
+        let mut buffered: Vec<(String, Option<String>, String)> = Vec::new();
 
         // Seed with the already-read message from the run loop (if any).
         // Already logged by the run loop, so buffer or dispatch without
         // re-logging. Virtually always a request (tool call) that gets
         // buffered; notifications are dispatched immediately.
-        if let Some((line, cid, method)) = initial_message {
+        if let Some((line, eid, method)) = initial_message {
             let json: serde_json::Value =
                 serde_json::from_str(&line).context("Failed to parse initial message")?;
             if json.get("id").is_some() && json.get("method").is_some() {
-                buffered.push((line, cid, method));
+                buffered.push((line, eid, method));
             } else {
-                self.dispatch_message(&line, writer, cid, &method)?;
+                self.current_exchange_id = eid;
+                self.dispatch_message(&line, writer, &method)?;
             }
         }
 
@@ -832,23 +820,22 @@ impl<H: ToolHandler> McpServer<H> {
                 let response: Response =
                     serde_json::from_value(json).context("Failed to parse roots/list response")?;
                 if response.id == request_id {
-                    // Log the response with request_id pointing to the outbound request
+                    // Log the response — same parent_id as outbound request
                     if let Ok(resp_json) = serde_json::to_value(&response) {
-                        let parent_str = outbound_id.0.to_string();
                         emit_mcp_event(
                             mcp_method_level("roots/list"),
                             &self.client_name,
                             "roots/list",
-                            outbound_id.0,
-                            Some(&parent_str),
+                            Some(&outbound_uuid),
                             &resp_json.to_string(),
                             "incoming response",
                         );
                     }
                     let result = self.handle_roots_response(response);
                     // Replay buffered requests against the updated roots
-                    for (msg, buf_correlation_id, buf_method) in &buffered {
-                        self.dispatch_message(msg, writer, *buf_correlation_id, buf_method)?;
+                    for (msg, buf_eid, buf_method) in &buffered {
+                        self.current_exchange_id.clone_from(buf_eid);
+                        self.dispatch_message(msg, writer, buf_method)?;
                     }
                     return result;
                 }
@@ -865,13 +852,12 @@ impl<H: ToolHandler> McpServer<H> {
                 .and_then(|m| m.as_str())
                 .unwrap_or("response")
                 .to_string();
-            let interleaved_id = self.logging.next_id();
+            let interleaved_uuid = uuid::Uuid::new_v4().to_string();
             emit_mcp_event(
                 mcp_method_level(&method),
                 &self.client_name,
                 &method,
-                interleaved_id.0,
-                None,
+                Some(&interleaved_uuid),
                 &json.to_string(),
                 "incoming",
             );
@@ -879,9 +865,10 @@ impl<H: ToolHandler> McpServer<H> {
             // Requests (id + method) are buffered until roots are applied.
             // Notifications dispatch immediately.
             if json.get("id").is_some() && json.get("method").is_some() {
-                buffered.push((trimmed, interleaved_id.0, method));
+                buffered.push((trimmed, Some(interleaved_uuid), method));
             } else {
-                self.dispatch_message(&trimmed, writer, interleaved_id.0, &method)?;
+                self.current_exchange_id = Some(interleaved_uuid);
+                self.dispatch_message(&trimmed, writer, &method)?;
             }
         }
     }
@@ -1538,45 +1525,36 @@ mod tests {
     /// Mirrors `run()`: for `tools/call`, a UUID is minted as the
     /// `parent_id` to group LSP events; for all other methods,
     /// `parent_id` is `None`.
+    /// Simulate the `run()` loop for a single message: mint a UUID,
+    /// emit the incoming MCP event, set `current_exchange_id`, and
+    /// dispatch. Returns the exchange UUID.
     fn simulate_incoming<H: ToolHandler>(
         server: &mut McpServer<H>,
         line: &str,
         writer: &mut Vec<u8>,
-    ) -> Result<i64> {
+    ) -> Result<String> {
         let json: serde_json::Value = serde_json::from_str(line).context("invalid JSON in test")?;
         let method = json
             .get("method")
             .and_then(|m| m.as_str())
             .unwrap_or("response")
             .to_string();
-        let id = server.logging.next_id();
         let payload = json.to_string();
+        let uuid = uuid::Uuid::new_v4().to_string();
         if method == "tools/call" {
-            let call_uuid = uuid::Uuid::new_v4().to_string();
-            server.current_call_uuid = Some(call_uuid.clone());
-            emit_mcp_event(
-                mcp_method_level(&method),
-                &server.client_name,
-                &method,
-                id.0,
-                Some(&call_uuid),
-                &payload,
-                "incoming",
-            );
-        } else {
-            emit_mcp_event(
-                mcp_method_level(&method),
-                &server.client_name,
-                &method,
-                id.0,
-                None,
-                &payload,
-                "incoming",
-            );
+            server.current_call_uuid = Some(uuid.clone());
         }
-        server.current_correlation_id = id.0;
-        server.dispatch_message(line, writer, id.0, &method)?;
-        Ok(id.0)
+        emit_mcp_event(
+            mcp_method_level(&method),
+            &server.client_name,
+            &method,
+            Some(&uuid),
+            &payload,
+            "incoming",
+        );
+        server.current_exchange_id = Some(uuid.clone());
+        server.dispatch_message(line, writer, &method)?;
+        Ok(uuid)
     }
 
     #[test]
@@ -1597,7 +1575,7 @@ mod tests {
 
         let line = serde_json::to_string(&request)?;
         let mut writer: Vec<u8> = Vec::new();
-        let correlation_id = simulate_incoming(&mut server, &line, &mut writer)?;
+        let exchange_id = simulate_incoming(&mut server, &line, &mut writer)?;
 
         let msgs = mcp_messages(&conn);
         assert!(
@@ -1606,17 +1584,16 @@ mod tests {
             msgs.len()
         );
         assert_eq!(msgs[0].method, "initialize");
-        assert!(msgs[0].parent_id.is_none());
+        assert_eq!(
+            msgs[0].parent_id.as_deref(),
+            Some(exchange_id.as_str()),
+            "request should carry exchange UUID"
+        );
         assert_eq!(msgs[1].method, "initialize");
         assert_eq!(
-            msgs[1].request_id,
-            Some(correlation_id),
-            "response request_id should point to the incoming request"
-        );
-        assert_eq!(
             msgs[1].parent_id.as_deref(),
-            Some(correlation_id.to_string().as_str()),
-            "response parent_id should match request_id (stringified)"
+            Some(exchange_id.as_str()),
+            "response should carry same exchange UUID"
         );
         Ok(())
     }
@@ -1638,7 +1615,7 @@ mod tests {
 
         let line = serde_json::to_string(&request)?;
         let mut writer: Vec<u8> = Vec::new();
-        let correlation_id = simulate_incoming(&mut server, &line, &mut writer)?;
+        let exchange_id = simulate_incoming(&mut server, &line, &mut writer)?;
 
         let msgs = mcp_messages(&conn);
         assert!(
@@ -1649,9 +1626,9 @@ mod tests {
         assert_eq!(msgs[0].method, "tools/call");
         assert_eq!(msgs[1].method, "tools/call");
         assert_eq!(
-            msgs[1].request_id,
-            Some(correlation_id),
-            "response request_id should point to the incoming request"
+            msgs[1].parent_id.as_deref(),
+            Some(exchange_id.as_str()),
+            "response should carry same exchange UUID"
         );
         Ok(())
     }
@@ -1783,8 +1760,7 @@ mod tests {
             "should have at least the notification row"
         );
         assert_eq!(msgs[0].method, "notifications/initialized");
-        assert!(msgs[0].request_id.is_some(), "should have a correlation ID");
-        assert!(msgs[0].parent_id.is_none());
+        assert!(msgs[0].parent_id.is_some(), "should have an exchange UUID");
         Ok(())
     }
 
@@ -1942,7 +1918,7 @@ mod tests {
         // The initial message is a ping (simulating a tool call).
         let initial = Some((
             r#"{"jsonrpc":"2.0","id":42,"method":"ping"}"#.to_string(),
-            100,
+            Some("exchange-100".to_string()),
             "ping".to_string(),
         ));
         server.fetch_roots(&inbox, &mut writer, initial)?;

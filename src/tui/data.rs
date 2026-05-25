@@ -579,9 +579,9 @@ mod tests {
         conn.execute(
             "INSERT INTO messages \
              (session_id, timestamp, type, method, server, client, \
-              request_id, parent_id, payload) \
+              parent_id, payload) \
              VALUES (?1, ?2, 'lsp', 'textDocument/hover', 'rust-analyzer', \
-              'catenary', NULL, NULL, '{}')",
+              'catenary', NULL, '{}')",
             rusqlite::params![session_id, "2026-01-01T00:00:00.000Z"],
         )
         .expect("insert test message");

@@ -28,22 +28,12 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
-use std::sync::atomic::AtomicI64;
-use std::sync::atomic::Ordering;
 
 use chrono::DateTime;
 use chrono::Utc;
 use tracing::Subscriber;
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::LookupSpan;
-
-/// In-process monotonic correlation ID.
-///
-/// Thin newtype over `i64` to prevent accidental conflation with DB ROWIDs
-/// during the migration period (tickets 07–10). The inner value is `pub` for
-/// ergonomic field access in `tracing` macros.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct CorrelationId(pub i64);
 
 /// Severity of a logging event.
 ///
@@ -105,7 +95,7 @@ impl From<&tracing::Level> for Severity {
 macro_rules! emit_protocol_event {
     ($level:ident, kind = $kind:expr, method = $method:expr,
      server = $server:expr, client = $client:expr,
-     request_id = $rid:expr, parent_id = $pid:expr,
+     parent_id = $pid:expr,
      payload = $payload:expr, $msg:expr) => {
         if let Some(pid) = $pid {
             tracing::$level!(
@@ -113,7 +103,6 @@ macro_rules! emit_protocol_event {
                 method = $method,
                 server = $server,
                 client = $client,
-                request_id = $rid,
                 parent_id = pid,
                 payload = $payload,
                 $msg
@@ -124,7 +113,6 @@ macro_rules! emit_protocol_event {
                 method = $method,
                 server = $server,
                 client = $client,
-                request_id = $rid,
                 payload = $payload,
                 $msg
             );
@@ -153,10 +141,9 @@ pub struct LogEvent<'a> {
     pub server: Option<String>,
     /// Client identifier (host CLI name).
     pub client: Option<String>,
-    /// In-process monotonic correlation ID.
-    pub request_id: Option<i64>,
-    /// Parent correlation ID (causation). UUID string minted at scope
-    /// boundaries (pre-tool hook dispatch, MCP `tools/call` dispatch).
+    /// Scope/pair identity. UUID string minted at exchange boundaries
+    /// (hook dispatch, MCP `tools/call` dispatch, LSP request/response).
+    /// Both request and response in an exchange share the same value.
     pub parent_id: Option<String>,
     /// Subsystem emitting the event (e.g., `"lsp.lifecycle"`).
     pub source: Option<String>,
@@ -187,7 +174,6 @@ struct OwnedEvent {
     method: Option<String>,
     server: Option<String>,
     client: Option<String>,
-    request_id: Option<i64>,
     parent_id: Option<String>,
     source: Option<String>,
     language: Option<String>,
@@ -206,7 +192,6 @@ impl OwnedEvent {
             method: self.method.clone(),
             server: self.server.clone(),
             client: self.client.clone(),
-            request_id: self.request_id,
             parent_id: self.parent_id.clone(),
             source: self.source.clone(),
             language: self.language.clone(),
@@ -334,10 +319,6 @@ struct Inner {
     sinks: OnceLock<Arc<[Arc<dyn Sink>]>>,
     /// Bootstrap buffer, `Some` until activation takes it.
     buffer: Mutex<Option<BufferingState>>,
-    /// In-process monotonic correlation ID counter. Session-scoped, starts
-    /// at 0. `Relaxed` ordering suffices — monotonicity per thread, no
-    /// inter-field synchronization.
-    next_id: AtomicI64,
 }
 
 struct BufferingState {
@@ -364,7 +345,6 @@ impl LoggingServer {
                     cap,
                     dropped: 0,
                 })),
-                next_id: AtomicI64::new(0),
             }),
         }
     }
@@ -427,17 +407,6 @@ impl LoggingServer {
         lock_recover(&self.inner.buffer)
             .as_ref()
             .map_or(0, |bs| bs.buffer.len())
-    }
-
-    /// Mint a new correlation ID. Values are monotonically increasing,
-    /// session-scoped, and unique across threads.
-    ///
-    /// Used by protocol-boundary components (tickets 07–09) to pair
-    /// requests with responses (`request_id`) and build causation chains
-    /// (`parent_id`).
-    #[must_use]
-    pub fn next_id(&self) -> CorrelationId {
-        CorrelationId(self.inner.next_id.fetch_add(1, Ordering::Relaxed))
     }
 }
 
@@ -595,8 +564,8 @@ where
 /// Field extractor for tracing events.
 ///
 /// Reserved field names (`message`, `kind`, `method`, `server`, `client`,
-/// `source`, `language`, `payload`, `request_id`, `parent_id`) populate
-/// typed members. All other fields collect into `fields`.
+/// `source`, `language`, `payload`, `parent_id`) populate typed members.
+/// All other fields collect into `fields`.
 #[derive(Default)]
 struct FieldVisitor {
     message: String,
@@ -604,7 +573,6 @@ struct FieldVisitor {
     method: Option<String>,
     server: Option<String>,
     client: Option<String>,
-    request_id: Option<i64>,
     parent_id: Option<String>,
     source: Option<String>,
     language: Option<String>,
@@ -647,7 +615,6 @@ impl FieldVisitor {
             method: self.method,
             server: self.server,
             client: self.client,
-            request_id: self.request_id,
             parent_id: self.parent_id,
             source: self.source,
             language: self.language,
@@ -667,7 +634,6 @@ impl FieldVisitor {
             method: self.method,
             server: self.server,
             client: self.client,
-            request_id: self.request_id,
             parent_id: self.parent_id,
             source: self.source,
             language: self.language,
@@ -688,24 +654,13 @@ impl tracing::field::Visit for FieldVisitor {
     }
 
     fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
-        match field.name() {
-            "request_id" => self.request_id = Some(value),
-            name => {
-                self.fields
-                    .insert(name.to_string(), serde_json::Value::Number(value.into()));
-            }
-        }
+        self.fields.insert(
+            field.name().to_string(),
+            serde_json::Value::Number(value.into()),
+        );
     }
 
     fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
-        // request_id accepts u64 but stores as i64. Values exceeding
-        // i64::MAX fall through to the generic map.
-        if let Ok(as_i64) = i64::try_from(value)
-            && field.name() == "request_id"
-        {
-            self.request_id = Some(as_i64);
-            return;
-        }
         self.fields.insert(
             field.name().to_string(),
             serde_json::Value::Number(value.into()),
@@ -748,7 +703,6 @@ pub mod test_support {
         pub level: String,
         pub method: String,
         pub client: String,
-        pub request_id: Option<i64>,
         pub parent_id: Option<String>,
     }
 
@@ -773,7 +727,6 @@ pub mod test_support {
                  method      TEXT NOT NULL,
                  server      TEXT NOT NULL,
                  client      TEXT NOT NULL,
-                 request_id  INTEGER,
                  parent_id   TEXT,
                  payload     TEXT NOT NULL
              );",
@@ -809,7 +762,7 @@ pub mod test_support {
     pub fn query_all_messages(conn: &Arc<Mutex<rusqlite::Connection>>) -> Vec<MsgRow> {
         let c = conn.lock().expect("lock");
         c.prepare(
-            "SELECT type, level, method, client, request_id, parent_id \
+            "SELECT type, level, method, client, parent_id \
              FROM messages ORDER BY id",
         )
         .expect("prepare")
@@ -819,8 +772,7 @@ pub mod test_support {
                 level: row.get(1)?,
                 method: row.get(2)?,
                 client: row.get(3)?,
-                request_id: row.get(4)?,
-                parent_id: row.get(5)?,
+                parent_id: row.get(4)?,
             })
         })
         .expect("query")
@@ -894,7 +846,6 @@ mod tests {
         method: Option<String>,
         server: Option<String>,
         client: Option<String>,
-        request_id: Option<i64>,
         parent_id: Option<String>,
         source: Option<String>,
         language: Option<String>,
@@ -921,7 +872,6 @@ mod tests {
                     method: event.method.clone(),
                     server: event.server.clone(),
                     client: event.client.clone(),
-                    request_id: event.request_id,
                     parent_id: event.parent_id.clone(),
                     source: event.source.clone(),
                     language: event.language.clone(),
@@ -941,7 +891,6 @@ mod tests {
             method: None,
             server: server.map(str::to_string),
             client: None,
-            request_id: None,
             parent_id: None,
             source: source.map(str::to_string),
             language: None,
@@ -1137,7 +1086,6 @@ mod tests {
                 method = "textDocument/hover",
                 server = "rust-analyzer",
                 client = "claude-code",
-                request_id = 7_i64,
                 parent_id = "scope-3",
                 source = crate::source::Source::LspDispatch.as_str(),
                 language = "rust",
@@ -1152,7 +1100,6 @@ mod tests {
         assert_eq!(e.method.as_deref(), Some("textDocument/hover"));
         assert_eq!(e.server.as_deref(), Some("rust-analyzer"));
         assert_eq!(e.client.as_deref(), Some("claude-code"));
-        assert_eq!(e.request_id, Some(7));
         assert_eq!(e.parent_id.as_deref(), Some("scope-3"));
         assert_eq!(
             e.source.as_deref(),
@@ -1293,39 +1240,6 @@ mod tests {
     }
 
     #[test]
-    fn correlation_next_id_is_monotonic() {
-        let server = LoggingServer::new();
-        assert_eq!(server.next_id(), super::CorrelationId(0));
-        assert_eq!(server.next_id(), super::CorrelationId(1));
-        assert_eq!(server.next_id(), super::CorrelationId(2));
-    }
-
-    #[test]
-    fn correlation_next_id_is_thread_safe() {
-        let server = LoggingServer::new();
-        std::thread::scope(|s| {
-            for _ in 0..4 {
-                s.spawn(|| {
-                    for _ in 0..1000 {
-                        let _ = server.next_id();
-                    }
-                });
-            }
-        });
-        assert_eq!(server.next_id(), super::CorrelationId(4000));
-    }
-
-    #[test]
-    fn correlation_counter_survives_activation() {
-        let server = LoggingServer::new();
-        let _ = server.next_id(); // 0
-        let _ = server.next_id(); // 1
-        let sink = Arc::new(RecorderSink::default());
-        server.activate(vec![sink]);
-        assert_eq!(server.next_id(), super::CorrelationId(2));
-    }
-
-    #[test]
     fn multi_sink_independence_through_layer() {
         // Verify through the tracing Layer path that a panicking sink
         // does not prevent other sinks from receiving the event.
@@ -1367,23 +1281,17 @@ mod tests {
     }
 
     #[test]
-    fn record_u64_routes_request_id() {
+    fn parent_id_extracted_as_string() {
         let server = LoggingServer::new();
         let sink = Arc::new(RecorderSink::default());
         with_subscriber(server.clone(), || {
             server.activate(vec![sink.clone()]);
-            tracing::info!(request_id = 42_u64, parent_id = "scope-7", "u64 ids");
+            tracing::info!(parent_id = "scope-7", "parent id test");
         });
         let events = sink.snapshot();
         assert_eq!(events.len(), 1);
-        let e = &events[0];
         assert_eq!(
-            e.request_id,
-            Some(42),
-            "request_id should be extracted from u64"
-        );
-        assert_eq!(
-            e.parent_id.as_deref(),
+            events[0].parent_id.as_deref(),
             Some("scope-7"),
             "parent_id should be extracted as string"
         );

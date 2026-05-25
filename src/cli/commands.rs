@@ -1134,8 +1134,8 @@ mod tests {
         conn.execute(
             "INSERT INTO messages \
              (session_id, timestamp, type, method, server, client, \
-              request_id, parent_id, payload) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, ?7)",
+              parent_id, payload) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7)",
             rusqlite::params![
                 session_id,
                 "2026-01-01T00:00:00.000Z",

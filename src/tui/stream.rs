@@ -565,35 +565,29 @@ mod tests {
         r#type: &str,
         method: &str,
         server: &str,
-        request_id: Option<i64>,
-        parent_id: Option<i64>,
+        parent_id: Option<&str>,
     ) -> SessionMessage {
         SessionMessage {
             session_id: session_id.to_string(),
-            ..test_support::message_with_ids(id, r#type, method, server, request_id, parent_id)
+            ..test_support::message_with_ids(id, r#type, method, server, parent_id)
         }
     }
 
     /// Build a pre-tool hook message that creates a scope.
     fn pre_hook(session_id: &str, scope_id: i64) -> SessionMessage {
-        let mut msg = make_message_with_ids(
+        make_message_with_ids(
             session_id,
             100 + scope_id,
             "hook",
             "pre-tool/editing-state",
             "",
-            Some(scope_id),
-            None,
-        );
-        // Pre-tool hooks carry a scope UUID as parent_id.
-        msg.parent_id = Some(format!("scope-{scope_id}"));
-        msg
+            Some(&format!("scope-{scope_id}")),
+        )
     }
 
     /// Build an MCP request that attaches to a scope.
     fn mcp_request(session_id: &str, scope_id: i64, tool: &str) -> SessionMessage {
-        let corr_id = scope_id + 1000;
-        let mut msg = SessionMessage {
+        SessionMessage {
             payload: serde_json::json!({"params": {"name": tool}}),
             ..make_message_with_ids(
                 session_id,
@@ -601,20 +595,14 @@ mod tests {
                 "mcp",
                 "tools/call",
                 "catenary",
-                Some(corr_id),
-                None,
+                Some(&format!("call-{scope_id}")),
             )
-        };
-        // MCP events carry a call UUID as parent_id (distinct from the
-        // scope UUID). LSP children share this value.
-        msg.parent_id = Some(format!("call-{scope_id}"));
-        msg
+        }
     }
 
     /// Build an MCP response for a scope.
     fn mcp_response(session_id: &str, scope_id: i64) -> SessionMessage {
-        let corr_id = scope_id + 1000;
-        let mut msg = SessionMessage {
+        SessionMessage {
             payload: serde_json::json!({"result": {"content": [{"type": "text", "text": "ok"}]}}),
             ..make_message_with_ids(
                 session_id,
@@ -622,44 +610,33 @@ mod tests {
                 "mcp",
                 "tools/call",
                 "catenary",
-                Some(corr_id),
-                None,
+                Some(&format!("call-{scope_id}")),
             )
-        };
-        msg.parent_id = Some(format!("call-{scope_id}"));
-        msg
+        }
     }
 
     /// Build a post-tool hook that closes a scope.
     fn post_hook(session_id: &str, scope_id: i64) -> SessionMessage {
-        let mut msg = make_message_with_ids(
+        make_message_with_ids(
             session_id,
             400 + scope_id,
             "hook",
             "post-tool/diagnostics",
             "",
-            Some(scope_id + 2000),
-            None,
-        );
-        msg.parent_id = Some(format!("scope-{scope_id}"));
-        msg
+            Some(&format!("scope-{scope_id}")),
+        )
     }
 
     /// Build an LSP child message of an MCP tool call.
     fn lsp_child(session_id: &str, scope_id: i64, method: &str) -> SessionMessage {
-        let mcp_corr_id = scope_id + 1000;
-        let mut msg = make_message_with_ids(
+        make_message_with_ids(
             session_id,
             500 + scope_id,
             "lsp",
             method,
             "rust-analyzer",
-            Some(mcp_corr_id + 100),
-            None,
-        );
-        // LSP children share the MCP event's call UUID as parent_id.
-        msg.parent_id = Some(format!("call-{scope_id}"));
-        msg
+            Some(&format!("call-{scope_id}")),
+        )
     }
 
     // ── Hex badge tests ───────────────────────────────────────────────

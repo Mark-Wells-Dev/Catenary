@@ -325,7 +325,7 @@ impl HookRouter {
     /// `systemMessage` from the notification queue drain. The queue is drained
     /// only at stationary points (`SessionStart`, `Stop`/`AfterAgent` when allowing).
     #[allow(clippy::too_many_lines, reason = "match arms are sequential and flat")]
-    pub(crate) fn dispatch(&self, request: HookRequest, _entry_id: i64) -> DispatchResult {
+    pub(crate) fn dispatch(&self, request: HookRequest) -> DispatchResult {
         match request {
             HookRequest::PreAgent { session_id } => {
                 self.store_client_session_id(session_id.as_deref());
@@ -832,13 +832,10 @@ mod tests {
         let router = test_router();
         assert!(!router.session.editing.is_editing(None, ""));
 
-        let result = router.dispatch(
-            crate::hook::HookRequest::PreToolStartEditing {
-                agent_id: String::new(),
-                session_id: None,
-            },
-            0,
-        );
+        let result = router.dispatch(crate::hook::HookRequest::PreToolStartEditing {
+            agent_id: String::new(),
+            session_id: None,
+        });
         assert!(result.result.is_none(), "start_editing should allow");
         assert!(
             router.session.editing.is_editing(None, ""),
@@ -849,13 +846,10 @@ mod tests {
     #[test]
     fn dispatch_start_editing_cli_with_agent_id() {
         let router = test_router();
-        let result = router.dispatch(
-            crate::hook::HookRequest::PreToolStartEditing {
-                agent_id: "sub-agent".to_string(),
-                session_id: None,
-            },
-            0,
-        );
+        let result = router.dispatch(crate::hook::HookRequest::PreToolStartEditing {
+            agent_id: "sub-agent".to_string(),
+            session_id: None,
+        });
         assert!(result.result.is_none());
         assert!(router.session.editing.is_editing(None, "sub-agent"));
         assert!(!router.session.editing.is_editing(None, ""));
@@ -865,13 +859,10 @@ mod tests {
     fn dispatch_start_editing_cli_then_edit_allowed() {
         let (router, root) = test_router_with_root();
         // Enter editing via the CLI path.
-        router.dispatch(
-            crate::hook::HookRequest::PreToolStartEditing {
-                agent_id: String::new(),
-                session_id: None,
-            },
-            0,
-        );
+        router.dispatch(crate::hook::HookRequest::PreToolStartEditing {
+            agent_id: String::new(),
+            session_id: None,
+        });
 
         // Edit tool should now be allowed.
         let in_root = format!("{}/src/main.rs", root.display());
@@ -1345,10 +1336,7 @@ mod tests {
             1
         );
 
-        let result = router.dispatch(
-            crate::hook::HookRequest::SessionStart { session_id: None },
-            0,
-        );
+        let result = router.dispatch(crate::hook::HookRequest::SessionStart { session_id: None });
         assert!(
             result.system_message.is_some(),
             "session start should drain notifications"
@@ -1365,14 +1353,11 @@ mod tests {
         );
 
         // Not editing → allow → should drain.
-        let result = router.dispatch(
-            crate::hook::HookRequest::PostAgent {
-                agent_id: String::new(),
-                session_id: None,
-                stop_hook_active: false,
-            },
-            0,
-        );
+        let result = router.dispatch(crate::hook::HookRequest::PostAgent {
+            agent_id: String::new(),
+            session_id: None,
+            stop_hook_active: false,
+        });
         assert!(result.result.is_none(), "should allow");
         assert!(
             result.system_message.is_some(),
@@ -1392,14 +1377,11 @@ mod tests {
             &make_notify_event("server offline", "ra"),
         );
 
-        let result = router.dispatch(
-            crate::hook::HookRequest::PostAgent {
-                agent_id: String::new(),
-                session_id: None,
-                stop_hook_active: false,
-            },
-            0,
-        );
+        let result = router.dispatch(crate::hook::HookRequest::PostAgent {
+            agent_id: String::new(),
+            session_id: None,
+            stop_hook_active: false,
+        });
         assert!(
             matches!(result.result, Some(HookResult::Block(_))),
             "should block"
@@ -1420,16 +1402,13 @@ mod tests {
             &make_notify_event("server offline", "ra"),
         );
 
-        let result = router.dispatch(
-            crate::hook::HookRequest::PreTool {
-                tool_name: "Read".to_string(),
-                file_path: None,
-                command: None,
-                agent_id: String::new(),
-                session_id: None,
-            },
-            0,
-        );
+        let result = router.dispatch(crate::hook::HookRequest::PreTool {
+            tool_name: "Read".to_string(),
+            file_path: None,
+            command: None,
+            agent_id: String::new(),
+            session_id: None,
+        });
         assert!(result.system_message.is_none(), "pre-tool should not drain");
         assert_eq!(
             router.session.notification_router.queue_len("test-session"),
@@ -1450,14 +1429,11 @@ mod tests {
         );
 
         // First stop: block (editing active) — queue preserved.
-        let result = router.dispatch(
-            crate::hook::HookRequest::PostAgent {
-                agent_id: String::new(),
-                session_id: None,
-                stop_hook_active: false,
-            },
-            0,
-        );
+        let result = router.dispatch(crate::hook::HookRequest::PostAgent {
+            agent_id: String::new(),
+            session_id: None,
+            stop_hook_active: false,
+        });
         assert!(matches!(result.result, Some(HookResult::Block(_))));
         assert!(result.system_message.is_none());
         assert_eq!(
@@ -1476,14 +1452,11 @@ mod tests {
         );
 
         // Second stop: retry (stop_hook_active) — force-clears editing, allows, drains.
-        let result = router.dispatch(
-            crate::hook::HookRequest::PostAgent {
-                agent_id: String::new(),
-                session_id: None,
-                stop_hook_active: true,
-            },
-            0,
-        );
+        let result = router.dispatch(crate::hook::HookRequest::PostAgent {
+            agent_id: String::new(),
+            session_id: None,
+            stop_hook_active: true,
+        });
         assert!(result.result.is_none(), "retry should allow");
         let msg = result
             .system_message
@@ -1511,14 +1484,11 @@ mod tests {
         );
 
         // Block — queue preserved.
-        let result = router.dispatch(
-            crate::hook::HookRequest::PostAgent {
-                agent_id: String::new(),
-                session_id: None,
-                stop_hook_active: false,
-            },
-            0,
-        );
+        let result = router.dispatch(crate::hook::HookRequest::PostAgent {
+            agent_id: String::new(),
+            session_id: None,
+            stop_hook_active: false,
+        });
         assert!(matches!(result.result, Some(HookResult::Block(_))));
 
         // Same notification again — dedup should reject.
@@ -1533,14 +1503,11 @@ mod tests {
         );
 
         // Retry-allow: drain should contain exactly one notification.
-        let result = router.dispatch(
-            crate::hook::HookRequest::PostAgent {
-                agent_id: String::new(),
-                session_id: None,
-                stop_hook_active: true,
-            },
-            0,
-        );
+        let result = router.dispatch(crate::hook::HookRequest::PostAgent {
+            agent_id: String::new(),
+            session_id: None,
+            stop_hook_active: true,
+        });
         let msg = result.system_message.expect("should drain");
         // Background header + 1 notification = 2 lines.
         assert_eq!(
@@ -1563,7 +1530,6 @@ mod tests {
             method: None,
             server: Some(server.to_string()),
             client: None,
-            request_id: None,
             parent_id: None,
             source: None,
             language: None,
@@ -1580,10 +1546,10 @@ mod tests {
         let router = test_router();
         assert_eq!(router.turn(), 0);
 
-        router.dispatch(crate::hook::HookRequest::PreAgent { session_id: None }, 0);
+        router.dispatch(crate::hook::HookRequest::PreAgent { session_id: None });
         assert_eq!(router.turn(), 1);
 
-        router.dispatch(crate::hook::HookRequest::PreAgent { session_id: None }, 0);
+        router.dispatch(crate::hook::HookRequest::PreAgent { session_id: None });
         assert_eq!(router.turn(), 2);
     }
 
@@ -1640,27 +1606,21 @@ mod tests {
     }
 
     fn dispatch_check_denied(router: &HookRouter) -> DispatchResult {
-        router.dispatch(
-            crate::hook::HookRequest::CheckCommand {
-                command: "cargo test".to_string(),
-                cwd: None,
-                session_id: None,
-                format: None,
-            },
-            0,
-        )
+        router.dispatch(crate::hook::HookRequest::CheckCommand {
+            command: "cargo test".to_string(),
+            cwd: None,
+            session_id: None,
+            format: None,
+        })
     }
 
     fn dispatch_check_allowed(router: &HookRouter) -> DispatchResult {
-        router.dispatch(
-            crate::hook::HookRequest::CheckCommand {
-                command: "git status".to_string(),
-                cwd: None,
-                session_id: None,
-                format: None,
-            },
-            0,
-        )
+        router.dispatch(crate::hook::HookRequest::CheckCommand {
+            command: "git status".to_string(),
+            cwd: None,
+            session_id: None,
+            format: None,
+        })
     }
 
     #[test]
@@ -1714,7 +1674,7 @@ mod tests {
         dispatch_check_denied(&router); // short
 
         // Advance turn, next denial → full again.
-        router.dispatch(crate::hook::HookRequest::PreAgent { session_id: None }, 0);
+        router.dispatch(crate::hook::HookRequest::PreAgent { session_id: None });
         let result = dispatch_check_denied(&router);
         let Some(HookResult::Deny(msg)) = result.result else {
             unreachable!("expected Deny, got {:?}", result.result);
@@ -1762,16 +1722,13 @@ mod tests {
         let _ = router.session.editing.start_editing(None, "");
 
         let file = format!("{}/src/main.rs", root.display());
-        router.dispatch(
-            crate::hook::HookRequest::PreTool {
-                tool_name: "Edit".to_string(),
-                file_path: Some(file.clone()),
-                command: None,
-                agent_id: String::new(),
-                session_id: None,
-            },
-            0,
-        );
+        router.dispatch(crate::hook::HookRequest::PreTool {
+            tool_name: "Edit".to_string(),
+            file_path: Some(file.clone()),
+            command: None,
+            agent_id: String::new(),
+            session_id: None,
+        });
 
         let files = router.session.editing.drain_files(None, "");
         assert_eq!(
@@ -1786,16 +1743,13 @@ mod tests {
         let (router, root) = test_router_with_root();
         // NOT in editing mode — Edit will be denied.
         let file = format!("{}/src/main.rs", root.display());
-        let result = router.dispatch(
-            crate::hook::HookRequest::PreTool {
-                tool_name: "Edit".to_string(),
-                file_path: Some(file),
-                command: None,
-                agent_id: String::new(),
-                session_id: None,
-            },
-            0,
-        );
+        let result = router.dispatch(crate::hook::HookRequest::PreTool {
+            tool_name: "Edit".to_string(),
+            file_path: Some(file),
+            command: None,
+            agent_id: String::new(),
+            session_id: None,
+        });
 
         assert!(
             matches!(result.result, Some(HookResult::Deny(_))),
@@ -1813,16 +1767,13 @@ mod tests {
         let _ = router.session.editing.start_editing(None, "");
 
         let file = format!("{}/src/main.rs", root.display());
-        router.dispatch(
-            crate::hook::HookRequest::PreTool {
-                tool_name: "mcp_catenary_grep".to_string(),
-                file_path: Some(file),
-                command: None,
-                agent_id: String::new(),
-                session_id: None,
-            },
-            0,
-        );
+        router.dispatch(crate::hook::HookRequest::PreTool {
+            tool_name: "mcp_catenary_grep".to_string(),
+            file_path: Some(file),
+            command: None,
+            agent_id: String::new(),
+            session_id: None,
+        });
 
         let files = router.session.editing.drain_files(None, "");
         assert!(files.is_empty(), "non-edit tool should not accumulate file");

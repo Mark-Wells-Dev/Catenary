@@ -39,7 +39,6 @@ pub(crate) fn emit_hook_event(
     level: tracing::Level,
     client_name: &str,
     method: &str,
-    request_id: i64,
     parent_id: Option<&str>,
     payload: &str,
     msg: &str,
@@ -51,7 +50,6 @@ pub(crate) fn emit_hook_event(
             method = method,
             server = "catenary",
             client = client_name,
-            request_id = request_id,
             parent_id = parent_id,
             payload = payload,
             "{msg}"
@@ -63,7 +61,6 @@ pub(crate) fn emit_hook_event(
             method = method,
             server = "catenary",
             client = client_name,
-            request_id = request_id,
             parent_id = parent_id,
             payload = payload,
             "{msg}"
@@ -75,7 +72,6 @@ pub(crate) fn emit_hook_event(
             method = method,
             server = "catenary",
             client = client_name,
-            request_id = request_id,
             parent_id = parent_id,
             payload = payload,
             "{msg}"
@@ -87,7 +83,6 @@ pub(crate) fn emit_hook_event(
             method = method,
             server = "catenary",
             client = client_name,
-            request_id = request_id,
             parent_id = parent_id,
             payload = payload,
             "{msg}"
@@ -418,13 +413,13 @@ impl HookServer {
             .unwrap_or("unknown")
             .to_string();
 
-        // Mint a correlation ID for this request/response pair
-        let id = self.router.session.logging.next_id();
+        // Mint a UUID for this request/response pair
+        let scope_id = uuid::Uuid::new_v4().to_string();
 
         let request: HookRequest = serde_json::from_value(raw.clone())
             .map_err(|e| anyhow!("Invalid hook request: {e}"))?;
 
-        let result = self.router.dispatch(request, id.0);
+        let result = self.router.dispatch(request);
 
         let envelope = HookResponseEnvelope {
             result: result.result,
@@ -445,20 +440,17 @@ impl HookServer {
             level,
             &self.router.client_name,
             &method,
-            id.0,
-            None,
+            Some(&scope_id),
             &raw.to_string(),
             "incoming hook",
         );
 
-        // Log outgoing hook response
-        let response_parent_str = id.0.to_string();
+        // Log outgoing hook response — same parent_id as request
         emit_hook_event(
             level,
             &self.router.client_name,
             &method,
-            id.0,
-            Some(&response_parent_str),
+            Some(&scope_id),
             &response,
             "outgoing hook response",
         );
@@ -716,15 +708,13 @@ mod tests {
 
     #[test]
     fn hook_request_writes_protocol_row() {
-        let (logging, conn, _guard) = setup_logging();
+        let (_logging, conn, _guard) = setup_logging();
 
-        let id = logging.next_id();
         emit_hook_event(
             tracing::Level::INFO,
             "claude-code",
             "pre-tool/editing-state",
-            id.0,
-            None,
+            Some("scope-1"),
             &serde_json::json!({
                 "method": "pre-tool/editing-state",
                 "file": "/tmp/test.rs",
@@ -742,17 +732,16 @@ mod tests {
 
     #[test]
     fn hook_pair_merges() {
-        let (logging, conn, _guard) = setup_logging();
+        let (_logging, conn, _guard) = setup_logging();
 
-        let id = logging.next_id();
+        let scope_id = "scope-pair-test";
 
         // Incoming request
         emit_hook_event(
             tracing::Level::INFO,
             "claude-code",
             "pre-tool/editing-state",
-            id.0,
-            None,
+            Some(scope_id),
             &serde_json::json!({
                 "method": "pre-tool/editing-state",
                 "file": "/tmp/test.rs"
@@ -761,14 +750,12 @@ mod tests {
             "incoming hook",
         );
 
-        // Outgoing response
-        let parent_str = id.0.to_string();
+        // Outgoing response — same parent_id
         emit_hook_event(
             tracing::Level::INFO,
             "claude-code",
             "pre-tool/editing-state",
-            id.0,
-            Some(&parent_str),
+            Some(scope_id),
             &serde_json::json!({"content": "[clean]"}).to_string(),
             "outgoing hook response",
         );
@@ -779,36 +766,30 @@ mod tests {
             "should have at least request + response, got {}",
             rows.len()
         );
-        // Both share the same request_id
-        assert_eq!(rows[0].request_id, Some(id.0));
-        assert_eq!(rows[1].request_id, Some(id.0));
-        // Response has parent_id pointing back
-        assert!(rows[0].parent_id.is_none());
-        assert_eq!(rows[1].parent_id.as_deref(), Some(parent_str.as_str()));
+        // Both share the same parent_id
+        assert_eq!(rows[0].parent_id.as_deref(), Some(scope_id));
+        assert_eq!(rows[1].parent_id.as_deref(), Some(scope_id));
     }
 
     #[test]
     fn hook_turn_start_writes_protocol_row() {
-        let (logging, conn, _guard) = setup_logging();
+        let (_logging, conn, _guard) = setup_logging();
 
-        let id = logging.next_id();
+        let scope_id = "turn-scope";
         emit_hook_event(
             tracing::Level::INFO,
             "host",
             "pre-agent/turn-start",
-            id.0,
-            None,
+            Some(scope_id),
             &serde_json::json!({"method": "pre-agent/turn-start"}).to_string(),
             "incoming hook",
         );
 
-        let parent_str = id.0.to_string();
         emit_hook_event(
             tracing::Level::INFO,
             "host",
             "pre-agent/turn-start",
-            id.0,
-            Some(&parent_str),
+            Some(scope_id),
             "",
             "outgoing hook response",
         );
@@ -827,14 +808,12 @@ mod tests {
 
     #[test]
     fn emit_at_debug_writes_debug_level() {
-        let (logging, conn, _guard) = setup_logging();
+        let (_logging, conn, _guard) = setup_logging();
 
-        let id = logging.next_id();
         emit_hook_event(
             tracing::Level::DEBUG,
             "test",
             "pre-tool/editing-state",
-            id.0,
             None,
             "{}",
             "debug emit",
@@ -847,14 +826,12 @@ mod tests {
 
     #[test]
     fn emit_at_info_writes_info_level() {
-        let (logging, conn, _guard) = setup_logging();
+        let (_logging, conn, _guard) = setup_logging();
 
-        let id = logging.next_id();
         emit_hook_event(
             tracing::Level::INFO,
             "test",
             "pre-tool/editing-state",
-            id.0,
             None,
             "{}",
             "info emit",
@@ -867,14 +844,12 @@ mod tests {
 
     #[test]
     fn emit_at_warn_writes_warn_level() {
-        let (logging, conn, _guard) = setup_logging();
+        let (_logging, conn, _guard) = setup_logging();
 
-        let id = logging.next_id();
         emit_hook_event(
             tracing::Level::WARN,
             "test",
             "pre-tool/editing-state",
-            id.0,
             None,
             "{}",
             "warn emit",
@@ -887,14 +862,12 @@ mod tests {
 
     #[test]
     fn emit_at_error_writes_error_level() {
-        let (logging, conn, _guard) = setup_logging();
+        let (_logging, conn, _guard) = setup_logging();
 
-        let id = logging.next_id();
         emit_hook_event(
             tracing::Level::ERROR,
             "test",
             "pre-tool/editing-state",
-            id.0,
             None,
             "{}",
             "error emit",
@@ -1060,9 +1033,8 @@ mod tests {
 
     #[test]
     fn hook_event_stores_host_payload() {
-        let (logging, conn, _guard) = setup_logging();
+        let (_logging, conn, _guard) = setup_logging();
 
-        let id = logging.next_id();
         let payload = serde_json::json!({
             "method": "pre-agent/turn-start",
             "host_payload": {
@@ -1076,7 +1048,6 @@ mod tests {
             tracing::Level::DEBUG,
             "claude-code",
             "pre-agent/turn-start",
-            id.0,
             None,
             &payload.to_string(),
             "incoming hook",

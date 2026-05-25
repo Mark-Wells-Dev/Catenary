@@ -112,8 +112,8 @@ impl Sink for MessageDbSink {
         let insert_result = conn.execute(
             "INSERT INTO messages \
              (session_id, timestamp, type, level, method, server, client, \
-              request_id, parent_id, payload) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+              parent_id, payload) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             rusqlite::params![
                 &*self.instance_id,
                 timestamp,
@@ -122,7 +122,6 @@ impl Sink for MessageDbSink {
                 method,
                 event.server.as_deref().unwrap_or(""),
                 client,
-                event.request_id,
                 event.parent_id,
                 payload,
             ],
@@ -189,7 +188,6 @@ mod tests {
                  method      TEXT NOT NULL,
                  server      TEXT NOT NULL,
                  client      TEXT NOT NULL,
-                 request_id  INTEGER,
                  parent_id   TEXT,
                  payload     TEXT NOT NULL
              );",
@@ -202,7 +200,6 @@ mod tests {
         kind: Option<&str>,
         method: Option<&str>,
         server: Option<&str>,
-        request_id: Option<i64>,
         parent_id: Option<&str>,
         payload: Option<&str>,
     ) -> LogEvent<'static> {
@@ -214,7 +211,6 @@ mod tests {
             method: method.map(str::to_string),
             server: server.map(str::to_string),
             client: None,
-            request_id,
             parent_id: parent_id.map(str::to_string),
             source: None,
             language: None,
@@ -233,7 +229,6 @@ mod tests {
             method: None,
             server: None,
             client: None,
-            request_id: None,
             parent_id: None,
             source: None,
             language: None,
@@ -250,7 +245,6 @@ mod tests {
         method: String,
         server: String,
         client: String,
-        request_id: Option<i64>,
         parent_id: Option<String>,
         payload: String,
     }
@@ -264,7 +258,7 @@ mod tests {
         let mut stmt = conn
             .prepare(
                 "SELECT session_id, type, level, method, server, client, \
-                 request_id, parent_id, payload FROM messages ORDER BY id",
+                 parent_id, payload FROM messages ORDER BY id",
             )
             .expect("prepare select");
         stmt.query_map([], |row| {
@@ -275,9 +269,8 @@ mod tests {
                 method: row.get(3)?,
                 server: row.get(4)?,
                 client: row.get(5)?,
-                request_id: row.get(6)?,
-                parent_id: row.get(7)?,
-                payload: row.get(8)?,
+                parent_id: row.get(6)?,
+                payload: row.get(7)?,
             })
         })
         .expect("query")
@@ -299,7 +292,6 @@ mod tests {
             Some("lsp"),
             Some("textDocument/hover"),
             Some("rs"),
-            None,
             None,
             Some("{}"),
         ));
@@ -324,7 +316,6 @@ mod tests {
             Some("tools/call"),
             None,
             None,
-            None,
             Some("{\"tool\":\"grep\"}"),
         ));
 
@@ -342,7 +333,6 @@ mod tests {
         sink.handle(&make_protocol_event(
             Some("hook"),
             Some("post-tool"),
-            None,
             None,
             None,
             None,
@@ -426,26 +416,24 @@ mod tests {
     // ── Correlation ID tests ─────────────────────────────────────────
 
     #[test]
-    fn correlation_ids_stored() {
+    fn parent_id_stored() {
         let db = test_db();
         let sink = MessageDbSink::new(db.clone(), "sess-1".into());
         sink.handle(&make_protocol_event(
             Some("lsp"),
             Some("hover"),
             None,
-            Some(42),
             Some("scope-7"),
             None,
         ));
 
         let rows = read_rows(&db);
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].request_id, Some(42));
         assert_eq!(rows[0].parent_id.as_deref(), Some("scope-7"));
     }
 
     #[test]
-    fn nullable_correlation_ids() {
+    fn nullable_parent_id() {
         let db = test_db();
         let sink = MessageDbSink::new(db.clone(), "sess-1".into());
         sink.handle(&make_protocol_event(
@@ -454,27 +442,23 @@ mod tests {
             None,
             None,
             None,
-            None,
         ));
 
         let rows = read_rows(&db);
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].request_id, None);
         assert_eq!(rows[0].parent_id, None);
     }
 
     #[test]
-    fn internal_event_correlation_ids() {
+    fn internal_event_parent_id() {
         let db = test_db();
         let sink = MessageDbSink::new(db.clone(), "sess-1".into());
         let mut event = make_trace_event(Severity::Error, "test", "correlated");
-        event.request_id = Some(42);
         event.parent_id = Some("scope-7".to_string());
         sink.handle(&event);
 
         let rows = read_rows(&db);
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].request_id, Some(42));
         assert_eq!(rows[0].parent_id.as_deref(), Some("scope-7"));
     }
 
@@ -533,7 +517,6 @@ mod tests {
             None,
             None,
             None,
-            None,
         ));
 
         let rowid = rx.try_recv().expect("should receive rowid");
@@ -571,7 +554,6 @@ mod tests {
             None,
             None,
             None,
-            None,
         ));
 
         assert!(rx.try_recv().is_err(), "no broadcast on insert failure");
@@ -596,7 +578,6 @@ mod tests {
             None,
             None,
             None,
-            None,
         ));
         sink.handle(&make_trace_event(
             Severity::Error,
@@ -618,13 +599,11 @@ mod tests {
             Some("hover"),
             Some("rs"),
             None,
-            None,
             Some("{}"),
         ));
         sink.handle(&make_protocol_event(
             Some("mcp"),
             Some("tools/call"),
-            None,
             None,
             None,
             None,
