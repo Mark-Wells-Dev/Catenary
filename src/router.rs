@@ -289,6 +289,36 @@ impl RootTracker {
         all.into_iter().collect()
     }
 
+    /// Returns all roots with their contributor sources.
+    ///
+    /// Each entry is `(path, sources)` where `sources` is a sorted list
+    /// of contributor keys (e.g., `["hook", "mcp:3"]`).
+    fn list_roots(&self) -> Vec<(PathBuf, Vec<String>)> {
+        let map = self
+            .contributors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // Invert: root → list of contributors.
+        let mut root_sources: HashMap<PathBuf, Vec<String>> = HashMap::new();
+        for (contributor, roots) in &*map {
+            for root in roots {
+                root_sources
+                    .entry(root.clone())
+                    .or_default()
+                    .push(contributor.clone());
+            }
+        }
+        drop(map);
+
+        let mut result: Vec<(PathBuf, Vec<String>)> = root_sources.into_iter().collect();
+        result.sort_by(|(a, _), (b, _)| a.cmp(b));
+        for (_, sources) in &mut result {
+            sources.sort();
+        }
+        result
+    }
+
     /// Returns the number of contributors that include the given root.
     #[cfg(test)]
     fn refcount(&self, root: &Path) -> usize {
@@ -918,6 +948,38 @@ async fn handle_hook_dispatch(
         writer.write_all(b"{\"status\":\"ok\"}\n").await?;
         writer.shutdown().await?;
         shutdown.cancel();
+        return Ok(());
+    }
+
+    // ── List tracked roots ─────────────────────────────────────
+    //
+    // `tool/ls-roots` is sent by `catenary ls-roots`. Returns all
+    // tracked workspace roots with their contributor sources.
+    if method == "tool/ls-roots" {
+        let roots = ctx
+            .root_tracker
+            .as_ref()
+            .map_or_else(Vec::new, RootTracker::list_roots);
+
+        let roots_json: Vec<serde_json::Value> = roots
+            .into_iter()
+            .map(|(path, sources)| {
+                serde_json::json!({
+                    "path": path.display().to_string(),
+                    "sources": sources,
+                })
+            })
+            .collect();
+
+        let response = serde_json::json!({
+            "status": "ok",
+            "roots": roots_json,
+        });
+
+        let mut payload = serde_json::to_vec(&response)?;
+        payload.push(b'\n');
+        writer.write_all(&payload).await?;
+        writer.shutdown().await?;
         return Ok(());
     }
 
@@ -3277,6 +3339,27 @@ mod tests {
         assert_eq!(global.len(), 2);
         assert!(global.contains(&PathBuf::from("/existing")));
         assert!(global.contains(&PathBuf::from("/new_root")));
+    }
+
+    #[test]
+    fn list_roots_returns_sorted_with_sources() {
+        let tracker = RootTracker::new();
+        tracker.set_roots("mcp:10", vec![PathBuf::from("/b"), PathBuf::from("/a")]);
+        tracker.add_roots("hook", &[PathBuf::from("/a")]);
+
+        let listed = tracker.list_roots();
+        assert_eq!(listed.len(), 2);
+        // Sorted by path.
+        assert_eq!(listed[0].0, PathBuf::from("/a"));
+        assert_eq!(listed[0].1, vec!["hook", "mcp:10"]);
+        assert_eq!(listed[1].0, PathBuf::from("/b"));
+        assert_eq!(listed[1].1, vec!["mcp:10"]);
+    }
+
+    #[test]
+    fn list_roots_empty_tracker() {
+        let tracker = RootTracker::new();
+        assert!(tracker.list_roots().is_empty());
     }
 
     // ── Function-level tests (mutant audit 03-07) ─────────────────

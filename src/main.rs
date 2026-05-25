@@ -161,6 +161,10 @@ enum Command {
         path: PathBuf,
     },
 
+    /// List all tracked workspace roots with their source.
+    #[command(name = "ls-roots")]
+    LsRoots,
+
     /// Run as the Catenary daemon (internal, spawned by bridge proxy).
     #[command(hide = true)]
     Daemon,
@@ -342,6 +346,13 @@ fn main() -> Result<()> {
         }
         #[cfg(not(unix))]
         Some(Command::RmRoot { .. }) => Err(anyhow::anyhow!("daemon mode requires Unix")),
+        #[cfg(unix)]
+        Some(Command::LsRoots) => {
+            let mut out = cli::Output::stdout(false);
+            build_runtime()?.block_on(cli::commands::run_ls_roots(&mut out))
+        }
+        #[cfg(not(unix))]
+        Some(Command::LsRoots) => Err(anyhow::anyhow!("daemon mode requires Unix")),
         #[cfg(unix)]
         Some(Command::Daemon) => run_daemon(),
         #[cfg(not(unix))]
@@ -913,5 +924,13 @@ mod tests {
             unreachable!("expected RmRoot command");
         };
         assert_eq!(path, PathBuf::from("/tmp/project"));
+    }
+
+    #[test]
+    fn test_cli_ls_roots() {
+        use clap::Parser;
+        let args = Args::try_parse_from(["catenary", "ls-roots"]);
+        let args = args.expect("ls-roots should parse");
+        assert!(matches!(args.command, Some(Command::LsRoots)));
     }
 }

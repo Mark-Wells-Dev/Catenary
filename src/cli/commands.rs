@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
-//! CLI subcommands: list, monitor, status, query, and gc.
+//! CLI subcommands: list, monitor, status, query, gc, and ls-roots.
 
 #![allow(
     clippy::print_stderr,
     reason = "find_session prints ambiguous matches to stderr"
 )]
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{Local, Utc};
 use regex::Regex;
 use std::time::Duration;
@@ -248,6 +248,70 @@ pub fn run_status(out: &mut Output, id: &str) -> Result<()> {
 
     for msg in recent.iter().rev() {
         print_message_annotated(out, msg);
+    }
+
+    Ok(())
+}
+
+/// List all tracked workspace roots with their source.
+///
+/// Connects to the daemon's hook socket and sends a `tool/ls-roots`
+/// request, then prints each root with its contributor sources.
+///
+/// # Errors
+///
+/// Returns an error if no daemon is running or the response is invalid.
+pub async fn run_ls_roots(out: &mut Output) -> Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let hook_path = crate::router::hook_socket_path();
+
+    let stream = tokio::net::UnixStream::connect(&hook_path)
+        .await
+        .context("no daemon running — start a Catenary session first")?;
+
+    let (reader, mut writer) = stream.into_split();
+    let request = serde_json::json!({"method": "tool/ls-roots"});
+    let mut payload = serde_json::to_string(&request)?;
+    payload.push('\n');
+    writer.write_all(payload.as_bytes()).await?;
+
+    let mut buf_reader = BufReader::new(reader);
+    let mut line = String::new();
+    buf_reader.read_line(&mut line).await?;
+
+    let response: serde_json::Value =
+        serde_json::from_str(line.trim()).context("invalid response from daemon")?;
+
+    let roots = response
+        .get("roots")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    if roots.is_empty() {
+        let _ = out.writeln(format_args!("No tracked roots"));
+        return Ok(());
+    }
+
+    for entry in &roots {
+        let path = entry.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+        let sources: Vec<&str> = entry
+            .get("sources")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|s| s.as_str()).collect::<Vec<&str>>())
+            .unwrap_or_default();
+
+        let source_label = if sources.is_empty() {
+            "unknown".to_string()
+        } else {
+            sources.join(", ")
+        };
+
+        let _ = out.writeln(format_args!(
+            "{path}  {}",
+            out.colors.dim(&format!("[{source_label}]"))
+        ));
     }
 
     Ok(())
