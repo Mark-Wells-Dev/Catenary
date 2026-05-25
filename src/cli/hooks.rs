@@ -17,8 +17,10 @@
 //! - `run_post_agent` — force `done_editing` (`Stop` / `AfterAgent`)
 //! - `run_session_start` — clear stale editing state (`SessionStart`)
 
-#![allow(clippy::print_stdout, reason = "CLI tool needs to output to stdout")]
-#![allow(clippy::print_stderr, reason = "CLI tool needs to output to stderr")]
+#![allow(
+    clippy::print_stdout,
+    reason = "hook output is stdout JSON for the host CLI"
+)]
 
 use std::path::PathBuf;
 use std::time::Duration;

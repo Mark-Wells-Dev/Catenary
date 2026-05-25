@@ -3,18 +3,15 @@
 
 //! Doctor command: check language server health and hook configuration.
 
-#![allow(clippy::print_stdout, reason = "CLI tool needs to output to stdout")]
-#![allow(clippy::print_stderr, reason = "CLI tool needs to output to stderr")]
-
 use std::collections::{HashMap, HashSet};
-use std::io::{Write, stdout};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::tty::IsTty;
 
-use crate::cli::ColorConfig;
+use crate::cli::{ColorConfig, Output};
 use crate::lsp;
 
 /// Expected Claude Code hooks, embedded at compile time.
@@ -227,22 +224,23 @@ async fn probe_server(
     clippy::too_many_lines,
     reason = "Doctor command has sequential output logic"
 )]
-pub async fn run_doctor(project_root: &Path, nocolor: bool, show_diff: bool) -> Result<()> {
-    let colors = ColorConfig::new(nocolor);
-
+pub async fn run_doctor(out: &mut Output, project_root: &Path, show_diff: bool) -> Result<()> {
     // Print version header
-    println!("Catenary {}", env!("CATENARY_VERSION"));
-    println!();
+    let _ = out.writeln(format_args!("Catenary {}", env!("CATENARY_VERSION")));
+    let _ = out.writeln(format_args!(""));
 
     // Check config sources for old-format entries before loading
-    doctor_check_config(&colors);
+    doctor_check_config(out);
 
     // Load configuration — report errors inline instead of bailing
     let config = match crate::config::Config::load() {
         Ok(c) => c,
         Err(e) => {
-            println!("{}", colors.red(&format!("✗ Config error: {e:#}")));
-            println!();
+            let _ = out.writeln(format_args!(
+                "{}",
+                out.colors.red(&format!("✗ Config error: {e:#}"))
+            ));
+            let _ = out.writeln(format_args!(""));
             return Ok(());
         }
     };
@@ -251,13 +249,17 @@ pub async fn run_doctor(project_root: &Path, nocolor: bool, show_diff: bool) -> 
     let config_source = std::env::var("CATENARY_CONFIG")
         .ok()
         .unwrap_or_else(|| "default paths".to_string());
-    println!("{} {}", colors.bold("Config:"), config_source);
-    println!();
+    let _ = out.writeln(format_args!(
+        "{} {}",
+        out.colors.bold("Config:"),
+        config_source
+    ));
+    let _ = out.writeln(format_args!(""));
 
     // Validation errors
     let validation_errors = config.validate();
     for err in &validation_errors {
-        println!("{}", colors.red(&format!("✗  {err}")));
+        let _ = out.writeln(format_args!("{}", out.colors.red(&format!("✗  {err}"))));
     }
 
     // Unreferenced server warnings
@@ -274,36 +276,36 @@ pub async fn run_doctor(project_root: &Path, nocolor: bool, show_diff: bool) -> 
         .collect();
     unreferenced.sort_unstable();
     for name in &unreferenced {
-        println!(
+        let _ = out.writeln(format_args!(
             "{}",
-            colors.yellow(&format!(
+            out.colors.yellow(&format!(
                 "⚠  Server '{name}' is defined but not referenced by any [language.*] entry"
             )),
-        );
+        ));
     }
 
     // Duplicate extension warnings
     let dup_exts =
         crate::bridge::filesystem_manager::ClassificationTables::find_duplicate_extensions(&config);
     for (ext, first, second) in &dup_exts {
-        println!(
+        let _ = out.writeln(format_args!(
             "{}",
-            colors.yellow(&format!(
+            out.colors.yellow(&format!(
                 "⚠  Extension '.{ext}' claimed by both [language.{first}] and \
                  [language.{second}] — first wins"
             )),
-        );
+        ));
     }
 
     if !validation_errors.is_empty() || !unreferenced.is_empty() || !dup_exts.is_empty() {
-        println!();
+        let _ = out.writeln(format_args!(""));
     }
 
     // ── Project config section ──────────────────────────────────────
-    doctor_check_project_config(&colors, project_root, &config);
+    doctor_check_project_config(out, project_root, &config);
 
     if config.language.is_empty() && config.server.is_empty() {
-        println!("No language servers configured.");
+        let _ = out.writeln(format_args!("No language servers configured."));
         return Ok(());
     }
 
@@ -314,9 +316,9 @@ pub async fn run_doctor(project_root: &Path, nocolor: bool, show_diff: bool) -> 
 
     let max_server_width = server_names.iter().map(String::len).max().unwrap_or(10);
 
-    let is_tty = stdout().is_tty();
+    let is_tty = std::io::stdout().is_tty();
 
-    println!("{}:", colors.bold("Servers"));
+    let _ = out.writeln(format_args!("{}:", out.colors.bold("Servers")));
 
     // Build index: server name → line offset (distance from bottom).
     // Binary-not-found servers are printed immediately and excluded from
@@ -341,7 +343,10 @@ pub async fn run_doctor(project_root: &Path, nocolor: bool, show_diff: bool) -> 
     // Print binary-not-found results immediately
     for result in &immediate_results {
         let name_display = format!("  {:<max_server_width$}", result.name);
-        println!("{name_display}  {}", result.format_status(&colors));
+        let _ = out.writeln(format_args!(
+            "{name_display}  {}",
+            result.format_status(&out.colors)
+        ));
     }
 
     // Print pending lines and spawn concurrent probes
@@ -349,7 +354,7 @@ pub async fn run_doctor(project_root: &Path, nocolor: bool, show_diff: bool) -> 
         // Print all pending lines with ⏳ status
         for name in &pending_names {
             let name_display = format!("  {name:<max_server_width$}");
-            println!("{name_display}  ⏳ checking...");
+            let _ = out.writeln(format_args!("{name_display}  ⏳ checking..."));
         }
     }
 
@@ -395,11 +400,11 @@ pub async fn run_doctor(project_root: &Path, nocolor: bool, show_diff: bool) -> 
                 Some(join_result) = join_set.join_next() => {
                     if let Ok(result) = join_result {
                         update_server_line(
+                            out,
                             &result,
                             &pending_names,
                             pending_count,
                             max_server_width,
-                            &colors,
                         );
                         completed.insert(result.name.clone(), result);
                     }
@@ -426,6 +431,7 @@ pub async fn run_doctor(project_root: &Path, nocolor: bool, show_diff: bool) -> 
                             && slow_hinted.insert(name.clone())
                         {
                             update_server_line_raw(
+                                out,
                                 name,
                                 "⏳ checking... (slow — see your language server's docs)",
                                 &pending_names,
@@ -448,7 +454,10 @@ pub async fn run_doctor(project_root: &Path, nocolor: bool, show_diff: bool) -> 
         for name in &pending_names {
             if let Some(result) = completed.get(name) {
                 let name_display = format!("  {name:<max_server_width$}");
-                println!("{name_display}  {}", result.format_status(&colors));
+                let _ = out.writeln(format_args!(
+                    "{name_display}  {}",
+                    result.format_status(&out.colors)
+                ));
             }
         }
     }
@@ -465,8 +474,8 @@ pub async fn run_doctor(project_root: &Path, nocolor: bool, show_diff: bool) -> 
     }
 
     // ── Languages section ────────────────────────────────────────────
-    println!();
-    println!("{}:", colors.bold("Languages"));
+    let _ = out.writeln(format_args!(""));
+    let _ = out.writeln(format_args!("{}:", out.colors.bold("Languages")));
 
     // Build sorted list of (language, server_name) pairs
     let mut lang_entries: Vec<(&str, &str)> = Vec::new();
@@ -485,41 +494,41 @@ pub async fn run_doctor(project_root: &Path, nocolor: bool, show_diff: bool) -> 
 
     for (lang, target) in &lang_entries {
         let lang_display = format!("  {lang:<max_lang_width$}");
-        println!("{lang_display}  → {target}");
+        let _ = out.writeln(format_args!("{lang_display}  → {target}"));
         // Show capabilities from the server, indented
         if let Some(tools) = server_capabilities.get(target)
             && !tools.is_empty()
         {
-            println!(
+            let _ = out.writeln(format_args!(
                 "{}    {}",
                 " ".repeat(max_lang_width + 2),
-                colors.dim(&tools.join(" ")),
-            );
+                out.colors.dim(&tools.join(" ")),
+            ));
         }
     }
 
     // Hooks health section
-    println!();
-    println!("{}:", colors.bold("Hooks"));
-    check_claude_hooks(&colors, show_diff);
-    check_gemini_hooks(&colors, show_diff);
-    check_antigravity_hooks(&colors, show_diff, project_root);
-    check_path_binary(&colors);
+    let _ = out.writeln(format_args!(""));
+    let _ = out.writeln(format_args!("{}:", out.colors.bold("Hooks")));
+    check_claude_hooks(out, show_diff);
+    check_gemini_hooks(out, show_diff);
+    check_antigravity_hooks(out, show_diff, project_root);
+    check_path_binary(out);
 
     // Legacy script migration warnings
-    println!();
-    println!("{}:", colors.bold("Command filter"));
-    check_constrained_bash_claude(&colors);
-    check_constrained_bash_gemini(&colors);
-    check_command_filter_config(&colors, &config);
+    let _ = out.writeln(format_args!(""));
+    let _ = out.writeln(format_args!("{}:", out.colors.bold("Command filter")));
+    check_constrained_bash_claude(out);
+    check_constrained_bash_gemini(out);
+    check_command_filter_config(out, &config);
 
     // Actionable suggestions at the very bottom so they aren't buried
     let suggestions = collect_suggestions(&config, dirs::config_dir());
     if !suggestions.is_empty() {
-        println!();
-        println!("{}:", colors.bold("Suggestions"));
+        let _ = out.writeln(format_args!(""));
+        let _ = out.writeln(format_args!("{}:", out.colors.bold("Suggestions")));
         for suggestion in &suggestions {
-            println!("  {}", colors.dim(suggestion));
+            let _ = out.writeln(format_args!("  {}", out.colors.dim(suggestion)));
         }
     }
 
@@ -543,19 +552,20 @@ const STDERR_MAX_LINES: usize = 50;
     reason = "Verbose doctor has sequential output sections"
 )]
 pub async fn run_doctor_single(
+    out: &mut Output,
     server_name: &str,
     project_root: &Path,
-    nocolor: bool,
 ) -> Result<()> {
-    let colors = ColorConfig::new(nocolor);
-
-    println!("Catenary {}", env!("CATENARY_VERSION"));
-    println!();
+    let _ = out.writeln(format_args!("Catenary {}", env!("CATENARY_VERSION")));
+    let _ = out.writeln(format_args!(""));
 
     let config = match crate::config::Config::load() {
         Ok(c) => c,
         Err(e) => {
-            println!("{}", colors.red(&format!("✗ Config error: {e:#}")));
+            let _ = out.writeln(format_args!(
+                "{}",
+                out.colors.red(&format!("✗ Config error: {e:#}"))
+            ));
             return Ok(());
         }
     };
@@ -578,15 +588,16 @@ pub async fn run_doctor_single(
 
     // Look up server
     let Some(server_def) = merged_config.server.get(server_name) else {
-        println!(
+        let _ = out.writeln(format_args!(
             "{}\n",
-            colors.red(&format!("✗ Unknown server: '{server_name}'")),
-        );
+            out.colors
+                .red(&format!("✗ Unknown server: '{server_name}'")),
+        ));
         let mut available: Vec<&str> = merged_config.server.keys().map(String::as_str).collect();
         available.sort_unstable();
-        println!("Configured servers:");
+        let _ = out.writeln(format_args!("Configured servers:"));
         for name in &available {
-            println!("  {name}");
+            let _ = out.writeln(format_args!("  {name}"));
         }
         return Ok(());
     };
@@ -598,9 +609,9 @@ pub async fn run_doctor_single(
     } else {
         format!(" {}", server_def.args.join(" "))
     };
-    println!("{}:", colors.bold("Command"));
-    println!("  {command}{args_display}");
-    println!();
+    let _ = out.writeln(format_args!("{}:", out.colors.bold("Command")));
+    let _ = out.writeln(format_args!("  {command}{args_display}"));
+    let _ = out.writeln(format_args!(""));
 
     // ── 1b. Root markers ────────────────────────────────────────────
     // Find languages that bind to this server and show their markers.
@@ -610,31 +621,35 @@ pub async fn run_doctor_single(
             && let Some(markers) = lang_config.active_markers()
         {
             if !shown_markers {
-                println!("{}:", colors.bold("Root markers"));
+                let _ = out.writeln(format_args!("{}:", out.colors.bold("Root markers")));
                 shown_markers = true;
             }
-            println!("  {lang_name}: {}", markers.join(", "));
+            let _ = out.writeln(format_args!("  {lang_name}: {}", markers.join(", ")));
         }
     }
     if shown_markers {
-        println!();
+        let _ = out.writeln(format_args!(""));
     }
 
     // ── 2. Binary check ────────────────────────────────────────────
-    println!("{}:", colors.bold("Binary"));
+    let _ = out.writeln(format_args!("{}:", out.colors.bold("Binary")));
     if let Some(path) = resolve_binary(command) {
-        println!("  {} {}", colors.green("✓"), path.display());
+        let _ = out.writeln(format_args!(
+            "  {} {}",
+            out.colors.green("✓"),
+            path.display()
+        ));
     } else {
-        println!(
+        let _ = out.writeln(format_args!(
             "  {}",
-            colors.red(&format!("✗ {command}: command not found")),
-        );
+            out.colors.red(&format!("✗ {command}: command not found")),
+        ));
         return Ok(());
     }
-    println!();
+    let _ = out.writeln(format_args!(""));
 
     // ── 3. Spawn ──────────────────────────────────────────────────
-    println!("{}:", colors.bold("Spawn"));
+    let _ = out.writeln(format_args!("{}:", out.colors.bold("Spawn")));
     let args_refs: Vec<&str> = server_def.args.iter().map(String::as_str).collect();
     let spawn_result = lsp::LspClient::spawn_for_doctor(
         command,
@@ -647,11 +662,14 @@ pub async fn run_doctor_single(
 
     let (mut client, child_stderr) = match spawn_result {
         Ok(pair) => {
-            println!("  {} process started", colors.green("✓"));
+            let _ = out.writeln(format_args!("  {} process started", out.colors.green("✓")));
             pair
         }
         Err(e) => {
-            println!("  {}", colors.red(&format!("✗ spawn failed: {e}")));
+            let _ = out.writeln(format_args!(
+                "  {}",
+                out.colors.red(&format!("✗ spawn failed: {e}"))
+            ));
             return Ok(());
         }
     };
@@ -673,7 +691,7 @@ pub async fn run_doctor_single(
         })
     });
 
-    println!();
+    let _ = out.writeln(format_args!(""));
 
     // ── 4. Initialize exchange ──────────────────────────────────────
     let resolved_roots: Vec<PathBuf> = project_root
@@ -703,15 +721,15 @@ pub async fn run_doctor_single(
         server_def.initialization_options.as_ref(),
     );
 
-    println!("{}:", colors.bold("Initialize request"));
+    let _ = out.writeln(format_args!("{}:", out.colors.bold("Initialize request")));
     if let Ok(pretty) = serde_json::to_string_pretty(&init_params) {
         for line in pretty.lines() {
-            println!("  {line}");
+            let _ = out.writeln(format_args!("  {line}"));
         }
     }
-    println!();
+    let _ = out.writeln(format_args!(""));
 
-    println!("{}:", colors.bold("Initialize response"));
+    let _ = out.writeln(format_args!("{}:", out.colors.bold("Initialize response")));
     match client
         .initialize(&resolved_roots, server_def.initialization_options.clone())
         .await
@@ -719,31 +737,34 @@ pub async fn run_doctor_single(
         Ok(result) => {
             if let Ok(pretty) = serde_json::to_string_pretty(&result) {
                 for line in pretty.lines() {
-                    println!("  {line}");
+                    let _ = out.writeln(format_args!("  {line}"));
                 }
             }
-            println!();
+            let _ = out.writeln(format_args!(""));
 
             // ── 5. Capabilities summary ─────────────────────────────
             let tools =
                 extract_capabilities(&result["capabilities"], client.supports_type_hierarchy());
-            println!("{}:", colors.bold("Capabilities"));
+            let _ = out.writeln(format_args!("{}:", out.colors.bold("Capabilities")));
             if tools.is_empty() {
-                println!("  {}", colors.dim("(none)"));
+                let _ = out.writeln(format_args!("  {}", out.colors.dim("(none)")));
             } else {
                 for tool in &tools {
-                    println!("  {} {tool}", colors.green("✓"));
+                    let _ = out.writeln(format_args!("  {} {tool}", out.colors.green("✓")));
                 }
             }
         }
         Err(e) => {
-            println!("  {}", colors.red(&format!("✗ initialize failed: {e}")));
+            let _ = out.writeln(format_args!(
+                "  {}",
+                out.colors.red(&format!("✗ initialize failed: {e}"))
+            ));
         }
     }
 
     // ── 6. Shutdown ────────────────────────────────────────────────
     let _ = client.shutdown().await;
-    println!();
+    let _ = out.writeln(format_args!(""));
 
     // ── 7. Server stderr ───────────────────────────────────────────
     if let Some(task) = stderr_task {
@@ -755,17 +776,18 @@ pub async fn run_doctor_single(
             .unwrap_or_default();
 
         if !lines.is_empty() {
-            println!("{}:", colors.bold("Server stderr"));
+            let _ = out.writeln(format_args!("{}:", out.colors.bold("Server stderr")));
             for line in &lines {
-                println!("  {line}");
+                let _ = out.writeln(format_args!("  {line}"));
             }
             if lines.len() >= STDERR_MAX_LINES {
-                println!(
+                let _ = out.writeln(format_args!(
                     "  {}",
-                    colors.dim(&format!("(truncated at {STDERR_MAX_LINES} lines)"))
-                );
+                    out.colors
+                        .dim(&format!("(truncated at {STDERR_MAX_LINES} lines)"))
+                ));
             }
-            println!();
+            let _ = out.writeln(format_args!(""));
         }
     }
 
@@ -779,7 +801,7 @@ pub async fn run_doctor_single(
 /// - `[language.*]` entries containing `command`/`args` etc. (intermediate format)
 ///
 /// Prints the equivalent new-format config for each detected old entry.
-fn doctor_check_config(colors: &ColorConfig) {
+fn doctor_check_config(out: &mut Output) {
     let sources = crate::config::config_sources();
     let mut found_issues = false;
 
@@ -804,7 +826,7 @@ fn doctor_check_config(colors: &ColorConfig) {
                     && entry_table.contains_key("command")
                 {
                     found_issues = true;
-                    print_migration(colors, source, key, entry_table, true);
+                    print_migration(out, source, key, entry_table, true);
                 }
             }
         }
@@ -820,15 +842,15 @@ fn doctor_check_config(colors: &ColorConfig) {
                             .get("inherit")
                             .and_then(toml::Value::as_str)
                             .unwrap_or("?");
-                        println!(
+                        let _ = out.writeln(format_args!(
                             "{}",
-                            colors.yellow(&format!(
+                            out.colors.yellow(&format!(
                                 "⚠  {}: [language.{key}] uses removed `inherit` field — \
                                  copy `servers` list from [language.{target}] into \
                                  [language.{key}] instead.",
                                 source.display(),
                             )),
-                        );
+                        ));
                     }
 
                     // Intermediate format: inline server definition fields
@@ -837,7 +859,7 @@ fn doctor_check_config(colors: &ColorConfig) {
                         .any(|k| entry_table.contains_key(*k));
                     if has_server_fields {
                         found_issues = true;
-                        print_migration(colors, source, key, entry_table, false);
+                        print_migration(out, source, key, entry_table, false);
                     }
                 }
             }
@@ -847,31 +869,31 @@ fn doctor_check_config(colors: &ColorConfig) {
         if let Some(cmd_table) = raw.get("commands").and_then(toml::Value::as_table) {
             if cmd_table.contains_key("deny_when_first") {
                 found_issues = true;
-                println!(
+                let _ = out.writeln(format_args!(
                     "{}",
-                    colors.yellow(&format!(
+                    out.colors.yellow(&format!(
                         "⚠  {}: [commands] uses removed `deny_when_first` field — \
                          Catenary now uses an allowlist model. \
                          Run `catenary config` for the recommended template.",
                         source.display(),
                     )),
-                );
+                ));
             }
 
             if let Some(deny_table) = cmd_table.get("deny").and_then(toml::Value::as_table) {
                 for (key, value) in deny_table {
                     if value.is_str() {
                         found_issues = true;
-                        println!(
+                        let _ = out.writeln(format_args!(
                             "{}",
-                            colors.yellow(&format!(
+                            out.colors.yellow(&format!(
                                 "⚠  {}: [commands.deny.{key}] has a string value — \
                                  the old guidance-string format is removed. `deny` now \
                                  maps commands to arrays of denied subcommands \
                                  (e.g., `git = [\"grep\", \"ls-files\"]`).",
                                 source.display(),
                             )),
-                        );
+                        ));
                         break; // One message per file is enough.
                     }
                 }
@@ -880,7 +902,7 @@ fn doctor_check_config(colors: &ColorConfig) {
     }
 
     if found_issues {
-        println!();
+        let _ = out.writeln(format_args!(""));
     }
 }
 
@@ -889,7 +911,7 @@ fn doctor_check_config(colors: &ColorConfig) {
 /// Reports unsupported sections, parse errors, and orphan server definitions.
 /// Called with `--root` (defaults to cwd).
 fn doctor_check_project_config(
-    colors: &ColorConfig,
+    out: &mut Output,
     project_root: &Path,
     user_config: &crate::config::Config,
 ) {
@@ -902,11 +924,11 @@ fn doctor_check_project_config(
         return;
     }
 
-    println!(
+    let _ = out.writeln(format_args!(
         "{} {}",
-        colors.bold("Project config:"),
+        out.colors.bold("Project config:"),
         config_path.display(),
-    );
+    ));
 
     // Flag deprecated `enabled` key before parsing.
     let has_deprecated_enabled = std::fs::read_to_string(&config_path)
@@ -916,10 +938,11 @@ fn doctor_check_project_config(
         .is_some();
 
     if has_deprecated_enabled {
-        println!(
+        let _ = out.writeln(format_args!(
             "  {}",
-            colors.yellow("⚠  `enabled` is deprecated — rename it to `lsp`"),
-        );
+            out.colors
+                .yellow("⚠  `enabled` is deprecated — rename it to `lsp`"),
+        ));
     }
 
     match crate::config::load_project_config(&resolved) {
@@ -927,14 +950,14 @@ fn doctor_check_project_config(
             // Count entries
             let lang_count = pc.language.len();
             let server_count = pc.server.len();
-            println!(
+            let _ = out.writeln(format_args!(
                 "  {}",
-                colors.green(&format!(
+                out.colors.green(&format!(
                     "✓ {lang_count} language{}, {server_count} server{}",
                     if lang_count == 1 { "" } else { "s" },
                     if server_count == 1 { "" } else { "s" },
                 )),
-            );
+            ));
 
             // Orphan server warnings
             for (server_name, server_def) in &pc.server {
@@ -953,13 +976,13 @@ fn doctor_check_project_config(
                     .any(|lc| lc.servers().iter().any(|b| b.name == *server_name));
 
                 if !referenced_by_project && !referenced_by_user {
-                    println!(
+                    let _ = out.writeln(format_args!(
                         "  {}",
-                        colors.yellow(&format!(
+                        out.colors.yellow(&format!(
                             "⚠  [server.{server_name}] has a `command` but no \
                              [language.*] references it"
                         )),
-                    );
+                    ));
                 }
             }
 
@@ -970,33 +993,34 @@ fn doctor_check_project_config(
                     if !pc.server.contains_key(&binding.name)
                         && !user_config.server.contains_key(&binding.name)
                     {
-                        println!(
+                        let _ = out.writeln(format_args!(
                             "  {}",
-                            colors.red(&format!(
+                            out.colors.red(&format!(
                                 "✗  [language.{lang_key}] references server '{}', \
                                  but no [server.{}] is defined in project or user config",
                                 binding.name, binding.name,
                             )),
-                        );
+                        ));
                     }
                 }
             }
         }
         Ok(None) => {} // No project config — already handled by the exists check above.
         Err(e) => {
-            println!(
+            let _ = out.writeln(format_args!(
                 "  {}",
-                colors.red(&format!("✗ {}: {e:#}", config_path.display())),
-            );
+                out.colors
+                    .red(&format!("✗ {}: {e:#}", config_path.display())),
+            ));
         }
     }
 
-    println!();
+    let _ = out.writeln(format_args!(""));
 }
 
 /// Print migration guidance for a single old-format entry.
 fn print_migration(
-    colors: &ColorConfig,
+    out: &mut Output,
     source: &Path,
     key: &str,
     entry: &toml::map::Map<String, toml::Value>,
@@ -1007,13 +1031,13 @@ fn print_migration(
     } else {
         "language"
     };
-    println!(
+    let _ = out.writeln(format_args!(
         "{}",
-        colors.yellow(&format!(
+        out.colors.yellow(&format!(
             "⚠  {}: [{section}.{key}] uses old format — migrate to [language.*] + [server.*]:",
             source.display(),
         )),
-    );
+    ));
 
     // Determine server name from command, falling back to the key
     let server_name = entry
@@ -1022,11 +1046,11 @@ fn print_migration(
         .unwrap_or(key);
 
     // Build old-format display
-    println!();
-    println!("  Old:");
-    println!("    [{section}.{key}]");
+    let _ = out.writeln(format_args!(""));
+    let _ = out.writeln(format_args!("  Old:"));
+    let _ = out.writeln(format_args!("    [{section}.{key}]"));
     for (k, v) in entry {
-        println!("    {k} = {v}");
+        let _ = out.writeln(format_args!("    {k} = {v}"));
     }
 
     // Build new-format display
@@ -1040,19 +1064,19 @@ fn print_migration(
         .map(|(k, v)| (k.as_str(), v))
         .collect();
 
-    println!();
-    println!("  New:");
-    println!("    [language.{key}]");
-    println!("    servers = [\"{server_name}\"]");
+    let _ = out.writeln(format_args!(""));
+    let _ = out.writeln(format_args!("  New:"));
+    let _ = out.writeln(format_args!("    [language.{key}]"));
+    let _ = out.writeln(format_args!("    servers = [\"{server_name}\"]"));
     for (k, v) in &lang_fields {
-        println!("    {k} = {v}");
+        let _ = out.writeln(format_args!("    {k} = {v}"));
     }
-    println!();
-    println!("    [server.{server_name}]");
+    let _ = out.writeln(format_args!(""));
+    let _ = out.writeln(format_args!("    [server.{server_name}]"));
     for (k, v) in &server_fields {
-        println!("    {k} = {v}");
+        let _ = out.writeln(format_args!("    {k} = {v}"));
     }
-    println!();
+    let _ = out.writeln(format_args!(""));
 }
 
 /// Return the user config file path if it exists on disk.
@@ -1100,14 +1124,15 @@ fn collect_suggestions(
 /// Moves the cursor up to the target line, clears it, prints the new status,
 /// and moves back down. Only called when stdout is a TTY.
 fn update_server_line(
+    out: &mut Output,
     result: &ServerProbeResult,
     pending_names: &[String],
     pending_count: usize,
     max_server_width: usize,
-    colors: &ColorConfig,
 ) {
-    let status = result.format_status(colors);
+    let status = result.format_status(&out.colors);
     overwrite_line(
+        out,
         &result.name,
         &status,
         pending_names,
@@ -1120,13 +1145,21 @@ fn update_server_line(
 ///
 /// Used for the slow-startup hint update.
 fn update_server_line_raw(
+    out: &mut Output,
     name: &str,
     status: &str,
     pending_names: &[String],
     pending_count: usize,
     max_server_width: usize,
 ) {
-    overwrite_line(name, status, pending_names, pending_count, max_server_width);
+    overwrite_line(
+        out,
+        name,
+        status,
+        pending_names,
+        pending_count,
+        max_server_width,
+    );
 }
 
 /// Overwrite a server's line in-place via crossterm cursor movement.
@@ -1139,6 +1172,7 @@ fn update_server_line_raw(
     reason = "server count will never exceed u16::MAX"
 )]
 fn overwrite_line(
+    out: &mut Output,
     name: &str,
     status: &str,
     pending_names: &[String],
@@ -1153,7 +1187,6 @@ fn overwrite_line(
     let lines_up = (pending_count - 1 - idx) as u16;
     let name_display = format!("  {name:<max_server_width$}");
 
-    let mut out = stdout();
     if lines_up > 0 {
         let _ = crossterm::execute!(out, crossterm::cursor::MoveUp(lines_up));
     }
@@ -1234,28 +1267,31 @@ fn extract_capabilities(caps: &serde_json::Value, type_hierarchy: bool) -> Vec<&
 }
 
 /// Check Claude Code plugin hooks against the embedded expected hooks.
-fn check_claude_hooks(colors: &ColorConfig, show_diff: bool) {
+fn check_claude_hooks(out: &mut Output, show_diff: bool) {
     let label = format!("{:<14}", "Claude Code");
     let Ok(home_str) = std::env::var("HOME") else {
-        println!(
+        let _ = out.writeln(format_args!(
             "  {label}{}",
-            colors.dim("- cannot determine home directory"),
-        );
+            out.colors.dim("- cannot determine home directory"),
+        ));
         return;
     };
     let home = PathBuf::from(home_str);
 
     let plugins_file = home.join(".claude/plugins/installed_plugins.json");
     let Ok(plugins_json) = std::fs::read_to_string(&plugins_file) else {
-        println!("  {label}{}", colors.dim("- not installed"));
+        let _ = out.writeln(format_args!(
+            "  {label}{}",
+            out.colors.dim("- not installed")
+        ));
         return;
     };
 
     let Ok(plugins) = serde_json::from_str::<serde_json::Value>(&plugins_json) else {
-        println!(
+        let _ = out.writeln(format_args!(
             "  {label}{}",
-            colors.yellow("? cannot parse installed_plugins.json"),
-        );
+            out.colors.yellow("? cannot parse installed_plugins.json"),
+        ));
         return;
     };
 
@@ -1267,7 +1303,10 @@ fn check_claude_hooks(colors: &ColorConfig, show_diff: bool) {
     {
         Some(arr) if !arr.is_empty() => arr,
         _ => {
-            println!("  {label}{}", colors.dim("- not installed"));
+            let _ = out.writeln(format_args!(
+                "  {label}{}",
+                out.colors.dim("- not installed")
+            ));
             return;
         }
     };
@@ -1280,10 +1319,10 @@ fn check_claude_hooks(colors: &ColorConfig, show_diff: bool) {
         .unwrap_or("?");
     let Some(install_path_str) = entry.get("installPath").and_then(serde_json::Value::as_str)
     else {
-        println!(
+        let _ = out.writeln(format_args!(
             "  {label}{version:<8}{}",
-            colors.yellow("? missing installPath"),
-        );
+            out.colors.yellow("? missing installPath"),
+        ));
         return;
     };
     let install_path = PathBuf::from(install_path_str);
@@ -1300,14 +1339,18 @@ fn check_claude_hooks(colors: &ColorConfig, show_diff: bool) {
     match std::fs::read_to_string(&hooks_path) {
         Ok(installed) => {
             if normalize_json(&installed) == normalize_json(CLAUDE_HOOKS_EXPECTED) {
-                println!("  {label}{ver_col}{}", colors.green("✓ hooks match"));
-            } else {
-                println!(
+                let _ = out.writeln(format_args!(
                     "  {label}{ver_col}{}",
-                    colors.red("✗ stale hooks (reinstall: claude plugin uninstall catenary@catenary && claude plugin install catenary@catenary)"),
-                );
+                    out.colors.green("✓ hooks match")
+                ));
+            } else {
+                let _ = out.writeln(format_args!(
+                    "  {label}{ver_col}{}",
+                    out.colors.red("✗ stale hooks (reinstall: claude plugin uninstall catenary@catenary && claude plugin install catenary@catenary)"),
+                ));
                 if show_diff {
                     show_unified_diff(
+                        out,
                         &pretty_json(&installed),
                         &pretty_json(CLAUDE_HOOKS_EXPECTED),
                         "installed",
@@ -1317,10 +1360,10 @@ fn check_claude_hooks(colors: &ColorConfig, show_diff: bool) {
             }
         }
         Err(_) => {
-            println!(
+            let _ = out.writeln(format_args!(
                 "  {label}{ver_col}{}",
-                colors.red("✗ hooks.json not found in plugin cache"),
-            );
+                out.colors.red("✗ hooks.json not found in plugin cache"),
+            ));
         }
     }
 }
@@ -1338,13 +1381,13 @@ fn read_marketplace_source(home: &Path) -> Option<String> {
 }
 
 /// Check Gemini CLI extension hooks against the embedded expected hooks.
-fn check_gemini_hooks(colors: &ColorConfig, show_diff: bool) {
+fn check_gemini_hooks(out: &mut Output, show_diff: bool) {
     let label = format!("{:<14}", "Gemini CLI");
     let Ok(home_str) = std::env::var("HOME") else {
-        println!(
+        let _ = out.writeln(format_args!(
             "  {label}{}",
-            colors.dim("- cannot determine home directory"),
-        );
+            out.colors.dim("- cannot determine home directory"),
+        ));
         return;
     };
     let home = PathBuf::from(home_str);
@@ -1358,7 +1401,10 @@ fn check_gemini_hooks(colors: &ColorConfig, show_diff: bool) {
         .find(|p| p.is_dir());
 
     let Some(ext_path) = ext_path else {
-        println!("  {label}{}", colors.dim("- not installed"));
+        let _ = out.writeln(format_args!(
+            "  {label}{}",
+            out.colors.dim("- not installed")
+        ));
         return;
     };
 
@@ -1412,14 +1458,18 @@ fn check_gemini_hooks(colors: &ColorConfig, show_diff: bool) {
     match std::fs::read_to_string(&hooks_path) {
         Ok(installed) => {
             if normalize_json(&installed) == normalize_json(GEMINI_HOOKS_EXPECTED) {
-                println!("  {label}{ver_col}{}", colors.green("✓ hooks match"));
-            } else {
-                println!(
+                let _ = out.writeln(format_args!(
                     "  {label}{ver_col}{}",
-                    colors.red("✗ stale hooks (update extension)"),
-                );
+                    out.colors.green("✓ hooks match")
+                ));
+            } else {
+                let _ = out.writeln(format_args!(
+                    "  {label}{ver_col}{}",
+                    out.colors.red("✗ stale hooks (update extension)"),
+                ));
                 if show_diff {
                     show_unified_diff(
+                        out,
                         &pretty_json(&installed),
                         &pretty_json(GEMINI_HOOKS_EXPECTED),
                         "installed",
@@ -1429,10 +1479,10 @@ fn check_gemini_hooks(colors: &ColorConfig, show_diff: bool) {
             }
         }
         Err(_) => {
-            println!(
+            let _ = out.writeln(format_args!(
                 "  {label}{ver_col}{}",
-                colors.yellow("? hooks.json not found"),
-            );
+                out.colors.yellow("? hooks.json not found"),
+            ));
         }
     }
 }
@@ -1443,7 +1493,7 @@ fn check_gemini_hooks(colors: &ColorConfig, show_diff: bool) {
 /// 1. `<project_root>/.agents/plugins/catenary/` (workspace)
 /// 2. `<project_root>/_agents/plugins/catenary/` (workspace)
 /// 3. `~/.gemini/config/plugins/catenary/` (global)
-fn check_antigravity_hooks(colors: &ColorConfig, show_diff: bool, project_root: &Path) {
+fn check_antigravity_hooks(out: &mut Output, show_diff: bool, project_root: &Path) {
     let label = format!("{:<14}", "Antigravity");
 
     let resolved_root = project_root
@@ -1473,7 +1523,10 @@ fn check_antigravity_hooks(colors: &ColorConfig, show_diff: bool, project_root: 
         .unzip();
 
     let Some(plugin_dir) = plugin_dir else {
-        println!("  {label}{}", colors.dim("- not installed"));
+        let _ = out.writeln(format_args!(
+            "  {label}{}",
+            out.colors.dim("- not installed")
+        ));
         return;
     };
     let scope = scope.unwrap_or("unknown");
@@ -1483,14 +1536,18 @@ fn check_antigravity_hooks(colors: &ColorConfig, show_diff: bool, project_root: 
     match std::fs::read_to_string(&hooks_path) {
         Ok(installed) => {
             if normalize_json(&installed) == normalize_json(ANTIGRAVITY_HOOKS_EXPECTED) {
-                println!("  {label}{scope_col}{}", colors.green("✓ hooks match"));
-            } else {
-                println!(
+                let _ = out.writeln(format_args!(
                     "  {label}{scope_col}{}",
-                    colors.red("✗ stale hooks (reinstall plugin)"),
-                );
+                    out.colors.green("✓ hooks match")
+                ));
+            } else {
+                let _ = out.writeln(format_args!(
+                    "  {label}{scope_col}{}",
+                    out.colors.red("✗ stale hooks (reinstall plugin)"),
+                ));
                 if show_diff {
                     show_unified_diff(
+                        out,
                         &pretty_json(&installed),
                         &pretty_json(ANTIGRAVITY_HOOKS_EXPECTED),
                         "installed",
@@ -1500,16 +1557,16 @@ fn check_antigravity_hooks(colors: &ColorConfig, show_diff: bool, project_root: 
             }
         }
         Err(_) => {
-            println!(
+            let _ = out.writeln(format_args!(
                 "  {label}{scope_col}{}",
-                colors.yellow("? hooks.json not found"),
-            );
+                out.colors.yellow("? hooks.json not found"),
+            ));
         }
     }
 }
 
 /// Check whether the running binary matches what `$PATH` would resolve.
-fn check_path_binary(colors: &ColorConfig) {
+fn check_path_binary(out: &mut Output) {
     let label = format!("{:<14}", "PATH");
     let spacer = " ".repeat(20);
 
@@ -1517,10 +1574,10 @@ fn check_path_binary(colors: &ColorConfig) {
         .ok()
         .and_then(|p| std::fs::canonicalize(p).ok())
     else {
-        println!(
+        let _ = out.writeln(format_args!(
             "  {label}{}",
-            colors.yellow("? cannot determine current executable"),
-        );
+            out.colors.yellow("? cannot determine current executable"),
+        ));
         return;
     };
 
@@ -1530,48 +1587,48 @@ fn check_path_binary(colors: &ColorConfig) {
         .map(|dir| dir.join("catenary"))
         .find(|p| p.is_file())
     else {
-        println!(
+        let _ = out.writeln(format_args!(
             "  {label}{spacer}{}",
-            colors.red("✗ catenary not found on PATH"),
-        );
+            out.colors.red("✗ catenary not found on PATH"),
+        ));
         return;
     };
 
     let resolved_path = std::fs::canonicalize(&path_binary).unwrap_or(path_binary);
 
     if current_exe == resolved_path {
-        println!(
+        let _ = out.writeln(format_args!(
             "  {label}{spacer}{}",
-            colors.green(&format!("✓ {}", resolved_path.display())),
-        );
+            out.colors.green(&format!("✓ {}", resolved_path.display())),
+        ));
     } else {
-        println!(
+        let _ = out.writeln(format_args!(
             "  {label}{spacer}{}",
-            colors.red(&format!(
+            out.colors.red(&format!(
                 "✗ {} differs from {}",
                 resolved_path.display(),
                 current_exe.display(),
             )),
-        );
+        ));
     }
 }
 
 /// Check whether `~/.claude/settings.json` still references the legacy Python script.
 ///
 /// If found, warns the user to remove it and migrate to `[commands]` config.
-fn check_constrained_bash_claude(colors: &ColorConfig) {
-    check_legacy_script(colors, "Claude Code", ".claude/settings.json");
+fn check_constrained_bash_claude(out: &mut Output) {
+    check_legacy_script(out, "Claude Code", ".claude/settings.json");
 }
 
 /// Check whether `~/.gemini/settings.json` still references the legacy Python script.
 ///
 /// If found, warns the user to remove it and migrate to `[commands]` config.
-fn check_constrained_bash_gemini(colors: &ColorConfig) {
-    check_legacy_script(colors, "Gemini CLI", ".gemini/settings.json");
+fn check_constrained_bash_gemini(out: &mut Output) {
+    check_legacy_script(out, "Gemini CLI", ".gemini/settings.json");
 }
 
 /// Check a host CLI settings file for references to the legacy `constrained_bash.py`.
-fn check_legacy_script(colors: &ColorConfig, client: &str, settings_rel: &str) {
+fn check_legacy_script(out: &mut Output, client: &str, settings_rel: &str) {
     let label = format!("{client:<14}");
 
     let Ok(home_str) = std::env::var("HOME") else {
@@ -1589,25 +1646,26 @@ fn check_legacy_script(colors: &ColorConfig, client: &str, settings_rel: &str) {
     };
 
     if find_script_path_in_json(&settings, "constrained_bash.py").is_some() {
-        println!(
+        let _ = out.writeln(format_args!(
             "  {label}{}",
-            colors.yellow("⚠  legacy constrained_bash.py detected"),
-        );
-        println!(
+            out.colors.yellow("⚠  legacy constrained_bash.py detected"),
+        ));
+        let _ = out.writeln(format_args!(
             "  {label}{}",
-            colors.dim(&format!("  {CONSTRAINED_BASH_MIGRATION}")),
-        );
+            out.colors.dim(&format!("  {CONSTRAINED_BASH_MIGRATION}")),
+        ));
     }
 }
 
 /// Report the status of the built-in command filter configuration.
-fn check_command_filter_config(colors: &ColorConfig, config: &crate::config::Config) {
+fn check_command_filter_config(out: &mut Output, config: &crate::config::Config) {
     match &config.resolved_commands {
         Some(resolved) if resolved.client_enforcement_only => {
-            println!(
+            let _ = out.writeln(format_args!(
                 "  {}",
-                colors.dim("client_enforcement_only — Catenary enforcement disabled"),
-            );
+                out.colors
+                    .dim("client_enforcement_only — Catenary enforcement disabled"),
+            ));
         }
         Some(resolved) if resolved.is_active() => {
             let total = resolved.allow.len() + resolved.pipeline.len();
@@ -1638,19 +1696,20 @@ fn check_command_filter_config(colors: &ColorConfig, config: &crate::config::Con
             } else {
                 String::new()
             };
-            println!(
+            let _ = out.writeln(format_args!(
                 "  {}",
-                colors.green(&format!(
+                out.colors.green(&format!(
                     "✓ {total} command{} allowed{build_suffix}",
                     if total == 1 { "" } else { "s" },
                 )),
-            );
+            ));
         }
         Some(_) | None => {
-            println!(
+            let _ = out.writeln(format_args!(
                 "  {}",
-                colors.dim("no [commands] section — all shell commands allowed"),
-            );
+                out.colors
+                    .dim("no [commands] section — all shell commands allowed"),
+            ));
         }
     }
 }
@@ -1677,15 +1736,15 @@ fn pretty_json(s: &str) -> String {
 }
 
 /// Print a unified diff between `old` and `new` using the `similar` crate.
-fn show_unified_diff(old: &str, new: &str, old_label: &str, new_label: &str) {
+fn show_unified_diff(out: &mut Output, old: &str, new: &str, old_label: &str, new_label: &str) {
     use similar::TextDiff;
     let diff = TextDiff::from_lines(old, new);
-    print!(
+    let _ = out.write_str(format_args!(
         "{}",
         diff.unified_diff()
             .context_radius(3)
             .header(old_label, new_label)
-    );
+    ));
 }
 
 /// Walk all string values in `json` and return the whitespace-split token

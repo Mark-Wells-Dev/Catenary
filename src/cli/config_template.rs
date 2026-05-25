@@ -7,7 +7,7 @@
 //! [`crate::config::DEFAULT_SERVERS`] so it stays current across
 //! releases.
 
-#![allow(clippy::print_stdout, reason = "CLI tool needs to output to stdout")]
+use crate::cli::Output;
 
 /// Annotated recommended config template.
 ///
@@ -163,9 +163,9 @@ const TEMPLATE: &str = r#"# Catenary recommended config
 ///
 /// Appends a built-in server defaults reference section generated from
 /// the embedded `defaults/servers.toml`.
-pub fn print_template() {
-    print!("{TEMPLATE}");
-    print!("{}", generate_defaults_section());
+pub fn print_template(out: &mut Output) {
+    let _ = out.write_str(format_args!("{TEMPLATE}"));
+    let _ = out.write_str(format_args!("{}", generate_defaults_section()));
 }
 
 /// Generate a commented-out reference section listing all built-in

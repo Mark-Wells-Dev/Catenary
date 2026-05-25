@@ -11,7 +11,7 @@ pub mod hooks;
 
 use clap::ValueEnum;
 use crossterm::tty::IsTty;
-use std::io::stdout;
+use std::io::{self, Write, stdout};
 
 /// Output format for hook commands.
 ///
@@ -150,6 +150,107 @@ impl ColorConfig {
 #[must_use]
 pub fn terminal_width() -> usize {
     crossterm::terminal::size().map_or(80, |(w, _)| w as usize)
+}
+
+/// Object-safe extension of [`Write`] that supports consuming the
+/// writer to extract captured bytes (test buffers).
+#[allow(dead_code, reason = "into_bytes is called only in #[cfg(test)]")]
+trait OutputWriter: Write + Send {
+    /// Consume the writer and return captured bytes, if applicable.
+    fn into_bytes(self: Box<Self>) -> Option<Vec<u8>>;
+}
+
+impl OutputWriter for io::Stdout {
+    fn into_bytes(self: Box<Self>) -> Option<Vec<u8>> {
+        None
+    }
+}
+
+impl OutputWriter for Vec<u8> {
+    fn into_bytes(self: Box<Self>) -> Option<Vec<u8>> {
+        Some(*self)
+    }
+}
+
+/// Consolidated output destination for CLI commands.
+///
+/// Wraps a writer with color configuration and terminal width.
+/// Production code uses [`Output::stdout`]; tests use [`Output::buffer`]
+/// to capture and assert on output.
+pub struct Output {
+    w: Box<dyn OutputWriter>,
+    /// Color configuration for styled output.
+    pub colors: ColorConfig,
+    /// Terminal width for layout calculations.
+    pub width: usize,
+}
+
+impl Output {
+    /// Create an `Output` that writes to stdout.
+    #[must_use]
+    pub fn stdout(nocolor: bool) -> Self {
+        Self {
+            w: Box::new(io::stdout()),
+            colors: ColorConfig::new(nocolor),
+            width: terminal_width(),
+        }
+    }
+
+    /// Write formatted text followed by a newline.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the write fails.
+    pub fn writeln(&mut self, args: std::fmt::Arguments<'_>) -> io::Result<()> {
+        writeln!(self.w, "{args}")
+    }
+
+    /// Write formatted text without a trailing newline.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the write fails.
+    pub fn write_str(&mut self, args: std::fmt::Arguments<'_>) -> io::Result<()> {
+        write!(self.w, "{args}")
+    }
+
+    /// Create a test buffer with the given width and colors disabled.
+    #[cfg(test)]
+    #[must_use]
+    pub fn buffer(width: usize) -> Self {
+        Self {
+            w: Box::new(Vec::<u8>::new()),
+            colors: ColorConfig::new(true),
+            width,
+        }
+    }
+
+    /// Consume the output and return the written bytes as a string.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the writer is not a `Vec<u8>` (i.e. not created via
+    /// [`Output::buffer`]).
+    #[cfg(test)]
+    #[must_use]
+    #[allow(clippy::expect_used, reason = "test-only method")]
+    pub fn into_string(self) -> String {
+        let bytes = self
+            .w
+            .into_bytes()
+            .expect("Output::into_string called on non-buffer Output");
+        String::from_utf8(bytes).unwrap_or_default()
+    }
+}
+
+impl Write for Output {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.w.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.w.flush()
+    }
 }
 
 /// Truncate a string to `max_len` characters, adding "..." if truncated.

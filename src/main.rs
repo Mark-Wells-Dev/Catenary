@@ -236,9 +236,13 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Some(Command::List) => cli::commands::run_list(),
+        Some(Command::List) => {
+            let mut out = cli::Output::stdout(false);
+            cli::commands::run_list(&mut out)
+        }
         Some(Command::Config) => {
-            cli::config_template::print_template();
+            let mut out = cli::Output::stdout(false);
+            cli::config_template::print_template(&mut out);
             Ok(())
         }
         Some(Command::Monitor {
@@ -246,8 +250,14 @@ fn main() -> Result<()> {
             raw,
             nocolor,
             filter,
-        }) => cli::commands::run_monitor(&id, raw, nocolor, filter.as_deref()),
-        Some(Command::Status { id }) => cli::commands::run_status(&id),
+        }) => {
+            let mut out = cli::Output::stdout(nocolor);
+            cli::commands::run_monitor(&mut out, &id, raw, filter.as_deref())
+        }
+        Some(Command::Status { id }) => {
+            let mut out = cli::Output::stdout(false);
+            cli::commands::run_status(&mut out, &id)
+        }
         Some(Command::Doctor {
             server,
             root,
@@ -255,12 +265,16 @@ fn main() -> Result<()> {
             diff,
         }) => {
             let rt = build_runtime()?;
-            server.map_or_else(
-                || rt.block_on(cli::doctor::run_doctor(&root, nocolor, diff)),
-                |server_name| {
-                    rt.block_on(cli::doctor::run_doctor_single(&server_name, &root, nocolor))
-                },
-            )
+            let mut out = cli::Output::stdout(nocolor);
+            if let Some(server_name) = server {
+                rt.block_on(cli::doctor::run_doctor_single(
+                    &mut out,
+                    &server_name,
+                    &root,
+                ))
+            } else {
+                rt.block_on(cli::doctor::run_doctor(&mut out, &root, diff))
+            }
         }
         Some(Command::Hook { command }) => {
             match command {
@@ -281,7 +295,9 @@ fn main() -> Result<()> {
             format,
         }) => {
             let conn = catenary_mcp::db::open_and_migrate()?;
+            let mut out = cli::Output::stdout(false);
             cli::commands::run_query(
+                &mut out,
                 &conn,
                 session.as_deref(),
                 since.as_deref(),
@@ -297,7 +313,14 @@ fn main() -> Result<()> {
             session,
         }) => {
             let conn = catenary_mcp::db::open_and_migrate()?;
-            cli::commands::run_gc(&conn, older_than.as_deref(), dead, session.as_deref())
+            let mut out = cli::Output::stdout(false);
+            cli::commands::run_gc(
+                &mut out,
+                &conn,
+                older_than.as_deref(),
+                dead,
+                session.as_deref(),
+            )
         }
         #[cfg(unix)]
         Some(Command::StartEditing) => build_runtime()?.block_on(run_start_editing()),

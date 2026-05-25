@@ -3,15 +3,17 @@
 
 //! CLI subcommands: list, monitor, status, query, and gc.
 
-#![allow(clippy::print_stdout, reason = "CLI tool needs to output to stdout")]
-#![allow(clippy::print_stderr, reason = "CLI tool needs to output to stderr")]
+#![allow(
+    clippy::print_stderr,
+    reason = "find_session prints ambiguous matches to stderr"
+)]
 
 use anyhow::Result;
 use chrono::{Local, Utc};
 use regex::Regex;
 use std::time::Duration;
 
-use crate::cli::{self, ColorConfig, ColumnWidths, QueryFormat};
+use crate::cli::{self, ColorConfig, ColumnWidths, Output, QueryFormat};
 use crate::session::{self, SessionMessage};
 
 /// List all active sessions.
@@ -19,21 +21,19 @@ use crate::session::{self, SessionMessage};
 /// # Errors
 ///
 /// Returns an error if listing sessions fails.
-pub fn run_list() -> Result<()> {
+pub fn run_list(out: &mut Output) -> Result<()> {
     let conn = crate::db::open_and_migrate()?;
     let sessions = session::list_sessions_with_conn(&conn)?;
 
     if sessions.is_empty() {
-        println!("No active Catenary sessions");
+        let _ = out.writeln(format_args!("No active Catenary sessions"));
         return Ok(());
     }
 
-    let term_width = cli::terminal_width();
-    let widths = ColumnWidths::calculate(term_width);
-    let colors = cli::ColorConfig::new(false);
+    let widths = ColumnWidths::calculate(out.width);
 
     // Print header
-    println!(
+    let _ = out.writeln(format_args!(
         "{:>width_num$} {:<width_id$} {:<width_pid$} {:<width_client$} {:<width_ws$} STARTED",
         "#",
         "ID",
@@ -45,8 +45,8 @@ pub fn run_list() -> Result<()> {
         width_pid = widths.pid,
         width_client = widths.client,
         width_ws = widths.workspace,
-    );
-    println!("{}", "-".repeat(term_width.min(120)));
+    ));
+    let _ = out.writeln(format_args!("{}", "-".repeat(out.width.min(120))));
 
     // Indent for the second line (aligns with ID column)
     let indent = " ".repeat(widths.row_num + 1);
@@ -81,18 +81,19 @@ pub fn run_list() -> Result<()> {
         );
 
         if *alive {
-            println!("{row_str}");
+            let _ = out.writeln(format_args!("{row_str}"));
             // Get active languages for this session (shown on second line)
             let languages = session::active_languages_with_conn(&conn, &s.id).unwrap_or_default();
             if !languages.is_empty() {
                 let lang_str = languages.join(", ");
-                println!(
+                let _ = out.writeln(format_args!(
                     "{}",
-                    colors.dim(&format!("{indent}language servers: {lang_str}"))
-                );
+                    out.colors
+                        .dim(&format!("{indent}language servers: {lang_str}"))
+                ));
             }
         } else {
-            println!("{} (dead)", colors.dim(&row_str));
+            let _ = out.writeln(format_args!("{} (dead)", out.colors.dim(&row_str)));
         }
     }
 
@@ -131,14 +132,11 @@ pub fn resolve_session_id(conn: &rusqlite::Connection, id: &str) -> Result<sessi
 /// # Errors
 ///
 /// Returns an error if the session cannot be found or monitoring fails.
-pub fn run_monitor(id: &str, raw: bool, nocolor: bool, filter: Option<&str>) -> Result<()> {
+pub fn run_monitor(out: &mut Output, id: &str, raw: bool, filter: Option<&str>) -> Result<()> {
     let conn = crate::db::open_and_migrate()?;
     // Resolve session ID (supports row numbers and prefix matching)
     let session = resolve_session_id(&conn, id)?;
     let full_id = session.id;
-
-    let colors = ColorConfig::new(nocolor);
-    let term_width = cli::terminal_width();
 
     // Compile filter regex if provided
     let filter_regex = filter
@@ -147,7 +145,9 @@ pub fn run_monitor(id: &str, raw: bool, nocolor: bool, filter: Option<&str>) -> 
         .transpose()
         .map_err(|e| anyhow::anyhow!("Invalid filter regex: {e}"))?;
 
-    println!("Monitoring session {full_id} (Ctrl+C to stop)\n");
+    let _ = out.writeln(format_args!(
+        "Monitoring session {full_id} (Ctrl+C to stop)\n"
+    ));
 
     let mut reader = session::tail_messages_new(&full_id, true)?;
 
@@ -166,7 +166,7 @@ pub fn run_monitor(id: &str, raw: bool, nocolor: bool, filter: Option<&str>) -> 
                 }
 
                 if raw {
-                    print_message_raw(&msg);
+                    print_message_raw(out, &msg);
                 } else {
                     // Collapse consecutive progress lines with the same title
                     if msg.r#type == "lsp" && msg.method == "$/progress" {
@@ -179,13 +179,13 @@ pub fn run_monitor(id: &str, raw: bool, nocolor: bool, filter: Option<&str>) -> 
                             .to_string();
                         let key = (msg.server.clone(), title);
                         if last_progress.as_ref() == Some(&key) {
-                            print!("\x1b[A\x1b[2K");
+                            let _ = out.write_str(format_args!("\x1b[A\x1b[2K"));
                         }
                         last_progress = Some(key);
                     } else {
                         last_progress = None;
                     }
-                    print_message_annotated(&msg, &colors, term_width);
+                    print_message_annotated(out, &msg);
                 }
             }
             Ok(None) => {
@@ -194,16 +194,16 @@ pub fn run_monitor(id: &str, raw: bool, nocolor: bool, filter: Option<&str>) -> 
 
                 if let Ok(Some((_, alive))) = session::get_session_with_conn(&conn, &full_id) {
                     if !alive {
-                        println!("\nSession ended (process dead)");
+                        let _ = out.writeln(format_args!("\nSession ended (process dead)"));
                         break;
                     }
                 } else {
-                    println!("\nSession ended (files removed)");
+                    let _ = out.writeln(format_args!("\nSession ended (files removed)"));
                     break;
                 }
             }
             Err(_) => {
-                println!("\nSession ended");
+                let _ = out.writeln(format_args!("\nSession ended"));
                 break;
             }
         }
@@ -217,39 +217,37 @@ pub fn run_monitor(id: &str, raw: bool, nocolor: bool, filter: Option<&str>) -> 
 /// # Errors
 ///
 /// Returns an error if the session cannot be found.
-pub fn run_status(id: &str) -> Result<()> {
+pub fn run_status(out: &mut Output, id: &str) -> Result<()> {
     let conn = crate::db::open_and_migrate()?;
     let session = find_session(&conn, id)?;
 
-    println!("Session: {}", session.id);
-    println!("PID: {}", session.pid);
-    println!("Workspace: {}", session.workspace);
-    println!(
+    let _ = out.writeln(format_args!("Session: {}", session.id));
+    let _ = out.writeln(format_args!("PID: {}", session.pid));
+    let _ = out.writeln(format_args!("Workspace: {}", session.workspace));
+    let _ = out.writeln(format_args!(
         "Started: {} ({})",
         session
             .started_at
             .with_timezone(&Local)
             .format("%Y-%m-%d %H:%M:%S"),
         format_duration_ago(session.started_at)
-    );
+    ));
 
     if let Some(name) = &session.client_name {
-        print!("Client: {name}");
         if let Some(ver) = &session.client_version {
-            print!(" v{ver}");
+            let _ = out.writeln(format_args!("Client: {name} v{ver}"));
+        } else {
+            let _ = out.writeln(format_args!("Client: {name}"));
         }
-        println!();
     }
 
     // Show recent messages
-    println!("\nRecent messages:");
+    let _ = out.writeln(format_args!("\nRecent messages:"));
     let messages = session::monitor_messages_with_conn(&conn, &session.id, true)?;
     let recent: Vec<_> = messages.iter().rev().take(10).collect();
 
-    let colors = ColorConfig::new(false);
-    let term_width = cli::terminal_width();
     for msg in recent.iter().rev() {
-        print_message_annotated(msg, &colors, term_width);
+        print_message_annotated(out, msg);
     }
 
     Ok(())
@@ -314,7 +312,12 @@ pub(crate) fn parse_since(s: &str) -> Result<chrono::DateTime<Utc>> {
     clippy::too_many_lines,
     reason = "Sequential query building and output formatting"
 )]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Output adds one parameter to existing signature"
+)]
 pub fn run_query(
+    out: &mut Output,
     conn: &rusqlite::Connection,
     session_filter: Option<&str>,
     since: Option<&str>,
@@ -345,7 +348,7 @@ pub fn run_query(
         }
         drop(db_rows);
 
-        print_query_results(&col_names, &rows_out, format);
+        print_query_results(out, &col_names, &rows_out, format);
         return Ok(());
     }
 
@@ -427,7 +430,7 @@ pub fn run_query(
         ]);
     }
 
-    print_query_results(&col_names, &rows_out, format);
+    print_query_results(out, &col_names, &rows_out, format);
     Ok(())
 }
 
@@ -443,9 +446,14 @@ fn format_sql_value(val: &rusqlite::types::Value) -> String {
 }
 
 /// Print query results in the chosen format.
-fn print_query_results(col_names: &[String], rows: &[Vec<String>], format: QueryFormat) {
+fn print_query_results(
+    out: &mut Output,
+    col_names: &[String],
+    rows: &[Vec<String>],
+    format: QueryFormat,
+) {
     if rows.is_empty() {
-        println!("No results");
+        let _ = out.writeln(format_args!("No results"));
         return;
     }
 
@@ -472,15 +480,15 @@ fn print_query_results(col_names: &[String], rows: &[Vec<String>], format: Query
                 .zip(&widths)
                 .map(|(name, w)| format!("{name:<w$}"))
                 .collect();
-            println!("{}", header.join("  "));
-            println!(
+            let _ = out.writeln(format_args!("{}", header.join("  ")));
+            let _ = out.writeln(format_args!(
                 "{}",
                 widths
                     .iter()
                     .map(|w| "-".repeat(*w))
                     .collect::<Vec<_>>()
                     .join("  ")
-            );
+            ));
 
             // Rows
             for row in rows {
@@ -495,7 +503,7 @@ fn print_query_results(col_names: &[String], rows: &[Vec<String>], format: Query
                         }
                     })
                     .collect();
-                println!("{}", formatted.join("  "));
+                let _ = out.writeln(format_args!("{}", formatted.join("  ")));
             }
         }
         QueryFormat::Json => {
@@ -510,10 +518,10 @@ fn print_query_results(col_names: &[String], rows: &[Vec<String>], format: Query
                 })
                 .collect();
             let json = serde_json::to_string_pretty(&arr).unwrap_or_default();
-            println!("{json}");
+            let _ = out.writeln(format_args!("{json}"));
         }
         QueryFormat::Csv => {
-            println!("{}", col_names.join(","));
+            let _ = out.writeln(format_args!("{}", col_names.join(",")));
             for row in rows {
                 let escaped: Vec<String> = row
                     .iter()
@@ -525,7 +533,7 @@ fn print_query_results(col_names: &[String], rows: &[Vec<String>], format: Query
                         }
                     })
                     .collect();
-                println!("{}", escaped.join(","));
+                let _ = out.writeln(format_args!("{}", escaped.join(",")));
             }
         }
     }
@@ -540,6 +548,7 @@ fn print_query_results(col_names: &[String], rows: &[Vec<String>], format: Query
 ///
 /// Returns an error if the database cannot be opened or a delete fails.
 pub fn run_gc(
+    out: &mut Output,
     conn: &rusqlite::Connection,
     older_than: Option<&str>,
     dead: bool,
@@ -560,7 +569,7 @@ pub fn run_gc(
             [&cutoff_str],
         )?;
 
-        println!(
+        let _ = out.writeln(format_args!(
             "Deleted {events_removed} event{}{} older than {duration_str}",
             if events_removed == 1 { "" } else { "s" },
             if filters_removed > 0 {
@@ -568,7 +577,7 @@ pub fn run_gc(
             } else {
                 String::new()
             },
-        );
+        ));
     }
 
     // --dead: detect crashed sessions, then delete all dead sessions
@@ -610,11 +619,11 @@ pub fn run_gc(
         sessions_deleted += removed;
         total_events_deleted += dead_events;
 
-        println!(
+        let _ = out.writeln(format_args!(
             "Deleted {removed} dead session{} ({dead_events} event{})",
             if removed == 1 { "" } else { "s" },
             if dead_events == 1 { "" } else { "s" },
-        );
+        ));
     }
 
     // --session: delete a specific session
@@ -637,15 +646,17 @@ pub fn run_gc(
         let socket_dir = session::sessions_dir().join(&resolved.id);
         let _ = std::fs::remove_dir_all(&socket_dir);
 
-        println!(
+        let _ = out.writeln(format_args!(
             "Deleted session {} ({event_count} event{})",
             &resolved.id[..8.min(resolved.id.len())],
             if event_count == 1 { "" } else { "s" },
-        );
+        ));
     }
 
     if older_than.is_none() && !dead && session_id.is_none() {
-        println!("Nothing to do. Use --older-than, --dead, or --session.");
+        let _ = out.writeln(format_args!(
+            "Nothing to do. Use --older-than, --dead, or --session."
+        ));
     }
 
     // VACUUM if significant data was deleted
@@ -657,7 +668,10 @@ pub fn run_gc(
         if let (Some(before), Some(after)) = (size_before, size_after) {
             let saved = before.saturating_sub(after);
             if saved > 0 {
-                println!("Database vacuumed (saved {})", format_bytes(saved));
+                let _ = out.writeln(format_args!(
+                    "Database vacuumed (saved {})",
+                    format_bytes(saved)
+                ));
             }
         }
     }
@@ -743,7 +757,7 @@ pub fn format_duration_ago(timestamp: chrono::DateTime<Utc>) -> String {
 }
 
 /// Print a message in raw JSON format.
-fn print_message_raw(msg: &SessionMessage) {
+fn print_message_raw(out: &mut Output, msg: &SessionMessage) {
     let time = msg.timestamp.with_timezone(&Local).format("%H:%M:%S");
     let tag = match msg.r#type.as_str() {
         "lsp" => format!("[{}]", msg.server),
@@ -756,22 +770,22 @@ fn print_message_raw(msg: &SessionMessage) {
     } else {
         "\u{2192}" // →
     };
-    println!("[{time}] {tag} {arrow}");
+    let _ = out.writeln(format_args!("[{time}] {tag} {arrow}"));
     let pretty = serde_json::to_string_pretty(&msg.payload).unwrap_or_default();
-    println!("{pretty}");
+    let _ = out.writeln(format_args!("{pretty}"));
 }
 
 /// Print a message with annotations and colors.
 #[allow(clippy::too_many_lines, reason = "match arms for each message type")]
-fn print_message_annotated(msg: &SessionMessage, colors: &ColorConfig, term_width: usize) {
+fn print_message_annotated(out: &mut Output, msg: &SessionMessage) {
     let time = msg.timestamp.with_timezone(&Local).format("%H:%M:%S");
-    let time_str = colors.dim(&format!("[{time}]"));
+    let time_str = out.colors.dim(&format!("[{time}]"));
 
     let is_response = msg.payload.get("result").is_some() || msg.payload.get("error").is_some();
 
     match msg.r#type.as_str() {
         "lsp" => {
-            let lang = colors.cyan(&msg.server);
+            let lang = out.colors.cyan(&msg.server);
             if msg.method == "$/progress" {
                 let title = msg
                     .payload
@@ -793,9 +807,9 @@ fn print_message_annotated(msg: &SessionMessage, colors: &ColorConfig, term_widt
                     .and_then(|m| m.as_str())
                     .map(|m| format!(" ({m})"))
                     .unwrap_or_default();
-                println!("{time_str} {lang}: {title}{pct}{detail}");
+                let _ = out.writeln(format_args!("{time_str} {lang}: {title}{pct}{detail}"));
             } else if is_response {
-                let arrow = colors.blue("\u{2190}");
+                let arrow = out.colors.blue("\u{2190}");
                 if msg.payload.get("error").is_some() {
                     let err_msg = msg
                         .payload
@@ -803,32 +817,32 @@ fn print_message_annotated(msg: &SessionMessage, colors: &ColorConfig, term_widt
                         .and_then(|e| e.get("message"))
                         .and_then(|m| m.as_str())
                         .unwrap_or("Unknown error");
-                    println!(
+                    let _ = out.writeln(format_args!(
                         "{time_str} {lang} {arrow} {} {}",
                         msg.method,
-                        colors.red(err_msg)
-                    );
+                        out.colors.red(err_msg)
+                    ));
                 } else {
-                    println!("{time_str} {lang} {arrow} {}", msg.method);
+                    let _ = out.writeln(format_args!("{time_str} {lang} {arrow} {}", msg.method));
                 }
             } else {
-                let arrow = colors.green("\u{2192}");
-                println!("{time_str} {lang} {arrow} {}", msg.method);
+                let arrow = out.colors.green("\u{2192}");
+                let _ = out.writeln(format_args!("{time_str} {lang} {arrow} {}", msg.method));
             }
         }
         "mcp" => {
-            let summary = extract_message_summary(&msg.payload, colors);
+            let summary = extract_message_summary(&msg.payload, &out.colors);
             let prefix_len = 10 + 5 + 2 + 2; // [time] + [mcp] + arrow + spaces
-            let max_summary_len = term_width.saturating_sub(prefix_len);
+            let max_summary_len = out.width.saturating_sub(prefix_len);
 
             if is_response {
-                let arrow = colors.blue("\u{2190}");
+                let arrow = out.colors.blue("\u{2190}");
                 let summary = cli::truncate(&summary, max_summary_len);
-                println!("{time_str} [mcp] {arrow} {summary}");
+                let _ = out.writeln(format_args!("{time_str} [mcp] {arrow} {summary}"));
             } else {
-                let arrow = colors.green("\u{2192}");
+                let arrow = out.colors.green("\u{2192}");
                 let summary = cli::truncate(&summary, max_summary_len);
-                println!("{time_str} [mcp] {arrow} {summary}");
+                let _ = out.writeln(format_args!("{time_str} [mcp] {arrow} {summary}"));
             }
 
             if let Some(error) = msg.payload.get("error") {
@@ -836,7 +850,10 @@ fn print_message_annotated(msg: &SessionMessage, colors: &ColorConfig, term_widt
                     .get("message")
                     .and_then(|m| m.as_str())
                     .unwrap_or("Unknown error");
-                println!("    {}", colors.red(&format!("Error: {err_msg}")));
+                let _ = out.writeln(format_args!(
+                    "    {}",
+                    out.colors.red(&format!("Error: {err_msg}"))
+                ));
             }
         }
         "hook" => {
@@ -853,10 +870,10 @@ fn print_message_annotated(msg: &SessionMessage, colors: &ColorConfig, term_widt
                     .unwrap_or(file);
 
                 if count == 0 {
-                    let check = colors.green("ok");
-                    println!("{time_str} {basename}: {check}");
+                    let check = out.colors.green("ok");
+                    let _ = out.writeln(format_args!("{time_str} {basename}: {check}"));
                 } else {
-                    let label = colors.yellow(&format!(
+                    let label = out.colors.yellow(&format!(
                         "{count} diagnostic{}",
                         if count == 1 { "" } else { "s" }
                     ));
@@ -868,17 +885,17 @@ fn print_message_annotated(msg: &SessionMessage, colors: &ColorConfig, term_widt
                     let detail = if preview.is_empty() {
                         String::new()
                     } else {
-                        let max_len = term_width.saturating_sub(14 + basename.len() + 20);
+                        let max_len = out.width.saturating_sub(14 + basename.len() + 20);
                         format!(" -- {}", cli::truncate(preview, max_len))
                     };
-                    println!("{time_str} {basename}: {label}{detail}");
+                    let _ = out.writeln(format_args!("{time_str} {basename}: {label}{detail}"));
                 }
             } else {
-                println!("{time_str} [hook] {}", msg.method);
+                let _ = out.writeln(format_args!("{time_str} [hook] {}", msg.method));
             }
         }
         other => {
-            println!("{time_str} [{other}] {}", msg.method);
+            let _ = out.writeln(format_args!("{time_str} [{other}] {}", msg.method));
         }
     }
 }
@@ -1098,7 +1115,9 @@ mod tests {
         );
 
         // Query with --kind mcp should work (now --type)
+        let mut out = Output::buffer(120);
         run_query(
+            &mut out,
             &conn,
             Some("s1"),
             None,
@@ -1131,7 +1150,9 @@ mod tests {
         );
 
         // Search for "grep" in payload should succeed
+        let mut out = Output::buffer(120);
         run_query(
+            &mut out,
             &conn,
             Some("s1"),
             None,
@@ -1156,7 +1177,8 @@ mod tests {
         assert!(!found.expect("checked above").1, "session should be dead");
 
         // Run gc --dead
-        run_gc(&conn, None, true, None)?;
+        let mut out = Output::buffer(120);
+        run_gc(&mut out, &conn, None, true, None)?;
 
         // Should be gone
         assert!(
@@ -1173,7 +1195,8 @@ mod tests {
         insert_dead_session(&conn, "gc-s2", "/tmp/test-gc-specific-2");
 
         // Delete only s1
-        run_gc(&conn, None, false, Some("gc-s1"))?;
+        let mut out = Output::buffer(120);
+        run_gc(&mut out, &conn, None, false, Some("gc-s1"))?;
 
         assert!(
             session::get_session_with_conn(&conn, "gc-s1")?.is_none(),
@@ -1192,7 +1215,8 @@ mod tests {
     fn test_gc_no_flags_is_noop() -> anyhow::Result<()> {
         let (_dir, _path, conn) = test_db();
         // Should not error
-        run_gc(&conn, None, false, None)?;
+        let mut out = Output::buffer(120);
+        run_gc(&mut out, &conn, None, false, None)?;
         Ok(())
     }
 
