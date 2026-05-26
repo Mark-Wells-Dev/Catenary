@@ -8,6 +8,7 @@
 
 use super::data::{DataSource, MessageTail};
 use super::icons::IconSet;
+use super::sidebar::SidebarState;
 use super::stream::{PAGE_SIZE, PageRequest, StreamState};
 use super::theme::Theme;
 
@@ -36,6 +37,15 @@ impl LevelThreshold {
     }
 }
 
+/// Which panel has keyboard focus.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FocusRegion {
+    /// Sidebar session list.
+    Sidebar,
+    /// Message stream.
+    Stream,
+}
+
 /// Application state driving the TUI.
 pub struct App<'a> {
     /// Semantic color theme.
@@ -48,6 +58,10 @@ pub struct App<'a> {
     pub quit: bool,
     /// Current display level threshold.
     pub level_threshold: LevelThreshold,
+    /// Which panel has keyboard focus.
+    pub focus: FocusRegion,
+    /// Session list sidebar state.
+    pub sidebar: SidebarState,
     /// Unified message stream state.
     pub stream: StreamState,
     /// Tail reader for incremental message updates.
@@ -72,15 +86,22 @@ impl<'a> App<'a> {
         // Fewer entries than the page size means we loaded everything.
         stream.reached_beginning = stream.entries.len() < PAGE_SIZE;
 
-        Ok(Self {
+        let mut app = Self {
             theme,
             icons,
             data,
             quit: false,
             level_threshold: LevelThreshold::Info,
+            focus: FocusRegion::Stream,
+            sidebar: SidebarState::new(),
             stream,
             tail,
-        })
+        };
+
+        // Load initial session list.
+        app.refresh_sessions();
+
+        Ok(app)
     }
 
     /// Drain new messages from the tail reader into the stream.
@@ -162,5 +183,35 @@ impl<'a> App<'a> {
         if let Ok(messages) = self.data.oldest_scopes(PAGE_SIZE, include_debug) {
             self.stream.load_oldest_page(messages);
         }
+    }
+
+    /// Toggle focus between sidebar and stream.
+    pub const fn toggle_focus(&mut self) {
+        self.focus = match self.focus {
+            FocusRegion::Sidebar => FocusRegion::Stream,
+            FocusRegion::Stream => FocusRegion::Sidebar,
+        };
+    }
+
+    /// Refresh the sidebar session list if the alive set has changed.
+    ///
+    /// Uses a two-phase query: lightweight ID check first, full metadata
+    /// only when the set changes. Silently ignores query failures.
+    pub fn refresh_sessions(&mut self) {
+        let Ok(current_ids) = self.data.list_alive_session_ids() else {
+            return;
+        };
+        if !self.sidebar.needs_refresh(&current_ids) {
+            return;
+        }
+        let Ok(rows) = self.data.list_sessions() else {
+            return;
+        };
+        let sessions: Vec<_> = rows
+            .into_iter()
+            .filter(|r| r.alive)
+            .map(|r| (r.info.id, r.info.client_name, r.info.workspace))
+            .collect();
+        self.sidebar.refresh(sessions, &mut self.stream.badges);
     }
 }
