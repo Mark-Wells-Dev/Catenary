@@ -8,7 +8,8 @@
 
 use super::data::{DataSource, MessageTail};
 use super::icons::IconSet;
-use super::stream::StreamState;
+use super::sidebar::SidebarState;
+use super::stream::{PAGE_SIZE, PageRequest, StreamState};
 use super::theme::Theme;
 
 /// Display level threshold for message queries.
@@ -36,6 +37,15 @@ impl LevelThreshold {
     }
 }
 
+/// Which panel has keyboard focus.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FocusRegion {
+    /// Sidebar session list.
+    Sidebar,
+    /// Message stream.
+    Stream,
+}
+
 /// Application state driving the TUI.
 pub struct App<'a> {
     /// Semantic color theme.
@@ -48,6 +58,10 @@ pub struct App<'a> {
     pub quit: bool,
     /// Current display level threshold.
     pub level_threshold: LevelThreshold,
+    /// Which panel has keyboard focus.
+    pub focus: FocusRegion,
+    /// Session list sidebar state.
+    pub sidebar: SidebarState,
     /// Unified message stream state.
     pub stream: StreamState,
     /// Tail reader for incremental message updates.
@@ -55,7 +69,7 @@ pub struct App<'a> {
 }
 
 impl<'a> App<'a> {
-    /// Create a new App and load the initial message stream.
+    /// Create a new App, loading only the most recent page of scopes.
     ///
     /// # Errors
     ///
@@ -66,19 +80,28 @@ impl<'a> App<'a> {
         data: Box<dyn DataSource>,
     ) -> anyhow::Result<Self> {
         let include_debug = false;
-        let messages = data.monitor_all_messages(include_debug)?;
+        let messages = data.recent_scopes(PAGE_SIZE, include_debug)?;
         let tail = data.create_all_message_tail(include_debug).ok();
-        let stream = StreamState::new(messages);
+        let mut stream = StreamState::new(messages);
+        // Fewer entries than the page size means we loaded everything.
+        stream.reached_beginning = stream.entries.len() < PAGE_SIZE;
 
-        Ok(Self {
+        let mut app = Self {
             theme,
             icons,
             data,
             quit: false,
             level_threshold: LevelThreshold::Info,
+            focus: FocusRegion::Stream,
+            sidebar: SidebarState::new(),
             stream,
             tail,
-        })
+        };
+
+        // Load initial session list.
+        app.refresh_sessions();
+
+        Ok(app)
     }
 
     /// Drain new messages from the tail reader into the stream.
@@ -95,16 +118,100 @@ impl<'a> App<'a> {
         }
     }
 
-    /// Reload all messages (e.g., after toggling severity threshold).
+    /// Reload the most recent page (e.g., after toggling severity threshold).
     ///
     /// # Errors
     ///
     /// Returns an error if loading messages fails.
     pub fn reload_messages(&mut self) -> anyhow::Result<()> {
         let include_debug = self.level_threshold.include_debug();
-        let messages = self.data.monitor_all_messages(include_debug)?;
+        let messages = self.data.recent_scopes(PAGE_SIZE, include_debug)?;
         self.tail = self.data.create_all_message_tail(include_debug).ok();
         self.stream = StreamState::new(messages);
+        self.stream.reached_beginning = self.stream.entries.len() < PAGE_SIZE;
         Ok(())
+    }
+
+    /// Fetch a page if the cursor is near a paging boundary.
+    pub fn fetch_page_if_needed(&mut self) {
+        let Some(request) = self.stream.check_paging() else {
+            return;
+        };
+        let include_debug = self.level_threshold.include_debug();
+
+        match request {
+            PageRequest::Older(before_id) => {
+                if let Ok(messages) =
+                    self.data
+                        .older_scopes(before_id, None, PAGE_SIZE, include_debug)
+                {
+                    self.stream.prepend_page(messages);
+                }
+            }
+            PageRequest::FillGap {
+                after_id,
+                before_id,
+                from_bottom,
+            } => {
+                let messages = if from_bottom {
+                    // Load the newest scopes in the gap (closest to bottom).
+                    self.data
+                        .older_scopes(before_id, Some(after_id), PAGE_SIZE, include_debug)
+                } else {
+                    // Load the oldest scopes in the gap (closest to top).
+                    self.data
+                        .newer_scopes(after_id, Some(before_id), PAGE_SIZE, include_debug)
+                };
+                if let Ok(messages) = messages {
+                    self.stream.fill_gap(messages);
+                }
+            }
+        }
+    }
+
+    /// Load the oldest page and create a gap (Home key).
+    pub fn jump_to_beginning(&mut self) {
+        // If already at the beginning with a gap, just move cursor.
+        if self.stream.gap_offset.is_some() || self.stream.reached_beginning {
+            self.stream.scroll_position = 0;
+            self.stream.cursor = 0;
+            self.stream.auto_scroll = false;
+            return;
+        }
+
+        let include_debug = self.level_threshold.include_debug();
+        if let Ok(messages) = self.data.oldest_scopes(PAGE_SIZE, include_debug) {
+            self.stream.load_oldest_page(messages);
+        }
+    }
+
+    /// Toggle focus between sidebar and stream.
+    pub const fn toggle_focus(&mut self) {
+        self.focus = match self.focus {
+            FocusRegion::Sidebar => FocusRegion::Stream,
+            FocusRegion::Stream => FocusRegion::Sidebar,
+        };
+    }
+
+    /// Refresh the sidebar session list if the alive set has changed.
+    ///
+    /// Uses a two-phase query: lightweight ID check first, full metadata
+    /// only when the set changes. Silently ignores query failures.
+    pub fn refresh_sessions(&mut self) {
+        let Ok(current_ids) = self.data.list_alive_session_ids() else {
+            return;
+        };
+        if !self.sidebar.needs_refresh(&current_ids) {
+            return;
+        }
+        let Ok(rows) = self.data.list_sessions() else {
+            return;
+        };
+        let sessions: Vec<_> = rows
+            .into_iter()
+            .filter(|r| r.alive)
+            .map(|r| (r.info.id, r.info.client_name, r.info.workspace))
+            .collect();
+        self.sidebar.refresh(sessions, &mut self.stream.badges);
     }
 }

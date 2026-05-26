@@ -34,14 +34,20 @@ use crossterm::terminal::{
 use notify::Watcher;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use ratatui::layout::Rect;
 use tracing::info;
 
 use crate::config::IconConfig;
 
+use self::app::FocusRegion;
 use self::data::SqliteDataSource;
 use self::icons::IconSet;
+use self::sidebar::render_sidebar;
 use self::stream::render_stream;
 use self::theme::Theme;
+
+/// Minimum terminal width before the sidebar auto-hides.
+const SIDEBAR_AUTO_HIDE_WIDTH: u16 = 60;
 
 /// Tick interval for the event loop.
 const TICK_INTERVAL: Duration = Duration::from_millis(200);
@@ -145,7 +151,68 @@ fn run_with_data_and_watcher(
     result
 }
 
-/// Main event loop — renders unified message stream, handles input.
+/// Handle a key event, dispatching to global or focus-specific handlers.
+fn handle_key(app: &mut App<'_>, code: KeyCode, show_sidebar: bool, viewport_height: usize) {
+    // Global keys (always active regardless of focus).
+    match code {
+        KeyCode::Char('q') => app.quit = true,
+        KeyCode::Char('d') => {
+            app.level_threshold.toggle();
+            let _ = app.reload_messages();
+        }
+        KeyCode::Tab | KeyCode::BackTab => {
+            if show_sidebar {
+                app.toggle_focus();
+            }
+        }
+        _ => match app.focus {
+            FocusRegion::Sidebar => {
+                // Visible entry rows = viewport height minus header row.
+                let visible = viewport_height.saturating_sub(1);
+                match code {
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        app.sidebar.cursor_down(1, visible);
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => app.sidebar.cursor_up(1, visible),
+                    _ => {}
+                }
+            }
+            FocusRegion::Stream => {
+                handle_stream_key(app, code, viewport_height);
+            }
+        },
+    }
+}
+
+/// Handle a key event when the stream is focused.
+fn handle_stream_key(app: &mut App<'_>, code: KeyCode, viewport_height: usize) {
+    match code {
+        KeyCode::Char('j') | KeyCode::Down => {
+            app.stream.cursor_down(1, viewport_height);
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            app.stream.cursor_up(1);
+        }
+        KeyCode::Enter => {
+            app.stream.toggle_expansion();
+        }
+        KeyCode::PageDown => {
+            app.stream.scroll_down(viewport_height / 2, viewport_height);
+        }
+        KeyCode::PageUp => {
+            app.stream.scroll_up(viewport_height / 2);
+        }
+        KeyCode::Home => {
+            app.jump_to_beginning();
+        }
+        KeyCode::End => {
+            app.stream.pin_to_bottom(viewport_height);
+        }
+        _ => {}
+    }
+}
+
+/// Main event loop — renders sidebar + message stream, handles input.
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App<'_>,
@@ -154,12 +221,45 @@ fn run_loop(
     let mut last_tick = Instant::now();
 
     loop {
-        let viewport_height = terminal.size()?.height as usize;
-        app.stream.apply_auto_scroll(viewport_height);
+        let size = terminal.size()?;
+        let show_sidebar = size.width >= SIDEBAR_AUTO_HIDE_WIDTH;
+        let stream_height = size.height as usize;
+        app.stream.apply_auto_scroll(stream_height);
 
         terminal.draw(|f| {
             let area = f.area();
-            render_stream(&app.stream, area, f.buffer_mut(), app.theme, app.icons);
+
+            if show_sidebar {
+                let sidebar_width = app.sidebar.content_width().min(area.width / 2);
+                let sidebar_area = Rect {
+                    x: area.x,
+                    y: area.y,
+                    width: sidebar_width,
+                    height: area.height,
+                };
+                let stream_area = Rect {
+                    x: area.x + sidebar_width,
+                    y: area.y,
+                    width: area.width.saturating_sub(sidebar_width),
+                    height: area.height,
+                };
+                render_sidebar(
+                    &app.sidebar,
+                    sidebar_area,
+                    f.buffer_mut(),
+                    app.theme,
+                    app.focus == FocusRegion::Sidebar,
+                );
+                render_stream(
+                    &app.stream,
+                    stream_area,
+                    f.buffer_mut(),
+                    app.theme,
+                    app.icons,
+                );
+            } else {
+                render_stream(&app.stream, area, f.buffer_mut(), app.theme, app.icons);
+            }
         })?;
 
         if app.quit {
@@ -173,37 +273,8 @@ fn run_loop(
         if event::poll(timeout)?
             && let Event::Key(key) = event::read()?
         {
-            match key.code {
-                KeyCode::Char('q') => app.quit = true,
-                KeyCode::Char('d') => {
-                    app.level_threshold.toggle();
-                    let _ = app.reload_messages();
-                }
-                KeyCode::Char('j') | KeyCode::Down => {
-                    app.stream.cursor_down(1, viewport_height);
-                }
-                KeyCode::Char('k') | KeyCode::Up => {
-                    app.stream.cursor_up(1);
-                }
-                KeyCode::Enter => {
-                    app.stream.toggle_expansion();
-                }
-                KeyCode::PageDown => {
-                    app.stream.scroll_down(viewport_height / 2, viewport_height);
-                }
-                KeyCode::PageUp => {
-                    app.stream.scroll_up(viewport_height / 2);
-                }
-                KeyCode::Home => {
-                    app.stream.scroll_position = 0;
-                    app.stream.cursor = 0;
-                    app.stream.auto_scroll = false;
-                }
-                KeyCode::End => {
-                    app.stream.pin_to_bottom(viewport_height);
-                }
-                _ => {}
-            }
+            handle_key(app, key.code, show_sidebar, stream_height);
+            app.fetch_page_if_needed();
         }
 
         if last_tick.elapsed() >= TICK_INTERVAL {
@@ -212,6 +283,7 @@ fn run_loop(
                 while rx.try_recv().is_ok() {}
             }
             app.drain_tail();
+            app.refresh_sessions();
             last_tick = Instant::now();
         }
     }

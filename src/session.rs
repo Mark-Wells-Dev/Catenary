@@ -450,6 +450,278 @@ pub fn monitor_all_messages_with_conn(
     Ok(messages)
 }
 
+// ── Paginated scope queries ─────────────────────────────────────────
+
+/// Parse a database row (10-column SELECT) into a [`SessionMessage`].
+///
+/// Returns `None` if the timestamp or payload is unparseable (matching
+/// the skip-on-error behavior in [`monitor_messages_with_conn`]).
+fn parse_message_row(row: &rusqlite::Row<'_>) -> Option<SessionMessage> {
+    let id: i64 = row.get(0).ok()?;
+    let session_id: String = row.get(1).ok()?;
+    let ts: String = row.get(2).ok()?;
+    let r#type: String = row.get(3).ok()?;
+    let level: String = row.get(4).ok()?;
+    let method: String = row.get(5).ok()?;
+    let server: String = row.get(6).ok()?;
+    let client: String = row.get(7).ok()?;
+    let parent_id: Option<String> = match row.get::<_, Option<String>>(8) {
+        Ok(v) => v,
+        Err(_) => return None,
+    };
+    let payload_str: String = row.get(9).ok()?;
+
+    let timestamp = DateTime::parse_from_rfc3339(&ts).ok()?.with_timezone(&Utc);
+    let payload = serde_json::from_str::<serde_json::Value>(&payload_str).ok()?;
+
+    Some(SessionMessage {
+        id,
+        session_id,
+        r#type,
+        level,
+        method,
+        server,
+        client,
+        parent_id,
+        timestamp,
+        payload,
+    })
+}
+
+/// Fetch all messages belonging to a set of scope roots.
+///
+/// Standalone roots (no `parent_id`) are fetched by their message ID.
+/// Scoped roots are fetched by `parent_id` (all messages in the scope).
+fn fetch_messages_for_roots(
+    conn: &Connection,
+    standalone_ids: &[i64],
+    parent_ids: &[String],
+    include_debug: bool,
+) -> Result<Vec<SessionMessage>> {
+    if standalone_ids.is_empty() && parent_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut conditions = Vec::new();
+    let mut params: Vec<rusqlite::types::Value> = Vec::new();
+    let mut idx = 1usize;
+
+    if !standalone_ids.is_empty() {
+        let placeholders: String = standalone_ids
+            .iter()
+            .map(|_| {
+                let p = format!("?{idx}");
+                idx += 1;
+                p
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        conditions.push(format!("(parent_id IS NULL AND id IN ({placeholders}))"));
+        for id in standalone_ids {
+            params.push(rusqlite::types::Value::Integer(*id));
+        }
+    }
+
+    if !parent_ids.is_empty() {
+        let placeholders: String = parent_ids
+            .iter()
+            .map(|_| {
+                let p = format!("?{idx}");
+                idx += 1;
+                p
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        conditions.push(format!("parent_id IN ({placeholders})"));
+        for pid in parent_ids {
+            params.push(rusqlite::types::Value::Text(pid.clone()));
+        }
+    }
+
+    let debug_clause = if include_debug {
+        String::new()
+    } else {
+        " AND level != 'debug'".to_string()
+    };
+
+    let query = format!(
+        "SELECT id, session_id, timestamp, type, level, method, server, client, \
+         parent_id, payload FROM messages WHERE ({}){debug_clause} ORDER BY id",
+        conditions.join(" OR "),
+    );
+
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params
+        .iter()
+        .map(|p| p as &dyn rusqlite::types::ToSql)
+        .collect();
+    let mut stmt = conn.prepare(&query)?;
+    let mut rows = stmt.query(param_refs.as_slice())?;
+    let mut messages = Vec::new();
+
+    while let Some(row) = rows.next()? {
+        if let Some(msg) = parse_message_row(row) {
+            messages.push(msg);
+        }
+    }
+
+    Ok(messages)
+}
+
+/// Execute a scope-root query and fetch all messages for the resulting scopes.
+///
+/// The `root_query` must return rows with columns `(root_id INTEGER, parent_id TEXT)`.
+fn fetch_scope_page(
+    conn: &Connection,
+    root_query: &str,
+    root_params: &[&dyn rusqlite::types::ToSql],
+    include_debug: bool,
+) -> Result<Vec<SessionMessage>> {
+    let mut standalone_ids: Vec<i64> = Vec::new();
+    let mut parent_ids: Vec<String> = Vec::new();
+
+    {
+        let mut stmt = conn.prepare(root_query)?;
+        let mut rows = stmt.query(root_params)?;
+        while let Some(row) = rows.next()? {
+            let root_id: i64 = row.get(0)?;
+            let pid: Option<String> = row.get(1)?;
+            match pid {
+                Some(p) => parent_ids.push(p),
+                None => standalone_ids.push(root_id),
+            }
+        }
+    }
+
+    fetch_messages_for_roots(conn, &standalone_ids, &parent_ids, include_debug)
+}
+
+/// Base CTE for identifying scope roots (top-level stream entries).
+///
+/// A scope root is either a standalone message (`parent_id IS NULL`)
+/// or the first message (`MIN(id)`) for a given `parent_id` UUID.
+const SCOPE_ROOTS_CTE: &str = "\
+    SELECT MIN(id) AS root_id, parent_id \
+    FROM messages WHERE parent_id IS NOT NULL GROUP BY parent_id \
+    UNION ALL \
+    SELECT id AS root_id, NULL AS parent_id \
+    FROM messages WHERE parent_id IS NULL";
+
+/// Load the most recent `limit` scopes (roots + children).
+///
+/// # Errors
+///
+/// Returns an error if the database cannot be queried.
+pub fn recent_scopes_with_conn(
+    conn: &Connection,
+    limit: usize,
+    include_debug: bool,
+) -> Result<Vec<SessionMessage>> {
+    let query = format!(
+        "SELECT root_id, parent_id FROM ({SCOPE_ROOTS_CTE}) \
+         ORDER BY root_id DESC LIMIT ?1"
+    );
+    let limit_sql = i64::try_from(limit).unwrap_or(i64::MAX);
+    fetch_scope_page(conn, &query, &[&limit_sql], include_debug)
+}
+
+/// Load scopes with root ID older than `before_id`, newest first.
+///
+/// When `after_id` is provided, results are bounded below (for gap
+/// filling from the bottom side — returns the newest scopes in a gap).
+///
+/// # Errors
+///
+/// Returns an error if the database cannot be queried.
+pub fn older_scopes_with_conn(
+    conn: &Connection,
+    before_id: i64,
+    after_id: Option<i64>,
+    limit: usize,
+    include_debug: bool,
+) -> Result<Vec<SessionMessage>> {
+    let limit_sql = i64::try_from(limit).unwrap_or(i64::MAX);
+
+    after_id.map_or_else(
+        || {
+            let query = format!(
+                "SELECT root_id, parent_id FROM ({SCOPE_ROOTS_CTE}) \
+                 WHERE root_id < ?1 ORDER BY root_id DESC LIMIT ?2"
+            );
+            fetch_scope_page(conn, &query, &[&before_id, &limit_sql], include_debug)
+        },
+        |after| {
+            let query = format!(
+                "SELECT root_id, parent_id FROM ({SCOPE_ROOTS_CTE}) \
+                 WHERE root_id < ?1 AND root_id > ?2 ORDER BY root_id DESC LIMIT ?3"
+            );
+            fetch_scope_page(
+                conn,
+                &query,
+                &[&before_id, &after, &limit_sql],
+                include_debug,
+            )
+        },
+    )
+}
+
+/// Load scopes with root ID newer than `after_id`, oldest first.
+///
+/// When `before_id` is provided, results are bounded above (for gap
+/// filling between two loaded regions).
+///
+/// # Errors
+///
+/// Returns an error if the database cannot be queried.
+pub fn newer_scopes_with_conn(
+    conn: &Connection,
+    after_id: i64,
+    before_id: Option<i64>,
+    limit: usize,
+    include_debug: bool,
+) -> Result<Vec<SessionMessage>> {
+    let limit_sql = i64::try_from(limit).unwrap_or(i64::MAX);
+
+    before_id.map_or_else(
+        || {
+            let query = format!(
+                "SELECT root_id, parent_id FROM ({SCOPE_ROOTS_CTE}) \
+                 WHERE root_id > ?1 ORDER BY root_id ASC LIMIT ?2"
+            );
+            fetch_scope_page(conn, &query, &[&after_id, &limit_sql], include_debug)
+        },
+        |before| {
+            let query = format!(
+                "SELECT root_id, parent_id FROM ({SCOPE_ROOTS_CTE}) \
+                 WHERE root_id > ?1 AND root_id < ?2 ORDER BY root_id ASC LIMIT ?3"
+            );
+            fetch_scope_page(
+                conn,
+                &query,
+                &[&after_id, &before, &limit_sql],
+                include_debug,
+            )
+        },
+    )
+}
+
+/// Load the oldest `limit` scopes (roots + children).
+///
+/// # Errors
+///
+/// Returns an error if the database cannot be queried.
+pub fn oldest_scopes_with_conn(
+    conn: &Connection,
+    limit: usize,
+    include_debug: bool,
+) -> Result<Vec<SessionMessage>> {
+    let query = format!(
+        "SELECT root_id, parent_id FROM ({SCOPE_ROOTS_CTE}) \
+         ORDER BY root_id ASC LIMIT ?1"
+    );
+    let limit_sql = i64::try_from(limit).unwrap_or(i64::MAX);
+    fetch_scope_page(conn, &query, &[&limit_sql], include_debug)
+}
+
 /// Tail only *new* messages from a session (starts from current end).
 ///
 /// Opens a database connection internally. For explicit connection
