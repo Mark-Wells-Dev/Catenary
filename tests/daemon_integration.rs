@@ -70,7 +70,10 @@ impl DaemonProcess {
 
     /// Returns the expected MCP socket path.
     fn socket_path(&self) -> PathBuf {
-        self.state_dir.path().join("catenary").join("catenary.sock")
+        self.state_dir
+            .path()
+            .join("catenary")
+            .join("catenary-mcp.sock")
     }
 
     /// Blocks until the socket file appears on disk or timeout expires.
@@ -231,7 +234,7 @@ fn daemon_starts_with_servers_configured() {
 
     let mut child = cmd.spawn().expect("spawn daemon");
 
-    let sock = state_dir.path().join("catenary").join("catenary.sock");
+    let sock = state_dir.path().join("catenary").join("catenary-mcp.sock");
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut appeared = false;
     while Instant::now() < deadline {
@@ -260,21 +263,19 @@ fn daemon_starts_with_servers_configured() {
 
 const MOCK_LANG: &str = "daemon_test";
 
-/// Returns the hook socket path for a given state home.
-fn hook_socket_in(state_home: &str) -> PathBuf {
-    Path::new(state_home)
-        .join("catenary")
-        .join("catenary-hooks.sock")
+/// Returns the IPC socket path for a given state home.
+fn ipc_socket_in(state_home: &str) -> PathBuf {
+    Path::new(state_home).join("catenary").join("catenary.sock")
 }
 
-/// Waits for the hook socket to appear (up to 5 seconds).
-fn wait_for_hook_socket(state_home: &str) -> PathBuf {
-    let path = hook_socket_in(state_home);
+/// Waits for the IPC socket to appear (up to 5 seconds).
+fn wait_for_ipc_socket(state_home: &str) -> PathBuf {
+    let path = ipc_socket_in(state_home);
     let deadline = Instant::now() + Duration::from_secs(5);
     while !path.exists() {
         assert!(
             Instant::now() < deadline,
-            "hook socket not found at {} within 5s",
+            "IPC socket not found at {} within 5s",
             path.display(),
         );
         std::thread::sleep(Duration::from_millis(100));
@@ -283,13 +284,13 @@ fn wait_for_hook_socket(state_home: &str) -> PathBuf {
 }
 
 /// Sends a hook JSON request and reads the response line.
-fn hook_roundtrip(hook_path: &Path, request: &serde_json::Value) -> Result<String> {
+fn hook_roundtrip(ipc_path: &Path, request: &serde_json::Value) -> Result<String> {
     use std::io::{Read, Write};
 
     let mut stream =
-        std::os::unix::net::UnixStream::connect(hook_path).context("connect to hook socket")?;
+        std::os::unix::net::UnixStream::connect(ipc_path).context("connect to IPC socket")?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    writeln!(stream, "{request}").context("write to hook socket")?;
+    writeln!(stream, "{request}").context("write to IPC socket")?;
     stream.shutdown(std::net::Shutdown::Write)?;
     let mut response = String::new();
     let _ = stream.read_to_string(&mut response);
@@ -409,7 +410,7 @@ fn stale_socket_recovery() -> Result<()> {
     // Create a stale socket file (regular file, nobody listening).
     let socket_dir = state_dir.path().join("catenary");
     std::fs::create_dir_all(&socket_dir)?;
-    std::fs::write(socket_dir.join("catenary.sock"), b"stale")?;
+    std::fs::write(socket_dir.join("catenary-mcp.sock"), b"stale")?;
 
     // Bridge should detect the stale socket, remove it, start daemon,
     // and connect successfully.
@@ -447,11 +448,8 @@ fn stop_command_shuts_down_daemon() -> Result<()> {
     bridge.initialize()?;
 
     // Verify sockets exist before stop.
-    let mcp_sock = state_dir.path().join("catenary").join("catenary.sock");
-    let hook_sock = state_dir
-        .path()
-        .join("catenary")
-        .join("catenary-hooks.sock");
+    let mcp_sock = state_dir.path().join("catenary").join("catenary-mcp.sock");
+    let ipc_sock = state_dir.path().join("catenary").join("catenary.sock");
     assert!(mcp_sock.exists(), "MCP socket should exist before stop");
 
     // Run `catenary stop` targeting the same state dir.
@@ -476,8 +474,8 @@ fn stop_command_shuts_down_daemon() -> Result<()> {
         "MCP socket should be removed after stop",
     );
     assert!(
-        !hook_sock.exists(),
-        "hook socket should be removed after stop",
+        !ipc_sock.exists(),
+        "IPC socket should be removed after stop",
     );
 
     // Drop bridge — the daemon connection is gone, so the bridge
@@ -522,11 +520,11 @@ fn editing_guardrail_blocks_cross_session() -> Result<()> {
     })?;
     bridge_b.initialize()?;
 
-    let hook_path = wait_for_hook_socket(state_home);
+    let ipc_path = wait_for_ipc_socket(state_home);
 
     // Correlate session A: PreToolUse(grep) → MCP tools/call.
     hook_roundtrip(
-        &hook_path,
+        &ipc_path,
         &json!({
             "method": "pre-tool/editing-state",
             "tool_name": "mcp_catenary_grep",
@@ -538,7 +536,7 @@ fn editing_guardrail_blocks_cross_session() -> Result<()> {
 
     // Correlate session B: PreToolUse(grep) → MCP tools/call.
     hook_roundtrip(
-        &hook_path,
+        &ipc_path,
         &json!({
             "method": "pre-tool/editing-state",
             "tool_name": "mcp_catenary_grep",
@@ -550,7 +548,7 @@ fn editing_guardrail_blocks_cross_session() -> Result<()> {
 
     // Session A: enter editing mode + edit a file (acquires guardrail).
     hook_roundtrip(
-        &hook_path,
+        &ipc_path,
         &json!({
             "method": "pre-tool/start-editing",
             "agent_id": "",
@@ -558,7 +556,7 @@ fn editing_guardrail_blocks_cross_session() -> Result<()> {
         }),
     )?;
     let response_a = hook_roundtrip(
-        &hook_path,
+        &ipc_path,
         &json!({
             "method": "pre-tool/editing-state",
             "tool_name": "Edit",
@@ -574,7 +572,7 @@ fn editing_guardrail_blocks_cross_session() -> Result<()> {
 
     // Session B: enter editing mode + try to edit same root.
     hook_roundtrip(
-        &hook_path,
+        &ipc_path,
         &json!({
             "method": "pre-tool/start-editing",
             "agent_id": "",
@@ -582,7 +580,7 @@ fn editing_guardrail_blocks_cross_session() -> Result<()> {
         }),
     )?;
     let response_b = hook_roundtrip(
-        &hook_path,
+        &ipc_path,
         &json!({
             "method": "pre-tool/editing-state",
             "tool_name": "Edit",
@@ -620,11 +618,11 @@ fn correlation_end_to_end() -> Result<()> {
     })?;
     bridge.initialize()?;
 
-    let hook_path = wait_for_hook_socket(state_home);
+    let ipc_path = wait_for_ipc_socket(state_home);
 
     // 1. Send PreToolUse hook for a Catenary tool with session_id.
     hook_roundtrip(
-        &hook_path,
+        &ipc_path,
         &json!({
             "method": "pre-tool/editing-state",
             "tool_name": "mcp_catenary_grep",
@@ -644,7 +642,7 @@ fn correlation_end_to_end() -> Result<()> {
     //    Verify by sending a pre-agent hook (which increments the turn
     //    counter on the correlated session).
     hook_roundtrip(
-        &hook_path,
+        &ipc_path,
         &json!({
             "method": "pre-agent/turn-start",
             "session_id": "corr-session"

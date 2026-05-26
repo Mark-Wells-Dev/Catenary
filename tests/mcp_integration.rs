@@ -4144,7 +4144,7 @@ fn test_turn_boundary_no_roots_capability() -> Result<()> {
     // Initialize WITHOUT roots capability.
     bridge.initialize()?;
 
-    let socket_path = bridge.wait_for_hook_socket()?;
+    let socket_path = bridge.wait_for_ipc_socket()?;
 
     // Send PreAgent hook.
     ipc_request(&socket_path, &json!({"method": "pre-agent/turn-start"}))?;

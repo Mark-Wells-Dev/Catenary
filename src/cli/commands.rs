@@ -255,7 +255,7 @@ pub fn run_status(out: &mut Output, id: &str) -> Result<()> {
 
 /// List all tracked workspace roots with their source.
 ///
-/// Connects to the daemon's hook socket and sends a `tool/ls-roots`
+/// Connects to the daemon's IPC socket and sends a `tool/ls-roots`
 /// request, then prints each root with its contributor sources.
 ///
 /// # Errors
@@ -264,9 +264,9 @@ pub fn run_status(out: &mut Output, id: &str) -> Result<()> {
 pub async fn run_ls_roots(out: &mut Output) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-    let hook_path = crate::router::hook_socket_path();
+    let ipc_path = crate::router::socket_path();
 
-    let stream = tokio::net::UnixStream::connect(&hook_path)
+    let stream = tokio::net::UnixStream::connect(&ipc_path)
         .await
         .context("no daemon running — start a Catenary session first")?;
 

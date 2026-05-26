@@ -27,10 +27,10 @@ use std::time::Duration;
 
 use crate::cli::HostFormat;
 
-/// Connect to the daemon's hook IPC endpoint.
+/// Connect to the daemon's IPC endpoint.
 #[cfg(unix)]
 fn hook_connect(_hook_json: &serde_json::Value) -> Option<std::os::unix::net::UnixStream> {
-    let daemon_path = crate::router::hook_socket_path();
+    let daemon_path = crate::router::socket_path();
     notify_connect(&daemon_path)
 }
 

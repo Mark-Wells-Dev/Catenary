@@ -143,13 +143,13 @@ fn replace_binary(_new_binary: &std::path::Path) -> Result<()> {
 }
 
 /// Checks whether a Catenary daemon is currently running by attempting
-/// to connect to the hook socket. A stale socket file (from a crashed
+/// to connect to the IPC socket. A stale socket file (from a crashed
 /// daemon) returns `ConnectionRefused`, so this only returns `true`
 /// when a live daemon is listening.
 #[cfg(unix)]
 fn daemon_is_running() -> bool {
-    let hook_path = crate::router::hook_socket_path();
-    std::os::unix::net::UnixStream::connect(&hook_path).is_ok()
+    let ipc_path = crate::router::socket_path();
+    std::os::unix::net::UnixStream::connect(&ipc_path).is_ok()
 }
 
 #[cfg(not(unix))]

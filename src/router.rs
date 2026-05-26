@@ -29,31 +29,35 @@ use crate::source::Source;
 
 /// Returns the MCP socket path for the daemon.
 ///
-/// The path is deterministic: `$XDG_STATE_HOME/catenary/catenary.sock`
+/// The path is deterministic: `$XDG_STATE_HOME/catenary/catenary-mcp.sock`
 /// (or platform equivalent via [`crate::db::state_dir`]).
+///
+/// Only the bridge proxy connects to this socket — it carries MCP
+/// JSON-RPC traffic between the host CLI and the daemon.
 #[must_use]
 pub fn mcp_socket_path() -> PathBuf {
+    crate::db::state_dir()
+        .join("catenary")
+        .join("catenary-mcp.sock")
+}
+
+/// Returns the general-purpose IPC socket path for the daemon.
+///
+/// The path is deterministic: `$XDG_STATE_HOME/catenary/catenary.sock`
+/// (or platform equivalent via [`crate::db::state_dir`]).
+///
+/// This socket carries all non-MCP daemon traffic: hook events
+/// (`pre-tool/*`, `post-tool/*`, etc.) and CLI commands
+/// (`start-editing`, `done-editing`, `add-root`, `rm-root`,
+/// `shutdown`, `ls-roots`).
+#[must_use]
+pub fn socket_path() -> PathBuf {
     crate::db::state_dir()
         .join("catenary")
         .join("catenary.sock")
 }
 
-/// Returns the hook socket path for the daemon.
-///
-/// The path is deterministic: `$XDG_STATE_HOME/catenary/catenary-hooks.sock`
-/// (or platform equivalent via [`crate::db::state_dir`]).
-///
-/// Hook CLI processes (`catenary hook pre-tool`, etc.) connect to this
-/// socket instead of discovering a per-session socket. The `session_id`
-/// is sent in the hook payload — routing happens daemon-side.
-#[must_use]
-pub fn hook_socket_path() -> PathBuf {
-    crate::db::state_dir()
-        .join("catenary")
-        .join("catenary-hooks.sock")
-}
-
-/// Pre-bound MCP and hook socket listeners.
+/// Pre-bound MCP and IPC socket listeners.
 ///
 /// Returned by [`bind_daemon_sockets`] for early socket binding in daemon
 /// mode. Pass to [`SessionManager::from_listeners`] once the tool handler
@@ -62,15 +66,15 @@ pub fn hook_socket_path() -> PathBuf {
 pub struct DaemonSockets {
     /// MCP socket listener.
     pub mcp_listener: tokio::net::UnixListener,
-    /// Hook socket listener.
-    pub hook_listener: tokio::net::UnixListener,
+    /// General-purpose IPC socket listener.
+    pub ipc_listener: tokio::net::UnixListener,
     /// Filesystem path of the MCP socket.
     pub mcp_path: PathBuf,
-    /// Filesystem path of the hook socket.
-    pub hook_path: PathBuf,
+    /// Filesystem path of the IPC socket.
+    pub ipc_path: PathBuf,
 }
 
-/// Binds the daemon's MCP and hook sockets immediately.
+/// Binds the daemon's MCP and IPC sockets immediately.
 ///
 /// Call this early in daemon startup so that bridge proxies can connect
 /// while heavy initialization (config loading, LSP spawning) proceeds.
@@ -84,34 +88,34 @@ pub struct DaemonSockets {
 #[cfg(unix)]
 pub fn bind_daemon_sockets() -> Result<DaemonSockets> {
     let mcp_path = mcp_socket_path();
-    let hook_path = hook_socket_path();
+    let ipc_path = socket_path();
 
     if let Some(parent) = mcp_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create socket directory: {}", parent.display()))?;
     }
-    if let Some(parent) = hook_path.parent() {
+    if let Some(parent) = ipc_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create socket directory: {}", parent.display()))?;
     }
 
     let mcp_listener = tokio::net::UnixListener::bind(&mcp_path)
         .with_context(|| format!("bind MCP socket: {}", mcp_path.display()))?;
-    let hook_listener = tokio::net::UnixListener::bind(&hook_path)
-        .with_context(|| format!("bind hook socket: {}", hook_path.display()))?;
+    let ipc_listener = tokio::net::UnixListener::bind(&ipc_path)
+        .with_context(|| format!("bind IPC socket: {}", ipc_path.display()))?;
 
     info!(
         source = Source::DaemonLifecycle.as_str(),
         mcp_path = %mcp_path.display(),
-        hook_path = %hook_path.display(),
+        ipc_path = %ipc_path.display(),
         "daemon sockets bound",
     );
 
     Ok(DaemonSockets {
         mcp_listener,
-        hook_listener,
+        ipc_listener,
         mcp_path,
-        hook_path,
+        ipc_path,
     })
 }
 
@@ -348,9 +352,9 @@ impl RootTracker {
 #[cfg(unix)]
 pub struct SessionManager {
     mcp_listener: tokio::net::UnixListener,
-    hook_listener: tokio::net::UnixListener,
+    ipc_listener: tokio::net::UnixListener,
     mcp_socket_path: PathBuf,
-    hook_socket_path: PathBuf,
+    ipc_socket_path: PathBuf,
     handler: Arc<dyn ToolHandler>,
     logging: LoggingServer,
     connection_count: Arc<AtomicUsize>,
@@ -372,7 +376,7 @@ pub struct SessionManager {
 
 #[cfg(unix)]
 impl SessionManager {
-    /// Binds the MCP and hook sockets at the default paths.
+    /// Binds the MCP and IPC sockets at the default paths.
     ///
     /// # Errors
     ///
@@ -380,7 +384,7 @@ impl SessionManager {
     /// either socket cannot be bound (e.g., another daemon is already
     /// running).
     pub fn bind(handler: Arc<dyn ToolHandler>, logging: LoggingServer) -> Result<Self> {
-        Self::bind_at(&mcp_socket_path(), &hook_socket_path(), handler, logging)
+        Self::bind_at(&mcp_socket_path(), &socket_path(), handler, logging)
     }
 
     /// Creates a `SessionManager` from pre-bound sockets.
@@ -397,9 +401,9 @@ impl SessionManager {
     ) -> Self {
         Self {
             mcp_listener: sockets.mcp_listener,
-            hook_listener: sockets.hook_listener,
+            ipc_listener: sockets.ipc_listener,
             mcp_socket_path: sockets.mcp_path,
-            hook_socket_path: sockets.hook_path,
+            ipc_socket_path: sockets.ipc_path,
             handler,
             logging,
             connection_count: Arc::new(AtomicUsize::new(0)),
@@ -412,7 +416,7 @@ impl SessionManager {
         }
     }
 
-    /// Binds the MCP and hook sockets at explicit paths.
+    /// Binds the MCP and IPC sockets at explicit paths.
     ///
     /// Used by tests to isolate socket files in tempdirs.
     ///
@@ -422,7 +426,7 @@ impl SessionManager {
     /// either socket cannot be bound.
     pub fn bind_at(
         mcp_path: &Path,
-        hook_path: &Path,
+        ipc_path: &Path,
         handler: Arc<dyn ToolHandler>,
         logging: LoggingServer,
     ) -> Result<Self> {
@@ -430,28 +434,28 @@ impl SessionManager {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create socket directory: {}", parent.display()))?;
         }
-        if let Some(parent) = hook_path.parent() {
+        if let Some(parent) = ipc_path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create socket directory: {}", parent.display()))?;
         }
 
         let mcp_listener = tokio::net::UnixListener::bind(mcp_path)
             .with_context(|| format!("bind MCP socket: {}", mcp_path.display()))?;
-        let hook_listener = tokio::net::UnixListener::bind(hook_path)
-            .with_context(|| format!("bind hook socket: {}", hook_path.display()))?;
+        let ipc_listener = tokio::net::UnixListener::bind(ipc_path)
+            .with_context(|| format!("bind IPC socket: {}", ipc_path.display()))?;
 
         info!(
             source = Source::DaemonLifecycle.as_str(),
             mcp_path = %mcp_path.display(),
-            hook_path = %hook_path.display(),
+            ipc_path = %ipc_path.display(),
             "daemon started",
         );
 
         Ok(Self {
             mcp_listener,
-            hook_listener,
+            ipc_listener,
             mcp_socket_path: mcp_path.to_path_buf(),
-            hook_socket_path: hook_path.to_path_buf(),
+            ipc_socket_path: ipc_path.to_path_buf(),
             handler,
             logging,
             connection_count: Arc::new(AtomicUsize::new(0)),
@@ -464,17 +468,17 @@ impl SessionManager {
         })
     }
 
-    /// Accepts incoming MCP and hook connections in a loop.
+    /// Accepts incoming MCP and IPC connections in a loop.
     ///
     /// Each MCP connection spawns a per-connection async task with a full
     /// MCP stack (`McpServer` backed by the shared tool handler). The
     /// task runs in a tracing span tagged with `mcp_fd` for log
-    /// correlation. Hook connections are short-lived and handled in
+    /// correlation. IPC connections are short-lived and handled in
     /// spawned tasks with passthrough responses.
     ///
     /// Returns `Ok(())` when the daemon should shut down. Three triggers:
     /// - Last MCP client disconnected (disconnect notify, count == 0)
-    /// - `catenary stop` received on the hook socket (shutdown token)
+    /// - `catenary stop` received on the IPC socket (shutdown token)
     /// - External signal cancelled the shutdown token
     ///
     /// On exit, socket files are removed so new bridges start a fresh
@@ -493,8 +497,8 @@ impl SessionManager {
                     let fd = stream.as_raw_fd();
                     self.handle_mcp_connection(stream, fd);
                 }
-                result = self.hook_listener.accept() => {
-                    let (stream, _addr) = result.context("accept hook connection")?;
+                result = self.ipc_listener.accept() => {
+                    let (stream, _addr) = result.context("accept IPC connection")?;
                     let shutdown = self.shutdown.clone();
                     if let Some(ctx) = &self.hook_ctx {
                         let ctx = ctx.clone();
@@ -548,7 +552,7 @@ impl SessionManager {
     /// Removes socket files so new bridges start a fresh daemon.
     fn remove_sockets(&self) {
         let _ = std::fs::remove_file(&self.mcp_socket_path);
-        let _ = std::fs::remove_file(&self.hook_socket_path);
+        let _ = std::fs::remove_file(&self.ipc_socket_path);
     }
 
     /// Spawns a per-connection MCP task.
@@ -724,10 +728,10 @@ impl SessionManager {
         &self.mcp_socket_path
     }
 
-    /// Returns the hook socket path this manager is bound to.
+    /// Returns the IPC socket path this manager is bound to.
     #[must_use]
-    pub fn hook_path(&self) -> &Path {
-        &self.hook_socket_path
+    pub fn ipc_path(&self) -> &Path {
+        &self.ipc_socket_path
     }
 
     /// Enables session-aware hook dispatch.
@@ -1388,7 +1392,7 @@ async fn handle_hook_dispatch(
 impl Drop for SessionManager {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.mcp_socket_path);
-        let _ = std::fs::remove_file(&self.hook_socket_path);
+        let _ = std::fs::remove_file(&self.ipc_socket_path);
     }
 }
 
@@ -1439,11 +1443,11 @@ pub fn run_bridge() -> Result<()> {
 /// Returns an error if the daemon cannot be reached after all retry attempts.
 #[cfg(unix)]
 fn connect_or_start_daemon() -> Result<std::os::unix::net::UnixStream> {
-    let socket_path = mcp_socket_path();
+    let mcp_path = mcp_socket_path();
     let mut daemon_spawned = false;
 
     for attempt in 0..MAX_CONNECT_ATTEMPTS {
-        if let Ok(stream) = std::os::unix::net::UnixStream::connect(&socket_path) {
+        if let Ok(stream) = std::os::unix::net::UnixStream::connect(&mcp_path) {
             info!(
                 source = Source::DaemonLifecycle.as_str(),
                 attempt, "connected to daemon",
@@ -1456,17 +1460,17 @@ fn connect_or_start_daemon() -> Result<std::os::unix::net::UnixStream> {
             anyhow::bail!(
                 "failed to connect to Catenary daemon \
                  after {MAX_CONNECT_ATTEMPTS} attempts ({})",
-                socket_path.display(),
+                mcp_path.display(),
             );
         }
 
         if !daemon_spawned {
-            if socket_path.exists() {
-                let _ = std::fs::remove_file(&socket_path);
+            if mcp_path.exists() {
+                let _ = std::fs::remove_file(&mcp_path);
             }
-            let hook_path = hook_socket_path();
-            if hook_path.exists() {
-                let _ = std::fs::remove_file(&hook_path);
+            let ipc_path = socket_path();
+            if ipc_path.exists() {
+                let _ = std::fs::remove_file(&ipc_path);
             }
             spawn_daemon()?;
             daemon_spawned = true;
@@ -1477,7 +1481,7 @@ fn connect_or_start_daemon() -> Result<std::os::unix::net::UnixStream> {
 
     anyhow::bail!(
         "failed to connect to Catenary daemon ({})",
-        socket_path.display(),
+        mcp_path.display(),
     )
 }
 
@@ -1745,19 +1749,19 @@ mod tests {
 
     /// Create an MCP socket path inside a tempdir.
     fn mcp_socket_in(dir: &Path) -> PathBuf {
-        dir.join("catenary").join("catenary.sock")
+        dir.join("catenary").join("catenary-mcp.sock")
     }
 
-    /// Create a hook socket path inside a tempdir.
-    fn hook_socket_in(dir: &Path) -> PathBuf {
-        dir.join("catenary").join("catenary-hooks.sock")
+    /// Create an IPC socket path inside a tempdir.
+    fn ipc_socket_in(dir: &Path) -> PathBuf {
+        dir.join("catenary").join("catenary.sock")
     }
 
     /// Bind a `SessionManager` with both sockets in a tempdir.
     fn bind_in(dir: &Path) -> SessionManager {
         SessionManager::bind_at(
             &mcp_socket_in(dir),
-            &hook_socket_in(dir),
+            &ipc_socket_in(dir),
             Arc::new(NoOpHandler),
             LoggingServer::new(),
         )
@@ -1876,11 +1880,11 @@ mod tests {
     async fn drop_removes_socket() {
         let dir = tempfile::tempdir().expect("create tempdir");
         let mcp_path = mcp_socket_in(dir.path());
-        let hook_path = hook_socket_in(dir.path());
+        let ipc_path = ipc_socket_in(dir.path());
 
         let manager = bind_in(dir.path());
         assert!(mcp_path.exists(), "MCP socket should exist before drop");
-        assert!(hook_path.exists(), "hook socket should exist before drop");
+        assert!(ipc_path.exists(), "IPC socket should exist before drop");
 
         drop(manager);
 
@@ -1889,8 +1893,8 @@ mod tests {
             "MCP socket should be removed after drop"
         );
         assert!(
-            !hook_path.exists(),
-            "hook socket should be removed after drop"
+            !ipc_path.exists(),
+            "IPC socket should be removed after drop"
         );
     }
 
@@ -1898,7 +1902,7 @@ mod tests {
     async fn bind_fails_if_mcp_socket_exists() {
         let dir = tempfile::tempdir().expect("create tempdir");
         let mcp_path = mcp_socket_in(dir.path());
-        let hook_path = hook_socket_in(dir.path());
+        let ipc_path = ipc_socket_in(dir.path());
 
         // Create a regular file at the MCP socket path.
         std::fs::create_dir_all(mcp_path.parent().expect("parent")).expect("create dir");
@@ -1906,7 +1910,7 @@ mod tests {
 
         let result = SessionManager::bind_at(
             &mcp_path,
-            &hook_path,
+            &ipc_path,
             Arc::new(NoOpHandler),
             LoggingServer::new(),
         );
@@ -1917,24 +1921,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bind_fails_if_hook_socket_exists() {
+    async fn bind_fails_if_ipc_socket_exists() {
         let dir = tempfile::tempdir().expect("create tempdir");
         let mcp_path = mcp_socket_in(dir.path());
-        let hook_path = hook_socket_in(dir.path());
+        let ipc_path = ipc_socket_in(dir.path());
 
-        // Create a regular file at the hook socket path.
-        std::fs::create_dir_all(hook_path.parent().expect("parent")).expect("create dir");
-        std::fs::write(&hook_path, b"").expect("create file");
+        // Create a regular file at the IPC socket path.
+        std::fs::create_dir_all(ipc_path.parent().expect("parent")).expect("create dir");
+        std::fs::write(&ipc_path, b"").expect("create file");
 
         let result = SessionManager::bind_at(
             &mcp_path,
-            &hook_path,
+            &ipc_path,
             Arc::new(NoOpHandler),
             LoggingServer::new(),
         );
         assert!(
             result.is_err(),
-            "bind should fail when hook socket already exists"
+            "bind should fail when IPC socket already exists"
         );
     }
 
@@ -1948,12 +1952,12 @@ mod tests {
         let subscriber = tracing_subscriber::registry().with(layer);
         let dir = tempfile::tempdir().expect("create tempdir");
         let mcp_path = mcp_socket_in(dir.path());
-        let hook_path = hook_socket_in(dir.path());
+        let ipc_path = ipc_socket_in(dir.path());
 
         let _manager = tracing::subscriber::with_default(subscriber, || {
             SessionManager::bind_at(
                 &mcp_path,
-                &hook_path,
+                &ipc_path,
                 Arc::new(NoOpHandler),
                 LoggingServer::new(),
             )
@@ -2086,25 +2090,22 @@ mod tests {
         shutdown.cancel();
     }
 
-    // ── Hook socket tests ────────────────────────────────────────────
+    // ── IPC socket tests ──────────────────────────────────────────────
 
     #[tokio::test]
-    async fn hook_socket_created_on_bind() {
+    async fn ipc_socket_created_on_bind() {
         let dir = tempfile::tempdir().expect("create tempdir");
-        let hook_path = hook_socket_in(dir.path());
+        let ipc_path = ipc_socket_in(dir.path());
 
         let _manager = bind_in(dir.path());
 
-        assert!(
-            hook_path.exists(),
-            "hook socket file should exist after bind"
-        );
+        assert!(ipc_path.exists(), "IPC socket file should exist after bind");
     }
 
     #[tokio::test]
-    async fn hook_connection_accepted() {
+    async fn ipc_connection_accepted() {
         let dir = tempfile::tempdir().expect("create tempdir");
-        let hook_path = hook_socket_in(dir.path());
+        let ipc_path = ipc_socket_in(dir.path());
 
         let manager = Arc::new(bind_in(dir.path()));
         let shutdown = manager.shutdown_token();
@@ -2113,18 +2114,18 @@ mod tests {
             let _ = m.accept_loop().await;
         });
 
-        let _stream = tokio::net::UnixStream::connect(&hook_path)
+        let _stream = tokio::net::UnixStream::connect(&ipc_path)
             .await
-            .expect("connect to hook socket");
+            .expect("connect to IPC socket");
 
         shutdown.cancel();
     }
 
     #[tokio::test]
-    async fn hook_and_mcp_sockets_independent() {
+    async fn ipc_and_mcp_sockets_independent() {
         let dir = tempfile::tempdir().expect("create tempdir");
         let mcp_path = mcp_socket_in(dir.path());
-        let hook_path = hook_socket_in(dir.path());
+        let ipc_path = ipc_socket_in(dir.path());
 
         let manager = Arc::new(bind_in(dir.path()));
         let shutdown = manager.shutdown_token();
@@ -2134,13 +2135,13 @@ mod tests {
         });
 
         // Connect to both sockets simultaneously.
-        let (mcp_result, hook_result) = tokio::join!(
+        let (mcp_result, ipc_result) = tokio::join!(
             tokio::net::UnixStream::connect(&mcp_path),
-            tokio::net::UnixStream::connect(&hook_path),
+            tokio::net::UnixStream::connect(&ipc_path),
         );
 
         let mcp_stream = mcp_result.expect("connect to MCP socket");
-        let _hook_stream = hook_result.expect("connect to hook socket");
+        let _ipc_stream = ipc_result.expect("connect to IPC socket");
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -2156,7 +2157,7 @@ mod tests {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
         let dir = tempfile::tempdir().expect("create tempdir");
-        let hook_path = hook_socket_in(dir.path());
+        let ipc_path = ipc_socket_in(dir.path());
 
         let manager = Arc::new(bind_in(dir.path()));
         let shutdown = manager.shutdown_token();
@@ -2165,7 +2166,7 @@ mod tests {
             let _ = m.accept_loop().await;
         });
 
-        let stream = tokio::net::UnixStream::connect(&hook_path)
+        let stream = tokio::net::UnixStream::connect(&ipc_path)
             .await
             .expect("connect");
         let (reader, mut writer) = stream.into_split();
@@ -2220,7 +2221,7 @@ mod tests {
     fn bind_echo(dir: &Path) -> SessionManager {
         SessionManager::bind_at(
             &mcp_socket_in(dir),
-            &hook_socket_in(dir),
+            &ipc_socket_in(dir),
             Arc::new(EchoHandler),
             LoggingServer::new(),
         )
@@ -2420,7 +2421,7 @@ mod tests {
     async fn shutdown_on_last_disconnect() {
         let dir = tempfile::tempdir().expect("create tempdir");
         let mcp_path = mcp_socket_in(dir.path());
-        let hook_path = hook_socket_in(dir.path());
+        let ipc_path = ipc_socket_in(dir.path());
 
         let manager = Arc::new(bind_in(dir.path()));
         let m = Arc::clone(&manager);
@@ -2449,7 +2450,7 @@ mod tests {
             "MCP socket should be removed after shutdown",
         );
         assert!(
-            !hook_path.exists(),
+            !ipc_path.exists(),
             "hook socket should be removed after shutdown",
         );
     }
@@ -2493,21 +2494,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stop_via_hook_socket() {
+    async fn stop_via_ipc_socket() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
         let dir = tempfile::tempdir().expect("create tempdir");
         let mcp_path = mcp_socket_in(dir.path());
-        let hook_path = hook_socket_in(dir.path());
+        let ipc_path = ipc_socket_in(dir.path());
 
         let manager = Arc::new(bind_in(dir.path()));
         let m = Arc::clone(&manager);
         let handle = tokio::spawn(async move { m.accept_loop().await });
 
-        // Send shutdown via hook socket.
-        let stream = tokio::net::UnixStream::connect(&hook_path)
+        // Send shutdown via IPC socket.
+        let stream = tokio::net::UnixStream::connect(&ipc_path)
             .await
-            .expect("connect to hook socket");
+            .expect("connect to IPC socket");
         let (reader, mut writer) = stream.into_split();
 
         let request = serde_json::json!({"method": "tool/shutdown"});
@@ -2538,8 +2539,8 @@ mod tests {
             "MCP socket should be removed after stop",
         );
         assert!(
-            !hook_path.exists(),
-            "hook socket should be removed after stop",
+            !ipc_path.exists(),
+            "IPC socket should be removed after stop",
         );
     }
 
@@ -2600,7 +2601,7 @@ mod tests {
 
         SessionManager::bind_at(
             &mcp_socket_in(dir),
-            &hook_socket_in(dir),
+            &ipc_socket_in(dir),
             Arc::new(NoOpHandler),
             logging,
         )
@@ -2609,12 +2610,12 @@ mod tests {
     }
 
     /// Send a hook JSON request and read the response line.
-    async fn hook_roundtrip(hook_path: &Path, request: &serde_json::Value) -> String {
+    async fn hook_roundtrip(ipc_path: &Path, request: &serde_json::Value) -> String {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-        let stream = tokio::net::UnixStream::connect(hook_path)
+        let stream = tokio::net::UnixStream::connect(ipc_path)
             .await
-            .expect("connect to hook socket");
+            .expect("connect to IPC socket");
         let (reader, mut writer) = stream.into_split();
 
         let mut payload = serde_json::to_string(request).expect("serialize");
@@ -2630,7 +2631,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn session_state_hook_creates_session() {
         let dir = tempfile::tempdir().expect("create tempdir");
-        let hook_path = hook_socket_in(dir.path());
+        let ipc_path = ipc_socket_in(dir.path());
 
         let manager = Arc::new(bind_with_session(dir.path()));
         let shutdown = manager.shutdown_token();
@@ -2646,7 +2647,7 @@ mod tests {
             "method": "pre-agent/turn-start",
             "session_id": "abc"
         });
-        let _ = hook_roundtrip(&hook_path, &request).await;
+        let _ = hook_roundtrip(&ipc_path, &request).await;
 
         assert_eq!(
             manager.session_count(),
@@ -2660,7 +2661,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn session_state_hook_routes_to_correct_session() {
         let dir = tempfile::tempdir().expect("create tempdir");
-        let hook_path = hook_socket_in(dir.path());
+        let ipc_path = ipc_socket_in(dir.path());
 
         let manager = Arc::new(bind_with_session(dir.path()));
         let shutdown = manager.shutdown_token();
@@ -2678,8 +2679,8 @@ mod tests {
             "method": "pre-agent/turn-start",
             "session_id": "session-b"
         });
-        let _ = hook_roundtrip(&hook_path, &req_a).await;
-        let _ = hook_roundtrip(&hook_path, &req_b).await;
+        let _ = hook_roundtrip(&ipc_path, &req_a).await;
+        let _ = hook_roundtrip(&ipc_path, &req_b).await;
 
         assert_eq!(
             manager.session_count(),
@@ -2693,7 +2694,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn session_state_editing_per_session() {
         let dir = tempfile::tempdir().expect("create tempdir");
-        let hook_path = hook_socket_in(dir.path());
+        let ipc_path = ipc_socket_in(dir.path());
 
         let manager = Arc::new(bind_with_session(dir.path()));
         let shutdown = manager.shutdown_token();
@@ -2708,7 +2709,7 @@ mod tests {
             "agent_id": "",
             "session_id": "session-a"
         });
-        let _ = hook_roundtrip(&hook_path, &req).await;
+        let _ = hook_roundtrip(&ipc_path, &req).await;
 
         // Session A: Edit should be allowed (in editing mode).
         let req = serde_json::json!({
@@ -2717,7 +2718,7 @@ mod tests {
             "agent_id": "",
             "session_id": "session-a"
         });
-        let line = hook_roundtrip(&hook_path, &req).await;
+        let line = hook_roundtrip(&ipc_path, &req).await;
         assert_eq!(
             line.trim(),
             "",
@@ -2731,7 +2732,7 @@ mod tests {
             "agent_id": "",
             "session_id": "session-b"
         });
-        let line = hook_roundtrip(&hook_path, &req).await;
+        let line = hook_roundtrip(&ipc_path, &req).await;
         let envelope: crate::hook::HookResponseEnvelope =
             serde_json::from_str(line.trim()).expect("parse response");
         assert!(
@@ -2745,7 +2746,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn session_state_turn_counter_per_session() {
         let dir = tempfile::tempdir().expect("create tempdir");
-        let hook_path = hook_socket_in(dir.path());
+        let ipc_path = ipc_socket_in(dir.path());
 
         let manager = Arc::new(bind_with_session(dir.path()));
         let shutdown = manager.shutdown_token();
@@ -2759,15 +2760,15 @@ mod tests {
             "method": "pre-agent/turn-start",
             "session_id": "session-a"
         });
-        let _ = hook_roundtrip(&hook_path, &req_a).await;
-        let _ = hook_roundtrip(&hook_path, &req_a).await;
+        let _ = hook_roundtrip(&ipc_path, &req_a).await;
+        let _ = hook_roundtrip(&ipc_path, &req_a).await;
 
         // Send one turn-start hook to session B.
         let req_b = serde_json::json!({
             "method": "pre-agent/turn-start",
             "session_id": "session-b"
         });
-        let _ = hook_roundtrip(&hook_path, &req_b).await;
+        let _ = hook_roundtrip(&ipc_path, &req_b).await;
 
         // Verify each session has its own turn counter by checking
         // that session A and B exist independently.
@@ -2788,7 +2789,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn session_state_subagent_passthrough() {
         let dir = tempfile::tempdir().expect("create tempdir");
-        let hook_path = hook_socket_in(dir.path());
+        let ipc_path = ipc_socket_in(dir.path());
 
         let manager = Arc::new(bind_with_session(dir.path()));
         let shutdown = manager.shutdown_token();
@@ -2805,7 +2806,7 @@ mod tests {
             "agent_id": "sub-agent-1",
             "session_id": "sess-1"
         });
-        let line = hook_roundtrip(&hook_path, &req).await;
+        let line = hook_roundtrip(&ipc_path, &req).await;
         assert_eq!(
             line.trim(),
             "",
@@ -2819,12 +2820,12 @@ mod tests {
 
     /// Send a hook JSON request and read all response data (may be
     /// multi-line, unlike `hook_roundtrip` which reads a single line).
-    async fn hook_roundtrip_full(hook_path: &Path, request: &serde_json::Value) -> String {
+    async fn hook_roundtrip_full(ipc_path: &Path, request: &serde_json::Value) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let mut stream = tokio::net::UnixStream::connect(hook_path)
+        let mut stream = tokio::net::UnixStream::connect(ipc_path)
             .await
-            .expect("connect to hook socket");
+            .expect("connect to IPC socket");
 
         let mut payload = serde_json::to_string(request).expect("serialize");
         payload.push('\n');
@@ -2842,7 +2843,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn done_editing_handoff_no_files() {
         let dir = tempfile::tempdir().expect("create tempdir");
-        let hook_path = hook_socket_in(dir.path());
+        let ipc_path = ipc_socket_in(dir.path());
 
         let manager = Arc::new(bind_with_session(dir.path()));
         let shutdown = manager.shutdown_token();
@@ -2857,7 +2858,7 @@ mod tests {
             "agent_id": "",
             "session_id": "sess-1"
         });
-        let _ = hook_roundtrip(&hook_path, &req).await;
+        let _ = hook_roundtrip(&ipc_path, &req).await;
 
         // Prepare handoff (no files accumulated).
         let req = serde_json::json!({
@@ -2865,12 +2866,12 @@ mod tests {
             "agent_id": "",
             "session_id": "sess-1"
         });
-        let line = hook_roundtrip(&hook_path, &req).await;
+        let line = hook_roundtrip(&ipc_path, &req).await;
         assert!(line.contains("ok"), "prepare should succeed, got: {line}");
 
         // Execute done_editing/run — should get "no files modified".
         let req = serde_json::json!({"method": "tool/done-editing"});
-        let response = hook_roundtrip_full(&hook_path, &req).await;
+        let response = hook_roundtrip_full(&ipc_path, &req).await;
         assert!(
             response.contains("no files modified"),
             "expected 'no files modified', got: {response}",
@@ -2882,7 +2883,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn done_editing_handoff_expired() {
         let dir = tempfile::tempdir().expect("create tempdir");
-        let hook_path = hook_socket_in(dir.path());
+        let ipc_path = ipc_socket_in(dir.path());
 
         let manager = Arc::new(bind_with_session(dir.path()));
         let shutdown = manager.shutdown_token();
@@ -2893,7 +2894,7 @@ mod tests {
 
         // Call done-editing/run without preparing a handoff.
         let req = serde_json::json!({"method": "tool/done-editing"});
-        let response = hook_roundtrip_full(&hook_path, &req).await;
+        let response = hook_roundtrip_full(&ipc_path, &req).await;
         assert!(
             response.contains("handoff expired"),
             "expected handoff expired message, got: {response}",
@@ -2905,7 +2906,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn done_editing_handoff_with_accumulated_files() {
         let dir = tempfile::tempdir().expect("create tempdir");
-        let hook_path = hook_socket_in(dir.path());
+        let ipc_path = ipc_socket_in(dir.path());
 
         let manager = Arc::new(bind_with_session(dir.path()));
         let shutdown = manager.shutdown_token();
@@ -2920,7 +2921,7 @@ mod tests {
             "agent_id": "",
             "session_id": "sess-1"
         });
-        let _ = hook_roundtrip(&hook_path, &req).await;
+        let _ = hook_roundtrip(&ipc_path, &req).await;
 
         // Accumulate a file via pre-tool hook (file tracking).
         let req = serde_json::json!({
@@ -2930,7 +2931,7 @@ mod tests {
             "agent_id": "",
             "session_id": "sess-1"
         });
-        let _ = hook_roundtrip(&hook_path, &req).await;
+        let _ = hook_roundtrip(&ipc_path, &req).await;
 
         // Prepare handoff — should drain the accumulated file.
         let req = serde_json::json!({
@@ -2938,7 +2939,7 @@ mod tests {
             "agent_id": "",
             "session_id": "sess-1"
         });
-        let line = hook_roundtrip(&hook_path, &req).await;
+        let line = hook_roundtrip(&ipc_path, &req).await;
         assert!(line.contains("ok"), "prepare should succeed, got: {line}");
 
         // Execute done_editing/run — diagnostics pipeline runs on
@@ -2946,7 +2947,7 @@ mod tests {
         // depends on whether the file exists and has LSP coverage.
         // The key test: the handoff consumed the files successfully.
         let req = serde_json::json!({"method": "tool/done-editing"});
-        let response = hook_roundtrip_full(&hook_path, &req).await;
+        let response = hook_roundtrip_full(&ipc_path, &req).await;
         // With no LSP servers, process_files_batched returns "[clean]"
         // for files without coverage. The response should not be the
         // expired message.
@@ -2961,7 +2962,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn done_editing_handoff_double_consume() {
         let dir = tempfile::tempdir().expect("create tempdir");
-        let hook_path = hook_socket_in(dir.path());
+        let ipc_path = ipc_socket_in(dir.path());
 
         let manager = Arc::new(bind_with_session(dir.path()));
         let shutdown = manager.shutdown_token();
@@ -2976,25 +2977,25 @@ mod tests {
             "agent_id": "",
             "session_id": "sess-1"
         });
-        let _ = hook_roundtrip(&hook_path, &req).await;
+        let _ = hook_roundtrip(&ipc_path, &req).await;
 
         let req = serde_json::json!({
             "method": "pre-tool/done-editing",
             "agent_id": "",
             "session_id": "sess-1"
         });
-        let _ = hook_roundtrip(&hook_path, &req).await;
+        let _ = hook_roundtrip(&ipc_path, &req).await;
 
         // First consume should succeed.
         let req = serde_json::json!({"method": "tool/done-editing"});
-        let response1 = hook_roundtrip_full(&hook_path, &req).await;
+        let response1 = hook_roundtrip_full(&ipc_path, &req).await;
         assert!(
             !response1.contains("handoff expired"),
             "first consume should succeed, got: {response1}",
         );
 
         // Second consume should see expired slot.
-        let response2 = hook_roundtrip_full(&hook_path, &req).await;
+        let response2 = hook_roundtrip_full(&ipc_path, &req).await;
         assert!(
             response2.contains("handoff expired"),
             "second consume should see expired slot, got: {response2}",
@@ -3367,8 +3368,19 @@ mod tests {
     fn test_mcp_socket_path_structure() {
         let path = mcp_socket_path();
         assert!(
+            path.ends_with("catenary/catenary-mcp.sock"),
+            "mcp_socket_path should end with catenary/catenary-mcp.sock, got: {}",
+            path.display()
+        );
+    }
+
+    /// `socket_path` returns a deterministic path inside `state_dir`.
+    #[test]
+    fn test_socket_path_structure() {
+        let path = socket_path();
+        assert!(
             path.ends_with("catenary/catenary.sock"),
-            "mcp_socket_path should end with catenary/catenary.sock, got: {}",
+            "socket_path should end with catenary/catenary.sock, got: {}",
             path.display()
         );
     }

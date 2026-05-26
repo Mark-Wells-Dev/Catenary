@@ -658,7 +658,7 @@ fn run_daemon_main() -> Result<()> {
 
 /// Stops the running Catenary daemon.
 ///
-/// Connects to the daemon's hook socket and sends a shutdown request.
+/// Connects to the daemon's IPC socket and sends a shutdown request.
 /// If no daemon is running, prints a message and returns successfully.
 ///
 /// # Errors
@@ -668,9 +668,9 @@ fn run_daemon_main() -> Result<()> {
 async fn run_stop() -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-    let hook_path = catenary_mcp::router::hook_socket_path();
+    let ipc_path = catenary_mcp::router::socket_path();
 
-    let Ok(stream) = tokio::net::UnixStream::connect(&hook_path).await else {
+    let Ok(stream) = tokio::net::UnixStream::connect(&ipc_path).await else {
         println!("No daemon running");
         return Ok(());
     };
@@ -691,7 +691,7 @@ async fn run_stop() -> Result<()> {
 
 /// Confirms editing mode is active on the running daemon.
 ///
-/// Connects to the daemon's hook socket and sends a status query.
+/// Connects to the daemon's IPC socket and sends a status query.
 /// The actual state transition happens in the `PreToolUse` hook — this
 /// command only prints confirmation for the agent's stdout.
 ///
@@ -702,9 +702,9 @@ async fn run_stop() -> Result<()> {
 async fn run_start_editing() -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-    let hook_path = catenary_mcp::router::hook_socket_path();
+    let ipc_path = catenary_mcp::router::socket_path();
 
-    let stream = tokio::net::UnixStream::connect(&hook_path)
+    let stream = tokio::net::UnixStream::connect(&ipc_path)
         .await
         .context("no daemon running — start a Catenary session first")?;
 
@@ -739,7 +739,7 @@ async fn run_start_editing() -> Result<()> {
 
 /// Exits editing mode and prints diagnostics to stdout.
 ///
-/// Connects to the daemon's hook socket and sends `done-editing/run`.
+/// Connects to the daemon's IPC socket and sends `done-editing/run`.
 /// The `PreToolUse` hook has already prepared the handoff — this command
 /// retrieves the diagnostics and prints them.
 ///
@@ -750,9 +750,9 @@ async fn run_start_editing() -> Result<()> {
 async fn run_done_editing() -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-    let hook_path = catenary_mcp::router::hook_socket_path();
+    let ipc_path = catenary_mcp::router::socket_path();
 
-    let stream = tokio::net::UnixStream::connect(&hook_path)
+    let stream = tokio::net::UnixStream::connect(&ipc_path)
         .await
         .context("catenary daemon not running")?;
 
@@ -784,7 +784,7 @@ async fn run_done_editing() -> Result<()> {
 
 /// Sends an add-root or rm-root request to the running daemon.
 ///
-/// Canonicalizes the path, connects to the daemon's hook socket, and
+/// Canonicalizes the path, connects to the daemon's IPC socket, and
 /// prints the result. If no daemon is running, prints an error and
 /// exits non-zero.
 ///
@@ -800,9 +800,9 @@ async fn run_root_command(path: PathBuf, method: &str) -> Result<()> {
         .canonicalize()
         .with_context(|| format!("cannot resolve path: {}", path.display()))?;
 
-    let hook_path = catenary_mcp::router::hook_socket_path();
+    let ipc_path = catenary_mcp::router::socket_path();
 
-    let stream = tokio::net::UnixStream::connect(&hook_path)
+    let stream = tokio::net::UnixStream::connect(&ipc_path)
         .await
         .context("no daemon running")?;
 

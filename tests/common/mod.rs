@@ -361,20 +361,20 @@ impl BridgeProcess {
         Ok(())
     }
 
-    /// Returns the daemon hook socket path for this test's XDG scope.
-    pub fn hook_socket_path(&self) -> PathBuf {
+    /// Returns the daemon IPC socket path for this test's XDG scope.
+    pub fn ipc_socket_path(&self) -> PathBuf {
         PathBuf::from(&self.state_home)
             .join("catenary")
-            .join("catenary-hooks.sock")
+            .join("catenary.sock")
     }
 
-    /// Waits for the daemon hook socket to appear (up to 5 seconds).
-    pub fn wait_for_hook_socket(&self) -> Result<PathBuf> {
-        let path = self.hook_socket_path();
+    /// Waits for the daemon IPC socket to appear (up to 5 seconds).
+    pub fn wait_for_ipc_socket(&self) -> Result<PathBuf> {
+        let path = self.ipc_socket_path();
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while !path.exists() {
             if std::time::Instant::now() > deadline {
-                bail!("Hook socket not found at {} within 5s", path.display());
+                bail!("IPC socket not found at {} within 5s", path.display());
             }
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -384,7 +384,7 @@ impl BridgeProcess {
     /// Enters editing mode, accumulates a file, then runs `done_editing`
     /// via the handoff protocol to retrieve diagnostics.
     pub fn call_diagnostics(&self, file: &str) -> Result<String> {
-        let socket_path = self.wait_for_hook_socket()?;
+        let socket_path = self.wait_for_ipc_socket()?;
 
         // Enter editing mode via CLI path
         ipc_request(
@@ -430,7 +430,7 @@ impl BridgeProcess {
     /// `done_editing` via the handoff protocol to retrieve batched
     /// diagnostics.
     pub fn call_diagnostics_multi(&self, files: &[&str]) -> Result<String> {
-        let socket_path = self.wait_for_hook_socket()?;
+        let socket_path = self.wait_for_ipc_socket()?;
 
         // Enter editing mode via CLI path
         ipc_request(
