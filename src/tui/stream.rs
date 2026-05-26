@@ -947,6 +947,93 @@ mod tests {
         assert_eq!(metrics.position, 20);
     }
 
+    // ── IPC scope tests ────────────────────────────────────────────────
+
+    /// IPC request — hook-typed message that opens a scope (e.g.,
+    /// `tool/done-editing` incoming).
+    fn ipc_request(session_id: &str, scope_id: i64) -> SessionMessage {
+        make_message_with_ids(
+            session_id,
+            600 + scope_id,
+            "hook",
+            "tool/done-editing",
+            "catenary",
+            Some(&format!("ipc-{scope_id}")),
+        )
+    }
+
+    /// IPC response — second hook message that closes the IPC scope.
+    fn ipc_response(session_id: &str, scope_id: i64) -> SessionMessage {
+        make_message_with_ids(
+            session_id,
+            700 + scope_id,
+            "hook",
+            "tool/done-editing",
+            "catenary",
+            Some(&format!("ipc-{scope_id}")),
+        )
+    }
+
+    /// LSP child sharing the IPC scope's `parent_id`.
+    fn ipc_lsp_child(session_id: &str, scope_id: i64, method: &str) -> SessionMessage {
+        make_message_with_ids(
+            session_id,
+            800 + scope_id,
+            "lsp",
+            method,
+            "rust-analyzer",
+            Some(&format!("ipc-{scope_id}")),
+        )
+    }
+
+    #[test]
+    fn test_ipc_done_editing_scope_with_lsp_children() {
+        // IPC request opens the scope, LSP children accumulate under
+        // the shared parent_id, IPC response closes it.
+        let messages = vec![
+            ipc_request("s1", 1),
+            ipc_lsp_child("s1", 1, "textDocument/didOpen"),
+            ipc_lsp_child("s1", 1, "textDocument/didSave"),
+            ipc_lsp_child("s1", 1, "textDocument/diagnostic"),
+            ipc_lsp_child("s1", 1, "textDocument/didClose"),
+            ipc_response("s1", 1),
+        ];
+        let state = StreamState::new(messages);
+
+        assert_eq!(state.entries.len(), 1, "all messages should form one scope");
+        let StreamEntry::Scope(scope) = &state.entries[0] else {
+            panic!("expected Scope entry");
+        };
+        assert_eq!(scope.state, ScopeState::Closed);
+        assert_eq!(scope.request.r#type, "hook");
+        assert_eq!(scope.request.method, "tool/done-editing");
+        assert!(scope.response.is_some());
+        assert_eq!(scope.children.len(), 4, "4 LSP children");
+        // Closed scope: collapsed to header only.
+        assert_eq!(state.display_rows.len(), 1);
+    }
+
+    #[test]
+    fn test_ipc_done_editing_open_scope_streams_children() {
+        // IPC request + LSP children, no response yet — scope is open
+        // and children are visible.
+        let messages = vec![
+            ipc_request("s1", 1),
+            ipc_lsp_child("s1", 1, "textDocument/didOpen"),
+            ipc_lsp_child("s1", 1, "textDocument/didSave"),
+        ];
+        let state = StreamState::new(messages);
+
+        assert_eq!(state.entries.len(), 1);
+        let StreamEntry::Scope(scope) = &state.entries[0] else {
+            panic!("expected Scope entry");
+        };
+        assert_eq!(scope.state, ScopeState::Open);
+        assert_eq!(scope.children.len(), 2);
+        // Open scope: header + 2 children = 3 rows.
+        assert_eq!(state.display_rows.len(), 3);
+    }
+
     // ── Render tests ──────────────────────────────────────────────────
 
     #[test]

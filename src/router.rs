@@ -167,6 +167,10 @@ struct HookDispatchContext {
 struct HandoffContext {
     /// Accumulated files from the editing session.
     files: Vec<PathBuf>,
+    /// Scope UUID minted at prepare time. Used as `parent_id` for the
+    /// IPC request/response events and all LSP children from
+    /// `process_files_batched`, linking them into one TUI scope.
+    parent_id: String,
     /// Owned semaphore permit — dropped when the `HandoffContext`
     /// is dropped (slot consumed or timeout), releasing the lock.
     /// Never read directly; held purely for RAII drop semantics.
@@ -1092,13 +1096,22 @@ async fn handle_hook_dispatch(
         // Release the editing guardrail.
         ctx.editing_guardrail.release_all(&session_id);
 
+        // Mint the scope UUID for the done-editing IPC execution.
+        // This is separate from the prepare handler's own scope_id —
+        // the prepare hook is one scope, the IPC execution is another.
+        let handoff_parent_id = uuid::Uuid::new_v4().to_string();
+
         // Deposit in the handoff slot.
         {
             let mut slot = ctx
                 .handoff_slot
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            *slot = Some(HandoffContext { files, permit });
+            *slot = Some(HandoffContext {
+                files,
+                parent_id: handoff_parent_id,
+                permit,
+            });
         }
 
         // Spawn timeout to clear the slot if the CLI never connects.
@@ -1138,33 +1151,36 @@ async fn handle_hook_dispatch(
     // command. Takes the file list from the handoff slot, runs
     // process_files_batched, and returns diagnostics.
     if method == "tool/done-editing" {
-        let scope_id = uuid::Uuid::new_v4().to_string();
-
-        // Take the file list from the handoff slot and release the
-        // permit immediately. The permit must not be held during the
-        // diagnostics pipeline (which may take seconds).
-        let files = {
+        // Take the file list and parent_id from the handoff slot,
+        // releasing the permit immediately. The permit must not be
+        // held during the diagnostics pipeline (which may take seconds).
+        let handoff = {
             let mut slot = ctx
                 .handoff_slot
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             // Destructure HandoffContext — dropping it releases the
             // owned semaphore permit.
-            slot.take().map(|h| h.files)
+            slot.take().map(|h| (h.files, h.parent_id))
         };
 
-        let response = if let Some(files) = files {
-            if files.is_empty() {
+        let (response, scope_id) = if let Some((files, parent_id)) = handoff {
+            let resp = if files.is_empty() {
                 "[no files modified]\n".to_string()
             } else {
                 ctx.primary
                     .diagnostics
-                    .process_files_batched(&files, None)
+                    .process_files_batched(&files, Some(&parent_id))
                     .await
-            }
+            };
+            (resp, parent_id)
         } else {
             // Handoff slot was empty — timeout expired or double-consume.
-            "done_editing handoff expired — no files available\n".to_string()
+            let fallback_id = uuid::Uuid::new_v4().to_string();
+            (
+                "done_editing handoff expired — no files available\n".to_string(),
+                fallback_id,
+            )
         };
 
         emit_hook_event(
