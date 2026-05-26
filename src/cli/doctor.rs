@@ -24,6 +24,16 @@ const GEMINI_HOOKS_EXPECTED: &str = include_str!("../../hooks/hooks.json");
 const ANTIGRAVITY_HOOKS_EXPECTED: &str =
     include_str!("../../plugins/catenary-antigravity/hooks.json");
 
+/// Expected Claude Code SKILL.md, embedded at compile time.
+const SKILL_MD_EXPECTED: &str = include_str!("../../plugins/catenary/skills/catenary/SKILL.md");
+
+/// Expected Gemini CLI context file, embedded at compile time.
+const GEMINI_CONTEXT_EXPECTED: &str = include_str!("../../gemini-context.md");
+
+/// Expected Antigravity rules file, embedded at compile time.
+const ANTIGRAVITY_RULES_EXPECTED: &str =
+    include_str!("../../plugins/catenary-antigravity/rules/catenary.md");
+
 /// Migration guidance for users who still have the legacy Python script configured.
 const CONSTRAINED_BASH_MIGRATION: &str = "Command filtering is now built into `catenary hook pre-tool`. \
      Remove the constrained_bash.py hook from your settings and use \
@@ -514,6 +524,13 @@ pub async fn run_doctor(out: &mut Output, project_root: &Path, show_diff: bool) 
     check_gemini_hooks(out, show_diff);
     check_antigravity_hooks(out, show_diff, project_root);
     check_path_binary(out);
+
+    // Agent instructions section
+    let _ = out.writeln(format_args!(""));
+    let _ = out.writeln(format_args!("{}:", out.colors.bold("Agent instructions")));
+    check_claude_instructions(out, show_diff);
+    check_gemini_instructions(out, show_diff);
+    check_antigravity_instructions(out, show_diff, project_root);
 
     // Legacy script migration warnings
     let _ = out.writeln(format_args!(""));
@@ -1613,6 +1630,448 @@ fn check_path_binary(out: &mut Output) {
     }
 }
 
+/// Check Claude Code agent instruction files (SKILL.md).
+///
+/// Validates plugin version against the current binary version and
+/// checks SKILL.md frontmatter format per the Agent Skills spec.
+fn check_claude_instructions(out: &mut Output, show_diff: bool) {
+    let label = format!("{:<14}", "Claude Code");
+    let Ok(home_str) = std::env::var("HOME") else {
+        let _ = out.writeln(format_args!(
+            "  {label}{}",
+            out.colors.dim("- cannot determine home directory"),
+        ));
+        return;
+    };
+    let home = PathBuf::from(home_str);
+
+    let plugins_file = home.join(".claude/plugins/installed_plugins.json");
+    let Ok(plugins_json) = std::fs::read_to_string(&plugins_file) else {
+        let _ = out.writeln(format_args!(
+            "  {label}{}",
+            out.colors.dim("- not installed"),
+        ));
+        return;
+    };
+
+    let Ok(plugins) = serde_json::from_str::<serde_json::Value>(&plugins_json) else {
+        let _ = out.writeln(format_args!(
+            "  {label}{}",
+            out.colors.yellow("? cannot parse installed_plugins.json"),
+        ));
+        return;
+    };
+
+    let entries = match plugins
+        .get("plugins")
+        .and_then(|p| p.get("catenary@catenary"))
+        .and_then(serde_json::Value::as_array)
+    {
+        Some(arr) if !arr.is_empty() => arr,
+        _ => {
+            let _ = out.writeln(format_args!(
+                "  {label}{}",
+                out.colors.dim("- not installed"),
+            ));
+            return;
+        }
+    };
+
+    let entry = &entries[0];
+    let installed_version = entry
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("?");
+    let expected_version = env!("CATENARY_VERSION");
+
+    let Some(install_path_str) = entry.get("installPath").and_then(serde_json::Value::as_str)
+    else {
+        let _ = out.writeln(format_args!(
+            "  {label}{}",
+            out.colors.yellow("? missing installPath"),
+        ));
+        return;
+    };
+    let install_path = PathBuf::from(install_path_str);
+
+    // Version staleness check
+    let is_stale = installed_version != expected_version;
+    if is_stale {
+        let _ = out.writeln(format_args!(
+            "  {label}{}",
+            out.colors.red(&format!(
+                "✗ stale (v{installed_version} installed, v{expected_version} expected)"
+            )),
+        ));
+        let _ = out.writeln(format_args!(
+            "  {label}{}",
+            out.colors.dim("  run: catenary install claude"),
+        ));
+    } else {
+        let _ = out.writeln(format_args!(
+            "  {label}{}",
+            out.colors
+                .green(&format!("✓ up to date (v{installed_version})")),
+        ));
+    }
+
+    // SKILL.md content comparison against embedded version
+    let skill_path = install_path.join("skills/catenary/SKILL.md");
+    match std::fs::read_to_string(&skill_path) {
+        Ok(content) if content != SKILL_MD_EXPECTED => {
+            if !is_stale {
+                // Version matches but content drifted (manual edit, corruption)
+                let _ = out.writeln(format_args!(
+                    "  {label}{}",
+                    out.colors
+                        .yellow("⚠ SKILL.md content differs from expected"),
+                ));
+            }
+            if show_diff {
+                show_unified_diff(out, &content, SKILL_MD_EXPECTED, "installed", "expected");
+            }
+        }
+        Ok(_) => {} // Content matches — nothing extra to report
+        Err(_) => {
+            let _ = out.writeln(format_args!(
+                "  {label}{}",
+                out.colors.red("✗ SKILL.md not found in plugin"),
+            ));
+        }
+    }
+}
+
+/// Check Gemini CLI agent instruction files (context file).
+///
+/// Validates extension version against the current binary version.
+/// Linked extensions are always current by definition.
+#[allow(
+    clippy::too_many_lines,
+    reason = "Sequential discovery + version check + file check"
+)]
+fn check_gemini_instructions(out: &mut Output, show_diff: bool) {
+    let label = format!("{:<14}", "Gemini CLI");
+    let Ok(home_str) = std::env::var("HOME") else {
+        let _ = out.writeln(format_args!(
+            "  {label}{}",
+            out.colors.dim("- cannot determine home directory"),
+        ));
+        return;
+    };
+    let home = PathBuf::from(home_str);
+
+    let ext_dir = home.join(".gemini/extensions");
+    let ext_path = ["Catenary", "catenary"]
+        .iter()
+        .map(|name| ext_dir.join(name))
+        .find(|p| p.is_dir());
+
+    let Some(ext_path) = ext_path else {
+        let _ = out.writeln(format_args!(
+            "  {label}{}",
+            out.colors.dim("- not installed"),
+        ));
+        return;
+    };
+
+    // Determine install type and resolve path
+    let install_meta_path = ext_path.join(".gemini-extension-install.json");
+    let install_meta = std::fs::read_to_string(&install_meta_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+
+    let install_type = install_meta
+        .as_ref()
+        .and_then(|m| m.get("type").and_then(serde_json::Value::as_str))
+        .unwrap_or("unknown");
+    let is_linked = install_type == "link";
+
+    let resolved = if is_linked {
+        install_meta
+            .as_ref()
+            .and_then(|m| m.get("source").and_then(serde_json::Value::as_str))
+            .map_or_else(|| ext_path.clone(), PathBuf::from)
+    } else {
+        ext_path
+    };
+
+    // Read manifest for version and context file name
+    let manifest_path = resolved.join("gemini-extension.json");
+    let manifest = std::fs::read_to_string(&manifest_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+
+    let version = manifest
+        .as_ref()
+        .and_then(|v| v.get("version").and_then(serde_json::Value::as_str));
+
+    let context_filename = manifest
+        .as_ref()
+        .and_then(|v| v.get("contextFileName").and_then(serde_json::Value::as_str))
+        .unwrap_or("gemini-context.md");
+
+    // Version staleness
+    let expected_version = env!("CATENARY_VERSION");
+    let is_stale = !is_linked && version.is_some_and(|v| v != expected_version);
+
+    if is_linked {
+        let _ = out.writeln(format_args!(
+            "  {label}{}",
+            out.colors.green("✓ linked (always current)"),
+        ));
+    } else if let Some(v) = version {
+        if v == expected_version {
+            let _ = out.writeln(format_args!(
+                "  {label}{}",
+                out.colors.green(&format!("✓ up to date (v{v})")),
+            ));
+        } else {
+            let _ = out.writeln(format_args!(
+                "  {label}{}",
+                out.colors.red(&format!(
+                    "✗ stale (v{v} installed, v{expected_version} expected)"
+                )),
+            ));
+            let _ = out.writeln(format_args!(
+                "  {label}{}",
+                out.colors.dim("  run: catenary install gemini"),
+            ));
+        }
+    } else {
+        let _ = out.writeln(format_args!(
+            "  {label}{}",
+            out.colors.yellow("? cannot determine version"),
+        ));
+    }
+
+    // Context file check
+    let context_path = resolved.join(context_filename);
+    match std::fs::read_to_string(&context_path) {
+        Ok(content) if content.trim().is_empty() => {
+            let _ = out.writeln(format_args!(
+                "  {label}{}",
+                out.colors.yellow(&format!("⚠ {context_filename} is empty")),
+            ));
+        }
+        Ok(content) => {
+            if is_stale && show_diff {
+                show_unified_diff(
+                    out,
+                    &content,
+                    GEMINI_CONTEXT_EXPECTED,
+                    "installed",
+                    "expected",
+                );
+            }
+        }
+        Err(_) => {
+            let _ = out.writeln(format_args!(
+                "  {label}{}",
+                out.colors.red(&format!("✗ {context_filename} not found")),
+            ));
+        }
+    }
+}
+
+/// Check Antigravity CLI agent instruction files (rules).
+///
+/// Compares installed rules file content against the embedded version.
+/// Symlinked installs are always current by definition.
+fn check_antigravity_instructions(out: &mut Output, show_diff: bool, project_root: &Path) {
+    let label = format!("{:<14}", "Antigravity");
+
+    let resolved_root = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf());
+
+    // Discovery: same paths as check_antigravity_hooks
+    let workspace_candidates = [
+        resolved_root.join(".agents/plugins/catenary"),
+        resolved_root.join("_agents/plugins/catenary"),
+    ];
+
+    let global_candidate = std::env::var("HOME")
+        .ok()
+        .map(|h| PathBuf::from(h).join(".gemini/config/plugins/catenary"));
+
+    let plugin_dir = workspace_candidates
+        .iter()
+        .find(|p| p.is_dir())
+        .cloned()
+        .or_else(|| global_candidate.filter(|p| p.is_dir()));
+
+    let Some(plugin_dir) = plugin_dir else {
+        let _ = out.writeln(format_args!(
+            "  {label}{}",
+            out.colors.dim("- not installed"),
+        ));
+        return;
+    };
+
+    // Symlinked installs are always current
+    if plugin_dir.is_symlink() {
+        let _ = out.writeln(format_args!(
+            "  {label}{}",
+            out.colors.green("✓ symlinked (always current)"),
+        ));
+        return;
+    }
+
+    // Content comparison
+    let rules_path = plugin_dir.join("rules/catenary.md");
+    if let Ok(content) = std::fs::read_to_string(&rules_path) {
+        if content == ANTIGRAVITY_RULES_EXPECTED {
+            let _ = out.writeln(format_args!(
+                "  {label}{}",
+                out.colors.green("✓ rules up to date"),
+            ));
+        } else {
+            let _ = out.writeln(format_args!("  {label}{}", out.colors.red("✗ stale rules")));
+            let _ = out.writeln(format_args!(
+                "  {label}{}",
+                out.colors.dim("  run: catenary install antigravity"),
+            ));
+            if show_diff {
+                show_unified_diff(
+                    out,
+                    &content,
+                    ANTIGRAVITY_RULES_EXPECTED,
+                    "installed",
+                    "expected",
+                );
+            }
+        }
+    } else {
+        let _ = out.writeln(format_args!(
+            "  {label}{}",
+            out.colors.red("✗ rules/catenary.md not found"),
+        ));
+        let _ = out.writeln(format_args!(
+            "  {label}{}",
+            out.colors.dim("  run: catenary install antigravity"),
+        ));
+    }
+}
+
+/// Validate SKILL.md frontmatter format per the Claude Code Agent Skills spec.
+///
+/// Returns a list of validation error messages. Empty list means valid.
+/// Checks: valid YAML frontmatter delimiters, `name` field (must match
+/// `catenary`, lowercase alphanumeric + hyphens, 1-64 chars), `description`
+/// field (non-empty, max 1024 chars), and non-empty body after frontmatter.
+#[cfg(test)]
+fn validate_skill_frontmatter(content: &str) -> Vec<String> {
+    let mut errors = Vec::new();
+
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with("---") {
+        errors.push("missing opening `---` delimiter".to_string());
+        return errors;
+    }
+
+    let after_opening = trimmed[3..]
+        .strip_prefix('\n')
+        .unwrap_or_else(|| &trimmed[3..]);
+    let Some(end_pos) = after_opening.find("\n---") else {
+        errors.push("missing closing `---` delimiter".to_string());
+        return errors;
+    };
+
+    let frontmatter = &after_opening[..end_pos];
+    let body_start = end_pos + 4; // skip "\n---"
+    let body = if body_start < after_opening.len() {
+        &after_opening[body_start..]
+    } else {
+        ""
+    };
+
+    // Validate name
+    match extract_frontmatter_value(frontmatter, "name") {
+        None => errors.push("`name` field missing".to_string()),
+        Some(name) => {
+            if name != "catenary" {
+                errors.push(format!("`name` is '{name}', expected 'catenary'"));
+            }
+            if !is_valid_skill_name(&name) {
+                errors.push(format!(
+                    "`name` '{name}': must be 1-64 lowercase alphanumeric/hyphen chars, \
+                     no leading/trailing/consecutive hyphens"
+                ));
+            }
+        }
+    }
+
+    // Validate description
+    match extract_frontmatter_value(frontmatter, "description") {
+        None => errors.push("`description` field missing".to_string()),
+        Some(desc) if desc.len() > 1024 => {
+            errors.push(format!("`description` is {} chars (max 1024)", desc.len()));
+        }
+        Some(_) => {}
+    }
+
+    // Validate body
+    if body.trim().is_empty() {
+        errors.push("no body content after frontmatter".to_string());
+    }
+
+    errors
+}
+
+/// Check whether a skill name conforms to the Claude Code Agent Skills spec.
+///
+/// Valid: 1-64 characters, lowercase alphanumeric + hyphens,
+/// no leading/trailing/consecutive hyphens.
+#[cfg(test)]
+fn is_valid_skill_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && !name.contains("--")
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// Extract a simple value from YAML frontmatter.
+///
+/// Handles inline values (`key: value`) and multi-line folded/literal
+/// scalars (`key: >` / `key: |` followed by indented continuation lines).
+#[cfg(test)]
+fn extract_frontmatter_value(frontmatter: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}:");
+    let mut lines = frontmatter.lines().peekable();
+
+    while let Some(line) = lines.next() {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix(&prefix) {
+            let rest = rest.trim();
+
+            if rest.is_empty() || rest == ">" || rest == "|" {
+                // Multi-line: collect indented continuation lines
+                let mut parts = Vec::new();
+                while let Some(&next) = lines.peek() {
+                    if next.starts_with(' ') || next.starts_with('\t') {
+                        parts.push(next.trim());
+                        lines.next();
+                    } else {
+                        break;
+                    }
+                }
+                return if parts.is_empty() {
+                    None
+                } else {
+                    Some(parts.join(" "))
+                };
+            }
+
+            return Some(rest.to_string());
+        }
+    }
+    None
+}
+
 /// Check whether `~/.claude/settings.json` still references the legacy Python script.
 ///
 /// If found, warns the user to remove it and migrate to `[commands]` config.
@@ -1995,6 +2454,183 @@ mod tests {
         assert!(
             result.contains('\n'),
             "pretty JSON should be multi-line, got: {result}",
+        );
+    }
+
+    // ── validate_skill_frontmatter tests ───────────────────────────
+
+    #[test]
+    fn valid_skill_frontmatter_inline() {
+        let content = "---\nname: catenary\ndescription: A tool\n---\n\nBody content here.\n";
+        let errors = validate_skill_frontmatter(content);
+        assert!(errors.is_empty(), "should be valid, got: {errors:?}");
+    }
+
+    #[test]
+    fn valid_skill_frontmatter_multiline_description() {
+        let content =
+            "---\nname: catenary\ndescription: >\n  Multi-line\n  description.\n---\n\nBody.\n";
+        let errors = validate_skill_frontmatter(content);
+        assert!(
+            errors.is_empty(),
+            "should be valid with folded description, got: {errors:?}",
+        );
+    }
+
+    #[test]
+    fn skill_frontmatter_missing_opening_delimiter() {
+        let content = "name: catenary\ndescription: A tool\n---\n\nBody.\n";
+        let errors = validate_skill_frontmatter(content);
+        assert!(
+            errors.iter().any(|e| e.contains("opening")),
+            "should report missing opening delimiter, got: {errors:?}",
+        );
+    }
+
+    #[test]
+    fn skill_frontmatter_missing_closing_delimiter() {
+        let content = "---\nname: catenary\ndescription: A tool\n\nBody.\n";
+        let errors = validate_skill_frontmatter(content);
+        assert!(
+            errors.iter().any(|e| e.contains("closing")),
+            "should report missing closing delimiter, got: {errors:?}",
+        );
+    }
+
+    #[test]
+    fn skill_frontmatter_missing_name() {
+        let content = "---\ndescription: A tool\n---\n\nBody.\n";
+        let errors = validate_skill_frontmatter(content);
+        assert!(
+            errors.iter().any(|e| e.contains("`name`")),
+            "should report missing name, got: {errors:?}",
+        );
+    }
+
+    #[test]
+    fn skill_frontmatter_wrong_name() {
+        let content = "---\nname: wrong\ndescription: A tool\n---\n\nBody.\n";
+        let errors = validate_skill_frontmatter(content);
+        assert!(
+            errors.iter().any(|e| e.contains("'wrong'")),
+            "should report wrong name, got: {errors:?}",
+        );
+    }
+
+    #[test]
+    fn skill_frontmatter_missing_description() {
+        let content = "---\nname: catenary\n---\n\nBody.\n";
+        let errors = validate_skill_frontmatter(content);
+        assert!(
+            errors.iter().any(|e| e.contains("`description`")),
+            "should report missing description, got: {errors:?}",
+        );
+    }
+
+    #[test]
+    fn skill_frontmatter_empty_body() {
+        let content = "---\nname: catenary\ndescription: A tool\n---\n";
+        let errors = validate_skill_frontmatter(content);
+        assert!(
+            errors.iter().any(|e| e.contains("body")),
+            "should report empty body, got: {errors:?}",
+        );
+    }
+
+    #[test]
+    fn skill_frontmatter_long_description() {
+        let long = "a".repeat(1025);
+        let content = format!("---\nname: catenary\ndescription: {long}\n---\n\nBody.\n");
+        let errors = validate_skill_frontmatter(&content);
+        assert!(
+            errors.iter().any(|e| e.contains("1024")),
+            "should report long description, got: {errors:?}",
+        );
+    }
+
+    // ── is_valid_skill_name tests ──────────────────────────────────
+
+    #[test]
+    fn valid_skill_names() {
+        assert!(is_valid_skill_name("catenary"));
+        assert!(is_valid_skill_name("my-tool"));
+        assert!(is_valid_skill_name("a"));
+        assert!(is_valid_skill_name("tool123"));
+    }
+
+    #[test]
+    fn invalid_skill_names() {
+        assert!(!is_valid_skill_name(""), "empty");
+        assert!(!is_valid_skill_name("-leading"), "leading hyphen");
+        assert!(!is_valid_skill_name("trailing-"), "trailing hyphen");
+        assert!(
+            !is_valid_skill_name("double--hyphen"),
+            "consecutive hyphens",
+        );
+        assert!(!is_valid_skill_name("UPPERCASE"), "uppercase");
+        assert!(!is_valid_skill_name("has spaces"), "spaces");
+        assert!(!is_valid_skill_name(&"a".repeat(65)), "too long");
+    }
+
+    // ── extract_frontmatter_value tests ────────────────────────────
+
+    #[test]
+    fn extract_inline_value() {
+        let fm = "name: catenary\ndescription: A tool";
+        assert_eq!(
+            extract_frontmatter_value(fm, "name"),
+            Some("catenary".to_string()),
+        );
+    }
+
+    #[test]
+    fn extract_multiline_value() {
+        let fm = "name: catenary\ndescription: >\n  Multi\n  line";
+        assert_eq!(
+            extract_frontmatter_value(fm, "description"),
+            Some("Multi line".to_string()),
+        );
+    }
+
+    #[test]
+    fn extract_missing_key() {
+        let fm = "name: catenary";
+        assert_eq!(extract_frontmatter_value(fm, "description"), None);
+    }
+
+    #[test]
+    fn extract_literal_block_scalar() {
+        let fm = "name: catenary\ndescription: |\n  Line one.\n  Line two.";
+        assert_eq!(
+            extract_frontmatter_value(fm, "description"),
+            Some("Line one. Line two.".to_string()),
+        );
+    }
+
+    // ── embedded instruction file tests ────────────────────────────
+
+    #[test]
+    fn embedded_skill_md_valid() {
+        let errors = validate_skill_frontmatter(SKILL_MD_EXPECTED);
+        assert!(
+            errors.is_empty(),
+            "embedded SKILL.md should pass validation, got: {errors:?}",
+        );
+    }
+
+    #[test]
+    fn embedded_gemini_context_non_empty() {
+        assert!(
+            !GEMINI_CONTEXT_EXPECTED.trim().is_empty(),
+            "embedded gemini-context.md should not be empty",
+        );
+    }
+
+    #[test]
+    fn embedded_antigravity_rules_non_empty() {
+        assert!(
+            !ANTIGRAVITY_RULES_EXPECTED.trim().is_empty(),
+            "embedded antigravity rules should not be empty",
         );
     }
 }
