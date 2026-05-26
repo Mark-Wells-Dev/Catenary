@@ -651,15 +651,18 @@ impl LspClientManager {
     }
 
     /// Spawns missing servers for the given paths and waits for
-    /// all to be ready.
+    /// the relevant servers to be ready.
     ///
     /// Combines [`ensure_clients_for_paths`](Self::ensure_clients_for_paths)
-    /// (spawn) with [`wait_ready_all`](Self::wait_ready_all). Closes the
-    /// lazy-spawn gap: after this call, all servers for the discovered
-    /// languages are Ready (or terminal).
+    /// (spawn) with per-path [`wait_ready_for_path`](Self::wait_ready_for_path).
+    /// Closes the lazy-spawn gap: after this call, all servers for the
+    /// discovered languages are Ready (or terminal). Only waits for
+    /// servers bound to the given paths — unrelated servers are not blocked on.
     pub async fn ensure_and_wait_for_paths(&self, paths: &[PathBuf]) {
         self.ensure_clients_for_paths(paths).await;
-        self.wait_ready_all().await;
+        for path in paths {
+            self.wait_ready_for_path(path).await;
+        }
     }
 
     /// Spawns with capability-driven scope (no project-scope check).

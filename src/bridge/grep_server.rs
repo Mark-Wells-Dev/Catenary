@@ -110,24 +110,6 @@ impl ToolServer for GrepServer {
             input.include_hidden = true;
         }
 
-        // Wait for all servers ready (grep doesn't target a specific file).
-        self.client_manager.wait_ready_all().await;
-
-        // Collect dead languages so the pipeline can skip prepareRename for them.
-        // Exclude single-file servers — they have no project context for
-        // workspace-wide search.
-        let mut dead_languages: HashSet<String> = HashSet::new();
-        let clients = self.client_manager.rooted_clients().await;
-        for (key, client_mutex) in &clients {
-            if !client_mutex.lock().await.is_alive() {
-                debug!(
-                    "[{}] server died \u{2014} tool will run in degraded mode",
-                    key.language_id
-                );
-                dead_languages.insert(key.language_id.clone());
-            }
-        }
-
         // Relative glob param → cwd context header.
         let cwd = input
             .glob
@@ -149,13 +131,7 @@ impl ToolServer for GrepServer {
                 page: input.page,
             };
             let output = self
-                .run(
-                    arm_input,
-                    parent_id,
-                    &dead_languages,
-                    cancel,
-                    cwd.as_deref(),
-                )
+                .run(arm_input, parent_id, cancel, cwd.as_deref())
                 .await?;
             if !output.is_empty() {
                 if !all_output.is_empty() {
@@ -184,7 +160,6 @@ impl GrepServer {
         &self,
         input: GrepInput,
         parent_id: Option<&str>,
-        dead_languages: &HashSet<String>,
         cancel: &tokio_util::sync::CancellationToken,
         cwd: Option<&Path>,
     ) -> Result<String> {
@@ -233,6 +208,22 @@ impl GrepServer {
         self.client_manager
             .ensure_and_wait_for_paths(&rg_paths)
             .await;
+
+        // Collect dead languages so the pipeline can skip prepareRename for them.
+        // Exclude single-file servers — they have no project context for
+        // workspace-wide search. Checked after ensure_and_wait_for_paths so
+        // servers are in a terminal state (Ready or Dead), not still initializing.
+        let mut dead_languages: HashSet<String> = HashSet::new();
+        let clients = self.client_manager.rooted_clients().await;
+        for (key, client_mutex) in &clients {
+            if !client_mutex.lock().await.is_alive() {
+                debug!(
+                    "[{}] server died \u{2014} tool will run in degraded mode",
+                    key.language_id
+                );
+                dead_languages.insert(key.language_id.clone());
+            }
+        }
 
         // Step 2b: Populate symbol index for matched files.
         super::ensure_symbols(self.symbol_index.as_ref(), &self.client_manager, &rg_paths).await;
