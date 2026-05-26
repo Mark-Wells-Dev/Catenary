@@ -185,6 +185,15 @@ impl<'a> App<'a> {
         }
     }
 
+    /// Toggle selection on the sidebar's cursor entry and update the
+    /// stream's session filter.
+    pub fn toggle_session_selection(&mut self) {
+        if self.sidebar.toggle_selected() {
+            self.stream
+                .set_session_filter(self.sidebar.session_filter());
+        }
+    }
+
     /// Toggle focus between sidebar and stream.
     pub const fn toggle_focus(&mut self) {
         self.focus = match self.focus {
@@ -212,6 +221,13 @@ impl<'a> App<'a> {
             .filter(|r| r.alive)
             .map(|r| (r.info.id, r.info.client_name, r.info.workspace))
             .collect();
+        let had_filter = self.sidebar.has_filter();
         self.sidebar.refresh(sessions, &mut self.stream.badges);
+        // If a selected session disconnected, the selected set shrank.
+        // Propagate to stream so filtered entries reappear if needed.
+        if had_filter {
+            self.stream
+                .set_session_filter(self.sidebar.session_filter());
+        }
     }
 }

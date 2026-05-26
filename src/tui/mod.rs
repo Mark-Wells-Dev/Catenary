@@ -174,6 +174,9 @@ fn handle_key(app: &mut App<'_>, code: KeyCode, show_sidebar: bool, viewport_hei
                         app.sidebar.cursor_down(1, visible);
                     }
                     KeyCode::Char('k') | KeyCode::Up => app.sidebar.cursor_up(1, visible),
+                    KeyCode::Enter => {
+                        app.toggle_session_selection();
+                    }
                     _ => {}
                 }
             }

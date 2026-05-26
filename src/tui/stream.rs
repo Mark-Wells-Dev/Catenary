@@ -10,7 +10,7 @@
 //! request (header), the response closes the scope, and everything in
 //! between is a child.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -226,6 +226,12 @@ pub struct StreamState {
     /// `parent_id` UUID → entries index. Single routing map.
     scope_map: HashMap<String, usize>,
 
+    // ── Filtering state ──────────────────────────────────────────────
+    /// Active session filter. `None` = show all. `Some(set)` = show only
+    /// entries whose session belongs to the set. Daemon-level events (no
+    /// matching session) are hidden when a filter is active.
+    session_filter: Option<HashSet<String>>,
+
     // ── Paging state ─────────────────────────────────────────────────
     /// Index in `entries` where the bottom region starts (after a gap).
     /// `None` when there is no gap (single contiguous region).
@@ -252,6 +258,7 @@ impl StreamState {
             cursor: 0,
             badges: HexBadgeMap::new(),
             scope_map: HashMap::new(),
+            session_filter: None,
             gap_offset: None,
             gap_display_row: None,
             bottom_oldest_root: None,
@@ -279,7 +286,8 @@ impl StreamState {
         route_into(&mut self.entries, &mut self.scope_map, msg);
     }
 
-    /// Flatten entries into display rows based on scope expansion state.
+    /// Flatten entries into display rows based on scope expansion state
+    /// and active session filter.
     fn rebuild_display_rows(&mut self) {
         self.display_rows.clear();
         self.gap_display_row = None;
@@ -288,6 +296,13 @@ impl StreamState {
             // Track the gap boundary in display-row space.
             if self.gap_offset.is_some_and(|go| i == go) {
                 self.gap_display_row = Some(self.display_rows.len());
+            }
+
+            // Apply session filter: skip entries not in the selected set.
+            if let Some(ref filter) = self.session_filter
+                && !filter.contains(entry.session_id())
+            {
+                continue;
             }
 
             match entry {
@@ -309,9 +324,11 @@ impl StreamState {
                 }
             }
         }
-        // Clamp cursor to valid range.
+        // Clamp cursor and scroll to valid range.
         let max = self.display_rows.len().saturating_sub(1);
         self.cursor = self.cursor.min(max);
+        let scroll_max = self.display_rows.len().saturating_sub(1);
+        self.scroll_position = self.scroll_position.min(scroll_max);
     }
 
     /// Total number of display rows (for scroll calculations).
@@ -421,6 +438,18 @@ impl StreamState {
             viewport_length: viewport_height,
             position: self.scroll_position,
         }
+    }
+
+    // ── Session filter ────────────────────────────────────────────
+
+    /// Update the session filter and rebuild display rows.
+    ///
+    /// `None` = show all. `Some(set)` = show only entries belonging to
+    /// sessions in the set. Daemon-level events are hidden when a
+    /// filter is active.
+    pub fn set_session_filter(&mut self, filter: Option<HashSet<String>>) {
+        self.session_filter = filter;
+        self.rebuild_display_rows();
     }
 
     // ── Paging ──────────────────────────────────────────────────────
@@ -1654,6 +1683,165 @@ mod tests {
         assert_eq!(state.gap_display_row, Some(1));
 
         // 2 display rows total (2 closed scope headers).
+        assert_eq!(state.display_rows.len(), 2);
+    }
+
+    // ── Session filter tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_session_filter_none_shows_all() {
+        let messages = vec![
+            mcp_request("s1", 1, "grep"),
+            mcp_response("s1", 1),
+            mcp_request("s2", 2, "glob"),
+            mcp_response("s2", 2),
+            make_message("daemon", "lifecycle"),
+        ];
+        let mut state = StreamState::new(messages);
+        state.set_session_filter(None);
+        assert_eq!(state.display_rows.len(), 3, "None filter shows all entries");
+    }
+
+    #[test]
+    fn test_session_filter_shows_only_selected() {
+        let messages = vec![
+            mcp_request("s1", 1, "grep"),
+            mcp_response("s1", 1),
+            mcp_request("s2", 2, "glob"),
+            mcp_response("s2", 2),
+            make_message("s1", "hover"),
+        ];
+        let mut state = StreamState::new(messages);
+
+        let mut filter = HashSet::new();
+        filter.insert("s1".to_string());
+        state.set_session_filter(Some(filter));
+
+        // Only s1's scope and standalone should show.
+        assert_eq!(
+            state.display_rows.len(),
+            2,
+            "filter should show only s1 entries"
+        );
+    }
+
+    #[test]
+    fn test_session_filter_hides_daemon_events() {
+        let messages = vec![
+            mcp_request("s1", 1, "grep"),
+            mcp_response("s1", 1),
+            make_message("daemon", "lifecycle"),
+            make_message("daemon", "gc"),
+        ];
+        let mut state = StreamState::new(messages);
+
+        let mut filter = HashSet::new();
+        filter.insert("s1".to_string());
+        state.set_session_filter(Some(filter));
+
+        // Daemon events should be hidden.
+        assert_eq!(
+            state.display_rows.len(),
+            1,
+            "daemon events should be hidden"
+        );
+    }
+
+    #[test]
+    fn test_session_filter_clamps_cursor() {
+        let messages = vec![
+            mcp_request("s1", 1, "grep"),
+            mcp_response("s1", 1),
+            mcp_request("s2", 2, "glob"),
+            mcp_response("s2", 2),
+        ];
+        let mut state = StreamState::new(messages);
+        // Cursor on the second entry.
+        state.cursor = 1;
+
+        // Filter to s1 only — only 1 display row remains.
+        let mut filter = HashSet::new();
+        filter.insert("s1".to_string());
+        state.set_session_filter(Some(filter));
+
+        assert_eq!(state.cursor, 0, "cursor should clamp to valid range");
+    }
+
+    #[test]
+    fn test_session_filter_clamps_scroll_position() {
+        let messages: Vec<_> = (0..30)
+            .map(|i| make_message("s1", &format!("method-{i}")))
+            .collect();
+        let mut state = StreamState::new(messages);
+        state.scroll_position = 25;
+
+        // Filter to non-existent session — empty display.
+        let mut filter = HashSet::new();
+        filter.insert("nonexistent".to_string());
+        state.set_session_filter(Some(filter));
+
+        assert_eq!(
+            state.scroll_position, 0,
+            "scroll should clamp when display rows shrink"
+        );
+    }
+
+    #[test]
+    fn test_session_filter_multiple_selected() {
+        let messages = vec![
+            mcp_request("s1", 1, "grep"),
+            mcp_response("s1", 1),
+            mcp_request("s2", 2, "glob"),
+            mcp_response("s2", 2),
+            mcp_request("s3", 3, "grep"),
+            mcp_response("s3", 3),
+        ];
+        let mut state = StreamState::new(messages);
+
+        let mut filter = HashSet::new();
+        filter.insert("s1".to_string());
+        filter.insert("s3".to_string());
+        state.set_session_filter(Some(filter));
+
+        assert_eq!(state.display_rows.len(), 2, "should show s1 and s3");
+    }
+
+    #[test]
+    fn test_session_filter_toggle_back_to_none() {
+        let messages = vec![
+            mcp_request("s1", 1, "grep"),
+            mcp_response("s1", 1),
+            mcp_request("s2", 2, "glob"),
+            mcp_response("s2", 2),
+        ];
+        let mut state = StreamState::new(messages);
+
+        // Apply filter.
+        let mut filter = HashSet::new();
+        filter.insert("s1".to_string());
+        state.set_session_filter(Some(filter));
+        assert_eq!(state.display_rows.len(), 1);
+
+        // Remove filter.
+        state.set_session_filter(None);
+        assert_eq!(state.display_rows.len(), 2, "removing filter restores all");
+    }
+
+    #[test]
+    fn test_session_filter_with_open_scope_children() {
+        // Open scope with children — filter should show header + children.
+        let messages = vec![
+            mcp_request("s1", 1, "grep"),
+            lsp_child("s1", 1, "workspace/symbol"),
+            make_message("s2", "hover"),
+        ];
+        let mut state = StreamState::new(messages);
+
+        let mut filter = HashSet::new();
+        filter.insert("s1".to_string());
+        state.set_session_filter(Some(filter));
+
+        // Open scope (header + 1 child) = 2 rows; s2's standalone hidden.
         assert_eq!(state.display_rows.len(), 2);
     }
 }
