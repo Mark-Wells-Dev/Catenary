@@ -8,7 +8,7 @@
 
 use super::data::{DataSource, MessageTail};
 use super::icons::IconSet;
-use super::stream::StreamState;
+use super::stream::{PAGE_SIZE, PageRequest, StreamState};
 use super::theme::Theme;
 
 /// Display level threshold for message queries.
@@ -55,7 +55,7 @@ pub struct App<'a> {
 }
 
 impl<'a> App<'a> {
-    /// Create a new App and load the initial message stream.
+    /// Create a new App, loading only the most recent page of scopes.
     ///
     /// # Errors
     ///
@@ -66,9 +66,11 @@ impl<'a> App<'a> {
         data: Box<dyn DataSource>,
     ) -> anyhow::Result<Self> {
         let include_debug = false;
-        let messages = data.monitor_all_messages(include_debug)?;
+        let messages = data.recent_scopes(PAGE_SIZE, include_debug)?;
         let tail = data.create_all_message_tail(include_debug).ok();
-        let stream = StreamState::new(messages);
+        let reached_beginning = messages.is_empty();
+        let mut stream = StreamState::new(messages);
+        stream.reached_beginning = reached_beginning;
 
         Ok(Self {
             theme,
@@ -95,16 +97,61 @@ impl<'a> App<'a> {
         }
     }
 
-    /// Reload all messages (e.g., after toggling severity threshold).
+    /// Reload the most recent page (e.g., after toggling severity threshold).
     ///
     /// # Errors
     ///
     /// Returns an error if loading messages fails.
     pub fn reload_messages(&mut self) -> anyhow::Result<()> {
         let include_debug = self.level_threshold.include_debug();
-        let messages = self.data.monitor_all_messages(include_debug)?;
+        let messages = self.data.recent_scopes(PAGE_SIZE, include_debug)?;
         self.tail = self.data.create_all_message_tail(include_debug).ok();
+        let reached_beginning = messages.is_empty();
         self.stream = StreamState::new(messages);
+        self.stream.reached_beginning = reached_beginning;
         Ok(())
+    }
+
+    /// Fetch a page if the cursor is near a paging boundary.
+    pub fn fetch_page_if_needed(&mut self) {
+        let Some(request) = self.stream.check_paging() else {
+            return;
+        };
+        let include_debug = self.level_threshold.include_debug();
+
+        match request {
+            PageRequest::Older(before_id) => {
+                if let Ok(messages) = self.data.older_scopes(before_id, PAGE_SIZE, include_debug) {
+                    self.stream.prepend_page(messages);
+                }
+            }
+            PageRequest::FillGap {
+                after_id,
+                before_id,
+            } => {
+                if let Ok(messages) =
+                    self.data
+                        .newer_scopes(after_id, Some(before_id), PAGE_SIZE, include_debug)
+                {
+                    self.stream.fill_gap(messages);
+                }
+            }
+        }
+    }
+
+    /// Load the oldest page and create a gap (Home key).
+    pub fn jump_to_beginning(&mut self) {
+        // If already at the beginning with a gap, just move cursor.
+        if self.stream.gap_offset.is_some() || self.stream.reached_beginning {
+            self.stream.scroll_position = 0;
+            self.stream.cursor = 0;
+            self.stream.auto_scroll = false;
+            return;
+        }
+
+        let include_debug = self.level_threshold.include_debug();
+        if let Ok(messages) = self.data.oldest_scopes(PAGE_SIZE, include_debug) {
+            self.stream.load_oldest_page(messages);
+        }
     }
 }

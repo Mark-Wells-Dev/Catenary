@@ -96,6 +96,51 @@ pub trait DataSource {
     ///
     /// Returns an error if the tail cannot be created.
     fn create_all_message_tail(&self, include_debug: bool) -> Result<Box<dyn MessageTail>>;
+
+    /// Load the most recent `limit` scopes (roots + children).
+    ///
+    /// A scope root is either a standalone message or the first message
+    /// for a given `parent_id` UUID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be queried.
+    fn recent_scopes(&self, limit: usize, include_debug: bool) -> Result<Vec<SessionMessage>>;
+
+    /// Load scopes with root ID older than `before_id`, newest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be queried.
+    fn older_scopes(
+        &self,
+        before_id: i64,
+        limit: usize,
+        include_debug: bool,
+    ) -> Result<Vec<SessionMessage>>;
+
+    /// Load scopes with root ID newer than `after_id`, oldest first.
+    ///
+    /// When `before_id` is provided, results are bounded above (for gap
+    /// filling between two loaded regions).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be queried.
+    fn newer_scopes(
+        &self,
+        after_id: i64,
+        before_id: Option<i64>,
+        limit: usize,
+        include_debug: bool,
+    ) -> Result<Vec<SessionMessage>>;
+
+    /// Load the oldest `limit` scopes (roots + children).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be queried.
+    fn oldest_scopes(&self, limit: usize, include_debug: bool) -> Result<Vec<SessionMessage>>;
 }
 
 /// Tail reader abstraction for streaming new messages.
@@ -297,6 +342,33 @@ impl DataSource for SqliteDataSource {
         let tail = session::tail_all_messages_new(include_debug)?;
         Ok(Box::new(tail))
     }
+
+    fn recent_scopes(&self, limit: usize, include_debug: bool) -> Result<Vec<SessionMessage>> {
+        session::recent_scopes_with_conn(&self.conn, limit, include_debug)
+    }
+
+    fn older_scopes(
+        &self,
+        before_id: i64,
+        limit: usize,
+        include_debug: bool,
+    ) -> Result<Vec<SessionMessage>> {
+        session::older_scopes_with_conn(&self.conn, before_id, limit, include_debug)
+    }
+
+    fn newer_scopes(
+        &self,
+        after_id: i64,
+        before_id: Option<i64>,
+        limit: usize,
+        include_debug: bool,
+    ) -> Result<Vec<SessionMessage>> {
+        session::newer_scopes_with_conn(&self.conn, after_id, before_id, limit, include_debug)
+    }
+
+    fn oldest_scopes(&self, limit: usize, include_debug: bool) -> Result<Vec<SessionMessage>> {
+        session::oldest_scopes_with_conn(&self.conn, limit, include_debug)
+    }
 }
 
 /// Query active languages for a session from its messages.
@@ -421,6 +493,138 @@ impl DataSource for MockDataSource {
         }
         Ok(Box::new(MockMessageTail { messages: all }))
     }
+
+    fn recent_scopes(&self, limit: usize, include_debug: bool) -> Result<Vec<SessionMessage>> {
+        let all = self.sorted_messages(include_debug);
+        let roots = scope_roots_from_messages(&all);
+        let page: Vec<_> = roots.iter().rev().take(limit).cloned().collect();
+        Ok(collect_scope_messages(&all, &page))
+    }
+
+    fn older_scopes(
+        &self,
+        before_id: i64,
+        limit: usize,
+        include_debug: bool,
+    ) -> Result<Vec<SessionMessage>> {
+        let all = self.sorted_messages(include_debug);
+        let roots = scope_roots_from_messages(&all);
+        let page: Vec<_> = roots
+            .iter()
+            .rev()
+            .filter(|r| r.root_id < before_id)
+            .take(limit)
+            .cloned()
+            .collect();
+        Ok(collect_scope_messages(&all, &page))
+    }
+
+    fn newer_scopes(
+        &self,
+        after_id: i64,
+        before_id: Option<i64>,
+        limit: usize,
+        include_debug: bool,
+    ) -> Result<Vec<SessionMessage>> {
+        let all = self.sorted_messages(include_debug);
+        let roots = scope_roots_from_messages(&all);
+        let page: Vec<_> = roots
+            .iter()
+            .filter(|r| r.root_id > after_id && before_id.is_none_or(|b| r.root_id < b))
+            .take(limit)
+            .cloned()
+            .collect();
+        Ok(collect_scope_messages(&all, &page))
+    }
+
+    fn oldest_scopes(&self, limit: usize, include_debug: bool) -> Result<Vec<SessionMessage>> {
+        let all = self.sorted_messages(include_debug);
+        let roots = scope_roots_from_messages(&all);
+        let page: Vec<_> = roots.iter().take(limit).cloned().collect();
+        Ok(collect_scope_messages(&all, &page))
+    }
+}
+
+impl MockDataSource {
+    /// Collect and sort all messages across sessions.
+    fn sorted_messages(&self, include_debug: bool) -> Vec<SessionMessage> {
+        let mut all: Vec<SessionMessage> = self.messages.values().flatten().cloned().collect();
+        if !include_debug {
+            all.retain(|m| m.level != "debug");
+        }
+        all.sort_by_key(|m| m.id);
+        all
+    }
+}
+
+/// A scope root entry identified from the message stream.
+#[derive(Clone)]
+struct ScopeRoot {
+    /// Message ID of the first message in this scope.
+    root_id: i64,
+    /// `parent_id` UUID, or `None` for standalone messages.
+    parent_id: Option<String>,
+}
+
+/// Identify scope roots from a sorted message list.
+///
+/// A scope root is either a standalone message (`parent_id` is `None`)
+/// or the first message (lowest ID) for a given `parent_id` UUID.
+/// Returns roots sorted by `root_id` ascending.
+fn scope_roots_from_messages(messages: &[SessionMessage]) -> Vec<ScopeRoot> {
+    let mut seen_parents: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut roots = Vec::new();
+
+    for msg in messages {
+        match &msg.parent_id {
+            None => roots.push(ScopeRoot {
+                root_id: msg.id,
+                parent_id: None,
+            }),
+            Some(pid) => {
+                if seen_parents.insert(pid.as_str()) {
+                    roots.push(ScopeRoot {
+                        root_id: msg.id,
+                        parent_id: Some(pid.clone()),
+                    });
+                }
+            }
+        }
+    }
+
+    roots.sort_by_key(|r| r.root_id);
+    roots
+}
+
+/// Collect all messages belonging to the given scope roots.
+fn collect_scope_messages(
+    all_messages: &[SessionMessage],
+    page_roots: &[ScopeRoot],
+) -> Vec<SessionMessage> {
+    let standalone_ids: std::collections::HashSet<i64> = page_roots
+        .iter()
+        .filter(|r| r.parent_id.is_none())
+        .map(|r| r.root_id)
+        .collect();
+
+    let parent_ids: std::collections::HashSet<&str> = page_roots
+        .iter()
+        .filter_map(|r| r.parent_id.as_deref())
+        .collect();
+
+    let mut result: Vec<SessionMessage> = all_messages
+        .iter()
+        .filter(|m| {
+            m.parent_id.as_ref().map_or_else(
+                || standalone_ids.contains(&m.id),
+                |pid| parent_ids.contains(pid.as_str()),
+            )
+        })
+        .cloned()
+        .collect();
+
+    result.sort_by_key(|m| m.id);
+    result
 }
 
 /// Tail reader backed by a [`VecDeque`] for testing.
@@ -761,6 +965,245 @@ mod tests {
         );
 
         ds.delete_session("ds-alive-1")?;
+        Ok(())
+    }
+
+    // ── Scope paging tests (mock) ───────────────────────────────────
+
+    use crate::session::test_support;
+
+    fn scoped_msg(id: i64, parent_id: &str, r#type: &str, method: &str) -> SessionMessage {
+        SessionMessage {
+            id,
+            parent_id: Some(parent_id.to_string()),
+            ..test_support::message(r#type, method, "rust-analyzer")
+        }
+    }
+
+    fn standalone_msg(id: i64, method: &str) -> SessionMessage {
+        SessionMessage {
+            id,
+            ..test_support::message("lsp", method, "rust-analyzer")
+        }
+    }
+
+    /// Build a `MockDataSource` with the given messages under session "test".
+    fn mock_ds(messages: Vec<SessionMessage>) -> MockDataSource {
+        let mut map = HashMap::new();
+        map.insert("test".to_string(), messages);
+        MockDataSource {
+            sessions: vec![],
+            messages: map,
+            tail_messages: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn test_mock_recent_scopes_returns_newest() -> Result<()> {
+        let ds = mock_ds(vec![
+            scoped_msg(1, "uuid-a", "mcp", "tools/call"),
+            scoped_msg(2, "uuid-a", "lsp", "workspace/symbol"),
+            scoped_msg(3, "uuid-b", "mcp", "tools/call"),
+            standalone_msg(4, "textDocument/hover"),
+        ]);
+
+        // Request 2 most recent scopes.
+        let msgs = ds.recent_scopes(2, true)?;
+        let ids: Vec<i64> = msgs.iter().map(|m| m.id).collect();
+        // Should include scope uuid-b (root=3) and standalone (id=4).
+        assert!(ids.contains(&3), "should include scope-b root: {ids:?}");
+        assert!(ids.contains(&4), "should include standalone: {ids:?}");
+        // Should NOT include scope uuid-a messages.
+        assert!(!ids.contains(&1), "should not include scope-a: {ids:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn test_mock_older_scopes() -> Result<()> {
+        let ds = mock_ds(vec![
+            scoped_msg(1, "uuid-a", "mcp", "tools/call"),
+            scoped_msg(2, "uuid-a", "lsp", "workspace/symbol"),
+            scoped_msg(3, "uuid-b", "mcp", "tools/call"),
+            standalone_msg(4, "textDocument/hover"),
+        ]);
+
+        // Scopes older than id 3 (scope-b root).
+        let msgs = ds.older_scopes(3, 10, true)?;
+        let ids: Vec<i64> = msgs.iter().map(|m| m.id).collect();
+        // Should include scope uuid-a (root=1) messages.
+        assert!(ids.contains(&1), "should include scope-a root: {ids:?}");
+        assert!(ids.contains(&2), "should include scope-a child: {ids:?}");
+        // Should NOT include scope-b or standalone.
+        assert!(!ids.contains(&3), "should not include scope-b: {ids:?}");
+        assert!(!ids.contains(&4), "should not include standalone: {ids:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn test_mock_newest_scopes() -> Result<()> {
+        let ds = mock_ds(vec![
+            scoped_msg(1, "uuid-a", "mcp", "tools/call"),
+            scoped_msg(3, "uuid-b", "mcp", "tools/call"),
+            standalone_msg(5, "textDocument/hover"),
+        ]);
+
+        // Scopes newer than id 1 (scope-a root).
+        let msgs = ds.newer_scopes(1, None, 10, true)?;
+        let ids: Vec<i64> = msgs.iter().map(|m| m.id).collect();
+        assert!(ids.contains(&3), "should include scope-b: {ids:?}");
+        assert!(ids.contains(&5), "should include standalone: {ids:?}");
+        assert!(!ids.contains(&1), "should not include scope-a: {ids:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn test_mock_newest_scopes_bounded() -> Result<()> {
+        let ds = mock_ds(vec![
+            scoped_msg(1, "uuid-a", "mcp", "tools/call"),
+            scoped_msg(3, "uuid-b", "mcp", "tools/call"),
+            standalone_msg(5, "textDocument/hover"),
+        ]);
+
+        // Scopes newer than 1 but older than 5.
+        let msgs = ds.newer_scopes(1, Some(5), 10, true)?;
+        let ids: Vec<i64> = msgs.iter().map(|m| m.id).collect();
+        assert!(ids.contains(&3), "should include scope-b: {ids:?}");
+        assert!(!ids.contains(&5), "should not include standalone: {ids:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn test_mock_oldest_scopes() -> Result<()> {
+        let ds = mock_ds(vec![
+            standalone_msg(1, "init"),
+            scoped_msg(2, "uuid-a", "mcp", "tools/call"),
+            scoped_msg(3, "uuid-b", "mcp", "tools/call"),
+        ]);
+
+        let msgs = ds.oldest_scopes(1, true)?;
+        let ids: Vec<i64> = msgs.iter().map(|m| m.id).collect();
+        assert_eq!(ids, vec![1], "should include only the oldest scope");
+        Ok(())
+    }
+
+    // ── Scope paging tests (SQLite) ─────────────────────────────────
+
+    fn insert_scoped_message(
+        conn: &rusqlite::Connection,
+        session_id: &str,
+        id: i64,
+        parent_id: Option<&str>,
+        method: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO messages \
+             (id, session_id, timestamp, type, method, server, client, \
+              parent_id, payload) \
+             VALUES (?1, ?2, ?3, 'mcp', ?4, 'ra', 'catenary', ?5, '{}')",
+            rusqlite::params![
+                id,
+                session_id,
+                "2026-01-01T00:00:00.000Z",
+                method,
+                parent_id,
+            ],
+        )
+        .expect("insert scoped message");
+    }
+
+    #[test]
+    fn test_sqlite_recent_scopes() -> Result<()> {
+        let (_dir, path, conn) = test_db();
+        let write = crate::db::open_and_migrate_at(&path)?;
+        insert_session(&write, "sp-1", "/tmp/test-sp");
+
+        // Insert 3 scopes + 1 standalone.
+        insert_scoped_message(&write, "sp-1", 1, Some("uuid-a"), "tools/call");
+        insert_scoped_message(&write, "sp-1", 2, Some("uuid-a"), "workspace/symbol");
+        insert_scoped_message(&write, "sp-1", 3, Some("uuid-b"), "tools/call");
+        insert_scoped_message(&write, "sp-1", 4, Some("uuid-b"), "workspace/symbol");
+        insert_scoped_message(&write, "sp-1", 5, Some("uuid-c"), "tools/call");
+        insert_scoped_message(&write, "sp-1", 6, None, "textDocument/hover");
+
+        let ds = SqliteDataSource::with_conn(conn);
+
+        // Request 2 most recent scopes.
+        let msgs = ds.recent_scopes(2, true)?;
+        let ids: Vec<i64> = msgs.iter().map(|m| m.id).collect();
+
+        // Scope uuid-c (root=5) and standalone (id=6) are the 2 most recent.
+        assert!(ids.contains(&5), "should include scope-c root: {ids:?}");
+        assert!(ids.contains(&6), "should include standalone: {ids:?}");
+        // Scope uuid-a should not be included.
+        assert!(!ids.contains(&1), "should not include scope-a: {ids:?}");
+
+        ds.delete_session("sp-1")?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_sqlite_older_scopes() -> Result<()> {
+        let (_dir, path, conn) = test_db();
+        let write = crate::db::open_and_migrate_at(&path)?;
+        insert_session(&write, "sp-2", "/tmp/test-sp-older");
+
+        insert_scoped_message(&write, "sp-2", 1, Some("uuid-a"), "tools/call");
+        insert_scoped_message(&write, "sp-2", 2, Some("uuid-a"), "workspace/symbol");
+        insert_scoped_message(&write, "sp-2", 3, Some("uuid-b"), "tools/call");
+
+        let ds = SqliteDataSource::with_conn(conn);
+
+        // Scopes older than id 3 (scope-b root).
+        let msgs = ds.older_scopes(3, 10, true)?;
+        let ids: Vec<i64> = msgs.iter().map(|m| m.id).collect();
+        assert!(ids.contains(&1), "should include scope-a root: {ids:?}");
+        assert!(ids.contains(&2), "should include scope-a child: {ids:?}");
+        assert!(!ids.contains(&3), "should not include scope-b: {ids:?}");
+
+        ds.delete_session("sp-2")?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_sqlite_oldest_scopes() -> Result<()> {
+        let (_dir, path, conn) = test_db();
+        let write = crate::db::open_and_migrate_at(&path)?;
+        insert_session(&write, "sp-3", "/tmp/test-sp-oldest");
+
+        insert_scoped_message(&write, "sp-3", 1, Some("uuid-a"), "tools/call");
+        insert_scoped_message(&write, "sp-3", 2, Some("uuid-b"), "tools/call");
+        insert_scoped_message(&write, "sp-3", 3, None, "hover");
+
+        let ds = SqliteDataSource::with_conn(conn);
+
+        let msgs = ds.oldest_scopes(1, true)?;
+        let ids: Vec<i64> = msgs.iter().map(|m| m.id).collect();
+        assert_eq!(ids, vec![1], "should return only scope-a: {ids:?}");
+
+        ds.delete_session("sp-3")?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_sqlite_newer_scopes_bounded() -> Result<()> {
+        let (_dir, path, conn) = test_db();
+        let write = crate::db::open_and_migrate_at(&path)?;
+        insert_session(&write, "sp-4", "/tmp/test-sp-newer");
+
+        insert_scoped_message(&write, "sp-4", 1, Some("uuid-a"), "tools/call");
+        insert_scoped_message(&write, "sp-4", 3, Some("uuid-b"), "tools/call");
+        insert_scoped_message(&write, "sp-4", 5, Some("uuid-c"), "tools/call");
+
+        let ds = SqliteDataSource::with_conn(conn);
+
+        // Scopes newer than 1 but older than 5.
+        let msgs = ds.newer_scopes(1, Some(5), 10, true)?;
+        let ids: Vec<i64> = msgs.iter().map(|m| m.id).collect();
+        assert!(ids.contains(&3), "should include scope-b: {ids:?}");
+        assert!(!ids.contains(&1), "should not include scope-a: {ids:?}");
+        assert!(!ids.contains(&5), "should not include scope-c: {ids:?}");
+
+        ds.delete_session("sp-4")?;
         Ok(())
     }
 }

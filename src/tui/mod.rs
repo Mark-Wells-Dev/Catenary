@@ -195,15 +195,16 @@ fn run_loop(
                     app.stream.scroll_up(viewport_height / 2);
                 }
                 KeyCode::Home => {
-                    app.stream.scroll_position = 0;
-                    app.stream.cursor = 0;
-                    app.stream.auto_scroll = false;
+                    app.jump_to_beginning();
                 }
                 KeyCode::End => {
                     app.stream.pin_to_bottom(viewport_height);
                 }
                 _ => {}
             }
+
+            // Check for paging after cursor movement.
+            app.fetch_page_if_needed();
         }
 
         if last_tick.elapsed() >= TICK_INTERVAL {
