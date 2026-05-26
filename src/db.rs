@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 /// Current schema version. Bump when adding migrations.
-const SCHEMA_VERSION: u32 = 11;
+const SCHEMA_VERSION: u32 = 12;
 
 /// Resolve the Catenary state directory.
 ///
@@ -142,6 +142,9 @@ pub fn open_and_migrate_at(path: &Path) -> Result<Connection> {
             if version < 11 {
                 migrate_v10_to_v11(&conn)?;
             }
+            if version < 12 {
+                migrate_v11_to_v12(&conn)?;
+            }
         }
     } else {
         create_schema(&conn)?;
@@ -177,7 +180,7 @@ fn create_schema(conn: &Connection) -> Result<()> {
              key   TEXT PRIMARY KEY,
              value TEXT NOT NULL
          );
-         INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '11');
+         INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '12');
 
          CREATE TABLE IF NOT EXISTS sessions (
              id             TEXT PRIMARY KEY,
@@ -227,6 +230,7 @@ fn create_schema(conn: &Connection) -> Result<()> {
          CREATE INDEX IF NOT EXISTS idx_messages_type ON messages(type);
          CREATE INDEX IF NOT EXISTS idx_messages_level ON messages(level);
          CREATE INDEX IF NOT EXISTS idx_messages_parent_id ON messages(parent_id);
+         CREATE INDEX IF NOT EXISTS idx_messages_parent_id_and_id ON messages(parent_id, id);
 
          CREATE TABLE IF NOT EXISTS language_servers (
              session_id   TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -664,6 +668,32 @@ fn migrate_v10_to_v11(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Migrates the database from schema version 11 to 12.
+///
+/// Adds a composite index `(parent_id, id)` on the `messages` table.
+/// The scope paging CTE uses `MIN(id) ... GROUP BY parent_id`; this
+/// index makes the aggregation a covering index scan instead of a
+/// full-group read.
+///
+/// # Errors
+///
+/// Returns an error if the index creation or version update fails.
+fn migrate_v11_to_v12(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "BEGIN IMMEDIATE;
+
+         CREATE INDEX IF NOT EXISTS idx_messages_parent_id_and_id
+             ON messages(parent_id, id);
+
+         UPDATE meta SET value = '12' WHERE key = 'schema_version';
+
+         COMMIT;",
+    )
+    .context("failed to migrate schema from v11 to v12")?;
+
+    Ok(())
+}
+
 /// Reads the current schema version from the `meta` table.
 ///
 /// # Errors
@@ -750,7 +780,7 @@ mod tests {
         let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
 
         let version = current_schema_version(&conn).expect("failed to read schema version");
-        assert_eq!(version, 11, "schema version should be 11");
+        assert_eq!(version, 12, "schema version should be 12");
     }
 
     #[allow(clippy::expect_used, reason = "test assertions")]
@@ -818,7 +848,7 @@ mod tests {
         let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
 
         let version = current_schema_version(&conn).expect("failed to read schema version");
-        assert_eq!(version, 11, "schema version should be 11 after migration");
+        assert_eq!(version, 12, "schema version should be 12 after migration");
 
         for table in &["grammars", "symbols", "file_parse_state"] {
             assert!(
@@ -859,7 +889,7 @@ mod tests {
         let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
 
         let version = current_schema_version(&conn).expect("failed to read schema version");
-        assert_eq!(version, 11, "schema version should be 11 after migration");
+        assert_eq!(version, 12, "schema version should be 12 after migration");
 
         // Verify client_session_id column exists by inserting a row that uses it.
         conn.execute(
@@ -911,7 +941,7 @@ mod tests {
         let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
 
         let version = current_schema_version(&conn).expect("failed to read schema version");
-        assert_eq!(version, 11, "schema version should be 11 after migration");
+        assert_eq!(version, 12, "schema version should be 12 after migration");
 
         assert!(
             table_exists(&conn, "messages"),
@@ -975,7 +1005,7 @@ mod tests {
         let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
 
         let version = current_schema_version(&conn).expect("failed to read schema version");
-        assert_eq!(version, 11, "schema version should be 11 after migration");
+        assert_eq!(version, 12, "schema version should be 12 after migration");
 
         // Editing tables should be dropped by v6→v7
         assert!(
@@ -1044,7 +1074,7 @@ mod tests {
         let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
 
         let version = current_schema_version(&conn).expect("failed to read schema version");
-        assert_eq!(version, 11, "schema version should be 11 after migration");
+        assert_eq!(version, 12, "schema version should be 12 after migration");
 
         assert!(
             !table_exists(&conn, "editing_state"),
@@ -1112,7 +1142,7 @@ mod tests {
         let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
 
         let version = current_schema_version(&conn).expect("failed to read schema version");
-        assert_eq!(version, 11, "schema version should be 11 after migration");
+        assert_eq!(version, 12, "schema version should be 12 after migration");
 
         // Old data should be gone (table was recreated).
         let count: i64 = conn
@@ -1252,7 +1282,7 @@ mod tests {
 
         let conn = open_and_migrate_at(&path).expect("migration failed");
         let version = current_schema_version(&conn).expect("read version");
-        assert_eq!(version, 11, "schema version should be 11");
+        assert_eq!(version, 12, "schema version should be 12");
 
         // Trace event: type was 'debug' → type='internal', level='debug'
         let (typ, level): (String, String) = conn

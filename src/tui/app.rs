@@ -68,9 +68,9 @@ impl<'a> App<'a> {
         let include_debug = false;
         let messages = data.recent_scopes(PAGE_SIZE, include_debug)?;
         let tail = data.create_all_message_tail(include_debug).ok();
-        let reached_beginning = messages.is_empty();
         let mut stream = StreamState::new(messages);
-        stream.reached_beginning = reached_beginning;
+        // Fewer entries than the page size means we loaded everything.
+        stream.reached_beginning = stream.entries.len() < PAGE_SIZE;
 
         Ok(Self {
             theme,
@@ -106,9 +106,8 @@ impl<'a> App<'a> {
         let include_debug = self.level_threshold.include_debug();
         let messages = self.data.recent_scopes(PAGE_SIZE, include_debug)?;
         self.tail = self.data.create_all_message_tail(include_debug).ok();
-        let reached_beginning = messages.is_empty();
         self.stream = StreamState::new(messages);
-        self.stream.reached_beginning = reached_beginning;
+        self.stream.reached_beginning = self.stream.entries.len() < PAGE_SIZE;
         Ok(())
     }
 
@@ -121,18 +120,28 @@ impl<'a> App<'a> {
 
         match request {
             PageRequest::Older(before_id) => {
-                if let Ok(messages) = self.data.older_scopes(before_id, PAGE_SIZE, include_debug) {
+                if let Ok(messages) =
+                    self.data
+                        .older_scopes(before_id, None, PAGE_SIZE, include_debug)
+                {
                     self.stream.prepend_page(messages);
                 }
             }
             PageRequest::FillGap {
                 after_id,
                 before_id,
+                from_bottom,
             } => {
-                if let Ok(messages) =
+                let messages = if from_bottom {
+                    // Load the newest scopes in the gap (closest to bottom).
+                    self.data
+                        .older_scopes(before_id, Some(after_id), PAGE_SIZE, include_debug)
+                } else {
+                    // Load the oldest scopes in the gap (closest to top).
                     self.data
                         .newer_scopes(after_id, Some(before_id), PAGE_SIZE, include_debug)
-                {
+                };
+                if let Ok(messages) = messages {
                     self.stream.fill_gap(messages);
                 }
             }

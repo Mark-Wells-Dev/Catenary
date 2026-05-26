@@ -109,12 +109,16 @@ pub trait DataSource {
 
     /// Load scopes with root ID older than `before_id`, newest first.
     ///
+    /// When `after_id` is provided, results are bounded below (for gap
+    /// filling from the bottom side).
+    ///
     /// # Errors
     ///
     /// Returns an error if the database cannot be queried.
     fn older_scopes(
         &self,
         before_id: i64,
+        after_id: Option<i64>,
         limit: usize,
         include_debug: bool,
     ) -> Result<Vec<SessionMessage>>;
@@ -350,10 +354,11 @@ impl DataSource for SqliteDataSource {
     fn older_scopes(
         &self,
         before_id: i64,
+        after_id: Option<i64>,
         limit: usize,
         include_debug: bool,
     ) -> Result<Vec<SessionMessage>> {
-        session::older_scopes_with_conn(&self.conn, before_id, limit, include_debug)
+        session::older_scopes_with_conn(&self.conn, before_id, after_id, limit, include_debug)
     }
 
     fn newer_scopes(
@@ -504,6 +509,7 @@ impl DataSource for MockDataSource {
     fn older_scopes(
         &self,
         before_id: i64,
+        after_id: Option<i64>,
         limit: usize,
         include_debug: bool,
     ) -> Result<Vec<SessionMessage>> {
@@ -512,7 +518,7 @@ impl DataSource for MockDataSource {
         let page: Vec<_> = roots
             .iter()
             .rev()
-            .filter(|r| r.root_id < before_id)
+            .filter(|r| r.root_id < before_id && after_id.is_none_or(|a| r.root_id > a))
             .take(limit)
             .cloned()
             .collect();
@@ -1028,7 +1034,7 @@ mod tests {
         ]);
 
         // Scopes older than id 3 (scope-b root).
-        let msgs = ds.older_scopes(3, 10, true)?;
+        let msgs = ds.older_scopes(3, None, 10, true)?;
         let ids: Vec<i64> = msgs.iter().map(|m| m.id).collect();
         // Should include scope uuid-a (root=1) messages.
         assert!(ids.contains(&1), "should include scope-a root: {ids:?}");
@@ -1154,7 +1160,7 @@ mod tests {
         let ds = SqliteDataSource::with_conn(conn);
 
         // Scopes older than id 3 (scope-b root).
-        let msgs = ds.older_scopes(3, 10, true)?;
+        let msgs = ds.older_scopes(3, None, 10, true)?;
         let ids: Vec<i64> = msgs.iter().map(|m| m.id).collect();
         assert!(ids.contains(&1), "should include scope-a root: {ids:?}");
         assert!(ids.contains(&2), "should include scope-a child: {ids:?}");

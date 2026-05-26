@@ -137,12 +137,15 @@ pub enum PageRequest {
     /// Contains the oldest loaded scope root message ID.
     Older(i64),
     /// Fill the gap between top and bottom regions.
-    /// Contains `(after_id, before_id)` bounds for the query.
     FillGap {
         /// Newest scope root ID in the top region.
         after_id: i64,
         /// Oldest scope root ID in the bottom region.
         before_id: i64,
+        /// Fill from the bottom side (cursor near bottom region).
+        /// When true, load the newest scopes in the gap (closest
+        /// to the bottom region) instead of the oldest.
+        from_bottom: bool,
     },
 }
 
@@ -586,6 +589,18 @@ impl StreamState {
         self.entries.extend(temp);
         self.entries.extend(tail);
 
+        // Shift cursor/scroll to keep them on the same bottom-region
+        // content. Closed scopes produce 1 display row each, so entry
+        // count is a good approximation of display-row shift.
+        if let Some(gap_dr) = self.gap_display_row {
+            if self.cursor >= gap_dr {
+                self.cursor += n;
+            }
+            if self.scroll_position >= gap_dr {
+                self.scroll_position += n;
+            }
+        }
+
         let new_gap = gap_offset + n;
         self.gap_offset = Some(new_gap);
 
@@ -635,6 +650,7 @@ impl StreamState {
                 return Some(PageRequest::FillGap {
                     after_id: top_newest,
                     before_id: bottom_oldest,
+                    from_bottom: near_bottom_start,
                 });
             }
         }
