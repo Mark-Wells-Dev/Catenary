@@ -175,6 +175,17 @@ enum Command {
         dry_run: bool,
     },
 
+    /// Self-update the Catenary binary from GitHub releases.
+    Update {
+        /// Print whether an update is available without downloading.
+        #[arg(long)]
+        check: bool,
+
+        /// Re-download even if versions match.
+        #[arg(long)]
+        force: bool,
+    },
+
     /// Run as the Catenary daemon (internal, spawned by bridge proxy).
     #[command(hide = true)]
     Daemon,
@@ -397,6 +408,10 @@ fn main() -> Result<()> {
                     cli::install::run_install_antigravity(&mut out, source.as_deref(), dry_run)
                 }
             }
+        }
+        Some(Command::Update { check, force }) => {
+            let mut out = cli::Output::stdout(false);
+            cli::update::run_update(&mut out, check, force)
         }
         #[cfg(unix)]
         Some(Command::Daemon) => run_daemon(),
@@ -1065,5 +1080,55 @@ mod tests {
             unreachable!("expected Install command");
         };
         assert!(dry_run);
+    }
+
+    // ── CLI update subcommand tests ───────────────────────────────
+
+    #[test]
+    fn test_cli_update_bare() {
+        use clap::Parser;
+        let args = Args::try_parse_from(["catenary", "update"]);
+        let args = args.expect("update should parse");
+        let Some(Command::Update { check, force }) = args.command else {
+            unreachable!("expected Update command");
+        };
+        assert!(!check);
+        assert!(!force);
+    }
+
+    #[test]
+    fn test_cli_update_check() {
+        use clap::Parser;
+        let args = Args::try_parse_from(["catenary", "update", "--check"]);
+        let args = args.expect("update --check should parse");
+        let Some(Command::Update { check, force }) = args.command else {
+            unreachable!("expected Update command");
+        };
+        assert!(check);
+        assert!(!force);
+    }
+
+    #[test]
+    fn test_cli_update_force() {
+        use clap::Parser;
+        let args = Args::try_parse_from(["catenary", "update", "--force"]);
+        let args = args.expect("update --force should parse");
+        let Some(Command::Update { check, force }) = args.command else {
+            unreachable!("expected Update command");
+        };
+        assert!(!check);
+        assert!(force);
+    }
+
+    #[test]
+    fn test_cli_update_check_and_force() {
+        use clap::Parser;
+        let args = Args::try_parse_from(["catenary", "update", "--check", "--force"]);
+        let args = args.expect("update --check --force should parse");
+        let Some(Command::Update { check, force }) = args.command else {
+            unreachable!("expected Update command");
+        };
+        assert!(check);
+        assert!(force);
     }
 }

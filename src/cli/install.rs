@@ -874,6 +874,45 @@ fn install_antigravity_bundled(out: &mut Output, target: &Path, dry_run: bool) -
     Ok(())
 }
 
+// ── Post-update refresh ───────────────────────────────────────────
+
+/// Refresh all hosts that have an existing Catenary installation.
+///
+/// Called by `catenary update` after binary replacement. Runs
+/// `install <host>` with no source argument for each host that
+/// already has Catenary installed, preserving the existing
+/// local/release registration.
+///
+/// # Errors
+///
+/// Returns an error if any install step fails.
+pub fn refresh_installed_hosts(out: &mut Output) -> Result<()> {
+    let claude = binary_exists("claude") && claude_plugin_is_installed();
+    let gemini = binary_exists("gemini") && gemini_current_install().is_some();
+    let antigravity = dirs::home_dir()
+        .map(|h| h.join(".gemini/config/plugins/catenary"))
+        .is_some_and(|p| p.is_dir() || p.is_symlink());
+
+    if claude {
+        run_install_claude(out, None, false)?;
+    }
+    if gemini {
+        run_install_gemini(out, None, false)?;
+    }
+    if antigravity {
+        run_install_antigravity(out, None, false)?;
+    }
+
+    if !claude && !gemini && !antigravity {
+        let _ = out.writeln(format_args!(
+            "  {} no hosts have Catenary installed",
+            out.colors.dim("—"),
+        ));
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(
     clippy::expect_used,

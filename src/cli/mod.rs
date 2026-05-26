@@ -9,6 +9,7 @@ pub mod config_template;
 pub mod doctor;
 pub mod hooks;
 pub mod install;
+pub mod update;
 
 use clap::ValueEnum;
 use crossterm::tty::IsTty;
