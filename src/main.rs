@@ -165,6 +165,16 @@ enum Command {
     #[command(name = "ls-roots")]
     LsRoots,
 
+    /// Install or update the Catenary plugin for a host CLI.
+    Install {
+        #[command(subcommand)]
+        host: Option<InstallHost>,
+
+        /// Show what would change without acting.
+        #[arg(long, global = true)]
+        dry_run: bool,
+    },
+
     /// Run as the Catenary daemon (internal, spawned by bridge proxy).
     #[command(hide = true)]
     Daemon,
@@ -210,6 +220,26 @@ enum HookCommand {
         /// Output format: "claude", "gemini", or "antigravity".
         #[arg(long, value_enum)]
         format: HostFormat,
+    },
+}
+
+/// Host targets for the install command.
+#[derive(Subcommand, Debug)]
+enum InstallHost {
+    /// Install the Catenary plugin for Claude Code.
+    Claude {
+        /// Source: local path (dev install) or repo identifier (release install).
+        source: Option<String>,
+    },
+    /// Install the Catenary extension for Gemini CLI.
+    Gemini {
+        /// Source: local path (dev install) or repo identifier (release install).
+        source: Option<String>,
+    },
+    /// Install the Catenary plugin for Antigravity CLI.
+    Antigravity {
+        /// Source: local path (dev install) or repo identifier (release install).
+        source: Option<String>,
     },
 }
 
@@ -353,6 +383,21 @@ fn main() -> Result<()> {
         }
         #[cfg(not(unix))]
         Some(Command::LsRoots) => Err(anyhow::anyhow!("daemon mode requires Unix")),
+        Some(Command::Install { host, dry_run }) => {
+            let mut out = cli::Output::stdout(false);
+            match host {
+                None => cli::install::run_install_list(&mut out),
+                Some(InstallHost::Claude { source }) => {
+                    cli::install::run_install_claude(&mut out, source.as_deref(), dry_run)
+                }
+                Some(InstallHost::Gemini { source }) => {
+                    cli::install::run_install_gemini(&mut out, source.as_deref(), dry_run)
+                }
+                Some(InstallHost::Antigravity { source }) => {
+                    cli::install::run_install_antigravity(&mut out, source.as_deref(), dry_run)
+                }
+            }
+        }
         #[cfg(unix)]
         Some(Command::Daemon) => run_daemon(),
         #[cfg(not(unix))]
@@ -932,5 +977,93 @@ mod tests {
         let args = Args::try_parse_from(["catenary", "ls-roots"]);
         let args = args.expect("ls-roots should parse");
         assert!(matches!(args.command, Some(Command::LsRoots)));
+    }
+
+    // ── CLI install subcommand tests ────────────────────────────────
+
+    #[test]
+    fn test_cli_install_bare() {
+        use clap::Parser;
+        let args = Args::try_parse_from(["catenary", "install"]);
+        let args = args.expect("install should parse");
+        let Some(Command::Install { host, dry_run }) = args.command else {
+            unreachable!("expected Install command");
+        };
+        assert!(host.is_none());
+        assert!(!dry_run);
+    }
+
+    #[test]
+    fn test_cli_install_claude() {
+        use clap::Parser;
+        let args = Args::try_parse_from(["catenary", "install", "claude"]);
+        let args = args.expect("install claude should parse");
+        let Some(Command::Install {
+            host: Some(InstallHost::Claude { source }),
+            ..
+        }) = args.command
+        else {
+            unreachable!("expected Install Claude command");
+        };
+        assert!(source.is_none());
+    }
+
+    #[test]
+    fn test_cli_install_claude_with_source() {
+        use clap::Parser;
+        let args = Args::try_parse_from([
+            "catenary",
+            "install",
+            "claude",
+            "/home/user/Projects/Catenary",
+        ]);
+        let args = args.expect("install claude with source should parse");
+        let Some(Command::Install {
+            host: Some(InstallHost::Claude { source }),
+            ..
+        }) = args.command
+        else {
+            unreachable!("expected Install Claude command");
+        };
+        assert_eq!(source.as_deref(), Some("/home/user/Projects/Catenary"));
+    }
+
+    #[test]
+    fn test_cli_install_gemini() {
+        use clap::Parser;
+        let args = Args::try_parse_from(["catenary", "install", "gemini"]);
+        let args = args.expect("install gemini should parse");
+        assert!(matches!(
+            args.command,
+            Some(Command::Install {
+                host: Some(InstallHost::Gemini { .. }),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_cli_install_antigravity() {
+        use clap::Parser;
+        let args = Args::try_parse_from(["catenary", "install", "antigravity"]);
+        let args = args.expect("install antigravity should parse");
+        assert!(matches!(
+            args.command,
+            Some(Command::Install {
+                host: Some(InstallHost::Antigravity { .. }),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_cli_install_dry_run() {
+        use clap::Parser;
+        let args = Args::try_parse_from(["catenary", "install", "--dry-run", "claude"]);
+        let args = args.expect("install --dry-run claude should parse");
+        let Some(Command::Install { dry_run, .. }) = args.command else {
+            unreachable!("expected Install command");
+        };
+        assert!(dry_run);
     }
 }
