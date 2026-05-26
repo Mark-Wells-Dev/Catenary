@@ -189,9 +189,15 @@ impl Session {
         let config = Arc::new(config);
 
         let message_db = crate::logging::message_db::MessageDbSink::new(conn, instance_id.clone());
+        let desktop_enabled = config
+            .notifications
+            .as_ref()
+            .and_then(|n| n.desktop)
+            .unwrap_or(true);
+        let desktop_sink = crate::notify::DesktopNotificationSink::with_enabled(desktop_enabled);
 
         // Activate — drains bootstrap buffer, enables direct dispatch.
-        logging.activate(vec![notification_router.clone(), message_db]);
+        logging.activate(vec![notification_router.clone(), message_db, desktop_sink]);
 
         let classification = super::filesystem_manager::ClassificationTables::from_config(&config);
         let fs_manager = Arc::new(FilesystemManager::with_classification(classification));

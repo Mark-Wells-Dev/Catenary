@@ -110,9 +110,13 @@ const TEMPLATE: &str = r#"# Catenary recommended config
 #
 # Controls which events are promoted to user-facing notifications
 # via systemMessage. Options: "debug", "info", "warn", "error".
+#
+# desktop: OS-level desktop notifications for error events.
+# Set to false to suppress. CATENARY_NOTIFY=0 env var also suppresses.
 
 # [notifications]
 # threshold = "warn"
+# desktop = true
 
 # ── Server environment ────────────────────────────────────────────
 #

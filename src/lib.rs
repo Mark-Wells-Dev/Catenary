@@ -26,6 +26,8 @@ pub mod logging;
 pub mod lsp;
 /// MCP server implementation and type definitions.
 pub mod mcp;
+/// Desktop notification support (OS-level notifications for error events).
+pub mod notify;
 /// Protocol classification shared by core and display layers.
 pub mod protocol;
 /// Daemon session manager and MCP socket listener.

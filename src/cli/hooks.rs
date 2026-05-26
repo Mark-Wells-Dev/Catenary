@@ -28,10 +28,23 @@ use std::time::Duration;
 use crate::cli::HostFormat;
 
 /// Connect to the daemon's IPC endpoint.
+///
+/// When the socket file exists but the connection fails (daemon likely
+/// crashed), emits an `error!()` event. The hook CLI's tracing subscriber
+/// routes this to a desktop notification so the user gets an immediate
+/// signal outside the agent's context.
 #[cfg(unix)]
 fn hook_connect(_hook_json: &serde_json::Value) -> Option<std::os::unix::net::UnixStream> {
     let daemon_path = crate::router::socket_path();
-    notify_connect(&daemon_path)
+    let result = notify_connect(&daemon_path);
+    if result.is_none() && daemon_path.exists() {
+        // Socket exists but connection failed — daemon likely crashed.
+        tracing::error!(
+            source = crate::source::Source::HookDispatch.as_str(),
+            "Catenary daemon unreachable (socket exists but connection failed). Run: catenary doctor",
+        );
+    }
+    result
 }
 
 /// Connect to the daemon's hook IPC endpoint (Windows stub).

@@ -322,6 +322,17 @@ fn main() -> Result<()> {
             }
         }
         Some(Command::Hook { command }) => {
+            // Install minimal tracing subscriber for hook CLI: only the
+            // desktop notification sink. When the daemon is unreachable,
+            // error!() events fire OS notifications directly from the
+            // hook process.
+            let hook_logging = LoggingServer::new();
+            tracing_subscriber::registry()
+                .with(hook_logging.clone())
+                .init();
+            let desktop_sink = catenary_mcp::notify::DesktopNotificationSink::new();
+            hook_logging.activate(vec![desktop_sink]);
+
             match command {
                 HookCommand::PreAgent { format } => cli::hooks::run_pre_agent(format),
                 HookCommand::PreTool { format } => cli::hooks::run_pre_tool(format),
@@ -545,6 +556,16 @@ fn run_daemon_main() -> Result<()> {
 
     let (handler, shared_session, shared_conn) = if disabled {
         info!("Catenary disabled by .catenary.toml (lsp = false) in {workspace_display}");
+        // Activate with just the desktop notification sink so stale hook
+        // detection can still fire OS notifications.
+        let desktop_enabled = config
+            .notifications
+            .as_ref()
+            .and_then(|n| n.desktop)
+            .unwrap_or(true);
+        let desktop_sink =
+            catenary_mcp::notify::DesktopNotificationSink::with_enabled(desktop_enabled);
+        logging.activate(vec![desktop_sink]);
         let handler: Arc<dyn catenary_mcp::mcp::ToolHandler> = Arc::new(DaemonDisabledHandler);
         (handler, None, None)
     } else {
@@ -613,6 +634,11 @@ fn run_daemon_main() -> Result<()> {
         source = Source::DaemonLifecycle.as_str(),
         "daemon serving workspace: {workspace_display}",
     );
+
+    // Check installed hooks against expected — fire error!() (→ desktop
+    // notification) if stale. The LoggingServer is active at this point,
+    // so error events route through the desktop notification sink.
+    check_stale_hooks();
 
     // Wire signals to the daemon's shutdown token so accept_loop
     // exits on SIGINT/SIGTERM.
@@ -851,6 +877,88 @@ async fn run_root_command(path: PathBuf, method: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Check installed hooks against embedded expected hooks at daemon startup.
+///
+/// Compares each host CLI's installed hooks with the compile-time expected
+/// version. Emits `error!()` for any mismatch — the `LoggingServer`
+/// routes this to the notification queue and the desktop notification
+/// sink automatically.
+///
+/// Only checks hosts that have hooks installed (missing hosts are ignored).
+#[cfg(unix)]
+fn check_stale_hooks() {
+    /// Expected Claude Code hooks, embedded at compile time.
+    const CLAUDE_HOOKS_EXPECTED: &str = include_str!("../plugins/catenary/hooks/hooks.json");
+    /// Expected Gemini CLI hooks, embedded at compile time.
+    const GEMINI_HOOKS_EXPECTED: &str = include_str!("../hooks/hooks.json");
+    /// Expected Antigravity CLI hooks, embedded at compile time.
+    const ANTIGRAVITY_HOOKS_EXPECTED: &str =
+        include_str!("../plugins/catenary-antigravity/hooks.json");
+
+    fn normalize_json(s: &str) -> String {
+        serde_json::from_str::<serde_json::Value>(s)
+            .ok()
+            .and_then(|v| serde_json::to_string(&v).ok())
+            .unwrap_or_else(|| s.trim().to_string())
+    }
+
+    fn check_host(host: &str, installed_path: &std::path::Path, expected: &str) {
+        match std::fs::read_to_string(installed_path) {
+            Ok(installed) if normalize_json(&installed) == normalize_json(expected) => {}
+            Ok(_) => {
+                tracing::error!(
+                    source = Source::HookDispatch.as_str(),
+                    "Stale {host} hooks detected. Run: catenary install",
+                );
+            }
+            Err(_) => {} // Hooks file not found — host not installed, skip.
+        }
+    }
+
+    let Ok(home) = std::env::var("HOME") else {
+        return;
+    };
+    let home = std::path::PathBuf::from(home);
+
+    // Claude Code: hooks live inside the plugin install path, which is
+    // recorded in installed_plugins.json. Resolve the actual path.
+    if let Some(hooks_path) = resolve_claude_hooks_path(&home) {
+        check_host("Claude Code", &hooks_path, CLAUDE_HOOKS_EXPECTED);
+    }
+
+    // Gemini CLI: hooks at ~/.gemini/hooks/hooks.json
+    let gemini_hooks = home.join(".gemini/hooks/hooks.json");
+    check_host("Gemini CLI", &gemini_hooks, GEMINI_HOOKS_EXPECTED);
+
+    // Antigravity CLI: hooks at ~/.antigravity/hooks.json
+    let antigravity_hooks = home.join(".antigravity/hooks.json");
+    check_host(
+        "Antigravity CLI",
+        &antigravity_hooks,
+        ANTIGRAVITY_HOOKS_EXPECTED,
+    );
+}
+
+/// Resolve the Claude Code hooks.json path from `installed_plugins.json`.
+///
+/// Returns `None` if Claude Code is not installed or the plugin entry
+/// cannot be resolved.
+#[cfg(unix)]
+fn resolve_claude_hooks_path(home: &std::path::Path) -> Option<std::path::PathBuf> {
+    let plugins_file = home.join(".claude/plugins/installed_plugins.json");
+    let plugins_json = std::fs::read_to_string(plugins_file).ok()?;
+    let plugins: serde_json::Value = serde_json::from_str(&plugins_json).ok()?;
+    let entries = plugins
+        .get("plugins")
+        .and_then(|p| p.get("catenary@catenary"))
+        .and_then(serde_json::Value::as_array)?;
+    let entry = entries.first()?;
+    let install_path = entry
+        .get("installPath")
+        .and_then(serde_json::Value::as_str)?;
+    Some(std::path::PathBuf::from(install_path).join("hooks/hooks.json"))
 }
 
 #[cfg(test)]

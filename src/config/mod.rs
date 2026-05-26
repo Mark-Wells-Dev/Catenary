@@ -34,12 +34,18 @@ pub use server::ServerDef;
 /// ```toml
 /// [notifications]
 /// threshold = "warn"
+/// desktop = true
 /// ```
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct NotificationConfig {
     /// Minimum severity for notification delivery.
     pub threshold: SeverityConfig,
+    /// Whether OS-level desktop notifications are enabled for error events.
+    /// Defaults to `true`. Set to `false` to suppress desktop notifications
+    /// while keeping `systemMessage` delivery. The `CATENARY_NOTIFY=0`
+    /// environment variable overrides this to `false`.
+    pub desktop: Option<bool>,
 }
 
 /// Severity level for notification threshold configuration.
@@ -1259,6 +1265,37 @@ command = "rust-analyzer"
             config.notifications.unwrap_or_default().threshold,
             SeverityConfig::Error,
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn notification_config_desktop_defaults_to_none() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "[notifications]\nthreshold = \"warn\"\n")?;
+
+        let config = Config::load_from_sources(&[path])?;
+        let notif = config.notifications.expect("should be Some");
+        assert!(
+            notif.desktop.is_none(),
+            "desktop should be None when omitted"
+        );
+        // Consuming code uses unwrap_or(true).
+        assert!(notif.desktop.unwrap_or(true));
+
+        Ok(())
+    }
+
+    #[test]
+    fn notification_config_desktop_false() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "[notifications]\ndesktop = false\n")?;
+
+        let config = Config::load_from_sources(&[path])?;
+        let notif = config.notifications.expect("should be Some");
+        assert_eq!(notif.desktop, Some(false));
 
         Ok(())
     }
