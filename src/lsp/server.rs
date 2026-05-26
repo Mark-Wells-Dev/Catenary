@@ -398,24 +398,25 @@ impl LspServer {
 
     /// Sets the lifecycle state and wakes waiters.
     ///
-    /// On transition to a terminal state (`Dead` or `Failed`), emits a
+    /// Emits a `debug!()` event on every transition so the DB sink can
+    /// update the `language_servers` table. On first transition to a
+    /// terminal state (`Dead` or `Failed`), additionally emits a
     /// `warn!()` notification that flows through `LoggingServer` →
-    /// `NotificationQueueSink` → `systemMessage`. Dedup is handled by
-    /// `NotificationQueueSink` — no per-tool tracking needed.
+    /// `NotificationQueueSink` → `systemMessage`.
     pub(crate) fn set_lifecycle(&self, state: ServerLifecycle) {
         let display = state.display_state().to_string();
+        let is_terminal = state.is_terminal();
         let mut lifecycle = self
             .lifecycle
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let was_terminal = lifecycle.is_terminal();
-        let is_terminal = state.is_terminal();
         *lifecycle = state;
         drop(lifecycle);
 
         self.persist_state(&display);
 
-        // Emit notification on first transition to terminal state.
+        // Emit user-facing notification on first transition to terminal state.
         if !was_terminal
             && is_terminal
             && let Some(key) = self.key()

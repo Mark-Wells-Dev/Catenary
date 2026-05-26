@@ -24,6 +24,21 @@ pub struct SessionRow {
     pub languages: Vec<String>,
 }
 
+/// A server instance row from the `language_servers` table.
+#[derive(Debug, Clone)]
+pub struct ServerStatusRow {
+    /// Language ID this instance handles.
+    pub language_id: String,
+    /// Server binary name (config key).
+    pub server: String,
+    /// Scope kind (`"root"`, `"single_file"`).
+    pub scope_kind: String,
+    /// Scope root path (empty for single-file).
+    pub scope_root: String,
+    /// Lifecycle display state (`"initializing"`, `"ready"`, `"busy"`, `"dead"`).
+    pub state: String,
+}
+
 /// Abstraction over session data access.
 ///
 /// [`SqliteDataSource`] reads from the database (production).
@@ -145,6 +160,15 @@ pub trait DataSource {
     ///
     /// Returns an error if the database cannot be queried.
     fn oldest_scopes(&self, limit: usize, include_debug: bool) -> Result<Vec<SessionMessage>>;
+
+    /// List active server instances from the `language_servers` table.
+    ///
+    /// Returns only non-terminal servers (excludes `"dead"` state).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be queried.
+    fn list_server_statuses(&self) -> Result<Vec<ServerStatusRow>>;
 }
 
 /// Tail reader abstraction for streaming new messages.
@@ -374,6 +398,27 @@ impl DataSource for SqliteDataSource {
     fn oldest_scopes(&self, limit: usize, include_debug: bool) -> Result<Vec<SessionMessage>> {
         session::oldest_scopes_with_conn(&self.conn, limit, include_debug)
     }
+
+    fn list_server_statuses(&self) -> Result<Vec<ServerStatusRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT language_id, server, scope_kind, scope_root, state \
+             FROM language_servers \
+             WHERE state != 'dead' \
+             ORDER BY server, language_id, scope_root",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut result = Vec::new();
+        while let Some(row) = rows.next()? {
+            result.push(ServerStatusRow {
+                language_id: row.get(0)?,
+                server: row.get(1)?,
+                scope_kind: row.get(2)?,
+                scope_root: row.get(3)?,
+                state: row.get(4)?,
+            });
+        }
+        Ok(result)
+    }
 }
 
 /// Query active languages for a session from its messages.
@@ -409,6 +454,8 @@ pub struct MockDataSource {
     pub messages: HashMap<String, Vec<SessionMessage>>,
     /// Tail messages keyed by session ID for [`DataSource::create_message_tail`].
     pub tail_messages: HashMap<String, VecDeque<SessionMessage>>,
+    /// Server statuses for [`DataSource::list_server_statuses`].
+    pub server_statuses: Vec<ServerStatusRow>,
 }
 
 impl DataSource for MockDataSource {
@@ -548,6 +595,15 @@ impl DataSource for MockDataSource {
         let roots = scope_roots_from_messages(&all);
         let page: Vec<_> = roots.iter().take(limit).cloned().collect();
         Ok(collect_scope_messages(&all, &page))
+    }
+
+    fn list_server_statuses(&self) -> Result<Vec<ServerStatusRow>> {
+        Ok(self
+            .server_statuses
+            .iter()
+            .filter(|s| s.state != "dead")
+            .cloned()
+            .collect())
     }
 }
 
@@ -708,6 +764,7 @@ mod tests {
             ],
             messages: HashMap::new(),
             tail_messages: HashMap::new(),
+            server_statuses: Vec::new(),
         };
 
         let rows = ds.list_sessions()?;
@@ -734,6 +791,7 @@ mod tests {
             sessions: vec![],
             messages: messages_map,
             tail_messages: HashMap::new(),
+            server_statuses: Vec::new(),
         };
 
         let result = ds.monitor_messages("abc", true)?;
@@ -890,6 +948,7 @@ mod tests {
             ],
             messages: HashMap::new(),
             tail_messages: HashMap::new(),
+            server_statuses: Vec::new(),
         };
 
         let ids = ds.list_alive_session_ids()?;
@@ -924,6 +983,76 @@ mod tests {
     }
 
     #[test]
+    fn test_sqlite_list_server_statuses() -> Result<()> {
+        let (_dir, path, conn) = test_db();
+        let write_conn = crate::db::open_and_migrate_at(&path)?;
+
+        // FK requires a session row.
+        insert_session(&write_conn, "daemon", "/tmp/daemon");
+
+        // Insert server rows.
+        write_conn.execute(
+            "INSERT INTO language_servers \
+             (session_id, language_id, server, scope_kind, scope_root, state) \
+             VALUES ('daemon', 'rust', 'rust-analyzer', 'root', '/home/user/A', 'ready')",
+            [],
+        )?;
+        write_conn.execute(
+            "INSERT INTO language_servers \
+             (session_id, language_id, server, scope_kind, scope_root, state) \
+             VALUES ('daemon', 'rust', 'rust-analyzer', 'root', '/home/user/B', 'busy')",
+            [],
+        )?;
+        write_conn.execute(
+            "INSERT INTO language_servers \
+             (session_id, language_id, server, scope_kind, scope_root, state) \
+             VALUES ('daemon', 'lua', 'lua-ls', 'root', '/home/user/C', 'dead')",
+            [],
+        )?;
+
+        let ds = SqliteDataSource::with_conn(conn);
+        let rows = ds.list_server_statuses()?;
+
+        // Should exclude dead servers.
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].server, "rust-analyzer");
+        assert_eq!(rows[0].state, "ready");
+        assert_eq!(rows[1].server, "rust-analyzer");
+        assert_eq!(rows[1].state, "busy");
+        Ok(())
+    }
+
+    #[test]
+    fn test_mock_list_server_statuses_excludes_dead() -> Result<()> {
+        let ds = MockDataSource {
+            sessions: vec![],
+            messages: HashMap::new(),
+            tail_messages: HashMap::new(),
+            server_statuses: vec![
+                ServerStatusRow {
+                    language_id: "rust".to_string(),
+                    server: "rust-analyzer".to_string(),
+                    scope_kind: "root".to_string(),
+                    scope_root: "/A".to_string(),
+                    state: "ready".to_string(),
+                },
+                ServerStatusRow {
+                    language_id: "lua".to_string(),
+                    server: "lua-ls".to_string(),
+                    scope_kind: "root".to_string(),
+                    scope_root: "/B".to_string(),
+                    state: "dead".to_string(),
+                },
+            ],
+        };
+
+        let rows = ds.list_server_statuses()?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].server, "rust-analyzer");
+        Ok(())
+    }
+
+    #[test]
     fn test_mock_create_message_tail_filters_debug() -> Result<()> {
         let mut tail_messages = VecDeque::new();
         let mut debug_msg = make_message("textDocument/hover");
@@ -939,6 +1068,7 @@ mod tests {
             sessions: vec![],
             messages: HashMap::new(),
             tail_messages: map,
+            server_statuses: Vec::new(),
         };
 
         let mut tail = ds.create_message_tail("sess-1", false)?;
@@ -1001,6 +1131,7 @@ mod tests {
             sessions: vec![],
             messages: map,
             tail_messages: HashMap::new(),
+            server_statuses: Vec::new(),
         }
     }
 

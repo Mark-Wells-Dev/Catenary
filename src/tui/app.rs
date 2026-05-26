@@ -98,8 +98,9 @@ impl<'a> App<'a> {
             tail,
         };
 
-        // Load initial session list.
+        // Load initial session and server lists.
         app.refresh_sessions();
+        app.refresh_servers();
 
         Ok(app)
     }
@@ -229,5 +230,19 @@ impl<'a> App<'a> {
             self.stream
                 .set_session_filter(self.sidebar.session_filter());
         }
+    }
+
+    /// Refresh the sidebar server list from the database.
+    ///
+    /// Queries `language_servers` and updates the server section.
+    /// Silently ignores query failures.
+    pub fn refresh_servers(&mut self) {
+        let Ok(rows) = self.data.list_server_statuses() else {
+            return;
+        };
+        if !self.sidebar.servers_need_refresh(&rows) {
+            return;
+        }
+        self.sidebar.refresh_servers(&rows);
     }
 }

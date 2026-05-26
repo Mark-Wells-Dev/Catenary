@@ -14,6 +14,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 
+use super::data::ServerStatusRow;
 use super::stream::HexBadgeMap;
 use super::theme::Theme;
 
@@ -44,18 +45,51 @@ impl SessionEntry {
     }
 }
 
+// ── Server entry ────────────────────────────────────────────────────
+
+/// A server entry in the sidebar, grouped by server name.
+///
+/// Multi-root servers (one process, multiple roots via `workspaceFolders`)
+/// appear as one entry with multiple root children. Per-root servers
+/// (separate instance per root) also group under one name, showing the
+/// most significant lifecycle state on the header line.
+pub struct ServerEntry {
+    /// Server binary name (config key, e.g., "rust-analyzer").
+    pub name: String,
+    /// Aggregated lifecycle display state for the header line.
+    /// Uses the most significant state when instances differ.
+    pub state: String,
+    /// Workspace root short names served by this server.
+    pub roots: Vec<String>,
+    /// Whether the children (roots) are visible.
+    pub expanded: bool,
+}
+
+impl ServerEntry {
+    /// Display width of the header line: `<name>  <state>`.
+    const fn header_width(&self) -> usize {
+        // name + 2 spaces + state
+        self.name.len() + 2 + self.state.len()
+    }
+}
+
 // ── Sidebar state ────────────────────────────────────────────────────
 
-/// Sidebar state: session list, navigation cursor, and selection filter.
+/// Sidebar state: session list, server list, navigation cursor, and
+/// selection filter.
 pub struct SidebarState {
     /// Alive sessions in display order.
     pub entries: Vec<SessionEntry>,
+    /// Active server entries, grouped by server name.
+    pub servers: Vec<ServerEntry>,
     /// Cursor position in the session list.
     pub cursor: usize,
     /// First visible entry index (scroll offset).
     pub scroll_offset: usize,
     /// Session IDs from the last refresh (for change detection).
     last_ids: Vec<String>,
+    /// Server names from the last refresh (for change detection).
+    last_server_names: Vec<String>,
     /// Selected session IDs (for stream filtering).
     /// Empty = show all (no filter active).
     selected: HashSet<String>,
@@ -67,9 +101,11 @@ impl SidebarState {
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
+            servers: Vec::new(),
             cursor: 0,
             scroll_offset: 0,
             last_ids: Vec::new(),
+            last_server_names: Vec::new(),
             selected: HashSet::new(),
         }
     }
@@ -118,8 +154,8 @@ impl SidebarState {
 
         self.last_ids = self.entries.iter().map(|e| e.session_id.clone()).collect();
 
-        // Clamp cursor.
-        let max = self.entries.len().saturating_sub(1);
+        // Clamp cursor to total item count.
+        let max = self.item_count().saturating_sub(1);
         self.cursor = self.cursor.min(max);
     }
 
@@ -165,6 +201,104 @@ impl SidebarState {
         self.selected.contains(session_id)
     }
 
+    /// Check whether the server list has changed since the last refresh.
+    #[must_use]
+    pub fn servers_need_refresh(&self, rows: &[ServerStatusRow]) -> bool {
+        // Quick check: compare sorted server names + states.
+        let current: Vec<String> = rows
+            .iter()
+            .map(|r| format!("{}:{}", r.server, r.state))
+            .collect();
+        self.last_server_names != current
+    }
+
+    /// Update the server list from DB rows.
+    ///
+    /// Groups rows by server name. Each group becomes one sidebar entry
+    /// with workspace root short names as expandable children.
+    pub fn refresh_servers(&mut self, rows: &[ServerStatusRow]) {
+        self.last_server_names = rows
+            .iter()
+            .map(|r| format!("{}:{}", r.server, r.state))
+            .collect();
+
+        // Preserve expansion state across refreshes.
+        let was_expanded: HashSet<String> = self
+            .servers
+            .iter()
+            .filter(|s| s.expanded)
+            .map(|s| s.name.clone())
+            .collect();
+
+        // Group by server name, preserving input order.
+        let mut groups: Vec<(String, String, Vec<String>)> = Vec::new();
+        for row in rows {
+            let root = server_root_name(&row.scope_root);
+            if let Some(group) = groups.iter_mut().find(|(name, _, _)| *name == row.server) {
+                if !root.is_empty() && !group.2.contains(&root) {
+                    group.2.push(root);
+                }
+                // Update state to most significant.
+                group.1 = most_significant_state(&group.1, &row.state);
+            } else {
+                let roots = if root.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![root]
+                };
+                groups.push((row.server.clone(), row.state.clone(), roots));
+            }
+        }
+
+        self.servers = groups
+            .into_iter()
+            .map(|(name, state, roots)| {
+                let expanded = was_expanded.contains(&name);
+                ServerEntry {
+                    name,
+                    state,
+                    roots,
+                    expanded,
+                }
+            })
+            .collect();
+    }
+
+    /// Toggle expand/collapse on the server entry at the cursor.
+    ///
+    /// Only applies when the cursor points to a server header line
+    /// (not a session entry). Returns `true` if state changed.
+    pub fn toggle_server_expansion(&mut self, cursor_in_servers: usize) -> bool {
+        if let Some(entry) = self.servers.get_mut(cursor_in_servers) {
+            entry.expanded = !entry.expanded;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Total number of navigable items (sessions + servers).
+    #[must_use]
+    pub const fn item_count(&self) -> usize {
+        self.entries.len() + self.servers.len()
+    }
+
+    /// Whether the cursor is on a session entry.
+    #[must_use]
+    pub const fn cursor_on_session(&self) -> bool {
+        self.cursor < self.entries.len()
+    }
+
+    /// Server index if cursor is on a server entry.
+    #[must_use]
+    pub const fn cursor_server_index(&self) -> Option<usize> {
+        if self.cursor >= self.entries.len() {
+            Some(self.cursor - self.entries.len())
+        } else {
+            None
+        }
+    }
+
     /// Move cursor up by `n` entries, scrolling if needed.
     ///
     /// `visible` is the number of entry rows visible in the sidebar
@@ -181,10 +315,11 @@ impl SidebarState {
     ///
     /// `visible` is the number of entry rows visible in the sidebar.
     pub fn cursor_down(&mut self, n: usize, visible: usize) {
-        if self.entries.is_empty() {
+        let total = self.item_count();
+        if total == 0 {
             return;
         }
-        let max = self.entries.len().saturating_sub(1);
+        let max = total.saturating_sub(1);
         self.cursor = (self.cursor + n).min(max);
         // Scroll down to keep cursor in view.
         if visible > 0 && self.cursor >= self.scroll_offset + visible {
@@ -194,24 +329,52 @@ impl SidebarState {
 
     /// Compute the total sidebar width including the separator column.
     ///
-    /// Auto-sizes based on the longest entry label, clamped between
-    /// [`MIN_WIDTH`] and [`MAX_WIDTH`].
+    /// Auto-sizes based on the longest session or server label, clamped
+    /// between [`MIN_WIDTH`] and [`MAX_WIDTH`].
     #[must_use]
     #[allow(
         clippy::cast_possible_truncation,
         reason = "entry widths are always small (< MAX_WIDTH)"
     )]
     pub fn content_width(&self) -> u16 {
-        let max_entry = self
+        let max_session = self
             .entries
             .iter()
             .map(SessionEntry::display_width)
             .max()
             .unwrap_or(0);
-        // "Sessions" header is 8 chars.
-        let width = max_entry.max(8) as u16;
+        let max_server = self
+            .servers
+            .iter()
+            .map(ServerEntry::header_width)
+            .max()
+            .unwrap_or(0);
+        // "Sessions" and "Servers" headers are 8/7 chars.
+        let width = max_session.max(max_server).max(8) as u16;
         // +1 for the vertical separator column.
         (width + 1).clamp(MIN_WIDTH, MAX_WIDTH)
+    }
+
+    /// Total number of visible rows in the sidebar content area.
+    ///
+    /// Sessions header + session entries + blank line + servers header +
+    /// server entries (with expanded children).
+    #[must_use]
+    pub fn total_rows(&self) -> usize {
+        let session_rows = 1 + self.entries.len(); // header + entries
+        let server_header = if self.servers.is_empty() { 0 } else { 2 }; // blank + header
+        let server_rows: usize = self
+            .servers
+            .iter()
+            .map(|s| {
+                if s.expanded {
+                    1 + s.roots.len() // header + roots
+                } else {
+                    1 // header only
+                }
+            })
+            .sum();
+        session_rows + server_header + server_rows
     }
 }
 
@@ -249,13 +412,47 @@ fn root_name(workspace: &str) -> String {
     format!("{name}/")
 }
 
+/// Extract the last path segment from a scope root path.
+///
+/// Returns an empty string if the path is empty.
+fn server_root_name(scope_root: &str) -> String {
+    if scope_root.is_empty() {
+        return String::new();
+    }
+    let name = Path::new(scope_root)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(scope_root);
+    format!("{name}/")
+}
+
+/// Return the more significant of two lifecycle display states.
+///
+/// Priority: `busy` > `initializing` > `ready` > `dead`.
+fn most_significant_state<'a>(a: &'a str, b: &'a str) -> String {
+    fn rank(s: &str) -> u8 {
+        match s {
+            "busy" => 3,
+            "initializing" => 2,
+            "ready" => 1,
+            _ => 0,
+        }
+    }
+    if rank(b) > rank(a) {
+        b.to_string()
+    } else {
+        a.to_string()
+    }
+}
+
 // ── Rendering ────────────────────────────────────────────────────────
 
 /// Render the sidebar into the given area.
 ///
 /// The rightmost column of `area` renders a vertical separator (`│`).
-/// The rest shows the "Sessions" header and session entries. Focus
-/// state controls header style and cursor highlight visibility.
+/// The rest shows two sections: "Sessions" (top) and "Servers" (bottom),
+/// separated by a blank line. Focus state controls header style and
+/// cursor highlight visibility.
 #[allow(
     clippy::cast_possible_truncation,
     reason = "terminal coordinates are always small"
@@ -275,22 +472,20 @@ pub fn render_sidebar(
     let content_width = area.width.saturating_sub(1);
     let header_style = if focused { theme.title } else { theme.muted };
 
-    // ── Header ───────────────────────────────────────────────────────
-    let header = Line::from(Span::styled("Sessions", header_style));
-    buf.set_line(area.x, area.y, &header, content_width);
+    let max_rows = area.height as usize;
+    let mut row: usize = 0;
 
-    // ── Session entries ──────────────────────────────────────────────
+    // ── Sessions header ─────────────────────────────────────────────
+    let header = Line::from(Span::styled("Sessions", header_style));
+    buf.set_line(area.x, area.y + row as u16, &header, content_width);
+    row += 1;
+
+    // ── Session entries ─────────────────────────────────────────────
     let has_filter = state.has_filter();
-    let max_entries = (area.height as usize).saturating_sub(1);
-    let visible = state
-        .entries
-        .iter()
-        .enumerate()
-        .skip(state.scroll_offset)
-        .take(max_entries);
-    for (i, entry) in visible {
-        let row = i - state.scroll_offset;
-        let y = area.y + 1 + row as u16;
+    for (i, entry) in state.entries.iter().enumerate() {
+        if row >= max_rows {
+            break;
+        }
 
         let is_cursor = focused && i == state.cursor;
 
@@ -308,6 +503,7 @@ pub fn render_sidebar(
             Span::styled(&entry.root, text_style),
         ]);
 
+        let y = area.y + row as u16;
         buf.set_line(area.x, y, &line, content_width);
 
         // Highlight cursor row.
@@ -321,9 +517,69 @@ pub fn render_sidebar(
                 }
             }
         }
+
+        row += 1;
     }
 
-    // ── Vertical separator ───────────────────────────────────────────
+    // ── Servers section ─────────────────────────────────────────────
+    if !state.servers.is_empty() && row < max_rows {
+        // Blank separator line.
+        row += 1;
+
+        if row < max_rows {
+            let server_header = Line::from(Span::styled("Servers", header_style));
+            buf.set_line(area.x, area.y + row as u16, &server_header, content_width);
+            row += 1;
+        }
+
+        let sessions_len = state.entries.len();
+        for (si, server) in state.servers.iter().enumerate() {
+            if row >= max_rows {
+                break;
+            }
+
+            let is_cursor = focused && state.cursor == sessions_len + si;
+
+            // Server header: name + state
+            let state_style = lifecycle_style(theme, &server.state);
+            let line = Line::from(vec![
+                Span::styled(&server.name, theme.text),
+                Span::raw("  "),
+                Span::styled(&server.state, state_style),
+            ]);
+            let y = area.y + row as u16;
+            buf.set_line(area.x, y, &line, content_width);
+
+            if is_cursor {
+                for x in area.x..area.x + content_width {
+                    let cell = &mut buf[(x, y)];
+                    if let Some(bg) = theme.selection.bg {
+                        cell.set_bg(bg);
+                    } else {
+                        cell.modifier |= ratatui::style::Modifier::REVERSED;
+                    }
+                }
+            }
+            row += 1;
+
+            if server.expanded {
+                // Show workspace roots as indented children.
+                for root in &server.roots {
+                    if row >= max_rows {
+                        break;
+                    }
+                    let line = Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(root.as_str(), theme.muted),
+                    ]);
+                    buf.set_line(area.x, area.y + row as u16, &line, content_width);
+                    row += 1;
+                }
+            }
+        }
+    }
+
+    // ── Vertical separator ──────────────────────────────────────────
     let sep_x = area.x + content_width;
     let sep_style = if focused {
         theme.border_focused
@@ -332,6 +588,15 @@ pub fn render_sidebar(
     };
     for y in area.y..area.y + area.height {
         buf.set_string(sep_x, y, "│", sep_style);
+    }
+}
+
+/// Choose a style for a lifecycle state string.
+fn lifecycle_style(theme: &Theme, state: &str) -> ratatui::style::Style {
+    match state {
+        "ready" => theme.text,
+        "busy" => theme.accent,
+        _ => theme.muted,
     }
 }
 
@@ -822,6 +1087,192 @@ mod tests {
             s2_root_cell.modifier
         );
     }
+
+    // ── Server tests ─────────────────────────────────────────────
+
+    fn make_server_row(server: &str, scope_root: &str, state: &str) -> ServerStatusRow {
+        ServerStatusRow {
+            language_id: "rust".to_string(),
+            server: server.to_string(),
+            scope_kind: "root".to_string(),
+            scope_root: scope_root.to_string(),
+            state: state.to_string(),
+        }
+    }
+
+    #[test]
+    fn refresh_servers_groups_by_name() {
+        let mut state = SidebarState::new();
+        let rows = vec![
+            make_server_row("rust-analyzer", "/home/user/Catenary", "ready"),
+            make_server_row("rust-analyzer", "/home/user/OmniDSP", "ready"),
+            make_server_row("lua-ls", "/home/user/scripts", "busy"),
+        ];
+
+        state.refresh_servers(&rows);
+        assert_eq!(state.servers.len(), 2);
+        assert_eq!(state.servers[0].name, "rust-analyzer");
+        assert_eq!(state.servers[0].roots.len(), 2);
+        assert!(state.servers[0].roots.contains(&"Catenary/".to_string()));
+        assert!(state.servers[0].roots.contains(&"OmniDSP/".to_string()));
+        assert_eq!(state.servers[1].name, "lua-ls");
+        assert_eq!(state.servers[1].roots.len(), 1);
+    }
+
+    #[test]
+    fn refresh_servers_most_significant_state() {
+        let mut state = SidebarState::new();
+        let rows = vec![
+            make_server_row("rust-analyzer", "/home/user/A", "ready"),
+            make_server_row("rust-analyzer", "/home/user/B", "busy"),
+        ];
+
+        state.refresh_servers(&rows);
+        assert_eq!(state.servers[0].state, "busy");
+    }
+
+    #[test]
+    fn refresh_servers_preserves_expansion() {
+        let mut state = SidebarState::new();
+        let rows = vec![make_server_row("rust-analyzer", "/home/user/A", "ready")];
+        state.refresh_servers(&rows);
+
+        // Expand it.
+        state.servers[0].expanded = true;
+
+        // Refresh again — expansion should be preserved.
+        let rows2 = vec![make_server_row("rust-analyzer", "/home/user/A", "busy")];
+        state.refresh_servers(&rows2);
+        assert!(
+            state.servers[0].expanded,
+            "expansion should persist across refresh"
+        );
+    }
+
+    #[test]
+    fn servers_need_refresh_detects_changes() {
+        let mut state = SidebarState::new();
+        let rows = vec![make_server_row("rust-analyzer", "/A", "ready")];
+        state.refresh_servers(&rows);
+
+        assert!(!state.servers_need_refresh(&rows));
+
+        let changed = vec![make_server_row("rust-analyzer", "/A", "busy")];
+        assert!(state.servers_need_refresh(&changed));
+    }
+
+    #[test]
+    fn cursor_spans_sessions_and_servers() {
+        let mut state = SidebarState::new();
+        let mut badges = HexBadgeMap::new();
+        state.refresh(vec![("s1".into(), None, "/tmp/A".into())], &mut badges);
+        state.refresh_servers(&[make_server_row("rust-analyzer", "/A", "ready")]);
+
+        assert_eq!(state.item_count(), 2);
+
+        // Cursor on session.
+        state.cursor = 0;
+        assert!(state.cursor_on_session());
+        assert!(state.cursor_server_index().is_none());
+
+        // Cursor on server.
+        state.cursor = 1;
+        assert!(!state.cursor_on_session());
+        assert_eq!(state.cursor_server_index(), Some(0));
+    }
+
+    #[test]
+    fn toggle_server_expansion() {
+        let mut state = SidebarState::new();
+        state.refresh_servers(&[make_server_row("rust-analyzer", "/A", "ready")]);
+
+        assert!(!state.servers[0].expanded);
+        assert!(state.toggle_server_expansion(0));
+        assert!(state.servers[0].expanded);
+        assert!(state.toggle_server_expansion(0));
+        assert!(!state.servers[0].expanded);
+    }
+
+    #[test]
+    fn render_sidebar_shows_servers() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut state = SidebarState::new();
+        state.refresh_servers(&[
+            make_server_row("rust-analyzer", "/home/user/Catenary", "ready"),
+            make_server_row("lua-ls", "/home/user/scripts", "busy"),
+        ]);
+
+        let theme = crate::tui::theme::Theme::new();
+        let backend = TestBackend::new(25, 10);
+        let mut terminal = Terminal::new(backend).expect("terminal creation");
+
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_sidebar(&state, area, frame.buffer_mut(), &theme, true);
+            })
+            .expect("draw");
+
+        let buf = terminal.backend().buffer().clone();
+        let content = buffer_to_string(&buf);
+
+        assert!(
+            content.contains("Servers"),
+            "should show servers header: {content}"
+        );
+        assert!(
+            content.contains("rust-analyzer"),
+            "should show server name: {content}"
+        );
+        assert!(
+            content.contains("ready"),
+            "should show lifecycle state: {content}"
+        );
+        assert!(
+            content.contains("lua-ls"),
+            "should show second server: {content}"
+        );
+    }
+
+    #[test]
+    fn render_sidebar_expanded_shows_roots() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut state = SidebarState::new();
+        state.refresh_servers(&[
+            make_server_row("rust-analyzer", "/home/user/Catenary", "ready"),
+            make_server_row("rust-analyzer", "/home/user/OmniDSP", "ready"),
+        ]);
+        state.servers[0].expanded = true;
+
+        let theme = crate::tui::theme::Theme::new();
+        let backend = TestBackend::new(25, 10);
+        let mut terminal = Terminal::new(backend).expect("terminal creation");
+
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_sidebar(&state, area, frame.buffer_mut(), &theme, true);
+            })
+            .expect("draw");
+
+        let buf = terminal.backend().buffer().clone();
+        let content = buffer_to_string(&buf);
+
+        assert!(
+            content.contains("Catenary/"),
+            "expanded server should show root: {content}"
+        );
+        assert!(
+            content.contains("OmniDSP/"),
+            "expanded server should show second root: {content}"
+        );
+    }
+
+    // ── Helpers ─────────────────────────────────────────────────────
 
     /// Convert a ratatui buffer to a string for assertion matching.
     fn buffer_to_string(buf: &ratatui::buffer::Buffer) -> String {

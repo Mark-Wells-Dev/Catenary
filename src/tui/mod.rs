@@ -174,8 +174,21 @@ fn handle_key(app: &mut App<'_>, code: KeyCode, show_sidebar: bool, viewport_hei
                         app.sidebar.cursor_down(1, visible);
                     }
                     KeyCode::Char('k') | KeyCode::Up => app.sidebar.cursor_up(1, visible),
-                    KeyCode::Enter => {
-                        app.toggle_session_selection();
+                    KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
+                        if app.sidebar.cursor_on_session() {
+                            if code == KeyCode::Enter {
+                                app.toggle_session_selection();
+                            }
+                        } else if let Some(idx) = app.sidebar.cursor_server_index() {
+                            app.sidebar.toggle_server_expansion(idx);
+                        }
+                    }
+                    KeyCode::Char('h') | KeyCode::Left => {
+                        if let Some(idx) = app.sidebar.cursor_server_index()
+                            && let Some(server) = app.sidebar.servers.get_mut(idx)
+                        {
+                            server.expanded = false;
+                        }
                     }
                     _ => {}
                 }
@@ -287,6 +300,7 @@ fn run_loop(
             }
             app.drain_tail();
             app.refresh_sessions();
+            app.refresh_servers();
             last_tick = Instant::now();
         }
     }

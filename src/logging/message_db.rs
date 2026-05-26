@@ -60,6 +60,14 @@ impl MessageDbSink {
 
 impl Sink for MessageDbSink {
     fn handle(&self, event: &LogEvent<'_>) {
+        // Lifecycle events update the language_servers table.
+        if event.source.as_deref() == Some("server.lifecycle")
+            && event.language.is_some()
+            && event.server.is_some()
+        {
+            self.handle_lifecycle(event);
+        }
+
         let type_val = match event.kind.as_deref() {
             Some("lsp") => "lsp",
             Some("mcp") => "mcp",
@@ -142,6 +150,60 @@ impl Sink for MessageDbSink {
     }
 }
 
+impl MessageDbSink {
+    /// Upsert server lifecycle state into the `language_servers` table.
+    ///
+    /// Called when a `server.lifecycle` event is detected. Extracts
+    /// `scope_kind`, `scope_root`, and `state` from the event's fields.
+    fn handle_lifecycle(&self, event: &LogEvent<'_>) {
+        let language = event.language.as_deref().unwrap_or("");
+        let server = event.server.as_deref().unwrap_or("");
+        let scope_kind = event
+            .fields
+            .get("scope_kind")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let scope_root = event
+            .fields
+            .get("scope_root")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let state = event
+            .fields
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+
+        if state.is_empty() {
+            return;
+        }
+
+        let result = match self.conn.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+        .execute(
+            "INSERT INTO language_servers \
+             (session_id, language_id, server, scope_kind, scope_root, state) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+             ON CONFLICT (session_id, language_id, server, scope_kind, scope_root) \
+             DO UPDATE SET state = excluded.state",
+            rusqlite::params![
+                &*self.instance_id,
+                language,
+                server,
+                scope_kind,
+                scope_root,
+                state
+            ],
+        );
+
+        if let Err(e) = result {
+            tracing::trace!(error = %e, "message_db: lifecycle upsert failed");
+        }
+    }
+}
+
 /// Build a JSON payload from an internal (non-protocol) trace event.
 ///
 /// Preserves the existing `ErrorLayer` row shape: `level`, `message`, optional
@@ -175,7 +237,7 @@ mod tests {
     use crate::logging::Severity;
     use crate::logging::Sink;
 
-    /// Create an in-memory DB with the messages table schema (including `level`).
+    /// Create an in-memory DB with the messages and `language_servers` table schemas.
     fn test_db() -> Arc<Mutex<Connection>> {
         let conn = Connection::open_in_memory().expect("open in-memory db");
         conn.execute_batch(
@@ -190,9 +252,18 @@ mod tests {
                  client      TEXT NOT NULL,
                  parent_id   TEXT,
                  payload     TEXT NOT NULL
+             );
+             CREATE TABLE language_servers (
+                 session_id   TEXT NOT NULL,
+                 language_id  TEXT NOT NULL,
+                 server       TEXT NOT NULL,
+                 scope_kind   TEXT NOT NULL,
+                 scope_root   TEXT NOT NULL DEFAULT '',
+                 state        TEXT NOT NULL,
+                 PRIMARY KEY (session_id, language_id, server, scope_kind, scope_root)
              );",
         )
-        .expect("create messages table");
+        .expect("create tables");
         Arc::new(Mutex::new(conn))
     }
 
@@ -635,5 +706,124 @@ mod tests {
         let db = test_db();
         let _sink = MessageDbSink::new(db.clone(), "sess-1".into());
         assert_eq!(row_count(&db), 0);
+    }
+
+    // ── Lifecycle upsert tests ──────────────────────────────────────
+
+    fn make_lifecycle_event(
+        language: &str,
+        server: &str,
+        scope_kind: &str,
+        scope_root: &str,
+        state: &str,
+    ) -> LogEvent<'static> {
+        let mut fields = serde_json::Map::new();
+        fields.insert(
+            "scope_kind".into(),
+            serde_json::Value::String(scope_kind.to_string()),
+        );
+        fields.insert(
+            "scope_root".into(),
+            serde_json::Value::String(scope_root.to_string()),
+        );
+        fields.insert("state".into(), serde_json::Value::String(state.to_string()));
+        LogEvent {
+            severity: Severity::Debug,
+            target: "catenary_mcp::lsp::server",
+            message: format!("lifecycle: {server} → {state}"),
+            kind: None,
+            method: None,
+            server: Some(server.to_string()),
+            client: None,
+            parent_id: None,
+            source: Some("server.lifecycle".to_string()),
+            language: Some(language.to_string()),
+            payload: None,
+            session_id: None,
+            fields,
+        }
+    }
+
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "MutexGuard must outlive the prepared statement"
+    )]
+    fn read_server_rows(conn: &Arc<Mutex<Connection>>) -> Vec<(String, String, String)> {
+        let conn = conn.lock().expect("lock db");
+        let mut stmt = conn
+            .prepare("SELECT server, scope_root, state FROM language_servers ORDER BY server")
+            .expect("prepare select");
+        stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .expect("query")
+        .map(|r| r.expect("row"))
+        .collect()
+    }
+
+    #[test]
+    fn lifecycle_event_inserts_server_row() {
+        let db = test_db();
+        let sink = MessageDbSink::new(db.clone(), "daemon".into());
+
+        sink.handle(&make_lifecycle_event(
+            "rust",
+            "rust-analyzer",
+            "root",
+            "/home/user/Catenary",
+            "initializing",
+        ));
+
+        let rows = read_server_rows(&db);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "rust-analyzer");
+        assert_eq!(rows[0].1, "/home/user/Catenary");
+        assert_eq!(rows[0].2, "initializing");
+    }
+
+    #[test]
+    fn lifecycle_event_updates_existing_row() {
+        let db = test_db();
+        let sink = MessageDbSink::new(db.clone(), "daemon".into());
+
+        sink.handle(&make_lifecycle_event(
+            "rust",
+            "rust-analyzer",
+            "root",
+            "/home/user/Catenary",
+            "initializing",
+        ));
+        sink.handle(&make_lifecycle_event(
+            "rust",
+            "rust-analyzer",
+            "root",
+            "/home/user/Catenary",
+            "ready",
+        ));
+
+        let rows = read_server_rows(&db);
+        assert_eq!(rows.len(), 1, "should upsert, not insert duplicate");
+        assert_eq!(rows[0].2, "ready", "state should be updated");
+    }
+
+    #[test]
+    fn lifecycle_event_empty_state_ignored() {
+        let db = test_db();
+        let sink = MessageDbSink::new(db.clone(), "daemon".into());
+
+        sink.handle(&make_lifecycle_event(
+            "rust",
+            "rust-analyzer",
+            "root",
+            "/A",
+            "",
+        ));
+
+        let rows = read_server_rows(&db);
+        assert!(rows.is_empty(), "empty state should be skipped");
     }
 }
