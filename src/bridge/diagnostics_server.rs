@@ -49,6 +49,14 @@ struct CleanEntry {
     root: PathBuf,
 }
 
+/// File without LSP server coverage.
+struct UncoveredEntry {
+    display: String,
+    /// Grouping root: workspace root, or parent directory for
+    /// files outside all roots.
+    root: PathBuf,
+}
+
 /// Classification outcome for a single file in the batch pipeline.
 ///
 /// Makes the three-way decision explicit: each category is a distinct
@@ -125,6 +133,7 @@ impl DiagnosticsServer {
 
         // ── Phase 1: resolve + canonicalize ────────────────────────
         let mut canonical_paths: Vec<PathBuf> = Vec::new();
+        let mut uncovered: Vec<UncoveredEntry> = Vec::new();
 
         // Server → list of canonical paths.
         // Keyed by server name for stable (alphabetical) iteration order.
@@ -145,9 +154,11 @@ impl DiagnosticsServer {
                 continue;
             };
 
-            // Files without LSP coverage are omitted from the output.
             let clients = self.client_manager.diagnostic_servers(&canonical).await;
             if clients.is_empty() {
+                let display = self.display_rel(&canonical.to_string_lossy());
+                let root = self.resolve_root_or_parent(&canonical);
+                uncovered.push(UncoveredEntry { display, root });
                 continue;
             }
 
@@ -175,7 +186,7 @@ impl DiagnosticsServer {
         }
 
         // ── Phase 3: classify and format ─────────────────────────
-        let output = self.format_output(&canonical_paths, &file_results);
+        let output = self.format_output(&canonical_paths, &file_results, &uncovered);
 
         // ── Phase 4: mark_current ─────────────────────────────────
         self.fs.mark_current(&canonical_paths);
@@ -185,13 +196,14 @@ impl DiagnosticsServer {
 
     /// Classifies files from server results and formats the full output.
     ///
-    /// Output starts with `[LSP available]`, followed by root-grouped
-    /// file entries with diagnostics or `[clean]` markers. Root headers
-    /// are collapsed when only one file exists under that root.
+    /// Root-grouped file entries with diagnostics, `[clean]` markers,
+    /// or `[no LSP coverage]` notes. Root headers are collapsed when
+    /// only one file exists under that root.
     fn format_output(
         &self,
         canonical_paths: &[PathBuf],
         file_results: &BTreeMap<String, (String, Vec<ServerDiagnostics>)>,
+        uncovered: &[UncoveredEntry],
     ) -> String {
         let mut diag_files: Vec<DiagnosticFile> = Vec::new();
         let mut clean: Vec<CleanEntry> = Vec::new();
@@ -218,7 +230,7 @@ impl DiagnosticsServer {
             }
         }
 
-        format_diagnostics(&diag_files, &clean)
+        format_diagnostics(&diag_files, &clean, uncovered)
     }
 
     /// Runs the batched diagnostics lifecycle on a single server.
@@ -832,18 +844,22 @@ pub(crate) fn format_diagnostics_entries(
 
 /// Formats the full diagnostics output.
 ///
-/// Output starts with `[LSP available]`, followed by bare root-path
-/// section headers. Files without LSP coverage are omitted. Clean
-/// files are listed inline with `[clean]`.
+/// Bare root-path section headers. Clean files listed inline with
+/// `[clean]`. Uncovered files noted with `[no LSP coverage]`.
 ///
 /// When a root contains a single file, the root and filename are
 /// collapsed into one path (e.g. `/tmp/scratch.sh`). Multi-file
 /// roots get a directory header with indented file entries beneath.
-fn format_diagnostics(diag_files: &[DiagnosticFile], clean: &[CleanEntry]) -> String {
+fn format_diagnostics(
+    diag_files: &[DiagnosticFile],
+    clean: &[CleanEntry],
+    uncovered: &[UncoveredEntry],
+) -> String {
     use std::fmt::Write;
 
     let mut root_diag: BTreeMap<&PathBuf, Vec<(&str, &[String])>> = BTreeMap::new();
     let mut root_clean: BTreeMap<&PathBuf, Vec<&str>> = BTreeMap::new();
+    let mut root_uncovered: BTreeMap<&PathBuf, Vec<&str>> = BTreeMap::new();
 
     for df in diag_files {
         root_diag
@@ -854,21 +870,30 @@ fn format_diagnostics(diag_files: &[DiagnosticFile], clean: &[CleanEntry]) -> St
     for ce in clean {
         root_clean.entry(&ce.root).or_default().push(&ce.display);
     }
+    for ue in uncovered {
+        root_uncovered
+            .entry(&ue.root)
+            .or_default()
+            .push(&ue.display);
+    }
 
     let mut all_roots: BTreeSet<&PathBuf> = BTreeSet::new();
     all_roots.extend(root_diag.keys());
     all_roots.extend(root_clean.keys());
+    all_roots.extend(root_uncovered.keys());
 
     let mut output = String::new();
-    _ = writeln!(output, "[LSP available]");
 
     for root in &all_roots {
         let diag_count = root_diag.get(root).map_or(0, Vec::len);
         let clean_count = root_clean.get(root).map_or(0, Vec::len);
-        let total = diag_count + clean_count;
+        let uncovered_count = root_uncovered.get(root).map_or(0, Vec::len);
+        let total = diag_count + clean_count + uncovered_count;
         let collapsed = total == 1;
 
-        output.push('\n');
+        if !output.is_empty() {
+            output.push('\n');
+        }
 
         if collapsed {
             // Single file: merge root and filename into one path.
@@ -888,6 +913,12 @@ fn format_diagnostics(diag_files: &[DiagnosticFile], clean: &[CleanEntry]) -> St
                     _ = writeln!(output, "\t[clean]");
                 }
             }
+            if let Some(uncov_files) = root_uncovered.get(root) {
+                for f in uncov_files {
+                    _ = writeln!(output, "{}", root.join(f).display());
+                    _ = writeln!(output, "\t[no LSP coverage]");
+                }
+            }
         } else {
             // Multiple files: directory header with indented entries.
             _ = writeln!(output, "{}", root.display());
@@ -905,6 +936,12 @@ fn format_diagnostics(diag_files: &[DiagnosticFile], clean: &[CleanEntry]) -> St
                 for f in clean_files {
                     _ = writeln!(output, "\t{f}");
                     _ = writeln!(output, "\t\t[clean]");
+                }
+            }
+            if let Some(uncov_files) = root_uncovered.get(root) {
+                for f in uncov_files {
+                    _ = writeln!(output, "\t{f}");
+                    _ = writeln!(output, "\t\t[no LSP coverage]");
                 }
             }
         }
@@ -999,8 +1036,8 @@ mod tests {
             root: PathBuf::from("/test"),
             entries: vec![":1:1 [error] test: msg".to_string()],
         }];
-        let output = format_diagnostics(&diag_files, &[]);
-        assert!(output.starts_with("[LSP available]\n"), "output: {output}");
+        let output = format_diagnostics(&diag_files, &[], &[]);
+        assert!(!output.contains("[LSP available]"), "output: {output}");
         // Single file under root → collapsed path.
         assert!(output.contains("/test/file.rs:"), "output: {output}");
         assert!(output.contains("\t:1:1 [error]"), "output: {output}");
@@ -1016,7 +1053,7 @@ mod tests {
             root: PathBuf::from("/test"),
             entries,
         }];
-        let output = format_diagnostics(&diag_files, &[]);
+        let output = format_diagnostics(&diag_files, &[], &[]);
         // All entries should be present (no paging).
         for i in 0..5 {
             assert!(output.contains(&format!("msg {i}")), "output: {output}");
@@ -1029,8 +1066,7 @@ mod tests {
             display: "clean.rs".to_string(),
             root: PathBuf::from("/test"),
         }];
-        let output = format_diagnostics(&[], &clean);
-        assert!(output.starts_with("[LSP available]\n"), "output: {output}");
+        let output = format_diagnostics(&[], &clean, &[]);
         // Single file → collapsed path with [clean].
         assert!(output.contains("/test/clean.rs\n"), "output: {output}");
         assert!(output.contains("\t[clean]"), "output: {output}");
@@ -1055,16 +1091,16 @@ mod tests {
             display: "src/main.rs".to_string(),
             root: PathBuf::from("/alpha"),
         }];
-        let output = format_diagnostics(&diag_files, &clean);
+        let output = format_diagnostics(&diag_files, &clean, &[]);
         // /alpha has 2 files (diag + clean) → expanded with directory header.
-        let alpha_pos = output.find("\n/alpha\n").expect("missing /alpha header");
+        let alpha_pos = output.find("/alpha\n").expect("missing /alpha header");
         assert!(output.contains("\tsrc/lib.rs:"), "output: {output}");
         assert!(output.contains("\t\t:1:1 [error]"), "output: {output}");
         assert!(output.contains("\tsrc/main.rs\n"), "output: {output}");
         assert!(output.contains("\t\t[clean]"), "output: {output}");
         // /beta has 1 file → collapsed into single path.
         let beta_pos = output
-            .find("\n/beta/src/lib.rs:")
+            .find("/beta/src/lib.rs:")
             .expect("missing /beta collapsed path");
         assert!(alpha_pos < beta_pos, "output: {output}");
         assert!(output.contains("beta warning"), "output: {output}");
@@ -1078,8 +1114,7 @@ mod tests {
             root: PathBuf::from("/tmp"),
             entries: vec![":3:1 [warning] test: standalone warning".to_string()],
         }];
-        let output = format_diagnostics(&diag_files, &[]);
-        assert!(output.starts_with("[LSP available]\n"), "output: {output}");
+        let output = format_diagnostics(&diag_files, &[], &[]);
         // Single file → collapsed path.
         assert!(output.contains("/tmp/scratch.sh:"), "output: {output}");
         assert!(output.contains("\t:3:1 [warning]"), "output: {output}");
@@ -1090,33 +1125,49 @@ mod tests {
     }
 
     #[test]
-    fn format_lsp_available_header() {
+    fn format_no_lsp_header() {
         let diag_files = vec![DiagnosticFile {
             display: "file.rs".to_string(),
             root: PathBuf::from("/test"),
             entries: vec![":1:1 [error] test: msg".to_string()],
         }];
-        let output = format_diagnostics(&diag_files, &[]);
-        // First line is the status header.
-        assert!(output.starts_with("[LSP available]\n"), "output: {output}");
+        let output = format_diagnostics(&diag_files, &[], &[]);
+        // No status header — output starts directly with file content.
+        assert!(!output.contains("[LSP available]"), "output: {output}");
         // Bare path, no prefix.
         assert!(output.contains("/test/file.rs:"), "output: {output}");
         assert!(!output.contains("Root:"), "output: {output}");
     }
 
     #[test]
-    fn format_omit_uncovered() {
+    fn format_uncovered_file() {
+        let uncovered = vec![UncoveredEntry {
+            display: "data.csv".to_string(),
+            root: PathBuf::from("/project"),
+        }];
+        let output = format_diagnostics(&[], &[], &uncovered);
+        // Single file → collapsed path with [no LSP coverage].
+        assert!(output.contains("/project/data.csv\n"), "output: {output}");
+        assert!(output.contains("\t[no LSP coverage]"), "output: {output}");
+    }
+
+    #[test]
+    fn format_mixed_clean_and_uncovered() {
         let clean = vec![CleanEntry {
             display: "lib.rs".to_string(),
             root: PathBuf::from("/project"),
         }];
-        let output = format_diagnostics(&[], &clean);
-        // No N/A or OutOfRoots sections.
-        assert!(!output.contains("N/A"), "output: {output}");
-        assert!(!output.contains("OutOfRoots"), "output: {output}");
-        // Single file → collapsed path with [clean].
-        assert!(output.contains("/project/lib.rs\n"), "output: {output}");
-        assert!(output.contains("\t[clean]"), "output: {output}");
+        let uncovered = vec![UncoveredEntry {
+            display: "data.csv".to_string(),
+            root: PathBuf::from("/project"),
+        }];
+        let output = format_diagnostics(&[], &clean, &uncovered);
+        // Two files under same root → expanded with directory header.
+        assert!(output.contains("/project\n"), "output: {output}");
+        assert!(output.contains("\tlib.rs\n"), "output: {output}");
+        assert!(output.contains("\t\t[clean]"), "output: {output}");
+        assert!(output.contains("\tdata.csv\n"), "output: {output}");
+        assert!(output.contains("\t\t[no LSP coverage]"), "output: {output}");
     }
 
     // ── enclosing symbol tests ────────────────────────────────────

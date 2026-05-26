@@ -595,7 +595,7 @@ fn test_diagnostics_per_server_min_severity() -> Result<()> {
 }
 
 /// Language-level `diagnostics = false`: no servers contribute diagnostics,
-/// file is omitted from output entirely.
+/// file shown with `[no LSP coverage]`.
 #[test]
 fn test_diagnostics_no_servers() -> Result<()> {
     let mockls_bin = env!("CARGO_BIN_EXE_mockls");
@@ -620,18 +620,18 @@ fn test_diagnostics_no_servers() -> Result<()> {
     let file = bridge.root_path().join(format!("test.{MOCK_LANG_A}"));
     let text = bridge.call_diagnostics(file.to_str().context("path")?)?;
 
-    // All servers suppressed — file omitted, only status header remains
+    // All servers suppressed — file shown with [no LSP coverage]
     assert!(
-        text.contains("[LSP available]"),
-        "Should show LSP available header. Got:\n{text}"
+        !text.contains("[LSP available]"),
+        "No LSP available header. Got:\n{text}"
     );
     assert!(
-        !text.contains("N/A"),
-        "No N/A section in output. Got:\n{text}"
+        text.contains(&format!("test.{MOCK_LANG_A}")),
+        "Suppressed file should appear in output. Got:\n{text}"
     );
     assert!(
-        !text.contains(&format!("test.{MOCK_LANG_A}")),
-        "Suppressed file should be omitted. Got:\n{text}"
+        text.contains("[no LSP coverage]"),
+        "Suppressed file should show no LSP coverage. Got:\n{text}"
     );
 
     Ok(())

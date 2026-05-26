@@ -127,7 +127,7 @@ fn test_batch_multi_file_different_servers() -> Result<()> {
 
 // ─── No diagnostic servers ─────────────────────────────────────────
 
-/// A file with no language server coverage is omitted from output.
+/// A file with no language server coverage shows `[no LSP coverage]`.
 /// Covered files still produce diagnostics.
 #[test]
 fn test_batch_uncovered_file() -> Result<()> {
@@ -151,12 +151,12 @@ fn test_batch_uncovered_file() -> Result<()> {
         "Covered file should produce diagnostics. Got:\n{text}"
     );
     assert!(
-        !text.contains("zzz_no_server"),
-        "Uncovered file should be omitted entirely. Got:\n{text}"
+        text.contains("zzz_no_server"),
+        "Uncovered file should appear in output. Got:\n{text}"
     );
     assert!(
-        !text.contains("N/A"),
-        "No N/A section in output. Got:\n{text}"
+        text.contains("[no LSP coverage]"),
+        "Uncovered file should show no LSP coverage. Got:\n{text}"
     );
 
     Ok(())
