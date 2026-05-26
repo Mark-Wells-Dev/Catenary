@@ -5,10 +5,10 @@
 //!
 //! The stream is the primary view surface for TUI v2: a full-width,
 //! scrollable, chronological list of scopes and standalone messages,
-//! prefixed with per-session hex badges. Each MCP tool call is a scope
-//! that opens on pre-tool hook arrival, streams children live, and
-//! auto-collapses to a summary line when the post-tool hook signals
-//! completion.
+//! prefixed with per-session hex badges. All messages sharing a
+//! `parent_id` UUID are grouped into a scope: the first message is the
+//! request (header), the response closes the scope, and everything in
+//! between is a child.
 
 use std::collections::HashMap;
 
@@ -137,12 +137,8 @@ pub struct StreamState {
     pub cursor: usize,
     /// Hex badge assignment for session IDs.
     pub badges: HexBadgeMap,
-    /// `scope_id` (UUID) → entries index for direct scope children (MCP req/resp, post-hook).
-    scope_id_map: HashMap<String, usize>,
-    /// MCP correlation ID (stringified) → entries index for LSP child routing.
-    mcp_corr_map: HashMap<String, usize>,
-    /// Session ID → entries index of the currently active (open) scope.
-    active_scope: HashMap<String, usize>,
+    /// `parent_id` UUID → entries index. Single routing map.
+    scope_map: HashMap<String, usize>,
 }
 
 impl StreamState {
@@ -156,9 +152,7 @@ impl StreamState {
             auto_scroll: true,
             cursor: 0,
             badges: HexBadgeMap::new(),
-            scope_id_map: HashMap::new(),
-            mcp_corr_map: HashMap::new(),
-            active_scope: HashMap::new(),
+            scope_map: HashMap::new(),
         };
         for msg in messages {
             state.route_message(msg);
@@ -177,85 +171,60 @@ impl StreamState {
 
     /// Route a single message into the scope model.
     ///
-    /// Creates, updates, or closes scopes based on message type and
-    /// `parent_id` relationships. Messages that don't belong to any
-    /// scope become standalone entries.
+    /// All messages sharing a `parent_id` UUID are grouped into a scope.
+    /// The first message for a UUID creates the scope (request/header).
+    /// A response message closes it. Everything else is a child.
+    /// Messages with no `parent_id` become standalone entries.
     fn route_message(&mut self, msg: SessionMessage) {
         self.badges.badge(&msg.session_id);
 
-        // 1. Pre-tool hook → create new scope.
-        if msg.r#type == "hook" && msg.method.starts_with("pre-tool/") && msg.parent_id.is_some() {
-            // Abandon any active scope for this session.
-            if let Some(&idx) = self.active_scope.get(&msg.session_id)
-                && let StreamEntry::Scope(scope) = &mut self.entries[idx]
-                && scope.is_active()
-            {
-                scope.abandon();
+        let Some(ref pid) = msg.parent_id else {
+            // No parent_id → standalone entry.
+            self.entries.push(StreamEntry::Standalone(msg));
+            return;
+        };
+
+        if let Some(&idx) = self.scope_map.get(pid.as_str()) {
+            // Existing scope — route as response or child.
+            let StreamEntry::Scope(scope) = &mut self.entries[idx] else {
+                // Shouldn't happen: scope_map points to non-scope.
+                self.entries.push(StreamEntry::Standalone(msg));
+                return;
+            };
+
+            if Self::is_response(&msg, scope) {
+                scope.close(msg);
+            } else {
+                scope.children.push(msg);
             }
+        } else {
+            // First message for this UUID — create scope.
             let idx = self.entries.len();
-            let scope_id = msg.parent_id.clone().unwrap_or_default();
-            self.scope_id_map.insert(scope_id, idx);
-            self.active_scope.insert(msg.session_id.clone(), idx);
+            self.scope_map.insert(pid.clone(), idx);
             self.entries
                 .push(StreamEntry::Scope(Box::new(Scope::new(msg))));
-            return;
         }
+    }
 
-        // 2. MCP tools/call → route to active scope for this session.
-        //    The MCP event's parent_id is a call UUID (not the scope UUID),
-        //    so it doesn't match scope_id_map. Route via session's active scope.
-        if msg.r#type == "mcp"
-            && msg.method == "tools/call"
-            && let Some(&idx) = self.active_scope.get(&msg.session_id)
-            && let StreamEntry::Scope(scope) = &mut self.entries[idx]
-            && scope.is_active()
-        {
-            if scope.request.is_none() {
-                // Register the MCP event's parent_id (call UUID) so
-                // LSP children with the same parent_id route here.
-                if let Some(ref call_pid) = msg.parent_id {
-                    self.mcp_corr_map.insert(call_pid.clone(), idx);
-                }
-                scope.attach_request(msg);
-            } else {
-                scope.attach_response(msg);
+    /// Determine whether a message is the response that closes a scope.
+    ///
+    /// - **Hook:** second hook message in the scope (request was also a hook).
+    /// - **MCP:** outgoing message with `result` or `error` key, no `method`.
+    /// - **IPC:** hook with a response-indicator method (e.g., `tool/done-editing` output).
+    fn is_response(msg: &SessionMessage, scope: &Scope) -> bool {
+        match msg.r#type.as_str() {
+            "hook" => {
+                // Second hook message with the same parent_id = response.
+                scope.request.r#type == "hook"
             }
-            return;
+            "mcp" => {
+                // Outgoing MCP: has "result" or "error", no "method" in payload.
+                let p = &msg.payload;
+                !p.get("method").is_some_and(serde_json::Value::is_string)
+                    && (p.get("result").is_some() || p.get("error").is_some())
+            }
+            _ => false,
         }
-
-        // 3. Route by parent_id.
-        if let Some(ref pid) = msg.parent_id {
-            // Check scope_id_map — scope children keyed by scope UUID
-            // (post-hook and other hook events share the scope UUID).
-            if let Some(&idx) = self.scope_id_map.get(pid.as_str())
-                && let StreamEntry::Scope(scope) = &mut self.entries[idx]
-            {
-                // Post-tool hook → close scope.
-                if msg.r#type == "hook" && msg.method.starts_with("post-tool/") {
-                    let session = scope.session_id.clone();
-                    scope.close(msg);
-                    // Only clear active_scope if it still points to this scope.
-                    if self.active_scope.get(&session) == Some(&idx) {
-                        self.active_scope.remove(&session);
-                    }
-                    return;
-                }
-                // Generic child of the scope (e.g., hook child).
-                scope.children.push(msg);
-                return;
-            }
-
-            // Check mcp_corr_map — LSP children of the tool call.
-            if let Some(&idx) = self.mcp_corr_map.get(pid.as_str())
-                && let StreamEntry::Scope(scope) = &mut self.entries[idx]
-            {
-                scope.children.push(msg);
-                return;
-            }
-        }
-
-        // 3. Standalone message (no matching scope).
-        self.entries.push(StreamEntry::Standalone(msg));
     }
 
     /// Flatten entries into display rows based on scope expansion state.
@@ -366,8 +335,8 @@ impl StreamState {
 
     /// Toggle expansion state on the scope at the cursor position.
     ///
-    /// Closed/abandoned scopes toggle between summary (header only) and
-    /// expanded (header + children). Active scopes are always expanded.
+    /// Closed scopes toggle between summary (header only) and expanded
+    /// (header + children). Open scopes are always expanded.
     /// Standalone messages are not expandable.
     pub fn toggle_expansion(&mut self) {
         let Some(row) = self.display_rows.get(self.cursor) else {
@@ -378,7 +347,7 @@ impl StreamState {
             DisplayRow::Standalone(_) => return,
         };
         if let StreamEntry::Scope(scope) = &mut self.entries[entry_idx]
-            && matches!(scope.state, ScopeState::Closed | ScopeState::Abandoned)
+            && scope.state == ScopeState::Closed
         {
             scope.user_expanded = !scope.user_expanded;
             self.rebuild_display_rows();
@@ -552,6 +521,7 @@ mod tests {
     use super::*;
     use crate::session::test_support;
 
+    /// Standalone message with no `parent_id`.
     fn make_message(session_id: &str, method: &str) -> SessionMessage {
         SessionMessage {
             session_id: session_id.to_string(),
@@ -573,19 +543,7 @@ mod tests {
         }
     }
 
-    /// Build a pre-tool hook message that creates a scope.
-    fn pre_hook(session_id: &str, scope_id: i64) -> SessionMessage {
-        make_message_with_ids(
-            session_id,
-            100 + scope_id,
-            "hook",
-            "pre-tool/editing-state",
-            "",
-            Some(&format!("scope-{scope_id}")),
-        )
-    }
-
-    /// Build an MCP request that attaches to a scope.
+    /// MCP request — first message in a scope, creates the scope.
     fn mcp_request(session_id: &str, scope_id: i64, tool: &str) -> SessionMessage {
         SessionMessage {
             payload: serde_json::json!({"params": {"name": tool}}),
@@ -595,12 +553,12 @@ mod tests {
                 "mcp",
                 "tools/call",
                 "catenary",
-                Some(&format!("call-{scope_id}")),
+                Some(&format!("scope-{scope_id}")),
             )
         }
     }
 
-    /// Build an MCP response for a scope.
+    /// MCP response — closes the scope (has `result`, no `method`).
     fn mcp_response(session_id: &str, scope_id: i64) -> SessionMessage {
         SessionMessage {
             payload: serde_json::json!({"result": {"content": [{"type": "text", "text": "ok"}]}}),
@@ -610,24 +568,36 @@ mod tests {
                 "mcp",
                 "tools/call",
                 "catenary",
-                Some(&format!("call-{scope_id}")),
+                Some(&format!("scope-{scope_id}")),
             )
         }
     }
 
-    /// Build a post-tool hook that closes a scope.
-    fn post_hook(session_id: &str, scope_id: i64) -> SessionMessage {
+    /// Hook request — first hook message for a scope UUID.
+    fn hook_request(session_id: &str, scope_id: i64) -> SessionMessage {
+        make_message_with_ids(
+            session_id,
+            100 + scope_id,
+            "hook",
+            "pre-tool/editing-state",
+            "",
+            Some(&format!("hook-{scope_id}")),
+        )
+    }
+
+    /// Hook response — second hook message, closes the hook scope.
+    fn hook_response(session_id: &str, scope_id: i64) -> SessionMessage {
         make_message_with_ids(
             session_id,
             400 + scope_id,
             "hook",
-            "post-tool/diagnostics",
+            "pre-tool/editing-state",
             "",
-            Some(&format!("scope-{scope_id}")),
+            Some(&format!("hook-{scope_id}")),
         )
     }
 
-    /// Build an LSP child message of an MCP tool call.
+    /// LSP child message sharing the scope's `parent_id`.
     fn lsp_child(session_id: &str, scope_id: i64, method: &str) -> SessionMessage {
         make_message_with_ids(
             session_id,
@@ -635,7 +605,7 @@ mod tests {
             "lsp",
             method,
             "rust-analyzer",
-            Some(&format!("call-{scope_id}")),
+            Some(&format!("scope-{scope_id}")),
         )
     }
 
@@ -708,26 +678,22 @@ mod tests {
     // ── Scope routing tests ──────────────────────────────────────────
 
     #[test]
-    fn test_scope_full_lifecycle() {
+    fn test_mcp_scope_full_lifecycle() {
         let messages = vec![
-            pre_hook("s1", 1),
             mcp_request("s1", 1, "grep"),
             lsp_child("s1", 1, "workspace/symbol"),
             lsp_child("s1", 1, "textDocument/references"),
             mcp_response("s1", 1),
-            post_hook("s1", 1),
         ];
         let state = StreamState::new(messages);
 
-        // Should produce one scope entry.
         assert_eq!(state.entries.len(), 1, "expected 1 scope");
         let StreamEntry::Scope(scope) = &state.entries[0] else {
             panic!("expected Scope entry");
         };
         assert_eq!(scope.state, ScopeState::Closed);
-        assert!(scope.request.is_some());
+        assert_eq!(scope.request.r#type, "mcp");
         assert!(scope.response.is_some());
-        assert!(scope.post_hook.is_some());
         assert_eq!(scope.children.len(), 2);
         // Closed scope: collapsed to header only.
         assert_eq!(state.display_rows.len(), 1);
@@ -736,7 +702,6 @@ mod tests {
     #[test]
     fn test_scope_open_expanded() {
         let messages = vec![
-            pre_hook("s1", 1),
             mcp_request("s1", 1, "grep"),
             lsp_child("s1", 1, "workspace/symbol"),
         ];
@@ -752,46 +717,16 @@ mod tests {
     }
 
     #[test]
-    fn test_scope_settling_expanded() {
-        let messages = vec![
-            pre_hook("s1", 1),
-            mcp_request("s1", 1, "grep"),
-            lsp_child("s1", 1, "workspace/symbol"),
-            mcp_response("s1", 1),
-        ];
+    fn test_hook_request_response_creates_leaf_scope() {
+        let messages = vec![hook_request("s1", 1), hook_response("s1", 1)];
         let state = StreamState::new(messages);
 
+        assert_eq!(state.entries.len(), 1, "hook pair = 1 scope");
         let StreamEntry::Scope(scope) = &state.entries[0] else {
             panic!("expected Scope entry");
         };
-        assert_eq!(scope.state, ScopeState::Settling);
-        // Settling: still expanded (header + 1 child).
-        assert_eq!(state.display_rows.len(), 2);
-    }
-
-    #[test]
-    fn test_scope_abandoned_on_new_prehook() {
-        let messages = vec![
-            pre_hook("s1", 1),
-            mcp_request("s1", 1, "grep"),
-            lsp_child("s1", 1, "workspace/symbol"),
-            // New pre-tool hook for same session without closing old scope.
-            pre_hook("s1", 2),
-            mcp_request("s1", 2, "glob"),
-        ];
-        let state = StreamState::new(messages);
-
-        assert_eq!(state.entries.len(), 2);
-        let StreamEntry::Scope(scope1) = &state.entries[0] else {
-            panic!("expected first scope");
-        };
-        assert_eq!(scope1.state, ScopeState::Abandoned);
-        assert!(!scope1.is_expanded(), "abandoned scope should be collapsed");
-
-        let StreamEntry::Scope(scope2) = &state.entries[1] else {
-            panic!("expected second scope");
-        };
-        assert_eq!(scope2.state, ScopeState::Open);
+        assert_eq!(scope.state, ScopeState::Closed);
+        assert!(scope.children.is_empty(), "hook scopes are leaf scopes");
     }
 
     #[test]
@@ -811,12 +746,10 @@ mod tests {
     #[test]
     fn test_mixed_scopes_and_standalones() {
         let messages = vec![
-            make_message("s1", "initialize"), // standalone
-            pre_hook("s1", 1),
+            make_message("s1", "initialize"), // standalone (no parent_id)
             mcp_request("s1", 1, "grep"),
             lsp_child("s1", 1, "workspace/symbol"),
             mcp_response("s1", 1),
-            post_hook("s1", 1),
             make_message("s1", "shutdown"), // standalone
         ];
         let state = StreamState::new(messages);
@@ -832,14 +765,11 @@ mod tests {
     #[test]
     fn test_two_sessions_independent_scopes() {
         let messages = vec![
-            pre_hook("s1", 1),
             mcp_request("s1", 1, "grep"),
-            pre_hook("s2", 2),
             mcp_request("s2", 2, "glob"),
             lsp_child("s1", 1, "workspace/symbol"),
             lsp_child("s2", 2, "textDocument/references"),
             mcp_response("s1", 1),
-            post_hook("s1", 1),
         ];
         let state = StreamState::new(messages);
 
@@ -860,13 +790,12 @@ mod tests {
 
     #[test]
     fn test_append_routes_incrementally() {
-        let mut state = StreamState::new(vec![pre_hook("s1", 1), mcp_request("s1", 1, "grep")]);
+        let mut state = StreamState::new(vec![mcp_request("s1", 1, "grep")]);
         assert_eq!(state.entries.len(), 1);
 
         state.append(vec![
             lsp_child("s1", 1, "workspace/symbol"),
             mcp_response("s1", 1),
-            post_hook("s1", 1),
         ]);
 
         let StreamEntry::Scope(scope) = &state.entries[0] else {
@@ -883,12 +812,10 @@ mod tests {
     #[test]
     fn test_toggle_closed_scope_expands() {
         let messages = vec![
-            pre_hook("s1", 1),
             mcp_request("s1", 1, "grep"),
             lsp_child("s1", 1, "workspace/symbol"),
             lsp_child("s1", 1, "textDocument/references"),
             mcp_response("s1", 1),
-            post_hook("s1", 1),
         ];
         let mut state = StreamState::new(messages);
         // Closed: header only.
@@ -910,7 +837,6 @@ mod tests {
     #[test]
     fn test_toggle_open_scope_noop() {
         let messages = vec![
-            pre_hook("s1", 1),
             mcp_request("s1", 1, "grep"),
             lsp_child("s1", 1, "workspace/symbol"),
         ];
@@ -930,12 +856,10 @@ mod tests {
     #[test]
     fn test_toggle_on_child_toggles_parent() {
         let messages = vec![
-            pre_hook("s1", 1),
             mcp_request("s1", 1, "grep"),
             lsp_child("s1", 1, "workspace/symbol"),
             lsp_child("s1", 1, "textDocument/references"),
             mcp_response("s1", 1),
-            post_hook("s1", 1),
         ];
         let mut state = StreamState::new(messages);
         // Expand closed scope first.
@@ -1095,7 +1019,6 @@ mod tests {
 
         // Open scope with 2 children shows tree chars.
         let messages = vec![
-            pre_hook("s1", 1),
             mcp_request("s1", 1, "grep"),
             lsp_child("s1", 1, "workspace/symbol"),
             lsp_child("s1", 1, "textDocument/references"),

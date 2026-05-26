@@ -370,12 +370,11 @@ fn progress_suffix(payload: &serde_json::Value) -> Option<String> {
 
 // ── Scope lifecycle header ──────────────────────────────────────────────
 
-/// Build a styled [`Line`] for an event-driven scope header.
+/// Build a styled [`Line`] for a scope header.
 ///
-/// Renders from the scope's MCP request (if available) or pre-tool hook.
-/// Closed scopes with a response show outcome icon, timing, and line count.
-/// Open/settling scopes show an activity indicator. Abandoned scopes show
-/// a cancellation indicator.
+/// Renders from the scope's request message. Closed scopes with a
+/// response show outcome icon, timing, and line count. Open scopes
+/// show an activity indicator.
 #[must_use]
 pub fn format_scope_header_styled(scope: &Scope, icons: &IconSet, theme: &Theme) -> Line<'static> {
     let header = scope.header_message();
@@ -389,9 +388,7 @@ pub fn format_scope_header_styled(scope: &Scope, icons: &IconSet, theme: &Theme)
     );
 
     // Extract tool name from MCP request payload.
-    let tool_name = scope
-        .request
-        .as_ref()
+    let tool_name = Some(&scope.request)
         .filter(|r| r.method == "tools/call")
         .and_then(|r| r.payload.get("params"))
         .and_then(|p| p.get("name"))
@@ -400,13 +397,12 @@ pub fn format_scope_header_styled(scope: &Scope, icons: &IconSet, theme: &Theme)
     let label = tool_name.unwrap_or(&header.method);
 
     // Closed scopes with a response get outcome-aware rendering.
-    if matches!(scope.state, ScopeState::Closed | ScopeState::Abandoned)
+    if scope.state == ScopeState::Closed
         && let Some(resp) = scope.response.as_ref()
-        && let Some(req) = scope.request.as_ref()
     {
         let delta_ms = resp
             .timestamp
-            .signed_duration_since(req.timestamp)
+            .signed_duration_since(scope.request.timestamp)
             .num_milliseconds();
         let timing = format_duration_short(delta_ms);
         let outcome = pair_outcome(resp);
@@ -445,7 +441,7 @@ pub fn format_scope_header_styled(scope: &Scope, icons: &IconSet, theme: &Theme)
             }
         };
 
-        let args = tool_name.and_then(|_| scope.request.as_ref().and_then(extract_tool_arguments));
+        let args = tool_name.and_then(|_| extract_tool_arguments(&scope.request));
 
         let mut spans = vec![ts_span, Span::styled(icon, icon_style)];
         spans.push(Span::styled(name_text, theme.text));
@@ -456,22 +452,15 @@ pub fn format_scope_header_styled(scope: &Scope, icons: &IconSet, theme: &Theme)
         return Line::from(spans);
     }
 
-    // Open/settling/abandoned without response: activity indicator.
-    let (icon, icon_style) = match scope.state {
-        ScopeState::Abandoned => (icons.cancelled.clone(), theme.muted),
-        ScopeState::Settling => (icons.spinner_done.clone(), theme.muted),
-        _ => {
-            let icon = tool_name.map_or_else(
-                || icons.tool_default.clone(),
-                |tn| tool_icon(tn, icons).to_string(),
-            );
-            (icon, theme.accent)
-        }
-    };
+    // Open scope: activity indicator.
+    let icon = tool_name.map_or_else(
+        || icons.tool_default.clone(),
+        |tn| tool_icon(tn, icons).to_string(),
+    );
 
-    let args = tool_name.and_then(|_| scope.request.as_ref().and_then(extract_tool_arguments));
+    let args = tool_name.and_then(|_| extract_tool_arguments(&scope.request));
 
-    let mut spans = vec![ts_span, Span::styled(icon, icon_style)];
+    let mut spans = vec![ts_span, Span::styled(icon, theme.accent)];
     spans.push(Span::styled(label.to_string(), theme.text));
     spans.push(Span::styled(format!(" ({children_label})"), theme.muted));
     if let Some(args_str) = args {
