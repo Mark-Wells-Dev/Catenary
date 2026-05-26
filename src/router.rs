@@ -57,6 +57,102 @@ pub fn socket_path() -> PathBuf {
         .join("catenary.sock")
 }
 
+// ── IPC request/response types for CLI tool commands ─────────────
+
+/// IPC method string for grep requests.
+pub const METHOD_GREP: &str = "tool/grep";
+
+/// IPC method string for glob requests.
+pub const METHOD_GLOB: &str = "tool/glob";
+
+/// IPC request payload for `catenary grep`.
+///
+/// Sent as a JSON line over the daemon IPC socket with
+/// `"method": "tool/grep"`. The daemon resolves relative `glob` and
+/// `exclude` patterns against `cwd` before dispatching to the grep
+/// pipeline — the same resolution that [`super::bridge::handler`]
+/// does for the `directory` MCP parameter.
+///
+/// Wire format:
+/// ```json
+/// {"method": "tool/grep", "cwd": "/path", "pattern": "foo", "glob": "src/**/*.rs"}
+/// ```
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct GrepRequest {
+    /// Working directory from the CLI process.
+    pub cwd: PathBuf,
+    /// Search pattern (regex, supports `|` for alternation).
+    pub pattern: String,
+    /// Glob pattern to scope the search.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub glob: Option<String>,
+    /// Glob pattern to exclude from matches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclude: Option<String>,
+    /// Page number for paged results (1-based, default: 1).
+    #[serde(default = "ipc_default_page")]
+    pub page: usize,
+    /// Include files ignored by `.gitignore`.
+    #[serde(default)]
+    pub include_gitignored: bool,
+    /// Include hidden files and directories.
+    #[serde(default)]
+    pub include_hidden: bool,
+}
+
+/// IPC response for `catenary grep`.
+///
+/// Returned as a JSON line over the daemon IPC socket.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct GrepResponse {
+    /// Rendered grep output.
+    pub output: String,
+}
+
+/// IPC request payload for `catenary glob`.
+///
+/// Sent as a JSON line over the daemon IPC socket with
+/// `"method": "tool/glob"`. The daemon resolves a relative `pattern`
+/// against `cwd` before dispatching to the glob pipeline.
+///
+/// Wire format:
+/// ```json
+/// {"method": "tool/glob", "cwd": "/path", "pattern": "src/"}
+/// ```
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct GlobRequest {
+    /// Working directory from the CLI process.
+    pub cwd: PathBuf,
+    /// File path, directory path, or glob pattern.
+    pub pattern: String,
+    /// Glob pattern to exclude from results.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclude: Option<String>,
+    /// Page number for paged results (1-based, default: 1).
+    #[serde(default = "ipc_default_page")]
+    pub page: usize,
+    /// Include files ignored by `.gitignore`.
+    #[serde(default)]
+    pub include_gitignored: bool,
+    /// Include hidden files and directories.
+    #[serde(default)]
+    pub include_hidden: bool,
+}
+
+/// IPC response for `catenary glob`.
+///
+/// Returned as a JSON line over the daemon IPC socket.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct GlobResponse {
+    /// Rendered glob output.
+    pub output: String,
+}
+
+/// Default page number for IPC tool requests (1-based).
+const fn ipc_default_page() -> usize {
+    1
+}
+
 /// Pre-bound MCP and IPC socket listeners.
 ///
 /// Returned by [`bind_daemon_sockets`] for early socket binding in daemon
@@ -3422,5 +3518,124 @@ mod tests {
         }];
         let result = parse_root_uris(&roots);
         assert!(result.is_empty(), "nonexistent paths should be skipped");
+    }
+
+    // ── IPC request/response type tests ──────────────────────────
+
+    /// `GrepRequest` roundtrips through JSON with all fields.
+    #[test]
+    fn grep_request_roundtrip_full() {
+        let req = GrepRequest {
+            cwd: PathBuf::from("/home/user/project"),
+            pattern: "TODO|FIXME".to_string(),
+            glob: Some("src/**/*.rs".to_string()),
+            exclude: Some("tests/**".to_string()),
+            page: 2,
+            include_gitignored: true,
+            include_hidden: false,
+        };
+        let json = serde_json::to_string(&req).expect("serialize");
+        let parsed: GrepRequest = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.cwd, PathBuf::from("/home/user/project"));
+        assert_eq!(parsed.pattern, "TODO|FIXME");
+        assert_eq!(parsed.glob.as_deref(), Some("src/**/*.rs"));
+        assert_eq!(parsed.exclude.as_deref(), Some("tests/**"));
+        assert_eq!(parsed.page, 2);
+        assert!(parsed.include_gitignored);
+        assert!(!parsed.include_hidden);
+    }
+
+    /// `GrepRequest` deserializes with defaults for optional fields.
+    #[test]
+    fn grep_request_minimal() {
+        let json = r#"{"cwd":"/tmp","pattern":"foo"}"#;
+        let req: GrepRequest = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(req.cwd, PathBuf::from("/tmp"));
+        assert_eq!(req.pattern, "foo");
+        assert!(req.glob.is_none());
+        assert!(req.exclude.is_none());
+        assert_eq!(req.page, 1);
+        assert!(!req.include_gitignored);
+        assert!(!req.include_hidden);
+    }
+
+    /// `GrepRequest` skips `None` fields in serialized output.
+    #[test]
+    fn grep_request_skips_none_fields() {
+        let req = GrepRequest {
+            cwd: PathBuf::from("/tmp"),
+            pattern: "foo".to_string(),
+            glob: None,
+            exclude: None,
+            page: 1,
+            include_gitignored: false,
+            include_hidden: false,
+        };
+        let json = serde_json::to_string(&req).expect("serialize");
+        assert!(!json.contains("glob"), "None glob should be skipped");
+        assert!(!json.contains("exclude"), "None exclude should be skipped");
+    }
+
+    /// `GrepResponse` roundtrips through JSON.
+    #[test]
+    fn grep_response_roundtrip() {
+        let resp = GrepResponse {
+            output: "file.rs:10 matched line".to_string(),
+        };
+        let json = serde_json::to_string(&resp).expect("serialize");
+        let parsed: GrepResponse = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.output, "file.rs:10 matched line");
+    }
+
+    /// `GlobRequest` roundtrips through JSON with all fields.
+    #[test]
+    fn glob_request_roundtrip_full() {
+        let req = GlobRequest {
+            cwd: PathBuf::from("/workspace"),
+            pattern: "src/**/*.rs".to_string(),
+            exclude: Some("target/**".to_string()),
+            page: 3,
+            include_gitignored: false,
+            include_hidden: true,
+        };
+        let json = serde_json::to_string(&req).expect("serialize");
+        let parsed: GlobRequest = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.cwd, PathBuf::from("/workspace"));
+        assert_eq!(parsed.pattern, "src/**/*.rs");
+        assert_eq!(parsed.exclude.as_deref(), Some("target/**"));
+        assert_eq!(parsed.page, 3);
+        assert!(!parsed.include_gitignored);
+        assert!(parsed.include_hidden);
+    }
+
+    /// `GlobRequest` deserializes with defaults for optional fields.
+    #[test]
+    fn glob_request_minimal() {
+        let json = r#"{"cwd":"/home","pattern":"src/"}"#;
+        let req: GlobRequest = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(req.cwd, PathBuf::from("/home"));
+        assert_eq!(req.pattern, "src/");
+        assert!(req.exclude.is_none());
+        assert_eq!(req.page, 1);
+        assert!(!req.include_gitignored);
+        assert!(!req.include_hidden);
+    }
+
+    /// `GlobResponse` roundtrips through JSON.
+    #[test]
+    fn glob_response_roundtrip() {
+        let resp = GlobResponse {
+            output: "src/\n  main.rs (42 lines)".to_string(),
+        };
+        let json = serde_json::to_string(&resp).expect("serialize");
+        let parsed: GlobResponse = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.output, "src/\n  main.rs (42 lines)");
+    }
+
+    /// IPC method constants match expected wire values.
+    #[test]
+    fn method_constants() {
+        assert_eq!(METHOD_GREP, "tool/grep");
+        assert_eq!(METHOD_GLOB, "tool/glob");
     }
 }
