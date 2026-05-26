@@ -21,6 +21,7 @@ use tracing::{Instrument, debug, error, info, warn};
 
 use crate::bridge::EditingGuardrail;
 use crate::bridge::HookRouter;
+use crate::bridge::ToolServer;
 use crate::bridge::session::Session;
 use crate::hook::{HookRequest, HookResponseEnvelope, emit_hook_event, hook_outcome_level};
 use crate::logging::LoggingServer;
@@ -151,6 +152,18 @@ pub struct GlobResponse {
 /// Default page number for IPC tool requests (1-based).
 const fn ipc_default_page() -> usize {
     1
+}
+
+/// Resolves a pattern path against a base directory if it is relative.
+///
+/// Tilde-expands the pattern first. Absolute paths and `~` paths are
+/// returned as-is. Relative paths are joined to `base`.
+fn resolve_relative(pattern: &str, base: &Path) -> String {
+    let expanded = crate::bridge::expand_tilde(pattern);
+    if Path::new(&expanded).is_absolute() {
+        return expanded;
+    }
+    base.join(&expanded).to_string_lossy().into_owned()
 }
 
 /// Pre-bound MCP and IPC socket listeners.
@@ -1166,6 +1179,97 @@ async fn handle_hook_dispatch(
     // The CLI command just needs a confirmation response.
     if method == "tool/start-editing" {
         writer.write_all(b"{\"status\":\"ok\"}\n").await?;
+        writer.shutdown().await?;
+        return Ok(());
+    }
+
+    // ── Grep query ──────────────────────────────────────────────
+    //
+    // `tool/grep` is sent by `catenary grep`. Resolves relative
+    // patterns against `cwd`, dispatches to the grep pipeline, and
+    // returns the rendered output as a `GrepResponse`.
+    if method == METHOD_GREP {
+        let grep_req: GrepRequest = serde_json::from_value(raw.clone())
+            .map_err(|e| anyhow!("invalid grep request: {e}"))?;
+
+        // Notify servers about filesystem changes before any LSP interaction.
+        ctx.primary.notify_file_changes().await;
+
+        // Build GrepInput-compatible params, resolving relative patterns
+        // against the CLI process's cwd.
+        let mut params = serde_json::json!({
+            "pattern": grep_req.pattern,
+            "page": grep_req.page,
+            "include_gitignored": grep_req.include_gitignored,
+            "include_hidden": grep_req.include_hidden,
+        });
+        if let Some(glob) = grep_req.glob {
+            let resolved = resolve_relative(&glob, &grep_req.cwd);
+            params["glob"] = serde_json::Value::String(resolved);
+        }
+        if let Some(exclude) = grep_req.exclude {
+            let resolved = resolve_relative(&exclude, &grep_req.cwd);
+            params["exclude"] = serde_json::Value::String(resolved);
+        }
+
+        let parent_id = uuid::Uuid::new_v4().to_string();
+        let cancel = CancellationToken::new();
+
+        emit_hook_event(
+            tracing::Level::INFO,
+            "cli",
+            &method,
+            Some(&parent_id),
+            &raw.to_string(),
+            "incoming hook",
+        );
+
+        // Race grep execution against client disconnect so a killed
+        // CLI process doesn't leave the pipeline running indefinitely.
+        let cancel_on_disconnect = cancel.clone();
+        let output = tokio::select! {
+            result = ctx.primary.grep.execute(&params, Some(&parent_id), &cancel) => {
+                match result {
+                    Ok(v) => v.as_str().unwrap_or("").to_string(),
+                    Err(e) => format!("grep error: {e}"),
+                }
+            }
+            () = async {
+                use tokio::io::AsyncReadExt;
+                let mut buf = [0u8; 1];
+                let _ = buf_reader.read(&mut buf).await;
+                cancel_on_disconnect.cancel();
+            } => {
+                debug!(
+                    source = Source::DaemonDispatch.as_str(),
+                    "grep client disconnected — query cancelled",
+                );
+                emit_hook_event(
+                    tracing::Level::INFO,
+                    "cli",
+                    &method,
+                    Some(&parent_id),
+                    "client disconnected",
+                    "outgoing hook response",
+                );
+                return Ok(());
+            }
+        };
+
+        let response = GrepResponse { output };
+        let mut payload = serde_json::to_vec(&response)?;
+
+        emit_hook_event(
+            tracing::Level::INFO,
+            "cli",
+            &method,
+            Some(&parent_id),
+            std::str::from_utf8(&payload).unwrap_or_default(),
+            "outgoing hook response",
+        );
+
+        payload.push(b'\n');
+        writer.write_all(&payload).await?;
         writer.shutdown().await?;
         return Ok(());
     }
@@ -3637,5 +3741,29 @@ mod tests {
     fn method_constants() {
         assert_eq!(METHOD_GREP, "tool/grep");
         assert_eq!(METHOD_GLOB, "tool/glob");
+    }
+
+    // ── resolve_relative tests ──────────────────────────────────
+
+    #[test]
+    fn resolve_relative_absolute_unchanged() {
+        let result = resolve_relative("/tmp/src/**/*.rs", Path::new("/home/user"));
+        assert_eq!(result, "/tmp/src/**/*.rs");
+    }
+
+    #[test]
+    fn resolve_relative_relative_joined() {
+        let result = resolve_relative("src/**/*.rs", Path::new("/home/user/project"));
+        assert_eq!(result, "/home/user/project/src/**/*.rs");
+    }
+
+    #[test]
+    fn resolve_relative_tilde_expanded() {
+        let result = resolve_relative("~/src/**/*.rs", Path::new("/home/user/project"));
+        // Tilde-expanded paths are absolute → not joined to base.
+        assert!(
+            !result.starts_with("/home/user/project"),
+            "tilde path should not be joined to base"
+        );
     }
 }

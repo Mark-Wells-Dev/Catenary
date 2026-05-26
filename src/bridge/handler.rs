@@ -34,7 +34,8 @@ impl McpRouter {
 }
 
 /// Expands a leading `~` or `~/` to the user's home directory.
-pub(super) fn expand_tilde(path: &str) -> String {
+#[must_use]
+pub fn expand_tilde(path: &str) -> String {
     if (path == "~" || path.starts_with("~/"))
         && let Ok(home) = std::env::var("HOME")
     {

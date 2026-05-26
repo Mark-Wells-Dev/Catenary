@@ -139,6 +139,32 @@ enum Command {
         session: Option<String>,
     },
 
+    /// Search for a pattern across the workspace.
+    Grep {
+        /// Regex pattern to search for (supports | for alternation).
+        pattern: String,
+
+        /// Glob pattern to scope the search (e.g., src/**/*.rs).
+        #[arg(long)]
+        glob: Option<String>,
+
+        /// Glob pattern to exclude from matches.
+        #[arg(long)]
+        exclude: Option<String>,
+
+        /// Page number for paged results (default: 1).
+        #[arg(long, default_value = "1")]
+        page: usize,
+
+        /// Include files ignored by .gitignore.
+        #[arg(long)]
+        include_gitignored: bool,
+
+        /// Include hidden files and directories.
+        #[arg(long)]
+        include_hidden: bool,
+    },
+
     /// Enter editing mode. Invoke via the host's shell tool.
     #[command(name = "start_editing")]
     StartEditing,
@@ -378,6 +404,24 @@ fn main() -> Result<()> {
                 session.as_deref(),
             )
         }
+        #[cfg(unix)]
+        Some(Command::Grep {
+            pattern,
+            glob,
+            exclude,
+            page,
+            include_gitignored,
+            include_hidden,
+        }) => build_runtime()?.block_on(run_grep(
+            pattern,
+            glob,
+            exclude,
+            page,
+            include_gitignored,
+            include_hidden,
+        )),
+        #[cfg(not(unix))]
+        Some(Command::Grep { .. }) => Err(anyhow::anyhow!("daemon mode requires Unix")),
         #[cfg(unix)]
         Some(Command::StartEditing) => build_runtime()?.block_on(run_start_editing()),
         #[cfg(not(unix))]
@@ -712,6 +756,75 @@ async fn run_stop() -> Result<()> {
     buf_reader.read_line(&mut line).await?;
 
     println!("Daemon stopped");
+    Ok(())
+}
+
+/// Runs a grep query against the running daemon.
+///
+/// Connects to the daemon's IPC socket, sends a [`GrepRequest`], and
+/// prints the rendered output to stdout. The daemon resolves relative
+/// patterns against `cwd` and dispatches to the grep pipeline.
+///
+/// # Errors
+///
+/// Returns an error if no daemon is running or the query fails.
+#[cfg(unix)]
+async fn run_grep(
+    pattern: String,
+    glob: Option<String>,
+    exclude: Option<String>,
+    page: usize,
+    include_gitignored: bool,
+    include_hidden: bool,
+) -> Result<()> {
+    use catenary_mcp::router::{GrepRequest, METHOD_GREP};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let cwd = std::env::current_dir().context("cannot determine working directory")?;
+    let ipc_path = catenary_mcp::router::socket_path();
+
+    let stream = tokio::net::UnixStream::connect(&ipc_path)
+        .await
+        .context("no daemon running — start a Catenary session first")?;
+
+    let (reader, mut writer) = stream.into_split();
+
+    let request = GrepRequest {
+        cwd,
+        pattern,
+        glob,
+        exclude,
+        page,
+        include_gitignored,
+        include_hidden,
+    };
+    let mut envelope = serde_json::to_value(&request)?;
+    envelope
+        .as_object_mut()
+        .context("request is not an object")?
+        .insert(
+            "method".to_string(),
+            serde_json::Value::String(METHOD_GREP.to_string()),
+        );
+    let mut payload = serde_json::to_string(&envelope)?;
+    payload.push('\n');
+    writer.write_all(payload.as_bytes()).await?;
+
+    let mut buf_reader = BufReader::new(reader);
+    let mut line = String::new();
+    buf_reader.read_line(&mut line).await?;
+
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+
+    let response: catenary_mcp::router::GrepResponse =
+        serde_json::from_str(trimmed).context("invalid grep response from daemon")?;
+    if !response.output.is_empty() {
+        println!("{}", response.output);
+    }
+
     Ok(())
 }
 
@@ -1058,6 +1171,75 @@ mod tests {
         let args = Args::try_parse_from(["catenary", "start_editing"]);
         let args = args.expect("start_editing should parse");
         assert!(matches!(args.command, Some(Command::StartEditing)));
+    }
+
+    // ── CLI grep subcommand tests ──────────────────────────────────
+
+    #[test]
+    fn test_cli_grep_minimal() {
+        use clap::Parser;
+        let args = Args::try_parse_from(["catenary", "grep", "foo"]);
+        let args = args.expect("grep with pattern should parse");
+        let Some(Command::Grep {
+            pattern,
+            glob,
+            exclude,
+            page,
+            include_gitignored,
+            include_hidden,
+        }) = args.command
+        else {
+            unreachable!("expected Grep command");
+        };
+        assert_eq!(pattern, "foo");
+        assert!(glob.is_none());
+        assert!(exclude.is_none());
+        assert_eq!(page, 1);
+        assert!(!include_gitignored);
+        assert!(!include_hidden);
+    }
+
+    #[test]
+    fn test_cli_grep_all_flags() {
+        use clap::Parser;
+        let args = Args::try_parse_from([
+            "catenary",
+            "grep",
+            "foo|bar",
+            "--glob",
+            "src/**/*.rs",
+            "--exclude",
+            "tests/",
+            "--page",
+            "3",
+            "--include-gitignored",
+            "--include-hidden",
+        ]);
+        let args = args.expect("grep with all flags should parse");
+        let Some(Command::Grep {
+            pattern,
+            glob,
+            exclude,
+            page,
+            include_gitignored,
+            include_hidden,
+        }) = args.command
+        else {
+            unreachable!("expected Grep command");
+        };
+        assert_eq!(pattern, "foo|bar");
+        assert_eq!(glob.as_deref(), Some("src/**/*.rs"));
+        assert_eq!(exclude.as_deref(), Some("tests/"));
+        assert_eq!(page, 3);
+        assert!(include_gitignored);
+        assert!(include_hidden);
+    }
+
+    #[test]
+    fn test_cli_grep_missing_pattern() {
+        use clap::Parser;
+        let result = Args::try_parse_from(["catenary", "grep"]);
+        assert!(result.is_err(), "grep without pattern should fail");
     }
 
     // ── CLI done_editing subcommand test ──────────────────────────
