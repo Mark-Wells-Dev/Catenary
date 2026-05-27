@@ -11,5 +11,5 @@ Run `catenary rm-root <path>` to remove a workspace root.
 
 ## Code Search
 
-Use the `catenary grep` and `catenary glob` MCP tools for code search.
-These are always available and do not require editing mode.
+Use `catenary grep` and `catenary glob` for code search.
+These are CLI commands, always available, and do not require editing mode.

@@ -24,8 +24,12 @@ const GEMINI_HOOKS_EXPECTED: &str = include_str!("../../hooks/hooks.json");
 const ANTIGRAVITY_HOOKS_EXPECTED: &str =
     include_str!("../../plugins/catenary-antigravity/hooks.json");
 
-/// Expected Claude Code SKILL.md, embedded at compile time.
-const SKILL_MD_EXPECTED: &str = include_str!("../../plugins/catenary/skills/catenary/SKILL.md");
+/// Expected Claude Code editing SKILL.md, embedded at compile time.
+const SKILL_MD_EXPECTED: &str = include_str!("../../plugins/catenary/skills/editing/SKILL.md");
+
+/// Expected Claude Code search SKILL.md, embedded at compile time.
+const SEARCH_SKILL_MD_EXPECTED: &str =
+    include_str!("../../plugins/catenary/skills/search/SKILL.md");
 
 /// Expected Gemini CLI context file, embedded at compile time.
 const GEMINI_CONTEXT_EXPECTED: &str = include_str!("../../gemini-context.md");
@@ -1715,12 +1719,39 @@ fn check_claude_instructions(out: &mut Output, show_diff: bool) {
         ));
     }
 
-    // SKILL.md content comparison against embedded version
-    let skill_path = install_path.join("skills/catenary/SKILL.md");
+    // Skill content comparison against embedded versions
+    check_skill_content(
+        out,
+        &install_path,
+        "editing",
+        SKILL_MD_EXPECTED,
+        is_stale,
+        show_diff,
+    );
+    check_skill_content(
+        out,
+        &install_path,
+        "search",
+        SEARCH_SKILL_MD_EXPECTED,
+        is_stale,
+        show_diff,
+    );
+}
+
+/// Check a single skill's `SKILL.md` against the expected content.
+fn check_skill_content(
+    out: &mut Output,
+    install_path: &Path,
+    skill_name: &str,
+    expected: &str,
+    is_stale: bool,
+    show_diff: bool,
+) {
+    let label = format!("{:<14}", format!("  skill/{skill_name}"));
+    let skill_path = install_path.join(format!("skills/{skill_name}/SKILL.md"));
     match std::fs::read_to_string(&skill_path) {
-        Ok(content) if content != SKILL_MD_EXPECTED => {
+        Ok(content) if content != expected => {
             if !is_stale {
-                // Version matches but content drifted (manual edit, corruption)
                 let _ = out.writeln(format_args!(
                     "  {label}{}",
                     out.colors
@@ -1728,14 +1759,14 @@ fn check_claude_instructions(out: &mut Output, show_diff: bool) {
                 ));
             }
             if show_diff {
-                show_unified_diff(out, &content, SKILL_MD_EXPECTED, "installed", "expected");
+                show_unified_diff(out, &content, expected, "installed", "expected");
             }
         }
-        Ok(_) => {} // Content matches — nothing extra to report
+        Ok(_) => {} // Content matches
         Err(_) => {
             let _ = out.writeln(format_args!(
                 "  {label}{}",
-                out.colors.red("✗ SKILL.md not found in plugin"),
+                out.colors.red("✗ SKILL.md not found"),
             ));
         }
     }
@@ -1953,12 +1984,17 @@ fn check_antigravity_instructions(out: &mut Output, show_diff: bool, project_roo
     }
 }
 
+/// Valid skill names for Catenary's Claude Code plugin.
+#[cfg(test)]
+const VALID_SKILL_NAMES: &[&str] = &["editing", "search"];
+
 /// Validate SKILL.md frontmatter format per the Claude Code Agent Skills spec.
 ///
 /// Returns a list of validation error messages. Empty list means valid.
-/// Checks: valid YAML frontmatter delimiters, `name` field (must match
-/// `catenary`, lowercase alphanumeric + hyphens, 1-64 chars), `description`
-/// field (non-empty, max 1024 chars), and non-empty body after frontmatter.
+/// Checks: valid YAML frontmatter delimiters, `name` field (must be one of
+/// `VALID_SKILL_NAMES`, lowercase alphanumeric + hyphens, 1-64 chars),
+/// `description` field (non-empty, max 1024 chars), and non-empty body after
+/// frontmatter.
 #[cfg(test)]
 fn validate_skill_frontmatter(content: &str) -> Vec<String> {
     let mut errors = Vec::new();
@@ -1989,8 +2025,11 @@ fn validate_skill_frontmatter(content: &str) -> Vec<String> {
     match extract_frontmatter_value(frontmatter, "name") {
         None => errors.push("`name` field missing".to_string()),
         Some(name) => {
-            if name != "catenary" {
-                errors.push(format!("`name` is '{name}', expected 'catenary'"));
+            if !VALID_SKILL_NAMES.contains(&name.as_str()) {
+                errors.push(format!(
+                    "`name` is '{name}', expected one of: {}",
+                    VALID_SKILL_NAMES.join(", "),
+                ));
             }
             if !is_valid_skill_name(&name) {
                 errors.push(format!(
@@ -2461,7 +2500,7 @@ mod tests {
 
     #[test]
     fn valid_skill_frontmatter_inline() {
-        let content = "---\nname: catenary\ndescription: A tool\n---\n\nBody content here.\n";
+        let content = "---\nname: editing\ndescription: A tool\n---\n\nBody content here.\n";
         let errors = validate_skill_frontmatter(content);
         assert!(errors.is_empty(), "should be valid, got: {errors:?}");
     }
@@ -2469,7 +2508,7 @@ mod tests {
     #[test]
     fn valid_skill_frontmatter_multiline_description() {
         let content =
-            "---\nname: catenary\ndescription: >\n  Multi-line\n  description.\n---\n\nBody.\n";
+            "---\nname: editing\ndescription: >\n  Multi-line\n  description.\n---\n\nBody.\n";
         let errors = validate_skill_frontmatter(content);
         assert!(
             errors.is_empty(),
@@ -2479,7 +2518,7 @@ mod tests {
 
     #[test]
     fn skill_frontmatter_missing_opening_delimiter() {
-        let content = "name: catenary\ndescription: A tool\n---\n\nBody.\n";
+        let content = "name: editing\ndescription: A tool\n---\n\nBody.\n";
         let errors = validate_skill_frontmatter(content);
         assert!(
             errors.iter().any(|e| e.contains("opening")),
@@ -2489,7 +2528,7 @@ mod tests {
 
     #[test]
     fn skill_frontmatter_missing_closing_delimiter() {
-        let content = "---\nname: catenary\ndescription: A tool\n\nBody.\n";
+        let content = "---\nname: editing\ndescription: A tool\n\nBody.\n";
         let errors = validate_skill_frontmatter(content);
         assert!(
             errors.iter().any(|e| e.contains("closing")),
@@ -2519,7 +2558,7 @@ mod tests {
 
     #[test]
     fn skill_frontmatter_missing_description() {
-        let content = "---\nname: catenary\n---\n\nBody.\n";
+        let content = "---\nname: editing\n---\n\nBody.\n";
         let errors = validate_skill_frontmatter(content);
         assert!(
             errors.iter().any(|e| e.contains("`description`")),
@@ -2529,7 +2568,7 @@ mod tests {
 
     #[test]
     fn skill_frontmatter_empty_body() {
-        let content = "---\nname: catenary\ndescription: A tool\n---\n";
+        let content = "---\nname: editing\ndescription: A tool\n---\n";
         let errors = validate_skill_frontmatter(content);
         assert!(
             errors.iter().any(|e| e.contains("body")),
@@ -2540,7 +2579,7 @@ mod tests {
     #[test]
     fn skill_frontmatter_long_description() {
         let long = "a".repeat(1025);
-        let content = format!("---\nname: catenary\ndescription: {long}\n---\n\nBody.\n");
+        let content = format!("---\nname: editing\ndescription: {long}\n---\n\nBody.\n");
         let errors = validate_skill_frontmatter(&content);
         assert!(
             errors.iter().any(|e| e.contains("1024")),
@@ -2576,16 +2615,16 @@ mod tests {
 
     #[test]
     fn extract_inline_value() {
-        let fm = "name: catenary\ndescription: A tool";
+        let fm = "name: editing\ndescription: A tool";
         assert_eq!(
             extract_frontmatter_value(fm, "name"),
-            Some("catenary".to_string()),
+            Some("editing".to_string()),
         );
     }
 
     #[test]
     fn extract_multiline_value() {
-        let fm = "name: catenary\ndescription: >\n  Multi\n  line";
+        let fm = "name: editing\ndescription: >\n  Multi\n  line";
         assert_eq!(
             extract_frontmatter_value(fm, "description"),
             Some("Multi line".to_string()),
@@ -2594,13 +2633,13 @@ mod tests {
 
     #[test]
     fn extract_missing_key() {
-        let fm = "name: catenary";
+        let fm = "name: editing";
         assert_eq!(extract_frontmatter_value(fm, "description"), None);
     }
 
     #[test]
     fn extract_literal_block_scalar() {
-        let fm = "name: catenary\ndescription: |\n  Line one.\n  Line two.";
+        let fm = "name: editing\ndescription: |\n  Line one.\n  Line two.";
         assert_eq!(
             extract_frontmatter_value(fm, "description"),
             Some("Line one. Line two.".to_string()),
@@ -2615,6 +2654,15 @@ mod tests {
         assert!(
             errors.is_empty(),
             "embedded SKILL.md should pass validation, got: {errors:?}",
+        );
+    }
+
+    #[test]
+    fn embedded_search_skill_md_valid() {
+        let errors = validate_skill_frontmatter(SEARCH_SKILL_MD_EXPECTED);
+        assert!(
+            errors.is_empty(),
+            "embedded search SKILL.md should pass validation, got: {errors:?}",
         );
     }
 

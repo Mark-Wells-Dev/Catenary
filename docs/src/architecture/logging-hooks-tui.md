@@ -90,7 +90,7 @@ use these for two purposes:
 
 - **`request_id`** — pairs a request with its response. The TUI joins
   on this field to create merged display entries with timing.
-- **`parent_id`** — links LSP messages to the MCP tool call that caused
+- **`parent_id`** — links LSP messages to the CLI command that caused
   them. The TUI uses this for scope collapse — hundreds of LSP messages
   from a single grep call group behind one summary line.
 
@@ -132,7 +132,6 @@ and the host CLI can display a message:
 | `Stop` / `AfterAgent` (allow) | Yes | Agent is done — safe to surface notices |
 | `Stop` / `AfterAgent` (block) | No | Agent must fix something — preserve queue |
 | `PreToolUse` | No | Mid-flight — don't interrupt |
-| `PostToolUse` | No | Mid-flight — don't interrupt |
 
 Why drain at stationary points: host CLIs may not display
 `systemMessage` during tool execution. Delivering at stationary points
@@ -183,20 +182,19 @@ Two components split protocol concerns from application logic:
 - **`HookRouter`** — application dispatch. Routes parsed `HookRequest`
   values to the appropriate handler. Owns editing state enforcement,
   file accumulation, root refresh signaling, and notification drain.
-  Analogous to `McpRouter` for MCP tool dispatch.
+  Analogous to the IPC router for CLI command dispatch.
 
 ### Hook methods
 
-Six hook methods, each corresponding to a host CLI lifecycle event:
+Five hook methods, each corresponding to a host CLI lifecycle event:
 
 | Method | Host event | Purpose |
 |--------|-----------|---------|
+| `session-start/clear-editing` | `SessionStart` | Clear stale editing state from a previous agent context |
 | `pre-agent/turn-start` | `UserPromptSubmit` / `BeforeAgent` | Increment the turn counter (debounce boundary) |
 | `pre-tool/editing-state` | `PreToolUse` / `BeforeTool` | Editing state enforcement — deny or allow a tool call |
 | `pre-tool/command-denied` | `PreToolUse` / `BeforeTool` | Command filter debounce — full or short denial message |
-| `post-tool/diagnostics` | `PostToolUse` / `AfterTool` | Accumulate modified file paths during editing mode |
 | `post-agent/require-release` | `Stop` / `AfterAgent` | Force `done_editing` if the agent stops while editing |
-| `session-start/clear-editing` | `SessionStart` | Clear stale editing state from a previous agent context |
 
 ### Hook contracts by host
 
@@ -205,31 +203,33 @@ live in host-specific JSON files:
 
 | Host CLI | Hook file | Events |
 |----------|-----------|--------|
-| Claude Code | `plugins/catenary/hooks/hooks.json` | `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`, `SubagentStop` |
-| Gemini CLI | `hooks/hooks.json` | `SessionStart`, `BeforeAgent`, `BeforeTool`, `AfterTool`, `AfterAgent` |
+| Claude Code | `plugins/catenary/hooks/hooks.json` | `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `Stop`, `SubagentStop`, `SessionEnd` |
+| Gemini CLI | `hooks/hooks.json` | `SessionStart`, `BeforeAgent`, `BeforeTool`, `AfterAgent`, `SessionEnd` |
 
-The `PostToolUse` / `AfterTool` hook uses a matcher to fire only on
-edit tools (`Edit|Write|NotebookEdit` for Claude Code,
-`read_file|write_file` for Gemini CLI). Other hooks fire unconditionally.
+All hooks fire unconditionally (empty matcher). The `PreToolUse` /
+`BeforeTool` hook handles both editing state enforcement and command
+filtering in a single invocation.
 
 The `--format=claude` / `--format=gemini` flag on each `catenary hook`
 command selects the output format for the host's expected JSON structure.
 
 ### Diagnostic delivery path
 
-Diagnostics flow through the `done_editing` MCP tool result, **not**
-through PostToolUse hooks. The hook-based diagnostic path was removed —
-it was unreliable (stalled the agent when diagnostics failed to return).
+Diagnostics flow through `catenary done_editing` stdout output. The
+`PreToolUse` hook tracks which files the agent modifies during editing
+mode; `done_editing` collects those paths and runs the batched
+diagnostic pipeline.
 
 The current path:
 
-1. `PostToolUse` hooks accumulate modified file paths in
-   `EditingManager` (via `HookRouter`).
-2. The agent calls `done_editing` (MCP tool).
+1. `PreToolUse` hooks track modified file paths in `EditingManager`
+   (via `HookRouter`) during editing mode.
+2. The agent calls `catenary done_editing` (CLI command via the host's
+   shell tool).
 3. `DiagnosticsServer` runs the batched diagnostic pipeline across all
    accumulated files.
-4. Results are returned as the `done_editing` tool result — directly to
-   the agent through MCP.
+4. Results are printed to stdout — the agent sees them in the shell
+   tool output.
 
 This keeps diagnostics in the agent channel (where the agent can act on
 them) and hook responses in the user channel (where operational
@@ -262,14 +262,14 @@ Every protocol message is stored as an envelope with these fields:
 | `server` | LSP server name (e.g., `rust-analyzer`) |
 | `client` | Host CLI identifier (e.g., `claude-code`) |
 | `request_id` | Correlation ID for request/response pairing |
-| `parent_id` | Causation ID linking LSP messages to their MCP tool call |
+| `parent_id` | Causation ID linking LSP messages to their originating CLI command |
 | `level` | Tracing severity (`debug`, `info`, `warn`, `error`) |
 | `payload` | Raw JSON content |
 
 Three boundary components own logging: `McpServer` (MCP), `LspClient`
-(LSP), and `HookServer` (hooks). Tool servers are black boxes — the
-protocol messages that went in and came out are linked by `parent_id`
-at the database level.
+(LSP), and `HookServer` (hooks). Application servers are black boxes —
+the protocol messages that went in and came out are linked by
+`parent_id` at the database level.
 
 ### Display pipeline
 

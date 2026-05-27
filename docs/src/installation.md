@@ -24,8 +24,9 @@ claude plugin marketplace add TwoWells/Catenary
 claude plugin install catenary@catenary
 ```
 
-The plugin registers the MCP server and all hooks (post-edit diagnostics,
-editing state enforcement, root sync, agent lifecycle).
+The plugin registers hooks for editing enforcement, command filtering,
+and agent lifecycle tracking, plus an MCP connection for session
+management and workspace root discovery.
 
 ### Gemini CLI (recommended: extension)
 
@@ -33,7 +34,7 @@ editing state enforcement, root sync, agent lifecycle).
 gemini extensions install https://github.com/TwoWells/Catenary
 ```
 
-The extension registers the MCP server and all hooks.
+The extension registers hooks and the MCP connection.
 
 ### Manual MCP registration
 
@@ -49,8 +50,8 @@ For other clients, or if you prefer manual setup:
 }
 ```
 
-This registers the MCP server only. Without the plugin/extension, you
-will not get post-edit diagnostics or editing state enforcement.
+This registers the MCP connection only. Without the plugin/extension,
+you will not get editing state enforcement or command filtering.
 
 ## Verify
 

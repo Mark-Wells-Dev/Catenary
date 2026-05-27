@@ -68,7 +68,7 @@ opened for that request is closed.
 
 This is a deliberate design choice from the waitv2 rewrite. Stateless
 lifecycle eliminates migration concerns when routing changes mid-session
-— for example, when `/add-dir` shifts which server handles a file, or
+— for example, when `catenary add-root` shifts which server handles a file, or
 when a project-scoped server is spawned that shadows a workspace
 instance. There is no accumulated document state to reconcile when
 ownership changes.
@@ -104,7 +104,7 @@ During editing mode:
 - **No LSP traffic for intermediate edits.** The agent edits freely
   with the host CLI's native Edit/Write tools. No `didOpen`,
   no `didChange`, no diagnostic retrieval per edit.
-- **Path accumulation.** The `PostToolUse` hook detects edit-tool
+- **Path accumulation.** The `PreToolUse` hook detects edit-tool
   calls and accumulates the modified file paths in `EditingManager`.
   Paths are deduplicated — editing the same file twice records it
   once.
@@ -167,15 +167,15 @@ reflect the fully consistent state.
 
 `EditingManager` holds the in-memory editing state: a map from
 `agent_id` to accumulated file paths. Both the `HookRouter` (which
-has the real `agent_id` from the host CLI) and the `McpRouter` (which
-produces the tool result) access it through `Session`.
+has the real `agent_id` from the host CLI) and the IPC router (which
+handles CLI commands) access it through `Session`.
 
-The MCP `start_editing` and `done_editing` tools are triggers — the
-`PreToolUse` hook owns the state transition for `start_editing`
-(because it has the `agent_id`), and the `McpRouter` handles the
-diagnostic pipeline for `done_editing` (because it produces the tool
-result). `SessionStart` clears any stale editing state from a
-previous agent context.
+`catenary start_editing` and `catenary done_editing` are CLI commands
+invoked via the host's shell tool. The `PreToolUse` hook owns the
+state transition for `start_editing` (because it has the `agent_id`),
+and the IPC router handles the diagnostic pipeline for `done_editing`
+(because it produces the stdout output). `SessionStart` clears any
+stale editing state from a previous agent context.
 
 ## File watching
 
@@ -260,8 +260,8 @@ the cache — the next `diff()` will not report them as deleted again.
 
 `notify_file_changes()` runs at two points:
 
-- **Before every non-editing tool call.** In `McpRouter::call_tool`,
-  file change notification runs before grep and glob dispatch. This
+- **Before every grep and glob CLI command.** The IPC router runs file
+  change notification before dispatching grep and glob requests. This
   ensures servers have up-to-date awareness of the filesystem state
   before the agent queries them.
 - **At the start of `done_editing`.** The diagnostic pipeline calls

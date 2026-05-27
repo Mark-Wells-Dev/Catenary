@@ -1,6 +1,10 @@
 # Catenary
 
-A high-performance multiplexing bridge between MCP (Model Context Protocol) and LSP (Language Server Protocol). Enables LLMs to access IDE-grade code intelligence across multiple languages simultaneously with smart routing and UTF-8 accuracy.
+LSP-powered code intelligence for AI coding agents. Catenary manages a
+pool of language servers and exposes them through CLI commands (`grep`,
+`glob`, `start_editing`, `done_editing`) and hooks (editing enforcement,
+command filtering). Multiple agents share the same LSP servers via a
+single daemon.
 
 ## Installation
 
@@ -11,8 +15,8 @@ cargo install catenary-mcp
 ```
 
 The `catenary` binary must be on your PATH. The plugin does not include it —
-it only registers hooks and the MCP server declaration. If the binary is
-missing, hooks will silently do nothing.
+it only registers hooks and the MCP connection. If the binary is missing,
+hooks will silently do nothing.
 
 ### 2. Install the plugin
 
@@ -21,8 +25,9 @@ missing, hooks will silently do nothing.
 /plugin install catenary@catenary
 ```
 
-The plugin registers the MCP server and adds hooks for post-edit diagnostics
-and workspace root sync.
+The plugin registers hooks for editing enforcement, command filtering,
+and agent lifecycle tracking, plus an MCP connection for session
+management and workspace root discovery.
 
 ## Configuration
 
@@ -30,4 +35,4 @@ See `config.example.toml` in this directory or the [Official Configuration Guide
 
 ## Documentation
 
-For full features, tool lists, and troubleshooting, please visit the **[Main Repository](https://github.com/TwoWells/Catenary)**.
+For full documentation, please visit the **[Main Repository](https://github.com/TwoWells/Catenary)**.

@@ -1,13 +1,14 @@
 # Catenary
 
-Catenary is an MCP server that gives AI coding agents LSP-powered code
-intelligence. It multiplexes one or more language servers behind a single
-MCP interface, providing search, diagnostics, and navigation without
-shell-based text scanning.
+Catenary gives AI coding agents LSP-powered code intelligence. It
+manages a pool of language servers and exposes them through CLI commands
+and hooks — search, diagnostics, and navigation without shell-based text
+scanning.
 
-Four MCP tools — `grep` and `glob` for search, `start_editing` and
-`done_editing` for batched diagnostics. The agent never needs to know
-which language server handles which file.
+Two CLI search commands — `catenary grep` and `catenary glob` — plus an
+editing lifecycle (`catenary start_editing` / `catenary done_editing`)
+for batched diagnostics. The agent never needs to know which language
+server handles which file.
 
 - [Installation](installation.md) — install the binary and connect it to your CLI
 - [Configuration](configuration.md) — configure language servers and settings

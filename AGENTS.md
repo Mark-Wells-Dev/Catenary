@@ -27,9 +27,10 @@ surfaces share the same LSP server pool. None depends on the others.
   and monitorable via `catenary monitor <id>`.
 - **Database:** All state (sessions, events, workspace roots) is stored in
   `~/.local/state/catenary/catenary.db` (SQLite with WAL mode). See `src/db.rs`.
-- **MCP tools:** Stateless query surface — `grep` and `glob`. No session
-  identity, no connection binding. Each tool delegates to one or more LSP servers
-  under the hood.
+- **CLI search commands:** `catenary grep` and `catenary glob`, invoked via the
+  host's shell tool. Stateless queries — no session identity, no connection
+  binding. Each command connects to the daemon over a Unix domain socket,
+  delegates to one or more LSP servers, and prints results to stdout.
 - **Hooks:** Catenary registers a single `PreToolUse` hook per host (Claude Code,
   Gemini CLI, Antigravity CLI). This hook handles editing enforcement, command
   filtering, and file tracking. Hook definitions live in

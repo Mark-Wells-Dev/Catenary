@@ -6,7 +6,7 @@ shutdown.
 ## Startup sequence
 
 When the binary starts without a subcommand and stdin/stdout are not a
-terminal, it runs as an MCP server. The startup sequence is:
+terminal, it starts the daemon. The startup sequence is:
 
 1. **`LoggingServer` construction.** Created in buffering mode. All
    `tracing` events during early startup are captured in a bounded
@@ -67,12 +67,12 @@ terminal, it runs as an MCP server. The startup sequence is:
    Windows). This enables host CLI hooks to communicate with the
    session.
 
-8. **MCP server start.** `McpServer` is created with the `McpRouter`
-   (which implements `ToolHandler`) and begins reading JSON-RPC
-   messages from stdin. The `on_client_info` callback records the MCP
-   client's name and version in the session. The `on_roots_changed`
-   callback triggers `Session::sync_roots` when the MCP client
-   updates its root list.
+8. **MCP server start.** `McpServer` is created and begins reading
+   JSON-RPC messages from stdin. It handles the MCP lifecycle
+   (initialize, roots, ping) but exposes no application-level tools.
+   The `on_client_info` callback records the MCP client's name and
+   version in the session. The `on_roots_changed` callback triggers
+   `Session::sync_roots` when the MCP client updates its root list.
 
 ## Root discovery
 
@@ -89,8 +89,10 @@ language detection.
 
 ## Serving
 
-Once initialized, Catenary enters the MCP dispatch loop. Each tool
-call follows this sequence:
+Once initialized, the daemon serves requests from two sources: CLI
+commands over the IPC socket (grep, glob, editing lifecycle) and MCP
+messages over stdin (session management, roots). Each CLI command
+follows this sequence:
 
 1. **File change notification.** Before any LSP interaction, Catenary
    diffs the filesystem against the last snapshot
@@ -98,34 +100,35 @@ call follows this sequence:
    `workspace/didChangeWatchedFiles` notifications to servers with
    matching glob registrations.
 
-2. **Tool dispatch.** `McpRouter` routes the tool name to the
-   appropriate `ToolServer`:
-   - `grep` → `GrepServer` — parallel ripgrep + tree-sitter symbol
-     index search, LSP enrichment (hover, definitions, references).
+2. **IPC dispatch.** The IPC router dispatches the request to the
+   appropriate application server:
+   - `grep` → `GrepServer` — parallel ripgrep + LSP symbol index
+     search, LSP enrichment.
    - `glob` → `GlobServer` — file listing with structural symbol
      outlines from LSP `documentSymbol`.
    - `start_editing` → enters editing mode (defers diagnostics).
    - `done_editing` → exits editing mode, runs batched diagnostics
      across all modified files.
 
-3. **LSP interaction.** Tool servers use `LspClientManager` to find
-   the right server(s) for each file, wait for readiness, open
+3. **LSP interaction.** Application servers use `LspClientManager` to
+   find the right server(s) for each file, wait for readiness, open
    documents, send LSP requests, and collect responses. Multi-server
    languages use priority-chain dispatch for request/response methods
    (first non-empty result wins) and diagnostic concatenation (all
    enabled servers contribute).
 
-4. **Result return.** The tool server returns a structured result
-   through MCP.
+4. **Result return.** The application server returns a result string
+   printed to the CLI command's stdout.
 
 ### Editing mode
 
-`start_editing` and `done_editing` bracket a batch of file edits. The
-host CLI's Edit/Write tools modify files directly; Catenary's
-`PostToolUse` hook accumulates the paths of changed files. When
-`done_editing` is called, `DiagnosticsServer` opens all modified files
-on their respective language servers, waits for each server to settle,
-retrieves diagnostics, and returns a consolidated report.
+`catenary start_editing` and `catenary done_editing` bracket a batch of
+file edits. The host CLI's Edit/Write tools modify files directly;
+Catenary's `PreToolUse` hook tracks which files are modified. When
+`catenary done_editing` is called, `DiagnosticsServer` opens all
+modified files on their respective language servers, waits for each
+server to settle, retrieves diagnostics, and prints a consolidated
+report to stdout.
 
 During editing mode, the `PreToolUse` hook enforces boundaries: only
 edit-related tools (Edit, Write, and filesystem Bash commands) are
@@ -133,8 +136,8 @@ allowed without calling `done_editing` first.
 
 ## Mid-session root addition
 
-When the host CLI adds a workspace directory (`/add-dir` in Claude
-Code), the MCP client sends a `roots/list` update. Catenary processes
+When a workspace root is added (`catenary add-root <path>` via the
+host's shell tool, or via MCP `roots/list` update), Catenary processes
 it through `Session::sync_roots`:
 
 1. `FilesystemManager` roots are updated and the filesystem is

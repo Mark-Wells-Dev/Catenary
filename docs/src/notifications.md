@@ -21,7 +21,6 @@ the host CLI naturally pauses to display system information:
 | `Stop` / `AfterAgent` (allow) | Yes | Agent is done — safe to surface accumulated notices |
 | `Stop` / `AfterAgent` (block) | No | Agent must fix something first — preserve queue for next allow |
 | `PreToolUse` | No | Mid-flight — don't interrupt |
-| `PostToolUse` | No | Mid-flight — don't interrupt |
 
 ## Configuration
 

@@ -1,7 +1,7 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "catenary",
-  "description": "LSP bridge for Claude Code - access IDE-quality code intelligence through MCP",
+  "description": "LSP-powered code intelligence for Claude Code - search, diagnostics, and navigation across languages",
   "owner": {
     "name": "Mark Wells Dev",
     "email": "contact@markwells.dev"
@@ -9,7 +9,7 @@
   "plugins": [
     {
       "name": "catenary",
-      "description": "Bridge between MCP and LSP, providing IDE-quality code intelligence (hover, go-to-definition, references, diagnostics, completions, and more) for any language with an LSP server",
+      "description": "LSP-powered code intelligence for AI coding agents - search, diagnostics, and navigation for any language with an LSP server",
       "version": "1.6.1",
       "author": {
         "name": "Mark Wells Dev",

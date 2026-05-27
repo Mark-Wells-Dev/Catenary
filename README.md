@@ -8,13 +8,14 @@
 Catenary manages a pool of LSP servers and exposes them through four
 decoupled surfaces — any combination works independently:
 
-- **MCP** — stateless search tools (`grep`, `glob`). Any MCP client
-  gets LSP-backed code intelligence with no session state.
+- **CLI** — search commands (`catenary grep`, `catenary glob`) and
+  editing lifecycle (`catenary start_editing`, `catenary done_editing`,
+  `catenary add-root`, `catenary rm-root`). Invoked via the host's
+  shell tool.
+- **MCP** — pure connection surface for session management and
+  workspace root discovery. No application-level tools.
 - **Hooks** — editing enforcement, command filtering, and file tracking.
   One `PreToolUse` hook per host, unified daemon IPC.
-- **CLI** — editing lifecycle commands (`catenary start_editing`,
-  `catenary done_editing`, `catenary add-root`, `catenary rm-root`).
-  Invoked via the host's shell tool.
 - **TUI** — real-time observability across all sessions and LSP servers.
   Watch what agents are actually doing.
 
@@ -66,8 +67,8 @@ args = ["--stdio"]
 
 ### 3. Connect your AI assistant
 
-> Plugins register hooks and MCP server declarations but **do not
-> include the binary** — step 1 above is required.
+> Plugins register hooks and the MCP connection but **do not include
+> the binary** — step 1 above is required.
 
 **Claude Code**
 ```
@@ -107,10 +108,10 @@ Hooks:
 
 **Search** — always available, no setup beyond installation:
 
-| MCP Tool | Description |
-|----------|-------------|
-| `grep` | Symbols, semantic references, and text matches |
-| `glob` | File outlines, directory listings, glob matches |
+| CLI Command | Description |
+|-------------|-------------|
+| `catenary grep <pattern>` | Symbols, semantic references, and text matches |
+| `catenary glob <pattern>` | File outlines, directory listings, glob matches |
 
 **Editing** — run in the host's shell tool:
 
@@ -129,7 +130,7 @@ catenary rm-root <path>      # remove a workspace root
 
 ## Observability
 
-Catenary logs every protocol message — MCP tool calls, LSP requests and
+Catenary logs every protocol message — MCP exchanges, LSP requests and
 responses, hook invocations — to a local SQLite database. The TUI
 dashboard shows the message flow in real time across all sessions.
 

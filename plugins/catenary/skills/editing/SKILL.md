@@ -1,5 +1,5 @@
 ---
-name: catenary
+name: editing
 description: >
   Catenary uses editing mode to deliver LSP diagnostics. Run
   `catenary start_editing` via Bash before using Edit/Write. Run
@@ -17,10 +17,9 @@ diagnostics for all files touched during editing.
 
 ## Code Search
 
-Catenary's grep and glob MCP tools are stateless and available at
-all times, including during editing mode. They work on any
-directory but results are only LSP-enriched within tracked
-workspace roots.
+Use `catenary grep` and `catenary glob` via Bash for LSP-backed
+code search. Available at all times, including during editing mode.
+See the `search` skill for full usage.
 
 ## Workspace Roots
 

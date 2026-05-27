@@ -1,6 +1,6 @@
 {
   "name": "catenary",
-  "description": "Bridge between MCP and LSP, providing IDE-quality code intelligence (hover, go-to-definition, references, diagnostics, completions, and more) for any language with an LSP server",
+  "description": "LSP-powered code intelligence for AI coding agents - search, diagnostics, and navigation for any language with an LSP server",
   "author": {
     "name": "Mark Wells Dev",
     "email": "contact@markwells.dev"

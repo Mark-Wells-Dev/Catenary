@@ -42,9 +42,9 @@ The binary will be located at `target/release/catenary`.
 ### 2. Install Plugin/Extension
 
 Catenary ships plugin/extension manifests for both Claude Code and Gemini CLI.
-These bundle the MCP server configuration along with hooks that feed LSP
-diagnostics back to the model after file edits and sync `/add-dir` roots
-mid-session.
+These bundle hooks for editing enforcement, command filtering, and agent
+lifecycle tracking, plus an MCP connection for session management and
+workspace root discovery.
 
 #### Claude Code
 
@@ -55,9 +55,9 @@ mid-session.
 ```
 
 The plugin includes:
-- MCP server configuration
-- `PreToolUse` hook — syncs `/add-dir` roots to the running session
-- `PostToolUse` hook — returns LSP diagnostics after file edits
+- MCP connection for session management and root discovery
+- `PreToolUse` hook — editing state enforcement and command filtering
+- Lifecycle hooks — session start/end, turn tracking, agent stop
 
 #### Gemini CLI
 
@@ -67,8 +67,9 @@ gemini extensions link /path/to/Catenary
 ```
 
 The extension includes:
-- MCP server configuration
-- `AfterTool` hook — returns LSP diagnostics after file edits
+- MCP connection for session management and root discovery
+- `BeforeTool` hook — editing state enforcement and command filtering
+- Lifecycle hooks — session start/end, turn tracking, agent stop
 
 ### 3. Iterate
 

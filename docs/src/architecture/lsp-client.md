@@ -171,7 +171,7 @@ Client-local state (not shared with the reader loop):
   UTF-16 per spec).
 
 - **Causation tracking.** `parent_id` links all LSP messages to their
-  originating MCP tool call for database correlation and TUI display.
+  originating CLI command for database correlation and TUI display.
 
 - **Cancellation.** `cancel: CancellationToken` — set before each tool
   dispatch, propagated to `Connection::request`.

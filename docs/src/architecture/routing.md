@@ -75,7 +75,7 @@ Tracked in misc 28b.
 
 ### Roots are explicit
 
-Only roots added via `--root` or `/add-dir` are active. Catenary never
+Only roots added via `--root` or `catenary add-root` are active. Catenary never
 auto-discovers roots from file paths. A file outside all active roots
 has no owning root and cannot route to any server (until tier 3 is
 implemented). This is deliberate: implicit root discovery would make

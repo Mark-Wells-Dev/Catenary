@@ -49,7 +49,7 @@ Keybinding hints appear in each pane's border.
 
 ## Protocol Transparency
 
-Catenary logs every protocol message — every MCP tool call, every LSP
+Catenary logs every protocol message — every MCP exchange, every LSP
 request and response, every hook invocation — to a local SQLite database.
 The TUI shows the full message flow in real time: what Catenary sends to
 your language servers, what they send back, and how long each exchange
@@ -58,6 +58,50 @@ takes.
 You can see exactly what Catenary does. Nothing is hidden.
 
 ## CLI Commands
+
+### `catenary grep`
+
+Search for a pattern across the workspace. Queries ripgrep and the LSP
+symbol index in parallel. Results are LSP-enriched within tracked
+workspace roots. Uses the shell's current working directory as the
+search root.
+
+```bash
+catenary grep "pattern"
+catenary grep "foo|bar" --glob "src/**/*.rs"
+catenary grep "TODO" --exclude "vendor/**" --page 2
+catenary grep "pattern" --include-hidden --include-gitignored
+```
+
+| Flag | Description |
+|------|-------------|
+| `--glob <pat>` | Glob pattern to scope the search |
+| `--exclude <pat>` | Glob pattern to exclude from matches |
+| `--page <n>` | Page number for paged results (default: 1) |
+| `--include-gitignored` | Include files ignored by .gitignore |
+| `--include-hidden` | Include hidden files and directories |
+
+### `catenary glob`
+
+Browse the workspace: file outline, directory listing, or glob pattern
+match. Auto-detects intent from the pattern — a file path shows a symbol
+outline, a directory path shows a listing with symbols, and a glob
+pattern shows matching files. Uses the shell's current working directory
+as the base for relative patterns.
+
+```bash
+catenary glob "src/"
+catenary glob "src/main.rs"
+catenary glob "**/*.toml"
+catenary glob "**/*.rs" --exclude "tests/**" --page 2
+```
+
+| Flag | Description |
+|------|-------------|
+| `--exclude <pat>` | Glob pattern to exclude from results |
+| `--page <n>` | Page number for paged results (default: 1) |
+| `--include-gitignored` | Include files ignored by .gitignore |
+| `--include-hidden` | Include hidden files and directories |
 
 ### `catenary list`
 

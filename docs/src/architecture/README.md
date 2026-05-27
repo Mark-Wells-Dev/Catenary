@@ -1,23 +1,29 @@
 # Architecture
 
-Catenary is a multiplexing bridge between MCP and LSP. AI agents talk
-to Catenary through MCP tools; Catenary translates those into LSP
-requests to one or more language servers, collects results, and returns
-them through MCP.
+Catenary is a multi-surface intelligence router. A single daemon manages
+a pool of LSP servers and exposes them through four decoupled interfaces:
+MCP (connection), hooks (enforcement), CLI (queries and editing
+lifecycle), and TUI (observability). All interfaces share the same LSP
+server pool. None depends on the others.
 
-## Three protocols
+## Four surfaces
 
-Every external interaction crosses one of three protocol boundaries:
+Every external interaction crosses one of four boundaries:
 
-- **MCP** — agent ↔ Catenary. The agent calls tools (`grep`, `glob`,
-  `start_editing`, `done_editing`) and receives structured results.
+- **CLI** — agent ↔ Catenary. The agent invokes CLI commands via the
+  host's shell tool: `catenary grep`, `catenary glob` for search;
+  `catenary start_editing`, `catenary done_editing` for batched
+  diagnostics. Commands connect to the daemon over a Unix domain socket,
+  send a request, and print the result to stdout.
+- **MCP** — agent ↔ Catenary. A pure connection surface for session
+  management and workspace root discovery. No application-level tools.
 - **LSP** — Catenary ↔ language servers. Catenary spawns and manages
   language server processes, sending requests and receiving
   notifications over JSON-RPC stdio.
 - **Hooks** — host CLI ↔ Catenary. The host CLI (Claude Code, Gemini
-  CLI) fires hooks at lifecycle boundaries (pre-tool, post-tool,
-  pre-agent, post-agent, session start). Hook processes connect to the
-  running session's IPC socket and exchange JSON messages.
+  CLI) fires hooks at lifecycle boundaries (pre-tool, pre-agent,
+  post-agent, session start/end). Hook processes connect to the daemon's
+  IPC socket and exchange JSON messages.
 
 ## Multiplexing
 
@@ -33,8 +39,9 @@ servers, Catenary dispatches to all of them and merges results.
 Catenary follows a port/adapter pattern. Three boundary components own
 all protocol logging:
 
-- **`McpServer`** — MCP protocol adapter. Reads JSON-RPC from stdin,
-  dispatches tool calls, writes responses to stdout.
+- **`McpServer`** — MCP protocol adapter. Handles the MCP lifecycle
+  (initialize, roots, ping) over JSON-RPC. No application-level tools —
+  grep and glob are served via CLI commands over the IPC socket.
 - **`LspClient`** — LSP protocol adapter. One instance per language
   server process. Manages the JSON-RPC connection, document state, and
   capability negotiation.
@@ -47,48 +54,48 @@ user-facing `systemMessage` delivery) and a message database (for
 monitor visibility, debugging, and TUI broadcast). Every protocol
 message flows through it.
 
-Tool servers (`GrepServer`, `GlobServer`, `DiagnosticsServer`) are the
-transformation layer. They receive application-level parameters, do
-work using `LspClient`, and return results. They do not log protocol
-messages — that is the boundary components' job. A tool server is a
-black box: the protocol messages that went in and came out are linked
-by `parent_id` at the database level.
+Application servers (`GrepServer`, `GlobServer`, `DiagnosticsServer`)
+are the transformation layer. They receive application-level parameters
+from the IPC router, do work using `LspClient`, and return results.
+They do not log protocol messages — that is the boundary components'
+job. An application server is a black box: the protocol messages that
+went in and came out are linked by `parent_id` at the database level.
 
 ## Component diagram
 
 ```
                 ┌─────────────────────────────────────────────────────┐
-                │                    Catenary                         │
+                │                    Catenary daemon                  │
                 │                                                     │
-Agent ◄──MCP──► │  McpServer ──► McpRouter ──► ToolServer            │
-                │                               (grep, glob,         │
-                │                                diagnostics)         │
-                │                                    │                │
-                │                              LspClientManager       │
-                │                              ┌─────┴──────┐        │
-                │                         LspClient    LspClient     │
-                │                              │            │         │
-                └──────────────────────────────┼────────────┼─────────┘
-                                               │            │
-                                          LSP (stdio)  LSP (stdio)
-                                               │            │
-                                        rust-analyzer  typescript-
-                                                       language-server
-                ┌──────────────────────────────────────────────────────┐
-  Host CLI ◄──IPC──► HookServer ──► HookRouter ──► Session           │
-  (hooks)       │                                                      │
-                └──────────────────────────────────────────────────────┘
+Agent ◄──CLI──► │  IPC router ──► GrepServer / GlobServer            │
+  (grep, glob,  │                  DiagnosticsServer                  │
+   editing)     │                       │                             │
+                │                 LspClientManager                    │
+                │                 ┌─────┴──────┐                     │
+                │            LspClient    LspClient                  │
+                │                 │            │                      │
+                └─────────────────┼────────────┼──────────────────────┘
+                                  │            │
+                             LSP (stdio)  LSP (stdio)
+                                  │            │
+                           rust-analyzer  typescript-
+                                          language-server
 
-  LoggingServer (tracing Layer) ─── dispatches all events to sinks:
-    ├── NotificationQueueSink  (user-facing systemMessage)
-    └── MessageDbSink          (messages table + TUI broadcast)
+Agent ◄──MCP──► McpServer (session management, roots discovery, ping)
+
+Host CLI ◄──IPC──► HookServer ──► HookRouter (editing enforcement,
+  (hooks)                          command filtering, file tracking)
+
+LoggingServer (tracing Layer) ─── dispatches all events to sinks:
+  ├── NotificationQueueSink  (user-facing systemMessage)
+  └── MessageDbSink          (messages table + TUI broadcast)
 ```
 
 ## Shared infrastructure
 
-- **`Session`** — application container. Owns tool servers, the client
-  manager, filesystem manager, editing state, path validation, logging,
-  and the tree-sitter index. Protocol boundaries hold `Arc<Session>`.
+- **`Session`** — application container. Owns application servers, the
+  client manager, filesystem manager, editing state, path validation,
+  and logging. Protocol boundaries hold `Arc<Session>`.
 - **`FilesystemManager`** — file classification and root resolution.
   Single authority for language detection, shebang parsing, and
   workspace root membership. Also implements the snapshot-and-diff
