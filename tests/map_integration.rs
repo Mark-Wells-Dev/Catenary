@@ -43,33 +43,18 @@ fn test_glob_directory_basic() -> Result<()> {
     let mut bridge = spawn_bridge(temp.path().to_str().context("invalid path")?, None)?;
     bridge.initialize()?;
 
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {
-            "name": "glob",
-            "arguments": {
-                "pattern": temp.path().to_str().context("invalid path")?
-            }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let result = &response["result"];
-    assert!(result["isError"].is_null() || result["isError"] == false);
-
-    let content = result["content"][0]["text"]
-        .as_str()
-        .context("Missing text in content")?;
+    let text = bridge.call_tool_text(
+        "glob",
+        &json!({ "pattern": temp.path().to_str().context("invalid path")? }),
+    )?;
 
     assert!(
-        content.contains("file1.txt"),
-        "Should list file1.txt, got:\n{content}"
+        text.contains("file1.txt"),
+        "Should list file1.txt, got:\n{text}"
     );
     assert!(
-        content.contains("subdir/"),
-        "Should list subdir/, got:\n{content}"
+        text.contains("subdir/"),
+        "Should list subdir/, got:\n{text}"
     );
     Ok(())
 }
@@ -83,32 +68,19 @@ fn test_glob_directory_symbols() -> Result<()> {
     let mut bridge = spawn_bridge(temp.path().to_str().context("invalid path")?, None)?;
     bridge.initialize()?;
 
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 2,
-        "method": "tools/call",
-        "params": {
-            "name": "glob",
-            "arguments": {
-                "pattern": temp.path().to_str().context("invalid path")?
-            }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let result = &response["result"];
-    let content = result["content"][0]["text"]
-        .as_str()
-        .context("Missing text in content")?;
+    let text = bridge.call_tool_text(
+        "glob",
+        &json!({ "pattern": temp.path().to_str().context("invalid path")? }),
+    )?;
 
     assert!(
-        content.contains(&format!("types.{MOCK_LANG_A}")),
-        "Should list the file, got:\n{content}"
+        text.contains(&format!("types.{MOCK_LANG_A}")),
+        "Should list the file, got:\n{text}"
     );
     // Tier 2: file listing with line counts (no symbols until 08b).
     assert!(
-        content.contains("(3 lines)"),
-        "Should show line count, got:\n{content}"
+        text.contains("(3 lines)"),
+        "Should show line count, got:\n{text}"
     );
     Ok(())
 }
@@ -132,34 +104,21 @@ fn test_glob_file_outline() -> Result<()> {
     let mut bridge = spawn_bridge(temp.path().to_str().context("invalid path")?, Some(&lsp))?;
     bridge.initialize()?;
 
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 3,
-        "method": "tools/call",
-        "params": {
-            "name": "glob",
-            "arguments": {
-                "pattern": script.to_str().context("file path")?
-            }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let result = &response["result"];
-    let content = result["content"][0]["text"]
-        .as_str()
-        .context("Missing text in content")?;
+    let text = bridge.call_tool_text(
+        "glob",
+        &json!({ "pattern": script.to_str().context("file path")? }),
+    )?;
 
     // Line count header
     assert!(
-        content.contains("(4 lines)"),
-        "Should show line count, got:\n{content}"
+        text.contains("(4 lines)"),
+        "Should show line count, got:\n{text}"
     );
 
     // Symbols from documentSymbol should appear as a defensive map.
     assert!(
-        content.contains("Config"),
-        "Should show symbols from documentSymbol, got:\n{content}"
+        text.contains("Config"),
+        "Should show symbols from documentSymbol, got:\n{text}"
     );
     Ok(())
 }
@@ -179,37 +138,15 @@ fn test_glob_directory_explicit_path() -> Result<()> {
     let mut bridge = spawn_bridge_multi_root(&[root_a, root_b], None)?;
     bridge.initialize()?;
 
-    // Request glob with explicit path pointing to root A only
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 11,
-        "method": "tools/call",
-        "params": {
-            "name": "glob",
-            "arguments": {
-                "pattern": root_a
-            }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let result = &response["result"];
-    assert!(
-        result["isError"].is_null() || result["isError"] == false,
-        "glob with explicit path failed: {response:?}"
-    );
-
-    let content = result["content"][0]["text"]
-        .as_str()
-        .context("Missing text in content")?;
+    let text = bridge.call_tool_text("glob", &json!({ "pattern": root_a }))?;
 
     assert!(
-        content.contains("only_a.txt"),
-        "Should contain only_a.txt from explicit path, got:\n{content}"
+        text.contains("only_a.txt"),
+        "Should contain only_a.txt from explicit path, got:\n{text}"
     );
     assert!(
-        !content.contains("only_b.txt"),
-        "Should NOT contain only_b.txt when explicit path is root A, got:\n{content}"
+        !text.contains("only_b.txt"),
+        "Should NOT contain only_b.txt when explicit path is root A, got:\n{text}"
     );
 
     Ok(())

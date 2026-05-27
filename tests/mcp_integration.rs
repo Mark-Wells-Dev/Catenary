@@ -192,25 +192,7 @@ fn test_multi_root_find_symbol() -> Result<()> {
     bridge.initialize()?;
 
     // Search should locate alpha_func from root A (via symbols or heatmap)
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 700,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "alpha_func" }
-        }
-    }))?;
-
-    let response_a = bridge.recv()?;
-    let result_a = &response_a["result"];
-    assert!(
-        result_a["isError"].is_null() || result_a["isError"] == false,
-        "search for alpha_func failed: {response_a:?}"
-    );
-    let text_a = result_a["content"][0]["text"]
-        .as_str()
-        .context("Missing text for alpha_func")?;
+    let text_a = bridge.call_tool_text("grep", &json!({ "pattern": "alpha_func" }))?;
     assert!(
         text_a.contains(&format!("alpha.{MOCK_LANG_A}")),
         "Expected search to find alpha.mock, got: {text_a}"
@@ -221,25 +203,7 @@ fn test_multi_root_find_symbol() -> Result<()> {
     );
 
     // Search should locate beta_func from root B (via symbols or heatmap)
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 701,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "beta_func" }
-        }
-    }))?;
-
-    let response_b = bridge.recv()?;
-    let result_b = &response_b["result"];
-    assert!(
-        result_b["isError"].is_null() || result_b["isError"] == false,
-        "search for beta_func failed: {response_b:?}"
-    );
-    let text_b = result_b["content"][0]["text"]
-        .as_str()
-        .context("Missing text for beta_func")?;
+    let text_b = bridge.call_tool_text("grep", &json!({ "pattern": "beta_func" }))?;
     assert!(
         text_b.contains(&format!("beta.{MOCK_LANG_A}")),
         "Expected search to find beta.mock, got: {text_b}"
@@ -268,27 +232,10 @@ fn test_multi_root_glob_file() -> Result<()> {
     bridge.initialize()?;
 
     // Get outline from root A file
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 720,
-        "method": "tools/call",
-        "params": {
-            "name": "glob",
-            "arguments": {
-                "pattern": script_a.to_str().context("Invalid script A path")?
-            }
-        }
-    }))?;
-
-    let response_a = bridge.recv()?;
-    let result_a = &response_a["result"];
-    assert!(
-        result_a["isError"].is_null() || result_a["isError"] == false,
-        "Glob file from root A failed: {response_a:?}"
-    );
-    let text_a = result_a["content"][0]["text"]
-        .as_str()
-        .context("Missing text for symbols A")?;
+    let text_a = bridge.call_tool_text(
+        "glob",
+        &json!({ "pattern": script_a.to_str().context("Invalid script A path")? }),
+    )?;
     // Glob file mode: line count header (no symbols until 08b).
     assert!(
         text_a.contains("(2 lines)"),
@@ -296,27 +243,10 @@ fn test_multi_root_glob_file() -> Result<()> {
     );
 
     // Get header from root B file
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 721,
-        "method": "tools/call",
-        "params": {
-            "name": "glob",
-            "arguments": {
-                "pattern": script_b.to_str().context("Invalid script B path")?
-            }
-        }
-    }))?;
-
-    let response_b = bridge.recv()?;
-    let result_b = &response_b["result"];
-    assert!(
-        result_b["isError"].is_null() || result_b["isError"] == false,
-        "Glob file from root B failed: {response_b:?}"
-    );
-    let text_b = result_b["content"][0]["text"]
-        .as_str()
-        .context("Missing text for symbols B")?;
+    let text_b = bridge.call_tool_text(
+        "glob",
+        &json!({ "pattern": script_b.to_str().context("Invalid script B path")? }),
+    )?;
     assert!(
         text_b.contains("(2 lines)"),
         "Should show line count for root B file, got: {text_b}"
@@ -357,22 +287,7 @@ fn test_sync_roots_restart_no_workspace_folders() -> Result<()> {
     bridge.initialize_with_roots(&[root_a])?;
 
     // Search in root_a — server should be working
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 10,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "unique_root_a_func" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let result = &response["result"];
-    assert!(
-        result["isError"].is_null() || result["isError"] == false,
-        "Search in root A failed: {response:?}"
-    );
+    let _ = bridge.call_tool_text("grep", &json!({ "pattern": "unique_root_a_func" }))?;
 
     // Send roots/list_changed, respond with both roots
     bridge.send(&json!({
@@ -407,27 +322,11 @@ fn test_sync_roots_restart_no_workspace_folders() -> Result<()> {
     // search waits for all servers to be ready, but retry to accommodate restart.
     let mut success = false;
     let mut last_text = String::new();
-    for i in 0..10 {
-        bridge.send(&json!({
-            "jsonrpc": "2.0",
-            "id": 20 + i,
-            "method": "tools/call",
-            "params": {
-                "name": "grep",
-                "arguments": { "pattern": "unique_root_b_func" }
-            }
-        }))?;
-
-        let response = bridge.recv()?;
-        let result = &response["result"];
-        if result["isError"] == true {
-            std::thread::sleep(Duration::from_millis(500));
-            continue;
-        }
-        let text = result["content"][0]["text"]
-            .as_str()
-            .context("Missing text")?;
-        last_text = text.to_string();
+    for _ in 0..10 {
+        let text = bridge
+            .call_tool_text("grep", &json!({ "pattern": "unique_root_b_func" }))
+            .unwrap_or_default();
+        last_text = text.clone();
         if text.contains("unique_root_b_func") && text.contains(&format!("funcs_b.{MOCK_LANG_A}")) {
             success = true;
             break;
@@ -595,22 +494,7 @@ fn test_mockls_sync_roots_across_profiles() -> Result<()> {
         bridge.initialize_with_roots(&[root_a])?;
 
         // Search in root_a — server should be working
-        bridge.send(&json!({
-            "jsonrpc": "2.0",
-            "id": 10,
-            "method": "tools/call",
-            "params": {
-                "name": "grep",
-                "arguments": { "pattern": "unique_root_a_func" }
-            }
-        }))?;
-
-        let response = bridge.recv()?;
-        let result = &response["result"];
-        assert!(
-            result["isError"].is_null() || result["isError"] == false,
-            "Profile {name}: search in root A failed: {response:?}"
-        );
+        let _ = bridge.call_tool_text("grep", &json!({ "pattern": "unique_root_a_func" }))?;
 
         // Send roots/list_changed with both roots
         bridge.send(&json!({
@@ -647,25 +531,7 @@ fn test_mockls_sync_roots_across_profiles() -> Result<()> {
         bridge.wait_for_root(root_b, std::time::Duration::from_secs(5))?;
 
         // Search in root_b
-        bridge.send(&json!({
-            "jsonrpc": "2.0",
-            "id": 20,
-            "method": "tools/call",
-            "params": {
-                "name": "grep",
-                "arguments": { "pattern": "unique_root_b_func" }
-            }
-        }))?;
-
-        let response = bridge.recv()?;
-        let result = &response["result"];
-        assert!(
-            result["isError"] != true,
-            "Profile {name}: search in root B returned error: {response:?}"
-        );
-        let text = result["content"][0]["text"]
-            .as_str()
-            .context("Missing text")?;
+        let text = bridge.call_tool_text("grep", &json!({ "pattern": "unique_root_b_func" }))?;
         assert!(
             text.contains(&format!("funcs_b.{MOCK_LANG_A}")),
             "Profile {name}: search in root B should reference funcs_b.mock, got: {text}"
@@ -701,21 +567,7 @@ fn test_mockls_sync_roots_no_progress_no_hang() -> Result<()> {
     bridge.initialize_with_roots(&[root_a])?;
 
     // Search in root_a — establishes server is working
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 10,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "hello" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    assert!(
-        response["result"]["isError"] != true,
-        "Root A search failed: {response:?}"
-    );
+    let _ = bridge.call_tool_text("grep", &json!({ "pattern": "hello" }))?;
 
     // Add root_b via roots/list_changed
     bridge.send(&json!({
@@ -749,24 +601,7 @@ fn test_mockls_sync_roots_no_progress_no_hang() -> Result<()> {
     // did_change_workspace_folders sets state to Busy.
     // Since mockls never sends $/progress, wait_ready() uses
     // the activity settle fallback to transition back to Ready.
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 20,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "world" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    assert!(
-        response["result"]["isError"] != true,
-        "Root B search should not hang or error: {response:?}"
-    );
-    let text = response["result"]["content"][0]["text"]
-        .as_str()
-        .context("Missing search text for root B")?;
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "world" }))?;
     assert!(
         text.contains(&format!("funcs_b.{MOCK_LANG_A}")),
         "Expected 'funcs_b.mock' in search results, got: {text}"
@@ -798,47 +633,10 @@ fn test_mockls_multiplexing() -> Result<()> {
     bridge.initialize()?;
 
     // Search for "greet" — should find in MOCK_LANG_A file
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 100,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "greet" }
-        }
-    }))?;
-
-    let response_a = bridge.recv()?;
-    let result_a = &response_a["result"];
-    assert!(
-        result_a["isError"].is_null() || result_a["isError"] == false,
-        "Lang A search failed: {response_a:?}"
-    );
+    let text_a = bridge.call_tool_text("grep", &json!({ "pattern": "greet" }))?;
 
     // Search for "package" — should find in MOCK_LANG_B file
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 101,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "package" }
-        }
-    }))?;
-
-    let response_b = bridge.recv()?;
-    let result_b = &response_b["result"];
-    assert!(
-        result_b["isError"].is_null() || result_b["isError"] == false,
-        "Lang B search failed: {response_b:?}"
-    );
-
-    let text_a = result_a["content"][0]["text"]
-        .as_str()
-        .context("Missing lang A search text")?;
-    let text_b = result_b["content"][0]["text"]
-        .as_str()
-        .context("Missing lang B search text")?;
+    let text_b = bridge.call_tool_text("grep", &json!({ "pattern": "package" }))?;
 
     assert!(
         text_a.contains(&format!("test.{MOCK_LANG_A}")),
@@ -937,24 +735,7 @@ fn test_search_graceful_degradation() -> Result<()> {
 
     // Search for "fn" — the line is a symbol definition (from documentSymbol),
     // so the hit is classified as a symbol.
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "fn" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    assert!(
-        response["result"]["isError"] != true,
-        "grep should succeed: {response:?}"
-    );
-    let text_fn = response["result"]["content"][0]["text"]
-        .as_str()
-        .context("Missing text")?;
+    let text_fn = bridge.call_tool_text("grep", &json!({ "pattern": "fn" }))?;
     // With documentSymbol, kind labels are present
     assert!(
         text_fn.contains("<Function>"),
@@ -962,20 +743,7 @@ fn test_search_graceful_degradation() -> Result<()> {
     );
 
     // Search for "greet" — a symbol, not a keyword.
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 2,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "greet" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let text = response["result"]["content"][0]["text"]
-        .as_str()
-        .context("Missing text")?;
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "greet" }))?;
     // rg-only heatmap: symbol found via ripgrep, file reference present
     assert!(
         text.contains("greet"),
@@ -1056,29 +824,8 @@ fn test_wait_ready_failure_detection() -> Result<()> {
 
     // Send a search request — wait_ready returns true (server is Healthy),
     // but individual LSP requests may time out during the CPU burn.
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 10,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "hello" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let result = &response["result"];
-
-    // Search degrades gracefully — ripgrep results still present
-    assert!(
-        result.get("isError").is_none() || result["isError"] == false,
-        "Search should degrade gracefully, not error. Got: {response:?}"
-    );
-
-    let content = result["content"]
-        .as_array()
-        .context("Missing content array")?;
-    let text = content[0]["text"].as_str().context("Missing result text")?;
+    // Search degrades gracefully — ripgrep results still present.
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "hello" }))?;
     assert!(
         text.contains("hello"),
         "Ripgrep results should still contain the match. Got: {text}"
@@ -1106,20 +853,10 @@ fn test_warmup_observation() -> Result<()> {
     bridge.initialize()?;
 
     // Send search immediately — server is still burning CPU
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "my_function" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let result = &response["result"];
     // Should succeed — wait_ready waits for CPU burn to finish
-    let text = result["content"][0]["text"].as_str().unwrap_or("");
+    let text = bridge
+        .call_tool_text("grep", &json!({ "pattern": "my_function" }))
+        .unwrap_or_default();
     assert!(
         text.contains(&format!("test.{MOCK_LANG_A}")),
         "Search should succeed after warmup observation. Got: {text}"
@@ -1148,24 +885,7 @@ fn test_search_symbols_with_scan_roots() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "greet" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    assert!(
-        response["result"]["isError"] != true,
-        "Search should succeed: {response:?}"
-    );
-    let text = response["result"]["content"][0]["text"]
-        .as_str()
-        .context("Missing search text")?;
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "greet" }))?;
 
     assert!(
         text.contains("greet"),
@@ -1195,20 +915,7 @@ fn test_grep_per_symbol_output() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "load_config|save_config" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let text = response["result"]["content"][0]["text"]
-        .as_str()
-        .context("Missing text")?;
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "load_config|save_config" }))?;
 
     // Both symbols should appear in output
     assert!(
@@ -1246,20 +953,7 @@ fn test_grep_resolve_provider() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "resolve_me" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let text = response["result"]["content"][0]["text"]
-        .as_str()
-        .context("Missing text")?;
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "resolve_me" }))?;
 
     assert!(
         text.contains("resolve_me"),
@@ -1293,25 +987,7 @@ fn test_grep_alternation() -> Result<()> {
     let mut bridge = BridgeProcess::spawn_multi_root(&[&lsp], &[root_a, root_b])?;
     bridge.initialize()?;
 
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 800,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "alpha_func|beta_func" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let result = &response["result"];
-    assert!(
-        result["isError"].is_null() || result["isError"] == false,
-        "grep alternation failed: {response:?}"
-    );
-    let text = result["content"][0]["text"]
-        .as_str()
-        .context("Missing text for alternation")?;
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "alpha_func|beta_func" }))?;
 
     // Both files should appear
     assert!(
@@ -1368,25 +1044,7 @@ fn test_grep_enrichment_threshold_broad() -> Result<()> {
 
     bridge.initialize()?;
 
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 810,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "zz_broad" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let result = &response["result"];
-    assert!(
-        result["isError"].is_null() || result["isError"] == false,
-        "grep broad should succeed: {response:?}"
-    );
-    let text = result["content"][0]["text"]
-        .as_str()
-        .context("Missing text for broad search")?;
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "zz_broad" }))?;
 
     // Should have page header indicating multiple pages
     assert!(
@@ -1437,25 +1095,7 @@ fn test_grep_rg_only_groups_by_matched_string() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 900,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "alpha_token|beta_token" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let result = &response["result"];
-    assert!(
-        result["isError"].is_null() || result["isError"] == false,
-        "grep rg-only failed: {response:?}"
-    );
-    let text = result["content"][0]["text"]
-        .as_str()
-        .context("Missing text")?;
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "alpha_token|beta_token" }))?;
 
     // Both tokens should appear in output
     assert!(
@@ -1501,25 +1141,7 @@ fn test_grep_alternation_routes_non_code_hits() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 910,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "compute|render" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let result = &response["result"];
-    assert!(
-        result["isError"].is_null() || result["isError"] == false,
-        "grep alternation routing failed: {response:?}"
-    );
-    let text = result["content"][0]["text"]
-        .as_str()
-        .context("Missing text")?;
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "compute|render" }))?;
 
     // Both symbols should appear in output
     assert!(
@@ -1566,25 +1188,7 @@ fn test_grep_two_defs_same_name_per_heading_refs() -> Result<()> {
     let mut bridge = BridgeProcess::spawn_multi_root(&[&lsp], &[root_a, root_b])?;
     bridge.initialize()?;
 
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 920,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "process" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let result = &response["result"];
-    assert!(
-        result["isError"].is_null() || result["isError"] == false,
-        "grep two-defs failed: {response:?}"
-    );
-    let text = result["content"][0]["text"]
-        .as_str()
-        .context("Missing text")?;
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "process" }))?;
 
     // Both files should appear with the symbol
     assert!(
@@ -1621,25 +1225,7 @@ fn test_grep_resolve_fallback_path() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 930,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "resolve_fallback" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let result = &response["result"];
-    assert!(
-        result["isError"].is_null() || result["isError"] == false,
-        "grep resolve fallback failed: {response:?}"
-    );
-    let text = result["content"][0]["text"]
-        .as_str()
-        .context("Missing text")?;
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "resolve_fallback" }))?;
 
     // Symbol should be found via ripgrep + prepareRename
     assert!(
@@ -1673,25 +1259,7 @@ fn test_grep_cross_server_same_symbol() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp_a, &lsp_b], root)?;
     bridge.initialize()?;
 
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 940,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "cross_server_fn" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let result = &response["result"];
-    assert!(
-        result["isError"].is_null() || result["isError"] == false,
-        "grep cross-server failed: {response:?}"
-    );
-    let text = result["content"][0]["text"]
-        .as_str()
-        .context("Missing text")?;
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "cross_server_fn" }))?;
 
     // Symbol should appear with both files
     assert!(
@@ -1724,25 +1292,7 @@ fn test_grep_enrichment_incoming_calls() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 950,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "callee_fn" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let result = &response["result"];
-    assert!(
-        result["isError"].is_null() || result["isError"] == false,
-        "grep incoming calls should succeed: {response:?}"
-    );
-    let text = result["content"][0]["text"]
-        .as_str()
-        .context("Missing text for incoming calls")?;
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "callee_fn" }))?;
 
     // Enrichment runs and renders the result
     assert!(
@@ -1772,25 +1322,7 @@ fn test_grep_enrichment_implementations() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 960,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "MyStruct" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let result = &response["result"];
-    assert!(
-        result["isError"].is_null() || result["isError"] == false,
-        "grep implementations should succeed: {response:?}"
-    );
-    let text = result["content"][0]["text"]
-        .as_str()
-        .context("Missing text for implementations")?;
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "MyStruct" }))?;
 
     // Enrichment runs and renders the result
     assert!(
@@ -1817,25 +1349,7 @@ fn test_grep_enrichment_subtypes() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 970,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "Animal" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let result = &response["result"];
-    assert!(
-        result["isError"].is_null() || result["isError"] == false,
-        "grep subtypes should succeed: {response:?}"
-    );
-    let text = result["content"][0]["text"]
-        .as_str()
-        .context("Missing text for subtypes")?;
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "Animal" }))?;
 
     // Enrichment runs and renders the result
     assert!(
@@ -1862,25 +1376,7 @@ fn test_symbol_index_finds_methods() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 5000,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "widget_method" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let result = &response["result"];
-    assert!(
-        result["isError"].is_null() || result["isError"] == false,
-        "grep should succeed: {response:?}"
-    );
-    let text = result["content"][0]["text"]
-        .as_str()
-        .context("Missing text")?;
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "widget_method" }))?;
 
     // Tree-sitter index should find the method with kind label
     assert!(
@@ -1916,20 +1412,7 @@ fn test_grep_basic_hits() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 3000,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "say_hello" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let text = response["result"]["content"][0]["text"]
-        .as_str()
-        .context("Missing text")?;
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "say_hello" }))?;
 
     // Should find the symbol with file and line reference
     assert!(
@@ -1960,23 +1443,10 @@ fn test_grep_glob_scoping() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 3001,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": {
-                "pattern": "scope_target",
-                "glob": "src/**"
-            }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let text = response["result"]["content"][0]["text"]
-        .as_str()
-        .context("Missing text")?;
+    let text = bridge.call_tool_text(
+        "grep",
+        &json!({ "pattern": "scope_target", "glob": "src/**" }),
+    )?;
 
     assert!(
         text.contains(&format!("a.{MOCK_LANG_A}")),
@@ -2012,23 +1482,10 @@ fn test_grep_exclude() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 3002,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": {
-                "pattern": "excl_func",
-                "exclude": "**/test_*"
-            }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let text = response["result"]["content"][0]["text"]
-        .as_str()
-        .context("Missing text")?;
+    let text = bridge.call_tool_text(
+        "grep",
+        &json!({ "pattern": "excl_func", "exclude": "**/test_*" }),
+    )?;
 
     assert!(
         text.contains(&format!("main.{MOCK_LANG_A}")),
@@ -2063,20 +1520,7 @@ fn test_grep_alternation_split() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 3004,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "alt_alpha|alt_beta" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let text = response["result"]["content"][0]["text"]
-        .as_str()
-        .context("Missing text")?;
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "alt_alpha|alt_beta" }))?;
 
     assert!(
         text.contains("alt_alpha"),
@@ -2105,20 +1549,7 @@ fn test_grep_alternation_nested() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 3005,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "(alpha|beta)_baz" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let text = response["result"]["content"][0]["text"]
-        .as_str()
-        .context("Missing text")?;
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "(alpha|beta)_baz" }))?;
 
     // Both matches should appear — the nested alternation is one arm
     assert!(
@@ -2146,20 +1577,7 @@ fn test_grep_prepare_rename_keyword() -> Result<()> {
     bridge.initialize()?;
 
     // Search for the keyword `struct` (not the symbol name)
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 3006,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "^struct$" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let text = response["result"]["content"][0]["text"]
-        .as_str()
-        .context("Missing text")?;
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "^struct$" }))?;
 
     // The keyword `struct` is filtered out by prepareRename returning null.
     // Only the keyword itself matched (not the symbol name), so output is empty.
@@ -2185,20 +1603,7 @@ fn test_grep_kind_brackets() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 3010,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "my_func|MyStruct" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let text = response["result"]["content"][0]["text"]
-        .as_str()
-        .context("Missing text")?;
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "my_func|MyStruct" }))?;
 
     // Tree-sitter kind labels should use <Kind> angle brackets
     assert!(
@@ -2233,20 +1638,7 @@ fn test_grep_reference_enclosing() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 3011,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "target" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let text = response["result"]["content"][0]["text"]
-        .as_str()
-        .context("Missing text")?;
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "target" }))?;
 
     // Reference hit with enclosing structure: `:line <Kind> name:span`
     assert!(
@@ -2275,17 +1667,8 @@ fn test_grep_parent_id_threading() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    // Call grep via IPC (intercepted by send()).
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "hello" }
-        }
-    }))?;
-    let _response = bridge.recv()?;
+    // Call grep via IPC.
+    let _ = bridge.call_tool_text("grep", &json!({ "pattern": "hello" }))?;
 
     // Open the database and verify parent_id threading
     let db_path = PathBuf::from(bridge.state_home())
@@ -2337,20 +1720,10 @@ fn test_glob_parent_id_threading() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {
-            "name": "glob",
-            "arguments": { "pattern": test_file.to_str().context("path")? }
-        }
-    }))?;
-    let response = bridge.recv()?;
-    let result = &response["result"];
-    let content = result["content"][0]["text"]
-        .as_str()
-        .context("Missing text")?;
+    let content = bridge.call_tool_text(
+        "glob",
+        &json!({ "pattern": test_file.to_str().context("path")? }),
+    )?;
 
     // Glob returns line count header only (no LSP calls).
     assert!(
@@ -2381,20 +1754,7 @@ fn test_grep_name_grouping() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 4000,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "test_alpha" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let text = response["result"]["content"][0]["text"]
-        .as_str()
-        .context("Missing text")?;
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "test_alpha" }))?;
 
     // Name group at column 0 (no leading whitespace)
     let first_line = text.lines().next().unwrap_or("");
@@ -2430,20 +1790,7 @@ fn test_grep_basic_output() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 4001,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "say_hello" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let text = response["result"]["content"][0]["text"]
-        .as_str()
-        .context("Missing text")?;
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "say_hello" }))?;
 
     // Symbol appears in output with line numbers
     assert!(
@@ -2472,20 +1819,7 @@ fn test_grep_narrow_pattern() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 4002,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "unique_symbol_xyz" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let text = response["result"]["content"][0]["text"]
-        .as_str()
-        .context("Missing text")?;
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "unique_symbol_xyz" }))?;
 
     // Name at column 0, <Kind> label present
     assert!(
@@ -2514,20 +1848,7 @@ fn test_grep_single_line_structure() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 4003,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "one_liner" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let text = response["result"]["content"][0]["text"]
-        .as_str()
-        .context("Missing text")?;
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "one_liner" }))?;
 
     assert!(
         text.contains("<Function>") && text.contains("one_liner"),
@@ -2555,20 +1876,7 @@ fn test_grep_no_blank_lines() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 4004,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "alpha_one|beta_two" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let text = response["result"]["content"][0]["text"]
-        .as_str()
-        .context("Missing text")?;
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "alpha_one|beta_two" }))?;
 
     // Each alternation arm produces its own output section
     assert!(
@@ -2624,20 +1932,7 @@ fn test_grep_prepare_rename_priority_chain() -> Result<()> {
     })?;
     bridge.initialize()?;
 
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 4100,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "chain_symbol" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let text = response["result"]["content"][0]["text"]
-        .as_str()
-        .context("Missing text")?;
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "chain_symbol" }))?;
 
     // Server A errors on prepareRename, server B succeeds.
     // The symbol should appear despite the first server failing.
@@ -2667,25 +1962,7 @@ fn test_enrich_ungated_function() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 5100,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "callee_fn" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let result = &response["result"];
-    assert!(
-        result["isError"].is_null() || result["isError"] == false,
-        "enrich_ungated_function should succeed: {response:?}"
-    );
-    let text = result["content"][0]["text"]
-        .as_str()
-        .context("Missing text")?;
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "callee_fn" }))?;
 
     // Tool completes successfully with enrichment
     assert!(
@@ -2713,25 +1990,7 @@ fn test_enrich_ungated_type() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 5110,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "Vehicle" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let result = &response["result"];
-    assert!(
-        result["isError"].is_null() || result["isError"] == false,
-        "enrich_ungated_type should succeed: {response:?}"
-    );
-    let text = result["content"][0]["text"]
-        .as_str()
-        .context("Missing text")?;
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "Vehicle" }))?;
 
     assert!(
         text.contains("Vehicle"),
@@ -2757,25 +2016,7 @@ fn test_enrich_symbol_index_path() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 5120,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "my_symbol" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let result = &response["result"];
-    assert!(
-        result["isError"].is_null() || result["isError"] == false,
-        "enrich symbol index path should succeed: {response:?}"
-    );
-    let text = result["content"][0]["text"]
-        .as_str()
-        .context("Missing text")?;
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "my_symbol" }))?;
 
     // Symbol index identified the symbol — enrichment runs without prepareRename
     assert!(
@@ -2804,25 +2045,7 @@ fn test_enrich_prepare_rename_symbol() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 5130,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "enrichable_sym" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let result = &response["result"];
-    assert!(
-        result["isError"].is_null() || result["isError"] == false,
-        "enrich prepare_rename symbol should succeed: {response:?}"
-    );
-    let text = result["content"][0]["text"]
-        .as_str()
-        .context("Missing text")?;
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "enrichable_sym" }))?;
 
     // prepareRename confirmed symbol, enrichment ran
     assert!(
@@ -2858,20 +2081,7 @@ fn test_enrich_prepare_rename_keyword() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 5140,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "^fn " }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let text = response["result"]["content"][0]["text"]
-        .as_str()
-        .context("Missing text")?;
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "^fn " }))?;
 
     // The line is a symbol definition — the index identifies it, so
     // the symbol appears in output (not filtered as keyword).
@@ -2971,25 +2181,7 @@ fn test_enrich_deprecated_type_edge() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 5150,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "Shape" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let result = &response["result"];
-    assert!(
-        result["isError"].is_null() || result["isError"] == false,
-        "enrich deprecated type edge should succeed: {response:?}"
-    );
-    let text = result["content"][0]["text"]
-        .as_str()
-        .context("Missing text")?;
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "Shape" }))?;
 
     // Tool completes with deprecated subtypes collected and rendered
     assert!(
@@ -3028,25 +2220,7 @@ fn test_enrich_outgoing_calls() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 5160,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "main_fn" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let result = &response["result"];
-    assert!(
-        result["isError"].is_null() || result["isError"] == false,
-        "enrich outgoing calls should succeed: {response:?}"
-    );
-    let text = result["content"][0]["text"]
-        .as_str()
-        .context("Missing text")?;
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "main_fn" }))?;
 
     // Enrichment — outgoing calls visible
     assert!(
@@ -3086,20 +2260,7 @@ fn test_grep_grammar_path_calls() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 7777,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "main_gp" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let text = response["result"]["content"][0]["text"]
-        .as_str()
-        .context("Missing text")?;
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "main_gp" }))?;
 
     // Symbol index: kind label present
     assert!(
@@ -3134,20 +2295,7 @@ fn test_grep_enriched() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 6000,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "caller_t1" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let text = response["result"]["content"][0]["text"]
-        .as_str()
-        .context("Missing text")?;
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "caller_t1" }))?;
 
     // Page header followed by bare root path and name at depth 0
     assert!(
@@ -3283,20 +2431,7 @@ fn test_grep_type_hierarchy() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 6010,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "Vehicle_t1" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let text = response["result"]["content"][0]["text"]
-        .as_str()
-        .context("Missing text")?;
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "Vehicle_t1" }))?;
 
     assert!(
         text.contains("Vehicle_t1"),
@@ -3335,20 +2470,7 @@ fn test_grep_path_syntax() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 6020,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "inner_ps" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let text = response["result"]["content"][0]["text"]
-        .as_str()
-        .context("Missing text")?;
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "inner_ps" }))?;
 
     // `/`-separated path syntax with scope
     assert!(
@@ -3382,20 +2504,7 @@ fn test_grep_refs_sort() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 6030,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "sorted_sym" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let text = response["result"]["content"][0]["text"]
-        .as_str()
-        .context("Missing text")?;
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "sorted_sym" }))?;
 
     // Should have enrichment with definition and reference info
     assert!(
@@ -3429,20 +2538,7 @@ fn test_grep_outgoing_calls_sorted() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 6040,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "main_caller" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let text = response["result"]["content"][0]["text"]
-        .as_str()
-        .context("Missing text")?;
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "main_caller" }))?;
 
     // Symbol index: kind label
     assert!(
@@ -3489,20 +2585,7 @@ fn test_grep_deprecated() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 6050,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "Shape_t1" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let text = response["result"]["content"][0]["text"]
-        .as_str()
-        .context("Missing text")?;
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "Shape_t1" }))?;
 
     // Symbol index: kind label
     assert!(
@@ -3544,20 +2627,7 @@ fn test_grep_paged_integration() -> Result<()> {
 
     bridge.initialize()?;
 
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 6060,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "demote_sym" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let text = response["result"]["content"][0]["text"]
-        .as_str()
-        .context("Missing text")?;
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "demote_sym" }))?;
 
     // Page header present, multiple pages expected
     assert!(
@@ -3579,20 +2649,7 @@ fn test_grep_paged_integration() -> Result<()> {
     );
 
     // Request page 2
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 6061,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "demote_sym", "page": 2 }
-        }
-    }))?;
-
-    let response2 = bridge.recv()?;
-    let text2 = response2["result"]["content"][0]["text"]
-        .as_str()
-        .context("Missing text page 2")?;
+    let text2 = bridge.call_tool_text("grep", &json!({ "pattern": "demote_sym", "page": 2 }))?;
 
     assert!(
         text2.starts_with("[page 2/"),
@@ -3619,20 +2676,7 @@ fn test_grep_fish_eye() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 6070,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "rich_fisheye" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let text = response["result"]["content"][0]["text"]
-        .as_str()
-        .context("Missing text")?;
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "rich_fisheye" }))?;
 
     // Symbol index: kind labels on both rich and lean symbols
     assert!(
@@ -3673,20 +2717,7 @@ fn test_grep_property_order() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 6080,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "main_ord" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let text = response["result"]["content"][0]["text"]
-        .as_str()
-        .context("Missing text")?;
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "main_ord" }))?;
 
     // If both calls and refs exist, calls should come first
     if text.contains("calls:") && text.contains("refs:") {
@@ -3714,20 +2745,7 @@ fn test_grep_enriched_name_grouping() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 6090,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "grouped_sym" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let text = response["result"]["content"][0]["text"]
-        .as_str()
-        .context("Missing text")?;
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "grouped_sym" }))?;
 
     let lines: Vec<&str> = text.lines().collect();
     // First line: [page N/M] header
@@ -3766,20 +2784,7 @@ fn test_grep_cross_def_dedup() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 6100,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "Dedup_t1" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let text = response["result"]["content"][0]["text"]
-        .as_str()
-        .context("Missing text")?;
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "Dedup_t1" }))?;
 
     // The struct definition should be present
     assert!(
@@ -3814,20 +2819,7 @@ fn test_grep_refs_dedup_labeled() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 6110,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "DeduRef" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let text = response["result"]["content"][0]["text"]
-        .as_str()
-        .context("Missing text")?;
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "DeduRef" }))?;
 
     // If impls section exists, lines in it should not also appear in refs
     if text.contains("impls:") && text.contains("refs:") {
@@ -3873,20 +2865,7 @@ fn test_grep_incoming_calls_merge() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 6120,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "target_inc" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let text = response["result"]["content"][0]["text"]
-        .as_str()
-        .context("Missing text")?;
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "target_inc" }))?;
 
     // No separate `callers:` section — incoming calls merge into refs
     assert!(
@@ -3916,20 +2895,7 @@ fn test_grep_impls_structure() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 6130,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "ImplStr" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let text = response["result"]["content"][0]["text"]
-        .as_str()
-        .context("Missing text")?;
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "ImplStr" }))?;
 
     // mockls routes textDocument/implementation to handle_references
     // (same word-search logic), so fetch_implementations returns
@@ -3964,20 +2930,7 @@ fn test_grep_single_line_ref() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 6140,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "target_sl" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let text = response["result"]["content"][0]["text"]
-        .as_str()
-        .context("Missing text")?;
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "target_sl" }))?;
 
     // Definition should have tree-sitter kind
     assert!(

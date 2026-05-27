@@ -423,25 +423,13 @@ fn ra_module_rename_resolves_after_notification() -> Result<()> {
 
     // Wait for rust-analyzer to index — poll with grep until symbols resolve.
     let mut indexed = false;
-    for attempt in 0..30 {
+    for _ in 0..30 {
         std::thread::sleep(Duration::from_secs(2));
 
-        bridge.send(&json!({
-            "jsonrpc": "2.0",
-            "id": 6000 + attempt,
-            "method": "tools/call",
-            "params": {
-                "name": "grep",
-                "arguments": { "pattern": "hello" }
-            }
-        }))?;
-
-        let response = bridge.recv()?;
-        if let Some(text) = response
-            .pointer("/result/content/0/text")
-            .and_then(Value::as_str)
-            && text.contains("## [")
-        {
+        let text = bridge
+            .call_tool_text("grep", &json!({ "pattern": "hello" }))
+            .unwrap_or_default();
+        if text.contains("## [") {
             indexed = true;
             break;
         }
@@ -462,21 +450,9 @@ fn ra_module_rename_resolves_after_notification() -> Result<()> {
     // Verify: grep for `hello` should still resolve the symbol in foo/mod.rs.
     // If the notification wasn't delivered, RA would show unlinked-file errors
     // and the module graph would be broken.
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 7000,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "hello" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let text = response
-        .pointer("/result/content/0/text")
-        .and_then(Value::as_str)
-        .unwrap_or("");
+    let text = bridge
+        .call_tool_text("grep", &json!({ "pattern": "hello" }))
+        .unwrap_or_default();
 
     // The symbol should still be enriched (resolved by RA) after the rename.
     assert!(
