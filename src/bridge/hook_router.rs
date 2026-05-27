@@ -84,24 +84,14 @@ fn is_filesystem_only_bash(command: &str) -> bool {
 
 /// Returns `true` if the tool is always allowed during editing mode.
 ///
-/// Catenary's `grep` and `glob` are read-only search tools that don't
-/// produce diagnostics — blocking them during editing is unnecessary friction.
 /// `ToolSearch` must be allowed because Catenary tools are deferred in
 /// Claude Code — blocking `ToolSearch` while editing prevents the agent
 /// from loading tool schemas it may need.
+///
+/// Grep and glob are bypassed earlier in the hook chain (`run_pre_tool`)
+/// before reaching editing enforcement, so they don't appear here.
 fn is_allowed_during_editing(tool_name: &str) -> bool {
-    is_catenary_tool(tool_name, "grep")
-        || is_catenary_tool(tool_name, "glob")
-        || tool_name == "ToolSearch"
-}
-
-/// Matches Catenary tool names: bare `{suffix}` or MCP-qualified
-/// `mcp*catenary*{suffix}` (Claude Code, Gemini CLI).
-pub fn is_catenary_tool(tool_name: &str, suffix: &str) -> bool {
-    tool_name == suffix
-        || (tool_name.starts_with("mcp")
-            && tool_name.contains("catenary")
-            && tool_name.ends_with(suffix))
+    tool_name == "ToolSearch"
 }
 
 /// Result of hook dispatch: the handler's result plus an optional
@@ -665,56 +655,17 @@ mod tests {
     }
 
     #[test]
-    fn test_is_catenary_tool() {
-        // Bare name (direct MCP tool name)
-        assert!(is_catenary_tool("grep", "grep"));
-        assert!(is_catenary_tool("start_editing", "start_editing"));
-        // Claude Code style: mcp__plugin_catenary_catenary__{suffix}
-        assert!(is_catenary_tool(
-            "mcp__plugin_catenary_catenary__grep",
-            "grep"
-        ));
-        assert!(is_catenary_tool(
-            "mcp__plugin_catenary_catenary__start_editing",
-            "start_editing"
-        ));
-        // Gemini CLI style: mcp_catenary_{suffix}
-        assert!(is_catenary_tool("mcp_catenary_grep", "grep"));
-        assert!(is_catenary_tool(
-            "mcp_catenary_start_editing",
-            "start_editing"
-        ));
-        // Wrong suffix
-        assert!(!is_catenary_tool("mcp_catenary_grep", "glob"));
-        // Unrelated tool with matching substring — must not match
-        assert!(!is_catenary_tool("grep_replace", "grep"));
-        assert!(!is_catenary_tool("super_grep", "grep"));
-    }
-
-    #[test]
     fn test_is_allowed_during_editing() {
-        // Bare Catenary tool names
-        assert!(is_allowed_during_editing("grep"));
-        assert!(is_allowed_during_editing("glob"));
-        // Claude Code style: mcp__plugin_catenary_catenary__{suffix}
-        assert!(is_allowed_during_editing(
-            "mcp__plugin_catenary_catenary__grep"
-        ));
-        assert!(is_allowed_during_editing(
-            "mcp__plugin_catenary_catenary__glob"
-        ));
-        // Gemini CLI style: mcp_catenary_{suffix}
-        assert!(is_allowed_during_editing("mcp_catenary_grep"));
-        assert!(is_allowed_during_editing("mcp_catenary_glob"));
         // ToolSearch (Claude Code deferred tool loader)
         assert!(is_allowed_during_editing("ToolSearch"));
-        // Editing tools are no longer MCP tools — not matched
-        assert!(!is_allowed_during_editing("start_editing"));
-        assert!(!is_allowed_during_editing("done_editing"));
-        // Unrelated tools — must not match
-        assert!(!is_allowed_during_editing("Edit"));
+        // Grep/glob are now CLI commands — bypassed in the hook
+        // chain before reaching editing enforcement.
+        assert!(!is_allowed_during_editing("grep"));
+        assert!(!is_allowed_during_editing("glob"));
         assert!(!is_allowed_during_editing("Bash"));
-        assert!(!is_allowed_during_editing("grep_replace"));
+        // Unrelated tools
+        assert!(!is_allowed_during_editing("Edit"));
+        assert!(!is_allowed_during_editing("Write"));
     }
 
     // ── Handler tests ───────────────────────────────────────────────────
