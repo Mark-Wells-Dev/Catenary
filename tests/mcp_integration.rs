@@ -1581,9 +1581,9 @@ fn test_grep_prepare_rename_keyword() -> Result<()> {
 
     // The keyword `struct` is filtered out by prepareRename returning null.
     // Only the keyword itself matched (not the symbol name), so output is empty.
-    assert_eq!(
-        text, "No results found",
-        "Expected 'No results found' when only keywords match, got:\n{text}"
+    assert!(
+        text.is_empty(),
+        "Expected empty output when only keywords match, got:\n{text}"
     );
 
     Ok(())
@@ -2119,7 +2119,7 @@ fn test_keyword_filtered_no_grammar() -> Result<()> {
     // `fn` is a declaration keyword — mockls's prepareRename returns
     // null at the keyword position. All hits should be filtered.
     assert!(
-        text.contains("No results found"),
+        text.is_empty(),
         "Expected keyword hits to be filtered, got:\n{text}"
     );
 

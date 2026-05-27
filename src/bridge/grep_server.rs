@@ -137,7 +137,7 @@ impl GrepServer {
         }
 
         if all_output.is_empty() {
-            return Ok(Value::String("No results found".to_string()));
+            return Ok(Value::String(String::new()));
         }
 
         Ok(Value::String(paginate(

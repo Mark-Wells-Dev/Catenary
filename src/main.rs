@@ -839,11 +839,13 @@ async fn run_grep(
 
     let response: catenary_mcp::router::GrepResponse =
         serde_json::from_str(trimmed).context("invalid grep response from daemon")?;
-    if !response.output.is_empty() {
+    if response.output.is_empty() {
+        println!("No results found");
+        if has_bre_alternation {
+            println!("hint: use `|` for alternation, not `\\|` (which matches a literal pipe)");
+        }
+    } else {
         println!("{}", response.output);
-    }
-    if response.output == "No results found" && has_bre_alternation {
-        println!("hint: use `|` for alternation, not `\\|` (which matches a literal pipe)");
     }
 
     Ok(())
