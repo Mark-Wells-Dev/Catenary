@@ -7,6 +7,9 @@ description: >
   listings. Always available, including during editing mode.
 ---
 
+Both commands use the shell's cwd as the search root. Relative
+patterns resolve against cwd — no directory parameter needed.
+
 ## `catenary grep <pattern>`
 
 Search for a regex pattern. Supports `|` for alternation.
