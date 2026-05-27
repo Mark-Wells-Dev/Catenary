@@ -47,6 +47,9 @@ pub struct GlobInput {
     /// Include hidden/dot files (default: false).
     #[serde(default)]
     pub include_hidden: bool,
+    /// Working directory for cwd-scoped searches (relative patterns).
+    #[serde(default)]
+    pub cwd: Option<PathBuf>,
 }
 
 /// Default page number (1-based).
@@ -377,12 +380,8 @@ impl GlobServer {
 
         let page = input.page.max(1);
 
-        // Relative patterns get a `cwd = …` context header.
-        let cwd = if PathBuf::from(&pattern).is_absolute() {
-            None
-        } else {
-            Some(std::env::current_dir()?)
-        };
+        // cwd-scoped search: present when the original pattern was relative.
+        let cwd = input.cwd.as_deref();
 
         // Run pipeline.
         let output = if path.is_file() || path.is_symlink() {
@@ -395,12 +394,12 @@ impl GlobServer {
                 std::slice::from_ref(&path),
             )
             .await;
-            self.handle_glob_file(&path, page, cwd.as_deref())
+            self.handle_glob_file(&path, page, cwd)
         } else if path.is_dir() {
-            self.handle_glob_dir(&path, &input, exclude.as_ref(), page, cwd.as_deref())
+            self.handle_glob_dir(&path, &input, exclude.as_ref(), page, cwd)
                 .await?
         } else {
-            self.handle_glob_pattern(&pattern, &input, exclude.as_ref(), page, cwd.as_deref())
+            self.handle_glob_pattern(&pattern, &input, exclude.as_ref(), page, cwd)
                 .await?
         };
 
@@ -423,14 +422,26 @@ impl GlobServer {
     fn handle_glob_file(&self, path: &Path, page: usize, cwd: Option<&Path>) -> String {
         let mut full = String::new();
 
-        // Context header: `cwd = …` for relative patterns, absolute path for absolute.
+        // Context header: `cwd: ~/…` for cwd-scoped, absolute path for absolute.
         let display = if let Some(cwd) = cwd {
-            let _ = writeln!(full, "cwd = {}", cwd.display());
+            let compressed = super::compress_home(cwd);
+            if self.fs_manager.resolve_root(cwd).is_some() {
+                let _ = writeln!(full, "cwd: {compressed}");
+            } else {
+                let _ = writeln!(
+                    full,
+                    "cwd: {compressed} (no LSP \u{2014} see catenary roots -h)"
+                );
+            }
             path.strip_prefix(cwd).map_or_else(
                 |_| path.to_string_lossy().to_string(),
                 |rel| rel.to_string_lossy().to_string(),
             )
         } else {
+            // Absolute pattern outside workspace roots: LSP warning.
+            if self.fs_manager.resolve_root(path).is_none() {
+                let _ = writeln!(full, "(no LSP \u{2014} see catenary roots -h)");
+            }
             path.to_string_lossy().to_string()
         };
 
@@ -650,16 +661,28 @@ impl GlobServer {
 
         let ts_guard = self.symbol_index.as_ref().and_then(|m| m.lock().ok());
 
-        // Context header: `cwd = …` for relative, absolute path for absolute.
+        // Context header: `cwd: ~/…` for cwd-scoped, absolute path for absolute.
         let mut full = String::new();
         if let Some(cwd) = cwd {
-            let _ = writeln!(full, "cwd = {}", cwd.display());
+            let compressed = super::compress_home(cwd);
+            if self.fs_manager.resolve_root(cwd).is_some() {
+                let _ = writeln!(full, "cwd: {compressed}");
+            } else {
+                let _ = writeln!(
+                    full,
+                    "cwd: {compressed} (no LSP \u{2014} see catenary roots -h)"
+                );
+            }
             let display = canonical.strip_prefix(cwd).map_or_else(
                 |_| canonical.to_string_lossy().to_string(),
                 |rel| rel.to_string_lossy().to_string(),
             );
             let _ = writeln!(full, "{display}/");
         } else {
+            // Absolute pattern outside workspace roots: LSP warning.
+            if self.fs_manager.resolve_root(&canonical).is_none() {
+                let _ = writeln!(full, "(no LSP \u{2014} see catenary roots -h)");
+            }
             let _ = writeln!(full, "{}/", canonical.display());
         }
 
@@ -704,6 +727,8 @@ impl GlobServer {
 
         let search_roots = if let Some(override_root) = resolved.override_root() {
             vec![override_root.to_path_buf()]
+        } else if let Some(cwd) = cwd {
+            vec![cwd.to_path_buf()]
         } else {
             let roots = self.client_manager.roots();
             if roots.is_empty() {
@@ -825,13 +850,23 @@ impl GlobServer {
 
         let mut full = String::new();
 
-        // Context header for relative patterns.
+        // Context header: `cwd: ~/…` for cwd-scoped, section root for absolute.
         if let Some(cwd) = cwd {
-            let _ = writeln!(full, "cwd = {}", cwd.display());
-        }
-
-        // For absolute patterns, the root path is the section header.
-        if cwd.is_none() {
+            let compressed = super::compress_home(cwd);
+            if self.fs_manager.resolve_root(cwd).is_some() {
+                let _ = writeln!(full, "cwd: {compressed}");
+            } else {
+                let _ = writeln!(
+                    full,
+                    "cwd: {compressed} (no LSP \u{2014} see catenary roots -h)"
+                );
+            }
+        } else if self.fs_manager.resolve_root(&tree_root).is_some() {
+            // Absolute pattern inside a workspace root: section header only.
+            let _ = writeln!(full, "{}", tree_root.display());
+        } else {
+            // Absolute pattern outside workspace roots: LSP warning + header.
+            let _ = writeln!(full, "(no LSP \u{2014} see catenary roots -h)");
             let _ = writeln!(full, "{}", tree_root.display());
         }
 

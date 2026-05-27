@@ -877,7 +877,7 @@ async fn run_grep(
     let (reader, mut writer) = stream.into_split();
 
     let request = GrepRequest {
-        cwd,
+        cwd: Some(cwd),
         pattern,
         glob,
         exclude,
@@ -950,7 +950,7 @@ async fn run_glob(
     let (reader, mut writer) = stream.into_split();
 
     let request = GlobRequest {
-        cwd,
+        cwd: Some(cwd),
         pattern,
         exclude,
         page,

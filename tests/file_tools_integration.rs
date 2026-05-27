@@ -1907,7 +1907,7 @@ fn test_glob_absolute_dir_no_cwd_header() -> Result<()> {
 
     // Absolute pattern: no cwd header.
     assert!(
-        !text.contains("cwd ="),
+        !text.contains("cwd:"),
         "Absolute pattern should not have cwd header: {text}"
     );
     // Should have the absolute path as section header.
@@ -1958,7 +1958,7 @@ fn test_glob_absolute_pattern_indented_tree() -> Result<()> {
 
     // No cwd header for absolute patterns.
     assert!(
-        !text.contains("cwd ="),
+        !text.contains("cwd:"),
         "Absolute pattern should not have cwd header: {text}"
     );
     // Tree content should be indented under the section header.
@@ -1983,7 +1983,7 @@ fn test_glob_absolute_file_no_cwd_header() -> Result<()> {
 
     // Absolute file: no cwd header, absolute path in output.
     assert!(
-        !text.contains("cwd ="),
+        !text.contains("cwd:"),
         "Absolute file should not have cwd header: {text}"
     );
     assert!(text.contains("readme.txt"), "Should show file name: {text}");
@@ -1991,7 +1991,7 @@ fn test_glob_absolute_file_no_cwd_header() -> Result<()> {
 }
 
 #[test]
-fn test_grep_no_glob_no_cwd_header() -> Result<()> {
+fn test_grep_no_glob_cwd_scoped() -> Result<()> {
     let dir = tempfile::tempdir()?;
     std::fs::write(dir.path().join("hello.txt"), "needle in haystack\n")?;
 
@@ -2000,10 +2000,10 @@ fn test_grep_no_glob_no_cwd_header() -> Result<()> {
 
     let text = bridge.call_tool_text("grep", &json!({ "pattern": "needle" }))?;
 
-    // No glob param → no cwd header.
+    // No glob → cwd-scoped search with cwd header.
     assert!(
-        !text.contains("cwd ="),
-        "Grep without glob should not have cwd header: {text}"
+        text.contains("cwd:"),
+        "Grep without glob should have cwd header: {text}"
     );
     assert!(text.contains("needle"), "Should find the match: {text}");
     Ok(())
@@ -2022,7 +2022,7 @@ fn test_grep_absolute_glob_no_cwd_header() -> Result<()> {
 
     // Absolute glob → no cwd header.
     assert!(
-        !text.contains("cwd ="),
+        !text.contains("cwd:"),
         "Grep with absolute glob should not have cwd header: {text}"
     );
     assert!(text.contains("needle"), "Should find the match: {text}");
@@ -2203,6 +2203,121 @@ fn test_grep_alternation_both_arms_present() -> Result<()> {
     assert!(
         !after_header.starts_with("\n\n\n"),
         "Should not have extra blank lines before content: {text:?}"
+    );
+    Ok(())
+}
+
+// ─── cwd scoping tests ────────────────────────────────────────────────
+
+/// Grep without a glob scopes to cwd. Hits in a second root should not
+/// appear when cwd points to the first root.
+#[test]
+fn test_grep_cwd_scoping_prevents_cross_root() -> Result<()> {
+    let dir_a = tempfile::tempdir()?;
+    let dir_b = tempfile::tempdir()?;
+
+    std::fs::write(dir_a.path().join("a.txt"), "unique_cross_root_a\n")?;
+    std::fs::write(dir_b.path().join("b.txt"), "unique_cross_root_b\n")?;
+
+    let root_a = dir_a.path().to_string_lossy().to_string();
+    let root_b = dir_b.path().to_string_lossy().to_string();
+
+    let mut bridge = BridgeProcess::spawn_multi_root(&[], &[&root_a, &root_b])?;
+    bridge.initialize()?;
+
+    // cwd defaults to root_a — search should NOT find root_b content.
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "unique_cross_root_b" }))?;
+    assert!(
+        text.is_empty(),
+        "cwd-scoped grep should not find hits from another root: {text}"
+    );
+
+    // Explicitly targeting root_b via directory should find it.
+    let text = bridge.call_tool_text(
+        "grep",
+        &json!({ "pattern": "unique_cross_root_b", "directory": &root_b }),
+    )?;
+    assert!(
+        text.contains("unique_cross_root_b"),
+        "grep with explicit directory should find hits: {text}"
+    );
+    Ok(())
+}
+
+/// Grep from a directory outside all workspace roots shows the LSP
+/// warning header and returns only matches from that directory.
+#[test]
+fn test_grep_outside_roots_lsp_warning() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let outside = tempfile::tempdir()?;
+
+    std::fs::write(root.path().join("in_root.txt"), "shared_needle\n")?;
+    std::fs::write(outside.path().join("outside.txt"), "shared_needle\n")?;
+
+    let root_str = root.path().to_string_lossy().to_string();
+
+    let mut bridge = spawn_no_lsp(&root_str)?;
+    bridge.initialize()?;
+
+    // Search from outside the workspace root.
+    let text = bridge.call_tool_text(
+        "grep",
+        &json!({ "pattern": "shared_needle", "directory": outside.path().to_string_lossy().as_ref() }),
+    )?;
+
+    // Should contain the LSP warning.
+    assert!(
+        text.contains("no LSP"),
+        "grep outside roots should show LSP warning: {text}"
+    );
+    // Should contain the cwd header.
+    assert!(
+        text.contains("cwd:"),
+        "grep outside roots should show cwd header: {text}"
+    );
+    // Should find the match in the outside directory.
+    assert!(
+        text.contains("shared_needle"),
+        "Should find the match outside roots: {text}"
+    );
+    // Should NOT find the match in the workspace root.
+    assert!(
+        !text.contains("in_root.txt"),
+        "cwd-scoped grep should not leak into workspace root: {text}"
+    );
+    Ok(())
+}
+
+/// Glob from a directory outside all workspace roots shows the LSP
+/// warning header.
+#[test]
+fn test_glob_outside_roots_lsp_warning() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let outside = tempfile::tempdir()?;
+
+    std::fs::write(root.path().join("in_root.txt"), "hello\n")?;
+    std::fs::write(outside.path().join("outside.txt"), "hello\n")?;
+
+    let root_str = root.path().to_string_lossy().to_string();
+
+    let mut bridge = spawn_no_lsp(&root_str)?;
+    bridge.initialize()?;
+
+    // Glob an absolute path outside workspace roots.
+    let text = bridge.call_tool_text(
+        "glob",
+        &json!({ "pattern": outside.path().to_string_lossy().as_ref() }),
+    )?;
+
+    // Should contain the LSP warning.
+    assert!(
+        text.contains("no LSP"),
+        "glob outside roots should show LSP warning: {text}"
+    );
+    // Should list the file in the outside directory.
+    assert!(
+        text.contains("outside.txt"),
+        "Should list file outside roots: {text}"
     );
     Ok(())
 }

@@ -24,7 +24,7 @@ pub mod path_security;
 /// Shared container for tool servers and cross-tool infrastructure.
 pub mod session;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::config::DispatchMethod;
@@ -38,6 +38,17 @@ pub use editing_manager::EditingManager;
 pub use handler::expand_tilde;
 pub use hook_router::HookRouter;
 pub use path_security::PathValidator;
+
+/// Compresses a path by replacing the `$HOME` prefix with `~`.
+pub(crate) fn compress_home(path: &Path) -> String {
+    if let Ok(home) = std::env::var("HOME") {
+        let home_path = Path::new(&home);
+        if let Ok(rel) = path.strip_prefix(home_path) {
+            return format!("~/{}", rel.display());
+        }
+    }
+    path.display().to_string()
+}
 
 /// Ensures the symbol index is populated for the given files.
 ///

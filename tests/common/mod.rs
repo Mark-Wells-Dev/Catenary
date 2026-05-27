@@ -509,7 +509,8 @@ impl BridgeProcess {
     /// Resolves the working directory for IPC tool queries.
     ///
     /// Priority: explicit `directory` arg > `ipc_cwd` (from spawn roots) >
-    /// `root_dir` (from `spawn_with_config`).
+    /// `root_dir` (from `spawn_with_config`). When no cwd is available,
+    /// the field is omitted and the daemon falls back to workspace roots.
     fn resolve_ipc_cwd(&self, obj: &mut serde_json::Map<String, Value>) {
         // Map the old MCP `directory` parameter to `cwd`.
         if let Some(dir) = obj.remove("directory") {
@@ -521,10 +522,11 @@ impl BridgeProcess {
                 .ipc_cwd
                 .as_deref()
                 .or_else(|| self.root_dir.as_ref().map(tempfile::TempDir::path));
-            // Default to "/" — all test fixtures use absolute paths,
-            // so the cwd is only relevant for relative pattern resolution.
-            let p = path.unwrap_or_else(|| Path::new("/"));
-            obj.insert("cwd".to_string(), json!(p.to_string_lossy().as_ref()));
+            if let Some(p) = path {
+                obj.insert("cwd".to_string(), json!(p.to_string_lossy().as_ref()));
+            }
+            // No fallback — omitting cwd makes the daemon search all
+            // workspace roots (the pre-cwd-scoping behavior).
         }
     }
 

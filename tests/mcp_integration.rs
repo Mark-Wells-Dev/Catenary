@@ -202,8 +202,11 @@ fn test_multi_root_find_symbol() -> Result<()> {
         "Expected alpha_func in output, got: {text_a}"
     );
 
-    // Search should locate beta_func from root B (via symbols or heatmap)
-    let text_b = bridge.call_tool_text("grep", &json!({ "pattern": "beta_func" }))?;
+    // Search should locate beta_func from root B (cwd must target root B)
+    let text_b = bridge.call_tool_text(
+        "grep",
+        &json!({ "pattern": "beta_func", "directory": root_b }),
+    )?;
     assert!(
         text_b.contains(&format!("beta.{MOCK_LANG_A}")),
         "Expected search to find beta.mock, got: {text_b}"
@@ -324,7 +327,10 @@ fn test_sync_roots_restart_no_workspace_folders() -> Result<()> {
     let mut last_text = String::new();
     for _ in 0..10 {
         let text = bridge
-            .call_tool_text("grep", &json!({ "pattern": "unique_root_b_func" }))
+            .call_tool_text(
+                "grep",
+                &json!({ "pattern": "unique_root_b_func", "directory": root_b }),
+            )
             .unwrap_or_default();
         last_text = text.clone();
         if text.contains("unique_root_b_func") && text.contains(&format!("funcs_b.{MOCK_LANG_A}")) {
@@ -530,8 +536,11 @@ fn test_mockls_sync_roots_across_profiles() -> Result<()> {
         // Wait for root_b to appear in the daemon's root tracker.
         bridge.wait_for_root(root_b, std::time::Duration::from_secs(5))?;
 
-        // Search in root_b
-        let text = bridge.call_tool_text("grep", &json!({ "pattern": "unique_root_b_func" }))?;
+        // Search in root_b (cwd must target root_b)
+        let text = bridge.call_tool_text(
+            "grep",
+            &json!({ "pattern": "unique_root_b_func", "directory": root_b }),
+        )?;
         assert!(
             text.contains(&format!("funcs_b.{MOCK_LANG_A}")),
             "Profile {name}: search in root B should reference funcs_b.mock, got: {text}"
@@ -601,7 +610,8 @@ fn test_mockls_sync_roots_no_progress_no_hang() -> Result<()> {
     // did_change_workspace_folders sets state to Busy.
     // Since mockls never sends $/progress, wait_ready() uses
     // the activity settle fallback to transition back to Ready.
-    let text = bridge.call_tool_text("grep", &json!({ "pattern": "world" }))?;
+    let text =
+        bridge.call_tool_text("grep", &json!({ "pattern": "world", "directory": root_b }))?;
     assert!(
         text.contains(&format!("funcs_b.{MOCK_LANG_A}")),
         "Expected 'funcs_b.mock' in search results, got: {text}"
@@ -968,23 +978,21 @@ fn test_grep_resolve_provider() -> Result<()> {
 }
 
 /// Verifies that pipe-separated alternation finds symbols from both patterns.
-/// `pattern: "alpha_func|beta_func"` should find both across two roots.
+/// `pattern: "alpha_func|beta_func"` should find both files in a single root.
 #[test]
 fn test_grep_alternation() -> Result<()> {
-    let dir_a = tempfile::tempdir().context("Failed to create temp dir A")?;
-    let dir_b = tempfile::tempdir().context("Failed to create temp dir B")?;
+    let dir = tempfile::tempdir().context("Failed to create temp dir")?;
 
-    let script_a = dir_a.path().join(format!("alpha.{MOCK_LANG_A}"));
+    let script_a = dir.path().join(format!("alpha.{MOCK_LANG_A}"));
     std::fs::write(&script_a, "function alpha_func()\nalpha_func\n")?;
 
-    let script_b = dir_b.path().join(format!("beta.{MOCK_LANG_A}"));
+    let script_b = dir.path().join(format!("beta.{MOCK_LANG_A}"));
     std::fs::write(&script_b, "function beta_func()\nbeta_func\n")?;
 
-    let root_a = dir_a.path().to_str().context("Invalid path A")?;
-    let root_b = dir_b.path().to_str().context("Invalid path B")?;
+    let root = dir.path().to_str().context("Invalid path")?;
 
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
-    let mut bridge = BridgeProcess::spawn_multi_root(&[&lsp], &[root_a, root_b])?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
     let text = bridge.call_tool_text("grep", &json!({ "pattern": "alpha_func|beta_func" }))?;
@@ -1172,20 +1180,18 @@ fn test_grep_alternation_routes_non_code_hits() -> Result<()> {
 /// heading with two `##` sub-headings, each showing their own references.
 #[test]
 fn test_grep_two_defs_same_name_per_heading_refs() -> Result<()> {
-    let dir_a = tempfile::tempdir()?;
-    let dir_b = tempfile::tempdir()?;
+    let dir = tempfile::tempdir()?;
 
-    let file_a = dir_a.path().join(format!("impl_a.{MOCK_LANG_A}"));
+    let file_a = dir.path().join(format!("impl_a.{MOCK_LANG_A}"));
     std::fs::write(&file_a, "fn process()\nprocess\n")?;
 
-    let file_b = dir_b.path().join(format!("impl_b.{MOCK_LANG_A}"));
+    let file_b = dir.path().join(format!("impl_b.{MOCK_LANG_A}"));
     std::fs::write(&file_b, "fn process()\nprocess\n")?;
 
-    let root_a = dir_a.path().to_str().context("Invalid path A")?;
-    let root_b = dir_b.path().to_str().context("Invalid path B")?;
+    let root = dir.path().to_str().context("Invalid path")?;
 
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
-    let mut bridge = BridgeProcess::spawn_multi_root(&[&lsp], &[root_a, root_b])?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
     let text = bridge.call_tool_text("grep", &json!({ "pattern": "process" }))?;

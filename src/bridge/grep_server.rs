@@ -47,6 +47,9 @@ pub struct GrepInput {
     /// Page number for paged results (default: 1).
     #[serde(default = "default_page")]
     pub page: usize,
+    /// Working directory for cwd-scoped searches (no glob or relative glob).
+    #[serde(default)]
+    pub cwd: Option<PathBuf>,
 }
 
 /// Default page number for grep (1-based).
@@ -105,12 +108,8 @@ impl GrepServer {
             return Err(anyhow!("page must be >= 1"));
         }
 
-        // Relative glob param → cwd context header.
-        let cwd = input
-            .glob
-            .as_ref()
-            .filter(|g| !PathBuf::from(g).is_absolute())
-            .and_then(|_| std::env::current_dir().ok());
+        // cwd-scoped search: present when no glob or relative glob.
+        let cwd = input.cwd.clone();
 
         // Split top-level alternation into independent arms
         let arms = split_alternation(&input.pattern);
@@ -124,6 +123,7 @@ impl GrepServer {
                 include_gitignored: input.include_gitignored,
                 include_hidden: input.include_hidden,
                 page: input.page,
+                cwd: cwd.clone(),
             };
             let output = self
                 .run(arm_input, parent_id, cancel, cwd.as_deref())
@@ -171,14 +171,16 @@ impl GrepServer {
             .transpose()?
             .map(Arc::new);
 
-        // Determine effective search roots: absolute glob overrides workspace roots.
-        let workspace_roots = self.client_manager.roots();
+        // Determine effective search roots: absolute glob overrides workspace
+        // roots; cwd scopes the search when no glob is present.
         let effective_roots = if let Some(ref rg) = resolved_glob
             && let Some(override_root) = rg.override_root()
         {
             vec![override_root.to_path_buf()]
+        } else if let Some(cwd) = cwd {
+            vec![cwd.to_path_buf()]
         } else {
-            workspace_roots
+            self.client_manager.roots()
         };
 
         // Step 1: Ripgrep scoped to file set → raw hits with matched text.
@@ -1030,7 +1032,7 @@ impl GrepServer {
 /// navigation edges when LSP data exists, enclosing symbol context
 /// when available, bare line numbers otherwise. Grouped by workspace
 /// root (bare absolute path header) for absolute patterns, or under
-/// a `cwd = …` context header for relative glob scoping.
+/// a `cwd: ~/…` context header for cwd-scoped searches.
 ///
 /// Returns the full unpaginated output. Pagination is applied by the
 /// caller (`execute`).
@@ -1045,8 +1047,16 @@ fn render_results(
     let mut full = String::new();
 
     if let Some(cwd) = cwd {
-        // Relative glob: one section, cwd context header, cwd-relative paths.
-        let _ = writeln!(full, "cwd = {}", cwd.display());
+        // cwd-scoped: one section, `cwd: ~/path` header, cwd-relative paths.
+        let compressed = super::compress_home(cwd);
+        if fs_manager.resolve_root(cwd).is_some() {
+            let _ = writeln!(full, "cwd: {compressed}");
+        } else {
+            let _ = writeln!(
+                full,
+                "cwd: {compressed} (no LSP \u{2014} see catenary roots -h)"
+            );
+        }
         let all_indices: Vec<usize> = (0..enrichments.len()).collect();
         render_section(
             enrichments,
@@ -1057,7 +1067,7 @@ fn render_results(
             Some(cwd),
         );
     } else {
-        // Absolute / no glob: group by workspace root.
+        // Absolute glob: group by workspace root.
         let mut root_items: BTreeMap<PathBuf, Vec<usize>> = BTreeMap::new();
         let mut oor_items: Vec<usize> = Vec::new();
         for (i, (hit, _)) in enrichments.iter().enumerate() {
@@ -1065,6 +1075,11 @@ fn render_results(
                 Some(root) => root_items.entry(root).or_default().push(i),
                 None => oor_items.push(i),
             }
+        }
+
+        // LSP warning when all results are outside workspace roots.
+        if root_items.is_empty() && !oor_items.is_empty() {
+            let _ = writeln!(full, "(no LSP \u{2014} see catenary roots -h)");
         }
 
         for (root, indices) in &root_items {
@@ -2535,9 +2550,9 @@ mod tests {
         let enrichments: Vec<(&GrepHit, Option<SymbolEnrichment>)> = vec![(&hit, None)];
         let full = render_results(&enrichments, None, &fs, Some(Path::new("/project")));
 
-        // cwd header present with the path
+        // cwd header present with the path (inside a root: no LSP warning).
         assert!(
-            full.starts_with("cwd = /project\n"),
+            full.starts_with("cwd: /project\n"),
             "cwd header should be first line: {full:?}"
         );
         // Relative path used (no root grouping header)
