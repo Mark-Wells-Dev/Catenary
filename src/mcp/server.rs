@@ -12,20 +12,19 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 
 use super::types::{
-    CallToolParams, CallToolResult, CancelledParams, INTERNAL_ERROR, InitializeParams,
-    InitializeResult, ListToolsResult, METHOD_NOT_FOUND, Notification, REQUEST_CANCELLED, Request,
-    RequestCancelled, RequestId, Response, Root, RootsListResult, ServerCapabilities, ServerInfo,
-    Tool, ToolsCapability,
+    CancelledParams, INTERNAL_ERROR, InitializeParams, InitializeResult, METHOD_NOT_FOUND,
+    Notification, Request, RequestId, Response, Root, RootsListResult, ServerCapabilities,
+    ServerInfo,
 };
 use crate::logging::LoggingServer;
 
 /// Map an MCP method to its tracing severity level.
 ///
-/// `tools/call` and `notifications/cancelled` are `info` (interesting signal).
-/// Everything else (initialize, tools/list, roots) is `debug` (plumbing).
+/// `notifications/cancelled` is `info` (interesting signal).
+/// Everything else (initialize, roots) is `debug` (plumbing).
 fn mcp_method_level(method: &str) -> tracing::Level {
     match method {
-        "tools/call" | "notifications/cancelled" => tracing::Level::INFO,
+        "notifications/cancelled" => tracing::Level::INFO,
         _ => tracing::Level::DEBUG,
     }
 }
@@ -96,66 +95,6 @@ fn emit_mcp_event(
     }
 }
 
-/// Trait for handling MCP tool calls.
-pub trait ToolHandler: Send + Sync {
-    /// Returns the list of available tools.
-    fn list_tools(&self) -> Vec<Tool>;
-
-    /// Handles a tool call and returns the result.
-    ///
-    /// `parent_id` is a UUID minted per `tools/call` dispatch. Implementations
-    /// forward it to [`ToolServer::execute`](super::super::bridge::ToolServer::execute)
-    /// so LSP messages are correlated with the triggering MCP request
-    /// in the monitor.
-    ///
-    /// `cancel` is triggered when the MCP client sends
-    /// `notifications/cancelled` for this tool call. Implementations
-    /// should forward it to tool servers and LSP clients.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the tool call fails for reasons other than the tool itself reporting an error.
-    fn call_tool(
-        &self,
-        name: &str,
-        arguments: Option<serde_json::Value>,
-        parent_id: Option<String>,
-        cancel: &CancellationToken,
-    ) -> Result<CallToolResult>;
-
-    /// Returns the scope parent ID for the current tool call, if any.
-    ///
-    /// The scope parent ID is the UUID of the pre-tool hook that opened
-    /// this tool call's scope. Used by [`McpServer`] to set `parent_id`
-    /// on the incoming `tools/call` protocol event, linking it to the
-    /// pre-tool hook in the scope tree.
-    fn scope_parent_id(&self) -> Option<String> {
-        None
-    }
-}
-
-/// Delegates to the inner handler, enabling shared ownership across
-/// per-connection `McpServer` instances in daemon mode.
-impl<T: ToolHandler + ?Sized> ToolHandler for Arc<T> {
-    fn list_tools(&self) -> Vec<Tool> {
-        (**self).list_tools()
-    }
-
-    fn call_tool(
-        &self,
-        name: &str,
-        arguments: Option<serde_json::Value>,
-        parent_id: Option<String>,
-        cancel: &CancellationToken,
-    ) -> Result<CallToolResult> {
-        (**self).call_tool(name, arguments, parent_id, cancel)
-    }
-
-    fn scope_parent_id(&self) -> Option<String> {
-        (**self).scope_parent_id()
-    }
-}
-
 /// Callback invoked when MCP client info is received during initialize.
 pub type ClientInfoCallback = Box<dyn Fn(&str, &str) + Send + Sync>;
 
@@ -163,12 +102,15 @@ pub type ClientInfoCallback = Box<dyn Fn(&str, &str) + Send + Sync>;
 pub type RootsChangedCallback = Box<dyn Fn(Vec<Root>) -> Result<()> + Send + Sync>;
 
 /// An MCP server implementation.
+///
+/// Handles the MCP protocol lifecycle (initialize, roots, ping) but
+/// exposes no application-level tools. Grep and glob are served via
+/// CLI commands over the IPC socket.
 #[allow(
     clippy::struct_excessive_bools,
     reason = "Bools track independent server state flags"
 )]
-pub struct McpServer<H: ToolHandler> {
-    handler: H,
+pub struct McpServer {
     initialized: bool,
     _logging: LoggingServer,
     /// Name of the connected MCP client (learned during initialize).
@@ -195,16 +137,13 @@ pub struct McpServer<H: ToolHandler> {
     /// `HookRouter` on `PreAgent` dispatch (turn boundary), cleared
     /// by this run loop after triggering `fetch_roots`.
     roots_refresh: Option<Arc<AtomicBool>>,
-    /// UUID minted per `tools/call` dispatch for LSP event correlation.
-    /// Set in the run loop before dispatch, read by `handle_tools_call`.
-    current_call_uuid: Option<String>,
 }
 
-impl<H: ToolHandler> McpServer<H> {
+impl McpServer {
     /// Creates a new `McpServer`.
-    pub fn new(handler: H, logging: LoggingServer) -> Self {
+    #[must_use]
+    pub fn new(logging: LoggingServer) -> Self {
         Self {
-            handler,
             initialized: false,
             _logging: logging,
             client_name: "unknown".to_string(),
@@ -217,7 +156,6 @@ impl<H: ToolHandler> McpServer<H> {
             current_exchange_id: None,
             cancel_map: Arc::new(std::sync::Mutex::new(HashMap::new())),
             roots_refresh: None,
-            current_call_uuid: None,
         }
     }
 
@@ -291,11 +229,7 @@ impl<H: ToolHandler> McpServer<H> {
                     let payload = json.to_string();
 
                     // Mint a UUID per exchange for pair-merge.
-                    // For tools/call, this also groups child LSP events.
                     let uuid = uuid::Uuid::new_v4().to_string();
-                    if method == "tools/call" {
-                        self.current_call_uuid = Some(uuid.clone());
-                    }
 
                     emit_mcp_event(
                         mcp_method_level(&method),
@@ -534,8 +468,6 @@ impl<H: ToolHandler> McpServer<H> {
 
         match request.method.as_str() {
             "initialize" => self.handle_initialize(request),
-            "tools/list" => self.handle_tools_list(request),
-            "tools/call" => self.handle_tools_call(request),
             "ping" => Ok(Response::success(request.id, serde_json::json!({}))?),
             _ => {
                 debug!("Unknown method: {}", request.method);
@@ -567,9 +499,8 @@ impl<H: ToolHandler> McpServer<H> {
             }
             "notifications/cancelled" => {
                 // Cancellation is handled proactively by the reader
-                // thread (triggers the token while call_tool blocks).
-                // If we see it here, the tool call already finished.
-                debug!("notifications/cancelled received (tool call already complete)");
+                // thread. If we see it here, the request already finished.
+                debug!("notifications/cancelled received (request already complete)");
             }
             "catenary/version-mismatch" => {
                 let bridge_version = notification
@@ -635,11 +566,7 @@ impl<H: ToolHandler> McpServer<H> {
 
         let result = InitializeResult {
             protocol_version: negotiated_version,
-            capabilities: ServerCapabilities {
-                tools: Some(ToolsCapability {
-                    list_changed: Some(false),
-                }),
-            },
+            capabilities: ServerCapabilities { tools: None },
             server_info: ServerInfo {
                 name: "catenary".to_string(),
                 version: Some(env!("CATENARY_VERSION").to_string()),
@@ -657,56 +584,6 @@ impl<H: ToolHandler> McpServer<H> {
         };
 
         Ok(Response::success(request.id, result)?)
-    }
-
-    fn handle_tools_list(&self, request: Request) -> Result<Response> {
-        let tools = self.handler.list_tools();
-        debug!("Listing {} tools", tools.len());
-
-        let result = ListToolsResult { tools };
-        Ok(Response::success(request.id, result)?)
-    }
-
-    fn handle_tools_call(&mut self, request: Request) -> Result<Response> {
-        let params: CallToolParams = request
-            .params
-            .map(serde_json::from_value)
-            .transpose()
-            .context("Invalid tools/call params")?
-            .ok_or_else(|| anyhow!("Missing tools/call params"))?;
-
-        debug!("Calling tool: {}", params.name);
-
-        // Look up the cancel token pre-registered by the run() loop.
-        // If the map was poisoned or the entry is missing (shouldn't
-        // happen), fall back to a token that never fires.
-        let cancel = self
-            .cancel_map
-            .lock()
-            .ok()
-            .and_then(|map| map.get(&request.id).cloned())
-            .unwrap_or_default();
-
-        let parent_id = self.current_call_uuid.take();
-        let result = self
-            .handler
-            .call_tool(&params.name, params.arguments, parent_id, &cancel);
-
-        match result {
-            Ok(result) => Ok(Response::success(request.id, result)?),
-            Err(e) if e.is::<RequestCancelled>() => Ok(Response::error(
-                request.id,
-                REQUEST_CANCELLED,
-                "Request cancelled",
-            )),
-            Err(e) => {
-                info!("Tool call failed: {}", e);
-                Ok(Response::success(
-                    request.id,
-                    CallToolResult::error(e.to_string()),
-                )?)
-            }
-        }
     }
 
     /// Generates a unique request ID for server-initiated requests.
@@ -923,40 +800,9 @@ impl<H: ToolHandler> McpServer<H> {
 mod tests {
     use super::*;
 
-    struct TestHandler;
-
-    impl ToolHandler for TestHandler {
-        fn list_tools(&self) -> Vec<Tool> {
-            vec![Tool {
-                name: "test_tool".to_string(),
-                title: Some("Test Tool".to_string()),
-                description: Some("A test tool".to_string()),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {}
-                }),
-                annotations: None,
-            }]
-        }
-
-        fn call_tool(
-            &self,
-            name: &str,
-            _arguments: Option<serde_json::Value>,
-            _parent_id: Option<String>,
-            _cancel: &CancellationToken,
-        ) -> Result<CallToolResult> {
-            match name {
-                "test_tool" => Ok(CallToolResult::text("Test result")),
-                "error_tool" => Err(anyhow!("Test error")),
-                _ => Err(anyhow!("Unknown tool: {name}")),
-            }
-        }
-    }
-
     #[test]
     fn test_handle_initialize() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, LoggingServer::new());
+        let mut server = McpServer::new(LoggingServer::new());
 
         let request = Request {
             jsonrpc: "2.0".to_string(),
@@ -985,8 +831,8 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_tools_list() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, LoggingServer::new());
+    fn test_tools_list_returns_method_not_found() -> Result<()> {
+        let mut server = McpServer::new(LoggingServer::new());
 
         let request = Request {
             jsonrpc: "2.0".to_string(),
@@ -996,18 +842,17 @@ mod tests {
         };
 
         let response = server.handle_request(request)?;
-        assert!(response.result.is_some());
-
-        let result: ListToolsResult =
-            serde_json::from_value(response.result.expect("response result"))?;
-        assert_eq!(result.tools.len(), 1);
-        assert_eq!(result.tools[0].name, "test_tool");
+        assert!(response.error.is_some());
+        assert_eq!(
+            response.error.expect("response error").code,
+            METHOD_NOT_FOUND
+        );
         Ok(())
     }
 
     #[test]
-    fn test_handle_tools_call_success() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, LoggingServer::new());
+    fn test_tools_call_returns_method_not_found() -> Result<()> {
+        let mut server = McpServer::new(LoggingServer::new());
 
         let request = Request {
             jsonrpc: "2.0".to_string(),
@@ -1020,39 +865,17 @@ mod tests {
         };
 
         let response = server.handle_request(request)?;
-        assert!(response.result.is_some());
-
-        let result: CallToolResult =
-            serde_json::from_value(response.result.expect("response result"))?;
-        assert!(result.is_error.is_none());
-        Ok(())
-    }
-
-    #[test]
-    fn test_handle_tools_call_error() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, LoggingServer::new());
-
-        let request = Request {
-            jsonrpc: "2.0".to_string(),
-            id: RequestId::Number(4),
-            method: "tools/call".to_string(),
-            params: Some(serde_json::json!({
-                "name": "error_tool"
-            })),
-        };
-
-        let response = server.handle_request(request)?;
-        assert!(response.result.is_some());
-
-        let result: CallToolResult =
-            serde_json::from_value(response.result.expect("response result"))?;
-        assert_eq!(result.is_error, Some(true));
+        assert!(response.error.is_some());
+        assert_eq!(
+            response.error.expect("response error").code,
+            METHOD_NOT_FOUND
+        );
         Ok(())
     }
 
     #[test]
     fn test_handle_unknown_method() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, LoggingServer::new());
+        let mut server = McpServer::new(LoggingServer::new());
 
         let request = Request {
             jsonrpc: "2.0".to_string(),
@@ -1072,7 +895,7 @@ mod tests {
 
     #[test]
     fn test_handle_ping() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, LoggingServer::new());
+        let mut server = McpServer::new(LoggingServer::new());
 
         let request = Request {
             jsonrpc: "2.0".to_string(),
@@ -1087,7 +910,7 @@ mod tests {
         Ok(())
     }
 
-    fn initialize_server(server: &mut McpServer<TestHandler>, with_roots: bool) -> Result<()> {
+    fn initialize_server(server: &mut McpServer, with_roots: bool) -> Result<()> {
         let caps = if with_roots {
             serde_json::json!({"roots": {"listChanged": true}})
         } else {
@@ -1110,7 +933,7 @@ mod tests {
 
     #[test]
     fn test_roots_capability_stored_when_present() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, LoggingServer::new());
+        let mut server = McpServer::new(LoggingServer::new());
         assert!(!server.client_has_roots);
 
         initialize_server(&mut server, true)?;
@@ -1120,7 +943,7 @@ mod tests {
 
     #[test]
     fn test_roots_capability_absent_by_default() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, LoggingServer::new());
+        let mut server = McpServer::new(LoggingServer::new());
         initialize_server(&mut server, false)?;
         assert!(!server.client_has_roots);
         Ok(())
@@ -1128,7 +951,7 @@ mod tests {
 
     #[test]
     fn test_should_fetch_roots_after_initialized() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, LoggingServer::new());
+        let mut server = McpServer::new(LoggingServer::new());
         initialize_server(&mut server, true)?;
 
         let notification = Notification {
@@ -1145,7 +968,7 @@ mod tests {
 
     #[test]
     fn test_should_fetch_roots_on_list_changed() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, LoggingServer::new());
+        let mut server = McpServer::new(LoggingServer::new());
         initialize_server(&mut server, true)?;
 
         let notification = Notification {
@@ -1161,7 +984,7 @@ mod tests {
 
     #[test]
     fn test_no_fetch_without_capability() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, LoggingServer::new());
+        let mut server = McpServer::new(LoggingServer::new());
         initialize_server(&mut server, false)?;
 
         let notification = Notification {
@@ -1176,33 +999,6 @@ mod tests {
     }
 
     // ── Cancellation tests ───────────────────────────────────────────
-
-    #[test]
-    fn test_cancel_token_registered_during_tools_call() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, LoggingServer::new());
-
-        let request = Request {
-            jsonrpc: "2.0".to_string(),
-            id: RequestId::Number(42),
-            method: "tools/call".to_string(),
-            params: Some(serde_json::json!({
-                "name": "test_tool",
-                "arguments": {}
-            })),
-        };
-
-        // After the call, the cancel map should be clean (entry removed).
-        let _response = server.handle_request(request)?;
-        assert!(
-            server
-                .cancel_map
-                .lock()
-                .map_err(|e| anyhow!("{e}"))?
-                .is_empty(),
-            "cancel map should be cleaned up after tool call"
-        );
-        Ok(())
-    }
 
     #[test]
     fn test_cancelled_notification_triggers_token() {
@@ -1221,7 +1017,7 @@ mod tests {
         });
 
         assert!(!token.is_cancelled());
-        McpServer::<TestHandler>::trigger_cancellation(&json, &cancel_map);
+        McpServer::trigger_cancellation(&json, &cancel_map);
         assert!(token.is_cancelled());
     }
 
@@ -1242,53 +1038,8 @@ mod tests {
             "params": {"requestId": 99}
         });
 
-        McpServer::<TestHandler>::trigger_cancellation(&json, &cancel_map);
+        McpServer::trigger_cancellation(&json, &cancel_map);
         assert!(!token.is_cancelled());
-    }
-
-    #[test]
-    fn test_cancelled_tool_returns_request_cancelled_error() -> Result<()> {
-        /// A handler whose tool call blocks until the cancel token fires.
-        struct BlockingHandler;
-
-        impl ToolHandler for BlockingHandler {
-            fn list_tools(&self) -> Vec<Tool> {
-                Vec::new()
-            }
-
-            fn call_tool(
-                &self,
-                _name: &str,
-                _arguments: Option<serde_json::Value>,
-                _parent_id: Option<String>,
-                cancel: &CancellationToken,
-            ) -> Result<CallToolResult> {
-                // Immediately pre-cancel the token to simulate a race.
-                cancel.cancel();
-                Err(RequestCancelled.into())
-            }
-        }
-
-        let mut server = McpServer::new(BlockingHandler, LoggingServer::new());
-
-        let request = Request {
-            jsonrpc: "2.0".to_string(),
-            id: RequestId::Number(1),
-            method: "tools/call".to_string(),
-            params: Some(serde_json::json!({
-                "name": "slow_tool",
-                "arguments": {}
-            })),
-        };
-
-        let response = server.handle_request(request)?;
-        assert!(
-            response.error.is_some(),
-            "should be a JSON-RPC error response"
-        );
-        let err = response.error.expect("error");
-        assert_eq!(err.code, REQUEST_CANCELLED);
-        Ok(())
     }
 
     /// Creates a channel pre-loaded with JSON messages, simulating stdin.
@@ -1306,7 +1057,7 @@ mod tests {
     fn test_fetch_roots_parses_response() -> Result<()> {
         use std::sync::{Arc, Mutex};
 
-        let mut server = McpServer::new(TestHandler, LoggingServer::new());
+        let mut server = McpServer::new(LoggingServer::new());
         initialize_server(&mut server, true)?;
 
         let received_roots: Arc<Mutex<Vec<Root>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1355,7 +1106,7 @@ mod tests {
     fn test_fetch_roots_buffers_interleaved_request() -> Result<()> {
         use std::sync::{Arc, Mutex};
 
-        let mut server = McpServer::new(TestHandler, LoggingServer::new());
+        let mut server = McpServer::new(LoggingServer::new());
         initialize_server(&mut server, true)?;
 
         let received_roots: Arc<Mutex<Vec<Root>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1410,7 +1161,7 @@ mod tests {
 
     #[test]
     fn test_fetch_roots_handles_error_response() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, LoggingServer::new());
+        let mut server = McpServer::new(LoggingServer::new());
         initialize_server(&mut server, true)?;
         server.should_fetch_roots = true;
 
@@ -1433,7 +1184,7 @@ mod tests {
     fn test_cancelled_notification_handled_without_panic() {
         // notifications/cancelled arriving after the tool call completed
         // should be silently accepted (not fall through to unknown).
-        let mut server = McpServer::new(TestHandler, LoggingServer::new());
+        let mut server = McpServer::new(LoggingServer::new());
 
         let notification = Notification {
             jsonrpc: "2.0".to_string(),
@@ -1450,7 +1201,7 @@ mod tests {
 
     #[test]
     fn test_list_changed_honored_without_capability() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, LoggingServer::new());
+        let mut server = McpServer::new(LoggingServer::new());
         // Initialize WITHOUT roots capability
         initialize_server(&mut server, false)?;
         assert!(!server.client_has_roots);
@@ -1469,7 +1220,7 @@ mod tests {
 
     #[test]
     fn test_roots_capability_without_list_changed() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, LoggingServer::new());
+        let mut server = McpServer::new(LoggingServer::new());
 
         // Initialize with `roots: {}` (no listChanged field)
         let request = Request {
@@ -1491,7 +1242,7 @@ mod tests {
 
     #[test]
     fn test_fetching_roots_reset_on_error() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, LoggingServer::new());
+        let mut server = McpServer::new(LoggingServer::new());
         initialize_server(&mut server, true)?;
         server.should_fetch_roots = true;
 
@@ -1518,18 +1269,11 @@ mod tests {
             .collect()
     }
 
-    /// Simulate the `run()` loop for a single message: mint a correlation
-    /// ID, emit the incoming MCP event, set `current_correlation_id`, and
-    /// dispatch.
-    ///
-    /// Mirrors `run()`: for `tools/call`, a UUID is minted as the
-    /// `parent_id` to group LSP events; for all other methods,
-    /// `parent_id` is `None`.
     /// Simulate the `run()` loop for a single message: mint a UUID,
     /// emit the incoming MCP event, set `current_exchange_id`, and
     /// dispatch. Returns the exchange UUID.
-    fn simulate_incoming<H: ToolHandler>(
-        server: &mut McpServer<H>,
+    fn simulate_incoming(
+        server: &mut McpServer,
         line: &str,
         writer: &mut Vec<u8>,
     ) -> Result<String> {
@@ -1541,9 +1285,6 @@ mod tests {
             .to_string();
         let payload = json.to_string();
         let uuid = uuid::Uuid::new_v4().to_string();
-        if method == "tools/call" {
-            server.current_call_uuid = Some(uuid.clone());
-        }
         emit_mcp_event(
             mcp_method_level(&method),
             &server.client_name,
@@ -1560,7 +1301,7 @@ mod tests {
     #[test]
     fn test_mcp_log_initialize() -> Result<()> {
         let (logging, conn, _guard) = setup_logging();
-        let mut server = McpServer::new(TestHandler, logging);
+        let mut server = McpServer::new(logging);
 
         let request = Request {
             jsonrpc: "2.0".to_string(),
@@ -1599,150 +1340,9 @@ mod tests {
     }
 
     #[test]
-    fn test_mcp_log_tools_call() -> Result<()> {
-        let (logging, conn, _guard) = setup_logging();
-        let mut server = McpServer::new(TestHandler, logging);
-
-        let request = Request {
-            jsonrpc: "2.0".to_string(),
-            id: RequestId::Number(2),
-            method: "tools/call".to_string(),
-            params: Some(serde_json::json!({
-                "name": "test_tool",
-                "arguments": {}
-            })),
-        };
-
-        let line = serde_json::to_string(&request)?;
-        let mut writer: Vec<u8> = Vec::new();
-        let exchange_id = simulate_incoming(&mut server, &line, &mut writer)?;
-
-        let msgs = mcp_messages(&conn);
-        assert!(
-            msgs.len() >= 2,
-            "should have at least request + response, got {}",
-            msgs.len()
-        );
-        assert_eq!(msgs[0].method, "tools/call");
-        assert_eq!(msgs[1].method, "tools/call");
-        assert_eq!(
-            msgs[1].parent_id.as_deref(),
-            Some(exchange_id.as_str()),
-            "response should carry same exchange UUID"
-        );
-        Ok(())
-    }
-
-    /// Handler that reports a fixed scope parent ID.
-    struct ScopedHandler(std::sync::Mutex<Option<String>>);
-
-    impl ToolHandler for ScopedHandler {
-        fn list_tools(&self) -> Vec<Tool> {
-            vec![Tool {
-                name: "test_tool".to_string(),
-                title: None,
-                description: None,
-                input_schema: serde_json::json!({"type": "object", "properties": {}}),
-                annotations: None,
-            }]
-        }
-
-        fn call_tool(
-            &self,
-            _name: &str,
-            _arguments: Option<serde_json::Value>,
-            _parent_id: Option<String>,
-            _cancel: &CancellationToken,
-        ) -> Result<CallToolResult> {
-            Ok(CallToolResult::text("ok"))
-        }
-
-        fn scope_parent_id(&self) -> Option<String> {
-            self.0
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone()
-        }
-    }
-
-    #[test]
-    fn tools_call_request_gets_call_uuid() -> Result<()> {
-        let (logging, conn, _guard) = setup_logging();
-        let handler = ScopedHandler(std::sync::Mutex::new(Some("scope-42".to_string())));
-        let mut server = McpServer::new(handler, logging);
-
-        let request = Request {
-            jsonrpc: "2.0".to_string(),
-            id: RequestId::Number(1),
-            method: "tools/call".to_string(),
-            params: Some(serde_json::json!({
-                "name": "test_tool",
-                "arguments": {}
-            })),
-        };
-
-        let line = serde_json::to_string(&request)?;
-        let mut writer: Vec<u8> = Vec::new();
-        simulate_incoming(&mut server, &line, &mut writer)?;
-
-        let msgs = mcp_messages(&conn);
-        assert!(
-            msgs.len() >= 2,
-            "should have request + response, got {}",
-            msgs.len()
-        );
-        // The incoming tools/call event gets a call UUID as parent_id
-        // (minted per dispatch), not the scope UUID from the handler.
-        assert!(
-            msgs[0].parent_id.is_some(),
-            "tools/call request should have a call UUID parent_id"
-        );
-        // Response parent_id is the stringified request_id (pair-merge).
-        assert!(
-            msgs[1].parent_id.is_some(),
-            "tools/call response should have parent_id for pair-merge"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn tools_call_request_no_scope_has_no_parent() -> Result<()> {
-        let (logging, conn, _guard) = setup_logging();
-        let mut server = McpServer::new(TestHandler, logging);
-
-        let request = Request {
-            jsonrpc: "2.0".to_string(),
-            id: RequestId::Number(1),
-            method: "tools/call".to_string(),
-            params: Some(serde_json::json!({
-                "name": "test_tool",
-                "arguments": {}
-            })),
-        };
-
-        let line = serde_json::to_string(&request)?;
-        let mut writer: Vec<u8> = Vec::new();
-        simulate_incoming(&mut server, &line, &mut writer)?;
-
-        let msgs = mcp_messages(&conn);
-        assert!(
-            msgs.len() >= 2,
-            "should have request + response, got {}",
-            msgs.len()
-        );
-        // Every tools/call gets a minted call UUID as parent_id,
-        // regardless of whether a scope exists.
-        assert!(
-            msgs[0].parent_id.is_some(),
-            "tools/call request should always have a call UUID parent_id"
-        );
-        Ok(())
-    }
-
-    #[test]
     fn test_mcp_log_notification() -> Result<()> {
         let (logging, conn, _guard) = setup_logging();
-        let mut server = McpServer::new(TestHandler, logging);
+        let mut server = McpServer::new(logging);
 
         let notification = Notification {
             jsonrpc: "2.0".to_string(),
@@ -1767,7 +1367,7 @@ mod tests {
     #[test]
     fn test_mcp_log_client_name() -> Result<()> {
         let (logging, conn, _guard) = setup_logging();
-        let mut server = McpServer::new(TestHandler, logging);
+        let mut server = McpServer::new(logging);
 
         // Initialize to set client_name
         let init_request = Request {
@@ -1813,35 +1413,9 @@ mod tests {
     // ── Level-aware emit tests ──────────────────────────────────────
 
     #[test]
-    fn test_mcp_tools_call_emits_at_info() -> Result<()> {
-        let (logging, conn, _guard) = setup_logging();
-        let mut server = McpServer::new(TestHandler, logging);
-
-        let request = Request {
-            jsonrpc: "2.0".to_string(),
-            id: RequestId::Number(10),
-            method: "tools/call".to_string(),
-            params: Some(serde_json::json!({
-                "name": "test_tool",
-                "arguments": {}
-            })),
-        };
-
-        let line = serde_json::to_string(&request)?;
-        let mut writer: Vec<u8> = Vec::new();
-        simulate_incoming(&mut server, &line, &mut writer)?;
-
-        let msgs = mcp_messages(&conn);
-        assert!(msgs.len() >= 2, "should have request + response");
-        assert_eq!(msgs[0].level, "info", "tools/call request should be info");
-        assert_eq!(msgs[1].level, "info", "tools/call response should be info");
-        Ok(())
-    }
-
-    #[test]
     fn test_mcp_initialize_emits_at_debug() -> Result<()> {
         let (logging, conn, _guard) = setup_logging();
-        let mut server = McpServer::new(TestHandler, logging);
+        let mut server = McpServer::new(logging);
 
         let request = Request {
             jsonrpc: "2.0".to_string(),
@@ -1874,7 +1448,7 @@ mod tests {
     fn test_roots_refresh_flag_triggers_fetch() -> Result<()> {
         use std::sync::{Arc, Mutex};
 
-        let mut server = McpServer::new(TestHandler, LoggingServer::new());
+        let mut server = McpServer::new(LoggingServer::new());
         initialize_server(&mut server, true)?;
 
         // Simulate PreAgent setting the external flag.
@@ -1947,7 +1521,7 @@ mod tests {
 
     #[test]
     fn test_roots_refresh_skipped_without_capability() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, LoggingServer::new());
+        let mut server = McpServer::new(LoggingServer::new());
         // Initialize WITHOUT roots capability.
         initialize_server(&mut server, false)?;
 
@@ -1975,7 +1549,7 @@ mod tests {
 
     #[test]
     fn test_roots_refresh_noop_when_not_set() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, LoggingServer::new());
+        let mut server = McpServer::new(LoggingServer::new());
         initialize_server(&mut server, true)?;
 
         // Flag exists but is false.
@@ -1997,7 +1571,7 @@ mod tests {
 
     #[test]
     fn test_roots_refresh_without_external_flag() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, LoggingServer::new());
+        let mut server = McpServer::new(LoggingServer::new());
         initialize_server(&mut server, true)?;
 
         // No external flag wired (roots_refresh is None).
@@ -2067,7 +1641,7 @@ mod tests {
         let subscriber = tracing_subscriber::registry().with(layer);
         let _guard = tracing::subscriber::set_default(subscriber);
 
-        let mut server = McpServer::new(TestHandler, LoggingServer::new());
+        let mut server = McpServer::new(LoggingServer::new());
 
         let notification = Notification {
             jsonrpc: "2.0".to_string(),
@@ -2087,7 +1661,7 @@ mod tests {
     fn test_list_changed_and_refresh_coexist() -> Result<()> {
         use std::sync::{Arc, Mutex};
 
-        let mut server = McpServer::new(TestHandler, LoggingServer::new());
+        let mut server = McpServer::new(LoggingServer::new());
         initialize_server(&mut server, true)?;
 
         let flag = Arc::new(AtomicBool::new(false));
@@ -2186,7 +1760,7 @@ mod tests {
 
         let stdin = synthetic_stdin(&[bad_line]);
         let (tx, _rx) = std::sync::mpsc::channel::<String>();
-        McpServer::<TestHandler>::reader_loop(stdin, &tx, &cancel_map);
+        McpServer::reader_loop(stdin, &tx, &cancel_map);
 
         assert!(
             !token.is_cancelled(),

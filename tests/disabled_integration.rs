@@ -27,7 +27,7 @@ fn spawn_disabled_bridge(root: &str) -> Result<BridgeProcess> {
 }
 
 #[test]
-fn tools_list_empty_when_disabled() -> Result<()> {
+fn tools_list_returns_method_not_found_when_disabled() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().to_str().ok_or_else(|| anyhow!("dir path"))?;
     let mut bridge = spawn_disabled_bridge(root)?;
@@ -41,20 +41,22 @@ fn tools_list_empty_when_disabled() -> Result<()> {
     }))?;
 
     let response = bridge.recv()?;
-    let tools = response["result"]["tools"]
-        .as_array()
-        .ok_or_else(|| anyhow!("tools should be an array: {response:?}"))?;
-    assert!(tools.is_empty(), "disabled session should list no tools");
+    assert!(
+        response.get("error").is_some(),
+        "tools/list should return error (method not found): {response:?}"
+    );
 
     Ok(())
 }
 
 #[test]
-fn enabled_true_is_default() -> Result<()> {
+fn tools_list_returns_method_not_found_when_enabled() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().to_str().ok_or_else(|| anyhow!("dir path"))?;
 
     // No .catenary.toml at all — should behave normally.
+    // MCP no longer serves application tools, so tools/list returns
+    // method-not-found regardless of enabled/disabled state.
     let mut bridge = BridgeProcess::spawn(&[], root)?;
     bridge.initialize()?;
 
@@ -65,12 +67,9 @@ fn enabled_true_is_default() -> Result<()> {
     }))?;
 
     let response = bridge.recv()?;
-    let tools = response["result"]["tools"]
-        .as_array()
-        .ok_or_else(|| anyhow!("tools should be an array: {response:?}"))?;
     assert!(
-        !tools.is_empty(),
-        "default session should list tools, got empty"
+        response.get("error").is_some(),
+        "tools/list should return error (method not found): {response:?}"
     );
 
     Ok(())

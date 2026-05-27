@@ -6,5 +6,5 @@ mod server;
 /// MCP type definitions and JSON-RPC messages.
 mod types;
 
-pub use server::{McpServer, RootsChangedCallback, ToolHandler};
+pub use server::{McpServer, RootsChangedCallback};
 pub use types::*;

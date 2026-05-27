@@ -54,12 +54,16 @@ fn test_mcp_initialize() -> Result<()> {
     let result = &response["result"];
     assert_eq!(result["protocolVersion"], "2024-11-05");
     assert_eq!(result["serverInfo"]["name"], "catenary");
-    assert!(result["capabilities"]["tools"].is_object());
+    // MCP no longer advertises tool capabilities.
+    assert!(
+        result["capabilities"]["tools"].is_null(),
+        "capabilities should not include tools"
+    );
     Ok(())
 }
 
 #[test]
-fn test_mcp_tools_list() -> Result<()> {
+fn test_mcp_tools_list_returns_method_not_found() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "");
     let mut bridge = BridgeProcess::spawn(&[&lsp], dir.path().to_str().context("dir")?)?;
@@ -72,43 +76,15 @@ fn test_mcp_tools_list() -> Result<()> {
     }))?;
 
     let response = bridge.recv()?;
-
-    assert!(response.get("result").is_some());
-    let tools = response["result"]["tools"]
-        .as_array()
-        .context("Missing tools array")?;
-
-    let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
-
-    // Check all expected tools are present (2 after diagnostics removal)
-    let expected_tools = ["grep", "glob"];
-
-    for expected in &expected_tools {
-        assert!(tool_names.contains(expected), "Missing {expected} tool");
-    }
-
-    // Verify all tools have valid schemas
-    for tool in tools {
-        let name = tool["name"].as_str().context("Missing tool name")?;
-        assert!(
-            tool.get("inputSchema").is_some(),
-            "Tool {name} missing inputSchema"
-        );
-        let schema = &tool["inputSchema"];
-        assert_eq!(
-            schema["type"], "object",
-            "Tool {name} schema type is not object"
-        );
-        assert!(
-            schema["properties"].is_object(),
-            "Tool {name} has no properties"
-        );
-    }
+    assert!(
+        response.get("error").is_some(),
+        "tools/list should return method-not-found: {response:?}"
+    );
     Ok(())
 }
 
 #[test]
-fn test_mcp_tool_call_unknown_tool() -> Result<()> {
+fn test_mcp_tools_call_returns_method_not_found() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "");
     let mut bridge = BridgeProcess::spawn(&[&lsp], dir.path().to_str().context("dir")?)?;
@@ -125,11 +101,10 @@ fn test_mcp_tool_call_unknown_tool() -> Result<()> {
     }))?;
 
     let response = bridge.recv()?;
-
-    assert!(response.get("result").is_some());
-
-    let result = &response["result"];
-    assert_eq!(result["isError"], true, "Expected error for unknown tool");
+    assert!(
+        response.get("error").is_some(),
+        "tools/call should return method-not-found: {response:?}"
+    );
     Ok(())
 }
 
@@ -668,7 +643,10 @@ fn test_mockls_sync_roots_across_profiles() -> Result<()> {
             }
         }))?;
 
-        // Search in root_b — bridge waits for all servers to be ready
+        // Allow the daemon to process the root sync before the IPC grep.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // Search in root_b
         bridge.send(&json!({
             "jsonrpc": "2.0",
             "id": 20,
@@ -761,6 +739,12 @@ fn test_mockls_sync_roots_no_progress_no_hang() -> Result<()> {
             ]
         }
     }))?;
+
+    // Allow the daemon to process the root sync (spawn LSP server
+    // for root_b, register workspace folder). The MCP roots/list
+    // response is processed asynchronously on the MCP connection
+    // while the IPC grep runs on a separate connection.
+    std::thread::sleep(std::time::Duration::from_millis(500));
 
     // Search in root_b — must not hang.
     // did_change_workspace_folders sets state to Busy.
@@ -2279,8 +2263,8 @@ fn test_grep_reference_enclosing() -> Result<()> {
     Ok(())
 }
 
-/// Verify that LSP messages triggered by grep carry the MCP tool call's
-/// `parent_id` in the database (misc 30: `parent_id` threading).
+/// Verify that LSP messages triggered by grep carry a `parent_id`
+/// in the database (CLI tool queries get a UUID for event correlation).
 #[test]
 fn test_grep_parent_id_threading() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -2292,6 +2276,7 @@ fn test_grep_parent_id_threading() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
+    // Call grep via IPC (intercepted by send()).
     bridge.send(&json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -2311,17 +2296,17 @@ fn test_grep_parent_id_threading() -> Result<()> {
         rusqlite::Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .context("open test database")?;
 
-    // Find the parent_id (call UUID) on the tools/call MCP event.
+    // Find the parent_id on the IPC tool/grep hook event.
     // This UUID is shared with LSP messages from the grep pipeline.
     let call_uuid: String = conn
         .query_row(
             "SELECT parent_id FROM messages \
-             WHERE type = 'mcp' AND method = 'tools/call' \
+             WHERE type = 'hook' AND method = 'tool/grep' \
              AND parent_id IS NOT NULL LIMIT 1",
             [],
             |row| row.get(0),
         )
-        .context("find tools/call parent_id (call UUID)")?;
+        .context("find tool/grep parent_id (call UUID)")?;
 
     // LSP messages from the grep pipeline should carry this parent_id
     let lsp_with_parent: i64 = conn
@@ -4011,60 +3996,28 @@ fn test_grep_single_line_ref() -> Result<()> {
 
 // ─── Cancellation tests ──────────────────────────────────────────────
 
-/// Sends `notifications/cancelled` while a `tools/call` is in progress.
+/// `notifications/cancelled` for a non-existent request is a no-op.
 ///
-/// Uses `--response-delay 2000` so the LSP server takes 2 seconds per
-/// response, giving the reader thread time to process the cancellation
-/// before the tool call completes. Verifies:
-/// 1. The response is JSON-RPC error −32800 (`RequestCancelled`).
-/// 2. The bridge is still functional afterward (responds to `ping`).
+/// The bridge should not crash when it receives a cancellation for a
+/// request ID that was never registered (e.g., a late or stale
+/// cancellation). Verifies the bridge still responds to ping afterward.
 #[test]
-fn test_mcp_cancel_inflight_tool_call() -> Result<()> {
+fn test_mcp_cancel_nonexistent_is_noop() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
-    // Create a file so grep has something to match.
-    let file = dir.path().join(format!("cancel_test.{MOCK_LANG_A}"));
-    std::fs::write(&file, "fn cancel_target\ncancel_target\n")?;
-
-    // --response-delay 2000: every LSP response takes 2s, so the grep
-    // tool call blocks long enough for cancellation to arrive.
-    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots --response-delay 2000");
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "");
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    // Send tools/call — this blocks the bridge's main loop.
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 9900,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "cancel_target" }
-        }
-    }))?;
-
-    // Immediately send cancellation — the reader thread processes this
-    // while call_tool is blocked waiting on slow LSP responses.
+    // Send cancellation for a request that never existed.
     bridge.send(&json!({
         "jsonrpc": "2.0",
         "method": "notifications/cancelled",
-        "params": { "requestId": 9900, "reason": "integration test" }
+        "params": { "requestId": 9999 }
     }))?;
 
-    let response = bridge.recv()?;
-
-    // Should be a JSON-RPC error with code -32800.
-    assert!(
-        response.get("error").is_some(),
-        "expected error response, got: {response}"
-    );
-    assert_eq!(
-        response["error"]["code"], -32800,
-        "expected -32800 RequestCancelled, got: {response}"
-    );
-
-    // Bridge should still be functional after cancellation.
+    // Bridge should still work.
     bridge.send(&json!({
         "jsonrpc": "2.0",
         "id": 9901,
@@ -4073,58 +4026,7 @@ fn test_mcp_cancel_inflight_tool_call() -> Result<()> {
     let ping_response = bridge.recv()?;
     assert!(
         ping_response.get("result").is_some(),
-        "bridge should respond to ping after cancellation: {ping_response}"
-    );
-
-    Ok(())
-}
-
-/// Cancellation for a request that already completed is a no-op.
-///
-/// The bridge should not crash or return an error when it receives
-/// `notifications/cancelled` for a request that already has a response.
-#[test]
-fn test_mcp_cancel_already_completed() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let root = dir.path().to_str().context("root path")?;
-
-    let lsp = mockls_lsp_arg(MOCK_LANG_A, "");
-    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
-    bridge.initialize()?;
-
-    // Send a fast tool call and wait for completion.
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 9910,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "nonexistent_xyz" }
-        }
-    }))?;
-    let response = bridge.recv()?;
-    assert!(
-        response.get("result").is_some(),
-        "grep should succeed: {response}"
-    );
-
-    // Now send cancellation for the already-completed request.
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "method": "notifications/cancelled",
-        "params": { "requestId": 9910 }
-    }))?;
-
-    // Bridge should still work — send another tool call.
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 9911,
-        "method": "ping"
-    }))?;
-    let ping_response = bridge.recv()?;
-    assert!(
-        ping_response.get("result").is_some(),
-        "bridge should respond after late cancellation: {ping_response}"
+        "bridge should respond to ping after stale cancellation: {ping_response}"
     );
 
     Ok(())

@@ -13,7 +13,7 @@ mod file_tools;
 pub mod filesystem_manager;
 /// Grep tool: ripgrep + workspace/symbol pipeline with LSP enrichment.
 mod grep_server;
-/// Maps MCP tool calls to LSP requests.
+/// Path utilities shared by bridge components.
 mod handler;
 /// Application dispatch for hook requests.
 mod hook_router;
@@ -23,8 +23,6 @@ mod pagination;
 pub mod path_security;
 /// Shared container for tool servers and cross-tool infrastructure.
 pub mod session;
-/// Transformation layer trait between protocol boundaries and LSP.
-pub mod tool_server;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -37,11 +35,9 @@ use crate::symbol_index::SymbolIndex;
 pub use diagnostics_server::DiagnosticsServer;
 pub use editing_guardrail::EditingGuardrail;
 pub use editing_manager::EditingManager;
-pub use handler::McpRouter;
 pub use handler::expand_tilde;
 pub use hook_router::HookRouter;
 pub use path_security::PathValidator;
-pub use tool_server::ToolServer;
 
 /// Ensures the symbol index is populated for the given files.
 ///

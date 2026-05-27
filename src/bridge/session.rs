@@ -122,8 +122,9 @@ impl ResolvedGlob {
 /// Shared application container for tool servers and cross-tool infrastructure.
 ///
 /// Creates and owns all internal servers and shared dependencies.
-/// [`super::handler::LspBridgeHandler`] holds an `Arc<Session>` and handles
-/// protocol boundary concerns (health checks, readiness, dispatch routing).
+/// [`super::hook_router::HookRouter`] holds an `Arc<Session>` and
+/// handles hook dispatch. CLI tool commands access grep/glob through
+/// the IPC socket.
 pub struct Session {
     /// Session-wide configuration (shared with `LspClientManager`).
     pub config: Arc<Config>,

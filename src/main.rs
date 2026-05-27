@@ -18,7 +18,6 @@ use tracing::info;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
-use catenary_mcp::bridge::McpRouter;
 use catenary_mcp::cli::{self, HostFormat, QueryFormat};
 use catenary_mcp::logging::LoggingServer;
 use catenary_mcp::session;
@@ -582,23 +581,6 @@ fn run_daemon() -> Result<()> {
 fn run_daemon_main() -> Result<()> {
     use catenary_mcp::router::SessionManager;
 
-    /// Tool handler that exposes no tools (disabled workspace).
-    struct DaemonDisabledHandler;
-    impl catenary_mcp::mcp::ToolHandler for DaemonDisabledHandler {
-        fn list_tools(&self) -> Vec<catenary_mcp::mcp::Tool> {
-            Vec::new()
-        }
-        fn call_tool(
-            &self,
-            _name: &str,
-            _arguments: Option<serde_json::Value>,
-            _parent_id: Option<String>,
-            _cancel: &tokio_util::sync::CancellationToken,
-        ) -> Result<catenary_mcp::mcp::CallToolResult> {
-            Err(anyhow::anyhow!("Catenary is disabled for this workspace"))
-        }
-    }
-
     // Build runtime first — bind_daemon_sockets needs the tokio
     // reactor for UnixListener::bind.
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -636,7 +618,7 @@ fn run_daemon_main() -> Result<()> {
         .and_then(|r| catenary_mcp::config::load_project_config(r).ok().flatten())
         .is_some_and(|pc| !pc.lsp);
 
-    let (handler, shared_session, shared_conn) = if disabled {
+    let (shared_session, shared_conn) = if disabled {
         info!("Catenary disabled by .catenary.toml (lsp = false) in {workspace_display}");
         // Activate with just the desktop notification sink so stale hook
         // detection can still fire OS notifications.
@@ -648,8 +630,7 @@ fn run_daemon_main() -> Result<()> {
         let desktop_sink =
             catenary_mcp::notify::DesktopNotificationSink::with_enabled(desktop_enabled);
         logging.activate(vec![desktop_sink]);
-        let handler: Arc<dyn catenary_mcp::mcp::ToolHandler> = Arc::new(DaemonDisabledHandler);
-        (handler, None, None)
+        (None, None)
     } else {
         let conn = catenary_mcp::db::open_and_migrate()?;
         let instance_id: Arc<str> = "daemon".into();
@@ -699,14 +680,12 @@ fn run_daemon_main() -> Result<()> {
         let session_for_spawn = session.clone();
         rt.spawn(async move { session_for_spawn.spawn_all().await });
 
-        let handler: Arc<dyn catenary_mcp::mcp::ToolHandler> =
-            Arc::new(McpRouter::new(session.clone()));
-        (handler, Some(session), Some(conn))
+        (Some(session), Some(conn))
     };
 
     let session_for_shutdown = shared_session.clone();
 
-    let manager = SessionManager::from_sockets(sockets, handler, logging);
+    let manager = SessionManager::from_sockets(sockets, logging);
     let manager = match (shared_session, shared_conn) {
         (Some(session), Some(conn)) => manager.with_session(session, conn),
         _ => manager,

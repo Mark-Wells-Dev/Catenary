@@ -27,7 +27,6 @@ use super::filesystem_manager::{FilesystemManager, format_file_size};
 use super::handler::{expand_tilde, resolve_path};
 use super::pagination::{format_page_header, paginate};
 use super::session::ResolvedGlob;
-use super::tool_server::ToolServer;
 use crate::lsp::LspClientManager;
 use crate::symbol_index::{Symbol, SymbolIndex, format_symbol_kind};
 
@@ -350,46 +349,30 @@ pub struct GlobServer {
     pub(super) outline_suppress: Vec<globset::GlobMatcher>,
 }
 
-impl ToolServer for GlobServer {
-    async fn execute(
+impl GlobServer {
+    /// Execute a glob query with the given parameters.
+    pub async fn execute(
         &self,
         params: &serde_json::Value,
         _parent_id: Option<&str>,
         _cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<serde_json::Value> {
-        let mut input: GlobInput = serde_json::from_value(params.clone())
+        let input: GlobInput = serde_json::from_value(params.clone())
             .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
 
         let pattern = expand_tilde(&input.pattern);
         let path = resolve_path(&pattern)?;
 
-        // Explicit hidden targets (e.g. `.gitignore`, `.github/*`) should
-        // match without requiring `include_hidden`. Only applies to glob
-        // patterns — resolved file/directory paths go through different
-        // branches that don't need the override.
-        if !path.exists() && ResolvedGlob::targets_hidden(&pattern) {
-            input.include_hidden = true;
-        }
-
         tracing::debug!("glob: {pattern}");
 
-        // Compile exclude pattern via ResolvedGlob — same semantics as
-        // grep's exclude. Absolute patterns (including those resolved
-        // against cwd by the CLI router) match against full paths.
-        // Relative patterns without a path separator get a `**/` prefix
-        // so that `exclude="test_*"` matches basenames at any depth.
+        // Compile exclude pattern via ResolvedGlob. The CLI router
+        // resolves exclude against cwd before dispatch, so patterns
+        // are always absolute here.
         let exclude = input
             .exclude
             .as_deref()
             .filter(|s| !s.is_empty())
-            .map(|pat| {
-                let effective = if pat.contains('/') {
-                    pat.to_string()
-                } else {
-                    format!("**/{pat}")
-                };
-                ResolvedGlob::new(&effective)
-            })
+            .map(ResolvedGlob::new)
             .transpose()?;
 
         let page = input.page.max(1);
@@ -423,9 +406,7 @@ impl ToolServer for GlobServer {
 
         Ok(Value::String(output))
     }
-}
 
-impl GlobServer {
     /// Single file: header with defensive map (if symbols available).
     ///
     /// Single files bypass `outline_threshold` — they get a map unless the

@@ -19,7 +19,6 @@ use tracing::debug;
 use super::filesystem_manager::FilesystemManager;
 use super::handler::display_path;
 use super::pagination::paginate;
-use super::tool_server::ToolServer;
 use crate::config::DispatchMethod;
 use crate::lsp::LspClientManager;
 use crate::lsp::server::LspServer;
@@ -84,14 +83,18 @@ pub struct GrepServer {
     pub(super) budget: usize,
 }
 
-impl ToolServer for GrepServer {
-    async fn execute(
+impl GrepServer {
+    /// Execute a grep query with the given parameters.
+    ///
+    /// `parent_id` is a UUID for LSP event correlation.
+    /// `cancel` is triggered when the CLI client disconnects.
+    pub async fn execute(
         &self,
         params: &serde_json::Value,
         parent_id: Option<&str>,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<serde_json::Value> {
-        let mut input: GrepInput = serde_json::from_value(params.clone())
+        let input: GrepInput = serde_json::from_value(params.clone())
             .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
 
         if input.pattern.is_empty() {
@@ -100,14 +103,6 @@ impl ToolServer for GrepServer {
 
         if input.page == 0 {
             return Err(anyhow!("page must be >= 1"));
-        }
-
-        // Explicit hidden targets (e.g. `.gitignore`, `.github/*`) should
-        // match without requiring `include_hidden`.
-        if let Some(ref glob) = input.glob
-            && ResolvedGlob::targets_hidden(glob)
-        {
-            input.include_hidden = true;
         }
 
         // Relative glob param → cwd context header.
@@ -151,9 +146,7 @@ impl ToolServer for GrepServer {
             input.page,
         )))
     }
-}
 
-impl GrepServer {
     /// Grep pipeline: ripgrep + `documentSymbol` index + hit classification.
     #[allow(clippy::too_many_lines, reason = "Core grep orchestration")]
     async fn run(

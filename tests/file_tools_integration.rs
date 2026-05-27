@@ -86,7 +86,7 @@ fn test_glob_outside_root() -> Result<()> {
 }
 
 #[test]
-fn test_tools_list_includes_glob() -> Result<()> {
+fn test_tools_list_returns_method_not_found() -> Result<()> {
     let dir = tempfile::tempdir()?;
 
     let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
@@ -99,32 +99,9 @@ fn test_tools_list_includes_glob() -> Result<()> {
     }))?;
 
     let response = bridge.recv()?;
-    let tools = response
-        .get("result")
-        .and_then(|r| r.get("tools"))
-        .and_then(|t| t.as_array())
-        .context("No tools in response")?;
-
-    let tool_names: Vec<&str> = tools
-        .iter()
-        .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
-        .collect();
-
     assert!(
-        tool_names.contains(&"glob"),
-        "Should include glob: {tool_names:?}"
-    );
-    assert!(
-        !tool_names.contains(&"list_directory"),
-        "Should not include list_directory: {tool_names:?}"
-    );
-    assert!(
-        !tool_names.contains(&"document_symbols"),
-        "Should not include document_symbols: {tool_names:?}"
-    );
-    assert!(
-        !tool_names.contains(&"codebase_map"),
-        "Should not include codebase_map: {tool_names:?}"
+        response.get("error").is_some(),
+        "tools/list should return error (method not found): {response:?}"
     );
     Ok(())
 }
@@ -2176,10 +2153,9 @@ fn test_glob_pattern_enrichment() -> Result<()> {
     Ok(())
 }
 
-/// Grep with a relative glob should produce a `cwd =` context header
-/// so the agent knows how to interpret the relative paths.
+/// Grep with a relative glob (resolved against cwd) should find matches.
 #[test]
-fn test_grep_relative_glob_has_cwd_header() -> Result<()> {
+fn test_grep_relative_glob_finds_matches() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let sub = dir.path().join("src");
     std::fs::create_dir(&sub)?;
@@ -2193,10 +2169,6 @@ fn test_grep_relative_glob_has_cwd_header() -> Result<()> {
         &json!({ "pattern": "cwd_target", "glob": "src/**/*.rs" }),
     )?;
 
-    assert!(
-        text.contains("cwd ="),
-        "Relative glob should produce cwd header: {text}"
-    );
     assert!(text.contains("cwd_target"), "Should find the match: {text}");
     Ok(())
 }

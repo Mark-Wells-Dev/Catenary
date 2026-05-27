@@ -28,10 +28,9 @@ fn editing_key(session_id: Option<&str>, agent_id: &str) -> String {
 
 /// In-memory editing state manager.
 ///
-/// Owns editing state for a single Catenary session. Both
+/// Owns editing state for a single Catenary session.
 /// [`super::hook_router::HookRouter`] (which has the real `agent_id` from
-/// the host CLI) and [`super::handler::McpRouter`] (which produces the
-/// tool result) access this through [`super::session::Session`].
+/// the host CLI) accesses this through [`super::session::Session`].
 ///
 /// State is keyed by a composite of `(session_id, agent_id)` to prevent
 /// cross-session collisions when multiple host CLI sessions share a

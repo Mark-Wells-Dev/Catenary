@@ -21,11 +21,10 @@ use tracing::{Instrument, debug, error, info, warn};
 
 use crate::bridge::EditingGuardrail;
 use crate::bridge::HookRouter;
-use crate::bridge::ToolServer;
 use crate::bridge::session::Session;
 use crate::hook::{HookRequest, HookResponseEnvelope, emit_hook_event, hook_outcome_level};
 use crate::logging::LoggingServer;
-use crate::mcp::{McpServer, ToolHandler};
+use crate::mcp::McpServer;
 use crate::source::Source;
 
 /// Returns the MCP socket path for the daemon.
@@ -453,8 +452,7 @@ impl RootTracker {
 /// Binds two Unix domain sockets: one for MCP connections from `catenary
 /// bridge` proxies, one for hook connections from `catenary hook` CLI
 /// processes. Each MCP connection spawns a per-connection async task
-/// with a full domain stack (`McpServer`/`ToolServer`), dispatching to
-/// the shared `LspClientManager` via the tool handler. Hook connections
+/// with a protocol-only `McpServer` (roots, lifecycle). Hook connections
 /// are routed to per-`session_id` [`HookRouter`] instances when a shared
 /// [`Session`] is configured (daemon mode), or receive passthrough
 /// responses (test mode).
@@ -464,7 +462,6 @@ pub struct SessionManager {
     ipc_listener: tokio::net::UnixListener,
     mcp_socket_path: PathBuf,
     ipc_socket_path: PathBuf,
-    handler: Arc<dyn ToolHandler>,
     logging: LoggingServer,
     connection_count: Arc<AtomicUsize>,
     /// Session-aware hook dispatch context. `None` in tests that don't
@@ -492,8 +489,8 @@ impl SessionManager {
     /// Returns an error if the parent directory cannot be created or
     /// either socket cannot be bound (e.g., another daemon is already
     /// running).
-    pub fn bind(handler: Arc<dyn ToolHandler>, logging: LoggingServer) -> Result<Self> {
-        Self::bind_at(&mcp_socket_path(), &socket_path(), handler, logging)
+    pub fn bind(logging: LoggingServer) -> Result<Self> {
+        Self::bind_at(&mcp_socket_path(), &socket_path(), logging)
     }
 
     /// Creates a `SessionManager` from pre-bound sockets.
@@ -503,17 +500,12 @@ impl SessionManager {
     /// are bound before heavy initialization so bridges can connect
     /// immediately. [`SessionManager::drop`] cleans up the socket files.
     #[must_use]
-    pub fn from_sockets(
-        sockets: DaemonSockets,
-        handler: Arc<dyn ToolHandler>,
-        logging: LoggingServer,
-    ) -> Self {
+    pub fn from_sockets(sockets: DaemonSockets, logging: LoggingServer) -> Self {
         Self {
             mcp_listener: sockets.mcp_listener,
             ipc_listener: sockets.ipc_listener,
             mcp_socket_path: sockets.mcp_path,
             ipc_socket_path: sockets.ipc_path,
-            handler,
             logging,
             connection_count: Arc::new(AtomicUsize::new(0)),
             hook_ctx: None,
@@ -533,12 +525,7 @@ impl SessionManager {
     ///
     /// Returns an error if the parent directories cannot be created or
     /// either socket cannot be bound.
-    pub fn bind_at(
-        mcp_path: &Path,
-        ipc_path: &Path,
-        handler: Arc<dyn ToolHandler>,
-        logging: LoggingServer,
-    ) -> Result<Self> {
+    pub fn bind_at(mcp_path: &Path, ipc_path: &Path, logging: LoggingServer) -> Result<Self> {
         if let Some(parent) = mcp_path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create socket directory: {}", parent.display()))?;
@@ -565,7 +552,6 @@ impl SessionManager {
             ipc_listener,
             mcp_socket_path: mcp_path.to_path_buf(),
             ipc_socket_path: ipc_path.to_path_buf(),
-            handler,
             logging,
             connection_count: Arc::new(AtomicUsize::new(0)),
             hook_ctx: None,
@@ -579,11 +565,11 @@ impl SessionManager {
 
     /// Accepts incoming MCP and IPC connections in a loop.
     ///
-    /// Each MCP connection spawns a per-connection async task with a full
-    /// MCP stack (`McpServer` backed by the shared tool handler). The
-    /// task runs in a tracing span tagged with `mcp_fd` for log
-    /// correlation. IPC connections are short-lived and handled in
-    /// spawned tasks with passthrough responses.
+    /// Each MCP connection spawns a per-connection async task with a
+    /// `McpServer` (protocol-only, no tools). The task runs in a tracing
+    /// span tagged with `mcp_fd` for log correlation. IPC connections
+    /// are short-lived and handled in spawned tasks with passthrough
+    /// responses.
     ///
     /// Returns `Ok(())` when the daemon should shut down. Three triggers:
     /// - Last MCP client disconnected (disconnect notify, count == 0)
@@ -674,7 +660,6 @@ impl SessionManager {
     /// should shut down.
     #[allow(clippy::too_many_lines, reason = "sequential connection setup steps")]
     fn handle_mcp_connection(&self, stream: tokio::net::UnixStream, fd: i32) {
-        let handler = self.handler.clone();
         let logging = self.logging.clone();
         let count = Arc::clone(&self.connection_count);
         let disconnect = Arc::clone(&self.disconnect);
@@ -737,7 +722,7 @@ impl SessionManager {
                 let result = tokio::task::spawn_blocking(move || {
                     let _entered = span_for_blocking.enter();
 
-                    let mut mcp = McpServer::new(handler, logging);
+                    let mut mcp = McpServer::new(logging);
 
                     // Wire lifecycle callbacks when the shared LSP
                     // infrastructure is available (daemon mode). When a
@@ -1204,6 +1189,14 @@ async fn handle_hook_dispatch(
             "include_hidden": grep_req.include_hidden,
         });
         if let Some(glob) = grep_req.glob {
+            // Check hidden targeting on relative patterns only —
+            // absolute paths may contain hidden components from the
+            // cwd that aren't user intent.
+            if !Path::new(&glob).is_absolute()
+                && crate::bridge::session::ResolvedGlob::targets_hidden(&glob)
+            {
+                params["include_hidden"] = serde_json::Value::Bool(true);
+            }
             let resolved = resolve_relative(&glob, &grep_req.cwd);
             params["glob"] = serde_json::Value::String(resolved);
         }
@@ -1287,17 +1280,29 @@ async fn handle_hook_dispatch(
         ctx.primary.notify_file_changes().await;
 
         // Build GlobInput-compatible params, resolving relative patterns
-        // against the CLI process's cwd.
+        // against the CLI process's cwd. Check hidden targeting on
+        // relative patterns only — absolute paths may contain hidden
+        // components from the cwd that aren't user intent.
+        let targets_hidden = !Path::new(&glob_req.pattern).is_absolute()
+            && crate::bridge::session::ResolvedGlob::targets_hidden(&glob_req.pattern);
+        let include_hidden = glob_req.include_hidden || targets_hidden;
         let resolved_pattern = resolve_relative(&glob_req.pattern, &glob_req.cwd);
         let mut params = serde_json::json!({
             "pattern": resolved_pattern,
             "page": glob_req.page,
             "include_gitignored": glob_req.include_gitignored,
-            "include_hidden": glob_req.include_hidden,
+            "include_hidden": include_hidden,
         });
         if let Some(exclude) = glob_req.exclude {
-            let resolved = resolve_relative(&exclude, &glob_req.cwd);
-            params["exclude"] = serde_json::Value::String(resolved);
+            // Basename patterns (no path separator) get a `**/` prefix so
+            // `exclude="test_*"` matches at any depth within the tree.
+            // Patterns with `/` are resolved against cwd as-is.
+            let effective = if exclude.contains('/') {
+                resolve_relative(&exclude, &glob_req.cwd)
+            } else {
+                format!("**/{exclude}")
+            };
+            params["exclude"] = serde_json::Value::String(effective);
         }
 
         let parent_id = uuid::Uuid::new_v4().to_string();
@@ -2017,24 +2022,6 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tracing_subscriber::layer::SubscriberExt;
 
-    /// Minimal no-op handler for tests that only exercise transport.
-    #[derive(Clone)]
-    struct NoOpHandler;
-    impl crate::mcp::ToolHandler for NoOpHandler {
-        fn list_tools(&self) -> Vec<crate::mcp::Tool> {
-            Vec::new()
-        }
-        fn call_tool(
-            &self,
-            _name: &str,
-            _arguments: Option<serde_json::Value>,
-            _parent_id: Option<String>,
-            _cancel: &tokio_util::sync::CancellationToken,
-        ) -> anyhow::Result<crate::mcp::CallToolResult> {
-            Err(anyhow::anyhow!("not implemented"))
-        }
-    }
-
     /// Create an MCP socket path inside a tempdir.
     fn mcp_socket_in(dir: &Path) -> PathBuf {
         dir.join("catenary").join("catenary-mcp.sock")
@@ -2050,7 +2037,6 @@ mod tests {
         SessionManager::bind_at(
             &mcp_socket_in(dir),
             &ipc_socket_in(dir),
-            Arc::new(NoOpHandler),
             LoggingServer::new(),
         )
         .expect("bind")
@@ -2196,12 +2182,7 @@ mod tests {
         std::fs::create_dir_all(mcp_path.parent().expect("parent")).expect("create dir");
         std::fs::write(&mcp_path, b"").expect("create file");
 
-        let result = SessionManager::bind_at(
-            &mcp_path,
-            &ipc_path,
-            Arc::new(NoOpHandler),
-            LoggingServer::new(),
-        );
+        let result = SessionManager::bind_at(&mcp_path, &ipc_path, LoggingServer::new());
         assert!(
             result.is_err(),
             "bind should fail when MCP socket already exists"
@@ -2218,12 +2199,7 @@ mod tests {
         std::fs::create_dir_all(ipc_path.parent().expect("parent")).expect("create dir");
         std::fs::write(&ipc_path, b"").expect("create file");
 
-        let result = SessionManager::bind_at(
-            &mcp_path,
-            &ipc_path,
-            Arc::new(NoOpHandler),
-            LoggingServer::new(),
-        );
+        let result = SessionManager::bind_at(&mcp_path, &ipc_path, LoggingServer::new());
         assert!(
             result.is_err(),
             "bind should fail when IPC socket already exists"
@@ -2243,12 +2219,7 @@ mod tests {
         let ipc_path = ipc_socket_in(dir.path());
 
         let _manager = tracing::subscriber::with_default(subscriber, || {
-            SessionManager::bind_at(
-                &mcp_path,
-                &ipc_path,
-                Arc::new(NoOpHandler),
-                LoggingServer::new(),
-            )
+            SessionManager::bind_at(&mcp_path, &ipc_path, LoggingServer::new())
         })
         .expect("bind");
 
@@ -2481,41 +2452,6 @@ mod tests {
 
     // ── Per-connection MCP stack tests ────────────────────────────────
 
-    /// Handler that echoes its tool list and tool calls (for MCP testing).
-    #[derive(Clone)]
-    struct EchoHandler;
-    impl crate::mcp::ToolHandler for EchoHandler {
-        fn list_tools(&self) -> Vec<crate::mcp::Tool> {
-            vec![crate::mcp::Tool {
-                name: "echo".to_string(),
-                title: Some("Echo Tool".to_string()),
-                description: Some("Returns a fixed string".to_string()),
-                input_schema: serde_json::json!({"type": "object", "properties": {}}),
-                annotations: None,
-            }]
-        }
-        fn call_tool(
-            &self,
-            _name: &str,
-            _arguments: Option<serde_json::Value>,
-            _parent_id: Option<String>,
-            _cancel: &tokio_util::sync::CancellationToken,
-        ) -> anyhow::Result<crate::mcp::CallToolResult> {
-            Ok(crate::mcp::CallToolResult::text("echo"))
-        }
-    }
-
-    /// Bind a `SessionManager` with an `EchoHandler` for MCP-level tests.
-    fn bind_echo(dir: &Path) -> SessionManager {
-        SessionManager::bind_at(
-            &mcp_socket_in(dir),
-            &ipc_socket_in(dir),
-            Arc::new(EchoHandler),
-            LoggingServer::new(),
-        )
-        .expect("bind")
-    }
-
     /// Helper: send JSON line, read JSON line response over a std stream.
     fn mcp_roundtrip(
         stream: &std::os::unix::net::UnixStream,
@@ -2545,7 +2481,7 @@ mod tests {
 
         let logging = LoggingServer::new();
         let handle = std::thread::spawn(move || {
-            let mut mcp = McpServer::new(EchoHandler, logging);
+            let mut mcp = McpServer::new(logging);
             mcp.run(reader, writer)
         });
 
@@ -2586,7 +2522,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("create tempdir");
         let mcp_path = mcp_socket_in(dir.path());
 
-        let manager = Arc::new(bind_echo(dir.path()));
+        let manager = Arc::new(bind_in(dir.path()));
         let shutdown = manager.shutdown_token();
         let m = Arc::clone(&manager);
         tokio::spawn(async move {
@@ -2624,11 +2560,11 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn per_connection_tools_list() {
+    async fn per_connection_tools_list_returns_method_not_found() {
         let dir = tempfile::tempdir().expect("create tempdir");
         let mcp_path = mcp_socket_in(dir.path());
 
-        let manager = Arc::new(bind_echo(dir.path()));
+        let manager = Arc::new(bind_in(dir.path()));
         let shutdown = manager.shutdown_token();
         let m = Arc::clone(&manager);
         tokio::spawn(async move {
@@ -2655,7 +2591,7 @@ mod tests {
             }),
         );
 
-        // List tools.
+        // tools/list should return method-not-found (no tools on MCP).
         let response = mcp_roundtrip(
             &stream,
             &serde_json::json!({
@@ -2665,9 +2601,10 @@ mod tests {
             }),
         );
 
-        let tools = response["result"]["tools"].as_array().expect("tools array");
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0]["name"], "echo");
+        assert!(
+            response.get("error").is_some(),
+            "tools/list should return error, got: {response}",
+        );
 
         drop(stream);
         shutdown.cancel();
@@ -2678,7 +2615,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("create tempdir");
         let mcp_path = mcp_socket_in(dir.path());
 
-        let manager = Arc::new(bind_echo(dir.path()));
+        let manager = Arc::new(bind_in(dir.path()));
         let shutdown = manager.shutdown_token();
         let m = Arc::clone(&manager);
         tokio::spawn(async move {
@@ -2887,14 +2824,9 @@ mod tests {
             notification_router,
         ));
 
-        SessionManager::bind_at(
-            &mcp_socket_in(dir),
-            &ipc_socket_in(dir),
-            Arc::new(NoOpHandler),
-            logging,
-        )
-        .expect("bind")
-        .with_session(session, conn)
+        SessionManager::bind_at(&mcp_socket_in(dir), &ipc_socket_in(dir), logging)
+            .expect("bind")
+            .with_session(session, conn)
     }
 
     /// Send a hook JSON request and read the response line.

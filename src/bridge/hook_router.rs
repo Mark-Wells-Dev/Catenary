@@ -5,8 +5,8 @@
 //!
 //! `HookRouter` owns all hook method handlers and application logic
 //! (editing state enforcement, diagnostics dispatch, turn tracking).
-//! Mirrors the [`super::handler::McpRouter`] pattern: protocol boundary
-//! delegates to router, router delegates to [`super::session::Session`].
+//! Protocol boundary delegates to router, router delegates to
+//! [`super::session::Session`].
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
