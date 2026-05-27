@@ -643,8 +643,8 @@ fn test_mockls_sync_roots_across_profiles() -> Result<()> {
             }
         }))?;
 
-        // Allow the daemon to process the root sync before the IPC grep.
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        // Wait for root_b to appear in the daemon's root tracker.
+        bridge.wait_for_root(root_b, std::time::Duration::from_secs(5))?;
 
         // Search in root_b
         bridge.send(&json!({
@@ -740,11 +740,10 @@ fn test_mockls_sync_roots_no_progress_no_hang() -> Result<()> {
         }
     }))?;
 
-    // Allow the daemon to process the root sync (spawn LSP server
-    // for root_b, register workspace folder). The MCP roots/list
-    // response is processed asynchronously on the MCP connection
-    // while the IPC grep runs on a separate connection.
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    // Wait for root_b to appear in the daemon's root tracker.
+    // MCP roots/list is processed asynchronously on the MCP connection
+    // while IPC grep runs on a separate connection.
+    bridge.wait_for_root(root_b, std::time::Duration::from_secs(5))?;
 
     // Search in root_b — must not hang.
     // did_change_workspace_folders sets state to Busy.

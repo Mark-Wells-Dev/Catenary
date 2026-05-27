@@ -443,6 +443,25 @@ impl BridgeProcess {
         Ok(path)
     }
 
+    /// Polls `ls-roots` until the given path appears as a tracked root.
+    ///
+    /// Used after MCP roots/list sync to ensure the daemon has processed
+    /// the new root before IPC tool queries run on a separate connection.
+    pub fn wait_for_root(&self, root: &str, timeout: Duration) -> Result<()> {
+        let socket_path = self.wait_for_ipc_socket()?;
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let response = ipc_request(&socket_path, &json!({"method": "tool/ls-roots"}))?;
+            if response.contains(root) {
+                return Ok(());
+            }
+            if std::time::Instant::now() > deadline {
+                bail!("root {root} not found in ls-roots within {timeout:?}");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     /// Enters editing mode, accumulates a file, then runs `done_editing`
     /// via the handoff protocol to retrieve diagnostics.
     pub fn call_diagnostics(&self, file: &str) -> Result<String> {
@@ -604,47 +623,23 @@ impl BridgeProcess {
         Ok(output.to_string())
     }
 
-    /// Calls a tool and returns the raw result object.
+    /// Calls a tool via the IPC socket and returns the raw result object.
     ///
-    /// For `grep` and `glob`, routes through the IPC socket (CLI path).
-    /// For other tools, falls through to MCP `tools/call`.
-    pub fn call_tool(&mut self, name: &str, args: &Value) -> Result<Value> {
-        match name {
-            "grep" | "glob" => {
-                let text = if name == "grep" {
-                    self.call_grep(args)?
-                } else {
-                    self.call_glob(args)?
-                };
-                Ok(json!({
-                    "content": [{"type": "text", "text": text}]
-                }))
-            }
-            _ => {
-                self.send(&json!({
-                    "jsonrpc": "2.0",
-                    "id": 100,
-                    "method": "tools/call",
-                    "params": {
-                        "name": name,
-                        "arguments": args
-                    }
-                }))?;
-
-                let response = self.recv()?;
-                let result = response
-                    .get("result")
-                    .context("No result in response")?
-                    .clone();
-                Ok(result)
-            }
-        }
+    /// Wraps the IPC text output in an MCP-style content structure for
+    /// backward compatibility with existing test assertions.
+    pub fn call_tool(&self, name: &str, args: &Value) -> Result<Value> {
+        let text = match name {
+            "grep" => self.call_grep(args)?,
+            "glob" => self.call_glob(args)?,
+            _ => bail!("unknown tool: {name} (MCP no longer serves tools)"),
+        };
+        Ok(json!({
+            "content": [{"type": "text", "text": text}]
+        }))
     }
 
-    /// Calls a tool and returns the first text content item.
-    ///
-    /// For `grep` and `glob`, routes through the IPC socket (CLI path).
-    pub fn call_tool_text(&mut self, name: &str, args: &Value) -> Result<String> {
+    /// Calls a tool via the IPC socket and returns the text output.
+    pub fn call_tool_text(&self, name: &str, args: &Value) -> Result<String> {
         let result = self.call_tool(name, args)?;
         let content = result
             .get("content")

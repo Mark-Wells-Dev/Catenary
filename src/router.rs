@@ -68,10 +68,9 @@ pub const METHOD_GLOB: &str = "tool/glob";
 /// IPC request payload for `catenary grep`.
 ///
 /// Sent as a JSON line over the daemon IPC socket with
-/// `"method": "tool/grep"`. The daemon resolves relative `glob` and
-/// `exclude` patterns against `cwd` before dispatching to the grep
-/// pipeline — the same resolution that [`super::bridge::handler`]
-/// does for the `directory` MCP parameter.
+/// `"method": "tool/grep"`. [`to_params`](Self::to_params) resolves
+/// relative `glob` and `exclude` patterns against `cwd` before
+/// dispatching to the grep pipeline.
 ///
 /// Wire format:
 /// ```json
@@ -98,6 +97,41 @@ pub struct GrepRequest {
     /// Include hidden files and directories.
     #[serde(default)]
     pub include_hidden: bool,
+}
+
+impl GrepRequest {
+    /// Resolves relative patterns against `cwd` and produces a
+    /// `GrepInput`-compatible JSON value for the grep pipeline.
+    ///
+    /// - `glob` and `exclude` are resolved against `cwd` (relative → absolute).
+    /// - `targets_hidden` is checked on the pre-resolution `glob` pattern
+    ///   (only for relative patterns) to auto-enable `include_hidden` for
+    ///   explicit hidden targets like `.gitignore`.
+    fn to_params(&self) -> serde_json::Value {
+        let mut include_hidden = self.include_hidden;
+
+        let mut params = serde_json::json!({
+            "pattern": self.pattern,
+            "page": self.page,
+            "include_gitignored": self.include_gitignored,
+        });
+        if let Some(ref glob) = self.glob {
+            // Check hidden targeting on relative patterns only — absolute
+            // paths may contain hidden components from the cwd that aren't
+            // user intent.
+            if !Path::new(glob).is_absolute()
+                && crate::bridge::session::ResolvedGlob::targets_hidden(glob)
+            {
+                include_hidden = true;
+            }
+            params["glob"] = serde_json::Value::String(resolve_relative(glob, &self.cwd));
+        }
+        if let Some(ref exclude) = self.exclude {
+            params["exclude"] = serde_json::Value::String(resolve_relative(exclude, &self.cwd));
+        }
+        params["include_hidden"] = serde_json::Value::Bool(include_hidden);
+        params
+    }
 }
 
 /// IPC response for `catenary grep`.
@@ -137,6 +171,42 @@ pub struct GlobRequest {
     /// Include hidden files and directories.
     #[serde(default)]
     pub include_hidden: bool,
+}
+
+impl GlobRequest {
+    /// Resolves relative patterns against `cwd` and produces a
+    /// `GlobInput`-compatible JSON value for the glob pipeline.
+    ///
+    /// - `pattern` is resolved against `cwd`.
+    /// - `targets_hidden` is checked on the pre-resolution `pattern`
+    ///   (only for relative patterns).
+    /// - Basename `exclude` patterns (no `/`) get a `**/` prefix for
+    ///   depth-independent matching; patterns with `/` are resolved
+    ///   against `cwd`.
+    fn to_params(&self) -> serde_json::Value {
+        let targets_hidden = !Path::new(&self.pattern).is_absolute()
+            && crate::bridge::session::ResolvedGlob::targets_hidden(&self.pattern);
+        let include_hidden = self.include_hidden || targets_hidden;
+        let resolved_pattern = resolve_relative(&self.pattern, &self.cwd);
+        let mut params = serde_json::json!({
+            "pattern": resolved_pattern,
+            "page": self.page,
+            "include_gitignored": self.include_gitignored,
+            "include_hidden": include_hidden,
+        });
+        if let Some(ref exclude) = self.exclude {
+            // Basename patterns (no path separator) get a `**/` prefix so
+            // `exclude="test_*"` matches at any depth within the tree.
+            // Patterns with `/` are resolved against cwd as-is.
+            let effective = if exclude.contains('/') {
+                resolve_relative(exclude, &self.cwd)
+            } else {
+                format!("**/{exclude}")
+            };
+            params["exclude"] = serde_json::Value::String(effective);
+        }
+        params
+    }
 }
 
 /// IPC response for `catenary glob`.
@@ -1180,31 +1250,7 @@ async fn handle_hook_dispatch(
         // Notify servers about filesystem changes before any LSP interaction.
         ctx.primary.notify_file_changes().await;
 
-        // Build GrepInput-compatible params, resolving relative patterns
-        // against the CLI process's cwd.
-        let mut params = serde_json::json!({
-            "pattern": grep_req.pattern,
-            "page": grep_req.page,
-            "include_gitignored": grep_req.include_gitignored,
-            "include_hidden": grep_req.include_hidden,
-        });
-        if let Some(glob) = grep_req.glob {
-            // Check hidden targeting on relative patterns only —
-            // absolute paths may contain hidden components from the
-            // cwd that aren't user intent.
-            if !Path::new(&glob).is_absolute()
-                && crate::bridge::session::ResolvedGlob::targets_hidden(&glob)
-            {
-                params["include_hidden"] = serde_json::Value::Bool(true);
-            }
-            let resolved = resolve_relative(&glob, &grep_req.cwd);
-            params["glob"] = serde_json::Value::String(resolved);
-        }
-        if let Some(exclude) = grep_req.exclude {
-            let resolved = resolve_relative(&exclude, &grep_req.cwd);
-            params["exclude"] = serde_json::Value::String(resolved);
-        }
-
+        let params = grep_req.to_params();
         let parent_id = uuid::Uuid::new_v4().to_string();
         let cancel = CancellationToken::new();
 
@@ -1279,32 +1325,7 @@ async fn handle_hook_dispatch(
         // Notify servers about filesystem changes before any LSP interaction.
         ctx.primary.notify_file_changes().await;
 
-        // Build GlobInput-compatible params, resolving relative patterns
-        // against the CLI process's cwd. Check hidden targeting on
-        // relative patterns only — absolute paths may contain hidden
-        // components from the cwd that aren't user intent.
-        let targets_hidden = !Path::new(&glob_req.pattern).is_absolute()
-            && crate::bridge::session::ResolvedGlob::targets_hidden(&glob_req.pattern);
-        let include_hidden = glob_req.include_hidden || targets_hidden;
-        let resolved_pattern = resolve_relative(&glob_req.pattern, &glob_req.cwd);
-        let mut params = serde_json::json!({
-            "pattern": resolved_pattern,
-            "page": glob_req.page,
-            "include_gitignored": glob_req.include_gitignored,
-            "include_hidden": include_hidden,
-        });
-        if let Some(exclude) = glob_req.exclude {
-            // Basename patterns (no path separator) get a `**/` prefix so
-            // `exclude="test_*"` matches at any depth within the tree.
-            // Patterns with `/` are resolved against cwd as-is.
-            let effective = if exclude.contains('/') {
-                resolve_relative(&exclude, &glob_req.cwd)
-            } else {
-                format!("**/{exclude}")
-            };
-            params["exclude"] = serde_json::Value::String(effective);
-        }
-
+        let params = glob_req.to_params();
         let parent_id = uuid::Uuid::new_v4().to_string();
         let cancel = CancellationToken::new();
 

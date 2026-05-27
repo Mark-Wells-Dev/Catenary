@@ -35,7 +35,7 @@ fn initialize_with_registration(bridge: &mut BridgeProcess) -> Result<()> {
 
 /// Calls `grep` to trigger `notify_file_changes()` at the tool boundary.
 /// The search itself doesn't matter — we just need the diff to run.
-fn trigger_file_watch_diff(bridge: &mut BridgeProcess) -> Result<Value> {
+fn trigger_file_watch_diff(bridge: &BridgeProcess) -> Result<Value> {
     bridge.call_tool(
         "grep",
         &json!({ "pattern": "NONEXISTENT_PATTERN_FOR_DIFF_TRIGGER" }),
@@ -119,7 +119,7 @@ fn noop_diff_sends_no_notification() -> Result<()> {
     initialize_with_registration(&mut bridge)?;
 
     // No filesystem changes — just trigger a diff
-    let _ = trigger_file_watch_diff(&mut bridge)?;
+    let _ = trigger_file_watch_diff(&bridge)?;
 
     drop(bridge);
     std::thread::sleep(Duration::from_millis(200));
@@ -155,7 +155,7 @@ fn new_file_sends_created_event() -> Result<()> {
     let new_file = dir.path().join(format!("new_module.{MOCK_LANG_A}"));
     std::fs::write(&new_file, "fn new_thing()\n")?;
 
-    let _ = trigger_file_watch_diff(&mut bridge)?;
+    let _ = trigger_file_watch_diff(&bridge)?;
 
     drop(bridge);
     std::thread::sleep(Duration::from_millis(200));
@@ -192,7 +192,7 @@ fn deleted_file_sends_deleted_event() -> Result<()> {
     // Delete the file
     std::fs::remove_file(&doomed_file)?;
 
-    let _ = trigger_file_watch_diff(&mut bridge)?;
+    let _ = trigger_file_watch_diff(&bridge)?;
 
     drop(bridge);
     std::thread::sleep(Duration::from_millis(200));
@@ -226,7 +226,7 @@ fn new_directory_sends_created_event() -> Result<()> {
     // Create a new subdirectory
     std::fs::create_dir(dir.path().join("subdir"))?;
 
-    let _ = trigger_file_watch_diff(&mut bridge)?;
+    let _ = trigger_file_watch_diff(&bridge)?;
 
     drop(bridge);
     std::thread::sleep(Duration::from_millis(200));
@@ -269,7 +269,7 @@ fn branch_switch_sends_batched_notification() -> Result<()> {
     let file_c = dir.path().join(format!("c.{MOCK_LANG_A}"));
     std::fs::write(&file_c, "fn c()\n")?;
 
-    let _ = trigger_file_watch_diff(&mut bridge)?;
+    let _ = trigger_file_watch_diff(&bridge)?;
 
     drop(bridge);
     std::thread::sleep(Duration::from_millis(200));
@@ -318,7 +318,7 @@ fn module_rename_sends_delete_and_create() -> Result<()> {
     let mod_file = foo_dir.join(format!("mod.{MOCK_LANG_A}"));
     std::fs::rename(&foo_file, &mod_file)?;
 
-    let _ = trigger_file_watch_diff(&mut bridge)?;
+    let _ = trigger_file_watch_diff(&bridge)?;
 
     drop(bridge);
     std::thread::sleep(Duration::from_millis(200));
@@ -360,12 +360,12 @@ fn watch_kind_delete_only_filters_creates() -> Result<()> {
     let new_file = dir.path().join(format!("new.{MOCK_LANG_A}"));
     std::fs::write(&new_file, "fn new()\n")?;
 
-    let _ = trigger_file_watch_diff(&mut bridge)?;
+    let _ = trigger_file_watch_diff(&bridge)?;
 
     // Now delete a file — should trigger
     std::fs::remove_file(&doomed_file)?;
 
-    let _ = trigger_file_watch_diff(&mut bridge)?;
+    let _ = trigger_file_watch_diff(&bridge)?;
 
     drop(bridge);
     std::thread::sleep(Duration::from_millis(200));
@@ -454,7 +454,7 @@ fn ra_module_rename_resolves_after_notification() -> Result<()> {
     std::fs::rename(src_dir.join("foo.rs"), foo_dir.join("mod.rs"))?;
 
     // Trigger diff → didChangeWatchedFiles
-    let _ = trigger_file_watch_diff(&mut bridge)?;
+    let _ = trigger_file_watch_diff(&bridge)?;
 
     // Give rust-analyzer time to process the notification and re-index.
     std::thread::sleep(Duration::from_secs(5));
