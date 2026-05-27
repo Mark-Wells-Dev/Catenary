@@ -535,6 +535,11 @@ pub fn run_pre_tool(format: HostFormat) {
             handle_done_editing_hook(&hook_json, format);
             return;
         }
+        // Search commands: always allowed, including during editing.
+        // The CLI commands handle IPC to the daemon directly.
+        if is_catenary_command(shell_cmd, &["grep", "glob"]) {
+            return;
+        }
         // Root management: allow through without IPC — the CLI
         // command handles root management via daemon IPC directly.
         if is_root_command(shell_cmd) {
