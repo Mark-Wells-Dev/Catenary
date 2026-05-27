@@ -14,3 +14,4 @@ Run `catenary rm-root <path>` to remove a workspace root.
 Use `catenary grep` and `catenary glob` for code search.
 These are CLI commands, always available, and do not require editing mode.
 Relative patterns resolve against the shell's cwd.
+Regex uses Rust/PCRE-style syntax: `|` for alternation (not `\|`).

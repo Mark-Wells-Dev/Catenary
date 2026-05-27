@@ -797,6 +797,7 @@ async fn run_grep(
     use catenary_mcp::router::{GrepRequest, METHOD_GREP};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+    let has_bre_alternation = pattern.contains("\\|");
     let cwd = std::env::current_dir().context("cannot determine working directory")?;
     let ipc_path = catenary_mcp::router::socket_path();
 
@@ -840,6 +841,9 @@ async fn run_grep(
         serde_json::from_str(trimmed).context("invalid grep response from daemon")?;
     if !response.output.is_empty() {
         println!("{}", response.output);
+    }
+    if response.output == "No results found" && has_bre_alternation {
+        println!("hint: use `|` for alternation, not `\\|` (which matches a literal pipe)");
     }
 
     Ok(())

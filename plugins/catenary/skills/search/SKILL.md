@@ -12,7 +12,8 @@ patterns resolve against cwd — no directory parameter needed.
 
 ## `catenary grep <pattern>`
 
-Search for a regex pattern. Supports `|` for alternation.
+Search for a regex pattern. The regex engine uses Rust/PCRE-style
+syntax: `|` for alternation (not `\|` — that matches a literal pipe).
 Results are LSP-enriched within tracked workspace roots.
 
 Flags: `--glob <pat>`, `--exclude <pat>`, `--page <n>`,

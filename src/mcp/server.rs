@@ -571,16 +571,7 @@ impl McpServer {
                 name: "catenary".to_string(),
                 version: Some(env!("CATENARY_VERSION").to_string()),
             },
-            instructions: Some(
-                "Catenary provides LSP-backed code intelligence tools. \
-                 Its search tools include all available LSP information \
-                 and condense grep-equivalent results into a heatmap. \
-                 Post-edit LSP diagnostics are provided automatically via \
-                 the notify hook. When multiple edits target the same file \
-                 in one response, only the final diagnostics per file are \
-                 authoritative \u{2014} ignore intermediate results."
-                    .to_string(),
-            ),
+            instructions: None,
         };
 
         Ok(Response::success(request.id, result)?)
@@ -826,7 +817,7 @@ mod tests {
             serde_json::from_value(response.result.expect("response result"))?;
         assert_eq!(result.server_info.name, "catenary");
         assert_eq!(result.protocol_version, "2024-11-05");
-        assert!(result.instructions.is_some());
+        assert!(result.instructions.is_none());
         Ok(())
     }
 

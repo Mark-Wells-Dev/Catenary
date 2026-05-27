@@ -2,7 +2,7 @@
   "id": "catenary",
   "name": "Catenary",
   "version": "1.6.1",
-  "description": "High-performance multiplexing bridge between MCP and LSP servers.",
+  "description": "LSP-powered code intelligence for AI coding agents - search, diagnostics, and navigation for any language with an LSP server",
   "publisher": "TwoWells",
   "contextFileName": "gemini-context.md",
   "mcpServers": {
