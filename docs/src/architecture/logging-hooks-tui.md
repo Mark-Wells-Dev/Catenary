@@ -194,7 +194,7 @@ Five hook methods, each corresponding to a host CLI lifecycle event:
 | `pre-agent/turn-start` | `UserPromptSubmit` / `BeforeAgent` | Increment the turn counter (debounce boundary) |
 | `pre-tool/editing-state` | `PreToolUse` / `BeforeTool` | Editing state enforcement — deny or allow a tool call |
 | `pre-tool/command-denied` | `PreToolUse` / `BeforeTool` | Command filter debounce — full or short denial message |
-| `post-agent/require-release` | `Stop` / `AfterAgent` | Force `done_editing` if the agent stops while editing |
+| `post-agent/require-release` | `Stop` / `AfterAgent` | Force `editing stop` if the agent stops while editing |
 
 ### Hook contracts by host
 
@@ -215,16 +215,16 @@ command selects the output format for the host's expected JSON structure.
 
 ### Diagnostic delivery path
 
-Diagnostics flow through `catenary done_editing` stdout output. The
+Diagnostics flow through `catenary editing stop` stdout output. The
 `PreToolUse` hook tracks which files the agent modifies during editing
-mode; `done_editing` collects those paths and runs the batched
+mode; `editing stop` collects those paths and runs the batched
 diagnostic pipeline.
 
 The current path:
 
 1. `PreToolUse` hooks track modified file paths in `EditingManager`
    (via `HookRouter`) during editing mode.
-2. The agent calls `catenary done_editing` (CLI command via the host's
+2. The agent calls `catenary editing stop` (CLI command via the host's
    shell tool).
 3. `DiagnosticsServer` runs the batched diagnostic pipeline across all
    accumulated files.
@@ -351,7 +351,7 @@ all code must follow. Key rules:
 - [Configuration Model](configuration.md) — `[notifications]` threshold
   configuration.
 - [Document Lifecycle & File Watching](documents.md) — editing mode
-  enforcement and the `done_editing` diagnostic pipeline.
+  enforcement and the `editing stop` diagnostic pipeline.
 - [Routing & Dispatch](routing.md) — dispatch errors surface via
   `warn!()` through the tracing pipeline.
 - [LSP Client Layer](lsp-client.md) — server lifecycle state

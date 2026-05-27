@@ -5,7 +5,7 @@ Catenary loads configuration from multiple sources, in order of priority
 
 1. **Built-in defaults**: Server definitions (`defaults/servers.toml`) and language classification with server bindings (`defaults/languages.toml`). Common language servers work without any config — if the binary is on PATH, Catenary uses it.
 2. **User config**: `~/.config/catenary/config.toml`.
-3. **Project config**: `.catenary.toml` in each workspace root. Discovered when roots are added (at startup or via `catenary add-root`). Scoped to `[language.*]`, `[server.*]`, and `[commands]` — other sections are user-level.
+3. **Project config**: `.catenary.toml` in each workspace root. Discovered when roots are added (at startup or via `catenary roots add`). Scoped to `[language.*]`, `[server.*]`, and `[commands]` — other sections are user-level.
 4. **Explicit file**: `--config <path>`.
 5. **Environment variables**: Prefixed with `CATENARY_` (e.g., `CATENARY_LOG_RETENTION_DAYS=30`). Use `__` for nested keys (e.g., `CATENARY_ICONS__PRESET=nerd`).
 
@@ -233,7 +233,7 @@ single_file = true
 ```
 
 Servers configured with `single_file = true` also gate out-of-root
-edits with `start_editing`/`done_editing`, so agents receive diagnostics
+edits with `editing start`/`editing stop`, so agents receive diagnostics
 for files outside the workspace. If the server rejects null-workspace
 initialization at runtime, the failure is cached and the server is not
 retried for the remainder of the session.
@@ -344,7 +344,7 @@ server, and command configuration for that root. Supported sections are
 `~/.config/catenary/config.toml`.
 
 Project config is discovered when roots are added (at startup or via
-`catenary add-root`). Changes to `.catenary.toml` require restarting
+`catenary roots add`). Changes to `.catenary.toml` require restarting
 the session.
 
 ### Disabling Catenary

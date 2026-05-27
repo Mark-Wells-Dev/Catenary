@@ -24,12 +24,9 @@ const GEMINI_HOOKS_EXPECTED: &str = include_str!("../../hooks/hooks.json");
 const ANTIGRAVITY_HOOKS_EXPECTED: &str =
     include_str!("../../plugins/catenary-antigravity/hooks.json");
 
-/// Expected Claude Code editing SKILL.md, embedded at compile time.
-const SKILL_MD_EXPECTED: &str = include_str!("../../plugins/catenary/skills/editing/SKILL.md");
-
-/// Expected Claude Code search SKILL.md, embedded at compile time.
-const SEARCH_SKILL_MD_EXPECTED: &str =
-    include_str!("../../plugins/catenary/skills/search/SKILL.md");
+/// Expected Claude Code primer SKILL.md, embedded at compile time.
+const PRIMER_SKILL_MD_EXPECTED: &str =
+    include_str!("../../plugins/catenary/skills/primer/SKILL.md");
 
 /// Expected Gemini CLI context file, embedded at compile time.
 const GEMINI_CONTEXT_EXPECTED: &str = include_str!("../../gemini-context.md");
@@ -1723,16 +1720,8 @@ fn check_claude_instructions(out: &mut Output, show_diff: bool) {
     check_skill_content(
         out,
         &install_path,
-        "editing",
-        SKILL_MD_EXPECTED,
-        is_stale,
-        show_diff,
-    );
-    check_skill_content(
-        out,
-        &install_path,
-        "search",
-        SEARCH_SKILL_MD_EXPECTED,
+        "primer",
+        PRIMER_SKILL_MD_EXPECTED,
         is_stale,
         show_diff,
     );
@@ -1986,7 +1975,7 @@ fn check_antigravity_instructions(out: &mut Output, show_diff: bool, project_roo
 
 /// Valid skill names for Catenary's Claude Code plugin.
 #[cfg(test)]
-const VALID_SKILL_NAMES: &[&str] = &["editing", "search"];
+const VALID_SKILL_NAMES: &[&str] = &["primer"];
 
 /// Validate SKILL.md frontmatter format per the Claude Code Agent Skills spec.
 ///
@@ -2500,7 +2489,7 @@ mod tests {
 
     #[test]
     fn valid_skill_frontmatter_inline() {
-        let content = "---\nname: editing\ndescription: A tool\n---\n\nBody content here.\n";
+        let content = "---\nname: primer\ndescription: A tool\n---\n\nBody content here.\n";
         let errors = validate_skill_frontmatter(content);
         assert!(errors.is_empty(), "should be valid, got: {errors:?}");
     }
@@ -2508,7 +2497,7 @@ mod tests {
     #[test]
     fn valid_skill_frontmatter_multiline_description() {
         let content =
-            "---\nname: editing\ndescription: >\n  Multi-line\n  description.\n---\n\nBody.\n";
+            "---\nname: primer\ndescription: >\n  Multi-line\n  description.\n---\n\nBody.\n";
         let errors = validate_skill_frontmatter(content);
         assert!(
             errors.is_empty(),
@@ -2649,20 +2638,11 @@ mod tests {
     // ── embedded instruction file tests ────────────────────────────
 
     #[test]
-    fn embedded_skill_md_valid() {
-        let errors = validate_skill_frontmatter(SKILL_MD_EXPECTED);
+    fn embedded_primer_skill_md_valid() {
+        let errors = validate_skill_frontmatter(PRIMER_SKILL_MD_EXPECTED);
         assert!(
             errors.is_empty(),
-            "embedded SKILL.md should pass validation, got: {errors:?}",
-        );
-    }
-
-    #[test]
-    fn embedded_search_skill_md_valid() {
-        let errors = validate_skill_frontmatter(SEARCH_SKILL_MD_EXPECTED);
-        assert!(
-            errors.is_empty(),
-            "embedded search SKILL.md should pass validation, got: {errors:?}",
+            "embedded primer SKILL.md should pass validation, got: {errors:?}",
         );
     }
 

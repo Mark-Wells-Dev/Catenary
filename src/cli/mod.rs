@@ -4,6 +4,7 @@
 //! CLI utilities for terminal output formatting and colors.
 
 pub mod command_filter;
+pub mod command_help;
 pub mod commands;
 pub mod config_template;
 pub mod doctor;

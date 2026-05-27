@@ -12,7 +12,7 @@ Every external interaction crosses one of four boundaries:
 
 - **CLI** — agent ↔ Catenary. The agent invokes CLI commands via the
   host's shell tool: `catenary grep`, `catenary glob` for search;
-  `catenary start_editing`, `catenary done_editing` for batched
+  `catenary editing start`, `catenary editing stop` for batched
   diagnostics. Commands connect to the daemon over a Unix domain socket,
   send a request, and print the result to stdout.
 - **MCP** — agent ↔ Catenary. A pure connection surface for session

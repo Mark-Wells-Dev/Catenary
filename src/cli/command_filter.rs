@@ -547,6 +547,14 @@ fn collect_command_names(cmd: &str, names: &mut Vec<String>) {
     }
 }
 
+/// Render the `-h` output for a Catenary subcommand.
+///
+/// Delegates to [`super::command_help::render_help`], which uses the
+/// canonical command definitions shared with the binary.
+fn render_subcommand_help(subcommand: &str) -> String {
+    super::command_help::render_help(subcommand)
+}
+
 /// Resolve per-client template variables in guidance messages.
 ///
 /// `{READ}` and `{EDIT}` resolve to the host CLI's tool names.
@@ -593,12 +601,26 @@ pub fn format_denial_full(
     format: Option<super::HostFormat>,
     build_hint: Option<&str>,
 ) -> String {
-    let mut parts = vec![format_opening_line(denied_cmd, denial.reason)];
-
-    // Guidance hint (static or build-resolved).
+    // Guidance hint (static, build-resolved, or redirect).
     // For the full dump, the base command name is used for lookup (strip
     // subcommand part: "git grep" → "git" won't match, but "grep" will).
     let lookup_cmd = denied_cmd.split_whitespace().next().unwrap_or(denied_cmd);
+
+    // Redirect denial: short format with the command's `-h` output.
+    if let Some(crate::config::GuidanceEntry::Redirect { command, summary }) =
+        commands.guidance_for(lookup_cmd)
+    {
+        let opening = format!("`{denied_cmd}` isn't allowed. {summary}");
+        let help = render_subcommand_help(command);
+        return if help.is_empty() {
+            opening
+        } else {
+            format!("{opening}\n\n{help}")
+        };
+    }
+
+    let mut parts = vec![format_opening_line(denied_cmd, denial.reason)];
+
     if let Some(entry) = commands.guidance_for(lookup_cmd) {
         match entry {
             crate::config::GuidanceEntry::Static(msg) => {
@@ -612,6 +634,9 @@ pub fn format_denial_full(
                 {
                     parts.push(format!("Hint: {hint}"));
                 }
+            }
+            crate::config::GuidanceEntry::Redirect { .. } => {
+                // Handled above (early return).
             }
         }
     }
@@ -719,6 +744,9 @@ pub fn format_denial_short(
             }
             crate::config::GuidanceEntry::Build(_) => {
                 build_hint.map_or_else(|| String::from(no_guidance), |hint| format!(" — {hint}"))
+            }
+            crate::config::GuidanceEntry::Redirect { summary, .. } => {
+                format!(" — {summary}")
             }
         },
     );

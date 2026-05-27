@@ -712,7 +712,7 @@ impl ServerProcess {
         let _response = self.recv()?;
 
         let output = Command::new(env!("CARGO_BIN_EXE_catenary"))
-            .arg("query")
+            .args(["debug", "query"])
             .arg("--sql")
             .arg("SELECT id FROM sessions LIMIT 1")
             .arg("--format")

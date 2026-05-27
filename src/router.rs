@@ -377,7 +377,7 @@ fn spawn_handoff_timeout(slot: Arc<std::sync::Mutex<Option<HandoffContext>>>) {
             *s = None;
             warn!(
                 source = Source::DaemonDispatch.as_str(),
-                "done_editing handoff timeout — discarding file list",
+                "editing stop handoff timeout — discarding file list",
             );
         }
     });
@@ -1125,7 +1125,7 @@ async fn handle_hook_dispatch(
 
     // ── List tracked roots ─────────────────────────────────────
     //
-    // `tool/ls-roots` is sent by `catenary ls-roots`. Returns all
+    // `tool/ls-roots` is sent by `catenary roots ls`. Returns all
     // tracked workspace roots with their contributor sources.
     if method == "tool/ls-roots" {
         let roots = ctx
@@ -1229,7 +1229,7 @@ async fn handle_hook_dispatch(
 
     // ── Start editing confirmation ────────────────────────────────
     //
-    // `start-editing/confirm` is sent by `catenary start_editing`
+    // `tool/start-editing` is sent by `catenary editing start`
     // after the PreToolUse hook has already entered editing mode.
     // The CLI command just needs a confirmation response.
     if method == "tool/start-editing" {
@@ -1390,8 +1390,8 @@ async fn handle_hook_dispatch(
 
     // ── Done editing handoff: prepare ────────────────────────────
     //
-    // `pre-tool/done-editing-prepare` is sent by the PreToolUse
-    // hook when the agent runs `catenary done_editing`. Acquires
+    // `pre-tool/done-editing` is sent by the PreToolUse hook when
+    // the agent runs `catenary editing stop`. Acquires
     // the handoff lock, drains files, releases the editing guardrail,
     // and deposits the file list for the subsequent CLI command.
     if method == "pre-tool/done-editing" {
@@ -1438,7 +1438,7 @@ async fn handle_hook_dispatch(
         debug!(
             source = Source::DaemonDispatch.as_str(),
             session_id = %session_id,
-            "done_editing handoff prepared",
+            "editing stop handoff prepared",
         );
 
         emit_hook_event(
@@ -1465,7 +1465,7 @@ async fn handle_hook_dispatch(
 
     // ── Done editing handoff: run ────────────────────────────────
     //
-    // `done-editing/run` is sent by `catenary done_editing` CLI
+    // `tool/done-editing` is sent by `catenary editing stop` CLI
     // command. Takes the file list from the handoff slot, runs
     // process_files_batched, and returns diagnostics.
     if method == "tool/done-editing" {
@@ -1496,7 +1496,7 @@ async fn handle_hook_dispatch(
             // Handoff slot was empty — timeout expired or double-consume.
             let fallback_id = uuid::Uuid::new_v4().to_string();
             (
-                "done_editing handoff expired — no files available\n".to_string(),
+                "editing stop handoff expired — no files available\n".to_string(),
                 fallback_id,
             )
         };
@@ -1526,8 +1526,8 @@ async fn handle_hook_dispatch(
 
     // ── Root management ──────────────────────────────────────────
     //
-    // `add-root/run` and `rm-root/run` are sent by the CLI commands
-    // (`catenary add-root`, `catenary rm-root`). The PreToolUse hook
+    // `tool/add-root` and `tool/rm-root` are sent by the CLI commands
+    // (`catenary roots add`, `catenary roots rm`). The PreToolUse hook
     // only bypasses the command filter — no hook-side IPC needed
     // since "hook" is a shared contributor with no session identity.
     //

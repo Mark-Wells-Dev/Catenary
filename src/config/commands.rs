@@ -92,8 +92,13 @@ fn format_build_list(tools: &[String]) -> String {
 #[serde(default)]
 pub struct GuidanceGroup {
     /// Static hint message (e.g., `"Use {read} instead"`).
-    /// Absent for the `build` group.
+    /// Absent for the `build` and `redirect` groups.
     pub message: Option<String>,
+    /// Catenary subcommand to redirect to (e.g., `"grep"`, `"glob"`).
+    /// When set, denials show a short message + the command's `-h` output.
+    pub redirect: Option<String>,
+    /// Opening line after the denial for redirect groups.
+    pub summary: Option<String>,
     /// Commands this guidance applies to.
     pub commands: Vec<String>,
     /// Build: message when user config has a build tool.
@@ -126,10 +131,17 @@ impl GuidanceGroup {
 /// Resolved guidance for a single command, ready for use at denial time.
 #[derive(Debug, Clone)]
 pub enum GuidanceEntry {
-    /// Static message (read, edit, scan, list groups).
+    /// Static message (read, edit groups).
     Static(String),
     /// Build group — message constructed at denial time from cwd context.
     Build(BuildGuidance),
+    /// Redirect to a Catenary command — short denial with `-h` output.
+    Redirect {
+        /// Catenary subcommand name (e.g., `"grep"`, `"glob"`).
+        command: String,
+        /// Opening line after the denial (e.g., "Use `catenary grep` for text + symbol search.").
+        summary: String,
+    },
 }
 
 /// Build-specific guidance with per-context message templates.
@@ -443,10 +455,18 @@ fn flatten_guidance(groups: &HashMap<String, GuidanceGroup>) -> HashMap<String, 
                     .clone()
                     .unwrap_or(defaults.message_cwd_unknown),
             })
+        } else if let Some(ref redirect) = group.redirect {
+            GuidanceEntry::Redirect {
+                command: redirect.clone(),
+                summary: group
+                    .summary
+                    .clone()
+                    .unwrap_or_else(|| format!("Use `catenary {redirect}` instead.")),
+            }
         } else if let Some(ref msg) = group.message {
             GuidanceEntry::Static(msg.clone())
         } else {
-            // No message and not build — skip this group.
+            // No message, not build, not redirect — skip this group.
             continue;
         };
         for cmd in &group.commands {

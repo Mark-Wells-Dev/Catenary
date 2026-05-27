@@ -126,7 +126,7 @@ config, so a root can specify its build tool without spawning
 servers.
 
 The earlier model (walk up from cwd, merge all sections) worked for
-single-project sessions. Multi-root sessions — where `catenary add-root` adds
+single-project sessions. Multi-root sessions — where `catenary roots add` adds
 roots with potentially conflicting configs — broke the assumption.
 The scope was narrowed to what is genuinely per-root: language server
 routing, server configuration, and command filtering.
@@ -149,7 +149,7 @@ are deep-merged over the user settings and returned. No `scopeUri` (or
 no matching root) returns user settings only.
 
 The interaction with `didChangeConfiguration`: this notification is
-triggered only by `catenary add-root` adding a root with a `.catenary.toml`.
+triggered only by `catenary roots add` adding a root with a `.catenary.toml`.
 The server re-sends `workspace/configuration` requests for its scopes
 and gets updated values. Live reload of `.catenary.toml` is out of
 scope — the user restarts the session to pick up project config edits.

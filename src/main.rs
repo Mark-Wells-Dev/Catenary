@@ -10,7 +10,7 @@
 #![allow(clippy::print_stderr, reason = "CLI tool needs to output to stderr")]
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{FromArgMatches, Parser, Subcommand};
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -27,7 +27,7 @@ use catenary_mcp::source::Source;
 /// Command-line arguments for Catenary.
 #[derive(Parser, Debug)]
 #[command(name = "catenary")]
-#[command(about = "Multiplexing bridge between MCP and multiple LSP servers")]
+#[command(about = "LSP-powered code intelligence for AI agents")]
 #[command(version = env!("CATENARY_VERSION"))]
 struct Args {
     /// The subcommand to run.
@@ -38,31 +38,75 @@ struct Args {
 /// Subcommands supported by Catenary.
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// List active Catenary sessions.
-    List,
+    /// Overview of Catenary's workflow and commands.
+    Primer,
 
-    /// Monitor events from a session.
-    Monitor {
-        /// Session ID or row number (use 'catenary list' to see available sessions).
-        id: String,
+    /// Search for a pattern with LSP-enriched results.
+    ///
+    /// Searches from the current working directory. Results within tracked
+    /// workspace roots include symbol context from LSP servers.
+    Grep {
+        /// Regex pattern (Rust/PCRE syntax, | for alternation).
+        pattern: String,
 
-        /// Show raw JSON output.
+        /// Scope the search (e.g., src/**/*.rs, **/*.{ts,js},
+        /// /home/user/project/**/*.py).
+        #[arg(name = "GLOB")]
+        glob: Option<String>,
+
+        /// Exclude matches (e.g., tests/**).
         #[arg(long)]
-        raw: bool,
+        exclude: Option<String>,
 
-        /// Disable colored output.
+        /// Page number for paged results [default: 1].
+        #[arg(long, default_value = "1")]
+        page: usize,
+
+        /// Include files ignored by .gitignore.
         #[arg(long)]
-        nocolor: bool,
+        include_gitignored: bool,
 
-        /// Filter events by regex pattern.
-        #[arg(long, short)]
-        filter: Option<String>,
+        /// Include hidden files and directories.
+        #[arg(long)]
+        include_hidden: bool,
     },
 
-    /// Show status of a session.
-    Status {
-        /// Session ID (use 'catenary list' to see available sessions).
-        id: String,
+    /// Browse the filesystem: file outlines, directory listings, glob patterns.
+    ///
+    /// Resolves against the current working directory. Results include symbol
+    /// outlines when LSP data is available.
+    Glob {
+        /// File, directory, or glob (e.g., src/, **/*.{rs,toml},
+        /// /home/user/project/src/).
+        pattern: String,
+
+        /// Exclude matches (e.g., tests/**).
+        #[arg(long)]
+        exclude: Option<String>,
+
+        /// Page number for paged results [default: 1].
+        #[arg(long, default_value = "1")]
+        page: usize,
+
+        /// Include files ignored by .gitignore.
+        #[arg(long)]
+        include_gitignored: bool,
+
+        /// Include hidden files and directories.
+        #[arg(long)]
+        include_hidden: bool,
+    },
+
+    /// Editing mode (start, stop).
+    Editing {
+        #[command(subcommand)]
+        command: EditingCommand,
+    },
+
+    /// Workspace root management (add, rm, ls).
+    Roots {
+        #[command(subcommand)]
+        command: RootsCommand,
     },
 
     /// Output a recommended annotated config template.
@@ -90,10 +134,102 @@ enum Command {
         diff: bool,
     },
 
+    /// Install or update the Catenary plugin for a host CLI.
+    Install {
+        #[command(subcommand)]
+        host: Option<InstallHost>,
+
+        /// Show what would change without acting.
+        #[arg(long, global = true)]
+        dry_run: bool,
+    },
+
+    /// Self-update the Catenary binary from GitHub releases.
+    Update {
+        /// Print whether an update is available without downloading.
+        #[arg(long)]
+        check: bool,
+
+        /// Re-download even if versions match.
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Stop the running Catenary daemon.
+    Stop,
+
+    /// Diagnostic and debugging tools (list, monitor, status, query, gc).
+    Debug {
+        #[command(subcommand)]
+        command: DebugCommand,
+    },
+
     /// Hook subcommands (invoked by host CLI hooks).
+    #[command(hide = true)]
     Hook {
         #[command(subcommand)]
         command: HookCommand,
+    },
+
+    /// Run as the Catenary daemon (internal, spawned by bridge proxy).
+    #[command(hide = true)]
+    Daemon,
+}
+
+/// Editing mode subcommands.
+#[derive(Subcommand, Debug)]
+enum EditingCommand {
+    /// Enter editing mode. Invoke via the host's shell tool.
+    Start,
+    /// Exit editing mode and print diagnostics. Invoke via the host's shell tool.
+    Stop,
+}
+
+/// Workspace root management subcommands.
+#[derive(Subcommand, Debug)]
+enum RootsCommand {
+    /// Add a workspace root.
+    Add {
+        /// Path to add as a workspace root.
+        path: PathBuf,
+    },
+    /// Remove a workspace root.
+    Rm {
+        /// Path to remove from workspace roots.
+        path: PathBuf,
+    },
+    /// List all tracked workspace roots with their source.
+    Ls,
+}
+
+/// Diagnostic and debugging subcommands.
+#[derive(Subcommand, Debug)]
+enum DebugCommand {
+    /// List active Catenary sessions.
+    List,
+
+    /// Monitor events from a session.
+    Monitor {
+        /// Session ID or row number (use 'catenary debug list' to see available sessions).
+        id: String,
+
+        /// Show raw JSON output.
+        #[arg(long)]
+        raw: bool,
+
+        /// Disable colored output.
+        #[arg(long)]
+        nocolor: bool,
+
+        /// Filter events by regex pattern.
+        #[arg(long, short)]
+        filter: Option<String>,
+    },
+
+    /// Show status of a session.
+    Status {
+        /// Session ID (use 'catenary debug list' to see available sessions).
+        id: String,
     },
 
     /// Query events from the database.
@@ -137,108 +273,6 @@ enum Command {
         #[arg(long)]
         session: Option<String>,
     },
-
-    /// Search for a pattern across the workspace.
-    Grep {
-        /// Regex pattern to search for (supports | for alternation).
-        pattern: String,
-
-        /// Glob pattern to scope the search (e.g., src/**/*.rs).
-        #[arg(long)]
-        glob: Option<String>,
-
-        /// Glob pattern to exclude from matches.
-        #[arg(long)]
-        exclude: Option<String>,
-
-        /// Page number for paged results (default: 1).
-        #[arg(long, default_value = "1")]
-        page: usize,
-
-        /// Include files ignored by .gitignore.
-        #[arg(long)]
-        include_gitignored: bool,
-
-        /// Include hidden files and directories.
-        #[arg(long)]
-        include_hidden: bool,
-    },
-
-    /// Browse the workspace: file outline, directory listing, or glob pattern.
-    Glob {
-        /// A file path, directory path, or glob pattern (e.g., 'src/', 'src/main.rs', '**/*.rs').
-        pattern: String,
-
-        /// Glob pattern to exclude from results.
-        #[arg(long)]
-        exclude: Option<String>,
-
-        /// Page number for paged results (default: 1).
-        #[arg(long, default_value = "1")]
-        page: usize,
-
-        /// Include files ignored by .gitignore.
-        #[arg(long)]
-        include_gitignored: bool,
-
-        /// Include hidden files and directories.
-        #[arg(long)]
-        include_hidden: bool,
-    },
-
-    /// Enter editing mode. Invoke via the host's shell tool.
-    #[command(name = "start_editing")]
-    StartEditing,
-
-    /// Exit editing mode and print diagnostics. Invoke via the host's shell tool.
-    #[command(name = "done_editing")]
-    DoneEditing,
-
-    /// Add a workspace root. Invoke via the host's shell tool.
-    #[command(name = "add-root")]
-    AddRoot {
-        /// Path to add as a workspace root.
-        path: PathBuf,
-    },
-
-    /// Remove a workspace root. Invoke via the host's shell tool.
-    #[command(name = "rm-root")]
-    RmRoot {
-        /// Path to remove from workspace roots.
-        path: PathBuf,
-    },
-
-    /// List all tracked workspace roots with their source.
-    #[command(name = "ls-roots")]
-    LsRoots,
-
-    /// Install or update the Catenary plugin for a host CLI.
-    Install {
-        #[command(subcommand)]
-        host: Option<InstallHost>,
-
-        /// Show what would change without acting.
-        #[arg(long, global = true)]
-        dry_run: bool,
-    },
-
-    /// Self-update the Catenary binary from GitHub releases.
-    Update {
-        /// Print whether an update is available without downloading.
-        #[arg(long)]
-        check: bool,
-
-        /// Re-download even if versions match.
-        #[arg(long)]
-        force: bool,
-    },
-
-    /// Run as the Catenary daemon (internal, spawned by bridge proxy).
-    #[command(hide = true)]
-    Daemon,
-
-    /// Stop the running Catenary daemon.
-    Stop,
 }
 
 /// Hook subcommands invoked by host CLI hooks.
@@ -307,9 +341,25 @@ enum InstallHost {
 /// non-Unix) build a standard tokio runtime on demand. The daemon
 /// builds its own runtime with larger thread stacks to accommodate its
 /// async state machines. The bridge proxy is entirely synchronous.
+/// Build the CLI `Command` with canonical help for agent-facing subcommands.
+///
+/// Starts from the derive-generated command, then replaces the `grep`,
+/// `glob`, `editing`, and `roots` subcommands with the canonical
+/// definitions from [`cli::command_help`]. This keeps the derive for
+/// typed argument extraction while using the shared help specs.
+fn canonical_command() -> clap::Command {
+    use clap::CommandFactory;
+    Args::command()
+        .mut_subcommand("grep", |_| cli::command_help::grep_command())
+        .mut_subcommand("glob", |_| cli::command_help::glob_command())
+        .mut_subcommand("editing", |_| cli::command_help::editing_command())
+        .mut_subcommand("roots", |_| cli::command_help::roots_command())
+}
+
 #[allow(clippy::too_many_lines, reason = "Dispatch table for all subcommands")]
 fn main() -> Result<()> {
-    let args = Args::parse();
+    let matches = canonical_command().get_matches();
+    let args = Args::from_arg_matches(&matches).context("parse CLI arguments")?;
 
     match args.command {
         None => {
@@ -328,102 +378,9 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Some(Command::List) => {
-            let mut out = cli::Output::stdout(false);
-            cli::commands::run_list(&mut out)
-        }
-        Some(Command::Config) => {
-            let mut out = cli::Output::stdout(false);
-            cli::config_template::print_template(&mut out);
+        Some(Command::Primer) => {
+            run_primer();
             Ok(())
-        }
-        Some(Command::Monitor {
-            id,
-            raw,
-            nocolor,
-            filter,
-        }) => {
-            let mut out = cli::Output::stdout(nocolor);
-            cli::commands::run_monitor(&mut out, &id, raw, filter.as_deref())
-        }
-        Some(Command::Status { id }) => {
-            let mut out = cli::Output::stdout(false);
-            cli::commands::run_status(&mut out, &id)
-        }
-        Some(Command::Doctor {
-            server,
-            root,
-            nocolor,
-            diff,
-        }) => {
-            let rt = build_runtime()?;
-            let mut out = cli::Output::stdout(nocolor);
-            if let Some(server_name) = server {
-                rt.block_on(cli::doctor::run_doctor_single(
-                    &mut out,
-                    &server_name,
-                    &root,
-                ))
-            } else {
-                rt.block_on(cli::doctor::run_doctor(&mut out, &root, diff))
-            }
-        }
-        Some(Command::Hook { command }) => {
-            // Install minimal tracing subscriber for hook CLI: only the
-            // desktop notification sink. When the daemon is unreachable,
-            // error!() events fire OS notifications directly from the
-            // hook process.
-            let hook_logging = LoggingServer::new();
-            tracing_subscriber::registry()
-                .with(hook_logging.clone())
-                .init();
-            let desktop_sink = catenary_mcp::notify::DesktopNotificationSink::new();
-            hook_logging.activate(vec![desktop_sink]);
-
-            match command {
-                HookCommand::PreAgent { format } => cli::hooks::run_pre_agent(format),
-                HookCommand::PreTool { format } => cli::hooks::run_pre_tool(format),
-                HookCommand::PostAgent { format } => cli::hooks::run_post_agent(format),
-                HookCommand::SessionStart { format } => cli::hooks::run_session_start(format),
-                HookCommand::SessionEnd { format } => cli::hooks::run_session_end(format),
-            }
-            Ok(())
-        }
-        Some(Command::Query {
-            session,
-            since,
-            kind,
-            search,
-            sql,
-            format,
-        }) => {
-            let conn = catenary_mcp::db::open_and_migrate()?;
-            let mut out = cli::Output::stdout(false);
-            cli::commands::run_query(
-                &mut out,
-                &conn,
-                session.as_deref(),
-                since.as_deref(),
-                kind.as_deref(),
-                search.as_deref(),
-                sql.as_deref(),
-                format,
-            )
-        }
-        Some(Command::Gc {
-            older_than,
-            dead,
-            session,
-        }) => {
-            let conn = catenary_mcp::db::open_and_migrate()?;
-            let mut out = cli::Output::stdout(false);
-            cli::commands::run_gc(
-                &mut out,
-                &conn,
-                older_than.as_deref(),
-                dead,
-                session.as_deref(),
-            )
         }
         #[cfg(unix)]
         Some(Command::Grep {
@@ -460,32 +417,50 @@ fn main() -> Result<()> {
         #[cfg(not(unix))]
         Some(Command::Glob { .. }) => Err(anyhow::anyhow!("daemon mode requires Unix")),
         #[cfg(unix)]
-        Some(Command::StartEditing) => build_runtime()?.block_on(run_start_editing()),
+        Some(Command::Editing { command }) => match command {
+            EditingCommand::Start => build_runtime()?.block_on(run_start_editing()),
+            EditingCommand::Stop => build_runtime()?.block_on(run_done_editing()),
+        },
         #[cfg(not(unix))]
-        Some(Command::StartEditing) => Err(anyhow::anyhow!("daemon mode requires Unix")),
+        Some(Command::Editing { .. }) => Err(anyhow::anyhow!("daemon mode requires Unix")),
         #[cfg(unix)]
-        Some(Command::DoneEditing) => build_runtime()?.block_on(run_done_editing()),
+        Some(Command::Roots { command }) => match command {
+            RootsCommand::Add { path } => {
+                build_runtime()?.block_on(run_root_command(path, "tool/add-root"))
+            }
+            RootsCommand::Rm { path } => {
+                build_runtime()?.block_on(run_root_command(path, "tool/rm-root"))
+            }
+            RootsCommand::Ls => {
+                let mut out = cli::Output::stdout(false);
+                build_runtime()?.block_on(cli::commands::run_ls_roots(&mut out))
+            }
+        },
         #[cfg(not(unix))]
-        Some(Command::DoneEditing) => Err(anyhow::anyhow!("daemon mode requires Unix")),
-        #[cfg(unix)]
-        Some(Command::AddRoot { path }) => {
-            build_runtime()?.block_on(run_root_command(path, "tool/add-root"))
-        }
-        #[cfg(not(unix))]
-        Some(Command::AddRoot { .. }) => Err(anyhow::anyhow!("daemon mode requires Unix")),
-        #[cfg(unix)]
-        Some(Command::RmRoot { path }) => {
-            build_runtime()?.block_on(run_root_command(path, "tool/rm-root"))
-        }
-        #[cfg(not(unix))]
-        Some(Command::RmRoot { .. }) => Err(anyhow::anyhow!("daemon mode requires Unix")),
-        #[cfg(unix)]
-        Some(Command::LsRoots) => {
+        Some(Command::Roots { .. }) => Err(anyhow::anyhow!("daemon mode requires Unix")),
+        Some(Command::Config) => {
             let mut out = cli::Output::stdout(false);
-            build_runtime()?.block_on(cli::commands::run_ls_roots(&mut out))
+            cli::config_template::print_template(&mut out);
+            Ok(())
         }
-        #[cfg(not(unix))]
-        Some(Command::LsRoots) => Err(anyhow::anyhow!("daemon mode requires Unix")),
+        Some(Command::Doctor {
+            server,
+            root,
+            nocolor,
+            diff,
+        }) => {
+            let rt = build_runtime()?;
+            let mut out = cli::Output::stdout(nocolor);
+            if let Some(server_name) = server {
+                rt.block_on(cli::doctor::run_doctor_single(
+                    &mut out,
+                    &server_name,
+                    &root,
+                ))
+            } else {
+                rt.block_on(cli::doctor::run_doctor(&mut out, &root, diff))
+            }
+        }
         Some(Command::Install { host, dry_run }) => {
             let mut out = cli::Output::stdout(false);
             match host {
@@ -506,13 +481,107 @@ fn main() -> Result<()> {
             cli::update::run_update(&mut out, check, force)
         }
         #[cfg(unix)]
-        Some(Command::Daemon) => run_daemon(),
-        #[cfg(not(unix))]
-        Some(Command::Daemon) => Err(anyhow::anyhow!("daemon mode requires Unix")),
-        #[cfg(unix)]
         Some(Command::Stop) => build_runtime()?.block_on(run_stop()),
         #[cfg(not(unix))]
         Some(Command::Stop) => Err(anyhow::anyhow!("daemon mode requires Unix")),
+        Some(Command::Debug { command }) => match command {
+            DebugCommand::List => {
+                let mut out = cli::Output::stdout(false);
+                cli::commands::run_list(&mut out)
+            }
+            DebugCommand::Monitor {
+                id,
+                raw,
+                nocolor,
+                filter,
+            } => {
+                let mut out = cli::Output::stdout(nocolor);
+                cli::commands::run_monitor(&mut out, &id, raw, filter.as_deref())
+            }
+            DebugCommand::Status { id } => {
+                let mut out = cli::Output::stdout(false);
+                cli::commands::run_status(&mut out, &id)
+            }
+            DebugCommand::Query {
+                session,
+                since,
+                kind,
+                search,
+                sql,
+                format,
+            } => {
+                let conn = catenary_mcp::db::open_and_migrate()?;
+                let mut out = cli::Output::stdout(false);
+                cli::commands::run_query(
+                    &mut out,
+                    &conn,
+                    session.as_deref(),
+                    since.as_deref(),
+                    kind.as_deref(),
+                    search.as_deref(),
+                    sql.as_deref(),
+                    format,
+                )
+            }
+            DebugCommand::Gc {
+                older_than,
+                dead,
+                session,
+            } => {
+                let conn = catenary_mcp::db::open_and_migrate()?;
+                let mut out = cli::Output::stdout(false);
+                cli::commands::run_gc(
+                    &mut out,
+                    &conn,
+                    older_than.as_deref(),
+                    dead,
+                    session.as_deref(),
+                )
+            }
+        },
+        Some(Command::Hook { command }) => {
+            // Install minimal tracing subscriber for hook CLI: only the
+            // desktop notification sink. When the daemon is unreachable,
+            // error!() events fire OS notifications directly from the
+            // hook process.
+            let hook_logging = LoggingServer::new();
+            tracing_subscriber::registry()
+                .with(hook_logging.clone())
+                .init();
+            let desktop_sink = catenary_mcp::notify::DesktopNotificationSink::new();
+            hook_logging.activate(vec![desktop_sink]);
+
+            match command {
+                HookCommand::PreAgent { format } => cli::hooks::run_pre_agent(format),
+                HookCommand::PreTool { format } => cli::hooks::run_pre_tool(format),
+                HookCommand::PostAgent { format } => cli::hooks::run_post_agent(format),
+                HookCommand::SessionStart { format } => cli::hooks::run_session_start(format),
+                HookCommand::SessionEnd { format } => cli::hooks::run_session_end(format),
+            }
+            Ok(())
+        }
+        #[cfg(unix)]
+        Some(Command::Daemon) => run_daemon(),
+        #[cfg(not(unix))]
+        Some(Command::Daemon) => Err(anyhow::anyhow!("daemon mode requires Unix")),
+    }
+}
+
+/// Print an overview of Catenary's workflow and commands.
+///
+/// Uses the canonical command definitions from [`cli::command_help`].
+/// When help text changes, `primer` updates automatically — both this
+/// function and `render_subcommand_help` consume the same specs.
+fn run_primer() {
+    let commands = cli::command_help::primer_commands();
+    for (i, mut cmd) in commands.into_iter().enumerate() {
+        if i > 0 {
+            println!("\n─────────────────────────────────────────────────");
+        }
+        let name = cmd.get_name().to_string();
+        cmd = cmd.bin_name(format!("catenary {name}"));
+        let help = cmd.render_help();
+        println!("{help}");
     }
 }
 
@@ -1253,14 +1322,32 @@ mod tests {
         assert!(matches!(args.command, Some(Command::Config)));
     }
 
-    // ── CLI start_editing subcommand test ─────────────────────────
+    // ── CLI editing subcommand tests ───────────────────────────────
 
     #[test]
-    fn test_cli_start_editing() {
+    fn test_cli_editing_start() {
         use clap::Parser;
-        let args = Args::try_parse_from(["catenary", "start_editing"]);
-        let args = args.expect("start_editing should parse");
-        assert!(matches!(args.command, Some(Command::StartEditing)));
+        let args = Args::try_parse_from(["catenary", "editing", "start"]);
+        let args = args.expect("editing start should parse");
+        assert!(matches!(
+            args.command,
+            Some(Command::Editing {
+                command: EditingCommand::Start
+            })
+        ));
+    }
+
+    #[test]
+    fn test_cli_editing_stop() {
+        use clap::Parser;
+        let args = Args::try_parse_from(["catenary", "editing", "stop"]);
+        let args = args.expect("editing stop should parse");
+        assert!(matches!(
+            args.command,
+            Some(Command::Editing {
+                command: EditingCommand::Stop
+            })
+        ));
     }
 
     // ── CLI grep subcommand tests ──────────────────────────────────
@@ -1290,13 +1377,36 @@ mod tests {
     }
 
     #[test]
+    fn test_cli_grep_positional_glob() {
+        use clap::Parser;
+        let args = Args::try_parse_from(["catenary", "grep", "foo|bar", "src/**/*.rs"]);
+        let args = args.expect("grep with positional glob should parse");
+        let Some(Command::Grep {
+            pattern,
+            glob,
+            exclude,
+            page,
+            include_gitignored,
+            include_hidden,
+        }) = args.command
+        else {
+            unreachable!("expected Grep command");
+        };
+        assert_eq!(pattern, "foo|bar");
+        assert_eq!(glob.as_deref(), Some("src/**/*.rs"));
+        assert!(exclude.is_none());
+        assert_eq!(page, 1);
+        assert!(!include_gitignored);
+        assert!(!include_hidden);
+    }
+
+    #[test]
     fn test_cli_grep_all_flags() {
         use clap::Parser;
         let args = Args::try_parse_from([
             "catenary",
             "grep",
             "foo|bar",
-            "--glob",
             "src/**/*.rs",
             "--exclude",
             "tests/",
@@ -1395,46 +1505,98 @@ mod tests {
         assert!(result.is_err(), "glob without pattern should fail");
     }
 
-    // ── CLI done_editing subcommand test ──────────────────────────
+    // ── CLI roots subcommand tests ──────────────────────────────────
 
     #[test]
-    fn test_cli_done_editing() {
+    fn test_cli_roots_add() {
         use clap::Parser;
-        let args = Args::try_parse_from(["catenary", "done_editing"]);
-        let args = args.expect("done_editing should parse");
-        assert!(matches!(args.command, Some(Command::DoneEditing)));
-    }
-
-    // ── CLI root management subcommand tests ─────────────────────
-
-    #[test]
-    fn test_cli_add_root() {
-        use clap::Parser;
-        let args = Args::try_parse_from(["catenary", "add-root", "/tmp/project"]);
-        let args = args.expect("add-root should parse");
-        let Some(Command::AddRoot { path }) = args.command else {
-            unreachable!("expected AddRoot command");
+        let args = Args::try_parse_from(["catenary", "roots", "add", "/tmp/project"]);
+        let args = args.expect("roots add should parse");
+        let Some(Command::Roots {
+            command: RootsCommand::Add { path },
+        }) = args.command
+        else {
+            unreachable!("expected Roots Add command");
         };
         assert_eq!(path, PathBuf::from("/tmp/project"));
     }
 
     #[test]
-    fn test_cli_rm_root() {
+    fn test_cli_roots_rm() {
         use clap::Parser;
-        let args = Args::try_parse_from(["catenary", "rm-root", "/tmp/project"]);
-        let args = args.expect("rm-root should parse");
-        let Some(Command::RmRoot { path }) = args.command else {
-            unreachable!("expected RmRoot command");
+        let args = Args::try_parse_from(["catenary", "roots", "rm", "/tmp/project"]);
+        let args = args.expect("roots rm should parse");
+        let Some(Command::Roots {
+            command: RootsCommand::Rm { path },
+        }) = args.command
+        else {
+            unreachable!("expected Roots Rm command");
         };
         assert_eq!(path, PathBuf::from("/tmp/project"));
     }
 
     #[test]
-    fn test_cli_ls_roots() {
+    fn test_cli_roots_ls() {
         use clap::Parser;
-        let args = Args::try_parse_from(["catenary", "ls-roots"]);
-        let args = args.expect("ls-roots should parse");
-        assert!(matches!(args.command, Some(Command::LsRoots)));
+        let args = Args::try_parse_from(["catenary", "roots", "ls"]);
+        let args = args.expect("roots ls should parse");
+        assert!(matches!(
+            args.command,
+            Some(Command::Roots {
+                command: RootsCommand::Ls
+            })
+        ));
+    }
+
+    // ── CLI debug subcommand tests ──────────────────────────────────
+
+    #[test]
+    fn test_cli_debug_list() {
+        use clap::Parser;
+        let args = Args::try_parse_from(["catenary", "debug", "list"]);
+        let args = args.expect("debug list should parse");
+        assert!(matches!(
+            args.command,
+            Some(Command::Debug {
+                command: DebugCommand::List
+            })
+        ));
+    }
+
+    #[test]
+    fn test_cli_debug_monitor() {
+        use clap::Parser;
+        let args = Args::try_parse_from(["catenary", "debug", "monitor", "abc123"]);
+        let args = args.expect("debug monitor should parse");
+        let Some(Command::Debug {
+            command: DebugCommand::Monitor { id, .. },
+        }) = args.command
+        else {
+            unreachable!("expected Debug Monitor command");
+        };
+        assert_eq!(id, "abc123");
+    }
+
+    #[test]
+    fn test_cli_debug_status() {
+        use clap::Parser;
+        let args = Args::try_parse_from(["catenary", "debug", "status", "abc123"]);
+        let args = args.expect("debug status should parse");
+        let Some(Command::Debug {
+            command: DebugCommand::Status { id },
+        }) = args.command
+        else {
+            unreachable!("expected Debug Status command");
+        };
+        assert_eq!(id, "abc123");
+    }
+
+    #[test]
+    fn test_cli_primer() {
+        use clap::Parser;
+        let args = Args::try_parse_from(["catenary", "primer"]);
+        let args = args.expect("primer should parse");
+        assert!(matches!(args.command, Some(Command::Primer)));
     }
 
     // ── CLI install subcommand tests ────────────────────────────────

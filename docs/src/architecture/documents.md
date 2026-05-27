@@ -37,7 +37,7 @@ never gets an open.
 
 ### `diagnostic_servers` — broadcast open
 
-Used by the `done_editing` pipeline. `diagnostic_servers` on
+Used by the `editing stop` pipeline. `diagnostic_servers` on
 `LspClientManager` returns every server where `diagnostics_enabled`
 is true for the file's language binding. It applies both the
 capability gate (`supports_diagnostics`) and the config-level filter
@@ -68,7 +68,7 @@ opened for that request is closed.
 
 This is a deliberate design choice from the waitv2 rewrite. Stateless
 lifecycle eliminates migration concerns when routing changes mid-session
-— for example, when `catenary add-root` shifts which server handles a file, or
+— for example, when `catenary roots add` shifts which server handles a file, or
 when a project-scoped server is spawned that shadows a workspace
 instance. There is no accumulated document state to reconcile when
 ownership changes.
@@ -98,7 +98,7 @@ by the next edit.
 
 ### The solution
 
-`start_editing` and `done_editing` bracket a batch of file edits.
+`editing start` and `editing stop` bracket a batch of file edits.
 During editing mode:
 
 - **No LSP traffic for intermediate edits.** The agent edits freely
@@ -112,16 +112,16 @@ During editing mode:
   mode boundaries. Only edit-related tools (Edit, Write, Read, and
   filesystem Bash commands like `rm`, `cp`, `mv`) are allowed during
   editing. Attempting to call grep, glob, or any other tool produces
-  a denial message telling the agent to call `done_editing` first.
+  a denial message telling the agent to call `editing stop` first.
   Conversely, attempting to use Edit/Write on workspace files without
-  `start_editing` first produces a denial.
-- **Batched diagnostics.** When the agent calls `done_editing`, the
+  `editing start` first produces a denial.
+- **Batched diagnostics.** When the agent calls `editing stop`, the
   `DiagnosticsServer` runs a single consolidated diagnostic pipeline
   across all modified files.
 
-### The `done_editing` pipeline
+### The `editing stop` pipeline
 
-`done_editing` triggers a multi-phase pipeline on `DiagnosticsServer`:
+`editing stop` triggers a multi-phase pipeline on `DiagnosticsServer`:
 
 1. **File change notifications.** `notify_file_changes()` runs first,
    so servers know about any filesystem changes (new files, deletes)
@@ -170,10 +170,10 @@ reflect the fully consistent state.
 has the real `agent_id` from the host CLI) and the IPC router (which
 handles CLI commands) access it through `Session`.
 
-`catenary start_editing` and `catenary done_editing` are CLI commands
+`catenary editing start` and `catenary editing stop` are CLI commands
 invoked via the host's shell tool. The `PreToolUse` hook owns the
-state transition for `start_editing` (because it has the `agent_id`),
-and the IPC router handles the diagnostic pipeline for `done_editing`
+state transition for `editing start` (because it has the `agent_id`),
+and the IPC router handles the diagnostic pipeline for `editing stop`
 (because it produces the stdout output). `SessionStart` clears any
 stale editing state from a previous agent context.
 
@@ -244,7 +244,7 @@ glob matching and notification loop.
 
 ### Interaction with editing mode
 
-`done_editing` calls `FilesystemManager::mark_current()` after
+`editing stop` calls `FilesystemManager::mark_current()` after
 processing diagnostics. This re-stats every processed file and
 updates its mtime in the cache. Without this step, the next
 `diff()` at the next tool boundary would report every edited file
@@ -264,7 +264,7 @@ the cache — the next `diff()` will not report them as deleted again.
   change notification before dispatching grep and glob requests. This
   ensures servers have up-to-date awareness of the filesystem state
   before the agent queries them.
-- **At the start of `done_editing`.** The diagnostic pipeline calls
+- **At the start of `editing stop`.** The diagnostic pipeline calls
   `notify_file_changes()` first, so servers know about any file
   creates or deletes before receiving `didOpen` for modified files.
 

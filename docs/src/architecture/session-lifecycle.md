@@ -106,8 +106,8 @@ follows this sequence:
      search, LSP enrichment.
    - `glob` → `GlobServer` — file listing with structural symbol
      outlines from LSP `documentSymbol`.
-   - `start_editing` → enters editing mode (defers diagnostics).
-   - `done_editing` → exits editing mode, runs batched diagnostics
+   - `editing start` → enters editing mode (defers diagnostics).
+   - `editing stop` → exits editing mode, runs batched diagnostics
      across all modified files.
 
 3. **LSP interaction.** Application servers use `LspClientManager` to
@@ -122,21 +122,21 @@ follows this sequence:
 
 ### Editing mode
 
-`catenary start_editing` and `catenary done_editing` bracket a batch of
+`catenary editing start` and `catenary editing stop` bracket a batch of
 file edits. The host CLI's Edit/Write tools modify files directly;
 Catenary's `PreToolUse` hook tracks which files are modified. When
-`catenary done_editing` is called, `DiagnosticsServer` opens all
+`catenary editing stop` is called, `DiagnosticsServer` opens all
 modified files on their respective language servers, waits for each
 server to settle, retrieves diagnostics, and prints a consolidated
 report to stdout.
 
 During editing mode, the `PreToolUse` hook enforces boundaries: only
 edit-related tools (Edit, Write, and filesystem Bash commands) are
-allowed without calling `done_editing` first.
+allowed without calling `editing stop` first.
 
 ## Mid-session root addition
 
-When a workspace root is added (`catenary add-root <path>` via the
+When a workspace root is added (`catenary roots add <path>` via the
 host's shell tool, or via MCP `roots/list` update), Catenary processes
 it through `Session::sync_roots`:
 

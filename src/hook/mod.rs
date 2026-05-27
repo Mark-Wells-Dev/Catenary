@@ -129,10 +129,10 @@ pub(crate) enum HookRequest {
         session_id: Option<String>,
     },
 
-    /// Enter editing mode via CLI command (`catenary start_editing`).
+    /// Enter editing mode via CLI command (`catenary editing start`).
     ///
     /// Sent by the `PreToolUse` hook when the agent runs
-    /// `catenary start_editing` via the host's shell tool. The daemon
+    /// `catenary editing start` via the host's shell tool. The daemon
     /// enters editing mode for the session.
     #[serde(rename = "pre-tool/start-editing")]
     PreToolStartEditing {
@@ -166,7 +166,7 @@ pub(crate) enum HookRequest {
         format: Option<String>,
     },
 
-    /// Force `done_editing` before the agent stops.
+    /// Force `editing stop` before the agent stops.
     #[serde(rename = "post-agent/require-release")]
     PostAgent {
         /// Agent ID (empty string for the main agent).
@@ -180,10 +180,10 @@ pub(crate) enum HookRequest {
         stop_hook_active: bool,
     },
 
-    /// Prepare handoff for `catenary done_editing` CLI command.
+    /// Prepare handoff for `catenary editing stop` CLI command.
     ///
     /// Sent by the `PreToolUse` hook when the agent runs
-    /// `catenary done_editing` via the host's shell tool. The daemon
+    /// `catenary editing stop` via the host's shell tool. The daemon
     /// acquires the handoff lock, drains accumulated files, releases
     /// the editing guardrail, and deposits the file list in the
     /// handoff slot for the subsequent `done-editing/run` request.
@@ -203,9 +203,9 @@ pub(crate) enum HookRequest {
         session_id: Option<String>,
     },
 
-    /// Execute the `done_editing` pipeline and return diagnostics.
+    /// Execute the `editing stop` pipeline and return diagnostics.
     ///
-    /// Sent by the `catenary done_editing` CLI command after the
+    /// Sent by the `catenary editing stop` CLI command after the
     /// `PreToolUse` hook has prepared the handoff slot. Takes the file
     /// list from the slot, runs `process_files_batched`, and returns
     /// formatted diagnostics.
@@ -502,7 +502,7 @@ mod tests {
 
     #[test]
     fn hook_result_deny_round_trip() {
-        let original = HookResult::Deny("call start_editing first".into());
+        let original = HookResult::Deny("call editing start first".into());
         let json = serde_json::to_string(&original).expect("serialize");
         let parsed: HookResult = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed, original);
@@ -510,7 +510,7 @@ mod tests {
 
     #[test]
     fn hook_result_block_round_trip() {
-        let original = HookResult::Block("call done_editing first".into());
+        let original = HookResult::Block("call editing stop first".into());
         let json = serde_json::to_string(&original).expect("serialize");
         let parsed: HookResult = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed, original);
@@ -883,14 +883,14 @@ mod tests {
     #[test]
     fn envelope_result_only() {
         let env = HookResponseEnvelope {
-            result: Some(HookResult::Deny("call start_editing first".into())),
+            result: Some(HookResult::Deny("call editing start first".into())),
             system_message: None,
         };
         let json = serde_json::to_string(&env).expect("serialize");
         let parsed: HookResponseEnvelope = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(
             parsed.result,
-            Some(HookResult::Deny("call start_editing first".into()))
+            Some(HookResult::Deny("call editing start first".into()))
         );
         assert!(parsed.system_message.is_none());
         // system_message should be absent from JSON (skip_serializing_if)
@@ -987,7 +987,7 @@ mod tests {
     #[test]
     fn hook_block_emits_at_info() {
         let env = HookResponseEnvelope {
-            result: Some(HookResult::Deny("call start_editing first".into())),
+            result: Some(HookResult::Deny("call editing start first".into())),
             system_message: None,
         };
         let level = HookServer::hook_outcome_level("pre-tool/editing-state", &env);

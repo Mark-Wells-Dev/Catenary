@@ -37,15 +37,15 @@ surfaces share the same LSP server pool. None depends on the others.
   `plugins/catenary/hooks/hooks.json` (Claude Code), `hooks/hooks.json`
   (Gemini CLI), and `plugins/catenary-antigravity/hooks.json` (Antigravity CLI).
 - **CLI commands:** Editing lifecycle invoked via the host's shell tool:
-  - `catenary start_editing` — enter editing mode (diagnostics deferred).
-  - `catenary done_editing` — exit editing mode, print LSP diagnostics for all
+  - `catenary editing start` — enter editing mode (diagnostics deferred).
+  - `catenary editing stop` — exit editing mode, print LSP diagnostics for all
     modified files to stdout.
-  - `catenary add-root <path>` / `catenary rm-root <path>` — manage workspace
+  - `catenary roots add <path>` / `catenary roots rm <path>` — manage workspace
     roots.
-- **Diagnostics:** `catenary done_editing` triggers the diagnostics pipeline:
+- **Diagnostics:** `catenary editing stop` triggers the diagnostics pipeline:
   batch all modified files, send to LSP servers, collect diagnostics, print to
   stdout. The agent sees diagnostics in the shell tool output. Diagnostic events
-  are stored in the SQLite database for later querying via `catenary query`.
+  are stored in the SQLite database for later querying via `catenary debug query`.
 - **Logging:** `LoggingServer` is a `tracing_subscriber::Layer` that subscribes
   to every tracing event and dispatches to multiple sinks: notification queue
   (user-facing `systemMessage`), protocol DB (LSP/MCP/hook messages), and trace

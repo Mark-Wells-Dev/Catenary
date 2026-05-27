@@ -156,12 +156,12 @@ fn test_client_info_stored_in_session() -> Result<()> {
     // Small delay to allow session update
     std::thread::sleep(Duration::from_millis(200));
 
-    // Run catenary list with the bridge's isolated state dir
+    // Run catenary debug list with the bridge's isolated state dir
     let output = Command::new(env!("CARGO_BIN_EXE_catenary"))
-        .arg("list")
+        .args(["debug", "list"])
         .env("XDG_STATE_HOME", bridge.state_home())
         .output()
-        .context("Failed to run catenary list")?;
+        .context("Failed to run catenary debug list")?;
 
     let stdout_str = String::from_utf8_lossy(&output.stdout);
 

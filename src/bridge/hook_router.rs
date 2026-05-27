@@ -501,7 +501,7 @@ impl HookRouter {
                 None
             } else {
                 Some(HookResult::Deny(
-                    "run `catenary done_editing` to get diagnostics".into(),
+                    "run `catenary editing stop` to get diagnostics".into(),
                 ))
             }
         } else if is_edit_tool(tool_name) {
@@ -515,7 +515,7 @@ impl HookRouter {
                 return None;
             }
             Some(HookResult::Deny(
-                "run `catenary start_editing` before editing".into(),
+                "run `catenary editing start` before editing".into(),
             ))
         } else {
             None
@@ -574,7 +574,7 @@ impl HookRouter {
 
         if self.session.editing.is_editing(session_id, agent_id) {
             Some(HookResult::Block(
-                "run `catenary done_editing` to get diagnostics before finishing".into(),
+                "run `catenary editing stop` to get diagnostics before finishing".into(),
             ))
         } else {
             None
@@ -678,7 +678,7 @@ mod tests {
         let Some(HookResult::Deny(reason)) = result else {
             unreachable!("expected Deny, got {result:?}");
         };
-        assert!(reason.contains("start_editing"));
+        assert!(reason.contains("editing start"));
     }
 
     #[test]
@@ -700,7 +700,7 @@ mod tests {
         let Some(HookResult::Deny(reason)) = result else {
             unreachable!("expected Deny for Bash, got {result:?}");
         };
-        assert!(reason.contains("done_editing"));
+        assert!(reason.contains("editing stop"));
     }
 
     #[test]
@@ -732,7 +732,7 @@ mod tests {
         let Some(HookResult::Block(reason)) = result else {
             unreachable!("expected Block, got {result:?}");
         };
-        assert!(reason.contains("done_editing"));
+        assert!(reason.contains("editing stop"));
     }
 
     #[test]
@@ -848,7 +848,7 @@ mod tests {
         let Some(HookResult::Deny(reason)) = result else {
             unreachable!("expected Deny for in-root edit, got {result:?}");
         };
-        assert!(reason.contains("catenary start_editing"));
+        assert!(reason.contains("catenary editing start"));
     }
 
     #[test]
@@ -985,7 +985,7 @@ mod tests {
         let Some(HookResult::Deny(reason)) = result else {
             unreachable!("expected Deny for single_file out-of-root edit, got {result:?}");
         };
-        assert!(reason.contains("catenary start_editing"));
+        assert!(reason.contains("catenary editing start"));
     }
 
     #[test]
@@ -1130,7 +1130,7 @@ mod tests {
         let Some(HookResult::Deny(reason)) = result else {
             unreachable!("expected Deny for non-filesystem Bash, got {result:?}");
         };
-        assert!(reason.contains("done_editing"));
+        assert!(reason.contains("editing stop"));
     }
 
     #[test]
