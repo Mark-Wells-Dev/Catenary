@@ -92,6 +92,7 @@ fn resolve_params_against_dir(tool: &str, params: &mut Value, dir: &Path) {
         }
         "glob" => {
             resolve_param(params, "pattern", dir);
+            resolve_param(params, "exclude", dir);
         }
         _ => {}
     }
@@ -349,14 +350,14 @@ mod tests {
     }
 
     #[test]
-    fn resolve_glob_does_not_resolve_exclude() {
+    fn resolve_glob_resolves_exclude() {
         let mut params = serde_json::json!({"pattern": "/abs/path", "exclude": "test_*"});
         let dir = Path::new("/project");
         resolve_params_against_dir("glob", &mut params, dir);
         // pattern is absolute → unchanged
         assert_eq!(params["pattern"].as_str(), Some("/abs/path"));
-        // exclude is NOT resolved for glob (not in scope per ticket)
-        assert_eq!(params["exclude"].as_str(), Some("test_*"));
+        // exclude is resolved against dir — same as grep
+        assert_eq!(params["exclude"].as_str(), Some("/project/test_*"));
     }
 
     #[test]

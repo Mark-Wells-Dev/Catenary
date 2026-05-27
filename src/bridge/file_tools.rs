@@ -15,7 +15,6 @@
 //! When results exceed the budget, output is paged via the `page` parameter.
 
 use anyhow::{Result, anyhow};
-use globset::Glob;
 use ignore::WalkBuilder;
 use serde::Deserialize;
 use serde_json::Value;
@@ -374,9 +373,11 @@ impl ToolServer for GlobServer {
 
         tracing::debug!("glob: {pattern}");
 
-        // Compile exclude pattern if provided. Patterns without a path
-        // separator match the basename (like `**/pat`) so the agent can
-        // write `exclude="test_*"` instead of `exclude="**/test_*"`.
+        // Compile exclude pattern via ResolvedGlob — same semantics as
+        // grep's exclude. Absolute patterns (including those resolved
+        // against cwd by the CLI router) match against full paths.
+        // Relative patterns without a path separator get a `**/` prefix
+        // so that `exclude="test_*"` matches basenames at any depth.
         let exclude = input
             .exclude
             .as_deref()
@@ -387,9 +388,7 @@ impl ToolServer for GlobServer {
                 } else {
                     format!("**/{pat}")
                 };
-                Glob::new(&effective)
-                    .map(|g| g.compile_matcher())
-                    .map_err(|e| anyhow!("Invalid exclude pattern: {e}"))
+                ResolvedGlob::new(&effective)
             })
             .transpose()?;
 
@@ -533,7 +532,7 @@ impl GlobServer {
         &self,
         dir: &Path,
         input: &GlobInput,
-        exclude: Option<&globset::GlobMatcher>,
+        exclude: Option<&ResolvedGlob>,
         page: usize,
         cwd: Option<&Path>,
     ) -> Result<String> {
@@ -574,9 +573,9 @@ impl GlobServer {
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
 
-            // Apply exclude filter against the entry name.
-            if let Some(matcher) = exclude
-                && matcher.is_match(&name)
+            // Apply exclude filter against the entry path.
+            if let Some(rg) = exclude
+                && rg.is_match(&entry_path, &canonical)
             {
                 continue;
             }
@@ -716,7 +715,7 @@ impl GlobServer {
         &self,
         pattern: &str,
         input: &GlobInput,
-        exclude: Option<&globset::GlobMatcher>,
+        exclude: Option<&ResolvedGlob>,
         page: usize,
         cwd: Option<&Path>,
     ) -> Result<String> {
@@ -773,8 +772,8 @@ impl GlobServer {
                 }
 
                 if resolved.is_match(entry_path, root) {
-                    if let Some(matcher) = exclude
-                        && matcher.is_match(entry_path.strip_prefix(root).unwrap_or(entry_path))
+                    if let Some(rg) = exclude
+                        && rg.is_match(entry_path, root)
                     {
                         continue;
                     }
@@ -1522,6 +1521,7 @@ fn build_sa_paths(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use globset::Glob;
 
     #[test]
     #[allow(clippy::expect_used, reason = "test assertions")]

@@ -165,6 +165,28 @@ enum Command {
         include_hidden: bool,
     },
 
+    /// Browse the workspace: file outline, directory listing, or glob pattern.
+    Glob {
+        /// A file path, directory path, or glob pattern (e.g., 'src/', 'src/main.rs', '**/*.rs').
+        pattern: String,
+
+        /// Glob pattern to exclude from results.
+        #[arg(long)]
+        exclude: Option<String>,
+
+        /// Page number for paged results (default: 1).
+        #[arg(long, default_value = "1")]
+        page: usize,
+
+        /// Include files ignored by .gitignore.
+        #[arg(long)]
+        include_gitignored: bool,
+
+        /// Include hidden files and directories.
+        #[arg(long)]
+        include_hidden: bool,
+    },
+
     /// Enter editing mode. Invoke via the host's shell tool.
     #[command(name = "start_editing")]
     StartEditing,
@@ -422,6 +444,22 @@ fn main() -> Result<()> {
         )),
         #[cfg(not(unix))]
         Some(Command::Grep { .. }) => Err(anyhow::anyhow!("daemon mode requires Unix")),
+        #[cfg(unix)]
+        Some(Command::Glob {
+            pattern,
+            exclude,
+            page,
+            include_gitignored,
+            include_hidden,
+        }) => build_runtime()?.block_on(run_glob(
+            pattern,
+            exclude,
+            page,
+            include_gitignored,
+            include_hidden,
+        )),
+        #[cfg(not(unix))]
+        Some(Command::Glob { .. }) => Err(anyhow::anyhow!("daemon mode requires Unix")),
         #[cfg(unix)]
         Some(Command::StartEditing) => build_runtime()?.block_on(run_start_editing()),
         #[cfg(not(unix))]
@@ -821,6 +859,73 @@ async fn run_grep(
 
     let response: catenary_mcp::router::GrepResponse =
         serde_json::from_str(trimmed).context("invalid grep response from daemon")?;
+    if !response.output.is_empty() {
+        println!("{}", response.output);
+    }
+
+    Ok(())
+}
+
+/// Runs a glob query against the running daemon.
+///
+/// Connects to the daemon's IPC socket, sends a [`GlobRequest`], and
+/// prints the rendered output to stdout. The daemon resolves relative
+/// patterns against `cwd` before dispatching to the glob pipeline.
+///
+/// # Errors
+///
+/// Returns an error if no daemon is running or the query fails.
+#[cfg(unix)]
+async fn run_glob(
+    pattern: String,
+    exclude: Option<String>,
+    page: usize,
+    include_gitignored: bool,
+    include_hidden: bool,
+) -> Result<()> {
+    use catenary_mcp::router::{GlobRequest, METHOD_GLOB};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let cwd = std::env::current_dir().context("cannot determine working directory")?;
+    let ipc_path = catenary_mcp::router::socket_path();
+
+    let stream = tokio::net::UnixStream::connect(&ipc_path)
+        .await
+        .context("no daemon running — start a Catenary session first")?;
+
+    let (reader, mut writer) = stream.into_split();
+
+    let request = GlobRequest {
+        cwd,
+        pattern,
+        exclude,
+        page,
+        include_gitignored,
+        include_hidden,
+    };
+    let mut envelope = serde_json::to_value(&request)?;
+    envelope
+        .as_object_mut()
+        .context("request is not an object")?
+        .insert(
+            "method".to_string(),
+            serde_json::Value::String(METHOD_GLOB.to_string()),
+        );
+    let mut payload = serde_json::to_string(&envelope)?;
+    payload.push('\n');
+    writer.write_all(payload.as_bytes()).await?;
+
+    let mut buf_reader = BufReader::new(reader);
+    let mut line = String::new();
+    buf_reader.read_line(&mut line).await?;
+
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+
+    let response: catenary_mcp::router::GlobResponse =
+        serde_json::from_str(trimmed).context("invalid glob response from daemon")?;
     if !response.output.is_empty() {
         println!("{}", response.output);
     }
@@ -1240,6 +1345,69 @@ mod tests {
         use clap::Parser;
         let result = Args::try_parse_from(["catenary", "grep"]);
         assert!(result.is_err(), "grep without pattern should fail");
+    }
+
+    // ── CLI glob subcommand tests ──────────────────────────────────
+
+    #[test]
+    fn test_cli_glob_minimal() {
+        use clap::Parser;
+        let args = Args::try_parse_from(["catenary", "glob", "src/"]);
+        let args = args.expect("glob with pattern should parse");
+        let Some(Command::Glob {
+            pattern,
+            exclude,
+            page,
+            include_gitignored,
+            include_hidden,
+        }) = args.command
+        else {
+            unreachable!("expected Glob command");
+        };
+        assert_eq!(pattern, "src/");
+        assert!(exclude.is_none());
+        assert_eq!(page, 1);
+        assert!(!include_gitignored);
+        assert!(!include_hidden);
+    }
+
+    #[test]
+    fn test_cli_glob_all_flags() {
+        use clap::Parser;
+        let args = Args::try_parse_from([
+            "catenary",
+            "glob",
+            "**/*.rs",
+            "--exclude",
+            "target/**",
+            "--page",
+            "2",
+            "--include-gitignored",
+            "--include-hidden",
+        ]);
+        let args = args.expect("glob with all flags should parse");
+        let Some(Command::Glob {
+            pattern,
+            exclude,
+            page,
+            include_gitignored,
+            include_hidden,
+        }) = args.command
+        else {
+            unreachable!("expected Glob command");
+        };
+        assert_eq!(pattern, "**/*.rs");
+        assert_eq!(exclude.as_deref(), Some("target/**"));
+        assert_eq!(page, 2);
+        assert!(include_gitignored);
+        assert!(include_hidden);
+    }
+
+    #[test]
+    fn test_cli_glob_missing_pattern() {
+        use clap::Parser;
+        let result = Args::try_parse_from(["catenary", "glob"]);
+        assert!(result.is_err(), "glob without pattern should fail");
     }
 
     // ── CLI done_editing subcommand test ──────────────────────────

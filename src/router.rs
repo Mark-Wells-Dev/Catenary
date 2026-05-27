@@ -1274,6 +1274,94 @@ async fn handle_hook_dispatch(
         return Ok(());
     }
 
+    // ── Glob query ──────────────────────────────────────────────
+    //
+    // `tool/glob` is sent by `catenary glob`. Resolves relative
+    // patterns against `cwd`, dispatches to the glob pipeline, and
+    // returns the rendered output as a `GlobResponse`.
+    if method == METHOD_GLOB {
+        let glob_req: GlobRequest = serde_json::from_value(raw.clone())
+            .map_err(|e| anyhow!("invalid glob request: {e}"))?;
+
+        // Notify servers about filesystem changes before any LSP interaction.
+        ctx.primary.notify_file_changes().await;
+
+        // Build GlobInput-compatible params, resolving relative patterns
+        // against the CLI process's cwd.
+        let resolved_pattern = resolve_relative(&glob_req.pattern, &glob_req.cwd);
+        let mut params = serde_json::json!({
+            "pattern": resolved_pattern,
+            "page": glob_req.page,
+            "include_gitignored": glob_req.include_gitignored,
+            "include_hidden": glob_req.include_hidden,
+        });
+        if let Some(exclude) = glob_req.exclude {
+            let resolved = resolve_relative(&exclude, &glob_req.cwd);
+            params["exclude"] = serde_json::Value::String(resolved);
+        }
+
+        let parent_id = uuid::Uuid::new_v4().to_string();
+        let cancel = CancellationToken::new();
+
+        emit_hook_event(
+            tracing::Level::INFO,
+            "cli",
+            &method,
+            Some(&parent_id),
+            &raw.to_string(),
+            "incoming hook",
+        );
+
+        // Race glob execution against client disconnect so a killed
+        // CLI process doesn't leave the pipeline running indefinitely.
+        let cancel_on_disconnect = cancel.clone();
+        let output = tokio::select! {
+            result = ctx.primary.glob.execute(&params, Some(&parent_id), &cancel) => {
+                match result {
+                    Ok(v) => v.as_str().unwrap_or("").to_string(),
+                    Err(e) => format!("glob error: {e}"),
+                }
+            }
+            () = async {
+                use tokio::io::AsyncReadExt;
+                let mut buf = [0u8; 1];
+                let _ = buf_reader.read(&mut buf).await;
+                cancel_on_disconnect.cancel();
+            } => {
+                debug!(
+                    source = Source::DaemonDispatch.as_str(),
+                    "glob client disconnected — query cancelled",
+                );
+                emit_hook_event(
+                    tracing::Level::INFO,
+                    "cli",
+                    &method,
+                    Some(&parent_id),
+                    "client disconnected",
+                    "outgoing hook response",
+                );
+                return Ok(());
+            }
+        };
+
+        let response = GlobResponse { output };
+        let mut payload = serde_json::to_vec(&response)?;
+
+        emit_hook_event(
+            tracing::Level::INFO,
+            "cli",
+            &method,
+            Some(&parent_id),
+            std::str::from_utf8(&payload).unwrap_or_default(),
+            "outgoing hook response",
+        );
+
+        payload.push(b'\n');
+        writer.write_all(&payload).await?;
+        writer.shutdown().await?;
+        return Ok(());
+    }
+
     // ── Done editing handoff: prepare ────────────────────────────
     //
     // `pre-tool/done-editing-prepare` is sent by the PreToolUse
