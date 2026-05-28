@@ -547,12 +547,39 @@ fn collect_command_names(cmd: &str, names: &mut Vec<String>) {
     }
 }
 
+/// Top-level CLI command, set once at binary startup by [`set_cli_command`].
+///
+/// Used by [`render_subcommand_help`] to extract subcommand help text
+/// for denial redirect messages and error-help-on-stderr. Library code
+/// reads this; the binary sets it.
+static CLI_COMMAND: std::sync::OnceLock<clap::Command> = std::sync::OnceLock::new();
+
+/// Store the top-level CLI command for subcommand help rendering.
+///
+/// Called once from `main()` before any hook or command dispatch.
+/// Subsequent calls are no-ops.
+pub fn set_cli_command(cmd: clap::Command) {
+    CLI_COMMAND.set(cmd).ok();
+}
+
 /// Render the `-h` output for a Catenary subcommand.
 ///
-/// Delegates to [`super::command_help::render_help`], which uses the
-/// canonical command definitions shared with the binary.
+/// Looks up the named subcommand in the top-level CLI definition
+/// (set via [`set_cli_command`]), sets the bin name, suppresses the
+/// auto-generated `help` subcommand, and renders. Returns an empty
+/// string if the CLI command is not set or the subcommand is not found.
 fn render_subcommand_help(subcommand: &str) -> String {
-    super::command_help::render_help(subcommand)
+    let Some(cli) = CLI_COMMAND.get() else {
+        return String::new();
+    };
+    let Some(sub) = cli.find_subcommand(subcommand) else {
+        return String::new();
+    };
+    let mut sub = sub.clone();
+    sub = sub
+        .bin_name(format!("catenary {subcommand}"))
+        .disable_help_subcommand(true);
+    sub.render_help().to_string()
 }
 
 /// Resolve per-client template variables in guidance messages.

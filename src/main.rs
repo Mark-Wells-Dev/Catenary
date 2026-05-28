@@ -58,7 +58,7 @@ enum Command {
         #[arg(long)]
         exclude: Option<String>,
 
-        /// Page number for paged results [default: 1].
+        /// Page number for paged results.
         #[arg(long, default_value = "1")]
         page: usize,
 
@@ -84,7 +84,7 @@ enum Command {
         #[arg(long)]
         exclude: Option<String>,
 
-        /// Page number for paged results [default: 1].
+        /// Page number for paged results.
         #[arg(long, default_value = "1")]
         page: usize,
 
@@ -341,24 +341,12 @@ enum InstallHost {
 /// non-Unix) build a standard tokio runtime on demand. The daemon
 /// builds its own runtime with larger thread stacks to accommodate its
 /// async state machines. The bridge proxy is entirely synchronous.
-/// Build the CLI `Command` with canonical help for agent-facing subcommands.
-///
-/// Starts from the derive-generated command, then replaces the `grep`,
-/// `glob`, `editing`, and `roots` subcommands with the canonical
-/// definitions from [`cli::command_help`]. This keeps the derive for
-/// typed argument extraction while using the shared help specs.
-fn canonical_command() -> clap::Command {
-    use clap::CommandFactory;
-    Args::command()
-        .mut_subcommand("grep", |_| cli::command_help::grep_command())
-        .mut_subcommand("glob", |_| cli::command_help::glob_command())
-        .mut_subcommand("editing", |_| cli::command_help::editing_command())
-        .mut_subcommand("roots", |_| cli::command_help::roots_command())
-}
-
 #[allow(clippy::too_many_lines, reason = "Dispatch table for all subcommands")]
 fn main() -> Result<()> {
-    let matches = match canonical_command().try_get_matches() {
+    use clap::CommandFactory;
+    let cli = Args::command();
+    cli::command_filter::set_cli_command(cli.clone());
+    let matches = match cli.clone().try_get_matches() {
         Ok(m) => m,
         Err(e) => {
             // For agent-facing subcommands, append `-h` output so the
@@ -367,17 +355,21 @@ fn main() -> Result<()> {
             let subcommand = ["grep", "glob", "editing", "roots"]
                 .into_iter()
                 .find(|cmd| raw.contains(&format!("catenary {cmd}")));
-            if let Some(cmd) = subcommand {
-                let help = cli::command_help::render_help(cmd);
-                if !help.is_empty() {
-                    // Extract just the "error:" line, drop clap's tip/Usage/--help boilerplate.
-                    let error_line = raw
-                        .lines()
-                        .find(|l| l.starts_with("error:"))
-                        .unwrap_or(&raw);
-                    eprint!("{error_line}\n\n{help}");
-                    std::process::exit(2);
-                }
+            if let Some(cmd) = subcommand
+                && let Some(sub) = cli.find_subcommand(cmd)
+            {
+                let mut sub = sub.clone();
+                sub = sub
+                    .bin_name(format!("catenary {cmd}"))
+                    .disable_help_subcommand(true);
+                let help = sub.render_help().to_string();
+                // Extract just the "error:" line, drop clap's tip/Usage/--help boilerplate.
+                let error_line = raw
+                    .lines()
+                    .find(|l| l.starts_with("error:"))
+                    .unwrap_or(&raw);
+                eprint!("{error_line}\n\n{help}");
+                std::process::exit(2);
             }
             e.exit();
         }
@@ -592,18 +584,27 @@ fn main() -> Result<()> {
 
 /// Print an overview of Catenary's workflow and commands.
 ///
-/// Uses the canonical command definitions from [`cli::command_help`].
-/// When help text changes, `primer` updates automatically — both this
-/// function and `render_subcommand_help` consume the same specs.
+/// Extracts the agent-facing subcommands from the derive-generated CLI
+/// definition. When help text changes (via doc comments on the derive
+/// structs), `primer` updates automatically.
 fn run_primer() {
-    let commands = cli::command_help::primer_commands();
-    for (i, mut cmd) in commands.into_iter().enumerate() {
-        if i > 0 {
+    use clap::CommandFactory;
+    let app = Args::command();
+    let agent_commands = ["editing", "grep", "glob", "roots"];
+    let mut first = true;
+    for name in agent_commands {
+        let Some(sub) = app.find_subcommand(name) else {
+            continue;
+        };
+        if !first {
             println!("\n─────────────────────────────────────────────────");
         }
-        let name = cmd.get_name().to_string();
-        cmd = cmd.bin_name(format!("catenary {name}"));
-        let help = cmd.render_help();
+        first = false;
+        let mut sub = sub.clone();
+        sub = sub
+            .bin_name(format!("catenary {name}"))
+            .disable_help_subcommand(true);
+        let help = sub.render_help();
         println!("{help}");
     }
 }
