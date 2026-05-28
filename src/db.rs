@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 /// Current schema version. Bump when adding migrations.
-const SCHEMA_VERSION: u32 = 12;
+const SCHEMA_VERSION: u32 = 13;
 
 /// Resolve the Catenary state directory.
 ///
@@ -145,6 +145,9 @@ pub fn open_and_migrate_at(path: &Path) -> Result<Connection> {
             if version < 12 {
                 migrate_v11_to_v12(&conn)?;
             }
+            if version < 13 {
+                migrate_v12_to_v13(&conn)?;
+            }
         }
     } else {
         create_schema(&conn)?;
@@ -180,7 +183,7 @@ fn create_schema(conn: &Connection) -> Result<()> {
              key   TEXT PRIMARY KEY,
              value TEXT NOT NULL
          );
-         INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '12');
+         INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '13');
 
          CREATE TABLE IF NOT EXISTS sessions (
              id             TEXT PRIMARY KEY,
@@ -233,12 +236,15 @@ fn create_schema(conn: &Connection) -> Result<()> {
          CREATE INDEX IF NOT EXISTS idx_messages_parent_id_and_id ON messages(parent_id, id);
 
          CREATE TABLE IF NOT EXISTS language_servers (
-             session_id   TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-             language_id  TEXT NOT NULL,
-             server       TEXT NOT NULL,
-             scope_kind   TEXT NOT NULL,
-             scope_root   TEXT NOT NULL DEFAULT '',
-             state        TEXT NOT NULL,
+             session_id      TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+             language_id     TEXT NOT NULL,
+             server          TEXT NOT NULL,
+             scope_kind      TEXT NOT NULL,
+             scope_root      TEXT NOT NULL DEFAULT '',
+             state           TEXT NOT NULL,
+             progress_title  TEXT,
+             progress_pct    INTEGER,
+             last_message    TEXT,
              PRIMARY KEY (session_id, language_id, server, scope_kind, scope_root)
          );
 
@@ -694,6 +700,33 @@ fn migrate_v11_to_v12(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Migrates the database from schema version 12 to 13.
+///
+/// Adds `progress_title`, `progress_pct`, and `last_message` columns to
+/// the `language_servers` table. These columns store per-instance server
+/// noise (progress and log messages) so the TUI can read them without
+/// scanning the `messages` table.
+///
+/// # Errors
+///
+/// Returns an error if the column additions or version update fails.
+fn migrate_v12_to_v13(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "BEGIN IMMEDIATE;
+
+         ALTER TABLE language_servers ADD COLUMN progress_title TEXT;
+         ALTER TABLE language_servers ADD COLUMN progress_pct INTEGER;
+         ALTER TABLE language_servers ADD COLUMN last_message TEXT;
+
+         UPDATE meta SET value = '13' WHERE key = 'schema_version';
+
+         COMMIT;",
+    )
+    .context("failed to migrate schema from v12 to v13")?;
+
+    Ok(())
+}
+
 /// Reads the current schema version from the `meta` table.
 ///
 /// # Errors
@@ -712,6 +745,206 @@ fn current_schema_version(conn: &Connection) -> Result<u32> {
     version_str
         .parse::<u32>()
         .with_context(|| format!("invalid schema_version: {version_str}"))
+}
+
+// ── Server status persistence ────────────────────────────────────────
+
+/// Upserts a server instance row in the `language_servers` table.
+///
+/// Inserts if the instance key doesn't exist, updates `state` if it does.
+/// Progress and message columns are left unchanged on conflict.
+///
+/// # Errors
+///
+/// Returns an error if the SQL statement fails.
+pub fn upsert_server_state(
+    conn: &Connection,
+    session_id: &str,
+    language_id: &str,
+    server: &str,
+    scope_kind: &str,
+    scope_root: &str,
+    state: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO language_servers \
+             (session_id, language_id, server, scope_kind, scope_root, state) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+         ON CONFLICT (session_id, language_id, server, scope_kind, scope_root) \
+         DO UPDATE SET state = excluded.state",
+        rusqlite::params![
+            session_id,
+            language_id,
+            server,
+            scope_kind,
+            scope_root,
+            state
+        ],
+    )
+    .context("failed to upsert server state")?;
+    Ok(())
+}
+
+/// Updates the progress columns for a server instance.
+///
+/// Sets `progress_title` and `progress_pct`. Pass `None` to clear
+/// (e.g., on progress end).
+///
+/// # Errors
+///
+/// Returns an error if the SQL statement fails.
+#[allow(clippy::too_many_arguments, reason = "matches PK columns")]
+pub fn update_server_progress(
+    conn: &Connection,
+    session_id: &str,
+    language_id: &str,
+    server: &str,
+    scope_kind: &str,
+    scope_root: &str,
+    progress_title: Option<&str>,
+    progress_pct: Option<u32>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE language_servers \
+         SET progress_title = ?1, progress_pct = ?2 \
+         WHERE session_id = ?3 AND language_id = ?4 \
+           AND server = ?5 AND scope_kind = ?6 AND scope_root = ?7",
+        rusqlite::params![
+            progress_title,
+            progress_pct,
+            session_id,
+            language_id,
+            server,
+            scope_kind,
+            scope_root,
+        ],
+    )
+    .context("failed to update server progress")?;
+    Ok(())
+}
+
+/// Updates the `last_message` column for a server instance.
+///
+/// # Errors
+///
+/// Returns an error if the SQL statement fails.
+pub fn update_server_message(
+    conn: &Connection,
+    session_id: &str,
+    language_id: &str,
+    server: &str,
+    scope_kind: &str,
+    scope_root: &str,
+    message: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE language_servers \
+         SET last_message = ?1 \
+         WHERE session_id = ?2 AND language_id = ?3 \
+           AND server = ?4 AND scope_kind = ?5 AND scope_root = ?6",
+        rusqlite::params![
+            message,
+            session_id,
+            language_id,
+            server,
+            scope_kind,
+            scope_root
+        ],
+    )
+    .context("failed to update server message")?;
+    Ok(())
+}
+
+/// A row from the `language_servers` table with progress and message data.
+#[derive(Debug, Clone)]
+pub struct ServerStatusRow {
+    /// Session ID (database key).
+    pub session_id: String,
+    /// Language identifier.
+    pub language_id: String,
+    /// Server config name.
+    pub server: String,
+    /// Scope kind ("root", "`single_file`").
+    pub scope_kind: String,
+    /// Scope root path (empty for single-file).
+    pub scope_root: String,
+    /// Lifecycle state string.
+    pub state: String,
+    /// Active progress title, if any.
+    pub progress_title: Option<String>,
+    /// Active progress percentage, if any.
+    pub progress_pct: Option<u32>,
+    /// Most recent server message, if any.
+    pub last_message: Option<String>,
+}
+
+/// Lists all server statuses for a given session.
+///
+/// Returns rows from the `language_servers` table including progress
+/// and message data.
+///
+/// # Errors
+///
+/// Returns an error if the database cannot be queried.
+pub fn list_server_statuses(conn: &Connection, session_id: &str) -> Result<Vec<ServerStatusRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT language_id, server, scope_kind, scope_root, state, \
+                progress_title, progress_pct, last_message \
+         FROM language_servers WHERE session_id = ?1 \
+         ORDER BY server, language_id, scope_root",
+    )?;
+    let mut rows = stmt.query([session_id])?;
+    let mut result = Vec::new();
+    while let Some(row) = rows.next()? {
+        result.push(ServerStatusRow {
+            session_id: session_id.to_string(),
+            language_id: row.get(0)?,
+            server: row.get(1)?,
+            scope_kind: row.get(2)?,
+            scope_root: row.get(3)?,
+            state: row.get(4)?,
+            progress_title: row.get(5)?,
+            progress_pct: row
+                .get::<_, Option<i64>>(6)?
+                .and_then(|v| u32::try_from(v).ok()),
+            last_message: row.get(7)?,
+        });
+    }
+    Ok(result)
+}
+
+/// Lists all server statuses across all sessions.
+///
+/// # Errors
+///
+/// Returns an error if the database cannot be queried.
+pub fn list_all_server_statuses(conn: &Connection) -> Result<Vec<ServerStatusRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT ls.session_id, ls.language_id, ls.server, ls.scope_kind, \
+                ls.scope_root, ls.state, ls.progress_title, ls.progress_pct, \
+                ls.last_message \
+         FROM language_servers ls \
+         JOIN sessions s ON s.id = ls.session_id AND s.alive = 1 \
+         ORDER BY ls.server, ls.language_id, ls.scope_root",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut result = Vec::new();
+    while let Some(row) = rows.next()? {
+        result.push(ServerStatusRow {
+            session_id: row.get(0)?,
+            language_id: row.get(1)?,
+            server: row.get(2)?,
+            scope_kind: row.get(3)?,
+            scope_root: row.get(4)?,
+            state: row.get(5)?,
+            progress_title: row.get(6)?,
+            progress_pct: row
+                .get::<_, Option<i64>>(7)?
+                .and_then(|v| u32::try_from(v).ok()),
+            last_message: row.get(8)?,
+        });
+    }
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -780,7 +1013,7 @@ mod tests {
         let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
 
         let version = current_schema_version(&conn).expect("failed to read schema version");
-        assert_eq!(version, 12, "schema version should be 12");
+        assert_eq!(version, 13, "schema version should be 13");
     }
 
     #[allow(clippy::expect_used, reason = "test assertions")]
@@ -848,7 +1081,7 @@ mod tests {
         let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
 
         let version = current_schema_version(&conn).expect("failed to read schema version");
-        assert_eq!(version, 12, "schema version should be 12 after migration");
+        assert_eq!(version, 13, "schema version should be 13 after migration");
 
         for table in &["grammars", "symbols", "file_parse_state"] {
             assert!(
@@ -889,7 +1122,7 @@ mod tests {
         let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
 
         let version = current_schema_version(&conn).expect("failed to read schema version");
-        assert_eq!(version, 12, "schema version should be 12 after migration");
+        assert_eq!(version, 13, "schema version should be 13 after migration");
 
         // Verify client_session_id column exists by inserting a row that uses it.
         conn.execute(
@@ -941,7 +1174,7 @@ mod tests {
         let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
 
         let version = current_schema_version(&conn).expect("failed to read schema version");
-        assert_eq!(version, 12, "schema version should be 12 after migration");
+        assert_eq!(version, 13, "schema version should be 13 after migration");
 
         assert!(
             table_exists(&conn, "messages"),
@@ -1005,7 +1238,7 @@ mod tests {
         let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
 
         let version = current_schema_version(&conn).expect("failed to read schema version");
-        assert_eq!(version, 12, "schema version should be 12 after migration");
+        assert_eq!(version, 13, "schema version should be 13 after migration");
 
         // Editing tables should be dropped by v6→v7
         assert!(
@@ -1074,7 +1307,7 @@ mod tests {
         let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
 
         let version = current_schema_version(&conn).expect("failed to read schema version");
-        assert_eq!(version, 12, "schema version should be 12 after migration");
+        assert_eq!(version, 13, "schema version should be 13 after migration");
 
         assert!(
             !table_exists(&conn, "editing_state"),
@@ -1142,7 +1375,7 @@ mod tests {
         let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
 
         let version = current_schema_version(&conn).expect("failed to read schema version");
-        assert_eq!(version, 12, "schema version should be 12 after migration");
+        assert_eq!(version, 13, "schema version should be 13 after migration");
 
         // Old data should be gone (table was recreated).
         let count: i64 = conn
@@ -1250,6 +1483,15 @@ mod tests {
              CREATE INDEX idx_messages_type ON messages(type);
              CREATE INDEX idx_messages_request_id ON messages(request_id);
              CREATE INDEX idx_messages_parent_id ON messages(parent_id);
+             CREATE TABLE language_servers (
+                 session_id   TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                 language_id  TEXT NOT NULL,
+                 server       TEXT NOT NULL,
+                 scope_kind   TEXT NOT NULL,
+                 scope_root   TEXT NOT NULL DEFAULT '',
+                 state        TEXT NOT NULL,
+                 PRIMARY KEY (session_id, language_id, server, scope_kind, scope_root)
+             );
              INSERT INTO sessions (id, pid, display_name, started_at)
              VALUES ('s1', 1, 'test', '2026-01-01T00:00:00Z');
              COMMIT;
@@ -1282,7 +1524,7 @@ mod tests {
 
         let conn = open_and_migrate_at(&path).expect("migration failed");
         let version = current_schema_version(&conn).expect("read version");
-        assert_eq!(version, 12, "schema version should be 12");
+        assert_eq!(version, 13, "schema version should be 13");
 
         // Trace event: type was 'debug' → type='internal', level='debug'
         let (typ, level): (String, String) = conn
@@ -1455,5 +1697,197 @@ mod tests {
             [],
         )
         .expect("UUID parent_id should succeed on fresh schema");
+    }
+
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    #[test]
+    fn test_migrate_v12_to_v13() {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let path = dir.path().join("test.db");
+
+        // Create a v12 database with the old language_servers schema.
+        let conn = open_at(&path).expect("open_at failed");
+        conn.execute_batch(
+            "PRAGMA foreign_keys=OFF;
+             BEGIN IMMEDIATE;
+             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta (key, value) VALUES ('schema_version', '12');
+             CREATE TABLE sessions (
+                 id TEXT PRIMARY KEY, pid INTEGER NOT NULL,
+                 display_name TEXT NOT NULL, started_at TEXT NOT NULL,
+                 ended_at TEXT, alive INTEGER NOT NULL DEFAULT 1
+             );
+             CREATE TABLE language_servers (
+                 session_id   TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                 language_id  TEXT NOT NULL,
+                 server       TEXT NOT NULL,
+                 scope_kind   TEXT NOT NULL,
+                 scope_root   TEXT NOT NULL DEFAULT '',
+                 state        TEXT NOT NULL,
+                 PRIMARY KEY (session_id, language_id, server, scope_kind, scope_root)
+             );
+             INSERT INTO sessions (id, pid, display_name, started_at)
+             VALUES ('s1', 1, 'test', '2026-01-01T00:00:00Z');
+             INSERT INTO language_servers
+                 (session_id, language_id, server, scope_kind, scope_root, state)
+             VALUES ('s1', 'rust', 'rust-analyzer', 'root', '/project', 'ready');
+             COMMIT;
+             PRAGMA foreign_keys=ON;",
+        )
+        .expect("failed to create v12 schema");
+        drop(conn);
+
+        let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
+
+        let version = current_schema_version(&conn).expect("failed to read schema version");
+        assert_eq!(version, 13, "schema version should be 13 after migration");
+
+        // Existing row should still be there.
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM language_servers WHERE session_id = 's1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query state");
+        assert_eq!(state, "ready");
+
+        // New columns should be NULL for existing rows.
+        let title: Option<String> = conn
+            .query_row(
+                "SELECT progress_title FROM language_servers WHERE session_id = 's1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query progress_title");
+        assert!(
+            title.is_none(),
+            "progress_title should be NULL after migration"
+        );
+    }
+
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    #[test]
+    fn test_server_status_crud() {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let path = dir.path().join("test.db");
+        let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
+
+        conn.execute(
+            "INSERT INTO sessions (id, pid, display_name, started_at) \
+             VALUES ('s1', 1, 'test', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .expect("insert session");
+
+        // Upsert initial state.
+        upsert_server_state(
+            &conn,
+            "s1",
+            "rust",
+            "rust-analyzer",
+            "root",
+            "/proj",
+            "initializing",
+        )
+        .expect("upsert");
+
+        let rows = list_server_statuses(&conn, "s1").expect("list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state, "initializing");
+        assert!(rows[0].progress_title.is_none());
+        assert!(rows[0].progress_pct.is_none());
+        assert!(rows[0].last_message.is_none());
+
+        // Update state via upsert.
+        upsert_server_state(
+            &conn,
+            "s1",
+            "rust",
+            "rust-analyzer",
+            "root",
+            "/proj",
+            "ready",
+        )
+        .expect("upsert state update");
+        let rows = list_server_statuses(&conn, "s1").expect("list");
+        assert_eq!(rows[0].state, "ready");
+
+        // Update progress.
+        update_server_progress(
+            &conn,
+            "s1",
+            "rust",
+            "rust-analyzer",
+            "root",
+            "/proj",
+            Some("Indexing"),
+            Some(42),
+        )
+        .expect("update progress");
+        let rows = list_server_statuses(&conn, "s1").expect("list");
+        assert_eq!(rows[0].progress_title.as_deref(), Some("Indexing"));
+        assert_eq!(rows[0].progress_pct, Some(42));
+
+        // Clear progress.
+        update_server_progress(
+            &conn,
+            "s1",
+            "rust",
+            "rust-analyzer",
+            "root",
+            "/proj",
+            None,
+            None,
+        )
+        .expect("clear progress");
+        let rows = list_server_statuses(&conn, "s1").expect("list");
+        assert!(rows[0].progress_title.is_none());
+        assert!(rows[0].progress_pct.is_none());
+
+        // Update message.
+        update_server_message(
+            &conn,
+            "s1",
+            "rust",
+            "rust-analyzer",
+            "root",
+            "/proj",
+            "Loading crate graph",
+        )
+        .expect("update message");
+        let rows = list_server_statuses(&conn, "s1").expect("list");
+        assert_eq!(rows[0].last_message.as_deref(), Some("Loading crate graph"));
+    }
+
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    #[test]
+    fn test_list_all_server_statuses() {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let path = dir.path().join("test.db");
+        let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
+
+        // Two sessions: one alive, one dead.
+        conn.execute(
+            "INSERT INTO sessions (id, pid, display_name, started_at, alive) \
+             VALUES ('alive', 1, 'a', '2026-01-01T00:00:00Z', 1)",
+            [],
+        )
+        .expect("insert alive session");
+        conn.execute(
+            "INSERT INTO sessions (id, pid, display_name, started_at, alive) \
+             VALUES ('dead', 2, 'd', '2026-01-01T00:00:00Z', 0)",
+            [],
+        )
+        .expect("insert dead session");
+
+        upsert_server_state(&conn, "alive", "rust", "ra", "root", "/a", "ready")
+            .expect("upsert alive");
+        upsert_server_state(&conn, "dead", "rust", "ra", "root", "/d", "dead")
+            .expect("upsert dead");
+
+        let rows = list_all_server_statuses(&conn).expect("list all");
+        assert_eq!(rows.len(), 1, "should only return alive session servers");
+        assert_eq!(rows[0].session_id, "alive");
     }
 }

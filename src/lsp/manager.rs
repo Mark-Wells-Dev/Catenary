@@ -150,6 +150,9 @@ pub struct LspClientManager {
     marker_cache: std::sync::Mutex<HashMap<(PathBuf, String), PathBuf>>,
     logging: LoggingServer,
     fs: Arc<FilesystemManager>,
+    /// DB connection for server noise persistence.
+    /// `None` in doctor/test contexts.
+    db: Option<(Arc<std::sync::Mutex<rusqlite::Connection>>, Arc<str>)>,
 }
 
 impl LspClientManager {
@@ -172,7 +175,20 @@ impl LspClientManager {
             marker_cache: std::sync::Mutex::new(HashMap::new()),
             logging,
             fs,
+            db: None,
         }
+    }
+
+    /// Sets the database connection for server noise persistence.
+    ///
+    /// Called by [`crate::bridge::session::Session`] after construction
+    /// in daemon mode. Doctor and test contexts skip this.
+    pub fn set_db(
+        &mut self,
+        conn: Arc<std::sync::Mutex<rusqlite::Connection>>,
+        session_id: Arc<str>,
+    ) {
+        self.db = Some((conn, session_id));
     }
 
     /// Returns a reference to the configuration.
@@ -753,6 +769,10 @@ impl LspClientManager {
 
         client.server().set_scope(Scope::Root(root.to_path_buf()));
 
+        if let Some((conn, session_id)) = &self.db {
+            client.server().set_db(conn.clone(), session_id.clone());
+        }
+
         let key = client
             .server()
             .key()
@@ -761,6 +781,33 @@ impl LspClientManager {
         let client_mutex = Arc::new(Mutex::new(client));
         clients.insert(key.clone(), client_mutex.clone());
         drop(clients);
+
+        // Persist initial server state to DB.
+        if let Some((conn, session_id)) = &self.db {
+            let state = client_mutex
+                .lock()
+                .await
+                .server()
+                .lifecycle()
+                .display_state()
+                .to_string();
+            let scope_root = key
+                .scope
+                .root_path()
+                .map_or_else(String::new, |p| p.display().to_string());
+            let db = conn
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _ = crate::db::upsert_server_state(
+                &db,
+                session_id,
+                &key.language_id,
+                &key.server,
+                key.scope.kind_str(),
+                &scope_root,
+                &state,
+            );
+        }
 
         Ok((key, client_mutex))
     }
@@ -838,9 +885,36 @@ impl LspClientManager {
 
         client.server().set_scope(Scope::SingleFile);
 
+        if let Some((conn, session_id)) = &self.db {
+            client.server().set_db(conn.clone(), session_id.clone());
+        }
+
         let client_mutex = Arc::new(Mutex::new(client));
-        clients.insert(sf_key, client_mutex.clone());
+        clients.insert(sf_key.clone(), client_mutex.clone());
         drop(clients);
+
+        // Persist initial server state to DB.
+        if let Some((conn, session_id)) = &self.db {
+            let state = client_mutex
+                .lock()
+                .await
+                .server()
+                .lifecycle()
+                .display_state()
+                .to_string();
+            let db = conn
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _ = crate::db::upsert_server_state(
+                &db,
+                session_id,
+                &sf_key.language_id,
+                &sf_key.server,
+                sf_key.scope.kind_str(),
+                "",
+                &state,
+            );
+        }
 
         Ok(client_mutex)
     }

@@ -189,7 +189,8 @@ impl Session {
     ) -> Self {
         let config = Arc::new(config);
 
-        let message_db = crate::logging::message_db::MessageDbSink::new(conn, instance_id.clone());
+        let message_db =
+            crate::logging::message_db::MessageDbSink::new(conn.clone(), instance_id.clone());
         let desktop_enabled = config
             .notifications
             .as_ref()
@@ -224,11 +225,10 @@ impl Session {
             .map_or_else(crate::config::GlobConfig::default, |t| t.glob.clone());
 
         let path_validator = Arc::new(RwLock::new(PathValidator::new(roots)));
-        let client_manager = Arc::new(LspClientManager::new(
-            config.clone(),
-            logging.clone(),
-            fs_manager.clone(),
-        ));
+        let mut client_manager =
+            LspClientManager::new(config.clone(), logging.clone(), fs_manager.clone());
+        client_manager.set_db(conn, instance_id.clone());
+        let client_manager = Arc::new(client_manager);
         let diagnostics = Arc::new(DiagnosticsServer::new(
             client_manager.clone(),
             path_validator.clone(),

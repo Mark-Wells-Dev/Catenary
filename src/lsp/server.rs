@@ -101,6 +101,12 @@ pub struct LspServer {
 
     // ── Transport ───────────────────────────────────────────────
     connection: OnceLock<Connection>,
+
+    // ── Database persistence ─────────────────────────────────
+    /// DB connection and session ID for writing server noise to
+    /// `language_servers`. Set after init via [`Self::set_db`].
+    /// `None` in doctor/test contexts.
+    db: OnceLock<(Arc<std::sync::Mutex<rusqlite::Connection>>, Arc<str>)>,
 }
 
 impl LspServer {
@@ -146,6 +152,7 @@ impl LspServer {
             config_change_registrations: Mutex::new(HashSet::new()),
             tree_monitor: Mutex::new(None),
             connection: OnceLock::new(),
+            db: OnceLock::new(),
         }
     }
 
@@ -396,6 +403,7 @@ impl LspServer {
     /// `NotificationQueueSink` → `systemMessage`. Dedup is handled by
     /// `NotificationQueueSink` — no per-tool tracking needed.
     pub(crate) fn set_lifecycle(&self, state: ServerLifecycle) {
+        let display = state.display_state().to_string();
         let mut lifecycle = self
             .lifecycle
             .lock()
@@ -404,6 +412,8 @@ impl LspServer {
         let is_terminal = state.is_terminal();
         *lifecycle = state;
         drop(lifecycle);
+
+        self.persist_state(&display);
 
         // Emit notification on first transition to terminal state.
         if !was_terminal
@@ -425,6 +435,107 @@ impl LspServer {
         }
 
         self.state_notify.notify_waiters();
+    }
+
+    // ── Database persistence ────────────────────────────────────
+
+    /// Sets the database connection for server noise persistence.
+    ///
+    /// Called once after init by [`super::manager::LspClientManager`].
+    /// Subsequent calls are no-ops (the `OnceLock` ignores them).
+    pub fn set_db(&self, conn: Arc<std::sync::Mutex<rusqlite::Connection>>, session_id: Arc<str>) {
+        let _ = self.db.set((conn, session_id));
+    }
+
+    /// Persists the lifecycle state to the `language_servers` table via upsert.
+    ///
+    /// No-op if the DB connection or instance key is unavailable.
+    fn persist_state(&self, state: &str) {
+        let Some((conn, session_id)) = self.db.get() else {
+            return;
+        };
+        let Some(key) = self.key() else {
+            return;
+        };
+        let scope_root = key
+            .scope
+            .root_path()
+            .map_or_else(String::new, |p| p.display().to_string());
+        let conn = conn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Err(e) = crate::db::upsert_server_state(
+            &conn,
+            session_id,
+            &key.language_id,
+            &key.server,
+            key.scope.kind_str(),
+            &scope_root,
+            state,
+        ) {
+            debug!("persist_state failed for {}: {e}", key.server);
+        }
+    }
+
+    /// Persists progress state to the `language_servers` table.
+    ///
+    /// No-op if the DB connection or instance key is unavailable.
+    fn persist_progress(&self, title: Option<&str>, pct: Option<u32>) {
+        let Some((conn, session_id)) = self.db.get() else {
+            return;
+        };
+        let Some(key) = self.key() else {
+            return;
+        };
+        let scope_root = key
+            .scope
+            .root_path()
+            .map_or_else(String::new, |p| p.display().to_string());
+        let conn = conn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Err(e) = crate::db::update_server_progress(
+            &conn,
+            session_id,
+            &key.language_id,
+            &key.server,
+            key.scope.kind_str(),
+            &scope_root,
+            title,
+            pct,
+        ) {
+            debug!("persist_progress failed for {}: {e}", key.server);
+        }
+    }
+
+    /// Persists a server message to the `language_servers` table.
+    ///
+    /// No-op if the DB connection or instance key is unavailable.
+    fn persist_message(&self, message: &str) {
+        let Some((conn, session_id)) = self.db.get() else {
+            return;
+        };
+        let Some(key) = self.key() else {
+            return;
+        };
+        let scope_root = key
+            .scope
+            .root_path()
+            .map_or_else(String::new, |p| p.display().to_string());
+        let conn = conn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Err(e) = crate::db::update_server_message(
+            &conn,
+            session_id,
+            &key.language_id,
+            &key.server,
+            key.scope.kind_str(),
+            &scope_root,
+            message,
+        ) {
+            debug!("persist_message failed for {}: {e}", key.server);
+        }
     }
 
     // ── Transport ────────────────────────────────────────────────
@@ -600,7 +711,13 @@ impl LspServer {
                 {
                     debug!("Progress: {} {}%", p.title, p.percentage.unwrap_or(0));
                 }
+
+                // Persist progress to DB.
+                let primary = tracker.primary_progress();
+                let db_title = primary.map(|p| p.title.clone());
+                let db_pct = primary.and_then(|p| p.percentage);
                 drop(tracker);
+                self.persist_progress(db_title.as_deref(), db_pct);
 
                 // Update lifecycle based on progress kind
                 let kind = params["value"]["kind"].as_str();
@@ -616,17 +733,19 @@ impl LspServer {
                 match kind {
                     Some("begin") => {
                         let first = !self.ever_busy.swap(true, Ordering::SeqCst);
-                        *lifecycle = match *lifecycle {
+                        let new_state = match *lifecycle {
                             ServerLifecycle::Busy(n) => ServerLifecycle::Busy(n + 1),
                             _ => ServerLifecycle::Busy(1),
                         };
+                        *lifecycle = new_state.clone();
                         drop(lifecycle);
+                        self.persist_state(new_state.display_state());
                         if first {
                             self.capability_notify.notify_waiters();
                         }
                     }
                     Some("end") => {
-                        *lifecycle = match *lifecycle {
+                        let new_state = match *lifecycle {
                             ServerLifecycle::Busy(n) if n > 1 => ServerLifecycle::Busy(n - 1),
                             ServerLifecycle::Busy(1) => {
                                 debug!("Server ready (progress completed)");
@@ -634,7 +753,9 @@ impl LspServer {
                             }
                             ref other => other.clone(),
                         };
+                        *lifecycle = new_state.clone();
                         drop(lifecycle);
+                        self.persist_state(new_state.display_state());
                     }
                     _ => {
                         drop(lifecycle);
@@ -647,6 +768,7 @@ impl LspServer {
             "window/logMessage" | "window/showMessage" => {
                 if let Some(message) = params.get("message").and_then(|m| m.as_str()) {
                     debug!("LSP server message: {}", message);
+                    self.persist_message(message);
                 }
             }
             _ => {
