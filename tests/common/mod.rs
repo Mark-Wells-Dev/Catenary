@@ -402,7 +402,7 @@ impl BridgeProcess {
         let socket_path = self.wait_for_ipc_socket()?;
         let deadline = std::time::Instant::now() + timeout;
         loop {
-            let response = ipc_request(&socket_path, &json!({"method": "tool/ls-roots"}))?;
+            let response = ipc_request(&socket_path, &json!({"method": "tool/roots-ls"}))?;
             if response.contains(root) {
                 return Ok(());
             }
@@ -422,7 +422,7 @@ impl BridgeProcess {
         ipc_request(
             &socket_path,
             &json!({
-                "method": "pre-tool/start-editing",
+                "method": "pre-tool/editing-start",
                 "agent_id": ""
             }),
         )?;
@@ -442,7 +442,7 @@ impl BridgeProcess {
         ipc_request(
             &socket_path,
             &json!({
-                "method": "pre-tool/done-editing",
+                "method": "pre-tool/editing-stop",
                 "agent_id": ""
             }),
         )?;
@@ -451,7 +451,7 @@ impl BridgeProcess {
         let text = ipc_request(
             &socket_path,
             &json!({
-                "method": "tool/done-editing"
+                "method": "tool/editing-stop"
             }),
         )?;
 
@@ -468,7 +468,7 @@ impl BridgeProcess {
         ipc_request(
             &socket_path,
             &json!({
-                "method": "pre-tool/start-editing",
+                "method": "pre-tool/editing-start",
                 "agent_id": ""
             }),
         )?;
@@ -490,7 +490,7 @@ impl BridgeProcess {
         ipc_request(
             &socket_path,
             &json!({
-                "method": "pre-tool/done-editing",
+                "method": "pre-tool/editing-stop",
                 "agent_id": ""
             }),
         )?;
@@ -499,7 +499,7 @@ impl BridgeProcess {
         let text = ipc_request(
             &socket_path,
             &json!({
-                "method": "tool/done-editing"
+                "method": "tool/editing-stop"
             }),
         )?;
 

@@ -206,16 +206,17 @@ mod tests {
     #[test]
     fn hook_category_methods() {
         // tool (CLI commands)
-        assert_eq!(hook_category("tool/done-editing"), "tool");
-        assert_eq!(hook_category("tool/start-editing"), "tool");
-        assert_eq!(hook_category("tool/add-root"), "tool");
-        assert_eq!(hook_category("tool/rm-root"), "tool");
+        assert_eq!(hook_category("tool/editing-stop"), "tool");
+        assert_eq!(hook_category("tool/editing-start"), "tool");
+        assert_eq!(hook_category("tool/roots-add"), "tool");
+        assert_eq!(hook_category("tool/roots-rm"), "tool");
+        assert_eq!(hook_category("tool/roots-ls"), "tool");
         assert_eq!(hook_category("tool/shutdown"), "tool");
         // lifecycle (hook events)
         assert_eq!(hook_category("pre-agent/turn-start"), "lifecycle");
         assert_eq!(hook_category("pre-tool/editing-state"), "lifecycle");
-        assert_eq!(hook_category("pre-tool/start-editing"), "lifecycle");
-        assert_eq!(hook_category("pre-tool/done-editing"), "lifecycle");
+        assert_eq!(hook_category("pre-tool/editing-start"), "lifecycle");
+        assert_eq!(hook_category("pre-tool/editing-stop"), "lifecycle");
         assert_eq!(hook_category("pre-tool/check-command"), "lifecycle");
         assert_eq!(hook_category("post-agent/require-release"), "lifecycle");
         assert_eq!(hook_category("session-start/clear-editing"), "lifecycle");

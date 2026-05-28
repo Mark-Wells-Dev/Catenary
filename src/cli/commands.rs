@@ -255,7 +255,7 @@ pub fn run_status(out: &mut Output, id: &str) -> Result<()> {
 
 /// List all tracked workspace roots with their source.
 ///
-/// Connects to the daemon's IPC socket and sends a `tool/ls-roots`
+/// Connects to the daemon's IPC socket and sends a `tool/roots-ls`
 /// request, then prints each root with its contributor sources.
 ///
 /// # Errors
@@ -271,7 +271,7 @@ pub async fn run_ls_roots(out: &mut Output) -> Result<()> {
         .context("no daemon running — start a Catenary session first")?;
 
     let (reader, mut writer) = stream.into_split();
-    let request = serde_json::json!({"method": "tool/ls-roots"});
+    let request = serde_json::json!({"method": "tool/roots-ls"});
     let mut payload = serde_json::to_string(&request)?;
     payload.push('\n');
     writer.write_all(payload.as_bytes()).await?;

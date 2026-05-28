@@ -850,7 +850,7 @@ fn is_root_command(shell_cmd: &str) -> bool {
 
 /// Handle `PreToolUse` for `catenary editing start`.
 ///
-/// Sends `pre-tool/start-editing` IPC to the daemon to enter editing mode.
+/// Sends `pre-tool/editing-start` IPC to the daemon to enter editing mode.
 /// The daemon checks the editing guardrail. Returns allow (silent) or deny
 /// (prints denial reason to stdout for the host CLI).
 fn handle_start_editing_hook(hook_json: &serde_json::Value, format: HostFormat) {
@@ -862,7 +862,7 @@ fn handle_start_editing_hook(hook_json: &serde_json::Value, format: HostFormat) 
     let session_id = extract_session_id(hook_json, format);
 
     let mut request = serde_json::json!({
-        "method": "pre-tool/start-editing",
+        "method": "pre-tool/editing-start",
         "agent_id": agent_id,
     });
     if let Some(sid) = session_id {
@@ -882,7 +882,7 @@ fn handle_start_editing_hook(hook_json: &serde_json::Value, format: HostFormat) 
 
 /// Handle `PreToolUse` for `catenary editing stop`.
 ///
-/// Sends `pre-tool/done-editing-prepare` IPC to the daemon to prepare
+/// Sends `pre-tool/editing-stop` IPC to the daemon to prepare
 /// the handoff: drain accumulated files, release the editing guardrail,
 /// and deposit the file list in the handoff slot. Returns allow (silent)
 /// or deny (prints denial reason to stdout for the host CLI).
@@ -895,7 +895,7 @@ fn handle_done_editing_hook(hook_json: &serde_json::Value, format: HostFormat) {
     let session_id = extract_session_id(hook_json, format);
 
     let mut request = serde_json::json!({
-        "method": "pre-tool/done-editing",
+        "method": "pre-tool/editing-stop",
         "agent_id": agent_id,
     });
     if let Some(sid) = session_id {

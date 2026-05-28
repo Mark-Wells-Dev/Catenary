@@ -550,7 +550,7 @@ fn editing_guardrail_blocks_cross_session() -> Result<()> {
     hook_roundtrip(
         &ipc_path,
         &json!({
-            "method": "pre-tool/start-editing",
+            "method": "pre-tool/editing-start",
             "agent_id": "",
             "session_id": "session-a"
         }),
@@ -574,7 +574,7 @@ fn editing_guardrail_blocks_cross_session() -> Result<()> {
     hook_roundtrip(
         &ipc_path,
         &json!({
-            "method": "pre-tool/start-editing",
+            "method": "pre-tool/editing-start",
             "agent_id": "",
             "session_id": "session-b"
         }),

@@ -47,9 +47,9 @@ pub fn mcp_socket_path() -> PathBuf {
 /// (or platform equivalent via [`crate::db::state_dir`]).
 ///
 /// This socket carries all non-MCP daemon traffic: hook events
-/// (`pre-tool/*`, `post-tool/*`, etc.) and CLI commands
-/// (`start-editing`, `done-editing`, `add-root`, `rm-root`,
-/// `shutdown`, `ls-roots`).
+/// (`pre-tool/*`, `post-agent/*`, etc.) and CLI commands
+/// (`editing-start`, `editing-stop`, `roots-add`, `roots-rm`,
+/// `roots-ls`, `shutdown`).
 #[must_use]
 pub fn socket_path() -> PathBuf {
     crate::db::state_dir()
@@ -389,8 +389,8 @@ struct HookDispatchContext {
     handoff_slot: Arc<std::sync::Mutex<Option<HandoffContext>>>,
 }
 
-/// Handoff context deposited by `pre-tool/done-editing-prepare`
-/// and consumed by `done-editing/run`.
+/// Handoff context deposited by `pre-tool/editing-stop`
+/// and consumed by `tool/editing-stop`.
 ///
 /// Dropping this struct drops the owned semaphore permit, releasing
 /// the handoff lock.
@@ -1173,9 +1173,9 @@ async fn handle_hook_dispatch(
 
     // ── List tracked roots ─────────────────────────────────────
     //
-    // `tool/ls-roots` is sent by `catenary roots ls`. Returns all
+    // `tool/roots-ls` is sent by `catenary roots ls`. Returns all
     // tracked workspace roots with their contributor sources.
-    if method == "tool/ls-roots" {
+    if method == "tool/roots-ls" {
         let roots = ctx
             .root_tracker
             .as_ref()
@@ -1277,10 +1277,10 @@ async fn handle_hook_dispatch(
 
     // ── Start editing confirmation ────────────────────────────────
     //
-    // `tool/start-editing` is sent by `catenary editing start`
+    // `tool/editing-start` is sent by `catenary editing start`
     // after the PreToolUse hook has already entered editing mode.
     // The CLI command just needs a confirmation response.
-    if method == "tool/start-editing" {
+    if method == "tool/editing-start" {
         writer.write_all(b"{\"status\":\"ok\"}\n").await?;
         writer.shutdown().await?;
         return Ok(());
@@ -1438,11 +1438,11 @@ async fn handle_hook_dispatch(
 
     // ── Done editing handoff: prepare ────────────────────────────
     //
-    // `pre-tool/done-editing` is sent by the PreToolUse hook when
+    // `pre-tool/editing-stop` is sent by the PreToolUse hook when
     // the agent runs `catenary editing stop`. Acquires
     // the handoff lock, drains files, releases the editing guardrail,
     // and deposits the file list for the subsequent CLI command.
-    if method == "pre-tool/done-editing" {
+    if method == "pre-tool/editing-stop" {
         let scope_id = uuid::Uuid::new_v4().to_string();
 
         let router = get_or_create_router(&ctx, &session_id);
@@ -1513,10 +1513,10 @@ async fn handle_hook_dispatch(
 
     // ── Done editing handoff: run ────────────────────────────────
     //
-    // `tool/done-editing` is sent by `catenary editing stop` CLI
+    // `tool/editing-stop` is sent by `catenary editing stop` CLI
     // command. Takes the file list from the handoff slot, runs
     // process_files_batched, and returns diagnostics.
-    if method == "tool/done-editing" {
+    if method == "tool/editing-stop" {
         // Take the file list and parent_id from the handoff slot,
         // releasing the permit immediately. The permit must not be
         // held during the diagnostics pipeline (which may take seconds).
@@ -1574,7 +1574,7 @@ async fn handle_hook_dispatch(
 
     // ── Root management ──────────────────────────────────────────
     //
-    // `tool/add-root` and `tool/rm-root` are sent by the CLI commands
+    // `tool/roots-add` and `tool/roots-rm` are sent by the CLI commands
     // (`catenary roots add`, `catenary roots rm`). The PreToolUse hook
     // only bypasses the command filter — no hook-side IPC needed
     // since "hook" is a shared contributor with no session identity.
@@ -1582,7 +1582,7 @@ async fn handle_hook_dispatch(
     // Handled before `get_or_create_router` because root management
     // is a daemon-level concern (RootTracker), not a per-session
     // router concern.
-    if method == "tool/add-root" {
+    if method == "tool/roots-add" {
         let scope_id = uuid::Uuid::new_v4().to_string();
         let response = if let Some(path_str) = raw.get("path").and_then(|v| v.as_str()) {
             let path = PathBuf::from(path_str);
@@ -1631,7 +1631,7 @@ async fn handle_hook_dispatch(
         return Ok(());
     }
 
-    if method == "tool/rm-root" {
+    if method == "tool/roots-rm" {
         let scope_id = uuid::Uuid::new_v4().to_string();
         let response = if let Some(path_str) = raw.get("path").and_then(|v| v.as_str()) {
             let path = PathBuf::from(path_str);
@@ -2994,7 +2994,7 @@ mod tests {
 
         // Session A: enter editing mode via CLI start_editing hook.
         let req = serde_json::json!({
-            "method": "pre-tool/start-editing",
+            "method": "pre-tool/editing-start",
             "agent_id": "",
             "session_id": "session-a"
         });
@@ -3143,7 +3143,7 @@ mod tests {
 
         // Enter editing mode.
         let req = serde_json::json!({
-            "method": "pre-tool/start-editing",
+            "method": "pre-tool/editing-start",
             "agent_id": "",
             "session_id": "sess-1"
         });
@@ -3151,7 +3151,7 @@ mod tests {
 
         // Prepare handoff (no files accumulated).
         let req = serde_json::json!({
-            "method": "pre-tool/done-editing",
+            "method": "pre-tool/editing-stop",
             "agent_id": "",
             "session_id": "sess-1"
         });
@@ -3159,7 +3159,7 @@ mod tests {
         assert!(line.contains("ok"), "prepare should succeed, got: {line}");
 
         // Execute done_editing/run — should get "no files modified".
-        let req = serde_json::json!({"method": "tool/done-editing"});
+        let req = serde_json::json!({"method": "tool/editing-stop"});
         let response = hook_roundtrip_full(&ipc_path, &req).await;
         assert!(
             response.contains("no files modified"),
@@ -3182,7 +3182,7 @@ mod tests {
         });
 
         // Call done-editing/run without preparing a handoff.
-        let req = serde_json::json!({"method": "tool/done-editing"});
+        let req = serde_json::json!({"method": "tool/editing-stop"});
         let response = hook_roundtrip_full(&ipc_path, &req).await;
         assert!(
             response.contains("handoff expired"),
@@ -3206,7 +3206,7 @@ mod tests {
 
         // Enter editing mode.
         let req = serde_json::json!({
-            "method": "pre-tool/start-editing",
+            "method": "pre-tool/editing-start",
             "agent_id": "",
             "session_id": "sess-1"
         });
@@ -3224,7 +3224,7 @@ mod tests {
 
         // Prepare handoff — should drain the accumulated file.
         let req = serde_json::json!({
-            "method": "pre-tool/done-editing",
+            "method": "pre-tool/editing-stop",
             "agent_id": "",
             "session_id": "sess-1"
         });
@@ -3235,7 +3235,7 @@ mod tests {
         // the files. Since there's no real LSP server, the output
         // depends on whether the file exists and has LSP coverage.
         // The key test: the handoff consumed the files successfully.
-        let req = serde_json::json!({"method": "tool/done-editing"});
+        let req = serde_json::json!({"method": "tool/editing-stop"});
         let response = hook_roundtrip_full(&ipc_path, &req).await;
         // With no LSP servers, process_files_batched returns "[clean]"
         // for files without coverage. The response should not be the
@@ -3262,21 +3262,21 @@ mod tests {
 
         // Enter editing mode and prepare handoff.
         let req = serde_json::json!({
-            "method": "pre-tool/start-editing",
+            "method": "pre-tool/editing-start",
             "agent_id": "",
             "session_id": "sess-1"
         });
         let _ = hook_roundtrip(&ipc_path, &req).await;
 
         let req = serde_json::json!({
-            "method": "pre-tool/done-editing",
+            "method": "pre-tool/editing-stop",
             "agent_id": "",
             "session_id": "sess-1"
         });
         let _ = hook_roundtrip(&ipc_path, &req).await;
 
         // First consume should succeed.
-        let req = serde_json::json!({"method": "tool/done-editing"});
+        let req = serde_json::json!({"method": "tool/editing-stop"});
         let response1 = hook_roundtrip_full(&ipc_path, &req).await;
         assert!(
             !response1.contains("handoff expired"),
