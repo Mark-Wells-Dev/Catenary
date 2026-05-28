@@ -176,15 +176,34 @@ fn is_scope_response(msg: &SessionMessage, scope: &Scope) -> bool {
     }
 }
 
+/// Whether a message is server noise that belongs in the sidebar, not
+/// the stream.
+///
+/// Server noise: `$/progress`, `window/logMessage`, `window/showMessage`
+/// with no `parent_id` (not part of a scope). These are server-level
+/// status messages shown in the sidebar server dashboard.
+fn is_server_noise(msg: &SessionMessage) -> bool {
+    msg.parent_id.is_none()
+        && msg.r#type == "lsp"
+        && super::data::SERVER_NOISE_METHODS.contains(&msg.method.as_str())
+}
+
 /// Route a single message into entries and scope map.
 ///
 /// Used by both instance methods (live append) and page operations
-/// (routing into temporary buffers).
+/// (routing into temporary buffers). Server noise (`$/progress`,
+/// `window/logMessage`, `window/showMessage` without `parent_id`)
+/// is silently dropped — it is shown in the sidebar instead.
 fn route_into(
     entries: &mut Vec<StreamEntry>,
     scope_map: &mut HashMap<String, usize>,
     msg: SessionMessage,
 ) {
+    // Server noise belongs in the sidebar, not the stream.
+    if is_server_noise(&msg) {
+        return;
+    }
+
     let Some(ref pid) = msg.parent_id else {
         entries.push(StreamEntry::Standalone(msg));
         return;
@@ -1843,5 +1862,65 @@ mod tests {
 
         // Open scope (header + 1 child) = 2 rows; s2's standalone hidden.
         assert_eq!(state.display_rows.len(), 2);
+    }
+
+    // ── Server noise suppression ────────────────────────────────────
+
+    #[test]
+    fn server_noise_suppressed_from_stream() {
+        // `$/progress` without parent_id should be dropped.
+        let progress = SessionMessage {
+            parent_id: None,
+            ..make_message_with_ids("s1", 1, "lsp", "$/progress", "rust-analyzer", None)
+        };
+        // `window/logMessage` without parent_id should be dropped.
+        let log_msg = SessionMessage {
+            parent_id: None,
+            ..make_message_with_ids("s1", 2, "lsp", "window/logMessage", "rust-analyzer", None)
+        };
+        // `window/showMessage` without parent_id should be dropped.
+        let show_msg = SessionMessage {
+            parent_id: None,
+            ..make_message_with_ids("s1", 3, "lsp", "window/showMessage", "rust-analyzer", None)
+        };
+        // Normal standalone LSP should stay.
+        let normal = make_message_with_ids(
+            "s1",
+            4,
+            "lsp",
+            "textDocument/definition",
+            "rust-analyzer",
+            None,
+        );
+
+        let state = StreamState::new(vec![progress, log_msg, show_msg, normal]);
+        // Only the normal message survives.
+        assert_eq!(state.entries.len(), 1);
+        let StreamEntry::Standalone(msg) = &state.entries[0] else {
+            panic!("expected standalone");
+        };
+        assert_eq!(msg.method, "textDocument/definition");
+    }
+
+    #[test]
+    fn scoped_progress_not_suppressed() {
+        // `$/progress` WITH parent_id is a child of a scope — not noise.
+        let request = mcp_request("s1", 1, "grep");
+        let progress = make_message_with_ids(
+            "s1",
+            5,
+            "lsp",
+            "$/progress",
+            "rust-analyzer",
+            Some("scope-1"),
+        );
+
+        let state = StreamState::new(vec![request, progress]);
+        assert_eq!(state.entries.len(), 1);
+        let StreamEntry::Scope(scope) = &state.entries[0] else {
+            panic!("expected scope");
+        };
+        assert_eq!(scope.children.len(), 1);
+        assert_eq!(scope.children[0].method, "$/progress");
     }
 }

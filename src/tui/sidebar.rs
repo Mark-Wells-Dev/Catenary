@@ -14,7 +14,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 
-use super::data::ServerStatusRow;
+use super::data::{ServerNoiseRow, ServerStatusRow};
 use super::stream::HexBadgeMap;
 use super::theme::Theme;
 
@@ -51,7 +51,8 @@ impl SessionEntry {
 ///
 /// Each entry represents one server process serving one workspace root.
 /// Every root gets its own server instance (misc 84 — per-root isolation).
-/// Header shows: `name (root/)  state`.
+/// Header shows: `name (root/)  state`. Child lines show active progress
+/// and the most recent server message.
 pub struct ServerEntry {
     /// Server binary name (config key, e.g., "rust-analyzer").
     pub name: String,
@@ -59,6 +60,10 @@ pub struct ServerEntry {
     pub root: String,
     /// Lifecycle display state (`"initializing"`, `"ready"`, `"busy"`, `"dead"`).
     pub state: String,
+    /// Active progress line (e.g., `"Indexing… 47%"`). `None` when idle.
+    pub progress_line: Option<String>,
+    /// Most recent `window/logMessage` or `window/showMessage` content.
+    pub server_message: Option<String>,
 }
 
 impl ServerEntry {
@@ -71,6 +76,13 @@ impl ServerEntry {
             // name + space + ( + root + ) + 2 spaces + state
             self.name.len() + 1 + 1 + self.root.len() + 1 + 2 + self.state.len()
         }
+    }
+
+    /// Number of child lines rendered under this entry.
+    const fn child_count(&self) -> usize {
+        let p = if self.progress_line.is_some() { 1 } else { 0 };
+        let m = if self.server_message.is_some() { 1 } else { 0 };
+        p + m
     }
 }
 
@@ -204,30 +216,43 @@ impl SidebarState {
 
     /// Check whether the server list has changed since the last refresh.
     #[must_use]
-    pub fn servers_need_refresh(&self, rows: &[ServerStatusRow]) -> bool {
-        let current: Vec<String> = rows
+    pub fn servers_need_refresh(&self, rows: &[ServerStatusRow], noise: &[ServerNoiseRow]) -> bool {
+        let mut current: Vec<String> = rows
             .iter()
             .map(|r| format!("{}:{}:{}", r.server, r.scope_root, r.state))
             .collect();
+        for n in noise {
+            current.push(format!("noise:{}:{}:{}", n.server, n.method, n.payload));
+        }
         self.last_server_names != current
     }
 
-    /// Update the server list from DB rows.
+    /// Update the server list from DB rows and noise data.
     ///
-    /// Each row becomes one sidebar entry — one entry per server process.
-    /// Every root gets its own server instance (per-root isolation).
-    pub fn refresh_servers(&mut self, rows: &[ServerStatusRow]) {
+    /// Each status row becomes one sidebar entry — one entry per server
+    /// process. Noise rows populate progress and server message children.
+    pub fn refresh_servers(&mut self, rows: &[ServerStatusRow], noise: &[ServerNoiseRow]) {
         self.last_server_names = rows
             .iter()
             .map(|r| format!("{}:{}:{}", r.server, r.scope_root, r.state))
             .collect();
+        for n in noise {
+            self.last_server_names
+                .push(format!("noise:{}:{}:{}", n.server, n.method, n.payload));
+        }
 
         self.servers = rows
             .iter()
-            .map(|row| ServerEntry {
-                name: row.server.clone(),
-                root: server_root_name(&row.scope_root),
-                state: row.state.clone(),
+            .map(|row| {
+                let progress_line = extract_progress_line(noise, &row.server);
+                let server_message = extract_server_message(noise, &row.server);
+                ServerEntry {
+                    name: row.server.clone(),
+                    root: server_root_name(&row.scope_root),
+                    state: row.state.clone(),
+                    progress_line,
+                    server_message,
+                }
             })
             .collect();
     }
@@ -313,12 +338,13 @@ impl SidebarState {
     /// Total number of visible rows in the sidebar content area.
     ///
     /// Sessions header + session entries + blank line + servers header +
-    /// server entries.
+    /// server entries (each with optional child lines).
     #[must_use]
-    pub const fn total_rows(&self) -> usize {
+    pub fn total_rows(&self) -> usize {
         let session_rows = 1 + self.entries.len(); // header + entries
         let server_header = if self.servers.is_empty() { 0 } else { 2 }; // blank + header
-        session_rows + server_header + self.servers.len()
+        let server_rows: usize = self.servers.iter().map(|s| 1 + s.child_count()).sum();
+        session_rows + server_header + server_rows
     }
 }
 
@@ -370,6 +396,69 @@ fn server_root_name(scope_root: &str) -> String {
     format!("{name}/")
 }
 
+// ── Noise extraction ────────────────────────────────────────────────
+
+/// Extract a progress line from noise data for the given server.
+///
+/// Reads the `$/progress` payload to build a display string like
+/// `"Indexing… 47%"`. Returns `None` if no active progress or if the
+/// most recent progress was an `end` event.
+fn extract_progress_line(noise: &[ServerNoiseRow], server: &str) -> Option<String> {
+    let row = noise
+        .iter()
+        .find(|n| n.server == server && n.method == "$/progress")?;
+
+    let value = row.payload.get("params").and_then(|p| p.get("value"))?;
+    let kind = value.get("kind").and_then(|k| k.as_str());
+
+    // End events mean no active progress.
+    if kind == Some("end") {
+        return None;
+    }
+
+    let title = value.get("title").and_then(|t| t.as_str());
+    let message = value.get("message").and_then(|m| m.as_str());
+    let pct = value.get("percentage").and_then(serde_json::Value::as_u64);
+
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(t) = title {
+        parts.push(format!("{t}…"));
+    } else if let Some(m) = message {
+        parts.push(format!("{m}…"));
+    }
+    if let Some(p) = pct {
+        parts.push(format!("{p}%"));
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" "))
+    }
+}
+
+/// Extract the most recent server message from noise data.
+///
+/// Reads `window/logMessage` or `window/showMessage` payload to get the
+/// message text. Prefers `showMessage` over `logMessage` if both exist.
+fn extract_server_message(noise: &[ServerNoiseRow], server: &str) -> Option<String> {
+    // Prefer showMessage (user-facing) over logMessage (telemetry).
+    let row = noise
+        .iter()
+        .find(|n| n.server == server && n.method == "window/showMessage")
+        .or_else(|| {
+            noise
+                .iter()
+                .find(|n| n.server == server && n.method == "window/logMessage")
+        })?;
+
+    row.payload
+        .get("params")
+        .and_then(|p| p.get("message"))
+        .and_then(|m| m.as_str())
+        .map(str::to_string)
+}
+
 // ── Rendering ────────────────────────────────────────────────────────
 
 /// Render the sidebar into the given area.
@@ -380,7 +469,8 @@ fn server_root_name(scope_root: &str) -> String {
 /// cursor highlight visibility.
 #[allow(
     clippy::cast_possible_truncation,
-    reason = "terminal coordinates are always small"
+    clippy::too_many_lines,
+    reason = "terminal coordinates are always small; server child lines add necessary rendering logic"
 )]
 pub fn render_sidebar(
     state: &SidebarState,
@@ -498,6 +588,28 @@ pub fn render_sidebar(
                 }
             }
             row += 1;
+
+            // ── Child lines: progress, then server message ─────
+            if let Some(ref progress) = server.progress_line
+                && row < max_rows
+            {
+                let child = Line::from(vec![
+                    Span::styled("  ", theme.muted),
+                    Span::styled(progress.clone(), theme.accent),
+                ]);
+                buf.set_line(area.x, area.y + row as u16, &child, content_width);
+                row += 1;
+            }
+            if let Some(ref msg) = server.server_message
+                && row < max_rows
+            {
+                let child = Line::from(vec![
+                    Span::styled("  ", theme.muted),
+                    Span::styled(msg.clone(), theme.muted),
+                ]);
+                buf.set_line(area.x, area.y + row as u16, &child, content_width);
+                row += 1;
+            }
         }
     }
 
@@ -1031,7 +1143,7 @@ mod tests {
             make_server_row("lua-ls", "/home/user/scripts", "ready"),
         ];
 
-        state.refresh_servers(&rows);
+        state.refresh_servers(&rows, &[]);
         assert_eq!(state.servers.len(), 3);
         assert_eq!(state.servers[0].name, "rust-analyzer");
         assert_eq!(state.servers[0].root, "Catenary/");
@@ -1046,12 +1158,12 @@ mod tests {
     fn servers_need_refresh_detects_changes() {
         let mut state = SidebarState::new();
         let rows = vec![make_server_row("rust-analyzer", "/A", "ready")];
-        state.refresh_servers(&rows);
+        state.refresh_servers(&rows, &[]);
 
-        assert!(!state.servers_need_refresh(&rows));
+        assert!(!state.servers_need_refresh(&rows, &[]));
 
         let changed = vec![make_server_row("rust-analyzer", "/A", "busy")];
-        assert!(state.servers_need_refresh(&changed));
+        assert!(state.servers_need_refresh(&changed, &[]));
     }
 
     #[test]
@@ -1059,7 +1171,7 @@ mod tests {
         let mut state = SidebarState::new();
         let mut badges = HexBadgeMap::new();
         state.refresh(vec![("s1".into(), None, "/tmp/A".into())], &mut badges);
-        state.refresh_servers(&[make_server_row("rust-analyzer", "/A", "ready")]);
+        state.refresh_servers(&[make_server_row("rust-analyzer", "/A", "ready")], &[]);
 
         assert_eq!(state.item_count(), 2);
 
@@ -1080,10 +1192,13 @@ mod tests {
         use ratatui::backend::TestBackend;
 
         let mut state = SidebarState::new();
-        state.refresh_servers(&[
-            make_server_row("rust-analyzer", "/home/user/Catenary", "ready"),
-            make_server_row("rust-analyzer", "/home/user/OmniDSP", "busy"),
-        ]);
+        state.refresh_servers(
+            &[
+                make_server_row("rust-analyzer", "/home/user/Catenary", "ready"),
+                make_server_row("rust-analyzer", "/home/user/OmniDSP", "busy"),
+            ],
+            &[],
+        );
 
         let theme = crate::tui::theme::Theme::new();
         // MAX_WIDTH is 30 — entries may truncate. Use MAX_WIDTH.
@@ -1118,6 +1233,190 @@ mod tests {
         );
         // Lifecycle state may be truncated by MAX_WIDTH — just verify
         // the entry includes the root scope to distinguish instances.
+    }
+
+    // ── Progress / server message extraction tests ────────────────
+
+    fn make_noise(server: &str, method: &str, payload: serde_json::Value) -> ServerNoiseRow {
+        ServerNoiseRow {
+            server: server.to_string(),
+            method: method.to_string(),
+            payload,
+        }
+    }
+
+    #[test]
+    fn extract_progress_line_begin() {
+        let noise = vec![make_noise(
+            "rust-analyzer",
+            "$/progress",
+            serde_json::json!({
+                "params": {
+                    "value": {
+                        "kind": "begin",
+                        "title": "Indexing",
+                        "percentage": 47
+                    }
+                }
+            }),
+        )];
+        let line = extract_progress_line(&noise, "rust-analyzer");
+        assert_eq!(line.as_deref(), Some("Indexing… 47%"));
+    }
+
+    #[test]
+    fn extract_progress_line_end_returns_none() {
+        let noise = vec![make_noise(
+            "rust-analyzer",
+            "$/progress",
+            serde_json::json!({
+                "params": {
+                    "value": { "kind": "end" }
+                }
+            }),
+        )];
+        assert!(extract_progress_line(&noise, "rust-analyzer").is_none());
+    }
+
+    #[test]
+    fn extract_progress_line_wrong_server() {
+        let noise = vec![make_noise(
+            "lua-ls",
+            "$/progress",
+            serde_json::json!({
+                "params": {
+                    "value": { "kind": "begin", "title": "Loading" }
+                }
+            }),
+        )];
+        assert!(extract_progress_line(&noise, "rust-analyzer").is_none());
+    }
+
+    #[test]
+    fn extract_server_message_log() {
+        let noise = vec![make_noise(
+            "rust-analyzer",
+            "window/logMessage",
+            serde_json::json!({
+                "params": { "message": "Fetching crate data" }
+            }),
+        )];
+        let msg = extract_server_message(&noise, "rust-analyzer");
+        assert_eq!(msg.as_deref(), Some("Fetching crate data"));
+    }
+
+    #[test]
+    fn extract_server_message_prefers_show_over_log() {
+        let noise = vec![
+            make_noise(
+                "rust-analyzer",
+                "window/logMessage",
+                serde_json::json!({
+                    "params": { "message": "log message" }
+                }),
+            ),
+            make_noise(
+                "rust-analyzer",
+                "window/showMessage",
+                serde_json::json!({
+                    "params": { "message": "show message" }
+                }),
+            ),
+        ];
+        let msg = extract_server_message(&noise, "rust-analyzer");
+        assert_eq!(msg.as_deref(), Some("show message"));
+    }
+
+    #[test]
+    fn total_rows_includes_child_lines() {
+        let mut state = SidebarState::new();
+        let rows = vec![make_server_row("rust-analyzer", "/A", "busy")];
+        let noise = vec![make_noise(
+            "rust-analyzer",
+            "$/progress",
+            serde_json::json!({
+                "params": {
+                    "value": { "kind": "begin", "title": "Indexing", "percentage": 50 }
+                }
+            }),
+        )];
+        state.refresh_servers(&rows, &noise);
+
+        // Sessions header(1) + blank(1) + servers header(1) + server(1) + progress child(1) = 5
+        assert_eq!(state.total_rows(), 5);
+    }
+
+    #[test]
+    fn servers_need_refresh_detects_noise_change() {
+        let mut state = SidebarState::new();
+        let rows = vec![make_server_row("rust-analyzer", "/A", "busy")];
+        let noise = vec![make_noise(
+            "rust-analyzer",
+            "$/progress",
+            serde_json::json!({
+                "params": { "value": { "kind": "begin", "title": "Indexing", "percentage": 10 } }
+            }),
+        )];
+        state.refresh_servers(&rows, &noise);
+
+        // Same noise — no refresh needed.
+        assert!(!state.servers_need_refresh(&rows, &noise));
+
+        // Changed percentage — refresh needed.
+        let noise2 = vec![make_noise(
+            "rust-analyzer",
+            "$/progress",
+            serde_json::json!({
+                "params": { "value": { "kind": "begin", "title": "Indexing", "percentage": 50 } }
+            }),
+        )];
+        assert!(state.servers_need_refresh(&rows, &noise2));
+    }
+
+    #[test]
+    fn render_sidebar_shows_progress_child() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut state = SidebarState::new();
+        let rows = vec![make_server_row("rust-analyzer", "/A", "busy")];
+        let noise = vec![make_noise(
+            "rust-analyzer",
+            "$/progress",
+            serde_json::json!({
+                "params": {
+                    "value": { "kind": "begin", "title": "Indexing", "percentage": 47 }
+                }
+            }),
+        )];
+        state.refresh_servers(&rows, &noise);
+
+        let theme = crate::tui::theme::Theme::new();
+        let backend = TestBackend::new(MAX_WIDTH, 10);
+        let mut terminal = Terminal::new(backend).expect("terminal creation");
+
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_sidebar(&state, area, frame.buffer_mut(), &theme, true);
+            })
+            .expect("draw");
+
+        let buf = terminal.backend().buffer().clone();
+        let content = buffer_to_string(&buf);
+
+        assert!(
+            content.contains("rust-analyzer"),
+            "should show server: {content}"
+        );
+        assert!(
+            content.contains("Indexing"),
+            "should show progress title: {content}"
+        );
+        assert!(
+            content.contains("47%"),
+            "should show progress percentage: {content}"
+        );
     }
 
     // ── Helpers ─────────────────────────────────────────────────────

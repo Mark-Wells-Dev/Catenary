@@ -234,15 +234,17 @@ impl<'a> App<'a> {
 
     /// Refresh the sidebar server list from the database.
     ///
-    /// Queries `language_servers` and updates the server section.
+    /// Queries `language_servers` and server noise (progress, log/show
+    /// messages) and updates the server section.
     /// Silently ignores query failures.
     pub fn refresh_servers(&mut self) {
         let Ok(rows) = self.data.list_server_statuses() else {
             return;
         };
-        if !self.sidebar.servers_need_refresh(&rows) {
+        let noise = self.data.list_server_noise().unwrap_or_default();
+        if !self.sidebar.servers_need_refresh(&rows, &noise) {
             return;
         }
-        self.sidebar.refresh_servers(&rows);
+        self.sidebar.refresh_servers(&rows, &noise);
     }
 }

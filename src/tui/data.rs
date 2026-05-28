@@ -39,6 +39,22 @@ pub struct ServerStatusRow {
     pub state: String,
 }
 
+/// A server noise row: the most recent `$/progress`, `window/logMessage`,
+/// or `window/showMessage` per server.
+#[derive(Debug, Clone)]
+pub struct ServerNoiseRow {
+    /// Server binary name (matches `ServerStatusRow::server`).
+    pub server: String,
+    /// LSP method (`$/progress`, `window/logMessage`, `window/showMessage`).
+    pub method: String,
+    /// Raw protocol JSON payload.
+    pub payload: serde_json::Value,
+}
+
+/// Methods that constitute server noise — redirected from stream to sidebar.
+pub const SERVER_NOISE_METHODS: &[&str] =
+    &["$/progress", "window/logMessage", "window/showMessage"];
+
 /// Abstraction over session data access.
 ///
 /// [`SqliteDataSource`] reads from the database (production).
@@ -169,6 +185,17 @@ pub trait DataSource {
     ///
     /// Returns an error if the database cannot be queried.
     fn list_server_statuses(&self) -> Result<Vec<ServerStatusRow>>;
+
+    /// Load the most recent server noise row per server.
+    ///
+    /// Queries `$/progress`, `window/logMessage`, and `window/showMessage`
+    /// from the messages table. Returns at most one row per (server, method)
+    /// combination — the most recent by message ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be queried.
+    fn list_server_noise(&self) -> Result<Vec<ServerNoiseRow>>;
 }
 
 /// Tail reader abstraction for streaming new messages.
@@ -419,6 +446,37 @@ impl DataSource for SqliteDataSource {
         }
         Ok(result)
     }
+
+    fn list_server_noise(&self) -> Result<Vec<ServerNoiseRow>> {
+        // Most recent row per (server, method) for server noise methods.
+        let mut stmt = self.conn.prepare(
+            "SELECT server, method, payload FROM messages \
+             WHERE type = 'lsp' \
+               AND method IN ('$/progress', 'window/logMessage', 'window/showMessage') \
+               AND parent_id IS NULL \
+               AND id IN ( \
+                   SELECT MAX(id) FROM messages \
+                   WHERE type = 'lsp' \
+                     AND method IN ('$/progress', 'window/logMessage', 'window/showMessage') \
+                     AND parent_id IS NULL \
+                   GROUP BY server, method \
+               ) \
+             ORDER BY server, method",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut result = Vec::new();
+        while let Some(row) = rows.next()? {
+            let payload_str: String = row.get(2)?;
+            let payload: serde_json::Value =
+                serde_json::from_str(&payload_str).unwrap_or(serde_json::Value::Null);
+            result.push(ServerNoiseRow {
+                server: row.get(0)?,
+                method: row.get(1)?,
+                payload,
+            });
+        }
+        Ok(result)
+    }
 }
 
 /// Query active languages for a session from its messages.
@@ -456,6 +514,8 @@ pub struct MockDataSource {
     pub tail_messages: HashMap<String, VecDeque<SessionMessage>>,
     /// Server statuses for [`DataSource::list_server_statuses`].
     pub server_statuses: Vec<ServerStatusRow>,
+    /// Server noise for [`DataSource::list_server_noise`].
+    pub server_noise: Vec<ServerNoiseRow>,
 }
 
 impl DataSource for MockDataSource {
@@ -604,6 +664,10 @@ impl DataSource for MockDataSource {
             .filter(|s| s.state != "dead")
             .cloned()
             .collect())
+    }
+
+    fn list_server_noise(&self) -> Result<Vec<ServerNoiseRow>> {
+        Ok(self.server_noise.clone())
     }
 }
 
@@ -765,6 +829,7 @@ mod tests {
             messages: HashMap::new(),
             tail_messages: HashMap::new(),
             server_statuses: Vec::new(),
+            server_noise: Vec::new(),
         };
 
         let rows = ds.list_sessions()?;
@@ -792,6 +857,7 @@ mod tests {
             messages: messages_map,
             tail_messages: HashMap::new(),
             server_statuses: Vec::new(),
+            server_noise: Vec::new(),
         };
 
         let result = ds.monitor_messages("abc", true)?;
@@ -949,6 +1015,7 @@ mod tests {
             messages: HashMap::new(),
             tail_messages: HashMap::new(),
             server_statuses: Vec::new(),
+            server_noise: Vec::new(),
         };
 
         let ids = ds.list_alive_session_ids()?;
@@ -1044,6 +1111,7 @@ mod tests {
                     state: "dead".to_string(),
                 },
             ],
+            server_noise: Vec::new(),
         };
 
         let rows = ds.list_server_statuses()?;
@@ -1069,6 +1137,7 @@ mod tests {
             messages: HashMap::new(),
             tail_messages: map,
             server_statuses: Vec::new(),
+            server_noise: Vec::new(),
         };
 
         let mut tail = ds.create_message_tail("sess-1", false)?;
@@ -1132,6 +1201,7 @@ mod tests {
             messages: map,
             tail_messages: HashMap::new(),
             server_statuses: Vec::new(),
+            server_noise: Vec::new(),
         }
     }
 
