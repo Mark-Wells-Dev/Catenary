@@ -128,14 +128,41 @@ pub fn try_parse_message(buffer: &mut BytesMut) -> Result<Option<String>> {
         let total_len = header_len + content_len;
 
         if buffer.len() >= total_len {
-            buffer.advance(header_len);
-            let message_bytes = buffer.split_to(content_len);
-            let message = String::from_utf8(message_bytes.to_vec())?;
+            // Validate body UTF-8 before consuming the buffer so that
+            // on any error the buffer remains unchanged for resync.
+            let message = std::str::from_utf8(&buffer[header_len..total_len])
+                .context("Failed to parse message body as UTF-8")?
+                .to_string();
+            buffer.advance(total_len);
             return Ok(Some(message));
         }
     }
 
     Ok(None)
+}
+
+/// Discard bytes up to the next `Content-Length:` header in the buffer.
+///
+/// Called after [`try_parse_message`] returns an error to skip past corrupt
+/// data and resynchronize with the next LSP message boundary. Scans forward
+/// from byte 1 (byte 0 belongs to the current broken message) for a
+/// case-insensitive `Content-Length:` prefix. If found, the buffer is
+/// advanced to that position. If no valid header is found, the entire
+/// buffer is cleared.
+pub fn resync_to_next_message(buffer: &mut BytesMut) {
+    let needle = b"content-length:";
+    for i in 1..=buffer.len().saturating_sub(needle.len()) {
+        if buffer[i..i + needle.len()]
+            .iter()
+            .zip(needle.iter())
+            .all(|(a, b)| a.to_ascii_lowercase() == *b)
+        {
+            buffer.advance(i);
+            return;
+        }
+    }
+    // No subsequent header found — discard everything.
+    buffer.clear();
 }
 
 #[cfg(test)]
@@ -259,5 +286,133 @@ mod tests {
         let msg: NotificationMessage = serde_json::from_str(json)?;
         assert_eq!(msg.method, "initialized");
         Ok(())
+    }
+
+    // --- Error recovery tests ---
+
+    #[test]
+    fn test_resync_after_corrupt_content_length() {
+        // Corrupt Content-Length value followed by a valid message.
+        let valid_body = r#"{"jsonrpc":"2.0","id":1}"#;
+        let raw = format!(
+            "Content-Length: abc\r\n\r\ngarbage\
+             Content-Length: {}\r\n\r\n{}",
+            valid_body.len(),
+            valid_body
+        );
+        let mut buffer = BytesMut::from(raw.as_str());
+
+        // First parse fails on "abc"
+        assert!(try_parse_message(&mut buffer).is_err());
+
+        // Resync finds the next Content-Length: header
+        resync_to_next_message(&mut buffer);
+
+        // Second parse succeeds
+        let result = try_parse_message(&mut buffer)
+            .expect("should parse")
+            .expect("should have message");
+        assert_eq!(result, valid_body);
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn test_resync_after_non_utf8_header() {
+        let valid_body = r#"{"jsonrpc":"2.0","id":2}"#;
+        // Non-UTF-8 bytes (0xFF 0xFE) in the header region, then \r\n\r\n,
+        // then a valid message.
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"Content-Length: 5\r\nX-Bad: ");
+        raw.extend_from_slice(&[0xFF, 0xFE]);
+        raw.extend_from_slice(b"\r\n\r\nhello");
+        raw.extend_from_slice(
+            format!("Content-Length: {}\r\n\r\n{}", valid_body.len(), valid_body).as_bytes(),
+        );
+        let mut buffer = BytesMut::from(&raw[..]);
+
+        // First parse fails on non-UTF-8 header
+        assert!(try_parse_message(&mut buffer).is_err());
+
+        // Resync
+        resync_to_next_message(&mut buffer);
+
+        // The valid second message is recovered
+        let result = try_parse_message(&mut buffer)
+            .expect("should parse")
+            .expect("should have message");
+        assert_eq!(result, valid_body);
+    }
+
+    #[test]
+    fn test_resync_after_non_utf8_body() {
+        let valid_body = r#"{"jsonrpc":"2.0","id":3}"#;
+        // Valid header but body contains non-UTF-8 bytes
+        let bad_body: &[u8] = &[0x80, 0x81, 0x82, 0x83, 0x84];
+        let mut raw = Vec::new();
+        raw.extend_from_slice(format!("Content-Length: {}\r\n\r\n", bad_body.len()).as_bytes());
+        raw.extend_from_slice(bad_body);
+        raw.extend_from_slice(
+            format!("Content-Length: {}\r\n\r\n{}", valid_body.len(), valid_body).as_bytes(),
+        );
+        let mut buffer = BytesMut::from(&raw[..]);
+
+        // First parse fails on non-UTF-8 body
+        assert!(try_parse_message(&mut buffer).is_err());
+
+        // Buffer is unchanged (body UTF-8 checked before advance)
+        resync_to_next_message(&mut buffer);
+
+        // Second message recovered
+        let result = try_parse_message(&mut buffer)
+            .expect("should parse")
+            .expect("should have message");
+        assert_eq!(result, valid_body);
+    }
+
+    #[test]
+    fn test_resync_garbage_prefix_then_valid_message() {
+        let valid_body = r#"{"jsonrpc":"2.0","id":4}"#;
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"GARBAGE BYTES HERE ");
+        raw.extend_from_slice(
+            format!("Content-Length: {}\r\n\r\n{}", valid_body.len(), valid_body).as_bytes(),
+        );
+        let mut buffer = BytesMut::from(&raw[..]);
+
+        // No \r\n\r\n before the valid header, so try_parse returns Ok(None)
+        // (it can't find headers_end). Simulate receiving more data that
+        // doesn't help — the caller should resync if stuck.
+        // In practice, resync is called after Err, but we can test the
+        // resync function directly on a garbage-prefixed buffer.
+        resync_to_next_message(&mut buffer);
+
+        let result = try_parse_message(&mut buffer)
+            .expect("should parse")
+            .expect("should have message");
+        assert_eq!(result, valid_body);
+    }
+
+    #[test]
+    fn test_resync_no_subsequent_header_clears_buffer() {
+        let mut buffer = BytesMut::from("garbage with no valid header at all");
+        resync_to_next_message(&mut buffer);
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn test_err_does_not_consume_buffer() {
+        // Verify that try_parse_message on error leaves the buffer unchanged.
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"Content-Length: 3\r\n\r\n");
+        raw.extend_from_slice(&[0xFF, 0xFE, 0xFD]); // non-UTF-8 body
+        let original = raw.clone();
+        let mut buffer = BytesMut::from(&raw[..]);
+
+        assert!(try_parse_message(&mut buffer).is_err());
+        assert_eq!(
+            &buffer[..],
+            &original[..],
+            "buffer must be unchanged after error"
+        );
     }
 }

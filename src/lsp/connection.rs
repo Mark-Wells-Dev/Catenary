@@ -13,7 +13,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStderr, ChildStdin, Command};
 use tokio::sync::{Mutex, oneshot};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::protocol::category::{lsp_category, lsp_category_level, window_message_level};
 
@@ -586,188 +586,215 @@ impl Connection {
             }
 
             // Try to parse complete messages
-            while let Ok(Some(message_str)) = protocol::try_parse_message(&mut buffer) {
-                let value: serde_json::Value = match serde_json::from_str(&message_str) {
-                    Ok(v) => v,
+            loop {
+                match protocol::try_parse_message(&mut buffer) {
+                    Ok(None) => break, // Need more data
                     Err(e) => {
-                        debug!("Failed to parse JSON: {}", e);
-                        continue;
-                    }
-                };
-
-                // Upgrade weak reference — if LspServer is gone, exit
-                let Some(server) = server.upgrade() else {
-                    debug!("LspServer dropped, reader loop exiting");
-                    break;
-                };
-
-                // Check message type
-                if let Some(method) = value.get("method").and_then(|m| m.as_str()) {
-                    // Request or Notification
-                    if let Some(id) = value.get("id") {
-                        // Server Request — always debug (server-initiated plumbing)
-                        debug!("Received server request: {} (id: {})", method, id);
-                        let exchange_id = uuid::Uuid::new_v4().to_string();
-                        emit_lsp_event(
-                            tracing::Level::DEBUG,
-                            &server_name,
-                            method,
-                            Some(&exchange_id),
-                            &value.to_string(),
-                            "incoming server request",
+                        let dump_len = buffer.len().min(128);
+                        warn!(
+                            server = server_name.as_str(),
+                            source = "lsp.protocol",
+                            "malformed LSP message from {server_name}, \
+                             resynchronizing: {e}"
                         );
-
-                        let request_id =
-                            serde_json::from_value(id.clone()).unwrap_or(RequestId::Number(0));
-
-                        let params = value.get("params").unwrap_or(&serde_json::Value::Null);
-
-                        let response = match server.on_request(method, params) {
-                            Ok(result) => ResponseMessage {
-                                jsonrpc: "2.0".to_string(),
-                                id: Some(request_id),
-                                result: Some(result),
-                                error: None,
-                            },
-                            Err(e) => ResponseMessage {
-                                jsonrpc: "2.0".to_string(),
-                                id: Some(request_id),
-                                result: None,
-                                error: Some(ResponseError {
-                                    code: e.code,
-                                    message: e.message,
-                                    data: None,
-                                }),
-                            },
+                        debug!(
+                            server = server_name.as_str(),
+                            buffer_len = buffer.len(),
+                            "buffer head (hex): {:02x?}",
+                            &buffer[..dump_len]
+                        );
+                        protocol::resync_to_next_message(&mut buffer);
+                    }
+                    Ok(Some(message_str)) => {
+                        let value: serde_json::Value = match serde_json::from_str(&message_str) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                debug!("Failed to parse JSON: {}", e);
+                                continue;
+                            }
                         };
 
-                        // Log outbound response (same level as request)
-                        if let Ok(response_json) = serde_json::to_value(&response) {
-                            emit_lsp_event(
-                                tracing::Level::DEBUG,
-                                &server_name,
-                                method,
-                                Some(&exchange_id),
-                                &response_json.to_string(),
-                                "outgoing server response",
-                            );
-                        }
+                        // Upgrade weak reference — if LspServer is gone, exit
+                        let Some(server) = server.upgrade() else {
+                            debug!("LspServer dropped, reader loop exiting");
+                            break;
+                        };
 
-                        if let Ok(body) = serde_json::to_string(&response) {
-                            let header = format!("Content-Length: {}\r\n\r\n", body.len());
-                            let mut stdin_guard = stdin.lock().await;
-                            if let Err(e) = stdin_guard.write_all(header.as_bytes()).await {
-                                debug!("Failed to write response header: {}", e);
-                            } else if let Err(e) = stdin_guard.write_all(body.as_bytes()).await {
-                                debug!("Failed to write response body: {}", e);
-                            } else if let Err(e) = stdin_guard.flush().await {
-                                debug!("Failed to flush response: {}", e);
-                            }
-                        }
-                    } else {
-                        // Notification — level determined by method
-                        if method == "window/logMessage" {
-                            // Server telemetry — always info to stay out of
-                            // notification drain (warn threshold). Original
-                            // LSP MessageType preserved as lsp_level for
-                            // future TUI filtering.
-                            let msg_type = value
-                                .get("params")
-                                .and_then(|p| p.get("type"))
-                                .and_then(serde_json::Value::as_u64);
-                            let text = value
-                                .get("params")
-                                .and_then(|p| p.get("message"))
-                                .and_then(serde_json::Value::as_str)
-                                .unwrap_or("(no message)");
-                            let payload_str = value.to_string();
-                            if let Some(lsp_level) = msg_type {
-                                tracing::info!(
-                                    kind = "lsp",
-                                    method = method,
-                                    server = server_name.as_str(),
-                                    client = "catenary",
-                                    payload = payload_str.as_str(),
-                                    source = crate::source::Source::LspLogging.as_str(),
-                                    lsp_level = lsp_level,
-                                    "{server_name}: {text}"
+                        // Check message type
+                        if let Some(method) = value.get("method").and_then(|m| m.as_str()) {
+                            // Request or Notification
+                            if let Some(id) = value.get("id") {
+                                // Server Request — always debug (server-initiated plumbing)
+                                debug!("Received server request: {} (id: {})", method, id);
+                                let exchange_id = uuid::Uuid::new_v4().to_string();
+                                emit_lsp_event(
+                                    tracing::Level::DEBUG,
+                                    &server_name,
+                                    method,
+                                    Some(&exchange_id),
+                                    &value.to_string(),
+                                    "incoming server request",
                                 );
+
+                                let request_id = serde_json::from_value(id.clone())
+                                    .unwrap_or(RequestId::Number(0));
+
+                                let params =
+                                    value.get("params").unwrap_or(&serde_json::Value::Null);
+
+                                let response = match server.on_request(method, params) {
+                                    Ok(result) => ResponseMessage {
+                                        jsonrpc: "2.0".to_string(),
+                                        id: Some(request_id),
+                                        result: Some(result),
+                                        error: None,
+                                    },
+                                    Err(e) => ResponseMessage {
+                                        jsonrpc: "2.0".to_string(),
+                                        id: Some(request_id),
+                                        result: None,
+                                        error: Some(ResponseError {
+                                            code: e.code,
+                                            message: e.message,
+                                            data: None,
+                                        }),
+                                    },
+                                };
+
+                                // Log outbound response (same level as request)
+                                if let Ok(response_json) = serde_json::to_value(&response) {
+                                    emit_lsp_event(
+                                        tracing::Level::DEBUG,
+                                        &server_name,
+                                        method,
+                                        Some(&exchange_id),
+                                        &response_json.to_string(),
+                                        "outgoing server response",
+                                    );
+                                }
+
+                                if let Ok(body) = serde_json::to_string(&response) {
+                                    let header = format!("Content-Length: {}\r\n\r\n", body.len());
+                                    let mut stdin_guard = stdin.lock().await;
+                                    if let Err(e) = stdin_guard.write_all(header.as_bytes()).await {
+                                        debug!("Failed to write response header: {}", e);
+                                    } else if let Err(e) =
+                                        stdin_guard.write_all(body.as_bytes()).await
+                                    {
+                                        debug!("Failed to write response body: {}", e);
+                                    } else if let Err(e) = stdin_guard.flush().await {
+                                        debug!("Failed to flush response: {}", e);
+                                    }
+                                }
                             } else {
-                                tracing::info!(
-                                    kind = "lsp",
-                                    method = method,
-                                    server = server_name.as_str(),
-                                    client = "catenary",
-                                    payload = payload_str.as_str(),
-                                    source = crate::source::Source::LspLogging.as_str(),
-                                    "{server_name}: {text}"
-                                );
-                            }
-                        } else {
-                            let notif_level = match method {
-                                "window/showMessage" => {
+                                // Notification — level determined by method
+                                if method == "window/logMessage" {
+                                    // Server telemetry — always info to stay out of
+                                    // notification drain (warn threshold). Original
+                                    // LSP MessageType preserved as lsp_level for
+                                    // future TUI filtering.
                                     let msg_type = value
                                         .get("params")
                                         .and_then(|p| p.get("type"))
                                         .and_then(serde_json::Value::as_u64);
-                                    window_message_level(msg_type)
-                                }
-                                _ => lsp_category_level(lsp_category(method)),
-                            };
-                            let msg = match method {
-                                "window/showMessage" => {
                                     let text = value
                                         .get("params")
                                         .and_then(|p| p.get("message"))
                                         .and_then(serde_json::Value::as_str)
                                         .unwrap_or("(no message)");
-                                    format!("{server_name}: {text}")
+                                    let payload_str = value.to_string();
+                                    if let Some(lsp_level) = msg_type {
+                                        tracing::info!(
+                                            kind = "lsp",
+                                            method = method,
+                                            server = server_name.as_str(),
+                                            client = "catenary",
+                                            payload = payload_str.as_str(),
+                                            source = crate::source::Source::LspLogging.as_str(),
+                                            lsp_level = lsp_level,
+                                            "{server_name}: {text}"
+                                        );
+                                    } else {
+                                        tracing::info!(
+                                            kind = "lsp",
+                                            method = method,
+                                            server = server_name.as_str(),
+                                            client = "catenary",
+                                            payload = payload_str.as_str(),
+                                            source = crate::source::Source::LspLogging.as_str(),
+                                            "{server_name}: {text}"
+                                        );
+                                    }
+                                } else {
+                                    let notif_level = match method {
+                                        "window/showMessage" => {
+                                            let msg_type = value
+                                                .get("params")
+                                                .and_then(|p| p.get("type"))
+                                                .and_then(serde_json::Value::as_u64);
+                                            window_message_level(msg_type)
+                                        }
+                                        _ => lsp_category_level(lsp_category(method)),
+                                    };
+                                    let msg = match method {
+                                        "window/showMessage" => {
+                                            let text = value
+                                                .get("params")
+                                                .and_then(|p| p.get("message"))
+                                                .and_then(serde_json::Value::as_str)
+                                                .unwrap_or("(no message)");
+                                            format!("{server_name}: {text}")
+                                        }
+                                        _ => {
+                                            format!("{server_name}: {method}")
+                                        }
+                                    };
+                                    emit_lsp_event(
+                                        notif_level,
+                                        &server_name,
+                                        method,
+                                        None,
+                                        &value.to_string(),
+                                        &msg,
+                                    );
                                 }
-                                _ => {
-                                    format!("{server_name}: {method}")
-                                }
-                            };
-                            emit_lsp_event(
-                                notif_level,
-                                &server_name,
-                                method,
-                                None,
-                                &value.to_string(),
-                                &msg,
-                            );
-                        }
-                        let params = value.get("params").unwrap_or(&serde_json::Value::Null);
-                        server.on_notification(method, params);
-                    }
-                } else if value.get("id").is_some() {
-                    // Response — match the level of the outgoing request
-                    if let Ok(response) = serde_json::from_value::<ResponseMessage>(value.clone())
-                        && let Some(id) = &response.id
-                    {
-                        let mut pending = pending.lock().await;
-                        if let Some(req) = pending.remove(id) {
-                            // Drain sentinels are internal markers, not
-                            // LSP traffic — skip protocol logging.
-                            if req.method != "drain" {
-                                let resp_level = lsp_category_level(lsp_category(&req.method));
-                                emit_lsp_event(
-                                    resp_level,
-                                    &server_name,
-                                    &req.method,
-                                    req.parent_id.as_deref(),
-                                    &value.to_string(),
-                                    "incoming response",
-                                );
+                                let params =
+                                    value.get("params").unwrap_or(&serde_json::Value::Null);
+                                server.on_notification(method, params);
                             }
-                            let _ = req.sender.send(response);
+                        } else if value.get("id").is_some() {
+                            // Response — match the level of the outgoing request
+                            if let Ok(response) =
+                                serde_json::from_value::<ResponseMessage>(value.clone())
+                                && let Some(id) = &response.id
+                            {
+                                let mut pending = pending.lock().await;
+                                if let Some(req) = pending.remove(id) {
+                                    // Drain sentinels are internal markers, not
+                                    // LSP traffic — skip protocol logging.
+                                    if req.method != "drain" {
+                                        let resp_level =
+                                            lsp_category_level(lsp_category(&req.method));
+                                        emit_lsp_event(
+                                            resp_level,
+                                            &server_name,
+                                            &req.method,
+                                            req.parent_id.as_deref(),
+                                            &value.to_string(),
+                                            "incoming response",
+                                        );
+                                    }
+                                    let _ = req.sender.send(response);
+                                } else {
+                                    debug!("Received response for unknown request id: {:?}", id);
+                                }
+                            }
                         } else {
-                            debug!("Received response for unknown request id: {:?}", id);
+                            debug!("Unknown message format: {}", message_str);
                         }
-                    }
-                } else {
-                    debug!("Unknown message format: {}", message_str);
-                }
-            }
+                    } // Ok(Some)
+                } // match
+            } // loop
         }
 
         // Mark server as dead and trigger shutdown cleanup
