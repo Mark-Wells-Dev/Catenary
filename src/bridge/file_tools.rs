@@ -25,7 +25,6 @@ use std::sync::{Arc, Mutex};
 
 use super::filesystem_manager::{FilesystemManager, format_file_size};
 use super::handler::{expand_tilde, resolve_path};
-use super::pagination::{format_page_header, paginate};
 use super::session::ResolvedGlob;
 use crate::lsp::LspClientManager;
 use crate::symbol_index::{Symbol, SymbolIndex, format_symbol_kind};
@@ -350,6 +349,8 @@ pub struct GlobServer {
     pub(super) budget: usize,
     pub(super) outline_threshold: usize,
     pub(super) outline_suppress: Vec<globset::GlobMatcher>,
+    /// Single-slot result cache for sequential page fetches.
+    pub(super) cache: std::sync::Mutex<super::result_cache::ResultCache>,
 }
 
 impl GlobServer {
@@ -360,6 +361,9 @@ impl GlobServer {
         _parent_id: Option<&str>,
         _cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<serde_json::Value> {
+        use super::pagination::paginate;
+        use super::result_cache::{GlobCacheParams, cache_key};
+
         let input: GlobInput = serde_json::from_value(params.clone())
             .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
 
@@ -367,6 +371,25 @@ impl GlobServer {
         let path = resolve_path(&pattern)?;
 
         tracing::debug!("glob: {pattern}");
+
+        let page = input.page.max(1);
+
+        // Compute cache key from pipeline-affecting parameters.
+        let key = cache_key(&GlobCacheParams {
+            pattern: &pattern,
+            exclude: input.exclude.as_deref(),
+            include_gitignored: input.include_gitignored,
+            include_hidden: input.include_hidden,
+            cwd: input.cwd.as_deref(),
+            budget: self.budget,
+        });
+
+        // Check cache before running the pipeline.
+        if let Ok(cache) = self.cache.lock()
+            && let Some(cached) = cache.get(key, page, &self.fs_manager)
+        {
+            return Ok(Value::String(cached));
+        }
 
         // Compile exclude pattern via ResolvedGlob. The CLI router
         // resolves exclude against cwd before dispatch, so patterns
@@ -378,13 +401,11 @@ impl GlobServer {
             .map(ResolvedGlob::new)
             .transpose()?;
 
-        let page = input.page.max(1);
-
         // cwd-scoped search: present when the original pattern was relative.
         let cwd = input.cwd.as_deref();
 
-        // Run pipeline.
-        let output = if path.is_file() || path.is_symlink() {
+        // Run pipeline — handlers return full unpaginated output.
+        let full_output = if path.is_file() || path.is_symlink() {
             self.client_manager
                 .ensure_and_wait_for_paths(std::slice::from_ref(&path))
                 .await;
@@ -394,23 +415,30 @@ impl GlobServer {
                 std::slice::from_ref(&path),
             )
             .await;
-            self.handle_glob_file(&path, page, cwd)
+            self.handle_glob_file(&path, cwd)
         } else if path.is_dir() {
-            self.handle_glob_dir(&path, &input, exclude.as_ref(), page, cwd)
+            self.handle_glob_dir(&path, &input, exclude.as_ref(), cwd)
                 .await?
         } else {
-            self.handle_glob_pattern(&pattern, &input, exclude.as_ref(), page, cwd)
+            self.handle_glob_pattern(&pattern, &input, exclude.as_ref(), cwd)
                 .await?
         };
 
-        Ok(Value::String(output))
+        // Paginate first (borrows), then move output into cache.
+        let paginated = paginate(&full_output, self.budget, page);
+        let roots = self.client_manager.roots();
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.put(key, full_output, &roots, &self.fs_manager);
+        }
+
+        Ok(Value::String(paginated))
     }
 
     /// Single file: header with defensive map (if symbols available).
     ///
     /// Single files bypass `outline_threshold` — they get a map unless the
-    /// grammar is not installed or the path matches `outline_suppress`. Pages
-    /// when the map exceeds budget.
+    /// grammar is not installed or the path matches `outline_suppress`.
+    /// Returns the full unpaginated output.
     #[allow(
         clippy::significant_drop_tightening,
         reason = "guard must live for all index queries"
@@ -419,7 +447,7 @@ impl GlobServer {
         clippy::option_if_let_else,
         reason = "side-effecting writeln in the Some branch"
     )]
-    fn handle_glob_file(&self, path: &Path, page: usize, cwd: Option<&Path>) -> String {
+    fn handle_glob_file(&self, path: &Path, cwd: Option<&Path>) -> String {
         let mut full = String::new();
 
         // Context header: `cwd: ~/…` for cwd-scoped, absolute path for absolute.
@@ -454,7 +482,7 @@ impl GlobServer {
             .unwrap_or_default();
         if is_snapshot(&name) {
             let _ = writeln!(full, "{display} [snapshot]");
-            return format_page_header(1, 1) + &full;
+            return full;
         }
 
         // File header with line count or size.
@@ -470,22 +498,22 @@ impl GlobServer {
 
         // Single-file map: bypass threshold, check symbols + deny only.
         let Some(ref ts_arc) = self.symbol_index else {
-            return format_page_header(1, 1) + &full;
+            return full;
         };
         let Ok(idx) = ts_arc.lock() else {
-            return format_page_header(1, 1) + &full;
+            return full;
         };
         if !idx.has_symbols_for(path)
             || is_outline_suppressed(path, &self.outline_suppress, &self.fs_manager)
         {
-            return format_page_header(1, 1) + &full;
+            return full;
         }
 
         let Ok(outline) = idx.query_outline_batch(&[path]) else {
-            return format_page_header(1, 1) + &full;
+            return full;
         };
         let Some(syms) = outline.get(path) else {
-            return format_page_header(1, 1) + &full;
+            return full;
         };
 
         // Build children set: names that appear as scope for other symbols.
@@ -507,14 +535,14 @@ impl GlobServer {
             render_symbol_line(&mut full, sym, Some(&children_set), "\t");
         }
 
-        paginate(&full, self.budget, page)
+        full
     }
 
     /// Directory listing: enriched (maps) where LSP available, plain (flags) otherwise.
     ///
     /// Collects immediate children, applies visibility and exclude filters,
     /// detects flags (gitignored, snapshot, broken). Output shape is
-    /// capability-driven, not volume-driven. Paged via `page` parameter.
+    /// capability-driven, not volume-driven. Returns the full unpaginated output.
     #[allow(clippy::too_many_lines, reason = "sequential pipeline steps")]
     #[allow(
         clippy::significant_drop_tightening,
@@ -525,7 +553,6 @@ impl GlobServer {
         dir: &Path,
         input: &GlobInput,
         exclude: Option<&ResolvedGlob>,
-        page: usize,
         cwd: Option<&Path>,
     ) -> Result<String> {
         let canonical = dir
@@ -696,13 +723,14 @@ impl GlobServer {
             "\t",
         );
         full.push_str(&content);
-        Ok(paginate(&full, self.budget, page))
+        Ok(full)
     }
 
     /// Glob pattern match across workspace roots with tree output.
     ///
     /// Output shape is capability-driven: enriched (maps) for files with LSP
-    /// symbols, plain (flags) for files without. Paged via `page` parameter.
+    /// symbols, plain (flags) for files without. Returns the full unpaginated
+    /// output.
     ///
     /// Absolute patterns (e.g. `/home/user/projects/*`) are searched from
     /// the pattern's base directory rather than workspace roots.
@@ -720,7 +748,6 @@ impl GlobServer {
         pattern: &str,
         input: &GlobInput,
         exclude: Option<&ResolvedGlob>,
-        page: usize,
         cwd: Option<&Path>,
     ) -> Result<String> {
         let resolved = ResolvedGlob::new(pattern)?;
@@ -920,7 +947,7 @@ impl GlobServer {
 
         full.push_str(&section_content);
 
-        Ok(paginate(&full, self.budget, page))
+        Ok(full)
     }
 
     /// Extracts file info: `(line_count, binary_size)`.

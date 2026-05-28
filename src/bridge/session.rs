@@ -242,6 +242,7 @@ impl Session {
             fs_manager: fs_manager.clone(),
             symbol_index: symbol_index.clone(),
             budget: grep_budget,
+            cache: std::sync::Mutex::new(super::result_cache::ResultCache::new(grep_budget)),
         };
         let outline_suppress: Vec<globset::GlobMatcher> = glob_config
             .outline_suppress
@@ -264,6 +265,7 @@ impl Session {
             budget: glob_budget,
             outline_threshold: glob_config.outline_threshold,
             outline_suppress,
+            cache: std::sync::Mutex::new(super::result_cache::ResultCache::new(glob_budget)),
         };
         Self {
             config,
@@ -339,6 +341,7 @@ impl Session {
                 fs_manager: primary.fs_manager.clone(),
                 symbol_index: primary.symbol_index.clone(),
                 budget: grep_budget,
+                cache: std::sync::Mutex::new(super::result_cache::ResultCache::new(grep_budget)),
             },
             glob: GlobServer {
                 client_manager: primary.client_manager.clone(),
@@ -347,6 +350,7 @@ impl Session {
                 budget: glob_budget,
                 outline_threshold: glob_config.outline_threshold,
                 outline_suppress,
+                cache: std::sync::Mutex::new(super::result_cache::ResultCache::new(glob_budget)),
             },
             diagnostics: primary.diagnostics.clone(),
             editing: EditingManager::new(),

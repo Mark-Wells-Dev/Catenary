@@ -734,6 +734,14 @@ impl FilesystemManager {
             .copied()
             .unwrap_or(0)
     }
+
+    /// Bumps the generation counter for a root (test-only).
+    #[cfg(test)]
+    pub fn bump_generation_for_test(&self, root: &Path) {
+        if let Ok(mut gens) = self.root_generations.lock() {
+            *gens.entry(root.to_path_buf()).or_insert(0) += 1;
+        }
+    }
 }
 
 /// Formats a file size in human-readable form.

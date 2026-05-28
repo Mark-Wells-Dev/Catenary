@@ -84,6 +84,8 @@ pub struct GrepServer {
     pub(super) fs_manager: Arc<FilesystemManager>,
     pub(super) symbol_index: Option<Arc<std::sync::Mutex<SymbolIndex>>>,
     pub(super) budget: usize,
+    /// Single-slot result cache for sequential page fetches.
+    pub(super) cache: std::sync::Mutex<super::result_cache::ResultCache>,
 }
 
 impl GrepServer {
@@ -97,6 +99,8 @@ impl GrepServer {
         parent_id: Option<&str>,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<serde_json::Value> {
+        use super::result_cache::{GrepCacheParams, cache_key};
+
         let input: GrepInput = serde_json::from_value(params.clone())
             .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
 
@@ -106,6 +110,24 @@ impl GrepServer {
 
         if input.page == 0 {
             return Err(anyhow!("page must be >= 1"));
+        }
+
+        // Compute cache key from pipeline-affecting parameters.
+        let key = cache_key(&GrepCacheParams {
+            pattern: &input.pattern,
+            glob: input.glob.as_deref(),
+            exclude: input.exclude.as_deref(),
+            include_gitignored: input.include_gitignored,
+            include_hidden: input.include_hidden,
+            cwd: input.cwd.as_deref(),
+            budget: self.budget,
+        });
+
+        // Check cache before running the pipeline.
+        if let Ok(cache) = self.cache.lock()
+            && let Some(cached) = cache.get(key, input.page, &self.fs_manager)
+        {
+            return Ok(Value::String(cached));
         }
 
         // cwd-scoped search: present when no glob or relative glob.
@@ -140,11 +162,14 @@ impl GrepServer {
             return Ok(Value::String(String::new()));
         }
 
-        Ok(Value::String(paginate(
-            &all_output,
-            self.budget,
-            input.page,
-        )))
+        // Paginate first (borrows), then move output into cache.
+        let paginated = paginate(&all_output, self.budget, input.page);
+        let roots = self.client_manager.roots();
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.put(key, all_output, &roots, &self.fs_manager);
+        }
+
+        Ok(Value::String(paginated))
     }
 
     /// Grep pipeline: ripgrep + `documentSymbol` index + hit classification.

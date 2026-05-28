@@ -21,6 +21,8 @@ mod hook_router;
 mod pagination;
 /// Path validation for LSP-aware operations and config file protection.
 pub mod path_security;
+/// Single-slot paginated result cache for grep and glob servers.
+mod result_cache;
 /// Shared container for tool servers and cross-tool infrastructure.
 pub mod session;
 
