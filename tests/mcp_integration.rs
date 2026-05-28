@@ -2303,10 +2303,10 @@ fn test_grep_enriched() -> Result<()> {
 
     let text = bridge.call_tool_text("grep", &json!({ "pattern": "caller_t1" }))?;
 
-    // Page header followed by bare root path and name at depth 0
+    // Single-page result: no page header, bare root path
     assert!(
-        text.starts_with("[page "),
-        "Expected [page N/M] header, got:\n{text}"
+        !text.contains("[page"),
+        "Single-page result should have no page header, got:\n{text}"
     );
     assert!(
         !text.contains("Root: "),
@@ -2753,19 +2753,17 @@ fn test_grep_enriched_name_grouping() -> Result<()> {
 
     let text = bridge.call_tool_text("grep", &json!({ "pattern": "grouped_sym" }))?;
 
-    let lines: Vec<&str> = text.lines().collect();
-    // First line: [page N/M] header
+    // Single-page result: no page header
     assert!(
-        !lines.is_empty() && lines[0].starts_with("[page "),
-        "Expected [page N/M] header in first line, got:\n{text}"
+        !text.contains("[page"),
+        "Single-page result should have no page header, got:\n{text}"
     );
-    // Second line: blank (separator after page header)
-    // Third line: bare root path (no Root: prefix)
     assert!(
         !text.contains("Root: "),
         "Should not contain Root: prefix, got:\n{text}"
     );
     // Definition at depth 0 (no name header, no leading tab)
+    let lines: Vec<&str> = text.lines().collect();
     let has_def = lines
         .iter()
         .any(|l| !l.starts_with('\t') && l.contains("<Function>") && l.contains("grouped_sym"));
