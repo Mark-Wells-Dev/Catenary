@@ -172,6 +172,17 @@ impl DiagnosticsServer {
         }
         drop(validator);
 
+        // ── Phase 1b: nudge servers with flat readdir ────────────
+        {
+            let nudge_roots: Vec<PathBuf> = canonical_paths
+                .iter()
+                .filter_map(|p| self.fs.resolve_root(p))
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            self.client_manager.nudge_roots(&nudge_roots).await;
+        }
+
         // ── Phase 2: per-server batch lifecycle ────────────────────
         // Collect per-file diagnostics across all servers.
         // Key: canonical path string → (display path, Vec<ServerDiagnostics>).

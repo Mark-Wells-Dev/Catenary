@@ -1117,6 +1117,60 @@ impl LspClientManager {
             .collect()
     }
 
+    /// Sends a flat `readdir` nudge to rooted LSP servers.
+    ///
+    /// For each root, reads top-level directory entries and sends them
+    /// as `didChangeWatchedFiles` notifications with `Changed` type to
+    /// servers whose scope root is within `roots`. Gives servers a
+    /// chance to notice files modified by Bash commands (sed, git
+    /// checkout, build tools) without diffing or caching.
+    pub async fn nudge_roots(&self, roots: &[PathBuf]) {
+        if roots.is_empty() {
+            return;
+        }
+
+        let clients = self.rooted_clients().await;
+        let relevant: Vec<Arc<Mutex<LspClient>>> = clients
+            .into_iter()
+            .filter(|(k, _)| {
+                k.scope
+                    .root_path()
+                    .is_some_and(|r| roots.iter().any(|root| r.starts_with(root)))
+            })
+            .map(|(_, v)| v)
+            .collect();
+
+        if relevant.is_empty() {
+            return;
+        }
+
+        let mut uris: Vec<String> = Vec::new();
+        for root in roots {
+            let Ok(entries) = std::fs::read_dir(root) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                uris.push(format!("file://{}", path.display()));
+            }
+        }
+
+        if uris.is_empty() {
+            return;
+        }
+
+        // FileChangeType::Changed = 2
+        let changes: Vec<(&str, u8)> = uris.iter().map(|u| (u.as_str(), 2)).collect();
+
+        for client in &relevant {
+            let locked = client.lock().await;
+            if locked.is_alive() {
+                let _ = locked.did_change_watched_files(&changes).await;
+                drop(locked);
+            }
+        }
+    }
+
     /// Returns status of all active servers.
     pub async fn all_server_status(&self) -> Vec<ServerStatus> {
         let clients = self.clients.lock().await.clone();
@@ -5385,6 +5439,94 @@ mod tests {
             "Should have two per-root instances after adding root"
         );
         assert_eq!(count_scope(&clients, MOCK_LANG_A, "root"), 2);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_nudge_roots_empty_is_noop() {
+        let manager = LspClientManager::new(
+            mockls_config(),
+            test_logging(),
+            test_fs_with_roots(&["/tmp"]),
+        );
+
+        // No roots → immediate return, no clients touched.
+        manager.nudge_roots(&[]).await;
+    }
+
+    #[tokio::test]
+    async fn test_nudge_roots_sends_to_matching_server() -> Result<()> {
+        use crate::logging::test_support::{query_protocol_messages, setup_logging};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+
+        // Create some files so readdir has entries.
+        std::fs::write(root.join("a.txt"), "hello").expect("write a");
+        std::fs::write(root.join("b.txt"), "world").expect("write b");
+
+        let (logging, conn, _guard) = setup_logging();
+        let root_str = root.to_str().expect("root path");
+        let manager =
+            LspClientManager::new(mockls_config(), logging, test_fs_with_roots(&[root_str]));
+
+        let client = ensure_first_server(&manager, MOCK_LANG_A).await?;
+        assert!(client.lock().await.is_alive());
+
+        let before = query_protocol_messages(&conn)
+            .iter()
+            .filter(|m| m.method == "workspace/didChangeWatchedFiles")
+            .count();
+
+        manager.nudge_roots(&[root]).await;
+
+        let after = query_protocol_messages(&conn)
+            .iter()
+            .filter(|m| m.method == "workspace/didChangeWatchedFiles")
+            .count();
+        assert_eq!(
+            after - before,
+            1,
+            "nudge should send exactly one didChangeWatchedFiles notification"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_nudge_roots_skips_non_matching_server() -> Result<()> {
+        use crate::logging::test_support::{query_protocol_messages, setup_logging};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("a.txt"), "hello").expect("write");
+
+        let (logging, conn, _guard) = setup_logging();
+        let root_str = root.to_str().expect("root path");
+        let manager =
+            LspClientManager::new(mockls_config(), logging, test_fs_with_roots(&[root_str]));
+
+        let client = ensure_first_server(&manager, MOCK_LANG_A).await?;
+        assert!(client.lock().await.is_alive());
+
+        let before = query_protocol_messages(&conn)
+            .iter()
+            .filter(|m| m.method == "workspace/didChangeWatchedFiles")
+            .count();
+
+        // Nudge with a completely different root — server should not
+        // be selected (scope root doesn't start with the nudge root).
+        manager.nudge_roots(&[PathBuf::from("/nonexistent")]).await;
+
+        let after = query_protocol_messages(&conn)
+            .iter()
+            .filter(|m| m.method == "workspace/didChangeWatchedFiles")
+            .count();
+        assert_eq!(
+            after, before,
+            "nudge with non-matching root should send no notifications"
+        );
 
         Ok(())
     }

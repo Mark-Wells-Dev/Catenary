@@ -245,6 +245,9 @@ impl GrepServer {
             }
         }
 
+        // Step 2a: Nudge servers with flat readdir of effective roots.
+        self.client_manager.nudge_roots(&effective_roots).await;
+
         // Step 2b: Populate symbol index for matched files.
         super::ensure_symbols(self.symbol_index.as_ref(), &self.client_manager, &rg_paths).await;
 
