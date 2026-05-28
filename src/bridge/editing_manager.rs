@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Result, anyhow};
 
@@ -38,12 +39,18 @@ fn editing_key(session_id: Option<&str>, agent_id: &str) -> String {
 pub struct EditingManager {
     /// Active editing sessions: composite key → accumulated file paths.
     state: Mutex<HashMap<String, Vec<PathBuf>>>,
+    /// Number of files skipped during accumulation because they lacked
+    /// LSP coverage (outside tracked roots). Reset by
+    /// [`drain_all_and_clear`](Self::drain_all_and_clear) and
+    /// [`clear_all`](Self::clear_all).
+    filtered_count: AtomicUsize,
 }
 
 impl Default for EditingManager {
     fn default() -> Self {
         Self {
             state: Mutex::new(HashMap::new()),
+            filtered_count: AtomicUsize::new(0),
         }
     }
 }
@@ -120,20 +127,29 @@ impl EditingManager {
         state.remove(&key);
     }
 
+    /// Records that a file was skipped during accumulation because it
+    /// lacked LSP coverage (outside tracked workspace roots).
+    pub fn increment_filtered(&self) {
+        self.filtered_count.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Drains accumulated file paths from all agents and clears all
-    /// editing state. Returns the combined file list.
+    /// editing state. Returns the combined file list and the number of
+    /// files that were filtered (skipped due to no LSP coverage).
     ///
     /// Used by the MCP `done_editing` tool, which does not carry an
     /// `agent_id` and cannot rely on [`active_agent`] to find the
     /// correct key.
-    pub fn drain_all_and_clear(&self) -> Vec<PathBuf> {
+    pub fn drain_all_and_clear(&self) -> (Vec<PathBuf>, usize) {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let files: Vec<PathBuf> = state.values_mut().flat_map(std::mem::take).collect();
         state.clear();
-        files
+        drop(state);
+        let filtered = self.filtered_count.swap(0, Ordering::Relaxed);
+        (files, filtered)
     }
 
     /// Clears all editing state. Returns the number of entries removed.
@@ -147,6 +163,8 @@ impl EditingManager {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let count = state.len();
         state.clear();
+        drop(state);
+        self.filtered_count.store(0, Ordering::Relaxed);
         count
     }
 }
@@ -237,14 +255,17 @@ mod tests {
         em.start_editing(None, "agent-a").expect("start");
         em.add_file(None, "agent-a", PathBuf::from("/src/main.rs"));
         em.add_file(None, "agent-a", PathBuf::from("/src/lib.rs"));
+        em.increment_filtered();
 
-        let files = em.drain_all_and_clear();
+        let (files, filtered) = em.drain_all_and_clear();
         assert_eq!(files.len(), 2);
+        assert_eq!(filtered, 1);
         assert!(!em.is_editing(None, "agent-a"));
 
         // Empty when nothing is editing
-        let files = em.drain_all_and_clear();
+        let (files, filtered) = em.drain_all_and_clear();
         assert!(files.is_empty());
+        assert_eq!(filtered, 0);
     }
 
     #[test]

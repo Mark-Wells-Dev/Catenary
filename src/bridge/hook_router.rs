@@ -546,6 +546,8 @@ impl HookRouter {
                 self.session
                     .editing
                     .add_file(session_id, agent_id, PathBuf::from(file_path));
+            } else {
+                self.session.editing.increment_filtered();
             }
         }
         None
@@ -866,13 +868,16 @@ mod tests {
         let router = test_router();
         let _ = router.session.editing.start_editing(None, "");
 
-        // File outside workspace roots — should not be accumulated.
+        // File outside workspace roots — should not be accumulated
+        // but should increment filtered counter.
         router.handle_file_accumulation("/outside/some/file.rs", None, "", Some("Edit"));
         let files = router.session.editing.drain_files(None, "");
         assert!(
             files.is_empty(),
             "out-of-root file should not be accumulated"
         );
+        let (_, filtered) = router.session.editing.drain_all_and_clear();
+        assert_eq!(filtered, 1, "out-of-root edit should increment filtered");
     }
 
     #[test]

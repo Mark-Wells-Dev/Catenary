@@ -120,7 +120,7 @@ impl DiagnosticsServer {
         parent_id: Option<&str>,
     ) -> String {
         if files.is_empty() {
-            return "[clean]\n".to_string();
+            return String::new();
         }
 
         // Ensure servers exist for all files before looking them up.

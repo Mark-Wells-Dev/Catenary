@@ -397,6 +397,9 @@ struct HookDispatchContext {
 struct HandoffContext {
     /// Accumulated files from the editing session.
     files: Vec<PathBuf>,
+    /// Number of files skipped because they were outside tracked
+    /// workspace roots (no LSP coverage).
+    filtered: usize,
     /// Scope UUID minted at prepare time. Used as `parent_id` for the
     /// IPC request/response events and all LSP children from
     /// `process_files_batched`, linking them into one TUI scope.
@@ -1451,7 +1454,7 @@ async fn handle_hook_dispatch(
             .map_err(|_| anyhow!("handoff semaphore closed"))?;
 
         // Drain accumulated files from EditingManager.
-        let files = router.session.editing.drain_all_and_clear();
+        let (files, filtered) = router.session.editing.drain_all_and_clear();
 
         // Release the editing guardrail.
         ctx.editing_guardrail.release_all(&session_id);
@@ -1469,6 +1472,7 @@ async fn handle_hook_dispatch(
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             *slot = Some(HandoffContext {
                 files,
+                filtered,
                 parent_id: handoff_parent_id,
                 permit,
             });
@@ -1521,12 +1525,16 @@ async fn handle_hook_dispatch(
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             // Destructure HandoffContext — dropping it releases the
             // owned semaphore permit.
-            slot.take().map(|h| (h.files, h.parent_id))
+            slot.take().map(|h| (h.files, h.filtered, h.parent_id))
         };
 
-        let (response, scope_id) = if let Some((files, parent_id)) = handoff {
+        let (response, scope_id) = if let Some((files, filtered, parent_id)) = handoff {
             let resp = if files.is_empty() {
-                "[no files modified]\n".to_string()
+                if filtered > 0 {
+                    "(edits outside tracked roots \u{2014} see `catenary roots -h`)\n".to_string()
+                } else {
+                    String::new()
+                }
             } else {
                 ctx.primary
                     .diagnostics
@@ -3152,12 +3160,62 @@ mod tests {
         let line = hook_roundtrip(&ipc_path, &req).await;
         assert!(line.contains("ok"), "prepare should succeed, got: {line}");
 
-        // Execute done_editing/run — should get "no files modified".
+        // Execute done_editing/run — no edits at all, silent output.
         let req = serde_json::json!({"method": "tool/editing-stop"});
         let response = hook_roundtrip_full(&ipc_path, &req).await;
         assert!(
-            response.contains("no files modified"),
-            "expected 'no files modified', got: {response}",
+            response.trim().is_empty(),
+            "expected empty output for no edits, got: {response}",
+        );
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn done_editing_handoff_out_of_roots() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let ipc_path = ipc_socket_in(dir.path());
+
+        let manager = Arc::new(bind_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        // Enter editing mode.
+        let req = serde_json::json!({
+            "method": "pre-tool/editing-start",
+            "agent_id": "",
+            "session_id": "sess-1"
+        });
+        let _ = hook_roundtrip(&ipc_path, &req).await;
+
+        // Edit a file outside workspace roots — filtered, not accumulated.
+        let req = serde_json::json!({
+            "method": "pre-tool/editing-state",
+            "tool_name": "Edit",
+            "file_path": "/outside/some/file.rs",
+            "agent_id": "",
+            "session_id": "sess-1"
+        });
+        let _ = hook_roundtrip(&ipc_path, &req).await;
+
+        // Prepare handoff — files empty but filtered > 0.
+        let req = serde_json::json!({
+            "method": "pre-tool/editing-stop",
+            "agent_id": "",
+            "session_id": "sess-1"
+        });
+        let line = hook_roundtrip(&ipc_path, &req).await;
+        assert!(line.contains("ok"), "prepare should succeed, got: {line}");
+
+        // Execute done_editing/run — should get out-of-roots message.
+        let req = serde_json::json!({"method": "tool/editing-stop"});
+        let response = hook_roundtrip_full(&ipc_path, &req).await;
+        assert!(
+            response.contains("edits outside tracked roots"),
+            "expected out-of-roots message, got: {response}",
         );
 
         shutdown.cancel();
