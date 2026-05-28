@@ -250,6 +250,10 @@ pub struct StreamState {
     /// entries whose session belongs to the set. Daemon-level events (no
     /// matching session) are hidden when a filter is active.
     session_filter: Option<HashSet<String>>,
+    /// Active server filter. `None` = show all. `Some(set)` = show only
+    /// scopes whose LSP children involve a server in the set. Scopes with
+    /// no matching LSP children are hidden.
+    server_filter: Option<HashSet<String>>,
 
     // ── Paging state ─────────────────────────────────────────────────
     /// Index in `entries` where the bottom region starts (after a gap).
@@ -278,6 +282,7 @@ impl StreamState {
             badges: HexBadgeMap::new(),
             scope_map: HashMap::new(),
             session_filter: None,
+            server_filter: None,
             gap_offset: None,
             gap_display_row: None,
             bottom_oldest_root: None,
@@ -306,7 +311,7 @@ impl StreamState {
     }
 
     /// Flatten entries into display rows based on scope expansion state
-    /// and active session filter.
+    /// and active session/server filters.
     fn rebuild_display_rows(&mut self) {
         self.display_rows.clear();
         self.gap_display_row = None;
@@ -322,6 +327,24 @@ impl StreamState {
                 && !filter.contains(entry.session_id())
             {
                 continue;
+            }
+
+            // Apply server filter: scope must have LSP children involving
+            // a selected server. Scopes with no matching LSP children
+            // (including hook-only scopes) are hidden.
+            if let Some(ref server_set) = self.server_filter {
+                let matches = match entry {
+                    StreamEntry::Scope(scope) => scope
+                        .children
+                        .iter()
+                        .any(|c| c.r#type == "lsp" && server_set.contains(&c.server)),
+                    StreamEntry::Standalone(msg) => {
+                        msg.r#type == "lsp" && server_set.contains(&msg.server)
+                    }
+                };
+                if !matches {
+                    continue;
+                }
             }
 
             match entry {
@@ -468,6 +491,15 @@ impl StreamState {
     /// filter is active.
     pub fn set_session_filter(&mut self, filter: Option<HashSet<String>>) {
         self.session_filter = filter;
+        self.rebuild_display_rows();
+    }
+
+    /// Update the server filter and rebuild display rows.
+    ///
+    /// `None` = show all. `Some(set)` = show only scopes whose LSP
+    /// children involve a server in the set.
+    pub fn set_server_filter(&mut self, filter: Option<HashSet<String>>) {
+        self.server_filter = filter;
         self.rebuild_display_rows();
     }
 
@@ -1922,5 +1954,162 @@ mod tests {
         };
         assert_eq!(scope.children.len(), 1);
         assert_eq!(scope.children[0].method, "$/progress");
+    }
+
+    // ── Server filter tests ──────────────────────────────────────────
+
+    /// LSP child with a specific server for server filter tests.
+    fn lsp_child_server(
+        session_id: &str,
+        scope_id: i64,
+        id_offset: i64,
+        server: &str,
+    ) -> SessionMessage {
+        make_message_with_ids(
+            session_id,
+            500 + scope_id * 10 + id_offset,
+            "lsp",
+            "textDocument/definition",
+            server,
+            Some(&format!("scope-{scope_id}")),
+        )
+    }
+
+    #[test]
+    fn test_server_filter_shows_matching_scopes() {
+        // Scope 1: has rust-analyzer children.
+        let req1 = mcp_request("s1", 1, "grep");
+        let child1 = lsp_child_server("s1", 1, 0, "rust-analyzer");
+        let resp1 = mcp_response("s1", 1);
+
+        // Scope 2: has lua-ls children.
+        let req2 = mcp_request("s1", 2, "grep");
+        let child2 = lsp_child_server("s1", 2, 0, "lua-ls");
+        let resp2 = mcp_response("s1", 2);
+
+        let mut state = StreamState::new(vec![req1, child1, resp1, req2, child2, resp2]);
+        assert_eq!(
+            state.display_rows.len(),
+            2,
+            "both scopes visible unfiltered"
+        );
+
+        // Filter to rust-analyzer only.
+        let mut filter = HashSet::new();
+        filter.insert("rust-analyzer".to_string());
+        state.set_server_filter(Some(filter));
+
+        assert_eq!(state.display_rows.len(), 1, "only rust-analyzer scope");
+        let DisplayRow::ScopeHeader(idx) = state.display_rows[0] else {
+            panic!("expected scope header");
+        };
+        let StreamEntry::Scope(scope) = &state.entries[idx] else {
+            panic!("expected scope entry");
+        };
+        assert_eq!(scope.scope_id, "scope-1");
+    }
+
+    #[test]
+    fn test_server_filter_hides_hook_only_scopes() {
+        // Hook scope — no LSP children.
+        let h_req = hook_request("s1", 1);
+        let h_resp = hook_response("s1", 1);
+
+        // MCP scope with LSP children.
+        let m_req = mcp_request("s1", 2, "grep");
+        let child = lsp_child_server("s1", 2, 0, "rust-analyzer");
+        let m_resp = mcp_response("s1", 2);
+
+        let mut state = StreamState::new(vec![h_req, h_resp, m_req, child, m_resp]);
+        assert_eq!(
+            state.display_rows.len(),
+            2,
+            "both scopes visible unfiltered"
+        );
+
+        let mut filter = HashSet::new();
+        filter.insert("rust-analyzer".to_string());
+        state.set_server_filter(Some(filter));
+
+        // Hook-only scope hidden, MCP scope visible.
+        assert_eq!(state.display_rows.len(), 1);
+    }
+
+    #[test]
+    fn test_server_filter_expanded_shows_all_children() {
+        // Scope with both rust-analyzer and lua-ls children.
+        let req = mcp_request("s1", 1, "grep");
+        let child_ra = lsp_child_server("s1", 1, 0, "rust-analyzer");
+        let child_lua = lsp_child_server("s1", 1, 1, "lua-ls");
+        // Don't close the scope so it's auto-expanded (Open state).
+
+        let mut state = StreamState::new(vec![req, child_ra, child_lua]);
+
+        // Filter to rust-analyzer — scope matches.
+        let mut filter = HashSet::new();
+        filter.insert("rust-analyzer".to_string());
+        state.set_server_filter(Some(filter));
+
+        // Scope header + both children visible (expansion shows all).
+        assert_eq!(state.display_rows.len(), 3);
+    }
+
+    #[test]
+    fn test_server_filter_combined_with_session_filter() {
+        // Session s1, scope 1: rust-analyzer.
+        let req1 = mcp_request("s1", 1, "grep");
+        let child1 = lsp_child_server("s1", 1, 0, "rust-analyzer");
+        let resp1 = mcp_response("s1", 1);
+
+        // Session s2, scope 2: rust-analyzer.
+        let req2 = mcp_request("s2", 2, "grep");
+        let child2 = lsp_child_server("s2", 2, 0, "rust-analyzer");
+        let resp2 = mcp_response("s2", 2);
+
+        // Session s1, scope 3: lua-ls.
+        let req3 = mcp_request("s1", 3, "glob");
+        let child3 = lsp_child_server("s1", 3, 0, "lua-ls");
+        let resp3 = mcp_response("s1", 3);
+
+        let mut state = StreamState::new(vec![
+            req1, child1, resp1, req2, child2, resp2, req3, child3, resp3,
+        ]);
+        assert_eq!(state.display_rows.len(), 3);
+
+        // Session filter: s1 only.
+        let mut sessions = HashSet::new();
+        sessions.insert("s1".to_string());
+        state.set_session_filter(Some(sessions));
+        assert_eq!(state.display_rows.len(), 2, "s1 scopes only");
+
+        // Add server filter: rust-analyzer only.
+        let mut servers = HashSet::new();
+        servers.insert("rust-analyzer".to_string());
+        state.set_server_filter(Some(servers));
+
+        // Intersection: s1 AND rust-analyzer = scope 1 only.
+        assert_eq!(state.display_rows.len(), 1);
+    }
+
+    #[test]
+    fn test_server_filter_clear_restores_all() {
+        let req = mcp_request("s1", 1, "grep");
+        let child = lsp_child_server("s1", 1, 0, "rust-analyzer");
+        let resp = mcp_response("s1", 1);
+
+        let standalone = make_message("s1", "textDocument/hover");
+
+        let mut state = StreamState::new(vec![req, child, resp, standalone]);
+        assert_eq!(state.display_rows.len(), 2);
+
+        // Apply filter.
+        let mut filter = HashSet::new();
+        filter.insert("lua-ls".to_string());
+        state.set_server_filter(Some(filter));
+        assert_eq!(state.display_rows.len(), 0, "nothing matches lua-ls");
+
+        // Clear filter.
+        state.set_server_filter(None);
+        assert_eq!(state.display_rows.len(), 2, "all restored");
     }
 }

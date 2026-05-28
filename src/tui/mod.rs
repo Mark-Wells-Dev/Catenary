@@ -160,22 +160,41 @@ fn handle_key(app: &mut App<'_>, code: KeyCode, show_sidebar: bool, viewport_hei
             app.level_threshold.toggle();
             let _ = app.reload_messages();
         }
-        KeyCode::Tab | KeyCode::BackTab => {
+        KeyCode::Tab => {
             if show_sidebar {
-                app.toggle_focus();
+                app.cycle_focus();
+            }
+        }
+        KeyCode::BackTab => {
+            if show_sidebar {
+                app.cycle_focus_back();
             }
         }
         _ => match app.focus {
-            FocusRegion::Sidebar => {
-                // Visible entry rows = viewport height minus header row.
+            FocusRegion::Sessions => {
                 let visible = viewport_height.saturating_sub(1);
                 match code {
                     KeyCode::Char('j') | KeyCode::Down => {
                         app.sidebar.cursor_down(1, visible);
                     }
                     KeyCode::Char('k') | KeyCode::Up => app.sidebar.cursor_up(1, visible),
-                    KeyCode::Enter if app.sidebar.cursor_on_session() => {
+                    KeyCode::Enter | KeyCode::Char(' ') => {
                         app.toggle_session_selection();
+                    }
+                    _ => {}
+                }
+            }
+            FocusRegion::Servers => {
+                let visible = viewport_height.saturating_sub(1);
+                match code {
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        app.sidebar.server_cursor_down(1, visible);
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        app.sidebar.server_cursor_up(1, visible);
+                    }
+                    KeyCode::Enter | KeyCode::Char(' ') => {
+                        app.toggle_server_selection();
                     }
                     _ => {}
                 }
@@ -251,7 +270,7 @@ fn run_loop(
                     sidebar_area,
                     f.buffer_mut(),
                     app.theme,
-                    app.focus == FocusRegion::Sidebar,
+                    app.focus,
                 );
                 render_stream(
                     &app.stream,

@@ -37,11 +37,13 @@ impl LevelThreshold {
     }
 }
 
-/// Which panel has keyboard focus.
+/// Which section has keyboard focus.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FocusRegion {
     /// Sidebar session list.
-    Sidebar,
+    Sessions,
+    /// Sidebar server list.
+    Servers,
     /// Message stream.
     Stream,
 }
@@ -186,7 +188,7 @@ impl<'a> App<'a> {
         }
     }
 
-    /// Toggle selection on the sidebar's cursor entry and update the
+    /// Toggle selection on the sidebar's cursor session entry and update the
     /// stream's session filter.
     pub fn toggle_session_selection(&mut self) {
         if self.sidebar.toggle_selected() {
@@ -195,11 +197,29 @@ impl<'a> App<'a> {
         }
     }
 
-    /// Toggle focus between sidebar and stream.
-    pub const fn toggle_focus(&mut self) {
+    /// Toggle selection on the sidebar's cursor server entry and update the
+    /// stream's server filter.
+    pub fn toggle_server_selection(&mut self) {
+        if self.sidebar.toggle_server_selected() {
+            self.stream.set_server_filter(self.sidebar.server_filter());
+        }
+    }
+
+    /// Cycle focus: Sessions → Servers → Stream → Sessions.
+    pub const fn cycle_focus(&mut self) {
         self.focus = match self.focus {
-            FocusRegion::Sidebar => FocusRegion::Stream,
-            FocusRegion::Stream => FocusRegion::Sidebar,
+            FocusRegion::Sessions => FocusRegion::Servers,
+            FocusRegion::Servers => FocusRegion::Stream,
+            FocusRegion::Stream => FocusRegion::Sessions,
+        };
+    }
+
+    /// Cycle focus in reverse: Sessions → Stream → Servers → Sessions.
+    pub const fn cycle_focus_back(&mut self) {
+        self.focus = match self.focus {
+            FocusRegion::Sessions => FocusRegion::Stream,
+            FocusRegion::Servers => FocusRegion::Sessions,
+            FocusRegion::Stream => FocusRegion::Servers,
         };
     }
 
@@ -235,7 +255,8 @@ impl<'a> App<'a> {
     /// Refresh the sidebar server list from the database.
     ///
     /// Queries `language_servers` and server noise (progress, log/show
-    /// messages) and updates the server section.
+    /// messages) and updates the server section. If a selected server
+    /// disappears, the server filter is propagated to the stream.
     /// Silently ignores query failures.
     pub fn refresh_servers(&mut self) {
         let Ok(rows) = self.data.list_server_statuses() else {
@@ -245,6 +266,12 @@ impl<'a> App<'a> {
         if !self.sidebar.servers_need_refresh(&rows, &noise) {
             return;
         }
+        let had_filter = self.sidebar.has_server_filter();
         self.sidebar.refresh_servers(&rows, &noise);
+        // If a selected server disappeared, the selected set shrank.
+        // Propagate to stream so filtered entries reappear if needed.
+        if had_filter {
+            self.stream.set_server_filter(self.sidebar.server_filter());
+        }
     }
 }

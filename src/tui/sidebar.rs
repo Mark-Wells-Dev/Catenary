@@ -14,6 +14,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 
+use super::app::FocusRegion;
 use super::data::{ServerNoiseRow, ServerStatusRow};
 use super::stream::HexBadgeMap;
 use super::theme::Theme;
@@ -88,8 +89,8 @@ impl ServerEntry {
 
 // ── Sidebar state ────────────────────────────────────────────────────
 
-/// Sidebar state: session list, server list, navigation cursor, and
-/// selection filter.
+/// Sidebar state: session list, server list, per-section cursors, and
+/// selection filters.
 pub struct SidebarState {
     /// Alive sessions in display order.
     pub entries: Vec<SessionEntry>,
@@ -97,8 +98,12 @@ pub struct SidebarState {
     pub servers: Vec<ServerEntry>,
     /// Cursor position in the session list.
     pub cursor: usize,
-    /// First visible entry index (scroll offset).
+    /// First visible session entry index (scroll offset).
     pub scroll_offset: usize,
+    /// Cursor position in the server list.
+    pub server_cursor: usize,
+    /// First visible server entry index (scroll offset).
+    pub server_scroll_offset: usize,
     /// Session IDs from the last refresh (for change detection).
     last_ids: Vec<String>,
     /// Server names from the last refresh (for change detection).
@@ -106,6 +111,9 @@ pub struct SidebarState {
     /// Selected session IDs (for stream filtering).
     /// Empty = show all (no filter active).
     selected: HashSet<String>,
+    /// Selected server names (for stream filtering).
+    /// Empty = show all (no server filter active).
+    selected_servers: HashSet<String>,
 }
 
 impl SidebarState {
@@ -117,9 +125,12 @@ impl SidebarState {
             servers: Vec::new(),
             cursor: 0,
             scroll_offset: 0,
+            server_cursor: 0,
+            server_scroll_offset: 0,
             last_ids: Vec::new(),
             last_server_names: Vec::new(),
             selected: HashSet::new(),
+            selected_servers: HashSet::new(),
         }
     }
 
@@ -167,8 +178,8 @@ impl SidebarState {
 
         self.last_ids = self.entries.iter().map(|e| e.session_id.clone()).collect();
 
-        // Clamp cursor to total item count.
-        let max = self.item_count().saturating_sub(1);
+        // Clamp cursor to session count.
+        let max = self.entries.len().saturating_sub(1);
         self.cursor = self.cursor.min(max);
     }
 
@@ -214,6 +225,53 @@ impl SidebarState {
         self.selected.contains(session_id)
     }
 
+    // ── Server selection ─────────────────────────────────────────────
+
+    /// Toggle selection on the server at the current server cursor.
+    ///
+    /// Toggles by server name: all instances of the same server binary
+    /// are selected/deselected together. Returns `true` if the selection
+    /// set changed.
+    pub fn toggle_server_selected(&mut self) -> bool {
+        let Some(entry) = self.servers.get(self.server_cursor) else {
+            return false;
+        };
+        let name = &entry.name;
+        if self.selected_servers.contains(name) {
+            self.selected_servers.remove(name);
+        } else {
+            self.selected_servers.insert(name.clone());
+        }
+        true
+    }
+
+    /// Return the active server filter.
+    ///
+    /// `None` = show all (no servers selected). `Some(set)` = show only
+    /// scopes involving servers in the set.
+    #[must_use]
+    pub fn server_filter(&self) -> Option<HashSet<String>> {
+        if self.selected_servers.is_empty() {
+            None
+        } else {
+            Some(self.selected_servers.clone())
+        }
+    }
+
+    /// Whether any server filter is active.
+    #[must_use]
+    pub fn has_server_filter(&self) -> bool {
+        !self.selected_servers.is_empty()
+    }
+
+    /// Whether a specific server name is selected.
+    #[must_use]
+    pub fn is_server_selected(&self, name: &str) -> bool {
+        self.selected_servers.contains(name)
+    }
+
+    // ── Server list refresh ─────────────────────────────────────────
+
     /// Check whether the server list has changed since the last refresh.
     #[must_use]
     pub fn servers_need_refresh(&self, rows: &[ServerStatusRow], noise: &[ServerNoiseRow]) -> bool {
@@ -231,6 +289,7 @@ impl SidebarState {
     ///
     /// Each status row becomes one sidebar entry — one entry per server
     /// process. Noise rows populate progress and server message children.
+    /// Prunes stale server selections for servers that no longer exist.
     pub fn refresh_servers(&mut self, rows: &[ServerStatusRow], noise: &[ServerNoiseRow]) {
         self.last_server_names = rows
             .iter()
@@ -255,31 +314,20 @@ impl SidebarState {
                 }
             })
             .collect();
+
+        // Prune stale server selections.
+        let live_names: HashSet<&str> = self.servers.iter().map(|s| s.name.as_str()).collect();
+        self.selected_servers
+            .retain(|name| live_names.contains(name.as_str()));
+
+        // Clamp server cursor.
+        let max = self.servers.len().saturating_sub(1);
+        self.server_cursor = self.server_cursor.min(max);
     }
 
-    /// Total number of navigable items (sessions + servers).
-    #[must_use]
-    pub const fn item_count(&self) -> usize {
-        self.entries.len() + self.servers.len()
-    }
+    // ── Session cursor navigation ──────────────────────────────────
 
-    /// Whether the cursor is on a session entry.
-    #[must_use]
-    pub const fn cursor_on_session(&self) -> bool {
-        self.cursor < self.entries.len()
-    }
-
-    /// Server index if cursor is on a server entry.
-    #[must_use]
-    pub const fn cursor_server_index(&self) -> Option<usize> {
-        if self.cursor >= self.entries.len() {
-            Some(self.cursor - self.entries.len())
-        } else {
-            None
-        }
-    }
-
-    /// Move cursor up by `n` entries, scrolling if needed.
+    /// Move session cursor up by `n` entries, scrolling if needed.
     ///
     /// `visible` is the number of entry rows visible in the sidebar
     /// (total height minus the header row).
@@ -291,11 +339,11 @@ impl SidebarState {
         }
     }
 
-    /// Move cursor down by `n` entries, scrolling if needed.
+    /// Move session cursor down by `n` entries, scrolling if needed.
     ///
     /// `visible` is the number of entry rows visible in the sidebar.
     pub fn cursor_down(&mut self, n: usize, visible: usize) {
-        let total = self.item_count();
+        let total = self.entries.len();
         if total == 0 {
             return;
         }
@@ -304,6 +352,30 @@ impl SidebarState {
         // Scroll down to keep cursor in view.
         if visible > 0 && self.cursor >= self.scroll_offset + visible {
             self.scroll_offset = self.cursor + 1 - visible;
+        }
+    }
+
+    // ── Server cursor navigation ───────────────────────────────────
+
+    /// Move server cursor up by `n` entries, scrolling if needed.
+    pub const fn server_cursor_up(&mut self, n: usize, visible: usize) {
+        let _ = visible;
+        self.server_cursor = self.server_cursor.saturating_sub(n);
+        if self.server_cursor < self.server_scroll_offset {
+            self.server_scroll_offset = self.server_cursor;
+        }
+    }
+
+    /// Move server cursor down by `n` entries, scrolling if needed.
+    pub fn server_cursor_down(&mut self, n: usize, visible: usize) {
+        let total = self.servers.len();
+        if total == 0 {
+            return;
+        }
+        let max = total.saturating_sub(1);
+        self.server_cursor = (self.server_cursor + n).min(max);
+        if visible > 0 && self.server_cursor >= self.server_scroll_offset + visible {
+            self.server_scroll_offset = self.server_cursor + 1 - visible;
         }
     }
 
@@ -465,8 +537,8 @@ fn extract_server_message(noise: &[ServerNoiseRow], server: &str) -> Option<Stri
 ///
 /// The rightmost column of `area` renders a vertical separator (`│`).
 /// The rest shows two sections: "Sessions" (top) and "Servers" (bottom),
-/// separated by a blank line. Focus state controls header style and
-/// cursor highlight visibility.
+/// separated by a blank line. The `focus` parameter determines which
+/// section shows a cursor highlight and bright header.
 #[allow(
     clippy::cast_possible_truncation,
     clippy::too_many_lines,
@@ -477,7 +549,7 @@ pub fn render_sidebar(
     area: Rect,
     buf: &mut Buffer,
     theme: &Theme,
-    focused: bool,
+    focus: FocusRegion,
 ) {
     if area.width < 3 || area.height == 0 {
         return;
@@ -485,13 +557,20 @@ pub fn render_sidebar(
 
     // Reserve rightmost column for the vertical separator.
     let content_width = area.width.saturating_sub(1);
-    let header_style = if focused { theme.title } else { theme.muted };
+    let sessions_focused = focus == FocusRegion::Sessions;
+    let servers_focused = focus == FocusRegion::Servers;
+    let sidebar_focused = sessions_focused || servers_focused;
 
     let max_rows = area.height as usize;
     let mut row: usize = 0;
 
     // ── Sessions header ─────────────────────────────────────────────
-    let header = Line::from(Span::styled("Sessions", header_style));
+    let session_header_style = if sessions_focused {
+        theme.title
+    } else {
+        theme.muted
+    };
+    let header = Line::from(Span::styled("Sessions", session_header_style));
     buf.set_line(area.x, area.y + row as u16, &header, content_width);
     row += 1;
 
@@ -502,7 +581,7 @@ pub fn render_sidebar(
             break;
         }
 
-        let is_cursor = focused && i == state.cursor;
+        let is_cursor = sessions_focused && i == state.cursor;
 
         // Bright when selected (or when no filter is active); dim otherwise.
         let is_bright = !has_filter || state.is_selected(&entry.session_id);
@@ -542,30 +621,43 @@ pub fn render_sidebar(
         row += 1;
 
         if row < max_rows {
-            let server_header = Line::from(Span::styled("Servers", header_style));
+            let server_header_style = if servers_focused {
+                theme.title
+            } else {
+                theme.muted
+            };
+            let server_header = Line::from(Span::styled("Servers", server_header_style));
             buf.set_line(area.x, area.y + row as u16, &server_header, content_width);
             row += 1;
         }
 
-        let sessions_len = state.entries.len();
+        let has_server_filter = state.has_server_filter();
         for (si, server) in state.servers.iter().enumerate() {
             if row >= max_rows {
                 break;
             }
 
-            let is_cursor = focused && state.cursor == sessions_len + si;
+            let is_cursor = servers_focused && si == state.server_cursor;
+
+            // Bright when selected (or when no server filter is active); dim otherwise.
+            let is_bright = !has_server_filter || state.is_server_selected(&server.name);
+            let name_style = if is_bright { theme.text } else { theme.muted };
+            let state_style = if is_bright {
+                lifecycle_style(theme, &server.state)
+            } else {
+                theme.muted
+            };
 
             // Server line: "name (root/)  state" or "name  state"
-            let state_style = lifecycle_style(theme, &server.state);
             let line = if server.root.is_empty() {
                 Line::from(vec![
-                    Span::styled(&server.name, theme.text),
+                    Span::styled(&server.name, name_style),
                     Span::raw("  "),
                     Span::styled(&server.state, state_style),
                 ])
             } else {
                 Line::from(vec![
-                    Span::styled(&server.name, theme.text),
+                    Span::styled(&server.name, name_style),
                     Span::raw(" "),
                     Span::styled("(", theme.muted),
                     Span::styled(&server.root, theme.muted),
@@ -615,7 +707,7 @@ pub fn render_sidebar(
 
     // ── Vertical separator ──────────────────────────────────────────
     let sep_x = area.x + content_width;
-    let sep_style = if focused {
+    let sep_style = if sidebar_focused {
         theme.border_focused
     } else {
         theme.border_unfocused
@@ -890,7 +982,13 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                render_sidebar(&state, area, frame.buffer_mut(), &theme, true);
+                render_sidebar(
+                    &state,
+                    area,
+                    frame.buffer_mut(),
+                    &theme,
+                    FocusRegion::Sessions,
+                );
             })
             .expect("draw");
 
@@ -920,7 +1018,13 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                render_sidebar(&state, area, frame.buffer_mut(), &theme, false);
+                render_sidebar(
+                    &state,
+                    area,
+                    frame.buffer_mut(),
+                    &theme,
+                    FocusRegion::Stream,
+                );
             })
             .expect("draw");
 
@@ -942,7 +1046,13 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                render_sidebar(&state, area, frame.buffer_mut(), &theme, true);
+                render_sidebar(
+                    &state,
+                    area,
+                    frame.buffer_mut(),
+                    &theme,
+                    FocusRegion::Sessions,
+                );
             })
             .expect("draw");
 
@@ -1095,7 +1205,13 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                render_sidebar(&state, area, frame.buffer_mut(), &theme, true);
+                render_sidebar(
+                    &state,
+                    area,
+                    frame.buffer_mut(),
+                    &theme,
+                    FocusRegion::Sessions,
+                );
             })
             .expect("draw");
 
@@ -1167,23 +1283,39 @@ mod tests {
     }
 
     #[test]
-    fn cursor_spans_sessions_and_servers() {
+    fn separate_cursors_for_sessions_and_servers() {
         let mut state = SidebarState::new();
         let mut badges = HexBadgeMap::new();
-        state.refresh(vec![("s1".into(), None, "/tmp/A".into())], &mut badges);
-        state.refresh_servers(&[make_server_row("rust-analyzer", "/A", "ready")], &[]);
+        state.refresh(
+            vec![
+                ("s1".into(), None, "/tmp/A".into()),
+                ("s2".into(), None, "/tmp/B".into()),
+            ],
+            &mut badges,
+        );
+        state.refresh_servers(
+            &[
+                make_server_row("rust-analyzer", "/A", "ready"),
+                make_server_row("lua-ls", "/B", "busy"),
+            ],
+            &[],
+        );
 
-        assert_eq!(state.item_count(), 2);
-
-        // Cursor on session.
+        // Session cursor is independent.
         state.cursor = 0;
-        assert!(state.cursor_on_session());
-        assert!(state.cursor_server_index().is_none());
+        state.server_cursor = 1;
+        assert_eq!(state.cursor, 0);
+        assert_eq!(state.server_cursor, 1);
 
-        // Cursor on server.
-        state.cursor = 1;
-        assert!(!state.cursor_on_session());
-        assert_eq!(state.cursor_server_index(), Some(0));
+        // Navigate sessions without affecting servers.
+        state.cursor_down(1, 10);
+        assert_eq!(state.cursor, 1);
+        assert_eq!(state.server_cursor, 1, "server cursor unchanged");
+
+        // Navigate servers without affecting sessions.
+        state.server_cursor_up(1, 10);
+        assert_eq!(state.server_cursor, 0);
+        assert_eq!(state.cursor, 1, "session cursor unchanged");
     }
 
     #[test]
@@ -1208,7 +1340,13 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                render_sidebar(&state, area, frame.buffer_mut(), &theme, true);
+                render_sidebar(
+                    &state,
+                    area,
+                    frame.buffer_mut(),
+                    &theme,
+                    FocusRegion::Sessions,
+                );
             })
             .expect("draw");
 
@@ -1398,7 +1536,13 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                render_sidebar(&state, area, frame.buffer_mut(), &theme, true);
+                render_sidebar(
+                    &state,
+                    area,
+                    frame.buffer_mut(),
+                    &theme,
+                    FocusRegion::Sessions,
+                );
             })
             .expect("draw");
 
@@ -1416,6 +1560,168 @@ mod tests {
         assert!(
             content.contains("47%"),
             "should show progress percentage: {content}"
+        );
+    }
+
+    // ── Server selection tests ──────────────────────────────────────
+
+    #[test]
+    fn toggle_server_selected_flips_state() {
+        let mut state = SidebarState::new();
+        state.refresh_servers(
+            &[
+                make_server_row("rust-analyzer", "/A", "ready"),
+                make_server_row("lua-ls", "/B", "ready"),
+            ],
+            &[],
+        );
+
+        assert!(!state.has_server_filter(), "no filter initially");
+        assert!(state.server_filter().is_none());
+
+        // Select first server.
+        state.server_cursor = 0;
+        assert!(state.toggle_server_selected());
+        assert!(state.has_server_filter());
+        assert!(state.is_server_selected("rust-analyzer"));
+        assert!(!state.is_server_selected("lua-ls"));
+
+        // Deselect → back to show-all.
+        assert!(state.toggle_server_selected());
+        assert!(!state.has_server_filter());
+    }
+
+    #[test]
+    fn toggle_server_selects_by_name() {
+        let mut state = SidebarState::new();
+        // Two instances of rust-analyzer (different roots).
+        state.refresh_servers(
+            &[
+                make_server_row("rust-analyzer", "/A", "ready"),
+                make_server_row("rust-analyzer", "/B", "busy"),
+                make_server_row("lua-ls", "/C", "ready"),
+            ],
+            &[],
+        );
+
+        // Select first rust-analyzer instance.
+        state.server_cursor = 0;
+        state.toggle_server_selected();
+
+        // Both instances show as selected (same name).
+        assert!(state.is_server_selected("rust-analyzer"));
+        // Second instance also matches by name.
+        assert!(state.is_server_selected(&state.servers[1].name));
+        assert!(!state.is_server_selected("lua-ls"));
+    }
+
+    #[test]
+    fn toggle_server_selected_empty_is_noop() {
+        let mut state = SidebarState::new();
+        assert!(!state.toggle_server_selected());
+        assert!(!state.has_server_filter());
+    }
+
+    #[test]
+    fn refresh_servers_clears_stale_selections() {
+        let mut state = SidebarState::new();
+        state.refresh_servers(
+            &[
+                make_server_row("rust-analyzer", "/A", "ready"),
+                make_server_row("lua-ls", "/B", "ready"),
+            ],
+            &[],
+        );
+
+        // Select both.
+        state.server_cursor = 0;
+        state.toggle_server_selected();
+        state.server_cursor = 1;
+        state.toggle_server_selected();
+        assert!(state.has_server_filter());
+
+        // lua-ls disappears.
+        state.refresh_servers(&[make_server_row("rust-analyzer", "/A", "ready")], &[]);
+
+        assert!(state.has_server_filter());
+        assert!(state.is_server_selected("rust-analyzer"));
+        assert!(!state.is_server_selected("lua-ls"));
+    }
+
+    #[test]
+    fn server_cursor_navigation() {
+        let mut state = SidebarState::new();
+        state.refresh_servers(
+            &[
+                make_server_row("rust-analyzer", "/A", "ready"),
+                make_server_row("lua-ls", "/B", "ready"),
+                make_server_row("pyright", "/C", "ready"),
+            ],
+            &[],
+        );
+
+        state.server_cursor_down(1, 10);
+        assert_eq!(state.server_cursor, 1);
+        state.server_cursor_down(5, 10);
+        assert_eq!(state.server_cursor, 2, "should clamp to last server");
+        state.server_cursor_up(1, 10);
+        assert_eq!(state.server_cursor, 1);
+        state.server_cursor_up(5, 10);
+        assert_eq!(state.server_cursor, 0, "should clamp to 0");
+    }
+
+    #[test]
+    fn render_sidebar_server_selected_bright_unselected_dim() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use ratatui::style::Modifier;
+
+        let mut state = SidebarState::new();
+        state.refresh_servers(
+            &[
+                make_server_row("rust-analyzer", "/A", "ready"),
+                make_server_row("lua-ls", "/B", "ready"),
+            ],
+            &[],
+        );
+
+        // Select rust-analyzer only.
+        state.server_cursor = 0;
+        state.toggle_server_selected();
+
+        let theme = crate::tui::theme::Theme::new();
+        let backend = TestBackend::new(MAX_WIDTH, 10);
+        let mut terminal = Terminal::new(backend).expect("terminal creation");
+
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_sidebar(
+                    &state,
+                    area,
+                    frame.buffer_mut(),
+                    &theme,
+                    FocusRegion::Servers,
+                );
+            })
+            .expect("draw");
+
+        let buf = terminal.backend().buffer().clone();
+
+        // Sessions header = row 0, no sessions, blank = row 1,
+        // Servers header = row 2, rust-analyzer = row 3, lua-ls = row 4
+        let ra_cell = &buf[(0, 3)]; // "r" in "rust-analyzer"
+        let lua_cell = &buf[(0, 4)]; // "l" in "lua-ls"
+
+        assert!(
+            !ra_cell.modifier.contains(Modifier::DIM),
+            "selected server should be bright, got: {:?}",
+            ra_cell.modifier
+        );
+        assert!(
+            lua_cell.modifier.contains(Modifier::DIM),
+            "unselected server should be dim, got: {:?}",
+            lua_cell.modifier
         );
     }
 
