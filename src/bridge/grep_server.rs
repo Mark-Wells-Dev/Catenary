@@ -2200,8 +2200,12 @@ mod tests {
         let output = render(&hits, 10_000, 1, &fs);
 
         assert!(
-            output.starts_with("[page 1/1]"),
-            "single-page result should show [page 1/1]: {output}"
+            !output.contains("[page"),
+            "single-page result should have no page header: {output}"
+        );
+        assert!(
+            output.contains("handle_grep"),
+            "should contain content: {output}"
         );
     }
 
@@ -2245,10 +2249,10 @@ mod tests {
 
         let output = render(&hits, 10_000, 99, &fs);
 
-        // Beyond-last clamps to last page and still shows content.
+        // Beyond-last clamps to last page, no header for single page.
         assert!(
-            output.starts_with("[page 1/1]"),
-            "beyond-last should clamp to last page: {output}"
+            !output.contains("[page"),
+            "single page should have no header: {output}"
         );
         assert!(
             output.contains("handle_grep"),
@@ -2609,8 +2613,8 @@ mod tests {
     fn paginate_single_page() {
         let output = paginate("line one\nline two", 1000, 1);
         assert!(
-            output.starts_with("[page 1/1]"),
-            "expected single page header: {output}"
+            !output.contains("[page"),
+            "single page should have no header: {output}"
         );
         assert!(output.contains("line one"), "missing content: {output}");
     }
@@ -2636,10 +2640,10 @@ mod tests {
     #[test]
     fn paginate_beyond_last_clamps() {
         let output = paginate("aaa\nbbb", 1000, 5);
-        // Beyond-last clamps to last page and shows content.
+        // Beyond-last clamps to last page and shows content, no header for single page.
         assert!(
-            output.starts_with("[page 1/1]"),
-            "beyond-last should clamp: {output}"
+            !output.contains("[page"),
+            "single page should have no header: {output}"
         );
         assert!(output.contains("aaa"), "clamped page has content: {output}");
     }
@@ -2654,8 +2658,8 @@ mod tests {
         // At budget: single page (verifies > not >=)
         let at = paginate(text, 10, 1);
         assert!(
-            at.starts_with("[page 1/1]"),
-            "budget=len should be single page: {at}"
+            !at.contains("[page"),
+            "budget=len should be single page with no header: {at}"
         );
         assert!(at.contains("aaaa"), "page has first line: {at}");
         assert!(at.contains("bbbb"), "page has second line: {at}");

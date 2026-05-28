@@ -2197,12 +2197,10 @@ fn test_grep_alternation_both_arms_present() -> Result<()> {
         text.contains("beta_unique_arm"),
         "Second alternation arm should be present: {text}"
     );
-    // Verify no leading blank line before content (catches separator inversion)
-    let content_start = text.find(']').expect("page header bracket") + 1;
-    let after_header = &text[content_start..];
+    // Single-page result: no page header, no leading blank lines
     assert!(
-        !after_header.starts_with("\n\n\n"),
-        "Should not have extra blank lines before content: {text:?}"
+        !text.starts_with("\n\n"),
+        "Should not have leading blank lines: {text:?}"
     );
     Ok(())
 }

@@ -4,23 +4,30 @@
 use std::fmt::Write;
 
 /// Formats the page header: `[page N/M]\n\n`.
+///
+/// Returns an empty string when `total` is 1 — single-page output
+/// needs no pagination header.
 pub(super) fn format_page_header(page: usize, total: usize) -> String {
+    if total <= 1 {
+        return String::new();
+    }
     format!("[page {page}/{total}]\n\n")
 }
 
-/// Splits full output into pages and returns the requested page with a header.
+/// Splits full output into pages and returns the requested page.
 ///
 /// Pages are split at line boundaries so no line is broken mid-way.
 /// The budget is the maximum character count per page (excluding the header).
+/// The `[page N/M]` header is only included when there are multiple pages.
 ///
 /// Edge behavior:
-/// - Empty input returns `[page 1/1]\n\n`.
+/// - Empty input returns an empty string.
 /// - Page 0 clamps to page 1.
 /// - Pages beyond the last clamp to the last page.
 pub(super) fn paginate(full: &str, budget: usize, page: usize) -> String {
     let lines: Vec<&str> = full.lines().collect();
     if lines.is_empty() {
-        return format_page_header(1, 1);
+        return String::new();
     }
 
     // Build pages by accumulating lines until budget is hit.
@@ -63,8 +70,8 @@ mod tests {
         let content = "line 1\nline 2\nline 3\n";
         let result = paginate(content, 5000, 1);
         assert!(
-            result.starts_with("[page 1/1]"),
-            "single-page result should show [page 1/1]: {result}"
+            !result.contains("[page"),
+            "single-page result should have no page header: {result}"
         );
         assert!(
             result.contains("line 1"),
@@ -92,10 +99,7 @@ mod tests {
     #[test]
     fn test_paginate_empty_input() {
         let result = paginate("", 100, 1);
-        assert_eq!(
-            result, "[page 1/1]\n\n",
-            "empty input should give 1 empty page"
-        );
+        assert_eq!(result, "", "empty input should give empty output");
     }
 
     #[test]
@@ -156,8 +160,8 @@ mod tests {
         // Budget of 6 fits both lines exactly (3 + 3 = 6).
         let result = paginate(content, 6, 1);
         assert_eq!(
-            result, "[page 1/1]\n\nab\ncd\n",
-            "both lines should fit in one page"
+            result, "ab\ncd\n",
+            "both lines should fit in one page with no header"
         );
 
         // Budget of 5: first line takes 3, second would push to 6 > 5 → page break.
@@ -188,8 +192,12 @@ mod tests {
         let content = "line 1\nline 2\n";
         let result = paginate(content, 5000, 0);
         assert!(
-            result.starts_with("[page 1/1]"),
-            "page 0 should clamp to page 1: {result:?}"
+            !result.contains("[page"),
+            "page 0 should clamp to single page with no header: {result:?}"
+        );
+        assert!(
+            result.contains("line 1"),
+            "should contain content: {result:?}"
         );
     }
 
@@ -197,10 +205,10 @@ mod tests {
     fn test_paginate_beyond_last_clamps() {
         let content = "line 1\nline 2\n";
         let result = paginate(content, 5000, 99);
-        // Should clamp to last page and show content.
+        // Should clamp to last page and show content, no header for single page.
         assert!(
-            result.starts_with("[page 1/1]"),
-            "beyond-last should clamp to last page: {result:?}"
+            !result.contains("[page"),
+            "single page should have no header: {result:?}"
         );
         assert!(result.contains("line 1"), "should show content: {result:?}");
         assert!(result.contains("line 2"), "should show content: {result:?}");
