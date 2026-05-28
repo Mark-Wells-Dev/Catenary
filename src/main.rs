@@ -449,10 +449,10 @@ fn main() -> Result<()> {
         #[cfg(unix)]
         Some(Command::Roots { command }) => match command {
             RootsCommand::Add { path } => {
-                build_runtime()?.block_on(run_root_command(path, "tool/add-root"))
+                build_runtime()?.block_on(run_root_command(path, "tool/roots-add"))
             }
             RootsCommand::Rm { path } => {
-                build_runtime()?.block_on(run_root_command(path, "tool/rm-root"))
+                build_runtime()?.block_on(run_root_command(path, "tool/roots-rm"))
             }
             RootsCommand::Ls => {
                 let mut out = cli::Output::stdout(false);
@@ -1030,7 +1030,7 @@ async fn run_start_editing() -> Result<()> {
         .context("no daemon running — start a Catenary session first")?;
 
     let (reader, mut writer) = stream.into_split();
-    let request = serde_json::json!({"method": "tool/start-editing"});
+    let request = serde_json::json!({"method": "tool/editing-start"});
     let mut payload = serde_json::to_string(&request)?;
     payload.push('\n');
     writer.write_all(payload.as_bytes()).await?;
@@ -1060,7 +1060,7 @@ async fn run_start_editing() -> Result<()> {
 
 /// Exits editing mode and prints diagnostics to stdout.
 ///
-/// Connects to the daemon's IPC socket and sends `done-editing/run`.
+/// Connects to the daemon's IPC socket and sends `tool/editing-stop`.
 /// The `PreToolUse` hook has already prepared the handoff — this command
 /// retrieves the diagnostics and prints them.
 ///
@@ -1078,7 +1078,7 @@ async fn run_done_editing() -> Result<()> {
         .context("catenary daemon not running")?;
 
     let (reader, mut writer) = stream.into_split();
-    let request = serde_json::json!({"method": "tool/done-editing"});
+    let request = serde_json::json!({"method": "tool/editing-stop"});
     let mut payload = serde_json::to_string(&request)?;
     payload.push('\n');
     writer.write_all(payload.as_bytes()).await?;
@@ -1148,7 +1148,7 @@ async fn run_root_command(path: PathBuf, method: &str) -> Result<()> {
 
     match status {
         "ok" => {
-            let verb = if method.contains("add-root") {
+            let verb = if method.contains("roots-add") {
                 "added"
             } else {
                 "removed"

@@ -1273,13 +1273,13 @@ mod tests {
     // ── IPC scope tests ────────────────────────────────────────────────
 
     /// IPC request — hook-typed message that opens a scope (e.g.,
-    /// `tool/done-editing` incoming).
+    /// `tool/editing-stop` incoming).
     fn ipc_request(session_id: &str, scope_id: i64) -> SessionMessage {
         make_message_with_ids(
             session_id,
             600 + scope_id,
             "hook",
-            "tool/done-editing",
+            "tool/editing-stop",
             "catenary",
             Some(&format!("ipc-{scope_id}")),
         )
@@ -1291,7 +1291,7 @@ mod tests {
             session_id,
             700 + scope_id,
             "hook",
-            "tool/done-editing",
+            "tool/editing-stop",
             "catenary",
             Some(&format!("ipc-{scope_id}")),
         )
@@ -1329,7 +1329,7 @@ mod tests {
         };
         assert_eq!(scope.state, ScopeState::Closed);
         assert_eq!(scope.request.r#type, "hook");
-        assert_eq!(scope.request.method, "tool/done-editing");
+        assert_eq!(scope.request.method, "tool/editing-stop");
         assert!(scope.response.is_some());
         assert_eq!(scope.children.len(), 4, "4 LSP children");
         // Closed scope: collapsed to header only.

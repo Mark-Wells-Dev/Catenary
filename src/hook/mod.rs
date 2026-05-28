@@ -134,7 +134,7 @@ pub(crate) enum HookRequest {
     /// Sent by the `PreToolUse` hook when the agent runs
     /// `catenary editing start` via the host's shell tool. The daemon
     /// enters editing mode for the session.
-    #[serde(rename = "pre-tool/start-editing")]
+    #[serde(rename = "pre-tool/editing-start")]
     PreToolStartEditing {
         /// Agent ID (empty string for the main agent).
         #[serde(default)]
@@ -187,7 +187,7 @@ pub(crate) enum HookRequest {
     /// acquires the handoff lock, drains accumulated files, releases
     /// the editing guardrail, and deposits the file list in the
     /// handoff slot for the subsequent `done-editing/run` request.
-    #[serde(rename = "pre-tool/done-editing")]
+    #[serde(rename = "pre-tool/editing-stop")]
     PreToolDoneEditingPrepare {
         /// Agent ID (empty string for the main agent).
         /// Deserialized from IPC but not consumed — the daemon
@@ -209,7 +209,7 @@ pub(crate) enum HookRequest {
     /// `PreToolUse` hook has prepared the handoff slot. Takes the file
     /// list from the slot, runs `process_files_batched`, and returns
     /// formatted diagnostics.
-    #[serde(rename = "tool/done-editing")]
+    #[serde(rename = "tool/editing-stop")]
     DoneEditingRun,
 
     /// Clear stale editing state on session start.
@@ -609,9 +609,9 @@ mod tests {
         };
         assert_eq!(session_id.as_deref(), Some("uuid-123"));
 
-        // pre-tool/start-editing
-        let json = r#"{"method": "pre-tool/start-editing", "agent_id": "sub-1", "session_id": "sess-xyz"}"#;
-        let req: HookRequest = serde_json::from_str(json).expect("start-editing");
+        // pre-tool/editing-start
+        let json = r#"{"method": "pre-tool/editing-start", "agent_id": "sub-1", "session_id": "sess-xyz"}"#;
+        let req: HookRequest = serde_json::from_str(json).expect("editing-start");
         let HookRequest::PreToolStartEditing {
             agent_id,
             session_id,
@@ -622,26 +622,26 @@ mod tests {
         assert_eq!(agent_id, "sub-1");
         assert_eq!(session_id.as_deref(), Some("sess-xyz"));
 
-        // pre-tool/start-editing minimal (defaults)
-        let json = r#"{"method": "pre-tool/start-editing"}"#;
-        let req: HookRequest = serde_json::from_str(json).expect("start-editing minimal");
+        // pre-tool/editing-start minimal (defaults)
+        let json = r#"{"method": "pre-tool/editing-start"}"#;
+        let req: HookRequest = serde_json::from_str(json).expect("editing-start minimal");
         assert!(matches!(
             req,
             HookRequest::PreToolStartEditing { agent_id, session_id: None } if agent_id.is_empty()
         ));
 
-        // pre-tool/done-editing
+        // pre-tool/editing-stop
         let json =
-            r#"{"method": "pre-tool/done-editing", "agent_id": "sub-1", "session_id": "sess-abc"}"#;
-        let req: HookRequest = serde_json::from_str(json).expect("pre-tool/done-editing");
+            r#"{"method": "pre-tool/editing-stop", "agent_id": "sub-1", "session_id": "sess-abc"}"#;
+        let req: HookRequest = serde_json::from_str(json).expect("pre-tool/editing-stop");
         let HookRequest::PreToolDoneEditingPrepare { session_id, .. } = req else {
             unreachable!("expected PreToolDoneEditingPrepare");
         };
         assert_eq!(session_id.as_deref(), Some("sess-abc"));
 
-        // pre-tool/done-editing minimal (defaults)
-        let json = r#"{"method": "pre-tool/done-editing"}"#;
-        let req: HookRequest = serde_json::from_str(json).expect("pre-tool/done-editing minimal");
+        // pre-tool/editing-stop minimal (defaults)
+        let json = r#"{"method": "pre-tool/editing-stop"}"#;
+        let req: HookRequest = serde_json::from_str(json).expect("pre-tool/editing-stop minimal");
         assert!(matches!(
             req,
             HookRequest::PreToolDoneEditingPrepare {
@@ -650,9 +650,9 @@ mod tests {
             }
         ));
 
-        // tool/done-editing
-        let json = r#"{"method": "tool/done-editing"}"#;
-        let req: HookRequest = serde_json::from_str(json).expect("tool/done-editing");
+        // tool/editing-stop
+        let json = r#"{"method": "tool/editing-stop"}"#;
+        let req: HookRequest = serde_json::from_str(json).expect("tool/editing-stop");
         assert!(matches!(req, HookRequest::DoneEditingRun));
 
         // pre-tool/check-command
