@@ -358,7 +358,30 @@ fn canonical_command() -> clap::Command {
 
 #[allow(clippy::too_many_lines, reason = "Dispatch table for all subcommands")]
 fn main() -> Result<()> {
-    let matches = canonical_command().get_matches();
+    let matches = match canonical_command().try_get_matches() {
+        Ok(m) => m,
+        Err(e) => {
+            // For agent-facing subcommands, append `-h` output so the
+            // agent sees correct usage without a second round-trip.
+            let raw = e.to_string();
+            let subcommand = ["grep", "glob", "editing", "roots"]
+                .into_iter()
+                .find(|cmd| raw.contains(&format!("catenary {cmd}")));
+            if let Some(cmd) = subcommand {
+                let help = cli::command_help::render_help(cmd);
+                if !help.is_empty() {
+                    // Extract just the "error:" line, drop clap's tip/Usage/--help boilerplate.
+                    let error_line = raw
+                        .lines()
+                        .find(|l| l.starts_with("error:"))
+                        .unwrap_or(&raw);
+                    eprint!("{error_line}\n\n{help}");
+                    std::process::exit(2);
+                }
+            }
+            e.exit();
+        }
+    };
     let args = Args::from_arg_matches(&matches).context("parse CLI arguments")?;
 
     match args.command {

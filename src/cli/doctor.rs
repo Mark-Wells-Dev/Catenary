@@ -1683,7 +1683,10 @@ fn check_claude_instructions(out: &mut Output, show_diff: bool) {
         .get("version")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("?");
-    let expected_version = env!("CATENARY_VERSION");
+    // Compare against CARGO_PKG_VERSION (the Cargo.toml semver that
+    // matches marketplace.json), not CATENARY_VERSION which includes
+    // git-describe commit distance on dev builds.
+    let expected_version = env!("CARGO_PKG_VERSION");
 
     let Some(install_path_str) = entry.get("installPath").and_then(serde_json::Value::as_str)
     else {
@@ -1830,8 +1833,8 @@ fn check_gemini_instructions(out: &mut Output, show_diff: bool) {
         .and_then(|v| v.get("contextFileName").and_then(serde_json::Value::as_str))
         .unwrap_or("gemini-context.md");
 
-    // Version staleness
-    let expected_version = env!("CATENARY_VERSION");
+    // Version staleness — same reasoning as Claude check above.
+    let expected_version = env!("CARGO_PKG_VERSION");
     let is_stale = !is_linked && version.is_some_and(|v| v != expected_version);
 
     if is_linked {

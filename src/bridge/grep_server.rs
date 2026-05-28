@@ -1054,7 +1054,7 @@ fn render_results(
         } else {
             let _ = writeln!(
                 full,
-                "cwd: {compressed} (no LSP \u{2014} see catenary roots -h)"
+                "cwd: {compressed} (no LSP \u{2014} see `catenary roots -h`)"
             );
         }
         let all_indices: Vec<usize> = (0..enrichments.len()).collect();
@@ -1079,7 +1079,7 @@ fn render_results(
 
         // LSP warning when all results are outside workspace roots.
         if root_items.is_empty() && !oor_items.is_empty() {
-            let _ = writeln!(full, "(no LSP \u{2014} see catenary roots -h)");
+            let _ = writeln!(full, "(no LSP \u{2014} see `catenary roots -h`)");
         }
 
         for (root, indices) in &root_items {

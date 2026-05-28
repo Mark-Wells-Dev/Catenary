@@ -120,6 +120,7 @@ pub fn roots_command() -> Command {
             Command::new("add").about("Add a workspace root").arg(
                 Arg::new("path")
                     .required(true)
+                    .value_parser(clap::value_parser!(std::path::PathBuf))
                     .help("Path to add as a workspace root"),
             ),
         )
@@ -127,6 +128,7 @@ pub fn roots_command() -> Command {
             Command::new("rm").about("Remove a workspace root").arg(
                 Arg::new("path")
                     .required(true)
+                    .value_parser(clap::value_parser!(std::path::PathBuf))
                     .help("Path to remove from workspace roots"),
             ),
         )

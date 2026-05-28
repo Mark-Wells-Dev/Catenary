@@ -430,7 +430,7 @@ impl GlobServer {
             } else {
                 let _ = writeln!(
                     full,
-                    "cwd: {compressed} (no LSP \u{2014} see catenary roots -h)"
+                    "cwd: {compressed} (no LSP \u{2014} see `catenary roots -h`)"
                 );
             }
             path.strip_prefix(cwd).map_or_else(
@@ -440,7 +440,7 @@ impl GlobServer {
         } else {
             // Absolute pattern outside workspace roots: LSP warning.
             if self.fs_manager.resolve_root(path).is_none() {
-                let _ = writeln!(full, "(no LSP \u{2014} see catenary roots -h)");
+                let _ = writeln!(full, "(no LSP \u{2014} see `catenary roots -h`)");
             }
             path.to_string_lossy().to_string()
         };
@@ -670,7 +670,7 @@ impl GlobServer {
             } else {
                 let _ = writeln!(
                     full,
-                    "cwd: {compressed} (no LSP \u{2014} see catenary roots -h)"
+                    "cwd: {compressed} (no LSP \u{2014} see `catenary roots -h`)"
                 );
             }
             let display = canonical.strip_prefix(cwd).map_or_else(
@@ -681,7 +681,7 @@ impl GlobServer {
         } else {
             // Absolute pattern outside workspace roots: LSP warning.
             if self.fs_manager.resolve_root(&canonical).is_none() {
-                let _ = writeln!(full, "(no LSP \u{2014} see catenary roots -h)");
+                let _ = writeln!(full, "(no LSP \u{2014} see `catenary roots -h`)");
             }
             let _ = writeln!(full, "{}/", canonical.display());
         }
@@ -858,7 +858,7 @@ impl GlobServer {
             } else {
                 let _ = writeln!(
                     full,
-                    "cwd: {compressed} (no LSP \u{2014} see catenary roots -h)"
+                    "cwd: {compressed} (no LSP \u{2014} see `catenary roots -h`)"
                 );
             }
         } else if self.fs_manager.resolve_root(&tree_root).is_some() {
@@ -866,7 +866,7 @@ impl GlobServer {
             let _ = writeln!(full, "{}", tree_root.display());
         } else {
             // Absolute pattern outside workspace roots: LSP warning + header.
-            let _ = writeln!(full, "(no LSP \u{2014} see catenary roots -h)");
+            let _ = writeln!(full, "(no LSP \u{2014} see `catenary roots -h`)");
             let _ = writeln!(full, "{}", tree_root.display());
         }
 
