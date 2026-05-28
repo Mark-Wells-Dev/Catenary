@@ -1533,29 +1533,6 @@ mod tests {
         Ok(())
     }
 
-    /// Verifies that `did_change_watched_files` delivers file change events.
-    #[tokio::test]
-    async fn did_change_watched_files_reaches_server() -> Result<()> {
-        let dir = tempfile::tempdir()?;
-        let log_path = dir.path().join("notif.jsonl");
-        let log_str = log_path.to_str().expect("path is UTF-8");
-
-        let (mut client, _dir) = spawn_and_init(&["--notification-log", log_str]).await?;
-
-        client
-            .did_change_watched_files(&[("file:///test.rs", 1)])
-            .await?;
-        client.shutdown().await?;
-
-        let log = std::fs::read_to_string(&log_path)?;
-        assert!(
-            log.contains("workspace/didChangeWatchedFiles"),
-            "notification log should contain didChangeWatchedFiles: {log}"
-        );
-
-        Ok(())
-    }
-
     /// Verifies that `definition` returns a real location, not a default.
     #[tokio::test]
     async fn definition_returns_location() -> Result<()> {

@@ -102,10 +102,10 @@ impl DiagnosticsServer {
     /// Processes multiple file changes with a batched lifecycle so
     /// servers see all modified files simultaneously.
     ///
-    /// Pipeline: notify file changes → resolve + canonicalize →
-    /// group by server → per server (open all → settle → health
-    /// probe → didSave all → settle → retrieve per file → close
-    /// all) → format → `mark_current`.
+    /// Pipeline: resolve + canonicalize → group by server → per
+    /// server (open all → settle → health probe → didSave all →
+    /// settle → retrieve per file → close all) → format → bump
+    /// generations.
     ///
     /// Cross-file diagnostics (e.g., a renamed type that breaks
     /// importers) are correct because every server sees the complete
@@ -122,9 +122,6 @@ impl DiagnosticsServer {
         if files.is_empty() {
             return "[clean]\n".to_string();
         }
-
-        // Notify servers about filesystem changes once before the batch.
-        self.client_manager.notify_file_changes().await;
 
         // Ensure servers exist for all files before looking them up.
         // Triggers lazy spawn for files in sub-roots that haven't
@@ -188,8 +185,8 @@ impl DiagnosticsServer {
         // ── Phase 3: classify and format ─────────────────────────
         let output = self.format_output(&canonical_paths, &file_results, &uncovered);
 
-        // ── Phase 4: mark_current ─────────────────────────────────
-        self.fs.mark_current(&canonical_paths);
+        // ── Phase 4: invalidate caches ────────────────────────────
+        self.fs.bump_generations(&canonical_paths);
 
         output
     }

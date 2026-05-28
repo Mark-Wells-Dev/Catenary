@@ -1527,7 +1527,6 @@ mod tests {
 
         let fs = crate::bridge::filesystem_manager::FilesystemManager::new();
         fs.set_roots(vec![dir_a.path().to_path_buf(), dir_b.path().to_path_buf()]);
-        fs.seed();
 
         let mut index = SymbolIndex::new().expect("create index");
 
@@ -1549,17 +1548,8 @@ mod tests {
             dummy_enrichment(),
         );
 
-        // Modify file in root A — bumps generation for root A only.
-        std::fs::write(&file_a, "fn a_changed() {}\n").expect("write a changed");
-        let time = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2_000_000);
-        let times = std::fs::FileTimes::new().set_modified(time);
-        std::fs::File::options()
-            .write(true)
-            .open(&file_a)
-            .expect("open for set_mtime")
-            .set_times(times)
-            .expect("set_times");
-        let _ = fs.diff();
+        // Bump generation for root A only (simulates editing a file there).
+        fs.bump_generations(std::slice::from_ref(&file_a));
 
         // Root A entry should be stale, root B should survive.
         assert!(

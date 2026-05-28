@@ -140,77 +140,6 @@ fn uri_to_path(uri: &str) -> Result<PathBuf> {
         .ok_or_else(|| anyhow!("expected file:// URI, got: {uri}"))
 }
 
-/// Bitmask for file watcher event kinds.
-///
-/// `Create = 1`, `Change = 2`, `Delete = 4`. Default `7` (all).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WatchKind(u8);
-
-impl WatchKind {
-    /// Bit flag for file creation events.
-    pub const CREATE: u8 = 1;
-    /// Bit flag for file change events.
-    pub const CHANGE: u8 = 2;
-    /// Bit flag for file deletion events.
-    pub const DELETE: u8 = 4;
-    /// All event kinds (create + change + delete).
-    pub const ALL: u8 = 7;
-
-    /// Creates a `WatchKind` from an optional LSP value.
-    ///
-    /// Defaults to [`Self::ALL`] if `None` (per LSP spec).
-    #[must_use]
-    pub fn from_value(value: Option<u8>) -> Self {
-        Self(value.unwrap_or(Self::ALL))
-    }
-
-    /// Tests whether this watch kind includes the given change type.
-    #[must_use]
-    pub const fn matches(self, change_type: FileChangeType) -> bool {
-        let bit = match change_type {
-            FileChangeType::Created => Self::CREATE,
-            FileChangeType::Changed => Self::CHANGE,
-            FileChangeType::Deleted => Self::DELETE,
-        };
-        self.0 & bit != 0
-    }
-}
-
-/// LSP `FileChangeType` — the kind of filesystem change.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum FileChangeType {
-    /// File was created.
-    Created = 1,
-    /// File was changed.
-    Changed = 2,
-    /// File was deleted.
-    Deleted = 3,
-}
-
-/// A filesystem change event.
-#[derive(Debug)]
-pub struct FileChange {
-    /// Absolute path of the changed file or directory.
-    pub path: PathBuf,
-    /// The type of change.
-    pub change_type: FileChangeType,
-}
-
-/// A set of file watchers from a single `client/registerCapability` registration.
-pub struct FileWatcherRegistration {
-    /// The parsed watchers in this registration.
-    pub watchers: Vec<ParsedWatcher>,
-}
-
-/// A single file watcher: a glob pattern and the event kinds to watch for.
-pub struct ParsedWatcher {
-    /// The compiled glob pattern.
-    pub pattern: GlobPattern,
-    /// Which event kinds this watcher is interested in.
-    pub kind: WatchKind,
-}
-
 #[cfg(test)]
 #[allow(clippy::expect_used, reason = "test assertions")]
 mod tests {
@@ -327,30 +256,6 @@ mod tests {
         assert!(matches!(pattern, GlobPattern::Relative { .. }));
     }
 
-    // ── WatchKind ────────────────────────────────────────────────
-
-    #[test]
-    fn watch_kind_default_all() {
-        let wk = WatchKind::from_value(None);
-        assert_eq!(wk, WatchKind(WatchKind::ALL));
-    }
-
-    #[test]
-    fn watch_kind_create_only() {
-        let wk = WatchKind::from_value(Some(WatchKind::CREATE));
-        assert!(wk.matches(FileChangeType::Created));
-        assert!(!wk.matches(FileChangeType::Changed));
-        assert!(!wk.matches(FileChangeType::Deleted));
-    }
-
-    #[test]
-    fn watch_kind_bitmask() {
-        let wk = WatchKind::from_value(Some(WatchKind::CREATE | WatchKind::DELETE));
-        assert!(wk.matches(FileChangeType::Created));
-        assert!(!wk.matches(FileChangeType::Changed));
-        assert!(wk.matches(FileChangeType::Deleted));
-    }
-
     // ── is_glob_pattern ─────────────────────────────────────────
 
     #[test]
@@ -361,14 +266,5 @@ mod tests {
         assert!(!is_glob_pattern("Cargo.toml"));
         assert!(!is_glob_pattern("go.mod"));
         assert!(!is_glob_pattern(".gitignore"));
-    }
-
-    // ── FileChangeType ───────────────────────────────────────────
-
-    #[test]
-    fn file_change_type_repr() {
-        assert_eq!(FileChangeType::Created as u8, 1);
-        assert_eq!(FileChangeType::Changed as u8, 2);
-        assert_eq!(FileChangeType::Deleted as u8, 3);
     }
 }

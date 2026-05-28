@@ -20,7 +20,6 @@ use tracing::{debug, info, trace};
 use super::client::DiagnosticsCache;
 use super::connection::Connection;
 use super::extract;
-use super::glob::{FileWatcherRegistration, GlobPattern, ParsedWatcher, WatchKind};
 use super::instance_key::{InstanceKey, Scope};
 use super::protocol::RpcError;
 use super::state::{ProgressTracker, ServerLifecycle};
@@ -100,11 +99,6 @@ pub struct LspServer {
     /// when a server holds multiple registrations.
     config_change_registrations: Mutex<HashSet<String>>,
 
-    // ── File watchers ─────────────────────────────────────────
-    /// Registered file watcher patterns from `client/registerCapability`.
-    /// Keyed by registration ID.
-    file_watchers: Mutex<HashMap<String, FileWatcherRegistration>>,
-
     // ── Transport ───────────────────────────────────────────────
     connection: OnceLock<Connection>,
 }
@@ -151,7 +145,6 @@ impl LspServer {
             settings,
             config_change_registrations: Mutex::new(HashSet::new()),
             tree_monitor: Mutex::new(None),
-            file_watchers: Mutex::new(HashMap::new()),
             connection: OnceLock::new(),
         }
     }
@@ -725,7 +718,6 @@ impl LspServer {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
-        self.clear_file_watchers();
         self.diagnostics_notify.notify_waiters();
     }
 
@@ -778,46 +770,12 @@ impl LspServer {
             .is_empty()
     }
 
-    // ── File watcher registration ────────────────────────────────
-
-    /// Snapshots all registered file watcher patterns.
-    ///
-    /// Returns an empty vec if no watchers are registered. Clones
-    /// the patterns under the lock so callers can match without
-    /// holding it during I/O.
-    #[must_use]
-    pub fn file_watcher_snapshot(&self) -> Vec<(GlobPattern, WatchKind)> {
-        let map = self
-            .file_watchers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        map.values()
-            .flat_map(|reg| reg.watchers.iter().map(|w| (w.pattern.clone(), w.kind)))
-            .collect()
-    }
-
-    /// Clears all file watcher registrations.
-    ///
-    /// Called on server shutdown to clean up registrations.
-    pub fn clear_file_watchers(&self) {
-        let mut map = self
-            .file_watchers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        map.clear();
-    }
-
     /// Parses `client/registerCapability` params and stores
     /// registrations for supported methods.
     fn handle_register_capability(&self, params: &Value) {
         let Some(registrations) = params.get("registrations").and_then(Value::as_array) else {
             return;
         };
-
-        let mut map = self
-            .file_watchers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         for reg in registrations {
             let Some(method) = reg.get("method").and_then(Value::as_str) else {
@@ -836,78 +794,17 @@ impl LspServer {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .insert(id);
                 debug!("server registered for workspace/didChangeConfiguration");
-                continue;
-            }
-
-            if method != "workspace/didChangeWatchedFiles" {
-                continue;
-            }
-
-            let Some(id) = reg.get("id").and_then(Value::as_str) else {
-                debug!("file watcher registration missing 'id' field");
-                continue;
-            };
-
-            let watchers_json = reg
-                .get("registerOptions")
-                .and_then(|opts| opts.get("watchers"))
-                .and_then(Value::as_array);
-
-            let Some(watchers_json) = watchers_json else {
-                debug!("file watcher registration {id} missing 'registerOptions.watchers'");
-                continue;
-            };
-
-            let mut parsed_watchers = Vec::new();
-            for watcher in watchers_json {
-                let Some(glob_value) = watcher.get("globPattern") else {
-                    debug!("file watcher in registration {id} missing 'globPattern'");
-                    continue;
-                };
-
-                let pattern = match GlobPattern::from_value(glob_value) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        debug!("skipping invalid glob in registration {id}: {e}");
-                        continue;
-                    }
-                };
-
-                let kind = WatchKind::from_value(
-                    watcher
-                        .get("kind")
-                        .and_then(Value::as_u64)
-                        .and_then(|v| u8::try_from(v).ok()),
-                );
-
-                parsed_watchers.push(ParsedWatcher { pattern, kind });
-            }
-
-            if parsed_watchers.is_empty() {
-                debug!("file watcher registration {id}: all watchers failed to parse");
-            } else {
-                map.insert(
-                    id.to_string(),
-                    FileWatcherRegistration {
-                        watchers: parsed_watchers,
-                    },
-                );
             }
         }
     }
 
-    /// Parses `client/unregisterCapability` params and removes file
-    /// watcher registrations by ID.
+    /// Parses `client/unregisterCapability` params and removes
+    /// registrations by ID.
     fn handle_unregister_capability(&self, params: &Value) {
         // Note: the LSP spec misspells "unregisterations" — this is normative.
         let Some(unregistrations) = params.get("unregisterations").and_then(Value::as_array) else {
             return;
         };
-
-        let mut map = self
-            .file_watchers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         for unreg in unregistrations {
             let Some(method) = unreg.get("method").and_then(Value::as_str) else {
@@ -915,23 +812,14 @@ impl LspServer {
                 continue;
             };
 
-            if method == "workspace/didChangeConfiguration" {
-                if let Some(id) = unreg.get("id").and_then(Value::as_str) {
-                    self.config_change_registrations
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .remove(id);
-                    debug!("server unregistered from workspace/didChangeConfiguration");
-                }
-                continue;
-            }
-
-            if method != "workspace/didChangeWatchedFiles" {
-                continue;
-            }
-
-            if let Some(id) = unreg.get("id").and_then(Value::as_str) {
-                map.remove(id);
+            if method == "workspace/didChangeConfiguration"
+                && let Some(id) = unreg.get("id").and_then(Value::as_str)
+            {
+                self.config_change_registrations
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(id);
+                debug!("server unregistered from workspace/didChangeConfiguration");
             }
         }
     }
@@ -1525,258 +1413,6 @@ mod tests {
         server.set_lifecycle(ServerLifecycle::Dead);
         server.try_transition_probing_to_healthy();
         assert_eq!(server.lifecycle(), ServerLifecycle::Dead);
-    }
-
-    // ── File watcher registration tests ──────────────────────────
-
-    /// Helper: builds a `registerCapability` params value with file watchers.
-    fn register_params(id: &str, watchers: &Value) -> Value {
-        json!({
-            "registrations": [{
-                "id": id,
-                "method": "workspace/didChangeWatchedFiles",
-                "registerOptions": { "watchers": watchers }
-            }]
-        })
-    }
-
-    #[test]
-    fn register_file_watcher_stores_registration() {
-        let server = test_server();
-        let params = register_params(
-            "reg-1",
-            &json!([
-                { "globPattern": "**/*.rs" }
-            ]),
-        );
-        let result = server
-            .on_request("client/registerCapability", &params)
-            .expect("should succeed");
-        assert_eq!(result, Value::Null);
-
-        let snapshot = server.file_watcher_snapshot();
-        assert_eq!(snapshot.len(), 1);
-    }
-
-    #[test]
-    fn register_multiple_watchers() {
-        let server = test_server();
-        let params = register_params(
-            "reg-1",
-            &json!([
-                { "globPattern": "**/*.rs" },
-                { "globPattern": "**/*.toml" }
-            ]),
-        );
-        server
-            .on_request("client/registerCapability", &params)
-            .expect("should succeed");
-
-        let snapshot = server.file_watcher_snapshot();
-        assert_eq!(snapshot.len(), 2);
-    }
-
-    #[test]
-    fn register_multiple_registrations() {
-        let server = test_server();
-        let params1 = register_params(
-            "reg-1",
-            &json!([
-                { "globPattern": "**/*.rs" }
-            ]),
-        );
-        let params2 = register_params(
-            "reg-2",
-            &json!([
-                { "globPattern": "**/*.toml" }
-            ]),
-        );
-        server
-            .on_request("client/registerCapability", &params1)
-            .expect("should succeed");
-        server
-            .on_request("client/registerCapability", &params2)
-            .expect("should succeed");
-
-        let snapshot = server.file_watcher_snapshot();
-        assert_eq!(snapshot.len(), 2);
-    }
-
-    #[test]
-    fn unregister_removes_by_id() {
-        let server = test_server();
-        let params = register_params(
-            "reg-1",
-            &json!([
-                { "globPattern": "**/*.rs" }
-            ]),
-        );
-        server
-            .on_request("client/registerCapability", &params)
-            .expect("should succeed");
-        assert_eq!(server.file_watcher_snapshot().len(), 1);
-
-        let unreg = json!({
-            "unregisterations": [{
-                "id": "reg-1",
-                "method": "workspace/didChangeWatchedFiles"
-            }]
-        });
-        let result = server
-            .on_request("client/unregisterCapability", &unreg)
-            .expect("should succeed");
-        assert_eq!(result, Value::Null);
-
-        assert!(server.file_watcher_snapshot().is_empty());
-    }
-
-    #[test]
-    fn unregister_unknown_id_is_noop() {
-        let server = test_server();
-        let unreg = json!({
-            "unregisterations": [{
-                "id": "nonexistent",
-                "method": "workspace/didChangeWatchedFiles"
-            }]
-        });
-        let result = server
-            .on_request("client/unregisterCapability", &unreg)
-            .expect("should succeed");
-        assert_eq!(result, Value::Null);
-        assert!(server.file_watcher_snapshot().is_empty());
-    }
-
-    #[test]
-    fn non_filewatcher_registration_ignored() {
-        let server = test_server();
-        let params = json!({
-            "registrations": [{
-                "id": "reg-1",
-                "method": "textDocument/didChangeConfiguration",
-                "registerOptions": {}
-            }]
-        });
-        server
-            .on_request("client/registerCapability", &params)
-            .expect("should succeed");
-
-        assert!(server.file_watcher_snapshot().is_empty());
-    }
-
-    #[test]
-    fn invalid_glob_skipped() {
-        let server = test_server();
-        let params = register_params(
-            "reg-1",
-            &json!([
-                { "globPattern": "[invalid" },
-                { "globPattern": "**/*.rs" }
-            ]),
-        );
-        server
-            .on_request("client/registerCapability", &params)
-            .expect("should succeed");
-
-        let snapshot = server.file_watcher_snapshot();
-        assert_eq!(snapshot.len(), 1);
-    }
-
-    #[test]
-    fn watch_kind_defaults_to_all() {
-        let server = test_server();
-        let params = register_params(
-            "reg-1",
-            &json!([
-                { "globPattern": "**/*.rs" }
-            ]),
-        );
-        server
-            .on_request("client/registerCapability", &params)
-            .expect("should succeed");
-
-        let snapshot = server.file_watcher_snapshot();
-        assert_eq!(snapshot.len(), 1);
-        let (_, kind) = &snapshot[0];
-        assert_eq!(*kind, WatchKind::from_value(Some(WatchKind::ALL)));
-    }
-
-    #[test]
-    fn watch_kind_parsed_from_value() {
-        let server = test_server();
-        let params = register_params(
-            "reg-1",
-            &json!([
-                { "globPattern": "**/*.rs", "kind": 1 }
-            ]),
-        );
-        server
-            .on_request("client/registerCapability", &params)
-            .expect("should succeed");
-
-        let snapshot = server.file_watcher_snapshot();
-        assert_eq!(snapshot.len(), 1);
-        let (_, kind) = &snapshot[0];
-        assert_eq!(*kind, WatchKind::from_value(Some(WatchKind::CREATE)));
-    }
-
-    #[test]
-    fn relative_pattern_parsed() {
-        let server = test_server();
-        let params = register_params(
-            "reg-1",
-            &json!([
-                {
-                    "globPattern": {
-                        "baseUri": { "uri": "file:///project", "name": "proj" },
-                        "pattern": "**/*.rs"
-                    }
-                }
-            ]),
-        );
-        server
-            .on_request("client/registerCapability", &params)
-            .expect("should succeed");
-
-        let snapshot = server.file_watcher_snapshot();
-        assert_eq!(snapshot.len(), 1);
-        let (pattern, _) = &snapshot[0];
-        assert!(matches!(pattern, GlobPattern::Relative { .. }));
-    }
-
-    #[test]
-    fn clear_file_watchers_empties_map() {
-        let server = test_server();
-        let params = register_params(
-            "reg-1",
-            &json!([
-                { "globPattern": "**/*.rs" }
-            ]),
-        );
-        server
-            .on_request("client/registerCapability", &params)
-            .expect("should succeed");
-        assert_eq!(server.file_watcher_snapshot().len(), 1);
-
-        server.clear_file_watchers();
-        assert!(server.file_watcher_snapshot().is_empty());
-    }
-
-    #[test]
-    fn on_shutdown_clears_file_watchers() {
-        let server = test_server();
-        let params = register_params(
-            "reg-1",
-            &json!([
-                { "globPattern": "**/*.rs" }
-            ]),
-        );
-        server
-            .on_request("client/registerCapability", &params)
-            .expect("should succeed");
-        assert_eq!(server.file_watcher_snapshot().len(), 1);
-
-        server.on_shutdown();
-        assert!(server.file_watcher_snapshot().is_empty());
     }
 
     // ── resolve_configuration tests ─────────────────────────────────

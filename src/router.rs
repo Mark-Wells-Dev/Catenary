@@ -1295,9 +1295,6 @@ async fn handle_hook_dispatch(
         let grep_req: GrepRequest = serde_json::from_value(raw.clone())
             .map_err(|e| anyhow!("invalid grep request: {e}"))?;
 
-        // Notify servers about filesystem changes before any LSP interaction.
-        ctx.primary.notify_file_changes().await;
-
         let params = grep_req.to_params();
         let parent_id = uuid::Uuid::new_v4().to_string();
         let cancel = CancellationToken::new();
@@ -1369,9 +1366,6 @@ async fn handle_hook_dispatch(
     if method == METHOD_GLOB {
         let glob_req: GlobRequest = serde_json::from_value(raw.clone())
             .map_err(|e| anyhow!("invalid glob request: {e}"))?;
-
-        // Notify servers about filesystem changes before any LSP interaction.
-        ctx.primary.notify_file_changes().await;
 
         let params = glob_req.to_params();
         let parent_id = uuid::Uuid::new_v4().to_string();

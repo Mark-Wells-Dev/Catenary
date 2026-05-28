@@ -203,7 +203,6 @@ impl Session {
         let classification = super::filesystem_manager::ClassificationTables::from_config(&config);
         let fs_manager = Arc::new(FilesystemManager::with_classification(classification));
         fs_manager.set_roots(roots.clone());
-        fs_manager.seed();
 
         // Build symbol index (in-memory, populated lazily from documentSymbol).
         let symbol_index = SymbolIndex::new()
@@ -432,12 +431,6 @@ impl Session {
     /// Returns the current workspace roots.
     pub fn roots(&self) -> Vec<PathBuf> {
         self.client_manager.roots()
-    }
-
-    /// Diffs the filesystem and notifies servers with matching file watcher
-    /// registrations. Delegates to [`LspClientManager::notify_file_changes`].
-    pub async fn notify_file_changes(&self) {
-        self.client_manager.notify_file_changes().await;
     }
 
     /// Spawns LSP servers for languages detected in the workspace.
