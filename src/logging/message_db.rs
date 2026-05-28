@@ -120,8 +120,8 @@ impl Sink for MessageDbSink {
         let insert_result = conn.execute(
             "INSERT INTO messages \
              (session_id, timestamp, type, level, method, server, client, \
-              parent_id, payload) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+              scope_root, parent_id, payload) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             rusqlite::params![
                 &*self.instance_id,
                 timestamp,
@@ -130,6 +130,7 @@ impl Sink for MessageDbSink {
                 method,
                 event.server.as_deref().unwrap_or(""),
                 client,
+                event.scope_root.as_deref().unwrap_or(""),
                 event.parent_id,
                 payload,
             ],
@@ -250,6 +251,7 @@ mod tests {
                  method      TEXT NOT NULL,
                  server      TEXT NOT NULL,
                  client      TEXT NOT NULL,
+                 scope_root  TEXT NOT NULL DEFAULT '',
                  parent_id   TEXT,
                  payload     TEXT NOT NULL
              );
@@ -283,6 +285,7 @@ mod tests {
             server: server.map(str::to_string),
             client: None,
             parent_id: parent_id.map(str::to_string),
+            scope_root: None,
             source: None,
             language: None,
             payload: payload.map(str::to_string),
@@ -301,6 +304,7 @@ mod tests {
             server: None,
             client: None,
             parent_id: None,
+            scope_root: None,
             source: None,
             language: None,
             payload: None,
@@ -736,6 +740,7 @@ mod tests {
             server: Some(server.to_string()),
             client: None,
             parent_id: None,
+            scope_root: None,
             source: Some("server.lifecycle".to_string()),
             language: Some(language.to_string()),
             payload: None,

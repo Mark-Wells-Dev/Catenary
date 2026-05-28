@@ -277,6 +277,7 @@ mod tests {
             server: server.map(str::to_string),
             client: None,
             parent_id: None,
+            scope_root: None,
             source: None,
             language: None,
             payload: None,

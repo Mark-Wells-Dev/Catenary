@@ -251,9 +251,9 @@ pub struct StreamState {
     /// matching session) are hidden when a filter is active.
     session_filter: Option<HashSet<String>>,
     /// Active server filter. `None` = show all. `Some(set)` = show only
-    /// scopes whose LSP children involve a server in the set. Scopes with
-    /// no matching LSP children are hidden.
-    server_filter: Option<HashSet<String>>,
+    /// scopes whose LSP children involve a `(server, scope_root)` pair in
+    /// the set. Scopes with no matching LSP children are hidden.
+    server_filter: Option<HashSet<(String, String)>>,
 
     // ── Paging state ─────────────────────────────────────────────────
     /// Index in `entries` where the bottom region starts (after a gap).
@@ -330,16 +330,17 @@ impl StreamState {
             }
 
             // Apply server filter: scope must have LSP children involving
-            // a selected server. Scopes with no matching LSP children
-            // (including hook-only scopes) are hidden.
+            // a selected (server, scope_root) pair. Scopes with no matching
+            // LSP children (including hook-only scopes) are hidden.
             if let Some(ref server_set) = self.server_filter {
                 let matches = match entry {
-                    StreamEntry::Scope(scope) => scope
-                        .children
-                        .iter()
-                        .any(|c| c.r#type == "lsp" && server_set.contains(&c.server)),
+                    StreamEntry::Scope(scope) => scope.children.iter().any(|c| {
+                        c.r#type == "lsp"
+                            && server_set.contains(&(c.server.clone(), c.scope_root.clone()))
+                    }),
                     StreamEntry::Standalone(msg) => {
-                        msg.r#type == "lsp" && server_set.contains(&msg.server)
+                        msg.r#type == "lsp"
+                            && server_set.contains(&(msg.server.clone(), msg.scope_root.clone()))
                     }
                 };
                 if !matches {
@@ -497,8 +498,8 @@ impl StreamState {
     /// Update the server filter and rebuild display rows.
     ///
     /// `None` = show all. `Some(set)` = show only scopes whose LSP
-    /// children involve a server in the set.
-    pub fn set_server_filter(&mut self, filter: Option<HashSet<String>>) {
+    /// children involve a `(server, scope_root)` pair in the set.
+    pub fn set_server_filter(&mut self, filter: Option<HashSet<(String, String)>>) {
         self.server_filter = filter;
         self.rebuild_display_rows();
     }
@@ -1996,7 +1997,7 @@ mod tests {
 
         // Filter to rust-analyzer only.
         let mut filter = HashSet::new();
-        filter.insert("rust-analyzer".to_string());
+        filter.insert(("rust-analyzer".to_string(), String::new()));
         state.set_server_filter(Some(filter));
 
         assert_eq!(state.display_rows.len(), 1, "only rust-analyzer scope");
@@ -2028,7 +2029,7 @@ mod tests {
         );
 
         let mut filter = HashSet::new();
-        filter.insert("rust-analyzer".to_string());
+        filter.insert(("rust-analyzer".to_string(), String::new()));
         state.set_server_filter(Some(filter));
 
         // Hook-only scope hidden, MCP scope visible.
@@ -2047,7 +2048,7 @@ mod tests {
 
         // Filter to rust-analyzer — scope matches.
         let mut filter = HashSet::new();
-        filter.insert("rust-analyzer".to_string());
+        filter.insert(("rust-analyzer".to_string(), String::new()));
         state.set_server_filter(Some(filter));
 
         // Scope header + both children visible (expansion shows all).
@@ -2084,7 +2085,7 @@ mod tests {
 
         // Add server filter: rust-analyzer only.
         let mut servers = HashSet::new();
-        servers.insert("rust-analyzer".to_string());
+        servers.insert(("rust-analyzer".to_string(), String::new()));
         state.set_server_filter(Some(servers));
 
         // Intersection: s1 AND rust-analyzer = scope 1 only.
@@ -2104,7 +2105,7 @@ mod tests {
 
         // Apply filter.
         let mut filter = HashSet::new();
-        filter.insert("lua-ls".to_string());
+        filter.insert(("lua-ls".to_string(), String::new()));
         state.set_server_filter(Some(filter));
         assert_eq!(state.display_rows.len(), 0, "nothing matches lua-ls");
 

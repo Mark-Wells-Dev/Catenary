@@ -41,6 +41,7 @@ struct PendingRequest {
 fn emit_lsp_event(
     level: tracing::Level,
     server_name: &str,
+    scope_root: &str,
     method: &str,
     parent_id: Option<&str>,
     payload: &str,
@@ -53,6 +54,7 @@ fn emit_lsp_event(
             method = method,
             server = server_name,
             client = "catenary",
+            scope_root = scope_root,
             parent_id = parent_id,
             payload = payload,
             "{msg}"
@@ -64,6 +66,7 @@ fn emit_lsp_event(
             method = method,
             server = server_name,
             client = "catenary",
+            scope_root = scope_root,
             parent_id = parent_id,
             payload = payload,
             "{msg}"
@@ -75,6 +78,7 @@ fn emit_lsp_event(
             method = method,
             server = server_name,
             client = "catenary",
+            scope_root = scope_root,
             parent_id = parent_id,
             payload = payload,
             "{msg}"
@@ -86,11 +90,26 @@ fn emit_lsp_event(
             method = method,
             server = server_name,
             client = "catenary",
+            scope_root = scope_root,
             parent_id = parent_id,
             payload = payload,
             "{msg}"
         );
     }
+}
+
+/// Extract the scope root path string from an `LspServer` weak reference.
+///
+/// Returns an empty string if the server has been dropped, the scope
+/// hasn't been set yet (pre-init), or the scope is `SingleFile`.
+fn scope_root_from(server: &Weak<LspServer>) -> String {
+    server
+        .upgrade()
+        .and_then(|s| {
+            s.scope()
+                .and_then(|sc| sc.root_path().map(|p| p.display().to_string()))
+        })
+        .unwrap_or_default()
 }
 
 /// Whether an LSP error code indicates a retriable condition.
@@ -299,10 +318,12 @@ impl Connection {
             };
 
             let level = lsp_category_level(lsp_category(method));
+            let sr = scope_root_from(&self.server);
             if let Ok(payload) = serde_json::to_value(&request) {
                 emit_lsp_event(
                     level,
                     &self.server_name,
+                    &sr,
                     method,
                     parent_id,
                     &payload.to_string(),
@@ -427,9 +448,11 @@ impl Connection {
             params,
         };
         if let Ok(payload) = serde_json::to_value(&notification) {
+            let sr = scope_root_from(&self.server);
             emit_lsp_event(
                 tracing::Level::DEBUG,
                 &self.server_name,
+                &sr,
                 method,
                 parent_id,
                 &payload.to_string(),
@@ -620,6 +643,11 @@ impl Connection {
                             break;
                         };
 
+                        let sr = server
+                            .scope()
+                            .and_then(|sc| sc.root_path().map(|p| p.display().to_string()))
+                            .unwrap_or_default();
+
                         // Check message type
                         if let Some(method) = value.get("method").and_then(|m| m.as_str()) {
                             // Request or Notification
@@ -630,6 +658,7 @@ impl Connection {
                                 emit_lsp_event(
                                     tracing::Level::DEBUG,
                                     &server_name,
+                                    &sr,
                                     method,
                                     Some(&exchange_id),
                                     &value.to_string(),
@@ -666,6 +695,7 @@ impl Connection {
                                     emit_lsp_event(
                                         tracing::Level::DEBUG,
                                         &server_name,
+                                        &sr,
                                         method,
                                         Some(&exchange_id),
                                         &response_json.to_string(),
@@ -709,6 +739,7 @@ impl Connection {
                                             method = method,
                                             server = server_name.as_str(),
                                             client = "catenary",
+                                            scope_root = sr.as_str(),
                                             payload = payload_str.as_str(),
                                             source = crate::source::Source::LspLogging.as_str(),
                                             lsp_level = lsp_level,
@@ -720,6 +751,7 @@ impl Connection {
                                             method = method,
                                             server = server_name.as_str(),
                                             client = "catenary",
+                                            scope_root = sr.as_str(),
                                             payload = payload_str.as_str(),
                                             source = crate::source::Source::LspLogging.as_str(),
                                             "{server_name}: {text}"
@@ -752,6 +784,7 @@ impl Connection {
                                     emit_lsp_event(
                                         notif_level,
                                         &server_name,
+                                        &sr,
                                         method,
                                         None,
                                         &value.to_string(),
@@ -778,6 +811,7 @@ impl Connection {
                                         emit_lsp_event(
                                             resp_level,
                                             &server_name,
+                                            &sr,
                                             &req.method,
                                             req.parent_id.as_deref(),
                                             &value.to_string(),
@@ -873,6 +907,7 @@ mod tests {
         emit_lsp_event(
             tracing::Level::ERROR,
             "test-server",
+            "",
             "test/error",
             None,
             "{}",
@@ -881,6 +916,7 @@ mod tests {
         emit_lsp_event(
             tracing::Level::WARN,
             "test-server",
+            "",
             "test/warn",
             None,
             "{}",
@@ -889,6 +925,7 @@ mod tests {
         emit_lsp_event(
             tracing::Level::INFO,
             "test-server",
+            "",
             "test/info",
             None,
             "{}",
@@ -897,6 +934,7 @@ mod tests {
         emit_lsp_event(
             tracing::Level::DEBUG,
             "test-server",
+            "",
             "test/debug",
             None,
             "{}",
@@ -927,6 +965,7 @@ mod tests {
         emit_lsp_event(
             tracing::Level::INFO,
             "test-server",
+            "",
             "test/method",
             Some("scope-5"),
             "{}",
@@ -935,6 +974,7 @@ mod tests {
         emit_lsp_event(
             tracing::Level::INFO,
             "test-server",
+            "",
             "test/method",
             None,
             "{}",

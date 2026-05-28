@@ -95,6 +95,7 @@ impl From<&tracing::Level> for Severity {
 macro_rules! emit_protocol_event {
     ($level:ident, kind = $kind:expr, method = $method:expr,
      server = $server:expr, client = $client:expr,
+     scope_root = $scope_root:expr,
      parent_id = $pid:expr,
      payload = $payload:expr, $msg:expr) => {
         if let Some(pid) = $pid {
@@ -103,6 +104,7 @@ macro_rules! emit_protocol_event {
                 method = $method,
                 server = $server,
                 client = $client,
+                scope_root = $scope_root,
                 parent_id = pid,
                 payload = $payload,
                 $msg
@@ -113,6 +115,7 @@ macro_rules! emit_protocol_event {
                 method = $method,
                 server = $server,
                 client = $client,
+                scope_root = $scope_root,
                 payload = $payload,
                 $msg
             );
@@ -147,6 +150,11 @@ pub struct LogEvent<'a> {
     pub parent_id: Option<String>,
     /// Subsystem emitting the event (e.g., `"lsp.lifecycle"`).
     pub source: Option<String>,
+    /// Workspace root path for the LSP server instance.
+    ///
+    /// Populated for LSP events from the `Scope::Root` path on the
+    /// `LspServer`. Empty for MCP, hook, and internal events.
+    pub scope_root: Option<String>,
     /// Language ID when relevant.
     pub language: Option<String>,
     /// Raw protocol JSON payload (for `kind in {lsp, mcp, hook}`).
@@ -175,6 +183,7 @@ struct OwnedEvent {
     server: Option<String>,
     client: Option<String>,
     parent_id: Option<String>,
+    scope_root: Option<String>,
     source: Option<String>,
     language: Option<String>,
     payload: Option<String>,
@@ -193,6 +202,7 @@ impl OwnedEvent {
             server: self.server.clone(),
             client: self.client.clone(),
             parent_id: self.parent_id.clone(),
+            scope_root: self.scope_root.clone(),
             source: self.source.clone(),
             language: self.language.clone(),
             payload: self.payload.clone(),
@@ -564,7 +574,8 @@ where
 /// Field extractor for tracing events.
 ///
 /// Reserved field names (`message`, `kind`, `method`, `server`, `client`,
-/// `source`, `language`, `payload`, `parent_id`) populate typed members.
+/// `source`, `language`, `payload`, `parent_id`, `scope_root`) populate typed
+/// members.
 /// All other fields collect into `fields`.
 #[derive(Default)]
 struct FieldVisitor {
@@ -574,6 +585,7 @@ struct FieldVisitor {
     server: Option<String>,
     client: Option<String>,
     parent_id: Option<String>,
+    scope_root: Option<String>,
     source: Option<String>,
     language: Option<String>,
     payload: Option<String>,
@@ -592,6 +604,7 @@ impl FieldVisitor {
             "source" => self.source = Some(value),
             "language" => self.language = Some(value),
             "parent_id" => self.parent_id = Some(value),
+            "scope_root" => self.scope_root = Some(value),
             "payload" => self.payload = Some(value),
             "session_id" => self.session_id = Some(value),
             _ => {
@@ -616,6 +629,7 @@ impl FieldVisitor {
             server: self.server,
             client: self.client,
             parent_id: self.parent_id,
+            scope_root: self.scope_root,
             source: self.source,
             language: self.language,
             payload: self.payload,
@@ -635,6 +649,7 @@ impl FieldVisitor {
             server: self.server,
             client: self.client,
             parent_id: self.parent_id,
+            scope_root: self.scope_root,
             source: self.source,
             language: self.language,
             payload: self.payload,
@@ -727,6 +742,7 @@ pub mod test_support {
                  method      TEXT NOT NULL,
                  server      TEXT NOT NULL,
                  client      TEXT NOT NULL,
+                 scope_root  TEXT NOT NULL DEFAULT '',
                  parent_id   TEXT,
                  payload     TEXT NOT NULL
              );",
@@ -892,6 +908,7 @@ mod tests {
             server: server.map(str::to_string),
             client: None,
             parent_id: None,
+            scope_root: None,
             source: source.map(str::to_string),
             language: None,
             payload: None,

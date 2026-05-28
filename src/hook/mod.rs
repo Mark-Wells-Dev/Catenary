@@ -50,6 +50,7 @@ pub(crate) fn emit_hook_event(
             method = method,
             server = "catenary",
             client = client_name,
+            scope_root = "",
             parent_id = parent_id,
             payload = payload,
             "{msg}"
@@ -61,6 +62,7 @@ pub(crate) fn emit_hook_event(
             method = method,
             server = "catenary",
             client = client_name,
+            scope_root = "",
             parent_id = parent_id,
             payload = payload,
             "{msg}"
@@ -72,6 +74,7 @@ pub(crate) fn emit_hook_event(
             method = method,
             server = "catenary",
             client = client_name,
+            scope_root = "",
             parent_id = parent_id,
             payload = payload,
             "{msg}"
@@ -83,6 +86,7 @@ pub(crate) fn emit_hook_event(
             method = method,
             server = "catenary",
             client = client_name,
+            scope_root = "",
             parent_id = parent_id,
             payload = payload,
             "{msg}"

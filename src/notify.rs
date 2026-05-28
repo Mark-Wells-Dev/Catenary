@@ -189,6 +189,7 @@ mod tests {
             server: None,
             client: None,
             parent_id: None,
+            scope_root: None,
             source: None,
             language: None,
             payload: None,
