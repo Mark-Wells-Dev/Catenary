@@ -42,6 +42,7 @@ pub fn grep_command() -> Command {
             Arg::new("page")
                 .long("page")
                 .default_value("1")
+                .value_parser(clap::value_parser!(usize))
                 .help("Page number for paged results"),
         )
         .arg(
@@ -83,6 +84,7 @@ pub fn glob_command() -> Command {
             Arg::new("page")
                 .long("page")
                 .default_value("1")
+                .value_parser(clap::value_parser!(usize))
                 .help("Page number for paged results"),
         )
         .arg(

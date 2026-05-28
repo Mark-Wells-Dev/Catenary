@@ -77,13 +77,11 @@ const TEMPLATE: &str = r#"# Catenary recommended config
 #
 # [commands.guidance.scan]
 # redirect = "grep"
-# summary = "Use `catenary grep` for text + symbol search."
 # commands = ["rg", "ag", "ack", "fd", "grep", "egrep",
 #             "fgrep", "rgrep", "zgrep"]
 #
 # [commands.guidance.list]
 # redirect = "glob"
-# summary = "Use `catenary glob` to browse the filesystem."
 # commands = ["ls", "dir", "tree", "find"]
 #
 # [commands.guidance.build]

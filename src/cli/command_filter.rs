@@ -607,10 +607,10 @@ pub fn format_denial_full(
     let lookup_cmd = denied_cmd.split_whitespace().next().unwrap_or(denied_cmd);
 
     // Redirect denial: short format with the command's `-h` output.
-    if let Some(crate::config::GuidanceEntry::Redirect { command, summary }) =
+    if let Some(crate::config::GuidanceEntry::Redirect { command }) =
         commands.guidance_for(lookup_cmd)
     {
-        let opening = format!("`{denied_cmd}` isn't allowed. {summary}");
+        let opening = format!("`{denied_cmd}` isn't allowed. Use `catenary {command}` instead.");
         let help = render_subcommand_help(command);
         return if help.is_empty() {
             opening
@@ -745,8 +745,8 @@ pub fn format_denial_short(
             crate::config::GuidanceEntry::Build(_) => {
                 build_hint.map_or_else(|| String::from(no_guidance), |hint| format!(" — {hint}"))
             }
-            crate::config::GuidanceEntry::Redirect { summary, .. } => {
-                format!(" — {summary}")
+            crate::config::GuidanceEntry::Redirect { command, .. } => {
+                format!(" — Use `catenary {command}` instead.")
             }
         },
     );

@@ -97,8 +97,6 @@ pub struct GuidanceGroup {
     /// Catenary subcommand to redirect to (e.g., `"grep"`, `"glob"`).
     /// When set, denials show a short message + the command's `-h` output.
     pub redirect: Option<String>,
-    /// Opening line after the denial for redirect groups.
-    pub summary: Option<String>,
     /// Commands this guidance applies to.
     pub commands: Vec<String>,
     /// Build: message when user config has a build tool.
@@ -139,8 +137,6 @@ pub enum GuidanceEntry {
     Redirect {
         /// Catenary subcommand name (e.g., `"grep"`, `"glob"`).
         command: String,
-        /// Opening line after the denial (e.g., "Use `catenary grep` for text + symbol search.").
-        summary: String,
     },
 }
 
@@ -458,10 +454,6 @@ fn flatten_guidance(groups: &HashMap<String, GuidanceGroup>) -> HashMap<String, 
         } else if let Some(ref redirect) = group.redirect {
             GuidanceEntry::Redirect {
                 command: redirect.clone(),
-                summary: group
-                    .summary
-                    .clone()
-                    .unwrap_or_else(|| format!("Use `catenary {redirect}` instead.")),
             }
         } else if let Some(ref msg) = group.message {
             GuidanceEntry::Static(msg.clone())
@@ -714,8 +706,12 @@ pub fn validate(config: &CommandsConfig) -> (Vec<String>, Vec<String>) {
                     ));
                 }
             }
-            // Non-build group must have a message
-            if name != "build" && !group.is_build() && group.message.is_none() {
+            // Non-build, non-redirect group must have a message
+            if name != "build"
+                && !group.is_build()
+                && group.redirect.is_none()
+                && group.message.is_none()
+            {
                 errors.push(format!("[commands] guidance.{name} has no `message` field"));
             }
         }
