@@ -1098,8 +1098,15 @@ async fn handle_hook_connection(
 /// Registers the session with the shared [`crate::logging::notification_router::NotificationRouter`]
 /// so `warn!()` / `error!()` events carrying this `session_id` in
 /// their span context route to this session's notification queue.
+///
+/// Also inserts a row into the `sessions` table on first creation so the
+/// TUI sidebar can discover per-agent sessions.
 #[cfg(unix)]
-fn get_or_create_router(ctx: &HookDispatchContext, session_id: &str) -> Arc<HookRouter> {
+fn get_or_create_router(
+    ctx: &HookDispatchContext,
+    session_id: &str,
+    raw: &serde_json::Value,
+) -> Arc<HookRouter> {
     ctx.sessions
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1119,6 +1126,28 @@ fn get_or_create_router(ctx: &HookDispatchContext, session_id: &str) -> Arc<Hook
             // Register session with the notification router so
             // events carrying this session_id route to its queue.
             session.notification_router.register_session(session_id);
+
+            // Insert a session row so the TUI can discover this agent.
+            // Uses the cwd from the host payload as display_name.
+            let display_name = raw
+                .get("host_payload")
+                .and_then(|hp| hp.get("cwd"))
+                .and_then(|v| v.as_str())
+                .unwrap_or(session_id);
+            if let Ok(conn) = ctx.conn.lock() {
+                let started_at = chrono::Utc::now().to_rfc3339();
+                let _ = conn.execute(
+                    "INSERT INTO sessions \
+                     (id, pid, display_name, started_at, alive) \
+                     VALUES (?1, ?2, ?3, ?4, 1) \
+                     ON CONFLICT(id) DO UPDATE SET \
+                       alive = 1, \
+                       display_name = excluded.display_name, \
+                       started_at = excluded.started_at, \
+                       ended_at = NULL",
+                    rusqlite::params![session_id, std::process::id(), display_name, &started_at,],
+                );
+            }
 
             let router = Arc::new(HookRouter::new(
                 session.clone(),
@@ -1238,6 +1267,15 @@ async fn handle_hook_dispatch(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&session_id);
+
+        // Mark session dead in DB so the TUI drops it from the sidebar.
+        if let Ok(conn) = ctx.conn.lock() {
+            let ended_at = chrono::Utc::now().to_rfc3339();
+            let _ = conn.execute(
+                "UPDATE sessions SET alive = 0, ended_at = ?1 WHERE id = ?2",
+                rusqlite::params![&ended_at, &session_id],
+            );
+        }
 
         if let Some(ref tracker) = ctx.root_tracker {
             // Sync the reduced root set.
@@ -1442,7 +1480,7 @@ async fn handle_hook_dispatch(
     if method == "pre-tool/editing-stop" {
         let scope_id = uuid::Uuid::new_v4().to_string();
 
-        let router = get_or_create_router(&ctx, &session_id);
+        let router = get_or_create_router(&ctx, &session_id, &raw);
 
         // Acquire the handoff semaphore (blocks if another session
         // is mid-handoff — holds for milliseconds at most).
@@ -1694,7 +1732,7 @@ async fn handle_hook_dispatch(
         return Ok(());
     }
 
-    let router = get_or_create_router(&ctx, &session_id);
+    let router = get_or_create_router(&ctx, &session_id, &raw);
 
     // Span with session_id so warn!/error! events emitted during
     // hook dispatch route to the correct notification queue.

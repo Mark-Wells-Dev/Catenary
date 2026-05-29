@@ -234,7 +234,8 @@ impl DataSource for SqliteDataSource {
             let mut stmt = self.conn.prepare(
                 "SELECT id, pid, display_name, client_name, client_version, \
                  client_session_id, started_at, alive \
-                 FROM sessions ORDER BY alive DESC, started_at DESC",
+                 FROM sessions WHERE id != 'daemon' \
+                 ORDER BY alive DESC, started_at DESC",
             )?;
             let mut r = stmt.query([])?;
             let mut rows = Vec::new();
@@ -306,7 +307,7 @@ impl DataSource for SqliteDataSource {
     fn list_alive_session_ids(&self) -> Result<Vec<String>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id FROM sessions WHERE alive = 1")?;
+            .prepare("SELECT id FROM sessions WHERE alive = 1 AND id != 'daemon'")?;
         let mut rows = stmt.query([])?;
         let mut ids = Vec::new();
         while let Some(row) = rows.next()? {
@@ -893,6 +894,39 @@ mod tests {
         assert!(
             ids.contains(&"ds-alive-1".to_string()),
             "alive session should appear"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_sqlite_excludes_daemon_session() -> Result<()> {
+        let (_dir, path, conn) = test_db();
+        let write_conn = crate::db::open_and_migrate_at(&path)?;
+        insert_session(&write_conn, "daemon", "/tmp/daemon-workspace");
+        insert_session(&write_conn, "agent-1", "/tmp/agent-workspace");
+        let ds = SqliteDataSource::with_conn(conn);
+
+        // list_alive_session_ids should exclude the daemon meta-session.
+        let ids = ds.list_alive_session_ids()?;
+        assert!(
+            !ids.contains(&"daemon".to_string()),
+            "daemon should be excluded"
+        );
+        assert!(
+            ids.contains(&"agent-1".to_string()),
+            "agent session should appear"
+        );
+
+        // list_sessions should also exclude the daemon meta-session.
+        let rows = ds.list_sessions()?;
+        assert!(
+            !rows.iter().any(|r| r.info.id == "daemon"),
+            "daemon should not appear in list_sessions"
+        );
+        assert!(
+            rows.iter().any(|r| r.info.id == "agent-1"),
+            "agent should appear in list_sessions"
         );
 
         Ok(())
