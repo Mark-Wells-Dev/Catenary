@@ -227,8 +227,8 @@ fn create_schema(conn: &Connection) -> Result<()> {
              method      TEXT NOT NULL,
              server      TEXT NOT NULL,
              client      TEXT NOT NULL,
-             scope_root  TEXT NOT NULL DEFAULT '',
              parent_id   TEXT,
+             scope_root  TEXT NOT NULL DEFAULT '',
              payload     TEXT NOT NULL,
              created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
          );
@@ -733,10 +733,10 @@ fn migrate_v12_to_v13(conn: &Connection) -> Result<()> {
 
 /// Migrates the database from schema version 13 to 14.
 ///
-/// Adds `scope_root` column to the `messages` table. LSP messages store the
-/// workspace root path so the TUI can filter by `(server, scope_root)` pair,
-/// distinguishing multiple instances of the same server. MCP and hook
-/// messages get the empty-string default.
+/// Adds `scope_root` column to the `messages` table. LSP messages store
+/// the workspace root path of the server instance that produced them,
+/// enabling per-instance server filtering in the TUI. MCP and hook
+/// messages get an empty string (default).
 ///
 /// # Errors
 ///
@@ -1756,8 +1756,7 @@ mod tests {
                  server      TEXT NOT NULL,
                  client      TEXT NOT NULL,
                  parent_id   TEXT,
-                 payload     TEXT NOT NULL,
-                 created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                 payload     TEXT NOT NULL
              );
              CREATE TABLE language_servers (
                  session_id   TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,

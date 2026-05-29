@@ -251,8 +251,8 @@ mod tests {
                  method      TEXT NOT NULL,
                  server      TEXT NOT NULL,
                  client      TEXT NOT NULL,
-                 scope_root  TEXT NOT NULL DEFAULT '',
                  parent_id   TEXT,
+                 scope_root  TEXT NOT NULL DEFAULT '',
                  payload     TEXT NOT NULL
              );
              CREATE TABLE language_servers (
@@ -287,8 +287,8 @@ mod tests {
             parent_id: parent_id.map(str::to_string),
             source: None,
             language: None,
-            scope_root: None,
             payload: payload.map(str::to_string),
+            scope_root: None,
             session_id: None,
             fields: serde_json::Map::new(),
         }
@@ -306,8 +306,8 @@ mod tests {
             parent_id: None,
             source: None,
             language: None,
-            scope_root: None,
             payload: None,
+            scope_root: None,
             session_id: None,
             fields: serde_json::Map::new(),
         }
@@ -742,8 +742,8 @@ mod tests {
             parent_id: None,
             source: Some("server.lifecycle".to_string()),
             language: Some(language.to_string()),
-            scope_root: None,
             payload: None,
+            scope_root: None,
             session_id: None,
             fields,
         }

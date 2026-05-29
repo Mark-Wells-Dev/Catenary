@@ -58,9 +58,10 @@ pub struct ServerEntry {
     /// Server binary name (config key, e.g., "rust-analyzer").
     pub name: String,
     /// Full scope root path (e.g., "/home/user/project").
-    /// Used as the second component in the `(name, scope_root)` filter key.
+    ///
+    /// Used as part of the `(name, scope_root)` selection key.
     pub scope_root: String,
-    /// Workspace root short name (e.g., "Catenary/").
+    /// Workspace root short name for display (e.g., "Catenary/").
     pub root: String,
     /// Lifecycle display state (`"initializing"`, `"ready"`, `"busy"`, `"dead"`).
     pub state: String,
@@ -92,6 +93,12 @@ impl ServerEntry {
 
 // ── Sidebar state ────────────────────────────────────────────────────
 
+/// Server instance identity: `(server_name, scope_root)`.
+///
+/// Used as the selection key so two instances of the same server binary
+/// serving different workspace roots can be filtered independently.
+pub type ServerInstanceKey = (String, String);
+
 /// Sidebar state: session list, server list, per-section cursors, and
 /// selection filters.
 pub struct SidebarState {
@@ -114,9 +121,9 @@ pub struct SidebarState {
     /// Selected session IDs (for stream filtering).
     /// Empty = show all (no filter active).
     selected: HashSet<String>,
-    /// Selected server `(name, scope_root)` pairs (for stream filtering).
+    /// Selected server instances `(name, scope_root)` (for stream filtering).
     /// Empty = show all (no server filter active).
-    selected_servers: HashSet<(String, String)>,
+    selected_servers: HashSet<ServerInstanceKey>,
 }
 
 impl SidebarState {
@@ -232,14 +239,14 @@ impl SidebarState {
 
     /// Toggle selection on the server at the current server cursor.
     ///
-    /// Toggles by `(name, scope_root)` pair: each server instance is
-    /// independently selectable. Returns `true` if the selection set
-    /// changed.
+    /// Toggles by `(name, scope_root)` pair: each server instance can
+    /// be independently selected/deselected. Returns `true` if the
+    /// selection set changed.
     pub fn toggle_server_selected(&mut self) -> bool {
         let Some(entry) = self.servers.get(self.server_cursor) else {
             return false;
         };
-        let key = (entry.name.clone(), entry.scope_root.clone());
+        let key: ServerInstanceKey = (entry.name.clone(), entry.scope_root.clone());
         if self.selected_servers.contains(&key) {
             self.selected_servers.remove(&key);
         } else {
@@ -251,9 +258,9 @@ impl SidebarState {
     /// Return the active server filter.
     ///
     /// `None` = show all (no servers selected). `Some(set)` = show only
-    /// scopes involving `(server, scope_root)` pairs in the set.
+    /// scopes involving server instances in the set.
     #[must_use]
-    pub fn server_filter(&self) -> Option<HashSet<(String, String)>> {
+    pub fn server_filter(&self) -> Option<HashSet<ServerInstanceKey>> {
         if self.selected_servers.is_empty() {
             None
         } else {
@@ -271,8 +278,7 @@ impl SidebarState {
     #[must_use]
     pub fn is_server_selected(&self, name: &str, scope_root: &str) -> bool {
         self.selected_servers
-            .iter()
-            .any(|(n, r)| n == name && r == scope_root)
+            .contains(&(name.to_string(), scope_root.to_string()))
     }
 
     // ── Server list refresh ─────────────────────────────────────────
@@ -328,7 +334,7 @@ impl SidebarState {
             .map(|s| (s.name.as_str(), s.scope_root.as_str()))
             .collect();
         self.selected_servers
-            .retain(|(name, sr)| live_keys.contains(&(name.as_str(), sr.as_str())));
+            .retain(|k| live_keys.contains(&(k.0.as_str(), k.1.as_str())));
 
         // Clamp server cursor.
         let max = self.servers.len().saturating_sub(1);
@@ -1615,12 +1621,13 @@ mod tests {
             &[],
         );
 
-        // Select first rust-analyzer instance (/A).
+        // Select first rust-analyzer instance (root /A).
         state.server_cursor = 0;
         state.toggle_server_selected();
 
-        // Only the /A instance is selected — /B is not.
+        // Only the selected instance matches.
         assert!(state.is_server_selected("rust-analyzer", "/A"));
+        // Second instance (root /B) is NOT selected.
         assert!(!state.is_server_selected("rust-analyzer", "/B"));
         assert!(!state.is_server_selected("lua-ls", "/C"));
     }

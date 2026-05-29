@@ -191,8 +191,8 @@ mod tests {
             parent_id: None,
             source: None,
             language: None,
-            scope_root: None,
             payload: None,
+            scope_root: None,
             session_id: None,
             fields: serde_json::Map::new(),
         }

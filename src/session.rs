@@ -54,15 +54,14 @@ pub struct SessionMessage {
     pub server: String,
     /// Client endpoint name.
     pub client: String,
-    /// Workspace root path for the LSP server instance.
-    ///
-    /// Populated for LSP messages from the `Scope::Root` path on the
-    /// `LspServer`. Empty string for MCP, hook, and internal events.
-    pub scope_root: String,
     /// Scope/pair identity. UUID string minted at exchange boundaries
     /// (hook dispatch, MCP `tools/call` dispatch, LSP request/response).
     /// Both request and response in an exchange share the same value.
     pub parent_id: Option<String>,
+    /// Workspace root path for the LSP server instance.
+    ///
+    /// Populated for LSP messages; empty string for MCP/hook messages.
+    pub scope_root: String,
     /// When the message was logged.
     pub timestamp: DateTime<Utc>,
     /// Raw protocol JSON, untouched.
@@ -97,11 +96,11 @@ impl SqliteMessageTail {
     pub fn try_next_message(&mut self) -> Result<Option<SessionMessage>> {
         let query = if self.include_debug {
             "SELECT id, timestamp, type, level, method, server, client, \
-             scope_root, parent_id, payload FROM messages \
+             parent_id, scope_root, payload FROM messages \
              WHERE session_id = ?1 AND id > ?2 ORDER BY id LIMIT 1"
         } else {
             "SELECT id, timestamp, type, level, method, server, client, \
-             scope_root, parent_id, payload FROM messages \
+             parent_id, scope_root, payload FROM messages \
              WHERE session_id = ?1 AND id > ?2 AND level != 'debug' \
              ORDER BY id LIMIT 1"
         };
@@ -117,17 +116,17 @@ impl SqliteMessageTail {
                 let method: String = row.get(4)?;
                 let server: String = row.get(5)?;
                 let client: String = row.get(6)?;
-                let scope_root: String = row.get(7)?;
-                let parent_id: Option<String> = row.get(8)?;
+                let parent_id: Option<String> = row.get(7)?;
+                let scope_root: String = row.get(8)?;
                 let payload: String = row.get(9)?;
                 Ok((
-                    id, ts, r#type, level, method, server, client, scope_root, parent_id, payload,
+                    id, ts, r#type, level, method, server, client, parent_id, scope_root, payload,
                 ))
             },
         );
 
         match result {
-            Ok((id, ts, r#type, level, method, server, client, scope_root, parent_id, payload)) => {
+            Ok((id, ts, r#type, level, method, server, client, parent_id, scope_root, payload)) => {
                 self.last_id = id;
                 let timestamp = DateTime::parse_from_rfc3339(&ts)
                     .with_context(|| format!("invalid message timestamp: {ts}"))?
@@ -142,8 +141,8 @@ impl SqliteMessageTail {
                     method,
                     server,
                     client,
-                    scope_root,
                     parent_id,
+                    scope_root,
                     timestamp,
                     payload,
                 }))
@@ -357,11 +356,11 @@ pub fn monitor_messages_with_conn(
 ) -> Result<Vec<SessionMessage>> {
     let query = if include_debug {
         "SELECT id, timestamp, type, level, method, server, client, \
-         scope_root, parent_id, payload FROM messages \
+         parent_id, scope_root, payload FROM messages \
          WHERE session_id = ?1 ORDER BY id"
     } else {
         "SELECT id, timestamp, type, level, method, server, client, \
-         scope_root, parent_id, payload FROM messages \
+         parent_id, scope_root, payload FROM messages \
          WHERE session_id = ?1 AND level != 'debug' ORDER BY id"
     };
     let mut stmt = conn.prepare(query)?;
@@ -376,8 +375,8 @@ pub fn monitor_messages_with_conn(
         let method: String = row.get(4)?;
         let server: String = row.get(5)?;
         let client: String = row.get(6)?;
-        let scope_root: String = row.get(7)?;
-        let parent_id: Option<String> = row.get(8)?;
+        let parent_id: Option<String> = row.get(7)?;
+        let scope_root: String = row.get(8)?;
         let payload_str: String = row.get(9)?;
 
         if let Ok(timestamp) = DateTime::parse_from_rfc3339(&ts)
@@ -391,8 +390,8 @@ pub fn monitor_messages_with_conn(
                 method,
                 server,
                 client,
-                scope_root,
                 parent_id,
+                scope_root,
                 timestamp: timestamp.with_timezone(&Utc),
                 payload,
             });
@@ -416,10 +415,10 @@ pub fn monitor_all_messages_with_conn(
 ) -> Result<Vec<SessionMessage>> {
     let query = if include_debug {
         "SELECT id, session_id, timestamp, type, level, method, server, client, \
-         scope_root, parent_id, payload FROM messages ORDER BY id"
+         parent_id, scope_root, payload FROM messages ORDER BY id"
     } else {
         "SELECT id, session_id, timestamp, type, level, method, server, client, \
-         scope_root, parent_id, payload FROM messages \
+         parent_id, scope_root, payload FROM messages \
          WHERE level != 'debug' ORDER BY id"
     };
     let mut stmt = conn.prepare(query)?;
@@ -435,8 +434,8 @@ pub fn monitor_all_messages_with_conn(
         let method: String = row.get(5)?;
         let server: String = row.get(6)?;
         let client: String = row.get(7)?;
-        let scope_root: String = row.get(8)?;
-        let parent_id: Option<String> = row.get(9)?;
+        let parent_id: Option<String> = row.get(8)?;
+        let scope_root: String = row.get(9)?;
         let payload_str: String = row.get(10)?;
 
         if let Ok(timestamp) = DateTime::parse_from_rfc3339(&ts)
@@ -450,8 +449,8 @@ pub fn monitor_all_messages_with_conn(
                 method,
                 server,
                 client,
-                scope_root,
                 parent_id,
+                scope_root,
                 timestamp: timestamp.with_timezone(&Utc),
                 payload,
             });
@@ -476,11 +475,11 @@ fn parse_message_row(row: &rusqlite::Row<'_>) -> Option<SessionMessage> {
     let method: String = row.get(5).ok()?;
     let server: String = row.get(6).ok()?;
     let client: String = row.get(7).ok()?;
-    let scope_root: String = row.get(8).ok()?;
-    let parent_id: Option<String> = match row.get::<_, Option<String>>(9) {
+    let parent_id: Option<String> = match row.get::<_, Option<String>>(8) {
         Ok(v) => v,
         Err(_) => return None,
     };
+    let scope_root: String = row.get(9).ok()?;
     let payload_str: String = row.get(10).ok()?;
 
     let timestamp = DateTime::parse_from_rfc3339(&ts).ok()?.with_timezone(&Utc);
@@ -494,8 +493,8 @@ fn parse_message_row(row: &rusqlite::Row<'_>) -> Option<SessionMessage> {
         method,
         server,
         client,
-        scope_root,
         parent_id,
+        scope_root,
         timestamp,
         payload,
     })
@@ -559,7 +558,7 @@ fn fetch_messages_for_roots(
 
     let query = format!(
         "SELECT id, session_id, timestamp, type, level, method, server, client, \
-         scope_root, parent_id, payload FROM messages WHERE ({}){debug_clause} ORDER BY id",
+         parent_id, scope_root, payload FROM messages WHERE ({}){debug_clause} ORDER BY id",
         conditions.join(" OR "),
     );
 
@@ -792,11 +791,11 @@ impl SqliteAllMessageTail {
     pub fn try_next_message(&mut self) -> Result<Option<SessionMessage>> {
         let query = if self.include_debug {
             "SELECT id, session_id, timestamp, type, level, method, server, client, \
-             scope_root, parent_id, payload FROM messages \
+             parent_id, scope_root, payload FROM messages \
              WHERE id > ?1 ORDER BY id LIMIT 1"
         } else {
             "SELECT id, session_id, timestamp, type, level, method, server, client, \
-             scope_root, parent_id, payload FROM messages \
+             parent_id, scope_root, payload FROM messages \
              WHERE id > ?1 AND level != 'debug' ORDER BY id LIMIT 1"
         };
 
@@ -811,12 +810,12 @@ impl SqliteAllMessageTail {
                 let method: String = row.get(5)?;
                 let server: String = row.get(6)?;
                 let client: String = row.get(7)?;
-                let scope_root: String = row.get(8)?;
-                let parent_id: Option<String> = row.get(9)?;
+                let parent_id: Option<String> = row.get(8)?;
+                let scope_root: String = row.get(9)?;
                 let payload: String = row.get(10)?;
                 Ok((
-                    id, session_id, ts, r#type, level, method, server, client, scope_root,
-                    parent_id, payload,
+                    id, session_id, ts, r#type, level, method, server, client, parent_id,
+                    scope_root, payload,
                 ))
             });
 
@@ -830,8 +829,8 @@ impl SqliteAllMessageTail {
                 method,
                 server,
                 client,
-                scope_root,
                 parent_id,
+                scope_root,
                 payload,
             )) => {
                 self.last_id = id;
@@ -848,8 +847,8 @@ impl SqliteAllMessageTail {
                     method,
                     server,
                     client,
-                    scope_root,
                     parent_id,
+                    scope_root,
                     timestamp,
                     payload,
                 }))
@@ -1049,7 +1048,7 @@ pub(crate) mod test_support {
     ///
     /// `level` defaults to `"info"`, `session_id` to `"test"`,
     /// `request_id`/`parent_id` to `None`, `client` to `"catenary"`,
-    /// `payload` to `{}`.
+    /// `scope_root` to `""`, `payload` to `{}`.
     #[must_use]
     pub fn message(r#type: &str, method: &str, server: &str) -> SessionMessage {
         SessionMessage {
@@ -1060,8 +1059,8 @@ pub(crate) mod test_support {
             method: method.to_string(),
             server: server.to_string(),
             client: "catenary".to_string(),
-            scope_root: String::new(),
             parent_id: None,
+            scope_root: String::new(),
             timestamp: Utc::now(),
             payload: serde_json::json!({}),
         }

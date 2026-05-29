@@ -84,9 +84,12 @@ impl From<&tracing::Level> for Severity {
 ///
 /// Tracing macros require the level to be a compile-time constant (`info!`,
 /// `debug!`, etc.). This macro accepts the level as an identifier and expands
-/// to the corresponding `tracing::$level!` call. The `parent_id` field is
-/// optional — tracing macros require static field sets, so the macro branches
-/// into two invocations.
+/// to the corresponding `tracing::$level!` call.
+///
+/// Optional fields (`parent_id`, `scope_root`, `source`) are always emitted.
+/// Absent values are passed as `""` (empty string). [`FieldVisitor`] treats
+/// empty strings as `None` for these fields, avoiding combinatorial branching
+/// over optional field presence.
 ///
 /// Boundary components (`emit_lsp_event`, `emit_mcp_event`, `emit_hook_event`)
 /// fix `kind` and delegate here via a runtime match on [`tracing::Level`].
@@ -95,30 +98,20 @@ impl From<&tracing::Level> for Severity {
 macro_rules! emit_protocol_event {
     ($level:ident, kind = $kind:expr, method = $method:expr,
      server = $server:expr, client = $client:expr,
-     parent_id = $pid:expr, scope_root = $scope_root:expr,
+     parent_id = $pid:expr, scope_root = $scope:expr,
+     source = $source:expr,
      payload = $payload:expr, $msg:expr) => {
-        if let Some(pid) = $pid {
-            tracing::$level!(
-                kind = $kind,
-                method = $method,
-                server = $server,
-                client = $client,
-                parent_id = pid,
-                scope_root = $scope_root,
-                payload = $payload,
-                $msg
-            );
-        } else {
-            tracing::$level!(
-                kind = $kind,
-                method = $method,
-                server = $server,
-                client = $client,
-                scope_root = $scope_root,
-                payload = $payload,
-                $msg
-            );
-        }
+        tracing::$level!(
+            kind = $kind,
+            method = $method,
+            server = $server,
+            client = $client,
+            parent_id = $pid.unwrap_or(""),
+            scope_root = $scope.unwrap_or(""),
+            source = $source.unwrap_or(""),
+            payload = $payload,
+            $msg
+        );
     };
 }
 
@@ -149,15 +142,15 @@ pub struct LogEvent<'a> {
     pub parent_id: Option<String>,
     /// Subsystem emitting the event (e.g., `"lsp.lifecycle"`).
     pub source: Option<String>,
-    /// Workspace root path for the LSP server instance.
-    ///
-    /// Populated for LSP events from the `Scope::Root` path on the
-    /// `LspServer`. Empty for MCP, hook, and internal events.
-    pub scope_root: Option<String>,
     /// Language ID when relevant.
     pub language: Option<String>,
     /// Raw protocol JSON payload (for `kind in {lsp, mcp, hook}`).
     pub payload: Option<String>,
+    /// Workspace root path for per-instance LSP server identification.
+    ///
+    /// Populated by LSP events from the server's routing scope. Empty for
+    /// MCP/hook events and LSP events before scope is set.
+    pub scope_root: Option<String>,
     /// Session ID from the tracing span hierarchy.
     ///
     /// Extracted from the nearest ancestor span with a `session_id` field.
@@ -184,8 +177,8 @@ struct OwnedEvent {
     parent_id: Option<String>,
     source: Option<String>,
     language: Option<String>,
-    scope_root: Option<String>,
     payload: Option<String>,
+    scope_root: Option<String>,
     session_id: Option<String>,
     fields: serde_json::Map<String, serde_json::Value>,
 }
@@ -203,8 +196,8 @@ impl OwnedEvent {
             parent_id: self.parent_id.clone(),
             source: self.source.clone(),
             language: self.language.clone(),
-            scope_root: self.scope_root.clone(),
             payload: self.payload.clone(),
+            scope_root: self.scope_root.clone(),
             session_id: self.session_id.clone(),
             fields: self.fields.clone(),
         }
@@ -573,8 +566,7 @@ where
 /// Field extractor for tracing events.
 ///
 /// Reserved field names (`message`, `kind`, `method`, `server`, `client`,
-/// `source`, `language`, `payload`, `parent_id`, `scope_root`) populate typed
-/// members.
+/// `source`, `language`, `payload`, `parent_id`) populate typed members.
 /// All other fields collect into `fields`.
 #[derive(Default)]
 struct FieldVisitor {
@@ -586,8 +578,8 @@ struct FieldVisitor {
     parent_id: Option<String>,
     source: Option<String>,
     language: Option<String>,
-    scope_root: Option<String>,
     payload: Option<String>,
+    scope_root: Option<String>,
     session_id: Option<String>,
     fields: serde_json::Map<String, serde_json::Value>,
 }
@@ -600,12 +592,16 @@ impl FieldVisitor {
             "method" => self.method = Some(value),
             "server" => self.server = Some(value),
             "client" => self.client = Some(value),
-            "source" => self.source = Some(value),
             "language" => self.language = Some(value),
-            "parent_id" => self.parent_id = Some(value),
-            "scope_root" => self.scope_root = Some(value),
             "payload" => self.payload = Some(value),
             "session_id" => self.session_id = Some(value),
+            // Optional fields: empty string → None (avoids combinatorial
+            // branching in emit_protocol_event! — always emitted, absent
+            // values passed as "").
+            "parent_id" | "scope_root" | "source" if value.is_empty() => {}
+            "parent_id" => self.parent_id = Some(value),
+            "scope_root" => self.scope_root = Some(value),
+            "source" => self.source = Some(value),
             _ => {
                 self.fields
                     .insert(name.to_string(), serde_json::Value::String(value));
@@ -630,8 +626,8 @@ impl FieldVisitor {
             parent_id: self.parent_id,
             source: self.source,
             language: self.language,
-            scope_root: self.scope_root,
             payload: self.payload,
+            scope_root: self.scope_root,
             // Event field takes priority; fall back to span context.
             session_id: self.session_id.or(span_session_id),
             fields: self.fields,
@@ -650,8 +646,8 @@ impl FieldVisitor {
             parent_id: self.parent_id,
             source: self.source,
             language: self.language,
-            scope_root: self.scope_root,
             payload: self.payload,
+            scope_root: self.scope_root,
             session_id: self.session_id,
             fields: self.fields,
         }
@@ -741,8 +737,8 @@ pub mod test_support {
                  method      TEXT NOT NULL,
                  server      TEXT NOT NULL,
                  client      TEXT NOT NULL,
-                 scope_root  TEXT NOT NULL DEFAULT '',
                  parent_id   TEXT,
+                 scope_root  TEXT NOT NULL DEFAULT '',
                  payload     TEXT NOT NULL
              );",
         )
@@ -909,8 +905,8 @@ mod tests {
             parent_id: None,
             source: source.map(str::to_string),
             language: None,
-            scope_root: None,
             payload: None,
+            scope_root: None,
             session_id: None,
             fields: serde_json::Map::new(),
         }

@@ -148,8 +148,8 @@ mod tests {
             parent_id: None,
             source: source.map(str::to_string),
             language: None,
-            scope_root: None,
             payload: None,
+            scope_root: None,
             session_id: None,
             fields: serde_json::Map::new(),
         }

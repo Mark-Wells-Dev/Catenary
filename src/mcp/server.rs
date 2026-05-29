@@ -56,7 +56,8 @@ fn emit_mcp_event(
             server = "catenary",
             client = client_name,
             parent_id = parent_id,
-            scope_root = "",
+            scope_root = Option::<&str>::None,
+            source = Option::<&str>::None,
             payload = payload,
             "{msg}"
         );
@@ -68,7 +69,8 @@ fn emit_mcp_event(
             server = "catenary",
             client = client_name,
             parent_id = parent_id,
-            scope_root = "",
+            scope_root = Option::<&str>::None,
+            source = Option::<&str>::None,
             payload = payload,
             "{msg}"
         );
@@ -80,7 +82,8 @@ fn emit_mcp_event(
             server = "catenary",
             client = client_name,
             parent_id = parent_id,
-            scope_root = "",
+            scope_root = Option::<&str>::None,
+            source = Option::<&str>::None,
             payload = payload,
             "{msg}"
         );
@@ -92,7 +95,8 @@ fn emit_mcp_event(
             server = "catenary",
             client = client_name,
             parent_id = parent_id,
-            scope_root = "",
+            scope_root = Option::<&str>::None,
+            source = Option::<&str>::None,
             payload = payload,
             "{msg}"
         );

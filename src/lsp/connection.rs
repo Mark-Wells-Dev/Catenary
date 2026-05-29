@@ -38,12 +38,17 @@ struct PendingRequest {
 /// Protocol routing is by `kind` field, not by level — `MessageDbSink`
 /// matches `kind in {lsp, mcp, hook}` regardless of tracing level.
 /// The level controls DB `level` column and TUI filtering threshold.
+///
+/// `source` is an optional subsystem tag (e.g., `lsp.logging`). Most
+/// callers pass `None`; `window/logMessage` passes its source tag.
+#[allow(clippy::too_many_arguments, reason = "protocol event boundary")]
 fn emit_lsp_event(
     level: tracing::Level,
     server_name: &str,
     method: &str,
     parent_id: Option<&str>,
-    scope_root: &str,
+    scope_root: Option<&str>,
+    source: Option<&str>,
     payload: &str,
     msg: &str,
 ) {
@@ -56,6 +61,7 @@ fn emit_lsp_event(
             client = "catenary",
             parent_id = parent_id,
             scope_root = scope_root,
+            source = source,
             payload = payload,
             "{msg}"
         );
@@ -68,6 +74,7 @@ fn emit_lsp_event(
             client = "catenary",
             parent_id = parent_id,
             scope_root = scope_root,
+            source = source,
             payload = payload,
             "{msg}"
         );
@@ -80,6 +87,7 @@ fn emit_lsp_event(
             client = "catenary",
             parent_id = parent_id,
             scope_root = scope_root,
+            source = source,
             payload = payload,
             "{msg}"
         );
@@ -92,24 +100,21 @@ fn emit_lsp_event(
             client = "catenary",
             parent_id = parent_id,
             scope_root = scope_root,
+            source = source,
             payload = payload,
             "{msg}"
         );
     }
 }
 
-/// Extract the scope root path string from an `LspServer` weak reference.
+/// Extract the scope root path string from an `LspServer`.
 ///
-/// Returns an empty string if the server has been dropped, the scope
-/// hasn't been set yet (pre-init), or the scope is `SingleFile`.
-fn scope_root_from(server: &Weak<LspServer>) -> String {
+/// Returns `Some(path)` for `Scope::Root` instances, `None` otherwise.
+fn scope_root_str(server: &LspServer) -> Option<String> {
     server
-        .upgrade()
-        .and_then(|s| {
-            s.scope()
-                .and_then(|sc| sc.root_path().map(|p| p.display().to_string()))
-        })
-        .unwrap_or_default()
+        .scope()
+        .and_then(|s| s.root_path())
+        .map(|p| p.to_string_lossy().into_owned())
 }
 
 /// Whether an LSP error code indicates a retriable condition.
@@ -306,6 +311,9 @@ impl Connection {
             .upgrade()
             .ok_or_else(|| anyhow!("[{}] server dropped", self.language))?;
 
+        let scope_root_str = scope_root_str(&server);
+        let scope_root_ref = scope_root_str.as_deref();
+
         // Retry loop for ContentModified errors
         for _attempt in 0..3 {
             let id = RequestId::Number(self.next_id.fetch_add(1, Ordering::SeqCst));
@@ -318,14 +326,14 @@ impl Connection {
             };
 
             let level = lsp_category_level(lsp_category(method));
-            let sr = scope_root_from(&self.server);
             if let Ok(payload) = serde_json::to_value(&request) {
                 emit_lsp_event(
                     level,
                     &self.server_name,
                     method,
                     parent_id,
-                    &sr,
+                    scope_root_ref,
+                    None,
                     &payload.to_string(),
                     "outgoing request",
                 );
@@ -448,13 +456,14 @@ impl Connection {
             params,
         };
         if let Ok(payload) = serde_json::to_value(&notification) {
-            let sr = scope_root_from(&self.server);
+            let sr = self.server.upgrade().as_deref().and_then(scope_root_str);
             emit_lsp_event(
                 tracing::Level::DEBUG,
                 &self.server_name,
                 method,
                 parent_id,
-                &sr,
+                sr.as_deref(),
+                None,
                 &payload.to_string(),
                 "outgoing notification",
             );
@@ -643,10 +652,8 @@ impl Connection {
                             break;
                         };
 
-                        let sr = server
-                            .scope()
-                            .and_then(|sc| sc.root_path().map(|p| p.display().to_string()))
-                            .unwrap_or_default();
+                        let sr = scope_root_str(&server);
+                        let sr_ref = sr.as_deref();
 
                         // Check message type
                         if let Some(method) = value.get("method").and_then(|m| m.as_str()) {
@@ -660,7 +667,8 @@ impl Connection {
                                     &server_name,
                                     method,
                                     Some(&exchange_id),
-                                    &sr,
+                                    sr_ref,
+                                    None,
                                     &value.to_string(),
                                     "incoming server request",
                                 );
@@ -697,7 +705,8 @@ impl Connection {
                                         &server_name,
                                         method,
                                         Some(&exchange_id),
-                                        &sr,
+                                        sr_ref,
+                                        None,
                                         &response_json.to_string(),
                                         "outgoing server response",
                                     );
@@ -717,80 +726,44 @@ impl Connection {
                                     }
                                 }
                             } else {
-                                // Notification — level determined by method
-                                if method == "window/logMessage" {
+                                // Notification — level and source determined by method.
+                                let (notif_level, source) = match method {
                                     // Server telemetry — always info to stay out of
-                                    // notification drain (warn threshold). Original
-                                    // LSP MessageType preserved as lsp_level for
-                                    // future TUI filtering.
-                                    let msg_type = value
-                                        .get("params")
-                                        .and_then(|p| p.get("type"))
-                                        .and_then(serde_json::Value::as_u64);
-                                    let text = value
-                                        .get("params")
-                                        .and_then(|p| p.get("message"))
-                                        .and_then(serde_json::Value::as_str)
-                                        .unwrap_or("(no message)");
-                                    let payload_str = value.to_string();
-                                    if let Some(lsp_level) = msg_type {
-                                        tracing::info!(
-                                            kind = "lsp",
-                                            method = method,
-                                            server = server_name.as_str(),
-                                            client = "catenary",
-                                            scope_root = sr.as_str(),
-                                            payload = payload_str.as_str(),
-                                            source = crate::source::Source::LspLogging.as_str(),
-                                            lsp_level = lsp_level,
-                                            "{server_name}: {text}"
-                                        );
-                                    } else {
-                                        tracing::info!(
-                                            kind = "lsp",
-                                            method = method,
-                                            server = server_name.as_str(),
-                                            client = "catenary",
-                                            scope_root = sr.as_str(),
-                                            payload = payload_str.as_str(),
-                                            source = crate::source::Source::LspLogging.as_str(),
-                                            "{server_name}: {text}"
-                                        );
+                                    // notification drain (warn threshold).
+                                    "window/logMessage" => (
+                                        tracing::Level::INFO,
+                                        Some(crate::source::Source::LspLogging.as_str()),
+                                    ),
+                                    "window/showMessage" => {
+                                        let msg_type = value
+                                            .get("params")
+                                            .and_then(|p| p.get("type"))
+                                            .and_then(serde_json::Value::as_u64);
+                                        (window_message_level(msg_type), None)
                                     }
-                                } else {
-                                    let notif_level = match method {
-                                        "window/showMessage" => {
-                                            let msg_type = value
-                                                .get("params")
-                                                .and_then(|p| p.get("type"))
-                                                .and_then(serde_json::Value::as_u64);
-                                            window_message_level(msg_type)
-                                        }
-                                        _ => lsp_category_level(lsp_category(method)),
-                                    };
-                                    let msg = match method {
-                                        "window/showMessage" => {
-                                            let text = value
-                                                .get("params")
-                                                .and_then(|p| p.get("message"))
-                                                .and_then(serde_json::Value::as_str)
-                                                .unwrap_or("(no message)");
-                                            format!("{server_name}: {text}")
-                                        }
-                                        _ => {
-                                            format!("{server_name}: {method}")
-                                        }
-                                    };
-                                    emit_lsp_event(
-                                        notif_level,
-                                        &server_name,
-                                        method,
-                                        None,
-                                        &sr,
-                                        &value.to_string(),
-                                        &msg,
-                                    );
-                                }
+                                    _ => (lsp_category_level(lsp_category(method)), None),
+                                };
+                                let msg = match method {
+                                    "window/logMessage" | "window/showMessage" => {
+                                        let text = value
+                                            .get("params")
+                                            .and_then(|p| p.get("message"))
+                                            .and_then(serde_json::Value::as_str)
+                                            .unwrap_or("(no message)");
+                                        format!("{server_name}: {text}")
+                                    }
+                                    _ => format!("{server_name}: {method}"),
+                                };
+                                emit_lsp_event(
+                                    notif_level,
+                                    &server_name,
+                                    method,
+                                    None,
+                                    sr_ref,
+                                    source,
+                                    &value.to_string(),
+                                    &msg,
+                                );
                                 let params =
                                     value.get("params").unwrap_or(&serde_json::Value::Null);
                                 server.on_notification(method, params);
@@ -813,7 +786,8 @@ impl Connection {
                                             &server_name,
                                             &req.method,
                                             req.parent_id.as_deref(),
-                                            &sr,
+                                            sr_ref,
+                                            None,
                                             &value.to_string(),
                                             "incoming response",
                                         );
@@ -909,7 +883,8 @@ mod tests {
             "test-server",
             "test/error",
             None,
-            "",
+            None,
+            None,
             "{}",
             "error msg",
         );
@@ -918,7 +893,8 @@ mod tests {
             "test-server",
             "test/warn",
             None,
-            "",
+            None,
+            None,
             "{}",
             "warn msg",
         );
@@ -927,7 +903,8 @@ mod tests {
             "test-server",
             "test/info",
             None,
-            "",
+            None,
+            None,
             "{}",
             "info msg",
         );
@@ -936,7 +913,8 @@ mod tests {
             "test-server",
             "test/debug",
             None,
-            "",
+            None,
+            None,
             "{}",
             "debug msg",
         );
@@ -967,7 +945,8 @@ mod tests {
             "test-server",
             "test/method",
             Some("scope-5"),
-            "",
+            None,
+            None,
             "{}",
             "with parent",
         );
@@ -976,7 +955,8 @@ mod tests {
             "test-server",
             "test/method",
             None,
-            "",
+            None,
+            None,
             "{}",
             "no parent",
         );

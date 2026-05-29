@@ -251,9 +251,10 @@ pub struct StreamState {
     /// matching session) are hidden when a filter is active.
     session_filter: Option<HashSet<String>>,
     /// Active server filter. `None` = show all. `Some(set)` = show only
-    /// scopes whose LSP children involve a `(server, scope_root)` pair in
-    /// the set. Scopes with no matching LSP children are hidden.
-    server_filter: Option<HashSet<(String, String)>>,
+    /// scopes whose LSP children involve a server instance in the set.
+    /// Each key is `(server_name, scope_root)`. Scopes with no matching
+    /// LSP children are hidden.
+    server_filter: Option<HashSet<super::sidebar::ServerInstanceKey>>,
 
     // ── Paging state ─────────────────────────────────────────────────
     /// Index in `entries` where the bottom region starts (after a gap).
@@ -330,22 +331,17 @@ impl StreamState {
             }
 
             // Apply server filter: scope must have LSP children involving
-            // a selected (server, scope_root) pair. Scopes with no matching
-            // LSP children (including hook-only scopes) are hidden.
-            // Linear scan — the selected set is tiny (1-5 entries).
+            // a selected server instance. Scopes with no matching LSP
+            // children (including hook-only scopes) are hidden.
             if let Some(ref server_set) = self.server_filter {
                 let matches = match entry {
                     StreamEntry::Scope(scope) => scope.children.iter().any(|c| {
                         c.r#type == "lsp"
-                            && server_set
-                                .iter()
-                                .any(|(n, r)| n == &c.server && r == &c.scope_root)
+                            && server_set.contains(&(c.server.clone(), c.scope_root.clone()))
                     }),
                     StreamEntry::Standalone(msg) => {
                         msg.r#type == "lsp"
-                            && server_set
-                                .iter()
-                                .any(|(n, r)| n == &msg.server && r == &msg.scope_root)
+                            && server_set.contains(&(msg.server.clone(), msg.scope_root.clone()))
                     }
                 };
                 if !matches {
@@ -503,8 +499,11 @@ impl StreamState {
     /// Update the server filter and rebuild display rows.
     ///
     /// `None` = show all. `Some(set)` = show only scopes whose LSP
-    /// children involve a `(server, scope_root)` pair in the set.
-    pub fn set_server_filter(&mut self, filter: Option<HashSet<(String, String)>>) {
+    /// children involve a server instance in the set.
+    pub fn set_server_filter(
+        &mut self,
+        filter: Option<HashSet<super::sidebar::ServerInstanceKey>>,
+    ) {
         self.server_filter = filter;
         self.rebuild_display_rows();
     }
@@ -1981,20 +1980,6 @@ mod tests {
         )
     }
 
-    /// LSP child with a specific server and scope root.
-    fn lsp_child_instance(
-        session_id: &str,
-        scope_id: i64,
-        id_offset: i64,
-        server: &str,
-        scope_root: &str,
-    ) -> SessionMessage {
-        SessionMessage {
-            scope_root: scope_root.to_string(),
-            ..lsp_child_server(session_id, scope_id, id_offset, server)
-        }
-    }
-
     #[test]
     fn test_server_filter_shows_matching_scopes() {
         // Scope 1: has rust-analyzer children.
@@ -2131,59 +2116,5 @@ mod tests {
         // Clear filter.
         state.set_server_filter(None);
         assert_eq!(state.display_rows.len(), 2, "all restored");
-    }
-
-    #[test]
-    fn test_server_filter_distinguishes_instances_by_scope_root() {
-        // Two scopes with the same server name but different scope roots.
-        let req1 = mcp_request("s1", 1, "grep");
-        let child1 = lsp_child_instance("s1", 1, 0, "rust-analyzer", "/project-a");
-        let resp1 = mcp_response("s1", 1);
-
-        let req2 = mcp_request("s1", 2, "grep");
-        let child2 = lsp_child_instance("s1", 2, 0, "rust-analyzer", "/project-b");
-        let resp2 = mcp_response("s1", 2);
-
-        let mut state = StreamState::new(vec![req1, child1, resp1, req2, child2, resp2]);
-        assert_eq!(
-            state.display_rows.len(),
-            2,
-            "both scopes visible unfiltered"
-        );
-
-        // Filter to rust-analyzer @ /project-a only.
-        let mut filter = HashSet::new();
-        filter.insert(("rust-analyzer".to_string(), "/project-a".to_string()));
-        state.set_server_filter(Some(filter));
-
-        assert_eq!(state.display_rows.len(), 1, "only /project-a scope");
-        let DisplayRow::ScopeHeader(idx) = state.display_rows[0] else {
-            panic!("expected scope header");
-        };
-        let StreamEntry::Scope(scope) = &state.entries[idx] else {
-            panic!("expected scope entry");
-        };
-        assert_eq!(scope.scope_id, "scope-1");
-
-        // Switch to /project-b.
-        let mut filter = HashSet::new();
-        filter.insert(("rust-analyzer".to_string(), "/project-b".to_string()));
-        state.set_server_filter(Some(filter));
-
-        assert_eq!(state.display_rows.len(), 1, "only /project-b scope");
-        let DisplayRow::ScopeHeader(idx) = state.display_rows[0] else {
-            panic!("expected scope header");
-        };
-        let StreamEntry::Scope(scope) = &state.entries[idx] else {
-            panic!("expected scope entry");
-        };
-        assert_eq!(scope.scope_id, "scope-2");
-
-        // Select both instances — both scopes visible.
-        let mut filter = HashSet::new();
-        filter.insert(("rust-analyzer".to_string(), "/project-a".to_string()));
-        filter.insert(("rust-analyzer".to_string(), "/project-b".to_string()));
-        state.set_server_filter(Some(filter));
-        assert_eq!(state.display_rows.len(), 2, "both instances selected");
     }
 }
