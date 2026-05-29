@@ -484,9 +484,10 @@ fn run_loop(
         terminal.draw(|f| {
             let area = f.area();
 
-            // Empty state: no sessions and no messages.
+            // Empty state: nothing to show the user.
             if app.sidebar.entries.is_empty()
                 && app.sidebar.servers.is_empty()
+                && app.sidebar.dead_servers.is_empty()
                 && app.stream.entries.is_empty()
             {
                 let msg = "Waiting for connections\u{2026}";

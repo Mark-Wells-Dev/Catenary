@@ -72,6 +72,12 @@ pub struct SidebarState {
     pub entries: Vec<SessionEntry>,
     /// Active server entries, grouped by server name.
     pub servers: Vec<ServerEntry>,
+    /// Servers observed to die during this TUI session.
+    ///
+    /// Accumulated below a thematic break in the Servers panel. No
+    /// backfilling — only servers that were live and then disappeared
+    /// (or transitioned to "dead") while the TUI was running.
+    pub dead_servers: Vec<ServerEntry>,
     /// Cursor position in the session list.
     pub cursor: usize,
     /// First visible session entry index (scroll offset).
@@ -99,6 +105,7 @@ impl SidebarState {
         Self {
             entries: Vec::new(),
             servers: Vec::new(),
+            dead_servers: Vec::new(),
             cursor: 0,
             scroll_offset: 0,
             server_cursor: 0,
@@ -269,7 +276,9 @@ impl SidebarState {
     ///
     /// Each status row becomes one sidebar entry — one entry per server
     /// process. Noise rows populate progress and server message children.
-    /// Prunes stale server selections for servers that no longer exist.
+    /// Servers that were previously live but are absent from the new set
+    /// are accumulated in `dead_servers`. Servers that reappear live are
+    /// removed from the dead list. Prunes stale server selections.
     pub fn refresh_servers(&mut self, rows: &[ServerStatusRow], noise: &[ServerNoiseRow]) {
         self.last_server_names = rows
             .iter()
@@ -281,6 +290,41 @@ impl SidebarState {
                 n.server, n.scope_root, n.method, n.payload
             ));
         }
+
+        let new_keys: HashSet<(&str, &str)> = rows
+            .iter()
+            .map(|r| (r.server.as_str(), r.scope_root.as_str()))
+            .collect();
+
+        // Detect servers that were live and are now gone → accumulate as dead.
+        // Only accumulate if there was a previous refresh (non-empty servers list
+        // or non-empty dead list indicates we've been running).
+        if !self.servers.is_empty() {
+            for server in &self.servers {
+                let key = (server.name.as_str(), server.scope_root.as_str());
+                if !new_keys.contains(&key) {
+                    // Only add if not already in dead list.
+                    let already_dead = self
+                        .dead_servers
+                        .iter()
+                        .any(|d| d.name == server.name && d.scope_root == server.scope_root);
+                    if !already_dead {
+                        self.dead_servers.push(ServerEntry {
+                            name: server.name.clone(),
+                            scope_root: server.scope_root.clone(),
+                            root: server.root.clone(),
+                            state: "dead".to_string(),
+                            progress_line: None,
+                            server_message: None,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Remove from dead list any servers that reappeared live.
+        self.dead_servers
+            .retain(|d| !new_keys.contains(&(d.name.as_str(), d.scope_root.as_str())));
 
         self.servers = rows
             .iter()
@@ -556,10 +600,13 @@ pub fn render_sessions(
 /// Render server entries into the given area (inside a `Block` frame).
 ///
 /// No header text — the `Block` title replaces it. No vertical separator.
+/// Dead servers (accumulated during this TUI session) render below a
+/// thematic break, dimmed with "dead" state badge.
 /// Returns a mapping from terminal row to server index for mouse clicks.
 #[allow(
     clippy::cast_possible_truncation,
-    reason = "terminal coordinates are always small"
+    clippy::too_many_lines,
+    reason = "render loop with dead-server thematic break; terminal coordinates are always small"
 )]
 pub fn render_servers(
     state: &SidebarState,
@@ -646,6 +693,40 @@ pub fn render_servers(
                 Span::styled(msg.clone(), theme.muted),
             ]);
             buf.set_line(area.x, area.y + row as u16, &child, area.width);
+            row += 1;
+        }
+    }
+
+    // ── Dead servers below thematic break ──��───────────────────────
+    if !state.dead_servers.is_empty() && row < max_rows {
+        // Render separator line.
+        let sep: String = "\u{2500}".repeat(area.width as usize);
+        let sep_line = Line::from(Span::styled(sep, theme.muted));
+        buf.set_line(area.x, area.y + row as u16, &sep_line, area.width);
+        row += 1;
+
+        for dead in &state.dead_servers {
+            if row >= max_rows {
+                break;
+            }
+            let line = if dead.root.is_empty() {
+                Line::from(vec![
+                    Span::styled(&dead.name, theme.muted),
+                    Span::raw("  "),
+                    Span::styled("dead", theme.muted),
+                ])
+            } else {
+                Line::from(vec![
+                    Span::styled(&dead.name, theme.muted),
+                    Span::raw(" "),
+                    Span::styled("(", theme.muted),
+                    Span::styled(&dead.root, theme.muted),
+                    Span::styled(")", theme.muted),
+                    Span::raw("  "),
+                    Span::styled("dead", theme.muted),
+                ])
+            };
+            buf.set_line(area.x, area.y + row as u16, &line, area.width);
             row += 1;
         }
     }
@@ -1601,6 +1682,178 @@ mod tests {
             "unselected server should be dim, got: {:?}",
             lua_cell.modifier
         );
+    }
+
+    // ── Dead server tests ───────────────────────────────────────────
+
+    #[test]
+    fn dead_server_accumulated_on_disappearance() {
+        let mut state = SidebarState::new();
+        state.refresh_servers(
+            &[
+                make_server_row("rust-analyzer", "/A", "ready"),
+                make_server_row("lua-ls", "/B", "ready"),
+            ],
+            &[],
+        );
+        assert!(state.dead_servers.is_empty());
+
+        // lua-ls disappears.
+        state.refresh_servers(&[make_server_row("rust-analyzer", "/A", "ready")], &[]);
+
+        assert_eq!(state.dead_servers.len(), 1);
+        assert_eq!(state.dead_servers[0].name, "lua-ls");
+        assert_eq!(state.dead_servers[0].scope_root, "/B");
+        assert_eq!(state.dead_servers[0].state, "dead");
+    }
+
+    #[test]
+    fn dead_server_not_duplicated() {
+        let mut state = SidebarState::new();
+        state.refresh_servers(
+            &[
+                make_server_row("rust-analyzer", "/A", "ready"),
+                make_server_row("lua-ls", "/B", "ready"),
+            ],
+            &[],
+        );
+
+        // lua-ls disappears.
+        state.refresh_servers(&[make_server_row("rust-analyzer", "/A", "ready")], &[]);
+        assert_eq!(state.dead_servers.len(), 1);
+
+        // Refresh again with same live set — dead list shouldn't grow.
+        state.refresh_servers(&[make_server_row("rust-analyzer", "/A", "ready")], &[]);
+        assert_eq!(state.dead_servers.len(), 1);
+    }
+
+    #[test]
+    fn dead_server_removed_on_reappearance() {
+        let mut state = SidebarState::new();
+        state.refresh_servers(
+            &[
+                make_server_row("rust-analyzer", "/A", "ready"),
+                make_server_row("lua-ls", "/B", "ready"),
+            ],
+            &[],
+        );
+
+        // lua-ls dies.
+        state.refresh_servers(&[make_server_row("rust-analyzer", "/A", "ready")], &[]);
+        assert_eq!(state.dead_servers.len(), 1);
+
+        // lua-ls comes back (restarted).
+        state.refresh_servers(
+            &[
+                make_server_row("rust-analyzer", "/A", "ready"),
+                make_server_row("lua-ls", "/B", "initializing"),
+            ],
+            &[],
+        );
+        assert!(
+            state.dead_servers.is_empty(),
+            "reappeared server should be removed from dead list"
+        );
+    }
+
+    #[test]
+    fn no_dead_servers_on_initial_refresh() {
+        let mut state = SidebarState::new();
+        // First refresh — nothing should be considered dead.
+        state.refresh_servers(&[make_server_row("rust-analyzer", "/A", "ready")], &[]);
+        assert!(state.dead_servers.is_empty());
+    }
+
+    #[test]
+    fn render_dead_servers_below_separator() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use ratatui::style::Modifier;
+
+        let mut state = SidebarState::new();
+        state.refresh_servers(
+            &[
+                make_server_row("rust-analyzer", "/A", "ready"),
+                make_server_row("lua-ls", "/B", "ready"),
+            ],
+            &[],
+        );
+
+        // lua-ls dies.
+        state.refresh_servers(&[make_server_row("rust-analyzer", "/A", "ready")], &[]);
+
+        let theme = crate::tui::theme::Theme::new();
+        let backend = TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).expect("terminal creation");
+
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_servers(&state, area, frame.buffer_mut(), &theme, false);
+            })
+            .expect("draw");
+
+        let buf = terminal.backend().buffer().clone();
+        let content = buffer_to_string(&buf);
+
+        // Live server on row 0.
+        assert!(
+            content.contains("rust-analyzer"),
+            "should show live server: {content}"
+        );
+        // Separator (box drawing horizontal).
+        assert!(
+            content.contains('\u{2500}'),
+            "should show separator: {content}"
+        );
+        // Dead server below separator.
+        assert!(
+            content.contains("lua-ls"),
+            "should show dead server: {content}"
+        );
+        assert!(
+            content.contains("dead"),
+            "should show dead badge: {content}"
+        );
+
+        // Dead server text should be dimmed.
+        // Row 0 = live server, row 1 = separator, row 2 = dead server.
+        let dead_cell = &buf[(0, 2)];
+        assert!(
+            dead_cell.modifier.contains(Modifier::DIM),
+            "dead server should be dimmed, got: {:?}",
+            dead_cell.modifier
+        );
+    }
+
+    #[test]
+    fn multiple_dead_servers_accumulate() {
+        let mut state = SidebarState::new();
+        state.refresh_servers(
+            &[
+                make_server_row("rust-analyzer", "/A", "ready"),
+                make_server_row("lua-ls", "/B", "ready"),
+                make_server_row("pyright", "/C", "ready"),
+            ],
+            &[],
+        );
+
+        // lua-ls dies first.
+        state.refresh_servers(
+            &[
+                make_server_row("rust-analyzer", "/A", "ready"),
+                make_server_row("pyright", "/C", "ready"),
+            ],
+            &[],
+        );
+        assert_eq!(state.dead_servers.len(), 1);
+        assert_eq!(state.dead_servers[0].name, "lua-ls");
+
+        // Then pyright dies too.
+        state.refresh_servers(&[make_server_row("rust-analyzer", "/A", "ready")], &[]);
+        assert_eq!(state.dead_servers.len(), 2);
+        assert_eq!(state.dead_servers[0].name, "lua-ls");
+        assert_eq!(state.dead_servers[1].name, "pyright");
     }
 
     // ── Helpers ─────────────────────────────────────────────────────
