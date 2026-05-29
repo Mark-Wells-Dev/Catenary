@@ -35,6 +35,26 @@ pub struct SessionEntry {
     pub host: String,
     /// Primary workspace root directory name with trailing slash.
     pub root: String,
+    /// Full workspace path(s), comma-separated.
+    pub workspace: String,
+    /// Process ID.
+    pub pid: u32,
+    /// Active language servers (e.g., `["rust-analyzer", "lua-language-server"]`).
+    pub languages: Vec<String>,
+}
+
+/// Input data for sidebar session refresh.
+pub struct SessionData {
+    /// Session ID (database key).
+    pub id: String,
+    /// Host CLI client name (e.g., `"claude-code"`).
+    pub client_name: Option<String>,
+    /// Full workspace path(s), comma-separated.
+    pub workspace: String,
+    /// Process ID.
+    pub pid: u32,
+    /// Active language server names.
+    pub languages: Vec<String>,
 }
 
 // ── Server entry ────────────────────────────────────────────────────
@@ -105,6 +125,8 @@ pub struct SidebarState {
     session_hscroll: u16,
     /// Horizontal scroll offset for server entries (in columns).
     server_hscroll: u16,
+    /// Session IDs with expanded detail rows.
+    expanded_sessions: HashSet<String>,
 }
 
 impl SidebarState {
@@ -125,6 +147,7 @@ impl SidebarState {
             selected_servers: HashSet::new(),
             session_hscroll: 0,
             server_hscroll: 0,
+            expanded_sessions: HashSet::new(),
         }
     }
 
@@ -137,35 +160,40 @@ impl SidebarState {
 
     /// Update the sidebar with fresh session data.
     ///
-    /// Accepts tuples of `(session_id, client_name, workspace)` for
-    /// alive sessions only. Releases badges for sessions that have
-    /// disconnected and assigns badges for new ones.
+    /// Accepts `SessionData` records for alive sessions only. Releases
+    /// badges for sessions that have disconnected and assigns badges
+    /// for new ones.
     pub fn refresh(
         &mut self,
-        sessions: Vec<(String, Option<String>, String)>,
+        sessions: Vec<SessionData>,
         badges: &mut HexBadgeMap,
     ) {
         // Release badges for removed sessions and prune stale selections.
-        let new_ids: HashSet<&str> = sessions.iter().map(|(id, _, _)| id.as_str()).collect();
+        let new_ids: HashSet<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
         for entry in &self.entries {
             if !new_ids.contains(entry.session_id.as_str()) {
                 badges.release(&entry.session_id);
             }
         }
         self.selected.retain(|id| new_ids.contains(id.as_str()));
+        self.expanded_sessions
+            .retain(|id| new_ids.contains(id.as_str()));
         drop(new_ids);
 
         self.entries = sessions
             .into_iter()
-            .map(|(id, client_name, workspace)| {
-                let badge = badges.badge(&id);
-                let host = client_name.unwrap_or_else(|| "agent".to_string());
-                let root = root_name(&workspace);
+            .map(|s| {
+                let badge = badges.badge(&s.id);
+                let host = s.client_name.unwrap_or_else(|| "agent".to_string());
+                let root = root_name(&s.workspace);
                 SessionEntry {
-                    session_id: id,
+                    session_id: s.id,
                     badge,
                     host,
                     root,
+                    workspace: s.workspace,
+                    pid: s.pid,
+                    languages: s.languages,
                 }
             })
             .collect();
@@ -192,6 +220,25 @@ impl SidebarState {
             self.selected.insert(id.clone());
         }
         true
+    }
+
+    /// Toggle expansion on the session at the current cursor position.
+    pub fn toggle_session_expanded(&mut self) {
+        let Some(entry) = self.entries.get(self.cursor) else {
+            return;
+        };
+        let id = &entry.session_id;
+        if self.expanded_sessions.contains(id) {
+            self.expanded_sessions.remove(id);
+        } else {
+            self.expanded_sessions.insert(id.clone());
+        }
+    }
+
+    /// Whether a specific session is expanded.
+    #[must_use]
+    pub fn is_expanded(&self, session_id: &str) -> bool {
+        self.expanded_sessions.contains(session_id)
     }
 
     /// Return the active session filter.
@@ -613,6 +660,7 @@ pub fn render_sessions(
 
     let max_rows = area.height as usize;
     let has_filter = state.has_filter();
+    let mut row: usize = 0;
 
     // Clamp hscroll so the user can't scroll past the longest entry.
     // Each entry: badge(2) + " " + host + " " + root.
@@ -627,7 +675,7 @@ pub fn render_sessions(
         .min(max_content.saturating_sub(area.width));
 
     for (i, entry) in state.entries.iter().enumerate() {
-        if i >= max_rows {
+        if row >= max_rows {
             break;
         }
 
@@ -646,7 +694,7 @@ pub fn render_sessions(
             Span::styled(&entry.root, text_style),
         ]);
 
-        let y = area.y + i as u16;
+        let y = area.y + row as u16;
         set_line_scrolled(buf, area, y, &line, hs, theme.muted);
         hits.push((y, i));
 
@@ -658,6 +706,35 @@ pub fn render_sessions(
                 } else {
                     cell.modifier |= ratatui::style::Modifier::REVERSED;
                 }
+            }
+        }
+        row += 1;
+
+        // ── Child lines: expanded detail ──────────────────────
+        if state.is_expanded(&entry.session_id) {
+            if row < max_rows {
+                let workspace_line = Line::from(vec![
+                    Span::styled("  ", theme.muted),
+                    Span::styled(&entry.workspace, theme.muted),
+                ]);
+                set_line_scrolled(buf, area, area.y + row as u16, &workspace_line, hs, theme.muted);
+                row += 1;
+            }
+            if row < max_rows {
+                let pid_line = Line::from(vec![
+                    Span::styled("  ", theme.muted),
+                    Span::styled(format!("pid {}", entry.pid), theme.muted),
+                    if entry.languages.is_empty() {
+                        Span::raw("")
+                    } else {
+                        Span::styled(
+                            format!("  {}", entry.languages.join(", ")),
+                            theme.accent,
+                        )
+                    },
+                ]);
+                set_line_scrolled(buf, area, area.y + row as u16, &pid_line, hs, theme.muted);
+                row += 1;
             }
         }
     }
@@ -841,6 +918,17 @@ fn lifecycle_style(theme: &Theme, state: &str) -> ratatui::style::Style {
 mod tests {
     use super::*;
 
+    /// Build a `SessionData` from the old `(id, client_name, workspace)` tuple.
+    fn sd(id: &str, client_name: Option<&str>, workspace: &str) -> SessionData {
+        SessionData {
+            id: id.to_string(),
+            client_name: client_name.map(str::to_string),
+            workspace: workspace.to_string(),
+            pid: 1000,
+            languages: Vec::new(),
+        }
+    }
+
     #[test]
     fn root_name_simple_path() {
         assert_eq!(root_name("/home/user/Projects/Catenary"), "Catenary/");
@@ -872,8 +960,8 @@ mod tests {
         // Add two sessions.
         state.refresh(
             vec![
-                ("s1".into(), Some("claude".into()), "/tmp/A".into()),
-                ("s2".into(), Some("gemini".into()), "/tmp/B".into()),
+                sd("s1", Some("claude"), "/tmp/A"),
+                sd("s2", Some("gemini"), "/tmp/B"),
             ],
             &mut badges,
         );
@@ -884,8 +972,8 @@ mod tests {
         // Remove s1, add s3.
         state.refresh(
             vec![
-                ("s2".into(), Some("gemini".into()), "/tmp/B".into()),
-                ("s3".into(), Some("claude".into()), "/tmp/C".into()),
+                sd("s2", Some("gemini"), "/tmp/B"),
+                sd("s3", Some("claude"), "/tmp/C"),
             ],
             &mut badges,
         );
@@ -900,7 +988,7 @@ mod tests {
         let mut state = SidebarState::new();
         let mut badges = HexBadgeMap::new();
 
-        state.refresh(vec![("s1".into(), None, "/tmp/A".into())], &mut badges);
+        state.refresh(vec![sd("s1", None, "/tmp/A")], &mut badges);
 
         assert!(!state.needs_refresh(&["s1".to_string()]));
         assert!(state.needs_refresh(&["s1".to_string(), "s2".to_string()]));
@@ -914,16 +1002,16 @@ mod tests {
 
         state.refresh(
             vec![
-                ("s1".into(), None, "/tmp/A".into()),
-                ("s2".into(), None, "/tmp/B".into()),
-                ("s3".into(), None, "/tmp/C".into()),
+                sd("s1", None, "/tmp/A"),
+                sd("s2", None, "/tmp/B"),
+                sd("s3", None, "/tmp/C"),
             ],
             &mut badges,
         );
         state.cursor = 2;
 
         // Remove two sessions — cursor should clamp.
-        state.refresh(vec![("s1".into(), None, "/tmp/A".into())], &mut badges);
+        state.refresh(vec![sd("s1", None, "/tmp/A")], &mut badges);
         assert_eq!(state.cursor, 0);
     }
 
@@ -933,9 +1021,9 @@ mod tests {
         let mut badges = HexBadgeMap::new();
         state.refresh(
             vec![
-                ("s1".into(), None, "/tmp/A".into()),
-                ("s2".into(), None, "/tmp/B".into()),
-                ("s3".into(), None, "/tmp/C".into()),
+                sd("s1", None, "/tmp/A"),
+                sd("s2", None, "/tmp/B"),
+                sd("s3", None, "/tmp/C"),
             ],
             &mut badges,
         );
@@ -956,11 +1044,11 @@ mod tests {
         let mut badges = HexBadgeMap::new();
         state.refresh(
             vec![
-                ("s1".into(), None, "/tmp/A".into()),
-                ("s2".into(), None, "/tmp/B".into()),
-                ("s3".into(), None, "/tmp/C".into()),
-                ("s4".into(), None, "/tmp/D".into()),
-                ("s5".into(), None, "/tmp/E".into()),
+                sd("s1", None, "/tmp/A"),
+                sd("s2", None, "/tmp/B"),
+                sd("s3", None, "/tmp/C"),
+                sd("s4", None, "/tmp/D"),
+                sd("s5", None, "/tmp/E"),
             ],
             &mut badges,
         );
@@ -1003,16 +1091,8 @@ mod tests {
         let mut badges = HexBadgeMap::new();
         state.refresh(
             vec![
-                (
-                    "s1".into(),
-                    Some("claude".into()),
-                    "/Projects/Catenary".into(),
-                ),
-                (
-                    "s2".into(),
-                    Some("gemini".into()),
-                    "/Projects/OmniDSP".into(),
-                ),
+                sd("s1", Some("claude"), "/Projects/Catenary"),
+                sd("s2", Some("gemini"), "/Projects/OmniDSP"),
             ],
             &mut badges,
         );
@@ -1054,10 +1134,7 @@ mod tests {
         let mut state = SidebarState::new();
         let mut badges = HexBadgeMap::new();
         state.refresh(
-            vec![
-                ("s1".into(), None, "/tmp/A".into()),
-                ("s2".into(), None, "/tmp/B".into()),
-            ],
+            vec![sd("s1", None, "/tmp/A"), sd("s2", None, "/tmp/B")],
             &mut badges,
         );
 
@@ -1087,9 +1164,9 @@ mod tests {
         let mut badges = HexBadgeMap::new();
         state.refresh(
             vec![
-                ("s1".into(), None, "/tmp/A".into()),
-                ("s2".into(), None, "/tmp/B".into()),
-                ("s3".into(), None, "/tmp/C".into()),
+                sd("s1", None, "/tmp/A"),
+                sd("s2", None, "/tmp/B"),
+                sd("s3", None, "/tmp/C"),
             ],
             &mut badges,
         );
@@ -1117,10 +1194,7 @@ mod tests {
         let mut state = SidebarState::new();
         let mut badges = HexBadgeMap::new();
         state.refresh(
-            vec![
-                ("s1".into(), None, "/tmp/A".into()),
-                ("s2".into(), None, "/tmp/B".into()),
-            ],
+            vec![sd("s1", None, "/tmp/A"), sd("s2", None, "/tmp/B")],
             &mut badges,
         );
 
@@ -1132,7 +1206,7 @@ mod tests {
         assert!(state.has_filter());
 
         // s2 disconnects.
-        state.refresh(vec![("s1".into(), None, "/tmp/A".into())], &mut badges);
+        state.refresh(vec![sd("s1", None, "/tmp/A")], &mut badges);
 
         // s2 selection should be cleared; s1 remains.
         assert!(state.has_filter());
@@ -1144,7 +1218,7 @@ mod tests {
     fn refresh_clears_filter_when_all_selected_disconnect() {
         let mut state = SidebarState::new();
         let mut badges = HexBadgeMap::new();
-        state.refresh(vec![("s1".into(), None, "/tmp/A".into())], &mut badges);
+        state.refresh(vec![sd("s1", None, "/tmp/A")], &mut badges);
 
         state.cursor = 0;
         state.toggle_selected();
@@ -1170,8 +1244,8 @@ mod tests {
         let mut badges = HexBadgeMap::new();
         state.refresh(
             vec![
-                ("s1".into(), Some("claude".into()), "/tmp/A".into()),
-                ("s2".into(), Some("gemini".into()), "/tmp/B".into()),
+                sd("s1", Some("claude"), "/tmp/A"),
+                sd("s2", Some("gemini"), "/tmp/B"),
             ],
             &mut badges,
         );
@@ -1263,10 +1337,7 @@ mod tests {
         let mut state = SidebarState::new();
         let mut badges = HexBadgeMap::new();
         state.refresh(
-            vec![
-                ("s1".into(), None, "/tmp/A".into()),
-                ("s2".into(), None, "/tmp/B".into()),
-            ],
+            vec![sd("s1", None, "/tmp/A"), sd("s2", None, "/tmp/B")],
             &mut badges,
         );
         state.refresh_servers(
@@ -1927,11 +1998,7 @@ mod tests {
         let mut state = SidebarState::new();
         let mut badges = HexBadgeMap::new();
         state.refresh(
-            vec![(
-                "s1".into(),
-                Some("claude-code".into()),
-                "/Projects/Catenary".into(),
-            )],
+            vec![sd("s1", Some("claude-code"), "/Projects/Catenary")],
             &mut badges,
         );
         state.session_hscroll = 4;
@@ -1965,11 +2032,7 @@ mod tests {
         let mut state = SidebarState::new();
         let mut badges = HexBadgeMap::new();
         state.refresh(
-            vec![(
-                "s1".into(),
-                Some("claude-code".into()),
-                "/Projects/Catenary".into(),
-            )],
+            vec![sd("s1", Some("claude-code"), "/Projects/Catenary")],
             &mut badges,
         );
 
@@ -2043,7 +2106,7 @@ mod tests {
         let mut badges = HexBadgeMap::new();
         // Content: "00 claude A/" = 12 cols.
         state.refresh(
-            vec![("s1".into(), Some("claude".into()), "/A".into())],
+            vec![sd("s1", Some("claude"), "/A")],
             &mut badges,
         );
         // Request a large hscroll, but content fits in 25 cols.

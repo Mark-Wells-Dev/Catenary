@@ -11,6 +11,7 @@ pub mod data;
 pub mod format;
 pub mod hints;
 pub mod icons;
+pub mod popup;
 pub mod scope;
 pub mod scrollbar;
 pub mod sidebar;
@@ -47,6 +48,7 @@ use self::app::{EffectiveLayout, FocusRegion};
 use self::data::SqliteDataSource;
 use self::hints::{KEYBINDS_EXPANDED_HEIGHT, render_keybinds_content};
 use self::icons::IconSet;
+use self::popup::render_server_detail;
 use self::sidebar::{render_servers, render_sessions};
 use self::stream::render_stream;
 use self::theme::Theme;
@@ -162,6 +164,10 @@ struct PanelLayout {
     tab_bar: Rect,
     /// Number of tabs rendered in the tab bar.
     tab_count: usize,
+    /// Server message detail panel (present when popup is open).
+    detail: Option<Rect>,
+    /// Inner height of the detail panel (for scroll clamping).
+    detail_height: usize,
     /// Terminal row → session entry index.
     session_hits: Vec<(u16, usize)>,
     /// Terminal row → server entry index.
@@ -173,7 +179,20 @@ struct PanelLayout {
 }
 
 /// Handle a key event, dispatching to global or focus-specific handlers.
-fn handle_key(app: &mut App<'_>, code: KeyCode, viewport_height: usize) {
+fn handle_key(app: &mut App<'_>, code: KeyCode, viewport_height: usize, detail_height: usize) {
+    // Detail panel captures all keys when open.
+    if let Some(ref mut popup) = app.popup {
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') => app.close_popup(),
+            KeyCode::Char('j') | KeyCode::Down => popup.scroll_down(1, detail_height),
+            KeyCode::Char('k') | KeyCode::Up => popup.scroll_up(1),
+            KeyCode::PageDown => popup.scroll_down(detail_height / 2, detail_height),
+            KeyCode::PageUp => popup.scroll_up(detail_height / 2),
+            _ => {}
+        }
+        return;
+    }
+
     // Search input mode intercepts all keys.
     if app.search_active {
         handle_search_input(app, code, viewport_height);
@@ -201,7 +220,10 @@ fn handle_key(app: &mut App<'_>, code: KeyCode, viewport_height: usize) {
                     KeyCode::Char('l') | KeyCode::Right => {
                         app.sidebar.hscroll_sessions_right();
                     }
-                    KeyCode::Enter | KeyCode::Char(' ') => {
+                    KeyCode::Enter => {
+                        app.sidebar.toggle_session_expanded();
+                    }
+                    KeyCode::Char(' ') => {
                         app.toggle_session_selection();
                     }
                     _ => {}
@@ -222,7 +244,10 @@ fn handle_key(app: &mut App<'_>, code: KeyCode, viewport_height: usize) {
                     KeyCode::Char('l') | KeyCode::Right => {
                         app.sidebar.hscroll_servers_right();
                     }
-                    KeyCode::Enter | KeyCode::Char(' ') => {
+                    KeyCode::Enter => {
+                        app.open_server_popup();
+                    }
+                    KeyCode::Char(' ') => {
                         app.toggle_server_selection();
                     }
                     _ => {}
@@ -380,6 +405,27 @@ fn handle_mouse(
     layout: &PanelLayout,
     viewport_height: usize,
 ) {
+    // Detail panel mouse handling: clicks inside scroll, clicks outside close and fall through.
+    if app.popup.is_some() {
+        let in_detail = layout
+            .detail
+            .is_some_and(|r| r.contains((column, row).into()));
+        if in_detail {
+            if let Some(ref mut popup) = app.popup {
+                match kind {
+                    MouseEventKind::ScrollUp => popup.scroll_up(3),
+                    MouseEventKind::ScrollDown => popup.scroll_down(3, layout.detail_height),
+                    _ => {}
+                }
+            }
+            return;
+        }
+        // Click outside detail panel: close it and fall through to normal dispatch.
+        if matches!(kind, MouseEventKind::Down(MouseButton::Left)) {
+            app.close_popup();
+        }
+    }
+
     // ── Divider drag ───────────────────────────────────────────
     // Any left-button-down clears stale drag state; hits on the divider
     // boundary start a new drag and return early.
@@ -590,6 +636,40 @@ fn render_keybinds_panel(
     layout.keybinds = panel_rect;
 }
 
+/// Render the right side: optional server detail panel above the Messages panel.
+///
+/// When a server popup is open, splits `right_rect` vertically (50/50) and
+/// renders the detail panel on top. Passes the remaining rect to
+/// [`render_messages_panel`]. Updates `layout.detail` and `layout.detail_height`.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "terminal coordinates are always small"
+)]
+fn render_right_side(
+    app: &mut App<'_>,
+    right_rect: Rect,
+    buf: &mut Buffer,
+    layout: &mut PanelLayout,
+) -> Option<(u16, u16)> {
+    let (detail_rect, messages_rect) = if app.popup.is_some() {
+        let v = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Fill(1), Constraint::Fill(1)])
+            .split(right_rect);
+        (Some(v[0]), v[1])
+    } else {
+        (None, right_rect)
+    };
+
+    if let (Some(detail_area), Some(popup)) = (detail_rect, &mut app.popup) {
+        render_server_detail(popup, detail_area, buf, app.theme, true);
+        layout.detail_height = detail_area.height.saturating_sub(2) as usize;
+    }
+    layout.detail = detail_rect;
+
+    render_messages_panel(app, messages_rect, buf, layout)
+}
+
 /// Render the Messages stream panel into `panel_rect`, including the search
 /// bar when active. Returns an optional cursor position for the search input.
 #[allow(
@@ -664,6 +744,8 @@ fn run_loop(
         stream: Rect::default(),
         tab_bar: Rect::default(),
         tab_count: 0,
+        detail: None,
+        detail_height: 0,
         session_hits: Vec::new(),
         server_hits: Vec::new(),
         divider_col: 0,
@@ -701,6 +783,8 @@ fn run_loop(
                 layout.tab_count = 0;
                 layout.divider_col = 0;
                 layout.total_width = 0;
+                layout.detail = None;
+                layout.detail_height = 0;
                 return;
             }
 
@@ -776,8 +860,8 @@ fn run_loop(
                     }
                     layout.keybinds = keybinds_rect;
 
-                    // Messages.
-                    search_cursor = render_messages_panel(app, right, f.buffer_mut(), &mut layout);
+                    // Messages (with optional detail panel above).
+                    search_cursor = render_right_side(app, right, f.buffer_mut(), &mut layout);
                 }
 
                 // ── Stacked: tab bar + active panel left, Messages right
@@ -820,8 +904,8 @@ fn run_loop(
                         _ => render_keybinds_panel(app, panel_rect, f.buffer_mut(), &mut layout),
                     }
 
-                    // Messages (always visible in stacked mode).
-                    search_cursor = render_messages_panel(app, right, f.buffer_mut(), &mut layout);
+                    // Messages (with optional detail panel above).
+                    search_cursor = render_right_side(app, right, f.buffer_mut(), &mut layout);
                 }
 
                 // ── FullStack: tab bar + one panel full-width ──────
@@ -856,7 +940,7 @@ fn run_loop(
                         2 => render_keybinds_panel(app, panel_rect, f.buffer_mut(), &mut layout),
                         _ => {
                             search_cursor =
-                                render_messages_panel(app, panel_rect, f.buffer_mut(), &mut layout);
+                                render_right_side(app, panel_rect, f.buffer_mut(), &mut layout);
                         }
                     }
                 }
@@ -878,7 +962,7 @@ fn run_loop(
         if event::poll(timeout)? {
             match event::read()? {
                 Event::Key(key) => {
-                    handle_key(app, key.code, stream_height);
+                    handle_key(app, key.code, stream_height, layout.detail_height);
                     app.fetch_page_if_needed();
                 }
                 Event::Mouse(mouse) => {
@@ -944,6 +1028,8 @@ mod tests {
             stream: Rect::new(40, 0, 40, 23),
             tab_bar: Rect::default(),
             tab_count: 0,
+            detail: None,
+            detail_height: 0,
             session_hits: Vec::new(),
             server_hits: Vec::new(),
             divider_col: 39, // left.x + left.width - 1

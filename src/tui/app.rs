@@ -8,7 +8,8 @@
 
 use super::data::{DataSource, MessageTail};
 use super::icons::IconSet;
-use super::sidebar::SidebarState;
+use super::popup::ServerPopup;
+use super::sidebar::{SessionData, SidebarState};
 use super::stream::{PAGE_SIZE, PageRequest, StreamState};
 use super::theme::Theme;
 
@@ -93,6 +94,8 @@ pub struct App<'a> {
     pub search_active: bool,
     /// Text being typed into the search bar.
     pub search_input: String,
+    /// Server message popup overlay (shown when user presses Enter on a server).
+    pub popup: Option<ServerPopup>,
 }
 
 impl<'a> App<'a> {
@@ -129,6 +132,7 @@ impl<'a> App<'a> {
             tail,
             search_active: false,
             search_input: String::new(),
+            popup: None,
         };
 
         // Load initial session and server lists.
@@ -404,7 +408,13 @@ impl<'a> App<'a> {
         let sessions: Vec<_> = rows
             .into_iter()
             .filter(|r| r.alive)
-            .map(|r| (r.info.id, r.info.client_name, r.info.workspace))
+            .map(|r| SessionData {
+                id: r.info.id,
+                client_name: r.info.client_name,
+                workspace: r.info.workspace,
+                pid: r.info.pid,
+                languages: r.languages,
+            })
             .collect();
         let had_filter = self.sidebar.has_filter();
         self.sidebar.refresh(sessions, &mut self.stream.badges);
@@ -437,6 +447,29 @@ impl<'a> App<'a> {
         if had_filter {
             self.stream.set_server_filter(self.sidebar.server_filter());
         }
+    }
+
+    /// Open the server message popup for the server at the current cursor.
+    ///
+    /// Queries the full message history from the database and displays
+    /// it in a centered overlay.
+    pub fn open_server_popup(&mut self) {
+        let Some(entry) = self.sidebar.servers.get(self.sidebar.server_cursor) else {
+            return;
+        };
+        let server = &entry.name;
+        let scope_root = &entry.scope_root;
+        let root = &entry.root;
+        let messages = self
+            .data
+            .list_server_message_history(server, scope_root)
+            .unwrap_or_default();
+        self.popup = Some(ServerPopup::new(server, root, messages));
+    }
+
+    /// Close the server message popup.
+    pub fn close_popup(&mut self) {
+        self.popup = None;
     }
 }
 

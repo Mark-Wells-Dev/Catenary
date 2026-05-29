@@ -25,6 +25,7 @@ const SIDEBAR_BINDS: &[(&str, &str)] = &[
     ("j/k", "navigate"),
     ("h/l", "scroll"),
     ("Space", "toggle filter"),
+    ("Enter", "expand/collapse"),
 ];
 
 /// Stream keybindings.

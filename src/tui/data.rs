@@ -55,6 +55,17 @@ pub struct ServerNoiseRow {
     pub last_message: Option<String>,
 }
 
+/// A single server message entry for the popup detail view.
+#[derive(Debug, Clone)]
+pub struct ServerMessageDetail {
+    /// LSP method (`window/logMessage` or `window/showMessage`).
+    pub method: String,
+    /// The message text extracted from the payload.
+    pub message: String,
+    /// When the message was received.
+    pub timestamp: DateTime<Utc>,
+}
+
 /// Methods that constitute server noise — redirected from stream to sidebar.
 pub const SERVER_NOISE_METHODS: &[&str] =
     &["$/progress", "window/logMessage", "window/showMessage"];
@@ -155,6 +166,20 @@ pub trait DataSource {
     ///
     /// Returns an error if the database cannot be queried.
     fn list_server_noise(&self) -> Result<Vec<ServerNoiseRow>>;
+
+    /// Load all `window/logMessage` and `window/showMessage` entries for
+    /// a specific server instance, newest first.
+    ///
+    /// Used by the server message popup to show full message history.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be queried.
+    fn list_server_message_history(
+        &self,
+        server: &str,
+        scope_root: &str,
+    ) -> Result<Vec<ServerMessageDetail>>;
 }
 
 /// Tail reader abstraction for streaming new messages.
@@ -385,6 +410,48 @@ impl DataSource for SqliteDataSource {
         }
         Ok(result)
     }
+
+    fn list_server_message_history(
+        &self,
+        server: &str,
+        scope_root: &str,
+    ) -> Result<Vec<ServerMessageDetail>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT method, payload, timestamp FROM messages \
+             WHERE type = 'lsp' \
+               AND method IN ('window/logMessage', 'window/showMessage') \
+               AND server = ?1 \
+               AND scope_root = ?2 \
+               AND parent_id IS NULL \
+             ORDER BY id DESC",
+        )?;
+        let mut rows = stmt.query(rusqlite::params![server, scope_root])?;
+        let mut result = Vec::new();
+        while let Some(row) = rows.next()? {
+            let method: String = row.get(0)?;
+            let payload_str: String = row.get(1)?;
+            let ts_str: String = row.get(2)?;
+            let timestamp = DateTime::parse_from_rfc3339(&ts_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_default();
+            let payload: serde_json::Value =
+                serde_json::from_str(&payload_str).unwrap_or(serde_json::Value::Null);
+            let message = payload
+                .get("params")
+                .and_then(|p| p.get("message"))
+                .and_then(|m| m.as_str())
+                .unwrap_or("")
+                .to_string();
+            if !message.is_empty() {
+                result.push(ServerMessageDetail {
+                    method,
+                    message,
+                    timestamp,
+                });
+            }
+        }
+        Ok(result)
+    }
 }
 
 /// Batch query: all active languages grouped by session ID.
@@ -522,6 +589,27 @@ impl DataSource for MockDataSource {
 
     fn list_server_noise(&self) -> Result<Vec<ServerNoiseRow>> {
         Ok(self.server_noise.clone())
+    }
+
+    fn list_server_message_history(
+        &self,
+        server: &str,
+        scope_root: &str,
+    ) -> Result<Vec<ServerMessageDetail>> {
+        let result: Vec<ServerMessageDetail> = self
+            .server_noise
+            .iter()
+            .filter(|n| n.server == server && n.scope_root == scope_root)
+            .filter_map(|n| {
+                let message = n.last_message.as_ref()?.clone();
+                Some(ServerMessageDetail {
+                    method: "window/logMessage".to_string(),
+                    message,
+                    timestamp: Utc::now(),
+                })
+            })
+            .collect();
+        Ok(result)
     }
 }
 
