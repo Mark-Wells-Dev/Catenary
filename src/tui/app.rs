@@ -55,7 +55,10 @@ const SHORT_THRESHOLD: u16 = 12;
 const NARROW_THRESHOLD: u16 = 50;
 
 /// Application state driving the TUI.
-#[allow(clippy::struct_excessive_bools, reason = "TUI state naturally has independent boolean flags")]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "TUI state naturally has independent boolean flags"
+)]
 pub struct App<'a> {
     /// Semantic color theme.
     pub theme: &'a Theme,

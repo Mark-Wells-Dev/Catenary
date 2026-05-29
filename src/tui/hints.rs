@@ -21,7 +21,11 @@ const GLOBAL_BINDS: &[(&str, &str)] = &[
 ];
 
 /// Sidebar keybindings (sessions/servers panels).
-const SIDEBAR_BINDS: &[(&str, &str)] = &[("j/k", "navigate"), ("Space", "toggle filter")];
+const SIDEBAR_BINDS: &[(&str, &str)] = &[
+    ("j/k", "navigate"),
+    ("h/l", "scroll"),
+    ("Space", "toggle filter"),
+];
 
 /// Stream keybindings.
 const STREAM_BINDS: &[(&str, &str)] = &[

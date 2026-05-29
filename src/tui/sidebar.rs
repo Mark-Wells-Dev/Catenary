@@ -12,11 +12,16 @@ use std::path::Path;
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::data::{ServerNoiseRow, ServerStatusRow};
 use super::stream::HexBadgeMap;
 use super::theme::Theme;
+
+/// Number of columns to scroll per horizontal scroll step.
+const HSCROLL_STEP: u16 = 4;
 
 // ── Session entry ────────────────────────────────────────────────────
 
@@ -96,6 +101,10 @@ pub struct SidebarState {
     /// Selected server instances `(name, scope_root)` (for stream filtering).
     /// Empty = show all (no server filter active).
     selected_servers: HashSet<ServerInstanceKey>,
+    /// Horizontal scroll offset for session entries (in columns).
+    session_hscroll: u16,
+    /// Horizontal scroll offset for server entries (in columns).
+    server_hscroll: u16,
 }
 
 impl SidebarState {
@@ -114,6 +123,8 @@ impl SidebarState {
             last_server_names: Vec::new(),
             selected: HashSet::new(),
             selected_servers: HashSet::new(),
+            session_hscroll: 0,
+            server_hscroll: 0,
         }
     }
 
@@ -409,6 +420,28 @@ impl SidebarState {
             self.server_scroll_offset = self.server_cursor + 1 - visible;
         }
     }
+
+    // ── Horizontal scroll ─────────────────────────────────────────────
+
+    /// Scroll session entries left by one step.
+    pub const fn hscroll_sessions_left(&mut self) {
+        self.session_hscroll = self.session_hscroll.saturating_sub(HSCROLL_STEP);
+    }
+
+    /// Scroll session entries right by one step.
+    pub const fn hscroll_sessions_right(&mut self) {
+        self.session_hscroll = self.session_hscroll.saturating_add(HSCROLL_STEP);
+    }
+
+    /// Scroll server entries left by one step.
+    pub const fn hscroll_servers_left(&mut self) {
+        self.server_hscroll = self.server_hscroll.saturating_sub(HSCROLL_STEP);
+    }
+
+    /// Scroll server entries right by one step.
+    pub const fn hscroll_servers_right(&mut self) {
+        self.server_hscroll = self.server_hscroll.saturating_add(HSCROLL_STEP);
+    }
 }
 
 impl Default for SidebarState {
@@ -497,6 +530,77 @@ fn extract_server_message(
     row.last_message.clone()
 }
 
+// ── Horizontal scroll helpers ────────────────────────────────────────
+
+/// Width of the `"…"` indicator shown when content is scrolled right.
+const HSCROLL_IND_WIDTH: u16 = 1;
+
+/// Render a line into the buffer, applying horizontal scroll.
+///
+/// When `hscroll` is 0 this is a plain `buf.set_line`. When non-zero,
+/// an `"…"` indicator is drawn at the left edge and content is shifted
+/// by `hscroll` columns so the user can see text clipped by the panel.
+fn set_line_scrolled(
+    buf: &mut Buffer,
+    area: Rect,
+    y: u16,
+    line: &Line<'_>,
+    hscroll: u16,
+    muted: Style,
+) {
+    if hscroll == 0 {
+        buf.set_line(area.x, y, line, area.width);
+        return;
+    }
+    let ind = Line::from(Span::styled("\u{2026}", muted));
+    buf.set_line(area.x, y, &ind, area.width);
+    let scrolled = hscroll_line(line, hscroll);
+    buf.set_line(
+        area.x + HSCROLL_IND_WIDTH,
+        y,
+        &scrolled,
+        area.width.saturating_sub(HSCROLL_IND_WIDTH),
+    );
+}
+
+/// Produce a new `Line` with the first `hscroll` columns removed.
+///
+/// Walks through spans character-by-character using unicode column
+/// widths. Spans fully consumed by the offset are dropped. A span
+/// partially consumed is trimmed to the remaining characters.
+fn hscroll_line(line: &Line<'_>, hscroll: u16) -> Line<'static> {
+    let mut remaining = usize::from(hscroll);
+    let mut spans: Vec<Span<'static>> = Vec::new();
+
+    for span in &line.spans {
+        if remaining == 0 {
+            spans.push(Span::styled(span.content.to_string(), span.style));
+            continue;
+        }
+
+        let mut char_iter = span.content.chars();
+        loop {
+            if remaining == 0 {
+                break;
+            }
+            match char_iter.next() {
+                Some(c) => {
+                    let w = UnicodeWidthChar::width(c).unwrap_or(0);
+                    remaining = remaining.saturating_sub(w);
+                }
+                None => break,
+            }
+        }
+
+        let rest: String = char_iter.collect();
+        if !rest.is_empty() {
+            spans.push(Span::styled(rest, span.style));
+        }
+    }
+
+    Line::from(spans)
+}
+
 // ── Rendering ────────────────────────────────────────────────────────
 
 /// Render session entries into the given area (inside a `Block` frame).
@@ -523,6 +627,18 @@ pub fn render_sessions(
     let max_rows = area.height as usize;
     let has_filter = state.has_filter();
 
+    // Clamp hscroll so the user can't scroll past the longest entry.
+    // Each entry: badge(2) + " " + host + " " + root.
+    let max_content: u16 = state
+        .entries
+        .iter()
+        .map(|e| (e.badge.width() + 1 + e.host.width() + 1 + e.root.width()) as u16)
+        .max()
+        .unwrap_or(0);
+    let hs = state
+        .session_hscroll
+        .min(max_content.saturating_sub(area.width));
+
     for (i, entry) in state.entries.iter().enumerate() {
         if i >= max_rows {
             break;
@@ -544,7 +660,7 @@ pub fn render_sessions(
         ]);
 
         let y = area.y + i as u16;
-        buf.set_line(area.x, y, &line, area.width);
+        set_line_scrolled(buf, area, y, &line, hs, theme.muted);
         hits.push((y, i));
 
         if is_cursor {
@@ -590,6 +706,26 @@ pub fn render_servers(
     let mut row: usize = 0;
     let has_server_filter = state.has_server_filter();
 
+    // Clamp hscroll so the user can't scroll past the longest line.
+    let max_content: u16 = state
+        .servers
+        .iter()
+        .map(|s| {
+            let header = if s.root.is_empty() {
+                s.name.width() + 2 + s.state.width()
+            } else {
+                s.name.width() + 1 + 1 + s.root.width() + 1 + 2 + s.state.width()
+            };
+            let progress = s.progress_line.as_ref().map_or(0, |p| 2 + p.width());
+            let msg = s.server_message.as_ref().map_or(0, |m| 2 + m.width());
+            header.max(progress).max(msg) as u16
+        })
+        .max()
+        .unwrap_or(0);
+    let hs = state
+        .server_hscroll
+        .min(max_content.saturating_sub(area.width));
+
     for (si, server) in state.servers.iter().enumerate() {
         if row >= max_rows {
             break;
@@ -624,7 +760,7 @@ pub fn render_servers(
             ])
         };
         let y = area.y + row as u16;
-        buf.set_line(area.x, y, &line, area.width);
+        set_line_scrolled(buf, area, y, &line, hs, theme.muted);
         hits.push((y, si));
 
         if is_cursor {
@@ -647,7 +783,7 @@ pub fn render_servers(
                 Span::styled("  ", theme.muted),
                 Span::styled(progress.clone(), theme.accent),
             ]);
-            buf.set_line(area.x, area.y + row as u16, &child, area.width);
+            set_line_scrolled(buf, area, area.y + row as u16, &child, hs, theme.muted);
             row += 1;
         }
         if let Some(ref msg) = server.server_message
@@ -657,7 +793,7 @@ pub fn render_servers(
                 Span::styled("  ", theme.muted),
                 Span::styled(msg.clone(), theme.muted),
             ]);
-            buf.set_line(area.x, area.y + row as u16, &child, area.width);
+            set_line_scrolled(buf, area, area.y + row as u16, &child, hs, theme.muted);
             row += 1;
         }
     }
@@ -1746,6 +1882,228 @@ mod tests {
         assert_eq!(state.dead_servers.len(), 2);
         assert_eq!(state.dead_servers[0].name, "lua-ls");
         assert_eq!(state.dead_servers[1].name, "pyright");
+    }
+
+    // ── Horizontal scroll tests ──────────────────────────────────────
+
+    #[test]
+    fn hscroll_line_zero_offset_preserves_content() {
+        let line = Line::from(vec![Span::raw("abc"), Span::raw(" "), Span::raw("def")]);
+        let result = hscroll_line(&line, 0);
+        let text: String = result.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "abc def");
+    }
+
+    #[test]
+    fn hscroll_line_partial_span() {
+        let line = Line::from(vec![Span::raw("abcdef")]);
+        let result = hscroll_line(&line, 3);
+        let text: String = result.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "def");
+    }
+
+    #[test]
+    fn hscroll_line_across_span_boundary() {
+        let line = Line::from(vec![Span::raw("ab"), Span::raw("cd"), Span::raw("ef")]);
+        let result = hscroll_line(&line, 3);
+        let text: String = result.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "def");
+    }
+
+    #[test]
+    fn hscroll_line_exact_span_boundary() {
+        let line = Line::from(vec![Span::raw("ab"), Span::raw("cd")]);
+        let result = hscroll_line(&line, 2);
+        let text: String = result.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "cd");
+    }
+
+    #[test]
+    fn hscroll_line_past_end_is_empty() {
+        let line = Line::from(vec![Span::raw("abc")]);
+        let result = hscroll_line(&line, 10);
+        assert!(result.spans.is_empty());
+    }
+
+    #[test]
+    fn hscroll_sessions_left_clamps_at_zero() {
+        let mut state = SidebarState::new();
+        state.session_hscroll = 2;
+        state.hscroll_sessions_left();
+        assert_eq!(state.session_hscroll, 0, "should clamp at zero");
+        state.hscroll_sessions_left();
+        assert_eq!(state.session_hscroll, 0, "should stay at zero");
+    }
+
+    #[test]
+    fn hscroll_sessions_right_increments() {
+        let mut state = SidebarState::new();
+        state.hscroll_sessions_right();
+        assert_eq!(state.session_hscroll, HSCROLL_STEP);
+        state.hscroll_sessions_right();
+        assert_eq!(state.session_hscroll, HSCROLL_STEP * 2);
+    }
+
+    #[test]
+    fn hscroll_servers_independent_from_sessions() {
+        let mut state = SidebarState::new();
+        state.hscroll_sessions_right();
+        state.hscroll_servers_right();
+        state.hscroll_servers_right();
+        assert_eq!(state.session_hscroll, HSCROLL_STEP);
+        assert_eq!(state.server_hscroll, HSCROLL_STEP * 2);
+    }
+
+    #[test]
+    fn render_sessions_hscrolled_shows_indicator() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut state = SidebarState::new();
+        let mut badges = HexBadgeMap::new();
+        state.refresh(
+            vec![(
+                "s1".into(),
+                Some("claude-code".into()),
+                "/Projects/Catenary".into(),
+            )],
+            &mut badges,
+        );
+        state.session_hscroll = 4;
+
+        let theme = crate::tui::theme::Theme::new();
+        // Content is 19 cols ("00 claude Catenary/"); narrow to 15 so hscroll is effective.
+        let backend = TestBackend::new(15, 3);
+        let mut terminal = Terminal::new(backend).expect("terminal creation");
+
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_sessions(&state, area, frame.buffer_mut(), &theme, false);
+            })
+            .expect("draw");
+
+        let buf = terminal.backend().buffer().clone();
+        let content = buffer_to_string(&buf);
+
+        assert!(
+            content.contains('\u{2026}'),
+            "should show scroll indicator: {content}"
+        );
+    }
+
+    #[test]
+    fn render_sessions_no_indicator_at_zero() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut state = SidebarState::new();
+        let mut badges = HexBadgeMap::new();
+        state.refresh(
+            vec![(
+                "s1".into(),
+                Some("claude-code".into()),
+                "/Projects/Catenary".into(),
+            )],
+            &mut badges,
+        );
+
+        let theme = crate::tui::theme::Theme::new();
+        let backend = TestBackend::new(25, 3);
+        let mut terminal = Terminal::new(backend).expect("terminal creation");
+
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_sessions(&state, area, frame.buffer_mut(), &theme, false);
+            })
+            .expect("draw");
+
+        let buf = terminal.backend().buffer().clone();
+        let content = buffer_to_string(&buf);
+
+        assert!(
+            content.contains("00"),
+            "should show badge without indicator: {content}"
+        );
+        assert!(
+            !content.contains('\u{2026}'),
+            "should not show indicator at hscroll 0: {content}"
+        );
+    }
+
+    #[test]
+    fn render_servers_hscrolled_shows_indicator() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut state = SidebarState::new();
+        state.refresh_servers(
+            &[make_server_row(
+                "rust-analyzer",
+                "/home/user/Catenary",
+                "ready",
+            )],
+            &[],
+        );
+        state.server_hscroll = 4;
+
+        let theme = crate::tui::theme::Theme::new();
+        // Content is ~31 cols; narrow to 25 so hscroll is effective.
+        let backend = TestBackend::new(25, 5);
+        let mut terminal = Terminal::new(backend).expect("terminal creation");
+
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_servers(&state, area, frame.buffer_mut(), &theme, false);
+            })
+            .expect("draw");
+
+        let buf = terminal.backend().buffer().clone();
+        let content = buffer_to_string(&buf);
+
+        assert!(
+            content.contains('\u{2026}'),
+            "should show scroll indicator: {content}"
+        );
+    }
+
+    #[test]
+    fn hscroll_clamped_when_content_fits() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut state = SidebarState::new();
+        let mut badges = HexBadgeMap::new();
+        // Content: "00 claude A/" = 12 cols.
+        state.refresh(
+            vec![("s1".into(), Some("claude".into()), "/A".into())],
+            &mut badges,
+        );
+        // Request a large hscroll, but content fits in 25 cols.
+        state.session_hscroll = 20;
+
+        let theme = crate::tui::theme::Theme::new();
+        let backend = TestBackend::new(25, 3);
+        let mut terminal = Terminal::new(backend).expect("terminal creation");
+
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_sessions(&state, area, frame.buffer_mut(), &theme, false);
+            })
+            .expect("draw");
+
+        let buf = terminal.backend().buffer().clone();
+        let content = buffer_to_string(&buf);
+
+        // Clamped to 0 — no indicator, full content visible.
+        assert!(
+            !content.contains('\u{2026}'),
+            "should not show indicator when content fits: {content}"
+        );
+        assert!(content.contains("00"), "should show badge: {content}");
     }
 
     // ── Helpers ─────────────────────────────────────────────────────

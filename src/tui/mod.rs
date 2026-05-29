@@ -195,6 +195,12 @@ fn handle_key(app: &mut App<'_>, code: KeyCode, viewport_height: usize) {
                         app.sidebar.cursor_down(1, visible);
                     }
                     KeyCode::Char('k') | KeyCode::Up => app.sidebar.cursor_up(1, visible),
+                    KeyCode::Char('h') | KeyCode::Left => {
+                        app.sidebar.hscroll_sessions_left();
+                    }
+                    KeyCode::Char('l') | KeyCode::Right => {
+                        app.sidebar.hscroll_sessions_right();
+                    }
                     KeyCode::Enter | KeyCode::Char(' ') => {
                         app.toggle_session_selection();
                     }
@@ -209,6 +215,12 @@ fn handle_key(app: &mut App<'_>, code: KeyCode, viewport_height: usize) {
                     }
                     KeyCode::Char('k') | KeyCode::Up => {
                         app.sidebar.server_cursor_up(1, visible);
+                    }
+                    KeyCode::Char('h') | KeyCode::Left => {
+                        app.sidebar.hscroll_servers_left();
+                    }
+                    KeyCode::Char('l') | KeyCode::Right => {
+                        app.sidebar.hscroll_servers_right();
                     }
                     KeyCode::Enter | KeyCode::Char(' ') => {
                         app.toggle_server_selection();
@@ -413,6 +425,20 @@ fn handle_mouse(
                 app.sidebar.server_cursor_down(3, viewport_height);
             } else if in_stream {
                 app.stream.scroll_down(3, viewport_height);
+            }
+        }
+        MouseEventKind::ScrollLeft => {
+            if in_sessions {
+                app.sidebar.hscroll_sessions_left();
+            } else if in_servers {
+                app.sidebar.hscroll_servers_left();
+            }
+        }
+        MouseEventKind::ScrollRight => {
+            if in_sessions {
+                app.sidebar.hscroll_sessions_right();
+            } else if in_servers {
+                app.sidebar.hscroll_servers_right();
             }
         }
         MouseEventKind::Down(MouseButton::Left) => {
