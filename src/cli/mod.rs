@@ -30,6 +30,19 @@ pub enum HostFormat {
 }
 
 impl HostFormat {
+    /// Short lowercase label for the host CLI format.
+    ///
+    /// Used in IPC requests so the daemon can store the format as
+    /// `client_name` in the sessions table.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Gemini => "gemini",
+            Self::Antigravity => "antigravity",
+        }
+    }
+
     /// The host CLI's file-read tool name (for guidance template resolution).
     #[must_use]
     pub const fn read_tool(self) -> &'static str {

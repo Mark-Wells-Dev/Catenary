@@ -1128,24 +1128,33 @@ fn get_or_create_router(
             session.notification_router.register_session(session_id);
 
             // Insert a session row so the TUI can discover this agent.
-            // Uses the cwd from the host payload as display_name.
+            // Uses the cwd from the host payload as display_name, and
+            // the format field as client_name (for sidebar host label).
             let display_name = raw
                 .get("host_payload")
                 .and_then(|hp| hp.get("cwd"))
                 .and_then(|v| v.as_str())
                 .unwrap_or(session_id);
+            let client_name = raw.get("format").and_then(|v| v.as_str());
             if let Ok(conn) = ctx.conn.lock() {
                 let started_at = chrono::Utc::now().to_rfc3339();
                 let _ = conn.execute(
                     "INSERT INTO sessions \
-                     (id, pid, display_name, started_at, alive) \
-                     VALUES (?1, ?2, ?3, ?4, 1) \
+                     (id, pid, display_name, client_name, started_at, alive) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, 1) \
                      ON CONFLICT(id) DO UPDATE SET \
                        alive = 1, \
                        display_name = excluded.display_name, \
+                       client_name = COALESCE(excluded.client_name, sessions.client_name), \
                        started_at = excluded.started_at, \
                        ended_at = NULL",
-                    rusqlite::params![session_id, std::process::id(), display_name, &started_at,],
+                    rusqlite::params![
+                        session_id,
+                        std::process::id(),
+                        display_name,
+                        client_name,
+                        &started_at,
+                    ],
                 );
             }
 

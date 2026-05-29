@@ -159,7 +159,7 @@ impl SidebarState {
             .into_iter()
             .map(|(id, client_name, workspace)| {
                 let badge = badges.badge(&id);
-                let host = host_label(client_name.as_deref());
+                let host = client_name.unwrap_or_else(|| "agent".to_string());
                 let root = root_name(&workspace);
                 SessionEntry {
                     session_id: id,
@@ -451,19 +451,6 @@ impl Default for SidebarState {
 }
 
 // ── Label helpers ────────────────────────────────────────────────────
-
-/// Derive host label from `client_name`.
-///
-/// Maps known host CLI names to short labels. Falls back to the raw
-/// name or `"agent"` when absent.
-fn host_label(client_name: Option<&str>) -> String {
-    match client_name {
-        Some(name) if name.contains("claude") => "claude".to_string(),
-        Some(name) if name.contains("gemini") => "gemini".to_string(),
-        Some(name) => name.to_string(),
-        None => "agent".to_string(),
-    }
-}
 
 /// Extract the primary root directory name from a workspace string.
 ///
@@ -855,28 +842,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn host_label_claude() {
-        assert_eq!(host_label(Some("claude-code")), "claude");
-        assert_eq!(host_label(Some("claude")), "claude");
-    }
-
-    #[test]
-    fn host_label_gemini() {
-        assert_eq!(host_label(Some("gemini-cli")), "gemini");
-        assert_eq!(host_label(Some("gemini")), "gemini");
-    }
-
-    #[test]
-    fn host_label_unknown() {
-        assert_eq!(host_label(Some("custom-agent")), "custom-agent");
-    }
-
-    #[test]
-    fn host_label_none() {
-        assert_eq!(host_label(None), "agent");
-    }
-
-    #[test]
     fn root_name_simple_path() {
         assert_eq!(root_name("/home/user/Projects/Catenary"), "Catenary/");
     }
@@ -907,8 +872,8 @@ mod tests {
         // Add two sessions.
         state.refresh(
             vec![
-                ("s1".into(), Some("claude-code".into()), "/tmp/A".into()),
-                ("s2".into(), Some("gemini-cli".into()), "/tmp/B".into()),
+                ("s1".into(), Some("claude".into()), "/tmp/A".into()),
+                ("s2".into(), Some("gemini".into()), "/tmp/B".into()),
             ],
             &mut badges,
         );
@@ -919,8 +884,8 @@ mod tests {
         // Remove s1, add s3.
         state.refresh(
             vec![
-                ("s2".into(), Some("gemini-cli".into()), "/tmp/B".into()),
-                ("s3".into(), Some("claude-code".into()), "/tmp/C".into()),
+                ("s2".into(), Some("gemini".into()), "/tmp/B".into()),
+                ("s3".into(), Some("claude".into()), "/tmp/C".into()),
             ],
             &mut badges,
         );
@@ -1040,12 +1005,12 @@ mod tests {
             vec![
                 (
                     "s1".into(),
-                    Some("claude-code".into()),
+                    Some("claude".into()),
                     "/Projects/Catenary".into(),
                 ),
                 (
                     "s2".into(),
-                    Some("gemini-cli".into()),
+                    Some("gemini".into()),
                     "/Projects/OmniDSP".into(),
                 ),
             ],
@@ -1205,8 +1170,8 @@ mod tests {
         let mut badges = HexBadgeMap::new();
         state.refresh(
             vec![
-                ("s1".into(), Some("claude-code".into()), "/tmp/A".into()),
-                ("s2".into(), Some("gemini-cli".into()), "/tmp/B".into()),
+                ("s1".into(), Some("claude".into()), "/tmp/A".into()),
+                ("s2".into(), Some("gemini".into()), "/tmp/B".into()),
             ],
             &mut badges,
         );

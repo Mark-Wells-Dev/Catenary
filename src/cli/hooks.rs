@@ -325,7 +325,10 @@ pub fn run_session_start(format: HostFormat) {
     };
 
     let session_id = extract_session_id(&hook_json, format);
-    let mut request = serde_json::json!({"method": "session-start/clear-editing"});
+    let mut request = serde_json::json!({
+        "method": "session-start/clear-editing",
+        "format": format.as_str(),
+    });
     if let Some(sid) = session_id {
         request["session_id"] = serde_json::json!(sid);
     }
@@ -376,7 +379,10 @@ pub fn run_session_end(format: HostFormat) {
     };
 
     let session_id = extract_session_id(&hook_json, format);
-    let mut request = serde_json::json!({"method": "session-end/cleanup"});
+    let mut request = serde_json::json!({
+        "method": "session-end/cleanup",
+        "format": format.as_str(),
+    });
     if let Some(sid) = session_id {
         request["session_id"] = serde_json::json!(sid);
     }
@@ -432,6 +438,7 @@ pub fn run_post_agent(format: HostFormat) {
         "method": "post-agent/require-release",
         "agent_id": agent_id,
         "stop_hook_active": stop_hook_active,
+        "format": format.as_str(),
     });
     if let Some(sid) = session_id {
         request["session_id"] = serde_json::json!(sid);
@@ -460,8 +467,6 @@ pub fn run_post_agent(format: HostFormat) {
 ///
 /// Silently succeeds on any error to avoid breaking the host CLI's flow.
 pub fn run_pre_agent(format: HostFormat) {
-    let _ = format; // Reserved for future per-host output formatting.
-
     let Ok(stdin_data) = std::io::read_to_string(std::io::stdin()) else {
         return;
     };
@@ -473,6 +478,7 @@ pub fn run_pre_agent(format: HostFormat) {
     if let Some(stream) = hook_connect(&hook_json) {
         let mut request = serde_json::json!({
             "method": "pre-agent/turn-start",
+            "format": format.as_str(),
             "host_payload": prepare_host_payload(&hook_json),
         });
         if let Some(sid) = extract_session_id(&hook_json, format) {
@@ -586,6 +592,7 @@ pub fn run_pre_tool(format: HostFormat) {
         "method": "pre-tool/editing-state",
         "tool_name": tool_name,
         "agent_id": agent_id,
+        "format": format.as_str(),
     });
     if let Some(path) = &file_path {
         request["file_path"] = serde_json::json!(path);
@@ -740,16 +747,10 @@ fn ipc_check_command(
     let cwd = extract_cwd_str(hook_json, format);
     let session_id = extract_session_id(hook_json, format);
 
-    let format_str = match format {
-        HostFormat::Claude => "claude",
-        HostFormat::Gemini => "gemini",
-        HostFormat::Antigravity => "antigravity",
-    };
-
     let mut request = serde_json::json!({
         "method": "pre-tool/check-command",
         "command": shell_cmd,
-        "format": format_str,
+        "format": format.as_str(),
     });
     if let Some(c) = cwd {
         request["cwd"] = serde_json::json!(c);
@@ -864,6 +865,7 @@ fn handle_start_editing_hook(hook_json: &serde_json::Value, format: HostFormat) 
     let mut request = serde_json::json!({
         "method": "pre-tool/editing-start",
         "agent_id": agent_id,
+        "format": format.as_str(),
     });
     if let Some(sid) = session_id {
         request["session_id"] = serde_json::json!(sid);
@@ -897,6 +899,7 @@ fn handle_done_editing_hook(hook_json: &serde_json::Value, format: HostFormat) {
     let mut request = serde_json::json!({
         "method": "pre-tool/editing-stop",
         "agent_id": agent_id,
+        "format": format.as_str(),
     });
     if let Some(sid) = session_id {
         request["session_id"] = serde_json::json!(sid);
