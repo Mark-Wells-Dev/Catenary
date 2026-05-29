@@ -264,7 +264,7 @@ impl DataSource for SqliteDataSource {
             let mut stmt = self.conn.prepare(
                 "SELECT id, pid, display_name, client_name, client_version, \
                  client_session_id, started_at, alive \
-                 FROM sessions WHERE id != 'daemon' \
+                 FROM sessions WHERE id LIKE 'mcp:%' \
                  ORDER BY alive DESC, started_at DESC",
             )?;
             let mut r = stmt.query([])?;
@@ -328,7 +328,7 @@ impl DataSource for SqliteDataSource {
     fn list_alive_session_ids(&self) -> Result<Vec<String>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id FROM sessions WHERE alive = 1 AND id != 'daemon'")?;
+            .prepare("SELECT id FROM sessions WHERE alive = 1 AND id LIKE 'mcp:%'")?;
         let mut rows = stmt.query([])?;
         let mut ids = Vec::new();
         while let Some(row) = rows.next()? {
@@ -812,11 +812,11 @@ mod tests {
     fn test_sqlite_data_source_list_sessions() -> Result<()> {
         let (_dir, path, conn) = test_db();
         let write_conn = crate::db::open_and_migrate_at(&path)?;
-        insert_session(&write_conn, "ds-list-1", "/tmp/test-ds-list");
+        insert_session(&write_conn, "mcp:5", "/tmp/test-ds-list");
         let ds = SqliteDataSource::with_conn(conn);
 
         let rows = ds.list_sessions()?;
-        assert!(rows.iter().any(|r| r.info.id == "ds-list-1"));
+        assert!(rows.iter().any(|r| r.info.id == "mcp:5"));
 
         Ok(())
     }
@@ -872,14 +872,14 @@ mod tests {
     fn test_sqlite_data_source_active_languages() -> Result<()> {
         let (_dir, path, conn) = test_db();
         let write_conn = crate::db::open_and_migrate_at(&path)?;
-        insert_session(&write_conn, "ds-lang-1", "/tmp/test-ds-lang");
-        insert_test_message(&write_conn, "ds-lang-1");
+        insert_session(&write_conn, "mcp:6", "/tmp/test-ds-lang");
+        insert_test_message(&write_conn, "mcp:6");
 
         let ds = SqliteDataSource::with_conn(conn);
         let rows = ds.list_sessions()?;
         let row = rows
             .iter()
-            .find(|r| r.info.id == "ds-lang-1")
+            .find(|r| r.info.id == "mcp:6")
             .expect("session should exist");
         assert_eq!(
             row.languages,
@@ -1030,47 +1030,56 @@ mod tests {
     fn test_sqlite_list_alive_session_ids() -> Result<()> {
         let (_dir, path, conn) = test_db();
         let write_conn = crate::db::open_and_migrate_at(&path)?;
-        insert_session(&write_conn, "ds-alive-1", "/tmp/test-ds-alive-ids");
+        insert_session(&write_conn, "mcp:7", "/tmp/test-ds-alive-ids");
         let ds = SqliteDataSource::with_conn(conn);
 
         // Session is alive (process is running, PID matches current).
         let ids = ds.list_alive_session_ids()?;
         assert!(
-            ids.contains(&"ds-alive-1".to_string()),
-            "alive session should appear"
+            ids.contains(&"mcp:7".to_string()),
+            "alive MCP session should appear"
         );
 
         Ok(())
     }
 
     #[test]
-    fn test_sqlite_excludes_daemon_session() -> Result<()> {
+    fn test_sqlite_shows_only_mcp_sessions() -> Result<()> {
         let (_dir, path, conn) = test_db();
         let write_conn = crate::db::open_and_migrate_at(&path)?;
         insert_session(&write_conn, "daemon", "/tmp/daemon-workspace");
-        insert_session(&write_conn, "agent-1", "/tmp/agent-workspace");
+        insert_session(&write_conn, "hook-session-1", "/tmp/hook-workspace");
+        insert_session(&write_conn, "mcp:8", "/tmp/mcp-workspace");
         let ds = SqliteDataSource::with_conn(conn);
 
-        // list_alive_session_ids should exclude the daemon meta-session.
+        // list_alive_session_ids should only include MCP connections.
         let ids = ds.list_alive_session_ids()?;
         assert!(
             !ids.contains(&"daemon".to_string()),
             "daemon should be excluded"
         );
         assert!(
-            ids.contains(&"agent-1".to_string()),
-            "agent session should appear"
+            !ids.contains(&"hook-session-1".to_string()),
+            "hook sessions should be excluded"
+        );
+        assert!(
+            ids.contains(&"mcp:8".to_string()),
+            "MCP connection should appear"
         );
 
-        // list_sessions should also exclude the daemon meta-session.
+        // list_sessions should also only include MCP connections.
         let rows = ds.list_sessions()?;
         assert!(
             !rows.iter().any(|r| r.info.id == "daemon"),
             "daemon should not appear in list_sessions"
         );
         assert!(
-            rows.iter().any(|r| r.info.id == "agent-1"),
-            "agent should appear in list_sessions"
+            !rows.iter().any(|r| r.info.id == "hook-session-1"),
+            "hook sessions should not appear in list_sessions"
+        );
+        assert!(
+            rows.iter().any(|r| r.info.id == "mcp:8"),
+            "MCP connection should appear in list_sessions"
         );
 
         Ok(())

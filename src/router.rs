@@ -585,6 +585,10 @@ pub struct SessionManager {
     ipc_socket_path: PathBuf,
     logging: LoggingServer,
     connection_count: Arc<AtomicUsize>,
+    /// Monotonic counter for unique MCP connection IDs. Incremented
+    /// once per accepted connection; never decremented. Used as the
+    /// session key (`mcp:{n}`) to avoid fd-reuse collisions.
+    next_connection_id: Arc<AtomicUsize>,
     /// Session-aware hook dispatch context. `None` in tests that don't
     /// exercise hook routing (passthrough mode).
     hook_ctx: Option<HookDispatchContext>,
@@ -629,6 +633,7 @@ impl SessionManager {
             ipc_socket_path: sockets.ipc_path,
             logging,
             connection_count: Arc::new(AtomicUsize::new(0)),
+            next_connection_id: Arc::new(AtomicUsize::new(0)),
             hook_ctx: None,
             lsp: None,
             root_tracker: None,
@@ -675,6 +680,7 @@ impl SessionManager {
             ipc_socket_path: ipc_path.to_path_buf(),
             logging,
             connection_count: Arc::new(AtomicUsize::new(0)),
+            next_connection_id: Arc::new(AtomicUsize::new(0)),
             hook_ctx: None,
             lsp: None,
             root_tracker: None,
@@ -788,11 +794,47 @@ impl SessionManager {
         let root_tracker = self.root_tracker.clone();
         let db_conn = self.db_conn.clone();
 
+        // Per-connection session key. Monotonic counter avoids
+        // collisions from fd reuse across the daemon's lifetime.
+        // The `mcp:` prefix distinguishes connection sessions from
+        // hook sessions (which remain for internal routing only).
+        let conn_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
+        let session_key = format!("mcp:{conn_id}");
+
+        // Create the per-connection session row before spawning so the
+        // FK constraint (messages.session_id → sessions.id) is
+        // satisfied for events emitted inside the connection span.
+        if let Some(ref conn) = db_conn
+            && let Ok(c) = conn.lock()
+        {
+            let started_at = chrono::Utc::now().to_rfc3339();
+            let _ = c.execute(
+                "INSERT INTO sessions \
+                 (id, pid, display_name, started_at, alive) \
+                 VALUES (?1, ?2, ?3, ?4, 1) \
+                 ON CONFLICT(id) DO UPDATE SET \
+                   alive = 1, \
+                   display_name = excluded.display_name, \
+                   started_at = excluded.started_at, \
+                   ended_at = NULL",
+                rusqlite::params![&session_key, std::process::id(), "", &started_at,],
+            );
+        }
+
+        // Clone DB connection for disconnect cleanup (originals move
+        // into spawn_blocking for callback closures).
+        let db_conn_cleanup = db_conn.clone();
+
         count.fetch_add(1, Ordering::Relaxed);
 
         tokio::spawn(async move {
-            let span = tracing::info_span!("mcp_connection", mcp_fd = fd,);
+            let span = tracing::info_span!(
+                "mcp_connection",
+                mcp_fd = fd,
+                session_id = %session_key,
+            );
             let span_for_blocking = span.clone();
+            let session_key_cleanup = session_key.clone();
             async {
                 let _guard = ConnectionGuard { count, disconnect };
 
@@ -853,8 +895,27 @@ impl SessionManager {
                     match (root_tracker, lsp) {
                         (Some(tracker), Some(cm)) => {
                             let mcp_key = format!("mcp:{fd}");
+                            let db_for_roots = db_conn.clone();
+                            let key_for_roots = session_key.clone();
                             mcp = mcp.on_roots_changed(Box::new(move |roots| {
                                 let paths = parse_root_uris(&roots);
+                                // Update display_name on the per-connection
+                                // session row so the TUI sidebar shows the
+                                // workspace path(s).
+                                if let Some(ref conn) = db_for_roots
+                                    && let Ok(c) = conn.lock()
+                                {
+                                    let display = paths
+                                        .iter()
+                                        .map(|p| p.to_string_lossy().into_owned())
+                                        .collect::<Vec<_>>()
+                                        .join(", ");
+                                    let _ = c.execute(
+                                        "UPDATE sessions SET display_name = ?1 \
+                                         WHERE id = ?2",
+                                        rusqlite::params![&display, &key_for_roots],
+                                    );
+                                }
                                 tracker.set_roots(&mcp_key, paths);
                                 let global = tracker.global_roots();
                                 tokio::runtime::Handle::current()
@@ -863,8 +924,24 @@ impl SessionManager {
                             }));
                         }
                         (None, Some(cm)) => {
+                            let db_for_roots = db_conn.clone();
+                            let key_for_roots = session_key.clone();
                             mcp = mcp.on_roots_changed(Box::new(move |roots| {
                                 let paths = parse_root_uris(&roots);
+                                if let Some(ref conn) = db_for_roots
+                                    && let Ok(c) = conn.lock()
+                                {
+                                    let display = paths
+                                        .iter()
+                                        .map(|p| p.to_string_lossy().into_owned())
+                                        .collect::<Vec<_>>()
+                                        .join(", ");
+                                    let _ = c.execute(
+                                        "UPDATE sessions SET display_name = ?1 \
+                                         WHERE id = ?2",
+                                        rusqlite::params![&display, &key_for_roots],
+                                    );
+                                }
                                 tokio::runtime::Handle::current().block_on(cm.sync_roots(paths))?;
                                 Ok(())
                             }));
@@ -873,12 +950,13 @@ impl SessionManager {
                     }
 
                     if let Some(conn) = db_conn {
+                        let key = session_key;
                         mcp = mcp.on_client_info(Box::new(move |name: &str, version: &str| {
                             if let Ok(c) = conn.lock() {
                                 let _ = c.execute(
                                     "UPDATE sessions SET client_name = ?1, \
-                                     client_version = ?2 WHERE id = 'daemon'",
-                                    rusqlite::params![name, version],
+                                     client_version = ?2 WHERE id = ?3",
+                                    rusqlite::params![name, version, &key],
                                 );
                             }
                         }));
@@ -905,11 +983,20 @@ impl SessionManager {
 
                 // ── Disconnect cleanup ────────────────────────────
                 //
-                // Remove this connection's roots from the tracker and
-                // sync the reduced root set to LSP servers. Session
-                // cleanup (editing guardrail, notification router,
-                // session registry) is handled by the SessionEnd hook
-                // in `handle_hook_dispatch`.
+                // Mark the per-connection session dead so the TUI
+                // drops it from the sidebar. Remove roots from the
+                // tracker and sync the reduced root set to LSP servers.
+                if let Some(ref conn) = db_conn_cleanup
+                    && let Ok(c) = conn.lock()
+                {
+                    let ended_at = chrono::Utc::now().to_rfc3339();
+                    let _ = c.execute(
+                        "UPDATE sessions SET alive = 0, ended_at = ?1 \
+                         WHERE id = ?2",
+                        rusqlite::params![&ended_at, &session_key_cleanup],
+                    );
+                }
+
                 if let Some(ref tracker) = tracker_cleanup {
                     let mcp_key = format!("mcp:{fd}");
                     tracker.remove_contributor(&mcp_key);

@@ -720,7 +720,7 @@ impl ServerProcess {
         let output = Command::new(env!("CARGO_BIN_EXE_catenary"))
             .args(["debug", "query"])
             .arg("--sql")
-            .arg("SELECT id FROM sessions LIMIT 1")
+            .arg("SELECT id FROM sessions WHERE id LIKE 'mcp:%' LIMIT 1")
             .arg("--format")
             .arg("json")
             .env("CATENARY_STATE_DIR", self.state_dir.path())

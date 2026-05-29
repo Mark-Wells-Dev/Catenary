@@ -151,9 +151,9 @@ fn run_with_data_and_watcher(
 }
 
 /// Tab label names for the left-column stack.
-const LEFT_TAB_NAMES: &[&str] = &["Sessions", "Servers", "Keybinds"];
+const LEFT_TAB_NAMES: &[&str] = &["Connections", "Servers", "Keybinds"];
 /// Tab label names for the full-width stack (includes Messages).
-const FULL_TAB_NAMES: &[&str] = &["Sessions", "Servers", "Keybinds", "Messages"];
+const FULL_TAB_NAMES: &[&str] = &["Connections", "Servers", "Keybinds", "Messages"];
 
 /// Stored panel rectangles and hit maps for mouse dispatch.
 struct PanelLayout {
@@ -749,7 +749,7 @@ fn render_sessions_panel(
     borders: Borders,
 ) {
     let focused = app.focus == FocusRegion::Sessions;
-    let block = panel_block(" Sessions ", focused, app.theme, borders);
+    let block = panel_block(" Connections ", focused, app.theme, borders);
     let inner = block.inner(panel_rect);
     block.render(panel_rect, buf);
     layout.session_hits = render_sessions(&app.sidebar, inner, buf, app.theme, focused);

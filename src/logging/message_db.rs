@@ -109,13 +109,18 @@ impl Sink for MessageDbSink {
             }
         };
 
+        // Prefer per-connection session_id from span context (e.g., MCP
+        // connections set session_id = "mcp:{fd}"). Fall back to the
+        // daemon's instance_id for events without span-level identity.
+        let session_id = event.session_id.as_deref().unwrap_or(&self.instance_id);
+
         let insert_result = conn.execute(
             "INSERT INTO messages \
              (session_id, timestamp, type, level, method, server, client, \
               parent_id, scope_root, payload) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             rusqlite::params![
-                &*self.instance_id,
+                session_id,
                 timestamp,
                 type_val,
                 level_val,
