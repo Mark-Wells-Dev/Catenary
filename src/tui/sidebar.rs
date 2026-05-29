@@ -271,7 +271,8 @@ impl SidebarState {
     #[must_use]
     pub fn is_server_selected(&self, name: &str, scope_root: &str) -> bool {
         self.selected_servers
-            .contains(&(name.to_string(), scope_root.to_string()))
+            .iter()
+            .any(|(n, r)| n == name && r == scope_root)
     }
 
     // ── Server list refresh ─────────────────────────────────────────

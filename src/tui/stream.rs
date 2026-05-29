@@ -332,15 +332,20 @@ impl StreamState {
             // Apply server filter: scope must have LSP children involving
             // a selected (server, scope_root) pair. Scopes with no matching
             // LSP children (including hook-only scopes) are hidden.
+            // Linear scan — the selected set is tiny (1-5 entries).
             if let Some(ref server_set) = self.server_filter {
                 let matches = match entry {
                     StreamEntry::Scope(scope) => scope.children.iter().any(|c| {
                         c.r#type == "lsp"
-                            && server_set.contains(&(c.server.clone(), c.scope_root.clone()))
+                            && server_set
+                                .iter()
+                                .any(|(n, r)| n == &c.server && r == &c.scope_root)
                     }),
                     StreamEntry::Standalone(msg) => {
                         msg.r#type == "lsp"
-                            && server_set.contains(&(msg.server.clone(), msg.scope_root.clone()))
+                            && server_set
+                                .iter()
+                                .any(|(n, r)| n == &msg.server && r == &msg.scope_root)
                     }
                 };
                 if !matches {

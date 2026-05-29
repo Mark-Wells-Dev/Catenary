@@ -760,14 +760,16 @@ impl LspClientManager {
             server_def.env.as_ref(),
         )?;
 
+        // Set scope before initialize so the reader loop has it for
+        // all protocol messages, including the init exchange itself.
+        client.server().set_scope(Scope::Root(root.to_path_buf()));
+
         client
             .initialize(
                 &[root.to_path_buf()],
                 server_def.initialization_options.clone(),
             )
             .await?;
-
-        client.server().set_scope(Scope::Root(root.to_path_buf()));
 
         if let Some((conn, session_id)) = &self.db {
             client.server().set_db(conn.clone(), session_id.clone());
@@ -865,6 +867,10 @@ impl LspClientManager {
             server_def.env.as_ref(),
         )?;
 
+        // Set scope before initialize so the reader loop has it for
+        // all protocol messages, including the init exchange itself.
+        client.server().set_scope(Scope::SingleFile);
+
         // Initialize with null workspace (single-file mode per LSP spec).
         if let Err(e) = client
             .initialize(&[], server_def.initialization_options.clone())
@@ -882,8 +888,6 @@ impl LspClientManager {
                 .insert((lang.to_string(), server_name.to_string()));
             return Err(e);
         }
-
-        client.server().set_scope(Scope::SingleFile);
 
         if let Some((conn, session_id)) = &self.db {
             client.server().set_db(conn.clone(), session_id.clone());

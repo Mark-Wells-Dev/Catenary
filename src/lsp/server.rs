@@ -113,8 +113,8 @@ impl LspServer {
     /// Creates a new `LspServer` with default state.
     ///
     /// `language_id` and `server_name` are known at spawn time and never
-    /// change. The routing scope is set later via [`Self::set_scope`]
-    /// after the `initialize` handshake reveals server capabilities.
+    /// change. The routing scope is set via [`Self::set_scope`] before
+    /// `initialize` so protocol messages carry `scope_root` from the start.
     ///
     /// Call [`Self::set_capabilities`] after the `initialize` handshake
     /// to populate capability fields.
@@ -190,7 +190,8 @@ impl LspServer {
         self.scope.get()
     }
 
-    /// Sets the routing scope. Called once after `initialize`.
+    /// Sets the routing scope. Called once before `initialize` so the
+    /// reader loop has it for all protocol messages.
     ///
     /// Subsequent calls are no-ops (the `OnceLock` ignores them).
     pub fn set_scope(&self, scope: Scope) {
