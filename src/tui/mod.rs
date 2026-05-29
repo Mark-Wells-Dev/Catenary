@@ -204,8 +204,14 @@ fn handle_key(app: &mut App<'_>, code: KeyCode, viewport_height: usize, detail_h
         KeyCode::Char('q') => app.quit = true,
         KeyCode::Char('?') => app.toggle_keybinds(),
         KeyCode::Char('b') => app.cycle_left_tab(),
-        KeyCode::Tab => app.cycle_focus(),
-        KeyCode::BackTab => app.cycle_focus_back(),
+        KeyCode::Tab => {
+            app.stream.exit_visual();
+            app.cycle_focus();
+        }
+        KeyCode::BackTab => {
+            app.stream.exit_visual();
+            app.cycle_focus_back();
+        }
         _ => match app.focus {
             FocusRegion::Sessions => {
                 let visible = viewport_height.saturating_sub(1);
@@ -272,13 +278,28 @@ fn handle_stream_key(app: &mut App<'_>, code: KeyCode, viewport_height: usize) {
         KeyCode::Char('k') | KeyCode::Up => {
             app.stream.cursor_up(1);
         }
-        KeyCode::Enter => {
+        KeyCode::Enter if !app.stream.in_visual() => {
             app.stream.toggle_expansion();
+        }
+        KeyCode::Char('v') => {
+            if app.stream.in_visual() {
+                app.stream.exit_visual();
+            } else {
+                app.stream.start_visual();
+            }
+        }
+        KeyCode::Esc => {
+            if app.stream.in_visual() {
+                app.stream.exit_visual();
+            } else {
+                app.stream.clear_search();
+            }
         }
         KeyCode::Char('y') => {
             if let Some(text) = app.stream.yank_text(app.icons) {
                 osc52_copy(&text);
             }
+            app.stream.exit_visual();
         }
         KeyCode::Char('/') => {
             app.search_active = true;
@@ -301,9 +322,6 @@ fn handle_stream_key(app: &mut App<'_>, code: KeyCode, viewport_height: usize) {
         }
         KeyCode::End => {
             app.stream.pin_to_bottom(viewport_height);
-        }
-        KeyCode::Esc => {
-            app.stream.clear_search();
         }
         _ => {}
     }
@@ -395,7 +413,8 @@ fn base64_encode(input: &[u8]) -> String {
 /// Handle a mouse event, dispatching to the correct panel based on position.
 #[allow(
     clippy::cast_possible_truncation,
-    reason = "terminal coordinates are always small"
+    clippy::too_many_lines,
+    reason = "terminal coordinates are always small; mouse dispatch covers many panel regions"
 )]
 fn handle_mouse(
     app: &mut App<'_>,
@@ -496,18 +515,21 @@ fn handle_mouse(
                 let clicked = clicked.min(layout.tab_count - 1);
                 app.set_left_tab(clicked);
             } else if in_sessions {
+                app.stream.exit_visual();
                 app.focus = FocusRegion::Sessions;
                 if let Some(&(_, idx)) = layout.session_hits.iter().find(|(r, _)| *r == row) {
                     app.sidebar.cursor = idx;
                     app.toggle_session_selection();
                 }
             } else if in_servers {
+                app.stream.exit_visual();
                 app.focus = FocusRegion::Servers;
                 if let Some(&(_, idx)) = layout.server_hits.iter().find(|(r, _)| *r == row) {
                     app.sidebar.server_cursor = idx;
                     app.toggle_server_selection();
                 }
             } else if in_keybinds {
+                app.stream.exit_visual();
                 // In quadrant mode, clicking collapsed keybinds expands it.
                 if app.effective == EffectiveLayout::Quadrant && !app.keybinds_expanded {
                     app.keybinds_expanded = true;
@@ -515,11 +537,15 @@ fn handle_mouse(
                 app.focus = FocusRegion::Keybinds;
             } else if in_stream {
                 app.focus = FocusRegion::Stream;
-                let stream_row = app.stream.scroll_position + row as usize;
-                if stream_row < app.stream.display_rows.len() {
-                    app.stream.cursor = stream_row;
-                    app.stream.auto_scroll = false;
-                    app.stream.toggle_expansion();
+                if app.stream.in_visual() {
+                    app.stream.exit_visual();
+                } else {
+                    let stream_row = app.stream.scroll_position + row as usize;
+                    if stream_row < app.stream.display_rows.len() {
+                        app.stream.cursor = stream_row;
+                        app.stream.auto_scroll = false;
+                        app.stream.toggle_expansion();
+                    }
                 }
             }
         }
@@ -683,7 +709,12 @@ fn render_messages_panel(
     layout: &mut PanelLayout,
 ) -> Option<(u16, u16)> {
     let focused = app.focus == FocusRegion::Stream;
-    let block = panel_block(" Messages ", focused, app.theme);
+    let title = if app.stream.in_visual() {
+        " Messages  VISUAL "
+    } else {
+        " Messages "
+    };
+    let block = panel_block(title, focused, app.theme);
     let inner = block.inner(panel_rect);
     block.render(panel_rect, buf);
 

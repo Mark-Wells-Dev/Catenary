@@ -32,7 +32,9 @@ const SIDEBAR_BINDS: &[(&str, &str)] = &[
 const STREAM_BINDS: &[(&str, &str)] = &[
     ("j/k", "navigate"),
     ("Enter", "expand/collapse"),
+    ("v", "visual select"),
     ("y", "yank"),
+    ("Esc", "cancel select"),
     ("/", "search"),
     ("n/N", "next/prev match"),
     ("PgUp/Dn", "scroll"),

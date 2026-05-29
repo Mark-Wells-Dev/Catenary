@@ -255,6 +255,10 @@ pub struct StreamState {
     scope_map: HashMap<String, usize>,
     /// Entry indices of expanded standalone internal messages.
     expanded_standalones: HashSet<usize>,
+    /// Visual selection anchor (display row index). When `Some`, the
+    /// selection spans from `visual_anchor` to `cursor` (inclusive).
+    /// `None` means no visual selection is active.
+    visual_anchor: Option<usize>,
 
     // ── Filtering state ──────────────────────────────────────────────
     /// Active session filter. `None` = show all. `Some(set)` = show only
@@ -305,6 +309,7 @@ impl StreamState {
             badges: HexBadgeMap::new(),
             scope_map: HashMap::new(),
             expanded_standalones: HashSet::new(),
+            visual_anchor: None,
             session_filter: None,
             server_filter: None,
             gap_offset: None,
@@ -438,9 +443,10 @@ impl StreamState {
     pub fn cursor_down(&mut self, n: usize, viewport_height: usize) {
         let max = self.row_count().saturating_sub(1);
         self.cursor = (self.cursor + n).min(max);
-        // Re-enable auto-scroll if cursor reached the bottom.
+        // Re-enable auto-scroll if cursor reached the bottom (but not
+        // during visual selection — the cursor should stay put).
         let content_max = self.row_count().saturating_sub(viewport_height);
-        if self.cursor >= self.row_count().saturating_sub(1) {
+        if self.cursor >= self.row_count().saturating_sub(1) && self.visual_anchor.is_none() {
             self.auto_scroll = true;
         }
         // Scroll viewport to keep cursor visible.
@@ -466,8 +472,9 @@ impl StreamState {
     pub fn scroll_down(&mut self, n: usize, viewport_height: usize) {
         let max = self.row_count().saturating_sub(viewport_height);
         self.scroll_position = (self.scroll_position + n).min(max);
-        // Re-enable auto-scroll if we've reached the bottom.
-        if self.scroll_position >= max {
+        // Re-enable auto-scroll if we've reached the bottom (but not
+        // during visual selection).
+        if self.scroll_position >= max && self.visual_anchor.is_none() {
             self.auto_scroll = true;
         }
         // Keep cursor in viewport.
@@ -489,8 +496,10 @@ impl StreamState {
     /// Update scroll position if auto-scroll is active.
     ///
     /// Call this before rendering so the draw function is read-only.
+    /// Suppressed during visual selection to prevent the cursor from
+    /// drifting to newly appended rows.
     pub const fn apply_auto_scroll(&mut self, viewport_height: usize) {
-        if self.auto_scroll {
+        if self.auto_scroll && self.visual_anchor.is_none() {
             self.scroll_position = self.row_count().saturating_sub(viewport_height);
             self.cursor = self.row_count().saturating_sub(1);
         }
@@ -531,13 +540,61 @@ impl StreamState {
         }
     }
 
-    /// Get plain-text content for the display row at the cursor position.
+    // ── Visual selection ───────────────────────────────────────────
+
+    /// Enter visual selection mode, anchoring at the current cursor.
+    pub const fn start_visual(&mut self) {
+        self.visual_anchor = Some(self.cursor);
+    }
+
+    /// Exit visual selection mode.
+    pub const fn exit_visual(&mut self) {
+        self.visual_anchor = None;
+    }
+
+    /// Whether visual selection mode is active.
+    #[must_use]
+    pub const fn in_visual(&self) -> bool {
+        self.visual_anchor.is_some()
+    }
+
+    /// Return the inclusive display-row range of the visual selection.
     ///
-    /// Used by the yank keybinding to copy content to the clipboard.
+    /// Returns `(start, end)` where `start <= end`. Returns `None` when
+    /// visual mode is inactive.
+    #[must_use]
+    pub const fn visual_range(&self) -> Option<(usize, usize)> {
+        let Some(anchor) = self.visual_anchor else {
+            return None;
+        };
+        if anchor <= self.cursor {
+            Some((anchor, self.cursor))
+        } else {
+            Some((self.cursor, anchor))
+        }
+    }
+
+    // ── Yank ────────────────────────────────────────────────────────
+
+    /// Get plain-text content for the current yank target.
+    ///
+    /// In visual mode, returns all rows in the selection range joined
+    /// by newlines. Otherwise returns the single row at the cursor.
     /// Returns `None` if the cursor is out of range.
     #[must_use]
     pub fn yank_text(&self, icons: &super::icons::IconSet) -> Option<String> {
-        self.row_plain_text(self.cursor, icons)
+        if let Some((start, end)) = self.visual_range() {
+            let lines: Vec<String> = (start..=end)
+                .filter_map(|i| self.row_plain_text(i, icons))
+                .collect();
+            if lines.is_empty() {
+                None
+            } else {
+                Some(lines.join("\n"))
+            }
+        } else {
+            self.row_plain_text(self.cursor, icons)
+        }
     }
 
     /// Return [`ScrollMetrics`] for the scrollbar.
@@ -998,10 +1055,11 @@ impl StreamState {
     /// Check whether the cursor is near a paging boundary.
     ///
     /// Returns `Some(PageRequest)` if the caller should fetch more
-    /// data, or `None` if no prefetch is needed.
+    /// data, or `None` if no prefetch is needed. Suppressed during
+    /// visual selection to prevent content shifts under the selection.
     #[must_use]
     pub fn check_paging(&self) -> Option<PageRequest> {
-        if self.display_rows.is_empty() {
+        if self.display_rows.is_empty() || self.visual_anchor.is_some() {
             return None;
         }
 
@@ -1082,6 +1140,9 @@ pub fn render_stream(
         height: area.height,
     };
 
+    // Visual selection range (inclusive), if active.
+    let visual = state.visual_range();
+
     // Render visible display rows.
     for row in 0..viewport_height {
         let row_idx = state.scroll_position + row;
@@ -1104,15 +1165,18 @@ pub fn render_stream(
             }
         }
 
-        // Highlight cursor row.
-        if row_idx == state.cursor {
+        // Highlight: cursor row, or any row in the visual selection range.
+        let highlighted = if let Some((start, end)) = visual {
+            row_idx >= start && row_idx <= end
+        } else {
+            row_idx == state.cursor
+        };
+        if highlighted {
             for x in area.x..area.x + content_width {
                 let cell = &mut buf[(x, y)];
-                // Merge selection background without overwriting foreground.
                 if let Some(bg) = theme.selection.bg {
                     cell.set_bg(bg);
                 } else {
-                    // Fallback: use REVERSED modifier.
                     cell.modifier |= ratatui::style::Modifier::REVERSED;
                 }
             }
@@ -2811,5 +2875,175 @@ mod tests {
         // No search active — append should not set dirty.
         state.append(vec![make_message("s1", "workspace/symbol")]);
         assert!(!state.search_dirty, "no query means no dirty flag");
+    }
+
+    // ── Visual selection tests ──────────────────────────────────────
+
+    #[test]
+    fn test_visual_mode_lifecycle() {
+        let state = StreamState::new(vec![
+            make_message("s1", "initialize"),
+            make_message("s1", "shutdown"),
+        ]);
+        assert!(!state.in_visual());
+        assert!(state.visual_range().is_none());
+    }
+
+    #[test]
+    fn test_visual_start_sets_anchor() {
+        let mut state = StreamState::new(vec![
+            make_message("s1", "initialize"),
+            make_message("s1", "shutdown"),
+        ]);
+        state.cursor = 0;
+        state.start_visual();
+        assert!(state.in_visual());
+        assert_eq!(state.visual_range(), Some((0, 0)));
+    }
+
+    #[test]
+    fn test_visual_range_expands_with_cursor() {
+        let mut state = StreamState::new(vec![
+            make_message("s1", "a"),
+            make_message("s1", "b"),
+            make_message("s1", "c"),
+        ]);
+        state.cursor = 0;
+        state.start_visual();
+        state.cursor_down(2, 100);
+        assert_eq!(state.visual_range(), Some((0, 2)));
+    }
+
+    #[test]
+    fn test_visual_range_cursor_above_anchor() {
+        let mut state = StreamState::new(vec![
+            make_message("s1", "a"),
+            make_message("s1", "b"),
+            make_message("s1", "c"),
+        ]);
+        state.cursor = 2;
+        state.start_visual();
+        state.cursor_up(2);
+        assert_eq!(state.visual_range(), Some((0, 2)));
+    }
+
+    #[test]
+    fn test_visual_exit_clears_anchor() {
+        let mut state = StreamState::new(vec![make_message("s1", "a")]);
+        state.start_visual();
+        assert!(state.in_visual());
+        state.exit_visual();
+        assert!(!state.in_visual());
+        assert!(state.visual_range().is_none());
+    }
+
+    #[test]
+    fn test_visual_yank_multiple_rows() {
+        let icons = icons();
+        let mut state = StreamState::new(vec![
+            make_message("s1", "initialize"),
+            make_message("s1", "shutdown"),
+            make_message("s1", "exit"),
+        ]);
+        state.cursor = 0;
+        state.start_visual();
+        state.cursor_down(2, 100);
+
+        let text = state.yank_text(&icons).expect("should yank visual range");
+        assert_eq!(text.lines().count(), 3, "should yank 3 lines, got: {text}");
+    }
+
+    #[test]
+    fn test_visual_yank_single_row_without_visual() {
+        let icons = icons();
+        let mut state = StreamState::new(vec![
+            make_message("s1", "initialize"),
+            make_message("s1", "shutdown"),
+        ]);
+        state.cursor = 0;
+
+        let text = state.yank_text(&icons).expect("should yank single row");
+        assert_eq!(
+            text.lines().count(),
+            1,
+            "without visual: single line, got: {text}"
+        );
+    }
+
+    #[test]
+    fn test_visual_yank_expanded_scope_children() {
+        let icons = icons();
+        let messages = vec![
+            mcp_request("s1", 1, "grep"),
+            lsp_child("s1", 1, "workspace/symbol"),
+            lsp_child("s1", 1, "textDocument/references"),
+            mcp_response("s1", 1),
+        ];
+        let mut state = StreamState::new(messages);
+        state.toggle_expansion();
+        assert_eq!(state.display_rows.len(), 3, "header + 2 children");
+
+        state.cursor = 0;
+        state.start_visual();
+        state.cursor_down(2, 100);
+
+        let text = state.yank_text(&icons).expect("should yank scope rows");
+        assert_eq!(
+            text.lines().count(),
+            3,
+            "should yank header + 2 children, got: {text}"
+        );
+    }
+
+    #[test]
+    fn test_visual_suppresses_paging() {
+        let mut state = StreamState::new(vec![
+            make_message("s1", "a"),
+            make_message("s1", "b"),
+        ]);
+        state.reached_beginning = false;
+        state.cursor = 0;
+
+        assert!(state.check_paging().is_some());
+
+        state.start_visual();
+        assert!(state.check_paging().is_none());
+    }
+
+    #[test]
+    fn test_visual_suppresses_auto_scroll() {
+        let mut state = StreamState::new(vec![
+            make_message("s1", "a"),
+            make_message("s1", "b"),
+            make_message("s1", "c"),
+        ]);
+        state.auto_scroll = true;
+        state.start_visual();
+
+        state.cursor = 0;
+        state.scroll_position = 0;
+        state.apply_auto_scroll(2);
+        assert_eq!(state.cursor, 0, "cursor should not move during visual");
+        assert_eq!(
+            state.scroll_position, 0,
+            "scroll should not move during visual"
+        );
+    }
+
+    #[test]
+    fn test_visual_cursor_down_does_not_reenable_auto_scroll() {
+        let mut state = StreamState::new(vec![
+            make_message("s1", "a"),
+            make_message("s1", "b"),
+        ]);
+        state.auto_scroll = false;
+        state.cursor = 0;
+        state.start_visual();
+
+        state.cursor_down(1, 100);
+        assert!(
+            !state.auto_scroll,
+            "auto_scroll should stay off during visual"
+        );
     }
 }
