@@ -67,27 +67,6 @@ pub trait DataSource {
     /// Returns an error if session data cannot be read.
     fn list_sessions(&self) -> Result<Vec<SessionRow>>;
 
-    /// Load all historical messages for a session (info level and above).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the session does not exist or messages cannot be read.
-    fn monitor_messages(&self, session_id: &str) -> Result<Vec<SessionMessage>>;
-
-    /// Create a tail reader for new messages (from current position onward).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the session does not exist or the tail cannot be created.
-    fn create_message_tail(&self, session_id: &str) -> Result<Box<dyn MessageTail>>;
-
-    /// Delete a dead session's data.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the session data cannot be removed.
-    fn delete_session(&self, session_id: &str) -> Result<()>;
-
     /// List IDs of sessions marked alive in the database.
     ///
     /// This is a lightweight query (no PID checks, no joins) suitable for
@@ -97,13 +76,6 @@ pub trait DataSource {
     ///
     /// Returns an error if the query fails.
     fn list_alive_session_ids(&self) -> Result<Vec<String>>;
-
-    /// Load all historical messages across all sessions (info level and above).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the database cannot be queried.
-    fn monitor_all_messages(&self) -> Result<Vec<SessionMessage>>;
 
     /// Create a tail reader for new messages across all sessions.
     ///
@@ -331,26 +303,6 @@ impl DataSource for SqliteDataSource {
         Ok(sessions)
     }
 
-    fn monitor_messages(&self, session_id: &str) -> Result<Vec<SessionMessage>> {
-        session::monitor_messages_with_conn(&self.conn, session_id, false)
-    }
-
-    fn create_message_tail(&self, session_id: &str) -> Result<Box<dyn MessageTail>> {
-        let tail = session::tail_messages_new(session_id, false)?;
-        Ok(Box::new(tail))
-    }
-
-    fn delete_session(&self, session_id: &str) -> Result<()> {
-        self.conn
-            .execute("DELETE FROM sessions WHERE id = ?1", [session_id])?;
-
-        // Clean up socket directory if it exists.
-        let socket_dir = session::sessions_dir().join(session_id);
-        let _ = std::fs::remove_dir_all(&socket_dir);
-
-        Ok(())
-    }
-
     fn list_alive_session_ids(&self) -> Result<Vec<String>> {
         let mut stmt = self
             .conn
@@ -361,10 +313,6 @@ impl DataSource for SqliteDataSource {
             ids.push(row.get(0)?);
         }
         Ok(ids)
-    }
-
-    fn monitor_all_messages(&self) -> Result<Vec<SessionMessage>> {
-        session::monitor_all_messages_with_conn(&self.conn, false)
     }
 
     fn create_all_message_tail(&self) -> Result<Box<dyn MessageTail>> {
@@ -506,35 +454,6 @@ impl DataSource for MockDataSource {
         Ok(rows)
     }
 
-    fn monitor_messages(&self, session_id: &str) -> Result<Vec<SessionMessage>> {
-        let messages = self
-            .messages
-            .get(session_id)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("Session not found: {session_id}"))?;
-        Ok(messages
-            .into_iter()
-            .filter(|m| m.level != "debug")
-            .collect())
-    }
-
-    fn create_message_tail(&self, session_id: &str) -> Result<Box<dyn MessageTail>> {
-        let messages = self
-            .tail_messages
-            .get(session_id)
-            .cloned()
-            .unwrap_or_default();
-        let filtered = messages
-            .into_iter()
-            .filter(|m| m.level != "debug")
-            .collect();
-        Ok(Box::new(MockMessageTail { messages: filtered }))
-    }
-
-    fn delete_session(&self, _session_id: &str) -> Result<()> {
-        Ok(())
-    }
-
     fn list_alive_session_ids(&self) -> Result<Vec<String>> {
         Ok(self
             .sessions
@@ -542,13 +461,6 @@ impl DataSource for MockDataSource {
             .filter(|r| r.alive)
             .map(|r| r.info.id.clone())
             .collect())
-    }
-
-    fn monitor_all_messages(&self) -> Result<Vec<SessionMessage>> {
-        let mut all: Vec<SessionMessage> = self.messages.values().flatten().cloned().collect();
-        all.retain(|m| m.level != "debug");
-        all.sort_by_key(|m| m.id);
-        Ok(all)
     }
 
     fn create_all_message_tail(&self) -> Result<Box<dyn MessageTail>> {
@@ -791,32 +703,6 @@ mod tests {
     }
 
     #[test]
-    fn test_mock_data_source_monitor_messages() -> Result<()> {
-        let messages = vec![
-            make_message("initialize"),
-            make_message("textDocument/hover"),
-            make_message("textDocument/definition"),
-        ];
-        let mut messages_map = HashMap::new();
-        messages_map.insert("abc".to_string(), messages);
-
-        let ds = MockDataSource {
-            sessions: vec![],
-            messages: messages_map,
-            tail_messages: HashMap::new(),
-            server_statuses: Vec::new(),
-            server_noise: Vec::new(),
-        };
-
-        let result = ds.monitor_messages("abc")?;
-        assert_eq!(result.len(), 3);
-
-        let err = ds.monitor_messages("nonexistent");
-        assert!(err.is_err());
-        Ok(())
-    }
-
-    #[test]
     fn test_mock_message_tail_drains() -> Result<()> {
         let mut messages = VecDeque::new();
         messages.push_back(make_message("initialize"));
@@ -852,7 +738,6 @@ mod tests {
         let rows = ds.list_sessions()?;
         assert!(rows.iter().any(|r| r.info.id == "ds-list-1"));
 
-        ds.delete_session("ds-list-1")?;
         Ok(())
     }
 
@@ -867,77 +752,6 @@ mod tests {
             rusqlite::params![session_id, "2026-01-01T00:00:00.000Z"],
         )
         .expect("insert test message");
-    }
-
-    #[test]
-    fn test_sqlite_data_source_monitor_messages() -> Result<()> {
-        let (_dir, path, conn) = test_db();
-        let ds = SqliteDataSource::with_conn(conn);
-
-        let write_conn = crate::db::open_and_migrate_at(&path)?;
-        insert_session(&write_conn, "ds-msg-1", "/tmp/test-ds-messages");
-        insert_test_message(&write_conn, "ds-msg-1");
-
-        let messages = ds.monitor_messages("ds-msg-1")?;
-        assert!(!messages.is_empty(), "should have at least one message");
-
-        ds.delete_session("ds-msg-1")?;
-        Ok(())
-    }
-
-    #[test]
-    fn test_sqlite_message_tail_streams() -> Result<()> {
-        let (_dir, path, conn) = test_db();
-
-        let write_conn = crate::db::open_and_migrate_at(&path)?;
-        insert_session(&write_conn, "ds-tail-1", "/tmp/test-ds-tail");
-
-        // Open a fresh connection for the tail (it takes ownership).
-        let tail_conn = crate::db::open_at(&path)?;
-        let mut tail: Box<dyn MessageTail> = Box::new(crate::session::tail_messages_new_with_conn(
-            tail_conn,
-            "ds-tail-1",
-            true,
-        )?);
-
-        // No new messages since tail was created after any existing messages
-        // (tail_messages_new starts from the current end).
-        assert!(
-            tail.try_next_message()?.is_none(),
-            "should have no messages initially"
-        );
-
-        // Insert a new message directly.
-        insert_test_message(&write_conn, "ds-tail-1");
-
-        let msg = tail.try_next_message()?;
-        assert!(msg.is_some(), "should see newly inserted message");
-
-        // No more messages.
-        assert!(tail.try_next_message()?.is_none());
-
-        conn.execute("DELETE FROM sessions WHERE id = ?1", ["ds-tail-1"])?;
-        Ok(())
-    }
-
-    #[test]
-    fn test_sqlite_data_source_delete_session() -> Result<()> {
-        let (_dir, path, conn) = test_db();
-        let ds = SqliteDataSource::with_conn(conn);
-
-        let write_conn = crate::db::open_and_migrate_at(&path)?;
-        insert_session(&write_conn, "ds-del-1", "/tmp/test-ds-delete");
-
-        // Should exist
-        assert!(ds.list_sessions()?.iter().any(|r| r.info.id == "ds-del-1"));
-
-        // Delete
-        ds.delete_session("ds-del-1")?;
-
-        // Should be gone
-        assert!(!ds.list_sessions()?.iter().any(|r| r.info.id == "ds-del-1"));
-
-        Ok(())
     }
 
     #[test]
@@ -993,7 +807,6 @@ mod tests {
             "active_languages_for should return the server from LSP messages"
         );
 
-        ds.delete_session("ds-lang-1")?;
         Ok(())
     }
 
@@ -1069,41 +882,6 @@ mod tests {
     }
 
     #[test]
-    fn test_mock_create_message_tail_filters_debug() -> Result<()> {
-        let mut tail_messages = VecDeque::new();
-        let mut debug_msg = make_message("textDocument/hover");
-        debug_msg.level = "debug".to_string();
-        let info_msg = make_message("textDocument/definition");
-        tail_messages.push_back(debug_msg);
-        tail_messages.push_back(info_msg);
-
-        let mut map = HashMap::new();
-        map.insert("sess-1".to_string(), tail_messages);
-
-        let ds = MockDataSource {
-            sessions: vec![],
-            messages: HashMap::new(),
-            tail_messages: map,
-            server_statuses: Vec::new(),
-            server_noise: Vec::new(),
-        };
-
-        let mut tail = ds.create_message_tail("sess-1")?;
-        let first = tail.try_next_message()?;
-        assert!(first.is_some(), "should have one non-debug message");
-        let msg = first.expect("checked above");
-        assert_eq!(
-            msg.method, "textDocument/definition",
-            "non-debug message should be the one returned"
-        );
-
-        let second = tail.try_next_message()?;
-        assert!(second.is_none(), "debug message should have been filtered");
-
-        Ok(())
-    }
-
-    #[test]
     fn test_sqlite_list_alive_session_ids() -> Result<()> {
         let (_dir, path, conn) = test_db();
         let write_conn = crate::db::open_and_migrate_at(&path)?;
@@ -1117,7 +895,6 @@ mod tests {
             "alive session should appear"
         );
 
-        ds.delete_session("ds-alive-1")?;
         Ok(())
     }
 
@@ -1292,7 +1069,6 @@ mod tests {
         // Scope uuid-a should not be included.
         assert!(!ids.contains(&1), "should not include scope-a: {ids:?}");
 
-        ds.delete_session("sp-1")?;
         Ok(())
     }
 
@@ -1315,7 +1091,6 @@ mod tests {
         assert!(ids.contains(&2), "should include scope-a child: {ids:?}");
         assert!(!ids.contains(&3), "should not include scope-b: {ids:?}");
 
-        ds.delete_session("sp-2")?;
         Ok(())
     }
 
@@ -1335,7 +1110,6 @@ mod tests {
         let ids: Vec<i64> = msgs.iter().map(|m| m.id).collect();
         assert_eq!(ids, vec![1], "should return only scope-a: {ids:?}");
 
-        ds.delete_session("sp-3")?;
         Ok(())
     }
 
@@ -1358,7 +1132,6 @@ mod tests {
         assert!(!ids.contains(&1), "should not include scope-a: {ids:?}");
         assert!(!ids.contains(&5), "should not include scope-c: {ids:?}");
 
-        ds.delete_session("sp-4")?;
         Ok(())
     }
 }

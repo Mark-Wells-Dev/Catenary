@@ -157,37 +157,6 @@ pub const fn compute_overflow(metrics: &ScrollMetrics) -> OverflowCounts {
     }
 }
 
-/// Given a click on the scrollbar track, compute the scroll position that
-/// centers the thumb on the clicked point.
-#[must_use]
-#[allow(
-    clippy::cast_possible_truncation,
-    reason = "track coordinates are always small"
-)]
-pub fn scroll_position_from_click(y: u16, track_area: Rect, metrics: &ScrollMetrics) -> usize {
-    if metrics.content_length <= metrics.viewport_length {
-        return 0;
-    }
-
-    let track_height = track_area.height;
-    if track_height == 0 {
-        return 0;
-    }
-
-    // Offset within the track (clamped to valid range).
-    let click_offset = y
-        .saturating_sub(track_area.y)
-        .min(track_height.saturating_sub(1));
-
-    let scrollable = metrics.content_length - metrics.viewport_length;
-
-    // Map click position to scroll position.
-    let position = u64::from(click_offset) * (scrollable as u64)
-        / u64::from(track_height.saturating_sub(1).max(1));
-
-    (position as usize).min(scrollable)
-}
-
 // ── Rendering ───────────────────────────────────────────────────────────
 
 /// Render the scrollbar into the panel's right border column.
@@ -312,58 +281,6 @@ pub fn render_overflow_counts(
             buf.set_line(x, y, &line, text_width);
         }
     }
-}
-
-/// Which overflow indicator was clicked.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OverflowHit {
-    /// Clicked the top indicator — jump to top.
-    Top,
-    /// Clicked the bottom indicator — jump to bottom.
-    Bottom,
-}
-
-/// Hit-test a click against the overflow count indicators.
-///
-/// The hit zone covers the digits and arrow (`15▲`) but excludes the
-/// leading padding space. Returns `None` if the click didn't land on
-/// either indicator.
-#[must_use]
-#[allow(
-    clippy::cast_possible_truncation,
-    reason = "terminal coordinates are always small"
-)]
-pub fn overflow_hit_test(
-    x: u16,
-    y: u16,
-    content_area: Rect,
-    counts: &OverflowCounts,
-) -> Option<OverflowHit> {
-    if content_area.width == 0 || content_area.height == 0 {
-        return None;
-    }
-
-    let right = content_area.x + content_area.width;
-
-    if counts.above > 0 && y == content_area.y {
-        // Hit zone: digits + arrow, excluding the leading space.
-        let label = format!("{}▲", counts.above);
-        let label_width = UnicodeWidthStr::width(label.as_str()) as u16;
-        if label_width <= content_area.width && x >= right - label_width && x < right {
-            return Some(OverflowHit::Top);
-        }
-    }
-
-    let bottom_y = content_area.y + content_area.height - 1;
-    if counts.below > 0 && y == bottom_y {
-        let label = format!("{}▼", counts.below);
-        let label_width = UnicodeWidthStr::width(label.as_str()) as u16;
-        if label_width <= content_area.width && x >= right - label_width && x < right {
-            return Some(OverflowHit::Bottom);
-        }
-    }
-
-    None
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
@@ -655,76 +572,6 @@ mod tests {
     }
 
     #[test]
-    fn test_scroll_position_from_click() {
-        let track_area = Rect::new(0, 0, 1, 20);
-        let metrics = ScrollMetrics {
-            content_length: 200,
-            viewport_length: 20,
-            position: 0,
-        };
-
-        // Click at the middle of the track (cell 10 of 20).
-        let pos = scroll_position_from_click(10, track_area, &metrics);
-        // scrollable = 180, click at 10/19 ≈ 0.526 → ~94.7.
-        // Allow some tolerance for integer rounding.
-        assert!(
-            (85..=100).contains(&pos),
-            "expected position roughly 90, got {pos}"
-        );
-
-        // Click at top should give position 0.
-        let pos_top = scroll_position_from_click(0, track_area, &metrics);
-        assert_eq!(pos_top, 0, "click at top should give position 0");
-
-        // Click at bottom should give max position.
-        let pos_bottom = scroll_position_from_click(19, track_area, &metrics);
-        assert_eq!(pos_bottom, 180, "click at bottom should give max position");
-    }
-
-    #[test]
-    fn test_overflow_hit_test_top() {
-        let content_area = Rect::new(0, 0, 40, 10);
-        let counts = OverflowCounts {
-            above: 15,
-            below: 5,
-        };
-
-        // "15▲" is 3 columns wide, right-aligned at columns 37..40.
-        // Click on the digits (x=37) → Top.
-        assert_eq!(
-            overflow_hit_test(37, 0, content_area, &counts),
-            Some(OverflowHit::Top)
-        );
-        // Click on the arrow (x=39).
-        assert_eq!(
-            overflow_hit_test(39, 0, content_area, &counts),
-            Some(OverflowHit::Top)
-        );
-        // Click on the leading space (x=36) → miss.
-        assert_eq!(overflow_hit_test(36, 0, content_area, &counts), None);
-        // Click on the right row but wrong y → miss.
-        assert_eq!(overflow_hit_test(38, 1, content_area, &counts), None);
-    }
-
-    #[test]
-    fn test_overflow_hit_test_bottom() {
-        let content_area = Rect::new(0, 0, 40, 10);
-        let counts = OverflowCounts { above: 0, below: 5 };
-
-        // "5▼" is 2 columns wide, right-aligned at columns 38..40.
-        assert_eq!(
-            overflow_hit_test(38, 9, content_area, &counts),
-            Some(OverflowHit::Bottom)
-        );
-        assert_eq!(
-            overflow_hit_test(39, 9, content_area, &counts),
-            Some(OverflowHit::Bottom)
-        );
-        // Leading space at x=37 → miss.
-        assert_eq!(overflow_hit_test(37, 9, content_area, &counts), None);
-    }
-
-    #[test]
     fn test_render_scrollbar_multi_cell_thumb() {
         // 50% viewport → thumb spans ~5 cells. Position at midpoint.
         let metrics = ScrollMetrics {
@@ -933,44 +780,5 @@ mod tests {
                 render_overflow_counts(&counts, area, f.buffer_mut(), style);
             })
             .expect("draw");
-    }
-
-    #[test]
-    fn test_overflow_hit_test_at_right_boundary() {
-        let content_area = Rect::new(0, 0, 40, 10);
-        let counts = OverflowCounts { above: 5, below: 5 };
-        let right = content_area.x + content_area.width; // = 40
-
-        // x == right should be a miss (x < right, not <=).
-        assert_eq!(
-            overflow_hit_test(right, 0, content_area, &counts),
-            None,
-            "x at right boundary should miss"
-        );
-    }
-
-    #[test]
-    fn test_overflow_hit_test_zero_dimensions() {
-        let counts = OverflowCounts { above: 5, below: 5 };
-
-        // Zero width.
-        assert_eq!(
-            overflow_hit_test(0, 0, Rect::new(0, 0, 0, 10), &counts),
-            None,
-        );
-        // Zero height.
-        assert_eq!(
-            overflow_hit_test(0, 0, Rect::new(0, 0, 40, 0), &counts),
-            None,
-        );
-    }
-
-    #[test]
-    fn test_overflow_hit_test_no_overflow() {
-        let content_area = Rect::new(0, 0, 40, 10);
-        let counts = OverflowCounts { above: 0, below: 0 };
-
-        assert_eq!(overflow_hit_test(39, 0, content_area, &counts), None);
-        assert_eq!(overflow_hit_test(39, 9, content_area, &counts), None);
     }
 }

@@ -8,7 +8,6 @@
 
 pub mod app;
 pub mod data;
-pub mod filter;
 pub mod format;
 pub mod hints;
 pub mod icons;
@@ -19,7 +18,7 @@ pub mod stream;
 pub mod theme;
 
 pub use app::App;
-pub use data::{DataSource, MockDataSource};
+pub use data::DataSource;
 
 use std::io;
 use std::path::Path;
@@ -108,18 +107,6 @@ pub fn run(icon_config: IconConfig) -> Result<()> {
     };
 
     run_with_data_and_watcher(icon_config, data, wal_rx.as_ref())
-}
-
-/// Run the interactive TUI with a provided data source (test entry point).
-///
-/// Tests can inject a [`MockDataSource`]. No WAL watcher — falls back to
-/// tick-based polling.
-///
-/// # Errors
-///
-/// Returns an error if terminal setup fails or session data cannot be read.
-pub fn run_with_data(icon_config: IconConfig, data: Box<dyn DataSource>) -> Result<()> {
-    run_with_data_and_watcher(icon_config, data, None)
 }
 
 /// Run the interactive TUI with an optional WAL watcher.

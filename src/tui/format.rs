@@ -12,26 +12,6 @@ use super::scope::{Scope, ScopeState};
 use super::theme::Theme;
 use crate::session::SessionMessage;
 
-// ── Helpers ──────────────────────────────────────────────────────────────
-
-/// Format a `started_at` timestamp as a human-readable duration.
-#[must_use]
-pub fn format_ago(started: chrono::DateTime<chrono::Utc>) -> String {
-    let elapsed = chrono::Utc::now()
-        .signed_duration_since(started)
-        .num_seconds()
-        .max(0);
-    if elapsed < 60 {
-        format!("{elapsed}s ago")
-    } else if elapsed < 3600 {
-        format!("{}m ago", elapsed / 60)
-    } else if elapsed < 86400 {
-        format!("{}h ago", elapsed / 3600)
-    } else {
-        format!("{}d ago", elapsed / 86400)
-    }
-}
-
 // ── Single message formatters ────────────────────────────────────────────
 
 /// Build a styled [`Line`] for a protocol message.
@@ -527,7 +507,6 @@ pub fn format_scope_header_plain(scope: &Scope, icons: &IconSet) -> String {
 )]
 mod tests {
     use super::*;
-    use chrono::{TimeDelta, Utc};
 
     use crate::config::IconConfig;
     use crate::session::SessionMessage;
@@ -544,34 +523,6 @@ mod tests {
         payload: serde_json::Value,
     ) -> SessionMessage {
         test_support::message_with_payload(r#type, method, server, payload)
-    }
-
-    #[test]
-    fn test_format_ago_seconds() {
-        let ts = Utc::now() - TimeDelta::seconds(30);
-        assert_eq!(format_ago(ts), "30s ago");
-    }
-
-    #[test]
-    fn test_format_ago_minutes() {
-        let ts = Utc::now() - TimeDelta::minutes(5);
-        assert_eq!(format_ago(ts), "5m ago");
-    }
-
-    #[test]
-    fn test_format_ago_hours() {
-        let ts = Utc::now() - TimeDelta::hours(2);
-        assert_eq!(format_ago(ts), "2h ago");
-    }
-
-    #[test]
-    fn test_format_ago_boundaries() {
-        let ts = Utc::now() - TimeDelta::seconds(60);
-        assert_eq!(format_ago(ts), "1m ago");
-        let ts = Utc::now() - TimeDelta::seconds(3600);
-        assert_eq!(format_ago(ts), "1h ago");
-        let ts = Utc::now() - TimeDelta::seconds(86400);
-        assert_eq!(format_ago(ts), "1d ago");
     }
 
     #[test]
