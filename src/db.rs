@@ -80,6 +80,41 @@ pub fn open_at(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
+/// Opens a read-only connection to the Catenary database.
+///
+/// Sets busy timeout for WAL readers but does not set journal mode or
+/// foreign keys (unnecessary for read-only access). The database file
+/// must already exist.
+///
+/// # Errors
+///
+/// Returns an error if the database cannot be opened.
+pub fn open_read_only() -> Result<Connection> {
+    open_read_only_at(&db_path())
+}
+
+/// Opens a read-only connection to a database at the given path.
+///
+/// Like [`open_read_only`] but uses an explicit path.
+///
+/// # Errors
+///
+/// Returns an error if the database cannot be opened.
+pub fn open_read_only_at(path: &Path) -> Result<Connection> {
+    let conn = Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("failed to open database read-only: {}", path.display()))?;
+
+    conn.execute_batch("PRAGMA busy_timeout=5000;")
+        .context("failed to set database pragmas")?;
+
+    Ok(conn)
+}
+
 /// Opens a connection and runs schema migrations if needed.
 ///
 /// On a fresh database, creates all tables. On an existing database,

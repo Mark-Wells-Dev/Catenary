@@ -257,6 +257,9 @@ impl DataSource for SqliteDataSource {
             rows
         };
 
+        // Batch query: all (session_id, server) pairs in one pass.
+        let lang_map = batch_active_languages(&self.conn);
+
         let mut sessions = Vec::with_capacity(raw.len());
         for RawSessionRow {
             id,
@@ -273,21 +276,9 @@ impl DataSource for SqliteDataSource {
                 .with_context(|| format!("invalid started_at: {started_at_str}"))?
                 .with_timezone(&Utc);
 
-            let alive = if db_alive {
-                if session::is_process_alive(pid) {
-                    true
-                } else {
-                    let _ = self.conn.execute(
-                        "UPDATE sessions SET alive = 0, ended_at = ?1 WHERE id = ?2",
-                        rusqlite::params![Utc::now().to_rfc3339(), &id],
-                    );
-                    false
-                }
-            } else {
-                false
-            };
+            let alive = db_alive && session::is_process_alive(pid);
 
-            let languages = active_languages_for(&self.conn, &id);
+            let languages = lang_map.get(&id).cloned().unwrap_or_default();
 
             sessions.push(SessionRow {
                 info: SessionInfo {
@@ -404,27 +395,31 @@ impl DataSource for SqliteDataSource {
     }
 }
 
-/// Query active languages for a session from its messages.
-fn active_languages_for(conn: &rusqlite::Connection, session_id: &str) -> Vec<String> {
+/// Batch query: all active languages grouped by session ID.
+///
+/// Replaces N+1 per-session `SELECT DISTINCT` queries with a single
+/// `GROUP BY session_id, server` scan.
+fn batch_active_languages(conn: &rusqlite::Connection) -> HashMap<String, Vec<String>> {
     let Ok(mut stmt) = conn.prepare(
-        "SELECT DISTINCT server FROM messages \
-         WHERE session_id = ?1 AND type = 'lsp' \
-         ORDER BY server",
+        "SELECT session_id, server FROM messages \
+         WHERE type = 'lsp' \
+         GROUP BY session_id, server \
+         ORDER BY session_id, server",
     ) else {
-        return vec![];
+        return HashMap::new();
     };
 
-    let Ok(mut rows) = stmt.query([session_id]) else {
-        return vec![];
+    let Ok(mut rows) = stmt.query([]) else {
+        return HashMap::new();
     };
 
-    let mut result = Vec::new();
+    let mut map: HashMap<String, Vec<String>> = HashMap::new();
     while let Ok(Some(row)) = rows.next() {
-        if let Ok(server) = row.get::<_, String>(0) {
-            result.push(server);
+        if let (Ok(sid), Ok(server)) = (row.get::<_, String>(0), row.get::<_, String>(1)) {
+            map.entry(sid).or_default().push(server);
         }
     }
-    result
+    map
 }
 
 // ── Mock (testing) implementation ────────────────────────────────────

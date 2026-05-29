@@ -114,7 +114,7 @@ fn run_with_data_and_watcher(
     data: Box<dyn DataSource>,
     wal_rx: Option<&mpsc::Receiver<()>>,
 ) -> Result<()> {
-    let theme = Theme::detect();
+    let theme = Theme::new();
     let icons = IconSet::from_config(icon_config);
 
     let mut app = App::new(&theme, &icons, data)?;

@@ -875,11 +875,15 @@ impl SqliteAllMessageTail {
 
 /// Tail all new messages across all sessions (starts from current end).
 ///
+/// Opens a read-only database connection. The TUI only reads — avoiding
+/// a read-write connection eliminates WAL mode pragma overhead and
+/// locking contention with the daemon's writer.
+///
 /// # Errors
 ///
 /// Returns an error if the database cannot be opened or queried.
 pub fn tail_all_messages_new(include_debug: bool) -> Result<SqliteAllMessageTail> {
-    let conn = crate::db::open()?;
+    let conn = crate::db::open_read_only()?;
     tail_all_messages_new_with_conn(conn, include_debug)
 }
 
