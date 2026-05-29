@@ -2776,11 +2776,7 @@ mod tests {
         state.append(vec![make_message("s1", "workspace/symbol")]);
         // Matches are stale until recompute.
         state.recompute_search_if_dirty(&icons);
-        assert_eq!(
-            state.search_matches.len(),
-            1,
-            "new message should be found"
-        );
+        assert_eq!(state.search_matches.len(), 1, "new message should be found");
     }
 
     #[test]

@@ -25,6 +25,35 @@ pub enum FocusRegion {
     Stream,
 }
 
+/// Left-column layout preference set by the user.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LeftLayout {
+    /// Three panels stacked vertically (Sessions, Servers, Keybinds).
+    #[default]
+    Quadrant,
+    /// Tab-stacked: one panel visible at a time, cycled with `b`.
+    Stacked,
+}
+
+/// Effective layout mode, computed from [`LeftLayout`] and terminal size.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EffectiveLayout {
+    /// Quadrant: left column has three panels, Messages on right.
+    #[default]
+    Quadrant,
+    /// Stacked sidebar: left column is a tab stack, Messages on right.
+    Stacked,
+    /// Full-width tab stack: all panels (including Messages) in one stack.
+    FullStack,
+}
+
+/// Terminal height below which the left column degrades to tab stacking.
+const SHORT_THRESHOLD: u16 = 12;
+
+/// Terminal width below which everything degrades to a single full-width
+/// tab stack.
+const NARROW_THRESHOLD: u16 = 50;
+
 /// Application state driving the TUI.
 pub struct App<'a> {
     /// Semantic color theme.
@@ -39,6 +68,13 @@ pub struct App<'a> {
     pub focus: FocusRegion,
     /// Whether the keybinds panel is expanded (`?` toggles).
     pub keybinds_expanded: bool,
+    /// User's left-column layout preference.
+    pub left_layout: LeftLayout,
+    /// Active tab in the left-column stack (0=Sessions, 1=Servers, 2=Keybinds).
+    pub active_left_tab: usize,
+    /// Effective layout mode, recomputed each frame from [`left_layout`] and
+    /// terminal dimensions.
+    pub effective: EffectiveLayout,
     /// Session list sidebar state.
     pub sidebar: SidebarState,
     /// Unified message stream state.
@@ -75,6 +111,9 @@ impl<'a> App<'a> {
             quit: false,
             focus: FocusRegion::Stream,
             keybinds_expanded: false,
+            left_layout: LeftLayout::Quadrant,
+            active_left_tab: 0,
+            effective: EffectiveLayout::Quadrant,
             sidebar: SidebarState::new(),
             stream,
             tail,
@@ -166,47 +205,175 @@ impl<'a> App<'a> {
         }
     }
 
-    /// Cycle focus: Sessions → Servers → [Keybinds] → Stream → Sessions.
+    /// Map a left-tab index to the corresponding [`FocusRegion`].
+    #[must_use]
+    pub const fn tab_focus(tab: usize) -> FocusRegion {
+        match tab {
+            0 => FocusRegion::Sessions,
+            1 => FocusRegion::Servers,
+            _ => FocusRegion::Keybinds,
+        }
+    }
+
+    /// Recompute `effective` from the user preference and terminal size.
     ///
-    /// Keybinds is skipped when collapsed.
+    /// Syncs focus with the active tab on transitions: entering stacked mode
+    /// updates the active tab to match the current focus; returning to quadrant
+    /// ensures focus doesn't land on an invisible keybinds panel.
+    pub fn update_effective(&mut self, width: u16, height: u16) {
+        let new = if width < NARROW_THRESHOLD {
+            EffectiveLayout::FullStack
+        } else if height < SHORT_THRESHOLD {
+            EffectiveLayout::Stacked
+        } else {
+            match self.left_layout {
+                LeftLayout::Quadrant => EffectiveLayout::Quadrant,
+                LeftLayout::Stacked => EffectiveLayout::Stacked,
+            }
+        };
+
+        // Entering stacked/fullstack: sync active_left_tab to current focus.
+        if new != EffectiveLayout::Quadrant && self.effective == EffectiveLayout::Quadrant {
+            match self.focus {
+                FocusRegion::Sessions => self.active_left_tab = 0,
+                FocusRegion::Servers => self.active_left_tab = 1,
+                FocusRegion::Keybinds => self.active_left_tab = 2,
+                FocusRegion::Stream => {}
+            }
+        }
+
+        // Returning to quadrant: if focused on collapsed keybinds, fall back.
+        if new == EffectiveLayout::Quadrant
+            && self.effective != EffectiveLayout::Quadrant
+            && self.focus == FocusRegion::Keybinds
+            && !self.keybinds_expanded
+        {
+            self.focus = FocusRegion::Servers;
+        }
+
+        self.effective = new;
+    }
+
+    /// Cycle the left-column tab (`b` key).
+    ///
+    /// - **Quadrant**: enters stacked mode, showing the current left tab.
+    /// - **Stacked**: cycles tabs (Sessions → Servers → Keybinds), then
+    ///   returns to quadrant if the terminal permits.
+    /// - **`FullStack`**: cycles through all four tabs including Messages.
+    pub const fn cycle_left_tab(&mut self) {
+        match self.effective {
+            EffectiveLayout::FullStack => {
+                if matches!(self.focus, FocusRegion::Stream) {
+                    self.active_left_tab = 0;
+                    self.focus = FocusRegion::Sessions;
+                } else if self.active_left_tab >= 2 {
+                    self.focus = FocusRegion::Stream;
+                } else {
+                    self.active_left_tab += 1;
+                    self.focus = Self::tab_focus(self.active_left_tab);
+                }
+            }
+            EffectiveLayout::Stacked => {
+                if self.active_left_tab >= 2 {
+                    // Wrap: request quadrant. If the terminal is too short,
+                    // update_effective will override back to Stacked next frame.
+                    self.active_left_tab = 0;
+                    self.left_layout = LeftLayout::Quadrant;
+                } else {
+                    self.active_left_tab += 1;
+                }
+                self.focus = Self::tab_focus(self.active_left_tab);
+            }
+            EffectiveLayout::Quadrant => {
+                self.left_layout = LeftLayout::Stacked;
+                self.focus = Self::tab_focus(self.active_left_tab);
+            }
+        }
+    }
+
+    /// Switch directly to a specific left tab, entering stacked mode if needed.
+    pub fn set_left_tab(&mut self, tab: usize) {
+        if tab > 2 {
+            self.focus = FocusRegion::Stream;
+            return;
+        }
+        self.active_left_tab = tab;
+        self.focus = Self::tab_focus(tab);
+        if self.effective == EffectiveLayout::Quadrant {
+            self.left_layout = LeftLayout::Stacked;
+        }
+    }
+
+    /// Cycle focus: in quadrant mode cycles all panels; in stacked/full-stack
+    /// mode toggles between the left stack and Messages.
     pub const fn cycle_focus(&mut self) {
-        self.focus = match self.focus {
-            FocusRegion::Sessions => FocusRegion::Servers,
-            FocusRegion::Servers => {
-                if self.keybinds_expanded {
-                    FocusRegion::Keybinds
+        match self.effective {
+            EffectiveLayout::Quadrant => {
+                self.focus = match self.focus {
+                    FocusRegion::Sessions => FocusRegion::Servers,
+                    FocusRegion::Servers => {
+                        if self.keybinds_expanded {
+                            FocusRegion::Keybinds
+                        } else {
+                            FocusRegion::Stream
+                        }
+                    }
+                    FocusRegion::Keybinds => FocusRegion::Stream,
+                    FocusRegion::Stream => FocusRegion::Sessions,
+                };
+            }
+            EffectiveLayout::Stacked | EffectiveLayout::FullStack => {
+                self.focus = if matches!(self.focus, FocusRegion::Stream) {
+                    Self::tab_focus(self.active_left_tab)
                 } else {
                     FocusRegion::Stream
-                }
+                };
             }
-            FocusRegion::Keybinds => FocusRegion::Stream,
-            FocusRegion::Stream => FocusRegion::Sessions,
-        };
+        }
     }
 
-    /// Cycle focus in reverse: Sessions → Stream → [Keybinds] → Servers → Sessions.
-    ///
-    /// Keybinds is skipped when collapsed.
+    /// Cycle focus in reverse. In stacked/full-stack mode this is identical
+    /// to forward cycling (only two regions).
     pub const fn cycle_focus_back(&mut self) {
-        self.focus = match self.focus {
-            FocusRegion::Sessions => FocusRegion::Stream,
-            FocusRegion::Servers => FocusRegion::Sessions,
-            FocusRegion::Keybinds => FocusRegion::Servers,
-            FocusRegion::Stream => {
-                if self.keybinds_expanded {
-                    FocusRegion::Keybinds
-                } else {
-                    FocusRegion::Servers
-                }
+        match self.effective {
+            EffectiveLayout::Quadrant => {
+                self.focus = match self.focus {
+                    FocusRegion::Sessions => FocusRegion::Stream,
+                    FocusRegion::Servers => FocusRegion::Sessions,
+                    FocusRegion::Keybinds => FocusRegion::Servers,
+                    FocusRegion::Stream => {
+                        if self.keybinds_expanded {
+                            FocusRegion::Keybinds
+                        } else {
+                            FocusRegion::Servers
+                        }
+                    }
+                };
             }
-        };
+            EffectiveLayout::Stacked | EffectiveLayout::FullStack => {
+                self.focus = if matches!(self.focus, FocusRegion::Stream) {
+                    Self::tab_focus(self.active_left_tab)
+                } else {
+                    FocusRegion::Stream
+                };
+            }
+        }
     }
 
-    /// Toggle keybinds panel expansion. Moves focus away when collapsing.
+    /// Toggle keybinds: in quadrant mode toggles expansion; in stacked/full-stack
+    /// mode jumps to the Keybinds tab.
     pub fn toggle_keybinds(&mut self) {
-        self.keybinds_expanded = !self.keybinds_expanded;
-        if !self.keybinds_expanded && self.focus == FocusRegion::Keybinds {
-            self.focus = FocusRegion::Servers;
+        match self.effective {
+            EffectiveLayout::Quadrant => {
+                self.keybinds_expanded = !self.keybinds_expanded;
+                if !self.keybinds_expanded && self.focus == FocusRegion::Keybinds {
+                    self.focus = FocusRegion::Servers;
+                }
+            }
+            EffectiveLayout::Stacked | EffectiveLayout::FullStack => {
+                self.active_left_tab = 2;
+                self.focus = FocusRegion::Keybinds;
+            }
         }
     }
 
@@ -285,6 +452,8 @@ mod tests {
         });
         App::new(theme, icons, data).expect("mock app creation")
     }
+
+    // ── Quadrant focus cycling (existing behavior) ──────────────────
 
     #[test]
     fn cycle_focus_skips_keybinds_when_collapsed() {
@@ -373,5 +542,208 @@ mod tests {
         app.focus = FocusRegion::Keybinds;
         app.toggle_keybinds();
         assert_eq!(app.focus, FocusRegion::Servers);
+    }
+
+    // ── Effective layout detection ──────────────────────────────────
+
+    #[test]
+    fn effective_layout_quadrant_on_large_terminal() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let mut app = make_app(&theme, &icons);
+
+        app.update_effective(120, 40);
+        assert_eq!(app.effective, EffectiveLayout::Quadrant);
+    }
+
+    #[test]
+    fn effective_layout_stacked_on_short_terminal() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let mut app = make_app(&theme, &icons);
+
+        app.update_effective(80, 10);
+        assert_eq!(app.effective, EffectiveLayout::Stacked);
+    }
+
+    #[test]
+    fn effective_layout_fullstack_on_narrow_terminal() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let mut app = make_app(&theme, &icons);
+
+        app.update_effective(40, 40);
+        assert_eq!(app.effective, EffectiveLayout::FullStack);
+    }
+
+    #[test]
+    fn effective_layout_narrow_takes_precedence_over_short() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let mut app = make_app(&theme, &icons);
+
+        app.update_effective(30, 8);
+        assert_eq!(app.effective, EffectiveLayout::FullStack);
+    }
+
+    #[test]
+    fn effective_layout_respects_user_stacked_preference() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let mut app = make_app(&theme, &icons);
+
+        app.left_layout = LeftLayout::Stacked;
+        app.update_effective(120, 40);
+        assert_eq!(app.effective, EffectiveLayout::Stacked);
+    }
+
+    // ── `b` key: cycle_left_tab ─────────────────────────────────────
+
+    #[test]
+    fn cycle_left_tab_enters_stacked_from_quadrant() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let mut app = make_app(&theme, &icons);
+
+        app.update_effective(120, 40);
+        assert_eq!(app.effective, EffectiveLayout::Quadrant);
+
+        app.cycle_left_tab();
+        assert_eq!(app.left_layout, LeftLayout::Stacked);
+        assert_eq!(app.focus, FocusRegion::Sessions);
+    }
+
+    #[test]
+    fn cycle_left_tab_cycles_through_stacked_tabs() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let mut app = make_app(&theme, &icons);
+
+        app.left_layout = LeftLayout::Stacked;
+        app.update_effective(120, 40);
+        app.active_left_tab = 0;
+
+        app.cycle_left_tab();
+        assert_eq!(app.active_left_tab, 1);
+        assert_eq!(app.focus, FocusRegion::Servers);
+
+        app.cycle_left_tab();
+        assert_eq!(app.active_left_tab, 2);
+        assert_eq!(app.focus, FocusRegion::Keybinds);
+
+        // Wraps back to quadrant.
+        app.cycle_left_tab();
+        assert_eq!(app.left_layout, LeftLayout::Quadrant);
+        assert_eq!(app.active_left_tab, 0);
+    }
+
+    #[test]
+    fn cycle_left_tab_fullstack_includes_messages() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let mut app = make_app(&theme, &icons);
+
+        app.update_effective(30, 40);
+        assert_eq!(app.effective, EffectiveLayout::FullStack);
+        app.active_left_tab = 0;
+        app.focus = FocusRegion::Sessions;
+
+        app.cycle_left_tab();
+        assert_eq!(app.active_left_tab, 1);
+        assert_eq!(app.focus, FocusRegion::Servers);
+
+        app.cycle_left_tab();
+        assert_eq!(app.active_left_tab, 2);
+        assert_eq!(app.focus, FocusRegion::Keybinds);
+
+        // Next goes to Messages (Stream).
+        app.cycle_left_tab();
+        assert_eq!(app.focus, FocusRegion::Stream);
+
+        // Wraps back to Sessions.
+        app.cycle_left_tab();
+        assert_eq!(app.active_left_tab, 0);
+        assert_eq!(app.focus, FocusRegion::Sessions);
+    }
+
+    // ── Stacked/FullStack focus cycling ─────────────────────────────
+
+    #[test]
+    fn cycle_focus_stacked_toggles_left_and_stream() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let mut app = make_app(&theme, &icons);
+
+        app.left_layout = LeftLayout::Stacked;
+        app.update_effective(120, 40);
+        app.active_left_tab = 1;
+        app.focus = FocusRegion::Servers;
+
+        app.cycle_focus();
+        assert_eq!(app.focus, FocusRegion::Stream);
+
+        app.cycle_focus();
+        assert_eq!(app.focus, FocusRegion::Servers);
+    }
+
+    #[test]
+    fn cycle_focus_fullstack_toggles_left_and_stream() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let mut app = make_app(&theme, &icons);
+
+        app.update_effective(30, 40);
+        app.active_left_tab = 2;
+        app.focus = FocusRegion::Keybinds;
+
+        app.cycle_focus();
+        assert_eq!(app.focus, FocusRegion::Stream);
+
+        app.cycle_focus();
+        assert_eq!(app.focus, FocusRegion::Keybinds);
+    }
+
+    // ── `?` in stacked mode ─────────────────────────────────────────
+
+    #[test]
+    fn toggle_keybinds_stacked_jumps_to_keybinds_tab() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let mut app = make_app(&theme, &icons);
+
+        app.left_layout = LeftLayout::Stacked;
+        app.update_effective(120, 40);
+        app.active_left_tab = 0;
+        app.focus = FocusRegion::Sessions;
+
+        app.toggle_keybinds();
+        assert_eq!(app.active_left_tab, 2);
+        assert_eq!(app.focus, FocusRegion::Keybinds);
+    }
+
+    // ── set_left_tab ────────────────────────────────────────────────
+
+    #[test]
+    fn set_left_tab_enters_stacked_from_quadrant() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let mut app = make_app(&theme, &icons);
+
+        app.update_effective(120, 40);
+        app.set_left_tab(1);
+        assert_eq!(app.left_layout, LeftLayout::Stacked);
+        assert_eq!(app.active_left_tab, 1);
+        assert_eq!(app.focus, FocusRegion::Servers);
+    }
+
+    #[test]
+    fn set_left_tab_messages_focuses_stream() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let mut app = make_app(&theme, &icons);
+
+        app.update_effective(30, 40);
+        app.set_left_tab(3);
+        assert_eq!(app.focus, FocusRegion::Stream);
     }
 }

@@ -35,14 +35,15 @@ use crossterm::terminal::{
 use notify::Watcher;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::text::Span;
-use ratatui::widgets::{Block, Borders, Widget};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Tabs, Widget};
 use tracing::info;
 
 use crate::config::IconConfig;
 
-use self::app::FocusRegion;
+use self::app::{EffectiveLayout, FocusRegion};
 use self::data::SqliteDataSource;
 use self::hints::{KEYBINDS_EXPANDED_HEIGHT, render_keybinds_content};
 use self::icons::IconSet;
@@ -140,12 +141,21 @@ fn run_with_data_and_watcher(
     result
 }
 
+/// Tab label names for the left-column stack.
+const LEFT_TAB_NAMES: &[&str] = &["Sessions", "Servers", "Keybinds"];
+/// Tab label names for the full-width stack (includes Messages).
+const FULL_TAB_NAMES: &[&str] = &["Sessions", "Servers", "Keybinds", "Messages"];
+
 /// Stored panel rectangles and hit maps for mouse dispatch.
 struct PanelLayout {
     sessions: Rect,
     servers: Rect,
     keybinds: Rect,
     stream: Rect,
+    /// Tab bar area (empty rect when in Quadrant mode).
+    tab_bar: Rect,
+    /// Number of tabs rendered in the tab bar.
+    tab_count: usize,
     /// Terminal row → session entry index.
     session_hits: Vec<(u16, usize)>,
     /// Terminal row → server entry index.
@@ -164,6 +174,7 @@ fn handle_key(app: &mut App<'_>, code: KeyCode, viewport_height: usize) {
     match code {
         KeyCode::Char('q') => app.quit = true,
         KeyCode::Char('?') => app.toggle_keybinds(),
+        KeyCode::Char('b') => app.cycle_left_tab(),
         KeyCode::Tab => app.cycle_focus(),
         KeyCode::BackTab => app.cycle_focus_back(),
         _ => match app.focus {
@@ -348,6 +359,7 @@ fn handle_mouse(
     viewport_height: usize,
 ) {
     let pos = (column, row);
+    let in_tab_bar = layout.tab_bar.contains(pos.into());
     let in_sessions = layout.sessions.contains(pos.into());
     let in_servers = layout.servers.contains(pos.into());
     let in_keybinds = layout.keybinds.contains(pos.into());
@@ -373,7 +385,14 @@ fn handle_mouse(
             }
         }
         MouseEventKind::Down(MouseButton::Left) => {
-            if in_sessions {
+            if in_tab_bar && layout.tab_count > 0 {
+                // Proportional tab hit detection.
+                let relative_x = column.saturating_sub(layout.tab_bar.x);
+                let clicked =
+                    (relative_x as usize * layout.tab_count) / layout.tab_bar.width.max(1) as usize;
+                let clicked = clicked.min(layout.tab_count - 1);
+                app.set_left_tab(clicked);
+            } else if in_sessions {
                 app.focus = FocusRegion::Sessions;
                 if let Some(&(_, idx)) = layout.session_hits.iter().find(|(r, _)| *r == row) {
                     app.sidebar.cursor = idx;
@@ -385,7 +404,11 @@ fn handle_mouse(
                     app.sidebar.server_cursor = idx;
                     app.toggle_server_selection();
                 }
-            } else if in_keybinds && app.keybinds_expanded {
+            } else if in_keybinds {
+                // In quadrant mode, clicking collapsed keybinds expands it.
+                if app.effective == EffectiveLayout::Quadrant && !app.keybinds_expanded {
+                    app.keybinds_expanded = true;
+                }
                 app.focus = FocusRegion::Keybinds;
             } else if in_stream {
                 app.focus = FocusRegion::Stream;
@@ -422,7 +445,7 @@ fn panel_block<'a>(title: &'a str, focused: bool, theme: &'a Theme) -> Block<'a>
 )]
 fn render_search_bar(
     area: Rect,
-    buf: &mut ratatui::buffer::Buffer,
+    buf: &mut Buffer,
     theme: &Theme,
     input_active: bool,
     input: &str,
@@ -454,11 +477,122 @@ fn render_search_bar(
     buf.set_line(area.x, area.y, &line, area.width);
 }
 
-/// Main event loop — renders quadrant layout, handles input.
+/// Render a horizontal tab bar with the active tab highlighted.
+fn render_tab_bar(names: &[&str], active: usize, area: Rect, buf: &mut Buffer, theme: &Theme) {
+    let titles: Vec<Line<'_>> = names.iter().map(|n| Line::from(*n)).collect();
+    Tabs::new(titles)
+        .select(active)
+        .highlight_style(theme.title)
+        .style(theme.muted)
+        .divider("│")
+        .render(area, buf);
+}
+
+/// Render Sessions into `panel_rect`, returning the session hit map.
+fn render_sessions_panel(
+    app: &App<'_>,
+    panel_rect: Rect,
+    buf: &mut Buffer,
+    layout: &mut PanelLayout,
+) {
+    let focused = app.focus == FocusRegion::Sessions;
+    let block = panel_block(" Sessions ", focused, app.theme);
+    let inner = block.inner(panel_rect);
+    block.render(panel_rect, buf);
+    layout.session_hits = render_sessions(&app.sidebar, inner, buf, app.theme, focused);
+    layout.sessions = panel_rect;
+}
+
+/// Render Servers into `panel_rect`, returning the server hit map.
+fn render_servers_panel(
+    app: &App<'_>,
+    panel_rect: Rect,
+    buf: &mut Buffer,
+    layout: &mut PanelLayout,
+) {
+    let focused = app.focus == FocusRegion::Servers;
+    let block = panel_block(" Servers ", focused, app.theme);
+    let inner = block.inner(panel_rect);
+    block.render(panel_rect, buf);
+    layout.server_hits = render_servers(&app.sidebar, inner, buf, app.theme, focused);
+    layout.servers = panel_rect;
+}
+
+/// Render the Keybinds panel at full height (for stacked/full-stack mode).
+fn render_keybinds_panel(
+    app: &App<'_>,
+    panel_rect: Rect,
+    buf: &mut Buffer,
+    layout: &mut PanelLayout,
+) {
+    let focused = app.focus == FocusRegion::Keybinds;
+    let block = panel_block(" Keybinds ", focused, app.theme);
+    let inner = block.inner(panel_rect);
+    block.render(panel_rect, buf);
+    render_keybinds_content(inner, buf, app.theme);
+    layout.keybinds = panel_rect;
+}
+
+/// Render the Messages stream panel into `panel_rect`, including the search
+/// bar when active. Returns an optional cursor position for the search input.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "search input length is always small"
+)]
+fn render_messages_panel(
+    app: &App<'_>,
+    panel_rect: Rect,
+    buf: &mut Buffer,
+    layout: &mut PanelLayout,
+) -> Option<(u16, u16)> {
+    let focused = app.focus == FocusRegion::Stream;
+    let block = panel_block(" Messages ", focused, app.theme);
+    let inner = block.inner(panel_rect);
+    block.render(panel_rect, buf);
+
+    let show_search = app.search_active || app.stream.has_search();
+    let (stream_area, search_bar_area) = if show_search && inner.height > 1 {
+        let content_height = inner.height - 1;
+        (
+            Rect {
+                height: content_height,
+                ..inner
+            },
+            Some(Rect {
+                y: inner.y + content_height,
+                height: 1,
+                ..inner
+            }),
+        )
+    } else {
+        (inner, None)
+    };
+
+    render_stream(&app.stream, stream_area, buf, app.theme, app.icons);
+    layout.stream = panel_rect;
+
+    if let Some(bar) = search_bar_area {
+        render_search_bar(
+            bar,
+            buf,
+            app.theme,
+            app.search_active,
+            &app.search_input,
+            app.stream.search_status().as_deref(),
+        );
+        if app.search_active {
+            let cursor_x = bar.x + 1 + app.search_input.len() as u16;
+            return Some((cursor_x.min(bar.x + bar.width - 1), bar.y));
+        }
+    }
+    None
+}
+
+/// Main event loop — renders layout based on effective mode, handles input.
 #[allow(
     clippy::too_many_lines,
     clippy::cast_possible_truncation,
-    reason = "render loop with quadrant layout + empty state in one draw closure; terminal widths are always small"
+    reason = "render loop with three layout modes + empty state in one draw closure; terminal widths are always small"
 )]
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
@@ -471,6 +605,8 @@ fn run_loop(
         servers: Rect::default(),
         keybinds: Rect::default(),
         stream: Rect::default(),
+        tab_bar: Rect::default(),
+        tab_count: 0,
         session_hits: Vec::new(),
         server_hits: Vec::new(),
     };
@@ -479,6 +615,7 @@ fn run_loop(
         let size = terminal.size()?;
         let stream_height = size.height as usize;
         app.stream.recompute_search_if_dirty(app.icons);
+        app.update_effective(size.width, size.height);
         app.stream.apply_auto_scroll(stream_height);
 
         terminal.draw(|f| {
@@ -501,140 +638,158 @@ fn run_loop(
                 layout.servers = Rect::default();
                 layout.keybinds = Rect::default();
                 layout.stream = Rect::default();
+                layout.tab_bar = Rect::default();
+                layout.tab_count = 0;
                 return;
             }
 
-            // ── Horizontal split: left (50%) | right (50%) ──────────
-            let h_chunks = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .split(area);
+            // Reset per-frame mouse-dispatch state.
+            layout.session_hits.clear();
+            layout.server_hits.clear();
+            layout.sessions = Rect::default();
+            layout.servers = Rect::default();
+            layout.keybinds = Rect::default();
+            layout.stream = Rect::default();
+            layout.tab_bar = Rect::default();
+            layout.tab_count = 0;
 
-            let left = h_chunks[0];
-            let right = h_chunks[1];
+            // Cursor position for the search bar (set by render_messages_panel).
+            let mut search_cursor: Option<(u16, u16)> = None;
 
-            // ── Left column: Sessions | Servers | Keybinds ──────────
-            let keybinds_height = if app.keybinds_expanded {
-                // +2 for Block border top/bottom.
-                KEYBINDS_EXPANDED_HEIGHT + 2
-            } else {
-                // Collapsed: title bar only (top border + bottom border + title row = 3).
-                // But with Block borders, a height of 3 shows the frame with 1 inner row.
-                // We want just the frame border lines (no inner content) = height of 2
-                // would show top + bottom border with no inner. But Borders::ALL needs
-                // at least 2 rows for the top and bottom borders.
-                // In practice 3 rows = top border + 1 line title area + bottom border.
-                3
-            };
+            match app.effective {
+                // ── Quadrant: three left panels + Messages right ────
+                EffectiveLayout::Quadrant => {
+                    let h_chunks = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                        .split(area);
 
-            let v_constraints = vec![
-                Constraint::Fill(1),                 // Sessions
-                Constraint::Fill(1),                 // Servers
-                Constraint::Length(keybinds_height), // Keybinds
-            ];
-            let v_chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints(v_constraints)
-                .split(left);
+                    let left = h_chunks[0];
+                    let right = h_chunks[1];
 
-            let sessions_rect = v_chunks[0];
-            let servers_rect = v_chunks[1];
-            let keybinds_rect = v_chunks[2];
+                    let keybinds_height = if app.keybinds_expanded {
+                        KEYBINDS_EXPANDED_HEIGHT + 2
+                    } else {
+                        3
+                    };
 
-            // ── Sessions panel ──────────────────────────────────────
-            let sessions_focused = app.focus == FocusRegion::Sessions;
-            let sessions_block = panel_block(" Sessions ", sessions_focused, app.theme);
-            let sessions_inner = sessions_block.inner(sessions_rect);
-            sessions_block.render(sessions_rect, f.buffer_mut());
-            layout.session_hits = render_sessions(
-                &app.sidebar,
-                sessions_inner,
-                f.buffer_mut(),
-                app.theme,
-                sessions_focused,
-            );
+                    let v_chunks = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([
+                            Constraint::Fill(1),
+                            Constraint::Fill(1),
+                            Constraint::Length(keybinds_height),
+                        ])
+                        .split(left);
 
-            // ── Servers panel ───────────────────────────────────────
-            let servers_focused = app.focus == FocusRegion::Servers;
-            let servers_block = panel_block(" Servers ", servers_focused, app.theme);
-            let servers_inner = servers_block.inner(servers_rect);
-            servers_block.render(servers_rect, f.buffer_mut());
-            layout.server_hits = render_servers(
-                &app.sidebar,
-                servers_inner,
-                f.buffer_mut(),
-                app.theme,
-                servers_focused,
-            );
+                    let sessions_rect = v_chunks[0];
+                    let servers_rect = v_chunks[1];
+                    let keybinds_rect = v_chunks[2];
 
-            // ── Keybinds panel ──────────────────────────────────────
-            let keybinds_focused = app.focus == FocusRegion::Keybinds;
-            let keybinds_title = if app.keybinds_expanded {
-                " Keybinds  ? "
-            } else {
-                " Keybinds  ? to expand "
-            };
-            let keybinds_block = panel_block(keybinds_title, keybinds_focused, app.theme);
-            let keybinds_inner = keybinds_block.inner(keybinds_rect);
-            keybinds_block.render(keybinds_rect, f.buffer_mut());
-            if app.keybinds_expanded {
-                render_keybinds_content(keybinds_inner, f.buffer_mut(), app.theme);
-            }
+                    // Sessions.
+                    render_sessions_panel(app, sessions_rect, f.buffer_mut(), &mut layout);
 
-            // ── Stream panel ────────────────────────────────────────
-            let stream_focused = app.focus == FocusRegion::Stream;
-            let show_search_bar = app.search_active || app.stream.has_search();
-            let stream_block = panel_block(" Messages ", stream_focused, app.theme);
-            let stream_inner = stream_block.inner(right);
-            stream_block.render(right, f.buffer_mut());
+                    // Servers.
+                    render_servers_panel(app, servers_rect, f.buffer_mut(), &mut layout);
 
-            let (stream_area, search_bar_area) = if show_search_bar && stream_inner.height > 1 {
-                let content_height = stream_inner.height - 1;
-                (
-                    Rect {
-                        height: content_height,
-                        ..stream_inner
-                    },
-                    Some(Rect {
-                        y: stream_inner.y + content_height,
-                        height: 1,
-                        ..stream_inner
-                    }),
-                )
-            } else {
-                (stream_inner, None)
-            };
+                    // Keybinds (collapsed/expanded).
+                    let keybinds_focused = app.focus == FocusRegion::Keybinds;
+                    let keybinds_title = if app.keybinds_expanded {
+                        " Keybinds  ? "
+                    } else {
+                        " Keybinds  ? to expand "
+                    };
+                    let keybinds_block = panel_block(keybinds_title, keybinds_focused, app.theme);
+                    let keybinds_inner = keybinds_block.inner(keybinds_rect);
+                    keybinds_block.render(keybinds_rect, f.buffer_mut());
+                    if app.keybinds_expanded {
+                        render_keybinds_content(keybinds_inner, f.buffer_mut(), app.theme);
+                    }
+                    layout.keybinds = keybinds_rect;
 
-            render_stream(
-                &app.stream,
-                stream_area,
-                f.buffer_mut(),
-                app.theme,
-                app.icons,
-            );
+                    // Messages.
+                    search_cursor = render_messages_panel(app, right, f.buffer_mut(), &mut layout);
+                }
 
-            // ── Search bar ─────────────────────────────────────────
-            if let Some(bar) = search_bar_area {
-                render_search_bar(
-                    bar,
-                    f.buffer_mut(),
-                    app.theme,
-                    app.search_active,
-                    &app.search_input,
-                    app.stream.search_status().as_deref(),
-                );
-                if app.search_active {
-                    // Position the terminal cursor inside the search bar.
-                    let cursor_x = bar.x + 1 + app.search_input.len() as u16;
-                    f.set_cursor_position((cursor_x.min(bar.x + bar.width - 1), bar.y));
+                // ── Stacked: tab bar + active panel left, Messages right
+                EffectiveLayout::Stacked => {
+                    let h_chunks = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                        .split(area);
+
+                    let left = h_chunks[0];
+                    let right = h_chunks[1];
+
+                    let v_chunks = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([Constraint::Length(1), Constraint::Fill(1)])
+                        .split(left);
+
+                    let tab_bar_rect = v_chunks[0];
+                    let panel_rect = v_chunks[1];
+
+                    render_tab_bar(
+                        LEFT_TAB_NAMES,
+                        app.active_left_tab,
+                        tab_bar_rect,
+                        f.buffer_mut(),
+                        app.theme,
+                    );
+                    layout.tab_bar = tab_bar_rect;
+                    layout.tab_count = LEFT_TAB_NAMES.len();
+
+                    match app.active_left_tab {
+                        0 => render_sessions_panel(app, panel_rect, f.buffer_mut(), &mut layout),
+                        1 => render_servers_panel(app, panel_rect, f.buffer_mut(), &mut layout),
+                        _ => render_keybinds_panel(app, panel_rect, f.buffer_mut(), &mut layout),
+                    }
+
+                    // Messages (always visible in stacked mode).
+                    search_cursor = render_messages_panel(app, right, f.buffer_mut(), &mut layout);
+                }
+
+                // ── FullStack: tab bar + one panel full-width ──────
+                EffectiveLayout::FullStack => {
+                    let v_chunks = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([Constraint::Length(1), Constraint::Fill(1)])
+                        .split(area);
+
+                    let tab_bar_rect = v_chunks[0];
+                    let panel_rect = v_chunks[1];
+
+                    let visible_tab = if matches!(app.focus, FocusRegion::Stream) {
+                        3
+                    } else {
+                        app.active_left_tab
+                    };
+
+                    render_tab_bar(
+                        FULL_TAB_NAMES,
+                        visible_tab,
+                        tab_bar_rect,
+                        f.buffer_mut(),
+                        app.theme,
+                    );
+                    layout.tab_bar = tab_bar_rect;
+                    layout.tab_count = FULL_TAB_NAMES.len();
+
+                    match visible_tab {
+                        0 => render_sessions_panel(app, panel_rect, f.buffer_mut(), &mut layout),
+                        1 => render_servers_panel(app, panel_rect, f.buffer_mut(), &mut layout),
+                        2 => render_keybinds_panel(app, panel_rect, f.buffer_mut(), &mut layout),
+                        _ => {
+                            search_cursor =
+                                render_messages_panel(app, panel_rect, f.buffer_mut(), &mut layout);
+                        }
+                    }
                 }
             }
 
-            // Store rects for mouse dispatch (use full panel rects).
-            layout.sessions = sessions_rect;
-            layout.servers = servers_rect;
-            layout.keybinds = keybinds_rect;
-            layout.stream = right;
+            if let Some(pos) = search_cursor {
+                f.set_cursor_position(pos);
+            }
         })?;
 
         if app.quit {

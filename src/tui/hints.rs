@@ -16,6 +16,7 @@ use super::theme::Theme;
 const GLOBAL_BINDS: &[(&str, &str)] = &[
     ("q", "quit"),
     ("Tab", "next panel"),
+    ("b", "cycle tabs"),
     ("?", "toggle keybinds"),
 ];
 
@@ -35,9 +36,18 @@ const STREAM_BINDS: &[(&str, &str)] = &[
 
 /// Number of content lines when the keybinds panel is expanded.
 ///
-/// Global(3) + blank(1) + "Sidebar"(1) + sidebar(2) + blank(1)
-/// + "Stream"(1) + stream(7) = 16
-pub const KEYBINDS_EXPANDED_HEIGHT: u16 = 16;
+/// Computed from the three bind groups plus group headers and blank separators.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "bind arrays have single-digit lengths"
+)]
+pub const KEYBINDS_EXPANDED_HEIGHT: u16 = GLOBAL_BINDS.len() as u16
+    + 1 // blank
+    + 1 // "Sidebar" header
+    + SIDEBAR_BINDS.len() as u16
+    + 1 // blank
+    + 1 // "Stream" header
+    + STREAM_BINDS.len() as u16;
 
 /// Render keybinds vertically into the given area.
 ///
