@@ -286,3 +286,109 @@ impl<'a> App<'a> {
         }
     }
 }
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "tests use expect for readable assertions"
+)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+    use crate::config::IconConfig;
+    use crate::tui::data::MockDataSource;
+
+    fn make_app<'a>(theme: &'a Theme, icons: &'a IconSet) -> App<'a> {
+        let data: Box<dyn DataSource> = Box::new(MockDataSource {
+            sessions: Vec::new(),
+            messages: HashMap::new(),
+            tail_messages: HashMap::new(),
+            server_statuses: Vec::new(),
+            server_noise: Vec::new(),
+        });
+        App::new(theme, icons, data).expect("mock app creation")
+    }
+
+    #[test]
+    fn toggle_sidebar_flips_visibility() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let mut app = make_app(&theme, &icons);
+
+        assert!(app.sidebar_visible);
+        app.toggle_sidebar();
+        assert!(!app.sidebar_visible);
+        app.toggle_sidebar();
+        assert!(app.sidebar_visible);
+    }
+
+    #[test]
+    fn toggle_sidebar_moves_focus_from_sessions_to_stream() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let mut app = make_app(&theme, &icons);
+
+        app.focus = FocusRegion::Sessions;
+        app.toggle_sidebar();
+        assert_eq!(app.focus, FocusRegion::Stream);
+    }
+
+    #[test]
+    fn toggle_sidebar_moves_focus_from_servers_to_stream() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let mut app = make_app(&theme, &icons);
+
+        app.focus = FocusRegion::Servers;
+        app.toggle_sidebar();
+        assert_eq!(app.focus, FocusRegion::Stream);
+    }
+
+    #[test]
+    fn toggle_sidebar_keeps_focus_on_stream() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let mut app = make_app(&theme, &icons);
+
+        app.focus = FocusRegion::Stream;
+        app.toggle_sidebar();
+        assert_eq!(app.focus, FocusRegion::Stream);
+    }
+
+    #[test]
+    fn toggle_sidebar_preserves_filter_state() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let mut app = make_app(&theme, &icons);
+
+        // Inject a session and select it.
+        app.sidebar.refresh(
+            vec![("s1".into(), Some("claude".into()), "/project".into())],
+            &mut app.stream.badges,
+        );
+        app.sidebar.cursor = 0;
+        app.sidebar.toggle_selected();
+        assert!(app.sidebar.has_filter());
+
+        // Hide and show sidebar — filter survives.
+        app.toggle_sidebar();
+        assert!(app.sidebar.has_filter());
+        app.toggle_sidebar();
+        assert!(app.sidebar.has_filter());
+    }
+
+    #[test]
+    fn show_sidebar_restores_after_toggle() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let mut app = make_app(&theme, &icons);
+
+        app.toggle_sidebar();
+        assert!(!app.sidebar_visible);
+        app.toggle_sidebar();
+        assert!(app.sidebar_visible);
+        // Focus should be on stream (moved there on hide, stays on show).
+        assert_eq!(app.focus, FocusRegion::Stream);
+    }
+}
