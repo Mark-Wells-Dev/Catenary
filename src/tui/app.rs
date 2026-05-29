@@ -45,6 +45,10 @@ pub struct App<'a> {
     pub stream: StreamState,
     /// Tail reader for incremental message updates.
     pub tail: Option<Box<dyn MessageTail>>,
+    /// Whether search input mode is active (`/` was pressed).
+    pub search_active: bool,
+    /// Text being typed into the search bar.
+    pub search_input: String,
 }
 
 impl<'a> App<'a> {
@@ -74,6 +78,8 @@ impl<'a> App<'a> {
             sidebar: SidebarState::new(),
             stream,
             tail,
+            search_active: false,
+            search_input: String::new(),
         };
 
         // Load initial session and server lists.

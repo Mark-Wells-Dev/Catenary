@@ -279,6 +279,17 @@ pub struct StreamState {
     top_newest_root: Option<i64>,
     /// Whether all older scopes have been loaded (reached the beginning).
     pub reached_beginning: bool,
+
+    // ── Search state ────────────────────────────────────────────────
+    /// Active search query (case-insensitive substring match).
+    search_query: Option<String>,
+    /// Display row indices that match the current search query.
+    search_matches: Vec<usize>,
+    /// Index into `search_matches` for the current match.
+    /// `None` when there are no matches.
+    search_match_idx: Option<usize>,
+    /// Whether search matches need recomputing after a display row rebuild.
+    search_dirty: bool,
 }
 
 impl StreamState {
@@ -301,6 +312,10 @@ impl StreamState {
             bottom_oldest_root: None,
             top_newest_root: None,
             reached_beginning: false,
+            search_query: None,
+            search_matches: Vec::new(),
+            search_match_idx: None,
+            search_dirty: false,
         };
         for msg in messages {
             state.route_message(msg);
@@ -396,6 +411,11 @@ impl StreamState {
         self.cursor = self.cursor.min(max);
         let scroll_max = self.display_rows.len().saturating_sub(1);
         self.scroll_position = self.scroll_position.min(scroll_max);
+
+        // Mark search matches as stale when a query is active.
+        if self.search_query.is_some() {
+            self.search_dirty = true;
+        }
     }
 
     /// Total number of display rows (for scroll calculations).
@@ -517,7 +537,51 @@ impl StreamState {
     /// Returns `None` if the cursor is out of range.
     #[must_use]
     pub fn yank_text(&self, icons: &super::icons::IconSet) -> Option<String> {
-        let row = self.display_rows.get(self.cursor)?;
+        self.row_plain_text(self.cursor, icons)
+    }
+
+    /// Return [`ScrollMetrics`] for the scrollbar.
+    #[must_use]
+    pub const fn scroll_metrics(&self, viewport_height: usize) -> ScrollMetrics {
+        ScrollMetrics {
+            content_length: self.row_count(),
+            viewport_length: viewport_height,
+            position: self.scroll_position,
+        }
+    }
+
+    // ── Session filter ────────────────────────────────────────────
+
+    /// Update the session filter and rebuild display rows.
+    ///
+    /// `None` = show all. `Some(set)` = show only entries belonging to
+    /// sessions in the set. Daemon-level events are hidden when a
+    /// filter is active.
+    pub fn set_session_filter(&mut self, filter: Option<HashSet<String>>) {
+        self.session_filter = filter;
+        self.rebuild_display_rows();
+    }
+
+    /// Update the server filter and rebuild display rows.
+    ///
+    /// `None` = show all. `Some(set)` = show only scopes whose LSP
+    /// children involve a server instance in the set.
+    pub fn set_server_filter(
+        &mut self,
+        filter: Option<HashSet<super::sidebar::ServerInstanceKey>>,
+    ) {
+        self.server_filter = filter;
+        self.rebuild_display_rows();
+    }
+
+    // ── Search ─────────────────────────────────────────────────────
+
+    /// Plain-text content for a display row at the given index.
+    ///
+    /// Used by search matching and yank. Returns `None` for out-of-range
+    /// indices or malformed entries.
+    fn row_plain_text(&self, row_idx: usize, icons: &super::icons::IconSet) -> Option<String> {
+        let row = self.display_rows.get(row_idx)?;
         match row {
             DisplayRow::ScopeHeader(entry_idx) => {
                 let StreamEntry::Scope(scope) = &self.entries[*entry_idx] else {
@@ -562,38 +626,165 @@ impl StreamState {
         }
     }
 
-    /// Return [`ScrollMetrics`] for the scrollbar.
-    #[must_use]
-    pub const fn scroll_metrics(&self, viewport_height: usize) -> ScrollMetrics {
-        ScrollMetrics {
-            content_length: self.row_count(),
-            viewport_length: viewport_height,
-            position: self.scroll_position,
+    /// Set the search query and recompute matches.
+    ///
+    /// If `query` is `None` or empty, clears the search. Otherwise
+    /// performs case-insensitive substring matching on every display
+    /// row's plain-text content and jumps to the first match at or
+    /// after the current cursor.
+    pub fn set_search(&mut self, query: Option<String>, icons: &super::icons::IconSet) {
+        self.search_query = query.filter(|q| !q.is_empty());
+        self.scan_search_matches(icons);
+        self.search_dirty = false;
+
+        if self.search_matches.is_empty() {
+            return;
+        }
+
+        // Jump to the first match at or after the current cursor.
+        let pos = self.search_matches.partition_point(|&m| m < self.cursor);
+        self.search_match_idx = Some(if pos < self.search_matches.len() {
+            pos
+        } else {
+            0
+        });
+        self.cursor = self.search_matches[self.search_match_idx.unwrap_or(0)];
+        self.auto_scroll = false;
+    }
+
+    /// Recompute search matches if display rows changed since the last scan.
+    ///
+    /// Preserves cursor position and keeps `search_match_idx` pointing at
+    /// the closest match to the current cursor. Called from the event loop
+    /// where icons are available.
+    pub fn recompute_search_if_dirty(&mut self, icons: &super::icons::IconSet) {
+        if !self.search_dirty {
+            return;
+        }
+        self.search_dirty = false;
+
+        let prev_cursor = self.cursor;
+        self.scan_search_matches(icons);
+
+        if self.search_matches.is_empty() {
+            return;
+        }
+
+        // Point search_match_idx at the closest match to the cursor.
+        let pos = self.search_matches.partition_point(|&m| m < prev_cursor);
+        self.search_match_idx = Some(if pos < self.search_matches.len() {
+            pos
+        } else {
+            self.search_matches.len() - 1
+        });
+    }
+
+    /// Scan all display rows for the current search query.
+    ///
+    /// Populates `search_matches` and resets `search_match_idx`.
+    fn scan_search_matches(&mut self, icons: &super::icons::IconSet) {
+        self.search_matches.clear();
+        self.search_match_idx = None;
+
+        let Some(ref pattern) = self.search_query else {
+            return;
+        };
+        let lower = pattern.to_lowercase();
+
+        for idx in 0..self.display_rows.len() {
+            if let Some(text) = self.row_plain_text(idx, icons)
+                && text.to_lowercase().contains(&lower)
+            {
+                self.search_matches.push(idx);
+            }
         }
     }
 
-    // ── Session filter ────────────────────────────────────────────
+    /// Jump to the next search match (wraps around).
+    pub fn search_next(&mut self, viewport_height: usize) {
+        if self.search_matches.is_empty() {
+            return;
+        }
+        let idx = self.search_match_idx.map_or(0, |i| {
+            if i + 1 < self.search_matches.len() {
+                i + 1
+            } else {
+                0
+            }
+        });
+        self.search_match_idx = Some(idx);
+        self.cursor = self.search_matches[idx];
+        self.auto_scroll = false;
 
-    /// Update the session filter and rebuild display rows.
-    ///
-    /// `None` = show all. `Some(set)` = show only entries belonging to
-    /// sessions in the set. Daemon-level events are hidden when a
-    /// filter is active.
-    pub fn set_session_filter(&mut self, filter: Option<HashSet<String>>) {
-        self.session_filter = filter;
-        self.rebuild_display_rows();
+        // Scroll to keep cursor visible.
+        if self.cursor < self.scroll_position {
+            self.scroll_position = self.cursor;
+        } else if self.cursor >= self.scroll_position + viewport_height {
+            self.scroll_position = self.cursor.saturating_sub(viewport_height / 2);
+        }
     }
 
-    /// Update the server filter and rebuild display rows.
+    /// Jump to the previous search match (wraps around).
+    pub fn search_prev(&mut self, viewport_height: usize) {
+        if self.search_matches.is_empty() {
+            return;
+        }
+        let idx = self.search_match_idx.map_or(0, |i| {
+            if i > 0 {
+                i - 1
+            } else {
+                self.search_matches.len() - 1
+            }
+        });
+        self.search_match_idx = Some(idx);
+        self.cursor = self.search_matches[idx];
+        self.auto_scroll = false;
+
+        // Scroll to keep cursor visible.
+        if self.cursor < self.scroll_position {
+            self.scroll_position = self.cursor;
+        } else if self.cursor >= self.scroll_position + viewport_height {
+            self.scroll_position = self.cursor.saturating_sub(viewport_height / 2);
+        }
+    }
+
+    /// Clear the search query and all match state.
+    pub fn clear_search(&mut self) {
+        self.search_query = None;
+        self.search_matches.clear();
+        self.search_match_idx = None;
+    }
+
+    /// Whether the given display row index is a search match.
+    #[must_use]
+    pub fn is_search_match(&self, row_idx: usize) -> bool {
+        self.search_query.is_some() && self.search_matches.binary_search(&row_idx).is_ok()
+    }
+
+    /// Whether a search query is active (has matches to navigate).
+    #[must_use]
+    pub const fn has_search(&self) -> bool {
+        self.search_query.is_some()
+    }
+
+    /// The current search query string, if any.
+    #[must_use]
+    pub fn search_query(&self) -> Option<&str> {
+        self.search_query.as_deref()
+    }
+
+    /// Format the match counter string (e.g., `"3/17"`).
     ///
-    /// `None` = show all. `Some(set)` = show only scopes whose LSP
-    /// children involve a server instance in the set.
-    pub fn set_server_filter(
-        &mut self,
-        filter: Option<HashSet<super::sidebar::ServerInstanceKey>>,
-    ) {
-        self.server_filter = filter;
-        self.rebuild_display_rows();
+    /// Returns `None` if there is no active search.
+    #[must_use]
+    pub fn search_status(&self) -> Option<String> {
+        self.search_query.as_ref()?;
+        let total = self.search_matches.len();
+        if total == 0 {
+            return Some("no matches".to_string());
+        }
+        let current = self.search_match_idx.map_or(0, |i| i + 1);
+        Some(format!("{current}/{total}"))
     }
 
     // ── Paging ──────────────────────────────────────────────────────
@@ -902,6 +1093,16 @@ pub fn render_stream(
         let line = render_display_row(display_row, state, icons, theme);
         let y = area.y + row as u16;
         buf.set_line(area.x, y, &line, content_width);
+
+        // Highlight search matches (non-cursor rows).
+        if row_idx != state.cursor
+            && state.is_search_match(row_idx)
+            && let Some(bg) = theme.search_match.bg
+        {
+            for x in area.x..area.x + content_width {
+                buf[(x, y)].set_bg(bg);
+            }
+        }
 
         // Highlight cursor row.
         if row_idx == state.cursor {
@@ -2345,10 +2546,7 @@ mod tests {
         assert!(expanded_before > 1, "should be expanded");
 
         // Prepend a page of older messages.
-        let older = vec![
-            mcp_request("s1", 1, "grep"),
-            mcp_response("s1", 1),
-        ];
+        let older = vec![mcp_request("s1", 1, "grep"), mcp_response("s1", 1)];
         state.prepend_page(older);
 
         // The internal message moved from index 0 to index 1.
@@ -2366,8 +2564,7 @@ mod tests {
 
     #[test]
     fn test_internal_yank_detail_row() {
-        let icons =
-            super::super::icons::IconSet::from_config(crate::config::IconConfig::default());
+        let icons = super::super::icons::IconSet::from_config(crate::config::IconConfig::default());
         let mut state = StreamState::new(vec![internal_message("s1", 1)]);
         state.toggle_expansion();
 
@@ -2378,5 +2575,245 @@ mod tests {
             text.contains(": "),
             "detail yank should contain label: value, got: {text}"
         );
+    }
+
+    // ── Search tests ───────────────────────────────────────────────
+
+    fn icons() -> super::super::icons::IconSet {
+        super::super::icons::IconSet::from_config(crate::config::IconConfig::default())
+    }
+
+    #[test]
+    fn search_finds_matching_rows() {
+        let icons = icons();
+        let messages = vec![
+            make_message("s1", "textDocument/hover"),
+            make_message("s1", "textDocument/completion"),
+            make_message("s1", "workspace/symbol"),
+        ];
+        let mut state = StreamState::new(messages);
+        state.set_search(Some("hover".to_string()), &icons);
+
+        assert_eq!(state.search_matches.len(), 1);
+        assert_eq!(state.search_match_idx, Some(0));
+        // Cursor should jump to the match.
+        assert_eq!(state.cursor, state.search_matches[0]);
+    }
+
+    #[test]
+    fn search_case_insensitive() {
+        let icons = icons();
+        let messages = vec![
+            make_message("s1", "textDocument/hover"),
+            make_message("s1", "workspace/symbol"),
+        ];
+        let mut state = StreamState::new(messages);
+        state.set_search(Some("HOVER".to_string()), &icons);
+
+        assert_eq!(state.search_matches.len(), 1);
+    }
+
+    #[test]
+    fn search_no_matches() {
+        let icons = icons();
+        let messages = vec![make_message("s1", "textDocument/hover")];
+        let mut state = StreamState::new(messages);
+        state.set_search(Some("nonexistent".to_string()), &icons);
+
+        assert!(state.search_matches.is_empty());
+        assert_eq!(state.search_match_idx, None);
+        assert_eq!(state.search_status().as_deref(), Some("no matches"));
+    }
+
+    #[test]
+    fn search_next_wraps_around() {
+        let icons = icons();
+        let messages = vec![
+            make_message("s1", "textDocument/hover"),
+            make_message("s1", "workspace/symbol"),
+            make_message("s1", "textDocument/hover"),
+        ];
+        let mut state = StreamState::new(messages);
+        // All three are standalones containing "rust-analyzer".
+        state.set_search(Some("rust-analyzer".to_string()), &icons);
+        assert_eq!(state.search_matches.len(), 3);
+
+        let first = state.cursor;
+        state.search_next(40);
+        let second = state.cursor;
+        assert!(second > first);
+
+        state.search_next(40);
+        let third = state.cursor;
+        assert!(third > second);
+
+        // Wrap around.
+        state.search_next(40);
+        assert_eq!(state.cursor, first);
+    }
+
+    #[test]
+    fn search_prev_wraps_around() {
+        let icons = icons();
+        let messages = vec![
+            make_message("s1", "textDocument/hover"),
+            make_message("s1", "workspace/symbol"),
+            make_message("s1", "textDocument/completion"),
+        ];
+        let mut state = StreamState::new(messages);
+        state.set_search(Some("rust-analyzer".to_string()), &icons);
+        assert_eq!(state.search_matches.len(), 3);
+
+        let first = state.cursor;
+        // Go to the last match.
+        state.search_prev(40);
+        assert!(state.cursor > first, "prev should wrap to last match");
+    }
+
+    #[test]
+    fn clear_search_removes_state() {
+        let icons = icons();
+        let messages = vec![make_message("s1", "textDocument/hover")];
+        let mut state = StreamState::new(messages);
+        state.set_search(Some("hover".to_string()), &icons);
+        assert!(state.has_search());
+
+        state.clear_search();
+        assert!(!state.has_search());
+        assert!(state.search_matches.is_empty());
+        assert_eq!(state.search_match_idx, None);
+        assert!(state.search_status().is_none());
+    }
+
+    #[test]
+    fn search_empty_query_clears() {
+        let icons = icons();
+        let messages = vec![make_message("s1", "textDocument/hover")];
+        let mut state = StreamState::new(messages);
+        state.set_search(Some("hover".to_string()), &icons);
+        assert!(state.has_search());
+
+        state.set_search(Some(String::new()), &icons);
+        assert!(!state.has_search());
+    }
+
+    #[test]
+    fn search_status_format() {
+        let icons = icons();
+        let messages = vec![
+            make_message("s1", "textDocument/hover"),
+            make_message("s1", "workspace/symbol"),
+            make_message("s1", "textDocument/hover"),
+        ];
+        let mut state = StreamState::new(messages);
+        state.set_search(Some("hover".to_string()), &icons);
+
+        let status = state.search_status().expect("should have status");
+        assert_eq!(status, "1/2");
+
+        state.search_next(40);
+        let status = state.search_status().expect("should have status");
+        assert_eq!(status, "2/2");
+    }
+
+    #[test]
+    fn is_search_match_returns_correct_rows() {
+        let icons = icons();
+        let messages = vec![
+            make_message("s1", "textDocument/hover"),
+            make_message("s1", "workspace/symbol"),
+        ];
+        let mut state = StreamState::new(messages);
+        state.set_search(Some("hover".to_string()), &icons);
+
+        assert!(state.is_search_match(0));
+        assert!(!state.is_search_match(1));
+    }
+
+    #[test]
+    fn search_next_scrolls_viewport() {
+        let icons = icons();
+        // Create enough messages that matches span multiple viewports.
+        let mut messages = Vec::new();
+        for i in 0..60 {
+            let method = if i % 20 == 0 {
+                "textDocument/hover"
+            } else {
+                "workspace/symbol"
+            };
+            messages.push(SessionMessage {
+                id: i64::from(i),
+                ..make_message("s1", method)
+            });
+        }
+        let mut state = StreamState::new(messages);
+        let viewport = 10;
+        state.set_search(Some("hover".to_string()), &icons);
+
+        // First match at row 0.
+        assert_eq!(state.cursor, 0);
+
+        // Next match should be row 20 — viewport should scroll.
+        state.search_next(viewport);
+        assert_eq!(state.cursor, 20);
+        assert!(
+            state.scroll_position <= 20 && state.cursor < state.scroll_position + viewport,
+            "cursor should be visible: scroll={}, cursor={}, viewport={viewport}",
+            state.scroll_position,
+            state.cursor
+        );
+    }
+
+    #[test]
+    fn search_recomputes_after_append() {
+        let icons = icons();
+        let messages = vec![make_message("s1", "textDocument/hover")];
+        let mut state = StreamState::new(messages);
+        state.set_search(Some("symbol".to_string()), &icons);
+        assert_eq!(state.search_matches.len(), 0, "no matches yet");
+
+        // Append a message that matches.
+        state.append(vec![make_message("s1", "workspace/symbol")]);
+        // Matches are stale until recompute.
+        state.recompute_search_if_dirty(&icons);
+        assert_eq!(
+            state.search_matches.len(),
+            1,
+            "new message should be found"
+        );
+    }
+
+    #[test]
+    fn search_recomputes_after_prepend() {
+        let icons = icons();
+        let messages = vec![SessionMessage {
+            id: 10,
+            ..make_message("s1", "workspace/symbol")
+        }];
+        let mut state = StreamState::new(messages);
+        state.set_search(Some("hover".to_string()), &icons);
+        assert_eq!(state.search_matches.len(), 0);
+
+        // Prepend an older message that matches.
+        let older = vec![SessionMessage {
+            id: 1,
+            ..make_message("s1", "textDocument/hover")
+        }];
+        state.prepend_page(older);
+        state.recompute_search_if_dirty(&icons);
+        assert_eq!(
+            state.search_matches.len(),
+            1,
+            "prepended message should be found"
+        );
+    }
+
+    #[test]
+    fn search_dirty_flag_not_set_without_query() {
+        let messages = vec![make_message("s1", "textDocument/hover")];
+        let mut state = StreamState::new(messages);
+        // No search active — append should not set dirty.
+        state.append(vec![make_message("s1", "workspace/symbol")]);
+        assert!(!state.search_dirty, "no query means no dirty flag");
     }
 }

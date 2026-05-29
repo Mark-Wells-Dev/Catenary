@@ -52,6 +52,9 @@ pub struct Theme {
     pub info: Style,
     /// Style for muted/dimmed text.
     pub muted: Style,
+
+    /// Style for display rows matching the current search query.
+    pub search_match: Style,
 }
 
 impl Default for Theme {
@@ -87,6 +90,8 @@ impl Theme {
             warning: Style::new().fg(Color::Yellow),
             info: Style::new().fg(Color::Blue),
             muted: Style::new().add_modifier(Modifier::DIM),
+
+            search_match: Style::new().fg(Color::Black).bg(Color::Yellow),
         }
     }
 }

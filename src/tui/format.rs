@@ -841,7 +841,10 @@ mod tests {
             text.contains("Failed to load workspaces"),
             "should show payload message, got: {text}"
         );
-        assert!(text.contains("[warn]"), "should show level tag, got: {text}");
+        assert!(
+            text.contains("[warn]"),
+            "should show level tag, got: {text}"
+        );
     }
 
     #[test]
@@ -971,7 +974,10 @@ mod tests {
         );
         let details = internal_detail_lines(&msg);
         let labels: Vec<&str> = details.iter().map(|(l, _)| l.as_str()).collect();
-        assert!(labels.contains(&"target"), "should include target: {labels:?}");
+        assert!(
+            labels.contains(&"target"),
+            "should include target: {labels:?}"
+        );
         assert!(
             labels.contains(&"source"),
             "should include source: {labels:?}"

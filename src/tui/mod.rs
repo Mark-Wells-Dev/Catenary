@@ -154,6 +154,12 @@ struct PanelLayout {
 
 /// Handle a key event, dispatching to global or focus-specific handlers.
 fn handle_key(app: &mut App<'_>, code: KeyCode, viewport_height: usize) {
+    // Search input mode intercepts all keys.
+    if app.search_active {
+        handle_search_input(app, code, viewport_height);
+        return;
+    }
+
     // Global keys (always active regardless of focus).
     match code {
         KeyCode::Char('q') => app.quit = true,
@@ -216,6 +222,16 @@ fn handle_stream_key(app: &mut App<'_>, code: KeyCode, viewport_height: usize) {
                 osc52_copy(&text);
             }
         }
+        KeyCode::Char('/') => {
+            app.search_active = true;
+            app.search_input.clear();
+        }
+        KeyCode::Char('n') => {
+            app.stream.search_next(viewport_height);
+        }
+        KeyCode::Char('N') => {
+            app.stream.search_prev(viewport_height);
+        }
         KeyCode::PageDown => {
             app.stream.scroll_down(viewport_height / 2, viewport_height);
         }
@@ -227,6 +243,49 @@ fn handle_stream_key(app: &mut App<'_>, code: KeyCode, viewport_height: usize) {
         }
         KeyCode::End => {
             app.stream.pin_to_bottom(viewport_height);
+        }
+        KeyCode::Esc => {
+            app.stream.clear_search();
+        }
+        _ => {}
+    }
+}
+
+/// Handle a key event during search input mode.
+fn handle_search_input(app: &mut App<'_>, code: KeyCode, viewport_height: usize) {
+    match code {
+        KeyCode::Char(c) => {
+            app.search_input.push(c);
+            app.stream
+                .set_search(Some(app.search_input.clone()), app.icons);
+        }
+        KeyCode::Backspace => {
+            app.search_input.pop();
+            if app.search_input.is_empty() {
+                app.stream.clear_search();
+            } else {
+                app.stream
+                    .set_search(Some(app.search_input.clone()), app.icons);
+            }
+        }
+        KeyCode::Enter => {
+            // Confirm search and exit input mode.
+            app.search_active = false;
+            if app.search_input.is_empty() {
+                app.stream.clear_search();
+            }
+        }
+        KeyCode::Esc => {
+            // Cancel search entirely.
+            app.search_active = false;
+            app.search_input.clear();
+            app.stream.clear_search();
+        }
+        KeyCode::Down => {
+            app.stream.search_next(viewport_height);
+        }
+        KeyCode::Up => {
+            app.stream.search_prev(viewport_height);
         }
         _ => {}
     }
@@ -356,6 +415,45 @@ fn panel_block<'a>(title: &'a str, focused: bool, theme: &'a Theme) -> Block<'a>
         .title(Span::styled(title, title_style))
 }
 
+/// Render the search bar at the bottom of the stream panel.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "search input length is always small"
+)]
+fn render_search_bar(
+    area: Rect,
+    buf: &mut ratatui::buffer::Buffer,
+    theme: &Theme,
+    input_active: bool,
+    input: &str,
+    status: Option<&str>,
+) {
+    if area.width < 4 {
+        return;
+    }
+
+    let mut spans = vec![Span::styled("/", theme.accent)];
+    if input_active {
+        spans.push(Span::raw(input.to_string()));
+    } else {
+        spans.push(Span::styled(input.to_string(), theme.text));
+    }
+
+    if let Some(status) = status {
+        // Right-align the status indicator.
+        let prefix_len = 1 + input.len();
+        let status_len = status.len() + 1; // space + status
+        let gap = (area.width as usize).saturating_sub(prefix_len + status_len);
+        if gap > 0 {
+            spans.push(Span::raw(" ".repeat(gap)));
+            spans.push(Span::styled(status.to_string(), theme.muted));
+        }
+    }
+
+    let line = ratatui::text::Line::from(spans);
+    buf.set_line(area.x, area.y, &line, area.width);
+}
+
 /// Main event loop — renders quadrant layout, handles input.
 #[allow(
     clippy::too_many_lines,
@@ -380,6 +478,7 @@ fn run_loop(
     loop {
         let size = terminal.size()?;
         let stream_height = size.height as usize;
+        app.stream.recompute_search_if_dirty(app.icons);
         app.stream.apply_auto_scroll(stream_height);
 
         terminal.draw(|f| {
@@ -483,16 +582,52 @@ fn run_loop(
 
             // ── Stream panel ────────────────────────────────────────
             let stream_focused = app.focus == FocusRegion::Stream;
+            let show_search_bar = app.search_active || app.stream.has_search();
             let stream_block = panel_block(" Messages ", stream_focused, app.theme);
             let stream_inner = stream_block.inner(right);
             stream_block.render(right, f.buffer_mut());
+
+            let (stream_area, search_bar_area) = if show_search_bar && stream_inner.height > 1 {
+                let content_height = stream_inner.height - 1;
+                (
+                    Rect {
+                        height: content_height,
+                        ..stream_inner
+                    },
+                    Some(Rect {
+                        y: stream_inner.y + content_height,
+                        height: 1,
+                        ..stream_inner
+                    }),
+                )
+            } else {
+                (stream_inner, None)
+            };
+
             render_stream(
                 &app.stream,
-                stream_inner,
+                stream_area,
                 f.buffer_mut(),
                 app.theme,
                 app.icons,
             );
+
+            // ── Search bar ─────────────────────────────────────────
+            if let Some(bar) = search_bar_area {
+                render_search_bar(
+                    bar,
+                    f.buffer_mut(),
+                    app.theme,
+                    app.search_active,
+                    &app.search_input,
+                    app.stream.search_status().as_deref(),
+                );
+                if app.search_active {
+                    // Position the terminal cursor inside the search bar.
+                    let cursor_x = bar.x + 1 + app.search_input.len() as u16;
+                    f.set_cursor_position((cursor_x.min(bar.x + bar.width - 1), bar.y));
+                }
+            }
 
             // Store rects for mouse dispatch (use full panel rects).
             layout.sessions = sessions_rect;

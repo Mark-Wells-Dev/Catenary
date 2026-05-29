@@ -27,6 +27,8 @@ const STREAM_BINDS: &[(&str, &str)] = &[
     ("j/k", "navigate"),
     ("Enter", "expand/collapse"),
     ("y", "yank"),
+    ("/", "search"),
+    ("n/N", "next/prev match"),
     ("PgUp/Dn", "scroll"),
     ("Home/End", "jump"),
 ];
@@ -34,8 +36,8 @@ const STREAM_BINDS: &[(&str, &str)] = &[
 /// Number of content lines when the keybinds panel is expanded.
 ///
 /// Global(3) + blank(1) + "Sidebar"(1) + sidebar(2) + blank(1)
-/// + "Stream"(1) + stream(5) = 14
-pub const KEYBINDS_EXPANDED_HEIGHT: u16 = 14;
+/// + "Stream"(1) + stream(7) = 16
+pub const KEYBINDS_EXPANDED_HEIGHT: u16 = 16;
 
 /// Render keybinds vertically into the given area.
 ///
