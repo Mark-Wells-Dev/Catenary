@@ -163,11 +163,7 @@ impl SidebarState {
     /// Accepts `SessionData` records for alive sessions only. Releases
     /// badges for sessions that have disconnected and assigns badges
     /// for new ones.
-    pub fn refresh(
-        &mut self,
-        sessions: Vec<SessionData>,
-        badges: &mut HexBadgeMap,
-    ) {
+    pub fn refresh(&mut self, sessions: Vec<SessionData>, badges: &mut HexBadgeMap) {
         // Release badges for removed sessions and prune stale selections.
         let new_ids: HashSet<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
         for entry in &self.entries {
@@ -717,7 +713,14 @@ pub fn render_sessions(
                     Span::styled("  ", theme.muted),
                     Span::styled(&entry.workspace, theme.muted),
                 ]);
-                set_line_scrolled(buf, area, area.y + row as u16, &workspace_line, hs, theme.muted);
+                set_line_scrolled(
+                    buf,
+                    area,
+                    area.y + row as u16,
+                    &workspace_line,
+                    hs,
+                    theme.muted,
+                );
                 row += 1;
             }
             if row < max_rows {
@@ -727,10 +730,7 @@ pub fn render_sessions(
                     if entry.languages.is_empty() {
                         Span::raw("")
                     } else {
-                        Span::styled(
-                            format!("  {}", entry.languages.join(", ")),
-                            theme.accent,
-                        )
+                        Span::styled(format!("  {}", entry.languages.join(", ")), theme.accent)
                     },
                 ]);
                 set_line_scrolled(buf, area, area.y + row as u16, &pid_line, hs, theme.muted);
@@ -2105,10 +2105,7 @@ mod tests {
         let mut state = SidebarState::new();
         let mut badges = HexBadgeMap::new();
         // Content: "00 claude A/" = 12 cols.
-        state.refresh(
-            vec![sd("s1", Some("claude"), "/A")],
-            &mut badges,
-        );
+        state.refresh(vec![sd("s1", Some("claude"), "/A")], &mut badges);
         // Request a large hscroll, but content fits in 25 cols.
         state.session_hscroll = 20;
 

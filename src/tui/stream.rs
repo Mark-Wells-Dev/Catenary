@@ -2997,10 +2997,7 @@ mod tests {
 
     #[test]
     fn test_visual_suppresses_paging() {
-        let mut state = StreamState::new(vec![
-            make_message("s1", "a"),
-            make_message("s1", "b"),
-        ]);
+        let mut state = StreamState::new(vec![make_message("s1", "a"), make_message("s1", "b")]);
         state.reached_beginning = false;
         state.cursor = 0;
 
@@ -3032,10 +3029,7 @@ mod tests {
 
     #[test]
     fn test_visual_cursor_down_does_not_reenable_auto_scroll() {
-        let mut state = StreamState::new(vec![
-            make_message("s1", "a"),
-            make_message("s1", "b"),
-        ]);
+        let mut state = StreamState::new(vec![make_message("s1", "a"), make_message("s1", "b")]);
         state.auto_scroll = false;
         state.cursor = 0;
         state.start_visual();
