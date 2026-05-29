@@ -91,6 +91,17 @@ impl EditingManager {
             .contains_key(&key)
     }
 
+    /// Returns `true` if the agent has accumulated any files during editing.
+    #[must_use]
+    pub fn has_files(&self, session_id: Option<&str>, agent_id: &str) -> bool {
+        let key = editing_key(session_id, agent_id);
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+            .is_some_and(|files| !files.is_empty())
+    }
+
     /// Accumulates a modified file path for an agent in editing mode.
     ///
     /// Idempotent — duplicate paths are not added.
@@ -225,6 +236,21 @@ mod tests {
         let em = EditingManager::new();
         em.add_file(None, "ghost", PathBuf::from("/src/main.rs"));
         assert!(em.drain_files(None, "ghost").is_empty());
+    }
+
+    #[test]
+    fn has_files_tracks_accumulation() {
+        let em = EditingManager::new();
+        em.start_editing(None, "").expect("start");
+        assert!(!em.has_files(None, ""), "no files yet");
+        em.add_file(None, "", PathBuf::from("/src/main.rs"));
+        assert!(em.has_files(None, ""), "file added");
+    }
+
+    #[test]
+    fn has_files_false_when_not_editing() {
+        let em = EditingManager::new();
+        assert!(!em.has_files(None, "ghost"));
     }
 
     #[test]

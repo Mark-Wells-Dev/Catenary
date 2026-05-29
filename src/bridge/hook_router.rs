@@ -501,7 +501,7 @@ impl HookRouter {
                 None
             } else {
                 Some(HookResult::Deny(
-                    "run `catenary editing stop` to get diagnostics".into(),
+                    "run `catenary editing stop` to exit editing mode".into(),
                 ))
             }
         } else if is_edit_tool(tool_name) {
@@ -515,7 +515,7 @@ impl HookRouter {
                 return None;
             }
             Some(HookResult::Deny(
-                "run `catenary editing start` before editing".into(),
+                "run `catenary editing start` to enter editing mode".into(),
             ))
         } else {
             None
@@ -575,9 +575,18 @@ impl HookRouter {
         }
 
         if self.session.editing.is_editing(session_id, agent_id) {
-            Some(HookResult::Block(
-                "run `catenary editing stop` to get diagnostics before finishing".into(),
-            ))
+            if self.session.editing.has_files(session_id, agent_id) {
+                Some(HookResult::Block(
+                    "run `catenary editing stop` before finishing".into(),
+                ))
+            } else {
+                // No files modified — silently clear editing state.
+                self.session.editing.done_editing(session_id, agent_id);
+                if let Some(guardrail) = &self.session.editing_guardrail {
+                    guardrail.release_all(&self.session.instance_id);
+                }
+                None
+            }
         } else {
             None
         }
@@ -729,12 +738,32 @@ mod tests {
     fn test_hook_require_release_block() {
         let router = test_router();
         let _ = router.session.editing.start_editing(None, "");
+        router
+            .session
+            .editing
+            .add_file(None, "", PathBuf::from("/src/main.rs"));
 
         let result = router.handle_require_release(None, "", false);
         let Some(HookResult::Block(reason)) = result else {
             unreachable!("expected Block, got {result:?}");
         };
         assert!(reason.contains("editing stop"));
+    }
+
+    #[test]
+    fn test_hook_require_release_no_files_allows() {
+        let router = test_router();
+        let _ = router.session.editing.start_editing(None, "");
+
+        // Editing mode active but no files modified — should allow
+        let result = router.handle_require_release(None, "", false);
+        assert!(result.is_none(), "expected allow, got {result:?}");
+
+        // Editing state should be cleared
+        assert!(
+            !router.session.editing.is_editing(None, ""),
+            "editing state should be cleared when no files pending"
+        );
     }
 
     #[test]
@@ -1328,6 +1357,12 @@ mod tests {
         // Enter editing mode so stop blocks.
         let _ = router.session.editing.start_editing(None, "");
 
+        // Add a file so editing mode has pending work.
+        router
+            .session
+            .editing
+            .add_file(None, "", PathBuf::from("/src/main.rs"));
+
         crate::logging::Sink::handle(
             router.session.notification_router.as_ref(),
             &make_notify_event("server offline", "ra"),
@@ -1375,8 +1410,12 @@ mod tests {
     #[test]
     fn dispatch_stop_block_then_allow_drains_accumulated() {
         let router = test_router();
-        // Enter editing mode so stop blocks.
+        // Enter editing mode with a file so stop blocks.
         let _ = router.session.editing.start_editing(None, "");
+        router
+            .session
+            .editing
+            .add_file(None, "", PathBuf::from("/src/main.rs"));
 
         // Enqueue a notification before the first stop.
         crate::logging::Sink::handle(
@@ -1432,6 +1471,10 @@ mod tests {
     fn dispatch_stop_dedup_persists_across_blocked_cycle() {
         let router = test_router();
         let _ = router.session.editing.start_editing(None, "");
+        router
+            .session
+            .editing
+            .add_file(None, "", PathBuf::from("/src/main.rs"));
 
         // Enqueue a notification.
         crate::logging::Sink::handle(
