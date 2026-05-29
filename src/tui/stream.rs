@@ -1981,6 +1981,20 @@ mod tests {
         )
     }
 
+    /// LSP child with a specific server and scope root.
+    fn lsp_child_instance(
+        session_id: &str,
+        scope_id: i64,
+        id_offset: i64,
+        server: &str,
+        scope_root: &str,
+    ) -> SessionMessage {
+        SessionMessage {
+            scope_root: scope_root.to_string(),
+            ..lsp_child_server(session_id, scope_id, id_offset, server)
+        }
+    }
+
     #[test]
     fn test_server_filter_shows_matching_scopes() {
         // Scope 1: has rust-analyzer children.
@@ -2117,5 +2131,59 @@ mod tests {
         // Clear filter.
         state.set_server_filter(None);
         assert_eq!(state.display_rows.len(), 2, "all restored");
+    }
+
+    #[test]
+    fn test_server_filter_distinguishes_instances_by_scope_root() {
+        // Two scopes with the same server name but different scope roots.
+        let req1 = mcp_request("s1", 1, "grep");
+        let child1 = lsp_child_instance("s1", 1, 0, "rust-analyzer", "/project-a");
+        let resp1 = mcp_response("s1", 1);
+
+        let req2 = mcp_request("s1", 2, "grep");
+        let child2 = lsp_child_instance("s1", 2, 0, "rust-analyzer", "/project-b");
+        let resp2 = mcp_response("s1", 2);
+
+        let mut state = StreamState::new(vec![req1, child1, resp1, req2, child2, resp2]);
+        assert_eq!(
+            state.display_rows.len(),
+            2,
+            "both scopes visible unfiltered"
+        );
+
+        // Filter to rust-analyzer @ /project-a only.
+        let mut filter = HashSet::new();
+        filter.insert(("rust-analyzer".to_string(), "/project-a".to_string()));
+        state.set_server_filter(Some(filter));
+
+        assert_eq!(state.display_rows.len(), 1, "only /project-a scope");
+        let DisplayRow::ScopeHeader(idx) = state.display_rows[0] else {
+            panic!("expected scope header");
+        };
+        let StreamEntry::Scope(scope) = &state.entries[idx] else {
+            panic!("expected scope entry");
+        };
+        assert_eq!(scope.scope_id, "scope-1");
+
+        // Switch to /project-b.
+        let mut filter = HashSet::new();
+        filter.insert(("rust-analyzer".to_string(), "/project-b".to_string()));
+        state.set_server_filter(Some(filter));
+
+        assert_eq!(state.display_rows.len(), 1, "only /project-b scope");
+        let DisplayRow::ScopeHeader(idx) = state.display_rows[0] else {
+            panic!("expected scope header");
+        };
+        let StreamEntry::Scope(scope) = &state.entries[idx] else {
+            panic!("expected scope entry");
+        };
+        assert_eq!(scope.scope_id, "scope-2");
+
+        // Select both instances — both scopes visible.
+        let mut filter = HashSet::new();
+        filter.insert(("rust-analyzer".to_string(), "/project-a".to_string()));
+        filter.insert(("rust-analyzer".to_string(), "/project-b".to_string()));
+        state.set_server_filter(Some(filter));
+        assert_eq!(state.display_rows.len(), 2, "both instances selected");
     }
 }
