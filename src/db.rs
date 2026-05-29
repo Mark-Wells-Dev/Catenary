@@ -733,10 +733,10 @@ fn migrate_v12_to_v13(conn: &Connection) -> Result<()> {
 
 /// Migrates the database from schema version 13 to 14.
 ///
-/// Adds `scope_root` column to the `messages` table so the TUI can
-/// filter by `(server, scope_root)` pair instead of server name alone.
-/// LSP messages store the workspace root path; MCP and hook messages
-/// get empty string.
+/// Adds `scope_root` column to the `messages` table. LSP messages store the
+/// workspace root path so the TUI can filter by `(server, scope_root)` pair,
+/// distinguishing multiple instances of the same server. MCP and hook
+/// messages get the empty-string default.
 ///
 /// # Errors
 ///

@@ -41,9 +41,9 @@ struct PendingRequest {
 fn emit_lsp_event(
     level: tracing::Level,
     server_name: &str,
-    scope_root: &str,
     method: &str,
     parent_id: Option<&str>,
+    scope_root: &str,
     payload: &str,
     msg: &str,
 ) {
@@ -54,8 +54,8 @@ fn emit_lsp_event(
             method = method,
             server = server_name,
             client = "catenary",
-            scope_root = scope_root,
             parent_id = parent_id,
+            scope_root = scope_root,
             payload = payload,
             "{msg}"
         );
@@ -66,8 +66,8 @@ fn emit_lsp_event(
             method = method,
             server = server_name,
             client = "catenary",
-            scope_root = scope_root,
             parent_id = parent_id,
+            scope_root = scope_root,
             payload = payload,
             "{msg}"
         );
@@ -78,8 +78,8 @@ fn emit_lsp_event(
             method = method,
             server = server_name,
             client = "catenary",
-            scope_root = scope_root,
             parent_id = parent_id,
+            scope_root = scope_root,
             payload = payload,
             "{msg}"
         );
@@ -90,8 +90,8 @@ fn emit_lsp_event(
             method = method,
             server = server_name,
             client = "catenary",
-            scope_root = scope_root,
             parent_id = parent_id,
+            scope_root = scope_root,
             payload = payload,
             "{msg}"
         );
@@ -323,9 +323,9 @@ impl Connection {
                 emit_lsp_event(
                     level,
                     &self.server_name,
-                    &sr,
                     method,
                     parent_id,
+                    &sr,
                     &payload.to_string(),
                     "outgoing request",
                 );
@@ -452,9 +452,9 @@ impl Connection {
             emit_lsp_event(
                 tracing::Level::DEBUG,
                 &self.server_name,
-                &sr,
                 method,
                 parent_id,
+                &sr,
                 &payload.to_string(),
                 "outgoing notification",
             );
@@ -658,9 +658,9 @@ impl Connection {
                                 emit_lsp_event(
                                     tracing::Level::DEBUG,
                                     &server_name,
-                                    &sr,
                                     method,
                                     Some(&exchange_id),
+                                    &sr,
                                     &value.to_string(),
                                     "incoming server request",
                                 );
@@ -695,9 +695,9 @@ impl Connection {
                                     emit_lsp_event(
                                         tracing::Level::DEBUG,
                                         &server_name,
-                                        &sr,
                                         method,
                                         Some(&exchange_id),
+                                        &sr,
                                         &response_json.to_string(),
                                         "outgoing server response",
                                     );
@@ -784,9 +784,9 @@ impl Connection {
                                     emit_lsp_event(
                                         notif_level,
                                         &server_name,
-                                        &sr,
                                         method,
                                         None,
+                                        &sr,
                                         &value.to_string(),
                                         &msg,
                                     );
@@ -811,9 +811,9 @@ impl Connection {
                                         emit_lsp_event(
                                             resp_level,
                                             &server_name,
-                                            &sr,
                                             &req.method,
                                             req.parent_id.as_deref(),
+                                            &sr,
                                             &value.to_string(),
                                             "incoming response",
                                         );
@@ -907,36 +907,36 @@ mod tests {
         emit_lsp_event(
             tracing::Level::ERROR,
             "test-server",
-            "",
             "test/error",
             None,
+            "",
             "{}",
             "error msg",
         );
         emit_lsp_event(
             tracing::Level::WARN,
             "test-server",
-            "",
             "test/warn",
             None,
+            "",
             "{}",
             "warn msg",
         );
         emit_lsp_event(
             tracing::Level::INFO,
             "test-server",
-            "",
             "test/info",
             None,
+            "",
             "{}",
             "info msg",
         );
         emit_lsp_event(
             tracing::Level::DEBUG,
             "test-server",
-            "",
             "test/debug",
             None,
+            "",
             "{}",
             "debug msg",
         );
@@ -965,18 +965,18 @@ mod tests {
         emit_lsp_event(
             tracing::Level::INFO,
             "test-server",
-            "",
             "test/method",
             Some("scope-5"),
+            "",
             "{}",
             "with parent",
         );
         emit_lsp_event(
             tracing::Level::INFO,
             "test-server",
-            "",
             "test/method",
             None,
+            "",
             "{}",
             "no parent",
         );
