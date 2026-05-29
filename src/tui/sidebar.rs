@@ -265,8 +265,8 @@ impl SidebarState {
             .collect();
         for n in noise {
             current.push(format!(
-                "noise:{}:{}:{}:{}",
-                n.server, n.scope_root, n.method, n.payload
+                "noise:{}:{}:{:?}:{:?}:{:?}",
+                n.server, n.scope_root, n.progress_title, n.progress_pct, n.last_message
             ));
         }
         self.last_server_names != current
@@ -286,8 +286,8 @@ impl SidebarState {
             .collect();
         for n in noise {
             self.last_server_names.push(format!(
-                "noise:{}:{}:{}:{}",
-                n.server, n.scope_root, n.method, n.payload
+                "noise:{}:{}:{:?}:{:?}:{:?}",
+                n.server, n.scope_root, n.progress_title, n.progress_pct, n.last_message
             ));
         }
 
@@ -463,9 +463,9 @@ fn server_root_name(scope_root: &str) -> String {
 
 /// Extract a progress line from noise data for the given server instance.
 ///
-/// Reads the `$/progress` payload to build a display string like
-/// `"Indexing… 47%"`. Returns `None` if no active progress or if the
-/// most recent progress was an `end` event.
+/// Reads pre-computed `progress_title` and `progress_pct` columns from
+/// the `language_servers` table. Returns a display string like
+/// `"Indexing… 47%"`, or `None` if no active progress.
 fn extract_progress_line(
     noise: &[ServerNoiseRow],
     server: &str,
@@ -473,63 +473,28 @@ fn extract_progress_line(
 ) -> Option<String> {
     let row = noise
         .iter()
-        .find(|n| n.server == server && n.scope_root == scope_root && n.method == "$/progress")?;
+        .find(|n| n.server == server && n.scope_root == scope_root && n.progress_title.is_some())?;
 
-    let value = row.payload.get("params").and_then(|p| p.get("value"))?;
-    let kind = value.get("kind").and_then(|k| k.as_str());
-
-    // End events mean no active progress.
-    if kind == Some("end") {
-        return None;
-    }
-
-    let title = value.get("title").and_then(|t| t.as_str());
-    let message = value.get("message").and_then(|m| m.as_str());
-    let pct = value.get("percentage").and_then(serde_json::Value::as_u64);
-
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(t) = title {
-        parts.push(format!("{t}…"));
-    } else if let Some(m) = message {
-        parts.push(format!("{m}…"));
-    }
-    if let Some(p) = pct {
-        parts.push(format!("{p}%"));
-    }
-
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join(" "))
-    }
+    let title = row.progress_title.as_deref()?;
+    Some(
+        row.progress_pct
+            .map_or_else(|| format!("{title}…"), |pct| format!("{title}… {pct}%")),
+    )
 }
 
 /// Extract the most recent server message from noise data for a server instance.
 ///
-/// Reads `window/logMessage` or `window/showMessage` payload to get the
-/// message text. Prefers `showMessage` over `logMessage` if both exist.
+/// Reads the pre-computed `last_message` column from the `language_servers`
+/// table.
 fn extract_server_message(
     noise: &[ServerNoiseRow],
     server: &str,
     scope_root: &str,
 ) -> Option<String> {
-    // Prefer showMessage (user-facing) over logMessage (telemetry).
     let row = noise
         .iter()
-        .find(|n| {
-            n.server == server && n.scope_root == scope_root && n.method == "window/showMessage"
-        })
-        .or_else(|| {
-            noise.iter().find(|n| {
-                n.server == server && n.scope_root == scope_root && n.method == "window/logMessage"
-            })
-        })?;
-
-    row.payload
-        .get("params")
-        .and_then(|p| p.get("message"))
-        .and_then(|m| m.as_str())
-        .map(str::to_string)
+        .find(|n| n.server == server && n.scope_root == scope_root && n.last_message.is_some())?;
+    row.last_message.clone()
 }
 
 // ── Rendering ────────────────────────────────────────────────────────
@@ -1275,14 +1240,16 @@ mod tests {
     fn make_noise(
         server: &str,
         scope_root: &str,
-        method: &str,
-        payload: serde_json::Value,
+        progress_title: Option<&str>,
+        progress_pct: Option<u32>,
+        last_message: Option<&str>,
     ) -> ServerNoiseRow {
         ServerNoiseRow {
             server: server.to_string(),
             scope_root: scope_root.to_string(),
-            method: method.to_string(),
-            payload,
+            progress_title: progress_title.map(str::to_string),
+            progress_pct,
+            last_message: last_message.map(str::to_string),
         }
     }
 
@@ -1291,48 +1258,23 @@ mod tests {
         let noise = vec![make_noise(
             "rust-analyzer",
             "/A",
-            "$/progress",
-            serde_json::json!({
-                "params": {
-                    "value": {
-                        "kind": "begin",
-                        "title": "Indexing",
-                        "percentage": 47
-                    }
-                }
-            }),
+            Some("Indexing"),
+            Some(47),
+            None,
         )];
         let line = extract_progress_line(&noise, "rust-analyzer", "/A");
         assert_eq!(line.as_deref(), Some("Indexing… 47%"));
     }
 
     #[test]
-    fn extract_progress_line_end_returns_none() {
-        let noise = vec![make_noise(
-            "rust-analyzer",
-            "/A",
-            "$/progress",
-            serde_json::json!({
-                "params": {
-                    "value": { "kind": "end" }
-                }
-            }),
-        )];
+    fn extract_progress_line_no_progress_returns_none() {
+        let noise = vec![make_noise("rust-analyzer", "/A", None, None, None)];
         assert!(extract_progress_line(&noise, "rust-analyzer", "/A").is_none());
     }
 
     #[test]
     fn extract_progress_line_wrong_server() {
-        let noise = vec![make_noise(
-            "lua-ls",
-            "/A",
-            "$/progress",
-            serde_json::json!({
-                "params": {
-                    "value": { "kind": "begin", "title": "Loading" }
-                }
-            }),
-        )];
+        let noise = vec![make_noise("lua-ls", "/A", Some("Loading"), None, None)];
         assert!(extract_progress_line(&noise, "rust-analyzer", "/A").is_none());
     }
 
@@ -1341,37 +1283,12 @@ mod tests {
         let noise = vec![make_noise(
             "rust-analyzer",
             "/A",
-            "window/logMessage",
-            serde_json::json!({
-                "params": { "message": "Fetching crate data" }
-            }),
+            None,
+            None,
+            Some("Fetching crate data"),
         )];
         let msg = extract_server_message(&noise, "rust-analyzer", "/A");
         assert_eq!(msg.as_deref(), Some("Fetching crate data"));
-    }
-
-    #[test]
-    fn extract_server_message_prefers_show_over_log() {
-        let noise = vec![
-            make_noise(
-                "rust-analyzer",
-                "/A",
-                "window/logMessage",
-                serde_json::json!({
-                    "params": { "message": "log message" }
-                }),
-            ),
-            make_noise(
-                "rust-analyzer",
-                "/A",
-                "window/showMessage",
-                serde_json::json!({
-                    "params": { "message": "show message" }
-                }),
-            ),
-        ];
-        let msg = extract_server_message(&noise, "rust-analyzer", "/A");
-        assert_eq!(msg.as_deref(), Some("show message"));
     }
 
     #[test]
@@ -1381,10 +1298,9 @@ mod tests {
         let noise = vec![make_noise(
             "rust-analyzer",
             "/A",
-            "$/progress",
-            serde_json::json!({
-                "params": { "value": { "kind": "begin", "title": "Indexing", "percentage": 10 } }
-            }),
+            Some("Indexing"),
+            Some(10),
+            None,
         )];
         state.refresh_servers(&rows, &noise);
 
@@ -1395,10 +1311,9 @@ mod tests {
         let noise2 = vec![make_noise(
             "rust-analyzer",
             "/A",
-            "$/progress",
-            serde_json::json!({
-                "params": { "value": { "kind": "begin", "title": "Indexing", "percentage": 50 } }
-            }),
+            Some("Indexing"),
+            Some(50),
+            None,
         )];
         assert!(state.servers_need_refresh(&rows, &noise2));
     }
@@ -1413,12 +1328,9 @@ mod tests {
         let noise = vec![make_noise(
             "rust-analyzer",
             "/A",
-            "$/progress",
-            serde_json::json!({
-                "params": {
-                    "value": { "kind": "begin", "title": "Indexing", "percentage": 47 }
-                }
-            }),
+            Some("Indexing"),
+            Some(47),
+            None,
         )];
         state.refresh_servers(&rows, &noise);
 
@@ -1458,26 +1370,8 @@ mod tests {
             make_server_row("rust-analyzer", "/B", "busy"),
         ];
         let noise = vec![
-            make_noise(
-                "rust-analyzer",
-                "/A",
-                "$/progress",
-                serde_json::json!({
-                    "params": {
-                        "value": { "kind": "begin", "title": "Indexing", "percentage": 20 }
-                    }
-                }),
-            ),
-            make_noise(
-                "rust-analyzer",
-                "/B",
-                "$/progress",
-                serde_json::json!({
-                    "params": {
-                        "value": { "kind": "begin", "title": "Loading", "percentage": 80 }
-                    }
-                }),
-            ),
+            make_noise("rust-analyzer", "/A", Some("Indexing"), Some(20), None),
+            make_noise("rust-analyzer", "/B", Some("Loading"), Some(80), None),
         ];
         state.refresh_servers(&rows, &noise);
 
@@ -1503,18 +1397,16 @@ mod tests {
             make_noise(
                 "rust-analyzer",
                 "/A",
-                "window/logMessage",
-                serde_json::json!({
-                    "params": { "message": "Workspace A loaded" }
-                }),
+                None,
+                None,
+                Some("Workspace A loaded"),
             ),
             make_noise(
                 "rust-analyzer",
                 "/B",
-                "window/logMessage",
-                serde_json::json!({
-                    "params": { "message": "Workspace B loaded" }
-                }),
+                None,
+                None,
+                Some("Workspace B loaded"),
             ),
         ];
         state.refresh_servers(&rows, &noise);

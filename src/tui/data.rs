@@ -39,18 +39,20 @@ pub struct ServerStatusRow {
     pub state: String,
 }
 
-/// A server noise row: the most recent `$/progress`, `window/logMessage`,
-/// or `window/showMessage` per server instance.
+/// A server noise row from the `language_servers` table: progress and
+/// message state for a single server instance.
 #[derive(Debug, Clone)]
 pub struct ServerNoiseRow {
     /// Server binary name (matches `ServerStatusRow::server`).
     pub server: String,
     /// Scope root path (matches `ServerStatusRow::scope_root`).
     pub scope_root: String,
-    /// LSP method (`$/progress`, `window/logMessage`, `window/showMessage`).
-    pub method: String,
-    /// Raw protocol JSON payload.
-    pub payload: serde_json::Value,
+    /// Active progress title, if any (from `$/progress`).
+    pub progress_title: Option<String>,
+    /// Active progress percentage, if any (from `$/progress`).
+    pub progress_pct: Option<u32>,
+    /// Most recent server message (from `window/logMessage` or `window/showMessage`).
+    pub last_message: Option<String>,
 }
 
 /// Methods that constitute server noise — redirected from stream to sidebar.
@@ -142,12 +144,12 @@ pub trait DataSource {
     /// Returns an error if the database cannot be queried.
     fn list_server_statuses(&self) -> Result<Vec<ServerStatusRow>>;
 
-    /// Load the most recent server noise row per server instance.
+    /// Load server noise (progress + messages) from the `language_servers` table.
     ///
-    /// Queries `$/progress`, `window/logMessage`, and `window/showMessage`
-    /// from the messages table. Returns at most one row per
-    /// `(server, scope_root, method)` combination — the most recent by
-    /// message ID.
+    /// Returns one row per non-dead server instance that has an active
+    /// progress title or a stored server message. Progress and message
+    /// columns are written by the daemon as it processes `$/progress`
+    /// and `window/logMessage`/`window/showMessage` notifications.
     ///
     /// # Errors
     ///
@@ -363,32 +365,22 @@ impl DataSource for SqliteDataSource {
     }
 
     fn list_server_noise(&self) -> Result<Vec<ServerNoiseRow>> {
-        // Most recent row per (server, scope_root, method) for server noise methods.
         let mut stmt = self.conn.prepare(
-            "SELECT server, scope_root, method, payload FROM messages \
-             WHERE type = 'lsp' \
-               AND method IN ('$/progress', 'window/logMessage', 'window/showMessage') \
-               AND parent_id IS NULL \
-               AND id IN ( \
-                   SELECT MAX(id) FROM messages \
-                   WHERE type = 'lsp' \
-                     AND method IN ('$/progress', 'window/logMessage', 'window/showMessage') \
-                     AND parent_id IS NULL \
-                   GROUP BY server, scope_root, method \
-               ) \
-             ORDER BY server, scope_root, method",
+            "SELECT server, scope_root, progress_title, progress_pct, last_message \
+             FROM language_servers \
+             WHERE state != 'dead' \
+               AND (progress_title IS NOT NULL OR last_message IS NOT NULL) \
+             ORDER BY server, scope_root",
         )?;
         let mut rows = stmt.query([])?;
         let mut result = Vec::new();
         while let Some(row) = rows.next()? {
-            let payload_str: String = row.get(3)?;
-            let payload: serde_json::Value =
-                serde_json::from_str(&payload_str).unwrap_or(serde_json::Value::Null);
             result.push(ServerNoiseRow {
                 server: row.get(0)?,
                 scope_root: row.get(1)?,
-                method: row.get(2)?,
-                payload,
+                progress_title: row.get(2)?,
+                progress_pct: row.get(3)?,
+                last_message: row.get(4)?,
             });
         }
         Ok(result)
@@ -888,45 +880,60 @@ mod tests {
         insert_session(&write_conn, "daemon", "/tmp/daemon");
 
         // Two rust-analyzer instances with different scope_root,
-        // each sending $/progress with different payloads.
-        write_conn.execute(
-            "INSERT INTO messages \
-             (session_id, timestamp, type, method, server, client, \
-              parent_id, scope_root, payload) \
-             VALUES ('daemon', '2026-01-01T00:00:01Z', 'lsp', '$/progress', \
-              'rust-analyzer', 'catenary', NULL, '/home/user/A', \
-              '{\"params\":{\"value\":{\"kind\":\"begin\",\"title\":\"Indexing\",\"percentage\":20}}}')",
-            [],
+        // each with progress data in the language_servers table.
+        crate::db::upsert_server_state(
+            &write_conn,
+            "daemon",
+            "rust",
+            "rust-analyzer",
+            "root",
+            "/home/user/A",
+            "busy",
         )?;
-        write_conn.execute(
-            "INSERT INTO messages \
-             (session_id, timestamp, type, method, server, client, \
-              parent_id, scope_root, payload) \
-             VALUES ('daemon', '2026-01-01T00:00:02Z', 'lsp', '$/progress', \
-              'rust-analyzer', 'catenary', NULL, '/home/user/B', \
-              '{\"params\":{\"value\":{\"kind\":\"begin\",\"title\":\"Loading\",\"percentage\":80}}}')",
-            [],
+        crate::db::update_server_progress(
+            &write_conn,
+            "daemon",
+            "rust",
+            "rust-analyzer",
+            "root",
+            "/home/user/A",
+            Some("Indexing"),
+            Some(20),
+        )?;
+
+        crate::db::upsert_server_state(
+            &write_conn,
+            "daemon",
+            "rust",
+            "rust-analyzer",
+            "root",
+            "/home/user/B",
+            "busy",
+        )?;
+        crate::db::update_server_progress(
+            &write_conn,
+            "daemon",
+            "rust",
+            "rust-analyzer",
+            "root",
+            "/home/user/B",
+            Some("Loading"),
+            Some(80),
         )?;
 
         let ds = SqliteDataSource::with_conn(conn);
         let noise = ds.list_server_noise()?;
 
-        // Should return two separate rows — one per (server, scope_root, method).
+        // Should return two separate rows — one per (server, scope_root).
         assert_eq!(noise.len(), 2, "expected 2 noise rows, got {}", noise.len());
         assert_eq!(noise[0].scope_root, "/home/user/A");
         assert_eq!(noise[1].scope_root, "/home/user/B");
 
-        // Payloads should be distinct.
-        let title_a = noise[0]
-            .payload
-            .pointer("/params/value/title")
-            .and_then(|v| v.as_str());
-        let title_b = noise[1]
-            .payload
-            .pointer("/params/value/title")
-            .and_then(|v| v.as_str());
-        assert_eq!(title_a, Some("Indexing"));
-        assert_eq!(title_b, Some("Loading"));
+        // Progress titles should be distinct.
+        assert_eq!(noise[0].progress_title.as_deref(), Some("Indexing"));
+        assert_eq!(noise[1].progress_title.as_deref(), Some("Loading"));
+        assert_eq!(noise[0].progress_pct, Some(20));
+        assert_eq!(noise[1].progress_pct, Some(80));
 
         Ok(())
     }
