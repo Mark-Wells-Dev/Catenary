@@ -28,7 +28,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, MouseButton, MouseEventKind,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseButton,
+    MouseEventKind,
 };
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -180,7 +181,17 @@ struct PanelLayout {
 }
 
 /// Handle a key event, dispatching to global or focus-specific handlers.
-fn handle_key(app: &mut App<'_>, code: KeyCode, viewport_height: usize, detail_height: usize) {
+#[allow(
+    clippy::too_many_lines,
+    reason = "key dispatch covers popup, search, global, and four panel-specific handlers"
+)]
+fn handle_key(
+    app: &mut App<'_>,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    viewport_height: usize,
+    detail_height: usize,
+) {
     // Detail panel captures all keys when open.
     if let Some(ref mut popup) = app.popup {
         match code {
@@ -189,6 +200,11 @@ fn handle_key(app: &mut App<'_>, code: KeyCode, viewport_height: usize, detail_h
             KeyCode::Char('k') | KeyCode::Up => popup.scroll_up(1),
             KeyCode::PageDown => popup.scroll_down(detail_height / 2, detail_height),
             KeyCode::PageUp => popup.scroll_up(detail_height / 2),
+            KeyCode::Char('y') => {
+                if let Some(text) = popup.yank_text() {
+                    osc52_copy(&text);
+                }
+            }
             _ => {}
         }
         return;
@@ -207,10 +223,14 @@ fn handle_key(app: &mut App<'_>, code: KeyCode, viewport_height: usize, detail_h
         KeyCode::Char('b') => app.cycle_left_tab(),
         KeyCode::Tab => {
             app.stream.exit_visual();
+            app.sidebar.exit_session_visual();
+            app.sidebar.exit_server_visual();
             app.cycle_focus();
         }
         KeyCode::BackTab => {
             app.stream.exit_visual();
+            app.sidebar.exit_session_visual();
+            app.sidebar.exit_server_visual();
             app.cycle_focus_back();
         }
         _ => match app.focus {
@@ -230,8 +250,28 @@ fn handle_key(app: &mut App<'_>, code: KeyCode, viewport_height: usize, detail_h
                     KeyCode::Enter => {
                         app.sidebar.toggle_session_expanded();
                     }
-                    KeyCode::Char(' ') => {
+                    KeyCode::Char('f') => {
                         app.toggle_session_selection();
+                    }
+                    KeyCode::Char(' ') => {
+                        if modifiers.contains(KeyModifiers::SHIFT) {
+                            if !app.sidebar.in_session_visual() {
+                                app.sidebar.start_session_visual();
+                            }
+                        } else if app.sidebar.in_session_visual() {
+                            app.sidebar.exit_session_visual();
+                        } else {
+                            app.sidebar.start_session_visual();
+                        }
+                    }
+                    KeyCode::Char('y') => {
+                        if let Some(text) = app.sidebar.yank_sessions_text() {
+                            osc52_copy(&text);
+                        }
+                        app.sidebar.exit_session_visual();
+                    }
+                    KeyCode::Esc => {
+                        app.sidebar.exit_session_visual();
                     }
                     _ => {}
                 }
@@ -254,8 +294,28 @@ fn handle_key(app: &mut App<'_>, code: KeyCode, viewport_height: usize, detail_h
                     KeyCode::Enter => {
                         app.open_server_popup();
                     }
-                    KeyCode::Char(' ') => {
+                    KeyCode::Char('f') => {
                         app.toggle_server_selection();
+                    }
+                    KeyCode::Char(' ') => {
+                        if modifiers.contains(KeyModifiers::SHIFT) {
+                            if !app.sidebar.in_server_visual() {
+                                app.sidebar.start_server_visual();
+                            }
+                        } else if app.sidebar.in_server_visual() {
+                            app.sidebar.exit_server_visual();
+                        } else {
+                            app.sidebar.start_server_visual();
+                        }
+                    }
+                    KeyCode::Char('y') => {
+                        if let Some(text) = app.sidebar.yank_servers_text() {
+                            osc52_copy(&text);
+                        }
+                        app.sidebar.exit_server_visual();
+                    }
+                    KeyCode::Esc => {
+                        app.sidebar.exit_server_visual();
                     }
                     _ => {}
                 }
@@ -264,14 +324,19 @@ fn handle_key(app: &mut App<'_>, code: KeyCode, viewport_height: usize, detail_h
                 // No navigation inside keybinds panel.
             }
             FocusRegion::Stream => {
-                handle_stream_key(app, code, viewport_height);
+                handle_stream_key(app, code, modifiers, viewport_height);
             }
         },
     }
 }
 
 /// Handle a key event when the stream is focused.
-fn handle_stream_key(app: &mut App<'_>, code: KeyCode, viewport_height: usize) {
+fn handle_stream_key(
+    app: &mut App<'_>,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    viewport_height: usize,
+) {
     match code {
         KeyCode::Char('j') | KeyCode::Down => {
             app.stream.cursor_down(1, viewport_height);
@@ -282,8 +347,13 @@ fn handle_stream_key(app: &mut App<'_>, code: KeyCode, viewport_height: usize) {
         KeyCode::Enter if !app.stream.in_visual() => {
             app.stream.toggle_expansion();
         }
-        KeyCode::Char('v') => {
-            if app.stream.in_visual() {
+        KeyCode::Char(' ') => {
+            if modifiers.contains(KeyModifiers::SHIFT) {
+                // Shift-Space: start visual if not active (extend mode).
+                if !app.stream.in_visual() {
+                    app.stream.start_visual();
+                }
+            } else if app.stream.in_visual() {
                 app.stream.exit_visual();
             } else {
                 app.stream.start_visual();
@@ -517,6 +587,8 @@ fn handle_mouse(
                 app.set_left_tab(clicked);
             } else if in_sessions {
                 app.stream.exit_visual();
+                app.sidebar.exit_server_visual();
+                app.sidebar.exit_session_visual();
                 app.focus = FocusRegion::Sessions;
                 if let Some(&(_, idx)) = layout.session_hits.iter().find(|(r, _)| *r == row) {
                     app.sidebar.cursor = idx;
@@ -524,6 +596,8 @@ fn handle_mouse(
                 }
             } else if in_servers {
                 app.stream.exit_visual();
+                app.sidebar.exit_session_visual();
+                app.sidebar.exit_server_visual();
                 app.focus = FocusRegion::Servers;
                 if let Some(&(_, idx)) = layout.server_hits.iter().find(|(r, _)| *r == row) {
                     app.sidebar.server_cursor = idx;
@@ -531,12 +605,16 @@ fn handle_mouse(
                 }
             } else if in_keybinds {
                 app.stream.exit_visual();
+                app.sidebar.exit_session_visual();
+                app.sidebar.exit_server_visual();
                 // In quadrant mode, clicking collapsed keybinds expands it.
                 if app.effective == EffectiveLayout::Quadrant && !app.keybinds_expanded {
                     app.keybinds_expanded = true;
                 }
                 app.focus = FocusRegion::Keybinds;
             } else if in_stream {
+                app.sidebar.exit_session_visual();
+                app.sidebar.exit_server_visual();
                 app.focus = FocusRegion::Stream;
                 if app.stream.in_visual() {
                     app.stream.exit_visual();
@@ -1303,7 +1381,13 @@ fn run_loop(
         if event::poll(timeout)? {
             match event::read()? {
                 Event::Key(key) => {
-                    handle_key(app, key.code, stream_height, layout.detail_height);
+                    handle_key(
+                        app,
+                        key.code,
+                        key.modifiers,
+                        stream_height,
+                        layout.detail_height,
+                    );
                     app.fetch_page_if_needed();
                 }
                 Event::Mouse(mouse) => {

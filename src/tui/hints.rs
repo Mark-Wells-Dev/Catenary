@@ -12,54 +12,30 @@ use ratatui::text::{Line, Span};
 
 use super::theme::Theme;
 
-/// Global keybindings (always active).
-const GLOBAL_BINDS: &[(&str, &str)] = &[
-    ("q", "quit"),
-    ("Tab", "next panel"),
-    ("b", "cycle tabs"),
-    ("?", "toggle keybinds"),
-];
-
-/// Sidebar keybindings (sessions/servers panels).
-const SIDEBAR_BINDS: &[(&str, &str)] = &[
-    ("j/k", "navigate"),
-    ("h/l", "scroll"),
-    ("Space", "toggle filter"),
-    ("Enter", "expand/collapse"),
-];
-
-/// Stream keybindings.
-const STREAM_BINDS: &[(&str, &str)] = &[
+/// All keybindings (flat list, no modal sections).
+const KEYBINDS: &[(&str, &str)] = &[
     ("j/k", "navigate"),
     ("Enter", "expand/collapse"),
-    ("v", "visual select"),
+    ("Space", "select"),
     ("y", "yank"),
-    ("Esc", "cancel select"),
-    ("/", "search"),
-    ("n/N", "next/prev match"),
+    ("f", "toggle filter"),
     ("PgUp/Dn", "scroll"),
     ("Home/End", "jump"),
+    ("q", "quit"),
+    ("?", "toggle keybinds"),
+    ("Tab", "next panel"),
 ];
 
 /// Number of content lines when the keybinds panel is expanded.
-///
-/// Computed from the three bind groups plus group headers and blank separators.
 #[allow(
     clippy::cast_possible_truncation,
-    reason = "bind arrays have single-digit lengths"
+    reason = "bind array has single-digit length"
 )]
-pub const KEYBINDS_EXPANDED_HEIGHT: u16 = GLOBAL_BINDS.len() as u16
-    + 1 // blank
-    + 1 // "Sidebar" header
-    + SIDEBAR_BINDS.len() as u16
-    + 1 // blank
-    + 1 // "Stream" header
-    + STREAM_BINDS.len() as u16;
+pub const KEYBINDS_EXPANDED_HEIGHT: u16 = KEYBINDS.len() as u16;
 
 /// Render keybinds vertically into the given area.
 ///
-/// Groups: Global, Sidebar, Stream. Each keybind is one line:
-/// `  key  label`. Group headers are bold.
+/// Flat list — one keybind per line: `  key  label`.
 #[allow(
     clippy::cast_possible_truncation,
     reason = "terminal coordinates are always small"
@@ -69,51 +45,17 @@ pub fn render_keybinds_content(area: Rect, buf: &mut Buffer, theme: &Theme) {
         return;
     }
 
-    let mut row: u16 = 0;
     let max_rows = area.height;
-
-    let render_group = |binds: &[(&str, &str)], row: &mut u16, buf: &mut Buffer, theme: &Theme| {
-        for (key, label) in binds {
-            if *row >= max_rows {
-                return;
-            }
-            let line = Line::from(vec![
-                Span::styled(format!("  {key:<8}"), theme.hint_key),
-                Span::styled((*label).to_string(), theme.hint_label),
-            ]);
-            buf.set_line(area.x, area.y + *row, &line, area.width);
-            *row += 1;
+    for (row, (key, label)) in KEYBINDS.iter().enumerate() {
+        if row as u16 >= max_rows {
+            break;
         }
-    };
-
-    // Global.
-    render_group(GLOBAL_BINDS, &mut row, buf, theme);
-
-    // Blank line.
-    if row < max_rows {
-        row += 1;
+        let line = Line::from(vec![
+            Span::styled(format!("  {key:<8}"), theme.hint_key),
+            Span::styled((*label).to_string(), theme.hint_label),
+        ]);
+        buf.set_line(area.x, area.y + row as u16, &line, area.width);
     }
-
-    // Sidebar header.
-    if row < max_rows {
-        let header = Line::from(Span::styled("Sidebar", theme.title));
-        buf.set_line(area.x, area.y + row, &header, area.width);
-        row += 1;
-    }
-    render_group(SIDEBAR_BINDS, &mut row, buf, theme);
-
-    // Blank line.
-    if row < max_rows {
-        row += 1;
-    }
-
-    // Stream header.
-    if row < max_rows {
-        let header = Line::from(Span::styled("Stream", theme.title));
-        buf.set_line(area.x, area.y + row, &header, area.width);
-        row += 1;
-    }
-    render_group(STREAM_BINDS, &mut row, buf, theme);
 }
 
 #[cfg(test)]
@@ -140,7 +82,7 @@ mod tests {
     }
 
     #[test]
-    fn keybinds_content_shows_all_groups() {
+    fn keybinds_content_shows_flat_list() {
         let theme = Theme::new();
         let backend = TestBackend::new(30, 20);
         let mut terminal = Terminal::new(backend).expect("terminal creation");
@@ -164,19 +106,25 @@ mod tests {
             "should show ? hint: {content}"
         );
         assert!(
-            content.contains("Sidebar"),
-            "should show Sidebar group: {content}"
-        );
-        assert!(
             content.contains("navigate"),
             "should show navigate: {content}"
         );
-        assert!(
-            content.contains("Stream"),
-            "should show Stream group: {content}"
-        );
         assert!(content.contains("yank"), "should show yank: {content}");
         assert!(content.contains("expand"), "should show expand: {content}");
+        assert!(content.contains("select"), "should show select: {content}");
+        assert!(
+            content.contains("toggle filter"),
+            "should show filter: {content}"
+        );
+        // No section headers in the flat layout.
+        assert!(
+            !content.contains("Sidebar"),
+            "should not show Sidebar header: {content}"
+        );
+        assert!(
+            !content.contains("Stream"),
+            "should not show Stream header: {content}"
+        );
     }
 
     #[test]
@@ -197,7 +145,7 @@ mod tests {
     #[test]
     fn keybinds_content_truncates_at_height() {
         let theme = Theme::new();
-        // Only 3 rows — should show global binds only.
+        // Only 3 rows — should show the first 3 keybinds.
         let backend = TestBackend::new(30, 3);
         let mut terminal = Terminal::new(backend).expect("terminal creation");
         terminal
@@ -210,11 +158,18 @@ mod tests {
         let buf = terminal.backend().buffer().clone();
         let content = buffer_to_string(&buf);
 
-        assert!(content.contains("quit"), "should show quit: {content}");
-        // Sidebar header shouldn't fit in 3 rows (3 global binds fill it).
         assert!(
-            !content.contains("Sidebar"),
-            "should not show Sidebar in 3 rows: {content}"
+            content.contains("navigate"),
+            "should show first keybind: {content}"
+        );
+        assert!(
+            content.contains("select"),
+            "should show third keybind: {content}"
+        );
+        // Fourth keybind (yank) shouldn't fit.
+        assert!(
+            !content.contains("yank"),
+            "should not show yank in 3 rows: {content}"
         );
     }
 }

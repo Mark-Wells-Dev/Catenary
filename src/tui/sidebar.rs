@@ -8,6 +8,7 @@
 //! names. Sessions appear on connect and disappear on disconnect.
 
 use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::path::Path;
 
 use ratatui::buffer::Buffer;
@@ -127,6 +128,10 @@ pub struct SidebarState {
     server_hscroll: u16,
     /// Session IDs with expanded detail rows.
     expanded_sessions: HashSet<String>,
+    /// Visual selection anchor for sessions (entry index).
+    session_visual_anchor: Option<usize>,
+    /// Visual selection anchor for servers (entry index).
+    server_visual_anchor: Option<usize>,
 }
 
 impl SidebarState {
@@ -148,6 +153,8 @@ impl SidebarState {
             session_hscroll: 0,
             server_hscroll: 0,
             expanded_sessions: HashSet::new(),
+            session_visual_anchor: None,
+            server_visual_anchor: None,
         }
     }
 
@@ -485,6 +492,137 @@ impl SidebarState {
     pub const fn hscroll_servers_right(&mut self) {
         self.server_hscroll = self.server_hscroll.saturating_add(HSCROLL_STEP);
     }
+
+    // ── Session visual selection ──────────────────────────────────────
+
+    /// Enter visual selection mode for sessions, anchoring at the cursor.
+    pub const fn start_session_visual(&mut self) {
+        self.session_visual_anchor = Some(self.cursor);
+    }
+
+    /// Exit visual selection mode for sessions.
+    pub const fn exit_session_visual(&mut self) {
+        self.session_visual_anchor = None;
+    }
+
+    /// Whether session visual selection is active.
+    #[must_use]
+    pub const fn in_session_visual(&self) -> bool {
+        self.session_visual_anchor.is_some()
+    }
+
+    /// Inclusive range of the session visual selection.
+    #[must_use]
+    pub const fn session_visual_range(&self) -> Option<(usize, usize)> {
+        let Some(anchor) = self.session_visual_anchor else {
+            return None;
+        };
+        if anchor <= self.cursor {
+            Some((anchor, self.cursor))
+        } else {
+            Some((self.cursor, anchor))
+        }
+    }
+
+    /// Plain text for a single session entry (for yank).
+    fn session_plain_text(&self, idx: usize) -> Option<String> {
+        let entry = self.entries.get(idx)?;
+        let mut text = format!("{} {} {}", entry.badge, entry.host, entry.root);
+        if self.is_expanded(&entry.session_id) {
+            let _ = write!(text, "\n  {}", entry.workspace);
+            if entry.languages.is_empty() {
+                let _ = write!(text, "\n  pid {}", entry.pid);
+            } else {
+                let _ = write!(
+                    text,
+                    "\n  pid {}  {}",
+                    entry.pid,
+                    entry.languages.join(", ")
+                );
+            }
+        }
+        Some(text)
+    }
+
+    /// Yank text for the session visual selection (or cursor entry).
+    #[must_use]
+    pub fn yank_sessions_text(&self) -> Option<String> {
+        let (start, end) = self
+            .session_visual_range()
+            .unwrap_or((self.cursor, self.cursor));
+        let lines: Vec<String> = (start..=end)
+            .filter_map(|i| self.session_plain_text(i))
+            .collect();
+        if lines.is_empty() {
+            None
+        } else {
+            Some(lines.join("\n"))
+        }
+    }
+
+    // ── Server visual selection ───────────────────────────────────────
+
+    /// Enter visual selection mode for servers, anchoring at the cursor.
+    pub const fn start_server_visual(&mut self) {
+        self.server_visual_anchor = Some(self.server_cursor);
+    }
+
+    /// Exit visual selection mode for servers.
+    pub const fn exit_server_visual(&mut self) {
+        self.server_visual_anchor = None;
+    }
+
+    /// Whether server visual selection is active.
+    #[must_use]
+    pub const fn in_server_visual(&self) -> bool {
+        self.server_visual_anchor.is_some()
+    }
+
+    /// Inclusive range of the server visual selection.
+    #[must_use]
+    pub const fn server_visual_range(&self) -> Option<(usize, usize)> {
+        let Some(anchor) = self.server_visual_anchor else {
+            return None;
+        };
+        if anchor <= self.server_cursor {
+            Some((anchor, self.server_cursor))
+        } else {
+            Some((self.server_cursor, anchor))
+        }
+    }
+
+    /// Plain text for a single server entry (for yank).
+    fn server_plain_text(&self, idx: usize) -> Option<String> {
+        let entry = self.servers.get(idx)?;
+        let mut text = if entry.root.is_empty() {
+            format!("{}  {}", entry.name, entry.state)
+        } else {
+            format!("{} ({})  {}", entry.name, entry.root, entry.state)
+        };
+        if let Some(ref progress) = entry.progress_line {
+            let _ = write!(text, "\n  {progress}");
+        }
+        if let Some(ref msg) = entry.server_message {
+            let _ = write!(text, "\n  {msg}");
+        }
+        Some(text)
+    }
+
+    /// Yank text for the server visual selection (or cursor entry).
+    #[must_use]
+    pub fn yank_servers_text(&self) -> Option<String> {
+        let (start, end) = self
+            .server_visual_range()
+            .unwrap_or((self.server_cursor, self.server_cursor));
+        let lines: Vec<String> = (start..=end)
+            .filter_map(|i| self.server_plain_text(i))
+            .collect();
+        if lines.is_empty() {
+            None
+        } else {
+            Some(lines.join("\n"))
+        }
+    }
 }
 
 impl Default for SidebarState {
@@ -676,6 +814,10 @@ pub fn render_sessions(
         }
 
         let is_cursor = focused && i == state.cursor;
+        let in_visual = focused
+            && state
+                .session_visual_range()
+                .is_some_and(|(s, e)| i >= s && i <= e);
 
         let is_bright = !has_filter || state.is_selected(&entry.session_id);
         let badge_style = if is_bright { theme.accent } else { theme.muted };
@@ -694,7 +836,7 @@ pub fn render_sessions(
         set_line_scrolled(buf, area, y, &line, hs, theme.muted);
         hits.push((y, i));
 
-        if is_cursor {
+        if is_cursor || in_visual {
             for x in area.x..area.x + area.width {
                 let cell = &mut buf[(x, y)];
                 if let Some(bg) = theme.selection.bg {
@@ -796,6 +938,10 @@ pub fn render_servers(
         }
 
         let is_cursor = focused && si == state.server_cursor;
+        let in_visual = focused
+            && state
+                .server_visual_range()
+                .is_some_and(|(s, e)| si >= s && si <= e);
 
         let is_bright =
             !has_server_filter || state.is_server_selected(&server.name, &server.scope_root);
@@ -827,7 +973,7 @@ pub fn render_servers(
         set_line_scrolled(buf, area, y, &line, hs, theme.muted);
         hits.push((y, si));
 
-        if is_cursor {
+        if is_cursor || in_visual {
             for x in area.x..area.x + area.width {
                 let cell = &mut buf[(x, y)];
                 if let Some(bg) = theme.selection.bg {

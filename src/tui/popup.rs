@@ -59,6 +59,27 @@ impl ServerPopup {
         let max = self.total_lines.saturating_sub(visible);
         self.scroll_offset = (self.scroll_offset + n).min(max);
     }
+
+    /// Plain text of all messages, for yank.
+    #[must_use]
+    pub fn yank_text(&self) -> Option<String> {
+        if self.messages.is_empty() {
+            return None;
+        }
+        let lines: Vec<String> = self
+            .messages
+            .iter()
+            .map(|detail| {
+                let ts = detail
+                    .timestamp
+                    .with_timezone(&Local)
+                    .format("%H:%M:%S")
+                    .to_string();
+                format!("{ts}  {}", detail.message)
+            })
+            .collect();
+        Some(lines.join("\n"))
+    }
 }
 
 /// Render the server message detail panel into the given area.
