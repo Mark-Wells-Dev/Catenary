@@ -249,7 +249,13 @@ impl GrepServer {
         self.client_manager.nudge_roots(&effective_roots).await;
 
         // Step 2b: Populate symbol index for matched files.
-        super::ensure_symbols(self.symbol_index.as_ref(), &self.client_manager, &rg_paths).await;
+        super::ensure_symbols(
+            self.symbol_index.as_ref(),
+            &self.client_manager,
+            &rg_paths,
+            parent_id,
+        )
+        .await;
 
         // Step 3: Symbol index query.
         let (indexed_symbols, indexed_files) = if let Some(ref index_mutex) = self.symbol_index {

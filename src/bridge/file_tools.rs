@@ -355,10 +355,14 @@ pub struct GlobServer {
 
 impl GlobServer {
     /// Execute a glob query with the given parameters.
+    ///
+    /// `parent_id` is a UUID for LSP event correlation — propagated to
+    /// `ensure_symbols` so that `documentSymbol` traffic appears as
+    /// children of this glob scope in the TUI.
     pub async fn execute(
         &self,
         params: &serde_json::Value,
-        _parent_id: Option<&str>,
+        parent_id: Option<&str>,
         _cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<serde_json::Value> {
         use super::pagination::paginate;
@@ -413,14 +417,15 @@ impl GlobServer {
                 self.symbol_index.as_ref(),
                 &self.client_manager,
                 std::slice::from_ref(&path),
+                parent_id,
             )
             .await;
             self.handle_glob_file(&path, cwd)
         } else if path.is_dir() {
-            self.handle_glob_dir(&path, &input, exclude.as_ref(), cwd)
+            self.handle_glob_dir(&path, &input, exclude.as_ref(), cwd, parent_id)
                 .await?
         } else {
-            self.handle_glob_pattern(&pattern, &input, exclude.as_ref(), cwd)
+            self.handle_glob_pattern(&pattern, &input, exclude.as_ref(), cwd, parent_id)
                 .await?
         };
 
@@ -554,6 +559,7 @@ impl GlobServer {
         input: &GlobInput,
         exclude: Option<&ResolvedGlob>,
         cwd: Option<&Path>,
+        parent_id: Option<&str>,
     ) -> Result<String> {
         let canonical = dir
             .canonicalize()
@@ -683,6 +689,7 @@ impl GlobServer {
             self.symbol_index.as_ref(),
             &self.client_manager,
             &file_paths,
+            parent_id,
         )
         .await;
 
@@ -749,6 +756,7 @@ impl GlobServer {
         input: &GlobInput,
         exclude: Option<&ResolvedGlob>,
         cwd: Option<&Path>,
+        parent_id: Option<&str>,
     ) -> Result<String> {
         let resolved = ResolvedGlob::new(pattern)?;
 
@@ -868,6 +876,7 @@ impl GlobServer {
             self.symbol_index.as_ref(),
             &self.client_manager,
             &file_paths,
+            parent_id,
         )
         .await;
 

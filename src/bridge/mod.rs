@@ -58,11 +58,16 @@ pub(crate) fn compress_home(path: &Path) -> String {
 /// server, requests `documentSymbol`, and feeds the response to the
 /// index. Files that don't exist on disk are skipped.
 ///
+/// `parent_id` is propagated to the LSP client so that `didOpen` and
+/// `documentSymbol` traffic appears as children of the calling scope
+/// in the TUI.
+///
 /// Shared by [`grep_server::GrepServer`] and [`file_tools::GlobServer`].
 pub(super) async fn ensure_symbols(
     symbol_index: Option<&Arc<std::sync::Mutex<SymbolIndex>>>,
     client_manager: &LspClientManager,
     files: &[PathBuf],
+    parent_id: Option<&str>,
 ) {
     let Some(idx_arc) = symbol_index else {
         return;
@@ -87,7 +92,10 @@ pub(super) async fn ensure_symbols(
         let Some(server) = servers.first() else {
             continue;
         };
-        let Ok(uri) = client_manager.open_document_on(path, server, None).await else {
+        let Ok(uri) = client_manager
+            .open_document_on(path, server, parent_id.map(str::to_string))
+            .await
+        else {
             continue;
         };
         let Ok(response) = server.lock().await.document_symbols(&uri).await else {
