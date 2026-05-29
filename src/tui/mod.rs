@@ -45,7 +45,7 @@ use self::app::FocusRegion;
 use self::data::SqliteDataSource;
 use self::hints::render_hints;
 use self::icons::IconSet;
-use self::sidebar::render_sidebar;
+use self::sidebar::{SidebarHit, SidebarHitMap, render_sidebar};
 use self::stream::render_stream;
 use self::theme::Theme;
 
@@ -292,19 +292,17 @@ fn handle_mouse(
     kind: MouseEventKind,
     column: u16,
     row: u16,
-    sidebar_width: u16,
-    show_sidebar: bool,
-    stream_height: usize,
+    sidebar_ctx: Option<(u16, &SidebarHitMap)>,
+    viewport_height: usize,
 ) {
-    let in_sidebar = show_sidebar && column < sidebar_width;
+    let in_sidebar = sidebar_ctx.is_some_and(|(w, _)| column < w);
 
     match kind {
         MouseEventKind::ScrollUp => {
             if in_sidebar {
-                // Scroll whichever sidebar section is focused.
                 match app.focus {
-                    FocusRegion::Sessions => app.sidebar.cursor_up(3, stream_height),
-                    FocusRegion::Servers => app.sidebar.server_cursor_up(3, stream_height),
+                    FocusRegion::Sessions => app.sidebar.cursor_up(3, viewport_height),
+                    FocusRegion::Servers => app.sidebar.server_cursor_up(3, viewport_height),
                     FocusRegion::Stream => {}
                 }
             } else {
@@ -314,17 +312,29 @@ fn handle_mouse(
         MouseEventKind::ScrollDown => {
             if in_sidebar {
                 match app.focus {
-                    FocusRegion::Sessions => app.sidebar.cursor_down(3, stream_height),
-                    FocusRegion::Servers => app.sidebar.server_cursor_down(3, stream_height),
+                    FocusRegion::Sessions => app.sidebar.cursor_down(3, viewport_height),
+                    FocusRegion::Servers => app.sidebar.server_cursor_down(3, viewport_height),
                     FocusRegion::Stream => {}
                 }
             } else {
-                app.stream.scroll_down(3, stream_height);
+                app.stream.scroll_down(3, viewport_height);
             }
         }
         MouseEventKind::Down(MouseButton::Left) => {
-            if in_sidebar {
-                handle_sidebar_click(app, row as usize);
+            if let Some((_, hits)) = sidebar_ctx
+                && in_sidebar
+            {
+                match hits.hit_test(row) {
+                    Some(SidebarHit::Session(idx)) => {
+                        app.sidebar.cursor = *idx;
+                        app.toggle_session_selection();
+                    }
+                    Some(SidebarHit::Server(idx)) => {
+                        app.sidebar.server_cursor = *idx;
+                        app.toggle_server_selection();
+                    }
+                    None => {}
+                }
             } else {
                 // Click in stream: move cursor, expand if scope header.
                 let stream_row = app.stream.scroll_position + row as usize;
@@ -336,47 +346,6 @@ fn handle_mouse(
             }
         }
         _ => {}
-    }
-}
-
-/// Handle a mouse click in the sidebar area.
-///
-/// Determines whether the click hit a session entry or a server entry
-/// based on the row position, then toggles the corresponding filter.
-fn handle_sidebar_click(app: &mut App<'_>, row: usize) {
-    // Sessions header is row 0, entries start at row 1.
-    let session_count = app.sidebar.entries.len();
-    let session_end = 1 + session_count; // header + entries
-
-    if row >= 1 && row < session_end {
-        // Clicked a session entry.
-        let entry_idx = row - 1;
-        if entry_idx < app.sidebar.entries.len() {
-            app.sidebar.cursor = entry_idx;
-            app.toggle_session_selection();
-        }
-        return;
-    }
-
-    // Servers section: blank line + header + entries.
-    if app.sidebar.servers.is_empty() {
-        return;
-    }
-    let servers_header_row = session_end + 1; // blank + header
-    if row <= servers_header_row {
-        return;
-    }
-
-    // Walk server entries (each has 1 header + child_count children).
-    let mut current_row = servers_header_row + 1;
-    for (si, server) in app.sidebar.servers.iter().enumerate() {
-        if row == current_row {
-            // Clicked this server's header.
-            app.sidebar.server_cursor = si;
-            app.toggle_server_selection();
-            return;
-        }
-        current_row += 1 + server.child_count();
     }
 }
 
@@ -393,6 +362,7 @@ fn run_loop(
 ) -> Result<()> {
     let mut last_tick = Instant::now();
     let mut last_sidebar_width: u16 = 0;
+    let mut hit_map = SidebarHitMap::new();
 
     loop {
         let size = terminal.size()?;
@@ -432,6 +402,7 @@ fn run_loop(
                 let x = content_area.x + content_area.width.saturating_sub(msg_width) / 2;
                 let y = content_area.y + content_area.height / 2;
                 f.buffer_mut().set_string(x, y, msg, app.theme.muted);
+                hit_map = SidebarHitMap::new();
             } else if show_sidebar {
                 let sidebar_width = app.sidebar.content_width().min(content_area.width / 2);
                 last_sidebar_width = sidebar_width;
@@ -447,7 +418,7 @@ fn run_loop(
                     width: content_area.width.saturating_sub(sidebar_width),
                     height: content_area.height,
                 };
-                render_sidebar(
+                hit_map = render_sidebar(
                     &app.sidebar,
                     sidebar_area,
                     f.buffer_mut(),
@@ -463,6 +434,7 @@ fn run_loop(
                 );
             } else {
                 last_sidebar_width = 0;
+                hit_map = SidebarHitMap::new();
                 render_stream(
                     &app.stream,
                     content_area,
@@ -490,15 +462,12 @@ fn run_loop(
                     app.fetch_page_if_needed();
                 }
                 Event::Mouse(mouse) => {
-                    handle_mouse(
-                        app,
-                        mouse.kind,
-                        mouse.column,
-                        mouse.row,
-                        last_sidebar_width,
-                        show_sidebar,
-                        stream_height,
-                    );
+                    let ctx = if show_sidebar {
+                        Some((last_sidebar_width, &hit_map))
+                    } else {
+                        None
+                    };
+                    handle_mouse(app, mouse.kind, mouse.column, mouse.row, ctx, stream_height);
                     app.fetch_page_if_needed();
                 }
                 _ => {}

@@ -548,9 +548,49 @@ fn extract_server_message(noise: &[ServerNoiseRow], server: &str) -> Option<Stri
         .map(str::to_string)
 }
 
+// ── Hit map ─────────────────────────────────────────────────────────
+
+/// What a sidebar row maps to for mouse click handling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SidebarHit {
+    /// A session entry at the given index.
+    Session(usize),
+    /// A server entry header at the given index.
+    Server(usize),
+}
+
+/// Row-to-entry mapping built during rendering.
+///
+/// Returned by [`render_sidebar`] so the click handler stays in sync
+/// with the rendered layout automatically.
+#[derive(Debug, Default)]
+pub struct SidebarHitMap {
+    /// `(terminal_row, hit)` pairs, in ascending row order.
+    hits: Vec<(u16, SidebarHit)>,
+}
+
+impl SidebarHitMap {
+    /// Create an empty hit map.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { hits: Vec::new() }
+    }
+
+    /// Look up what occupies the given terminal row.
+    #[must_use]
+    pub fn hit_test(&self, row: u16) -> Option<&SidebarHit> {
+        self.hits
+            .iter()
+            .find(|(r, _)| *r == row)
+            .map(|(_, hit)| hit)
+    }
+}
+
 // ── Rendering ────────────────────────────────────────────────────────
 
 /// Render the sidebar into the given area.
+///
+/// Returns a [`SidebarHitMap`] mapping terminal rows to clickable entries.
 ///
 /// The rightmost column of `area` renders a vertical separator (`│`).
 /// The rest shows two sections: "Sessions" (top) and "Servers" (bottom),
@@ -567,9 +607,11 @@ pub fn render_sidebar(
     buf: &mut Buffer,
     theme: &Theme,
     focus: FocusRegion,
-) {
+) -> SidebarHitMap {
+    let mut hit_map = SidebarHitMap::new();
+
     if area.width < 3 || area.height == 0 {
-        return;
+        return hit_map;
     }
 
     // Reserve rightmost column for the vertical separator.
@@ -616,6 +658,7 @@ pub fn render_sidebar(
 
         let y = area.y + row as u16;
         buf.set_line(area.x, y, &line, content_width);
+        hit_map.hits.push((y, SidebarHit::Session(i)));
 
         // Highlight cursor row.
         if is_cursor {
@@ -686,6 +729,7 @@ pub fn render_sidebar(
             };
             let y = area.y + row as u16;
             buf.set_line(area.x, y, &line, content_width);
+            hit_map.hits.push((y, SidebarHit::Server(si)));
 
             if is_cursor {
                 for x in area.x..area.x + content_width {
@@ -733,6 +777,8 @@ pub fn render_sidebar(
     for y in area.y..area.y + area.height {
         buf.set_string(sep_x, y, "│", sep_style);
     }
+
+    hit_map
 }
 
 /// Choose a style for a lifecycle state string.
