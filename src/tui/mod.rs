@@ -156,6 +156,7 @@ fn handle_key(app: &mut App<'_>, code: KeyCode, show_sidebar: bool, viewport_hei
     // Global keys (always active regardless of focus).
     match code {
         KeyCode::Char('q') => app.quit = true,
+        KeyCode::Char('b') => app.toggle_sidebar(),
         KeyCode::Char('d') => {
             app.level_threshold.toggle();
             let _ = app.reload_messages();
@@ -244,7 +245,12 @@ fn run_loop(
 
     loop {
         let size = terminal.size()?;
-        let show_sidebar = size.width >= SIDEBAR_AUTO_HIDE_WIDTH;
+        let sidebar_fits = size.width >= SIDEBAR_AUTO_HIDE_WIDTH;
+        let show_sidebar = app.sidebar_visible && sidebar_fits;
+        // Move focus to stream when sidebar is not visible.
+        if !show_sidebar && app.focus != FocusRegion::Stream {
+            app.focus = FocusRegion::Stream;
+        }
         let stream_height = size.height as usize;
         app.stream.apply_auto_scroll(stream_height);
 

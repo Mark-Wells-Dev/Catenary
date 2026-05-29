@@ -62,6 +62,8 @@ pub struct App<'a> {
     pub level_threshold: LevelThreshold,
     /// Which panel has keyboard focus.
     pub focus: FocusRegion,
+    /// User preference: sidebar visible (toggled by `b` keybinding).
+    pub sidebar_visible: bool,
     /// Session list sidebar state.
     pub sidebar: SidebarState,
     /// Unified message stream state.
@@ -95,6 +97,7 @@ impl<'a> App<'a> {
             quit: false,
             level_threshold: LevelThreshold::Info,
             focus: FocusRegion::Stream,
+            sidebar_visible: true,
             sidebar: SidebarState::new(),
             stream,
             tail,
@@ -221,6 +224,14 @@ impl<'a> App<'a> {
             FocusRegion::Servers => FocusRegion::Sessions,
             FocusRegion::Stream => FocusRegion::Servers,
         };
+    }
+
+    /// Toggle sidebar visibility. Moves focus to the stream when hiding.
+    pub fn toggle_sidebar(&mut self) {
+        self.sidebar_visible = !self.sidebar_visible;
+        if !self.sidebar_visible && self.focus != FocusRegion::Stream {
+            self.focus = FocusRegion::Stream;
+        }
     }
 
     /// Refresh the sidebar session list if the alive set has changed.
