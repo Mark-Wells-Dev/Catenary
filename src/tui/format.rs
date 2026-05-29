@@ -112,6 +112,16 @@ pub fn format_message_styled(
                 ])
             }
         }
+        "internal" => {
+            let level_style = internal_level_style(&msg.payload, theme);
+            let tag = internal_level_tag(&msg.payload);
+            let body = internal_body(msg);
+            Line::from(vec![
+                ts_span,
+                Span::styled(format!("[{tag}] "), level_style),
+                Span::styled(body, theme.text),
+            ])
+        }
         other => Line::from(vec![
             ts_span,
             Span::styled(format!("[{other}] "), theme.text),
@@ -167,6 +177,11 @@ pub fn format_message_plain(msg: &SessionMessage) -> String {
                 }
             },
         ),
+        "internal" => {
+            let tag = internal_level_tag(&msg.payload);
+            let body = internal_body(msg);
+            format!("{ts} [{tag}] {body}")
+        }
         other => format!("{ts} [{other}] {}", msg.method),
     }
 }
@@ -352,6 +367,93 @@ fn progress_suffix(payload: &serde_json::Value) -> Option<String> {
     } else {
         Some(parts.join(", "))
     }
+}
+
+// ── Internal message helpers ────────────────────────────────────────────
+
+/// Map the `level` field in an internal message payload to a theme style.
+fn internal_level_style(payload: &serde_json::Value, theme: &Theme) -> ratatui::style::Style {
+    match payload
+        .get("level")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("info")
+    {
+        "error" => theme.error,
+        "warn" => theme.warning,
+        "debug" => theme.muted,
+        _ => theme.info,
+    }
+}
+
+/// Extract a short level tag from an internal message payload.
+///
+/// Returns `"error"`, `"warn"`, `"info"`, or `"debug"`.
+fn internal_level_tag(payload: &serde_json::Value) -> &str {
+    payload
+        .get("level")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("info")
+}
+
+/// Build the summary body for an internal message.
+///
+/// Prefers `payload.message`, falls back to the method (module path).
+fn internal_body(msg: &SessionMessage) -> String {
+    let text = msg
+        .payload
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if text.is_empty() {
+        return msg.method.clone();
+    }
+    if msg.server.is_empty() {
+        text.to_string()
+    } else {
+        format!("{}: {text}", msg.server)
+    }
+}
+
+/// Build detail lines for an expanded internal message.
+///
+/// Returns `(label, value)` pairs for payload fields worth showing:
+/// `source`, `language`, and individual `fields` entries.
+#[must_use]
+pub fn internal_detail_lines(msg: &SessionMessage) -> Vec<(String, String)> {
+    let mut lines = Vec::new();
+
+    // Always show the module path (stored in method).
+    if !msg.method.is_empty() {
+        lines.push(("target".to_string(), msg.method.clone()));
+    }
+
+    if let Some(source) = msg
+        .payload
+        .get("source")
+        .and_then(serde_json::Value::as_str)
+    {
+        lines.push(("source".to_string(), source.to_string()));
+    }
+
+    if let Some(lang) = msg
+        .payload
+        .get("language")
+        .and_then(serde_json::Value::as_str)
+    {
+        lines.push(("language".to_string(), lang.to_string()));
+    }
+
+    if let Some(fields) = msg
+        .payload
+        .get("fields")
+        .and_then(serde_json::Value::as_object)
+    {
+        for (k, v) in fields {
+            lines.push((k.clone(), compact_value(v)));
+        }
+    }
+
+    lines
 }
 
 // ── Scope lifecycle header ──────────────────────────────────────────────
@@ -719,5 +821,184 @@ mod tests {
             serde_json::json!({"id": 1}),
         );
         assert_eq!(extract_tool_arguments(&msg), None);
+    }
+
+    // ── Internal message tests ──────────────────────────────────────
+
+    #[test]
+    fn test_format_internal_styled_shows_message() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let msg = make_message_with_payload(
+            "internal",
+            "catenary_mcp::lsp::manager",
+            "rust-analyzer",
+            serde_json::json!({"level": "warn", "message": "Failed to load workspaces"}),
+        );
+        let line = format_message_styled(&msg, &icons, &theme);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.contains("Failed to load workspaces"),
+            "should show payload message, got: {text}"
+        );
+        assert!(text.contains("[warn]"), "should show level tag, got: {text}");
+    }
+
+    #[test]
+    fn test_format_internal_styled_with_server_prefix() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let msg = make_message_with_payload(
+            "internal",
+            "catenary_mcp::lsp::manager",
+            "rust-analyzer",
+            serde_json::json!({"level": "error", "message": "crashed"}),
+        );
+        let line = format_message_styled(&msg, &icons, &theme);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.contains("rust-analyzer: crashed"),
+            "should prefix server name, got: {text}"
+        );
+    }
+
+    #[test]
+    fn test_format_internal_styled_no_server() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let msg = make_message_with_payload(
+            "internal",
+            "catenary_mcp::session",
+            "",
+            serde_json::json!({"level": "info", "message": "session started"}),
+        );
+        let line = format_message_styled(&msg, &icons, &theme);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.contains("session started"),
+            "should show message without server prefix, got: {text}"
+        );
+        assert!(
+            !text.contains(": session started"),
+            "should not have colon prefix without server, got: {text}"
+        );
+    }
+
+    #[test]
+    fn test_format_internal_styled_fallback_to_method() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let msg = make_message_with_payload(
+            "internal",
+            "catenary_mcp::lsp::manager",
+            "",
+            serde_json::json!({"level": "debug"}),
+        );
+        let line = format_message_styled(&msg, &icons, &theme);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.contains("catenary_mcp::lsp::manager"),
+            "should fall back to method when no message, got: {text}"
+        );
+    }
+
+    #[test]
+    fn test_format_internal_plain() {
+        let msg = make_message_with_payload(
+            "internal",
+            "catenary_mcp::lsp::manager",
+            "rust-analyzer",
+            serde_json::json!({"level": "warn", "message": "Failed to load workspaces"}),
+        );
+        let plain = format_message_plain(&msg);
+        assert!(
+            plain.contains("[warn]"),
+            "should contain level tag, got: {plain}"
+        );
+        assert!(
+            plain.contains("Failed to load workspaces"),
+            "should contain message, got: {plain}"
+        );
+    }
+
+    #[test]
+    fn test_format_internal_level_styles() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+
+        let warn_msg = make_message_with_payload(
+            "internal",
+            "mod",
+            "",
+            serde_json::json!({"level": "warn", "message": "w"}),
+        );
+        let warn_line = format_message_styled(&warn_msg, &icons, &theme);
+        let warn_tag = warn_line
+            .spans
+            .iter()
+            .find(|s| s.content.contains("[warn]"))
+            .expect("should have warn tag");
+        assert_eq!(warn_tag.style, theme.warning);
+
+        let error_msg = make_message_with_payload(
+            "internal",
+            "mod",
+            "",
+            serde_json::json!({"level": "error", "message": "e"}),
+        );
+        let error_line = format_message_styled(&error_msg, &icons, &theme);
+        let error_tag = error_line
+            .spans
+            .iter()
+            .find(|s| s.content.contains("[error]"))
+            .expect("should have error tag");
+        assert_eq!(error_tag.style, theme.error);
+    }
+
+    #[test]
+    fn test_internal_detail_lines() {
+        let msg = make_message_with_payload(
+            "internal",
+            "catenary_mcp::lsp::manager",
+            "rust-analyzer",
+            serde_json::json!({
+                "level": "warn",
+                "message": "Failed to load workspaces",
+                "source": "server.lifecycle",
+                "language": "rust",
+                "fields": {"error_code": 42}
+            }),
+        );
+        let details = internal_detail_lines(&msg);
+        let labels: Vec<&str> = details.iter().map(|(l, _)| l.as_str()).collect();
+        assert!(labels.contains(&"target"), "should include target: {labels:?}");
+        assert!(
+            labels.contains(&"source"),
+            "should include source: {labels:?}"
+        );
+        assert!(
+            labels.contains(&"language"),
+            "should include language: {labels:?}"
+        );
+        assert!(
+            labels.contains(&"error_code"),
+            "should include field: {labels:?}"
+        );
+
+        let target = details.iter().find(|(l, _)| l == "target").expect("target");
+        assert_eq!(target.1, "catenary_mcp::lsp::manager");
+    }
+
+    #[test]
+    fn test_internal_detail_lines_minimal() {
+        let msg = make_message_with_payload(
+            "internal",
+            "catenary_mcp::session",
+            "",
+            serde_json::json!({"level": "info", "message": "started"}),
+        );
+        let details = internal_detail_lines(&msg);
+        assert_eq!(details.len(), 1, "only target when no extras");
+        assert_eq!(details[0].0, "target");
     }
 }

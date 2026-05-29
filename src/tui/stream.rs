@@ -119,6 +119,15 @@ pub enum DisplayRow {
     },
     /// A standalone message not belonging to any scope.
     Standalone(usize),
+    /// A detail line within an expanded standalone internal message.
+    StandaloneDetail {
+        /// Index into `StreamState::entries` for the parent standalone.
+        entry_idx: usize,
+        /// Index into the detail lines vec.
+        detail_idx: usize,
+        /// Whether this is the last detail line.
+        is_last: bool,
+    },
 }
 
 // ── Paging ───────────────────────────────────────────────────────────
@@ -244,6 +253,8 @@ pub struct StreamState {
     pub badges: HexBadgeMap,
     /// `parent_id` UUID → entries index. Single routing map.
     scope_map: HashMap<String, usize>,
+    /// Entry indices of expanded standalone internal messages.
+    expanded_standalones: HashSet<usize>,
 
     // ── Filtering state ──────────────────────────────────────────────
     /// Active session filter. `None` = show all. `Some(set)` = show only
@@ -282,6 +293,7 @@ impl StreamState {
             cursor: 0,
             badges: HexBadgeMap::new(),
             scope_map: HashMap::new(),
+            expanded_standalones: HashSet::new(),
             session_filter: None,
             server_filter: None,
             gap_offset: None,
@@ -363,8 +375,19 @@ impl StreamState {
                         }
                     }
                 }
-                StreamEntry::Standalone(_) => {
+                StreamEntry::Standalone(msg) => {
                     self.display_rows.push(DisplayRow::Standalone(i));
+                    if self.expanded_standalones.contains(&i) && msg.r#type == "internal" {
+                        let details = super::format::internal_detail_lines(msg);
+                        let len = details.len();
+                        for di in 0..len {
+                            self.display_rows.push(DisplayRow::StandaloneDetail {
+                                entry_idx: i,
+                                detail_idx: di,
+                                is_last: di == len - 1,
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -453,24 +476,38 @@ impl StreamState {
         }
     }
 
-    /// Toggle expansion state on the scope at the cursor position.
+    /// Toggle expansion state on the scope or standalone at the cursor.
     ///
     /// Closed scopes toggle between summary (header only) and expanded
     /// (header + children). Open scopes are always expanded.
-    /// Standalone messages are not expandable.
+    /// Standalone internal messages toggle to show payload detail lines.
     pub fn toggle_expansion(&mut self) {
         let Some(row) = self.display_rows.get(self.cursor) else {
             return;
         };
-        let entry_idx = match row {
-            DisplayRow::ScopeHeader(idx) | DisplayRow::ScopeChild { entry_idx: idx, .. } => *idx,
-            DisplayRow::Standalone(_) => return,
-        };
-        if let StreamEntry::Scope(scope) = &mut self.entries[entry_idx]
-            && scope.state == ScopeState::Closed
-        {
-            scope.user_expanded = !scope.user_expanded;
-            self.rebuild_display_rows();
+        match row {
+            DisplayRow::ScopeHeader(idx) | DisplayRow::ScopeChild { entry_idx: idx, .. } => {
+                let idx = *idx;
+                if let StreamEntry::Scope(scope) = &mut self.entries[idx]
+                    && scope.state == ScopeState::Closed
+                {
+                    scope.user_expanded = !scope.user_expanded;
+                    self.rebuild_display_rows();
+                }
+            }
+            DisplayRow::Standalone(idx) | DisplayRow::StandaloneDetail { entry_idx: idx, .. } => {
+                let idx = *idx;
+                if let StreamEntry::Standalone(msg) = &self.entries[idx]
+                    && msg.r#type == "internal"
+                {
+                    if self.expanded_standalones.contains(&idx) {
+                        self.expanded_standalones.remove(&idx);
+                    } else {
+                        self.expanded_standalones.insert(idx);
+                    }
+                    self.rebuild_display_rows();
+                }
+            }
         }
     }
 
@@ -508,6 +545,19 @@ impl StreamState {
                 let badge = self.badges.get(&msg.session_id);
                 let plain = super::format::format_message_plain(msg);
                 Some(format!("{badge} {plain}"))
+            }
+            DisplayRow::StandaloneDetail {
+                entry_idx,
+                detail_idx,
+                ..
+            } => {
+                let StreamEntry::Standalone(msg) = &self.entries[*entry_idx] else {
+                    return None;
+                };
+                let details = super::format::internal_detail_lines(msg);
+                details
+                    .get(*detail_idx)
+                    .map(|(label, value)| format!("{label}: {value}"))
             }
         }
     }
@@ -583,6 +633,9 @@ impl StreamState {
         }
         self.scope_map.extend(temp_map);
 
+        // Shift expanded standalone indices.
+        self.expanded_standalones = self.expanded_standalones.iter().map(|i| i + n).collect();
+
         // Prepend.
         temp.append(&mut self.entries);
         self.entries = temp;
@@ -624,6 +677,9 @@ impl StreamState {
         let bottom_oldest = self.entries.first().map(entry_root_id);
 
         let n = temp.len();
+
+        // Shift expanded standalone indices.
+        self.expanded_standalones = self.expanded_standalones.iter().map(|i| i + n).collect();
 
         // Check for overlap — if top region reaches bottom, no gap needed.
         if top_newest >= bottom_oldest {
@@ -701,6 +757,13 @@ impl StreamState {
                 *idx += n;
             }
         }
+
+        // Shift expanded standalone indices >= gap_offset.
+        self.expanded_standalones = self
+            .expanded_standalones
+            .iter()
+            .map(|&i| if i >= gap_offset { i + n } else { i })
+            .collect();
 
         // Adjust temp_map indices relative to gap_offset.
         for (key, val) in temp_map {
@@ -922,6 +985,26 @@ fn render_display_row(
             spans.push(Span::styled(format!("{badge} "), theme.accent));
             spans.extend(styled.spans);
             Line::from(spans)
+        }
+        DisplayRow::StandaloneDetail {
+            entry_idx,
+            detail_idx,
+            is_last,
+        } => {
+            let StreamEntry::Standalone(msg) = &state.entries[*entry_idx] else {
+                return Line::from("");
+            };
+            let details = super::format::internal_detail_lines(msg);
+            let Some((label, value)) = details.get(*detail_idx) else {
+                return Line::from("");
+            };
+            let tree_char = if *is_last { TREE_END } else { TREE_MID };
+            Line::from(vec![
+                Span::styled(BADGE_INDENT.to_string(), theme.muted),
+                Span::styled(tree_char.to_string(), theme.muted),
+                Span::styled(format!("{label}: "), theme.muted),
+                Span::styled(value.clone(), theme.text),
+            ])
         }
     }
 }
@@ -2154,5 +2237,146 @@ mod tests {
         // Clear filter.
         state.set_server_filter(None);
         assert_eq!(state.display_rows.len(), 2, "all restored");
+    }
+
+    // ── Internal message expansion tests ─────────────────────────────
+
+    /// Standalone internal message with payload.
+    fn internal_message(session_id: &str, id: i64) -> SessionMessage {
+        SessionMessage {
+            session_id: session_id.to_string(),
+            payload: serde_json::json!({
+                "level": "warn",
+                "message": "Failed to load workspaces",
+                "source": "server.lifecycle",
+                "language": "rust"
+            }),
+            ..test_support::message_with_ids(
+                id,
+                "internal",
+                "catenary_mcp::lsp::manager",
+                "rust-analyzer",
+                None,
+            )
+        }
+    }
+
+    #[test]
+    fn test_internal_standalone_initially_collapsed() {
+        let state = StreamState::new(vec![internal_message("s1", 1)]);
+        assert_eq!(state.display_rows.len(), 1);
+        assert_eq!(state.display_rows[0], DisplayRow::Standalone(0));
+    }
+
+    #[test]
+    fn test_internal_standalone_toggle_expands() {
+        let mut state = StreamState::new(vec![internal_message("s1", 1)]);
+        assert_eq!(state.display_rows.len(), 1);
+
+        // Toggle expand.
+        state.toggle_expansion();
+        // target + source + language = 3 detail rows + 1 header.
+        assert!(
+            state.display_rows.len() > 1,
+            "should expand with detail rows, got {}",
+            state.display_rows.len()
+        );
+        assert_eq!(state.display_rows[0], DisplayRow::Standalone(0));
+        assert!(
+            matches!(
+                state.display_rows[1],
+                DisplayRow::StandaloneDetail { entry_idx: 0, .. }
+            ),
+            "second row should be a detail"
+        );
+    }
+
+    #[test]
+    fn test_internal_standalone_toggle_collapses() {
+        let mut state = StreamState::new(vec![internal_message("s1", 1)]);
+        state.toggle_expansion(); // expand
+        let expanded_count = state.display_rows.len();
+        assert!(expanded_count > 1);
+
+        state.toggle_expansion(); // collapse
+        assert_eq!(state.display_rows.len(), 1);
+    }
+
+    #[test]
+    fn test_internal_standalone_detail_last_flag() {
+        let mut state = StreamState::new(vec![internal_message("s1", 1)]);
+        state.toggle_expansion();
+
+        let last_row = state.display_rows.last().expect("should have rows");
+        match last_row {
+            DisplayRow::StandaloneDetail { is_last, .. } => {
+                assert!(is_last, "last detail row should have is_last=true");
+            }
+            other => panic!("expected StandaloneDetail, got {other:?}"),
+        }
+
+        // Non-last detail rows should have is_last=false.
+        if state.display_rows.len() > 2 {
+            match &state.display_rows[1] {
+                DisplayRow::StandaloneDetail { is_last, .. } => {
+                    assert!(!is_last, "first detail row should have is_last=false");
+                }
+                other => panic!("expected StandaloneDetail, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_non_internal_standalone_not_expandable() {
+        let msg = make_message("s1", "textDocument/hover");
+        let mut state = StreamState::new(vec![msg]);
+        assert_eq!(state.display_rows.len(), 1);
+
+        state.toggle_expansion();
+        // LSP standalone should not expand.
+        assert_eq!(state.display_rows.len(), 1);
+    }
+
+    #[test]
+    fn test_internal_expansion_survives_prepend() {
+        let mut state = StreamState::new(vec![internal_message("s1", 10)]);
+        state.toggle_expansion();
+        let expanded_before = state.display_rows.len();
+        assert!(expanded_before > 1, "should be expanded");
+
+        // Prepend a page of older messages.
+        let older = vec![
+            mcp_request("s1", 1, "grep"),
+            mcp_response("s1", 1),
+        ];
+        state.prepend_page(older);
+
+        // The internal message moved from index 0 to index 1.
+        // It should still be expanded.
+        let detail_count = state
+            .display_rows
+            .iter()
+            .filter(|r| matches!(r, DisplayRow::StandaloneDetail { .. }))
+            .count();
+        assert!(
+            detail_count > 0,
+            "expansion should survive prepend, detail rows: {detail_count}"
+        );
+    }
+
+    #[test]
+    fn test_internal_yank_detail_row() {
+        let icons =
+            super::super::icons::IconSet::from_config(crate::config::IconConfig::default());
+        let mut state = StreamState::new(vec![internal_message("s1", 1)]);
+        state.toggle_expansion();
+
+        // Move cursor to the first detail row.
+        state.cursor = 1;
+        let text = state.yank_text(&icons).expect("should yank detail");
+        assert!(
+            text.contains(": "),
+            "detail yank should contain label: value, got: {text}"
+        );
     }
 }
