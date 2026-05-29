@@ -40,11 +40,13 @@ pub struct ServerStatusRow {
 }
 
 /// A server noise row: the most recent `$/progress`, `window/logMessage`,
-/// or `window/showMessage` per server.
+/// or `window/showMessage` per server instance.
 #[derive(Debug, Clone)]
 pub struct ServerNoiseRow {
     /// Server binary name (matches `ServerStatusRow::server`).
     pub server: String,
+    /// Scope root path (matches `ServerStatusRow::scope_root`).
+    pub scope_root: String,
     /// LSP method (`$/progress`, `window/logMessage`, `window/showMessage`).
     pub method: String,
     /// Raw protocol JSON payload.
@@ -140,11 +142,12 @@ pub trait DataSource {
     /// Returns an error if the database cannot be queried.
     fn list_server_statuses(&self) -> Result<Vec<ServerStatusRow>>;
 
-    /// Load the most recent server noise row per server.
+    /// Load the most recent server noise row per server instance.
     ///
     /// Queries `$/progress`, `window/logMessage`, and `window/showMessage`
-    /// from the messages table. Returns at most one row per (server, method)
-    /// combination — the most recent by message ID.
+    /// from the messages table. Returns at most one row per
+    /// `(server, scope_root, method)` combination — the most recent by
+    /// message ID.
     ///
     /// # Errors
     ///
@@ -369,9 +372,9 @@ impl DataSource for SqliteDataSource {
     }
 
     fn list_server_noise(&self) -> Result<Vec<ServerNoiseRow>> {
-        // Most recent row per (server, method) for server noise methods.
+        // Most recent row per (server, scope_root, method) for server noise methods.
         let mut stmt = self.conn.prepare(
-            "SELECT server, method, payload FROM messages \
+            "SELECT server, scope_root, method, payload FROM messages \
              WHERE type = 'lsp' \
                AND method IN ('$/progress', 'window/logMessage', 'window/showMessage') \
                AND parent_id IS NULL \
@@ -380,19 +383,20 @@ impl DataSource for SqliteDataSource {
                    WHERE type = 'lsp' \
                      AND method IN ('$/progress', 'window/logMessage', 'window/showMessage') \
                      AND parent_id IS NULL \
-                   GROUP BY server, method \
+                   GROUP BY server, scope_root, method \
                ) \
-             ORDER BY server, method",
+             ORDER BY server, scope_root, method",
         )?;
         let mut rows = stmt.query([])?;
         let mut result = Vec::new();
         while let Some(row) = rows.next()? {
-            let payload_str: String = row.get(2)?;
+            let payload_str: String = row.get(3)?;
             let payload: serde_json::Value =
                 serde_json::from_str(&payload_str).unwrap_or(serde_json::Value::Null);
             result.push(ServerNoiseRow {
                 server: row.get(0)?,
-                method: row.get(1)?,
+                scope_root: row.get(1)?,
+                method: row.get(2)?,
                 payload,
             });
         }
@@ -879,6 +883,56 @@ mod tests {
         let rows = ds.list_server_statuses()?;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].server, "rust-analyzer");
+        Ok(())
+    }
+
+    #[test]
+    fn test_sqlite_noise_scoped_by_instance() -> Result<()> {
+        let (_dir, path, conn) = test_db();
+        let write_conn = crate::db::open_and_migrate_at(&path)?;
+        insert_session(&write_conn, "daemon", "/tmp/daemon");
+
+        // Two rust-analyzer instances with different scope_root,
+        // each sending $/progress with different payloads.
+        write_conn.execute(
+            "INSERT INTO messages \
+             (session_id, timestamp, type, method, server, client, \
+              parent_id, scope_root, payload) \
+             VALUES ('daemon', '2026-01-01T00:00:01Z', 'lsp', '$/progress', \
+              'rust-analyzer', 'catenary', NULL, '/home/user/A', \
+              '{\"params\":{\"value\":{\"kind\":\"begin\",\"title\":\"Indexing\",\"percentage\":20}}}')",
+            [],
+        )?;
+        write_conn.execute(
+            "INSERT INTO messages \
+             (session_id, timestamp, type, method, server, client, \
+              parent_id, scope_root, payload) \
+             VALUES ('daemon', '2026-01-01T00:00:02Z', 'lsp', '$/progress', \
+              'rust-analyzer', 'catenary', NULL, '/home/user/B', \
+              '{\"params\":{\"value\":{\"kind\":\"begin\",\"title\":\"Loading\",\"percentage\":80}}}')",
+            [],
+        )?;
+
+        let ds = SqliteDataSource::with_conn(conn);
+        let noise = ds.list_server_noise()?;
+
+        // Should return two separate rows — one per (server, scope_root, method).
+        assert_eq!(noise.len(), 2, "expected 2 noise rows, got {}", noise.len());
+        assert_eq!(noise[0].scope_root, "/home/user/A");
+        assert_eq!(noise[1].scope_root, "/home/user/B");
+
+        // Payloads should be distinct.
+        let title_a = noise[0]
+            .payload
+            .pointer("/params/value/title")
+            .and_then(|v| v.as_str());
+        let title_b = noise[1]
+            .payload
+            .pointer("/params/value/title")
+            .and_then(|v| v.as_str());
+        assert_eq!(title_a, Some("Indexing"));
+        assert_eq!(title_b, Some("Loading"));
+
         Ok(())
     }
 

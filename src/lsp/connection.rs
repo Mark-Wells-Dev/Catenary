@@ -114,7 +114,7 @@ fn scope_root_str(server: &LspServer) -> Option<String> {
     server
         .scope()
         .and_then(|s| s.root_path())
-        .map(|p| p.to_string_lossy().into_owned())
+        .map(|p| p.display().to_string())
 }
 
 /// Whether an LSP error code indicates a retriable condition.
