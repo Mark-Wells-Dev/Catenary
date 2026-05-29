@@ -55,6 +55,7 @@ const SHORT_THRESHOLD: u16 = 12;
 const NARROW_THRESHOLD: u16 = 50;
 
 /// Application state driving the TUI.
+#[allow(clippy::struct_excessive_bools, reason = "TUI state naturally has independent boolean flags")]
 pub struct App<'a> {
     /// Semantic color theme.
     pub theme: &'a Theme,
@@ -75,6 +76,10 @@ pub struct App<'a> {
     /// Effective layout mode, recomputed each frame from [`left_layout`] and
     /// terminal dimensions.
     pub effective: EffectiveLayout,
+    /// Sidebar width as a percentage of the terminal (clamped to 10..=90).
+    pub sidebar_pct: u16,
+    /// Whether the user is dragging the panel divider.
+    pub dragging_divider: bool,
     /// Session list sidebar state.
     pub sidebar: SidebarState,
     /// Unified message stream state.
@@ -114,6 +119,8 @@ impl<'a> App<'a> {
             left_layout: LeftLayout::Quadrant,
             active_left_tab: 0,
             effective: EffectiveLayout::Quadrant,
+            sidebar_pct: 50,
+            dragging_divider: false,
             sidebar: SidebarState::new(),
             stream,
             tail,
@@ -530,6 +537,16 @@ mod tests {
         assert!(app.keybinds_expanded);
         app.toggle_keybinds();
         assert!(!app.keybinds_expanded);
+    }
+
+    #[test]
+    fn sidebar_pct_defaults_to_50() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let app = make_app(&theme, &icons);
+
+        assert_eq!(app.sidebar_pct, 50);
+        assert!(!app.dragging_divider);
     }
 
     #[test]

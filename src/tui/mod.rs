@@ -54,6 +54,12 @@ use self::theme::Theme;
 /// Tick interval for the event loop.
 const TICK_INTERVAL: Duration = Duration::from_millis(200);
 
+/// Minimum sidebar width as a percentage of the terminal.
+const MIN_SIDEBAR_PCT: u16 = 10;
+
+/// Maximum sidebar width as a percentage of the terminal.
+const MAX_SIDEBAR_PCT: u16 = 90;
+
 /// Start a file watcher on the WAL file's parent directory.
 ///
 /// Watches the parent directory (non-recursive) because the WAL file may not
@@ -160,6 +166,10 @@ struct PanelLayout {
     session_hits: Vec<(u16, usize)>,
     /// Terminal row → server entry index.
     server_hits: Vec<(u16, usize)>,
+    /// Column at the right edge of the left panel (divider hit target).
+    divider_col: u16,
+    /// Total terminal width for percentage computation during drag.
+    total_width: u16,
 }
 
 /// Handle a key event, dispatching to global or focus-specific handlers.
@@ -358,6 +368,27 @@ fn handle_mouse(
     layout: &PanelLayout,
     viewport_height: usize,
 ) {
+    // ── Divider drag ───────────────────────────────────────────
+    // Any left-button-down clears stale drag state; hits on the divider
+    // boundary start a new drag and return early.
+    if matches!(kind, MouseEventKind::Down(MouseButton::Left)) {
+        app.dragging_divider = layout.total_width > 0 && column.abs_diff(layout.divider_col) <= 1;
+        if app.dragging_divider {
+            return;
+        }
+    }
+    if matches!(kind, MouseEventKind::Up(MouseButton::Left)) {
+        app.dragging_divider = false;
+    }
+    if app.dragging_divider {
+        if kind == MouseEventKind::Drag(MouseButton::Left) && layout.total_width > 0 {
+            let raw = (u32::from(column) * 100 / u32::from(layout.total_width)) as u16;
+            app.sidebar_pct = raw.clamp(MIN_SIDEBAR_PCT, MAX_SIDEBAR_PCT);
+        }
+        return;
+    }
+
+    // ── Normal panel dispatch ──────────────────────────────────
     let pos = (column, row);
     let in_tab_bar = layout.tab_bar.contains(pos.into());
     let in_sessions = layout.sessions.contains(pos.into());
@@ -609,6 +640,8 @@ fn run_loop(
         tab_count: 0,
         session_hits: Vec::new(),
         server_hits: Vec::new(),
+        divider_col: 0,
+        total_width: 0,
     };
 
     loop {
@@ -640,6 +673,8 @@ fn run_loop(
                 layout.stream = Rect::default();
                 layout.tab_bar = Rect::default();
                 layout.tab_count = 0;
+                layout.divider_col = 0;
+                layout.total_width = 0;
                 return;
             }
 
@@ -652,6 +687,8 @@ fn run_loop(
             layout.stream = Rect::default();
             layout.tab_bar = Rect::default();
             layout.tab_count = 0;
+            layout.divider_col = 0;
+            layout.total_width = 0;
 
             // Cursor position for the search bar (set by render_messages_panel).
             let mut search_cursor: Option<(u16, u16)> = None;
@@ -661,11 +698,17 @@ fn run_loop(
                 EffectiveLayout::Quadrant => {
                     let h_chunks = Layout::default()
                         .direction(Direction::Horizontal)
-                        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                        .constraints([
+                            Constraint::Percentage(app.sidebar_pct),
+                            Constraint::Percentage(100 - app.sidebar_pct),
+                        ])
                         .split(area);
 
                     let left = h_chunks[0];
                     let right = h_chunks[1];
+
+                    layout.divider_col = left.x + left.width.saturating_sub(1);
+                    layout.total_width = area.width;
 
                     let keybinds_height = if app.keybinds_expanded {
                         KEYBINDS_EXPANDED_HEIGHT + 2
@@ -715,11 +758,17 @@ fn run_loop(
                 EffectiveLayout::Stacked => {
                     let h_chunks = Layout::default()
                         .direction(Direction::Horizontal)
-                        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                        .constraints([
+                            Constraint::Percentage(app.sidebar_pct),
+                            Constraint::Percentage(100 - app.sidebar_pct),
+                        ])
                         .split(area);
 
                     let left = h_chunks[0];
                     let right = h_chunks[1];
+
+                    layout.divider_col = left.x + left.width.saturating_sub(1);
+                    layout.total_width = area.width;
 
                     let v_chunks = Layout::default()
                         .direction(Direction::Vertical)
@@ -831,5 +880,228 @@ fn run_loop(
             app.refresh_servers();
             last_tick = Instant::now();
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "tests use expect for readable assertions"
+)]
+mod tests {
+    use std::collections::HashMap;
+
+    use crossterm::event::{MouseButton, MouseEventKind};
+    use ratatui::layout::Rect;
+
+    use super::*;
+    use crate::config::IconConfig;
+    use crate::tui::data::MockDataSource;
+
+    fn make_app<'a>(theme: &'a Theme, icons: &'a IconSet) -> App<'a> {
+        let data: Box<dyn DataSource> = Box::new(MockDataSource {
+            sessions: Vec::new(),
+            messages: HashMap::new(),
+            tail_messages: HashMap::new(),
+            server_statuses: Vec::new(),
+            server_noise: Vec::new(),
+        });
+        App::new(theme, icons, data).expect("mock app creation")
+    }
+
+    fn layout_80_cols() -> PanelLayout {
+        // Simulate an 80-column terminal with 50% sidebar (40 cols each).
+        PanelLayout {
+            sessions: Rect::new(0, 0, 40, 10),
+            servers: Rect::new(0, 10, 40, 10),
+            keybinds: Rect::new(0, 20, 40, 3),
+            stream: Rect::new(40, 0, 40, 23),
+            tab_bar: Rect::default(),
+            tab_count: 0,
+            session_hits: Vec::new(),
+            server_hits: Vec::new(),
+            divider_col: 39, // left.x + left.width - 1
+            total_width: 80,
+        }
+    }
+
+    #[test]
+    fn click_on_divider_starts_drag() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let mut app = make_app(&theme, &icons);
+        let layout = layout_80_cols();
+
+        // Click exactly on divider_col.
+        handle_mouse(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            39,
+            5,
+            &layout,
+            23,
+        );
+        assert!(app.dragging_divider);
+    }
+
+    #[test]
+    fn click_adjacent_to_divider_starts_drag() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let mut app = make_app(&theme, &icons);
+        let layout = layout_80_cols();
+
+        // Click one column to the right of divider_col (stream border).
+        handle_mouse(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            40,
+            5,
+            &layout,
+            23,
+        );
+        assert!(app.dragging_divider);
+    }
+
+    #[test]
+    fn click_away_from_divider_does_not_drag() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let mut app = make_app(&theme, &icons);
+        let layout = layout_80_cols();
+
+        // Click well inside the stream panel.
+        handle_mouse(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            60,
+            5,
+            &layout,
+            23,
+        );
+        assert!(!app.dragging_divider);
+    }
+
+    #[test]
+    fn drag_updates_sidebar_pct() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let mut app = make_app(&theme, &icons);
+        let layout = layout_80_cols();
+
+        // Start drag.
+        handle_mouse(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            39,
+            5,
+            &layout,
+            23,
+        );
+        assert!(app.dragging_divider);
+
+        // Drag to column 60 on an 80-col terminal → 75%.
+        handle_mouse(
+            &mut app,
+            MouseEventKind::Drag(MouseButton::Left),
+            60,
+            5,
+            &layout,
+            23,
+        );
+        assert_eq!(app.sidebar_pct, 75);
+        assert!(app.dragging_divider);
+    }
+
+    #[test]
+    fn drag_clamps_to_min_max() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let mut app = make_app(&theme, &icons);
+        let layout = layout_80_cols();
+
+        // Start drag.
+        handle_mouse(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            39,
+            5,
+            &layout,
+            23,
+        );
+
+        // Drag to column 0 → clamped to MIN_SIDEBAR_PCT (10).
+        handle_mouse(
+            &mut app,
+            MouseEventKind::Drag(MouseButton::Left),
+            0,
+            5,
+            &layout,
+            23,
+        );
+        assert_eq!(app.sidebar_pct, MIN_SIDEBAR_PCT);
+
+        // Drag to column 79 → 98% → clamped to MAX_SIDEBAR_PCT (90).
+        handle_mouse(
+            &mut app,
+            MouseEventKind::Drag(MouseButton::Left),
+            79,
+            5,
+            &layout,
+            23,
+        );
+        assert_eq!(app.sidebar_pct, MAX_SIDEBAR_PCT);
+    }
+
+    #[test]
+    fn mouse_up_ends_drag() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let mut app = make_app(&theme, &icons);
+        let layout = layout_80_cols();
+
+        // Start drag.
+        handle_mouse(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            39,
+            5,
+            &layout,
+            23,
+        );
+        assert!(app.dragging_divider);
+
+        // Release.
+        handle_mouse(
+            &mut app,
+            MouseEventKind::Up(MouseButton::Left),
+            50,
+            5,
+            &layout,
+            23,
+        );
+        assert!(!app.dragging_divider);
+    }
+
+    #[test]
+    fn stale_drag_cleared_by_new_click() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let mut app = make_app(&theme, &icons);
+        let layout = layout_80_cols();
+
+        // Force stale drag state (e.g., mouse released outside terminal).
+        app.dragging_divider = true;
+
+        // Click away from divider — should clear drag and proceed normally.
+        handle_mouse(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            60,
+            5,
+            &layout,
+            23,
+        );
+        assert!(!app.dragging_divider);
     }
 }
