@@ -38,6 +38,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Tabs, Widget};
 use tracing::info;
@@ -554,7 +555,7 @@ fn handle_mouse(
 }
 
 /// Build a `Block` frame for a panel, styling the border based on focus.
-fn panel_block<'a>(title: &'a str, focused: bool, theme: &'a Theme) -> Block<'a> {
+fn panel_block<'a>(title: &'a str, focused: bool, theme: &'a Theme, borders: Borders) -> Block<'a> {
     let border_style = if focused {
         theme.border_focused
     } else {
@@ -562,9 +563,131 @@ fn panel_block<'a>(title: &'a str, focused: bool, theme: &'a Theme) -> Block<'a>
     };
     let title_style = if focused { theme.title } else { theme.muted };
     Block::default()
-        .borders(Borders::ALL)
+        .borders(borders)
         .border_style(border_style)
         .title(Span::styled(title, title_style))
+}
+
+/// Render a horizontal separator row in the left column.
+///
+/// Draws `├──Title──` across the row, with `├` at the left edge and `─`
+/// filling the rest. The title overlays the horizontal line.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "terminal coordinates are always small"
+)]
+fn render_left_separator(
+    y: u16,
+    x: u16,
+    width: u16,
+    title: &str,
+    focused: bool,
+    theme: &Theme,
+    buf: &mut Buffer,
+) {
+    let border_style = if focused {
+        theme.border_focused
+    } else {
+        theme.border_unfocused
+    };
+    let title_style = if focused { theme.title } else { theme.muted };
+
+    // ├ at the left edge.
+    buf.set_string(x, y, "├", border_style);
+
+    // Fill with ─.
+    for col in (x + 1)..(x + width) {
+        buf.set_string(col, y, "─", border_style);
+    }
+
+    // Overlay title after the junction.
+    if !title.is_empty() && width > 2 {
+        let max = (width - 1) as usize;
+        let truncated: String = title.chars().take(max).collect();
+        buf.set_string(x + 1, y, &truncated, title_style);
+    }
+}
+
+/// Render a horizontal separator row in the right column.
+///
+/// Draws `─Title──┤` across the row, with `─` filling and `┤` at the
+/// right edge. When `has_left_border` is true (`FullStack` mode), also
+/// places `├` at the left edge to connect the vertical LEFT border.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::too_many_arguments,
+    reason = "terminal coordinates are always small; separator needs position, content, style, and border flag"
+)]
+fn render_right_separator(
+    y: u16,
+    x: u16,
+    width: u16,
+    title: &str,
+    focused: bool,
+    theme: &Theme,
+    buf: &mut Buffer,
+    has_left_border: bool,
+) {
+    let border_style = if focused {
+        theme.border_focused
+    } else {
+        theme.border_unfocused
+    };
+    let title_style = if focused { theme.title } else { theme.muted };
+
+    // Fill with ─.
+    for col in x..(x + width) {
+        buf.set_string(col, y, "─", border_style);
+    }
+
+    // ├ at the left edge when panels have a LEFT border.
+    if has_left_border && width > 0 {
+        buf.set_string(x, y, "├", border_style);
+    }
+
+    // ┤ at the right edge.
+    if width > 0 {
+        buf.set_string(x + width - 1, y, "┤", border_style);
+    }
+
+    // Overlay title between the junctions.
+    let title_offset = u16::from(has_left_border);
+    if !title.is_empty() && width > 2 + title_offset {
+        let max = (width - 2 - title_offset) as usize;
+        let truncated: String = title.chars().take(max).collect();
+        buf.set_string(x + 1 + title_offset, y, &truncated, title_style);
+    }
+}
+
+/// Render the vertical divider column between the left panels and the
+/// right side, using box-drawing intersection characters.
+fn render_divider_col(
+    col: u16,
+    top: u16,
+    bottom: u16,
+    left_seps: &[u16],
+    right_seps: &[u16],
+    style: Style,
+    buf: &mut Buffer,
+) {
+    for y in top..=bottom {
+        let has_left = left_seps.contains(&y);
+        let has_right = right_seps.contains(&y);
+        let ch = if y == top {
+            "┬"
+        } else if y == bottom {
+            "┴"
+        } else if has_left && has_right {
+            "┼"
+        } else if has_left {
+            "┤"
+        } else if has_right {
+            "├"
+        } else {
+            "│"
+        };
+        buf.set_string(col, y, ch, style);
+    }
 }
 
 /// Render the search bar at the bottom of the stream panel.
@@ -623,9 +746,10 @@ fn render_sessions_panel(
     panel_rect: Rect,
     buf: &mut Buffer,
     layout: &mut PanelLayout,
+    borders: Borders,
 ) {
     let focused = app.focus == FocusRegion::Sessions;
-    let block = panel_block(" Sessions ", focused, app.theme);
+    let block = panel_block(" Sessions ", focused, app.theme, borders);
     let inner = block.inner(panel_rect);
     block.render(panel_rect, buf);
     layout.session_hits = render_sessions(&app.sidebar, inner, buf, app.theme, focused);
@@ -638,9 +762,11 @@ fn render_servers_panel(
     panel_rect: Rect,
     buf: &mut Buffer,
     layout: &mut PanelLayout,
+    borders: Borders,
+    title: &str,
 ) {
     let focused = app.focus == FocusRegion::Servers;
-    let block = panel_block(" Servers ", focused, app.theme);
+    let block = panel_block(title, focused, app.theme, borders);
     let inner = block.inner(panel_rect);
     block.render(panel_rect, buf);
     layout.server_hits = render_servers(&app.sidebar, inner, buf, app.theme, focused);
@@ -653,9 +779,11 @@ fn render_keybinds_panel(
     panel_rect: Rect,
     buf: &mut Buffer,
     layout: &mut PanelLayout,
+    borders: Borders,
+    title: &str,
 ) {
     let focused = app.focus == FocusRegion::Keybinds;
-    let block = panel_block(" Keybinds ", focused, app.theme);
+    let block = panel_block(title, focused, app.theme, borders);
     let inner = block.inner(panel_rect);
     block.render(panel_rect, buf);
     render_keybinds_content(inner, buf, app.theme);
@@ -664,9 +792,10 @@ fn render_keybinds_panel(
 
 /// Render the right side: optional server detail panel above the Messages panel.
 ///
-/// When a server popup is open, splits `right_rect` vertically (50/50) and
-/// renders the detail panel on top. Passes the remaining rect to
-/// [`render_messages_panel`]. Updates `layout.detail` and `layout.detail_height`.
+/// When a server popup is open, splits `right_rect` vertically with a
+/// shared separator row between detail and Messages. Updates `layout.detail`,
+/// `layout.detail_height`, and returns the separator row (if any) for the
+/// divider renderer.
 #[allow(
     clippy::cast_possible_truncation,
     reason = "terminal coordinates are always small"
@@ -676,24 +805,58 @@ fn render_right_side(
     right_rect: Rect,
     buf: &mut Buffer,
     layout: &mut PanelLayout,
-) -> Option<(u16, u16)> {
-    let (detail_rect, messages_rect) = if app.popup.is_some() {
-        let v = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Fill(1), Constraint::Fill(1)])
-            .split(right_rect);
-        (Some(v[0]), v[1])
-    } else {
-        (None, right_rect)
-    };
+    right_borders: Borders,
+) -> (Option<(u16, u16)>, Vec<u16>) {
+    let mut right_seps = Vec::new();
+
+    let (detail_rect, sep_rect, messages_rect, detail_borders, messages_borders) =
+        if app.popup.is_some() {
+            let v = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Fill(1),
+                    Constraint::Length(1),
+                    Constraint::Fill(1),
+                ])
+                .split(right_rect);
+            right_seps.push(v[1].y);
+            (
+                Some(v[0]),
+                Some(v[1]),
+                v[2],
+                // Detail: TOP + whatever RIGHT/BOTTOM the caller gives, minus BOTTOM.
+                (right_borders | Borders::TOP) - Borders::BOTTOM,
+                // Messages: BOTTOM + whatever RIGHT the caller gives, minus TOP.
+                (right_borders | Borders::BOTTOM) - Borders::TOP,
+            )
+        } else {
+            (None, None, right_rect, Borders::NONE, right_borders)
+        };
 
     if let (Some(detail_area), Some(popup)) = (detail_rect, &mut app.popup) {
-        render_server_detail(popup, detail_area, buf, app.theme, true);
-        layout.detail_height = detail_area.height.saturating_sub(2) as usize;
+        render_server_detail(popup, detail_area, buf, app.theme, true, detail_borders);
+        let border_rows = u16::from(detail_borders.contains(Borders::TOP))
+            + u16::from(detail_borders.contains(Borders::BOTTOM));
+        layout.detail_height = detail_area.height.saturating_sub(border_rows) as usize;
     }
     layout.detail = detail_rect;
 
-    render_messages_panel(app, messages_rect, buf, layout)
+    // Render the separator between detail and Messages.
+    if let Some(sep) = sep_rect {
+        let focused = app.focus == FocusRegion::Stream;
+        let title = if app.stream.in_visual() {
+            " Messages  VISUAL "
+        } else {
+            " Messages "
+        };
+        let has_left = right_borders.contains(Borders::LEFT);
+        render_right_separator(
+            sep.y, sep.x, sep.width, title, focused, app.theme, buf, has_left,
+        );
+    }
+
+    let cursor = render_messages_panel(app, messages_rect, buf, layout, messages_borders);
+    (cursor, right_seps)
 }
 
 /// Render the Messages stream panel into `panel_rect`, including the search
@@ -707,14 +870,21 @@ fn render_messages_panel(
     panel_rect: Rect,
     buf: &mut Buffer,
     layout: &mut PanelLayout,
+    borders: Borders,
 ) -> Option<(u16, u16)> {
     let focused = app.focus == FocusRegion::Stream;
-    let title = if app.stream.in_visual() {
-        " Messages  VISUAL "
+    // Only show the title when the block has a TOP border (otherwise
+    // the separator row above already rendered the title).
+    let title = if borders.contains(Borders::TOP) {
+        if app.stream.in_visual() {
+            " Messages  VISUAL "
+        } else {
+            " Messages "
+        }
     } else {
-        " Messages "
+        ""
     };
-    let block = panel_block(title, focused, app.theme);
+    let block = panel_block(title, focused, app.theme, borders);
     let inner = block.inner(panel_rect);
     block.render(panel_rect, buf);
 
@@ -841,58 +1011,133 @@ fn run_loop(
                         .direction(Direction::Horizontal)
                         .constraints([
                             Constraint::Percentage(app.sidebar_pct),
-                            Constraint::Percentage(100 - app.sidebar_pct),
+                            Constraint::Length(1),
+                            Constraint::Fill(1),
                         ])
                         .split(area);
 
                     let left = h_chunks[0];
-                    let right = h_chunks[1];
+                    let divider_rect = h_chunks[1];
+                    let right = h_chunks[2];
 
-                    layout.divider_col = left.x + left.width.saturating_sub(1);
+                    layout.divider_col = divider_rect.x;
                     layout.total_width = area.width;
 
+                    // Keybinds: content + BOTTOM border (no TOP — title
+                    // lives on the separator above).
                     let keybinds_height = if app.keybinds_expanded {
-                        KEYBINDS_EXPANDED_HEIGHT + 2
+                        KEYBINDS_EXPANDED_HEIGHT + 1
                     } else {
-                        3
+                        1 // just the BOTTOM border row
                     };
 
                     let v_chunks = Layout::default()
                         .direction(Direction::Vertical)
                         .constraints([
                             Constraint::Fill(1),
+                            Constraint::Length(1),
                             Constraint::Fill(1),
+                            Constraint::Length(1),
                             Constraint::Length(keybinds_height),
                         ])
                         .split(left);
 
                     let sessions_rect = v_chunks[0];
-                    let servers_rect = v_chunks[1];
-                    let keybinds_rect = v_chunks[2];
+                    let sep1 = v_chunks[1];
+                    let servers_rect = v_chunks[2];
+                    let sep2 = v_chunks[3];
+                    let keybinds_rect = v_chunks[4];
 
-                    // Sessions.
-                    render_sessions_panel(app, sessions_rect, f.buffer_mut(), &mut layout);
+                    // Sessions: TOP + LEFT.
+                    render_sessions_panel(
+                        app,
+                        sessions_rect,
+                        f.buffer_mut(),
+                        &mut layout,
+                        Borders::TOP | Borders::LEFT,
+                    );
 
-                    // Servers.
-                    render_servers_panel(app, servers_rect, f.buffer_mut(), &mut layout);
+                    // Separator: Servers title.
+                    let servers_focused = app.focus == FocusRegion::Servers;
+                    render_left_separator(
+                        sep1.y,
+                        sep1.x,
+                        sep1.width,
+                        " Servers ",
+                        servers_focused,
+                        app.theme,
+                        f.buffer_mut(),
+                    );
 
-                    // Keybinds (collapsed/expanded).
+                    // Servers: LEFT only (title on separator above).
+                    render_servers_panel(
+                        app,
+                        servers_rect,
+                        f.buffer_mut(),
+                        &mut layout,
+                        Borders::LEFT,
+                        "",
+                    );
+                    // Include separator in hit area.
+                    layout.servers = Rect {
+                        y: sep1.y,
+                        height: sep1.height + servers_rect.height,
+                        ..servers_rect
+                    };
+
+                    // Separator: Keybinds title.
                     let keybinds_focused = app.focus == FocusRegion::Keybinds;
                     let keybinds_title = if app.keybinds_expanded {
                         " Keybinds  ? "
                     } else {
                         " Keybinds  ? to expand "
                     };
-                    let keybinds_block = panel_block(keybinds_title, keybinds_focused, app.theme);
+                    render_left_separator(
+                        sep2.y,
+                        sep2.x,
+                        sep2.width,
+                        keybinds_title,
+                        keybinds_focused,
+                        app.theme,
+                        f.buffer_mut(),
+                    );
+
+                    // Keybinds: BOTTOM + LEFT (title on separator above).
+                    let keybinds_block = panel_block(
+                        "",
+                        keybinds_focused,
+                        app.theme,
+                        Borders::BOTTOM | Borders::LEFT,
+                    );
                     let keybinds_inner = keybinds_block.inner(keybinds_rect);
                     keybinds_block.render(keybinds_rect, f.buffer_mut());
                     if app.keybinds_expanded {
                         render_keybinds_content(keybinds_inner, f.buffer_mut(), app.theme);
                     }
-                    layout.keybinds = keybinds_rect;
+                    // Include separator in hit area.
+                    layout.keybinds = Rect {
+                        y: sep2.y,
+                        height: sep2.height + keybinds_rect.height,
+                        ..keybinds_rect
+                    };
 
-                    // Messages (with optional detail panel above).
-                    search_cursor = render_right_side(app, right, f.buffer_mut(), &mut layout);
+                    // Right side: Messages (+ optional detail panel).
+                    let right_borders = Borders::TOP | Borders::RIGHT | Borders::BOTTOM;
+                    let (cursor, right_seps) =
+                        render_right_side(app, right, f.buffer_mut(), &mut layout, right_borders);
+                    search_cursor = cursor;
+
+                    // Vertical divider with intersection characters.
+                    let left_seps = [sep1.y, sep2.y];
+                    render_divider_col(
+                        divider_rect.x,
+                        divider_rect.y,
+                        divider_rect.y + divider_rect.height.saturating_sub(1),
+                        &left_seps,
+                        &right_seps,
+                        app.theme.border_unfocused,
+                        f.buffer_mut(),
+                    );
                 }
 
                 // ── Stacked: tab bar + active panel left, Messages right
@@ -901,14 +1146,16 @@ fn run_loop(
                         .direction(Direction::Horizontal)
                         .constraints([
                             Constraint::Percentage(app.sidebar_pct),
-                            Constraint::Percentage(100 - app.sidebar_pct),
+                            Constraint::Length(1),
+                            Constraint::Fill(1),
                         ])
                         .split(area);
 
                     let left = h_chunks[0];
-                    let right = h_chunks[1];
+                    let divider_rect = h_chunks[1];
+                    let right = h_chunks[2];
 
-                    layout.divider_col = left.x + left.width.saturating_sub(1);
+                    layout.divider_col = divider_rect.x;
                     layout.total_width = area.width;
 
                     let v_chunks = Layout::default()
@@ -929,14 +1176,51 @@ fn run_loop(
                     layout.tab_bar = tab_bar_rect;
                     layout.tab_count = LEFT_TAB_NAMES.len();
 
+                    let stacked_borders = Borders::TOP | Borders::LEFT | Borders::BOTTOM;
                     match app.active_left_tab {
-                        0 => render_sessions_panel(app, panel_rect, f.buffer_mut(), &mut layout),
-                        1 => render_servers_panel(app, panel_rect, f.buffer_mut(), &mut layout),
-                        _ => render_keybinds_panel(app, panel_rect, f.buffer_mut(), &mut layout),
+                        0 => render_sessions_panel(
+                            app,
+                            panel_rect,
+                            f.buffer_mut(),
+                            &mut layout,
+                            stacked_borders,
+                        ),
+                        1 => render_servers_panel(
+                            app,
+                            panel_rect,
+                            f.buffer_mut(),
+                            &mut layout,
+                            stacked_borders,
+                            " Servers ",
+                        ),
+                        _ => render_keybinds_panel(
+                            app,
+                            panel_rect,
+                            f.buffer_mut(),
+                            &mut layout,
+                            stacked_borders,
+                            " Keybinds ",
+                        ),
                     }
 
-                    // Messages (with optional detail panel above).
-                    search_cursor = render_right_side(app, right, f.buffer_mut(), &mut layout);
+                    // Right side: Messages (+ optional detail panel).
+                    let right_borders = Borders::TOP | Borders::RIGHT | Borders::BOTTOM;
+                    let (cursor, right_seps) =
+                        render_right_side(app, right, f.buffer_mut(), &mut layout, right_borders);
+                    search_cursor = cursor;
+
+                    // Vertical divider — panel TOP is an internal
+                    // junction.
+                    let left_seps = [panel_rect.y];
+                    render_divider_col(
+                        divider_rect.x,
+                        divider_rect.y,
+                        divider_rect.y + divider_rect.height.saturating_sub(1),
+                        &left_seps,
+                        &right_seps,
+                        app.theme.border_unfocused,
+                        f.buffer_mut(),
+                    );
                 }
 
                 // ── FullStack: tab bar + one panel full-width ──────
@@ -966,12 +1250,38 @@ fn run_loop(
                     layout.tab_count = FULL_TAB_NAMES.len();
 
                     match visible_tab {
-                        0 => render_sessions_panel(app, panel_rect, f.buffer_mut(), &mut layout),
-                        1 => render_servers_panel(app, panel_rect, f.buffer_mut(), &mut layout),
-                        2 => render_keybinds_panel(app, panel_rect, f.buffer_mut(), &mut layout),
+                        0 => render_sessions_panel(
+                            app,
+                            panel_rect,
+                            f.buffer_mut(),
+                            &mut layout,
+                            Borders::ALL,
+                        ),
+                        1 => render_servers_panel(
+                            app,
+                            panel_rect,
+                            f.buffer_mut(),
+                            &mut layout,
+                            Borders::ALL,
+                            " Servers ",
+                        ),
+                        2 => render_keybinds_panel(
+                            app,
+                            panel_rect,
+                            f.buffer_mut(),
+                            &mut layout,
+                            Borders::ALL,
+                            " Keybinds ",
+                        ),
                         _ => {
-                            search_cursor =
-                                render_right_side(app, panel_rect, f.buffer_mut(), &mut layout);
+                            let (cursor, _) = render_right_side(
+                                app,
+                                panel_rect,
+                                f.buffer_mut(),
+                                &mut layout,
+                                Borders::ALL,
+                            );
+                            search_cursor = cursor;
                         }
                     }
                 }
@@ -1051,19 +1361,20 @@ mod tests {
     }
 
     fn layout_80_cols() -> PanelLayout {
-        // Simulate an 80-column terminal with 50% sidebar (40 cols each).
+        // Simulate an 80-column terminal: 50% sidebar (40 cols),
+        // 1-col divider at col 40, fill right (39 cols).
         PanelLayout {
             sessions: Rect::new(0, 0, 40, 10),
             servers: Rect::new(0, 10, 40, 10),
             keybinds: Rect::new(0, 20, 40, 3),
-            stream: Rect::new(40, 0, 40, 23),
+            stream: Rect::new(41, 0, 39, 23),
             tab_bar: Rect::default(),
             tab_count: 0,
             detail: None,
             detail_height: 0,
             session_hits: Vec::new(),
             server_hits: Vec::new(),
-            divider_col: 39, // left.x + left.width - 1
+            divider_col: 40,
             total_width: 80,
         }
     }
@@ -1079,7 +1390,7 @@ mod tests {
         handle_mouse(
             &mut app,
             MouseEventKind::Down(MouseButton::Left),
-            39,
+            40,
             5,
             &layout,
             23,
@@ -1094,11 +1405,11 @@ mod tests {
         let mut app = make_app(&theme, &icons);
         let layout = layout_80_cols();
 
-        // Click one column to the right of divider_col (stream border).
+        // Click one column to the right of divider_col.
         handle_mouse(
             &mut app,
             MouseEventKind::Down(MouseButton::Left),
-            40,
+            41,
             5,
             &layout,
             23,
@@ -1136,7 +1447,7 @@ mod tests {
         handle_mouse(
             &mut app,
             MouseEventKind::Down(MouseButton::Left),
-            39,
+            40,
             5,
             &layout,
             23,
@@ -1167,7 +1478,7 @@ mod tests {
         handle_mouse(
             &mut app,
             MouseEventKind::Down(MouseButton::Left),
-            39,
+            40,
             5,
             &layout,
             23,
@@ -1207,7 +1518,7 @@ mod tests {
         handle_mouse(
             &mut app,
             MouseEventKind::Down(MouseButton::Left),
-            39,
+            40,
             5,
             &layout,
             23,

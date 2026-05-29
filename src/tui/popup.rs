@@ -76,6 +76,7 @@ pub fn render_server_detail(
     buf: &mut Buffer,
     theme: &Theme,
     focused: bool,
+    borders: Borders,
 ) {
     let border_style = if focused {
         theme.border_focused
@@ -84,7 +85,7 @@ pub fn render_server_detail(
     };
     let title_style = if focused { theme.title } else { theme.muted };
     let block = Block::default()
-        .borders(Borders::ALL)
+        .borders(borders)
         .border_style(border_style)
         .title(Span::styled(&popup.title, title_style));
     let inner = block.inner(area);
@@ -311,7 +312,7 @@ mod tests {
         let mut popup = ServerPopup::new("ra", "proj/", vec![]);
         let area = Rect::new(0, 0, 60, 20);
         let mut buf = Buffer::empty(area);
-        render_server_detail(&mut popup, area, &mut buf, &theme, true);
+        render_server_detail(&mut popup, area, &mut buf, &theme, true, Borders::ALL);
 
         let content = buffer_to_string(&buf);
         assert!(
@@ -330,7 +331,7 @@ mod tests {
         let mut popup = ServerPopup::new("rust-analyzer", "Catenary/", msgs);
         let area = Rect::new(0, 0, 80, 30);
         let mut buf = Buffer::empty(area);
-        render_server_detail(&mut popup, area, &mut buf, &theme, true);
+        render_server_detail(&mut popup, area, &mut buf, &theme, true, Borders::ALL);
 
         let content = buffer_to_string(&buf);
         assert!(
@@ -360,7 +361,7 @@ mod tests {
 
         let area = Rect::new(0, 0, 80, 30);
         let mut buf = Buffer::empty(area);
-        render_server_detail(&mut popup, area, &mut buf, &theme, true);
+        render_server_detail(&mut popup, area, &mut buf, &theme, true, Borders::ALL);
 
         assert_eq!(popup.total_lines, 3);
     }
