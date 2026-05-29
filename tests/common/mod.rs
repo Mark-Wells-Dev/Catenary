@@ -447,8 +447,10 @@ impl BridgeProcess {
             }),
         )?;
 
-        // Run diagnostics via handoff slot
-        let text = ipc_request(
+        // Run diagnostics via handoff slot. Uses the long timeout because
+        // the diagnostics pipeline (settle + flycheck) can take tens of
+        // seconds under CPU contention from parallel tests.
+        let text = ipc_request_long(
             &socket_path,
             &json!({
                 "method": "tool/editing-stop"
@@ -495,8 +497,10 @@ impl BridgeProcess {
             }),
         )?;
 
-        // Run diagnostics via handoff slot
-        let text = ipc_request(
+        // Run diagnostics via handoff slot. Uses the long timeout because
+        // the diagnostics pipeline (settle + flycheck) can take tens of
+        // seconds under CPU contention from parallel tests.
+        let text = ipc_request_long(
             &socket_path,
             &json!({
                 "method": "tool/editing-stop"
@@ -782,11 +786,32 @@ pub fn ipc_tool_request(socket_path: &Path, request: &Value) -> Result<String> {
 }
 
 /// Sends a one-shot IPC request to the hook server. Returns the response.
+///
+/// Uses a 10-second read timeout — sufficient for hook calls that return
+/// immediately. For calls that block on the diagnostics pipeline (e.g.,
+/// `tool/editing-stop` with flycheck), use [`ipc_request_long`].
 pub fn ipc_request(socket_path: &Path, request: &Value) -> Result<String> {
+    ipc_request_with_timeout(socket_path, request, Duration::from_secs(10))
+}
+
+/// Like [`ipc_request`], but with a 60-second read timeout.
+///
+/// Used for `tool/editing-stop` which blocks on the diagnostics pipeline.
+/// Under parallel test load, CPU contention stretches flycheck wall time
+/// well past the default 10-second timeout.
+pub fn ipc_request_long(socket_path: &Path, request: &Value) -> Result<String> {
+    ipc_request_with_timeout(socket_path, request, Duration::from_mins(1))
+}
+
+fn ipc_request_with_timeout(
+    socket_path: &Path,
+    request: &Value,
+    timeout: Duration,
+) -> Result<String> {
     use std::io::Read as _;
     let mut stream =
         std::os::unix::net::UnixStream::connect(socket_path).context("connect to notify socket")?;
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    stream.set_read_timeout(Some(timeout))?;
     writeln!(stream, "{request}").context("write to notify socket")?;
     stream.shutdown(std::net::Shutdown::Write)?;
     let mut response = String::new();
