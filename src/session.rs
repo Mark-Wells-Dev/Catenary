@@ -638,100 +638,21 @@ pub fn recent_scopes_with_conn(
 
 /// Load scopes with root ID older than `before_id`, newest first.
 ///
-/// When `after_id` is provided, results are bounded below (for gap
-/// filling from the bottom side — returns the newest scopes in a gap).
-///
 /// # Errors
 ///
 /// Returns an error if the database cannot be queried.
 pub fn older_scopes_with_conn(
     conn: &Connection,
     before_id: i64,
-    after_id: Option<i64>,
     limit: usize,
     include_debug: bool,
 ) -> Result<Vec<SessionMessage>> {
     let limit_sql = i64::try_from(limit).unwrap_or(i64::MAX);
-
-    after_id.map_or_else(
-        || {
-            let query = format!(
-                "SELECT root_id, parent_id FROM ({SCOPE_ROOTS_CTE}) \
-                 WHERE root_id < ?1 ORDER BY root_id DESC LIMIT ?2"
-            );
-            fetch_scope_page(conn, &query, &[&before_id, &limit_sql], include_debug)
-        },
-        |after| {
-            let query = format!(
-                "SELECT root_id, parent_id FROM ({SCOPE_ROOTS_CTE}) \
-                 WHERE root_id < ?1 AND root_id > ?2 ORDER BY root_id DESC LIMIT ?3"
-            );
-            fetch_scope_page(
-                conn,
-                &query,
-                &[&before_id, &after, &limit_sql],
-                include_debug,
-            )
-        },
-    )
-}
-
-/// Load scopes with root ID newer than `after_id`, oldest first.
-///
-/// When `before_id` is provided, results are bounded above (for gap
-/// filling between two loaded regions).
-///
-/// # Errors
-///
-/// Returns an error if the database cannot be queried.
-pub fn newer_scopes_with_conn(
-    conn: &Connection,
-    after_id: i64,
-    before_id: Option<i64>,
-    limit: usize,
-    include_debug: bool,
-) -> Result<Vec<SessionMessage>> {
-    let limit_sql = i64::try_from(limit).unwrap_or(i64::MAX);
-
-    before_id.map_or_else(
-        || {
-            let query = format!(
-                "SELECT root_id, parent_id FROM ({SCOPE_ROOTS_CTE}) \
-                 WHERE root_id > ?1 ORDER BY root_id ASC LIMIT ?2"
-            );
-            fetch_scope_page(conn, &query, &[&after_id, &limit_sql], include_debug)
-        },
-        |before| {
-            let query = format!(
-                "SELECT root_id, parent_id FROM ({SCOPE_ROOTS_CTE}) \
-                 WHERE root_id > ?1 AND root_id < ?2 ORDER BY root_id ASC LIMIT ?3"
-            );
-            fetch_scope_page(
-                conn,
-                &query,
-                &[&after_id, &before, &limit_sql],
-                include_debug,
-            )
-        },
-    )
-}
-
-/// Load the oldest `limit` scopes (roots + children).
-///
-/// # Errors
-///
-/// Returns an error if the database cannot be queried.
-pub fn oldest_scopes_with_conn(
-    conn: &Connection,
-    limit: usize,
-    include_debug: bool,
-) -> Result<Vec<SessionMessage>> {
     let query = format!(
         "SELECT root_id, parent_id FROM ({SCOPE_ROOTS_CTE}) \
-         ORDER BY root_id ASC LIMIT ?1"
+         WHERE root_id < ?1 ORDER BY root_id DESC LIMIT ?2"
     );
-    let limit_sql = i64::try_from(limit).unwrap_or(i64::MAX);
-    fetch_scope_page(conn, &query, &[&limit_sql], include_debug)
+    fetch_scope_page(conn, &query, &[&before_id, &limit_sql], include_debug)
 }
 
 /// Tail only *new* messages from a session (starts from current end).

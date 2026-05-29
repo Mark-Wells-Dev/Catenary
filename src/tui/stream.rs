@@ -145,17 +145,6 @@ pub enum PageRequest {
     /// Load older scopes, prepending to the loaded range.
     /// Contains the oldest loaded scope root message ID.
     Older(i64),
-    /// Fill the gap between top and bottom regions.
-    FillGap {
-        /// Newest scope root ID in the top region.
-        after_id: i64,
-        /// Oldest scope root ID in the bottom region.
-        before_id: i64,
-        /// Fill from the bottom side (cursor near bottom region).
-        /// When true, load the newest scopes in the gap (closest
-        /// to the bottom region) instead of the oldest.
-        from_bottom: bool,
-    },
 }
 
 /// Get the scope root message ID for a stream entry.
@@ -272,15 +261,6 @@ pub struct StreamState {
     server_filter: Option<HashSet<super::sidebar::ServerInstanceKey>>,
 
     // ── Paging state ─────────────────────────────────────────────────
-    /// Index in `entries` where the bottom region starts (after a gap).
-    /// `None` when there is no gap (single contiguous region).
-    pub(super) gap_offset: Option<usize>,
-    /// Display row index where the bottom region starts.
-    gap_display_row: Option<usize>,
-    /// Oldest scope root message ID in the bottom region (set when gap exists).
-    bottom_oldest_root: Option<i64>,
-    /// Newest scope root message ID in the top region (set when gap exists).
-    top_newest_root: Option<i64>,
     /// Whether all older scopes have been loaded (reached the beginning).
     pub reached_beginning: bool,
 
@@ -312,10 +292,6 @@ impl StreamState {
             visual_anchor: None,
             session_filter: None,
             server_filter: None,
-            gap_offset: None,
-            gap_display_row: None,
-            bottom_oldest_root: None,
-            top_newest_root: None,
             reached_beginning: false,
             search_query: None,
             search_matches: Vec::new(),
@@ -347,14 +323,8 @@ impl StreamState {
     /// and active session/server filters.
     fn rebuild_display_rows(&mut self) {
         self.display_rows.clear();
-        self.gap_display_row = None;
 
         for (i, entry) in self.entries.iter().enumerate() {
-            // Track the gap boundary in display-row space.
-            if self.gap_offset.is_some_and(|go| i == go) {
-                self.gap_display_row = Some(self.display_rows.len());
-            }
-
             // Apply session filter: skip entries not in the selected set.
             if let Some(ref filter) = self.session_filter
                 && !filter.contains(entry.session_id())
@@ -888,166 +858,9 @@ impl StreamState {
         temp.append(&mut self.entries);
         self.entries = temp;
 
-        // Adjust gap offset.
-        if let Some(ref mut go) = self.gap_offset {
-            *go += n;
-        }
-
         // Keep cursor and scroll on the same content.
         self.cursor += n;
         self.scroll_position += n;
-
-        self.rebuild_display_rows();
-    }
-
-    /// Create a gap by loading the oldest page as a top region.
-    ///
-    /// The current entries become the bottom region; the oldest page
-    /// is prepended as the top region with a gap in between. Positions
-    /// the viewport at the top (oldest messages).
-    pub fn load_oldest_page(&mut self, messages: Vec<SessionMessage>) {
-        if messages.is_empty() {
-            return;
-        }
-
-        let mut temp = Vec::new();
-        let mut temp_map: HashMap<String, usize> = HashMap::new();
-        for msg in messages {
-            self.badges.badge(&msg.session_id);
-            route_into(&mut temp, &mut temp_map, msg);
-        }
-
-        if temp.is_empty() {
-            return;
-        }
-
-        let top_newest = temp.iter().map(entry_root_id).max();
-        let bottom_oldest = self.entries.first().map(entry_root_id);
-
-        let n = temp.len();
-
-        // Shift expanded standalone indices.
-        self.expanded_standalones = self.expanded_standalones.iter().map(|i| i + n).collect();
-
-        // Check for overlap — if top region reaches bottom, no gap needed.
-        if top_newest >= bottom_oldest {
-            // Covers the entire range; just prepend.
-            for idx in self.scope_map.values_mut() {
-                *idx += n;
-            }
-            self.scope_map.extend(temp_map);
-            temp.append(&mut self.entries);
-            self.entries = temp;
-            self.reached_beginning = true;
-            self.gap_offset = None;
-            self.top_newest_root = None;
-            self.bottom_oldest_root = None;
-        } else {
-            self.top_newest_root = top_newest;
-            self.bottom_oldest_root = bottom_oldest;
-
-            for idx in self.scope_map.values_mut() {
-                *idx += n;
-            }
-            self.scope_map.extend(temp_map);
-
-            temp.append(&mut self.entries);
-            self.entries = temp;
-            self.gap_offset = Some(n);
-            self.reached_beginning = true;
-        }
-
-        self.rebuild_display_rows();
-
-        // Position viewport at the top.
-        self.scroll_position = 0;
-        self.cursor = 0;
-        self.auto_scroll = false;
-    }
-
-    /// Insert scopes into the gap between top and bottom regions.
-    ///
-    /// Entries are inserted at the gap boundary, growing the top
-    /// region toward the bottom. When the gap closes, the two
-    /// regions merge.
-    pub fn fill_gap(&mut self, messages: Vec<SessionMessage>) {
-        let Some(gap_offset) = self.gap_offset else {
-            return;
-        };
-
-        if messages.is_empty() {
-            // No scopes left in the gap — close it.
-            self.gap_offset = None;
-            self.gap_display_row = None;
-            self.top_newest_root = None;
-            self.bottom_oldest_root = None;
-            self.rebuild_display_rows();
-            return;
-        }
-
-        let mut temp = Vec::new();
-        let mut temp_map: HashMap<String, usize> = HashMap::new();
-        for msg in messages {
-            self.badges.badge(&msg.session_id);
-            route_into(&mut temp, &mut temp_map, msg);
-        }
-
-        let n = temp.len();
-
-        // Update top_newest_root with the newest entry in the fill.
-        if let Some(newest) = temp.iter().map(entry_root_id).max() {
-            self.top_newest_root = Some(newest);
-        }
-
-        // Shift scope_map indices >= gap_offset to make room.
-        for idx in self.scope_map.values_mut() {
-            if *idx >= gap_offset {
-                *idx += n;
-            }
-        }
-
-        // Shift expanded standalone indices >= gap_offset.
-        self.expanded_standalones = self
-            .expanded_standalones
-            .iter()
-            .map(|&i| if i >= gap_offset { i + n } else { i })
-            .collect();
-
-        // Adjust temp_map indices relative to gap_offset.
-        for (key, val) in temp_map {
-            self.scope_map.insert(key, val + gap_offset);
-        }
-
-        // Splice entries at the gap boundary.
-        let tail = self.entries.split_off(gap_offset);
-        self.entries.extend(temp);
-        self.entries.extend(tail);
-
-        // Shift cursor/scroll to keep them on the same bottom-region
-        // content. Closed scopes produce 1 display row each, so entry
-        // count is a good approximation of display-row shift.
-        if let Some(gap_dr) = self.gap_display_row {
-            if self.cursor >= gap_dr {
-                self.cursor += n;
-            }
-            if self.scroll_position >= gap_dr {
-                self.scroll_position += n;
-            }
-        }
-
-        let new_gap = gap_offset + n;
-        self.gap_offset = Some(new_gap);
-
-        // Check if the gap has closed.
-        if let (Some(top_newest), Some(bottom_oldest)) =
-            (self.top_newest_root, self.bottom_oldest_root)
-            && top_newest >= bottom_oldest
-        {
-            self.gap_offset = None;
-            self.gap_display_row = None;
-            self.top_newest_root = None;
-            self.bottom_oldest_root = None;
-        }
 
         self.rebuild_display_rows();
     }
@@ -1069,25 +882,6 @@ impl StreamState {
             && let Some(oldest) = self.oldest_loaded_root()
         {
             return Some(PageRequest::Older(oldest));
-        }
-
-        // Near a gap boundary — fill the gap.
-        if let (Some(gap_dr), Some(top_newest), Some(bottom_oldest)) = (
-            self.gap_display_row,
-            self.top_newest_root,
-            self.bottom_oldest_root,
-        ) {
-            let near_top_end =
-                self.cursor >= gap_dr.saturating_sub(BUFFER_ZONE) && self.cursor < gap_dr;
-            let near_bottom_start =
-                self.cursor >= gap_dr && self.cursor < gap_dr.saturating_add(BUFFER_ZONE);
-            if near_top_end || near_bottom_start {
-                return Some(PageRequest::FillGap {
-                    after_id: top_newest,
-                    before_id: bottom_oldest,
-                    from_bottom: near_bottom_start,
-                });
-            }
         }
 
         None
@@ -1959,82 +1753,6 @@ mod tests {
     }
 
     #[test]
-    fn test_load_oldest_page_creates_gap() {
-        // Bottom region: scope 50.
-        let mut state =
-            StreamState::new(vec![mcp_request("s1", 50, "grep"), mcp_response("s1", 50)]);
-        assert!(state.gap_offset.is_none());
-
-        // Load oldest page: scope 1.
-        state.load_oldest_page(vec![mcp_request("s1", 1, "glob"), mcp_response("s1", 1)]);
-
-        assert_eq!(state.entries.len(), 2, "should have 2 entries");
-        assert_eq!(state.gap_offset, Some(1), "gap after top region");
-        assert!(state.top_newest_root.is_some());
-        assert!(state.bottom_oldest_root.is_some());
-        assert_eq!(state.scroll_position, 0, "viewport at top");
-        assert_eq!(state.cursor, 0, "cursor at top");
-        assert!(!state.auto_scroll);
-    }
-
-    #[test]
-    fn test_load_oldest_page_no_gap_when_overlapping() {
-        // Bottom region: scope 1 (same as oldest).
-        let mut state = StreamState::new(vec![mcp_request("s1", 1, "grep"), mcp_response("s1", 1)]);
-
-        // Load "oldest" which is the same scope.
-        state.load_oldest_page(vec![mcp_request("s1", 1, "glob"), mcp_response("s1", 1)]);
-
-        // No gap since top overlaps bottom.
-        assert!(
-            state.gap_offset.is_none(),
-            "overlapping pages should not create a gap"
-        );
-        assert!(state.reached_beginning);
-    }
-
-    #[test]
-    fn test_fill_gap_inserts_between_regions() {
-        // Set up: top region (scope 1), bottom region (scope 50).
-        let mut state =
-            StreamState::new(vec![mcp_request("s1", 50, "grep"), mcp_response("s1", 50)]);
-        state.load_oldest_page(vec![mcp_request("s1", 1, "glob"), mcp_response("s1", 1)]);
-        assert_eq!(state.gap_offset, Some(1));
-        assert_eq!(state.entries.len(), 2);
-
-        // Fill gap with scope 25.
-        state.fill_gap(vec![mcp_request("s1", 25, "grep"), mcp_response("s1", 25)]);
-
-        assert_eq!(state.entries.len(), 3, "should have 3 entries now");
-        assert_eq!(state.gap_offset, Some(2), "gap shifted right");
-
-        // Verify order: scope 1, scope 25, scope 50.
-        let ids: Vec<_> = state
-            .entries
-            .iter()
-            .map(|e| match e {
-                StreamEntry::Scope(s) => s.scope_id.clone(),
-                StreamEntry::Standalone(m) => m.method.clone(),
-            })
-            .collect();
-        assert_eq!(ids, vec!["scope-1", "scope-25", "scope-50"]);
-    }
-
-    #[test]
-    fn test_fill_gap_empty_closes_gap() {
-        let mut state =
-            StreamState::new(vec![mcp_request("s1", 50, "grep"), mcp_response("s1", 50)]);
-        state.load_oldest_page(vec![mcp_request("s1", 1, "glob"), mcp_response("s1", 1)]);
-        assert!(state.gap_offset.is_some());
-
-        // Empty fill closes the gap.
-        state.fill_gap(vec![]);
-        assert!(state.gap_offset.is_none(), "gap should be closed");
-        assert!(state.top_newest_root.is_none());
-        assert!(state.bottom_oldest_root.is_none());
-    }
-
-    #[test]
     fn test_check_paging_near_top_requests_older() {
         let messages: Vec<_> = (0..5)
             .map(|i| make_message_with_ids("s1", i + 1, "lsp", &format!("m{i}"), "ra", None))
@@ -2065,28 +1783,6 @@ mod tests {
     }
 
     #[test]
-    fn test_check_paging_near_gap_requests_fill() {
-        // Create a gap between scope 1 and scope 50.
-        let mut state =
-            StreamState::new(vec![mcp_request("s1", 50, "grep"), mcp_response("s1", 50)]);
-        state.load_oldest_page(vec![mcp_request("s1", 1, "glob"), mcp_response("s1", 1)]);
-
-        // cursor = 0 is in the top region (scope 1 header).
-        // gap_display_row should be 1.
-        assert_eq!(state.gap_display_row, Some(1));
-
-        // Move cursor near the gap boundary.
-        state.cursor = 0;
-        let request = state.check_paging();
-        // Cursor 0 is within BUFFER_ZONE of gap_display_row 1,
-        // so it should request a gap fill.
-        assert!(
-            matches!(request, Some(PageRequest::FillGap { .. })),
-            "expected FillGap, got {request:?}"
-        );
-    }
-
-    #[test]
     fn test_scope_map_integrity_after_prepend() {
         // Scope 2 with a child.
         let mut state = StreamState::new(vec![
@@ -2108,24 +1804,6 @@ mod tests {
         };
         assert_eq!(scope2.scope_id, "scope-2");
         assert_eq!(scope2.children.len(), 2);
-    }
-
-    #[test]
-    fn test_gap_display_row_tracked_in_rebuild() {
-        let mut state =
-            StreamState::new(vec![mcp_request("s1", 50, "grep"), mcp_response("s1", 50)]);
-
-        // No gap initially.
-        assert!(state.gap_display_row.is_none());
-
-        // Create gap.
-        state.load_oldest_page(vec![mcp_request("s1", 1, "glob"), mcp_response("s1", 1)]);
-
-        // Gap display row should point to the bottom region.
-        assert_eq!(state.gap_display_row, Some(1));
-
-        // 2 display rows total (2 closed scope headers).
-        assert_eq!(state.display_rows.len(), 2);
     }
 
     // ── Session filter tests ─────────────────────────────────────────

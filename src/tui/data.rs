@@ -111,40 +111,10 @@ pub trait DataSource {
 
     /// Load scopes with root ID older than `before_id`, newest first.
     ///
-    /// When `after_id` is provided, results are bounded below (for gap
-    /// filling from the bottom side).
-    ///
     /// # Errors
     ///
     /// Returns an error if the database cannot be queried.
-    fn older_scopes(
-        &self,
-        before_id: i64,
-        after_id: Option<i64>,
-        limit: usize,
-    ) -> Result<Vec<SessionMessage>>;
-
-    /// Load scopes with root ID newer than `after_id`, oldest first.
-    ///
-    /// When `before_id` is provided, results are bounded above (for gap
-    /// filling between two loaded regions).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the database cannot be queried.
-    fn newer_scopes(
-        &self,
-        after_id: i64,
-        before_id: Option<i64>,
-        limit: usize,
-    ) -> Result<Vec<SessionMessage>>;
-
-    /// Load the oldest `limit` scopes (roots + children).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the database cannot be queried.
-    fn oldest_scopes(&self, limit: usize) -> Result<Vec<SessionMessage>>;
+    fn older_scopes(&self, before_id: i64, limit: usize) -> Result<Vec<SessionMessage>>;
 
     /// List active server instances from the `language_servers` table.
     ///
@@ -346,26 +316,8 @@ impl DataSource for SqliteDataSource {
         session::recent_scopes_with_conn(&self.conn, limit, false)
     }
 
-    fn older_scopes(
-        &self,
-        before_id: i64,
-        after_id: Option<i64>,
-        limit: usize,
-    ) -> Result<Vec<SessionMessage>> {
-        session::older_scopes_with_conn(&self.conn, before_id, after_id, limit, false)
-    }
-
-    fn newer_scopes(
-        &self,
-        after_id: i64,
-        before_id: Option<i64>,
-        limit: usize,
-    ) -> Result<Vec<SessionMessage>> {
-        session::newer_scopes_with_conn(&self.conn, after_id, before_id, limit, false)
-    }
-
-    fn oldest_scopes(&self, limit: usize) -> Result<Vec<SessionMessage>> {
-        session::oldest_scopes_with_conn(&self.conn, limit, false)
+    fn older_scopes(&self, before_id: i64, limit: usize) -> Result<Vec<SessionMessage>> {
+        session::older_scopes_with_conn(&self.conn, before_id, limit, false)
     }
 
     fn list_server_statuses(&self) -> Result<Vec<ServerStatusRow>> {
@@ -536,45 +488,16 @@ impl DataSource for MockDataSource {
         Ok(collect_scope_messages(&all, &page))
     }
 
-    fn older_scopes(
-        &self,
-        before_id: i64,
-        after_id: Option<i64>,
-        limit: usize,
-    ) -> Result<Vec<SessionMessage>> {
+    fn older_scopes(&self, before_id: i64, limit: usize) -> Result<Vec<SessionMessage>> {
         let all = self.sorted_messages();
         let roots = scope_roots_from_messages(&all);
         let page: Vec<_> = roots
             .iter()
             .rev()
-            .filter(|r| r.root_id < before_id && after_id.is_none_or(|a| r.root_id > a))
+            .filter(|r| r.root_id < before_id)
             .take(limit)
             .cloned()
             .collect();
-        Ok(collect_scope_messages(&all, &page))
-    }
-
-    fn newer_scopes(
-        &self,
-        after_id: i64,
-        before_id: Option<i64>,
-        limit: usize,
-    ) -> Result<Vec<SessionMessage>> {
-        let all = self.sorted_messages();
-        let roots = scope_roots_from_messages(&all);
-        let page: Vec<_> = roots
-            .iter()
-            .filter(|r| r.root_id > after_id && before_id.is_none_or(|b| r.root_id < b))
-            .take(limit)
-            .cloned()
-            .collect();
-        Ok(collect_scope_messages(&all, &page))
-    }
-
-    fn oldest_scopes(&self, limit: usize) -> Result<Vec<SessionMessage>> {
-        let all = self.sorted_messages();
-        let roots = scope_roots_from_messages(&all);
-        let page: Vec<_> = roots.iter().take(limit).cloned().collect();
         Ok(collect_scope_messages(&all, &page))
     }
 
@@ -1147,7 +1070,7 @@ mod tests {
         ]);
 
         // Scopes older than id 3 (scope-b root).
-        let msgs = ds.older_scopes(3, None, 10)?;
+        let msgs = ds.older_scopes(3, 10)?;
         let ids: Vec<i64> = msgs.iter().map(|m| m.id).collect();
         // Should include scope uuid-a (root=1) messages.
         assert!(ids.contains(&1), "should include scope-a root: {ids:?}");
@@ -1155,53 +1078,6 @@ mod tests {
         // Should NOT include scope-b or standalone.
         assert!(!ids.contains(&3), "should not include scope-b: {ids:?}");
         assert!(!ids.contains(&4), "should not include standalone: {ids:?}");
-        Ok(())
-    }
-
-    #[test]
-    fn test_mock_newest_scopes() -> Result<()> {
-        let ds = mock_ds(vec![
-            scoped_msg(1, "uuid-a", "mcp", "tools/call"),
-            scoped_msg(3, "uuid-b", "mcp", "tools/call"),
-            standalone_msg(5, "textDocument/hover"),
-        ]);
-
-        // Scopes newer than id 1 (scope-a root).
-        let msgs = ds.newer_scopes(1, None, 10)?;
-        let ids: Vec<i64> = msgs.iter().map(|m| m.id).collect();
-        assert!(ids.contains(&3), "should include scope-b: {ids:?}");
-        assert!(ids.contains(&5), "should include standalone: {ids:?}");
-        assert!(!ids.contains(&1), "should not include scope-a: {ids:?}");
-        Ok(())
-    }
-
-    #[test]
-    fn test_mock_newest_scopes_bounded() -> Result<()> {
-        let ds = mock_ds(vec![
-            scoped_msg(1, "uuid-a", "mcp", "tools/call"),
-            scoped_msg(3, "uuid-b", "mcp", "tools/call"),
-            standalone_msg(5, "textDocument/hover"),
-        ]);
-
-        // Scopes newer than 1 but older than 5.
-        let msgs = ds.newer_scopes(1, Some(5), 10)?;
-        let ids: Vec<i64> = msgs.iter().map(|m| m.id).collect();
-        assert!(ids.contains(&3), "should include scope-b: {ids:?}");
-        assert!(!ids.contains(&5), "should not include standalone: {ids:?}");
-        Ok(())
-    }
-
-    #[test]
-    fn test_mock_oldest_scopes() -> Result<()> {
-        let ds = mock_ds(vec![
-            standalone_msg(1, "init"),
-            scoped_msg(2, "uuid-a", "mcp", "tools/call"),
-            scoped_msg(3, "uuid-b", "mcp", "tools/call"),
-        ]);
-
-        let msgs = ds.oldest_scopes(1)?;
-        let ids: Vec<i64> = msgs.iter().map(|m| m.id).collect();
-        assert_eq!(ids, vec![1], "should include only the oldest scope");
         Ok(())
     }
 
@@ -1272,52 +1148,11 @@ mod tests {
         let ds = SqliteDataSource::with_conn(conn);
 
         // Scopes older than id 3 (scope-b root).
-        let msgs = ds.older_scopes(3, None, 10)?;
+        let msgs = ds.older_scopes(3, 10)?;
         let ids: Vec<i64> = msgs.iter().map(|m| m.id).collect();
         assert!(ids.contains(&1), "should include scope-a root: {ids:?}");
         assert!(ids.contains(&2), "should include scope-a child: {ids:?}");
         assert!(!ids.contains(&3), "should not include scope-b: {ids:?}");
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_sqlite_oldest_scopes() -> Result<()> {
-        let (_dir, path, conn) = test_db();
-        let write = crate::db::open_and_migrate_at(&path)?;
-        insert_session(&write, "sp-3", "/tmp/test-sp-oldest");
-
-        insert_scoped_message(&write, "sp-3", 1, Some("uuid-a"), "tools/call");
-        insert_scoped_message(&write, "sp-3", 2, Some("uuid-b"), "tools/call");
-        insert_scoped_message(&write, "sp-3", 3, None, "hover");
-
-        let ds = SqliteDataSource::with_conn(conn);
-
-        let msgs = ds.oldest_scopes(1)?;
-        let ids: Vec<i64> = msgs.iter().map(|m| m.id).collect();
-        assert_eq!(ids, vec![1], "should return only scope-a: {ids:?}");
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_sqlite_newer_scopes_bounded() -> Result<()> {
-        let (_dir, path, conn) = test_db();
-        let write = crate::db::open_and_migrate_at(&path)?;
-        insert_session(&write, "sp-4", "/tmp/test-sp-newer");
-
-        insert_scoped_message(&write, "sp-4", 1, Some("uuid-a"), "tools/call");
-        insert_scoped_message(&write, "sp-4", 3, Some("uuid-b"), "tools/call");
-        insert_scoped_message(&write, "sp-4", 5, Some("uuid-c"), "tools/call");
-
-        let ds = SqliteDataSource::with_conn(conn);
-
-        // Scopes newer than 1 but older than 5.
-        let msgs = ds.newer_scopes(1, Some(5), 10)?;
-        let ids: Vec<i64> = msgs.iter().map(|m| m.id).collect();
-        assert!(ids.contains(&3), "should include scope-b: {ids:?}");
-        assert!(!ids.contains(&1), "should not include scope-a: {ids:?}");
-        assert!(!ids.contains(&5), "should not include scope-c: {ids:?}");
 
         Ok(())
     }

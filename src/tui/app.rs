@@ -158,48 +158,20 @@ impl<'a> App<'a> {
 
     /// Fetch a page if the cursor is near a paging boundary.
     pub fn fetch_page_if_needed(&mut self) {
-        let Some(request) = self.stream.check_paging() else {
+        let Some(PageRequest::Older(before_id)) = self.stream.check_paging() else {
             return;
         };
 
-        match request {
-            PageRequest::Older(before_id) => {
-                if let Ok(messages) = self.data.older_scopes(before_id, None, PAGE_SIZE) {
-                    self.stream.prepend_page(messages);
-                }
-            }
-            PageRequest::FillGap {
-                after_id,
-                before_id,
-                from_bottom,
-            } => {
-                let messages = if from_bottom {
-                    // Load the newest scopes in the gap (closest to bottom).
-                    self.data.older_scopes(before_id, Some(after_id), PAGE_SIZE)
-                } else {
-                    // Load the oldest scopes in the gap (closest to top).
-                    self.data.newer_scopes(after_id, Some(before_id), PAGE_SIZE)
-                };
-                if let Ok(messages) = messages {
-                    self.stream.fill_gap(messages);
-                }
-            }
+        if let Ok(messages) = self.data.older_scopes(before_id, PAGE_SIZE) {
+            self.stream.prepend_page(messages);
         }
     }
 
-    /// Load the oldest page and create a gap (Home key).
-    pub fn jump_to_beginning(&mut self) {
-        // If already at the beginning with a gap, just move cursor.
-        if self.stream.gap_offset.is_some() || self.stream.reached_beginning {
-            self.stream.scroll_position = 0;
-            self.stream.cursor = 0;
-            self.stream.auto_scroll = false;
-            return;
-        }
-
-        if let Ok(messages) = self.data.oldest_scopes(PAGE_SIZE) {
-            self.stream.load_oldest_page(messages);
-        }
+    /// Jump to the top of loaded content (Home key).
+    pub const fn jump_to_beginning(&mut self) {
+        self.stream.scroll_position = 0;
+        self.stream.cursor = 0;
+        self.stream.auto_scroll = false;
     }
 
     /// Toggle selection on the sidebar's cursor session entry and update the
