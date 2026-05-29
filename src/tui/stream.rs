@@ -474,6 +474,44 @@ impl StreamState {
         }
     }
 
+    /// Get plain-text content for the display row at the cursor position.
+    ///
+    /// Used by the yank keybinding to copy content to the clipboard.
+    /// Returns `None` if the cursor is out of range.
+    #[must_use]
+    pub fn yank_text(&self, icons: &super::icons::IconSet) -> Option<String> {
+        let row = self.display_rows.get(self.cursor)?;
+        match row {
+            DisplayRow::ScopeHeader(entry_idx) => {
+                let StreamEntry::Scope(scope) = &self.entries[*entry_idx] else {
+                    return None;
+                };
+                let badge = self.badges.get(&scope.session_id);
+                let plain = super::format::format_scope_header_plain(scope, icons);
+                Some(format!("{badge} {plain}"))
+            }
+            DisplayRow::ScopeChild {
+                entry_idx,
+                child_idx,
+                ..
+            } => {
+                let StreamEntry::Scope(scope) = &self.entries[*entry_idx] else {
+                    return None;
+                };
+                let child = scope.children.get(*child_idx)?;
+                Some(super::format::format_message_plain(child))
+            }
+            DisplayRow::Standalone(entry_idx) => {
+                let StreamEntry::Standalone(msg) = &self.entries[*entry_idx] else {
+                    return None;
+                };
+                let badge = self.badges.get(&msg.session_id);
+                let plain = super::format::format_message_plain(msg);
+                Some(format!("{badge} {plain}"))
+            }
+        }
+    }
+
     /// Return [`ScrollMetrics`] for the scrollbar.
     #[must_use]
     pub const fn scroll_metrics(&self, viewport_height: usize) -> ScrollMetrics {

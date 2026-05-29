@@ -84,7 +84,8 @@ impl ServerEntry {
     }
 
     /// Number of child lines rendered under this entry.
-    const fn child_count(&self) -> usize {
+    #[must_use]
+    pub const fn child_count(&self) -> usize {
         let p = if self.progress_line.is_some() { 1 } else { 0 };
         let m = if self.server_message.is_some() { 1 } else { 0 };
         p + m

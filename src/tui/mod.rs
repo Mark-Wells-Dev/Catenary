@@ -4,7 +4,7 @@
 //! Interactive TUI for monitoring sessions and tailing events.
 //!
 //! Renders a unified chronological message stream with per-session hex
-//! badges, scrolling, severity toggle, and a scrollbar.
+//! badges, scrolling, and a scrollbar.
 
 pub mod app;
 pub mod data;
@@ -27,7 +27,9 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, MouseButton, MouseEventKind,
+};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
@@ -41,6 +43,7 @@ use crate::config::IconConfig;
 
 use self::app::FocusRegion;
 use self::data::SqliteDataSource;
+use self::hints::render_hints;
 use self::icons::IconSet;
 use self::sidebar::render_sidebar;
 use self::stream::render_stream;
@@ -157,10 +160,6 @@ fn handle_key(app: &mut App<'_>, code: KeyCode, show_sidebar: bool, viewport_hei
     match code {
         KeyCode::Char('q') => app.quit = true,
         KeyCode::Char('b') => app.toggle_sidebar(),
-        KeyCode::Char('d') => {
-            app.level_threshold.toggle();
-            let _ = app.reload_messages();
-        }
         KeyCode::Tab => {
             if show_sidebar {
                 app.cycle_focus();
@@ -219,6 +218,11 @@ fn handle_stream_key(app: &mut App<'_>, code: KeyCode, viewport_height: usize) {
         KeyCode::Enter => {
             app.stream.toggle_expansion();
         }
+        KeyCode::Char('y') => {
+            if let Some(text) = app.stream.yank_text(app.icons) {
+                osc52_copy(&text);
+            }
+        }
         KeyCode::PageDown => {
             app.stream.scroll_down(viewport_height / 2, viewport_height);
         }
@@ -235,13 +239,160 @@ fn handle_stream_key(app: &mut App<'_>, code: KeyCode, viewport_height: usize) {
     }
 }
 
+/// Copy text to the system clipboard via OSC 52.
+///
+/// Works through SSH, tmux, and modern terminals that support this
+/// escape sequence. Falls back to a no-op if the write fails.
+fn osc52_copy(text: &str) {
+    let encoded = base64_encode(text.as_bytes());
+    let _ = crossterm::execute!(
+        io::stdout(),
+        crossterm::style::Print(format!("\x1b]52;c;{encoded}\x07"))
+    );
+}
+
+/// Minimal base64 encoder (RFC 4648). No external dependency needed.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "base64 index is always 0..63, safe for usize; byte-to-char is ASCII"
+)]
+fn base64_encode(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = u32::from(chunk[0]);
+        let b1 = u32::from(chunk.get(1).copied().unwrap_or(0));
+        let b2 = u32::from(chunk.get(2).copied().unwrap_or(0));
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+
+        out.push(ALPHABET[((triple >> 18) & 0x3F) as usize] as char);
+        out.push(ALPHABET[((triple >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(ALPHABET[((triple >> 6) & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(ALPHABET[(triple & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+/// Handle a mouse event, dispatching to sidebar or stream based on position.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "terminal coordinates are always small"
+)]
+fn handle_mouse(
+    app: &mut App<'_>,
+    kind: MouseEventKind,
+    column: u16,
+    row: u16,
+    sidebar_width: u16,
+    show_sidebar: bool,
+    stream_height: usize,
+) {
+    let in_sidebar = show_sidebar && column < sidebar_width;
+
+    match kind {
+        MouseEventKind::ScrollUp => {
+            if in_sidebar {
+                // Scroll whichever sidebar section is focused.
+                match app.focus {
+                    FocusRegion::Sessions => app.sidebar.cursor_up(3, stream_height),
+                    FocusRegion::Servers => app.sidebar.server_cursor_up(3, stream_height),
+                    FocusRegion::Stream => {}
+                }
+            } else {
+                app.stream.scroll_up(3);
+            }
+        }
+        MouseEventKind::ScrollDown => {
+            if in_sidebar {
+                match app.focus {
+                    FocusRegion::Sessions => app.sidebar.cursor_down(3, stream_height),
+                    FocusRegion::Servers => app.sidebar.server_cursor_down(3, stream_height),
+                    FocusRegion::Stream => {}
+                }
+            } else {
+                app.stream.scroll_down(3, stream_height);
+            }
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            if in_sidebar {
+                handle_sidebar_click(app, row as usize);
+            } else {
+                // Click in stream: move cursor, expand if scope header.
+                let stream_row = app.stream.scroll_position + row as usize;
+                if stream_row < app.stream.display_rows.len() {
+                    app.stream.cursor = stream_row;
+                    app.stream.auto_scroll = false;
+                    app.stream.toggle_expansion();
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Handle a mouse click in the sidebar area.
+///
+/// Determines whether the click hit a session entry or a server entry
+/// based on the row position, then toggles the corresponding filter.
+fn handle_sidebar_click(app: &mut App<'_>, row: usize) {
+    // Sessions header is row 0, entries start at row 1.
+    let session_count = app.sidebar.entries.len();
+    let session_end = 1 + session_count; // header + entries
+
+    if row >= 1 && row < session_end {
+        // Clicked a session entry.
+        let entry_idx = row - 1;
+        if entry_idx < app.sidebar.entries.len() {
+            app.sidebar.cursor = entry_idx;
+            app.toggle_session_selection();
+        }
+        return;
+    }
+
+    // Servers section: blank line + header + entries.
+    if app.sidebar.servers.is_empty() {
+        return;
+    }
+    let servers_header_row = session_end + 1; // blank + header
+    if row <= servers_header_row {
+        return;
+    }
+
+    // Walk server entries (each has 1 header + child_count children).
+    let mut current_row = servers_header_row + 1;
+    for (si, server) in app.sidebar.servers.iter().enumerate() {
+        if row == current_row {
+            // Clicked this server's header.
+            app.sidebar.server_cursor = si;
+            app.toggle_server_selection();
+            return;
+        }
+        current_row += 1 + server.child_count();
+    }
+}
+
 /// Main event loop — renders sidebar + message stream, handles input.
+#[allow(
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    reason = "render loop with sidebar + stream + hints + empty state in one draw closure; terminal widths are always small"
+)]
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App<'_>,
     wal_rx: Option<&mpsc::Receiver<()>>,
 ) -> Result<()> {
     let mut last_tick = Instant::now();
+    let mut last_sidebar_width: u16 = 0;
 
     loop {
         let size = terminal.size()?;
@@ -251,25 +402,50 @@ fn run_loop(
         if !show_sidebar && app.focus != FocusRegion::Stream {
             app.focus = FocusRegion::Stream;
         }
-        let stream_height = size.height as usize;
+        // Reserve bottom row for hints bar.
+        let content_height = size.height.saturating_sub(1);
+        let stream_height = content_height as usize;
         app.stream.apply_auto_scroll(stream_height);
 
         terminal.draw(|f| {
             let area = f.area();
+            let content_area = Rect {
+                x: area.x,
+                y: area.y,
+                width: area.width,
+                height: content_height,
+            };
+            let hints_area = Rect {
+                x: area.x,
+                y: area.y + content_height,
+                width: area.width,
+                height: 1.min(area.height),
+            };
 
-            if show_sidebar {
-                let sidebar_width = app.sidebar.content_width().min(area.width / 2);
+            // Empty state: no sessions and no messages.
+            if app.sidebar.entries.is_empty()
+                && app.sidebar.servers.is_empty()
+                && app.stream.entries.is_empty()
+            {
+                let msg = "Waiting for connections\u{2026}";
+                let msg_width = unicode_width::UnicodeWidthStr::width(msg) as u16;
+                let x = content_area.x + content_area.width.saturating_sub(msg_width) / 2;
+                let y = content_area.y + content_area.height / 2;
+                f.buffer_mut().set_string(x, y, msg, app.theme.muted);
+            } else if show_sidebar {
+                let sidebar_width = app.sidebar.content_width().min(content_area.width / 2);
+                last_sidebar_width = sidebar_width;
                 let sidebar_area = Rect {
-                    x: area.x,
-                    y: area.y,
+                    x: content_area.x,
+                    y: content_area.y,
                     width: sidebar_width,
-                    height: area.height,
+                    height: content_area.height,
                 };
                 let stream_area = Rect {
-                    x: area.x + sidebar_width,
-                    y: area.y,
-                    width: area.width.saturating_sub(sidebar_width),
-                    height: area.height,
+                    x: content_area.x + sidebar_width,
+                    y: content_area.y,
+                    width: content_area.width.saturating_sub(sidebar_width),
+                    height: content_area.height,
                 };
                 render_sidebar(
                     &app.sidebar,
@@ -286,8 +462,17 @@ fn run_loop(
                     app.icons,
                 );
             } else {
-                render_stream(&app.stream, area, f.buffer_mut(), app.theme, app.icons);
+                last_sidebar_width = 0;
+                render_stream(
+                    &app.stream,
+                    content_area,
+                    f.buffer_mut(),
+                    app.theme,
+                    app.icons,
+                );
             }
+
+            render_hints(hints_area, f.buffer_mut(), app.theme, app.focus);
         })?;
 
         if app.quit {
@@ -298,11 +483,26 @@ fn run_loop(
             .checked_sub(last_tick.elapsed())
             .unwrap_or_default();
 
-        if event::poll(timeout)?
-            && let Event::Key(key) = event::read()?
-        {
-            handle_key(app, key.code, show_sidebar, stream_height);
-            app.fetch_page_if_needed();
+        if event::poll(timeout)? {
+            match event::read()? {
+                Event::Key(key) => {
+                    handle_key(app, key.code, show_sidebar, stream_height);
+                    app.fetch_page_if_needed();
+                }
+                Event::Mouse(mouse) => {
+                    handle_mouse(
+                        app,
+                        mouse.kind,
+                        mouse.column,
+                        mouse.row,
+                        last_sidebar_width,
+                        show_sidebar,
+                        stream_height,
+                    );
+                    app.fetch_page_if_needed();
+                }
+                _ => {}
+            }
         }
 
         if last_tick.elapsed() >= TICK_INTERVAL {

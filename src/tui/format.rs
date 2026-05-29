@@ -469,6 +469,57 @@ pub fn format_scope_header_styled(scope: &Scope, icons: &IconSet, theme: &Theme)
     Line::from(spans)
 }
 
+/// Plain-text scope header (used for yank/clipboard).
+#[must_use]
+pub fn format_scope_header_plain(scope: &Scope, icons: &IconSet) -> String {
+    let header = scope.header_message();
+    let ts = header.timestamp.format("%H:%M:%S");
+
+    let tool_name = Some(&scope.request)
+        .filter(|r| r.method == "tools/call")
+        .and_then(|r| r.payload.get("params"))
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str());
+
+    let label = tool_name.unwrap_or(&header.method);
+
+    if scope.state == ScopeState::Closed
+        && let Some(resp) = scope.response.as_ref()
+    {
+        let delta_ms = resp
+            .timestamp
+            .signed_duration_since(scope.request.timestamp)
+            .num_milliseconds();
+        let timing = format_duration_short(delta_ms);
+        let outcome = pair_outcome(resp);
+
+        let status = match &outcome {
+            PairOutcome::Cancelled => "cancelled".to_string(),
+            PairOutcome::Error { message } => message
+                .as_deref()
+                .map_or_else(|| "error".to_string(), |m| format!("error: {m}")),
+            PairOutcome::Success => {
+                let line_count = tool_name.and_then(|_| extract_line_count(resp));
+                format_tool_metrics(line_count, &timing)
+            }
+        };
+
+        let args = tool_name.and_then(|_| extract_tool_arguments(&scope.request));
+        let icon = tool_name.map_or_else(String::new, |tn| tool_icon(tn, icons).to_string());
+        args.map_or_else(
+            || format!("{ts} {icon}{label} ({status})"),
+            |a| format!("{ts} {icon}{label} ({status}) {a}"),
+        )
+    } else {
+        let args = tool_name.and_then(|_| extract_tool_arguments(&scope.request));
+        let icon = tool_name.map_or_else(String::new, |tn| tool_icon(tn, icons).to_string());
+        args.map_or_else(
+            || format!("{ts} {icon}{label}"),
+            |a| format!("{ts} {icon}{label} {a}"),
+        )
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::expect_used,

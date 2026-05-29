@@ -67,32 +67,19 @@ pub trait DataSource {
     /// Returns an error if session data cannot be read.
     fn list_sessions(&self) -> Result<Vec<SessionRow>>;
 
-    /// Load all historical messages for a session.
-    ///
-    /// When `include_debug` is false, messages with `level = "debug"` are
-    /// excluded from the result set.
+    /// Load all historical messages for a session (info level and above).
     ///
     /// # Errors
     ///
     /// Returns an error if the session does not exist or messages cannot be read.
-    fn monitor_messages(
-        &self,
-        session_id: &str,
-        include_debug: bool,
-    ) -> Result<Vec<SessionMessage>>;
+    fn monitor_messages(&self, session_id: &str) -> Result<Vec<SessionMessage>>;
 
     /// Create a tail reader for new messages (from current position onward).
-    ///
-    /// When `include_debug` is false, the tail skips debug-level messages.
     ///
     /// # Errors
     ///
     /// Returns an error if the session does not exist or the tail cannot be created.
-    fn create_message_tail(
-        &self,
-        session_id: &str,
-        include_debug: bool,
-    ) -> Result<Box<dyn MessageTail>>;
+    fn create_message_tail(&self, session_id: &str) -> Result<Box<dyn MessageTail>>;
 
     /// Delete a dead session's data.
     ///
@@ -111,22 +98,19 @@ pub trait DataSource {
     /// Returns an error if the query fails.
     fn list_alive_session_ids(&self) -> Result<Vec<String>>;
 
-    /// Load all historical messages across all sessions.
-    ///
-    /// When `include_debug` is false, messages with `level = "debug"` are
-    /// excluded from the result set.
+    /// Load all historical messages across all sessions (info level and above).
     ///
     /// # Errors
     ///
     /// Returns an error if the database cannot be queried.
-    fn monitor_all_messages(&self, include_debug: bool) -> Result<Vec<SessionMessage>>;
+    fn monitor_all_messages(&self) -> Result<Vec<SessionMessage>>;
 
     /// Create a tail reader for new messages across all sessions.
     ///
     /// # Errors
     ///
     /// Returns an error if the tail cannot be created.
-    fn create_all_message_tail(&self, include_debug: bool) -> Result<Box<dyn MessageTail>>;
+    fn create_all_message_tail(&self) -> Result<Box<dyn MessageTail>>;
 
     /// Load the most recent `limit` scopes (roots + children).
     ///
@@ -136,7 +120,7 @@ pub trait DataSource {
     /// # Errors
     ///
     /// Returns an error if the database cannot be queried.
-    fn recent_scopes(&self, limit: usize, include_debug: bool) -> Result<Vec<SessionMessage>>;
+    fn recent_scopes(&self, limit: usize) -> Result<Vec<SessionMessage>>;
 
     /// Load scopes with root ID older than `before_id`, newest first.
     ///
@@ -151,7 +135,6 @@ pub trait DataSource {
         before_id: i64,
         after_id: Option<i64>,
         limit: usize,
-        include_debug: bool,
     ) -> Result<Vec<SessionMessage>>;
 
     /// Load scopes with root ID newer than `after_id`, oldest first.
@@ -167,7 +150,6 @@ pub trait DataSource {
         after_id: i64,
         before_id: Option<i64>,
         limit: usize,
-        include_debug: bool,
     ) -> Result<Vec<SessionMessage>>;
 
     /// Load the oldest `limit` scopes (roots + children).
@@ -175,7 +157,7 @@ pub trait DataSource {
     /// # Errors
     ///
     /// Returns an error if the database cannot be queried.
-    fn oldest_scopes(&self, limit: usize, include_debug: bool) -> Result<Vec<SessionMessage>>;
+    fn oldest_scopes(&self, limit: usize) -> Result<Vec<SessionMessage>>;
 
     /// List active server instances from the `language_servers` table.
     ///
@@ -349,20 +331,12 @@ impl DataSource for SqliteDataSource {
         Ok(sessions)
     }
 
-    fn monitor_messages(
-        &self,
-        session_id: &str,
-        include_debug: bool,
-    ) -> Result<Vec<SessionMessage>> {
-        session::monitor_messages_with_conn(&self.conn, session_id, include_debug)
+    fn monitor_messages(&self, session_id: &str) -> Result<Vec<SessionMessage>> {
+        session::monitor_messages_with_conn(&self.conn, session_id, false)
     }
 
-    fn create_message_tail(
-        &self,
-        session_id: &str,
-        include_debug: bool,
-    ) -> Result<Box<dyn MessageTail>> {
-        let tail = session::tail_messages_new(session_id, include_debug)?;
+    fn create_message_tail(&self, session_id: &str) -> Result<Box<dyn MessageTail>> {
+        let tail = session::tail_messages_new(session_id, false)?;
         Ok(Box::new(tail))
     }
 
@@ -389,17 +363,17 @@ impl DataSource for SqliteDataSource {
         Ok(ids)
     }
 
-    fn monitor_all_messages(&self, include_debug: bool) -> Result<Vec<SessionMessage>> {
-        session::monitor_all_messages_with_conn(&self.conn, include_debug)
+    fn monitor_all_messages(&self) -> Result<Vec<SessionMessage>> {
+        session::monitor_all_messages_with_conn(&self.conn, false)
     }
 
-    fn create_all_message_tail(&self, include_debug: bool) -> Result<Box<dyn MessageTail>> {
-        let tail = session::tail_all_messages_new(include_debug)?;
+    fn create_all_message_tail(&self) -> Result<Box<dyn MessageTail>> {
+        let tail = session::tail_all_messages_new(false)?;
         Ok(Box::new(tail))
     }
 
-    fn recent_scopes(&self, limit: usize, include_debug: bool) -> Result<Vec<SessionMessage>> {
-        session::recent_scopes_with_conn(&self.conn, limit, include_debug)
+    fn recent_scopes(&self, limit: usize) -> Result<Vec<SessionMessage>> {
+        session::recent_scopes_with_conn(&self.conn, limit, false)
     }
 
     fn older_scopes(
@@ -407,9 +381,8 @@ impl DataSource for SqliteDataSource {
         before_id: i64,
         after_id: Option<i64>,
         limit: usize,
-        include_debug: bool,
     ) -> Result<Vec<SessionMessage>> {
-        session::older_scopes_with_conn(&self.conn, before_id, after_id, limit, include_debug)
+        session::older_scopes_with_conn(&self.conn, before_id, after_id, limit, false)
     }
 
     fn newer_scopes(
@@ -417,13 +390,12 @@ impl DataSource for SqliteDataSource {
         after_id: i64,
         before_id: Option<i64>,
         limit: usize,
-        include_debug: bool,
     ) -> Result<Vec<SessionMessage>> {
-        session::newer_scopes_with_conn(&self.conn, after_id, before_id, limit, include_debug)
+        session::newer_scopes_with_conn(&self.conn, after_id, before_id, limit, false)
     }
 
-    fn oldest_scopes(&self, limit: usize, include_debug: bool) -> Result<Vec<SessionMessage>> {
-        session::oldest_scopes_with_conn(&self.conn, limit, include_debug)
+    fn oldest_scopes(&self, limit: usize) -> Result<Vec<SessionMessage>> {
+        session::oldest_scopes_with_conn(&self.conn, limit, false)
     }
 
     fn list_server_statuses(&self) -> Result<Vec<ServerStatusRow>> {
@@ -534,45 +506,29 @@ impl DataSource for MockDataSource {
         Ok(rows)
     }
 
-    fn monitor_messages(
-        &self,
-        session_id: &str,
-        include_debug: bool,
-    ) -> Result<Vec<SessionMessage>> {
+    fn monitor_messages(&self, session_id: &str) -> Result<Vec<SessionMessage>> {
         let messages = self
             .messages
             .get(session_id)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("Session not found: {session_id}"))?;
-        if include_debug {
-            Ok(messages)
-        } else {
-            Ok(messages
-                .into_iter()
-                .filter(|m| m.level != "debug")
-                .collect())
-        }
+        Ok(messages
+            .into_iter()
+            .filter(|m| m.level != "debug")
+            .collect())
     }
 
-    fn create_message_tail(
-        &self,
-        session_id: &str,
-        include_debug: bool,
-    ) -> Result<Box<dyn MessageTail>> {
+    fn create_message_tail(&self, session_id: &str) -> Result<Box<dyn MessageTail>> {
         let messages = self
             .tail_messages
             .get(session_id)
             .cloned()
             .unwrap_or_default();
-        if include_debug {
-            Ok(Box::new(MockMessageTail { messages }))
-        } else {
-            let filtered = messages
-                .into_iter()
-                .filter(|m| m.level != "debug")
-                .collect();
-            Ok(Box::new(MockMessageTail { messages: filtered }))
-        }
+        let filtered = messages
+            .into_iter()
+            .filter(|m| m.level != "debug")
+            .collect();
+        Ok(Box::new(MockMessageTail { messages: filtered }))
     }
 
     fn delete_session(&self, _session_id: &str) -> Result<()> {
@@ -588,26 +544,22 @@ impl DataSource for MockDataSource {
             .collect())
     }
 
-    fn monitor_all_messages(&self, include_debug: bool) -> Result<Vec<SessionMessage>> {
+    fn monitor_all_messages(&self) -> Result<Vec<SessionMessage>> {
         let mut all: Vec<SessionMessage> = self.messages.values().flatten().cloned().collect();
-        if !include_debug {
-            all.retain(|m| m.level != "debug");
-        }
+        all.retain(|m| m.level != "debug");
         all.sort_by_key(|m| m.id);
         Ok(all)
     }
 
-    fn create_all_message_tail(&self, include_debug: bool) -> Result<Box<dyn MessageTail>> {
+    fn create_all_message_tail(&self) -> Result<Box<dyn MessageTail>> {
         let mut all: VecDeque<SessionMessage> =
             self.tail_messages.values().flatten().cloned().collect();
-        if !include_debug {
-            all.retain(|m| m.level != "debug");
-        }
+        all.retain(|m| m.level != "debug");
         Ok(Box::new(MockMessageTail { messages: all }))
     }
 
-    fn recent_scopes(&self, limit: usize, include_debug: bool) -> Result<Vec<SessionMessage>> {
-        let all = self.sorted_messages(include_debug);
+    fn recent_scopes(&self, limit: usize) -> Result<Vec<SessionMessage>> {
+        let all = self.sorted_messages();
         let roots = scope_roots_from_messages(&all);
         let page: Vec<_> = roots.iter().rev().take(limit).cloned().collect();
         Ok(collect_scope_messages(&all, &page))
@@ -618,9 +570,8 @@ impl DataSource for MockDataSource {
         before_id: i64,
         after_id: Option<i64>,
         limit: usize,
-        include_debug: bool,
     ) -> Result<Vec<SessionMessage>> {
-        let all = self.sorted_messages(include_debug);
+        let all = self.sorted_messages();
         let roots = scope_roots_from_messages(&all);
         let page: Vec<_> = roots
             .iter()
@@ -637,9 +588,8 @@ impl DataSource for MockDataSource {
         after_id: i64,
         before_id: Option<i64>,
         limit: usize,
-        include_debug: bool,
     ) -> Result<Vec<SessionMessage>> {
-        let all = self.sorted_messages(include_debug);
+        let all = self.sorted_messages();
         let roots = scope_roots_from_messages(&all);
         let page: Vec<_> = roots
             .iter()
@@ -650,8 +600,8 @@ impl DataSource for MockDataSource {
         Ok(collect_scope_messages(&all, &page))
     }
 
-    fn oldest_scopes(&self, limit: usize, include_debug: bool) -> Result<Vec<SessionMessage>> {
-        let all = self.sorted_messages(include_debug);
+    fn oldest_scopes(&self, limit: usize) -> Result<Vec<SessionMessage>> {
+        let all = self.sorted_messages();
         let roots = scope_roots_from_messages(&all);
         let page: Vec<_> = roots.iter().take(limit).cloned().collect();
         Ok(collect_scope_messages(&all, &page))
@@ -672,12 +622,10 @@ impl DataSource for MockDataSource {
 }
 
 impl MockDataSource {
-    /// Collect and sort all messages across sessions.
-    fn sorted_messages(&self, include_debug: bool) -> Vec<SessionMessage> {
+    /// Collect and sort all messages across sessions (info level and above).
+    fn sorted_messages(&self) -> Vec<SessionMessage> {
         let mut all: Vec<SessionMessage> = self.messages.values().flatten().cloned().collect();
-        if !include_debug {
-            all.retain(|m| m.level != "debug");
-        }
+        all.retain(|m| m.level != "debug");
         all.sort_by_key(|m| m.id);
         all
     }
@@ -860,10 +808,10 @@ mod tests {
             server_noise: Vec::new(),
         };
 
-        let result = ds.monitor_messages("abc", true)?;
+        let result = ds.monitor_messages("abc")?;
         assert_eq!(result.len(), 3);
 
-        let err = ds.monitor_messages("nonexistent", true);
+        let err = ds.monitor_messages("nonexistent");
         assert!(err.is_err());
         Ok(())
     }
@@ -930,7 +878,7 @@ mod tests {
         insert_session(&write_conn, "ds-msg-1", "/tmp/test-ds-messages");
         insert_test_message(&write_conn, "ds-msg-1");
 
-        let messages = ds.monitor_messages("ds-msg-1", true)?;
+        let messages = ds.monitor_messages("ds-msg-1")?;
         assert!(!messages.is_empty(), "should have at least one message");
 
         ds.delete_session("ds-msg-1")?;
@@ -1140,7 +1088,7 @@ mod tests {
             server_noise: Vec::new(),
         };
 
-        let mut tail = ds.create_message_tail("sess-1", false)?;
+        let mut tail = ds.create_message_tail("sess-1")?;
         let first = tail.try_next_message()?;
         assert!(first.is_some(), "should have one non-debug message");
         let msg = first.expect("checked above");
@@ -1215,7 +1163,7 @@ mod tests {
         ]);
 
         // Request 2 most recent scopes.
-        let msgs = ds.recent_scopes(2, true)?;
+        let msgs = ds.recent_scopes(2)?;
         let ids: Vec<i64> = msgs.iter().map(|m| m.id).collect();
         // Should include scope uuid-b (root=3) and standalone (id=4).
         assert!(ids.contains(&3), "should include scope-b root: {ids:?}");
@@ -1235,7 +1183,7 @@ mod tests {
         ]);
 
         // Scopes older than id 3 (scope-b root).
-        let msgs = ds.older_scopes(3, None, 10, true)?;
+        let msgs = ds.older_scopes(3, None, 10)?;
         let ids: Vec<i64> = msgs.iter().map(|m| m.id).collect();
         // Should include scope uuid-a (root=1) messages.
         assert!(ids.contains(&1), "should include scope-a root: {ids:?}");
@@ -1255,7 +1203,7 @@ mod tests {
         ]);
 
         // Scopes newer than id 1 (scope-a root).
-        let msgs = ds.newer_scopes(1, None, 10, true)?;
+        let msgs = ds.newer_scopes(1, None, 10)?;
         let ids: Vec<i64> = msgs.iter().map(|m| m.id).collect();
         assert!(ids.contains(&3), "should include scope-b: {ids:?}");
         assert!(ids.contains(&5), "should include standalone: {ids:?}");
@@ -1272,7 +1220,7 @@ mod tests {
         ]);
 
         // Scopes newer than 1 but older than 5.
-        let msgs = ds.newer_scopes(1, Some(5), 10, true)?;
+        let msgs = ds.newer_scopes(1, Some(5), 10)?;
         let ids: Vec<i64> = msgs.iter().map(|m| m.id).collect();
         assert!(ids.contains(&3), "should include scope-b: {ids:?}");
         assert!(!ids.contains(&5), "should not include standalone: {ids:?}");
@@ -1287,7 +1235,7 @@ mod tests {
             scoped_msg(3, "uuid-b", "mcp", "tools/call"),
         ]);
 
-        let msgs = ds.oldest_scopes(1, true)?;
+        let msgs = ds.oldest_scopes(1)?;
         let ids: Vec<i64> = msgs.iter().map(|m| m.id).collect();
         assert_eq!(ids, vec![1], "should include only the oldest scope");
         Ok(())
@@ -1335,7 +1283,7 @@ mod tests {
         let ds = SqliteDataSource::with_conn(conn);
 
         // Request 2 most recent scopes.
-        let msgs = ds.recent_scopes(2, true)?;
+        let msgs = ds.recent_scopes(2)?;
         let ids: Vec<i64> = msgs.iter().map(|m| m.id).collect();
 
         // Scope uuid-c (root=5) and standalone (id=6) are the 2 most recent.
@@ -1361,7 +1309,7 @@ mod tests {
         let ds = SqliteDataSource::with_conn(conn);
 
         // Scopes older than id 3 (scope-b root).
-        let msgs = ds.older_scopes(3, None, 10, true)?;
+        let msgs = ds.older_scopes(3, None, 10)?;
         let ids: Vec<i64> = msgs.iter().map(|m| m.id).collect();
         assert!(ids.contains(&1), "should include scope-a root: {ids:?}");
         assert!(ids.contains(&2), "should include scope-a child: {ids:?}");
@@ -1383,7 +1331,7 @@ mod tests {
 
         let ds = SqliteDataSource::with_conn(conn);
 
-        let msgs = ds.oldest_scopes(1, true)?;
+        let msgs = ds.oldest_scopes(1)?;
         let ids: Vec<i64> = msgs.iter().map(|m| m.id).collect();
         assert_eq!(ids, vec![1], "should return only scope-a: {ids:?}");
 
@@ -1404,7 +1352,7 @@ mod tests {
         let ds = SqliteDataSource::with_conn(conn);
 
         // Scopes newer than 1 but older than 5.
-        let msgs = ds.newer_scopes(1, Some(5), 10, true)?;
+        let msgs = ds.newer_scopes(1, Some(5), 10)?;
         let ids: Vec<i64> = msgs.iter().map(|m| m.id).collect();
         assert!(ids.contains(&3), "should include scope-b: {ids:?}");
         assert!(!ids.contains(&1), "should not include scope-a: {ids:?}");

@@ -12,31 +12,6 @@ use super::sidebar::SidebarState;
 use super::stream::{PAGE_SIZE, PageRequest, StreamState};
 use super::theme::Theme;
 
-/// Display level threshold for message queries.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LevelThreshold {
-    /// Show info, warn, error. Default.
-    Info,
-    /// Show everything including debug.
-    Debug,
-}
-
-impl LevelThreshold {
-    /// Whether to include debug-level messages in queries.
-    #[must_use]
-    pub const fn include_debug(self) -> bool {
-        matches!(self, Self::Debug)
-    }
-
-    /// Toggle between Info and Debug.
-    pub const fn toggle(&mut self) {
-        *self = match self {
-            Self::Info => Self::Debug,
-            Self::Debug => Self::Info,
-        };
-    }
-}
-
 /// Which section has keyboard focus.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FocusRegion {
@@ -58,8 +33,6 @@ pub struct App<'a> {
     pub data: Box<dyn DataSource>,
     /// Whether the user wants to quit.
     pub quit: bool,
-    /// Current display level threshold.
-    pub level_threshold: LevelThreshold,
     /// Which panel has keyboard focus.
     pub focus: FocusRegion,
     /// User preference: sidebar visible (toggled by `b` keybinding).
@@ -83,9 +56,8 @@ impl<'a> App<'a> {
         icons: &'a IconSet,
         data: Box<dyn DataSource>,
     ) -> anyhow::Result<Self> {
-        let include_debug = false;
-        let messages = data.recent_scopes(PAGE_SIZE, include_debug)?;
-        let tail = data.create_all_message_tail(include_debug).ok();
+        let messages = data.recent_scopes(PAGE_SIZE)?;
+        let tail = data.create_all_message_tail().ok();
         let mut stream = StreamState::new(messages);
         // Fewer entries than the page size means we loaded everything.
         stream.reached_beginning = stream.entries.len() < PAGE_SIZE;
@@ -95,7 +67,6 @@ impl<'a> App<'a> {
             icons,
             data,
             quit: false,
-            level_threshold: LevelThreshold::Info,
             focus: FocusRegion::Stream,
             sidebar_visible: true,
             sidebar: SidebarState::new(),
@@ -124,33 +95,15 @@ impl<'a> App<'a> {
         }
     }
 
-    /// Reload the most recent page (e.g., after toggling severity threshold).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if loading messages fails.
-    pub fn reload_messages(&mut self) -> anyhow::Result<()> {
-        let include_debug = self.level_threshold.include_debug();
-        let messages = self.data.recent_scopes(PAGE_SIZE, include_debug)?;
-        self.tail = self.data.create_all_message_tail(include_debug).ok();
-        self.stream = StreamState::new(messages);
-        self.stream.reached_beginning = self.stream.entries.len() < PAGE_SIZE;
-        Ok(())
-    }
-
     /// Fetch a page if the cursor is near a paging boundary.
     pub fn fetch_page_if_needed(&mut self) {
         let Some(request) = self.stream.check_paging() else {
             return;
         };
-        let include_debug = self.level_threshold.include_debug();
 
         match request {
             PageRequest::Older(before_id) => {
-                if let Ok(messages) =
-                    self.data
-                        .older_scopes(before_id, None, PAGE_SIZE, include_debug)
-                {
+                if let Ok(messages) = self.data.older_scopes(before_id, None, PAGE_SIZE) {
                     self.stream.prepend_page(messages);
                 }
             }
@@ -161,12 +114,10 @@ impl<'a> App<'a> {
             } => {
                 let messages = if from_bottom {
                     // Load the newest scopes in the gap (closest to bottom).
-                    self.data
-                        .older_scopes(before_id, Some(after_id), PAGE_SIZE, include_debug)
+                    self.data.older_scopes(before_id, Some(after_id), PAGE_SIZE)
                 } else {
                     // Load the oldest scopes in the gap (closest to top).
-                    self.data
-                        .newer_scopes(after_id, Some(before_id), PAGE_SIZE, include_debug)
+                    self.data.newer_scopes(after_id, Some(before_id), PAGE_SIZE)
                 };
                 if let Ok(messages) = messages {
                     self.stream.fill_gap(messages);
@@ -185,8 +136,7 @@ impl<'a> App<'a> {
             return;
         }
 
-        let include_debug = self.level_threshold.include_debug();
-        if let Ok(messages) = self.data.oldest_scopes(PAGE_SIZE, include_debug) {
+        if let Ok(messages) = self.data.oldest_scopes(PAGE_SIZE) {
             self.stream.load_oldest_page(messages);
         }
     }
