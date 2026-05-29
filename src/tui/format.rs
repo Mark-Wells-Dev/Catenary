@@ -5,12 +5,18 @@
 //!
 //! Styled and plain-text formatters for single messages and scope headers.
 
+use chrono::{DateTime, Local, Utc};
 use ratatui::text::{Line, Span};
 
 use super::icons::{IconSet, basename, diag_style, tool_icon};
 use super::scope::{Scope, ScopeState};
 use super::theme::Theme;
 use crate::session::SessionMessage;
+
+/// Format a UTC timestamp as `HH:MM:SS` in the local timezone.
+fn local_hms(ts: &DateTime<Utc>) -> String {
+    ts.with_timezone(&Local).format("%H:%M:%S").to_string()
+}
 
 // ── Single message formatters ────────────────────────────────────────────
 
@@ -25,7 +31,7 @@ pub fn format_message_styled(
     icons: &IconSet,
     theme: &Theme,
 ) -> Line<'static> {
-    let ts = msg.timestamp.format("%H:%M:%S").to_string();
+    let ts = local_hms(&msg.timestamp);
     let ts_span = Span::styled(format!("{ts}  "), theme.timestamp);
 
     match msg.r#type.as_str() {
@@ -117,7 +123,7 @@ pub fn format_message_styled(
 /// Plain-text message summary (used for filter matching).
 #[must_use]
 pub fn format_message_plain(msg: &SessionMessage) -> String {
-    let ts = msg.timestamp.format("%H:%M:%S");
+    let ts = local_hms(&msg.timestamp);
 
     match msg.r#type.as_str() {
         "lsp" => {
@@ -358,7 +364,7 @@ fn progress_suffix(payload: &serde_json::Value) -> Option<String> {
 #[must_use]
 pub fn format_scope_header_styled(scope: &Scope, icons: &IconSet, theme: &Theme) -> Line<'static> {
     let header = scope.header_message();
-    let ts = header.timestamp.format("%H:%M:%S").to_string();
+    let ts = local_hms(&header.timestamp);
     let ts_span = Span::styled(format!("{ts}  "), theme.timestamp);
 
     let child_count = scope.child_count();
@@ -453,7 +459,7 @@ pub fn format_scope_header_styled(scope: &Scope, icons: &IconSet, theme: &Theme)
 #[must_use]
 pub fn format_scope_header_plain(scope: &Scope, icons: &IconSet) -> String {
     let header = scope.header_message();
-    let ts = header.timestamp.format("%H:%M:%S");
+    let ts = local_hms(&header.timestamp);
 
     let tool_name = Some(&scope.request)
         .filter(|r| r.method == "tools/call")
