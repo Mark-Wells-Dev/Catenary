@@ -1,201 +1,100 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
-//! Context-sensitive navigation hints bar rendered at the bottom of the TUI.
+//! Keybinds panel for the TUI.
 //!
-//! Hints change based on which region has keyboard focus: sidebar
-//! (sessions/servers) or stream. Uses width degradation to fit in
-//! narrow terminals.
+//! Renders keybind groups vertically (one per line) inside a collapsible
+//! panel on the left sidebar. Replaces the previous bottom hints bar.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
-use unicode_width::UnicodeWidthStr;
 
-use super::app::FocusRegion;
 use super::theme::Theme;
 
-/// Hints shown when the sidebar (sessions or servers) is focused.
-const SIDEBAR_HINTS: &[(&str, &str)] = &[
+/// Global keybindings (always active).
+const GLOBAL_BINDS: &[(&str, &str)] = &[
     ("q", "quit"),
-    ("Tab", "focus"),
-    ("Space", "toggle"),
-    ("j/k", "navigate"),
-    ("b", "sidebar"),
+    ("Tab", "next panel"),
+    ("?", "toggle keybinds"),
 ];
 
-/// Hints shown when the message stream is focused.
-const STREAM_HINTS: &[(&str, &str)] = &[
-    ("q", "quit"),
-    ("Tab", "focus"),
-    ("Enter", "expand"),
+/// Sidebar keybindings (sessions/servers panels).
+const SIDEBAR_BINDS: &[(&str, &str)] = &[("j/k", "navigate"), ("Space", "toggle filter")];
+
+/// Stream keybindings.
+const STREAM_BINDS: &[(&str, &str)] = &[
     ("j/k", "navigate"),
-    ("b", "sidebar"),
+    ("Enter", "expand/collapse"),
     ("y", "yank"),
+    ("PgUp/Dn", "scroll"),
+    ("Home/End", "jump"),
 ];
 
-/// Select hints for the current focus region.
-const fn hints_for_focus(focus: FocusRegion) -> &'static [(&'static str, &'static str)] {
-    match focus {
-        FocusRegion::Sessions | FocusRegion::Servers => SIDEBAR_HINTS,
-        FocusRegion::Stream => STREAM_HINTS,
-    }
-}
-
-/// Return the navigation hints that fit in the given width.
+/// Number of content lines when the keybinds panel is expanded.
 ///
-/// Progressively drops hints from the front until they fit.
-#[must_use]
-fn degrade_hints(
-    all: &[(&'static str, &'static str)],
-    max_width: u16,
-) -> Vec<(&'static str, &'static str)> {
-    let max = max_width as usize;
+/// Global(3) + blank(1) + "Sidebar"(1) + sidebar(2) + blank(1)
+/// + "Stream"(1) + stream(5) = 14
+pub const KEYBINDS_EXPANDED_HEIGHT: u16 = 14;
 
-    // Level 1: all hints with separators.
-    if hints_width_with_separators(all) <= max {
-        return all.to_vec();
-    }
-
-    // Level 2: all hints, space-separated.
-    if hints_width_spaced(all) <= max {
-        return all.to_vec();
-    }
-
-    // Levels 3+: progressively drop hints from the front.
-    for drop_count in 1..all.len() {
-        let remaining = &all[drop_count..];
-        if hints_width_spaced(remaining) <= max {
-            return remaining.to_vec();
-        }
-    }
-
-    // Empty.
-    Vec::new()
-}
-
-/// Render context-sensitive navigation hints into a 1-row area.
+/// Render keybinds vertically into the given area.
 ///
-/// Hints change based on `focus`. Rendered between styled border caps:
-/// `──┤ hints ├──` (light).
+/// Groups: Global, Sidebar, Stream. Each keybind is one line:
+/// `  key  label`. Group headers are bold.
 #[allow(
     clippy::cast_possible_truncation,
     reason = "terminal coordinates are always small"
 )]
-pub fn render_hints(area: Rect, buf: &mut Buffer, theme: &Theme, focus: FocusRegion) {
-    if area.width < 4 || area.height < 1 {
+pub fn render_keybinds_content(area: Rect, buf: &mut Buffer, theme: &Theme) {
+    if area.width < 4 || area.height == 0 {
         return;
     }
 
-    let hint_budget = area.width.saturating_sub(6);
-    let all = hints_for_focus(focus);
-    let hints = degrade_hints(all, hint_budget);
+    let mut row: u16 = 0;
+    let max_rows = area.height;
 
-    if hints.is_empty() {
-        render_border_only(area, buf, theme);
-        return;
-    }
-
-    // Build hint spans.
-    let total_width_with_seps = hints_width_with_separators(&hints);
-    let total_width_spaced = hints_width_spaced(&hints);
-    let use_separators = total_width_with_seps <= hint_budget as usize;
-
-    let mut hint_spans: Vec<Span<'static>> = Vec::new();
-    for (i, (key, label)) in hints.iter().enumerate() {
-        if i > 0 {
-            if use_separators {
-                hint_spans.push(Span::styled(" \u{2571} ", theme.muted)); // ╱
-            } else {
-                hint_spans.push(Span::raw(" "));
+    let render_group = |binds: &[(&str, &str)], row: &mut u16, buf: &mut Buffer, theme: &Theme| {
+        for (key, label) in binds {
+            if *row >= max_rows {
+                return;
             }
+            let line = Line::from(vec![
+                Span::styled(format!("  {key:<8}"), theme.hint_key),
+                Span::styled((*label).to_string(), theme.hint_label),
+            ]);
+            buf.set_line(area.x, area.y + *row, &line, area.width);
+            *row += 1;
         }
-        hint_spans.push(Span::styled((*key).to_string(), theme.hint_key));
-        if !label.is_empty() {
-            hint_spans.push(Span::raw(" "));
-            hint_spans.push(Span::styled((*label).to_string(), theme.hint_label));
-        }
-    }
-
-    let hints_text_width = if use_separators {
-        total_width_with_seps
-    } else {
-        total_width_spaced
     };
 
-    // Border characters.
-    let h_line = "\u{2500}"; // ─
-    let left_cap = "\u{2524}"; // ┤
-    let right_cap = "\u{251C}"; // ├
+    // Global.
+    render_group(GLOBAL_BINDS, &mut row, buf, theme);
 
-    // Fill pattern: left_fill, left_cap, space, hints, space, right_cap, right_fill
-    let inner_used = 1 + 1 + hints_text_width + 1 + 1; // left_cap, space, hints, space, right_cap
-    let fill_total = (area.width as usize).saturating_sub(inner_used);
-    let fill_right = fill_total / 2;
-    let fill_left = fill_total.saturating_sub(fill_right);
-
-    let mut spans: Vec<Span<'static>> = Vec::new();
-
-    if fill_left > 0 {
-        spans.push(Span::styled(
-            h_line.repeat(fill_left),
-            theme.border_unfocused,
-        ));
+    // Blank line.
+    if row < max_rows {
+        row += 1;
     }
 
-    spans.push(Span::styled(left_cap.to_string(), theme.border_unfocused));
-    spans.push(Span::raw(" "));
-    spans.extend(hint_spans);
-    spans.push(Span::raw(" "));
-    spans.push(Span::styled(right_cap.to_string(), theme.border_unfocused));
+    // Sidebar header.
+    if row < max_rows {
+        let header = Line::from(Span::styled("Sidebar", theme.title));
+        buf.set_line(area.x, area.y + row, &header, area.width);
+        row += 1;
+    }
+    render_group(SIDEBAR_BINDS, &mut row, buf, theme);
 
-    if fill_right > 0 {
-        spans.push(Span::styled(
-            h_line.repeat(fill_right),
-            theme.border_unfocused,
-        ));
+    // Blank line.
+    if row < max_rows {
+        row += 1;
     }
 
-    let line = Line::from(spans);
-    buf.set_line(area.x, area.y, &line, area.width);
-}
-
-/// Render just the border line when no hints fit.
-fn render_border_only(area: Rect, buf: &mut Buffer, theme: &Theme) {
-    let h_line = "\u{2500}"; // ─
-    let fill = area.width as usize;
-    if fill > 0 {
-        let line = Line::from(Span::styled(h_line.repeat(fill), theme.border_unfocused));
-        buf.set_line(area.x, area.y, &line, area.width);
+    // Stream header.
+    if row < max_rows {
+        let header = Line::from(Span::styled("Stream", theme.title));
+        buf.set_line(area.x, area.y + row, &header, area.width);
+        row += 1;
     }
-}
-
-/// Display width of a single hint: `key label` or just `key`.
-fn hint_display_width(key: &str, label: &str) -> usize {
-    if label.is_empty() {
-        UnicodeWidthStr::width(key)
-    } else {
-        UnicodeWidthStr::width(key) + 1 + UnicodeWidthStr::width(label)
-    }
-}
-
-/// Total display width of hints joined by ` ╱ ` separators.
-fn hints_width_with_separators(hints: &[(&str, &str)]) -> usize {
-    if hints.is_empty() {
-        return 0;
-    }
-    let content: usize = hints.iter().map(|(k, s)| hint_display_width(k, s)).sum();
-    let seps = (hints.len() - 1) * 3;
-    content + seps
-}
-
-/// Total display width of hints joined by single spaces.
-fn hints_width_spaced(hints: &[(&str, &str)]) -> usize {
-    if hints.is_empty() {
-        return 0;
-    }
-    let content: usize = hints.iter().map(|(k, s)| hint_display_width(k, s)).sum();
-    content + hints.len() - 1
+    render_group(STREAM_BINDS, &mut row, buf, theme);
 }
 
 #[cfg(test)]
@@ -222,166 +121,81 @@ mod tests {
     }
 
     #[test]
-    fn test_stream_hints_render_full() {
+    fn keybinds_content_shows_all_groups() {
         let theme = Theme::new();
-        let backend = TestBackend::new(80, 1);
+        let backend = TestBackend::new(30, 20);
         let mut terminal = Terminal::new(backend).expect("terminal creation");
         terminal
             .draw(|f| {
                 let area = f.area();
-                render_hints(area, f.buffer_mut(), &theme, FocusRegion::Stream);
+                render_keybinds_content(area, f.buffer_mut(), &theme);
             })
             .expect("draw");
 
         let buf = terminal.backend().buffer().clone();
         let content = buffer_to_string(&buf);
 
-        assert!(content.contains('q'), "expected 'q' hint key in: {content}");
+        assert!(content.contains("quit"), "should show quit: {content}");
         assert!(
-            content.contains("yank"),
-            "expected 'yank' hint in stream mode: {content}"
+            content.contains("next panel"),
+            "should show Tab hint: {content}"
         );
         assert!(
-            content.contains("expand"),
-            "expected 'expand' hint in stream mode: {content}"
+            content.contains("toggle keybinds"),
+            "should show ? hint: {content}"
+        );
+        assert!(
+            content.contains("Sidebar"),
+            "should show Sidebar group: {content}"
+        );
+        assert!(
+            content.contains("navigate"),
+            "should show navigate: {content}"
+        );
+        assert!(
+            content.contains("Stream"),
+            "should show Stream group: {content}"
+        );
+        assert!(content.contains("yank"), "should show yank: {content}");
+        assert!(content.contains("expand"), "should show expand: {content}");
+    }
+
+    #[test]
+    fn keybinds_content_narrow_guard() {
+        let theme = Theme::new();
+        let area = Rect::new(0, 0, 3, 5);
+        let mut buf = Buffer::empty(area);
+        render_keybinds_content(area, &mut buf, &theme);
+
+        let content = buffer_to_string(&buf);
+        let non_space = content.replace([' ', '\n'], "");
+        assert!(
+            non_space.is_empty(),
+            "width < 4 should produce empty output, got: {content}"
         );
     }
 
     #[test]
-    fn test_sidebar_hints_render_full() {
+    fn keybinds_content_truncates_at_height() {
         let theme = Theme::new();
-        let backend = TestBackend::new(80, 1);
+        // Only 3 rows — should show global binds only.
+        let backend = TestBackend::new(30, 3);
         let mut terminal = Terminal::new(backend).expect("terminal creation");
         terminal
             .draw(|f| {
                 let area = f.area();
-                render_hints(area, f.buffer_mut(), &theme, FocusRegion::Sessions);
+                render_keybinds_content(area, f.buffer_mut(), &theme);
             })
             .expect("draw");
 
         let buf = terminal.backend().buffer().clone();
         let content = buffer_to_string(&buf);
 
-        assert!(content.contains('q'), "expected 'q' hint key in: {content}");
+        assert!(content.contains("quit"), "should show quit: {content}");
+        // Sidebar header shouldn't fit in 3 rows (3 global binds fill it).
         assert!(
-            content.contains("toggle"),
-            "expected 'toggle' hint in sidebar mode: {content}"
-        );
-        // Sidebar should NOT have yank or expand.
-        assert!(
-            !content.contains("yank"),
-            "sidebar should not show yank: {content}"
-        );
-    }
-
-    #[test]
-    fn test_hints_render_narrow_border_only() {
-        let theme = Theme::new();
-        let backend = TestBackend::new(5, 1);
-        let mut terminal = Terminal::new(backend).expect("terminal creation");
-        terminal
-            .draw(|f| {
-                let area = f.area();
-                render_hints(area, f.buffer_mut(), &theme, FocusRegion::Stream);
-            })
-            .expect("draw");
-
-        let buf = terminal.backend().buffer().clone();
-        let content = buffer_to_string(&buf);
-
-        assert!(
-            !content.contains('q'),
-            "no hints at narrow width: {content}"
-        );
-        assert!(
-            content.contains('\u{2500}'),
-            "should have border line: {content}"
-        );
-    }
-
-    #[test]
-    fn test_hints_render_too_narrow() {
-        let theme = Theme::new();
-        let backend = TestBackend::new(3, 1);
-        let mut terminal = Terminal::new(backend).expect("terminal creation");
-        terminal
-            .draw(|f| {
-                let area = f.area();
-                render_hints(area, f.buffer_mut(), &theme, FocusRegion::Stream);
-            })
-            .expect("draw");
-
-        let buf = terminal.backend().buffer().clone();
-        let content = buffer_to_string(&buf);
-
-        assert!(
-            !content.contains('\u{2500}'),
-            "width < 4 should render nothing: {content}"
-        );
-    }
-
-    #[test]
-    fn test_no_debug_toggle_hint() {
-        let theme = Theme::new();
-        let backend = TestBackend::new(80, 1);
-        let mut terminal = Terminal::new(backend).expect("terminal creation");
-        terminal
-            .draw(|f| {
-                let area = f.area();
-                render_hints(area, f.buffer_mut(), &theme, FocusRegion::Stream);
-            })
-            .expect("draw");
-
-        let buf = terminal.backend().buffer().clone();
-        let content = buffer_to_string(&buf);
-
-        assert!(
-            !content.contains("debug"),
-            "debug toggle should not appear: {content}"
-        );
-    }
-
-    // ── Width calculation tests ─────────────────────────────────────────
-
-    #[test]
-    fn test_hints_width_with_separators() {
-        assert_eq!(hints_width_with_separators(&[]), 0);
-        // "q quit" = 6 cols
-        let one: Vec<(&str, &str)> = vec![("q", "quit")];
-        assert_eq!(hints_width_with_separators(&one), 6);
-        // "q quit" + " ╱ " + "b sidebar" = 6 + 3 + 9 = 18
-        let two: Vec<(&str, &str)> = vec![("q", "quit"), ("b", "sidebar")];
-        assert_eq!(hints_width_with_separators(&two), 18);
-    }
-
-    #[test]
-    fn test_hints_width_spaced() {
-        assert_eq!(hints_width_spaced(&[]), 0);
-        let one: Vec<(&str, &str)> = vec![("q", "quit")];
-        assert_eq!(hints_width_spaced(&one), 6);
-        // "q quit" + " " + "b sidebar" = 6 + 1 + 9 = 16
-        let two: Vec<(&str, &str)> = vec![("q", "quit"), ("b", "sidebar")];
-        assert_eq!(hints_width_spaced(&two), 16);
-    }
-
-    #[test]
-    fn test_server_focus_uses_sidebar_hints() {
-        let theme = Theme::new();
-        let backend = TestBackend::new(80, 1);
-        let mut terminal = Terminal::new(backend).expect("terminal creation");
-        terminal
-            .draw(|f| {
-                let area = f.area();
-                render_hints(area, f.buffer_mut(), &theme, FocusRegion::Servers);
-            })
-            .expect("draw");
-
-        let buf = terminal.backend().buffer().clone();
-        let content = buffer_to_string(&buf);
-
-        assert!(
-            content.contains("toggle"),
-            "servers focus should show sidebar hints: {content}"
+            !content.contains("Sidebar"),
+            "should not show Sidebar in 3 rows: {content}"
         );
     }
 }

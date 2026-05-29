@@ -15,10 +15,12 @@ use super::theme::Theme;
 /// Which section has keyboard focus.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FocusRegion {
-    /// Sidebar session list.
+    /// Session list panel.
     Sessions,
-    /// Sidebar server list.
+    /// Server dashboard panel.
     Servers,
+    /// Keybinds panel (only focusable when expanded).
+    Keybinds,
     /// Message stream.
     Stream,
 }
@@ -35,8 +37,8 @@ pub struct App<'a> {
     pub quit: bool,
     /// Which panel has keyboard focus.
     pub focus: FocusRegion,
-    /// User preference: sidebar visible (toggled by `b` keybinding).
-    pub sidebar_visible: bool,
+    /// Whether the keybinds panel is expanded (`?` toggles).
+    pub keybinds_expanded: bool,
     /// Session list sidebar state.
     pub sidebar: SidebarState,
     /// Unified message stream state.
@@ -68,7 +70,7 @@ impl<'a> App<'a> {
             data,
             quit: false,
             focus: FocusRegion::Stream,
-            sidebar_visible: true,
+            keybinds_expanded: false,
             sidebar: SidebarState::new(),
             stream,
             tail,
@@ -158,29 +160,47 @@ impl<'a> App<'a> {
         }
     }
 
-    /// Cycle focus: Sessions → Servers → Stream → Sessions.
+    /// Cycle focus: Sessions → Servers → [Keybinds] → Stream → Sessions.
+    ///
+    /// Keybinds is skipped when collapsed.
     pub const fn cycle_focus(&mut self) {
         self.focus = match self.focus {
             FocusRegion::Sessions => FocusRegion::Servers,
-            FocusRegion::Servers => FocusRegion::Stream,
+            FocusRegion::Servers => {
+                if self.keybinds_expanded {
+                    FocusRegion::Keybinds
+                } else {
+                    FocusRegion::Stream
+                }
+            }
+            FocusRegion::Keybinds => FocusRegion::Stream,
             FocusRegion::Stream => FocusRegion::Sessions,
         };
     }
 
-    /// Cycle focus in reverse: Sessions → Stream → Servers → Sessions.
+    /// Cycle focus in reverse: Sessions → Stream → [Keybinds] → Servers → Sessions.
+    ///
+    /// Keybinds is skipped when collapsed.
     pub const fn cycle_focus_back(&mut self) {
         self.focus = match self.focus {
             FocusRegion::Sessions => FocusRegion::Stream,
             FocusRegion::Servers => FocusRegion::Sessions,
-            FocusRegion::Stream => FocusRegion::Servers,
+            FocusRegion::Keybinds => FocusRegion::Servers,
+            FocusRegion::Stream => {
+                if self.keybinds_expanded {
+                    FocusRegion::Keybinds
+                } else {
+                    FocusRegion::Servers
+                }
+            }
         };
     }
 
-    /// Toggle sidebar visibility. Moves focus to the stream when hiding.
-    pub fn toggle_sidebar(&mut self) {
-        self.sidebar_visible = !self.sidebar_visible;
-        if !self.sidebar_visible && self.focus != FocusRegion::Stream {
-            self.focus = FocusRegion::Stream;
+    /// Toggle keybinds panel expansion. Moves focus away when collapsing.
+    pub fn toggle_keybinds(&mut self) {
+        self.keybinds_expanded = !self.keybinds_expanded;
+        if !self.keybinds_expanded && self.focus == FocusRegion::Keybinds {
+            self.focus = FocusRegion::Servers;
         }
     }
 
@@ -261,84 +281,91 @@ mod tests {
     }
 
     #[test]
-    fn toggle_sidebar_flips_visibility() {
-        let theme = Theme::new();
-        let icons = IconSet::from_config(IconConfig::default());
-        let mut app = make_app(&theme, &icons);
-
-        assert!(app.sidebar_visible);
-        app.toggle_sidebar();
-        assert!(!app.sidebar_visible);
-        app.toggle_sidebar();
-        assert!(app.sidebar_visible);
-    }
-
-    #[test]
-    fn toggle_sidebar_moves_focus_from_sessions_to_stream() {
+    fn cycle_focus_skips_keybinds_when_collapsed() {
         let theme = Theme::new();
         let icons = IconSet::from_config(IconConfig::default());
         let mut app = make_app(&theme, &icons);
 
         app.focus = FocusRegion::Sessions;
-        app.toggle_sidebar();
+        assert!(!app.keybinds_expanded);
+
+        app.cycle_focus();
+        assert_eq!(app.focus, FocusRegion::Servers);
+        app.cycle_focus();
         assert_eq!(app.focus, FocusRegion::Stream);
+        app.cycle_focus();
+        assert_eq!(app.focus, FocusRegion::Sessions);
     }
 
     #[test]
-    fn toggle_sidebar_moves_focus_from_servers_to_stream() {
+    fn cycle_focus_includes_keybinds_when_expanded() {
         let theme = Theme::new();
         let icons = IconSet::from_config(IconConfig::default());
         let mut app = make_app(&theme, &icons);
 
+        app.keybinds_expanded = true;
         app.focus = FocusRegion::Servers;
-        app.toggle_sidebar();
+
+        app.cycle_focus();
+        assert_eq!(app.focus, FocusRegion::Keybinds);
+        app.cycle_focus();
         assert_eq!(app.focus, FocusRegion::Stream);
     }
 
     #[test]
-    fn toggle_sidebar_keeps_focus_on_stream() {
+    fn cycle_focus_back_skips_keybinds_when_collapsed() {
         let theme = Theme::new();
         let icons = IconSet::from_config(IconConfig::default());
         let mut app = make_app(&theme, &icons);
 
         app.focus = FocusRegion::Stream;
-        app.toggle_sidebar();
+        assert!(!app.keybinds_expanded);
+
+        app.cycle_focus_back();
+        assert_eq!(app.focus, FocusRegion::Servers);
+        app.cycle_focus_back();
+        assert_eq!(app.focus, FocusRegion::Sessions);
+        app.cycle_focus_back();
         assert_eq!(app.focus, FocusRegion::Stream);
     }
 
     #[test]
-    fn toggle_sidebar_preserves_filter_state() {
+    fn cycle_focus_back_includes_keybinds_when_expanded() {
         let theme = Theme::new();
         let icons = IconSet::from_config(IconConfig::default());
         let mut app = make_app(&theme, &icons);
 
-        // Inject a session and select it.
-        app.sidebar.refresh(
-            vec![("s1".into(), Some("claude".into()), "/project".into())],
-            &mut app.stream.badges,
-        );
-        app.sidebar.cursor = 0;
-        app.sidebar.toggle_selected();
-        assert!(app.sidebar.has_filter());
+        app.keybinds_expanded = true;
+        app.focus = FocusRegion::Stream;
 
-        // Hide and show sidebar — filter survives.
-        app.toggle_sidebar();
-        assert!(app.sidebar.has_filter());
-        app.toggle_sidebar();
-        assert!(app.sidebar.has_filter());
+        app.cycle_focus_back();
+        assert_eq!(app.focus, FocusRegion::Keybinds);
+        app.cycle_focus_back();
+        assert_eq!(app.focus, FocusRegion::Servers);
     }
 
     #[test]
-    fn show_sidebar_restores_after_toggle() {
+    fn toggle_keybinds_flips_expanded() {
         let theme = Theme::new();
         let icons = IconSet::from_config(IconConfig::default());
         let mut app = make_app(&theme, &icons);
 
-        app.toggle_sidebar();
-        assert!(!app.sidebar_visible);
-        app.toggle_sidebar();
-        assert!(app.sidebar_visible);
-        // Focus should be on stream (moved there on hide, stays on show).
-        assert_eq!(app.focus, FocusRegion::Stream);
+        assert!(!app.keybinds_expanded);
+        app.toggle_keybinds();
+        assert!(app.keybinds_expanded);
+        app.toggle_keybinds();
+        assert!(!app.keybinds_expanded);
+    }
+
+    #[test]
+    fn toggle_keybinds_moves_focus_on_collapse() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let mut app = make_app(&theme, &icons);
+
+        app.keybinds_expanded = true;
+        app.focus = FocusRegion::Keybinds;
+        app.toggle_keybinds();
+        assert_eq!(app.focus, FocusRegion::Servers);
     }
 }

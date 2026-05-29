@@ -3,8 +3,8 @@
 
 //! Interactive TUI for monitoring sessions and tailing events.
 //!
-//! Renders a unified chronological message stream with per-session hex
-//! badges, scrolling, and a scrollbar.
+//! Renders a quadrant layout: Sessions (upper-left), Servers (lower-left),
+//! a collapsible Keybinds panel, and a full-height message stream (right).
 
 pub mod app;
 pub mod data;
@@ -35,21 +35,20 @@ use crossterm::terminal::{
 use notify::Watcher;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::text::Span;
+use ratatui::widgets::{Block, Borders, Widget};
 use tracing::info;
 
 use crate::config::IconConfig;
 
 use self::app::FocusRegion;
 use self::data::SqliteDataSource;
-use self::hints::render_hints;
+use self::hints::{KEYBINDS_EXPANDED_HEIGHT, render_keybinds_content};
 use self::icons::IconSet;
-use self::sidebar::{SidebarHit, SidebarHitMap, render_sidebar};
+use self::sidebar::{render_servers, render_sessions};
 use self::stream::render_stream;
 use self::theme::Theme;
-
-/// Minimum terminal width before the sidebar auto-hides.
-const SIDEBAR_AUTO_HIDE_WIDTH: u16 = 60;
 
 /// Tick interval for the event loop.
 const TICK_INTERVAL: Duration = Duration::from_millis(200);
@@ -141,22 +140,26 @@ fn run_with_data_and_watcher(
     result
 }
 
+/// Stored panel rectangles and hit maps for mouse dispatch.
+struct PanelLayout {
+    sessions: Rect,
+    servers: Rect,
+    keybinds: Rect,
+    stream: Rect,
+    /// Terminal row → session entry index.
+    session_hits: Vec<(u16, usize)>,
+    /// Terminal row → server entry index.
+    server_hits: Vec<(u16, usize)>,
+}
+
 /// Handle a key event, dispatching to global or focus-specific handlers.
-fn handle_key(app: &mut App<'_>, code: KeyCode, show_sidebar: bool, viewport_height: usize) {
+fn handle_key(app: &mut App<'_>, code: KeyCode, viewport_height: usize) {
     // Global keys (always active regardless of focus).
     match code {
         KeyCode::Char('q') => app.quit = true,
-        KeyCode::Char('b') => app.toggle_sidebar(),
-        KeyCode::Tab => {
-            if show_sidebar {
-                app.cycle_focus();
-            }
-        }
-        KeyCode::BackTab => {
-            if show_sidebar {
-                app.cycle_focus_back();
-            }
-        }
+        KeyCode::Char('?') => app.toggle_keybinds(),
+        KeyCode::Tab => app.cycle_focus(),
+        KeyCode::BackTab => app.cycle_focus_back(),
         _ => match app.focus {
             FocusRegion::Sessions => {
                 let visible = viewport_height.saturating_sub(1);
@@ -185,6 +188,9 @@ fn handle_key(app: &mut App<'_>, code: KeyCode, show_sidebar: bool, viewport_hei
                     }
                     _ => {}
                 }
+            }
+            FocusRegion::Keybinds => {
+                // No navigation inside keybinds panel.
             }
             FocusRegion::Stream => {
                 handle_stream_key(app, code, viewport_height);
@@ -269,7 +275,7 @@ fn base64_encode(input: &[u8]) -> String {
     out
 }
 
-/// Handle a mouse event, dispatching to sidebar or stream based on position.
+/// Handle a mouse event, dispatching to the correct panel based on position.
 #[allow(
     clippy::cast_possible_truncation,
     reason = "terminal coordinates are always small"
@@ -279,51 +285,51 @@ fn handle_mouse(
     kind: MouseEventKind,
     column: u16,
     row: u16,
-    sidebar_ctx: Option<(u16, &SidebarHitMap)>,
+    layout: &PanelLayout,
     viewport_height: usize,
 ) {
-    let in_sidebar = sidebar_ctx.is_some_and(|(w, _)| column < w);
+    let pos = (column, row);
+    let in_sessions = layout.sessions.contains(pos.into());
+    let in_servers = layout.servers.contains(pos.into());
+    let in_keybinds = layout.keybinds.contains(pos.into());
+    let in_stream = layout.stream.contains(pos.into());
 
     match kind {
         MouseEventKind::ScrollUp => {
-            if in_sidebar {
-                match app.focus {
-                    FocusRegion::Sessions => app.sidebar.cursor_up(3, viewport_height),
-                    FocusRegion::Servers => app.sidebar.server_cursor_up(3, viewport_height),
-                    FocusRegion::Stream => {}
-                }
-            } else {
+            if in_sessions {
+                app.sidebar.cursor_up(3, viewport_height);
+            } else if in_servers {
+                app.sidebar.server_cursor_up(3, viewport_height);
+            } else if in_stream {
                 app.stream.scroll_up(3);
             }
         }
         MouseEventKind::ScrollDown => {
-            if in_sidebar {
-                match app.focus {
-                    FocusRegion::Sessions => app.sidebar.cursor_down(3, viewport_height),
-                    FocusRegion::Servers => app.sidebar.server_cursor_down(3, viewport_height),
-                    FocusRegion::Stream => {}
-                }
-            } else {
+            if in_sessions {
+                app.sidebar.cursor_down(3, viewport_height);
+            } else if in_servers {
+                app.sidebar.server_cursor_down(3, viewport_height);
+            } else if in_stream {
                 app.stream.scroll_down(3, viewport_height);
             }
         }
         MouseEventKind::Down(MouseButton::Left) => {
-            if let Some((_, hits)) = sidebar_ctx
-                && in_sidebar
-            {
-                match hits.hit_test(row) {
-                    Some(SidebarHit::Session(idx)) => {
-                        app.sidebar.cursor = *idx;
-                        app.toggle_session_selection();
-                    }
-                    Some(SidebarHit::Server(idx)) => {
-                        app.sidebar.server_cursor = *idx;
-                        app.toggle_server_selection();
-                    }
-                    None => {}
+            if in_sessions {
+                app.focus = FocusRegion::Sessions;
+                if let Some(&(_, idx)) = layout.session_hits.iter().find(|(r, _)| *r == row) {
+                    app.sidebar.cursor = idx;
+                    app.toggle_session_selection();
                 }
-            } else {
-                // Click in stream: move cursor, expand if scope header.
+            } else if in_servers {
+                app.focus = FocusRegion::Servers;
+                if let Some(&(_, idx)) = layout.server_hits.iter().find(|(r, _)| *r == row) {
+                    app.sidebar.server_cursor = idx;
+                    app.toggle_server_selection();
+                }
+            } else if in_keybinds && app.keybinds_expanded {
+                app.focus = FocusRegion::Keybinds;
+            } else if in_stream {
+                app.focus = FocusRegion::Stream;
                 let stream_row = app.stream.scroll_position + row as usize;
                 if stream_row < app.stream.display_rows.len() {
                     app.stream.cursor = stream_row;
@@ -336,11 +342,25 @@ fn handle_mouse(
     }
 }
 
-/// Main event loop — renders sidebar + message stream, handles input.
+/// Build a `Block` frame for a panel, styling the border based on focus.
+fn panel_block<'a>(title: &'a str, focused: bool, theme: &'a Theme) -> Block<'a> {
+    let border_style = if focused {
+        theme.border_focused
+    } else {
+        theme.border_unfocused
+    };
+    let title_style = if focused { theme.title } else { theme.muted };
+    Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .title(Span::styled(title, title_style))
+}
+
+/// Main event loop — renders quadrant layout, handles input.
 #[allow(
     clippy::too_many_lines,
     clippy::cast_possible_truncation,
-    reason = "render loop with sidebar + stream + hints + empty state in one draw closure; terminal widths are always small"
+    reason = "render loop with quadrant layout + empty state in one draw closure; terminal widths are always small"
 )]
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
@@ -348,36 +368,22 @@ fn run_loop(
     wal_rx: Option<&mpsc::Receiver<()>>,
 ) -> Result<()> {
     let mut last_tick = Instant::now();
-    let mut last_sidebar_width: u16 = 0;
-    let mut hit_map = SidebarHitMap::new();
+    let mut layout = PanelLayout {
+        sessions: Rect::default(),
+        servers: Rect::default(),
+        keybinds: Rect::default(),
+        stream: Rect::default(),
+        session_hits: Vec::new(),
+        server_hits: Vec::new(),
+    };
 
     loop {
         let size = terminal.size()?;
-        let sidebar_fits = size.width >= SIDEBAR_AUTO_HIDE_WIDTH;
-        let show_sidebar = app.sidebar_visible && sidebar_fits;
-        // Move focus to stream when sidebar is not visible.
-        if !show_sidebar && app.focus != FocusRegion::Stream {
-            app.focus = FocusRegion::Stream;
-        }
-        // Reserve bottom row for hints bar.
-        let content_height = size.height.saturating_sub(1);
-        let stream_height = content_height as usize;
+        let stream_height = size.height as usize;
         app.stream.apply_auto_scroll(stream_height);
 
         terminal.draw(|f| {
             let area = f.area();
-            let content_area = Rect {
-                x: area.x,
-                y: area.y,
-                width: area.width,
-                height: content_height,
-            };
-            let hints_area = Rect {
-                x: area.x,
-                y: area.y + content_height,
-                width: area.width,
-                height: 1.min(area.height),
-            };
 
             // Empty state: no sessions and no messages.
             if app.sidebar.entries.is_empty()
@@ -386,52 +392,113 @@ fn run_loop(
             {
                 let msg = "Waiting for connections\u{2026}";
                 let msg_width = unicode_width::UnicodeWidthStr::width(msg) as u16;
-                let x = content_area.x + content_area.width.saturating_sub(msg_width) / 2;
-                let y = content_area.y + content_area.height / 2;
+                let x = area.x + area.width.saturating_sub(msg_width) / 2;
+                let y = area.y + area.height / 2;
                 f.buffer_mut().set_string(x, y, msg, app.theme.muted);
-                hit_map = SidebarHitMap::new();
-            } else if show_sidebar {
-                let sidebar_width = app.sidebar.content_width().min(content_area.width / 2);
-                last_sidebar_width = sidebar_width;
-                let sidebar_area = Rect {
-                    x: content_area.x,
-                    y: content_area.y,
-                    width: sidebar_width,
-                    height: content_area.height,
-                };
-                let stream_area = Rect {
-                    x: content_area.x + sidebar_width,
-                    y: content_area.y,
-                    width: content_area.width.saturating_sub(sidebar_width),
-                    height: content_area.height,
-                };
-                hit_map = render_sidebar(
-                    &app.sidebar,
-                    sidebar_area,
-                    f.buffer_mut(),
-                    app.theme,
-                    app.focus,
-                );
-                render_stream(
-                    &app.stream,
-                    stream_area,
-                    f.buffer_mut(),
-                    app.theme,
-                    app.icons,
-                );
-            } else {
-                last_sidebar_width = 0;
-                hit_map = SidebarHitMap::new();
-                render_stream(
-                    &app.stream,
-                    content_area,
-                    f.buffer_mut(),
-                    app.theme,
-                    app.icons,
-                );
+                layout.session_hits.clear();
+                layout.server_hits.clear();
+                layout.sessions = Rect::default();
+                layout.servers = Rect::default();
+                layout.keybinds = Rect::default();
+                layout.stream = Rect::default();
+                return;
             }
 
-            render_hints(hints_area, f.buffer_mut(), app.theme, app.focus);
+            // ── Horizontal split: left (50%) | right (50%) ──────────
+            let h_chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(area);
+
+            let left = h_chunks[0];
+            let right = h_chunks[1];
+
+            // ── Left column: Sessions | Servers | Keybinds ──────────
+            let keybinds_height = if app.keybinds_expanded {
+                // +2 for Block border top/bottom.
+                KEYBINDS_EXPANDED_HEIGHT + 2
+            } else {
+                // Collapsed: title bar only (top border + bottom border + title row = 3).
+                // But with Block borders, a height of 3 shows the frame with 1 inner row.
+                // We want just the frame border lines (no inner content) = height of 2
+                // would show top + bottom border with no inner. But Borders::ALL needs
+                // at least 2 rows for the top and bottom borders.
+                // In practice 3 rows = top border + 1 line title area + bottom border.
+                3
+            };
+
+            let v_constraints = vec![
+                Constraint::Fill(1),                 // Sessions
+                Constraint::Fill(1),                 // Servers
+                Constraint::Length(keybinds_height), // Keybinds
+            ];
+            let v_chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints(v_constraints)
+                .split(left);
+
+            let sessions_rect = v_chunks[0];
+            let servers_rect = v_chunks[1];
+            let keybinds_rect = v_chunks[2];
+
+            // ── Sessions panel ──────────────────────────────────────
+            let sessions_focused = app.focus == FocusRegion::Sessions;
+            let sessions_block = panel_block(" Sessions ", sessions_focused, app.theme);
+            let sessions_inner = sessions_block.inner(sessions_rect);
+            sessions_block.render(sessions_rect, f.buffer_mut());
+            layout.session_hits = render_sessions(
+                &app.sidebar,
+                sessions_inner,
+                f.buffer_mut(),
+                app.theme,
+                sessions_focused,
+            );
+
+            // ── Servers panel ───────────────────────────────────────
+            let servers_focused = app.focus == FocusRegion::Servers;
+            let servers_block = panel_block(" Servers ", servers_focused, app.theme);
+            let servers_inner = servers_block.inner(servers_rect);
+            servers_block.render(servers_rect, f.buffer_mut());
+            layout.server_hits = render_servers(
+                &app.sidebar,
+                servers_inner,
+                f.buffer_mut(),
+                app.theme,
+                servers_focused,
+            );
+
+            // ── Keybinds panel ──────────────────────────────────────
+            let keybinds_focused = app.focus == FocusRegion::Keybinds;
+            let keybinds_title = if app.keybinds_expanded {
+                " Keybinds  ? "
+            } else {
+                " Keybinds  ? to expand "
+            };
+            let keybinds_block = panel_block(keybinds_title, keybinds_focused, app.theme);
+            let keybinds_inner = keybinds_block.inner(keybinds_rect);
+            keybinds_block.render(keybinds_rect, f.buffer_mut());
+            if app.keybinds_expanded {
+                render_keybinds_content(keybinds_inner, f.buffer_mut(), app.theme);
+            }
+
+            // ── Stream panel ────────────────────────────────────────
+            let stream_focused = app.focus == FocusRegion::Stream;
+            let stream_block = panel_block(" Messages ", stream_focused, app.theme);
+            let stream_inner = stream_block.inner(right);
+            stream_block.render(right, f.buffer_mut());
+            render_stream(
+                &app.stream,
+                stream_inner,
+                f.buffer_mut(),
+                app.theme,
+                app.icons,
+            );
+
+            // Store rects for mouse dispatch (use full panel rects).
+            layout.sessions = sessions_rect;
+            layout.servers = servers_rect;
+            layout.keybinds = keybinds_rect;
+            layout.stream = right;
         })?;
 
         if app.quit {
@@ -445,16 +512,18 @@ fn run_loop(
         if event::poll(timeout)? {
             match event::read()? {
                 Event::Key(key) => {
-                    handle_key(app, key.code, show_sidebar, stream_height);
+                    handle_key(app, key.code, stream_height);
                     app.fetch_page_if_needed();
                 }
                 Event::Mouse(mouse) => {
-                    let ctx = if show_sidebar {
-                        Some((last_sidebar_width, &hit_map))
-                    } else {
-                        None
-                    };
-                    handle_mouse(app, mouse.kind, mouse.column, mouse.row, ctx, stream_height);
+                    handle_mouse(
+                        app,
+                        mouse.kind,
+                        mouse.column,
+                        mouse.row,
+                        &layout,
+                        stream_height,
+                    );
                     app.fetch_page_if_needed();
                 }
                 _ => {}

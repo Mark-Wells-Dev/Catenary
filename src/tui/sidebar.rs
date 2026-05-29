@@ -14,15 +14,9 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 
-use super::app::FocusRegion;
 use super::data::{ServerNoiseRow, ServerStatusRow};
 use super::stream::HexBadgeMap;
 use super::theme::Theme;
-
-/// Minimum sidebar width (chars, including separator column).
-const MIN_WIDTH: u16 = 20;
-/// Maximum sidebar width (chars, including separator column).
-const MAX_WIDTH: u16 = 30;
 
 // ── Session entry ────────────────────────────────────────────────────
 
@@ -36,14 +30,6 @@ pub struct SessionEntry {
     pub host: String,
     /// Primary workspace root directory name with trailing slash.
     pub root: String,
-}
-
-impl SessionEntry {
-    /// Display width of this entry: `XX host Root/`.
-    const fn display_width(&self) -> usize {
-        // badge(2) + space(1) + host + space(1) + root
-        2 + 1 + self.host.len() + 1 + self.root.len()
-    }
 }
 
 // ── Server entry ────────────────────────────────────────────────────
@@ -69,27 +55,6 @@ pub struct ServerEntry {
     pub progress_line: Option<String>,
     /// Most recent `window/logMessage` or `window/showMessage` content.
     pub server_message: Option<String>,
-}
-
-impl ServerEntry {
-    /// Display width of the header line: `name (root)  state`.
-    const fn header_width(&self) -> usize {
-        if self.root.is_empty() {
-            // name + 2 spaces + state
-            self.name.len() + 2 + self.state.len()
-        } else {
-            // name + space + ( + root + ) + 2 spaces + state
-            self.name.len() + 1 + 1 + self.root.len() + 1 + 2 + self.state.len()
-        }
-    }
-
-    /// Number of child lines rendered under this entry.
-    #[must_use]
-    pub const fn child_count(&self) -> usize {
-        let p = if self.progress_line.is_some() { 1 } else { 0 };
-        let m = if self.server_message.is_some() { 1 } else { 0 };
-        p + m
-    }
 }
 
 // ── Sidebar state ────────────────────────────────────────────────────
@@ -395,46 +360,6 @@ impl SidebarState {
             self.server_scroll_offset = self.server_cursor + 1 - visible;
         }
     }
-
-    /// Compute the total sidebar width including the separator column.
-    ///
-    /// Auto-sizes based on the longest session or server label, clamped
-    /// between [`MIN_WIDTH`] and [`MAX_WIDTH`].
-    #[must_use]
-    #[allow(
-        clippy::cast_possible_truncation,
-        reason = "entry widths are always small (< MAX_WIDTH)"
-    )]
-    pub fn content_width(&self) -> u16 {
-        let max_session = self
-            .entries
-            .iter()
-            .map(SessionEntry::display_width)
-            .max()
-            .unwrap_or(0);
-        let max_server = self
-            .servers
-            .iter()
-            .map(ServerEntry::header_width)
-            .max()
-            .unwrap_or(0);
-        // "Sessions" and "Servers" headers are 8/7 chars.
-        let width = max_session.max(max_server).max(8) as u16;
-        // +1 for the vertical separator column.
-        (width + 1).clamp(MIN_WIDTH, MAX_WIDTH)
-    }
-
-    /// Total number of visible rows in the sidebar content area.
-    ///
-    /// Sessions header + session entries + blank line + servers header +
-    /// server entries (each with optional child lines).
-    #[must_use]
-    pub fn total_rows(&self) -> usize {
-        let session_rows = 1 + self.entries.len(); // header + entries
-        let server_header = if self.servers.is_empty() { 0 } else { 2 }; // blank + header
-        let server_rows: usize = self.servers.iter().map(|s| 1 + s.child_count()).sum();
-        session_rows + server_header + server_rows
-    }
 }
 
 impl Default for SidebarState {
@@ -548,101 +473,39 @@ fn extract_server_message(noise: &[ServerNoiseRow], server: &str) -> Option<Stri
         .map(str::to_string)
 }
 
-// ── Hit map ─────────────────────────────────────────────────────────
-
-/// What a sidebar row maps to for mouse click handling.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SidebarHit {
-    /// A session entry at the given index.
-    Session(usize),
-    /// A server entry header at the given index.
-    Server(usize),
-}
-
-/// Row-to-entry mapping built during rendering.
-///
-/// Returned by [`render_sidebar`] so the click handler stays in sync
-/// with the rendered layout automatically.
-#[derive(Debug, Default)]
-pub struct SidebarHitMap {
-    /// `(terminal_row, hit)` pairs, in ascending row order.
-    hits: Vec<(u16, SidebarHit)>,
-}
-
-impl SidebarHitMap {
-    /// Create an empty hit map.
-    #[must_use]
-    pub const fn new() -> Self {
-        Self { hits: Vec::new() }
-    }
-
-    /// Look up what occupies the given terminal row.
-    #[must_use]
-    pub fn hit_test(&self, row: u16) -> Option<&SidebarHit> {
-        self.hits
-            .iter()
-            .find(|(r, _)| *r == row)
-            .map(|(_, hit)| hit)
-    }
-}
-
 // ── Rendering ────────────────────────────────────────────────────────
 
-/// Render the sidebar into the given area.
+/// Render session entries into the given area (inside a `Block` frame).
 ///
-/// Returns a [`SidebarHitMap`] mapping terminal rows to clickable entries.
-///
-/// The rightmost column of `area` renders a vertical separator (`│`).
-/// The rest shows two sections: "Sessions" (top) and "Servers" (bottom),
-/// separated by a blank line. The `focus` parameter determines which
-/// section shows a cursor highlight and bright header.
+/// No header text — the `Block` title replaces it. No vertical separator.
+/// Returns a mapping from terminal row to session index for mouse clicks.
 #[allow(
     clippy::cast_possible_truncation,
-    clippy::too_many_lines,
-    reason = "terminal coordinates are always small; server child lines add necessary rendering logic"
+    reason = "terminal coordinates are always small"
 )]
-pub fn render_sidebar(
+pub fn render_sessions(
     state: &SidebarState,
     area: Rect,
     buf: &mut Buffer,
     theme: &Theme,
-    focus: FocusRegion,
-) -> SidebarHitMap {
-    let mut hit_map = SidebarHitMap::new();
+    focused: bool,
+) -> Vec<(u16, usize)> {
+    let mut hits: Vec<(u16, usize)> = Vec::new();
 
-    if area.width < 3 || area.height == 0 {
-        return hit_map;
+    if area.width == 0 || area.height == 0 {
+        return hits;
     }
 
-    // Reserve rightmost column for the vertical separator.
-    let content_width = area.width.saturating_sub(1);
-    let sessions_focused = focus == FocusRegion::Sessions;
-    let servers_focused = focus == FocusRegion::Servers;
-    let sidebar_focused = sessions_focused || servers_focused;
-
     let max_rows = area.height as usize;
-    let mut row: usize = 0;
-
-    // ── Sessions header ─────────────────────────────────────────────
-    let session_header_style = if sessions_focused {
-        theme.title
-    } else {
-        theme.muted
-    };
-    let header = Line::from(Span::styled("Sessions", session_header_style));
-    buf.set_line(area.x, area.y + row as u16, &header, content_width);
-    row += 1;
-
-    // ── Session entries ─────────────────────────────────────────────
     let has_filter = state.has_filter();
+
     for (i, entry) in state.entries.iter().enumerate() {
-        if row >= max_rows {
+        if i >= max_rows {
             break;
         }
 
-        let is_cursor = sessions_focused && i == state.cursor;
+        let is_cursor = focused && i == state.cursor;
 
-        // Bright when selected (or when no filter is active); dim otherwise.
         let is_bright = !has_filter || state.is_selected(&entry.session_id);
         let badge_style = if is_bright { theme.accent } else { theme.muted };
         let host_style = theme.muted;
@@ -656,13 +519,12 @@ pub fn render_sidebar(
             Span::styled(&entry.root, text_style),
         ]);
 
-        let y = area.y + row as u16;
-        buf.set_line(area.x, y, &line, content_width);
-        hit_map.hits.push((y, SidebarHit::Session(i)));
+        let y = area.y + i as u16;
+        buf.set_line(area.x, y, &line, area.width);
+        hits.push((y, i));
 
-        // Highlight cursor row.
         if is_cursor {
-            for x in area.x..area.x + content_width {
+            for x in area.x..area.x + area.width {
                 let cell = &mut buf[(x, y)];
                 if let Some(bg) = theme.selection.bg {
                     cell.set_bg(bg);
@@ -671,114 +533,109 @@ pub fn render_sidebar(
                 }
             }
         }
-
-        row += 1;
     }
 
-    // ── Servers section ─────────────────────────────────────────────
-    if !state.servers.is_empty() && row < max_rows {
-        // Blank separator line.
-        row += 1;
+    hits
+}
 
-        if row < max_rows {
-            let server_header_style = if servers_focused {
-                theme.title
-            } else {
-                theme.muted
-            };
-            let server_header = Line::from(Span::styled("Servers", server_header_style));
-            buf.set_line(area.x, area.y + row as u16, &server_header, content_width);
-            row += 1;
+/// Render server entries into the given area (inside a `Block` frame).
+///
+/// No header text — the `Block` title replaces it. No vertical separator.
+/// Returns a mapping from terminal row to server index for mouse clicks.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "terminal coordinates are always small"
+)]
+pub fn render_servers(
+    state: &SidebarState,
+    area: Rect,
+    buf: &mut Buffer,
+    theme: &Theme,
+    focused: bool,
+) -> Vec<(u16, usize)> {
+    let mut hits: Vec<(u16, usize)> = Vec::new();
+
+    if area.width == 0 || area.height == 0 {
+        return hits;
+    }
+
+    let max_rows = area.height as usize;
+    let mut row: usize = 0;
+    let has_server_filter = state.has_server_filter();
+
+    for (si, server) in state.servers.iter().enumerate() {
+        if row >= max_rows {
+            break;
         }
 
-        let has_server_filter = state.has_server_filter();
-        for (si, server) in state.servers.iter().enumerate() {
-            if row >= max_rows {
-                break;
-            }
+        let is_cursor = focused && si == state.server_cursor;
 
-            let is_cursor = servers_focused && si == state.server_cursor;
+        let is_bright =
+            !has_server_filter || state.is_server_selected(&server.name, &server.scope_root);
+        let name_style = if is_bright { theme.text } else { theme.muted };
+        let state_style = if is_bright {
+            lifecycle_style(theme, &server.state)
+        } else {
+            theme.muted
+        };
 
-            // Bright when selected (or when no server filter is active); dim otherwise.
-            let is_bright =
-                !has_server_filter || state.is_server_selected(&server.name, &server.scope_root);
-            let name_style = if is_bright { theme.text } else { theme.muted };
-            let state_style = if is_bright {
-                lifecycle_style(theme, &server.state)
-            } else {
-                theme.muted
-            };
+        let line = if server.root.is_empty() {
+            Line::from(vec![
+                Span::styled(&server.name, name_style),
+                Span::raw("  "),
+                Span::styled(&server.state, state_style),
+            ])
+        } else {
+            Line::from(vec![
+                Span::styled(&server.name, name_style),
+                Span::raw(" "),
+                Span::styled("(", theme.muted),
+                Span::styled(&server.root, theme.muted),
+                Span::styled(")", theme.muted),
+                Span::raw("  "),
+                Span::styled(&server.state, state_style),
+            ])
+        };
+        let y = area.y + row as u16;
+        buf.set_line(area.x, y, &line, area.width);
+        hits.push((y, si));
 
-            // Server line: "name (root/)  state" or "name  state"
-            let line = if server.root.is_empty() {
-                Line::from(vec![
-                    Span::styled(&server.name, name_style),
-                    Span::raw("  "),
-                    Span::styled(&server.state, state_style),
-                ])
-            } else {
-                Line::from(vec![
-                    Span::styled(&server.name, name_style),
-                    Span::raw(" "),
-                    Span::styled("(", theme.muted),
-                    Span::styled(&server.root, theme.muted),
-                    Span::styled(")", theme.muted),
-                    Span::raw("  "),
-                    Span::styled(&server.state, state_style),
-                ])
-            };
-            let y = area.y + row as u16;
-            buf.set_line(area.x, y, &line, content_width);
-            hit_map.hits.push((y, SidebarHit::Server(si)));
-
-            if is_cursor {
-                for x in area.x..area.x + content_width {
-                    let cell = &mut buf[(x, y)];
-                    if let Some(bg) = theme.selection.bg {
-                        cell.set_bg(bg);
-                    } else {
-                        cell.modifier |= ratatui::style::Modifier::REVERSED;
-                    }
+        if is_cursor {
+            for x in area.x..area.x + area.width {
+                let cell = &mut buf[(x, y)];
+                if let Some(bg) = theme.selection.bg {
+                    cell.set_bg(bg);
+                } else {
+                    cell.modifier |= ratatui::style::Modifier::REVERSED;
                 }
             }
-            row += 1;
+        }
+        row += 1;
 
-            // ── Child lines: progress, then server message ─────
-            if let Some(ref progress) = server.progress_line
-                && row < max_rows
-            {
-                let child = Line::from(vec![
-                    Span::styled("  ", theme.muted),
-                    Span::styled(progress.clone(), theme.accent),
-                ]);
-                buf.set_line(area.x, area.y + row as u16, &child, content_width);
-                row += 1;
-            }
-            if let Some(ref msg) = server.server_message
-                && row < max_rows
-            {
-                let child = Line::from(vec![
-                    Span::styled("  ", theme.muted),
-                    Span::styled(msg.clone(), theme.muted),
-                ]);
-                buf.set_line(area.x, area.y + row as u16, &child, content_width);
-                row += 1;
-            }
+        // ── Child lines: progress, then server message ─────
+        if let Some(ref progress) = server.progress_line
+            && row < max_rows
+        {
+            let child = Line::from(vec![
+                Span::styled("  ", theme.muted),
+                Span::styled(progress.clone(), theme.accent),
+            ]);
+            buf.set_line(area.x, area.y + row as u16, &child, area.width);
+            row += 1;
+        }
+        if let Some(ref msg) = server.server_message
+            && row < max_rows
+        {
+            let child = Line::from(vec![
+                Span::styled("  ", theme.muted),
+                Span::styled(msg.clone(), theme.muted),
+            ]);
+            buf.set_line(area.x, area.y + row as u16, &child, area.width);
+            row += 1;
         }
     }
 
-    // ── Vertical separator ──────────────────────────────────────────
-    let sep_x = area.x + content_width;
-    let sep_style = if sidebar_focused {
-        theme.border_focused
-    } else {
-        theme.border_unfocused
-    };
-    for y in area.y..area.y + area.height {
-        buf.set_string(sep_x, y, "│", sep_style);
-    }
-
-    hit_map
+    hits
 }
 
 /// Choose a style for a lifecycle state string.
@@ -843,47 +700,6 @@ mod tests {
     #[test]
     fn root_name_bare_name() {
         assert_eq!(root_name("Catenary"), "Catenary/");
-    }
-
-    #[test]
-    fn content_width_empty() {
-        let state = SidebarState::new();
-        let w = state.content_width();
-        assert!(w >= MIN_WIDTH, "empty sidebar should use MIN_WIDTH");
-        assert!(w <= MAX_WIDTH);
-    }
-
-    #[test]
-    fn content_width_auto_sizes() {
-        let mut state = SidebarState::new();
-        let mut badges = HexBadgeMap::new();
-        state.refresh(
-            vec![(
-                "s1".into(),
-                Some("claude-code".into()),
-                "/Projects/CatenaryLongName".into(),
-            )],
-            &mut badges,
-        );
-        // "00 claude CatenaryLongName/" = 2+1+6+1+17 = 27, +1 sep = 28
-        let w = state.content_width();
-        assert!(w >= 20);
-        assert!(w <= MAX_WIDTH);
-    }
-
-    #[test]
-    fn content_width_clamped_to_max() {
-        let mut state = SidebarState::new();
-        let mut badges = HexBadgeMap::new();
-        state.refresh(
-            vec![(
-                "s1".into(),
-                Some("claude-code".into()),
-                "/a/VeryLongWorkspaceRootNameThatExceedsMax".into(),
-            )],
-            &mut badges,
-        );
-        assert_eq!(state.content_width(), MAX_WIDTH);
     }
 
     #[test]
@@ -1017,7 +833,7 @@ mod tests {
     }
 
     #[test]
-    fn render_sidebar_shows_entries() {
+    fn render_sessions_shows_entries() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
 
@@ -1046,23 +862,13 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                render_sidebar(
-                    &state,
-                    area,
-                    frame.buffer_mut(),
-                    &theme,
-                    FocusRegion::Sessions,
-                );
+                render_sessions(&state, area, frame.buffer_mut(), &theme, true);
             })
             .expect("draw");
 
         let buf = terminal.backend().buffer().clone();
         let content = buffer_to_string(&buf);
 
-        assert!(
-            content.contains("Sessions"),
-            "should show header: {content}"
-        );
         assert!(content.contains("00"), "should show badge 00: {content}");
         assert!(content.contains("01"), "should show badge 01: {content}");
         assert!(content.contains("claude"), "should show host: {content}");
@@ -1070,63 +876,13 @@ mod tests {
     }
 
     #[test]
-    fn render_sidebar_separator() {
-        use ratatui::Terminal;
-        use ratatui::backend::TestBackend;
-
+    fn render_sessions_zero_area() {
         let state = SidebarState::new();
         let theme = crate::tui::theme::Theme::new();
-        let backend = TestBackend::new(22, 3);
-        let mut terminal = Terminal::new(backend).expect("terminal creation");
-
-        terminal
-            .draw(|frame| {
-                let area = frame.area();
-                render_sidebar(
-                    &state,
-                    area,
-                    frame.buffer_mut(),
-                    &theme,
-                    FocusRegion::Stream,
-                );
-            })
-            .expect("draw");
-
-        let buf = terminal.backend().buffer().clone();
-        let content = buffer_to_string(&buf);
-        assert!(content.contains('│'), "should show separator: {content}");
-    }
-
-    #[test]
-    fn render_sidebar_narrow_guard() {
-        use ratatui::Terminal;
-        use ratatui::backend::TestBackend;
-
-        let state = SidebarState::new();
-        let theme = crate::tui::theme::Theme::new();
-        let backend = TestBackend::new(2, 3);
-        let mut terminal = Terminal::new(backend).expect("terminal creation");
-
-        terminal
-            .draw(|frame| {
-                let area = frame.area();
-                render_sidebar(
-                    &state,
-                    area,
-                    frame.buffer_mut(),
-                    &theme,
-                    FocusRegion::Sessions,
-                );
-            })
-            .expect("draw");
-
-        let buf = terminal.backend().buffer().clone();
-        let content = buffer_to_string(&buf);
-        let non_space = content.replace([' ', '\n'], "");
-        assert!(
-            non_space.is_empty(),
-            "narrow sidebar should produce empty output, got: {content}"
-        );
+        let area = Rect::new(0, 0, 0, 0);
+        let mut buf = Buffer::empty(area);
+        let hits = render_sessions(&state, area, &mut buf, &theme, true);
+        assert!(hits.is_empty(), "zero-area should produce no hits");
     }
 
     // ── Selection tests ──────────────────────────────────────────────
@@ -1243,7 +999,7 @@ mod tests {
     // ── Render dim/bright tests ─────────────────────────────────────
 
     #[test]
-    fn render_sidebar_selected_bright_unselected_dim() {
+    fn render_sessions_selected_bright_unselected_dim() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
         use ratatui::style::Modifier;
@@ -1269,13 +1025,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                render_sidebar(
-                    &state,
-                    area,
-                    frame.buffer_mut(),
-                    &theme,
-                    FocusRegion::Sessions,
-                );
+                render_sessions(&state, area, frame.buffer_mut(), &theme, true);
             })
             .expect("draw");
 
@@ -1285,16 +1035,16 @@ mod tests {
         // badge(2) + space(1) + host(6) + space(1) = 10.
         let root_col = 10;
 
-        // Row 1 (s1, selected): root text should NOT be dim.
-        let s1_root_cell = &buf[(root_col, 1)];
+        // Row 0 (s1, selected): root text should NOT be dim.
+        let s1_root_cell = &buf[(root_col, 0)];
         assert!(
             !s1_root_cell.modifier.contains(Modifier::DIM),
             "selected entry root should be bright, got modifiers: {:?}",
             s1_root_cell.modifier
         );
 
-        // Row 2 (s2, unselected): root text should be dim.
-        let s2_root_cell = &buf[(root_col, 2)];
+        // Row 1 (s2, unselected): root text should be dim.
+        let s2_root_cell = &buf[(root_col, 1)];
         assert!(
             s2_root_cell.modifier.contains(Modifier::DIM),
             "unselected entry root should be dim, got modifiers: {:?}",
@@ -1383,7 +1133,7 @@ mod tests {
     }
 
     #[test]
-    fn render_sidebar_shows_per_instance_servers() {
+    fn render_servers_shows_per_instance_servers() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
 
@@ -1397,30 +1147,19 @@ mod tests {
         );
 
         let theme = crate::tui::theme::Theme::new();
-        // MAX_WIDTH is 30 — entries may truncate. Use MAX_WIDTH.
-        let backend = TestBackend::new(MAX_WIDTH, 10);
+        let backend = TestBackend::new(40, 10);
         let mut terminal = Terminal::new(backend).expect("terminal creation");
 
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                render_sidebar(
-                    &state,
-                    area,
-                    frame.buffer_mut(),
-                    &theme,
-                    FocusRegion::Sessions,
-                );
+                render_servers(&state, area, frame.buffer_mut(), &theme, false);
             })
             .expect("draw");
 
         let buf = terminal.backend().buffer().clone();
         let content = buffer_to_string(&buf);
 
-        assert!(
-            content.contains("Servers"),
-            "should show servers header: {content}"
-        );
         assert!(
             content.contains("rust-analyzer"),
             "should show server name: {content}"
@@ -1433,8 +1172,6 @@ mod tests {
             content.contains("OmniDSP/"),
             "should show second instance root: {content}"
         );
-        // Lifecycle state may be truncated by MAX_WIDTH — just verify
-        // the entry includes the root scope to distinguish instances.
     }
 
     // ── Progress / server message extraction tests ────────────────
@@ -1530,25 +1267,6 @@ mod tests {
     }
 
     #[test]
-    fn total_rows_includes_child_lines() {
-        let mut state = SidebarState::new();
-        let rows = vec![make_server_row("rust-analyzer", "/A", "busy")];
-        let noise = vec![make_noise(
-            "rust-analyzer",
-            "$/progress",
-            serde_json::json!({
-                "params": {
-                    "value": { "kind": "begin", "title": "Indexing", "percentage": 50 }
-                }
-            }),
-        )];
-        state.refresh_servers(&rows, &noise);
-
-        // Sessions header(1) + blank(1) + servers header(1) + server(1) + progress child(1) = 5
-        assert_eq!(state.total_rows(), 5);
-    }
-
-    #[test]
     fn servers_need_refresh_detects_noise_change() {
         let mut state = SidebarState::new();
         let rows = vec![make_server_row("rust-analyzer", "/A", "busy")];
@@ -1576,7 +1294,7 @@ mod tests {
     }
 
     #[test]
-    fn render_sidebar_shows_progress_child() {
+    fn render_servers_shows_progress_child() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
 
@@ -1594,19 +1312,13 @@ mod tests {
         state.refresh_servers(&rows, &noise);
 
         let theme = crate::tui::theme::Theme::new();
-        let backend = TestBackend::new(MAX_WIDTH, 10);
+        let backend = TestBackend::new(40, 10);
         let mut terminal = Terminal::new(backend).expect("terminal creation");
 
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                render_sidebar(
-                    &state,
-                    area,
-                    frame.buffer_mut(),
-                    &theme,
-                    FocusRegion::Sessions,
-                );
+                render_servers(&state, area, frame.buffer_mut(), &theme, false);
             })
             .expect("draw");
 
@@ -1735,7 +1447,7 @@ mod tests {
     }
 
     #[test]
-    fn render_sidebar_server_selected_bright_unselected_dim() {
+    fn render_servers_selected_bright_unselected_dim() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
         use ratatui::style::Modifier;
@@ -1754,28 +1466,21 @@ mod tests {
         state.toggle_server_selected();
 
         let theme = crate::tui::theme::Theme::new();
-        let backend = TestBackend::new(MAX_WIDTH, 10);
+        let backend = TestBackend::new(40, 10);
         let mut terminal = Terminal::new(backend).expect("terminal creation");
 
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                render_sidebar(
-                    &state,
-                    area,
-                    frame.buffer_mut(),
-                    &theme,
-                    FocusRegion::Servers,
-                );
+                render_servers(&state, area, frame.buffer_mut(), &theme, true);
             })
             .expect("draw");
 
         let buf = terminal.backend().buffer().clone();
 
-        // Sessions header = row 0, no sessions, blank = row 1,
-        // Servers header = row 2, rust-analyzer = row 3, lua-ls = row 4
-        let ra_cell = &buf[(0, 3)]; // "r" in "rust-analyzer"
-        let lua_cell = &buf[(0, 4)]; // "l" in "lua-ls"
+        // rust-analyzer = row 0, lua-ls = row 1
+        let ra_cell = &buf[(0, 0)]; // "r" in "rust-analyzer"
+        let lua_cell = &buf[(0, 1)]; // "l" in "lua-ls"
 
         assert!(
             !ra_cell.modifier.contains(Modifier::DIM),
