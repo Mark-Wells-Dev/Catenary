@@ -621,6 +621,10 @@ fn format_opening_line(denied_cmd: &str, reason: DenialReason) -> String {
 /// The denied command is always named in the opening line. `build_hint` is
 /// a pre-resolved build guidance string from the caller (when available).
 #[must_use]
+#[allow(
+    clippy::too_many_lines,
+    reason = "redirect guidance expanded the format string"
+)]
 pub fn format_denial_full(
     denied_cmd: &str,
     commands: &ResolvedCommands,
@@ -637,7 +641,9 @@ pub fn format_denial_full(
     if let Some(crate::config::GuidanceEntry::Redirect { command }) =
         commands.guidance_for(lookup_cmd)
     {
-        let opening = format!("`{denied_cmd}` isn't allowed. Use `catenary {command}` instead.");
+        let opening = format!(
+            "`{denied_cmd}` isn't allowed. Use `catenary {command}` instead. Works on any path (LSP enrichment only within tracked roots)."
+        );
         let help = render_subcommand_help(command);
         return if help.is_empty() {
             opening
@@ -773,7 +779,10 @@ pub fn format_denial_short(
                 build_hint.map_or_else(|| String::from(no_guidance), |hint| format!(" — {hint}"))
             }
             crate::config::GuidanceEntry::Redirect { command, .. } => {
-                format!(" — Use `catenary {command}` instead.")
+                format!(
+                    " — Use `catenary {command}` instead. \
+                     Works on any path (LSP enrichment only within tracked roots)."
+                )
             }
         },
     );
