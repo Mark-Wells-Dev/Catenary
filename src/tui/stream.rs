@@ -627,7 +627,7 @@ impl StreamState {
                     return None;
                 };
                 let child = scope.children.get(*child_idx)?;
-                Some(super::format::format_message_plain(child))
+                Some(format!("  {}", super::format::format_message_plain(child)))
             }
             DisplayRow::Standalone(entry_idx) => {
                 let StreamEntry::Standalone(msg) = &self.entries[*entry_idx] else {
@@ -648,7 +648,7 @@ impl StreamState {
                 let details = super::format::internal_detail_lines(msg);
                 details
                     .get(*detail_idx)
-                    .map(|(label, value)| format!("{label}: {value}"))
+                    .map(|(label, value)| format!("  {label}: {value}"))
             }
         }
     }
