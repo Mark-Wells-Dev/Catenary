@@ -624,10 +624,15 @@ impl LspClientManager {
             let clients = self.clients.lock().await;
             if let Some(root) = self.fs.resolve_root(path) {
                 // Tiers 1–2: rooted file.
+                // Use resolve_server_root to match the instance key used
+                // by ensure_clients_for_paths and get_servers.
+                let resolved = self.resolve_server_root(path, &lang_id, &root);
                 lang_config
                     .servers()
                     .iter()
-                    .filter_map(|binding| find_instance(&clients, &lang_id, &binding.name, &root))
+                    .filter_map(|binding| {
+                        find_instance(&clients, &lang_id, &binding.name, &resolved)
+                    })
                     .collect()
             } else {
                 // Tier 3: single-file servers.
@@ -5422,6 +5427,56 @@ mod tests {
         manager.wait_ready_for_path(&file).await;
 
         // After waiting, the server should be in Probing or Healthy state
+        let clients = manager.clients().await;
+        let (_, client) = clients.iter().next().expect("should have client");
+        let lifecycle = client.lock().await.lifecycle();
+        assert!(
+            lifecycle == crate::lsp::state::ServerLifecycle::Probing
+                || lifecycle == crate::lsp::state::ServerLifecycle::Healthy,
+            "server should be Probing or Healthy after wait_ready, got {lifecycle:?}"
+        );
+        Ok(())
+    }
+
+    /// `wait_ready_for_path` finds the instance when markers resolve
+    /// to a sub-crate root different from the workspace root.
+    #[tokio::test]
+    async fn test_wait_ready_for_path_marker_root() -> Result<()> {
+        // Layout: workspace/sub_crate/Cargo.toml + workspace/sub_crate/src/lib.yX4Za
+        // Marker root = workspace/sub_crate, workspace root = workspace.
+        let dir = tempfile::tempdir()?;
+        let ws = dir.path().join("workspace");
+        let sub = ws.join("sub_crate");
+        let src = sub.join("src");
+        std::fs::create_dir_all(&src).expect("mkdir");
+        std::fs::write(sub.join("Cargo.toml"), "").expect("marker");
+        let file = src.join(format!("lib.{MOCK_LANG_A}"));
+        std::fs::write(&file, "").expect("file");
+
+        let config = mockls_legacy_markers_config(vec!["Cargo.toml".into()]);
+        let ws_str = ws.to_str().expect("utf8");
+        let manager = LspClientManager::new(config, test_logging(), test_fs_with_roots(&[ws_str]));
+
+        // Spawn at the marker root (sub_crate), matching what
+        // ensure_clients_for_paths would do.
+        let server_name = &manager
+            .config
+            .resolve_language(MOCK_LANG_A)
+            .expect("lang config")
+            .servers()
+            .first()
+            .expect("binding")
+            .name;
+        manager
+            .ensure_server(MOCK_LANG_A, server_name, &sub)
+            .await?;
+
+        // Before the fix, this would fail to find the instance
+        // (looking up workspace root instead of marker root) and
+        // return immediately without waiting.
+        manager.wait_ready_for_path(&file).await;
+
+        // Verify we actually found and waited on the server.
         let clients = manager.clients().await;
         let (_, client) = clients.iter().next().expect("should have client");
         let lifecycle = client.lock().await.lifecycle();
