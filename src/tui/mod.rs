@@ -178,6 +178,8 @@ struct PanelLayout {
     divider_col: u16,
     /// Total terminal width for percentage computation during drag.
     total_width: u16,
+    /// Inner height of the stream panel (excludes borders and search bar).
+    stream_inner_height: usize,
 }
 
 /// Handle a key event, dispatching to global or focus-specific handlers.
@@ -986,6 +988,7 @@ fn render_messages_panel(
 
     render_stream(&app.stream, stream_area, buf, app.theme, app.icons);
     layout.stream = panel_rect;
+    layout.stream_inner_height = stream_area.height as usize;
 
     if let Some(bar) = search_bar_area {
         render_search_bar(
@@ -1029,11 +1032,19 @@ fn run_loop(
         server_hits: Vec::new(),
         divider_col: 0,
         total_width: 0,
+        stream_inner_height: 0,
     };
 
     loop {
         let size = terminal.size()?;
-        let stream_height = size.height as usize;
+        // Use inner height from the previous render frame (excludes borders
+        // and search bar). Before the first render, fall back to terminal
+        // height minus 2 for the block borders.
+        let stream_height = if layout.stream_inner_height > 0 {
+            layout.stream_inner_height
+        } else {
+            (size.height as usize).saturating_sub(2)
+        };
         app.stream.recompute_search_if_dirty(app.icons);
         app.update_effective(size.width, size.height);
         app.stream.apply_auto_scroll(stream_height);
@@ -1447,11 +1458,13 @@ mod tests {
     fn layout_80_cols() -> PanelLayout {
         // Simulate an 80-column terminal: 50% sidebar (40 cols),
         // 1-col divider at col 40, fill right (39 cols).
+        let stream = Rect::new(41, 0, 39, 23);
         PanelLayout {
             sessions: Rect::new(0, 0, 40, 10),
             servers: Rect::new(0, 10, 40, 10),
             keybinds: Rect::new(0, 20, 40, 3),
-            stream: Rect::new(41, 0, 39, 23),
+            stream_inner_height: stream.height.saturating_sub(2) as usize,
+            stream,
             tab_bar: Rect::default(),
             tab_count: 0,
             detail: None,
