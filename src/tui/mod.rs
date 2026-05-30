@@ -153,8 +153,8 @@ fn run_with_data_and_watcher(
 
 /// Tab label names for the left-column stack.
 const LEFT_TAB_NAMES: &[&str] = &["Connections", "Servers", "Keybinds"];
-/// Tab label names for the full-width stack (includes Messages).
-const FULL_TAB_NAMES: &[&str] = &["Connections", "Servers", "Keybinds", "Messages"];
+/// Tab label names for the full-width stack (includes Traffic).
+const FULL_TAB_NAMES: &[&str] = &["Connections", "Servers", "Keybinds", "Traffic"];
 
 /// Stored panel rectangles and hit maps for mouse dispatch.
 struct PanelLayout {
@@ -868,10 +868,10 @@ fn render_keybinds_panel(
     layout.keybinds = panel_rect;
 }
 
-/// Render the right side: optional server detail panel above the Messages panel.
+/// Render the right side: optional server detail panel above the Traffic panel.
 ///
 /// When a server popup is open, splits `right_rect` vertically with a
-/// shared separator row between detail and Messages. Updates `layout.detail`,
+/// shared separator row between detail and Traffic. Updates `layout.detail`,
 /// `layout.detail_height`, and returns the separator row (if any) for the
 /// divider renderer.
 #[allow(
@@ -919,13 +919,13 @@ fn render_right_side(
     }
     layout.detail = detail_rect;
 
-    // Render the separator between detail and Messages.
+    // Render the separator between detail and Traffic.
     if let Some(sep) = sep_rect {
         let focused = app.focus == FocusRegion::Stream;
         let title = if app.stream.in_visual() {
-            " Messages  VISUAL "
+            " Traffic  VISUAL "
         } else {
-            " Messages "
+            " Traffic "
         };
         let has_left = right_borders.contains(Borders::LEFT);
         render_right_separator(
@@ -937,7 +937,7 @@ fn render_right_side(
     (cursor, right_seps)
 }
 
-/// Render the Messages stream panel into `panel_rect`, including the search
+/// Render the Traffic stream panel into `panel_rect`, including the search
 /// bar when active. Returns an optional cursor position for the search input.
 #[allow(
     clippy::cast_possible_truncation,
@@ -955,9 +955,9 @@ fn render_messages_panel(
     // the separator row above already rendered the title).
     let title = if borders.contains(Borders::TOP) {
         if app.stream.in_visual() {
-            " Messages  VISUAL "
+            " Traffic  VISUAL "
         } else {
-            " Messages "
+            " Traffic "
         }
     } else {
         ""
@@ -1079,11 +1079,11 @@ fn run_loop(
             layout.divider_col = 0;
             layout.total_width = 0;
 
-            // Cursor position for the search bar (set by render_messages_panel).
+            // Cursor position for the search bar (set by render_traffic_panel).
             let mut search_cursor: Option<(u16, u16)> = None;
 
             match app.effective {
-                // ── Quadrant: three left panels + Messages right ────
+                // ── Quadrant: three left panels + Traffic right ─────
                 EffectiveLayout::Quadrant => {
                     let h_chunks = Layout::default()
                         .direction(Direction::Horizontal)
@@ -1199,7 +1199,7 @@ fn run_loop(
                         ..keybinds_rect
                     };
 
-                    // Right side: Messages (+ optional detail panel).
+                    // Right side: Traffic (+ optional detail panel).
                     let right_borders = Borders::TOP | Borders::RIGHT | Borders::BOTTOM;
                     let (cursor, right_seps) =
                         render_right_side(app, right, f.buffer_mut(), &mut layout, right_borders);
@@ -1218,7 +1218,7 @@ fn run_loop(
                     );
                 }
 
-                // ── Stacked: tab bar + active panel left, Messages right
+                // ── Stacked: tab bar + active panel left, Traffic right
                 EffectiveLayout::Stacked => {
                     let h_chunks = Layout::default()
                         .direction(Direction::Horizontal)
@@ -1281,7 +1281,7 @@ fn run_loop(
                         ),
                     }
 
-                    // Right side: Messages (+ optional detail panel).
+                    // Right side: Traffic (+ optional detail panel).
                     let right_borders = Borders::TOP | Borders::RIGHT | Borders::BOTTOM;
                     let (cursor, right_seps) =
                         render_right_side(app, right, f.buffer_mut(), &mut layout, right_borders);

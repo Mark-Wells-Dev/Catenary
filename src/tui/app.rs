@@ -39,12 +39,12 @@ pub enum LeftLayout {
 /// Effective layout mode, computed from [`LeftLayout`] and terminal size.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum EffectiveLayout {
-    /// Quadrant: left column has three panels, Messages on right.
+    /// Quadrant: left column has three panels, Traffic on right.
     #[default]
     Quadrant,
-    /// Stacked sidebar: left column is a tab stack, Messages on right.
+    /// Stacked sidebar: left column is a tab stack, Traffic on right.
     Stacked,
-    /// Full-width tab stack: all panels (including Messages) in one stack.
+    /// Full-width tab stack: all panels (including Traffic) in one stack.
     FullStack,
 }
 
@@ -245,7 +245,7 @@ impl<'a> App<'a> {
     /// - **Quadrant**: enters stacked mode, showing the current left tab.
     /// - **Stacked**: cycles tabs (Sessions → Servers → Keybinds), then
     ///   returns to quadrant if the terminal permits.
-    /// - **`FullStack`**: cycles through all four tabs including Messages.
+    /// - **`FullStack`**: cycles through all four tabs including Traffic.
     pub const fn cycle_left_tab(&mut self) {
         match self.effective {
             EffectiveLayout::FullStack => {
@@ -662,7 +662,7 @@ mod tests {
     }
 
     #[test]
-    fn cycle_left_tab_fullstack_includes_messages() {
+    fn cycle_left_tab_fullstack_includes_traffic() {
         let theme = Theme::new();
         let icons = IconSet::from_config(IconConfig::default());
         let mut app = make_app(&theme, &icons);
@@ -680,7 +680,7 @@ mod tests {
         assert_eq!(app.active_left_tab, 2);
         assert_eq!(app.focus, FocusRegion::Keybinds);
 
-        // Next goes to Messages (Stream).
+        // Next goes to Traffic (Stream).
         app.cycle_left_tab();
         assert_eq!(app.focus, FocusRegion::Stream);
 
