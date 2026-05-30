@@ -827,6 +827,23 @@ impl LspClient {
             .unwrap_or_default()
     }
 
+    /// Removes cached diagnostics for the given URIs.
+    ///
+    /// Clears stale entries that may have been populated by
+    /// file-watcher notifications before the diagnostic batch
+    /// opens files. Only fresh `publishDiagnostics` from the
+    /// batch settle phase should survive to retrieval.
+    pub fn clear_diagnostics_for(&self, uris: &[&str]) {
+        let mut cache = self
+            .server
+            .diagnostics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for uri in uris {
+            cache.remove(*uri);
+        }
+    }
+
     /// Returns whether the server advertised `textDocumentSync.save` support.
     ///
     /// When `false`, `did_save` should not be sent — the server doesn't
@@ -1751,6 +1768,14 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(found, "diagnostics should appear in cache after didOpen");
+
+        // clear_diagnostics_for removes the cached entry
+        client.clear_diagnostics_for(&[&uri]);
+        let after_clear = client.get_diagnostics(&uri);
+        assert!(
+            after_clear.is_empty(),
+            "cache should be empty after clear: {after_clear:?}"
+        );
 
         client.shutdown().await?;
         Ok(())

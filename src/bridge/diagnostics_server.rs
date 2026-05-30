@@ -258,6 +258,16 @@ impl DiagnosticsServer {
             return;
         };
 
+        // The readdir nudge (Phase 1b) sends didChangeWatchedFiles for
+        // top-level root entries. Servers may re-scan subdirectories,
+        // discover new files, and emit stale diagnostics (e.g.,
+        // rust-analyzer's "unlinked-file" for a .rs file whose parent
+        // mod declaration hasn't been seen yet). pre_open_settle waits
+        // for the server to go idle after the nudge, so any stale
+        // publishDiagnostics are already in the cache. Clear them so
+        // only fresh diagnostics from the batch settle survive.
+        self.clear_stale_diagnostics(client_mutex, paths).await;
+
         let opened = self.open_files(client_mutex, paths, parent_id).await;
         if opened.is_empty() {
             return;
@@ -532,6 +542,28 @@ impl DiagnosticsServer {
                 .1
                 .push(ServerDiagnostics { entries });
         }
+    }
+
+    /// Clears diagnostics cache entries for files about to be opened.
+    ///
+    /// The readdir nudge (Phase 1b) may cause the server to emit
+    /// `publishDiagnostics` for files it discovers on disk — e.g.,
+    /// rust-analyzer's "unlinked-file" for a new `.rs` file before
+    /// the parent `mod` declaration is visible. Clearing the cache
+    /// after `pre_open_settle` ensures only fresh diagnostics from
+    /// the batch settle phase survive to retrieval.
+    async fn clear_stale_diagnostics(
+        &self,
+        client_mutex: &Arc<Mutex<LspClient>>,
+        paths: &[PathBuf],
+    ) {
+        let uris: Vec<String> = paths
+            .iter()
+            .filter_map(|p| p.canonicalize().ok())
+            .map(|p| crate::lsp::lang::path_to_uri(&p))
+            .collect();
+        let uri_refs: Vec<&str> = uris.iter().map(String::as_str).collect();
+        client_mutex.lock().await.clear_diagnostics_for(&uri_refs);
     }
 
     /// Closes all opened documents on a server and clears `parent_id`.
