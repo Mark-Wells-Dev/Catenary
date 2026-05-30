@@ -263,9 +263,16 @@ impl DiagnosticsServer {
         // discover new files, and emit stale diagnostics (e.g.,
         // rust-analyzer's "unlinked-file" for a .rs file whose parent
         // mod declaration hasn't been seen yet). pre_open_settle waits
-        // for the server to go idle after the nudge, so any stale
-        // publishDiagnostics are already in the cache. Clear them so
-        // only fresh diagnostics from the batch settle survive.
+        // for the server to go idle after the nudge, but the server's
+        // final publishDiagnostics may still be in the kernel pipe
+        // buffer — the write syscall completed (so CPU shows idle) but
+        // the reader loop hasn't processed the bytes yet. Under load,
+        // this gap widens. Drain the pipe first to ensure the cache
+        // reflects the server's final state, then clear.
+        {
+            let server = client_mutex.lock().await.server().clone();
+            drain_pipe(&server).await;
+        }
         self.clear_stale_diagnostics(client_mutex, paths).await;
 
         let opened = self.open_files(client_mutex, paths, parent_id).await;
