@@ -470,7 +470,7 @@ impl LspClientManager {
     /// (e.g., diagnostic dispatch uses the `diagnostics` flag).
     ///
     /// Returns an empty Vec when no server matches. On empty result,
-    /// emits a `warn!()` — dedup handled by `NotificationQueueSink`.
+    /// emits a `debug!()` with the file path.
     ///
     /// Does not block on server readiness — callers must call
     /// `wait_ready_for_path` or `wait_ready_all` before invoking.
@@ -508,24 +508,44 @@ impl LspClientManager {
             let mut result = Vec::new();
 
             for binding in lang_config.servers() {
+                let skip = |reason: &str| {
+                    debug!(
+                        source = Source::LspDispatch.as_str(),
+                        server = binding.name.as_str(),
+                        "get_servers: skipped {}: {reason}",
+                        binding.name,
+                    );
+                };
                 if method.is_some_and(|m| binding.is_method_disabled(m)) {
+                    skip("method disabled");
                     continue;
                 }
                 let Some(server_def) = self.config.server.get(&binding.name) else {
+                    skip("server def not found");
                     continue;
                 };
                 if !file_matches_patterns(path, &server_def.compiled_patterns) {
+                    skip("file_patterns mismatch");
                     continue;
                 }
                 let Some(client) = find_instance(&clients, &lang_id, &binding.name, &resolved)
                 else {
+                    debug!(
+                        source = Source::LspDispatch.as_str(),
+                        server = binding.name.as_str(),
+                        "get_servers: skipped {}: no instance for root {}",
+                        binding.name,
+                        resolved.display(),
+                    );
                     continue;
                 };
                 let locked = client.lock().await;
                 if !locked.is_alive() {
+                    skip("server not alive");
                     continue;
                 }
                 if !capability(locked.server()) {
+                    skip("capability not supported");
                     continue;
                 }
                 drop(locked);
@@ -533,10 +553,11 @@ impl LspClientManager {
             }
 
             if result.is_empty() && !lang_config.servers().is_empty() {
-                info!(
+                debug!(
                     source = Source::LspDispatch.as_str(),
                     language = lang_id.as_str(),
-                    "No server supports the requested capability for {lang_id} files",
+                    "No server supports the requested capability for {lang_id} file: {}",
+                    path.display(),
                 );
             }
 
