@@ -1,14 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
-//! Unified message stream with hex badges, scope lifecycle, and scrolling.
+//! Unified message stream with scope lifecycle and scrolling.
 //!
 //! The stream is the primary view surface for TUI v2: a full-width,
-//! scrollable, chronological list of scopes and standalone messages,
-//! prefixed with per-session hex badges. All messages sharing a
-//! `parent_id` UUID are grouped into a scope: the first message is the
-//! request (header), the response closes the scope, and everything in
-//! between is a child.
+//! scrollable, chronological list of scopes and standalone messages.
+//! All messages sharing a `parent_id` UUID are grouped into a scope:
+//! the first message is the request (header), the response closes the
+//! scope, and everything in between is a child.
 
 use std::collections::{HashMap, HashSet};
 
@@ -65,17 +64,6 @@ impl HexBadgeMap {
             }
         });
         format!("{id:02X}")
-    }
-
-    /// Look up an already-assigned badge without allocating.
-    ///
-    /// Returns `"??"` if the session has no badge (should not happen in
-    /// normal operation — badges are assigned during message routing).
-    #[must_use]
-    pub fn get(&self, session_id: &str) -> String {
-        self.map
-            .get(session_id)
-            .map_or_else(|| "??".to_string(), |id| format!("{id:02X}"))
     }
 
     /// Release a session's badge back to the free pool.
@@ -315,7 +303,6 @@ impl StreamState {
 
     /// Route a single message into the scope model.
     fn route_message(&mut self, msg: SessionMessage) {
-        self.badges.badge(&msg.session_id);
         route_into(&mut self.entries, &mut self.scope_map, msg);
     }
 
@@ -614,9 +601,7 @@ impl StreamState {
                 let StreamEntry::Scope(scope) = &self.entries[*entry_idx] else {
                     return None;
                 };
-                let badge = self.badges.get(&scope.session_id);
-                let plain = super::format::format_scope_header_plain(scope, icons);
-                Some(format!("{badge} {plain}"))
+                Some(super::format::format_scope_header_plain(scope, icons))
             }
             DisplayRow::ScopeChild {
                 entry_idx,
@@ -633,9 +618,7 @@ impl StreamState {
                 let StreamEntry::Standalone(msg) = &self.entries[*entry_idx] else {
                     return None;
                 };
-                let badge = self.badges.get(&msg.session_id);
-                let plain = super::format::format_message_plain(msg);
-                Some(format!("{badge} {plain}"))
+                Some(super::format::format_message_plain(msg))
             }
             DisplayRow::StandaloneDetail {
                 entry_idx,
@@ -834,7 +817,6 @@ impl StreamState {
         let mut temp = Vec::new();
         let mut temp_map: HashMap<String, usize> = HashMap::new();
         for msg in messages {
-            self.badges.badge(&msg.session_id);
             route_into(&mut temp, &mut temp_map, msg);
         }
 
@@ -891,20 +873,17 @@ impl StreamState {
 // ── Rendering helpers ────────────────────────────────────────────────
 
 /// Tree-drawing prefix for child rows.
-const TREE_MID: &str = "├─ ";
+const TREE_MID: &str = "  ├─ ";
 /// Tree-drawing prefix for the last child row.
-const TREE_END: &str = "└─ ";
-/// Blank indent matching the badge width ("XX ").
-const BADGE_INDENT: &str = "   ";
+const TREE_END: &str = "  └─ ";
 
 // ── Rendering ─────────────────────────────────────────────────────────
 
 /// Render the message stream into the given area.
 ///
-/// Each entry line: `XX <formatted content>` where `XX` is the hex
-/// badge. Scope children use tree-drawing characters with indentation
-/// instead of a badge. The scrollbar occupies the rightmost column.
-/// The cursor row is highlighted.
+/// Scope children use tree-drawing characters with indentation.
+/// The scrollbar occupies the rightmost column. The cursor row is
+/// highlighted.
 ///
 /// Call [`StreamState::apply_auto_scroll`] before rendering to update
 /// the scroll position — this function is read-only.
@@ -1010,12 +989,7 @@ fn render_display_row(
             let StreamEntry::Scope(scope) = &state.entries[*entry_idx] else {
                 return Line::from("");
             };
-            let badge = state.badges.get(&scope.session_id);
-            let styled = format_scope_header_styled(scope, icons, theme);
-            let mut spans = Vec::with_capacity(styled.spans.len() + 1);
-            spans.push(Span::styled(format!("{badge} "), theme.accent));
-            spans.extend(styled.spans);
-            Line::from(spans)
+            format_scope_header_styled(scope, icons, theme)
         }
         DisplayRow::ScopeChild {
             entry_idx,
@@ -1028,8 +1002,7 @@ fn render_display_row(
             let child = &scope.children[*child_idx];
             let tree_char = if *is_last { TREE_END } else { TREE_MID };
             let styled = format_message_styled(child, icons, theme);
-            let mut spans = Vec::with_capacity(styled.spans.len() + 2);
-            spans.push(Span::styled(BADGE_INDENT.to_string(), theme.muted));
+            let mut spans = Vec::with_capacity(styled.spans.len() + 1);
             spans.push(Span::styled(tree_char.to_string(), theme.muted));
             spans.extend(styled.spans);
             Line::from(spans)
@@ -1038,12 +1011,7 @@ fn render_display_row(
             let StreamEntry::Standalone(msg) = &state.entries[*entry_idx] else {
                 return Line::from("");
             };
-            let badge = state.badges.get(&msg.session_id);
-            let styled = format_message_styled(msg, icons, theme);
-            let mut spans = Vec::with_capacity(styled.spans.len() + 1);
-            spans.push(Span::styled(format!("{badge} "), theme.accent));
-            spans.extend(styled.spans);
-            Line::from(spans)
+            format_message_styled(msg, icons, theme)
         }
         DisplayRow::StandaloneDetail {
             entry_idx,
@@ -1059,7 +1027,6 @@ fn render_display_row(
             };
             let tree_char = if *is_last { TREE_END } else { TREE_MID };
             Line::from(vec![
-                Span::styled(BADGE_INDENT.to_string(), theme.muted),
                 Span::styled(tree_char.to_string(), theme.muted),
                 Span::styled(format!("{label}: "), theme.muted),
                 Span::styled(value.clone(), theme.text),
@@ -1484,15 +1451,6 @@ mod tests {
     }
 
     #[test]
-    fn test_stream_state_append_assigns_badges() {
-        let mut state = StreamState::new(vec![make_message("s1", "hover")]);
-        assert_eq!(state.badges.badge("s1"), "00");
-
-        state.append(vec![make_message("s2", "definition")]);
-        assert_eq!(state.badges.badge("s2"), "01");
-    }
-
-    #[test]
     fn test_stream_scroll_metrics() {
         let messages: Vec<_> = (0..30)
             .map(|i| make_message("s1", &format!("m-{i}")))
@@ -1596,7 +1554,7 @@ mod tests {
     // ── Render tests ──────────────────────────────────────────────────
 
     #[test]
-    fn test_render_stream_shows_hex_badges() {
+    fn test_render_stream_no_hex_badges() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
 
@@ -1620,13 +1578,11 @@ mod tests {
 
         let buf = terminal.backend().buffer().clone();
         let content = buffer_to_string(&buf);
+        // Stream entries should NOT start with hex badges.
+        let first_line = content.lines().next().unwrap_or("");
         assert!(
-            content.contains("00"),
-            "expected hex badge '00' in output, got: {content}"
-        );
-        assert!(
-            content.contains("01"),
-            "expected hex badge '01' in output, got: {content}"
+            !first_line.starts_with("00"),
+            "stream should not have hex badge prefix, got: {first_line}"
         );
     }
 
