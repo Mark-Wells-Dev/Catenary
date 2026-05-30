@@ -38,8 +38,6 @@ pub struct SessionEntry {
     pub root: String,
     /// Full workspace path(s), comma-separated.
     pub workspace: String,
-    /// Process ID.
-    pub pid: u32,
     /// Active language servers (e.g., `["rust-analyzer", "lua-language-server"]`).
     pub languages: Vec<String>,
 }
@@ -52,8 +50,6 @@ pub struct SessionData {
     pub client_name: Option<String>,
     /// Full workspace path(s), comma-separated.
     pub workspace: String,
-    /// Process ID.
-    pub pid: u32,
     /// Active language server names.
     pub languages: Vec<String>,
 }
@@ -195,7 +191,6 @@ impl SidebarState {
                     host,
                     root,
                     workspace: s.workspace,
-                    pid: s.pid,
                     languages: s.languages,
                 }
             })
@@ -530,15 +525,8 @@ impl SidebarState {
         let mut text = format!("{} {} {}", entry.badge, entry.host, entry.root);
         if self.is_expanded(&entry.session_id) {
             let _ = write!(text, "\n  {}", entry.workspace);
-            if entry.languages.is_empty() {
-                let _ = write!(text, "\n  pid {}", entry.pid);
-            } else {
-                let _ = write!(
-                    text,
-                    "\n  pid {}  {}",
-                    entry.pid,
-                    entry.languages.join(", ")
-                );
+            if !entry.languages.is_empty() {
+                let _ = write!(text, "\n  {}", entry.languages.join(", "));
             }
         }
         Some(text)
@@ -865,17 +853,12 @@ pub fn render_sessions(
                 );
                 row += 1;
             }
-            if row < max_rows {
-                let pid_line = Line::from(vec![
+            if row < max_rows && !entry.languages.is_empty() {
+                let lang_line = Line::from(vec![
                     Span::styled("  ", theme.muted),
-                    Span::styled(format!("pid {}", entry.pid), theme.muted),
-                    if entry.languages.is_empty() {
-                        Span::raw("")
-                    } else {
-                        Span::styled(format!("  {}", entry.languages.join(", ")), theme.accent)
-                    },
+                    Span::styled(entry.languages.join(", "), theme.accent),
                 ]);
-                set_line_scrolled(buf, area, area.y + row as u16, &pid_line, hs, theme.muted);
+                set_line_scrolled(buf, area, area.y + row as u16, &lang_line, hs, theme.muted);
                 row += 1;
             }
         }
@@ -1070,7 +1053,6 @@ mod tests {
             id: id.to_string(),
             client_name: client_name.map(str::to_string),
             workspace: workspace.to_string(),
-            pid: 1000,
             languages: Vec::new(),
         }
     }

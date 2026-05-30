@@ -384,7 +384,6 @@ impl<'a> App<'a> {
                 id: r.info.id,
                 client_name: r.info.client_name,
                 workspace: r.info.workspace,
-                pid: r.info.pid,
                 languages: r.languages,
             })
             .collect();
