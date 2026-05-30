@@ -28,6 +28,8 @@ pub struct Theme {
     pub hint_label: Style,
     /// Style for the selection highlight.
     pub selection: Style,
+    /// Style for visual selection highlight (distinct from cursor).
+    pub visual_selection: Style,
 
     /// Style for active sessions.
     pub session_active: Style,
@@ -77,6 +79,7 @@ impl Theme {
             hint_key: Style::new().add_modifier(Modifier::BOLD),
             hint_label: Style::new().add_modifier(Modifier::DIM),
             selection: Style::new().add_modifier(Modifier::REVERSED),
+            visual_selection: Style::new().bg(Color::Yellow),
 
             session_active: Style::new().fg(Color::Green),
             session_dead: Style::new().add_modifier(Modifier::DIM),
@@ -106,5 +109,6 @@ mod tests {
         assert!(!theme.border_focused.add_modifier.contains(Modifier::DIM));
         assert!(theme.border_unfocused.add_modifier.contains(Modifier::DIM));
         assert!(theme.selection.add_modifier.contains(Modifier::REVERSED));
+        assert_eq!(theme.visual_selection.bg, Some(Color::Yellow));
     }
 }

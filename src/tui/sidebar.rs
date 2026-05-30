@@ -759,6 +759,21 @@ fn hscroll_line(line: &Line<'_>, hscroll: u16) -> Line<'static> {
 
 // ── Rendering ────────────────────────────────────────────────────────
 
+/// Apply a highlight style to every cell in a row.
+///
+/// If the style has an explicit background color, sets `bg`; otherwise
+/// applies `REVERSED` so the terminal's own colors are used.
+fn apply_highlight(buf: &mut Buffer, area: Rect, y: u16, style: &Style) {
+    for x in area.x..area.x + area.width {
+        let cell = &mut buf[(x, y)];
+        if let Some(bg) = style.bg {
+            cell.set_bg(bg);
+        } else {
+            cell.modifier |= ratatui::style::Modifier::REVERSED;
+        }
+    }
+}
+
 /// Render session entries into the given area (inside a `Block` frame).
 ///
 /// No header text — the `Block` title replaces it. No vertical separator.
@@ -824,41 +839,43 @@ pub fn render_sessions(
         set_line_scrolled(buf, area, y, &line, hs, theme.muted);
         hits.push((y, i));
 
-        if is_cursor || in_visual {
-            for x in area.x..area.x + area.width {
-                let cell = &mut buf[(x, y)];
-                if let Some(bg) = theme.selection.bg {
-                    cell.set_bg(bg);
-                } else {
-                    cell.modifier |= ratatui::style::Modifier::REVERSED;
-                }
-            }
+        let highlight = if is_cursor {
+            Some(&theme.selection)
+        } else if in_visual {
+            Some(&theme.visual_selection)
+        } else {
+            None
+        };
+
+        if let Some(style) = highlight {
+            apply_highlight(buf, area, y, style);
         }
         row += 1;
 
         // ── Child lines: expanded detail ──────────────────────
         if state.is_expanded(&entry.session_id) {
             if row < max_rows {
+                let child_y = area.y + row as u16;
                 let workspace_line = Line::from(vec![
                     Span::styled("  ", theme.muted),
                     Span::styled(&entry.workspace, theme.muted),
                 ]);
-                set_line_scrolled(
-                    buf,
-                    area,
-                    area.y + row as u16,
-                    &workspace_line,
-                    hs,
-                    theme.muted,
-                );
+                set_line_scrolled(buf, area, child_y, &workspace_line, hs, theme.muted);
+                if let Some(style) = highlight {
+                    apply_highlight(buf, area, child_y, style);
+                }
                 row += 1;
             }
             if row < max_rows && !entry.languages.is_empty() {
+                let child_y = area.y + row as u16;
                 let lang_line = Line::from(vec![
                     Span::styled("  ", theme.muted),
                     Span::styled(entry.languages.join(", "), theme.accent),
                 ]);
-                set_line_scrolled(buf, area, area.y + row as u16, &lang_line, hs, theme.muted);
+                set_line_scrolled(buf, area, child_y, &lang_line, hs, theme.muted);
+                if let Some(style) = highlight {
+                    apply_highlight(buf, area, child_y, style);
+                }
                 row += 1;
             }
         }
@@ -956,15 +973,16 @@ pub fn render_servers(
         set_line_scrolled(buf, area, y, &line, hs, theme.muted);
         hits.push((y, si));
 
-        if is_cursor || in_visual {
-            for x in area.x..area.x + area.width {
-                let cell = &mut buf[(x, y)];
-                if let Some(bg) = theme.selection.bg {
-                    cell.set_bg(bg);
-                } else {
-                    cell.modifier |= ratatui::style::Modifier::REVERSED;
-                }
-            }
+        let highlight = if is_cursor {
+            Some(&theme.selection)
+        } else if in_visual {
+            Some(&theme.visual_selection)
+        } else {
+            None
+        };
+
+        if let Some(style) = highlight {
+            apply_highlight(buf, area, y, style);
         }
         row += 1;
 
@@ -972,21 +990,29 @@ pub fn render_servers(
         if let Some(ref progress) = server.progress_line
             && row < max_rows
         {
+            let child_y = area.y + row as u16;
             let child = Line::from(vec![
                 Span::styled("  ", theme.muted),
                 Span::styled(progress.clone(), theme.accent),
             ]);
-            set_line_scrolled(buf, area, area.y + row as u16, &child, hs, theme.muted);
+            set_line_scrolled(buf, area, child_y, &child, hs, theme.muted);
+            if let Some(style) = highlight {
+                apply_highlight(buf, area, child_y, style);
+            }
             row += 1;
         }
         if let Some(ref msg) = server.server_message
             && row < max_rows
         {
+            let child_y = area.y + row as u16;
             let child = Line::from(vec![
                 Span::styled("  ", theme.muted),
                 Span::styled(msg.clone(), theme.muted),
             ]);
-            set_line_scrolled(buf, area, area.y + row as u16, &child, hs, theme.muted);
+            set_line_scrolled(buf, area, child_y, &child, hs, theme.muted);
+            if let Some(style) = highlight {
+                apply_highlight(buf, area, child_y, style);
+            }
             row += 1;
         }
     }
