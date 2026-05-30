@@ -112,24 +112,27 @@ fn test_diagnostics_token_monitor_path() -> Result<()> {
     Ok(())
 }
 
-/// mockls with `--drop-after 2`: crashes after 2 responses (initialize
-/// + shutdown or first tool call). Verifies `ServerDied` is handled.
+/// mockls with `--drop-after 3`: crashes after 3 responses (initialize,
+/// eager health probe, first diagnostics request). Verifies
+/// `ServerDied` is handled during the diagnostics pipeline.
 #[test]
 fn test_diagnostics_server_death() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
     std::fs::write(&file, "echo hello\n")?;
 
-    let mut bridge = spawn_mockls(&["--drop-after", "2"], dir.path().to_str().context("path")?)?;
+    let mut bridge = spawn_mockls(&["--drop-after", "3"], dir.path().to_str().context("path")?)?;
     bridge.initialize()?;
 
-    // Server will die during or before diagnostics processing
+    // Server survives the eager health probe (response #2) but dies
+    // during diagnostics processing (response #3).
     let text = bridge
         .call_diagnostics(file.to_str().context("path")?)
         .unwrap_or_default();
 
     // Should either get diagnostics (if server published before dying),
-    // a status message, or a notify error. No raw infrastructure messages to agent.
+    // a status message, or a notify error. No raw infrastructure
+    // messages to agent.
     let is_acceptable = text.contains("mock diagnostic")
         || text.contains("[no language server]")
         || text.contains("[clean]")

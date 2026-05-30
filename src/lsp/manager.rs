@@ -784,6 +784,10 @@ impl LspClientManager {
         clients.insert(key.clone(), client_mutex.clone());
         drop(clients);
 
+        // Eager health probe: transition Probing → Healthy before the
+        // DB persist so the TUI shows "ready" immediately.
+        self.run_eager_health_probe(&client_mutex, lang, root).await;
+
         // Persist initial server state to DB.
         if let Some((conn, session_id)) = &self.db {
             let state = client_mutex
@@ -812,6 +816,68 @@ impl LspClientManager {
         }
 
         Ok((key, client_mutex))
+    }
+
+    /// Runs an eager health probe on a freshly spawned server.
+    ///
+    /// Finds the first file matching `lang` under `root`, opens it on
+    /// the server, sends `documentSymbol`, and closes it. If no
+    /// matching file exists or the probe fails, the server stays in its
+    /// current state and will transition on the first real request.
+    async fn run_eager_health_probe(
+        &self,
+        client_mutex: &Arc<Mutex<LspClient>>,
+        lang: &str,
+        root: &Path,
+    ) {
+        // Walk the root for the first file matching the language.
+        let probe_path = {
+            let walker = ignore::WalkBuilder::new(root)
+                .git_ignore(true)
+                .hidden(true)
+                .build();
+
+            let mut found = None;
+            for entry in walker.flatten() {
+                if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+                    continue;
+                }
+                let path = entry.path();
+                let matches = self.fs.language_id(path).as_deref() == Some(lang)
+                    || path.extension().and_then(|e| e.to_str()) == Some(lang);
+                if matches {
+                    found = Some(path.to_path_buf());
+                    break;
+                }
+            }
+            found
+        };
+
+        let Some(probe_path) = probe_path else {
+            debug!(
+                "No {lang} file found under {} for eager health probe",
+                root.display(),
+            );
+            return;
+        };
+
+        let Ok(content) = std::fs::read_to_string(&probe_path) else {
+            debug!("Cannot read probe file {}", probe_path.display());
+            return;
+        };
+
+        let uri = crate::lsp::lang::path_to_uri(&probe_path);
+        let mut client = client_mutex.lock().await;
+
+        let (_, version) = client.open_document(&uri);
+        if let Err(e) = client.did_open(&uri, lang, version, &content).await {
+            debug!("Eager probe didOpen failed: {e}");
+            return;
+        }
+
+        client.run_health_probe(&uri).await;
+        client.close_tracked_document(&uri).await;
+        drop(client);
     }
 
     /// Spawns a single-file server with null workspace.
@@ -2275,6 +2341,51 @@ mod tests {
             .expect("key should be set after init");
         assert_eq!(key.language_id, MOCK_LANG_A);
         assert_eq!(key.scope, Scope::Root(PathBuf::from("/tmp")));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_spawn_runs_eager_health_probe() -> Result<()> {
+        // A freshly spawned server transitions to Healthy via the eager
+        // health probe when a matching file exists under the root.
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let probe_file = root.join(format!("test.{MOCK_LANG_A}"));
+        std::fs::write(&probe_file, "fn hello\nhello\n")?;
+
+        let fs = Arc::new(FilesystemManager::new());
+        fs.set_roots(vec![root.to_path_buf()]);
+
+        let manager = LspClientManager::new(mockls_config(), test_logging(), fs);
+        let client = ensure_first_server(&manager, MOCK_LANG_A).await?;
+
+        assert_eq!(
+            client.lock().await.lifecycle(),
+            crate::lsp::state::ServerLifecycle::Healthy,
+            "Server should be Healthy after eager health probe"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_spawn_stays_probing_without_matching_file() -> Result<()> {
+        // Without a matching file the eager probe is skipped and the
+        // server remains in Probing.
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        // No file matching MOCK_LANG_A in the root.
+
+        let fs = Arc::new(FilesystemManager::new());
+        fs.set_roots(vec![root.to_path_buf()]);
+
+        let manager = LspClientManager::new(mockls_config(), test_logging(), fs);
+        let client = ensure_first_server(&manager, MOCK_LANG_A).await?;
+
+        assert_eq!(
+            client.lock().await.lifecycle(),
+            crate::lsp::state::ServerLifecycle::Probing,
+            "Server should stay Probing when no matching file exists"
+        );
         Ok(())
     }
 
