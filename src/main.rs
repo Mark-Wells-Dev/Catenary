@@ -49,10 +49,12 @@ enum Command {
         /// Regex pattern (Rust/PCRE syntax, | for alternation).
         pattern: String,
 
-        /// Scope the search (e.g., src/**/*.rs, **/*.{ts,js},
-        /// /home/user/project/**/*.py).
+        /// Scope the search: glob, directory, or file path(s).
+        ///
+        /// Multiple values are unioned — unquoted `src/tui/*` expands
+        /// to individual files and all are searched.
         #[arg(name = "GLOB")]
-        glob: Option<String>,
+        glob: Vec<String>,
 
         /// Exclude matches (e.g., tests/**).
         #[arg(long)]
@@ -76,9 +78,12 @@ enum Command {
     /// Resolves against the current working directory. Results include symbol
     /// outlines when LSP data is available.
     Glob {
-        /// File, directory, or glob (e.g., src/, **/*.{rs,toml},
-        /// /home/user/project/src/).
-        pattern: String,
+        /// File, directory, or glob pattern(s).
+        ///
+        /// Multiple values are unioned — unquoted `src/tui/*` expands
+        /// to individual files and all are browsed.
+        #[arg(required = true)]
+        pattern: Vec<String>,
 
         /// Exclude matches (e.g., tests/**).
         #[arg(long)]
@@ -405,14 +410,18 @@ fn main() -> Result<()> {
             page,
             include_gitignored,
             include_hidden,
-        }) => build_runtime()?.block_on(run_grep(
-            pattern,
-            glob,
-            exclude,
-            page,
-            include_gitignored,
-            include_hidden,
-        )),
+        }) => {
+            let (glob, paths) = split_variadic(glob);
+            build_runtime()?.block_on(run_grep(
+                pattern,
+                glob,
+                paths,
+                exclude,
+                page,
+                include_gitignored,
+                include_hidden,
+            ))
+        }
         #[cfg(not(unix))]
         Some(Command::Grep { .. }) => Err(anyhow::anyhow!("daemon mode requires Unix")),
         #[cfg(unix)]
@@ -422,13 +431,17 @@ fn main() -> Result<()> {
             page,
             include_gitignored,
             include_hidden,
-        }) => build_runtime()?.block_on(run_glob(
-            pattern,
-            exclude,
-            page,
-            include_gitignored,
-            include_hidden,
-        )),
+        }) => {
+            let (pattern, paths) = split_variadic_required(pattern);
+            build_runtime()?.block_on(run_glob(
+                pattern,
+                paths,
+                exclude,
+                page,
+                include_gitignored,
+                include_hidden,
+            ))
+        }
         #[cfg(not(unix))]
         Some(Command::Glob { .. }) => Err(anyhow::anyhow!("daemon mode requires Unix")),
         #[cfg(unix)]
@@ -579,6 +592,37 @@ fn main() -> Result<()> {
         Some(Command::Daemon) => run_daemon(),
         #[cfg(not(unix))]
         Some(Command::Daemon) => Err(anyhow::anyhow!("daemon mode requires Unix")),
+    }
+}
+
+/// Splits variadic positional arguments into a glob pattern vs literal paths.
+///
+/// - One value → glob pattern (preserves existing behavior: the value
+///   could be a glob, directory, or file).
+/// - Multiple values → literal paths (shell-expanded from an unquoted
+///   glob like `src/tui/*`). These are concrete filesystem paths, not
+///   glob patterns, and must not be interpreted as glob syntax.
+fn split_variadic(values: Vec<String>) -> (Option<String>, Vec<PathBuf>) {
+    match values.len() {
+        0 => (None, Vec::new()),
+        1 => (values.into_iter().next(), Vec::new()),
+        _ => (None, values.into_iter().map(PathBuf::from).collect()),
+    }
+}
+
+/// Splits variadic positional arguments for a required positional.
+///
+/// Same as [`split_variadic`] but for required arguments (always at
+/// least one value). Clap's `required = true` ensures the vec is
+/// never empty.
+fn split_variadic_required(mut values: Vec<String>) -> (String, Vec<PathBuf>) {
+    match values.len() {
+        0 => unreachable!("clap ensures at least one value"),
+        1 => (values.swap_remove(0), Vec::new()),
+        _ => (
+            String::new(),
+            values.into_iter().map(PathBuf::from).collect(),
+        ),
     }
 }
 
@@ -882,6 +926,7 @@ async fn run_stop() -> Result<()> {
 async fn run_grep(
     pattern: String,
     glob: Option<String>,
+    paths: Vec<PathBuf>,
     exclude: Option<String>,
     page: usize,
     include_gitignored: bool,
@@ -904,6 +949,7 @@ async fn run_grep(
         cwd: Some(cwd),
         pattern,
         glob,
+        paths,
         exclude,
         page,
         include_gitignored,
@@ -956,6 +1002,7 @@ async fn run_grep(
 #[cfg(unix)]
 async fn run_glob(
     pattern: String,
+    paths: Vec<PathBuf>,
     exclude: Option<String>,
     page: usize,
     include_gitignored: bool,
@@ -976,6 +1023,7 @@ async fn run_glob(
     let request = GlobRequest {
         cwd: Some(cwd),
         pattern,
+        paths,
         exclude,
         page,
         include_gitignored,
@@ -1393,7 +1441,7 @@ mod tests {
             unreachable!("expected Grep command");
         };
         assert_eq!(pattern, "foo");
-        assert!(glob.is_none());
+        assert!(glob.is_empty());
         assert!(exclude.is_none());
         assert_eq!(page, 1);
         assert!(!include_gitignored);
@@ -1417,11 +1465,29 @@ mod tests {
             unreachable!("expected Grep command");
         };
         assert_eq!(pattern, "foo|bar");
-        assert_eq!(glob.as_deref(), Some("src/**/*.rs"));
+        assert_eq!(glob, vec!["src/**/*.rs"]);
         assert!(exclude.is_none());
         assert_eq!(page, 1);
         assert!(!include_gitignored);
         assert!(!include_hidden);
+    }
+
+    #[test]
+    fn test_cli_grep_variadic_glob() {
+        use clap::Parser;
+        let args = Args::try_parse_from([
+            "catenary",
+            "grep",
+            "pattern",
+            "src/tui/stream.rs",
+            "src/tui/mod.rs",
+        ]);
+        let args = args.expect("grep with multiple globs should parse");
+        let Some(Command::Grep { pattern, glob, .. }) = args.command else {
+            unreachable!("expected Grep command");
+        };
+        assert_eq!(pattern, "pattern");
+        assert_eq!(glob, vec!["src/tui/stream.rs", "src/tui/mod.rs"]);
     }
 
     #[test]
@@ -1452,7 +1518,7 @@ mod tests {
             unreachable!("expected Grep command");
         };
         assert_eq!(pattern, "foo|bar");
-        assert_eq!(glob.as_deref(), Some("src/**/*.rs"));
+        assert_eq!(glob, vec!["src/**/*.rs"]);
         assert_eq!(exclude.as_deref(), Some("tests/"));
         assert_eq!(page, 3);
         assert!(include_gitignored);
@@ -1483,11 +1549,31 @@ mod tests {
         else {
             unreachable!("expected Glob command");
         };
-        assert_eq!(pattern, "src/");
+        assert_eq!(pattern, vec!["src/"]);
         assert!(exclude.is_none());
         assert_eq!(page, 1);
         assert!(!include_gitignored);
         assert!(!include_hidden);
+    }
+
+    #[test]
+    fn test_cli_glob_variadic() {
+        use clap::Parser;
+        let args = Args::try_parse_from([
+            "catenary",
+            "glob",
+            "src/tui/stream.rs",
+            "src/tui/mod.rs",
+            "src/tui/render.rs",
+        ]);
+        let args = args.expect("glob with multiple patterns should parse");
+        let Some(Command::Glob { pattern, .. }) = args.command else {
+            unreachable!("expected Glob command");
+        };
+        assert_eq!(
+            pattern,
+            vec!["src/tui/stream.rs", "src/tui/mod.rs", "src/tui/render.rs"]
+        );
     }
 
     #[test]
@@ -1515,7 +1601,7 @@ mod tests {
         else {
             unreachable!("expected Glob command");
         };
-        assert_eq!(pattern, "**/*.rs");
+        assert_eq!(pattern, vec!["**/*.rs"]);
         assert_eq!(exclude.as_deref(), Some("target/**"));
         assert_eq!(page, 2);
         assert!(include_gitignored);
@@ -1759,5 +1845,60 @@ mod tests {
         };
         assert!(check);
         assert!(force);
+    }
+
+    // ── split_variadic tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_split_variadic_empty() {
+        let (glob, paths) = split_variadic(vec![]);
+        assert!(glob.is_none());
+        assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn test_split_variadic_single_is_glob() {
+        let (glob, paths) = split_variadic(vec!["src/**/*.rs".to_string()]);
+        assert_eq!(glob.as_deref(), Some("src/**/*.rs"));
+        assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn test_split_variadic_multiple_are_paths() {
+        let (glob, paths) = split_variadic(vec![
+            "src/tui/stream.rs".to_string(),
+            "src/tui/mod.rs".to_string(),
+        ]);
+        assert!(glob.is_none());
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("src/tui/stream.rs"),
+                PathBuf::from("src/tui/mod.rs"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_split_variadic_required_single() {
+        let (pattern, paths) = split_variadic_required(vec!["src/".to_string()]);
+        assert_eq!(pattern, "src/");
+        assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn test_split_variadic_required_multiple() {
+        let (pattern, paths) = split_variadic_required(vec![
+            "src/tui/stream.rs".to_string(),
+            "src/tui/mod.rs".to_string(),
+        ]);
+        assert!(pattern.is_empty());
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("src/tui/stream.rs"),
+                PathBuf::from("src/tui/mod.rs"),
+            ]
+        );
     }
 }

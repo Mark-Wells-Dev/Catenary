@@ -34,6 +34,13 @@ use crate::symbol_index::{Symbol, SymbolIndex, format_symbol_kind};
 pub struct GlobInput {
     /// File path, directory path, or glob pattern.
     pub pattern: String,
+    /// Literal file/directory paths (from shell expansion).
+    ///
+    /// When set, each path is dispatched through the appropriate handler
+    /// (file outline, directory listing) without glob interpretation.
+    /// `pattern` is ignored.
+    #[serde(default)]
+    pub paths: Vec<PathBuf>,
     /// Glob pattern to exclude from results.
     #[serde(default)]
     pub exclude: Option<String>,
@@ -381,6 +388,7 @@ impl GlobServer {
         // Compute cache key from pipeline-affecting parameters.
         let key = cache_key(&GlobCacheParams {
             pattern: &pattern,
+            paths: &input.paths,
             exclude: input.exclude.as_deref(),
             include_gitignored: input.include_gitignored,
             include_hidden: input.include_hidden,
@@ -409,7 +417,12 @@ impl GlobServer {
         let cwd = input.cwd.as_deref();
 
         // Run pipeline — handlers return full unpaginated output.
-        let full_output = if path.is_file() || path.is_symlink() {
+        let full_output = if !input.paths.is_empty() {
+            // Literal paths from shell expansion — dispatch each through
+            // the appropriate handler (file outline, directory listing).
+            self.handle_literal_paths(&input.paths, &input, exclude.as_ref(), cwd, parent_id)
+                .await?
+        } else if path.is_file() || path.is_symlink() {
             self.client_manager
                 .ensure_and_wait_for_paths(std::slice::from_ref(&path))
                 .await;
@@ -541,6 +554,44 @@ impl GlobServer {
         }
 
         full
+    }
+
+    /// Multiple literal paths: dispatch each through the file or directory handler.
+    ///
+    /// Used when the CLI receives multiple positional arguments (shell-expanded
+    /// from an unquoted glob). Each path is concrete — no glob interpretation.
+    async fn handle_literal_paths(
+        &self,
+        paths: &[PathBuf],
+        input: &GlobInput,
+        exclude: Option<&ResolvedGlob>,
+        cwd: Option<&Path>,
+        parent_id: Option<&str>,
+    ) -> Result<String> {
+        let mut full = String::new();
+        for path in paths {
+            if path.is_file() || path.is_symlink() {
+                self.client_manager
+                    .ensure_and_wait_for_paths(std::slice::from_ref(path))
+                    .await;
+                super::ensure_symbols(
+                    self.symbol_index.as_ref(),
+                    &self.client_manager,
+                    std::slice::from_ref(path),
+                    parent_id,
+                )
+                .await;
+                full.push_str(&self.handle_glob_file(path, cwd));
+            } else if path.is_dir() {
+                let output = self
+                    .handle_glob_dir(path, input, exclude, cwd, parent_id)
+                    .await?;
+                full.push_str(&output);
+            }
+            // Skip non-existent paths silently — shell expansion
+            // shouldn't produce them, but be defensive.
+        }
+        Ok(full)
     }
 
     /// Directory listing: enriched (maps) where LSP available, plain (flags) otherwise.

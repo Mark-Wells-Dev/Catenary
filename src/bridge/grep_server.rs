@@ -35,6 +35,13 @@ pub struct GrepInput {
     /// Glob pattern to scope the search (optional).
     #[serde(default)]
     pub glob: Option<String>,
+    /// Literal file/directory paths (from shell expansion).
+    ///
+    /// When set, these replace glob/cwd as the search scope. Each path
+    /// is used as a direct root for the file walker — files are searched
+    /// directly, directories are walked. No glob matching is applied.
+    #[serde(default)]
+    pub paths: Vec<PathBuf>,
     /// Glob pattern to exclude from matches (optional).
     #[serde(default)]
     pub exclude: Option<String>,
@@ -116,6 +123,7 @@ impl GrepServer {
         let key = cache_key(&GrepCacheParams {
             pattern: &input.pattern,
             glob: input.glob.as_deref(),
+            paths: &input.paths,
             exclude: input.exclude.as_deref(),
             include_gitignored: input.include_gitignored,
             include_hidden: input.include_hidden,
@@ -141,6 +149,7 @@ impl GrepServer {
             let arm_input = GrepInput {
                 pattern: arm.clone(),
                 glob: input.glob.clone(),
+                paths: input.paths.clone(),
                 exclude: input.exclude.clone(),
                 include_gitignored: input.include_gitignored,
                 include_hidden: input.include_hidden,
@@ -183,30 +192,34 @@ impl GrepServer {
     ) -> Result<String> {
         debug!("Grep request: pattern={}", input.pattern);
 
-        let resolved_glob = input
-            .glob
-            .as_deref()
-            .map(ResolvedGlob::new)
-            .transpose()?
-            .map(Arc::new);
+        // Literal paths bypass glob resolution — each path is a direct
+        // search root (files searched directly, directories walked).
+        let (resolved_glob, effective_roots) = if input.paths.is_empty() {
+            let rg = input
+                .glob
+                .as_deref()
+                .map(ResolvedGlob::new)
+                .transpose()?
+                .map(Arc::new);
+            let roots = if let Some(ref rg) = rg
+                && let Some(override_root) = rg.override_root()
+            {
+                vec![override_root.to_path_buf()]
+            } else if let Some(cwd) = cwd {
+                vec![cwd.to_path_buf()]
+            } else {
+                self.client_manager.roots()
+            };
+            (rg, roots)
+        } else {
+            (None, input.paths.clone())
+        };
         let resolved_exclude = input
             .exclude
             .as_deref()
             .map(ResolvedGlob::new)
             .transpose()?
             .map(Arc::new);
-
-        // Determine effective search roots: absolute glob overrides workspace
-        // roots; cwd scopes the search when no glob is present.
-        let effective_roots = if let Some(ref rg) = resolved_glob
-            && let Some(override_root) = rg.override_root()
-        {
-            vec![override_root.to_path_buf()]
-        } else if let Some(cwd) = cwd {
-            vec![cwd.to_path_buf()]
-        } else {
-            self.client_manager.roots()
-        };
 
         // Step 1: Ripgrep scoped to file set → raw hits with matched text.
         let rg = Self::ripgrep_matches(
