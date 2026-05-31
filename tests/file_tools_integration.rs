@@ -43,7 +43,7 @@ fn test_glob_directory_basic() -> Result<()> {
 
     let text = bridge.call_tool_text(
         "glob",
-        &json!({ "pattern": dir.path().to_string_lossy().to_string() }),
+        &json!({ "paths": [dir.path().to_string_lossy().to_string()] }),
     )?;
 
     assert!(text.contains("src/"), "Should list src directory: {text}");
@@ -65,7 +65,7 @@ fn test_glob_outside_root() -> Result<()> {
 
     let result = bridge.call_tool(
         "glob",
-        &json!({ "pattern": outside.path().to_string_lossy().as_ref() }),
+        &json!({ "paths": [outside.path().to_string_lossy().as_ref()] }),
     )?;
 
     let is_error = result.get("isError").and_then(serde_json::Value::as_bool);
@@ -127,7 +127,7 @@ fn test_glob_directory_symlink() -> Result<()> {
 
     let text = bridge.call_tool_text(
         "glob",
-        &json!({ "pattern": dir.path().to_string_lossy().to_string() }),
+        &json!({ "paths": [dir.path().to_string_lossy().to_string()] }),
     )?;
 
     // Symlink should be shown with its target
@@ -152,7 +152,7 @@ fn test_glob_file_header() -> Result<()> {
 
     let text = bridge.call_tool_text(
         "glob",
-        &json!({ "pattern": script.to_str().context("file path")? }),
+        &json!({ "paths": [script.to_str().context("file path")?] }),
     )?;
 
     // File header with line count
@@ -162,53 +162,6 @@ fn test_glob_file_header() -> Result<()> {
     assert!(
         !text.contains("Config"),
         "Should not show symbols without grammar: {text}"
-    );
-    Ok(())
-}
-
-#[test]
-#[ignore = "glob pattern interpretation removed (ticket 104)"]
-fn test_glob_pattern_matching() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    std::fs::write(dir.path().join("main.rs"), "fn main() {}")?;
-    std::fs::write(dir.path().join("lib.rs"), "pub mod lib;")?;
-    std::fs::write(dir.path().join("readme.md"), "# Readme")?;
-
-    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
-    bridge.initialize()?;
-
-    let text = bridge.call_tool_text("glob", &json!({ "pattern": "*.rs" }))?;
-
-    assert!(text.contains("main.rs"), "Should match main.rs: {text}");
-    assert!(text.contains("lib.rs"), "Should match lib.rs: {text}");
-    assert!(
-        !text.contains("readme.md"),
-        "Should not match readme.md: {text}"
-    );
-    Ok(())
-}
-
-#[test]
-#[ignore = "glob pattern interpretation removed (ticket 104)"]
-fn test_glob_alternation() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    std::fs::write(dir.path().join("main.rs"), "fn main() {}")?;
-    std::fs::write(dir.path().join("Cargo.toml"), "[package]")?;
-    std::fs::write(dir.path().join("readme.md"), "# Readme")?;
-
-    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
-    bridge.initialize()?;
-
-    let text = bridge.call_tool_text("glob", &json!({ "pattern": "*.{rs,toml}" }))?;
-
-    assert!(text.contains("main.rs"), "Should match main.rs: {text}");
-    assert!(
-        text.contains("Cargo.toml"),
-        "Should match Cargo.toml: {text}"
-    );
-    assert!(
-        !text.contains("readme.md"),
-        "Should not match readme.md: {text}"
     );
     Ok(())
 }
@@ -224,7 +177,7 @@ fn test_glob_line_counts() -> Result<()> {
 
     let text = bridge.call_tool_text(
         "glob",
-        &json!({ "pattern": dir.path().to_string_lossy().to_string() }),
+        &json!({ "paths": [dir.path().to_string_lossy().to_string()] }),
     )?;
 
     assert!(
@@ -241,86 +194,6 @@ fn test_glob_line_counts() -> Result<()> {
 }
 
 #[test]
-#[ignore = "glob pattern interpretation removed (ticket 104)"]
-fn test_glob_pattern_detection() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let script = dir.path().join(format!("types.{MOCK_LANG_A}"));
-    std::fs::write(&script, "struct Config\nenum Mode\n")?;
-    std::fs::create_dir(dir.path().join("subdir"))?;
-
-    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
-    bridge.initialize()?;
-
-    // File path → header format (shows line count)
-    let file_text = bridge.call_tool_text(
-        "glob",
-        &json!({ "pattern": script.to_str().context("file path")? }),
-    )?;
-    assert!(
-        file_text.contains("(2 lines)"),
-        "File mode should show line count: {file_text}"
-    );
-
-    // Directory path → listing format (shows entries)
-    let dir_text = bridge.call_tool_text(
-        "glob",
-        &json!({ "pattern": dir.path().to_string_lossy().to_string() }),
-    )?;
-    assert!(
-        dir_text.contains("subdir/"),
-        "Dir mode should show subdirectories: {dir_text}"
-    );
-    assert!(
-        dir_text.contains(&format!("types.{MOCK_LANG_A}")),
-        "Dir mode should list files: {dir_text}"
-    );
-
-    // Glob pattern → match format
-    let glob_text =
-        bridge.call_tool_text("glob", &json!({ "pattern": format!("*.{MOCK_LANG_A}") }))?;
-    assert!(
-        glob_text.contains(&format!("types.{MOCK_LANG_A}")),
-        "Pattern mode should match files: {glob_text}"
-    );
-    Ok(())
-}
-
-// ─── New 08a tests ─────────────────────────────────────────────────────
-
-#[test]
-#[ignore = "glob pattern interpretation removed (ticket 104)"]
-fn test_glob_exclude() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let src = dir.path().join("src");
-    std::fs::create_dir_all(&src)?;
-    std::fs::write(src.join("main.rs"), "fn main() {}")?;
-    std::fs::write(src.join("test_helper.rs"), "fn test() {}")?;
-    std::fs::write(src.join("test_util.rs"), "fn util() {}")?;
-
-    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
-    bridge.initialize()?;
-
-    let text = bridge.call_tool_text(
-        "glob",
-        &json!({
-            "pattern": "src/*.rs",
-            "exclude": "test_*"
-        }),
-    )?;
-
-    assert!(text.contains("main.rs"), "Should include main.rs: {text}");
-    assert!(
-        !text.contains("test_helper.rs"),
-        "Should exclude test_helper.rs: {text}"
-    );
-    assert!(
-        !text.contains("test_util.rs"),
-        "Should exclude test_util.rs: {text}"
-    );
-    Ok(())
-}
-
-#[test]
 fn test_glob_include_hidden() -> Result<()> {
     let dir = tempfile::tempdir()?;
     std::fs::write(dir.path().join("visible.txt"), "content")?;
@@ -332,7 +205,7 @@ fn test_glob_include_hidden() -> Result<()> {
     // Default: hidden files excluded
     let text_default = bridge.call_tool_text(
         "glob",
-        &json!({ "pattern": dir.path().to_string_lossy().to_string() }),
+        &json!({ "paths": [dir.path().to_string_lossy().to_string()] }),
     )?;
     assert!(
         text_default.contains("visible.txt"),
@@ -347,37 +220,13 @@ fn test_glob_include_hidden() -> Result<()> {
     let text_hidden = bridge.call_tool_text(
         "glob",
         &json!({
-            "pattern": dir.path().to_string_lossy().to_string(),
+            "paths": [dir.path().to_string_lossy().to_string()],
             "include_hidden": true
         }),
     )?;
     assert!(
         text_hidden.contains(".hidden"),
         "Should show .hidden with include_hidden: {text_hidden}"
-    );
-    Ok(())
-}
-
-/// Grep with `glob=.gitignore` should find matches in `.gitignore`
-/// without requiring `include_hidden`. This is the motivating case
-/// for ticket misc/45.
-#[test]
-#[ignore = "glob pattern interpretation removed (ticket 104)"]
-fn test_grep_explicit_hidden_glob_matches() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    std::fs::write(dir.path().join(".gitignore"), "target/\nbuild/\n")?;
-    std::fs::write(dir.path().join("README.md"), "hello")?;
-
-    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
-    bridge.initialize()?;
-
-    let text = bridge.call_tool_text(
-        "grep",
-        &json!({ "pattern": "target", "glob": ".gitignore" }),
-    )?;
-    assert!(
-        text.contains("target"),
-        "grep glob=.gitignore should find 'target' without include_hidden: {text}"
     );
     Ok(())
 }
@@ -416,32 +265,10 @@ fn test_glob_explicit_hidden_matches() -> Result<()> {
     let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
     bridge.initialize()?;
 
-    let text = bridge.call_tool_text("glob", &json!({ "pattern": ".gitignore" }))?;
+    let text = bridge.call_tool_text("glob", &json!({ "paths": [".gitignore"] }))?;
     assert!(
         text.contains(".gitignore"),
         "Explicit .gitignore glob should match without include_hidden: {text}"
-    );
-    Ok(())
-}
-
-/// Glob with an explicit hidden directory pattern (`.github/*`) should
-/// match without `include_hidden`.
-#[test]
-#[ignore = "glob pattern interpretation removed (ticket 104)"]
-fn test_glob_explicit_hidden_dir_matches() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let gh = dir.path().join(".github");
-    std::fs::create_dir(&gh)?;
-    std::fs::write(gh.join("ci.yml"), "name: CI\n")?;
-    std::fs::write(dir.path().join("README.md"), "hello")?;
-
-    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
-    bridge.initialize()?;
-
-    let text = bridge.call_tool_text("glob", &json!({ "pattern": ".github/*.yml" }))?;
-    assert!(
-        text.contains("ci.yml"),
-        "Explicit .github/*.yml glob should match without include_hidden: {text}"
     );
     Ok(())
 }
@@ -468,7 +295,7 @@ fn test_glob_include_gitignored() -> Result<()> {
     let text_default = bridge.call_tool_text(
         "glob",
         &json!({
-            "pattern": dir.path().to_string_lossy().to_string(),
+            "paths": [dir.path().to_string_lossy().to_string()],
             "include_hidden": true
         }),
     )?;
@@ -485,7 +312,7 @@ fn test_glob_include_gitignored() -> Result<()> {
     let text_ignored = bridge.call_tool_text(
         "glob",
         &json!({
-            "pattern": dir.path().to_string_lossy().to_string(),
+            "paths": [dir.path().to_string_lossy().to_string()],
             "include_gitignored": true,
             "include_hidden": true
         }),
@@ -523,7 +350,7 @@ fn test_glob_tier3_bucketed() -> Result<()> {
 
     let text = bridge.call_tool_text(
         "glob",
-        &json!({ "pattern": dir.path().to_string_lossy().to_string() }),
+        &json!({ "paths": [dir.path().to_string_lossy().to_string()] }),
     )?;
 
     // With 50 files, each line is ~30 chars = ~1500 chars.
@@ -549,7 +376,7 @@ fn test_glob_tier2_file_listing() -> Result<()> {
 
     let text = bridge.call_tool_text(
         "glob",
-        &json!({ "pattern": dir.path().to_string_lossy().to_string() }),
+        &json!({ "paths": [dir.path().to_string_lossy().to_string()] }),
     )?;
 
     // Small directory — should get tier 2 file listing.
@@ -584,7 +411,7 @@ fn test_glob_budget_small() -> Result<()> {
 
     let text = bridge.call_tool_text(
         "glob",
-        &json!({ "pattern": bridge.root_path().to_string_lossy().to_string() }),
+        &json!({ "paths": [bridge.root_path().to_string_lossy().to_string()] }),
     )?;
 
     // With small budget, output should be compact.
@@ -621,7 +448,7 @@ fn test_glob_bucket_drill() -> Result<()> {
     // First call: directory listing (may be tier 2 or 3).
     let text = bridge.call_tool_text(
         "glob",
-        &json!({ "pattern": dir.path().to_string_lossy().to_string() }),
+        &json!({ "paths": [dir.path().to_string_lossy().to_string()] }),
     )?;
 
     // If there's a bucket pattern, it should be a valid glob.
@@ -632,7 +459,7 @@ fn test_glob_bucket_drill() -> Result<()> {
                 let pattern = line.split("  (").next().unwrap_or("").trim();
                 if !pattern.is_empty() {
                     // The bucket pattern should be passable back to glob.
-                    let drill = bridge.call_tool_text("glob", &json!({ "pattern": pattern }))?;
+                    let drill = bridge.call_tool_text("glob", &json!({ "paths": [pattern] }))?;
                     assert!(
                         !drill.contains("No matches"),
                         "Bucket pattern '{pattern}' should be drillable: {drill}"
@@ -641,60 +468,6 @@ fn test_glob_bucket_drill() -> Result<()> {
             }
         }
     }
-    Ok(())
-}
-
-#[test]
-#[ignore = "glob pattern interpretation removed (ticket 104)"]
-fn test_glob_pattern_tree() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let src = dir.path().join("src");
-    let bridge_dir = src.join("bridge");
-    let lsp_dir = src.join("lsp");
-    std::fs::create_dir_all(&bridge_dir)?;
-    std::fs::create_dir_all(&lsp_dir)?;
-
-    std::fs::write(bridge_dir.join("handler.rs"), "fn handle() {}\n")?;
-    std::fs::write(bridge_dir.join("mod.rs"), "mod handler;\n")?;
-    std::fs::write(lsp_dir.join("client.rs"), "struct Client;\n")?;
-    std::fs::write(src.join("lib.rs"), "mod bridge;\n")?;
-
-    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
-    bridge.initialize()?;
-
-    let text = bridge.call_tool_text("glob", &json!({ "pattern": "src/**/*.rs" }))?;
-
-    // Should produce a nested tree.
-    assert!(
-        text.contains("src/") || text.contains("bridge/"),
-        "Should have directory nodes: {text}"
-    );
-    assert!(
-        text.contains("handler.rs"),
-        "Should include handler.rs: {text}"
-    );
-    assert!(
-        text.contains("client.rs"),
-        "Should include client.rs: {text}"
-    );
-    Ok(())
-}
-
-#[test]
-#[ignore = "glob pattern interpretation removed (ticket 104)"]
-fn test_glob_tab_structure() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let sub = dir.path().join("src").join("inner");
-    std::fs::create_dir_all(&sub)?;
-    std::fs::write(sub.join("file.rs"), "fn f() {}\n")?;
-
-    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
-    bridge.initialize()?;
-
-    let text = bridge.call_tool_text("glob", &json!({ "pattern": "src/**/*.rs" }))?;
-
-    // Tree output should use literal tab characters for indentation.
-    assert!(text.contains('\t'), "Should use tab indentation: {text:?}");
     Ok(())
 }
 
@@ -719,7 +492,7 @@ fn test_glob_directories_count_against_budget() -> Result<()> {
 
     let text = bridge.call_tool_text(
         "glob",
-        &json!({ "pattern": dir.path().to_string_lossy().to_string() }),
+        &json!({ "paths": [dir.path().to_string_lossy().to_string()] }),
     )?;
 
     // With 60 dirs + 10 files, each ~15 chars, total ~1050 chars.
@@ -775,7 +548,7 @@ fn test_glob_separator_bucketing() -> Result<()> {
 
     let text = bridge2.call_tool_text(
         "glob",
-        &json!({ "pattern": bridge2.root_path().to_string_lossy().to_string() }),
+        &json!({ "paths": [bridge2.root_path().to_string_lossy().to_string()] }),
     )?;
 
     // With a small budget and separator-based filenames, bucketing should
@@ -826,7 +599,7 @@ fn test_lua_glob_file_outline() -> Result<()> {
 
         let result = bridge.call_tool_text(
             "glob",
-            &json!({ "pattern": lua_file.to_str().context("file path")? }),
+            &json!({ "paths": [lua_file.to_str().context("file path")?] }),
         )?;
 
         if result.contains("lines)") {
@@ -884,7 +657,7 @@ fn test_lua_glob_pattern() -> Result<()> {
     std::thread::sleep(Duration::from_secs(2));
 
     let start = std::time::Instant::now();
-    let text = bridge.call_tool_text("glob", &json!({ "pattern": "**/*.lua" }))?;
+    let text = bridge.call_tool_text("glob", &json!({ "paths": ["**/*.lua"] }))?;
     let elapsed = start.elapsed();
 
     assert!(text.contains("main.lua"), "Should match main.lua: {text}");
@@ -937,7 +710,7 @@ fn test_lua_glob_directory() -> Result<()> {
     let start = std::time::Instant::now();
     let text = bridge.call_tool_text(
         "glob",
-        &json!({ "pattern": dir.path().to_string_lossy().to_string() }),
+        &json!({ "paths": [dir.path().to_string_lossy().to_string()] }),
     )?;
     let elapsed = start.elapsed();
 
@@ -1005,7 +778,7 @@ fn test_glob_defensive_maps() -> Result<()> {
 
     let text = bridge.call_tool_text(
         "glob",
-        &json!({ "pattern": dir.path().to_string_lossy().to_string() }),
+        &json!({ "paths": [dir.path().to_string_lossy().to_string()] }),
     )?;
 
     // Big file should have a map with symbols.
@@ -1041,7 +814,7 @@ fn test_glob_no_maps_needed() -> Result<()> {
 
     let text = bridge.call_tool_text(
         "glob",
-        &json!({ "pattern": dir.path().to_string_lossy().to_string() }),
+        &json!({ "paths": [dir.path().to_string_lossy().to_string()] }),
     )?;
 
     assert!(!text.contains('<'), "No symbols should appear: {text}");
@@ -1063,7 +836,7 @@ fn test_glob_dir_large_file_paged() -> Result<()> {
 
     let text = bridge.call_tool_text(
         "glob",
-        &json!({ "pattern": dir.path().to_string_lossy().to_string() }),
+        &json!({ "paths": [dir.path().to_string_lossy().to_string()] }),
     )?;
 
     // With stable shape, maps are always rendered and paged.
@@ -1091,7 +864,7 @@ fn test_glob_outline_suppress() -> Result<()> {
 
     let text = bridge.call_tool_text(
         "glob",
-        &json!({ "pattern": dir.path().to_string_lossy().to_string() }),
+        &json!({ "paths": [dir.path().to_string_lossy().to_string()] }),
     )?;
 
     // Should NOT have symbol lines (denied by outline_suppress).
@@ -1123,7 +896,7 @@ fn test_glob_trailing_slash() -> Result<()> {
 
     let text = bridge.call_tool_text(
         "glob",
-        &json!({ "pattern": dir.path().to_string_lossy().to_string() }),
+        &json!({ "paths": [dir.path().to_string_lossy().to_string()] }),
     )?;
 
     // Container symbols should have trailing /.
@@ -1147,7 +920,7 @@ fn test_glob_single_file_map() -> Result<()> {
 
     let text = bridge.call_tool_text(
         "glob",
-        &json!({ "pattern": file.to_str().context("file path")? }),
+        &json!({ "paths": [file.to_str().context("file path")?] }),
     )?;
 
     // Read stderr for diagnostics on failure.
@@ -1177,7 +950,7 @@ fn test_glob_single_file_denied() -> Result<()> {
 
     let text = bridge.call_tool_text(
         "glob",
-        &json!({ "pattern": file.to_str().context("file path")? }),
+        &json!({ "paths": [file.to_str().context("file path")?] }),
     )?;
 
     // outline_suppress blocks the map even for single files.
@@ -1204,7 +977,7 @@ fn test_glob_symlink_broken() -> Result<()> {
 
     let text = bridge.call_tool_text(
         "glob",
-        &json!({ "pattern": dir.path().to_string_lossy().to_string() }),
+        &json!({ "paths": [dir.path().to_string_lossy().to_string()] }),
     )?;
 
     assert!(
@@ -1230,7 +1003,7 @@ fn test_glob_symlink_valid() -> Result<()> {
 
     let text = bridge.call_tool_text(
         "glob",
-        &json!({ "pattern": dir.path().to_string_lossy().to_string() }),
+        &json!({ "paths": [dir.path().to_string_lossy().to_string()] }),
     )?;
 
     // Valid symlink should show -> with resolved target path
@@ -1269,7 +1042,7 @@ fn test_glob_maps_deny_partial() -> Result<()> {
 
     let text = bridge.call_tool_text(
         "glob",
-        &json!({ "pattern": dir.path().to_string_lossy().to_string() }),
+        &json!({ "paths": [dir.path().to_string_lossy().to_string()] }),
     )?;
 
     // File outside test_assets/ should have a map
@@ -1313,7 +1086,7 @@ fn test_glob_bounding_ranges() -> Result<()> {
 
     let text = bridge.call_tool_text(
         "glob",
-        &json!({ "pattern": dir.path().to_string_lossy().to_string() }),
+        &json!({ "paths": [dir.path().to_string_lossy().to_string()] }),
     )?;
 
     // Should show "common structure" for deduplicated group
@@ -1343,7 +1116,7 @@ fn test_glob_snapshot_flag() -> Result<()> {
 
     let text = bridge.call_tool_text(
         "glob",
-        &json!({ "pattern": dir.path().to_string_lossy().to_string() }),
+        &json!({ "paths": [dir.path().to_string_lossy().to_string()] }),
     )?;
 
     assert!(
@@ -1382,7 +1155,7 @@ fn test_glob_gitignored_flag() -> Result<()> {
     let text = bridge.call_tool_text(
         "glob",
         &json!({
-            "pattern": dir.path().to_string_lossy().to_string(),
+            "paths": [dir.path().to_string_lossy().to_string()],
             "include_gitignored": true,
             "include_hidden": true
         }),
@@ -1428,7 +1201,7 @@ fn test_glob_composing_flags() -> Result<()> {
     let text = bridge.call_tool_text(
         "glob",
         &json!({
-            "pattern": dir.path().to_string_lossy().to_string(),
+            "paths": [dir.path().to_string_lossy().to_string()],
             "include_gitignored": true,
             "include_hidden": true
         }),
@@ -1460,7 +1233,7 @@ fn test_glob_paging() -> Result<()> {
     // First page — should show [page 1/N] where N > 1.
     let text1 = bridge.call_tool_text(
         "glob",
-        &json!({ "pattern": file.to_str().context("file path")? }),
+        &json!({ "paths": [file.to_str().context("file path")?] }),
     )?;
 
     assert!(
@@ -1477,7 +1250,7 @@ fn test_glob_paging() -> Result<()> {
     let text2 = bridge.call_tool_text(
         "glob",
         &json!({
-            "pattern": file.to_str().context("file path")?,
+            "paths": [file.to_str().context("file path")?],
             "page": 2
         }),
     )?;
@@ -1510,7 +1283,7 @@ fn test_glob_no_grammar() -> Result<()> {
 
     let text = bridge.call_tool_text(
         "glob",
-        &json!({ "pattern": dir.path().to_string_lossy().to_string() }),
+        &json!({ "paths": [dir.path().to_string_lossy().to_string()] }),
     )?;
 
     // Should show line count but no symbols and no [symbols available].
@@ -1537,7 +1310,7 @@ fn test_glob_budget_minimum() -> Result<()> {
 
     let text = bridge.call_tool_text(
         "glob",
-        &json!({ "pattern": bridge.root_path().to_string_lossy().to_string() }),
+        &json!({ "paths": [bridge.root_path().to_string_lossy().to_string()] }),
     )?;
 
     // Output should fit within clamped budget (1000) + tolerance.
@@ -1564,7 +1337,7 @@ fn test_glob_structure_dedup() -> Result<()> {
 
     let text = bridge.call_tool_text(
         "glob",
-        &json!({ "pattern": dir.path().to_string_lossy().to_string() }),
+        &json!({ "paths": [dir.path().to_string_lossy().to_string()] }),
     )?;
 
     // Should show "common structure" for deduplicated group.
@@ -1600,7 +1373,7 @@ fn test_glob_dedup_mixed() -> Result<()> {
 
     let text = bridge.call_tool_text(
         "glob",
-        &json!({ "pattern": dir.path().to_string_lossy().to_string() }),
+        &json!({ "paths": [dir.path().to_string_lossy().to_string()] }),
     )?;
 
     // Should show both shared map and individual map.
@@ -1611,299 +1384,6 @@ fn test_glob_dedup_mixed() -> Result<()> {
     assert!(
         text.contains("unique_func"),
         "Should show individual map symbols: {text}"
-    );
-    Ok(())
-}
-
-#[test]
-#[ignore = "glob pattern interpretation removed (ticket 104)"]
-fn test_glob_tree_dedup() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    // Two subdirectories, each with identical files.
-    // group_a: 3 files with same structure → shared map.
-    // group_b: 2 files with different structure → individual maps.
-    let group_a = dir.path().join("group_a");
-    let group_b = dir.path().join("group_b");
-    std::fs::create_dir_all(&group_a)?;
-    std::fs::create_dir_all(&group_b)?;
-
-    let shared = "fn alpha\nstruct Beta\n\n\n\n\n\n\n\n\n";
-    for i in 0..3 {
-        std::fs::write(group_a.join(format!("proto_{i}.mock")), shared)?;
-    }
-    std::fs::write(
-        group_b.join("handler.mock"),
-        "fn process\nstruct Config\n\n\n\n\n\n\n\n\n",
-    )?;
-    std::fs::write(
-        group_b.join("router.mock"),
-        "fn dispatch\nstruct Route\n\n\n\n\n\n\n\n\n",
-    )?;
-
-    let config = "[tools.glob]\noutline_threshold = 5\nbudget = 5000\n";
-    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), Some(config))?;
-    bridge.initialize()?;
-
-    let text = bridge.call_tool_text("glob", &json!({ "pattern": "**/*.mock" }))?;
-
-    // group_a should have dedup (3 identical files).
-    assert!(
-        text.contains("common structure"),
-        "group_a should have shared dedup map: {text}"
-    );
-    assert!(
-        text.contains("ranges are bounding"),
-        "Should note bounding ranges: {text}"
-    );
-    // group_b should have individual maps (different structures).
-    assert!(
-        text.contains("process") && text.contains("dispatch"),
-        "group_b should have individual symbols: {text}"
-    );
-    Ok(())
-}
-
-#[test]
-#[ignore = "glob pattern interpretation removed (ticket 104)"]
-fn test_glob_tree_dedup_per_directory() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    // Two directories with IDENTICAL file structures — dedup should NOT
-    // merge across directories. Each directory gets its own shared map.
-    let dir_a = dir.path().join("dir_a");
-    let dir_b = dir.path().join("dir_b");
-    std::fs::create_dir_all(&dir_a)?;
-    std::fs::create_dir_all(&dir_b)?;
-
-    let content = "fn alpha\nstruct Beta\n\n\n\n\n\n\n\n\n";
-    for i in 0..3 {
-        std::fs::write(dir_a.join(format!("file_{i}.mock")), content)?;
-        std::fs::write(dir_b.join(format!("file_{i}.mock")), content)?;
-    }
-
-    let config = "[tools.glob]\noutline_threshold = 5\nbudget = 5000\n";
-    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), Some(config))?;
-    bridge.initialize()?;
-
-    let text = bridge.call_tool_text("glob", &json!({ "pattern": "**/*.mock" }))?;
-
-    // Count occurrences of "common structure" — should be 2 (one per dir).
-    let dedup_count = text.matches("common structure").count();
-    assert_eq!(
-        dedup_count, 2,
-        "Should have separate dedup per directory (expected 2, got {dedup_count}): {text}"
-    );
-    Ok(())
-}
-
-// ─── Ticket 65: directory matching in glob patterns ─────────────────
-
-#[test]
-#[ignore = "glob pattern interpretation removed (ticket 104)"]
-fn test_glob_pattern_matches_directories() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    // Directory containing only subdirectories — no files.
-    std::fs::create_dir(dir.path().join("movies"))?;
-    std::fs::create_dir(dir.path().join("music"))?;
-    std::fs::create_dir(dir.path().join("photos"))?;
-
-    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
-    bridge.initialize()?;
-
-    let text = bridge.call_tool_text(
-        "glob",
-        &json!({ "pattern": format!("{}/*", dir.path().display()) }),
-    )?;
-
-    assert!(
-        text.contains("movies/"),
-        "Should match movies directory: {text}"
-    );
-    assert!(
-        text.contains("music/"),
-        "Should match music directory: {text}"
-    );
-    assert!(
-        text.contains("photos/"),
-        "Should match photos directory: {text}"
-    );
-    assert!(
-        !text.contains("No matches found"),
-        "Should not report no matches: {text}"
-    );
-    Ok(())
-}
-
-#[test]
-#[ignore = "glob pattern interpretation removed (ticket 104)"]
-fn test_glob_pattern_mixed_entries() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    std::fs::create_dir(dir.path().join("subdir"))?;
-    std::fs::write(dir.path().join("file.txt"), "content\n")?;
-
-    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
-    bridge.initialize()?;
-
-    let text = bridge.call_tool_text(
-        "glob",
-        &json!({ "pattern": format!("{}/*", dir.path().display()) }),
-    )?;
-
-    assert!(
-        text.contains("subdir/"),
-        "Should include directory with trailing /: {text}"
-    );
-    assert!(text.contains("file.txt"), "Should include file: {text}");
-    Ok(())
-}
-
-#[test]
-#[ignore = "glob pattern interpretation removed (ticket 104)"]
-fn test_glob_recursive_pattern_includes_dirs() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let sub = dir.path().join("level1");
-    let subsub = sub.join("level2");
-    std::fs::create_dir_all(&subsub)?;
-    std::fs::write(subsub.join("file.txt"), "content\n")?;
-
-    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
-    bridge.initialize()?;
-
-    let text = bridge.call_tool_text(
-        "glob",
-        &json!({ "pattern": format!("{}/**/*", dir.path().display()) }),
-    )?;
-
-    assert!(text.contains("level1/"), "Should include level1/: {text}");
-    assert!(text.contains("level2/"), "Should include level2/: {text}");
-    assert!(text.contains("file.txt"), "Should include files: {text}");
-
-    // Directories that appear as tree branches should NOT also appear as
-    // file-level leaves (prune_dir_dupes).
-    let level1_count = text.matches("level1/").count();
-    assert_eq!(
-        level1_count, 1,
-        "level1/ should appear exactly once, not duplicated: {text}"
-    );
-    Ok(())
-}
-
-#[test]
-#[ignore = "glob pattern interpretation removed (ticket 104)"]
-fn test_glob_pattern_dirs_no_enrichment() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    // Only directories — no files to enrich.
-    std::fs::create_dir(dir.path().join("alpha"))?;
-    std::fs::create_dir(dir.path().join("beta"))?;
-
-    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
-    bridge.initialize()?;
-
-    let text = bridge.call_tool_text(
-        "glob",
-        &json!({ "pattern": format!("{}/*", dir.path().display()) }),
-    )?;
-
-    // Directories should have no line counts or symbol markers.
-    assert!(
-        !text.contains("lines)"),
-        "Directories should have no line counts: {text}"
-    );
-    assert!(
-        !text.contains("[symbols available]"),
-        "Directories should have no symbol markers: {text}"
-    );
-    Ok(())
-}
-
-#[test]
-#[ignore = "glob pattern interpretation removed (ticket 104)"]
-fn test_glob_pattern_paged_large_result() -> Result<()> {
-    let mut bridge = BridgeProcess::spawn_with_config(|root| {
-        for i in 0..30 {
-            let sub = root.join(format!("dir_{i:02}"));
-            std::fs::create_dir(&sub)?;
-            for j in 0..5 {
-                std::fs::write(sub.join(format!("file_{j}.txt")), format!("line {j}\n"))?;
-            }
-        }
-        let config_path = root.join("config.toml");
-        std::fs::write(&config_path, "[tools.glob]\nbudget = 600\n")?;
-        Ok(config_path)
-    })?;
-    bridge.initialize()?;
-
-    let text = bridge.call_tool_text(
-        "glob",
-        &json!({ "pattern": format!("{}/**/*.txt", bridge.root_path().display()) }),
-    )?;
-
-    // With 150 files across 30 dirs, the tree won't fit in 600 chars.
-    // Output should be paged with [page N/M] header.
-    assert!(text.contains("[page 1/"), "Should have page header: {text}");
-    assert!(
-        text.contains("dir_"),
-        "Should show directory structure: {text}"
-    );
-    Ok(())
-}
-
-#[test]
-#[ignore = "glob pattern interpretation removed (ticket 104)"]
-fn test_glob_paged_preserves_tree_structure() -> Result<()> {
-    let mut bridge = BridgeProcess::spawn_with_config(|root| {
-        let src = root.join("src");
-        let bridge_dir = src.join("bridge");
-        let lsp_dir = src.join("lsp");
-        std::fs::create_dir_all(&bridge_dir)?;
-        std::fs::create_dir_all(&lsp_dir)?;
-        for i in 0..20 {
-            std::fs::write(
-                bridge_dir.join(format!("handler_{i}.rs")),
-                format!("fn handle_{i}() {{}}\n"),
-            )?;
-        }
-        for i in 0..20 {
-            std::fs::write(
-                lsp_dir.join(format!("client_{i}.rs")),
-                format!("struct Client{i};\n"),
-            )?;
-        }
-        let config_path = root.join("config.toml");
-        std::fs::write(&config_path, "[tools.glob]\nbudget = 400\n")?;
-        Ok(config_path)
-    })?;
-    bridge.initialize()?;
-
-    let text = bridge.call_tool_text("glob", &json!({ "pattern": "src/**/*.rs" }))?;
-
-    // Paged output should preserve tree structure with directory names.
-    assert!(
-        text.contains("bridge") || text.contains("lsp"),
-        "Paged output should show directory structure: {text}"
-    );
-    assert!(text.contains("[page 1/"), "Should have page header: {text}");
-    Ok(())
-}
-
-#[test]
-#[ignore = "glob pattern interpretation removed (ticket 104)"]
-fn test_glob_pattern_in_roots_unchanged() -> Result<()> {
-    // Verify that in-root file matching still works with enrichment.
-    let dir = tempfile::tempdir()?;
-    std::fs::write(dir.path().join("main.rs"), "fn main() {}\n")?;
-    std::fs::write(dir.path().join("lib.rs"), "pub mod lib;\n")?;
-
-    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
-    bridge.initialize()?;
-
-    let text = bridge.call_tool_text("glob", &json!({ "pattern": "*.rs" }))?;
-
-    assert!(text.contains("main.rs"), "Should match main.rs: {text}");
-    assert!(text.contains("lib.rs"), "Should match lib.rs: {text}");
-    // File entries should still have line counts.
-    assert!(
-        text.contains("lines)"),
-        "File entries should still have line counts: {text}"
     );
     Ok(())
 }
@@ -1920,7 +1400,7 @@ fn test_glob_absolute_dir_no_cwd_header() -> Result<()> {
     bridge.initialize()?;
 
     let abs_path = dir.path().to_string_lossy().to_string();
-    let text = bridge.call_tool_text("glob", &json!({ "pattern": &abs_path }))?;
+    let text = bridge.call_tool_text("glob", &json!({ "paths": [&abs_path] }))?;
 
     // Absolute pattern: no cwd header.
     assert!(
@@ -1946,7 +1426,7 @@ fn test_glob_absolute_dir_indented_entries() -> Result<()> {
     bridge.initialize()?;
 
     let abs_path = dir.path().to_string_lossy().to_string();
-    let text = bridge.call_tool_text("glob", &json!({ "pattern": &abs_path }))?;
+    let text = bridge.call_tool_text("glob", &json!({ "paths": [&abs_path] }))?;
 
     // Entries should be indented under the directory header.
     assert!(
@@ -1961,33 +1441,6 @@ fn test_glob_absolute_dir_indented_entries() -> Result<()> {
 }
 
 #[test]
-#[ignore = "glob pattern interpretation removed (ticket 104)"]
-fn test_glob_absolute_pattern_indented_tree() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    std::fs::create_dir_all(dir.path().join("src/bridge"))?;
-    std::fs::write(dir.path().join("src/bridge/mod.rs"), "pub mod bridge;\n")?;
-    std::fs::write(dir.path().join("src/lib.rs"), "pub mod src;\n")?;
-
-    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
-    bridge.initialize()?;
-
-    let pattern = format!("{}/**/*.rs", dir.path().display());
-    let text = bridge.call_tool_text("glob", &json!({ "pattern": &pattern }))?;
-
-    // No cwd header for absolute patterns.
-    assert!(
-        !text.contains("cwd:"),
-        "Absolute pattern should not have cwd header: {text}"
-    );
-    // Tree content should be indented under the section header.
-    assert!(
-        text.contains("\tsrc/"),
-        "Tree should be indented under section header: {text}"
-    );
-    Ok(())
-}
-
-#[test]
 fn test_glob_absolute_file_no_cwd_header() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let file_path = dir.path().join("readme.txt");
@@ -1997,7 +1450,7 @@ fn test_glob_absolute_file_no_cwd_header() -> Result<()> {
     bridge.initialize()?;
 
     let abs_path = file_path.to_string_lossy().to_string();
-    let text = bridge.call_tool_text("glob", &json!({ "pattern": &abs_path }))?;
+    let text = bridge.call_tool_text("glob", &json!({ "paths": [&abs_path] }))?;
 
     // Absolute file: no cwd header, absolute path in output.
     assert!(
@@ -2024,154 +1477,6 @@ fn test_grep_no_glob_cwd_scoped() -> Result<()> {
         "Grep without glob should have cwd header: {text}"
     );
     assert!(text.contains("needle"), "Should find the match: {text}");
-    Ok(())
-}
-
-#[test]
-#[ignore = "glob pattern interpretation removed (ticket 104)"]
-fn test_grep_absolute_glob_no_cwd_header() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    std::fs::write(dir.path().join("target.rs"), "fn needle() {}\n")?;
-
-    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
-    bridge.initialize()?;
-
-    let glob = format!("{}/**/*.rs", dir.path().display());
-    let text = bridge.call_tool_text("grep", &json!({ "pattern": "needle", "glob": &glob }))?;
-
-    // Absolute glob → no cwd header.
-    assert!(
-        !text.contains("cwd:"),
-        "Grep with absolute glob should not have cwd header: {text}"
-    );
-    assert!(text.contains("needle"), "Should find the match: {text}");
-    Ok(())
-}
-
-// ─── Pattern + gitignored tests ─────────────────────────────────────
-
-/// Glob pattern should exclude gitignored files by default.
-#[test]
-#[ignore = "glob pattern interpretation removed (ticket 104)"]
-fn test_glob_pattern_excludes_gitignored_by_default() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-
-    Command::new("git")
-        .args(["init"])
-        .current_dir(dir.path())
-        .output()
-        .context("git init")?;
-
-    std::fs::write(dir.path().join(".gitignore"), "*.log\n")?;
-    std::fs::write(dir.path().join("app.rs"), "fn main() {}\n")?;
-    std::fs::write(dir.path().join("debug.log"), "log data\n")?;
-
-    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
-    bridge.initialize()?;
-
-    // Pattern mode (glob), not directory mode.
-    let text = bridge.call_tool_text(
-        "glob",
-        &json!({ "pattern": format!("{}/*", dir.path().display()) }),
-    )?;
-
-    assert!(
-        text.contains("app.rs"),
-        "Should show non-ignored file: {text}"
-    );
-    assert!(
-        !text.contains("debug.log"),
-        "Should exclude gitignored file by default: {text}"
-    );
-    Ok(())
-}
-
-/// Glob pattern with `include_gitignored: true` should show gitignored
-/// files and mark them with the `[gitignored]` flag.
-#[test]
-#[ignore = "glob pattern interpretation removed (ticket 104)"]
-fn test_glob_pattern_gitignored_flag() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-
-    Command::new("git")
-        .args(["init"])
-        .current_dir(dir.path())
-        .output()
-        .context("git init")?;
-
-    std::fs::write(dir.path().join(".gitignore"), "*.log\n")?;
-    std::fs::write(dir.path().join("app.rs"), "fn main() {}\n")?;
-    std::fs::write(dir.path().join("debug.log"), "log data\n")?;
-
-    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
-    bridge.initialize()?;
-
-    // Pattern mode with include_gitignored.
-    let text = bridge.call_tool_text(
-        "glob",
-        &json!({
-            "pattern": format!("{}/*", dir.path().display()),
-            "include_gitignored": true,
-            "include_hidden": true
-        }),
-    )?;
-
-    assert!(
-        text.contains("debug.log"),
-        "Should show gitignored file: {text}"
-    );
-
-    // The gitignored flag should be on the .log file, not on app.rs.
-    let log_line = text.lines().find(|l| l.contains("debug.log")).unwrap_or("");
-    assert!(
-        log_line.contains("[gitignored]"),
-        "debug.log should have [gitignored] flag: {log_line}"
-    );
-
-    let app_line = text.lines().find(|l| l.contains("app.rs")).unwrap_or("");
-    assert!(
-        !app_line.contains("gitignored"),
-        "app.rs should NOT have gitignored flag: {app_line}"
-    );
-    Ok(())
-}
-
-/// Pattern enrichment with mockls verifies that eligible files in a
-/// pattern tree get defensive maps rendered.
-#[test]
-#[ignore = "glob pattern interpretation removed (ticket 104)"]
-fn test_glob_pattern_enrichment() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let src = dir.path().join("src");
-    std::fs::create_dir(&src)?;
-
-    // Big file above threshold.
-    std::fs::write(
-        src.join(format!("handler.{MOCK_EXT}")),
-        "fn process\nstruct Config\n\n\n\n\n\n\n\n\n",
-    )?;
-    // Small file below threshold.
-    std::fs::write(src.join(format!("util.{MOCK_EXT}")), "fn helper\n")?;
-
-    let config = "[tools.glob]\noutline_threshold = 5\nbudget = 5000\n";
-    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), Some(config))?;
-    bridge.initialize()?;
-
-    let text = bridge.call_tool_text(
-        "glob",
-        &json!({ "pattern": format!("src/**/*.{MOCK_EXT}") }),
-    )?;
-
-    // Big file should have enriched map symbols.
-    assert!(
-        text.contains("<Function>") || text.contains("<Struct>"),
-        "Pattern tree should have enriched symbols for large file: {text}"
-    );
-    // Small file should appear but without symbols.
-    assert!(
-        text.contains(&format!("util.{MOCK_EXT}")),
-        "Should list small file: {text}"
-    );
     Ok(())
 }
 
@@ -2326,7 +1631,7 @@ fn test_glob_outside_roots_lsp_warning() -> Result<()> {
     // Glob an absolute path outside workspace roots.
     let text = bridge.call_tool_text(
         "glob",
-        &json!({ "pattern": outside.path().to_string_lossy().as_ref() }),
+        &json!({ "paths": [outside.path().to_string_lossy().as_ref()] }),
     )?;
 
     // Should contain the LSP warning.

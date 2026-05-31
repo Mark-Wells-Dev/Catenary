@@ -45,7 +45,7 @@ fn test_glob_directory_basic() -> Result<()> {
 
     let text = bridge.call_tool_text(
         "glob",
-        &json!({ "pattern": temp.path().to_str().context("invalid path")? }),
+        &json!({ "paths": [temp.path().to_str().context("invalid path")?] }),
     )?;
 
     assert!(
@@ -70,7 +70,7 @@ fn test_glob_directory_symbols() -> Result<()> {
 
     let text = bridge.call_tool_text(
         "glob",
-        &json!({ "pattern": temp.path().to_str().context("invalid path")? }),
+        &json!({ "paths": [temp.path().to_str().context("invalid path")?] }),
     )?;
 
     assert!(
@@ -106,7 +106,7 @@ fn test_glob_file_outline() -> Result<()> {
 
     let text = bridge.call_tool_text(
         "glob",
-        &json!({ "pattern": script.to_str().context("file path")? }),
+        &json!({ "paths": [script.to_str().context("file path")?] }),
     )?;
 
     // Line count header
@@ -138,7 +138,7 @@ fn test_glob_directory_explicit_path() -> Result<()> {
     let mut bridge = spawn_bridge_multi_root(&[root_a, root_b], None)?;
     bridge.initialize()?;
 
-    let text = bridge.call_tool_text("glob", &json!({ "pattern": root_a }))?;
+    let text = bridge.call_tool_text("glob", &json!({ "paths": [root_a] }))?;
 
     assert!(
         text.contains("only_a.txt"),

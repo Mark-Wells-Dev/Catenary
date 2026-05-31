@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
-//! Glob tool handler: unified file/directory/pattern browsing.
+//! Glob tool handler: file/directory browsing.
 //!
-//! The `glob` tool auto-detects intent from the pattern:
-//! - File path → single file with defensive map (if grammar installed)
+//! Each path is dispatched by type:
+//! - File path → single file with defensive map (if LSP available)
 //! - Directory path → listing with line counts, maps, and flags
-//! - Glob pattern → recursive file tree with symbols
 //!
 //! Output shape is determined by LSP coverage, not result volume:
 //! - Enriched: file listing with defensive maps from symbol index (LSP available)
@@ -24,7 +23,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use super::filesystem_manager::{FilesystemManager, format_file_size};
-use super::handler::{expand_tilde, resolve_path};
 use super::session::ResolvedGlob;
 use crate::lsp::LspClientManager;
 use crate::symbol_index::{Symbol, SymbolIndex, format_symbol_kind};
@@ -32,13 +30,10 @@ use crate::symbol_index::{Symbol, SymbolIndex, format_symbol_kind};
 /// Input for the `glob` tool.
 #[derive(Debug, Deserialize)]
 pub struct GlobInput {
-    /// File path, directory path, or glob pattern.
-    pub pattern: String,
     /// Literal file/directory paths (from shell expansion).
     ///
-    /// When set, each path is dispatched through the appropriate handler
+    /// Each path is dispatched through the appropriate handler
     /// (file outline, directory listing) without glob interpretation.
-    /// `pattern` is ignored.
     #[serde(default)]
     pub paths: Vec<PathBuf>,
     /// Glob pattern to exclude from results.
@@ -93,7 +88,7 @@ struct GlobEntry {
 
 // ─── Glob tool server ─────────────────────────────────────────────────
 
-/// Glob tool server: unified file/directory/pattern browsing.
+/// Glob tool server: file/directory browsing.
 pub struct GlobServer {
     pub(super) client_manager: Arc<LspClientManager>,
     pub(super) fs_manager: Arc<FilesystemManager>,
@@ -123,16 +118,16 @@ impl GlobServer {
         let input: GlobInput = serde_json::from_value(params.clone())
             .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
 
-        let pattern = expand_tilde(&input.pattern);
-        let path = resolve_path(&pattern)?;
+        if input.paths.is_empty() {
+            return Err(anyhow!("no paths provided"));
+        }
 
-        tracing::debug!("glob: {pattern}");
+        tracing::debug!("glob: {} path(s)", input.paths.len());
 
         let page = input.page.max(1);
 
         // Compute cache key from pipeline-affecting parameters.
         let key = cache_key(&GlobCacheParams {
-            pattern: &pattern,
             paths: &input.paths,
             exclude: input.exclude.as_deref(),
             include_gitignored: input.include_gitignored,
@@ -164,27 +159,9 @@ impl GlobServer {
         // Run pipeline — handlers return full unpaginated output.
         // All positional arguments are literal paths (the shell is the
         // only glob engine). Dispatch each through the appropriate handler.
-        let full_output = if !input.paths.is_empty() {
-            self.handle_literal_paths(&input.paths, &input, exclude.as_ref(), cwd, parent_id)
-                .await?
-        } else if path.is_file() || path.is_symlink() {
-            self.client_manager
-                .ensure_and_wait_for_paths(std::slice::from_ref(&path))
-                .await;
-            super::ensure_symbols(
-                self.symbol_index.as_ref(),
-                &self.client_manager,
-                std::slice::from_ref(&path),
-                parent_id,
-            )
-            .await;
-            self.handle_glob_file(&path, cwd)
-        } else if path.is_dir() {
-            self.handle_glob_dir(&path, &input, exclude.as_ref(), cwd, parent_id)
-                .await?
-        } else {
-            format!("not found: {pattern}")
-        };
+        let full_output = self
+            .handle_literal_paths(&input.paths, &input, exclude.as_ref(), cwd, parent_id)
+            .await?;
 
         // Paginate first (borrows), then move output into cache.
         let paginated = paginate(&full_output, self.budget, page);
@@ -1055,7 +1032,7 @@ mod tests {
     #[allow(clippy::expect_used, reason = "test assertions")]
     fn test_default_page_deserialization() {
         let input: GlobInput =
-            serde_json::from_value(serde_json::json!({"pattern": "*.rs"})).expect("deserialize");
+            serde_json::from_value(serde_json::json!({"paths": ["src/"]})).expect("deserialize");
         assert_eq!(input.page, 1, "default page should be 1");
     }
 

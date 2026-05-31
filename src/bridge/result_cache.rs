@@ -147,7 +147,6 @@ pub(super) struct GrepCacheParams<'a> {
 /// Glob cache parameters (excludes `page`).
 #[derive(Hash)]
 pub(super) struct GlobCacheParams<'a> {
-    pub pattern: &'a str,
     pub paths: &'a [PathBuf],
     pub exclude: Option<&'a str>,
     pub include_gitignored: bool,

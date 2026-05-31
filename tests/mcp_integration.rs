@@ -237,7 +237,7 @@ fn test_multi_root_glob_file() -> Result<()> {
     // Get outline from root A file
     let text_a = bridge.call_tool_text(
         "glob",
-        &json!({ "pattern": script_a.to_str().context("Invalid script A path")? }),
+        &json!({ "paths": [script_a.to_str().context("Invalid script A path")?] }),
     )?;
     // Glob file mode: line count header (no symbols until 08b).
     assert!(
@@ -248,7 +248,7 @@ fn test_multi_root_glob_file() -> Result<()> {
     // Get header from root B file
     let text_b = bridge.call_tool_text(
         "glob",
-        &json!({ "pattern": script_b.to_str().context("Invalid script B path")? }),
+        &json!({ "paths": [script_b.to_str().context("Invalid script B path")?] }),
     )?;
     assert!(
         text_b.contains("(2 lines)"),
@@ -1728,7 +1728,7 @@ fn test_glob_parent_id_threading() -> Result<()> {
 
     let content = bridge.call_tool_text(
         "glob",
-        &json!({ "pattern": test_file.to_str().context("path")? }),
+        &json!({ "paths": [test_file.to_str().context("path")?] }),
     )?;
 
     // Glob returns line count header only (no LSP calls).
@@ -2366,55 +2366,6 @@ fn test_grep_enrichment_cache_hit() -> Result<()> {
     assert_eq!(
         text1, text2,
         "Second grep should match first (cache hit).\nFirst:\n{text1}\nSecond:\n{text2}"
-    );
-
-    Ok(())
-}
-
-/// Out-of-root grep via absolute glob: enrichment works but is not cached.
-/// Files outside workspace roots reach `enrich_at_position` through absolute
-/// glob override. `resolve_root` returns `None`, so the enrichment cache is
-/// bypassed. Second call must still return correct results (no stale state).
-#[test]
-#[ignore = "glob pattern interpretation removed (ticket 104)"]
-fn test_grep_enrichment_cache_skip_out_of_root() -> Result<()> {
-    let root_dir = tempfile::tempdir()?;
-    let root = root_dir.path().to_str().context("root path")?;
-    let oor_dir = tempfile::tempdir()?;
-
-    // Put a file in the workspace root (triggers server startup).
-    let root_file = root_dir.path().join(format!("root.{MOCK_LANG_A}"));
-    std::fs::write(&root_file, "fn root_fn\n")?;
-
-    // Put a file outside workspace roots.
-    let oor_file = oor_dir.path().join(format!("outside.{MOCK_LANG_A}"));
-    std::fs::write(&oor_file, "fn callee_oor\nfn caller_oor {\ncallee_oor\n}\n")?;
-
-    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
-    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
-    bridge.initialize()?;
-
-    // Grep with absolute glob targeting the out-of-root directory.
-    let abs_glob = format!("{}/**", oor_dir.path().display());
-    let text1 = bridge.call_tool_text(
-        "grep",
-        &json!({ "pattern": "caller_oor", "glob": abs_glob }),
-    )?;
-
-    assert!(
-        text1.contains("caller_oor"),
-        "Out-of-root grep should find hits, got:\n{text1}"
-    );
-
-    // Second call — must still work (no stale cache, no crash).
-    let text2 = bridge.call_tool_text(
-        "grep",
-        &json!({ "pattern": "caller_oor", "glob": abs_glob }),
-    )?;
-
-    assert!(
-        text2.contains("caller_oor"),
-        "Second out-of-root grep should still find hits, got:\n{text2}"
     );
 
     Ok(())

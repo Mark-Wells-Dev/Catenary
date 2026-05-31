@@ -231,7 +231,6 @@ impl GlobRequest {
         let mut include_hidden = self.include_hidden;
 
         let mut params = serde_json::json!({
-            "pattern": "",
             "page": self.page,
             "include_gitignored": self.include_gitignored,
         });
