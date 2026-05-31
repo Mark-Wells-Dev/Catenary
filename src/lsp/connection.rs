@@ -252,9 +252,28 @@ impl Connection {
         {
             let drain_for_close = drain_writer.clone();
             let kill = kill_token.clone();
+            let exit_server_name = server_name.to_string();
             tokio::spawn(async move {
                 tokio::select! {
-                    _ = child.wait() => {}
+                    status = child.wait() => {
+                        match status {
+                            Ok(s) if !s.success() => {
+                                info!(
+                                    source = "lsp.lifecycle",
+                                    server = exit_server_name.as_str(),
+                                    "{exit_server_name}: exited with {s}",
+                                );
+                            }
+                            Err(e) => {
+                                info!(
+                                    source = "lsp.lifecycle",
+                                    server = exit_server_name.as_str(),
+                                    "{exit_server_name}: wait failed: {e}",
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
                     () = kill.cancelled() => {
                         let _ = child.start_kill();
                     }

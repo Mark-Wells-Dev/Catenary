@@ -846,12 +846,22 @@ impl LspClientManager {
         // all protocol messages, including the init exchange itself.
         client.server().set_scope(Scope::Root(root.to_path_buf()));
 
-        client
+        if let Err(e) = client
             .initialize(
                 &[root.to_path_buf()],
                 server_def.initialization_options.clone(),
             )
-            .await?;
+            .await
+        {
+            // Tombstone: insert the dead client so `find_instance` returns
+            // `Some` on subsequent calls.  `ensure_clients_for_paths` skips
+            // bindings that already have an entry (dead or alive), and
+            // `ensure_server` bails with "is dead" — stopping the retry loop.
+            if let Some(key) = client.server().key() {
+                clients.insert(key, Arc::new(Mutex::new(client)));
+            }
+            return Err(e);
+        }
 
         if let Some((conn, session_id)) = &self.db {
             client.server().set_db(conn.clone(), session_id.clone());

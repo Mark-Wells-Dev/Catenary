@@ -458,3 +458,52 @@ async fn test_server_env_passed_to_process() -> Result<()> {
     client.shutdown().await?;
     Ok(())
 }
+
+/// Smoke test: spawn real rust-analyzer via `rustup run stable rust-analyzer`
+/// and complete the initialize handshake.
+///
+/// Ignored by default — requires a working Rust stable toolchain with
+/// rust-analyzer installed. Run with:
+///     cargo nextest run test_real_rust_analyzer_initialize --run-ignored=all
+#[tokio::test]
+#[ignore]
+async fn test_real_rust_analyzer_initialize() -> Result<()> {
+    let dir = tempdir()?;
+
+    // Create a minimal Cargo.toml so rust-analyzer has a valid project.
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"probe\"\nversion = \"0.0.0\"\nedition = \"2024\"\n",
+    )?;
+    std::fs::create_dir_all(dir.path().join("src"))?;
+    std::fs::write(dir.path().join("src/lib.rs"), "")?;
+
+    let mut client = catenary_mcp::lsp::LspClient::spawn(
+        "rustup",
+        &["run", "stable", "rust-analyzer"],
+        "rust",
+        "rust-analyzer",
+        test_logging(),
+        None,
+        None,
+    )?;
+
+    let result = client
+        .initialize(&[dir.path().to_path_buf()], None)
+        .await;
+
+    match &result {
+        Ok(v) => {
+            assert!(
+                v.get("capabilities").is_some(),
+                "initialize response should contain capabilities"
+            );
+        }
+        Err(e) => {
+            panic!("rust-analyzer initialize failed: {e}");
+        }
+    }
+
+    client.shutdown().await?;
+    Ok(())
+}
