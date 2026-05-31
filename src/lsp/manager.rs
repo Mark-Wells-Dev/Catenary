@@ -211,6 +211,32 @@ impl LspClientManager {
             .collect()
     }
 
+    /// Returns `true` if the primary server for this file path has
+    /// `suppress_symbol_kind` enabled.
+    ///
+    /// Resolves the file's language via [`FilesystemManager`], looks up the
+    /// first server binding in the language config, and checks the flag on
+    /// the corresponding [`ServerDef`](crate::config::ServerDef).
+    #[must_use]
+    pub fn suppress_symbol_kind(&self, path: &Path) -> bool {
+        let Some(lang_id) = self.fs.language_id(path) else {
+            return false;
+        };
+        let Some(lang_config) = self.config.language.get(&lang_id) else {
+            return false;
+        };
+        let Some(servers) = lang_config.servers.as_ref() else {
+            return false;
+        };
+        let Some(first) = servers.first() else {
+            return false;
+        };
+        self.config
+            .server
+            .get(&first.name)
+            .is_some_and(|def| def.suppress_symbol_kind)
+    }
+
     /// Resolves the effective root for a server instance given a file path.
     ///
     /// If the language has active `root_markers`, walks up from `file`

@@ -125,6 +125,11 @@ const TEMPLATE: &str = r#"# Catenary recommended config
 #
 # [server.rust-analyzer]
 # env = { CLIPPY_DISABLE_DOCS_LINKS = "1" }
+#
+# # Suppress SymbolKind prefix in glob output. Useful for servers
+# # where the symbol name embeds structural context (e.g., H1:, CodeBlock:).
+# [server.marksman]
+# suppress_symbol_kind = true
 
 # ── Root markers ──────────────────────────────────────────────────
 #

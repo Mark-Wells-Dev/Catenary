@@ -69,6 +69,13 @@ pub struct ServerDef {
     #[serde(default)]
     pub file_patterns: Vec<String>,
 
+    /// When `true`, glob output omits the `SymbolKind` prefix for symbols
+    /// from this server. Useful for non-programming language servers
+    /// (e.g., markdown) where the symbol name already embeds structural
+    /// context like `H1:` or `CodeBlock:`.
+    #[serde(default)]
+    pub suppress_symbol_kind: bool,
+
     /// Compiled glob patterns from `file_patterns`. Populated by
     /// [`Self::compile_patterns`] after deserialization.
     #[serde(skip)]

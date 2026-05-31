@@ -250,6 +250,37 @@ flag that distinguishes these cases. Neovim's `nvim-lspconfig` uses the
 same approach: a per-server `single_file_support` flag, opt-in, set by
 the server config maintainers who know which servers handle it well.
 
+### Suppress SymbolKind
+
+`suppress_symbol_kind = true` on `[server.*]` hides the LSP `SymbolKind`
+label (e.g., `Class`, `Struct`, `Module`) in `catenary glob` output.
+Useful for non-programming language servers where the symbol name already
+embeds structural context — for example, markdown servers that map
+headings to `Class` and code blocks to `Object`.
+
+```toml
+[server.marksman]
+suppress_symbol_kind = true
+```
+
+Without suppression:
+
+```
+file.md (45 lines)
+  :1-5 <Class> H1: Setup Guide
+  :8-12 <Struct> Table
+```
+
+With `suppress_symbol_kind = true`:
+
+```
+file.md (45 lines)
+  :1-5 H1: Setup Guide
+  :8-12 Table
+```
+
+Default is `false`.
+
 ### Root Markers
 
 `root_markers` on `[language.*]` defines project boundary files for

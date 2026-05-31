@@ -934,6 +934,7 @@ args = ["start"]
             min_severity: Some("error".into()),
             single_file: true,
             file_patterns: vec!["*.rs".into()],
+            suppress_symbol_kind: true,
             compiled_patterns: Vec::new(),
         };
 
