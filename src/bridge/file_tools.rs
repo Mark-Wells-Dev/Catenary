@@ -18,7 +18,7 @@ use anyhow::{Result, anyhow};
 use ignore::WalkBuilder;
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -89,277 +89,6 @@ struct GlobEntry {
     is_gitignored: bool,
     /// True if this is a `.catenary_snapshot_*` sidecar file.
     is_snapshot: bool,
-}
-
-// ─── Tree types ──────────────────────────────────────────────────────
-
-/// A directory node in the tree structure for glob pattern results.
-struct DirNode {
-    dirs: BTreeMap<String, Self>,
-    files: Vec<FileNode>,
-}
-
-/// A file leaf in the tree structure.
-struct FileNode {
-    name: String,
-    abs_path: PathBuf,
-    line_count: Option<usize>,
-    binary_size: Option<String>,
-    is_gitignored: bool,
-    is_snapshot: bool,
-}
-
-impl DirNode {
-    const fn new() -> Self {
-        Self {
-            dirs: BTreeMap::new(),
-            files: Vec::new(),
-        }
-    }
-
-    /// Inserts a file at the given path components.
-    fn insert(&mut self, components: &[&str], file: FileNode) {
-        if components.len() <= 1 {
-            self.files.push(file);
-        } else {
-            let dir = self
-                .dirs
-                .entry(components[0].to_owned())
-                .or_insert_with(Self::new);
-            dir.insert(&components[1..], file);
-        }
-    }
-
-    /// Removes `FileNode` leaves whose name (minus trailing `/`) duplicates
-    /// a `DirNode` key at the same level. Recurses into children.
-    ///
-    /// This happens when `**/*` matches both a directory and files inside
-    /// it — the directory appears as a `DirNode` branch (from deeper
-    /// matches) and as a `FileNode` leaf (from the directory itself).
-    fn prune_dir_dupes(&mut self) {
-        self.files
-            .retain(|f| !self.dirs.contains_key(f.name.trim_end_matches('/')));
-        for child in self.dirs.values_mut() {
-            child.prune_dir_dupes();
-        }
-    }
-
-    /// Renders the tree with tab indentation (plain: flags, no maps).
-    fn render_plain(
-        &self,
-        out: &mut String,
-        depth: usize,
-        symbol_index: Option<&SymbolIndex>,
-        outline_threshold: usize,
-        outline_suppress: &[globset::GlobMatcher],
-        fs_manager: &FilesystemManager,
-    ) {
-        let indent: String = "\t".repeat(depth);
-
-        for (name, child) in &self.dirs {
-            let _ = writeln!(out, "{indent}{name}/");
-            child.render_plain(
-                out,
-                depth + 1,
-                symbol_index,
-                outline_threshold,
-                outline_suppress,
-                fs_manager,
-            );
-        }
-
-        let mut sorted: Vec<&FileNode> = self.files.iter().collect();
-        sorted.sort_by(|a, b| a.name.cmp(&b.name));
-
-        for file in sorted {
-            let flags = compute_plain_flags(
-                file,
-                symbol_index,
-                outline_threshold,
-                outline_suppress,
-                fs_manager,
-                false,
-            );
-            render_file_node(out, file, &indent, &flags);
-        }
-    }
-
-    /// Renders the tree with tab indentation (enriched: maps + flags + dedup).
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "threading suppress set alongside existing params"
-    )]
-    fn render_enriched(
-        &self,
-        out: &mut String,
-        depth: usize,
-        outline: &HashMap<PathBuf, Vec<Symbol>>,
-        children_sets: &HashMap<PathBuf, HashSet<String>>,
-        sa_paths: &HashSet<PathBuf>,
-        suppress_kind_paths: &HashSet<PathBuf>,
-        symbol_index: &SymbolIndex,
-    ) {
-        let indent: String = "\t".repeat(depth);
-        let sym_indent = format!("{indent}\t");
-
-        for (name, child) in &self.dirs {
-            let _ = writeln!(out, "{indent}{name}/");
-            child.render_enriched(
-                out,
-                depth + 1,
-                outline,
-                children_sets,
-                sa_paths,
-                suppress_kind_paths,
-                symbol_index,
-            );
-        }
-
-        let mut sorted: Vec<(usize, &FileNode)> = self.files.iter().enumerate().collect();
-        sorted.sort_by(|a, b| a.1.name.cmp(&b.1.name));
-
-        // Build MapItems for files that have outline data (map-eligible).
-        let eligible: Vec<(usize, MapItem<'_>)> = sorted
-            .iter()
-            .filter(|(_, f)| outline.contains_key(&f.abs_path))
-            .map(|&(i, f)| {
-                (
-                    i,
-                    MapItem {
-                        name: &f.name,
-                        abs_path: &f.abs_path,
-                        line_count: f.line_count,
-                    },
-                )
-            })
-            .collect();
-
-        let map_items: Vec<MapItem<'_>> = eligible
-            .iter()
-            .map(|(_, mi)| MapItem {
-                name: mi.name,
-                abs_path: mi.abs_path,
-                line_count: mi.line_count,
-            })
-            .collect();
-
-        let (shared_groups, individual_map_indices) =
-            compute_dedup(&map_items, outline, symbol_index);
-
-        // Build lookup: original file index → shared group index.
-        let mut file_to_group: HashMap<usize, usize> = HashMap::new();
-        for (gi, (mi_indices, _)) in shared_groups.iter().enumerate() {
-            for &mi in mi_indices {
-                file_to_group.insert(eligible[mi].0, gi);
-            }
-        }
-        let individual_files: HashSet<usize> = individual_map_indices
-            .iter()
-            .map(|&mi| eligible[mi].0)
-            .collect();
-
-        let mut rendered_groups: HashSet<usize> = HashSet::new();
-
-        for &(fi, file) in &sorted {
-            if let Some(&gi) = file_to_group.get(&fi) {
-                if rendered_groups.contains(&gi) {
-                    continue;
-                }
-                rendered_groups.insert(gi);
-
-                let (mi_indices, bounding) = &shared_groups[gi];
-                let suppress = suppress_kind_paths.contains(&file.abs_path);
-                render_shared_group(
-                    out,
-                    &map_items,
-                    mi_indices,
-                    bounding,
-                    &indent,
-                    &sym_indent,
-                    suppress,
-                );
-            } else if individual_files.contains(&fi) {
-                let mut flags = Vec::new();
-                if file.is_gitignored {
-                    flags.push("gitignored");
-                }
-                if file.is_snapshot {
-                    flags.push("snapshot");
-                }
-                render_file_node(out, file, &indent, &flags);
-                if let Some(syms) = outline.get(&file.abs_path) {
-                    let cs = children_sets.get(&file.abs_path);
-                    let suppress = suppress_kind_paths.contains(&file.abs_path);
-                    render_individual_map(out, syms, cs, &sym_indent, suppress);
-                }
-            } else {
-                // Non-eligible file: flags only.
-                // Files reaching this branch are NOT in `outline` (those
-                // go through eligible → file_to_group/individual_files),
-                // so we only need the sa_paths check.
-                let mut flags = Vec::new();
-                if sa_paths.contains(&file.abs_path) {
-                    flags.push("symbols available");
-                }
-                if file.is_gitignored {
-                    flags.push("gitignored");
-                }
-                if file.is_snapshot {
-                    flags.push("snapshot");
-                }
-                render_file_node(out, file, &indent, &flags);
-            }
-        }
-    }
-}
-
-/// Renders a single `FileNode` line with optional flags.
-fn render_file_node(out: &mut String, file: &FileNode, indent: &str, flags: &[&str]) {
-    let flag_str = if flags.is_empty() {
-        String::new()
-    } else {
-        format!(" [{}]", flags.join(", "))
-    };
-
-    if file.is_snapshot {
-        let _ = writeln!(out, "{indent}{} [snapshot]", file.name);
-    } else if let Some(ref size) = file.binary_size {
-        let _ = writeln!(out, "{indent}{}  ({size}){flag_str}", file.name);
-    } else if let Some(lc) = file.line_count {
-        let _ = writeln!(out, "{indent}{}  ({lc} lines){flag_str}", file.name);
-    } else {
-        let _ = writeln!(out, "{indent}{}{flag_str}", file.name);
-    }
-}
-
-/// Computes flags for a `FileNode` in plain tree rendering.
-fn compute_plain_flags<'a>(
-    file: &FileNode,
-    symbol_index: Option<&SymbolIndex>,
-    outline_threshold: usize,
-    outline_suppress: &[globset::GlobMatcher],
-    fs_manager: &FilesystemManager,
-    map_rendered: bool,
-) -> Vec<&'a str> {
-    let mut flags = Vec::new();
-
-    if !map_rendered
-        && !file.is_snapshot
-        && has_symbols_available(&file.abs_path, symbol_index)
-        && (file.line_count.is_some_and(|lc| lc >= outline_threshold)
-            || is_outline_suppressed(&file.abs_path, outline_suppress, fs_manager))
-    {
-        flags.push("symbols available");
-    }
-
-    if file.is_gitignored {
-        flags.push("gitignored");
-    }
-    if file.is_snapshot {
-        flags.push("snapshot");
-    }
-
-    flags
 }
 
 // ─── Glob tool server ─────────────────────────────────────────────────
@@ -433,9 +162,9 @@ impl GlobServer {
         let cwd = input.cwd.as_deref();
 
         // Run pipeline — handlers return full unpaginated output.
+        // All positional arguments are literal paths (the shell is the
+        // only glob engine). Dispatch each through the appropriate handler.
         let full_output = if !input.paths.is_empty() {
-            // Literal paths from shell expansion — dispatch each through
-            // the appropriate handler (file outline, directory listing).
             self.handle_literal_paths(&input.paths, &input, exclude.as_ref(), cwd, parent_id)
                 .await?
         } else if path.is_file() || path.is_symlink() {
@@ -454,8 +183,7 @@ impl GlobServer {
             self.handle_glob_dir(&path, &input, exclude.as_ref(), cwd, parent_id)
                 .await?
         } else {
-            self.handle_glob_pattern(&pattern, &input, exclude.as_ref(), cwd, parent_id)
-                .await?
+            format!("not found: {pattern}")
         };
 
         // Paginate first (borrows), then move output into cache.
@@ -565,9 +293,8 @@ impl GlobServer {
             })
             .unwrap_or_default();
 
-        let suppress = self.client_manager.suppress_symbol_kind(path);
         for sym in syms {
-            render_symbol_line(&mut full, sym, Some(&children_set), "\t", suppress);
+            render_symbol_line(&mut full, sym, Some(&children_set), "\t");
         }
 
         full
@@ -788,13 +515,6 @@ impl GlobServer {
             let _ = writeln!(full, "{}/", canonical.display());
         }
 
-        // Pre-compute files whose server suppresses SymbolKind prefix.
-        let suppress_kind_paths: HashSet<PathBuf> = entries
-            .iter()
-            .filter(|e| !e.is_dir && self.client_manager.suppress_symbol_kind(&e.abs_path))
-            .map(|e| e.abs_path.clone())
-            .collect();
-
         // Render: enriched (maps) for eligible files, plain (flags) for the rest.
         let content = render_dir(
             &entries,
@@ -802,244 +522,9 @@ impl GlobServer {
             self.outline_threshold,
             &self.outline_suppress,
             &self.fs_manager,
-            &suppress_kind_paths,
             "\t",
         );
         full.push_str(&content);
-        Ok(full)
-    }
-
-    /// Glob pattern match across workspace roots with tree output.
-    ///
-    /// Output shape is capability-driven: enriched (maps) for files with LSP
-    /// symbols, plain (flags) for files without. Returns the full unpaginated
-    /// output.
-    ///
-    /// Absolute patterns (e.g. `/home/user/projects/*`) are searched from
-    /// the pattern's base directory rather than workspace roots.
-    #[allow(clippy::too_many_lines, reason = "sequential pipeline steps")]
-    #[allow(
-        clippy::significant_drop_tightening,
-        reason = "guard must live for all index queries"
-    )]
-    #[allow(
-        clippy::option_if_let_else,
-        reason = "if-let reads better for large divergent branches"
-    )]
-    async fn handle_glob_pattern(
-        &self,
-        pattern: &str,
-        input: &GlobInput,
-        exclude: Option<&ResolvedGlob>,
-        cwd: Option<&Path>,
-        parent_id: Option<&str>,
-    ) -> Result<String> {
-        let resolved = ResolvedGlob::new(pattern)?;
-
-        let search_roots = if let Some(override_root) = resolved.override_root() {
-            vec![override_root.to_path_buf()]
-        } else if let Some(cwd) = cwd {
-            vec![cwd.to_path_buf()]
-        } else {
-            let roots = self.client_manager.roots();
-            if roots.is_empty() {
-                vec![std::env::current_dir()?]
-            } else {
-                roots
-            }
-        };
-
-        // Build non-gitignored set for flag detection.
-        let non_ignored: HashSet<PathBuf> = if input.include_gitignored {
-            let mut set = HashSet::new();
-            for root in &search_roots {
-                let walker = WalkBuilder::new(root)
-                    .git_ignore(true)
-                    .hidden(!input.include_hidden)
-                    .build();
-                set.extend(walker.flatten().map(ignore::DirEntry::into_path));
-            }
-            set
-        } else {
-            HashSet::new()
-        };
-
-        // (abs, root, gitignored, is_dir)
-        let mut matched_entries: Vec<(PathBuf, PathBuf, bool, bool)> = Vec::new();
-
-        for root in &search_roots {
-            let walker = WalkBuilder::new(root)
-                .git_ignore(!input.include_gitignored)
-                .hidden(!input.include_hidden)
-                .build();
-
-            for entry in walker.flatten() {
-                let ft = entry.file_type();
-                let is_file = ft.is_some_and(|ft| ft.is_file());
-                let is_dir = ft.is_some_and(|ft| ft.is_dir());
-                if !is_file && !is_dir {
-                    continue;
-                }
-
-                let entry_path = entry.path();
-
-                // Skip the search root itself (walker emits it as first entry).
-                if is_dir && entry_path == root.as_path() {
-                    continue;
-                }
-
-                if resolved.is_match(entry_path, root) {
-                    if let Some(rg) = exclude
-                        && rg.is_match(entry_path, root)
-                    {
-                        continue;
-                    }
-                    let gitignored = input.include_gitignored && !non_ignored.contains(entry_path);
-                    matched_entries.push((
-                        entry_path.to_path_buf(),
-                        root.clone(),
-                        gitignored,
-                        is_dir,
-                    ));
-                }
-            }
-        }
-
-        matched_entries.sort_by(|a, b| a.0.cmp(&b.0));
-        matched_entries.dedup_by(|a, b| a.0 == b.0);
-
-        if matched_entries.is_empty() {
-            return Ok("No matches found".to_string());
-        }
-
-        // Build tree. Relative patterns: paths relative to cwd.
-        // Absolute patterns: paths relative to the (single) override root.
-        let tree_root = if let Some(cwd) = cwd {
-            cwd.to_path_buf()
-        } else {
-            search_roots[0].clone()
-        };
-
-        let mut node = DirNode::new();
-        let mut files: Vec<(PathBuf, PathBuf, bool)> = Vec::new();
-        for (abs_path, _, gitignored, is_dir) in &matched_entries {
-            let rel = abs_path.strip_prefix(&tree_root).unwrap_or(abs_path);
-            let rel_str = rel.to_string_lossy();
-            let components: Vec<&str> = rel_str.split('/').collect();
-            Self::insert_entry(
-                &mut node,
-                &mut files,
-                abs_path,
-                &tree_root,
-                *gitignored,
-                *is_dir,
-                &components,
-                self,
-            );
-        }
-        node.prune_dir_dupes();
-
-        // Populate symbol index for matched files (not directories).
-        let file_paths: Vec<PathBuf> = matched_entries
-            .iter()
-            .filter(|(_, _, _, is_dir)| !is_dir)
-            .map(|(p, _, _, _)| p.clone())
-            .collect();
-        self.client_manager
-            .ensure_and_wait_for_paths(&file_paths)
-            .await;
-        super::ensure_symbols(
-            self.symbol_index.as_ref(),
-            &self.client_manager,
-            &file_paths,
-            parent_id,
-        )
-        .await;
-
-        // Render: enriched (maps) where LSP available, plain (flags) otherwise.
-        let ts_guard = self.symbol_index.as_ref().and_then(|m| m.lock().ok());
-        let ts_ref = ts_guard.as_deref();
-
-        let mut full = String::new();
-
-        // Context header: `cwd: ~/…` for cwd-scoped, section root for absolute.
-        if let Some(cwd) = cwd {
-            let compressed = super::compress_home(cwd);
-            if self.fs_manager.resolve_root(cwd).is_some() {
-                let _ = writeln!(full, "cwd: {compressed}");
-            } else {
-                let _ = writeln!(
-                    full,
-                    "cwd: {compressed} (no LSP \u{2014} see `catenary roots -h`)"
-                );
-            }
-        } else if self.fs_manager.resolve_root(&tree_root).is_some() {
-            // Absolute pattern inside a workspace root: section header only.
-            let _ = writeln!(full, "{}", tree_root.display());
-        } else {
-            // Absolute pattern outside workspace roots: LSP warning + header.
-            let _ = writeln!(full, "(no LSP \u{2014} see `catenary roots -h`)");
-            let _ = writeln!(full, "{}", tree_root.display());
-        }
-
-        // Pre-compute files whose server suppresses SymbolKind prefix.
-        let suppress_kind_paths: HashSet<PathBuf> = file_paths
-            .iter()
-            .filter(|p| self.client_manager.suppress_symbol_kind(p))
-            .cloned()
-            .collect();
-
-        let base_depth = usize::from(cwd.is_none());
-        let mut section_content = String::new();
-        if let Some(idx) = ts_ref {
-            let group_abs: Vec<PathBuf> = files.iter().map(|(p, _, _)| p.clone()).collect();
-            let eligible: Vec<&Path> = group_abs
-                .iter()
-                .filter(|p| {
-                    is_enrichment_eligible(
-                        p,
-                        &files,
-                        self.outline_threshold,
-                        &self.outline_suppress,
-                        idx,
-                        &self.fs_manager,
-                    )
-                })
-                .map(PathBuf::as_path)
-                .collect();
-
-            if !eligible.is_empty()
-                && let Ok(outline) = idx.query_outline_batch(&eligible)
-                && !outline.is_empty()
-            {
-                let children_sets = build_children_sets(idx, &eligible);
-                let sa_paths = build_sa_paths(&files, idx);
-                node.render_enriched(
-                    &mut section_content,
-                    base_depth,
-                    &outline,
-                    &children_sets,
-                    &sa_paths,
-                    &suppress_kind_paths,
-                    idx,
-                );
-            }
-        }
-
-        // Fall back to plain if enriched produced nothing.
-        if section_content.is_empty() {
-            node.render_plain(
-                &mut section_content,
-                base_depth,
-                ts_ref,
-                self.outline_threshold,
-                &self.outline_suppress,
-                &self.fs_manager,
-            );
-        }
-
-        full.push_str(&section_content);
-
         Ok(full)
     }
 
@@ -1055,62 +540,6 @@ impl GlobServer {
                 |lc| (Some(lc), None),
             )
         })
-    }
-
-    /// Inserts a matched entry into a tree node and files list.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "avoids struct wrapper for one call site"
-    )]
-    fn insert_entry(
-        node: &mut DirNode,
-        files: &mut Vec<(PathBuf, PathBuf, bool)>,
-        abs_path: &Path,
-        root: &Path,
-        gitignored: bool,
-        is_dir: bool,
-        components: &[&str],
-        server: &Self,
-    ) {
-        if is_dir {
-            let dir_name = components.last().unwrap_or(&"").to_string();
-            let display_name = format!("{dir_name}/");
-            files.push((abs_path.to_path_buf(), root.to_path_buf(), gitignored));
-            node.insert(
-                components,
-                FileNode {
-                    name: display_name,
-                    abs_path: abs_path.to_path_buf(),
-                    line_count: None,
-                    binary_size: None,
-                    is_gitignored: gitignored,
-                    is_snapshot: false,
-                },
-            );
-        } else {
-            let metadata = std::fs::metadata(abs_path).ok();
-            let file_name = components.last().unwrap_or(&"").to_string();
-            let snap = is_snapshot(&file_name);
-
-            let (line_count, binary_size) = if snap {
-                (None, None)
-            } else {
-                server.file_info(abs_path, metadata.as_ref())
-            };
-
-            files.push((abs_path.to_path_buf(), root.to_path_buf(), gitignored));
-            node.insert(
-                components,
-                FileNode {
-                    name: file_name,
-                    abs_path: abs_path.to_path_buf(),
-                    line_count,
-                    binary_size,
-                    is_gitignored: gitignored,
-                    is_snapshot: snap,
-                },
-            );
-        }
     }
 }
 
@@ -1130,31 +559,6 @@ fn is_enrichment_eligible_entry(
         && entry.line_count.is_some_and(|lc| lc >= outline_threshold)
         && symbol_index.has_symbols_for(&entry.abs_path)
         && !is_outline_suppressed(&entry.abs_path, outline_suppress, fs_manager)
-}
-
-/// Returns `true` if a matched file in a glob pattern tree is map-eligible.
-fn is_enrichment_eligible(
-    path: &Path,
-    _matched_files: &[(PathBuf, PathBuf, bool)],
-    outline_threshold: usize,
-    outline_suppress: &[globset::GlobMatcher],
-    symbol_index: &SymbolIndex,
-    fs_manager: &FilesystemManager,
-) -> bool {
-    let metadata = std::fs::metadata(path).ok();
-    let line_count = metadata
-        .as_ref()
-        .and_then(|m| fs_manager.line_count(path, m));
-
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_default();
-
-    !is_snapshot(&name)
-        && line_count.is_some_and(|lc| lc >= outline_threshold)
-        && symbol_index.has_symbols_for(path)
-        && !is_outline_suppressed(path, outline_suppress, fs_manager)
 }
 
 /// Returns `true` if symbols are cached for the file in the index.
@@ -1186,41 +590,26 @@ fn is_snapshot(name: &str) -> bool {
 // ─── Symbol rendering ─────────────────────────────────────────────────
 
 /// Renders a single symbol line: `:start-end <Kind[, deprecated]> Name[/]`.
-///
-/// When `suppress_kind` is `true`, the `<Kind>` prefix is omitted and
-/// the symbol name is shown directly.
 fn render_symbol_line(
     out: &mut String,
     sym: &Symbol,
     children_set: Option<&HashSet<String>>,
     indent: &str,
-    suppress_kind: bool,
 ) {
+    let kind_label = format_symbol_kind(&sym.kind);
     let trailing = if children_set.is_some_and(|cs| cs.contains(&sym.name)) {
         "/"
     } else {
         ""
     };
-    if suppress_kind {
-        let deprecated = if sym.deprecated { " [deprecated]" } else { "" };
-        let _ = writeln!(
-            out,
-            "{indent}:{}-{} {}{trailing}{deprecated}",
-            sym.line + 1,
-            sym.end_line + 1,
-            sym.name,
-        );
-    } else {
-        let deprecated = if sym.deprecated { ", deprecated" } else { "" };
-        let kind_label = format_symbol_kind(&sym.kind);
-        let _ = writeln!(
-            out,
-            "{indent}:{}-{} <{kind_label}{deprecated}> {}{trailing}",
-            sym.line + 1,
-            sym.end_line + 1,
-            sym.name,
-        );
-    }
+    let deprecated = if sym.deprecated { ", deprecated" } else { "" };
+    let _ = writeln!(
+        out,
+        "{indent}:{}-{} <{kind_label}{deprecated}> {}{trailing}",
+        sym.line + 1,
+        sym.end_line + 1,
+        sym.name,
+    );
 }
 
 // ─── Structure deduplication ──────────────────────────────────────────
@@ -1330,7 +719,6 @@ fn render_shared_group(
     bounding: &[BoundingSymbol],
     indent: &str,
     sym_indent: &str,
-    suppress_kind: bool,
 ) {
     for &gi in group_indices {
         let item = &items[gi];
@@ -1343,24 +731,14 @@ fn render_shared_group(
     let _ = writeln!(out, "{indent}common structure (ranges are bounding):");
     for sym in bounding {
         let trailing = if sym.has_children { "/" } else { "" };
-        if suppress_kind {
-            let _ = writeln!(
-                out,
-                "{sym_indent}:{}-{} {}{trailing}",
-                sym.min_line + 1,
-                sym.max_end_line + 1,
-                sym.name,
-            );
-        } else {
-            let kind_label = format_symbol_kind(&sym.kind);
-            let _ = writeln!(
-                out,
-                "{sym_indent}:{}-{} <{kind_label}> {}{trailing}",
-                sym.min_line + 1,
-                sym.max_end_line + 1,
-                sym.name,
-            );
-        }
+        let kind_label = format_symbol_kind(&sym.kind);
+        let _ = writeln!(
+            out,
+            "{sym_indent}:{}-{} <{kind_label}> {}{trailing}",
+            sym.min_line + 1,
+            sym.max_end_line + 1,
+            sym.name,
+        );
     }
 }
 
@@ -1370,10 +748,9 @@ fn render_individual_map(
     syms: &[Symbol],
     children_set: Option<&HashSet<String>>,
     sym_indent: &str,
-    suppress_kind: bool,
 ) {
     for sym in syms {
-        render_symbol_line(out, sym, children_set, sym_indent, suppress_kind);
+        render_symbol_line(out, sym, children_set, sym_indent);
     }
 }
 
@@ -1381,22 +758,13 @@ fn render_individual_map(
 
 /// Renders a directory listing: enriched (maps) for files with LSP
 /// symbols, plain (flags) for the rest.
-///
-/// `suppress_kind_paths` contains files whose server has
-/// `suppress_symbol_kind = true` — the `<Kind>` prefix is omitted
-/// for their symbols.
 #[allow(clippy::too_many_lines, reason = "sequential rendering pipeline")]
-#[allow(
-    clippy::too_many_arguments,
-    reason = "threading suppress set alongside existing params"
-)]
 fn render_dir(
     entries: &[GlobEntry],
     symbol_index: Option<&SymbolIndex>,
     outline_threshold: usize,
     outline_suppress: &[globset::GlobMatcher],
     fs_manager: &FilesystemManager,
-    suppress_kind_paths: &HashSet<PathBuf>,
     indent: &str,
 ) -> String {
     let sym_indent = format!("{indent}\t");
@@ -1505,7 +873,6 @@ fn render_dir(
             }
             rendered_groups.insert(gi);
             let (mi_indices, bounding) = &shared_groups[gi];
-            let suppress = suppress_kind_paths.contains(&f.abs_path);
             render_shared_group(
                 &mut result,
                 &map_items,
@@ -1513,15 +880,13 @@ fn render_dir(
                 bounding,
                 indent,
                 &sym_indent,
-                suppress,
             );
         } else if individual_entries.contains(&ei) {
             let flags = compute_entry_flags(f, Some(idx), 0, outline_suppress, fs_manager, true);
             render_entry_line(&mut result, f, &flags, indent);
             if let Some(syms) = outline.get(&f.abs_path) {
                 let cs = children_sets.get(&f.abs_path);
-                let suppress = suppress_kind_paths.contains(&f.abs_path);
-                render_individual_map(&mut result, syms, cs, &sym_indent, suppress);
+                render_individual_map(&mut result, syms, cs, &sym_indent);
             }
         } else {
             // Non-eligible file: plain flags.
@@ -1681,18 +1046,6 @@ fn build_children_sets(
     result
 }
 
-/// Builds the set of paths that have grammars available (for `[symbols available]`).
-fn build_sa_paths(
-    matched_files: &[(PathBuf, PathBuf, bool)],
-    symbol_index: &SymbolIndex,
-) -> HashSet<PathBuf> {
-    matched_files
-        .iter()
-        .filter(|(p, _, _)| symbol_index.has_symbols_for(p))
-        .map(|(p, _, _)| p.clone())
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1700,412 +1053,10 @@ mod tests {
 
     #[test]
     #[allow(clippy::expect_used, reason = "test assertions")]
-    fn test_per_root_tier2_rendering() {
-        let mut node = DirNode::new();
-
-        node.insert(
-            &["main.rs"],
-            FileNode {
-                name: "main.rs".to_string(),
-                abs_path: PathBuf::from("/test/root/main.rs"),
-                line_count: Some(10),
-                binary_size: None,
-                is_gitignored: false,
-                is_snapshot: false,
-            },
-        );
-        node.insert(
-            &["lib.rs"],
-            FileNode {
-                name: "lib.rs".to_string(),
-                abs_path: PathBuf::from("/test/root/lib.rs"),
-                line_count: Some(5),
-                binary_size: None,
-                is_gitignored: false,
-                is_snapshot: false,
-            },
-        );
-
-        let mut tier2 = String::new();
-        node.render_plain(&mut tier2, 0, None, 200, &[], &FilesystemManager::new());
-
-        // Files sorted alphabetically with exact format.
-        assert_eq!(
-            tier2, "lib.rs  (5 lines)\nmain.rs  (10 lines)\n",
-            "render_plain should produce sorted file listing with line counts"
-        );
-    }
-
-    #[test]
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    fn test_render_plain_nested_indentation() {
-        let mut node = DirNode::new();
-
-        node.insert(
-            &["sub", "inner.rs"],
-            FileNode {
-                name: "inner.rs".to_string(),
-                abs_path: PathBuf::from("/test/sub/inner.rs"),
-                line_count: Some(3),
-                binary_size: None,
-                is_gitignored: false,
-                is_snapshot: false,
-            },
-        );
-        node.insert(
-            &["top.rs"],
-            FileNode {
-                name: "top.rs".to_string(),
-                abs_path: PathBuf::from("/test/top.rs"),
-                line_count: Some(5),
-                binary_size: None,
-                is_gitignored: false,
-                is_snapshot: false,
-            },
-        );
-
-        let mut out = String::new();
-        node.render_plain(&mut out, 0, None, 200, &[], &FilesystemManager::new());
-
-        // Dirs at depth 0 (no tab), nested files at depth 1 (one tab).
-        assert_eq!(
-            out, "sub/\n\tinner.rs  (3 lines)\ntop.rs  (5 lines)\n",
-            "nested directory should increase indentation depth"
-        );
-    }
-
-    #[test]
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    fn test_compute_plain_flags_symbols_available() {
-        let idx = SymbolIndex::new().expect("create index");
-        let path = PathBuf::from("/test/big.rs");
-
-        idx.populate_from_document_symbols(
-            &path,
-            &serde_json::json!([{
-                "name": "foo",
-                "kind": 12,
-                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 2, "character": 1 } },
-                "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 6 } }
-            }]),
-        )
-        .expect("populate");
-
-        let file = FileNode {
-            name: "big.rs".to_string(),
-            abs_path: path,
-            line_count: Some(200),
-            binary_size: None,
-            is_gitignored: false,
-            is_snapshot: false,
-        };
-        let fs = FilesystemManager::new();
-
-        // Above threshold, symbols exist, not rendered, not snapshot.
-        let flags = compute_plain_flags(&file, Some(&idx), 100, &[], &fs, false);
-        assert_eq!(flags, vec!["symbols available"]);
-
-        // map_rendered = true suppresses the flag.
-        let flags = compute_plain_flags(&file, Some(&idx), 100, &[], &fs, true);
-        assert!(
-            !flags.contains(&"symbols available"),
-            "map_rendered should suppress flag: {flags:?}"
-        );
-    }
-
-    #[test]
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    fn test_compute_plain_flags_snapshot_suppresses() {
-        let idx = SymbolIndex::new().expect("create index");
-        let path = PathBuf::from("/test/snap.rs");
-
-        idx.populate_from_document_symbols(
-            &path,
-            &serde_json::json!([{
-                "name": "bar",
-                "kind": 12,
-                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 1, "character": 1 } },
-                "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 6 } }
-            }]),
-        )
-        .expect("populate");
-
-        let file = FileNode {
-            name: "snap.rs".to_string(),
-            abs_path: path,
-            line_count: Some(200),
-            binary_size: None,
-            is_gitignored: false,
-            is_snapshot: true,
-        };
-        let fs = FilesystemManager::new();
-
-        let flags = compute_plain_flags(&file, Some(&idx), 100, &[], &fs, false);
-        assert!(
-            !flags.contains(&"symbols available"),
-            "snapshot should suppress symbols available: {flags:?}"
-        );
-        assert_eq!(flags, vec!["snapshot"]);
-    }
-
-    #[test]
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    fn test_compute_plain_flags_below_threshold() {
-        let idx = SymbolIndex::new().expect("create index");
-        let path = PathBuf::from("/test/small.rs");
-
-        idx.populate_from_document_symbols(
-            &path,
-            &serde_json::json!([{
-                "name": "tiny",
-                "kind": 12,
-                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 1, "character": 1 } },
-                "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 7 } }
-            }]),
-        )
-        .expect("populate");
-
-        let file = FileNode {
-            name: "small.rs".to_string(),
-            abs_path: path,
-            line_count: Some(50),
-            binary_size: None,
-            is_gitignored: false,
-            is_snapshot: false,
-        };
-        let fs = FilesystemManager::new();
-
-        // Below threshold, no suppress → no flag.
-        let flags = compute_plain_flags(&file, Some(&idx), 100, &[], &fs, false);
-        assert!(
-            flags.is_empty(),
-            "below threshold should have no flags: {flags:?}"
-        );
-    }
-
-    #[test]
-    fn test_compute_plain_flags_gitignored() {
-        let file = FileNode {
-            name: "debug.log".to_string(),
-            abs_path: PathBuf::from("/test/debug.log"),
-            line_count: Some(10),
-            binary_size: None,
-            is_gitignored: true,
-            is_snapshot: false,
-        };
-        let fs = FilesystemManager::new();
-
-        let flags = compute_plain_flags(&file, None, 200, &[], &fs, false);
-        assert_eq!(flags, vec!["gitignored"]);
-    }
-
-    #[test]
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    fn test_compute_plain_flags_suppressed_below_threshold() {
-        let idx = SymbolIndex::new().expect("create index");
-        let path = PathBuf::from("/test/suppressed.rs");
-
-        idx.populate_from_document_symbols(
-            &path,
-            &serde_json::json!([{
-                "name": "func",
-                "kind": 12,
-                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 1, "character": 1 } },
-                "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 7 } }
-            }]),
-        )
-        .expect("populate");
-
-        let file = FileNode {
-            name: "suppressed.rs".to_string(),
-            abs_path: path,
-            line_count: Some(50), // below threshold
-            binary_size: None,
-            is_gitignored: false,
-            is_snapshot: false,
-        };
-        let fs = FilesystemManager::new();
-
-        // Below threshold BUT outline_suppress matches → flag via || branch.
-        let suppress = vec![
-            Glob::new("**/*.rs")
-                .expect("compile glob")
-                .compile_matcher(),
-        ];
-        let flags = compute_plain_flags(&file, Some(&idx), 100, &suppress, &fs, false);
-        assert_eq!(
-            flags,
-            vec!["symbols available"],
-            "suppressed file below threshold should still have flag"
-        );
-    }
-
-    #[test]
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    fn test_render_enriched_symbols_available_flag() {
-        let idx = SymbolIndex::new().expect("create index");
-
-        // File A: has symbols in outline → gets individual map.
-        let path_a = PathBuf::from("/test/a.rs");
-        idx.populate_from_document_symbols(
-            &path_a,
-            &serde_json::json!([{
-                "name": "foo",
-                "kind": 12,
-                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 2, "character": 1 } },
-                "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 6 } }
-            }]),
-        )
-        .expect("populate a");
-
-        // File B: has symbols in index but NOT in outline.
-        let path_b = PathBuf::from("/test/b.rs");
-        idx.populate_from_document_symbols(
-            &path_b,
-            &serde_json::json!([{
-                "name": "bar",
-                "kind": 12,
-                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 1, "character": 1 } },
-                "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 6 } }
-            }]),
-        )
-        .expect("populate b");
-
-        let mut node = DirNode::new();
-        node.insert(
-            &["a.rs"],
-            FileNode {
-                name: "a.rs".to_string(),
-                abs_path: path_a.clone(),
-                line_count: Some(10),
-                binary_size: None,
-                is_gitignored: false,
-                is_snapshot: false,
-            },
-        );
-        node.insert(
-            &["b.rs"],
-            FileNode {
-                name: "b.rs".to_string(),
-                abs_path: path_b.clone(),
-                line_count: Some(5),
-                binary_size: None,
-                is_gitignored: false,
-                is_snapshot: false,
-            },
-        );
-
-        // Outline only includes a.rs — b.rs is non-eligible.
-        let mut outline = HashMap::new();
-        outline.insert(
-            path_a.clone(),
-            vec![Symbol {
-                name: "foo".to_string(),
-                kind: "function".to_string(),
-                line: 0,
-                end_line: 2,
-                scope: None,
-                scope_kind: None,
-                deprecated: false,
-            }],
-        );
-
-        let children_sets = HashMap::new();
-        let sa_paths: HashSet<PathBuf> = [path_a, path_b].into();
-
-        let mut out = String::new();
-        let suppress_kind_paths = HashSet::new();
-        node.render_enriched(
-            &mut out,
-            0,
-            &outline,
-            &children_sets,
-            &sa_paths,
-            &suppress_kind_paths,
-            &idx,
-        );
-
-        // a.rs should have its symbol map rendered.
-        assert!(
-            out.contains("<Function> foo"),
-            "a.rs should have symbol in map: {out:?}"
-        );
-        // b.rs should show [symbols available] (in sa_paths, not in outline).
-        let b_line = out
-            .lines()
-            .find(|l| l.contains("b.rs"))
-            .expect("b.rs in output");
-        assert!(
-            b_line.contains("[symbols available]"),
-            "b.rs should have [symbols available]: {b_line}"
-        );
-        // a.rs header should NOT have [symbols available] (it has a map).
-        let a_line = out
-            .lines()
-            .find(|l| l.contains("a.rs"))
-            .expect("a.rs in output");
-        assert!(
-            !a_line.contains("[symbols available]"),
-            "a.rs with map should not have [symbols available]: {a_line}"
-        );
-    }
-
-    #[test]
-    #[allow(clippy::expect_used, reason = "test assertions")]
     fn test_default_page_deserialization() {
         let input: GlobInput =
             serde_json::from_value(serde_json::json!({"pattern": "*.rs"})).expect("deserialize");
         assert_eq!(input.page, 1, "default page should be 1");
-    }
-
-    #[test]
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    fn test_prune_dir_dupes() {
-        let mut node = DirNode::new();
-
-        // Simulate `**/*` matching both "sub" (dir) and "sub/file.rs" (file).
-        // The dir match inserts a FileNode leaf at root level.
-        node.insert(
-            &["sub"],
-            FileNode {
-                name: "sub/".to_string(),
-                abs_path: PathBuf::from("/r/sub"),
-                line_count: None,
-                binary_size: None,
-                is_gitignored: false,
-                is_snapshot: false,
-            },
-        );
-        // The file match creates a DirNode branch and inserts inside it.
-        node.insert(
-            &["sub", "file.rs"],
-            FileNode {
-                name: "file.rs".to_string(),
-                abs_path: PathBuf::from("/r/sub/file.rs"),
-                line_count: Some(10),
-                binary_size: None,
-                is_gitignored: false,
-                is_snapshot: false,
-            },
-        );
-
-        // Before prune: root has both a "sub" DirNode and a "sub/" FileNode.
-        assert_eq!(node.files.len(), 1, "should have dir leaf before prune");
-        assert_eq!(node.dirs.len(), 1, "should have dir branch");
-
-        node.prune_dir_dupes();
-
-        // After prune: the duplicate FileNode leaf is removed.
-        assert!(
-            node.files.is_empty(),
-            "dir leaf should be pruned: {:?}",
-            node.files.iter().map(|f| &f.name).collect::<Vec<_>>()
-        );
-        assert_eq!(node.dirs.len(), 1, "dir branch should remain");
-
-        // The file inside the DirNode should be unaffected.
-        let sub = node.dirs.get("sub").expect("sub dir should exist");
-        assert_eq!(sub.files.len(), 1, "nested file should remain");
     }
 
     // ─── is_enrichment_eligible_entry ────────────────────────────────
@@ -2481,7 +1432,7 @@ mod tests {
         };
 
         let mut out = String::new();
-        render_symbol_line(&mut out, &sym, None, "\t", false);
+        render_symbol_line(&mut out, &sym, None, "\t");
 
         assert_eq!(out, "\t:10-20 <Function> my_func\n");
     }
@@ -2500,7 +1451,7 @@ mod tests {
 
         let children: HashSet<String> = ["MyStruct".to_string()].into();
         let mut out = String::new();
-        render_symbol_line(&mut out, &sym, Some(&children), "\t", false);
+        render_symbol_line(&mut out, &sym, Some(&children), "\t");
 
         assert_eq!(out, "\t:1-11 <Struct> MyStruct/\n");
     }
@@ -2518,7 +1469,7 @@ mod tests {
         };
 
         let mut out = String::new();
-        render_symbol_line(&mut out, &sym, None, "", false);
+        render_symbol_line(&mut out, &sym, None, "");
 
         assert_eq!(out, ":5-7 <Function, deprecated> old_fn\n");
     }
@@ -2538,65 +1489,10 @@ mod tests {
         // Children set exists but doesn't contain this symbol.
         let children: HashSet<String> = ["OtherThing".to_string()].into();
         let mut out = String::new();
-        render_symbol_line(&mut out, &sym, Some(&children), "", false);
+        render_symbol_line(&mut out, &sym, Some(&children), "");
 
         // No trailing slash since not in children set.
         assert_eq!(out, ":1-6 <Function> standalone\n");
-    }
-
-    #[test]
-    fn test_render_symbol_line_suppress_kind() {
-        let sym = Symbol {
-            name: "H1: Setup Guide".to_string(),
-            kind: "class".to_string(),
-            line: 0,
-            end_line: 44,
-            scope: None,
-            scope_kind: None,
-            deprecated: false,
-        };
-
-        let mut out = String::new();
-        render_symbol_line(&mut out, &sym, None, "\t", true);
-
-        assert_eq!(out, "\t:1-45 H1: Setup Guide\n");
-    }
-
-    #[test]
-    fn test_render_symbol_line_suppress_kind_with_children() {
-        let sym = Symbol {
-            name: "H1: Setup Guide".to_string(),
-            kind: "class".to_string(),
-            line: 0,
-            end_line: 44,
-            scope: None,
-            scope_kind: None,
-            deprecated: false,
-        };
-
-        let children: HashSet<String> = ["H1: Setup Guide".to_string()].into();
-        let mut out = String::new();
-        render_symbol_line(&mut out, &sym, Some(&children), "\t", true);
-
-        assert_eq!(out, "\t:1-45 H1: Setup Guide/\n");
-    }
-
-    #[test]
-    fn test_render_symbol_line_suppress_kind_deprecated() {
-        let sym = Symbol {
-            name: "H2: Old Section".to_string(),
-            kind: "class".to_string(),
-            line: 4,
-            end_line: 6,
-            scope: None,
-            scope_kind: None,
-            deprecated: true,
-        };
-
-        let mut out = String::new();
-        render_symbol_line(&mut out, &sym, None, "", true);
-
-        assert_eq!(out, ":5-7 H2: Old Section [deprecated]\n");
     }
 
     // ─── make_fingerprint ───────────────────────────────────────────
@@ -2679,201 +1575,6 @@ mod tests {
             make_fingerprint(&syms_a),
             make_fingerprint(&syms_b),
             "same symbols at different lines should have identical fingerprints"
-        );
-    }
-
-    // ─── is_enrichment_eligible (pattern tree) ────────────────────────
-
-    /// Generates a string with `n` lines for tests that need files of a
-    /// specific line count.
-    fn gen_lines(n: usize) -> String {
-        "x\n".repeat(n)
-    }
-
-    #[test]
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    fn test_enrichment_eligible_regular_file() {
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let path = dir.path().join("big.rs");
-        // 200 lines to exceed threshold of 100.
-        std::fs::write(&path, gen_lines(200)).expect("write file");
-
-        let idx = SymbolIndex::new().expect("create index");
-        idx.populate_from_document_symbols(
-            &path,
-            &serde_json::json!([{
-                "name": "sym",
-                "kind": 12,
-                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 1, "character": 1 } },
-                "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 6 } }
-            }]),
-        )
-        .expect("populate");
-
-        let fs = FilesystemManager::new();
-        let matched = vec![(path.clone(), dir.path().to_path_buf(), false)];
-
-        assert!(
-            is_enrichment_eligible(&path, &matched, 100, &[], &idx, &fs),
-            "regular file above threshold with symbols should be eligible"
-        );
-    }
-
-    #[test]
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    fn test_enrichment_eligible_snapshot_file() {
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let path = dir.path().join("handler.catenary_snapshot_5.rs");
-        std::fs::write(&path, gen_lines(200)).expect("write file");
-
-        let idx = SymbolIndex::new().expect("create index");
-        idx.populate_from_document_symbols(
-            &path,
-            &serde_json::json!([{
-                "name": "sym",
-                "kind": 12,
-                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 1, "character": 1 } },
-                "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 6 } }
-            }]),
-        )
-        .expect("populate");
-
-        let fs = FilesystemManager::new();
-        let matched = vec![(path.clone(), dir.path().to_path_buf(), false)];
-
-        assert!(
-            !is_enrichment_eligible(&path, &matched, 100, &[], &idx, &fs),
-            "snapshot file should not be enrichment eligible"
-        );
-    }
-
-    #[test]
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    fn test_enrichment_eligible_below_threshold() {
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let path = dir.path().join("small.rs");
-        // 10 lines, below threshold of 100.
-        std::fs::write(&path, gen_lines(10)).expect("write file");
-
-        let idx = SymbolIndex::new().expect("create index");
-        idx.populate_from_document_symbols(
-            &path,
-            &serde_json::json!([{
-                "name": "sym",
-                "kind": 12,
-                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 1, "character": 1 } },
-                "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 6 } }
-            }]),
-        )
-        .expect("populate");
-
-        let fs = FilesystemManager::new();
-        let matched = vec![(path.clone(), dir.path().to_path_buf(), false)];
-
-        assert!(
-            !is_enrichment_eligible(&path, &matched, 100, &[], &idx, &fs),
-            "file below threshold should not be eligible"
-        );
-    }
-
-    #[test]
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    fn test_enrichment_eligible_no_symbols() {
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let path = dir.path().join("no_syms.rs");
-        std::fs::write(&path, gen_lines(200)).expect("write file");
-
-        let idx = SymbolIndex::new().expect("create index");
-        // Don't populate symbols.
-        let fs = FilesystemManager::new();
-        let matched = vec![(path.clone(), dir.path().to_path_buf(), false)];
-
-        assert!(
-            !is_enrichment_eligible(&path, &matched, 100, &[], &idx, &fs),
-            "file without symbols should not be eligible"
-        );
-    }
-
-    #[test]
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    fn test_enrichment_eligible_suppressed() {
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let path = dir.path().join("denied.rs");
-        std::fs::write(&path, gen_lines(200)).expect("write file");
-
-        let idx = SymbolIndex::new().expect("create index");
-        idx.populate_from_document_symbols(
-            &path,
-            &serde_json::json!([{
-                "name": "sym",
-                "kind": 12,
-                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 1, "character": 1 } },
-                "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 6 } }
-            }]),
-        )
-        .expect("populate");
-
-        let suppress = vec![
-            Glob::new("**/*.rs")
-                .expect("compile glob")
-                .compile_matcher(),
-        ];
-        let fs = FilesystemManager::new();
-        let matched = vec![(path.clone(), dir.path().to_path_buf(), false)];
-
-        assert!(
-            !is_enrichment_eligible(&path, &matched, 100, &suppress, &idx, &fs),
-            "suppressed file should not be eligible"
-        );
-    }
-
-    #[test]
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    fn test_enrichment_eligible_at_threshold_boundary() {
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let path = dir.path().join("boundary.rs");
-        // Exactly 100 lines for threshold of 100.
-        std::fs::write(&path, gen_lines(100)).expect("write file");
-
-        let idx = SymbolIndex::new().expect("create index");
-        idx.populate_from_document_symbols(
-            &path,
-            &serde_json::json!([{
-                "name": "sym",
-                "kind": 12,
-                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 1, "character": 1 } },
-                "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 6 } }
-            }]),
-        )
-        .expect("populate");
-
-        let fs = FilesystemManager::new();
-        let matched = vec![(path.clone(), dir.path().to_path_buf(), false)];
-
-        assert!(
-            is_enrichment_eligible(&path, &matched, 100, &[], &idx, &fs),
-            "file at exact threshold should be eligible"
-        );
-
-        // One line below threshold.
-        let path_below = dir.path().join("below.rs");
-        std::fs::write(&path_below, gen_lines(99)).expect("write file");
-
-        idx.populate_from_document_symbols(
-            &path_below,
-            &serde_json::json!([{
-                "name": "sym",
-                "kind": 12,
-                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 1, "character": 1 } },
-                "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 6 } }
-            }]),
-        )
-        .expect("populate");
-
-        let matched_below = vec![(path_below.clone(), dir.path().to_path_buf(), false)];
-        assert!(
-            !is_enrichment_eligible(&path_below, &matched_below, 100, &[], &idx, &fs),
-            "file one below threshold should not be eligible"
         );
     }
 
@@ -3105,7 +1806,7 @@ mod tests {
         }];
 
         let mut out = String::new();
-        render_shared_group(&mut out, &items, &[0, 1], &bounding, "", "\t", false);
+        render_shared_group(&mut out, &items, &[0, 1], &bounding, "", "\t");
 
         // File with line count shows "(N lines)".
         assert!(
@@ -3146,40 +1847,11 @@ mod tests {
         }];
 
         let mut out = String::new();
-        render_shared_group(&mut out, &items, &[0], &bounding, "", "\t", false);
+        render_shared_group(&mut out, &items, &[0], &bounding, "", "\t");
 
         assert!(
             out.contains("<Struct> MyStruct/\n"),
             "children should produce trailing slash: {out:?}"
-        );
-    }
-
-    #[test]
-    fn test_render_shared_group_suppress_kind() {
-        let items = vec![MapItem {
-            name: "doc.md",
-            abs_path: Path::new("/test/doc.md"),
-            line_count: Some(45),
-        }];
-
-        let bounding = vec![BoundingSymbol {
-            name: "H1: Setup Guide".to_string(),
-            kind: "class".to_string(),
-            min_line: 0,
-            max_end_line: 44,
-            has_children: false,
-        }];
-
-        let mut out = String::new();
-        render_shared_group(&mut out, &items, &[0], &bounding, "", "\t", true);
-
-        assert!(
-            out.contains("\t:1-45 H1: Setup Guide\n"),
-            "suppress_kind should omit <Class> prefix: {out:?}"
-        );
-        assert!(
-            !out.contains("<Class>"),
-            "should not contain kind label: {out:?}"
         );
     }
 

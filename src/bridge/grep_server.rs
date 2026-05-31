@@ -32,14 +32,12 @@ use crate::symbol_index::{
 pub struct GrepInput {
     /// Search pattern (supports `|` for alternation, passed to ripgrep).
     pub pattern: String,
-    /// Glob pattern to scope the search (optional).
-    #[serde(default)]
-    pub glob: Option<String>,
-    /// Literal file/directory paths (from shell expansion).
+    /// Literal file/directory paths to scope the search.
     ///
-    /// When set, these replace glob/cwd as the search scope. Each path
-    /// is used as a direct root for the file walker — files are searched
-    /// directly, directories are walked. No glob matching is applied.
+    /// Each path is used as a direct root for the file walker — files
+    /// are searched directly, directories are walked. No glob matching
+    /// is applied. When empty, the search scopes to `cwd` or all
+    /// workspace roots.
     #[serde(default)]
     pub paths: Vec<PathBuf>,
     /// Glob pattern to exclude from matches (optional).
@@ -54,7 +52,7 @@ pub struct GrepInput {
     /// Page number for paged results (default: 1).
     #[serde(default = "default_page")]
     pub page: usize,
-    /// Working directory for cwd-scoped searches (no glob or relative glob).
+    /// Working directory for cwd-scoped searches.
     #[serde(default)]
     pub cwd: Option<PathBuf>,
 }
@@ -122,7 +120,6 @@ impl GrepServer {
         // Compute cache key from pipeline-affecting parameters.
         let key = cache_key(&GrepCacheParams {
             pattern: &input.pattern,
-            glob: input.glob.as_deref(),
             paths: &input.paths,
             exclude: input.exclude.as_deref(),
             include_gitignored: input.include_gitignored,
@@ -148,7 +145,6 @@ impl GrepServer {
         for arm in &arms {
             let arm_input = GrepInput {
                 pattern: arm.clone(),
-                glob: input.glob.clone(),
                 paths: input.paths.clone(),
                 exclude: input.exclude.clone(),
                 include_gitignored: input.include_gitignored,
@@ -192,27 +188,15 @@ impl GrepServer {
     ) -> Result<String> {
         debug!("Grep request: pattern={}", input.pattern);
 
-        // Literal paths bypass glob resolution — each path is a direct
-        // search root (files searched directly, directories walked).
-        let (resolved_glob, effective_roots) = if input.paths.is_empty() {
-            let rg = input
-                .glob
-                .as_deref()
-                .map(ResolvedGlob::new)
-                .transpose()?
-                .map(Arc::new);
-            let roots = if let Some(ref rg) = rg
-                && let Some(override_root) = rg.override_root()
-            {
-                vec![override_root.to_path_buf()]
-            } else if let Some(cwd) = cwd {
-                vec![cwd.to_path_buf()]
-            } else {
-                self.client_manager.roots()
-            };
-            (rg, roots)
+        // All paths are literal — no glob interpretation. When no paths
+        // are provided, scope to cwd or all workspace roots.
+        let effective_roots = if input.paths.is_empty() {
+            cwd.map_or_else(
+                || self.client_manager.roots(),
+                |cwd| vec![cwd.to_path_buf()],
+            )
         } else {
-            (None, input.paths.clone())
+            input.paths.clone()
         };
         let resolved_exclude = input
             .exclude
@@ -225,7 +209,6 @@ impl GrepServer {
         let rg = Self::ripgrep_matches(
             &input.pattern,
             &effective_roots,
-            resolved_glob.as_ref(),
             resolved_exclude.as_ref(),
             input.include_gitignored,
             input.include_hidden,
@@ -982,7 +965,6 @@ impl GrepServer {
     fn ripgrep_matches(
         pattern: &str,
         roots: &[PathBuf],
-        glob: Option<&Arc<ResolvedGlob>>,
         exclude: Option<&Arc<ResolvedGlob>>,
         include_gitignored: bool,
         include_hidden: bool,
@@ -1010,7 +992,6 @@ impl GrepServer {
 
             walker.run(|| {
                 let matcher = matcher.clone();
-                let glob = glob.cloned();
                 let exclude = exclude.cloned();
                 let root = root.clone();
                 let fs_manager = Arc::clone(fs_manager);
@@ -1028,11 +1009,6 @@ impl GrepServer {
                         return WalkState::Continue;
                     }
 
-                    if let Some(rg) = &glob
-                        && !rg.is_match(path, &root)
-                    {
-                        return WalkState::Continue;
-                    }
                     if let Some(rg) = &exclude
                         && rg.is_match(path, &root)
                     {

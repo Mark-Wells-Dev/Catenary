@@ -2376,6 +2376,7 @@ fn test_grep_enrichment_cache_hit() -> Result<()> {
 /// glob override. `resolve_root` returns `None`, so the enrichment cache is
 /// bypassed. Second call must still return correct results (no stale state).
 #[test]
+#[ignore = "glob pattern interpretation removed (ticket 104)"]
 fn test_grep_enrichment_cache_skip_out_of_root() -> Result<()> {
     let root_dir = tempfile::tempdir()?;
     let root = root_dir.path().to_str().context("root path")?;

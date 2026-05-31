@@ -537,9 +537,8 @@ impl BridgeProcess {
     /// Calls grep via the IPC socket and returns the output text.
     ///
     /// `args` should contain the grep parameters (`pattern`, and optionally
-    /// `glob`, `exclude`, `page`, `include_gitignored`, `include_hidden`).
-    /// A `directory` field, if present, is used as the cwd for pattern
-    /// resolution (matching the old MCP `directory` parameter semantics).
+    /// `paths`, `exclude`, `page`, `include_gitignored`, `include_hidden`).
+    /// A `directory` field, if present, is used as the cwd.
     pub fn call_grep(&self, args: &Value) -> Result<String> {
         let socket_path = self.wait_for_ipc_socket()?;
         let mut request = args.clone();
@@ -559,14 +558,20 @@ impl BridgeProcess {
 
     /// Calls glob via the IPC socket and returns the output text.
     ///
-    /// `args` should contain the glob parameters (`pattern`, and optionally
+    /// `args` should contain the glob parameters (`paths`, and optionally
     /// `exclude`, `page`, `include_gitignored`, `include_hidden`).
-    /// A `directory` field, if present, is used as the cwd for pattern
-    /// resolution.
+    /// A `pattern` field is automatically migrated to `paths: [pattern]`.
+    /// A `directory` field, if present, is used as the cwd.
     pub fn call_glob(&self, args: &Value) -> Result<String> {
         let socket_path = self.wait_for_ipc_socket()?;
         let mut request = args.clone();
         let obj = request.as_object_mut().context("args must be an object")?;
+        // Migrate legacy `pattern` field to `paths` array.
+        if let Some(pattern) = obj.remove("pattern")
+            && obj.get("paths").is_none()
+        {
+            obj.insert("paths".to_string(), json!([pattern]));
+        }
         obj.insert("method".to_string(), json!("tool/glob"));
         self.resolve_ipc_cwd(obj);
 

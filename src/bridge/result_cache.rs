@@ -136,7 +136,6 @@ fn count_pages(output: &str, budget: usize) -> usize {
 #[derive(Hash)]
 pub(super) struct GrepCacheParams<'a> {
     pub pattern: &'a str,
-    pub glob: Option<&'a str>,
     pub paths: &'a [PathBuf],
     pub exclude: Option<&'a str>,
     pub include_gitignored: bool,
@@ -270,7 +269,6 @@ mod tests {
     fn cache_key_differs_for_different_params() {
         let params_a = GrepCacheParams {
             pattern: "foo",
-            glob: None,
             paths: &[],
             exclude: None,
             include_gitignored: false,
@@ -280,7 +278,6 @@ mod tests {
         };
         let params_b = GrepCacheParams {
             pattern: "bar",
-            glob: None,
             paths: &[],
             exclude: None,
             include_gitignored: false,
@@ -295,8 +292,7 @@ mod tests {
     fn cache_key_same_for_same_params() {
         let params_a = GrepCacheParams {
             pattern: "foo",
-            glob: Some("*.rs"),
-            paths: &[],
+            paths: &[PathBuf::from("src/main.rs")],
             exclude: None,
             include_gitignored: false,
             include_hidden: true,
@@ -305,8 +301,7 @@ mod tests {
         };
         let params_b = GrepCacheParams {
             pattern: "foo",
-            glob: Some("*.rs"),
-            paths: &[],
+            paths: &[PathBuf::from("src/main.rs")],
             exclude: None,
             include_gitignored: false,
             include_hidden: true,

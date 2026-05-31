@@ -12,7 +12,7 @@
 use anyhow::{Context, Result};
 use clap::{FromArgMatches, Parser, Subcommand};
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::info;
 use tracing_subscriber::layer::SubscriberExt;
@@ -49,15 +49,15 @@ enum Command {
         /// Regex pattern (Rust/PCRE syntax, | for alternation).
         pattern: String,
 
-        /// Scope the search: glob, directory, or file path(s).
+        /// File or directory path(s) to scope the search.
         ///
-        /// Multiple values are unioned — unquoted `src/tui/*` expands
+        /// Multiple values are unioned — `src/tui/*` expands
         /// to individual files and all are searched.
-        #[arg(name = "GLOB")]
-        glob: Vec<String>,
+        #[arg(name = "PATH")]
+        scope: Vec<String>,
 
-        /// Exclude matches (e.g., tests/**).
-        #[arg(long)]
+        /// Exclude matches by glob pattern (e.g., tests/**).
+        #[arg(long = "exclude-pattern")]
         exclude: Option<String>,
 
         /// Page number for paged results.
@@ -73,20 +73,20 @@ enum Command {
         include_hidden: bool,
     },
 
-    /// Browse the filesystem: file outlines, directory listings, glob patterns.
+    /// Browse the filesystem: file outlines, directory listings.
     ///
     /// Resolves against the current working directory. Results include symbol
     /// outlines when LSP data is available.
     Glob {
-        /// File, directory, or glob pattern(s).
+        /// File or directory path(s).
         ///
-        /// Multiple values are unioned — unquoted `src/tui/*` expands
+        /// Multiple values are unioned — `src/tui/*` expands
         /// to individual files and all are browsed.
-        #[arg(required = true)]
-        pattern: Vec<String>,
+        #[arg(name = "PATH", required = true)]
+        paths: Vec<String>,
 
-        /// Exclude matches (e.g., tests/**).
-        #[arg(long)]
+        /// Exclude matches by glob pattern (e.g., tests/**).
+        #[arg(long = "exclude-pattern")]
         exclude: Option<String>,
 
         /// Page number for paged results.
@@ -405,16 +405,15 @@ fn main() -> Result<()> {
         #[cfg(unix)]
         Some(Command::Grep {
             pattern,
-            glob,
+            scope,
             exclude,
             page,
             include_gitignored,
             include_hidden,
         }) => {
-            let (glob, paths) = split_variadic(glob);
+            let paths = to_literal_paths(scope);
             build_runtime()?.block_on(run_grep(
                 pattern,
-                glob,
                 paths,
                 exclude,
                 page,
@@ -426,15 +425,14 @@ fn main() -> Result<()> {
         Some(Command::Grep { .. }) => Err(anyhow::anyhow!("daemon mode requires Unix")),
         #[cfg(unix)]
         Some(Command::Glob {
-            pattern,
+            paths,
             exclude,
             page,
             include_gitignored,
             include_hidden,
         }) => {
-            let (pattern, paths) = split_variadic_required(pattern);
+            let paths = to_literal_paths(paths);
             build_runtime()?.block_on(run_glob(
-                pattern,
                 paths,
                 exclude,
                 page,
@@ -595,34 +593,37 @@ fn main() -> Result<()> {
     }
 }
 
-/// Splits variadic positional arguments into a glob pattern vs literal paths.
+/// Converts positional arguments to literal file/directory paths.
 ///
-/// - One value → glob pattern (preserves existing behavior: the value
-///   could be a glob, directory, or file).
-/// - Multiple values → literal paths (shell-expanded from an unquoted
-///   glob like `src/tui/*`). These are concrete filesystem paths, not
-///   glob patterns, and must not be interpreted as glob syntax.
-fn split_variadic(values: Vec<String>) -> (Option<String>, Vec<PathBuf>) {
-    match values.len() {
-        0 => (None, Vec::new()),
-        1 => (values.into_iter().next(), Vec::new()),
-        _ => (None, values.into_iter().map(PathBuf::from).collect()),
-    }
+/// All values are treated as concrete filesystem paths — the shell is
+/// the only glob engine. No glob interpretation is applied.
+fn to_literal_paths(values: Vec<String>) -> Vec<PathBuf> {
+    values.into_iter().map(PathBuf::from).collect()
 }
 
-/// Splits variadic positional arguments for a required positional.
+/// Returns `true` if the string contains glob metacharacters (`*`, `?`, `[`, `{`).
+fn contains_glob_metachar(s: &str) -> bool {
+    s.contains('*') || s.contains('?') || s.contains('[') || s.contains('{')
+}
+
+/// Emits a hint to stderr for non-existent paths that look like quoted glob patterns.
 ///
-/// Same as [`split_variadic`] but for required arguments (always at
-/// least one value). Clap's `required = true` ensures the vec is
-/// never empty.
-fn split_variadic_required(mut values: Vec<String>) -> (String, Vec<PathBuf>) {
-    match values.len() {
-        0 => unreachable!("clap ensures at least one value"),
-        1 => (values.swap_remove(0), Vec::new()),
-        _ => (
-            String::new(),
-            values.into_iter().map(PathBuf::from).collect(),
-        ),
+/// When the user passes a quoted glob (e.g. `'src/**/*.rs'`), the shell
+/// does not expand it. The resulting literal path won't exist on disk.
+/// This function detects that case and suggests retrying without quotes.
+fn emit_glob_hints(paths: &[PathBuf], cwd: &Path, command: &str) {
+    for path in paths {
+        let resolved = if path.is_absolute() {
+            path.clone()
+        } else {
+            cwd.join(path)
+        };
+        if !resolved.exists() {
+            let s = path.to_string_lossy();
+            if contains_glob_metachar(&s) {
+                eprintln!("hint: path not found — try without quotes: {command} {s}");
+            }
+        }
     }
 }
 
@@ -925,7 +926,6 @@ async fn run_stop() -> Result<()> {
 #[cfg(unix)]
 async fn run_grep(
     pattern: String,
-    glob: Option<String>,
     paths: Vec<PathBuf>,
     exclude: Option<String>,
     page: usize,
@@ -937,6 +937,9 @@ async fn run_grep(
 
     let has_bre_alternation = pattern.contains("\\|");
     let cwd = std::env::current_dir().context("cannot determine working directory")?;
+
+    emit_glob_hints(&paths, &cwd, "catenary grep");
+
     let ipc_path = catenary_mcp::router::socket_path();
 
     let stream = tokio::net::UnixStream::connect(&ipc_path)
@@ -948,7 +951,6 @@ async fn run_grep(
     let request = GrepRequest {
         cwd: Some(cwd),
         pattern,
-        glob,
         paths,
         exclude,
         page,
@@ -994,14 +996,13 @@ async fn run_grep(
 ///
 /// Connects to the daemon's IPC socket, sends a [`GlobRequest`], and
 /// prints the rendered output to stdout. The daemon resolves relative
-/// patterns against `cwd` before dispatching to the glob pipeline.
+/// paths against `cwd` before dispatching to the glob pipeline.
 ///
 /// # Errors
 ///
 /// Returns an error if no daemon is running or the query fails.
 #[cfg(unix)]
 async fn run_glob(
-    pattern: String,
     paths: Vec<PathBuf>,
     exclude: Option<String>,
     page: usize,
@@ -1012,6 +1013,9 @@ async fn run_glob(
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     let cwd = std::env::current_dir().context("cannot determine working directory")?;
+
+    emit_glob_hints(&paths, &cwd, "catenary glob");
+
     let ipc_path = catenary_mcp::router::socket_path();
 
     let stream = tokio::net::UnixStream::connect(&ipc_path)
@@ -1022,7 +1026,6 @@ async fn run_glob(
 
     let request = GlobRequest {
         cwd: Some(cwd),
-        pattern,
         paths,
         exclude,
         page,
@@ -1431,7 +1434,7 @@ mod tests {
         let args = args.expect("grep with pattern should parse");
         let Some(Command::Grep {
             pattern,
-            glob,
+            scope,
             exclude,
             page,
             include_gitignored,
@@ -1441,7 +1444,7 @@ mod tests {
             unreachable!("expected Grep command");
         };
         assert_eq!(pattern, "foo");
-        assert!(glob.is_empty());
+        assert!(scope.is_empty());
         assert!(exclude.is_none());
         assert_eq!(page, 1);
         assert!(!include_gitignored);
@@ -1449,31 +1452,19 @@ mod tests {
     }
 
     #[test]
-    fn test_cli_grep_positional_glob() {
+    fn test_cli_grep_single_path() {
         use clap::Parser;
-        let args = Args::try_parse_from(["catenary", "grep", "foo|bar", "src/**/*.rs"]);
-        let args = args.expect("grep with positional glob should parse");
-        let Some(Command::Grep {
-            pattern,
-            glob,
-            exclude,
-            page,
-            include_gitignored,
-            include_hidden,
-        }) = args.command
-        else {
+        let args = Args::try_parse_from(["catenary", "grep", "foo|bar", "src/main.rs"]);
+        let args = args.expect("grep with single path should parse");
+        let Some(Command::Grep { pattern, scope, .. }) = args.command else {
             unreachable!("expected Grep command");
         };
         assert_eq!(pattern, "foo|bar");
-        assert_eq!(glob, vec!["src/**/*.rs"]);
-        assert!(exclude.is_none());
-        assert_eq!(page, 1);
-        assert!(!include_gitignored);
-        assert!(!include_hidden);
+        assert_eq!(scope, vec!["src/main.rs"]);
     }
 
     #[test]
-    fn test_cli_grep_variadic_glob() {
+    fn test_cli_grep_variadic_paths() {
         use clap::Parser;
         let args = Args::try_parse_from([
             "catenary",
@@ -1482,12 +1473,12 @@ mod tests {
             "src/tui/stream.rs",
             "src/tui/mod.rs",
         ]);
-        let args = args.expect("grep with multiple globs should parse");
-        let Some(Command::Grep { pattern, glob, .. }) = args.command else {
+        let args = args.expect("grep with multiple paths should parse");
+        let Some(Command::Grep { pattern, scope, .. }) = args.command else {
             unreachable!("expected Grep command");
         };
         assert_eq!(pattern, "pattern");
-        assert_eq!(glob, vec!["src/tui/stream.rs", "src/tui/mod.rs"]);
+        assert_eq!(scope, vec!["src/tui/stream.rs", "src/tui/mod.rs"]);
     }
 
     #[test]
@@ -1497,8 +1488,8 @@ mod tests {
             "catenary",
             "grep",
             "foo|bar",
-            "src/**/*.rs",
-            "--exclude",
+            "src/",
+            "--exclude-pattern",
             "tests/",
             "--page",
             "3",
@@ -1508,7 +1499,7 @@ mod tests {
         let args = args.expect("grep with all flags should parse");
         let Some(Command::Grep {
             pattern,
-            glob,
+            scope,
             exclude,
             page,
             include_gitignored,
@@ -1518,7 +1509,7 @@ mod tests {
             unreachable!("expected Grep command");
         };
         assert_eq!(pattern, "foo|bar");
-        assert_eq!(glob, vec!["src/**/*.rs"]);
+        assert_eq!(scope, vec!["src/"]);
         assert_eq!(exclude.as_deref(), Some("tests/"));
         assert_eq!(page, 3);
         assert!(include_gitignored);
@@ -1538,9 +1529,9 @@ mod tests {
     fn test_cli_glob_minimal() {
         use clap::Parser;
         let args = Args::try_parse_from(["catenary", "glob", "src/"]);
-        let args = args.expect("glob with pattern should parse");
+        let args = args.expect("glob with path should parse");
         let Some(Command::Glob {
-            pattern,
+            paths,
             exclude,
             page,
             include_gitignored,
@@ -1549,7 +1540,7 @@ mod tests {
         else {
             unreachable!("expected Glob command");
         };
-        assert_eq!(pattern, vec!["src/"]);
+        assert_eq!(paths, vec!["src/"]);
         assert!(exclude.is_none());
         assert_eq!(page, 1);
         assert!(!include_gitignored);
@@ -1566,12 +1557,12 @@ mod tests {
             "src/tui/mod.rs",
             "src/tui/render.rs",
         ]);
-        let args = args.expect("glob with multiple patterns should parse");
-        let Some(Command::Glob { pattern, .. }) = args.command else {
+        let args = args.expect("glob with multiple paths should parse");
+        let Some(Command::Glob { paths, .. }) = args.command else {
             unreachable!("expected Glob command");
         };
         assert_eq!(
-            pattern,
+            paths,
             vec!["src/tui/stream.rs", "src/tui/mod.rs", "src/tui/render.rs"]
         );
     }
@@ -1582,8 +1573,8 @@ mod tests {
         let args = Args::try_parse_from([
             "catenary",
             "glob",
-            "**/*.rs",
-            "--exclude",
+            "src/",
+            "--exclude-pattern",
             "target/**",
             "--page",
             "2",
@@ -1592,7 +1583,7 @@ mod tests {
         ]);
         let args = args.expect("glob with all flags should parse");
         let Some(Command::Glob {
-            pattern,
+            paths,
             exclude,
             page,
             include_gitignored,
@@ -1601,7 +1592,7 @@ mod tests {
         else {
             unreachable!("expected Glob command");
         };
-        assert_eq!(pattern, vec!["**/*.rs"]);
+        assert_eq!(paths, vec!["src/"]);
         assert_eq!(exclude.as_deref(), Some("target/**"));
         assert_eq!(page, 2);
         assert!(include_gitignored);
@@ -1609,10 +1600,10 @@ mod tests {
     }
 
     #[test]
-    fn test_cli_glob_missing_pattern() {
+    fn test_cli_glob_missing_path() {
         use clap::Parser;
         let result = Args::try_parse_from(["catenary", "glob"]);
-        assert!(result.is_err(), "glob without pattern should fail");
+        assert!(result.is_err(), "glob without path should fail");
     }
 
     // ── CLI roots subcommand tests ──────────────────────────────────
@@ -1847,29 +1838,26 @@ mod tests {
         assert!(force);
     }
 
-    // ── split_variadic tests ──────────────────────────────────────────
+    // ── to_literal_paths tests ─────────────────────────────────────────
 
     #[test]
-    fn test_split_variadic_empty() {
-        let (glob, paths) = split_variadic(vec![]);
-        assert!(glob.is_none());
+    fn test_to_literal_paths_empty() {
+        let paths = to_literal_paths(vec![]);
         assert!(paths.is_empty());
     }
 
     #[test]
-    fn test_split_variadic_single_is_glob() {
-        let (glob, paths) = split_variadic(vec!["src/**/*.rs".to_string()]);
-        assert_eq!(glob.as_deref(), Some("src/**/*.rs"));
-        assert!(paths.is_empty());
+    fn test_to_literal_paths_single() {
+        let paths = to_literal_paths(vec!["src/main.rs".to_string()]);
+        assert_eq!(paths, vec![PathBuf::from("src/main.rs")]);
     }
 
     #[test]
-    fn test_split_variadic_multiple_are_paths() {
-        let (glob, paths) = split_variadic(vec![
+    fn test_to_literal_paths_multiple() {
+        let paths = to_literal_paths(vec![
             "src/tui/stream.rs".to_string(),
             "src/tui/mod.rs".to_string(),
         ]);
-        assert!(glob.is_none());
         assert_eq!(
             paths,
             vec![
@@ -1879,26 +1867,35 @@ mod tests {
         );
     }
 
+    // ── contains_glob_metachar tests ─────────────────────────────────
+
     #[test]
-    fn test_split_variadic_required_single() {
-        let (pattern, paths) = split_variadic_required(vec!["src/".to_string()]);
-        assert_eq!(pattern, "src/");
-        assert!(paths.is_empty());
+    fn test_contains_glob_metachar_star() {
+        assert!(contains_glob_metachar("src/**/*.rs"));
     }
 
     #[test]
-    fn test_split_variadic_required_multiple() {
-        let (pattern, paths) = split_variadic_required(vec![
-            "src/tui/stream.rs".to_string(),
-            "src/tui/mod.rs".to_string(),
-        ]);
-        assert!(pattern.is_empty());
-        assert_eq!(
-            paths,
-            vec![
-                PathBuf::from("src/tui/stream.rs"),
-                PathBuf::from("src/tui/mod.rs"),
-            ]
-        );
+    fn test_contains_glob_metachar_question() {
+        assert!(contains_glob_metachar("src/?.rs"));
+    }
+
+    #[test]
+    fn test_contains_glob_metachar_bracket() {
+        assert!(contains_glob_metachar("src/[ab].rs"));
+    }
+
+    #[test]
+    fn test_contains_glob_metachar_brace() {
+        assert!(contains_glob_metachar("src/{a,b}.rs"));
+    }
+
+    #[test]
+    fn test_contains_glob_metachar_none() {
+        assert!(!contains_glob_metachar("src/main.rs"));
+    }
+
+    #[test]
+    fn test_contains_glob_metachar_directory() {
+        assert!(!contains_glob_metachar("src/tui/"));
     }
 }

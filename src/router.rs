@@ -69,12 +69,12 @@ pub const METHOD_GLOB: &str = "tool/glob";
 ///
 /// Sent as a JSON line over the daemon IPC socket with
 /// `"method": "tool/grep"`. [`to_params`](Self::to_params) resolves
-/// relative `glob` and `exclude` patterns against `cwd` before
+/// relative paths and `exclude` patterns against `cwd` before
 /// dispatching to the grep pipeline.
 ///
 /// Wire format:
 /// ```json
-/// {"method": "tool/grep", "cwd": "/path", "pattern": "foo", "glob": "src/**/*.rs"}
+/// {"method": "tool/grep", "cwd": "/path", "pattern": "foo", "paths": ["src/main.rs"]}
 /// ```
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct GrepRequest {
@@ -87,15 +87,11 @@ pub struct GrepRequest {
     pub cwd: Option<PathBuf>,
     /// Search pattern (regex, supports `|` for alternation).
     pub pattern: String,
-    /// Glob pattern to scope the search.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub glob: Option<String>,
-    /// Literal file/directory paths from shell expansion.
+    /// Literal file/directory paths to scope the search.
     ///
-    /// When the agent passes an unquoted glob (e.g. `src/tui/*`), the
-    /// shell expands it into individual paths. These are concrete
-    /// filesystem paths, not glob patterns — they bypass glob matching
-    /// and are used as direct search roots.
+    /// All positional arguments are concrete filesystem paths — the
+    /// shell is the only glob engine. These bypass glob matching and
+    /// are used as direct search roots.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub paths: Vec<PathBuf>,
     /// Glob pattern to exclude from matches.
@@ -113,13 +109,13 @@ pub struct GrepRequest {
 }
 
 impl GrepRequest {
-    /// Resolves relative patterns against `cwd` and produces a
+    /// Resolves relative paths against `cwd` and produces a
     /// `GrepInput`-compatible JSON value for the grep pipeline.
     ///
-    /// - `glob` and `exclude` are resolved against `cwd` (relative → absolute).
-    /// - `targets_hidden` is checked on the pre-resolution `glob` pattern
-    ///   (only for relative patterns) to auto-enable `include_hidden` for
-    ///   explicit hidden targets like `.gitignore`.
+    /// - Paths are resolved against `cwd` (relative → absolute).
+    /// - `exclude` is resolved against `cwd`.
+    /// - `targets_hidden` is checked on paths to auto-enable
+    ///   `include_hidden` for explicit hidden targets like `.gitignore`.
     fn to_params(&self) -> serde_json::Value {
         let mut include_hidden = self.include_hidden;
 
@@ -130,40 +126,20 @@ impl GrepRequest {
         });
 
         if self.paths.is_empty() {
-            // Pass cwd when glob is absent or relative (cwd-scoped search).
-            // Absolute globs scope via override_root, so cwd is not needed.
-            // When cwd is None (no meaningful working directory), the daemon
-            // falls back to searching all workspace roots.
-            let glob_is_absolute = self
-                .glob
-                .as_ref()
-                .is_some_and(|g| Path::new(g).is_absolute());
-            if let Some(ref cwd) = self.cwd
-                && !glob_is_absolute
-            {
+            // No paths — cwd-scoped search. Pass cwd so the daemon
+            // scopes to the agent's working directory.
+            if let Some(ref cwd) = self.cwd {
                 params["cwd"] = serde_json::Value::String(cwd.to_string_lossy().into_owned());
             }
-
-            if let Some(ref glob) = self.glob {
-                // Check hidden targeting on relative patterns only — absolute
-                // paths may contain hidden components from the cwd that aren't
-                // user intent.
-                if !Path::new(glob).is_absolute()
-                    && crate::bridge::session::ResolvedGlob::targets_hidden(glob)
-                {
+        } else {
+            // Literal paths — resolve relative paths against cwd,
+            // check for hidden targeting.
+            for p in &self.paths {
+                let s = p.to_string_lossy();
+                if !p.is_absolute() && crate::bridge::session::ResolvedGlob::targets_hidden(&s) {
                     include_hidden = true;
                 }
-                // Resolve relative globs against cwd; fall back to unresolved
-                // if no cwd is available (the pattern stays relative).
-                let resolved = self
-                    .cwd
-                    .as_ref()
-                    .map_or_else(|| glob.clone(), |cwd| resolve_relative(glob, cwd));
-                params["glob"] = serde_json::Value::String(resolved);
             }
-        } else {
-            // Literal paths from shell expansion — resolve relative paths
-            // against cwd and pass as-is (no glob interpretation).
             params["paths"] = serde_json::Value::Array(
                 self.paths
                     .iter()
@@ -205,12 +181,12 @@ pub struct GrepResponse {
 /// IPC request payload for `catenary glob`.
 ///
 /// Sent as a JSON line over the daemon IPC socket with
-/// `"method": "tool/glob"`. The daemon resolves a relative `pattern`
+/// `"method": "tool/glob"`. The daemon resolves relative paths
 /// against `cwd` before dispatching to the glob pipeline.
 ///
 /// Wire format:
 /// ```json
-/// {"method": "tool/glob", "cwd": "/path", "pattern": "src/"}
+/// {"method": "tool/glob", "cwd": "/path", "paths": ["src/"]}
 /// ```
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct GlobRequest {
@@ -220,16 +196,12 @@ pub struct GlobRequest {
     /// daemon falls back to searching all workspace roots.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<PathBuf>,
-    /// File path, directory path, or glob pattern.
-    pub pattern: String,
-    /// Literal file/directory paths from shell expansion.
+    /// Literal file/directory paths.
     ///
-    /// When the agent passes an unquoted glob (e.g. `src/tui/*`), the
-    /// shell expands it into individual paths. These are concrete
-    /// filesystem paths — each is dispatched through the appropriate
-    /// handler (file outline, directory listing) without glob
-    /// interpretation.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// All positional arguments are concrete filesystem paths — the
+    /// shell is the only glob engine. Each is dispatched through the
+    /// appropriate handler (file outline, directory listing).
+    #[serde(default)]
     pub paths: Vec<PathBuf>,
     /// Glob pattern to exclude from results.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -246,66 +218,52 @@ pub struct GlobRequest {
 }
 
 impl GlobRequest {
-    /// Resolves relative patterns against `cwd` and produces a
+    /// Resolves relative paths against `cwd` and produces a
     /// `GlobInput`-compatible JSON value for the glob pipeline.
     ///
-    /// - `pattern` is resolved against `cwd`.
-    /// - `targets_hidden` is checked on the pre-resolution `pattern`
-    ///   (only for relative patterns).
+    /// - Paths are resolved against `cwd` (relative → absolute).
+    /// - `targets_hidden` is checked on paths to auto-enable
+    ///   `include_hidden` for explicit hidden targets.
     /// - Basename `exclude` patterns (no `/`) get a `**/` prefix for
     ///   depth-independent matching; patterns with `/` are resolved
     ///   against `cwd`.
     fn to_params(&self) -> serde_json::Value {
+        let mut include_hidden = self.include_hidden;
+
         let mut params = serde_json::json!({
-            "pattern": self.pattern,
+            "pattern": "",
             "page": self.page,
             "include_gitignored": self.include_gitignored,
         });
 
-        if self.paths.is_empty() {
-            let pattern_is_absolute = Path::new(&self.pattern).is_absolute();
-            let targets_hidden = !pattern_is_absolute
-                && crate::bridge::session::ResolvedGlob::targets_hidden(&self.pattern);
-            let include_hidden = self.include_hidden || targets_hidden;
-            let resolved_pattern = self.cwd.as_ref().map_or_else(
-                || self.pattern.clone(),
-                |cwd| resolve_relative(&self.pattern, cwd),
-            );
-            params["pattern"] = serde_json::Value::String(resolved_pattern);
-            params["include_hidden"] = serde_json::Value::Bool(include_hidden);
-
-            // Pass cwd when the original pattern is relative (cwd-scoped).
-            if let Some(ref cwd) = self.cwd
-                && !pattern_is_absolute
-            {
-                params["cwd"] = serde_json::Value::String(cwd.to_string_lossy().into_owned());
+        // Check for hidden targeting on relative paths.
+        for p in &self.paths {
+            let s = p.to_string_lossy();
+            if !p.is_absolute() && crate::bridge::session::ResolvedGlob::targets_hidden(&s) {
+                include_hidden = true;
             }
-        } else {
-            // Literal paths from shell expansion — resolve relative paths
-            // against cwd and pass as-is (no glob interpretation).
-            params["paths"] = serde_json::Value::Array(
-                self.paths
-                    .iter()
-                    .map(|p| {
-                        let s = if p.is_absolute() {
-                            p.to_string_lossy().into_owned()
-                        } else {
-                            self.cwd.as_ref().map_or_else(
-                                || p.to_string_lossy().into_owned(),
-                                |cwd| cwd.join(p).to_string_lossy().into_owned(),
-                            )
-                        };
-                        serde_json::Value::String(s)
-                    })
-                    .collect(),
-            );
-            params["include_hidden"] = serde_json::Value::Bool(self.include_hidden);
         }
 
+        // Resolve relative paths against cwd.
+        params["paths"] = serde_json::Value::Array(
+            self.paths
+                .iter()
+                .map(|p| {
+                    let s = if p.is_absolute() {
+                        p.to_string_lossy().into_owned()
+                    } else {
+                        self.cwd.as_ref().map_or_else(
+                            || p.to_string_lossy().into_owned(),
+                            |cwd| cwd.join(p).to_string_lossy().into_owned(),
+                        )
+                    };
+                    serde_json::Value::String(s)
+                })
+                .collect(),
+        );
+        params["include_hidden"] = serde_json::Value::Bool(include_hidden);
+
         if let Some(ref exclude) = self.exclude {
-            // Basename patterns (no path separator) get a `**/` prefix so
-            // `exclude="test_*"` matches at any depth within the tree.
-            // Patterns with `/` are resolved against cwd as-is.
             let effective = if exclude.contains('/') {
                 self.cwd
                     .as_ref()
@@ -3969,8 +3927,7 @@ mod tests {
         let req = GrepRequest {
             cwd: Some(PathBuf::from("/home/user/project")),
             pattern: "TODO|FIXME".to_string(),
-            glob: Some("src/**/*.rs".to_string()),
-            paths: vec![],
+            paths: vec![PathBuf::from("src/main.rs"), PathBuf::from("src/lib.rs")],
             exclude: Some("tests/**".to_string()),
             page: 2,
             include_gitignored: true,
@@ -3980,8 +3937,10 @@ mod tests {
         let parsed: GrepRequest = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed.cwd, Some(PathBuf::from("/home/user/project")));
         assert_eq!(parsed.pattern, "TODO|FIXME");
-        assert_eq!(parsed.glob.as_deref(), Some("src/**/*.rs"));
-        assert!(parsed.paths.is_empty());
+        assert_eq!(
+            parsed.paths,
+            vec![PathBuf::from("src/main.rs"), PathBuf::from("src/lib.rs")]
+        );
         assert_eq!(parsed.exclude.as_deref(), Some("tests/**"));
         assert_eq!(parsed.page, 2);
         assert!(parsed.include_gitignored);
@@ -3995,20 +3954,18 @@ mod tests {
         let req: GrepRequest = serde_json::from_str(json).expect("deserialize");
         assert_eq!(req.cwd, Some(PathBuf::from("/tmp")));
         assert_eq!(req.pattern, "foo");
-        assert!(req.glob.is_none());
         assert!(req.exclude.is_none());
         assert_eq!(req.page, 1);
         assert!(!req.include_gitignored);
         assert!(!req.include_hidden);
     }
 
-    /// `GrepRequest` skips `None` fields in serialized output.
+    /// `GrepRequest` skips empty/`None` fields in serialized output.
     #[test]
     fn grep_request_skips_none_fields() {
         let req = GrepRequest {
             cwd: Some(PathBuf::from("/tmp")),
             pattern: "foo".to_string(),
-            glob: None,
             paths: vec![],
             exclude: None,
             page: 1,
@@ -4016,7 +3973,6 @@ mod tests {
             include_hidden: false,
         };
         let json = serde_json::to_string(&req).expect("serialize");
-        assert!(!json.contains("glob"), "None glob should be skipped");
         assert!(!json.contains("paths"), "empty paths should be skipped");
         assert!(!json.contains("exclude"), "None exclude should be skipped");
     }
@@ -4037,8 +3993,7 @@ mod tests {
     fn glob_request_roundtrip_full() {
         let req = GlobRequest {
             cwd: Some(PathBuf::from("/workspace")),
-            pattern: "src/**/*.rs".to_string(),
-            paths: vec![],
+            paths: vec![PathBuf::from("src/"), PathBuf::from("tests/")],
             exclude: Some("target/**".to_string()),
             page: 3,
             include_gitignored: false,
@@ -4047,8 +4002,10 @@ mod tests {
         let json = serde_json::to_string(&req).expect("serialize");
         let parsed: GlobRequest = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed.cwd, Some(PathBuf::from("/workspace")));
-        assert_eq!(parsed.pattern, "src/**/*.rs");
-        assert!(parsed.paths.is_empty());
+        assert_eq!(
+            parsed.paths,
+            vec![PathBuf::from("src/"), PathBuf::from("tests/")]
+        );
         assert_eq!(parsed.exclude.as_deref(), Some("target/**"));
         assert_eq!(parsed.page, 3);
         assert!(!parsed.include_gitignored);
@@ -4058,10 +4015,10 @@ mod tests {
     /// `GlobRequest` deserializes with defaults for optional fields.
     #[test]
     fn glob_request_minimal() {
-        let json = r#"{"cwd":"/home","pattern":"src/"}"#;
+        let json = r#"{"cwd":"/home","paths":["src/"]}"#;
         let req: GlobRequest = serde_json::from_str(json).expect("deserialize");
         assert_eq!(req.cwd, Some(PathBuf::from("/home")));
-        assert_eq!(req.pattern, "src/");
+        assert_eq!(req.paths, vec![PathBuf::from("src/")]);
         assert!(req.exclude.is_none());
         assert_eq!(req.page, 1);
         assert!(!req.include_gitignored);

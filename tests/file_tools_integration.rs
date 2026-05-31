@@ -167,6 +167,7 @@ fn test_glob_file_header() -> Result<()> {
 }
 
 #[test]
+#[ignore = "glob pattern interpretation removed (ticket 104)"]
 fn test_glob_pattern_matching() -> Result<()> {
     let dir = tempfile::tempdir()?;
     std::fs::write(dir.path().join("main.rs"), "fn main() {}")?;
@@ -188,6 +189,7 @@ fn test_glob_pattern_matching() -> Result<()> {
 }
 
 #[test]
+#[ignore = "glob pattern interpretation removed (ticket 104)"]
 fn test_glob_alternation() -> Result<()> {
     let dir = tempfile::tempdir()?;
     std::fs::write(dir.path().join("main.rs"), "fn main() {}")?;
@@ -239,6 +241,7 @@ fn test_glob_line_counts() -> Result<()> {
 }
 
 #[test]
+#[ignore = "glob pattern interpretation removed (ticket 104)"]
 fn test_glob_pattern_detection() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let script = dir.path().join(format!("types.{MOCK_LANG_A}"));
@@ -285,6 +288,7 @@ fn test_glob_pattern_detection() -> Result<()> {
 // ─── New 08a tests ─────────────────────────────────────────────────────
 
 #[test]
+#[ignore = "glob pattern interpretation removed (ticket 104)"]
 fn test_glob_exclude() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let src = dir.path().join("src");
@@ -358,6 +362,7 @@ fn test_glob_include_hidden() -> Result<()> {
 /// without requiring `include_hidden`. This is the motivating case
 /// for ticket misc/45.
 #[test]
+#[ignore = "glob pattern interpretation removed (ticket 104)"]
 fn test_grep_explicit_hidden_glob_matches() -> Result<()> {
     let dir = tempfile::tempdir()?;
     std::fs::write(dir.path().join(".gitignore"), "target/\nbuild/\n")?;
@@ -422,6 +427,7 @@ fn test_glob_explicit_hidden_matches() -> Result<()> {
 /// Glob with an explicit hidden directory pattern (`.github/*`) should
 /// match without `include_hidden`.
 #[test]
+#[ignore = "glob pattern interpretation removed (ticket 104)"]
 fn test_glob_explicit_hidden_dir_matches() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let gh = dir.path().join(".github");
@@ -639,6 +645,7 @@ fn test_glob_bucket_drill() -> Result<()> {
 }
 
 #[test]
+#[ignore = "glob pattern interpretation removed (ticket 104)"]
 fn test_glob_pattern_tree() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let src = dir.path().join("src");
@@ -674,6 +681,7 @@ fn test_glob_pattern_tree() -> Result<()> {
 }
 
 #[test]
+#[ignore = "glob pattern interpretation removed (ticket 104)"]
 fn test_glob_tab_structure() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let sub = dir.path().join("src").join("inner");
@@ -1608,6 +1616,7 @@ fn test_glob_dedup_mixed() -> Result<()> {
 }
 
 #[test]
+#[ignore = "glob pattern interpretation removed (ticket 104)"]
 fn test_glob_tree_dedup() -> Result<()> {
     let dir = tempfile::tempdir()?;
     // Two subdirectories, each with identical files.
@@ -1655,6 +1664,7 @@ fn test_glob_tree_dedup() -> Result<()> {
 }
 
 #[test]
+#[ignore = "glob pattern interpretation removed (ticket 104)"]
 fn test_glob_tree_dedup_per_directory() -> Result<()> {
     let dir = tempfile::tempdir()?;
     // Two directories with IDENTICAL file structures — dedup should NOT
@@ -1688,6 +1698,7 @@ fn test_glob_tree_dedup_per_directory() -> Result<()> {
 // ─── Ticket 65: directory matching in glob patterns ─────────────────
 
 #[test]
+#[ignore = "glob pattern interpretation removed (ticket 104)"]
 fn test_glob_pattern_matches_directories() -> Result<()> {
     let dir = tempfile::tempdir()?;
     // Directory containing only subdirectories — no files.
@@ -1723,6 +1734,7 @@ fn test_glob_pattern_matches_directories() -> Result<()> {
 }
 
 #[test]
+#[ignore = "glob pattern interpretation removed (ticket 104)"]
 fn test_glob_pattern_mixed_entries() -> Result<()> {
     let dir = tempfile::tempdir()?;
     std::fs::create_dir(dir.path().join("subdir"))?;
@@ -1745,6 +1757,7 @@ fn test_glob_pattern_mixed_entries() -> Result<()> {
 }
 
 #[test]
+#[ignore = "glob pattern interpretation removed (ticket 104)"]
 fn test_glob_recursive_pattern_includes_dirs() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let sub = dir.path().join("level1");
@@ -1775,6 +1788,7 @@ fn test_glob_recursive_pattern_includes_dirs() -> Result<()> {
 }
 
 #[test]
+#[ignore = "glob pattern interpretation removed (ticket 104)"]
 fn test_glob_pattern_dirs_no_enrichment() -> Result<()> {
     let dir = tempfile::tempdir()?;
     // Only directories — no files to enrich.
@@ -1802,6 +1816,7 @@ fn test_glob_pattern_dirs_no_enrichment() -> Result<()> {
 }
 
 #[test]
+#[ignore = "glob pattern interpretation removed (ticket 104)"]
 fn test_glob_pattern_paged_large_result() -> Result<()> {
     let mut bridge = BridgeProcess::spawn_with_config(|root| {
         for i in 0..30 {
@@ -1833,6 +1848,7 @@ fn test_glob_pattern_paged_large_result() -> Result<()> {
 }
 
 #[test]
+#[ignore = "glob pattern interpretation removed (ticket 104)"]
 fn test_glob_paged_preserves_tree_structure() -> Result<()> {
     let mut bridge = BridgeProcess::spawn_with_config(|root| {
         let src = root.join("src");
@@ -1870,6 +1886,7 @@ fn test_glob_paged_preserves_tree_structure() -> Result<()> {
 }
 
 #[test]
+#[ignore = "glob pattern interpretation removed (ticket 104)"]
 fn test_glob_pattern_in_roots_unchanged() -> Result<()> {
     // Verify that in-root file matching still works with enrichment.
     let dir = tempfile::tempdir()?;
@@ -1944,6 +1961,7 @@ fn test_glob_absolute_dir_indented_entries() -> Result<()> {
 }
 
 #[test]
+#[ignore = "glob pattern interpretation removed (ticket 104)"]
 fn test_glob_absolute_pattern_indented_tree() -> Result<()> {
     let dir = tempfile::tempdir()?;
     std::fs::create_dir_all(dir.path().join("src/bridge"))?;
@@ -2010,6 +2028,7 @@ fn test_grep_no_glob_cwd_scoped() -> Result<()> {
 }
 
 #[test]
+#[ignore = "glob pattern interpretation removed (ticket 104)"]
 fn test_grep_absolute_glob_no_cwd_header() -> Result<()> {
     let dir = tempfile::tempdir()?;
     std::fs::write(dir.path().join("target.rs"), "fn needle() {}\n")?;
@@ -2033,6 +2052,7 @@ fn test_grep_absolute_glob_no_cwd_header() -> Result<()> {
 
 /// Glob pattern should exclude gitignored files by default.
 #[test]
+#[ignore = "glob pattern interpretation removed (ticket 104)"]
 fn test_glob_pattern_excludes_gitignored_by_default() -> Result<()> {
     let dir = tempfile::tempdir()?;
 
@@ -2069,6 +2089,7 @@ fn test_glob_pattern_excludes_gitignored_by_default() -> Result<()> {
 /// Glob pattern with `include_gitignored: true` should show gitignored
 /// files and mark them with the `[gitignored]` flag.
 #[test]
+#[ignore = "glob pattern interpretation removed (ticket 104)"]
 fn test_glob_pattern_gitignored_flag() -> Result<()> {
     let dir = tempfile::tempdir()?;
 
@@ -2118,6 +2139,7 @@ fn test_glob_pattern_gitignored_flag() -> Result<()> {
 /// Pattern enrichment with mockls verifies that eligible files in a
 /// pattern tree get defensive maps rendered.
 #[test]
+#[ignore = "glob pattern interpretation removed (ticket 104)"]
 fn test_glob_pattern_enrichment() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let src = dir.path().join("src");
