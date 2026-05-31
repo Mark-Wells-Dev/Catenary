@@ -1578,11 +1578,14 @@ mod tests {
 
         let buf = terminal.backend().buffer().clone();
         let content = buffer_to_string(&buf);
-        // Stream entries should NOT start with hex badges.
+        // Stream entries should start with a timestamp (HH:MM:SS), not
+        // a hex badge like "0A " or "FF ".
         let first_line = content.lines().next().unwrap_or("");
         assert!(
-            !first_line.starts_with("00"),
-            "stream should not have hex badge prefix, got: {first_line}"
+            first_line.len() >= 8
+                && first_line.as_bytes()[2] == b':'
+                && first_line.as_bytes()[5] == b':',
+            "stream should start with HH:MM:SS timestamp, got: {first_line}"
         );
     }
 
