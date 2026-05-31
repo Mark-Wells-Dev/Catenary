@@ -196,6 +196,19 @@ pub fn did_change_watched_files(changes: &[(&str, u8)]) -> Value {
     })
 }
 
+/// Builds `DidChangeWorkspaceFoldersParams`.
+///
+/// `added` and `removed` are slices of `(uri, name)` pairs.
+#[must_use]
+pub fn did_change_workspace_folders(added: &[(&str, &str)], removed: &[(&str, &str)]) -> Value {
+    json!({
+        "event": {
+            "added": folder_array(added),
+            "removed": folder_array(removed),
+        }
+    })
+}
+
 /// Builds `WorkspaceSymbolParams`.
 #[must_use]
 pub fn workspace_symbols(query: &str) -> Value {
@@ -702,5 +715,22 @@ mod tests {
         let ours = subtypes(&item);
 
         assert_eq!(ours, json!({ "item": item }));
+    }
+
+    #[test]
+    fn did_change_workspace_folders_golden() {
+        let added = [("file:///sub", "sub")];
+        let removed: [(&str, &str); 0] = [];
+        let ours = did_change_workspace_folders(&added, &removed);
+
+        assert_eq!(
+            ours,
+            json!({
+                "event": {
+                    "added": [{ "uri": "file:///sub", "name": "sub" }],
+                    "removed": [],
+                }
+            })
+        );
     }
 }

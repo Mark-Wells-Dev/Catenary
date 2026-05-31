@@ -504,6 +504,10 @@ impl LspClientManager {
         clippy::significant_drop_tightening,
         reason = "clients lock held across async iteration for consistent snapshot"
     )]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "workspace folder fallback adds branches but logic is linear"
+    )]
     pub async fn get_servers(
         &self,
         path: &Path,
@@ -554,8 +558,27 @@ impl LspClientManager {
                     skip("file_patterns mismatch");
                     continue;
                 }
-                let Some(client) = find_instance(&clients, &lang_id, &binding.name, &resolved)
-                else {
+                let client = if let Some(c) =
+                    find_instance(&clients, &lang_id, &binding.name, &resolved)
+                {
+                    c
+                } else if resolved != root {
+                    // No instance at marker root — check for a
+                    // workspace-folder-capable instance at the workspace root.
+                    if let Some(ws) = find_instance(&clients, &lang_id, &binding.name, &root) {
+                        if ws.lock().await.supports_workspace_folders() {
+                            ws
+                        } else {
+                            skip(
+                                "no instance for marker root, workspace instance not folder-capable",
+                            );
+                            continue;
+                        }
+                    } else {
+                        skip(&format!("no instance for root {}", resolved.display()));
+                        continue;
+                    }
+                } else {
                     debug!(
                         source = Source::LspDispatch.as_str(),
                         server = binding.name.as_str(),
@@ -653,13 +676,20 @@ impl LspClientManager {
                 // Use resolve_server_root to match the instance key used
                 // by ensure_clients_for_paths and get_servers.
                 let resolved = self.resolve_server_root(path, &lang_id, &root);
-                lang_config
-                    .servers()
-                    .iter()
-                    .filter_map(|binding| {
-                        find_instance(&clients, &lang_id, &binding.name, &resolved)
-                    })
-                    .collect()
+                let mut instances = Vec::new();
+                for binding in lang_config.servers() {
+                    if let Some(c) = find_instance(&clients, &lang_id, &binding.name, &resolved) {
+                        instances.push(c);
+                    } else if resolved != root
+                        && let Some(ws) = find_instance(&clients, &lang_id, &binding.name, &root)
+                        && ws.lock().await.supports_workspace_folders()
+                    {
+                        // No instance at marker root — fall back to a
+                        // workspace-folder-capable instance at the workspace root.
+                        instances.push(ws);
+                    }
+                }
+                instances
             } else {
                 // Tier 3: single-file servers.
                 lang_config
@@ -1230,12 +1260,19 @@ impl LspClientManager {
     /// servers for configured languages that don't already have an instance
     /// covering the file's root. Unrooted files are skipped. Servers that
     /// fail to spawn are logged and skipped.
+    ///
+    /// For workspace-folder-capable servers, marker roots within a workspace
+    /// root are sent as `workspace/didChangeWorkspaceFolders` additions to
+    /// the existing workspace-root instance instead of spawning a redundant
+    /// server.
     pub async fn ensure_clients_for_paths(&self, paths: &[PathBuf]) {
         let configured_keys: HashSet<&str> =
             self.config.language.keys().map(String::as_str).collect();
 
-        // Collect (language, server_name, root) triples that need spawning.
+        // Collect (language, server_name, root) triples that need spawning,
+        // and (client, marker_root) pairs that need workspace folder additions.
         let mut to_spawn: HashSet<(String, String, PathBuf)> = HashSet::new();
+        let mut folder_additions: Vec<(Arc<Mutex<LspClient>>, PathBuf)> = Vec::new();
 
         {
             let active = self.clients.lock().await;
@@ -1265,10 +1302,36 @@ impl LspClientManager {
                 // share the same markers.
                 let resolved = self.resolve_server_root(path, &lang, &root);
                 for binding in lang_config.servers() {
-                    if find_instance(&active, &lang, &binding.name, &resolved).is_none() {
-                        to_spawn.insert((lang.clone(), binding.name.clone(), resolved.clone()));
+                    if find_instance(&active, &lang, &binding.name, &resolved).is_some() {
+                        continue;
                     }
+                    // No instance at marker root. For workspace-folder-capable
+                    // servers, send the marker root as a workspace folder
+                    // addition to the workspace-root instance.
+                    if resolved != root
+                        && let Some(ws) = find_instance(&active, &lang, &binding.name, &root)
+                        && ws.lock().await.supports_workspace_folders()
+                    {
+                        folder_additions.push((ws, resolved.clone()));
+                        continue;
+                    }
+                    to_spawn.insert((lang.clone(), binding.name.clone(), resolved.clone()));
                 }
+            }
+        }
+
+        // Send workspace folder additions to existing instances.
+        // Deduplication is handled by LspClient::add_workspace_folder
+        // (tracks added folders across calls).
+        for (client, marker_root) in &folder_additions {
+            let mut locked = client.lock().await;
+            if locked.is_alive()
+                && let Err(e) = locked.add_workspace_folder(marker_root).await
+            {
+                debug!(
+                    "Failed to add workspace folder {}: {e}",
+                    marker_root.display(),
+                );
             }
         }
 
@@ -5731,6 +5794,176 @@ mod tests {
         );
         assert_eq!(count_scope(&clients, MOCK_LANG_A, "root"), 2);
 
+        Ok(())
+    }
+
+    // ── Workspace folder marker tests (misc 103) ────────────────────
+
+    /// Workspace-folder-capable server with markers: `ensure_clients_for_paths`
+    /// should NOT spawn a redundant instance at the marker root when a
+    /// workspace-root instance already exists. Instead it sends
+    /// `didChangeWorkspaceFolders`.
+    #[tokio::test]
+    async fn test_ensure_clients_ws_folders_no_redundant_spawn() -> Result<()> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ws = dir.path().join("workspace");
+        let sub = ws.join("sub_crate");
+        let src = sub.join("src");
+        std::fs::create_dir_all(&src).expect("mkdir");
+        std::fs::write(sub.join("Cargo.toml"), "").expect("marker");
+        let file = src.join(format!("lib.{MOCK_LANG_A}"));
+        std::fs::write(&file, "").expect("file");
+
+        let config = mockls_workspace_folders_markers_config(vec!["Cargo.toml".into()]);
+        let ws_str = ws.to_str().expect("utf8");
+        let manager = LspClientManager::new(config, test_logging(), test_fs_with_roots(&[ws_str]));
+
+        // Spawn at workspace root (normal spawn_all behavior).
+        let server_name = &manager
+            .config
+            .resolve_language(MOCK_LANG_A)
+            .expect("lang config")
+            .servers()
+            .first()
+            .expect("binding")
+            .name;
+        manager.ensure_server(MOCK_LANG_A, server_name, &ws).await?;
+        assert_eq!(manager.clients().await.len(), 1);
+
+        // ensure_clients_for_paths for a file in the sub-crate should
+        // NOT spawn a second instance.
+        manager.ensure_clients_for_paths(&[file]).await;
+        assert_eq!(
+            manager.clients().await.len(),
+            1,
+            "Workspace-folder-capable server should not spawn redundant instance at marker root"
+        );
+
+        Ok(())
+    }
+
+    /// Legacy server (no workspace folders) with markers:
+    /// `ensure_clients_for_paths` SHOULD spawn a per-marker-root instance.
+    #[tokio::test]
+    async fn test_ensure_clients_legacy_spawns_at_marker_root() -> Result<()> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ws = dir.path().join("workspace");
+        let sub = ws.join("sub_crate");
+        let src = sub.join("src");
+        std::fs::create_dir_all(&src).expect("mkdir");
+        std::fs::write(sub.join("Cargo.toml"), "").expect("marker");
+        let file = src.join(format!("lib.{MOCK_LANG_A}"));
+        std::fs::write(&file, "").expect("file");
+
+        let config = mockls_legacy_markers_config(vec!["Cargo.toml".into()]);
+        let ws_str = ws.to_str().expect("utf8");
+        let manager = LspClientManager::new(config, test_logging(), test_fs_with_roots(&[ws_str]));
+
+        // Spawn at workspace root.
+        let server_name = &manager
+            .config
+            .resolve_language(MOCK_LANG_A)
+            .expect("lang config")
+            .servers()
+            .first()
+            .expect("binding")
+            .name;
+        manager.ensure_server(MOCK_LANG_A, server_name, &ws).await?;
+        assert_eq!(manager.clients().await.len(), 1);
+
+        // ensure_clients_for_paths for a sub-crate file SHOULD spawn
+        // a second instance (legacy server can't receive workspace folders).
+        manager.ensure_clients_for_paths(&[file]).await;
+        assert_eq!(
+            manager.clients().await.len(),
+            2,
+            "Legacy server should spawn a separate instance at the marker root"
+        );
+
+        Ok(())
+    }
+
+    /// `get_servers` finds the workspace-root instance for files in
+    /// sub-crate marker roots (workspace-folder-capable server).
+    #[tokio::test]
+    async fn test_get_servers_ws_folder_fallback() -> Result<()> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ws = dir.path().join("workspace");
+        let sub = ws.join("sub_crate");
+        let src = sub.join("src");
+        std::fs::create_dir_all(&src).expect("mkdir");
+        std::fs::write(sub.join("Cargo.toml"), "").expect("marker");
+        let file = src.join(format!("lib.{MOCK_LANG_A}"));
+        std::fs::write(&file, "").expect("file");
+
+        let config = mockls_workspace_folders_markers_config(vec!["Cargo.toml".into()]);
+        let ws_str = ws.to_str().expect("utf8");
+        let manager = LspClientManager::new(config, test_logging(), test_fs_with_roots(&[ws_str]));
+
+        // Only spawn at workspace root — no instance at marker root.
+        let server_name = &manager
+            .config
+            .resolve_language(MOCK_LANG_A)
+            .expect("lang config")
+            .servers()
+            .first()
+            .expect("binding")
+            .name;
+        manager.ensure_server(MOCK_LANG_A, server_name, &ws).await?;
+
+        // get_servers should find the workspace-root instance for the
+        // sub-crate file via workspace folder fallback.
+        let servers = manager
+            .get_servers(&file, LspServer::supports_diagnostics, None)
+            .await;
+        assert_eq!(
+            servers.len(),
+            1,
+            "get_servers should find the workspace-root instance for sub-crate files"
+        );
+
+        Ok(())
+    }
+
+    /// `wait_ready_for_path` finds the workspace-root instance for
+    /// sub-crate marker roots (workspace-folder-capable server).
+    #[tokio::test]
+    async fn test_wait_ready_ws_folder_fallback() -> Result<()> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ws = dir.path().join("workspace");
+        let sub = ws.join("sub_crate");
+        let src = sub.join("src");
+        std::fs::create_dir_all(&src).expect("mkdir");
+        std::fs::write(sub.join("Cargo.toml"), "").expect("marker");
+        let file = src.join(format!("lib.{MOCK_LANG_A}"));
+        std::fs::write(&file, "").expect("file");
+
+        let config = mockls_workspace_folders_markers_config(vec!["Cargo.toml".into()]);
+        let ws_str = ws.to_str().expect("utf8");
+        let manager = LspClientManager::new(config, test_logging(), test_fs_with_roots(&[ws_str]));
+
+        // Only spawn at workspace root.
+        let server_name = &manager
+            .config
+            .resolve_language(MOCK_LANG_A)
+            .expect("lang config")
+            .servers()
+            .first()
+            .expect("binding")
+            .name;
+        manager.ensure_server(MOCK_LANG_A, server_name, &ws).await?;
+
+        // wait_ready_for_path should find the workspace-root instance.
+        manager.wait_ready_for_path(&file).await;
+
+        let clients = manager.clients().await;
+        let (_, client) = clients.iter().next().expect("should have client");
+        let lifecycle = client.lock().await.lifecycle();
+        assert!(
+            lifecycle == crate::lsp::state::ServerLifecycle::Probing
+                || lifecycle == crate::lsp::state::ServerLifecycle::Healthy,
+            "server should be Probing or Healthy after wait_ready, got {lifecycle:?}"
+        );
         Ok(())
     }
 

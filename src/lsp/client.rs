@@ -3,8 +3,8 @@
 
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -55,6 +55,12 @@ pub struct LspClient {
     /// that multi-server dispatch gives each server a clean monotonic
     /// sequence starting at 1.
     open_documents: HashMap<String, i32>,
+    /// Workspace folders added via `didChangeWorkspaceFolders` after
+    /// initialization. Tracked for deduplication — repeated
+    /// `ensure_clients_for_paths` calls don't re-send additions.
+    /// The root from `initialize` is NOT included here (it's implicit).
+    /// Dropped with the instance on shutdown.
+    added_workspace_folders: HashSet<PathBuf>,
 }
 
 impl LspClient {
@@ -189,6 +195,7 @@ impl LspClient {
                 parent_id: None,
                 cancel: CancellationToken::new(),
                 open_documents: HashMap::new(),
+                added_workspace_folders: HashSet::new(),
             },
             child_stderr,
         ))
@@ -506,6 +513,35 @@ impl LspClient {
             params::did_change_watched_files(changes),
         )
         .await
+    }
+
+    /// Adds a workspace folder to this server instance.
+    ///
+    /// Sends `workspace/didChangeWorkspaceFolders` and tracks the folder
+    /// for deduplication. Returns `false` without sending if the folder
+    /// was already added or the server doesn't support workspace folders.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the notification fails.
+    pub async fn add_workspace_folder(&mut self, folder: &Path) -> Result<bool> {
+        if !self.supports_workspace_folders
+            || !self.added_workspace_folders.insert(folder.to_path_buf())
+        {
+            return Ok(false);
+        }
+        let uri = format!("file://{}", folder.display());
+        let name = folder.file_name().map_or_else(
+            || "workspace".to_string(),
+            |s| s.to_string_lossy().to_string(),
+        );
+        let added = [(uri.as_str(), name.as_str())];
+        self.notify(
+            "workspace/didChangeWorkspaceFolders",
+            params::did_change_workspace_folders(&added, &[]),
+        )
+        .await?;
+        Ok(true)
     }
 
     /// Sends `workspace/didChangeConfiguration` notification.
