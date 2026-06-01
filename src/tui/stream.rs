@@ -964,16 +964,24 @@ pub fn render_stream(
             }
         }
 
-        // Highlight: cursor row, or any row in the visual selection range.
-        let highlighted = if let Some((start, end)) = visual {
-            row_idx >= start && row_idx <= end
+        // Highlight: cursor row (REVERSED) or visual selection (yellow).
+        let highlight = if let Some((start, end)) = visual {
+            if row_idx == state.cursor {
+                Some(&theme.selection)
+            } else if row_idx >= start && row_idx <= end {
+                Some(&theme.visual_selection)
+            } else {
+                None
+            }
+        } else if row_idx == state.cursor {
+            Some(&theme.selection)
         } else {
-            row_idx == state.cursor
+            None
         };
-        if highlighted {
+        if let Some(style) = highlight {
             for x in area.x..area.x + content_width {
                 let cell = &mut buf[(x, y)];
-                if let Some(bg) = theme.selection.bg {
+                if let Some(bg) = style.bg {
                     cell.set_bg(bg);
                 } else {
                     cell.modifier |= ratatui::style::Modifier::REVERSED;

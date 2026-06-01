@@ -542,7 +542,9 @@ fn handle_mouse(
                 if app.stream.in_visual() {
                     app.stream.exit_visual();
                 } else {
-                    let stream_row = app.stream.scroll_position + row as usize;
+                    let inner_top = layout.stream.y as usize + 1; // +1 for top border
+                    let relative_row = (row as usize).saturating_sub(inner_top);
+                    let stream_row = app.stream.scroll_position + relative_row;
                     if stream_row < app.stream.display_rows.len() {
                         app.stream.cursor = stream_row;
                         app.stream.auto_scroll = false;
