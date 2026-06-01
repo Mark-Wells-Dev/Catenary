@@ -780,6 +780,7 @@ impl LspClientManager {
     /// Every instance gets `Scope::Root(root)`. `project_scoped`
     /// controls server def resolution (merged vs user-level) but
     /// does not affect scope selection.
+    #[allow(clippy::too_many_lines, reason = "spawn + tombstone path")]
     async fn spawn_inner(
         &self,
         server_name: &str,
@@ -821,8 +822,10 @@ impl LspClientManager {
         }
 
         info!(
-            "Spawning LSP server for {}: {} {}",
-            lang,
+            source = Source::LspLifecycle.as_str(),
+            server = server_name,
+            scope_root = %root.display(),
+            "Spawning LSP server for {lang}: {} {}",
             server_def.command,
             server_def.args.join(" ")
         );

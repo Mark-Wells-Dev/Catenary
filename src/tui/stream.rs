@@ -247,6 +247,10 @@ pub struct StreamState {
     /// Each key is `(server_name, scope_root)`. Scopes with no matching
     /// LSP children are hidden.
     server_filter: Option<HashSet<super::sidebar::ServerInstanceKey>>,
+    /// Pre-computed set of `scope_root` values from `server_filter`.
+    /// Used for O(1) trace-event matching (non-LSP messages match on
+    /// root alone, not `(server, root)`).
+    server_filter_roots: Option<HashSet<String>>,
 
     // ── Paging state ─────────────────────────────────────────────────
     /// Whether all older scopes have been loaded (reached the beginning).
@@ -280,6 +284,7 @@ impl StreamState {
             visual_anchor: None,
             session_filter: None,
             server_filter: None,
+            server_filter_roots: None,
             reached_beginning: false,
             search_query: None,
             search_matches: Vec::new(),
@@ -319,18 +324,27 @@ impl StreamState {
                 continue;
             }
 
-            // Apply server filter: scope must have LSP children involving
-            // a selected server instance. Scopes with no matching LSP
-            // children (including hook-only scopes) are hidden.
+            // Apply server filter: entry must involve a selected server
+            // instance. LSP messages match on (server, scope_root). Other
+            // messages (trace events like spawn/lifecycle) match on
+            // scope_root alone — any selected instance at that root.
             if let Some(ref server_set) = self.server_filter {
+                let roots = self.server_filter_roots.as_ref();
+                let msg_matches = |typ: &str, server: &str, scope_root: &str| {
+                    if typ == "lsp" {
+                        server_set.contains(&(server.to_string(), scope_root.to_string()))
+                    } else {
+                        !scope_root.is_empty()
+                            && roots.is_some_and(|r| r.contains(scope_root))
+                    }
+                };
                 let matches = match entry {
-                    StreamEntry::Scope(scope) => scope.children.iter().any(|c| {
-                        c.r#type == "lsp"
-                            && server_set.contains(&(c.server.clone(), c.scope_root.clone()))
-                    }),
+                    StreamEntry::Scope(scope) => scope
+                        .children
+                        .iter()
+                        .any(|c| msg_matches(&c.r#type, &c.server, &c.scope_root)),
                     StreamEntry::Standalone(msg) => {
-                        msg.r#type == "lsp"
-                            && server_set.contains(&(msg.server.clone(), msg.scope_root.clone()))
+                        msg_matches(&msg.r#type, &msg.server, &msg.scope_root)
                     }
                 };
                 if !matches {
@@ -584,6 +598,9 @@ impl StreamState {
         &mut self,
         filter: Option<HashSet<super::sidebar::ServerInstanceKey>>,
     ) {
+        self.server_filter_roots = filter
+            .as_ref()
+            .map(|set| set.iter().map(|(_, sr)| sr.clone()).collect());
         self.server_filter = filter;
         self.rebuild_display_rows();
     }
@@ -1986,6 +2003,23 @@ mod tests {
 
     // ── Server filter tests ──────────────────────────────────────────
 
+    /// Trace event with a `scope_root` (e.g., spawn/lifecycle messages).
+    fn trace_event_with_root(session_id: &str, id: i64, scope_root: &str) -> SessionMessage {
+        SessionMessage {
+            id,
+            session_id: session_id.to_string(),
+            r#type: String::new(),
+            level: "info".to_string(),
+            method: String::new(),
+            server: String::new(),
+            client: String::new(),
+            parent_id: None,
+            scope_root: scope_root.to_string(),
+            timestamp: chrono::Utc::now(),
+            payload: serde_json::json!({}),
+        }
+    }
+
     /// LSP child with a specific server for server filter tests.
     fn lsp_child_server(
         session_id: &str,
@@ -2139,6 +2173,49 @@ mod tests {
         // Clear filter.
         state.set_server_filter(None);
         assert_eq!(state.display_rows.len(), 2, "all restored");
+    }
+
+    #[test]
+    fn test_server_filter_matches_trace_events_by_scope_root() {
+        // Standalone trace event with scope_root (e.g., "Spawning LSP server").
+        let trace = trace_event_with_root("s1", 1, "/projects/catenary");
+
+        // Standalone LSP message at the same root.
+        let mut lsp = lsp_child_server("s1", 1, 1, "rust-analyzer");
+        lsp.scope_root = "/projects/catenary".to_string();
+        lsp.parent_id = None; // standalone
+
+        // Standalone trace event at a different root.
+        let other = trace_event_with_root("s1", 3, "/projects/other");
+
+        let mut state = StreamState::new(vec![trace, lsp, other]);
+        assert_eq!(state.display_rows.len(), 3, "all visible unfiltered");
+
+        // Filter to rust-analyzer at /projects/catenary.
+        let mut filter = HashSet::new();
+        filter.insert((
+            "rust-analyzer".to_string(),
+            "/projects/catenary".to_string(),
+        ));
+        state.set_server_filter(Some(filter));
+
+        // Trace event at matching root included, other root excluded.
+        assert_eq!(state.display_rows.len(), 2);
+    }
+
+    #[test]
+    fn test_server_filter_excludes_trace_events_without_scope_root() {
+        // Trace event with no scope_root should not match any filter.
+        let trace = trace_event_with_root("s1", 1, "");
+
+        let mut state = StreamState::new(vec![trace]);
+        assert_eq!(state.display_rows.len(), 1, "visible unfiltered");
+
+        let mut filter = HashSet::new();
+        filter.insert(("rust-analyzer".to_string(), "/some/root".to_string()));
+        state.set_server_filter(Some(filter));
+
+        assert_eq!(state.display_rows.len(), 0, "empty scope_root excluded");
     }
 
     // ── Internal message expansion tests ─────────────────────────────

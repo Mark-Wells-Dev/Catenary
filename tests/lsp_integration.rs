@@ -459,14 +459,14 @@ async fn test_server_env_passed_to_process() -> Result<()> {
     Ok(())
 }
 
-/// Smoke test: spawn real rust-analyzer via `rustup run stable rust-analyzer`
-/// and complete the initialize handshake.
+/// Smoke test: spawn real rust-analyzer via rustup and complete the
+/// initialize handshake.
 ///
 /// Ignored by default — requires a working Rust stable toolchain with
 /// rust-analyzer installed. Run with:
-///     cargo nextest run test_real_rust_analyzer_initialize --run-ignored=all
+///     `make test-ignored T=test_real_rust_analyzer_initialize`
 #[tokio::test]
-#[ignore]
+#[ignore = "requires real rust-analyzer"]
 async fn test_real_rust_analyzer_initialize() -> Result<()> {
     let dir = tempdir()?;
 
@@ -488,21 +488,12 @@ async fn test_real_rust_analyzer_initialize() -> Result<()> {
         None,
     )?;
 
-    let result = client
-        .initialize(&[dir.path().to_path_buf()], None)
-        .await;
+    let result = client.initialize(&[dir.path().to_path_buf()], None).await?;
 
-    match &result {
-        Ok(v) => {
-            assert!(
-                v.get("capabilities").is_some(),
-                "initialize response should contain capabilities"
-            );
-        }
-        Err(e) => {
-            panic!("rust-analyzer initialize failed: {e}");
-        }
-    }
+    assert!(
+        result.get("capabilities").is_some(),
+        "initialize response should contain capabilities"
+    );
 
     client.shutdown().await?;
     Ok(())
