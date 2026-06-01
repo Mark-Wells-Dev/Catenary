@@ -771,15 +771,12 @@ fn run_daemon_main() -> Result<()> {
         (None, None, None)
     } else {
         let conn = catenary_mcp::db::open_and_migrate()?;
-        let instance_id: Arc<str> =
-            format!("daemon:{}", uuid::Uuid::new_v4()).into();
+        let instance_id: Arc<str> = format!("daemon:{}", uuid::Uuid::new_v4()).into();
 
         // Prune sessions from previous daemon runs whose process is
         // gone. CASCADE deletes their language_servers rows so stale
         // workspace roots don't accumulate in the TUI.
-        if let Err(e) =
-            session::prune_sessions_with_conn(&conn, config.log_retention_days)
-        {
+        if let Err(e) = session::prune_sessions_with_conn(&conn, config.log_retention_days) {
             info!("session pruning at daemon start: {e}");
         }
 

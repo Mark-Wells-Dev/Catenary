@@ -238,10 +238,10 @@ pub struct StreamState {
     visual_anchor: Option<usize>,
 
     // ── Filtering state ──────────────────────────────────────────────
-    /// Active session filter. `None` = show all. `Some(set)` = show only
-    /// entries whose session belongs to the set. Daemon-level events (no
-    /// matching session) are hidden when a filter is active.
-    session_filter: Option<HashSet<String>>,
+    /// Active workspace root filter. `None` = show all. `Some(set)` = show
+    /// only entries whose `scope_root` matches a value in the set.
+    /// Daemon-level events (empty `scope_root`) are hidden when active.
+    root_filter: Option<HashSet<String>>,
     /// Active server filter. `None` = show all. `Some(set)` = show only
     /// scopes whose LSP children involve a server instance in the set.
     /// Each key is `(server_name, scope_root)`. Scopes with no matching
@@ -282,7 +282,7 @@ impl StreamState {
             scope_map: HashMap::new(),
             expanded_standalones: HashSet::new(),
             visual_anchor: None,
-            session_filter: None,
+            root_filter: None,
             server_filter: None,
             server_filter_roots: None,
             reached_beginning: false,
@@ -317,11 +317,21 @@ impl StreamState {
         self.display_rows.clear();
 
         for (i, entry) in self.entries.iter().enumerate() {
-            // Apply session filter: skip entries not in the selected set.
-            if let Some(ref filter) = self.session_filter
-                && !filter.contains(entry.session_id())
-            {
-                continue;
+            // Apply root filter: skip entries not associated with
+            // selected workspace roots (matched via scope_root).
+            if let Some(ref filter) = self.root_filter {
+                let matches = match entry {
+                    StreamEntry::Scope(scope) => scope
+                        .children
+                        .iter()
+                        .any(|c| !c.scope_root.is_empty() && filter.contains(&c.scope_root)),
+                    StreamEntry::Standalone(msg) => {
+                        !msg.scope_root.is_empty() && filter.contains(&msg.scope_root)
+                    }
+                };
+                if !matches {
+                    continue;
+                }
             }
 
             // Apply server filter: entry must involve a selected server
@@ -334,8 +344,7 @@ impl StreamState {
                     if typ == "lsp" {
                         server_set.contains(&(server.to_string(), scope_root.to_string()))
                     } else {
-                        !scope_root.is_empty()
-                            && roots.is_some_and(|r| r.contains(scope_root))
+                        !scope_root.is_empty() && roots.is_some_and(|r| r.contains(scope_root))
                     }
                 };
                 let matches = match entry {
@@ -580,13 +589,13 @@ impl StreamState {
 
     // ── Session filter ────────────────────────────────────────────
 
-    /// Update the session filter and rebuild display rows.
+    /// Update the workspace root filter and rebuild display rows.
     ///
-    /// `None` = show all. `Some(set)` = show only entries belonging to
-    /// sessions in the set. Daemon-level events are hidden when a
-    /// filter is active.
-    pub fn set_session_filter(&mut self, filter: Option<HashSet<String>>) {
-        self.session_filter = filter;
+    /// `None` = show all. `Some(set)` = show only entries whose
+    /// `scope_root` matches a value in the set. Entries with empty
+    /// `scope_root` (daemon-level events) are hidden when active.
+    pub fn set_root_filter(&mut self, filter: Option<HashSet<String>>) {
+        self.root_filter = filter;
         self.rebuild_display_rows();
     }
 
@@ -1782,60 +1791,88 @@ mod tests {
         assert_eq!(scope2.children.len(), 2);
     }
 
-    // ── Session filter tests ─────────────────────────────────────────
+    // ── Root filter tests ────────────────────────────────────────────
+
+    /// LSP child with a specific `scope_root` for root filter tests.
+    fn lsp_child_at_root(
+        session_id: &str,
+        scope_id: i64,
+        id_offset: i64,
+        scope_root: &str,
+    ) -> SessionMessage {
+        SessionMessage {
+            scope_root: scope_root.to_string(),
+            ..make_message_with_ids(
+                session_id,
+                500 + scope_id * 10 + id_offset,
+                "lsp",
+                "textDocument/definition",
+                "rust-analyzer",
+                Some(&format!("scope-{scope_id}")),
+            )
+        }
+    }
 
     #[test]
-    fn test_session_filter_none_shows_all() {
+    fn test_root_filter_none_shows_all() {
         let messages = vec![
             mcp_request("s1", 1, "grep"),
+            lsp_child_at_root("s1", 1, 0, "/projects/alpha"),
             mcp_response("s1", 1),
-            mcp_request("s2", 2, "glob"),
-            mcp_response("s2", 2),
+            trace_event_with_root("s1", 50, "/projects/beta"),
             make_message("daemon", "lifecycle"),
         ];
         let mut state = StreamState::new(messages);
-        state.set_session_filter(None);
+        state.set_root_filter(None);
         assert_eq!(state.display_rows.len(), 3, "None filter shows all entries");
     }
 
     #[test]
-    fn test_session_filter_shows_only_selected() {
-        let messages = vec![
-            mcp_request("s1", 1, "grep"),
-            mcp_response("s1", 1),
-            mcp_request("s2", 2, "glob"),
-            mcp_response("s2", 2),
-            make_message("s1", "hover"),
-        ];
-        let mut state = StreamState::new(messages);
+    fn test_root_filter_shows_only_matching_root() {
+        // Scope 1: LSP child at /projects/alpha.
+        let req1 = mcp_request("s1", 1, "grep");
+        let child1 = lsp_child_at_root("s1", 1, 0, "/projects/alpha");
+        let resp1 = mcp_response("s1", 1);
 
-        let mut filter = HashSet::new();
-        filter.insert("s1".to_string());
-        state.set_session_filter(Some(filter));
+        // Scope 2: LSP child at /projects/beta.
+        let req2 = mcp_request("s1", 2, "glob");
+        let child2 = lsp_child_at_root("s1", 2, 0, "/projects/beta");
+        let resp2 = mcp_response("s1", 2);
 
-        // Only s1's scope and standalone should show.
+        // Standalone trace at /projects/alpha.
+        let trace = trace_event_with_root("s1", 50, "/projects/alpha");
+
+        let mut state = StreamState::new(vec![req1, child1, resp1, req2, child2, resp2, trace]);
+        assert_eq!(state.display_rows.len(), 3, "all visible unfiltered");
+
+        let filter = HashSet::from(["/projects/alpha".to_string()]);
+        state.set_root_filter(Some(filter));
+
+        // Only scope 1 and the trace at /projects/alpha should show.
         assert_eq!(
             state.display_rows.len(),
             2,
-            "filter should show only s1 entries"
+            "filter should show only /projects/alpha entries"
         );
     }
 
     #[test]
-    fn test_session_filter_hides_daemon_events() {
-        let messages = vec![
-            mcp_request("s1", 1, "grep"),
-            mcp_response("s1", 1),
-            make_message("daemon", "lifecycle"),
-            make_message("daemon", "gc"),
-        ];
-        let mut state = StreamState::new(messages);
+    fn test_root_filter_hides_daemon_events() {
+        // Scope with a root.
+        let req = mcp_request("s1", 1, "grep");
+        let child = lsp_child_at_root("s1", 1, 0, "/projects/alpha");
+        let resp = mcp_response("s1", 1);
 
-        let mut filter = HashSet::new();
-        filter.insert("s1".to_string());
-        state.set_session_filter(Some(filter));
+        // Daemon-level events (empty scope_root).
+        let daemon1 = make_message("daemon", "lifecycle");
+        let daemon2 = make_message("daemon", "gc");
 
-        // Daemon events should be hidden.
+        let mut state = StreamState::new(vec![req, child, resp, daemon1, daemon2]);
+
+        let filter = HashSet::from(["/projects/alpha".to_string()]);
+        state.set_root_filter(Some(filter));
+
+        // Daemon events (empty scope_root) should be hidden.
         assert_eq!(
             state.display_rows.len(),
             1,
@@ -1844,37 +1881,40 @@ mod tests {
     }
 
     #[test]
-    fn test_session_filter_clamps_cursor() {
-        let messages = vec![
-            mcp_request("s1", 1, "grep"),
-            mcp_response("s1", 1),
-            mcp_request("s2", 2, "glob"),
-            mcp_response("s2", 2),
-        ];
-        let mut state = StreamState::new(messages);
+    fn test_root_filter_clamps_cursor() {
+        let req1 = mcp_request("s1", 1, "grep");
+        let child1 = lsp_child_at_root("s1", 1, 0, "/projects/alpha");
+        let resp1 = mcp_response("s1", 1);
+
+        let req2 = mcp_request("s1", 2, "glob");
+        let child2 = lsp_child_at_root("s1", 2, 0, "/projects/beta");
+        let resp2 = mcp_response("s1", 2);
+
+        let mut state = StreamState::new(vec![req1, child1, resp1, req2, child2, resp2]);
         // Cursor on the second entry.
         state.cursor = 1;
 
-        // Filter to s1 only — only 1 display row remains.
-        let mut filter = HashSet::new();
-        filter.insert("s1".to_string());
-        state.set_session_filter(Some(filter));
+        // Filter to alpha only — only 1 display row remains.
+        let filter = HashSet::from(["/projects/alpha".to_string()]);
+        state.set_root_filter(Some(filter));
 
         assert_eq!(state.cursor, 0, "cursor should clamp to valid range");
     }
 
     #[test]
-    fn test_session_filter_clamps_scroll_position() {
+    fn test_root_filter_clamps_scroll_position() {
         let messages: Vec<_> = (0..30)
-            .map(|i| make_message("s1", &format!("method-{i}")))
+            .map(|i| SessionMessage {
+                scope_root: "/projects/alpha".to_string(),
+                ..make_message("s1", &format!("method-{i}"))
+            })
             .collect();
         let mut state = StreamState::new(messages);
         state.scroll_position = 25;
 
-        // Filter to non-existent session — empty display.
-        let mut filter = HashSet::new();
-        filter.insert("nonexistent".to_string());
-        state.set_session_filter(Some(filter));
+        // Filter to non-existent root — empty display.
+        let filter = HashSet::from(["/nonexistent".to_string()]);
+        state.set_root_filter(Some(filter));
 
         assert_eq!(
             state.scroll_position, 0,
@@ -1883,61 +1923,67 @@ mod tests {
     }
 
     #[test]
-    fn test_session_filter_multiple_selected() {
-        let messages = vec![
-            mcp_request("s1", 1, "grep"),
-            mcp_response("s1", 1),
-            mcp_request("s2", 2, "glob"),
-            mcp_response("s2", 2),
-            mcp_request("s3", 3, "grep"),
-            mcp_response("s3", 3),
-        ];
-        let mut state = StreamState::new(messages);
+    fn test_root_filter_multiple_selected() {
+        let req1 = mcp_request("s1", 1, "grep");
+        let child1 = lsp_child_at_root("s1", 1, 0, "/projects/alpha");
+        let resp1 = mcp_response("s1", 1);
 
-        let mut filter = HashSet::new();
-        filter.insert("s1".to_string());
-        filter.insert("s3".to_string());
-        state.set_session_filter(Some(filter));
+        let req2 = mcp_request("s1", 2, "glob");
+        let child2 = lsp_child_at_root("s1", 2, 0, "/projects/beta");
+        let resp2 = mcp_response("s1", 2);
 
-        assert_eq!(state.display_rows.len(), 2, "should show s1 and s3");
+        let req3 = mcp_request("s1", 3, "grep");
+        let child3 = lsp_child_at_root("s1", 3, 0, "/projects/gamma");
+        let resp3 = mcp_response("s1", 3);
+
+        let mut state = StreamState::new(vec![
+            req1, child1, resp1, req2, child2, resp2, req3, child3, resp3,
+        ]);
+
+        let filter = HashSet::from(["/projects/alpha".to_string(), "/projects/gamma".to_string()]);
+        state.set_root_filter(Some(filter));
+
+        assert_eq!(state.display_rows.len(), 2, "should show alpha and gamma");
     }
 
     #[test]
-    fn test_session_filter_toggle_back_to_none() {
-        let messages = vec![
-            mcp_request("s1", 1, "grep"),
-            mcp_response("s1", 1),
-            mcp_request("s2", 2, "glob"),
-            mcp_response("s2", 2),
-        ];
-        let mut state = StreamState::new(messages);
+    fn test_root_filter_toggle_back_to_none() {
+        let req1 = mcp_request("s1", 1, "grep");
+        let child1 = lsp_child_at_root("s1", 1, 0, "/projects/alpha");
+        let resp1 = mcp_response("s1", 1);
+
+        let req2 = mcp_request("s1", 2, "glob");
+        let child2 = lsp_child_at_root("s1", 2, 0, "/projects/beta");
+        let resp2 = mcp_response("s1", 2);
+
+        let mut state = StreamState::new(vec![req1, child1, resp1, req2, child2, resp2]);
 
         // Apply filter.
-        let mut filter = HashSet::new();
-        filter.insert("s1".to_string());
-        state.set_session_filter(Some(filter));
+        let filter = HashSet::from(["/projects/alpha".to_string()]);
+        state.set_root_filter(Some(filter));
         assert_eq!(state.display_rows.len(), 1);
 
         // Remove filter.
-        state.set_session_filter(None);
+        state.set_root_filter(None);
         assert_eq!(state.display_rows.len(), 2, "removing filter restores all");
     }
 
     #[test]
-    fn test_session_filter_with_open_scope_children() {
-        // Open scope with children — filter should show header + children.
-        let messages = vec![
-            mcp_request("s1", 1, "grep"),
-            lsp_child("s1", 1, "workspace/symbol"),
-            make_message("s2", "hover"),
-        ];
-        let mut state = StreamState::new(messages);
+    fn test_root_filter_with_open_scope_children() {
+        // Open scope with children at /projects/alpha.
+        let req = mcp_request("s1", 1, "grep");
+        let child = lsp_child_at_root("s1", 1, 0, "/projects/alpha");
 
-        let mut filter = HashSet::new();
-        filter.insert("s1".to_string());
-        state.set_session_filter(Some(filter));
+        // Standalone at /projects/beta.
+        let mut standalone = make_message("s1", "hover");
+        standalone.scope_root = "/projects/beta".to_string();
 
-        // Open scope (header + 1 child) = 2 rows; s2's standalone hidden.
+        let mut state = StreamState::new(vec![req, child, standalone]);
+
+        let filter = HashSet::from(["/projects/alpha".to_string()]);
+        state.set_root_filter(Some(filter));
+
+        // Open scope (header + 1 child) = 2 rows; beta standalone hidden.
         assert_eq!(state.display_rows.len(), 2);
     }
 
@@ -2117,20 +2163,23 @@ mod tests {
     }
 
     #[test]
-    fn test_server_filter_combined_with_session_filter() {
-        // Session s1, scope 1: rust-analyzer.
+    fn test_server_filter_combined_with_root_filter() {
+        // Scope 1 at /projects/alpha: rust-analyzer.
         let req1 = mcp_request("s1", 1, "grep");
-        let child1 = lsp_child_server("s1", 1, 0, "rust-analyzer");
+        let mut child1 = lsp_child_server("s1", 1, 0, "rust-analyzer");
+        child1.scope_root = "/projects/alpha".to_string();
         let resp1 = mcp_response("s1", 1);
 
-        // Session s2, scope 2: rust-analyzer.
-        let req2 = mcp_request("s2", 2, "grep");
-        let child2 = lsp_child_server("s2", 2, 0, "rust-analyzer");
-        let resp2 = mcp_response("s2", 2);
+        // Scope 2 at /projects/beta: rust-analyzer.
+        let req2 = mcp_request("s1", 2, "grep");
+        let mut child2 = lsp_child_server("s1", 2, 0, "rust-analyzer");
+        child2.scope_root = "/projects/beta".to_string();
+        let resp2 = mcp_response("s1", 2);
 
-        // Session s1, scope 3: lua-ls.
+        // Scope 3 at /projects/alpha: lua-ls.
         let req3 = mcp_request("s1", 3, "glob");
-        let child3 = lsp_child_server("s1", 3, 0, "lua-ls");
+        let mut child3 = lsp_child_server("s1", 3, 0, "lua-ls");
+        child3.scope_root = "/projects/alpha".to_string();
         let resp3 = mcp_response("s1", 3);
 
         let mut state = StreamState::new(vec![
@@ -2138,18 +2187,16 @@ mod tests {
         ]);
         assert_eq!(state.display_rows.len(), 3);
 
-        // Session filter: s1 only.
-        let mut sessions = HashSet::new();
-        sessions.insert("s1".to_string());
-        state.set_session_filter(Some(sessions));
-        assert_eq!(state.display_rows.len(), 2, "s1 scopes only");
+        // Root filter: /projects/alpha only.
+        let roots = HashSet::from(["/projects/alpha".to_string()]);
+        state.set_root_filter(Some(roots));
+        assert_eq!(state.display_rows.len(), 2, "alpha scopes only");
 
-        // Add server filter: rust-analyzer only.
-        let mut servers = HashSet::new();
-        servers.insert(("rust-analyzer".to_string(), String::new()));
+        // Add server filter: rust-analyzer at /projects/alpha.
+        let servers = HashSet::from([("rust-analyzer".to_string(), "/projects/alpha".to_string())]);
         state.set_server_filter(Some(servers));
 
-        // Intersection: s1 AND rust-analyzer = scope 1 only.
+        // Intersection: alpha root AND rust-analyzer = scope 1 only.
         assert_eq!(state.display_rows.len(), 1);
     }
 

@@ -174,8 +174,7 @@ impl<'a> App<'a> {
     /// the stream filters.
     pub fn toggle_workspace_selection(&mut self) {
         if self.sidebar.toggle_selected() {
-            self.stream
-                .set_session_filter(self.sidebar.session_filter());
+            self.stream.set_root_filter(self.sidebar.root_filter());
             self.stream.set_server_filter(self.sidebar.server_filter());
         }
     }
@@ -365,8 +364,7 @@ impl<'a> App<'a> {
         let had_filter = self.sidebar.has_filter();
         self.sidebar.refresh(sessions, &mut self.stream.badges);
         if had_filter {
-            self.stream
-                .set_session_filter(self.sidebar.session_filter());
+            self.stream.set_root_filter(self.sidebar.root_filter());
         }
     }
 

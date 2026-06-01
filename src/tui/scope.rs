@@ -31,8 +31,6 @@ pub enum ScopeState {
 pub struct Scope {
     /// Scope identity — the `parent_id` UUID shared by all scope messages.
     pub scope_id: String,
-    /// Session that owns this scope.
-    pub session_id: String,
     /// The request that opened this scope (first message with this UUID).
     pub request: SessionMessage,
     /// The response that closed this scope.
@@ -53,10 +51,8 @@ impl Scope {
     #[must_use]
     pub fn new(request: SessionMessage) -> Self {
         let scope_id = request.parent_id.clone().unwrap_or_default();
-        let session_id = request.session_id.clone();
         Self {
             scope_id,
-            session_id,
             request,
             response: None,
             children: Vec::new(),
@@ -110,17 +106,6 @@ pub enum StreamEntry {
     Scope(Box<Scope>),
     /// A standalone message not belonging to any scope.
     Standalone(SessionMessage),
-}
-
-impl StreamEntry {
-    /// The session ID for this entry.
-    #[must_use]
-    pub fn session_id(&self) -> &str {
-        match self {
-            Self::Scope(scope) => &scope.session_id,
-            Self::Standalone(msg) => &msg.session_id,
-        }
-    }
 }
 
 #[cfg(test)]

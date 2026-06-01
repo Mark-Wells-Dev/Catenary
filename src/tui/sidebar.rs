@@ -581,26 +581,17 @@ impl SidebarState {
         }
     }
 
-    /// Build the session filter from selected workspace roots.
+    /// Build the workspace root filter from selected roots.
     ///
-    /// `None` = show all. `Some(set)` = show only sessions connected
-    /// to the selected workspace roots.
+    /// `None` = show all. `Some(set)` = filter stream entries by
+    /// `scope_root` matching a selected workspace root path.
     #[must_use]
-    pub fn session_filter(&self) -> Option<HashSet<String>> {
+    pub fn root_filter(&self) -> Option<HashSet<String>> {
         if self.selected_roots.is_empty() {
-            return None;
+            None
+        } else {
+            Some(self.selected_roots.clone())
         }
-        let mut ids = HashSet::new();
-        for ws in &self.workspaces {
-            if self.selected_roots.contains(&ws.root_path) {
-                for cg in &ws.connections {
-                    for id in &cg.session_ids {
-                        ids.insert(id.clone());
-                    }
-                }
-            }
-        }
-        if ids.is_empty() { None } else { Some(ids) }
     }
 
     /// Return the active server filter.
@@ -1468,7 +1459,7 @@ mod tests {
         );
 
         assert!(!state.has_filter());
-        assert!(state.session_filter().is_none());
+        assert!(state.root_filter().is_none());
 
         state.cursor = 0;
         assert!(state.toggle_selected());
@@ -1476,9 +1467,9 @@ mod tests {
         assert!(state.is_root_selected("/A"));
         assert!(!state.is_root_selected("/B"));
 
-        let filter = state.session_filter().expect("filter should be Some");
-        assert!(filter.contains("s1"));
-        assert!(!filter.contains("s2"));
+        let filter = state.root_filter().expect("filter should be Some");
+        assert!(filter.contains("/A"));
+        assert!(!filter.contains("/B"));
 
         assert!(state.toggle_selected());
         assert!(!state.has_filter());
