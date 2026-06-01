@@ -322,10 +322,11 @@ impl DataSource for SqliteDataSource {
 
     fn list_server_statuses(&self) -> Result<Vec<ServerStatusRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT language_id, server, scope_kind, scope_root, state \
-             FROM language_servers \
-             WHERE state != 'dead' \
-             ORDER BY server, language_id, scope_root",
+            "SELECT ls.language_id, ls.server, ls.scope_kind, ls.scope_root, ls.state \
+             FROM language_servers ls \
+             JOIN sessions s ON s.id = ls.session_id AND s.alive = 1 \
+             WHERE ls.state != 'dead' \
+             ORDER BY ls.server, ls.language_id, ls.scope_root",
         )?;
         let mut rows = stmt.query([])?;
         let mut result = Vec::new();
@@ -343,11 +344,12 @@ impl DataSource for SqliteDataSource {
 
     fn list_server_noise(&self) -> Result<Vec<ServerNoiseRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT server, scope_root, progress_title, progress_pct, last_message \
-             FROM language_servers \
-             WHERE state != 'dead' \
-               AND (progress_title IS NOT NULL OR last_message IS NOT NULL) \
-             ORDER BY server, scope_root",
+            "SELECT ls.server, ls.scope_root, ls.progress_title, ls.progress_pct, ls.last_message \
+             FROM language_servers ls \
+             JOIN sessions s ON s.id = ls.session_id AND s.alive = 1 \
+             WHERE ls.state != 'dead' \
+               AND (ls.progress_title IS NOT NULL OR ls.last_message IS NOT NULL) \
+             ORDER BY ls.server, ls.scope_root",
         )?;
         let mut rows = stmt.query([])?;
         let mut result = Vec::new();

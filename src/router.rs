@@ -1681,27 +1681,14 @@ async fn handle_hook_dispatch(
             slot.take().map(|h| (h.files, h.filtered, h.parent_id))
         };
 
-        let (response, scope_id) = if let Some((files, filtered, parent_id)) = handoff {
-            let resp = if files.is_empty() {
-                if filtered > 0 {
-                    "(edits outside tracked roots \u{2014} see `catenary roots -h`)\n".to_string()
-                } else {
-                    String::new()
-                }
-            } else {
-                ctx.primary
-                    .diagnostics
-                    .process_files_batched(&files, Some(&parent_id))
-                    .await
-            };
-            (resp, parent_id)
-        } else {
-            // Handoff slot was empty — timeout expired or double-consume.
-            let fallback_id = uuid::Uuid::new_v4().to_string();
-            (
-                "editing stop handoff expired — no files available\n".to_string(),
-                fallback_id,
-            )
+        // Extract scope_id early so we can emit the incoming hook
+        // event before running the diagnostics pipeline. This ensures
+        // the tool/editing-stop event is the first message in the
+        // parent_id group, making it the scope header in the TUI
+        // (matching the grep/glob pattern).
+        let scope_id = match &handoff {
+            Some((_, _, parent_id)) => parent_id.clone(),
+            None => uuid::Uuid::new_v4().to_string(),
         };
 
         emit_hook_event(
@@ -1712,6 +1699,25 @@ async fn handle_hook_dispatch(
             &raw.to_string(),
             "incoming hook",
         );
+
+        let response = if let Some((files, filtered, _)) = handoff {
+            if files.is_empty() {
+                if filtered > 0 {
+                    "(edits outside tracked roots \u{2014} see `catenary roots -h`)\n".to_string()
+                } else {
+                    String::new()
+                }
+            } else {
+                ctx.primary
+                    .diagnostics
+                    .process_files_batched(&files, Some(&scope_id))
+                    .await
+            }
+        } else {
+            // Handoff slot was empty — timeout expired or double-consume.
+            "editing stop handoff expired — no files available\n".to_string()
+        };
+
         emit_hook_event(
             tracing::Level::INFO,
             "cli",
