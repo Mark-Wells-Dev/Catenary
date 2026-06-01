@@ -756,7 +756,7 @@ fn run_daemon_main() -> Result<()> {
         .and_then(|r| catenary_mcp::config::load_project_config(r).ok().flatten())
         .is_some_and(|pc| !pc.lsp);
 
-    let (shared_session, shared_conn) = if disabled {
+    let (shared_session, shared_conn, daemon_instance_id) = if disabled {
         info!("Catenary disabled by .catenary.toml (lsp = false) in {workspace_display}");
         // Activate with just the desktop notification sink so stale hook
         // detection can still fire OS notifications.
@@ -768,10 +768,20 @@ fn run_daemon_main() -> Result<()> {
         let desktop_sink =
             catenary_mcp::notify::DesktopNotificationSink::with_enabled(desktop_enabled);
         logging.activate(vec![desktop_sink]);
-        (None, None)
+        (None, None, None)
     } else {
         let conn = catenary_mcp::db::open_and_migrate()?;
-        let instance_id: Arc<str> = "daemon".into();
+        let instance_id: Arc<str> =
+            format!("daemon:{}", uuid::Uuid::new_v4()).into();
+
+        // Prune sessions from previous daemon runs whose process is
+        // gone. CASCADE deletes their language_servers rows so stale
+        // workspace roots don't accumulate in the TUI.
+        if let Err(e) =
+            session::prune_sessions_with_conn(&conn, config.log_retention_days)
+        {
+            info!("session pruning at daemon start: {e}");
+        }
 
         // Insert a session row so MessageDbSink's FK constraint
         // (messages.session_id → sessions.id) is satisfied. Without
@@ -779,7 +789,7 @@ fn run_daemon_main() -> Result<()> {
         // violation → trace!() → recursive on_event → stack overflow.
         let started_at = chrono::Utc::now().to_rfc3339();
         conn.execute(
-            "INSERT OR IGNORE INTO sessions \
+            "INSERT INTO sessions \
              (id, pid, display_name, started_at, alive) \
              VALUES (?1, ?2, ?3, ?4, 1)",
             rusqlite::params![
@@ -809,7 +819,7 @@ fn run_daemon_main() -> Result<()> {
             roots,
             logging.clone(),
             conn.clone(),
-            instance_id,
+            instance_id.clone(),
             rt.handle().clone(),
             notification_router,
         ));
@@ -818,7 +828,7 @@ fn run_daemon_main() -> Result<()> {
         let session_for_spawn = session.clone();
         rt.spawn(async move { session_for_spawn.spawn_all().await });
 
-        (Some(session), Some(conn))
+        (Some(session), Some(conn), Some(instance_id))
     };
 
     let session_for_shutdown = shared_session.clone();
@@ -875,6 +885,19 @@ fn run_daemon_main() -> Result<()> {
 
     // Drop removes socket files.
     drop(manager);
+
+    // Mark the daemon session dead so the TUI stops showing its
+    // workspace roots. On crash, prune_sessions_with_conn detects the
+    // dead PID on the next daemon or TUI startup.
+    if let Some(id) = daemon_instance_id
+        && let Ok(conn) = catenary_mcp::db::open()
+    {
+        let ended_at = chrono::Utc::now().to_rfc3339();
+        let _ = conn.execute(
+            "UPDATE sessions SET alive = 0, ended_at = ?1 WHERE id = ?2",
+            rusqlite::params![&ended_at, &*id],
+        );
+    }
 
     info!(source = Source::DaemonLifecycle.as_str(), "daemon stopped",);
 
