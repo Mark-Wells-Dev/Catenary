@@ -10,5 +10,5 @@ target/
 *.log
 __pycache__/
 *.pyc
-mutants.out/
+mutants.out*/
 .claude/
