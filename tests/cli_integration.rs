@@ -1070,3 +1070,27 @@ fn test_doctor_piped_no_ansi() -> Result<()> {
     assert!(output.status.success());
     Ok(())
 }
+
+// ── --help exit code tests ────────────────────────────────────────
+
+/// Agent-facing subcommands must exit 0 on `--help` so that parallel
+/// tool calls (e.g., `catenary grep --help` and `catenary glob --help`
+/// in the same turn) don't cancel each other on a non-zero exit code.
+#[test]
+fn test_help_exits_zero_for_agent_subcommands() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    for subcmd in ["grep", "glob", "editing", "roots"] {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
+        isolate_env(&mut cmd, tmp.path().to_str().context("tempdir path")?);
+        cmd.args([subcmd, "--help"]);
+        let output = cmd
+            .output()
+            .with_context(|| format!("failed to run catenary {subcmd} --help"))?;
+        assert!(
+            output.status.success(),
+            "catenary {subcmd} --help should exit 0, got {:?}",
+            output.status.code()
+        );
+    }
+    Ok(())
+}

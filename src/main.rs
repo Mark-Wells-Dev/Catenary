@@ -354,6 +354,14 @@ fn main() -> Result<()> {
     let matches = match cli.clone().try_get_matches() {
         Ok(m) => m,
         Err(e) => {
+            // Let clap handle --help and --version normally (exit 0).
+            if matches!(
+                e.kind(),
+                clap::error::ErrorKind::DisplayHelp
+                    | clap::error::ErrorKind::DisplayVersion
+            ) {
+                e.exit();
+            }
             // For agent-facing subcommands, append `-h` output so the
             // agent sees correct usage without a second round-trip.
             let raw = e.to_string();
