@@ -1071,6 +1071,57 @@ fn test_doctor_piped_no_ansi() -> Result<()> {
     Ok(())
 }
 
+// ── non-existent path tests ───────────────────────────────────────
+
+/// Grep and glob must fail with a non-zero exit code and an error
+/// message when given a path that does not exist, rather than silently
+/// returning empty results.
+#[test]
+fn test_grep_nonexistent_path_fails() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let bogus = tmp.path().join("no_such_dir");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
+    isolate_env(&mut cmd, tmp.path().to_str().context("tempdir path")?);
+    cmd.args(["grep", "pattern"])
+        .arg(&bogus)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = cmd.output().context("failed to run catenary grep")?;
+    assert!(
+        !output.status.success(),
+        "catenary grep on non-existent path should fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("path does not exist"),
+        "stderr should mention missing path, got:\n{stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_glob_nonexistent_path_fails() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let bogus = tmp.path().join("no_such_dir");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
+    isolate_env(&mut cmd, tmp.path().to_str().context("tempdir path")?);
+    cmd.args(["glob"])
+        .arg(&bogus)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = cmd.output().context("failed to run catenary glob")?;
+    assert!(
+        !output.status.success(),
+        "catenary glob on non-existent path should fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("path does not exist"),
+        "stderr should mention missing path, got:\n{stderr}"
+    );
+    Ok(())
+}
+
 // ── --help exit code tests ────────────────────────────────────────
 
 /// Agent-facing subcommands must exit 0 on `--help` so that parallel

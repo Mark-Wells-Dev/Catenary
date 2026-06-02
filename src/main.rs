@@ -357,8 +357,7 @@ fn main() -> Result<()> {
             // Let clap handle --help and --version normally (exit 0).
             if matches!(
                 e.kind(),
-                clap::error::ErrorKind::DisplayHelp
-                    | clap::error::ErrorKind::DisplayVersion
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
             ) {
                 e.exit();
             }
@@ -614,12 +613,16 @@ fn contains_glob_metachar(s: &str) -> bool {
     s.contains('*') || s.contains('?') || s.contains('[') || s.contains('{')
 }
 
-/// Emits a hint to stderr for non-existent paths that look like quoted glob patterns.
+/// Validates that all paths exist and emits hints for quoted glob patterns.
 ///
 /// When the user passes a quoted glob (e.g. `'src/**/*.rs'`), the shell
 /// does not expand it. The resulting literal path won't exist on disk.
 /// This function detects that case and suggests retrying without quotes.
-fn emit_glob_hints(paths: &[PathBuf], cwd: &Path, command: &str) {
+///
+/// Returns an error listing all non-existent paths so the agent gets
+/// immediate feedback instead of silent empty results.
+fn validate_paths(paths: &[PathBuf], cwd: &Path, command: &str) -> Result<()> {
+    let mut missing = Vec::new();
     for path in paths {
         let resolved = if path.is_absolute() {
             path.clone()
@@ -631,8 +634,16 @@ fn emit_glob_hints(paths: &[PathBuf], cwd: &Path, command: &str) {
             if contains_glob_metachar(&s) {
                 eprintln!("hint: path not found — try without quotes: {command} {s}");
             }
+            missing.push(path.display().to_string());
         }
     }
+    if missing.is_empty() {
+        return Ok(());
+    }
+    if missing.len() == 1 {
+        anyhow::bail!("path does not exist: {}", missing[0]);
+    }
+    anyhow::bail!("paths do not exist:\n{}", missing.join("\n"));
 }
 
 /// Print an overview of Catenary's workflow and commands.
@@ -966,7 +977,7 @@ async fn run_grep(
     let has_bre_alternation = pattern.contains("\\|");
     let cwd = std::env::current_dir().context("cannot determine working directory")?;
 
-    emit_glob_hints(&paths, &cwd, "catenary grep");
+    validate_paths(&paths, &cwd, "catenary grep")?;
 
     let ipc_path = catenary_mcp::router::socket_path();
 
@@ -1042,7 +1053,7 @@ async fn run_glob(
 
     let cwd = std::env::current_dir().context("cannot determine working directory")?;
 
-    emit_glob_hints(&paths, &cwd, "catenary glob");
+    validate_paths(&paths, &cwd, "catenary glob")?;
 
     let ipc_path = catenary_mcp::router::socket_path();
 
