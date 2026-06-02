@@ -535,20 +535,32 @@ impl HookRouter {
         agent_id: &str,
         tool_name: Option<&str>,
     ) -> Option<HookResult> {
-        if self.session.editing.is_editing(session_id, agent_id)
-            && tool_name.is_some_and(is_edit_tool)
+        if !self.session.editing.is_editing(session_id, agent_id)
+            || !tool_name.is_some_and(is_edit_tool)
         {
-            // Only accumulate files with known LSP coverage — files
-            // without coverage have no server to produce diagnostics,
-            // so processing them in done_editing is wasted work.
-            let path = Path::new(file_path);
-            if self.session.has_lsp_coverage(path) {
-                self.session
-                    .editing
-                    .add_file(session_id, agent_id, PathBuf::from(file_path));
-            } else {
-                self.session.editing.increment_filtered();
-            }
+            return None;
+        }
+
+        // Only accumulate files with known LSP coverage — files
+        // without coverage have no server to produce diagnostics,
+        // so processing them in done_editing is wasted work.
+        let path = Path::new(file_path);
+        if self.session.has_lsp_coverage(path) {
+            self.session
+                .editing
+                .add_file(session_id, agent_id, PathBuf::from(file_path));
+            debug!(
+                source = Source::HookDispatch.as_str(),
+                file = file_path,
+                "file accumulated for diagnostics",
+            );
+        } else {
+            self.session.editing.increment_filtered();
+            debug!(
+                source = Source::HookDispatch.as_str(),
+                file = file_path,
+                "file filtered (no LSP coverage)",
+            );
         }
         None
     }

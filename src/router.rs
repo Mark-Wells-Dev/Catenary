@@ -810,6 +810,7 @@ impl SessionManager {
         let count = Arc::clone(&self.connection_count);
         let disconnect = Arc::clone(&self.disconnect);
         let lsp = self.lsp.clone();
+        let primary_session = self.hook_ctx.as_ref().map(|ctx| ctx.primary.clone());
         let root_tracker = self.root_tracker.clone();
         let db_conn = self.db_conn.clone();
 
@@ -899,6 +900,7 @@ impl SessionManager {
                 // Clone shared state for post-disconnect cleanup
                 // (originals move into spawn_blocking).
                 let tracker_cleanup = root_tracker.clone();
+                let session_cleanup = primary_session.clone();
                 let lsp_cleanup = lsp.clone();
 
                 let result = tokio::task::spawn_blocking(move || {
@@ -911,8 +913,8 @@ impl SessionManager {
                     // root tracker is configured, root changes go through
                     // refcounting so multiple sessions can share roots
                     // without clobbering each other.
-                    match (root_tracker, lsp) {
-                        (Some(tracker), Some(cm)) => {
+                    match (root_tracker, lsp, primary_session) {
+                        (Some(tracker), Some(_), Some(session)) => {
                             let mcp_key = format!("mcp:{fd}");
                             let db_for_roots = db_conn.clone();
                             let key_for_roots = session_key.clone();
@@ -938,11 +940,11 @@ impl SessionManager {
                                 tracker.set_roots(&mcp_key, paths);
                                 let global = tracker.global_roots();
                                 tokio::runtime::Handle::current()
-                                    .block_on(cm.sync_roots(global))?;
+                                    .block_on(session.sync_roots(global))?;
                                 Ok(())
                             }));
                         }
-                        (None, Some(cm)) => {
+                        (None, Some(cm), _) => {
                             let db_for_roots = db_conn.clone();
                             let key_for_roots = session_key.clone();
                             mcp = mcp.on_roots_changed(Box::new(move |roots| {
@@ -1020,15 +1022,22 @@ impl SessionManager {
                     let mcp_key = format!("mcp:{fd}");
                     tracker.remove_contributor(&mcp_key);
 
-                    // Sync the reduced root set.
-                    if let Some(ref cm) = lsp_cleanup {
-                        let global = tracker.global_roots();
-                        if let Err(e) = cm.sync_roots(global).await {
-                            debug!(
-                                source = Source::DaemonDispatch.as_str(),
-                                "root sync after disconnect failed: {e}",
-                            );
-                        }
+                    // Sync the reduced root set through the primary
+                    // session so both FilesystemManager and PathValidator
+                    // are updated.
+                    let global = tracker.global_roots();
+                    let sync_result = if let Some(ref session) = session_cleanup {
+                        session.sync_roots(global).await
+                    } else if let Some(ref cm) = lsp_cleanup {
+                        cm.sync_roots(global).await
+                    } else {
+                        Ok(())
+                    };
+                    if let Err(e) = sync_result {
+                        debug!(
+                            source = Source::DaemonDispatch.as_str(),
+                            "root sync after disconnect failed: {e}",
+                        );
                     }
                 }
             }
@@ -1608,6 +1617,14 @@ async fn handle_hook_dispatch(
 
         // Drain accumulated files from EditingManager.
         let (files, filtered) = router.session.editing.drain_all_and_clear();
+
+        debug!(
+            source = Source::DaemonDispatch.as_str(),
+            session_id = %session_id,
+            file_count = files.len(),
+            filtered,
+            "editing stop: drained files from EditingManager",
+        );
 
         // Release the editing guardrail.
         ctx.editing_guardrail.release_all(&session_id);
