@@ -1830,6 +1830,7 @@ mod tests {
             "test".to_string(),
             logging,
             "test-server",
+            "",
         )
         .expect("mockls should spawn");
         server.set_connection(conn);

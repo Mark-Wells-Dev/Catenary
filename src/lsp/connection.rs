@@ -173,7 +173,11 @@ impl Connection {
     /// Returns an error if:
     /// - The server process cannot be spawned.
     /// - Stdin or stdout cannot be captured.
-    #[allow(clippy::too_many_arguments, reason = "spawn parameters from ServerDef")]
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "spawn parameters from ServerDef"
+    )]
     pub fn new(
         program: &str,
         args: &[&str],
@@ -183,6 +187,7 @@ impl Connection {
         language: String,
         logging: LoggingServer,
         server_name: &str,
+        scope_root: &str,
     ) -> Result<(Self, Option<ChildStderr>)> {
         // Create the stdout pipe ourselves so we can keep the write end
         // for drain sentinel injection. The child gets one copy of the
@@ -241,6 +246,7 @@ impl Connection {
             stdout,
             logging.clone(),
             server_name.to_string(),
+            scope_root.to_string(),
         ));
 
         let drain_writer = Arc::new(std::sync::Mutex::new(Some(drain_writer)));
@@ -253,7 +259,13 @@ impl Connection {
             let drain_for_close = drain_writer.clone();
             let kill = kill_token.clone();
             let exit_server_name = server_name.to_string();
+            let exit_scope_root = scope_root.to_string();
             tokio::spawn(async move {
+                let sr = if exit_scope_root.is_empty() {
+                    None
+                } else {
+                    Some(exit_scope_root.as_str())
+                };
                 tokio::select! {
                     status = child.wait() => {
                         match status {
@@ -261,6 +273,7 @@ impl Connection {
                                 info!(
                                     source = "lsp.lifecycle",
                                     server = exit_server_name.as_str(),
+                                    scope_root = sr,
                                     "{exit_server_name}: exited with {s}",
                                 );
                             }
@@ -268,6 +281,7 @@ impl Connection {
                                 info!(
                                     source = "lsp.lifecycle",
                                     server = exit_server_name.as_str(),
+                                    scope_root = sr,
                                     "{exit_server_name}: wait failed: {e}",
                                 );
                             }
@@ -605,6 +619,7 @@ impl Connection {
     /// Background task that reads LSP messages and routes them.
     #[allow(
         clippy::too_many_lines,
+        clippy::too_many_arguments,
         reason = "Internal task requires sequential message parsing and dispatch"
     )]
     async fn reader_loop<R: AsyncRead + Unpin>(
@@ -615,7 +630,14 @@ impl Connection {
         stdout: R,
         _logging: LoggingServer,
         server_name: String,
+        scope_root: String,
     ) {
+        let scope_root_opt = if scope_root.is_empty() {
+            None
+        } else {
+            Some(scope_root)
+        };
+        let scope_root_ref = scope_root_opt.as_deref();
         let mut reader = BufReader::new(stdout);
         let mut buffer = BytesMut::with_capacity(8192);
 
@@ -631,7 +653,12 @@ impl Connection {
                     buffer.extend_from_slice(&temp[..n]);
                 }
                 Err(e) => {
-                    info!("Error reading from LSP stdout: {}", e);
+                    info!(
+                        source = "lsp.lifecycle",
+                        server = server_name.as_str(),
+                        scope_root = scope_root_ref,
+                        "Error reading from LSP stdout: {e}",
+                    );
                     break;
                 }
             }
@@ -645,6 +672,7 @@ impl Connection {
                         warn!(
                             server = server_name.as_str(),
                             source = "lsp.protocol",
+                            scope_root = scope_root_ref,
                             "malformed LSP message from {server_name}, \
                              resynchronizing: {e}"
                         );
@@ -829,7 +857,12 @@ impl Connection {
         if let Some(server) = server.upgrade() {
             server.on_shutdown();
         }
-        info!("LSP reader task exiting - server connection lost");
+        info!(
+            source = "lsp.lifecycle",
+            server = server_name.as_str(),
+            scope_root = scope_root_ref,
+            "LSP reader task exiting - server connection lost",
+        );
     }
 }
 
@@ -1039,6 +1072,7 @@ mod tests {
             "test".to_string(),
             logging,
             "test-server",
+            "",
         )
         .expect("mockls should spawn");
 

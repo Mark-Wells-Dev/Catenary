@@ -818,7 +818,7 @@ pub mod test_support {
         let dir = tempfile::tempdir()?;
 
         let mut client =
-            crate::lsp::LspClient::spawn(bin, &[lang], lang, lang, logging, None, None)?;
+            crate::lsp::LspClient::spawn(bin, &[lang], lang, lang, logging, None, None, "")?;
 
         client.initialize(&[dir.path().to_path_buf()], None).await?;
         Ok((client, dir))

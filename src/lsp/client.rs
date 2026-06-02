@@ -71,6 +71,7 @@ impl LspClient {
     /// Returns an error if:
     /// - The server process cannot be spawned.
     /// - Stdin or stdout cannot be captured.
+    #[allow(clippy::too_many_arguments, reason = "spawn parameters from ServerDef")]
     pub fn spawn(
         program: &str,
         args: &[&str],
@@ -79,6 +80,7 @@ impl LspClient {
         logging: LoggingServer,
         settings: Option<serde_json::Value>,
         env: Option<&HashMap<String, String>>,
+        scope_root: &str,
     ) -> Result<Self> {
         let (client, child_stderr) = Self::spawn_inner(
             program,
@@ -89,6 +91,7 @@ impl LspClient {
             Stdio::piped(),
             settings,
             env,
+            scope_root,
         )?;
         if let Some(stderr) = child_stderr {
             Self::spawn_stderr_reader(stderr, server_name);
@@ -119,6 +122,7 @@ impl LspClient {
             Stdio::null(),
             None,
             env,
+            "",
         )?;
         Ok(client)
     }
@@ -148,6 +152,7 @@ impl LspClient {
             Stdio::piped(),
             None,
             env,
+            "",
         )
     }
 
@@ -164,6 +169,7 @@ impl LspClient {
         stderr: Stdio,
         settings: Option<serde_json::Value>,
         env: Option<&HashMap<String, String>>,
+        scope_root: &str,
     ) -> Result<(Self, Option<tokio::process::ChildStderr>)> {
         let server = Arc::new(LspServer::new(
             language_id.to_string(),
@@ -180,6 +186,7 @@ impl LspClient {
             language_id.to_string(),
             logging,
             server_name,
+            scope_root,
         )?;
         server.set_connection(connection);
 
@@ -1099,6 +1106,7 @@ mod tests {
             test_logging(),
             None,
             None,
+            "",
         )?;
         client.initialize(&[dir.path().to_path_buf()], None).await?;
         Ok((client, dir))
@@ -1168,6 +1176,7 @@ mod tests {
             test_logging(),
             None,
             Some(&env),
+            "",
         )?;
         client.initialize(&[dir.path().to_path_buf()], None).await?;
 
@@ -1427,6 +1436,7 @@ mod tests {
             logging,
             None,
             None,
+            "",
         )?;
         client.initialize(&[dir.path().to_path_buf()], None).await?;
 
@@ -1462,6 +1472,7 @@ mod tests {
             logging,
             None,
             None,
+            "",
         )?;
         client.initialize(&[dir.path().to_path_buf()], None).await?;
 
@@ -1493,6 +1504,7 @@ mod tests {
             logging,
             None,
             None,
+            "",
         )?;
         client.initialize(&[dir.path().to_path_buf()], None).await?;
 

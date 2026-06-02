@@ -31,6 +31,7 @@ async fn test_mockls_initialize() -> Result<()> {
         test_logging(),
         None,
         None,
+        "",
     )?;
 
     let result = client.initialize(&[dir.path().to_path_buf()], None).await?;
@@ -56,6 +57,7 @@ async fn test_mockls_initialize_workspace_folders() -> Result<()> {
         test_logging(),
         None,
         None,
+        "",
     )?;
 
     let result = client.initialize(&[dir.path().to_path_buf()], None).await?;
@@ -87,6 +89,7 @@ async fn test_mockls_document_lifecycle() -> Result<()> {
         test_logging(),
         None,
         None,
+        "",
     )?;
 
     client.initialize(&[dir.path().to_path_buf()], None).await?;
@@ -127,6 +130,7 @@ async fn test_client_capabilities() -> Result<()> {
         test_logging(),
         None,
         None,
+        "",
     )?;
 
     client.initialize(&[dir.path().to_path_buf()], None).await?;
@@ -241,6 +245,7 @@ async fn test_settle_waits_through_busy_to_healthy() -> Result<()> {
         test_logging(),
         None,
         None,
+        "",
     )?;
 
     client.initialize(&[dir.path().to_path_buf()], None).await?;
@@ -284,6 +289,7 @@ async fn test_settle_returns_settled_on_quiet_tree() -> Result<()> {
         test_logging(),
         None,
         None,
+        "",
     )?;
 
     client.initialize(&[dir.path().to_path_buf()], None).await?;
@@ -325,6 +331,7 @@ async fn test_content_modified_retry() -> Result<()> {
         test_logging(),
         None,
         None,
+        "",
     )?;
 
     client.initialize(&[dir.path().to_path_buf()], None).await?;
@@ -367,6 +374,7 @@ async fn test_lifecycle_probing_to_healthy_on_tool_request() -> Result<()> {
         test_logging(),
         None,
         None,
+        "",
     )?;
 
     // Before init: Initializing
@@ -409,6 +417,7 @@ async fn test_health_probe_transitions_to_healthy() -> Result<()> {
         test_logging(),
         None,
         None,
+        "",
     )?;
 
     client.initialize(&[dir.path().to_path_buf()], None).await?;
@@ -446,6 +455,7 @@ async fn test_server_env_passed_to_process() -> Result<()> {
         test_logging(),
         None,
         Some(&env),
+        "",
     )?;
 
     let result = client.initialize(&[dir.path().to_path_buf()], None).await?;
@@ -486,6 +496,7 @@ async fn test_real_rust_analyzer_initialize() -> Result<()> {
         test_logging(),
         None,
         None,
+        "",
     )?;
 
     let result = client.initialize(&[dir.path().to_path_buf()], None).await?;

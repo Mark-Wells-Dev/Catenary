@@ -342,6 +342,7 @@ impl LspClientManager {
                             source = Source::LspLifecycle.as_str(),
                             language = lang.as_str(),
                             server = binding.name.as_str(),
+                            scope_root = %root.display(),
                             "Failed to spawn LSP server for {lang} at {}: {e}",
                             root.display(),
                         );
@@ -835,6 +836,7 @@ impl LspClientManager {
             .iter()
             .map(|s: &String| s.as_str())
             .collect();
+        let root_str = root.display().to_string();
         let mut client = LspClient::spawn(
             &server_def.command,
             &args,
@@ -843,6 +845,7 @@ impl LspClientManager {
             self.logging.clone(),
             server_def.settings.clone(),
             server_def.env.as_ref(),
+            &root_str,
         )?;
 
         // Set scope before initialize so the reader loop has it for
@@ -1026,6 +1029,7 @@ impl LspClientManager {
             self.logging.clone(),
             server_def.settings.clone(),
             server_def.env.as_ref(),
+            "",
         )?;
 
         // Set scope before initialize so the reader loop has it for
@@ -1363,6 +1367,7 @@ impl LspClientManager {
                     source = Source::LspLifecycle.as_str(),
                     language = lang.as_str(),
                     server = server_name.as_str(),
+                    scope_root = %root.display(),
                     "Failed to spawn LSP server for {lang} ({server_name}): {e}",
                 );
             }
@@ -1458,14 +1463,25 @@ impl LspClientManager {
 
     /// Shuts down a specific server instance if it exists.
     pub async fn shutdown_instance(&self, key: &InstanceKey) {
+        let sr = key.scope.root_path().map(|p| p.display().to_string());
         let mut clients = self.clients.lock().await;
         if let Some(client_mutex) = clients.remove(key) {
-            info!("Shutting down LSP server instance {}", key);
+            info!(
+                source = Source::LspLifecycle.as_str(),
+                server = key.server.as_str(),
+                scope_root = sr.as_deref(),
+                "Shutting down LSP server instance {key}",
+            );
             let mut client = client_mutex.lock().await;
             if client.is_alive()
                 && let Err(e) = client.shutdown().await
             {
-                info!("Failed to shutdown LSP server instance {}: {}", key, e);
+                info!(
+                    source = Source::LspLifecycle.as_str(),
+                    server = key.server.as_str(),
+                    scope_root = sr.as_deref(),
+                    "Failed to shutdown LSP server instance {key}: {e}",
+                );
             }
         }
     }
@@ -1475,6 +1491,7 @@ impl LspClientManager {
     /// Only affects `Scope::Root(path)` instances where the path matches.
     /// Workspace-scoped and other instances are untouched.
     async fn shutdown_root_instances(&self, root: &Path) {
+        let sr = root.display().to_string();
         let mut clients = self.clients.lock().await;
         let to_remove: Vec<InstanceKey> = clients
             .keys()
@@ -1483,12 +1500,22 @@ impl LspClientManager {
             .collect();
         for key in to_remove {
             if let Some(client_mutex) = clients.remove(&key) {
-                info!("Shutting down per-root instance {}", key);
+                info!(
+                    source = Source::LspLifecycle.as_str(),
+                    server = key.server.as_str(),
+                    scope_root = sr.as_str(),
+                    "Shutting down per-root instance {key}",
+                );
                 let mut client = client_mutex.lock().await;
                 if client.is_alive()
                     && let Err(e) = client.shutdown().await
                 {
-                    info!("Failed to shutdown per-root instance {}: {}", key, e);
+                    info!(
+                        source = Source::LspLifecycle.as_str(),
+                        server = key.server.as_str(),
+                        scope_root = sr.as_str(),
+                        "Failed to shutdown per-root instance {key}: {e}",
+                    );
                 }
             }
         }
@@ -1509,12 +1536,20 @@ impl LspClientManager {
             .collect();
         for key in sf_keys {
             if let Some(client_mutex) = clients.remove(&key) {
-                info!("Shutting down single-file instance {}", key);
+                info!(
+                    source = Source::LspLifecycle.as_str(),
+                    server = key.server.as_str(),
+                    "Shutting down single-file instance {key}",
+                );
                 let mut client = client_mutex.lock().await;
                 if client.is_alive()
                     && let Err(e) = client.shutdown().await
                 {
-                    info!("Failed to shutdown single-file instance {}: {}", key, e);
+                    info!(
+                        source = Source::LspLifecycle.as_str(),
+                        server = key.server.as_str(),
+                        "Failed to shutdown single-file instance {key}: {e}",
+                    );
                 }
             }
         }
