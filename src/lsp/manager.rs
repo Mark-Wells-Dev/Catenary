@@ -10,7 +10,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use crate::bridge::filesystem_manager::{ClassificationTables, FilesystemManager};
-use crate::config::{Config, DispatchMethod, LanguageConfig, ServerBinding, ServerDef};
+use crate::config::{Config, DispatchMethod, LanguageConfig, ServerDef};
 use crate::logging::LoggingServer;
 use crate::lsp::LspClient;
 use crate::lsp::glob::{self, LspGlob};
@@ -303,40 +303,49 @@ impl LspClientManager {
 
         let configured_keys: HashSet<&str> =
             self.config.language.keys().map(String::as_str).collect();
-        let relevant = self.fs.detect_workspace_languages(&roots, &configured_keys);
 
-        if relevant.is_empty() {
-            info!("No configured languages detected in workspace");
-            return;
-        }
+        // Detect languages per root and spawn only the languages each
+        // root actually contains. A flat union across all roots would
+        // leak markerless languages (no `root_markers`, e.g. julia,
+        // bash, yaml) into roots that have no files of that language —
+        // a language detected in one served root would spawn a server
+        // in every served root.
+        for root in &roots {
+            let detected = self
+                .fs
+                .detect_workspace_languages(std::slice::from_ref(root), &configured_keys);
 
-        let mut sorted: Vec<&str> = relevant.iter().map(String::as_str).collect();
-        sorted.sort_unstable();
-        info!("Detected languages in workspace: {}", sorted.join(", "));
-
-        for lang in &relevant {
-            let Some(lang_config) = self.config.resolve_language(lang) else {
+            if detected.is_empty() {
                 continue;
-            };
-            let bindings: Vec<ServerBinding> = lang_config.servers().to_vec();
+            }
 
-            for binding in &bindings {
-                let marker_set = lang_config.marker_set();
-                for root in &roots {
-                    // If the language has root markers but this root
-                    // doesn't contain any, defer to lazy spawn on first need.
-                    if let Some((markers, compiled)) = marker_set
-                        && !dir_has_marker(root, markers, compiled)
-                    {
-                        debug!(
-                            language = lang.as_str(),
-                            server = binding.name.as_str(),
-                            "No root marker at {} — deferring to lazy spawn",
-                            root.display(),
-                        );
-                        continue;
-                    }
+            let mut sorted: Vec<&str> = detected.iter().map(String::as_str).collect();
+            sorted.sort_unstable();
+            info!(
+                "Detected languages in {}: {}",
+                root.display(),
+                sorted.join(", ")
+            );
 
+            for lang in &detected {
+                let Some(lang_config) = self.config.resolve_language(lang) else {
+                    continue;
+                };
+
+                // If the language has root markers but this root doesn't
+                // contain any, defer to lazy spawn on first need.
+                if let Some((markers, compiled)) = lang_config.marker_set()
+                    && !dir_has_marker(root, markers, compiled)
+                {
+                    debug!(
+                        language = lang.as_str(),
+                        "No root marker at {} — deferring to lazy spawn",
+                        root.display(),
+                    );
+                    continue;
+                }
+
+                for binding in lang_config.servers() {
                     if let Err(e) = self.ensure_server(lang, &binding.name, root).await {
                         warn!(
                             source = Source::LspLifecycle.as_str(),
@@ -1581,26 +1590,30 @@ impl LspClientManager {
             return;
         }
 
-        // Detect which languages have files in the added roots.
+        // Detect per root and spawn only the languages each root actually
+        // contains. Detecting a union across all added roots would leak
+        // markerless languages (no `root_markers`) into added roots that
+        // have no files of that language.
         let configured_keys: HashSet<&str> = active_langs.keys().map(String::as_str).collect();
-        let detected = self
-            .fs
-            .detect_workspace_languages(added_roots, &configured_keys);
 
-        for lang in &detected {
-            let Some(servers) = active_langs.get(lang) else {
-                continue;
-            };
-            let marker_set = self
-                .config
-                .resolve_language(lang)
-                .and_then(LanguageConfig::marker_set);
-            for server_name in servers {
-                for root in added_roots {
-                    // Skip roots without markers when markers are configured.
-                    if marker_set.is_some_and(|(m, c)| !dir_has_marker(root, m, c)) {
-                        continue;
-                    }
+        for root in added_roots {
+            let detected = self
+                .fs
+                .detect_workspace_languages(std::slice::from_ref(root), &configured_keys);
+
+            for lang in &detected {
+                let Some(servers) = active_langs.get(lang) else {
+                    continue;
+                };
+                let marker_set = self
+                    .config
+                    .resolve_language(lang)
+                    .and_then(LanguageConfig::marker_set);
+                // Skip roots without markers when markers are configured.
+                if marker_set.is_some_and(|(m, c)| !dir_has_marker(root, m, c)) {
+                    continue;
+                }
+                for server_name in servers {
                     if let Err(e) = self.ensure_server(lang, server_name, root).await {
                         warn!(
                             source = Source::LspLifecycle.as_str(),
@@ -2665,6 +2678,86 @@ mod tests {
             .collect();
         assert!(root_paths.contains(&PathBuf::from("/tmp")));
         assert!(root_paths.contains(&PathBuf::from("/var")));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_spawn_all_markerless_scoped_per_root() -> Result<()> {
+        // A markerless language (no `root_markers`) detected in one root
+        // must NOT spawn a server at a different root that has no files of
+        // that language. Regression for the union-detection leak where a
+        // language found in one served root (e.g. julia in a homelab repo)
+        // spawned servers in every served root.
+        const LANG_B: &str = "zZ9Qb";
+
+        let root_a = tempfile::tempdir().expect("tempdir a");
+        let root_b = tempfile::tempdir().expect("tempdir b");
+
+        // root_a has only a LANG_A file; root_b has only a LANG_B file.
+        std::fs::write(root_a.path().join(format!("a.{MOCK_LANG_A}")), "x").expect("write a");
+        std::fs::write(root_b.path().join(format!("b.{LANG_B}")), "x").expect("write b");
+
+        // Two markerless languages, each with its own mockls server.
+        let bin = mockls_bin();
+        let mut server = HashMap::new();
+        let mut language = HashMap::new();
+        for lang in [MOCK_LANG_A, LANG_B] {
+            let server_name = format!("mockls-{lang}");
+            server.insert(
+                server_name.clone(),
+                ServerDef {
+                    command: bin.to_string_lossy().to_string(),
+                    args: vec![lang.to_string()],
+                    ..ServerDef::default()
+                },
+            );
+            language.insert(
+                lang.to_string(),
+                LanguageConfig {
+                    servers: Some(vec![ServerBinding::new(server_name)]),
+                    ..LanguageConfig::default()
+                },
+            );
+        }
+        let config = Arc::new(Config {
+            language,
+            server,
+            log_retention_days: 7,
+            notifications: None,
+            icons: None,
+            tui: None,
+            tools: None,
+            resolved_commands: None,
+        });
+
+        let fs = test_fs_with_roots(&[
+            root_a.path().to_str().expect("path a"),
+            root_b.path().to_str().expect("path b"),
+        ]);
+        let manager = LspClientManager::new(config, test_logging(), fs);
+
+        manager.spawn_all().await;
+
+        let clients = manager.clients().await;
+        let roots_for = |lang: &str| -> HashSet<PathBuf> {
+            clients
+                .keys()
+                .filter(|k| k.language_id == lang)
+                .filter_map(|k| k.scope.root_path().map(Path::to_path_buf))
+                .collect()
+        };
+
+        assert_eq!(
+            roots_for(MOCK_LANG_A),
+            HashSet::from([root_a.path().to_path_buf()]),
+            "LANG_A should spawn only at root_a (the root that contains its files)",
+        );
+        assert_eq!(
+            roots_for(LANG_B),
+            HashSet::from([root_b.path().to_path_buf()]),
+            "LANG_B should spawn only at root_b (the root that contains its files)",
+        );
 
         Ok(())
     }
