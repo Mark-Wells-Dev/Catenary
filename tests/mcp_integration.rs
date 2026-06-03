@@ -13,7 +13,6 @@
 
 mod common;
 
-use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
@@ -159,7 +158,10 @@ fn test_client_info_stored_in_session() -> Result<()> {
     // Run catenary debug list with the bridge's isolated state dir
     let output = Command::new(env!("CARGO_BIN_EXE_catenary"))
         .args(["debug", "list"])
-        .env("XDG_STATE_HOME", bridge.state_home())
+        .env(
+            "XDG_STATE_HOME",
+            common::xdg_state_home(bridge.state_home()),
+        )
         .output()
         .context("Failed to run catenary debug list")?;
 
@@ -1677,7 +1679,7 @@ fn test_grep_parent_id_threading() -> Result<()> {
     let _ = bridge.call_tool_text("grep", &json!({ "pattern": "hello" }))?;
 
     // Open the database and verify parent_id threading
-    let db_path = PathBuf::from(bridge.state_home())
+    let db_path = common::xdg_state_home(bridge.state_home())
         .join("catenary")
         .join("catenary.db");
     let conn =

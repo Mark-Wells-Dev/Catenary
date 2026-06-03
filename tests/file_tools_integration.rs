@@ -739,7 +739,9 @@ fn spawn_with_mockls_and_config(root: &str, config_toml: Option<&str>) -> Result
     let lsp = common::mockls_lsp_arg("mock", "");
     BridgeProcess::spawn_with_pre_start(&[&lsp], root, |state_home| {
         if let Some(toml) = config_toml {
-            let config_dir = std::path::PathBuf::from(state_home).join("catenary");
+            // Config is discovered via `$XDG_CONFIG_HOME/catenary/`, which
+            // `isolate_env` splits to `<root>/config` — not the state home.
+            let config_dir = common::xdg_config_home(state_home).join("catenary");
             std::fs::create_dir_all(&config_dir)?;
             std::fs::write(config_dir.join("config.toml"), toml)?;
         }

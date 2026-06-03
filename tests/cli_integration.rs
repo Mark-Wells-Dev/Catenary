@@ -20,6 +20,51 @@ use serde_json::json;
 
 use common::{ServerProcess, isolate_env};
 
+/// `isolate_env` must point the four XDG base dirs at *distinct* subdirs
+/// of the root, so a subprocess writing under the wrong base can no
+/// longer silently land in the one shared directory. Regression guard
+/// for the split.
+#[test]
+fn isolate_env_distinct_subdirs() {
+    use std::collections::{HashMap, HashSet};
+
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let root = tmp.path().to_str().expect("tempdir path");
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
+    isolate_env(&mut cmd, root);
+
+    // `.env()` entries appear with a value; `.env_remove()` entries
+    // appear with `None` and are skipped here.
+    let envs: HashMap<String, String> = cmd
+        .get_envs()
+        .filter_map(|(k, v)| Some((k.to_str()?.to_owned(), v?.to_str()?.to_owned())))
+        .collect();
+
+    let dirs: Vec<&String> = [
+        "XDG_CONFIG_HOME",
+        "XDG_STATE_HOME",
+        "XDG_DATA_HOME",
+        "XDG_RUNTIME_DIR",
+    ]
+    .iter()
+    .map(|var| envs.get(*var).expect("XDG base dir set by isolate_env"))
+    .collect();
+
+    // Every base dir lives under the root...
+    for dir in &dirs {
+        assert!(dir.starts_with(root), "{dir} should be under root {root}");
+    }
+
+    // ...and all four resolve to distinct paths.
+    let distinct: HashSet<&&String> = dirs.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        4,
+        "the four XDG base dirs should be distinct, got: {dirs:?}"
+    );
+}
+
 #[test]
 fn test_list_shows_row_numbers() -> Result<()> {
     // Start a server to ensure at least one session exists
@@ -29,7 +74,7 @@ fn test_list_shows_row_numbers() -> Result<()> {
     // Run catenary list
     let output = Command::new(env!("CARGO_BIN_EXE_catenary"))
         .args(["debug", "list"])
-        .env("CATENARY_STATE_DIR", server.state_dir.path())
+        .env("CATENARY_STATE_DIR", server.state_dir_path())
         .output()
         .context("Failed to run list command")?;
 
@@ -74,7 +119,7 @@ fn test_list_shows_language_servers_line() -> Result<()> {
     // Run catenary list
     let output = Command::new(env!("CARGO_BIN_EXE_catenary"))
         .args(["debug", "list"])
-        .env("CATENARY_STATE_DIR", server.state_dir.path())
+        .env("CATENARY_STATE_DIR", server.state_dir_path())
         .output()
         .context("Failed to run list command")?;
 
@@ -104,7 +149,7 @@ fn test_monitor_by_row_number_starts() -> Result<()> {
     // monitoring some session (row number resolution works)
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
     cmd.args(["debug", "monitor"]).arg("1");
-    cmd.env("CATENARY_STATE_DIR", server.state_dir.path());
+    cmd.env("CATENARY_STATE_DIR", server.state_dir_path());
     cmd.stdout(Stdio::piped()).stderr(Stdio::null());
     let mut child = cmd.spawn().context("Failed to spawn monitor")?;
     let stdout = child
@@ -176,7 +221,7 @@ fn test_monitor_numeric_session_id_resolves() -> Result<()> {
     // of whether the ID happens to be all digits.
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
     cmd.args(["debug", "monitor"]).arg(&session_id);
-    cmd.env("CATENARY_STATE_DIR", server.state_dir.path());
+    cmd.env("CATENARY_STATE_DIR", server.state_dir_path());
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().context("Failed to spawn monitor")?;
     let stdout = child
@@ -223,7 +268,7 @@ fn test_monitor_raw_flag() -> Result<()> {
     // Start monitor with --raw flag
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
     cmd.args(["debug", "monitor"]).arg(&session_id).arg("--raw");
-    cmd.env("CATENARY_STATE_DIR", server.state_dir.path());
+    cmd.env("CATENARY_STATE_DIR", server.state_dir_path());
     cmd.stdout(Stdio::piped()).stderr(Stdio::null());
     let mut child = cmd.spawn().context("Failed to spawn monitor")?;
     let stdout = child
@@ -290,7 +335,7 @@ fn test_monitor_nocolor_flag() -> Result<()> {
     cmd.args(["debug", "monitor"])
         .arg(&session_id)
         .arg("--nocolor");
-    cmd.env("CATENARY_STATE_DIR", server.state_dir.path());
+    cmd.env("CATENARY_STATE_DIR", server.state_dir_path());
     cmd.stdout(Stdio::piped()).stderr(Stdio::null());
     let mut child = cmd.spawn().context("Failed to spawn monitor")?;
     let stdout = child
@@ -362,7 +407,7 @@ fn test_monitor_filter_flag() -> Result<()> {
         .arg(&session_id)
         .arg("--filter")
         .arg("ping");
-    cmd.env("CATENARY_STATE_DIR", server.state_dir.path());
+    cmd.env("CATENARY_STATE_DIR", server.state_dir_path());
     cmd.stdout(Stdio::piped()).stderr(Stdio::null());
     let mut child = cmd.spawn().context("Failed to spawn monitor")?;
     let stdout = child
@@ -428,7 +473,7 @@ fn test_monitor_uses_arrows() -> Result<()> {
     cmd.args(["debug", "monitor"])
         .arg(&session_id)
         .arg("--nocolor");
-    cmd.env("CATENARY_STATE_DIR", server.state_dir.path());
+    cmd.env("CATENARY_STATE_DIR", server.state_dir_path());
     cmd.stdout(Stdio::piped()).stderr(Stdio::null());
     let mut child = cmd.spawn().context("Failed to spawn monitor")?;
     let stdout = child
@@ -582,7 +627,7 @@ fn test_doctor_suggests_config_when_no_config_file() -> Result<()> {
 #[test]
 fn test_doctor_no_suggestions_when_config_with_commands() -> Result<()> {
     let tmp = tempfile::tempdir()?;
-    let config_dir = tmp.path().join("catenary");
+    let config_dir = common::xdg_config_home(tmp.path()).join("catenary");
     std::fs::create_dir_all(&config_dir)?;
     std::fs::write(
         config_dir.join("config.toml"),
@@ -606,7 +651,7 @@ fn test_doctor_no_suggestions_when_config_with_commands() -> Result<()> {
 #[test]
 fn test_doctor_suggests_commands_when_config_exists_without_commands() -> Result<()> {
     let tmp = tempfile::tempdir()?;
-    let config_dir = tmp.path().join("catenary");
+    let config_dir = common::xdg_config_home(tmp.path()).join("catenary");
     std::fs::create_dir_all(&config_dir)?;
     std::fs::write(config_dir.join("config.toml"), "# no commands section\n")?;
 
@@ -637,7 +682,7 @@ fn test_doctor_suggests_commands_when_config_exists_without_commands() -> Result
 #[test]
 fn test_doctor_single_server_found() -> Result<()> {
     let tmp = tempfile::tempdir()?;
-    let config_dir = tmp.path().join("catenary");
+    let config_dir = common::xdg_config_home(tmp.path()).join("catenary");
     std::fs::create_dir_all(&config_dir)?;
 
     let mockls_bin = env!("CARGO_BIN_EXE_mockls");
@@ -710,7 +755,7 @@ fn test_doctor_single_server_found() -> Result<()> {
 #[test]
 fn test_doctor_single_server_not_found() -> Result<()> {
     let tmp = tempfile::tempdir()?;
-    let config_dir = tmp.path().join("catenary");
+    let config_dir = common::xdg_config_home(tmp.path()).join("catenary");
     std::fs::create_dir_all(&config_dir)?;
 
     let mockls_bin = env!("CARGO_BIN_EXE_mockls");
@@ -756,7 +801,7 @@ fn test_doctor_single_server_not_found() -> Result<()> {
 #[test]
 fn test_doctor_no_args_unchanged() -> Result<()> {
     let tmp = tempfile::tempdir()?;
-    let config_dir = tmp.path().join("catenary");
+    let config_dir = common::xdg_config_home(tmp.path()).join("catenary");
     std::fs::create_dir_all(&config_dir)?;
 
     let mockls_bin = env!("CARGO_BIN_EXE_mockls");
@@ -809,7 +854,7 @@ fn test_doctor_no_args_unchanged() -> Result<()> {
 #[test]
 fn test_doctor_parallel_all_ready() -> Result<()> {
     let tmp = tempfile::tempdir()?;
-    let config_dir = tmp.path().join("catenary");
+    let config_dir = common::xdg_config_home(tmp.path()).join("catenary");
     std::fs::create_dir_all(&config_dir)?;
 
     let mockls_bin = env!("CARGO_BIN_EXE_mockls");
@@ -873,7 +918,7 @@ fn test_doctor_parallel_all_ready() -> Result<()> {
 #[test]
 fn test_doctor_parallel_one_fails() -> Result<()> {
     let tmp = tempfile::tempdir()?;
-    let config_dir = tmp.path().join("catenary");
+    let config_dir = common::xdg_config_home(tmp.path()).join("catenary");
     std::fs::create_dir_all(&config_dir)?;
 
     let mockls_bin = env!("CARGO_BIN_EXE_mockls");
@@ -923,7 +968,7 @@ fn test_doctor_parallel_one_fails() -> Result<()> {
 #[test]
 fn test_doctor_output_sorted() -> Result<()> {
     let tmp = tempfile::tempdir()?;
-    let config_dir = tmp.path().join("catenary");
+    let config_dir = common::xdg_config_home(tmp.path()).join("catenary");
     std::fs::create_dir_all(&config_dir)?;
 
     let mockls_bin = env!("CARGO_BIN_EXE_mockls");
@@ -979,7 +1024,7 @@ fn test_doctor_output_sorted() -> Result<()> {
 #[test]
 fn test_doctor_parallel_timeout() -> Result<()> {
     let tmp = tempfile::tempdir()?;
-    let config_dir = tmp.path().join("catenary");
+    let config_dir = common::xdg_config_home(tmp.path()).join("catenary");
     std::fs::create_dir_all(&config_dir)?;
 
     let mockls_bin = env!("CARGO_BIN_EXE_mockls");
@@ -1031,7 +1076,7 @@ fn test_doctor_parallel_timeout() -> Result<()> {
 #[test]
 fn test_doctor_piped_no_ansi() -> Result<()> {
     let tmp = tempfile::tempdir()?;
-    let config_dir = tmp.path().join("catenary");
+    let config_dir = common::xdg_config_home(tmp.path()).join("catenary");
     std::fs::create_dir_all(&config_dir)?;
 
     let mockls_bin = env!("CARGO_BIN_EXE_mockls");

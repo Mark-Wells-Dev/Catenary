@@ -22,28 +22,68 @@ use serde_json::{Value, json};
 
 /// Isolates a subprocess from the user's environment.
 ///
-/// Sets `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, and `XDG_DATA_HOME` to the
-/// given root so the process uses the test's tempdir instead of
-/// `~/.config`, `~/.local/state`, or `~/.local/share`. Clears all
-/// `CATENARY_*` env vars that could leak from the user's shell and
-/// override test-specific settings. Clears `PATH` so built-in server
-/// defaults (julia-language-server, cmake-language-server, etc.) fail
-/// the binary check immediately instead of spawning real processes.
+/// Points each XDG base dir at a *distinct* subdir of the given root —
+/// `XDG_CONFIG_HOME` → `<root>/config`, `XDG_STATE_HOME` → `<root>/state`,
+/// `XDG_DATA_HOME` → `<root>/data`, `XDG_RUNTIME_DIR` → `<root>/runtime` —
+/// so the process uses the test's tempdir instead of `~/.config`,
+/// `~/.local/state`, `~/.local/share`, or the host runtime dir. Keeping
+/// the four bases distinct makes `isolate_env` a mislocation detector:
+/// code that writes under the *wrong* base no longer silently lands in
+/// the one shared directory.
+///
+/// Clears all `CATENARY_*` env vars that could leak from the user's
+/// shell and override test-specific settings. Clears `PATH` so built-in
+/// server defaults (julia-language-server, cmake-language-server, etc.)
+/// fail the binary check immediately instead of spawning real processes.
 /// Tests that need specific binaries use absolute paths.
 ///
 /// All integration test subprocesses (bridge, `catenary install`, etc.)
 /// must call this. Callers set `CATENARY_SERVERS`, `CATENARY_ROOTS`, or
 /// `CATENARY_CONFIG` explicitly after this call.
+///
+/// Test-side code that resolves a daemon path (socket, DB, log via
+/// `db::state_dir`) or writes a file the subprocess reads (config via
+/// `config_sources()`) must derive it through [`xdg_state_home`] /
+/// [`xdg_config_home`] so both sides agree on the split layout.
 pub fn isolate_env(cmd: &mut Command, root: &str) {
-    cmd.env("XDG_CONFIG_HOME", root);
-    cmd.env("XDG_STATE_HOME", root);
-    cmd.env("XDG_DATA_HOME", root);
+    cmd.env("XDG_CONFIG_HOME", xdg_config_home(root));
+    cmd.env("XDG_STATE_HOME", xdg_state_home(root));
+    cmd.env("XDG_DATA_HOME", xdg_data_home(root));
+    cmd.env("XDG_RUNTIME_DIR", xdg_runtime_dir(root));
     cmd.env("PATH", "");
     cmd.env_remove("CATENARY_STATE_DIR");
     cmd.env_remove("CATENARY_DATA_DIR");
     cmd.env_remove("CATENARY_CONFIG");
     cmd.env_remove("CATENARY_SERVERS");
     cmd.env_remove("CATENARY_ROOTS");
+}
+
+/// The `XDG_CONFIG_HOME` subdir [`isolate_env`] configures under `root`.
+///
+/// `config_sources()` resolves user config at
+/// `$XDG_CONFIG_HOME/catenary/config.toml`, so a test writing a config
+/// the subprocess must read writes under this path.
+pub fn xdg_config_home(root: impl AsRef<Path>) -> PathBuf {
+    root.as_ref().join("config")
+}
+
+/// The `XDG_STATE_HOME` subdir [`isolate_env`] configures under `root`.
+///
+/// `db::state_dir()` resolves here, so the DB, sockets, and daemon log
+/// all live under `$XDG_STATE_HOME/catenary/`. Test-side code computing
+/// those paths must resolve through this helper.
+pub fn xdg_state_home(root: impl AsRef<Path>) -> PathBuf {
+    root.as_ref().join("state")
+}
+
+/// The `XDG_DATA_HOME` subdir [`isolate_env`] configures under `root`.
+pub fn xdg_data_home(root: impl AsRef<Path>) -> PathBuf {
+    root.as_ref().join("data")
+}
+
+/// The `XDG_RUNTIME_DIR` [`isolate_env`] configures under `root`.
+pub fn xdg_runtime_dir(root: impl AsRef<Path>) -> PathBuf {
+    root.as_ref().join("runtime")
 }
 
 // ── BridgeProcess ────────────────────────────────────────────────────
@@ -268,7 +308,7 @@ impl BridgeProcess {
                 .and_then(|p| std::fs::read_to_string(p).ok())
                 .unwrap_or_default();
             // Also read daemon log if the bridge went through the daemon path.
-            let daemon_log = PathBuf::from(&self.state_home)
+            let daemon_log = xdg_state_home(&self.state_home)
                 .join("catenary")
                 .join("daemon.log");
             let daemon_buf = std::fs::read_to_string(&daemon_log).unwrap_or_default();
@@ -376,7 +416,7 @@ impl BridgeProcess {
 
     /// Returns the daemon IPC socket path for this test's XDG scope.
     pub fn ipc_socket_path(&self) -> PathBuf {
-        PathBuf::from(&self.state_home)
+        xdg_state_home(&self.state_home)
             .join("catenary")
             .join("catenary.sock")
     }
@@ -697,6 +737,16 @@ impl ServerProcess {
         })
     }
 
+    /// Returns the daemon state dir for `CATENARY_STATE_DIR` overrides.
+    ///
+    /// The server is spawned via [`isolate_env`], which points
+    /// `XDG_STATE_HOME` at `<root>/state`, so its `db::state_dir()`
+    /// resolves here. Sibling subcommands that read the same DB must
+    /// target this exact path (not the bare tempdir root).
+    pub fn state_dir_path(&self) -> PathBuf {
+        xdg_state_home(self.state_dir.path())
+    }
+
     /// Sends an MCP `initialize` request and reads the response.
     ///
     /// Proves the server is running and the session exists in the DB.
@@ -721,7 +771,7 @@ impl ServerProcess {
             .arg("SELECT id FROM sessions WHERE id LIKE 'mcp:%' LIMIT 1")
             .arg("--format")
             .arg("json")
-            .env("CATENARY_STATE_DIR", self.state_dir.path())
+            .env("CATENARY_STATE_DIR", self.state_dir_path())
             .output()
             .context("Failed to run query command")?;
 

@@ -70,8 +70,7 @@ impl DaemonProcess {
 
     /// Returns the expected MCP socket path.
     fn socket_path(&self) -> PathBuf {
-        self.state_dir
-            .path()
+        common::xdg_state_home(self.state_dir.path())
             .join("catenary")
             .join("catenary-mcp.sock")
     }
@@ -234,7 +233,9 @@ fn daemon_starts_with_servers_configured() {
 
     let mut child = cmd.spawn().expect("spawn daemon");
 
-    let sock = state_dir.path().join("catenary").join("catenary-mcp.sock");
+    let sock = common::xdg_state_home(state_dir.path())
+        .join("catenary")
+        .join("catenary-mcp.sock");
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut appeared = false;
     while Instant::now() < deadline {
@@ -265,7 +266,9 @@ const MOCK_LANG: &str = "daemon_test";
 
 /// Returns the IPC socket path for a given state home.
 fn ipc_socket_in(state_home: &str) -> PathBuf {
-    Path::new(state_home).join("catenary").join("catenary.sock")
+    common::xdg_state_home(state_home)
+        .join("catenary")
+        .join("catenary.sock")
 }
 
 /// Waits for the IPC socket to appear (up to 5 seconds).
@@ -408,7 +411,7 @@ fn stale_socket_recovery() -> Result<()> {
     let lsp = mockls_lsp_arg(MOCK_LANG, "--scan-roots");
 
     // Create a stale socket file (regular file, nobody listening).
-    let socket_dir = state_dir.path().join("catenary");
+    let socket_dir = common::xdg_state_home(state_dir.path()).join("catenary");
     std::fs::create_dir_all(&socket_dir)?;
     std::fs::write(socket_dir.join("catenary-mcp.sock"), b"stale")?;
 
@@ -448,8 +451,9 @@ fn stop_command_shuts_down_daemon() -> Result<()> {
     bridge.initialize()?;
 
     // Verify sockets exist before stop.
-    let mcp_sock = state_dir.path().join("catenary").join("catenary-mcp.sock");
-    let ipc_sock = state_dir.path().join("catenary").join("catenary.sock");
+    let sock_dir = common::xdg_state_home(state_dir.path()).join("catenary");
+    let mcp_sock = sock_dir.join("catenary-mcp.sock");
+    let ipc_sock = sock_dir.join("catenary.sock");
     assert!(mcp_sock.exists(), "MCP socket should exist before stop");
 
     // Run `catenary stop` targeting the same state dir.
