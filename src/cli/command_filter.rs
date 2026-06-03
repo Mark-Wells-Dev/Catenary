@@ -503,6 +503,29 @@ pub fn extract_command_names(cmd: &str) -> Vec<String> {
     names
 }
 
+/// Return the argument tokens following the command token in a single
+/// shell command, joined by single spaces.
+///
+/// Tokenizes `cmd` with the same quote-aware splitter as
+/// [`extract_command_names`] and skips leading `VAR=value` env
+/// assignments, so the command token is located positionally rather than
+/// by substring search. Returns `None` if there is no command token
+/// (e.g. an all-assignments line).
+///
+/// Hook command recognition uses this to read a Catenary subcommand
+/// without being fooled by the command name appearing literally inside a
+/// quoted argument — `catenary grep '("catenary")'` must still resolve
+/// its subcommand to `grep`, which `str::rfind("catenary")` would not.
+/// Quoted arguments are dropped by the tokenizer, so this is only
+/// suitable for reading leading subcommand words, not full arguments.
+#[must_use]
+pub fn args_after_command(cmd: &str) -> Option<String> {
+    let tokens = shell_split(cmd);
+    let token_refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
+    let cmd_idx = find_command(&token_refs)?;
+    Some(token_refs[cmd_idx + 1..].join(" "))
+}
+
 /// Recursive helper for [`extract_command_names`].
 fn collect_command_names(cmd: &str, names: &mut Vec<String>) {
     let cmd_string = strip_heredoc_bodies(cmd);
@@ -1604,6 +1627,40 @@ mod tests {
     #[test]
     fn find_command_all_env_vars() {
         assert_eq!(find_command(&["A=1", "B=2"]), None);
+    }
+
+    // ── args_after_command tests ─────────────────────────────────────
+
+    #[test]
+    fn args_after_command_simple() {
+        assert_eq!(
+            args_after_command("catenary grep foo src"),
+            Some("grep foo src".to_string())
+        );
+    }
+
+    #[test]
+    fn args_after_command_skips_env_and_path_prefix() {
+        assert_eq!(
+            args_after_command("DEBUG=1 /usr/local/bin/catenary editing start"),
+            Some("editing start".to_string())
+        );
+    }
+
+    #[test]
+    fn args_after_command_ignores_quoted_command_name() {
+        // The quoted argument is dropped by the tokenizer, but the
+        // subcommand token is still read positionally — not by matching
+        // the literal "catenary" inside the quotes.
+        assert_eq!(
+            args_after_command(r#"catenary grep "catenary" src"#),
+            Some("grep src".to_string())
+        );
+    }
+
+    #[test]
+    fn args_after_command_all_env_vars() {
+        assert_eq!(args_after_command("A=1 B=2"), None);
     }
 
     // ── pipe_split tests ─────────────────────────────────────────────

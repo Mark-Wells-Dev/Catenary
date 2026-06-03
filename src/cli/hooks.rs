@@ -825,10 +825,11 @@ fn is_catenary_command(shell_cmd: &str, subcommands: &[&str]) -> bool {
         return false;
     }
 
-    // Check if the rest of the command contains a matching subcommand.
-    // Find "catenary" in the trimmed string, then check the next token(s).
-    let basename_pos = trimmed.rfind("catenary").map(|p| p + "catenary".len());
-    let Some(after_catenary) = basename_pos.map(|p| trimmed[p..].trim_start()) else {
+    // Read the subcommand from the tokens *after* the command token.
+    // Locating it positionally (not via `rfind("catenary")`) avoids
+    // matching the literal word "catenary" inside an argument — e.g.
+    // `catenary grep '("catenary")'` must still resolve to `grep`.
+    let Some(after_catenary) = crate::cli::command_filter::args_after_command(trimmed) else {
         return false;
     };
 
@@ -1462,6 +1463,33 @@ mod tests {
         assert!(!is_catenary_command(
             "catenary doctor",
             &["roots add", "roots rm"],
+        ));
+    }
+
+    #[test]
+    fn catenary_grep_arg_contains_literal_catenary() {
+        // Regression: the subcommand was located with `rfind("catenary")`,
+        // which matched the literal word inside the search pattern (or any
+        // argument), so `catenary grep` was not recognized and fell through
+        // to editing enforcement — denying a read-only search mid-edit.
+        assert!(is_catenary_command(
+            r#"catenary grep 'let config_dir = tmp.path\(\).join\("catenary"\);' tests/cli_integration.rs"#,
+            &["grep", "glob"],
+        ));
+        assert!(is_catenary_command(
+            "catenary grep catenary src",
+            &["grep", "glob"],
+        ));
+    }
+
+    #[test]
+    fn catenary_grep_path_prefix_with_literal_catenary_arg() {
+        // Path prefix containing "catenary" *and* an argument containing
+        // "catenary": neither `find` nor `rfind` would land on the command
+        // token, but positional tokenization does.
+        assert!(is_catenary_command(
+            r#"/opt/catenary/bin/catenary grep "catenary" src"#,
+            &["grep", "glob"],
         ));
     }
 
