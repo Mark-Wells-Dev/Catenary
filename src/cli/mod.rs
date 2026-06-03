@@ -169,7 +169,6 @@ pub fn terminal_width() -> usize {
 
 /// Object-safe extension of [`Write`] that supports consuming the
 /// writer to extract captured bytes (test buffers).
-#[allow(dead_code, reason = "into_bytes is called only in #[cfg(test)]")]
 trait OutputWriter: Write + Send {
     /// Consume the writer and return captured bytes, if applicable.
     fn into_bytes(self: Box<Self>) -> Option<Vec<u8>>;
@@ -229,8 +228,13 @@ impl Output {
         write!(self.w, "{args}")
     }
 
-    /// Create a test buffer with the given width and colors disabled.
-    #[cfg(test)]
+    /// Create an in-memory buffer that captures written bytes.
+    ///
+    /// Pairs with [`Output::into_string`] to capture and assert on emitted
+    /// output in tests. Colors are disabled; `width` is fixed to the given
+    /// value. Lives outside `#[cfg(test)]` so handlers in the `catenary`
+    /// binary crate — a separate compilation unit that links the library
+    /// without its `cfg(test)` items — can still capture output in tests.
     #[must_use]
     pub fn buffer(width: usize) -> Self {
         Self {
@@ -240,21 +244,17 @@ impl Output {
         }
     }
 
-    /// Consume the output and return the written bytes as a string.
+    /// Consume the output and return any captured bytes as a string.
     ///
-    /// # Panics
-    ///
-    /// Panics if the writer is not a `Vec<u8>` (i.e. not created via
-    /// [`Output::buffer`]).
-    #[cfg(test)]
+    /// Returns an empty string when the writer captured nothing — e.g. an
+    /// [`Output::stdout`] destination, which retains no bytes. Pair with
+    /// [`Output::buffer`] to capture emitted text.
     #[must_use]
-    #[allow(clippy::expect_used, reason = "test-only method")]
     pub fn into_string(self) -> String {
-        let bytes = self
-            .w
+        self.w
             .into_bytes()
-            .expect("Output::into_string called on non-buffer Output");
-        String::from_utf8(bytes).unwrap_or_default()
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_default()
     }
 }
 

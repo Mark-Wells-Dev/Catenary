@@ -6,7 +6,6 @@
 //! This is the main entry point for the Catenary multiplexing bridge.
 //! It can be run as an MCP server or as a CLI tool to list and monitor sessions.
 
-#![allow(clippy::print_stdout, reason = "CLI tool needs to output to stdout")]
 #![allow(clippy::print_stderr, reason = "CLI tool needs to output to stderr")]
 
 use anyhow::{Context, Result};
@@ -406,7 +405,8 @@ fn main() -> Result<()> {
             }
         }
         Some(Command::Primer) => {
-            run_primer();
+            let mut out = cli::Output::stdout(false);
+            run_primer(&mut out);
             Ok(())
         }
         #[cfg(unix)]
@@ -419,7 +419,9 @@ fn main() -> Result<()> {
             include_hidden,
         }) => {
             let paths = to_literal_paths(scope);
+            let mut out = cli::Output::stdout(false);
             build_runtime()?.block_on(run_grep(
+                &mut out,
                 pattern,
                 paths,
                 exclude,
@@ -439,7 +441,9 @@ fn main() -> Result<()> {
             include_hidden,
         }) => {
             let paths = to_literal_paths(paths);
+            let mut out = cli::Output::stdout(false);
             build_runtime()?.block_on(run_glob(
+                &mut out,
                 paths,
                 exclude,
                 page,
@@ -450,25 +454,30 @@ fn main() -> Result<()> {
         #[cfg(not(unix))]
         Some(Command::Glob { .. }) => Err(anyhow::anyhow!("daemon mode requires Unix")),
         #[cfg(unix)]
-        Some(Command::Editing { command }) => match command {
-            EditingCommand::Start => build_runtime()?.block_on(run_start_editing()),
-            EditingCommand::Stop => build_runtime()?.block_on(run_done_editing()),
-        },
+        Some(Command::Editing { command }) => {
+            let mut out = cli::Output::stdout(false);
+            match command {
+                EditingCommand::Start => build_runtime()?.block_on(run_start_editing(&mut out)),
+                EditingCommand::Stop => build_runtime()?.block_on(run_done_editing(&mut out)),
+            }
+        }
         #[cfg(not(unix))]
         Some(Command::Editing { .. }) => Err(anyhow::anyhow!("daemon mode requires Unix")),
         #[cfg(unix)]
-        Some(Command::Roots { command }) => match command {
-            RootsCommand::Add { path } => {
-                build_runtime()?.block_on(run_root_command(path, "tool/roots-add"))
+        Some(Command::Roots { command }) => {
+            let mut out = cli::Output::stdout(false);
+            match command {
+                RootsCommand::Add { path } => {
+                    build_runtime()?.block_on(run_root_command(&mut out, path, "tool/roots-add"))
+                }
+                RootsCommand::Rm { path } => {
+                    build_runtime()?.block_on(run_root_command(&mut out, path, "tool/roots-rm"))
+                }
+                RootsCommand::Ls => {
+                    build_runtime()?.block_on(cli::commands::run_ls_roots(&mut out))
+                }
             }
-            RootsCommand::Rm { path } => {
-                build_runtime()?.block_on(run_root_command(path, "tool/roots-rm"))
-            }
-            RootsCommand::Ls => {
-                let mut out = cli::Output::stdout(false);
-                build_runtime()?.block_on(cli::commands::run_ls_roots(&mut out))
-            }
-        },
+        }
         #[cfg(not(unix))]
         Some(Command::Roots { .. }) => Err(anyhow::anyhow!("daemon mode requires Unix")),
         Some(Command::Config) => {
@@ -514,7 +523,10 @@ fn main() -> Result<()> {
             cli::update::run_update(&mut out, check, force)
         }
         #[cfg(unix)]
-        Some(Command::Stop) => build_runtime()?.block_on(run_stop()),
+        Some(Command::Stop) => {
+            let mut out = cli::Output::stdout(false);
+            build_runtime()?.block_on(run_stop(&mut out))
+        }
         #[cfg(not(unix))]
         Some(Command::Stop) => Err(anyhow::anyhow!("daemon mode requires Unix")),
         Some(Command::Debug { command }) => match command {
@@ -651,7 +663,7 @@ fn validate_paths(paths: &[PathBuf], cwd: &Path, command: &str) -> Result<()> {
 /// Extracts the agent-facing subcommands from the derive-generated CLI
 /// definition. When help text changes (via doc comments on the derive
 /// structs), `primer` updates automatically.
-fn run_primer() {
+fn run_primer(out: &mut cli::Output) {
     use clap::CommandFactory;
     let app = Args::command();
     let agent_commands = ["editing", "grep", "glob", "roots"];
@@ -661,7 +673,9 @@ fn run_primer() {
             continue;
         };
         if !first {
-            println!("\n─────────────────────────────────────────────────");
+            let _ = out.writeln(format_args!(
+                "\n─────────────────────────────────────────────────"
+            ));
         }
         first = false;
         let mut sub = sub.clone();
@@ -669,7 +683,7 @@ fn run_primer() {
             .bin_name(format!("catenary {name}"))
             .disable_help_subcommand(true);
         let help = sub.render_help();
-        println!("{help}");
+        let _ = out.writeln(format_args!("{help}"));
     }
 }
 
@@ -929,13 +943,13 @@ fn run_daemon_main() -> Result<()> {
 ///
 /// Returns an error if the shutdown request fails after connecting.
 #[cfg(unix)]
-async fn run_stop() -> Result<()> {
+async fn run_stop(out: &mut cli::Output) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     let ipc_path = catenary_mcp::router::socket_path();
 
     let Ok(stream) = tokio::net::UnixStream::connect(&ipc_path).await else {
-        println!("No daemon running");
+        let _ = out.writeln(format_args!("No daemon running"));
         return Ok(());
     };
 
@@ -949,7 +963,7 @@ async fn run_stop() -> Result<()> {
     let mut line = String::new();
     buf_reader.read_line(&mut line).await?;
 
-    println!("Daemon stopped");
+    let _ = out.writeln(format_args!("Daemon stopped"));
     Ok(())
 }
 
@@ -964,6 +978,7 @@ async fn run_stop() -> Result<()> {
 /// Returns an error if no daemon is running or the query fails.
 #[cfg(unix)]
 async fn run_grep(
+    out: &mut cli::Output,
     pattern: String,
     paths: Vec<PathBuf>,
     exclude: Option<String>,
@@ -1020,12 +1035,14 @@ async fn run_grep(
     let response: catenary_mcp::router::GrepResponse =
         serde_json::from_str(trimmed).context("invalid grep response from daemon")?;
     if response.output.is_empty() {
-        println!("No results found");
+        let _ = out.writeln(format_args!("No results found"));
         if has_bre_alternation {
-            println!("hint: use `|` for alternation, not `\\|` (which matches a literal pipe)");
+            let _ = out.writeln(format_args!(
+                "hint: use `|` for alternation, not `\\|` (which matches a literal pipe)"
+            ));
         }
     } else {
-        println!("{}", response.output);
+        let _ = out.writeln(format_args!("{}", response.output));
     }
 
     Ok(())
@@ -1042,6 +1059,7 @@ async fn run_grep(
 /// Returns an error if no daemon is running or the query fails.
 #[cfg(unix)]
 async fn run_glob(
+    out: &mut cli::Output,
     paths: Vec<PathBuf>,
     exclude: Option<String>,
     page: usize,
@@ -1095,7 +1113,7 @@ async fn run_glob(
     let response: catenary_mcp::router::GlobResponse =
         serde_json::from_str(trimmed).context("invalid glob response from daemon")?;
     if !response.output.is_empty() {
-        println!("{}", response.output);
+        let _ = out.writeln(format_args!("{}", response.output));
     }
 
     Ok(())
@@ -1111,7 +1129,7 @@ async fn run_glob(
 ///
 /// Returns an error if no daemon is running.
 #[cfg(unix)]
-async fn run_start_editing() -> Result<()> {
+async fn run_start_editing(out: &mut cli::Output) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     let ipc_path = catenary_mcp::router::socket_path();
@@ -1137,7 +1155,7 @@ async fn run_start_editing() -> Result<()> {
         .unwrap_or("ok");
 
     if status == "ok" {
-        println!("editing mode active");
+        let _ = out.writeln(format_args!("editing mode active"));
     } else {
         let msg = response
             .get("message")
@@ -1159,7 +1177,7 @@ async fn run_start_editing() -> Result<()> {
 ///
 /// Returns an error if no daemon is running or the response is invalid.
 #[cfg(unix)]
-async fn run_done_editing() -> Result<()> {
+async fn run_done_editing(out: &mut cli::Output) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     let ipc_path = catenary_mcp::router::socket_path();
@@ -1188,7 +1206,7 @@ async fn run_done_editing() -> Result<()> {
 
     let trimmed = output.trim();
     if !trimmed.is_empty() {
-        println!("{trimmed}");
+        let _ = out.writeln(format_args!("{trimmed}"));
     }
 
     Ok(())
@@ -1205,7 +1223,7 @@ async fn run_done_editing() -> Result<()> {
 /// Returns an error if the path cannot be canonicalized or the daemon
 /// request fails.
 #[cfg(unix)]
-async fn run_root_command(path: PathBuf, method: &str) -> Result<()> {
+async fn run_root_command(out: &mut cli::Output, path: PathBuf, method: &str) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     let canonical = path
@@ -1244,14 +1262,14 @@ async fn run_root_command(path: PathBuf, method: &str) -> Result<()> {
             } else {
                 "removed"
             };
-            println!("{verb} root: {}", canonical.display());
+            let _ = out.writeln(format_args!("{verb} root: {}", canonical.display()));
         }
         "not_found" => {
             let msg = response
                 .get("message")
                 .and_then(|v| v.as_str())
                 .unwrap_or("root not found in hook-managed roots");
-            println!("{msg}");
+            let _ = out.writeln(format_args!("{msg}"));
         }
         _ => {
             let msg = response
@@ -1737,6 +1755,33 @@ mod tests {
         let args = Args::try_parse_from(["catenary", "primer"]);
         let args = args.expect("primer should parse");
         assert!(matches!(args.command, Some(Command::Primer)));
+    }
+
+    #[test]
+    fn run_primer_emits_reference() {
+        // The primer renders help for each agent-facing subcommand, with the
+        // bin name rewritten to `catenary <name>`. Capturing through an
+        // `Output::buffer` proves the migrated handler writes via `Output`
+        // (not raw `println!`) and emits the expected reference text.
+        let mut out = cli::Output::buffer(80);
+        run_primer(&mut out);
+        let text = out.into_string();
+        assert!(
+            text.contains("catenary grep"),
+            "primer should document grep"
+        );
+        assert!(
+            text.contains("catenary glob"),
+            "primer should document glob"
+        );
+        assert!(
+            text.contains("catenary editing"),
+            "primer should document editing"
+        );
+        assert!(
+            text.contains("catenary roots"),
+            "primer should document roots"
+        );
     }
 
     // ── CLI install subcommand tests ────────────────────────────────
