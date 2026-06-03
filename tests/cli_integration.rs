@@ -1118,11 +1118,13 @@ fn test_doctor_piped_no_ansi() -> Result<()> {
 
 // ── non-existent path tests ───────────────────────────────────────
 
-/// Grep and glob must fail with a non-zero exit code and an error
-/// message when given a path that does not exist, rather than silently
-/// returning empty results.
+/// A plain path that does not exist is a soft condition: grep/glob must
+/// exit 0 with a loud `path does not exist` on stdout, never a non-zero
+/// exit that would cancel sibling tool calls in a parallel batch
+/// (`bugs/13`). A bogus path with no glob metacharacter resolves
+/// client-side, so no daemon is required.
 #[test]
-fn test_grep_nonexistent_path_fails() -> Result<()> {
+fn test_grep_nonexistent_path_exits_zero_loud() -> Result<()> {
     let tmp = tempfile::tempdir()?;
     let bogus = tmp.path().join("no_such_dir");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
@@ -1133,19 +1135,20 @@ fn test_grep_nonexistent_path_fails() -> Result<()> {
         .stderr(Stdio::piped());
     let output = cmd.output().context("failed to run catenary grep")?;
     assert!(
-        !output.status.success(),
-        "catenary grep on non-existent path should fail"
+        output.status.success(),
+        "catenary grep on a non-existent path must exit 0, got {:?}",
+        output.status.code()
     );
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stderr.contains("path does not exist"),
-        "stderr should mention missing path, got:\n{stderr}"
+        stdout.contains("path does not exist"),
+        "stdout should loudly report the missing path, got:\n{stdout}"
     );
     Ok(())
 }
 
 #[test]
-fn test_glob_nonexistent_path_fails() -> Result<()> {
+fn test_glob_nonexistent_path_exits_zero_loud() -> Result<()> {
     let tmp = tempfile::tempdir()?;
     let bogus = tmp.path().join("no_such_dir");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
@@ -1156,13 +1159,14 @@ fn test_glob_nonexistent_path_fails() -> Result<()> {
         .stderr(Stdio::piped());
     let output = cmd.output().context("failed to run catenary glob")?;
     assert!(
-        !output.status.success(),
-        "catenary glob on non-existent path should fail"
+        output.status.success(),
+        "catenary glob on a non-existent path must exit 0, got {:?}",
+        output.status.code()
     );
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stderr.contains("path does not exist"),
-        "stderr should mention missing path, got:\n{stderr}"
+        stdout.contains("path does not exist"),
+        "stdout should loudly report the missing path, got:\n{stdout}"
     );
     Ok(())
 }
@@ -1188,5 +1192,62 @@ fn test_help_exits_zero_for_agent_subcommands() -> Result<()> {
             output.status.code()
         );
     }
+    Ok(())
+}
+
+// ── quoted-glob exit-code contract ────────────────────────────────
+
+/// End-to-end: a quoted glob that matches nothing must exit 0 with a
+/// loud `no files matched` on stdout. The `catenary glob` binary talks
+/// to a live daemon (the pattern is expanded daemon-side), so a sibling
+/// tool call in the same parallel batch is never cancelled (`bugs/13`).
+#[test]
+fn test_glob_quoted_zero_match_exits_zero_loud() -> Result<()> {
+    let state_dir = tempfile::tempdir()?;
+    let state_home = state_dir.path().to_str().context("state dir")?;
+
+    let root = tempfile::tempdir()?;
+    let root_str = root.path().to_str().context("root path")?;
+    std::fs::write(root.path().join("only.txt"), "x")?;
+
+    // Start a daemon bound to this state dir (no LSP servers needed).
+    let mut bridge = common::BridgeProcess::spawn_in_state(state_home, |cmd| {
+        cmd.env("CATENARY_ROOTS", root_str);
+    })?;
+    bridge.initialize()?;
+
+    // Wait for the IPC socket the `glob` binary will connect to.
+    let ipc_sock = common::xdg_state_home(state_dir.path())
+        .join("catenary")
+        .join("catenary.sock");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !ipc_sock.exists() && std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    // Run the `glob` binary against the same daemon, cwd = workspace root.
+    // The arg reaches the process literally (no shell expansion), exactly
+    // as a quoted glob would.
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
+    isolate_env(&mut cmd, state_home);
+    cmd.current_dir(root.path())
+        .args(["glob", "**/*.rs"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = cmd.output().context("failed to run catenary glob")?;
+
+    assert!(
+        output.status.success(),
+        "quoted zero-match glob must exit 0, got {:?}; stderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("no files matched"),
+        "stdout should loudly report zero matches, got:\n{stdout}"
+    );
+
+    drop(bridge);
     Ok(())
 }

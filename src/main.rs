@@ -614,10 +614,10 @@ fn main() -> Result<()> {
     }
 }
 
-/// Converts positional arguments to literal file/directory paths.
+/// Converts positional arguments to `PathBuf`s.
 ///
-/// All values are treated as concrete filesystem paths — the shell is
-/// the only glob engine. No glob interpretation is applied.
+/// A plain string→path mapping; literal-vs-pattern classification and glob
+/// resolution happen later in [`resolve_search_paths`].
 fn to_literal_paths(values: Vec<String>) -> Vec<PathBuf> {
     values.into_iter().map(PathBuf::from).collect()
 }
@@ -627,37 +627,138 @@ fn contains_glob_metachar(s: &str) -> bool {
     s.contains('*') || s.contains('?') || s.contains('[') || s.contains('{')
 }
 
-/// Validates that all paths exist and emits hints for quoted glob patterns.
+/// Classified search-path arguments under the literal-first contract.
 ///
-/// When the user passes a quoted glob (e.g. `'src/**/*.rs'`), the shell
-/// does not expand it. The resulting literal path won't exist on disk.
-/// This function detects that case and suggests retrying without quotes.
+/// Produced by [`resolve_search_paths`] and consumed by
+/// [`render_search_outcome`] to honor the three-outcome, always-exit-0
+/// contract for `catenary grep`/`glob` (`bugs/13`).
+struct SearchPaths {
+    /// Arguments forwarded to the daemon: paths that exist plus glob patterns
+    /// (original spelling). On a zero-result search these are echoed back so
+    /// the agent sees exactly what was searched.
+    forward: Vec<PathBuf>,
+    /// Plain-path arguments that do not exist, reported loudly as
+    /// `path does not exist: <path>`.
+    missing: Vec<String>,
+}
+
+/// Resolves each search-path argument under the literal-first contract.
 ///
-/// Returns an error listing all non-existent paths so the agent gets
-/// immediate feedback instead of silent empty results.
-fn validate_paths(paths: &[PathBuf], cwd: &Path, command: &str) -> Result<()> {
+/// For each argument (resolved against `cwd` for the existence probe):
+/// - **exists** (file, directory, or symlink — including a broken one) →
+///   forwarded as a concrete path. Probing existence *first* preserves
+///   literal matching of filenames that contain glob metacharacters and keeps
+///   each variadic argument independent.
+/// - **missing + glob metacharacter** (`* ? [ {`) → forwarded as a pattern;
+///   the daemon expands it via its gitignore-aware walker.
+/// - **missing + no metacharacter** → recorded in `missing` for a loud
+///   `path does not exist` (exit 0, never a hard error that would cancel a
+///   parallel tool batch).
+fn resolve_search_paths(args: &[PathBuf], cwd: &Path) -> SearchPaths {
+    let mut forward = Vec::new();
     let mut missing = Vec::new();
-    for path in paths {
-        let resolved = if path.is_absolute() {
-            path.clone()
+    for arg in args {
+        let resolved = if arg.is_absolute() {
+            arg.clone()
         } else {
-            cwd.join(path)
+            cwd.join(arg)
         };
-        if !resolved.exists() {
-            let s = path.to_string_lossy();
-            if contains_glob_metachar(&s) {
-                eprintln!("hint: path not found — try without quotes: {command} {s}");
-            }
-            missing.push(path.display().to_string());
+        if resolved.symlink_metadata().is_ok() || contains_glob_metachar(&arg.to_string_lossy()) {
+            forward.push(arg.clone());
+        } else {
+            missing.push(arg.to_string_lossy().into_owned());
         }
     }
-    if missing.is_empty() {
-        return Ok(());
+    SearchPaths { forward, missing }
+}
+
+/// Which search command is being rendered — selects the zero-result wording.
+enum SearchKind {
+    /// `catenary grep`. On no match, echoes the pattern (so the agent can
+    /// check its escaping) and the searched scope.
+    Grep {
+        /// The search pattern, echoed on a zero-result search.
+        pattern: String,
+        /// The pattern contained `\|`, a basic-regex alternation that ripgrep
+        /// reads as a literal pipe — nudge toward `|`.
+        bre_alternation: bool,
+    },
+    /// `catenary glob`.
+    Glob,
+}
+
+/// Compresses a path by replacing the `$HOME` prefix with `~`.
+fn compress_home(path: &Path) -> String {
+    if let Ok(home) = std::env::var("HOME")
+        && let Ok(rel) = path.strip_prefix(&home)
+    {
+        return format!("~/{}", rel.display());
     }
-    if missing.len() == 1 {
-        anyhow::bail!("path does not exist: {}", missing[0]);
+    path.display().to_string()
+}
+
+/// Joins the forwarded path arguments for the `searched:` echo line.
+fn forward_display(paths: &SearchPaths) -> String {
+    paths
+        .forward
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Renders a search command's outcome under the three-outcome, always-exit-0
+/// contract (`bugs/13`).
+///
+/// - **Results** — `daemon_output` non-empty → printed verbatim; the daemon
+///   prepends its own cwd/root anchor.
+/// - **Empty** — `queried` ran but nothing came back → the cwd anchor is
+///   always printed (the only signal distinguishing "ran here, found nothing"
+///   from "did not run"), then the zero-result echo: `no files matched:
+///   <arg>` per glob argument, or grep's `no matches for: <pattern>` plus the
+///   `searched:` scope so the agent can check both its escaping and its paths.
+/// - **Missing** — a loud `path does not exist: <path>` is appended for each
+///   non-existent plain-path argument, regardless of the above.
+fn render_search_outcome(
+    out: &mut cli::Output,
+    cwd: &Path,
+    paths: &SearchPaths,
+    daemon_output: &str,
+    queried: bool,
+    kind: &SearchKind,
+) {
+    let body = daemon_output.trim_end_matches('\n');
+    if body.is_empty() {
+        let _ = out.writeln(format_args!("cwd: {}", compress_home(cwd)));
+        if queried {
+            match kind {
+                SearchKind::Glob => {
+                    for arg in &paths.forward {
+                        let _ = out.writeln(format_args!("no files matched: {}", arg.display()));
+                    }
+                }
+                SearchKind::Grep {
+                    pattern,
+                    bre_alternation,
+                } => {
+                    let _ = out.writeln(format_args!("no matches for: {pattern}"));
+                    if !paths.forward.is_empty() {
+                        let _ = out.writeln(format_args!("searched: {}", forward_display(paths)));
+                    }
+                    if *bre_alternation {
+                        let _ = out.writeln(format_args!(
+                            "hint: use `|` for alternation, not `\\|` (which matches a literal pipe)"
+                        ));
+                    }
+                }
+            }
+        }
+    } else {
+        let _ = out.writeln(format_args!("{body}"));
     }
-    anyhow::bail!("paths do not exist:\n{}", missing.join("\n"));
+    for path in &paths.missing {
+        let _ = out.writeln(format_args!("path does not exist: {path}"));
+    }
 }
 
 /// Print an overview of Catenary's workflow and commands.
@@ -1000,37 +1101,73 @@ async fn run_grep(
     include_hidden: bool,
 ) -> Result<()> {
     use catenary_mcp::router::{GrepRequest, METHOD_GREP};
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-    let has_bre_alternation = pattern.contains("\\|");
     let cwd = std::env::current_dir().context("cannot determine working directory")?;
 
-    validate_paths(&paths, &cwd, "catenary grep")?;
+    let resolved = resolve_search_paths(&paths, &cwd);
+    // No path arguments means a cwd-scoped search; otherwise query only when
+    // at least one argument resolved to a path or pattern.
+    let queried = paths.is_empty() || !resolved.forward.is_empty();
+    let kind = SearchKind::Grep {
+        pattern: pattern.clone(),
+        bre_alternation: pattern.contains("\\|"),
+    };
+
+    let daemon_output = if queried {
+        let request = GrepRequest {
+            cwd: Some(cwd.clone()),
+            pattern,
+            paths: resolved.forward.clone(),
+            exclude,
+            page,
+            include_gitignored,
+            include_hidden,
+        };
+        search_ipc(METHOD_GREP, &request).await?
+    } else {
+        String::new()
+    };
+
+    render_search_outcome(out, &cwd, &resolved, &daemon_output, queried, &kind);
+    Ok(())
+}
+
+/// Sends a `tool/grep` or `tool/glob` request to the daemon and returns the
+/// rendered output text.
+///
+/// Connects to the daemon IPC socket, serializes `request` with `method`
+/// injected, and reads the single response line. An empty response line maps
+/// to an empty string (the caller renders the empty outcome). A non-zero exit
+/// is reserved for genuine faults — no daemon, transport failure, or a
+/// malformed response — so soft conditions never cancel a parallel tool batch.
+///
+/// # Errors
+///
+/// Returns an error if no daemon is running or the query fails.
+#[cfg(unix)]
+async fn search_ipc<R: serde::Serialize + Sync>(method: &str, request: &R) -> Result<String> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    /// Shared response shape — both `GrepResponse` and `GlobResponse` are
+    /// `{ "output": String }`.
+    #[derive(serde::Deserialize)]
+    struct SearchResponse {
+        output: String,
+    }
 
     let ipc_path = catenary_mcp::router::socket_path();
-
     let stream = tokio::net::UnixStream::connect(&ipc_path)
         .await
         .context("no daemon running — start a Catenary session first")?;
-
     let (reader, mut writer) = stream.into_split();
 
-    let request = GrepRequest {
-        cwd: Some(cwd),
-        pattern,
-        paths,
-        exclude,
-        page,
-        include_gitignored,
-        include_hidden,
-    };
-    let mut envelope = serde_json::to_value(&request)?;
+    let mut envelope = serde_json::to_value(request)?;
     envelope
         .as_object_mut()
         .context("request is not an object")?
         .insert(
             "method".to_string(),
-            serde_json::Value::String(METHOD_GREP.to_string()),
+            serde_json::Value::String(method.to_string()),
         );
     let mut payload = serde_json::to_string(&envelope)?;
     payload.push('\n');
@@ -1042,23 +1179,11 @@ async fn run_grep(
 
     let trimmed = line.trim();
     if trimmed.is_empty() {
-        return Ok(());
+        return Ok(String::new());
     }
-
-    let response: catenary_mcp::router::GrepResponse =
-        serde_json::from_str(trimmed).context("invalid grep response from daemon")?;
-    if response.output.is_empty() {
-        let _ = out.writeln(format_args!("No results found"));
-        if has_bre_alternation {
-            let _ = out.writeln(format_args!(
-                "hint: use `|` for alternation, not `\\|` (which matches a literal pipe)"
-            ));
-        }
-    } else {
-        let _ = out.writeln(format_args!("{}", response.output));
-    }
-
-    Ok(())
+    let response: SearchResponse =
+        serde_json::from_str(trimmed).context("invalid search response from daemon")?;
+    Ok(response.output)
 }
 
 /// Runs a glob query against the running daemon.
@@ -1080,55 +1205,36 @@ async fn run_glob(
     include_hidden: bool,
 ) -> Result<()> {
     use catenary_mcp::router::{GlobRequest, METHOD_GLOB};
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     let cwd = std::env::current_dir().context("cannot determine working directory")?;
 
-    validate_paths(&paths, &cwd, "catenary glob")?;
+    let resolved = resolve_search_paths(&paths, &cwd);
+    // Glob always scopes to explicit paths (clap requires at least one); query
+    // only when at least one argument resolved to a path or pattern.
+    let queried = !resolved.forward.is_empty();
 
-    let ipc_path = catenary_mcp::router::socket_path();
-
-    let stream = tokio::net::UnixStream::connect(&ipc_path)
-        .await
-        .context("no daemon running — start a Catenary session first")?;
-
-    let (reader, mut writer) = stream.into_split();
-
-    let request = GlobRequest {
-        cwd: Some(cwd),
-        paths,
-        exclude,
-        page,
-        include_gitignored,
-        include_hidden,
+    let daemon_output = if queried {
+        let request = GlobRequest {
+            cwd: Some(cwd.clone()),
+            paths: resolved.forward.clone(),
+            exclude,
+            page,
+            include_gitignored,
+            include_hidden,
+        };
+        search_ipc(METHOD_GLOB, &request).await?
+    } else {
+        String::new()
     };
-    let mut envelope = serde_json::to_value(&request)?;
-    envelope
-        .as_object_mut()
-        .context("request is not an object")?
-        .insert(
-            "method".to_string(),
-            serde_json::Value::String(METHOD_GLOB.to_string()),
-        );
-    let mut payload = serde_json::to_string(&envelope)?;
-    payload.push('\n');
-    writer.write_all(payload.as_bytes()).await?;
 
-    let mut buf_reader = BufReader::new(reader);
-    let mut line = String::new();
-    buf_reader.read_line(&mut line).await?;
-
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
-        return Ok(());
-    }
-
-    let response: catenary_mcp::router::GlobResponse =
-        serde_json::from_str(trimmed).context("invalid glob response from daemon")?;
-    if !response.output.is_empty() {
-        let _ = out.writeln(format_args!("{}", response.output));
-    }
-
+    render_search_outcome(
+        out,
+        &cwd,
+        &resolved,
+        &daemon_output,
+        queried,
+        &SearchKind::Glob,
+    );
     Ok(())
 }
 
@@ -1994,5 +2100,193 @@ mod tests {
     #[test]
     fn test_contains_glob_metachar_directory() {
         assert!(!contains_glob_metachar("src/tui/"));
+    }
+
+    // ── resolve_search_paths tests ───────────────────────────────────
+
+    #[test]
+    fn resolve_existing_path_is_forwarded() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("real.rs"), "x").expect("write");
+        let res = resolve_search_paths(&[PathBuf::from("real.rs")], tmp.path());
+        assert_eq!(res.forward, vec![PathBuf::from("real.rs")]);
+        assert!(res.missing.is_empty());
+    }
+
+    #[test]
+    fn resolve_metachar_named_file_is_literal_not_pattern() {
+        // A file literally named with a glob metacharacter resolves as a
+        // path — existence is probed before pattern classification.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let name = "weird[1].rs";
+        std::fs::write(tmp.path().join(name), "x").expect("write");
+        let res = resolve_search_paths(&[PathBuf::from(name)], tmp.path());
+        assert_eq!(res.forward, vec![PathBuf::from(name)]);
+        assert!(res.missing.is_empty());
+    }
+
+    #[test]
+    fn resolve_missing_glob_is_forwarded_as_pattern() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let res = resolve_search_paths(&[PathBuf::from("src/**/none.rs")], tmp.path());
+        // Missing + glob metacharacter → forwarded for the daemon to expand.
+        assert_eq!(res.forward, vec![PathBuf::from("src/**/none.rs")]);
+        assert!(res.missing.is_empty());
+    }
+
+    #[test]
+    fn resolve_missing_plain_path_is_missing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let res = resolve_search_paths(&[PathBuf::from("src/not/real.rs")], tmp.path());
+        assert!(res.forward.is_empty());
+        assert_eq!(res.missing, vec!["src/not/real.rs".to_string()]);
+    }
+
+    #[test]
+    fn resolve_mixed_arguments_classified_independently() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("real.rs"), "x").expect("write");
+        let args = [
+            PathBuf::from("real.rs"),
+            PathBuf::from("*.toml"),
+            PathBuf::from("gone.rs"),
+        ];
+        let res = resolve_search_paths(&args, tmp.path());
+        assert_eq!(
+            res.forward,
+            vec![PathBuf::from("real.rs"), PathBuf::from("*.toml")]
+        );
+        assert_eq!(res.missing, vec!["gone.rs".to_string()]);
+    }
+
+    // ── render_search_outcome tests ──────────────────────────────────
+
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "test helper builds owned args inline at the call site"
+    )]
+    fn render(paths: SearchPaths, output: &str, queried: bool, kind: SearchKind) -> String {
+        let mut out = cli::Output::buffer(80);
+        render_search_outcome(
+            &mut out,
+            Path::new("/tmp/work"),
+            &paths,
+            output,
+            queried,
+            &kind,
+        );
+        out.into_string()
+    }
+
+    #[test]
+    fn render_results_pass_through_verbatim() {
+        let paths = SearchPaths {
+            forward: vec![PathBuf::from("src")],
+            missing: vec![],
+        };
+        let text = render(
+            paths,
+            "cwd: ~/work\nsrc/\n\tmain.rs",
+            true,
+            SearchKind::Glob,
+        );
+        assert!(text.contains("main.rs"), "{text}");
+        assert!(!text.contains("no files matched"), "{text}");
+    }
+
+    #[test]
+    fn render_glob_zero_match_is_loud() {
+        let paths = SearchPaths {
+            forward: vec![PathBuf::from("src/**/none.rs")],
+            missing: vec![],
+        };
+        let text = render(paths, "", true, SearchKind::Glob);
+        assert!(text.contains("cwd:"), "cwd anchor always printed: {text}");
+        assert!(text.contains("no files matched: src/**/none.rs"), "{text}");
+    }
+
+    #[test]
+    fn render_missing_plain_path_is_loud() {
+        let paths = SearchPaths {
+            forward: vec![],
+            missing: vec!["src/not/real.rs".to_string()],
+        };
+        let text = render(paths, "", false, SearchKind::Glob);
+        assert!(text.contains("cwd:"), "{text}");
+        assert!(
+            text.contains("path does not exist: src/not/real.rs"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn render_cwd_printed_on_empty() {
+        let paths = SearchPaths {
+            forward: vec![],
+            missing: vec![],
+        };
+        let text = render(paths, "", true, SearchKind::Glob);
+        assert!(
+            text.contains("cwd:"),
+            "empty result still anchors cwd: {text}"
+        );
+    }
+
+    #[test]
+    fn render_grep_empty_echoes_pattern_and_scope() {
+        let paths = SearchPaths {
+            forward: vec![PathBuf::from("src")],
+            missing: vec![],
+        };
+        let text = render(
+            paths,
+            "",
+            true,
+            SearchKind::Grep {
+                pattern: "needle".to_string(),
+                bre_alternation: false,
+            },
+        );
+        assert!(text.contains("no matches for: needle"), "{text}");
+        assert!(text.contains("searched: src"), "{text}");
+    }
+
+    #[test]
+    fn render_grep_bre_alternation_hint() {
+        let paths = SearchPaths {
+            forward: vec![],
+            missing: vec![],
+        };
+        let text = render(
+            paths,
+            "",
+            true,
+            SearchKind::Grep {
+                pattern: "foo\\|bar".to_string(),
+                bre_alternation: true,
+            },
+        );
+        assert!(text.contains("alternation"), "BRE hint shown: {text}");
+    }
+
+    #[test]
+    fn render_not_queried_skips_zero_result_line() {
+        // All arguments missing: no query ran, so no "no matches for" —
+        // the path-does-not-exist lines carry the explanation.
+        let paths = SearchPaths {
+            forward: vec![],
+            missing: vec!["gone.rs".to_string()],
+        };
+        let text = render(
+            paths,
+            "",
+            false,
+            SearchKind::Grep {
+                pattern: "needle".to_string(),
+                bre_alternation: false,
+            },
+        );
+        assert!(!text.contains("no matches for"), "{text}");
+        assert!(text.contains("path does not exist: gone.rs"), "{text}");
     }
 }

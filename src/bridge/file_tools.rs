@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use super::filesystem_manager::{FilesystemManager, format_file_size};
-use super::session::ResolvedGlob;
+use super::session::{ResolvedGlob, expand_search_paths};
 use crate::lsp::LspClientManager;
 use crate::symbol_index::{Symbol, SymbolIndex, format_symbol_kind};
 
@@ -157,8 +157,8 @@ impl GlobServer {
         let cwd = input.cwd.as_deref();
 
         // Run pipeline — handlers return full unpaginated output.
-        // All positional arguments are literal paths (the shell is the
-        // only glob engine). Dispatch each through the appropriate handler.
+        // Existing paths dispatch directly; unexpanded glob patterns are
+        // expanded daemon-side. Dispatch each through the appropriate handler.
         let full_output = self
             .handle_literal_paths(&input.paths, &input, exclude.as_ref(), cwd, parent_id)
             .await?;
@@ -277,10 +277,13 @@ impl GlobServer {
         full
     }
 
-    /// Multiple literal paths: dispatch each through the file or directory handler.
+    /// Dispatch each resolved path through the file or directory handler.
     ///
-    /// Used when the CLI receives multiple positional arguments (shell-expanded
-    /// from an unquoted glob). Each path is concrete — no glob interpretation.
+    /// Paths that exist are dispatched directly; non-existent paths are treated
+    /// as glob patterns and expanded daemon-side via the gitignore-aware
+    /// `ignore` walker ([`expand_search_paths`]). A shell-expanded (unquoted)
+    /// glob arrives as concrete paths and an unexpanded (quoted) glob arrives
+    /// as a pattern — both resolve to the same set here.
     async fn handle_literal_paths(
         &self,
         paths: &[PathBuf],
@@ -289,8 +292,9 @@ impl GlobServer {
         cwd: Option<&Path>,
         parent_id: Option<&str>,
     ) -> Result<String> {
+        let resolved = expand_search_paths(paths, input.include_gitignored, input.include_hidden);
         let mut full = String::new();
-        for path in paths {
+        for path in &resolved {
             if path.is_file() || path.is_symlink() {
                 self.client_manager
                     .ensure_and_wait_for_paths(std::slice::from_ref(path))

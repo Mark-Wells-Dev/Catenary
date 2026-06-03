@@ -324,6 +324,101 @@ fn test_glob_include_gitignored() -> Result<()> {
     Ok(())
 }
 
+// ── literal-first glob expansion (bugs/13, ticket 07) ──────────────
+
+/// A quoted (unexpanded) glob pattern is expanded daemon-side: the
+/// relative pattern is resolved against cwd and the gitignore-aware
+/// walker yields the matching files, just as if the shell had expanded
+/// it unquoted.
+#[test]
+fn test_glob_quoted_pattern_expands_daemon_side() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::create_dir_all(dir.path().join("src/inner"))?;
+    std::fs::write(dir.path().join("src/main.rs"), "fn main() {}")?;
+    std::fs::write(dir.path().join("src/inner/lib.rs"), "fn lib() {}")?;
+    std::fs::write(dir.path().join("src/notes.txt"), "notes")?;
+
+    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    // Pattern is relative — the daemon resolves it against the cwd
+    // (the workspace root) and expands via the `ignore` walker.
+    let text = bridge.call_tool_text("glob", &json!({ "paths": ["src/**/*.rs"] }))?;
+
+    assert!(text.contains("main.rs"), "expands to main.rs: {text}");
+    assert!(
+        text.contains("lib.rs"),
+        "expands recursively to lib.rs: {text}"
+    );
+    assert!(
+        !text.contains("notes.txt"),
+        "non-matching extension excluded: {text}"
+    );
+    Ok(())
+}
+
+/// A quoted glob pattern that matches nothing yields empty daemon output
+/// (the CLI renders the loud `no files matched` anchor) — never an error.
+#[test]
+fn test_glob_quoted_pattern_zero_match_is_empty() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(dir.path().join("only.txt"), "x")?;
+
+    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text("glob", &json!({ "paths": ["**/*.rs"] }))?;
+    assert!(
+        text.trim().is_empty(),
+        "zero-match pattern returns empty output, got: {text:?}"
+    );
+    Ok(())
+}
+
+/// grep applies the same expansion to its path arguments: a quoted glob
+/// scopes the search to the files it matches.
+#[test]
+fn test_grep_quoted_pattern_path_scopes_search() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(dir.path().join("a.rs"), "let needle = 1;")?;
+    std::fs::write(dir.path().join("b.txt"), "needle in text")?;
+
+    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "needle", "paths": ["*.rs"] }))?;
+    assert!(
+        text.contains("a.rs"),
+        "searches the expanded .rs file: {text}"
+    );
+    assert!(
+        !text.contains("b.txt"),
+        "the .txt file is outside the expanded scope: {text}"
+    );
+    Ok(())
+}
+
+/// grep with a path glob that matches no files returns empty — it must
+/// NOT silently fall back to a cwd-wide search.
+#[test]
+fn test_grep_path_glob_zero_files_does_not_search_cwd() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(dir.path().join("a.rs"), "let needle = 1;")?;
+
+    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text(
+        "grep",
+        &json!({ "pattern": "needle", "paths": ["*.nomatchext"] }),
+    )?;
+    assert!(
+        text.trim().is_empty(),
+        "zero-file glob must not fall back to a cwd search, got: {text}"
+    );
+    Ok(())
+}
+
 #[test]
 fn test_glob_tier3_bucketed() -> Result<()> {
     let dir = tempfile::tempdir()?;

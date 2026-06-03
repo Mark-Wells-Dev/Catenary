@@ -8,6 +8,8 @@
 //! and access any dependency through it.
 
 use anyhow::Result;
+use ignore::WalkBuilder;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::runtime::Handle;
@@ -117,6 +119,127 @@ impl ResolvedGlob {
             base
         }
     }
+
+    /// Expands this glob into the concrete paths it matches on disk.
+    ///
+    /// Walks the pattern's non-glob base directory with the gitignore-aware
+    /// [`ignore`] walker, so within a git repository gitignored and (by
+    /// default) hidden entries are skipped — a blind `**/*.rs` from a project
+    /// root would otherwise descend into `target/` and hang.
+    /// `include_gitignored` / `include_hidden` lift those filters. Gitignore is
+    /// repo-scoped (matching ripgrep and editors): outside a git repository no
+    /// `.gitignore` rules apply. Results are sorted for deterministic output.
+    ///
+    /// Only meaningful for absolute patterns (the only form the daemon
+    /// receives — the CLI resolves every path argument against `cwd` before
+    /// dispatch). Relative patterns carry no base directory and yield an empty
+    /// list.
+    #[must_use]
+    pub fn expand(&self, include_gitignored: bool, include_hidden: bool) -> Vec<PathBuf> {
+        let Some(base) = self.override_root.as_deref() else {
+            return Vec::new();
+        };
+        let mut matches: Vec<PathBuf> = WalkBuilder::new(base)
+            .git_ignore(!include_gitignored)
+            .hidden(!include_hidden)
+            .build()
+            .flatten()
+            .map(ignore::DirEntry::into_path)
+            .filter(|path| self.is_match(path, base))
+            .collect();
+        matches.sort();
+        matches
+    }
+}
+
+/// Resolves search path arguments into the concrete paths to scope a query.
+///
+/// Mirrors the CLI's literal-first contract on the daemon side: a path that
+/// exists on disk (file, directory, or symlink — including a broken one) is
+/// kept; a non-existent path is treated as a glob pattern and expanded via
+/// [`ResolvedGlob::expand`]. A non-existent path with no glob metacharacters
+/// compiles to a literal glob whose base directory does not exist, so it
+/// expands to nothing — the CLI reports those as `path does not exist` before
+/// they ever reach here.
+///
+/// Existing concrete paths are still filtered against `.gitignore` unless
+/// `include_gitignored` is set: a shell-expanded `target/*.rs` and a
+/// daemon-expanded `'target/*.rs'` must yield the same set, so a gitignored
+/// path is dropped no matter how it arrived. Gitignore is repo-scoped
+/// (matching ripgrep/editors); outside a git repository nothing is filtered.
+///
+/// Paths are expected to be absolute (the CLI resolves them against `cwd`
+/// before dispatch). An empty input yields an empty result; callers
+/// distinguish "no path arguments" (search `cwd`) from "arguments that matched
+/// nothing" (empty result) before calling this.
+#[must_use]
+pub fn expand_search_paths(
+    paths: &[PathBuf],
+    include_gitignored: bool,
+    include_hidden: bool,
+) -> Vec<PathBuf> {
+    let mut resolved = Vec::new();
+    // Per-parent cache of gitignore-visible entries, so a batch of
+    // shell-expanded siblings only walks their directory once.
+    let mut visible: HashMap<PathBuf, HashSet<PathBuf>> = HashMap::new();
+    for path in paths {
+        if path.symlink_metadata().is_ok() {
+            if include_gitignored || !is_gitignored(path, &mut visible) {
+                resolved.push(path.clone());
+            }
+        } else if let Ok(glob) = ResolvedGlob::new(&path.to_string_lossy()) {
+            resolved.extend(glob.expand(include_gitignored, include_hidden));
+        }
+    }
+    resolved
+}
+
+/// Whether `path` is excluded by `.gitignore`, repo-scoped like ripgrep.
+///
+/// Outside a git repository nothing is gitignored, so the directory walk is
+/// skipped entirely (cheap `.git` probe up the tree). Inside a repo, a
+/// depth-1 walk of the parent applies the full ignore hierarchy; `path` is
+/// gitignored iff it is absent from the visible set. `cache` memoizes that
+/// set per parent directory.
+fn is_gitignored(path: &Path, cache: &mut HashMap<PathBuf, HashSet<PathBuf>>) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    if !in_git_repo(parent) {
+        return false;
+    }
+    let entries = cache
+        .entry(parent.to_path_buf())
+        .or_insert_with(|| visible_entries(parent));
+    !entries.contains(path)
+}
+
+/// Walks up from `dir` (inclusive) looking for a `.git` entry (a directory
+/// for a normal checkout, a file for worktrees/submodules).
+fn in_git_repo(dir: &Path) -> bool {
+    let mut current = Some(dir);
+    while let Some(d) = current {
+        if d.join(".git").exists() {
+            return true;
+        }
+        current = d.parent();
+    }
+    false
+}
+
+/// The gitignore-visible entries directly under `dir` (depth-1 walk).
+///
+/// Hidden filtering is left off — an explicitly named hidden file should not
+/// be dropped here; only `.gitignore` governs this filter.
+fn visible_entries(dir: &Path) -> HashSet<PathBuf> {
+    WalkBuilder::new(dir)
+        .max_depth(Some(1))
+        .git_ignore(true)
+        .hidden(false)
+        .build()
+        .flatten()
+        .map(ignore::DirEntry::into_path)
+        .collect()
 }
 
 /// Shared application container for tool servers and cross-tool infrastructure.
@@ -554,5 +677,127 @@ mod tests {
     #[test]
     fn targets_hidden_single_dot_is_not_hidden() {
         assert!(!ResolvedGlob::targets_hidden("./src/*.rs"));
+    }
+
+    // ── glob expansion ─────────────────────────────────────────────
+
+    #[test]
+    fn expand_matches_recursively_with_doublestar() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("a/b")).expect("mkdir");
+        std::fs::write(root.join("a/b/deep.rs"), "x").expect("write");
+        std::fs::write(root.join("top.rs"), "x").expect("write");
+        std::fs::write(root.join("a/note.txt"), "x").expect("write");
+
+        let pattern = format!("{}/**/*.rs", root.display());
+        let glob = ResolvedGlob::new(&pattern).expect("compile glob");
+        let matches = glob.expand(false, false);
+
+        assert!(matches.contains(&root.join("a/b/deep.rs")), "{matches:?}");
+        assert!(matches.contains(&root.join("top.rs")), "{matches:?}");
+        assert!(
+            !matches.iter().any(|p| p.ends_with("note.txt")),
+            "non-matching extension excluded: {matches:?}"
+        );
+    }
+
+    /// Initializes a git repo at `dir` so gitignore rules apply (gitignore is
+    /// repo-scoped: outside a repo no `.gitignore` is honored).
+    fn git_init(dir: &Path) {
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir)
+            .output()
+            .expect("git init");
+    }
+
+    #[test]
+    fn expand_is_gitignore_aware() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        git_init(root);
+        std::fs::write(root.join(".gitignore"), "target/\n").expect("write");
+        std::fs::create_dir_all(root.join("target")).expect("mkdir");
+        std::fs::write(root.join("target/ignored.rs"), "x").expect("write");
+        std::fs::write(root.join("kept.rs"), "x").expect("write");
+
+        let pattern = format!("{}/**/*.rs", root.display());
+        let glob = ResolvedGlob::new(&pattern).expect("compile glob");
+
+        let matches = glob.expand(false, false);
+        assert!(matches.contains(&root.join("kept.rs")), "{matches:?}");
+        assert!(
+            !matches.iter().any(|p| p.ends_with("ignored.rs")),
+            "gitignored target/ pruned: {matches:?}"
+        );
+
+        // The escape hatch lifts the filter.
+        let with_ignored = glob.expand(true, false);
+        assert!(
+            with_ignored.iter().any(|p| p.ends_with("ignored.rs")),
+            "include_gitignored surfaces target/: {with_ignored:?}"
+        );
+    }
+
+    #[test]
+    fn expand_search_paths_drops_gitignored_concrete() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        git_init(root);
+        std::fs::write(root.join(".gitignore"), "ignored.rs\n").expect("write");
+        std::fs::write(root.join("ignored.rs"), "x").expect("write");
+        std::fs::write(root.join("kept.rs"), "x").expect("write");
+
+        let ignored = root.join("ignored.rs");
+        let kept = root.join("kept.rs");
+
+        // A shell-expanded gitignored path is dropped just like an internally
+        // expanded one — convergence regardless of who expanded.
+        let resolved = expand_search_paths(&[ignored.clone(), kept.clone()], false, false);
+        assert_eq!(resolved, vec![kept], "{resolved:?}");
+
+        // The escape hatch keeps it.
+        let with_ignored = expand_search_paths(std::slice::from_ref(&ignored), true, false);
+        assert_eq!(with_ignored, vec![ignored], "{with_ignored:?}");
+    }
+
+    #[test]
+    fn expand_single_star_does_not_cross_directories() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("sub")).expect("mkdir");
+        std::fs::write(root.join("flat.rs"), "x").expect("write");
+        std::fs::write(root.join("sub/nested.rs"), "x").expect("write");
+
+        let pattern = format!("{}/*.rs", root.display());
+        let glob = ResolvedGlob::new(&pattern).expect("compile glob");
+        let matches = glob.expand(false, false);
+
+        assert!(matches.contains(&root.join("flat.rs")), "{matches:?}");
+        assert!(
+            !matches.contains(&root.join("sub/nested.rs")),
+            "single star stays within one segment: {matches:?}"
+        );
+    }
+
+    #[test]
+    fn expand_search_paths_keeps_existing_and_expands_patterns() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::write(root.join("real.rs"), "x").expect("write");
+        std::fs::write(root.join("other.rs"), "x").expect("write");
+
+        let existing = root.join("real.rs");
+        // An existing path passes through; a non-glob, non-existent path
+        // expands to nothing (the CLI reports those as `path does not exist`).
+        let resolved =
+            expand_search_paths(&[existing.clone(), root.join("ghost.rs")], false, false);
+        assert_eq!(resolved, vec![existing], "{resolved:?}");
+
+        // A pattern expands to its matches.
+        let expanded = expand_search_paths(&[root.join("*.rs")], false, false);
+        assert!(expanded.contains(&root.join("real.rs")), "{expanded:?}");
+        assert!(expanded.contains(&root.join("other.rs")), "{expanded:?}");
     }
 }

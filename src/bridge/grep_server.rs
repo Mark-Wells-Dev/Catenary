@@ -138,6 +138,24 @@ impl GrepServer {
         // cwd-scoped search: present when no glob or relative glob.
         let cwd = input.cwd.clone();
 
+        // Resolve path arguments into concrete search roots: existing paths
+        // pass through, unexpanded glob patterns expand daemon-side via the
+        // gitignore-aware walker. When path arguments were given but matched
+        // nothing, the result is empty — never a fallback to a cwd-wide search.
+        let search_paths = if input.paths.is_empty() {
+            Vec::new()
+        } else {
+            let expanded = super::session::expand_search_paths(
+                &input.paths,
+                input.include_gitignored,
+                input.include_hidden,
+            );
+            if expanded.is_empty() {
+                return Ok(Value::String(String::new()));
+            }
+            expanded
+        };
+
         // Split top-level alternation into independent arms
         let arms = split_alternation(&input.pattern);
 
@@ -145,7 +163,7 @@ impl GrepServer {
         for arm in &arms {
             let arm_input = GrepInput {
                 pattern: arm.clone(),
-                paths: input.paths.clone(),
+                paths: search_paths.clone(),
                 exclude: input.exclude.clone(),
                 include_gitignored: input.include_gitignored,
                 include_hidden: input.include_hidden,
