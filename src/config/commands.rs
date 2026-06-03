@@ -190,6 +190,13 @@ pub struct CommandsConfig {
     /// Deliberate opt-out — no enforcement, no hint notification.
     #[serde(default)]
     pub client_enforcement_only: bool,
+    /// Permit output redirection (`>`, `>>`, `&>`, `2>file`) to a file
+    /// target. Default `false` — a redirected write bypasses the tracked
+    /// Edit/Write path, so the diagnostics batch would be incomplete.
+    /// fd-dups (`2>&1`, `>&2`) and device sinks (`/dev/null`, `/dev/stdout`,
+    /// `/dev/stderr`) are always allowed regardless of this flag.
+    #[serde(default)]
+    pub allow_file_redirects: bool,
     /// The project's build tool(s) (e.g., `"make"` or `["make", "npm"]`).
     pub build: Option<StringOrVec>,
     /// Commands the agent can run unconditionally.
@@ -212,6 +219,13 @@ pub struct CommandsConfig {
 pub struct ResolvedCommands {
     /// Deliberate opt-out — no enforcement, no hint notification.
     pub client_enforcement_only: bool,
+    /// Whether output redirection to a file target is permitted.
+    ///
+    /// `false` (the default) denies `>`/`>>`/`&>`/`2>file` pointing at a
+    /// file; fd-dups (`2>&1`, `>&2`) and device sinks (`/dev/null`,
+    /// `/dev/stdout`, `/dev/stderr`) stay allowed. See the command filter's
+    /// `redirects_to_file`.
+    pub allow_file_redirects: bool,
     /// User-level default build tools (from user config, no root context).
     ///
     /// Used as fallback when `cwd` doesn't match any root in `build`.
@@ -247,6 +261,9 @@ impl ResolvedCommands {
     pub fn merge(&mut self, layer: &CommandsConfig) {
         if layer.client_enforcement_only {
             self.client_enforcement_only = true;
+        }
+        if layer.allow_file_redirects {
+            self.allow_file_redirects = true;
         }
         if let Some(ref build) = layer.build {
             self.default_build.clone_from(&build.0);
@@ -302,9 +319,16 @@ impl ResolvedCommands {
         let mut merged_deny: HashMap<String, HashSet<String>> = HashMap::new();
         let mut merged_deny_flags: HashMap<String, HashSet<String>> = HashMap::new();
         let mut merged_build: HashMap<PathBuf, Vec<String>> = HashMap::new();
+        // Opt-in only: the user baseline plus any project root that enables
+        // redirects (a codegen-heavy repo can relax locally; no root can
+        // re-tighten what the user opened).
+        let mut merged_allow_file_redirects = self.allow_file_redirects;
 
         for root in roots {
             let project = project_commands.get(root);
+            if project.is_some_and(|p| p.allow_file_redirects) {
+                merged_allow_file_redirects = true;
+            }
 
             // allow: project replaces user for this root's contribution
             if let Some(project_allow) = project.and_then(|p| p.allow.as_ref()) {
@@ -365,6 +389,7 @@ impl ResolvedCommands {
 
         Self {
             client_enforcement_only: self.client_enforcement_only,
+            allow_file_redirects: merged_allow_file_redirects,
             default_build: self.default_build.clone(),
             build: merged_build,
             allow: merged_allow,
@@ -558,12 +583,13 @@ pub fn validate(config: &CommandsConfig) -> (Vec<String>, Vec<String>) {
             || config.pipeline.is_some()
             || config.deny.is_some()
             || config.deny_flags.is_some()
-            || config.build.is_some())
+            || config.build.is_some()
+            || config.allow_file_redirects)
     {
         errors.push(
             "[commands] `client_enforcement_only = true` with `allow`, `pipeline`, \
-             `deny`, `deny_flags`, or `build` is contradictory — opt-out means \
-             no enforcement"
+             `deny`, `deny_flags`, `build`, or `allow_file_redirects` is contradictory — \
+             opt-out means no enforcement"
                 .to_string(),
         );
     }
@@ -813,6 +839,47 @@ git = ["--no-verify", "--force"]
     }
 
     #[test]
+    fn deserialize_allow_file_redirects() {
+        let config: CommandsConfig =
+            toml::from_str("allow_file_redirects = true").expect("valid TOML");
+        assert!(config.allow_file_redirects);
+    }
+
+    #[test]
+    fn allow_file_redirects_defaults_false() {
+        let config: CommandsConfig = toml::from_str("allow = [\"git\"]").expect("valid TOML");
+        assert!(!config.allow_file_redirects);
+    }
+
+    #[test]
+    fn merge_sets_allow_file_redirects() {
+        let mut resolved = ResolvedCommands::default();
+        assert!(!resolved.allow_file_redirects);
+        resolved.merge(&CommandsConfig {
+            allow: Some(vec!["git".to_string()]),
+            allow_file_redirects: true,
+            ..CommandsConfig::default()
+        });
+        assert!(resolved.allow_file_redirects);
+    }
+
+    #[test]
+    fn merge_allow_file_redirects_sticky() {
+        // Once a layer opts in, a later layer that omits the flag (deserializes
+        // to false) cannot turn it back off.
+        let mut resolved = ResolvedCommands::default();
+        resolved.merge(&CommandsConfig {
+            allow_file_redirects: true,
+            ..CommandsConfig::default()
+        });
+        resolved.merge(&CommandsConfig {
+            allow: Some(vec!["git".to_string()]),
+            ..CommandsConfig::default()
+        });
+        assert!(resolved.allow_file_redirects);
+    }
+
+    #[test]
     fn resolve_single_layer() {
         let layer = CommandsConfig {
             build: Some(StringOrVec(vec!["make".to_string()])),
@@ -1010,6 +1077,20 @@ git = ["--no-verify", "--force"]
         let (errors, _) = validate(&config);
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("client_enforcement_only"));
+    }
+
+    #[test]
+    fn validate_client_enforcement_only_with_redirects() {
+        let config = CommandsConfig {
+            client_enforcement_only: true,
+            allow_file_redirects: true,
+            ..CommandsConfig::default()
+        };
+
+        let (errors, _) = validate(&config);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("client_enforcement_only"));
+        assert!(errors[0].contains("allow_file_redirects"));
     }
 
     #[test]
@@ -1485,6 +1566,47 @@ git = ["--no-verify", "--force"]
         // Root A: ls-files (project). Root B: grep (user). Union:
         assert!(git_deny.contains("grep"));
         assert!(git_deny.contains("ls-files"));
+    }
+
+    #[test]
+    fn merge_project_root_opts_into_redirects() {
+        // User baseline denies redirects; a single project root enables them,
+        // and the merged result is permissive (opt-in only, OR across roots).
+        let mut user = ResolvedCommands::default();
+        user.merge(&CommandsConfig {
+            allow: Some(vec!["git".into()]),
+            ..CommandsConfig::default()
+        });
+        assert!(!user.allow_file_redirects);
+
+        let root_a = PathBuf::from("/project/a");
+        let root_b = PathBuf::from("/project/b");
+        let project_commands = HashMap::from([(
+            root_a.clone(),
+            CommandsConfig {
+                allow_file_redirects: true,
+                ..CommandsConfig::default()
+            },
+        )]);
+
+        let merged = user.merge_project_commands(&[root_a, root_b], &project_commands);
+        assert!(merged.allow_file_redirects);
+    }
+
+    #[test]
+    fn merge_project_preserves_user_redirects() {
+        // User opted in globally; a project root that omits the flag does not
+        // re-tighten it.
+        let mut user = ResolvedCommands::default();
+        user.merge(&CommandsConfig {
+            allow: Some(vec!["git".into()]),
+            allow_file_redirects: true,
+            ..CommandsConfig::default()
+        });
+
+        let root = PathBuf::from("/project");
+        let merged = user.merge_project_commands(std::slice::from_ref(&root), &HashMap::new());
+        assert!(merged.allow_file_redirects);
     }
 
     // ── Guidance tests ─────────────────────────────────────────────

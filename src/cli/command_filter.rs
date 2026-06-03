@@ -209,6 +209,93 @@ fn shell_split(s: &str) -> Vec<String> {
     tokens.into_iter().map(String::from).collect()
 }
 
+/// Device sinks allowed as redirect targets even in the deny state.
+///
+/// These don't write the working tree, so a redirect to one never threatens
+/// batch completeness. Anything more exotic flips `allow_file_redirects`
+/// rather than growing this set.
+const DEVICE_SINKS: [&str; 3] = ["/dev/null", "/dev/stdout", "/dev/stderr"];
+
+/// Whether a shell segment redirects output to a file target.
+///
+/// Scans the quote-masked segment for `>` redirect operators (`>`, `>>`,
+/// `1>`, `2>`, `&>`, `>|`, `>&`), so a `>` inside quotes is ignored. Two
+/// forms carry no file target and are not flagged: file-descriptor
+/// duplications (`2>&1`, `>&2`, `>&-`) and output process substitution
+/// (`>(cmd)`). The literal [`DEVICE_SINKS`] are allowed. Every other `>`
+/// pointing at a target is a file write.
+///
+/// Closes the redirection write-bypass (`bugs/11`): a redirected write skips
+/// the tracked Edit/Write path and would make the diagnostics batch lie. The
+/// target is read from the original bytes — a quoted target masks to spaces
+/// and reads as empty (or as the following operator), which denies, since a
+/// quoted redirect still writes a file and the device-sink exception is only
+/// spelled unquoted.
+fn redirects_to_file(segment: &str) -> bool {
+    let masked = mask_quotes(segment);
+    let mbytes = masked.as_bytes();
+    let bytes = segment.as_bytes();
+    let n = mbytes.len();
+    let mut i = 0;
+
+    while i < n {
+        if mbytes[i] != b'>' {
+            i += 1;
+            continue;
+        }
+
+        // Consume the operator: `>`, optional append `>`, optional clobber
+        // `|`, optional `&` (fd-dup or `>&word`).
+        let mut j = i + 1;
+        if j < n && mbytes[j] == b'>' {
+            j += 1;
+        }
+        if j < n && mbytes[j] == b'|' {
+            j += 1;
+        }
+        let amp = j < n && mbytes[j] == b'&';
+        if amp {
+            j += 1;
+        }
+
+        // `>&<digit>` / `>&-` duplicates a descriptor — no file target.
+        if amp && j < n && (mbytes[j].is_ascii_digit() || mbytes[j] == b'-') {
+            i = j;
+            continue;
+        }
+
+        // `>(cmd)` is output process substitution, not a file write.
+        if j < n && mbytes[j] == b'(' {
+            i = j;
+            continue;
+        }
+
+        // Skip whitespace between the operator and its target.
+        while j < n && (mbytes[j] == b' ' || mbytes[j] == b'\t') {
+            j += 1;
+        }
+
+        // Read the target token, stopping at whitespace or a shell operator.
+        let start = j;
+        while j < n
+            && !mbytes[j].is_ascii_whitespace()
+            && !matches!(mbytes[j], b'|' | b'<' | b'>' | b';' | b'&')
+        {
+            j += 1;
+        }
+        let target = &bytes[start..j];
+
+        if target.is_empty() || !DEVICE_SINKS.iter().any(|s| target == s.as_bytes()) {
+            return true;
+        }
+
+        // Device sink — allowed. Keep scanning for other redirects.
+        i = j;
+    }
+
+    false
+}
+
 /// Check whether a command is denied by the allowlist rules.
 ///
 /// A command is denied if:
@@ -308,6 +395,9 @@ pub enum DenialReason {
     DeniedSubcommand,
     /// Command is allowed but a specific flag is denied.
     DeniedFlag,
+    /// Command redirects output to a file target (`>`, `>>`, `&>`, `2>file`).
+    /// A redirected write bypasses the tracked Edit/Write path.
+    OutputRedirect,
 }
 
 /// Result of a command check that was denied.
@@ -383,6 +473,21 @@ pub fn check_command(
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or(token_refs[cmd_idx]);
+
+            // Output redirection to a file bypasses the tracked Edit/Write
+            // path, making the diagnostics batch incomplete. Deny it before
+            // the allow/deny decision (and before the heredoc exception) so
+            // neither an otherwise-allowed command nor the heredoc
+            // short-circuit can carry a redirect through. Gated by
+            // `allow_file_redirects`.
+            if !rules.allow_file_redirects && redirects_to_file(segment) {
+                return Some(Denial {
+                    command: name.to_string(),
+                    reason: DenialReason::OutputRedirect,
+                    unresolved_cd: saw_unresolved_cd,
+                    effective_cwd,
+                });
+            }
 
             let rest = &token_refs[cmd_idx..];
             // Heredoc exception: only when `<<` is the first argument after
@@ -617,6 +722,23 @@ fn resolve_client_vars(msg: &str, format: Option<super::HostFormat>) -> String {
     msg.replace("{READ}", read).replace("{EDIT}", edit)
 }
 
+/// Denial message for output redirection to a file target.
+///
+/// A redirected write skips the host's edit tool, so post-edit diagnostics
+/// can't observe it — the message routes the agent back through the tracked
+/// path and names the `allow_file_redirects` escape hatch. Used by both the
+/// full and short denial forms (it carries the same essential guidance).
+fn format_redirect_denial(format: Option<super::HostFormat>) -> String {
+    let edit = format.map_or("Edit", super::HostFormat::edit_tool);
+    format!(
+        "Output redirection to a file isn't allowed — a redirected write \
+         bypasses the {edit} tool, so post-edit diagnostics can't see it. \
+         Use {edit} to write files. (`2>&1`, `>&2`, and `/dev/null`-style \
+         sinks are still allowed; set `allow_file_redirects = true` under \
+         `[commands]` to permit file redirects.)"
+    )
+}
+
 /// Format the opening line based on denial reason.
 fn format_opening_line(denied_cmd: &str, reason: DenialReason) -> String {
     match reason {
@@ -631,6 +753,11 @@ fn format_opening_line(denied_cmd: &str, reason: DenialReason) -> String {
         }
         DenialReason::DeniedFlag => {
             format!("`{denied_cmd}` isn't allowed (denied flag).")
+        }
+        // OutputRedirect denials early-return in the callers; this arm only
+        // satisfies exhaustiveness.
+        DenialReason::OutputRedirect => {
+            format!("`{denied_cmd}` isn't allowed (output redirection).")
         }
     }
 }
@@ -655,6 +782,12 @@ pub fn format_denial_full(
     format: Option<super::HostFormat>,
     build_hint: Option<&str>,
 ) -> String {
+    // Output-redirection denial: a fixed message pointing at the edit tool,
+    // independent of the command name, its guidance entry, and the build hint.
+    if denial.reason == DenialReason::OutputRedirect {
+        return format_redirect_denial(format);
+    }
+
     // Guidance hint (static, build-resolved, or redirect).
     // For the full dump, the base command name is used for lookup (strip
     // subcommand part: "git grep" → "git" won't match, but "grep" will).
@@ -788,6 +921,11 @@ pub fn format_denial_short(
     format: Option<super::HostFormat>,
     build_hint: Option<&str>,
 ) -> String {
+    // Output-redirection denial carries the same fixed guidance in both forms.
+    if denial.reason == DenialReason::OutputRedirect {
+        return format_redirect_denial(format);
+    }
+
     let lookup_cmd = denied_cmd.split_whitespace().next().unwrap_or(denied_cmd);
 
     let no_guidance = " — see earlier message for the current Catenary command configuration.";
@@ -820,6 +958,10 @@ pub fn format_denial_short(
         }
         DenialReason::DeniedFlag => {
             format!("`{denied_cmd}` isn't allowed (denied flag)")
+        }
+        // Early-returned above; arm only satisfies exhaustiveness.
+        DenialReason::OutputRedirect => {
+            format!("`{denied_cmd}` isn't allowed (output redirection)")
         }
     };
 
@@ -2379,6 +2521,116 @@ mod tests {
         };
         let denial = check_command("cargo build", &rules, None).expect("cargo should be denied");
         assert_eq!(denial.reason, DenialReason::NotAllowed);
+    }
+
+    // ── Output redirection tests ────────────────────────────────────
+
+    #[test]
+    fn redirect_to_file_denied() {
+        let rules = basic_rules();
+        // git is allowed, but the redirect must still be denied.
+        let denial = check_command("git status > out.txt", &rules, None).expect("redirect denied");
+        assert_eq!(denial.reason, DenialReason::OutputRedirect);
+    }
+
+    #[test]
+    fn redirect_append_denied() {
+        let rules = basic_rules();
+        let denial =
+            check_command("git log >> out.txt", &rules, None).expect("append redirect denied");
+        assert_eq!(denial.reason, DenialReason::OutputRedirect);
+    }
+
+    #[test]
+    fn redirect_glued_target_denied() {
+        let rules = basic_rules();
+        for cmd in ["echo x>file", "make test 2>file", "make test &>file"] {
+            let denial = check_command(cmd, &rules, None).expect("glued redirect denied");
+            assert_eq!(
+                denial.reason,
+                DenialReason::OutputRedirect,
+                "glued redirect should be OutputRedirect: {cmd}",
+            );
+        }
+    }
+
+    #[test]
+    fn redirect_clobber_denied() {
+        let rules = basic_rules();
+        let denial =
+            check_command("git status >| out.txt", &rules, None).expect("clobber redirect denied");
+        assert_eq!(denial.reason, DenialReason::OutputRedirect);
+    }
+
+    #[test]
+    fn heredoc_plus_redirect_denied() {
+        // The redirect check runs before the heredoc exception, so the
+        // stdin-reading short-circuit can't smuggle a file write through.
+        let rules = basic_rules();
+        let denial = check_command("cat <<'EOF' > file.rs\nfn main() {}\nEOF", &rules, None)
+            .expect("heredoc + redirect denied");
+        assert_eq!(denial.reason, DenialReason::OutputRedirect);
+    }
+
+    #[test]
+    fn fd_dup_allowed() {
+        let rules = basic_rules();
+        // make is the build tool (allowed); the fd-dups carry no file target.
+        assert!(check_command("make test 2>&1", &rules, None).is_none());
+        assert!(check_command("make test >&2", &rules, None).is_none());
+    }
+
+    #[test]
+    fn device_sink_allowed() {
+        let rules = basic_rules();
+        assert!(check_command("make test > /dev/null", &rules, None).is_none());
+        assert!(check_command("make test > /dev/stdout", &rules, None).is_none());
+        assert!(check_command("make test > /dev/stderr", &rules, None).is_none());
+        // Device sink with a trailing fd-dup is still allowed.
+        assert!(check_command("make test > /dev/null 2>&1", &rules, None).is_none());
+    }
+
+    #[test]
+    fn redirect_inside_quotes_allowed() {
+        let rules = basic_rules();
+        // The `>` is inside a quoted argument — not a real redirect.
+        assert!(check_command("git commit -m \"a > b\"", &rules, None).is_none());
+    }
+
+    #[test]
+    fn allow_file_redirects_true_permits() {
+        let mut rules = basic_rules();
+        rules.allow_file_redirects = true;
+        // git is allowed and the flag lifts the redirect deny.
+        assert!(check_command("git status > out.txt", &rules, None).is_none());
+    }
+
+    #[test]
+    fn tee_file_operand_handled() {
+        // `tee` is absent from the default pipeline, so a `tee <file>` write
+        // vector is denied (NotAllowed) rather than waved through.
+        let rules = basic_rules();
+        assert!(check_command("make test | tee src/x.rs", &rules, None).is_some());
+    }
+
+    #[test]
+    fn redirect_denial_message_points_at_edit_tool() {
+        let rules = basic_rules();
+        let denial = check_command("git status > out.txt", &rules, None).expect("denied");
+        let full = format_denial_full("git", &rules, &denial, None, None);
+        assert!(
+            full.contains("Edit"),
+            "full message names edit tool: {full}"
+        );
+        assert!(
+            full.contains("allow_file_redirects"),
+            "full message names the escape hatch: {full}",
+        );
+        let short = format_denial_short("git", &denial, &rules, None, None);
+        assert!(
+            short.contains("Edit"),
+            "short message names edit tool: {short}"
+        );
     }
 
     // ── mask_quotes boundary tests ──────────────────────────────────

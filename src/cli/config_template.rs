@@ -45,16 +45,23 @@ const TEMPLATE: &str = r#"# Catenary recommended config
 #   pipeline — commands allowed mid-pipeline (reading stdin), denied
 #              at pipeline position 0 (reading files directly).
 #   deny.*   — subcommand denylist within an allowed command.
+#   allow_file_redirects — permit `>`/`>>`/`2>file` redirects (default
+#              false). Redirected writes bypass the tracked Edit/Write
+#              path, so the diagnostics batch may be incomplete (it shows
+#              fixes for tracked files while the redirected write went
+#              unseen). fd-dups (`2>&1`, `>&2`) and device sinks
+#              (`/dev/null`, ...) are always allowed regardless.
 #
 # Uncomment the [commands] section below to activate.
 
 # [commands]
 # # client_enforcement_only = true
+# # allow_file_redirects = false
 # build = "make"
 # allow = ["git", "gh", "cp", "rm", "mkdir", "mv", "touch",
 #          "chmod", "sleep", "cd", "true", "false", "which"]
 # pipeline = ["grep", "head", "tail", "wc", "jq", "awk",
-#             "sort", "sed", "tr", "cut", "uniq", "tee"]
+#             "sort", "sed", "tr", "cut", "uniq"]
 #
 # [commands.deny]
 # git = ["grep", "ls-files", "ls-tree"]
@@ -278,6 +285,24 @@ mod tests {
         assert!(
             TEMPLATE.contains("[commands.deny_flags]"),
             "template should contain [commands.deny_flags] section",
+        );
+    }
+
+    #[test]
+    fn template_documents_allow_file_redirects() {
+        assert!(
+            TEMPLATE.contains("allow_file_redirects"),
+            "template should document the allow_file_redirects flag",
+        );
+    }
+
+    #[test]
+    fn template_pipeline_drops_tee() {
+        // `tee` writes its file operand directly — a write vector that
+        // bypasses Edit/Write — so it is not in the default pipeline.
+        assert!(
+            !TEMPLATE.contains("\"tee\""),
+            "template pipeline should not include tee",
         );
     }
 
