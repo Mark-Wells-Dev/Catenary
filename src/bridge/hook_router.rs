@@ -466,10 +466,14 @@ impl HookRouter {
 
     /// Editing state enforcement: deny or allow a tool call.
     ///
-    /// If the agent is in editing mode, only Edit/Read/Write, Catenary
-    /// search tools, and filesystem-only Bash commands are allowed. If the
-    /// agent is not in editing mode, Edit/Write requires
-    /// `catenary start_editing` first.
+    /// The first Edit/Write to a covered file *implicitly* enters editing
+    /// mode and is allowed in the same invocation — there is no separate
+    /// `editing start` step to race against parallel tool calls. While in
+    /// editing mode, only Edit/Read/Write, Catenary search tools, and
+    /// filesystem-only Bash commands are allowed; everything else is denied
+    /// until `catenary editing stop`. Edits to files without known LSP
+    /// coverage are always allowed and never enter editing mode (no
+    /// diagnostics would be produced for them).
     fn handle_enforce_editing(
         &self,
         tool_name: &str,
@@ -482,18 +486,7 @@ impl HookRouter {
 
         if agent_editing {
             if is_edit_tool(tool_name) {
-                // Check cross-session guardrail on the file's root.
-                // Locks are acquired lazily per-root, so only roots
-                // with actual edits are locked.
-                if let Some(guardrail) = &self.session.editing_guardrail
-                    && let Some(root) = file_path
-                        .map(Path::new)
-                        .and_then(|p| self.session.resolve_root(p))
-                    && let Err(msg) = guardrail.try_acquire(&root, &self.session.instance_id)
-                {
-                    return Some(HookResult::Deny(msg));
-                }
-                None
+                self.acquire_editing_guardrail(file_path)
             } else if is_allowed_during_editing(tool_name)
                 || is_read_tool(tool_name)
                 || (is_bash_tool(tool_name) && command.is_some_and(is_filesystem_only_bash))
@@ -505,21 +498,50 @@ impl HookRouter {
                 ))
             }
         } else if is_edit_tool(tool_name) {
-            // Skip the editing gate for files without known LSP coverage.
+            // Skip implicit start for files without known LSP coverage.
             // In-root files always have coverage. Out-of-root files have
             // coverage only after a single-file server has successfully
             // initialized (positive cache). Files with no cache entry or
-            // a negative cache entry skip the gate — no diagnostics would
-            // be produced, so requiring start_editing is pointless.
+            // a negative cache entry are allowed without entering editing
+            // mode — no diagnostics would be produced, so tracking them is
+            // pointless.
             if file_path.is_some_and(|p| !self.session.has_lsp_coverage(Path::new(p))) {
                 return None;
             }
-            Some(HookResult::Deny(
-                "run `catenary editing start` to enter editing mode".into(),
-            ))
+            // Cross-session guardrail before claiming the root: if another
+            // session is editing it, deny without entering editing mode.
+            if let Some(deny) = self.acquire_editing_guardrail(file_path) {
+                return Some(deny);
+            }
+            // Implicit start: mark editing mode and allow the edit in the
+            // same invocation. The set is treated as idempotent — an
+            // "already editing" error from a racing concurrent first-edit
+            // is ignored — so parallel first-edits all succeed and none can
+            // reject the others. Race-free by construction.
+            let _ = self.session.editing.start_editing(session_id, agent_id);
+            None
         } else {
             None
         }
+    }
+
+    /// Acquires the cross-session editing guardrail for `file_path`'s root.
+    ///
+    /// Returns `Some(Deny)` with guidance when another session holds the
+    /// lock on that root; otherwise `None` (lock acquired or re-affirmed
+    /// for this session, or there is no guardrail / no resolvable root).
+    /// Locks are acquired lazily per-root, so only roots with actual edits
+    /// are locked.
+    fn acquire_editing_guardrail(&self, file_path: Option<&str>) -> Option<HookResult> {
+        if let Some(guardrail) = &self.session.editing_guardrail
+            && let Some(root) = file_path
+                .map(Path::new)
+                .and_then(|p| self.session.resolve_root(p))
+            && let Err(msg) = guardrail.try_acquire(&root, &self.session.instance_id)
+        {
+            return Some(HookResult::Deny(msg));
+        }
+        None
     }
 
     /// Accumulates edited file paths during editing mode.
@@ -694,14 +716,17 @@ mod tests {
     // ── Handler tests ───────────────────────────────────────────────────
 
     #[test]
-    fn test_hook_enforce_editing_deny() {
-        let router = test_router();
-        // No editing state — Edit should be denied
-        let result = router.handle_enforce_editing("Edit", None, None, None, "");
-        let Some(HookResult::Deny(reason)) = result else {
-            unreachable!("expected Deny, got {result:?}");
-        };
-        assert!(reason.contains("editing start"));
+    fn no_explicit_start_required() {
+        let (router, root) = test_router_with_root();
+        // No prior `editing start`. The old behavior denied an in-root
+        // edit with "run `catenary editing start`"; implicit start now
+        // allows it.
+        let in_root = format!("{}/src/main.rs", root.display());
+        let result = router.handle_enforce_editing("Edit", Some(&in_root), None, None, "");
+        assert!(
+            result.is_none(),
+            "in-root edit should be allowed without explicit start, got {result:?}"
+        );
     }
 
     #[test]
@@ -883,25 +908,126 @@ mod tests {
     }
 
     #[test]
-    fn test_enforce_editing_still_denies_in_root_file() {
+    fn first_edit_enters_editing_mode() {
         let (router, root) = test_router_with_root();
-        // Edit on a file inside workspace roots while not editing → deny.
         let in_root = format!("{}/src/main.rs", root.display());
-        let result = router.handle_enforce_editing("Edit", Some(&in_root), None, None, "");
-        let Some(HookResult::Deny(reason)) = result else {
-            unreachable!("expected Deny for in-root edit, got {result:?}");
-        };
-        assert!(reason.contains("catenary editing start"));
+        assert!(
+            !router.session.editing.is_editing(None, ""),
+            "not editing before first edit"
+        );
+
+        // A single Edit with no prior start, dispatched end-to-end:
+        // enforce enters editing mode, then accumulation tracks the file.
+        let res = router.dispatch(crate::hook::HookRequest::PreTool {
+            tool_name: "Edit".to_string(),
+            file_path: Some(in_root.clone()),
+            command: None,
+            agent_id: String::new(),
+            session_id: None,
+        });
+        assert!(
+            res.result.is_none(),
+            "first edit allowed, got {:?}",
+            res.result
+        );
+        assert!(
+            router.session.editing.is_editing(None, ""),
+            "editing mode entered by the first edit"
+        );
+
+        let files = router.session.editing.drain_files(None, "");
+        assert_eq!(
+            files,
+            vec![PathBuf::from(&in_root)],
+            "covered file accumulated"
+        );
     }
 
     #[test]
-    fn test_enforce_editing_no_file_path_still_denies() {
+    fn parallel_edits_both_succeed() {
+        let (router, root) = test_router_with_root();
+        let f1 = format!("{}/src/a.rs", root.display());
+        let f2 = format!("{}/src/b.rs", root.display());
+
+        // Two first-edits for the same session, no prior `editing start`.
+        // Dispatched back-to-back; both must be allowed and editing mode
+        // must be entered exactly once (the idempotent set never rejects).
+        let r1 = router.dispatch(crate::hook::HookRequest::PreTool {
+            tool_name: "Edit".to_string(),
+            file_path: Some(f1.clone()),
+            command: None,
+            agent_id: String::new(),
+            session_id: None,
+        });
+        let r2 = router.dispatch(crate::hook::HookRequest::PreTool {
+            tool_name: "Edit".to_string(),
+            file_path: Some(f2.clone()),
+            command: None,
+            agent_id: String::new(),
+            session_id: None,
+        });
+
+        assert!(
+            r1.result.is_none(),
+            "first edit allowed, got {:?}",
+            r1.result
+        );
+        assert!(
+            r2.result.is_none(),
+            "second edit allowed, got {:?}",
+            r2.result
+        );
+        assert!(router.session.editing.is_editing(None, ""));
+
+        // Both files land under a single (session, agent) entry.
+        let files = router.session.editing.drain_files(None, "");
+        assert_eq!(files, vec![PathBuf::from(&f1), PathBuf::from(&f2)]);
+        assert_eq!(
+            router.session.editing.clear_all(),
+            1,
+            "mode entered exactly once"
+        );
+    }
+
+    #[test]
+    fn uncovered_file_no_mode_no_gate() {
+        // No roots → no LSP coverage for the edited file.
         let router = test_router();
-        // Edit with no file path (e.g., host didn't supply it) → deny.
+        let res = router.dispatch(crate::hook::HookRequest::PreTool {
+            tool_name: "Edit".to_string(),
+            file_path: Some("/outside/some/file.rs".to_string()),
+            command: None,
+            agent_id: String::new(),
+            session_id: None,
+        });
+        assert!(
+            res.result.is_none(),
+            "uncovered edit allowed, got {:?}",
+            res.result
+        );
+        assert!(
+            !router.session.editing.is_editing(None, ""),
+            "uncovered edit must not enter editing mode"
+        );
+        let (files, filtered) = router.session.editing.drain_all_and_clear();
+        assert!(files.is_empty(), "uncovered file not accumulated");
+        // Not in editing mode → accumulation returns early, so the file is
+        // not even counted as filtered.
+        assert_eq!(filtered, 0);
+    }
+
+    #[test]
+    fn no_file_path_edit_enters_editing() {
+        let router = test_router();
+        // Edit with no file path (e.g., host didn't supply it): there is
+        // no path to test for coverage, so the edit is allowed and enters
+        // editing mode like any other first edit.
         let result = router.handle_enforce_editing("Edit", None, None, None, "");
-        let Some(HookResult::Deny(_)) = result else {
-            unreachable!("expected Deny when file_path is None, got {result:?}");
-        };
+        assert!(
+            result.is_none(),
+            "edit with no file path should be allowed, got {result:?}"
+        );
+        assert!(router.session.editing.is_editing(None, ""));
     }
 
     #[test]
@@ -1023,15 +1149,17 @@ mod tests {
     }
 
     #[test]
-    fn test_enforce_editing_gates_out_of_root_with_single_file_config() {
-        // single_file = true, no failure → server expected to work → gate.
+    fn single_file_covered_edit_enters_editing() {
+        // single_file = true, no failure → server expected to cover it →
+        // implicit start (previously gated with "catenary editing start").
         let router = test_router_with_sf_config(false);
         let path = format!("/outside/file.{SF_LANG}");
         let result = router.handle_enforce_editing("Edit", Some(&path), None, None, "");
-        let Some(HookResult::Deny(reason)) = result else {
-            unreachable!("expected Deny for single_file out-of-root edit, got {result:?}");
-        };
-        assert!(reason.contains("catenary editing start"));
+        assert!(
+            result.is_none(),
+            "single_file-covered edit should enter editing, got {result:?}"
+        );
+        assert!(router.session.editing.is_editing(None, ""));
     }
 
     #[test]
@@ -1301,6 +1429,76 @@ mod tests {
                 router,
             },
             root,
+        )
+    }
+
+    /// Create a daemon-mode `HookRouter` with a cross-session editing
+    /// guardrail and one workspace root.
+    ///
+    /// Returns the router, the root, and the shared guardrail so a test can
+    /// pre-acquire a foreign lock to exercise the cross-session deny path.
+    fn test_router_with_guardrail() -> (
+        TestHookRouter,
+        PathBuf,
+        Arc<crate::bridge::editing_guardrail::EditingGuardrail>,
+    ) {
+        let (dir, _path, conn) = test_db();
+        let conn = Arc::new(std::sync::Mutex::new(conn));
+
+        conn.lock()
+            .expect("lock")
+            .execute(
+                "INSERT INTO sessions (id, pid, display_name, started_at) \
+                 VALUES ('test-session', 1, 'test', '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .expect("insert session");
+
+        let config = Config::default();
+        let logging = crate::logging::LoggingServer::new();
+
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let handle = runtime.handle().clone();
+
+        let root = dir.path().join("workspace");
+        std::fs::create_dir_all(&root).expect("create workspace dir");
+
+        let instance_id: Arc<str> = "test-session".into();
+        let notification_router = Arc::new(
+            crate::logging::notification_router::NotificationRouter::new(
+                crate::logging::Severity::Warn,
+            ),
+        );
+        notification_router.register_session(&instance_id);
+        // The primary session owns the shared resources (fs_manager carries
+        // the workspace root); the per-session daemon session carries the
+        // guardrail under test.
+        let primary = Session::new(
+            config,
+            vec![root.clone()],
+            logging,
+            conn.clone(),
+            instance_id.clone(),
+            handle,
+            notification_router,
+        );
+        let guardrail = Arc::new(crate::bridge::editing_guardrail::EditingGuardrail::new());
+        let session = Arc::new(Session::new_for_daemon(
+            &primary,
+            instance_id.clone(),
+            Some(guardrail.clone()),
+        ));
+
+        let router = HookRouter::new(session, conn, instance_id, "test".to_string());
+
+        (
+            TestHookRouter {
+                _dir: dir,
+                _runtime: runtime,
+                router,
+            },
+            root,
+            guardrail,
         )
     }
 
@@ -1752,8 +1950,13 @@ mod tests {
 
     #[test]
     fn dispatch_pre_tool_denied_does_not_accumulate() {
-        let (router, root) = test_router_with_root();
-        // NOT in editing mode — Edit will be denied.
+        // A guardrail-denied edit (another session owns the root) must be
+        // denied without entering editing mode or accumulating the file.
+        let (router, root, guardrail) = test_router_with_guardrail();
+        guardrail
+            .try_acquire(&root, "other-session")
+            .expect("foreign lock acquired");
+
         let file = format!("{}/src/main.rs", root.display());
         let result = router.dispatch(crate::hook::HookRequest::PreTool {
             tool_name: "Edit".to_string(),
@@ -1765,11 +1968,13 @@ mod tests {
 
         assert!(
             matches!(result.result, Some(HookResult::Deny(_))),
-            "Edit outside editing mode should be denied"
+            "edit on a root owned by another session should be denied"
         );
-        // Enter editing to drain (drain_files requires editing state).
-        let _ = router.session.editing.start_editing(None, "");
-        let files = router.session.editing.drain_files(None, "");
+        assert!(
+            !router.session.editing.is_editing(None, ""),
+            "denied first edit must not enter editing mode"
+        );
+        let (files, _) = router.session.editing.drain_all_and_clear();
         assert!(files.is_empty(), "denied edit should not accumulate file");
     }
 

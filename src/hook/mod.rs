@@ -119,9 +119,9 @@ pub(crate) enum HookRequest {
     PreTool {
         /// Host CLI tool name (e.g., "Edit", "Write", `"write_file"`).
         tool_name: String,
-        /// Absolute path to the target file. Used for scope boundary
-        /// checks — edits on files outside workspace roots skip the
-        /// `start_editing` gate.
+        /// Absolute path to the target file. Used for coverage checks —
+        /// edits on files without known LSP coverage are allowed without
+        /// entering editing mode.
         #[serde(default)]
         file_path: Option<String>,
         /// Shell command string for Bash/`run_shell_command` tools.

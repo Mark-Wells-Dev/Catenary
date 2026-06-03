@@ -3170,7 +3170,8 @@ mod tests {
             let _ = m.accept_loop().await;
         });
 
-        // Session A: enter editing mode via CLI start_editing hook.
+        // Session A enters editing mode (implicit start would also work; an
+        // explicit start keeps the intent clear).
         let req = serde_json::json!({
             "method": "pre-tool/editing-start",
             "agent_id": "",
@@ -3178,33 +3179,37 @@ mod tests {
         });
         let _ = hook_roundtrip(&ipc_path, &req).await;
 
-        // Session A: Edit should be allowed (in editing mode).
+        // Session A is editing: a non-filesystem Bash command is gated
+        // (the agent must run `catenary editing stop` first).
         let req = serde_json::json!({
             "method": "pre-tool/editing-state",
-            "tool_name": "Edit",
+            "tool_name": "Bash",
+            "command": "cargo build",
             "agent_id": "",
             "session_id": "session-a"
-        });
-        let line = hook_roundtrip(&ipc_path, &req).await;
-        assert_eq!(
-            line.trim(),
-            "",
-            "session A should allow Edit (in editing mode)"
-        );
-
-        // Session B: Edit should be denied (not in editing mode).
-        let req = serde_json::json!({
-            "method": "pre-tool/editing-state",
-            "tool_name": "Edit",
-            "agent_id": "",
-            "session_id": "session-b"
         });
         let line = hook_roundtrip(&ipc_path, &req).await;
         let envelope: crate::hook::HookResponseEnvelope =
             serde_json::from_str(line.trim()).expect("parse response");
         assert!(
             matches!(envelope.result, Some(crate::hook::HookResult::Deny(_))),
-            "session B should deny Edit (not editing), got: {envelope:?}"
+            "session A (editing) should gate non-filesystem Bash, got: {envelope:?}"
+        );
+
+        // Session B never entered editing mode: the same command is allowed,
+        // proving editing state does not leak across sessions.
+        let req = serde_json::json!({
+            "method": "pre-tool/editing-state",
+            "tool_name": "Bash",
+            "command": "cargo build",
+            "agent_id": "",
+            "session_id": "session-b"
+        });
+        let line = hook_roundtrip(&ipc_path, &req).await;
+        assert_eq!(
+            line.trim(),
+            "",
+            "session B (not editing) should allow Bash — editing state is per-session"
         );
 
         shutdown.cancel();

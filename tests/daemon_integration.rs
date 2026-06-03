@@ -489,15 +489,14 @@ fn stop_command_shuts_down_daemon() -> Result<()> {
     Ok(())
 }
 
-/// Cross-session editing guardrail: session A editing a root blocks
-/// session B from editing the same root.
+/// Cross-session editing guardrail: session A's first edit to a root
+/// blocks session B's first edit to the same root.
 ///
-/// Each session needs its own bridge (MCP connection) and must be
-/// correlated first. Catenary tool hooks (`start_editing`) trigger
-/// the sandwich correlation path, which acquires a serialization
-/// semaphore. Without a matching MCP `tools/call` to resolve the
-/// correlation, the semaphore blocks subsequent sessions. Correlating
-/// both sessions upfront (via grep) avoids this.
+/// Each session needs its own bridge (MCP connection) and is correlated
+/// first via a grep `tools/call`. With implicit editing start, the first
+/// Edit both enters editing mode and acquires the per-root guardrail — no
+/// explicit `editing start` is needed, so session A claims the root on its
+/// edit alone.
 #[test]
 fn editing_guardrail_blocks_cross_session() -> Result<()> {
     let state_dir = tempfile::tempdir()?;
@@ -550,15 +549,8 @@ fn editing_guardrail_blocks_cross_session() -> Result<()> {
     )?;
     bridge_b.call_tool_text("grep", &json!({"pattern": "guarded_fn"}))?;
 
-    // Session A: enter editing mode + edit a file (acquires guardrail).
-    hook_roundtrip(
-        &ipc_path,
-        &json!({
-            "method": "pre-tool/editing-start",
-            "agent_id": "",
-            "session_id": "session-a"
-        }),
-    )?;
+    // Session A: first edit implicitly enters editing mode and acquires
+    // the per-root guardrail.
     let response_a = hook_roundtrip(
         &ipc_path,
         &json!({
@@ -574,15 +566,7 @@ fn editing_guardrail_blocks_cross_session() -> Result<()> {
         "session A should be allowed to edit, got: {response_a}",
     );
 
-    // Session B: enter editing mode + try to edit same root.
-    hook_roundtrip(
-        &ipc_path,
-        &json!({
-            "method": "pre-tool/editing-start",
-            "agent_id": "",
-            "session_id": "session-b"
-        }),
-    )?;
+    // Session B: first edit to the same root is blocked by the guardrail.
     let response_b = hook_roundtrip(
         &ipc_path,
         &json!({

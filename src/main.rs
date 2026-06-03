@@ -183,7 +183,9 @@ enum Command {
 /// Editing mode subcommands.
 #[derive(Subcommand, Debug)]
 enum EditingCommand {
-    /// Enter editing mode. Invoke via the host's shell tool.
+    /// Enter editing mode (optional). Editing now starts implicitly on the
+    /// first edit; this remains as an idempotent confirmation so a stray
+    /// invocation never errors. Invoke via the host's shell tool.
     Start,
     /// Exit editing mode and print diagnostics. Invoke via the host's shell tool.
     Stop,
