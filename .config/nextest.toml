@@ -1,2 +1,15 @@
+# Nextest configuration. Docs: https://nexte.st/docs/configuration/
+
 [profile.default]
+# Hang backstop. Most tests finish in under a second; a test still running
+# after 5 minutes is a runaway — an unbounded loop, or a language server that
+# never answers. Mark it slow at 60s and terminate after 5 periods (300s) so
+# an infinite loop fails the run instead of hanging it (or, without the memory
+# cap in the Makefile, exhausting RAM). The window is more generous than the
+# sibling repos' 120s because real LSP startup/indexing (the ignored tests)
+# can legitimately run minutes.
 slow-timeout = { period = "60s", terminate-after = 5 }
+
+# No silent retries: a failing test is a real, reproducible bug, not a flake.
+# Retrying must never turn a genuine failure green.
+retries = 0
