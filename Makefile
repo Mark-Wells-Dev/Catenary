@@ -13,13 +13,20 @@ CURRENT_VERSION := $(shell grep '^version = ' Cargo.toml | head -1 | sed 's/vers
 # Files that contain the version
 VERSION_FILES := Cargo.toml .claude-plugin/marketplace.json gemini-extension.json
 
+# Hard per-process address-space cap (KiB) applied to test runs, so a runaway
+# allocation (e.g. an unbounded loop in a test) aborts that single process at
+# the limit instead of exhausting system RAM. Override with MEMLIMIT_KB=<kib>,
+# or MEMLIMIT_KB=unlimited to disable.
+MEMLIMIT_KB ?= 8388608
+
 # Run benchmarks. Pass B= to select a specific bench, e.g.: make bench B=logging_overhead
 bench:
 	@cargo bench $(if $(B),--bench $(B),) --quiet
 
 # Run benchmark tests with stdout visible. Pass T= to filter.
 bench-test:
-	@cargo nextest run --workspace --features mockls --no-capture --status-level all --cargo-quiet $(if $(T),-E 'test($(T))',)
+	@if [ "$(MEMLIMIT_KB)" != unlimited ]; then ulimit -v $(MEMLIMIT_KB); fi; \
+	 cargo nextest run --workspace --features mockls --no-capture --status-level all --cargo-quiet $(if $(T),-E 'test($(T))',)
 
 # Default target: run all checks
 build-release:
@@ -45,7 +52,8 @@ check:
 	   fi; \
 	 done
 	@cargo machete --skip-target-dir
-	@cargo nextest run --workspace --features mockls --no-fail-fast --status-level fail --final-status-level fail --cargo-quiet --show-progress only
+	@if [ "$(MEMLIMIT_KB)" != unlimited ]; then ulimit -v $(MEMLIMIT_KB); fi; \
+	 cargo nextest run --workspace --features mockls --no-fail-fast --status-level fail --final-status-level fail --cargo-quiet --show-progress only
 
 # Detect unused dependencies
 machete:
@@ -90,11 +98,14 @@ mutants-stop:
 # Prefix with ! to exclude: make test T=\!flaky_test
 # Run ignored tests (e.g. requiring real LSP): make test-ignored T=ra_symbol_universe
 CLEAN_T = $(subst \,,$(subst !,,$(T)))
+# Not memory-capped: real language servers (e.g. rust-analyzer) have legitimately
+# large, variable footprints, and this is a rarely-run manual target.
 test-ignored:
 	@cargo nextest run --workspace --features mockls --run-ignored ignored-only --status-level all --final-status-level all --no-capture $(if $(T),-E 'test($(CLEAN_T))',)
 
 test:
-	@cargo nextest run --workspace --features mockls --status-level fail --final-status-level slow --cargo-quiet $(if $(N),--stress-count $(N),) $(if $(T),$(if $(findstring !,$(T)),-E 'not test($(CLEAN_T))',-E 'test($(T))'),)
+	@if [ "$(MEMLIMIT_KB)" != unlimited ]; then ulimit -v $(MEMLIMIT_KB); fi; \
+	 cargo nextest run --workspace --features mockls --status-level fail --final-status-level slow --cargo-quiet $(if $(N),--stress-count $(N),) $(if $(T),$(if $(findstring !,$(T)),-E 'not test($(CLEAN_T))',-E 'test($(T))'),)
 
 # Verify we're in a good state for release
 pre-release-check:
