@@ -765,7 +765,18 @@ fn run_daemon_main() -> Result<()> {
     let sockets = catenary_mcp::router::bind_daemon_sockets()?;
 
     let logging = LoggingServer::new();
-    tracing_subscriber::registry().with(logging.clone()).init();
+    // Floor the tracing stream before it reaches the DB sink. Without a filter
+    // the registry captures everything down to TRACE, and the `log`->`tracing`
+    // bridge (third-party crates) spews debug events persisted to `messages`
+    // forever (no row retention) — the multi-GB DB wedge. The measured flood is
+    // entirely target `log` (~99.6% of rows), so silence that to `warn` while
+    // keeping Catenary's own telemetry at `debug`. Override with CATENARY_LOG.
+    let filter = tracing_subscriber::EnvFilter::try_from_env("CATENARY_LOG")
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("debug,log=warn"));
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(logging.clone())
+        .init();
 
     let config = catenary_mcp::config::Config::load()?;
 
