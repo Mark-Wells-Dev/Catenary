@@ -98,19 +98,19 @@ const TEMPLATE: &str = r#"# Catenary recommended config
 
 # ── Project-local overrides (.catenary.toml) ─────────────────────
 #
-# Project config scopes build tools and can replace the user's
-# allowlist for a specific workspace. Examples:
+# A project .catenary.toml honors `build` only. Every other [commands]
+# key — client_enforcement_only, allow, pipeline, deny, deny_flags,
+# allow_file_redirects — is user-level only: the filter resolves
+# daemon-globally (one daemon serves every session), so a project can
+# neither relax it nor turn it on/off for itself. Those keys are ignored
+# (with a warning) in project config — keep them here in user config.
 #
 #   # Set the build tool for this project
 #   [commands]
 #   build = "make"
 #
-#   # Replace the user's allowlist for this project
-#   [commands]
-#   allow = ["git", "gh", "kubectl", "docker"]
-#
 #   # Disable Catenary LSP for this workspace entirely
-#   # (commands config still applies)
+#   # (the project build tool still applies)
 #   lsp = false
 
 # ── Notifications ────────────────────────────────────────────────

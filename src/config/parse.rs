@@ -492,6 +492,24 @@ impl Default for ProjectConfig {
     }
 }
 
+/// Project `[commands]` keys that Catenary ignores — everything but `build`.
+///
+/// Detected on the **raw** TOML rather than the parsed [`CommandsConfig`] so a
+/// boolean written as `= false` (e.g. `client_enforcement_only = false`, a
+/// project asking for enforcement the daemon-global filter won't grant) is
+/// caught as well as `= true` — the parsed form can't tell `false` from
+/// absent. See [`commands::PROJECT_IGNORED_COMMAND_KEYS`] for the rationale.
+fn ignored_project_command_keys(raw: &toml::Value) -> Vec<&'static str> {
+    let Some(table) = raw.get("commands").and_then(toml::Value::as_table) else {
+        return Vec::new();
+    };
+    commands::PROJECT_IGNORED_COMMAND_KEYS
+        .iter()
+        .copied()
+        .filter(|key| table.contains_key(*key))
+        .collect()
+}
+
 /// Discovers and loads `.catenary.toml` at a workspace root.
 ///
 /// Returns `None` if no `.catenary.toml` exists at the root.
@@ -705,6 +723,28 @@ pub fn load_project_config(root: &std::path::Path) -> Result<Option<ProjectConfi
         }
     }
 
+    // Command enforcement is user-level only (ticket 15): a project
+    // `.catenary.toml [commands]` honors `build` and nothing else. The filter
+    // resolves daemon-globally, so honoring any other key here would change
+    // the filter for every connected session. Warn loudly rather than dropping
+    // them silently — detected on the raw TOML so an explicit `= false` on a
+    // boolean (a project asking for *more* enforcement, the silent direction)
+    // is caught too. The keys still parse and are ignored at merge time
+    // (`merge_project_commands`).
+    let ignored = ignored_project_command_keys(&raw);
+    if !ignored.is_empty() {
+        tracing::warn!(
+            source = Source::ConfigValidation.as_str(),
+            path = %config_path.display(),
+            "Project config {}: [commands] keys other than `build` are ignored \
+             at project scope ({}) — command enforcement is a daemon-wide, \
+             user-level decision (one daemon serves every session). Move them \
+             to your user config (~/.config/catenary/config.toml).",
+            config_path.display(),
+            ignored.join(", "),
+        );
+    }
+
     Ok(Some(ProjectConfig {
         lsp,
         language,
@@ -754,6 +794,69 @@ servers = ["rust-analyzer"]
         let dir = tempdir()?;
         let result = load_project_config(dir.path())?;
         assert!(result.is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn ignored_project_command_keys_detects_presence_including_false_bools() {
+        // Only `build` → nothing ignored.
+        let raw: toml::Value =
+            toml::from_str("[commands]\nbuild = \"make\"\n").expect("valid toml");
+        assert!(ignored_project_command_keys(&raw).is_empty());
+
+        // No `[commands]` table → nothing ignored.
+        let raw: toml::Value = toml::from_str("lsp = true\n").expect("valid toml");
+        assert!(ignored_project_command_keys(&raw).is_empty());
+
+        // Explicit `= false` on the enforcement booleans is still flagged — the
+        // silent, dangerous direction (a project asking for *more* enforcement
+        // than the daemon-global, user-level filter grants).
+        let raw: toml::Value = toml::from_str(
+            "[commands]\nbuild = \"make\"\n\
+             client_enforcement_only = false\nallow_file_redirects = false\n",
+        )
+        .expect("valid toml");
+        let ignored = ignored_project_command_keys(&raw);
+        assert!(ignored.contains(&"client_enforcement_only"));
+        assert!(ignored.contains(&"allow_file_redirects"));
+        assert!(!ignored.contains(&"build"));
+
+        // Non-boolean enforcement keys and guidance are flagged by presence.
+        let raw: toml::Value = toml::from_str(
+            "[commands]\nallow = [\"git\"]\npipeline = [\"grep\"]\n\
+             [commands.deny]\ngit = [\"push\"]\n\
+             [commands.deny_flags]\ngit = [\"-f\"]\n\
+             [commands.guidance.scan]\nmessage = \"x\"\ncommands = [\"rg\"]\n",
+        )
+        .expect("valid toml");
+        let ignored = ignored_project_command_keys(&raw);
+        for key in ["allow", "pipeline", "deny", "deny_flags", "guidance"] {
+            assert!(ignored.contains(&key), "{key} should be flagged");
+        }
+    }
+
+    #[test]
+    fn load_project_config_tolerates_ignored_enforcement_keys() -> Result<()> {
+        // A project [commands] with enforcement keys must still load (build is
+        // honored; the rest warns and is ignored at merge time) — not bail.
+        let dir = tempdir()?;
+        fs::write(
+            dir.path().join(".catenary.toml"),
+            r#"
+[commands]
+build = "make"
+allow = ["git", "kubectl"]
+"#,
+        )?;
+        let config = load_project_config(dir.path())?.expect("project config");
+        let cmds = config.commands.expect("commands parsed");
+        assert!(cmds.build.is_some(), "build is honored at project scope");
+        assert_eq!(
+            cmds.allow,
+            Some(vec!["git".to_string(), "kubectl".to_string()]),
+            "enforcement keys still parse (ignored later, at merge time)",
+        );
 
         Ok(())
     }

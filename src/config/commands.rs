@@ -251,12 +251,15 @@ pub struct ResolvedCommands {
 }
 
 impl ResolvedCommands {
-    /// Merge a config layer into this resolved set.
+    /// Merge a user-level config *source* layer into this resolved set.
     ///
-    /// Each field overwrites when present in the layer. `allow` and `pipeline`
-    /// are replaced (not unioned) — the design doc specifies that project
-    /// `allow` replaces the user list. `deny` entries are merged per-command.
-    /// `build` is stored as `default_build` (user-level, no root context).
+    /// Layers later config sources (e.g. user config + an explicit
+    /// `CATENARY_CONFIG` override); it is **not** the project-config path —
+    /// project `.catenary.toml` enforcement is ignored (see
+    /// [`merge_project_commands`](Self::merge_project_commands)). Each field
+    /// overwrites when present in the layer: `allow` and `pipeline` are
+    /// replaced (not unioned), `deny` entries are merged per-command, `build`
+    /// is stored as `default_build` (user-level, no root context), and
     /// `guidance` groups are flattened into per-command entries.
     pub fn merge(&mut self, layer: &CommandsConfig) {
         if layer.client_enforcement_only {
@@ -295,109 +298,48 @@ impl ResolvedCommands {
         }
     }
 
-    /// Merge per-root project commands into this user-level baseline.
+    /// Merge per-root project **build** tools into this user-level baseline.
     ///
-    /// For each root, the project's `allow`/`pipeline`/`deny` replaces the
-    /// user baseline for that root's contribution (if set), then all roots'
-    /// contributions are unioned. `build` is collected per-root (project
-    /// override or user default). Disabled roots contribute commands just
-    /// like enabled roots.
+    /// Command **enforcement** — `allow`/`pipeline`/`deny`/`deny_flags`/
+    /// `allow_file_redirects` — is **user-level only**: it is taken verbatim
+    /// from `self`, and a project `.catenary.toml` cannot relax or replace it.
+    /// The filter resolves daemon-globally (`Session::merged_commands` reads the
+    /// *shared* `LspClientManager`'s daemon-wide roots + project configs), so
+    /// honoring project enforcement keys would let one session's repo change the
+    /// filter that *every* connected session sees. Only `build` is per-root and
+    /// benign — it names a build tool and relaxes nothing. See DESIGN Decision 5
+    /// Correction (ticket 15); ignored project keys are surfaced via
+    /// [`PROJECT_IGNORED_COMMAND_KEYS`] at config-load time.
     ///
-    /// Returns a new `ResolvedCommands` with the merged result.
+    /// For each root the project's `build` overrides the user default; roots
+    /// without a project `build` fall back to
+    /// [`default_build`](Self::default_build). Disabled roots contribute their
+    /// `build` like enabled roots.
+    ///
+    /// Returns a new `ResolvedCommands` identical to `self` except for the
+    /// per-root [`build`](Self::build) map.
     #[must_use]
     pub fn merge_project_commands(
         &self,
         roots: &[PathBuf],
         project_commands: &HashMap<PathBuf, CommandsConfig>,
     ) -> Self {
-        if roots.is_empty() {
-            return self.clone();
-        }
-
-        let mut merged_allow: HashSet<String> = HashSet::new();
-        let mut merged_pipeline: HashSet<String> = HashSet::new();
-        let mut merged_deny: HashMap<String, HashSet<String>> = HashMap::new();
-        let mut merged_deny_flags: HashMap<String, HashSet<String>> = HashMap::new();
-        let mut merged_build: HashMap<PathBuf, Vec<String>> = HashMap::new();
-        // Opt-in only: the user baseline plus any project root that enables
-        // redirects (a codegen-heavy repo can relax locally; no root can
-        // re-tighten what the user opened).
-        let mut merged_allow_file_redirects = self.allow_file_redirects;
-
+        let mut build: HashMap<PathBuf, Vec<String>> = HashMap::new();
         for root in roots {
-            let project = project_commands.get(root);
-            if project.is_some_and(|p| p.allow_file_redirects) {
-                merged_allow_file_redirects = true;
-            }
-
-            // allow: project replaces user for this root's contribution
-            if let Some(project_allow) = project.and_then(|p| p.allow.as_ref()) {
-                merged_allow.extend(project_allow.iter().cloned());
-            } else {
-                merged_allow.extend(self.allow.iter().cloned());
-            }
-
-            // pipeline: same replacement semantics
-            if let Some(project_pipeline) = project.and_then(|p| p.pipeline.as_ref()) {
-                merged_pipeline.extend(project_pipeline.iter().cloned());
-            } else {
-                merged_pipeline.extend(self.pipeline.iter().cloned());
-            }
-
-            // deny: same replacement semantics, then per-command union
-            if let Some(project_deny) = project.and_then(|p| p.deny.as_ref()) {
-                for (cmd, subs) in project_deny {
-                    merged_deny
-                        .entry(cmd.clone())
-                        .or_default()
-                        .extend(subs.iter().cloned());
-                }
-            } else {
-                for (cmd, subs) in &self.deny {
-                    merged_deny
-                        .entry(cmd.clone())
-                        .or_default()
-                        .extend(subs.iter().cloned());
-                }
-            }
-
-            // deny_flags: same replacement semantics as deny
-            if let Some(project_deny_flags) = project.and_then(|p| p.deny_flags.as_ref()) {
-                for (cmd, flags) in project_deny_flags {
-                    merged_deny_flags
-                        .entry(cmd.clone())
-                        .or_default()
-                        .extend(flags.iter().cloned());
-                }
-            } else {
-                for (cmd, flags) in &self.deny_flags {
-                    merged_deny_flags
-                        .entry(cmd.clone())
-                        .or_default()
-                        .extend(flags.iter().cloned());
-                }
-            }
-
-            // build: project overrides user default for this root
-            let root_build = project
+            // build: project overrides user default for this root; everything
+            // else is enforcement and stays user-level (taken from `self`).
+            let root_build = project_commands
+                .get(root)
                 .and_then(|p| p.build.as_ref())
                 .map_or(&self.default_build[..], |sv| &sv.0);
             if !root_build.is_empty() {
-                merged_build.insert(root.clone(), root_build.to_vec());
+                build.insert(root.clone(), root_build.to_vec());
             }
         }
 
         Self {
-            client_enforcement_only: self.client_enforcement_only,
-            allow_file_redirects: merged_allow_file_redirects,
-            default_build: self.default_build.clone(),
-            build: merged_build,
-            allow: merged_allow,
-            pipeline: merged_pipeline,
-            deny: merged_deny,
-            deny_flags: merged_deny_flags,
-            // Guidance is user-level only — not overridden per-root.
-            guidance: self.guidance.clone(),
+            build,
+            ..self.clone()
         }
     }
 
@@ -745,6 +687,35 @@ pub fn validate(config: &CommandsConfig) -> (Vec<String>, Vec<String>) {
 
     (errors, warnings)
 }
+
+/// `[commands]` keys that Catenary **ignores** in a *project* `.catenary.toml`.
+///
+/// Only `build` is honored at project scope — it is per-root and benign (it
+/// names a build tool and relaxes nothing). Everything else is user-level
+/// only: command enforcement
+/// (`client_enforcement_only`/`allow`/`pipeline`/`deny`/`deny_flags`/
+/// `allow_file_redirects`) and denial `guidance`. The filter resolves
+/// daemon-globally (`Session::merged_commands`), so honoring any of these at
+/// project scope would change the filter *every* connected session sees. See
+/// [`merge_project_commands`](ResolvedCommands::merge_project_commands) and
+/// DESIGN Decision 5 Correction (ticket 15).
+///
+/// The project-config loader warns on **presence** of any of these keys
+/// (detected on the raw TOML, not the parsed config) so an explicit `= false`
+/// on a boolean is caught too — `client_enforcement_only = false` (a project
+/// asking for enforcement the daemon won't grant) and `allow_file_redirects =
+/// false` (a project asking to tighten redirects) are silently ignored
+/// otherwise, which is the dangerous direction. Value-based detection cannot
+/// distinguish `= false` from absent.
+pub const PROJECT_IGNORED_COMMAND_KEYS: &[&str] = &[
+    "client_enforcement_only",
+    "allow_file_redirects",
+    "allow",
+    "pipeline",
+    "deny",
+    "deny_flags",
+    "guidance",
+];
 
 #[cfg(test)]
 #[allow(
@@ -1313,62 +1284,117 @@ git = ["--no-verify", "--force"]
     // ── Project config merge tests ─────────────────────────────────
 
     #[test]
-    fn merge_project_allow_replaces_user() {
+    fn merge_project_build_only() {
+        // Project enforcement keys (allow/pipeline/deny/deny_flags/redirects)
+        // are user-level only and must be ignored — only `build` overrides
+        // per-root. See DESIGN Decision 5 Correction (ticket 15).
         let mut user = ResolvedCommands::default();
         user.merge(&CommandsConfig {
-            allow: Some(vec!["git".into(), "gh".into(), "cp".into()]),
+            allow: Some(vec!["git".into(), "gh".into()]),
+            pipeline: Some(vec!["grep".into()]),
+            deny: Some(HashMap::from([("git".into(), vec!["push".into()])])),
+            build: Some(StringOrVec(vec!["make".into()])),
             ..CommandsConfig::default()
         });
 
-        let root_a = PathBuf::from("/project/a");
+        let root = PathBuf::from("/project/a");
         let project_commands = HashMap::from([(
-            root_a.clone(),
+            root.clone(),
             CommandsConfig {
-                allow: Some(vec!["git".into(), "kubectl".into()]),
+                allow: Some(vec!["kubectl".into()]),
+                pipeline: Some(vec!["jq".into()]),
+                deny: Some(HashMap::from([("git".into(), vec!["ls-files".into()])])),
+                deny_flags: Some(HashMap::from([("git".into(), vec!["--no-verify".into()])])),
+                allow_file_redirects: true,
+                build: Some(StringOrVec(vec!["npm".into()])),
                 ..CommandsConfig::default()
             },
         )]);
 
-        let merged = user.merge_project_commands(&[root_a], &project_commands);
+        let merged = user.merge_project_commands(std::slice::from_ref(&root), &project_commands);
+
+        // Enforcement is exactly the user's — every project value ignored.
         assert!(merged.allow.contains("git"));
-        assert!(merged.allow.contains("kubectl"));
-        assert!(
-            !merged.allow.contains("gh"),
-            "user allow replaced by project"
-        );
-        assert!(
-            !merged.allow.contains("cp"),
-            "user allow replaced by project"
+        assert!(merged.allow.contains("gh"));
+        assert!(!merged.allow.contains("kubectl"), "project allow ignored");
+        assert!(merged.pipeline.contains("grep"));
+        assert!(!merged.pipeline.contains("jq"), "project pipeline ignored");
+        let git_deny = merged.deny.get("git").expect("user git deny preserved");
+        assert!(git_deny.contains("push"));
+        assert!(!git_deny.contains("ls-files"), "project deny ignored");
+        assert!(merged.deny_flags.is_empty(), "project deny_flags ignored");
+        assert!(!merged.allow_file_redirects, "project redirects ignored");
+
+        // Only `build` is honored per-root.
+        assert_eq!(
+            merged.build.get(&root).map(Vec::as_slice),
+            Some(["npm".to_string()].as_slice()),
         );
     }
 
     #[test]
-    fn merge_project_multi_root_unions_allow() {
-        let mut user = ResolvedCommands::default();
-        user.merge(&CommandsConfig {
-            allow: Some(vec!["git".into(), "gh".into(), "cp".into()]),
+    fn user_redirects_not_overridable_by_project() {
+        let root = PathBuf::from("/project");
+
+        // User denies; a project root tries to enable → stays denied.
+        let mut user_deny = ResolvedCommands::default();
+        user_deny.merge(&CommandsConfig {
+            allow: Some(vec!["git".into()]),
             ..CommandsConfig::default()
         });
+        assert!(!user_deny.allow_file_redirects);
+        let project_on = HashMap::from([(
+            root.clone(),
+            CommandsConfig {
+                allow_file_redirects: true,
+                ..CommandsConfig::default()
+            },
+        )]);
+        let merged = user_deny.merge_project_commands(std::slice::from_ref(&root), &project_on);
+        assert!(
+            !merged.allow_file_redirects,
+            "project cannot opt into redirects",
+        );
 
-        let root_a = PathBuf::from("/project/a");
-        let root_b = PathBuf::from("/project/b");
-        let project_commands = HashMap::from([
-            (
-                root_a.clone(),
-                CommandsConfig {
-                    allow: Some(vec!["git".into(), "kubectl".into()]),
-                    ..CommandsConfig::default()
-                },
-            ),
-            // root_b has no commands — falls back to user
-        ]);
+        // User enables; a project root omitting the flag → stays enabled.
+        let mut user_allow = ResolvedCommands::default();
+        user_allow.merge(&CommandsConfig {
+            allow: Some(vec!["git".into()]),
+            allow_file_redirects: true,
+            ..CommandsConfig::default()
+        });
+        let merged =
+            user_allow.merge_project_commands(std::slice::from_ref(&root), &HashMap::new());
+        assert!(
+            merged.allow_file_redirects,
+            "user redirects preserved through project merge",
+        );
+    }
 
-        let merged = user.merge_project_commands(&[root_a, root_b], &project_commands);
-        // Root A: git, kubectl. Root B: git, gh, cp (user fallback). Union:
-        assert!(merged.allow.contains("git"));
-        assert!(merged.allow.contains("kubectl"));
-        assert!(merged.allow.contains("gh"));
-        assert!(merged.allow.contains("cp"));
+    #[test]
+    fn project_ignored_command_keys_cover_everything_but_build() {
+        // `build` is the one key honored at project scope.
+        assert!(
+            !PROJECT_IGNORED_COMMAND_KEYS.contains(&"build"),
+            "`build` must stay honored at project scope",
+        );
+        // Every other `[commands]` key — enforcement and guidance — is ignored,
+        // so the loader warns on its presence (the `= false` boolean cases
+        // included; see the const docs).
+        for key in [
+            "client_enforcement_only",
+            "allow_file_redirects",
+            "allow",
+            "pipeline",
+            "deny",
+            "deny_flags",
+            "guidance",
+        ] {
+            assert!(
+                PROJECT_IGNORED_COMMAND_KEYS.contains(&key),
+                "{key} should be ignored at project scope",
+            );
+        }
     }
 
     #[test]
@@ -1514,99 +1540,6 @@ git = ["--no-verify", "--force"]
         );
         // Default preserved
         assert_eq!(merged.default_build, vec!["make", "npm"]);
-    }
-
-    #[test]
-    fn merge_project_pipeline_replaces_per_root() {
-        let mut user = ResolvedCommands::default();
-        user.merge(&CommandsConfig {
-            allow: Some(vec!["git".into()]),
-            pipeline: Some(vec!["grep".into(), "head".into()]),
-            ..CommandsConfig::default()
-        });
-
-        let root_a = PathBuf::from("/project/a");
-        let root_b = PathBuf::from("/project/b");
-        let project_commands = HashMap::from([(
-            root_a.clone(),
-            CommandsConfig {
-                pipeline: Some(vec!["jq".into()]),
-                ..CommandsConfig::default()
-            },
-        )]);
-
-        let merged = user.merge_project_commands(&[root_a, root_b], &project_commands);
-        // Root A: jq (project). Root B: grep, head (user). Union:
-        assert!(merged.pipeline.contains("jq"));
-        assert!(merged.pipeline.contains("grep"));
-        assert!(merged.pipeline.contains("head"));
-    }
-
-    #[test]
-    fn merge_project_deny_replaces_per_root() {
-        let mut user = ResolvedCommands::default();
-        user.merge(&CommandsConfig {
-            allow: Some(vec!["git".into()]),
-            deny: Some(HashMap::from([("git".into(), vec!["grep".into()])])),
-            ..CommandsConfig::default()
-        });
-
-        let root_a = PathBuf::from("/project/a");
-        let root_b = PathBuf::from("/project/b");
-        let project_commands = HashMap::from([(
-            root_a.clone(),
-            CommandsConfig {
-                deny: Some(HashMap::from([("git".into(), vec!["ls-files".into()])])),
-                ..CommandsConfig::default()
-            },
-        )]);
-
-        let merged = user.merge_project_commands(&[root_a, root_b], &project_commands);
-        let git_deny = merged.deny.get("git").expect("git deny");
-        // Root A: ls-files (project). Root B: grep (user). Union:
-        assert!(git_deny.contains("grep"));
-        assert!(git_deny.contains("ls-files"));
-    }
-
-    #[test]
-    fn merge_project_root_opts_into_redirects() {
-        // User baseline denies redirects; a single project root enables them,
-        // and the merged result is permissive (opt-in only, OR across roots).
-        let mut user = ResolvedCommands::default();
-        user.merge(&CommandsConfig {
-            allow: Some(vec!["git".into()]),
-            ..CommandsConfig::default()
-        });
-        assert!(!user.allow_file_redirects);
-
-        let root_a = PathBuf::from("/project/a");
-        let root_b = PathBuf::from("/project/b");
-        let project_commands = HashMap::from([(
-            root_a.clone(),
-            CommandsConfig {
-                allow_file_redirects: true,
-                ..CommandsConfig::default()
-            },
-        )]);
-
-        let merged = user.merge_project_commands(&[root_a, root_b], &project_commands);
-        assert!(merged.allow_file_redirects);
-    }
-
-    #[test]
-    fn merge_project_preserves_user_redirects() {
-        // User opted in globally; a project root that omits the flag does not
-        // re-tighten it.
-        let mut user = ResolvedCommands::default();
-        user.merge(&CommandsConfig {
-            allow: Some(vec!["git".into()]),
-            allow_file_redirects: true,
-            ..CommandsConfig::default()
-        });
-
-        let root = PathBuf::from("/project");
-        let merged = user.merge_project_commands(std::slice::from_ref(&root), &HashMap::new());
-        assert!(merged.allow_file_redirects);
     }
 
     // ── Guidance tests ─────────────────────────────────────────────

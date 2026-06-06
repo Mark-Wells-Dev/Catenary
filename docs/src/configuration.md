@@ -368,9 +368,11 @@ Classification precedence (highest first): shebang > filename > extension.
 
 ## Project Configuration
 
-Place a `.catenary.toml` in a workspace root to override language,
-server, and command configuration for that root. Supported sections are
-`lsp`, `[language.*]`, `[server.*]`, and `[commands]` — other sections
+Place a `.catenary.toml` in a workspace root to override language and
+server configuration and set the per-project build tool for that root.
+Supported sections are `lsp`, `[language.*]`, `[server.*]`, and
+`[commands]` (the build tool only — command **enforcement** is user-level;
+see [Project-scoped commands](#project-scoped-commands)). Other sections
 (`[notifications]`, `[icons]`, etc.) are user-level and belong in
 `~/.config/catenary/config.toml`.
 
@@ -598,23 +600,39 @@ sqlite3 = ["-cmd"]
 
 ### Project-scoped commands
 
-In `.catenary.toml`, `[commands]` supports two fields:
-
-- **`build`** — per-root build tool. "In this project, the build tool
-  is `make`." Even disabled roots (`lsp = false`) contribute
-  `commands.build`.
-- **`allow`** — replaces (not merges with) the user's `allow` list for
-  this root's contribution.
-
-In multi-root sessions, `allow` lists are unioned across roots — adding
-a root is an intentional scope expansion. `build` is collected per-root;
-the evaluator resolves which root a command targets via `cwd`.
+In `.catenary.toml`, `[commands]` honors **only** `build` — the per-root
+build tool ("in this project, the build tool is `make`"). Even disabled
+roots (`lsp = false`) contribute `commands.build`. In multi-root sessions
+`build` is collected per-root; the evaluator resolves which root a command
+targets via `cwd`.
 
 ```toml
 # .catenary.toml
 [commands]
 build = "make"
 ```
+
+**Only `build` is honored.** Every other `[commands]` key —
+`client_enforcement_only`, `allow`, `pipeline`, `deny`, `deny_flags`,
+`allow_file_redirects`, and `guidance` — is **user-level only** and is
+ignored at project scope (Catenary warns when it sees one). They must live
+in `~/.config/catenary/config.toml`.
+
+This includes the on/off switch: a project cannot turn enforcement *on*
+(`client_enforcement_only = false`) or *off* (`client_enforcement_only =
+true`) for itself.
+
+Why: the command filter resolves daemon-globally. One Catenary daemon
+serves every connected session, so a project that changed enforcement —
+relaxing it (`allow_file_redirects = true`, a wider `allow`) **or** trying
+to tighten it (`allow_file_redirects = false`, `client_enforcement_only =
+false`) — would change the filter *every* session sees, including agents
+in unrelated repos. Worse, the tighten/turn-on direction would fail
+*silently*: enforcement never engages, so no agent ever hits a hook to
+reveal that the project's request was dropped. Keeping enforcement
+user-level makes the filter exactly what the user configured, regardless of
+which projects are open. `build` is exempt: it only names a build tool and
+relaxes nothing.
 
 Run `catenary config` to generate a recommended config template with
 a commented-out `[commands]` section.

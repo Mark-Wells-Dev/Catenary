@@ -106,30 +106,52 @@ Why each remaining section is excluded:
 
 ### `[commands]` in project config
 
-`[commands]` is the exception to the "user preferences only" rule.
-Two fields are project-scoped:
+`[commands]` is the exception to the "user preferences only" rule, but a
+narrow one: **only `build` is project-scoped.**
 
 - **`build`** — per-root build tool. The answer to "why can't I run
   cargo/npm/go directly?" is inherently per-project. The evaluator
   resolves `cwd` (from the hook JSON payload) to a root via
-  longest-prefix match, then looks up that root's build tool.
+  longest-prefix match, then looks up that root's build tool. Disabled
+  roots (`lsp = false`) still contribute `build`, so a root can name its
+  build tool without spawning servers.
 
-- **`allow`** — replaces (not merges with) the user's `allow` list
-  for this root's contribution. Use case: a homelab root gets
-  `kubectl` and `ssh`, a Catenary repo root doesn't.
+Everything else under `[commands]` is **user-level only**: command
+enforcement (`client_enforcement_only`, `allow`, `pipeline`, `deny`,
+`deny_flags`, `allow_file_redirects`) and denial `guidance`. A project
+`.catenary.toml` that sets these keys still loads, but they are ignored
+with a warning; only `build` flows through
+`ResolvedCommands::merge_project_commands`. The warning is raised on raw-TOML
+**presence** (`ignored_project_command_keys`), not the parsed value, so an
+explicit `= false` on a boolean is caught — see below.
 
-In multi-root sessions, `allow` lists are unioned across roots —
-adding a root is an intentional scope expansion. `pipeline` and
-`deny` follow the same per-root replacement semantics. Disabled
-roots (`lsp = false`) contribute `[commands]` config but not LSP
-config, so a root can specify its build tool without spawning
-servers.
+This reverses the earlier "project `allow` replaces the user list, unioned
+across roots" model. The command filter resolves **daemon-globally**:
+`Session::merged_commands` reads the *shared* `LspClientManager`'s
+daemon-wide `roots()` + `project_commands()` with no requesting-session
+identity, so every connected session resolves the *same* set. A project
+that changed enforcement would thus change the filter *every* session sees,
+including agents in unrelated repos. This cuts both ways:
 
-The earlier model (walk up from cwd, merge all sections) worked for
-single-project sessions. Multi-root sessions — where `catenary roots add` adds
-roots with potentially conflicting configs — broke the assumption.
-The scope was narrowed to what is genuinely per-root: language server
-routing, server configuration, and command filtering.
+- **Relaxing** (`allow_file_redirects = true`, a wider `allow`) would weaken
+  the filter for stricter repos sharing the daemon. Fails *loud* if the
+  project instead wanted less and didn't get it — the agent hits a hook.
+- **Tightening / turning on** (`allow_file_redirects = false`,
+  `client_enforcement_only = false` to request enforcement) would fail
+  *silently*: enforcement is on/off for the whole daemon, so a project
+  asking for more gets none, and because nothing engages, no agent ever
+  hits a hook to reveal the dropped request. The silent direction is why
+  presence detection (not value) drives the warning — `= false` is
+  indistinguishable from absent in the parsed config.
+
+`build` is exempt: it is consumed per-root via `build_for_cwd` and only
+names a build tool — it relaxes nothing.
+
+The earlier section-scope model (walk up from cwd, merge all sections)
+worked for single-project sessions. Multi-root sessions — where `catenary
+roots add` adds roots with potentially conflicting configs — broke the
+assumption. The scope was narrowed to what is genuinely per-root: language
+server routing, server configuration, and the per-project build tool.
 
 ## Per-root settings resolution
 
