@@ -418,19 +418,22 @@ struct HookDispatchContext {
     /// per-session `Session` instances to prevent concurrent editing
     /// in the same workspace root.
     editing_guardrail: Arc<EditingGuardrail>,
-    /// Serialization semaphore (1 permit): only one session can be
-    /// in the `done_editing` handoff window at a time.
-    handoff_semaphore: Arc<tokio::sync::Semaphore>,
-    /// Handoff slot: file list + owned permit deposited by
-    /// `PreToolUse`, consumed by the `done_editing` CLI command.
-    handoff_slot: Arc<std::sync::Mutex<Option<HandoffContext>>>,
+    /// Per-key hook→CLI handoff (ADR 014). Replaces the single global slot +
+    /// 1-permit semaphore: each [`HandoffKey`] serializes independently, so a
+    /// `diagnostics` handoff never stalls a `sed` handoff — or any other
+    /// session — daemon-wide.
+    handoff: KeyedHandoff,
 }
 
-/// Handoff context deposited by `pre-tool/editing-stop`
-/// and consumed by `tool/editing-stop`.
+/// A staged hook→CLI handoff, deposited under a [`HandoffKey`] by the
+/// `PreToolUse` hook and consumed by the matching CLI command.
 ///
-/// Dropping this struct drops the owned semaphore permit, releasing
-/// the handoff lock.
+/// Today's only wired key is `diagnostics`, whose payload is *data-back*: the
+/// drained file set that `catenary diagnostics` retrieves. (Ticket 08 adds the
+/// `sed` *identity-forward* payload — see [`HandoffKey`].)
+///
+/// Dropping this struct drops the owned semaphore permit, releasing the key's
+/// serialization lock for the next same-key stage.
 struct HandoffContext {
     /// Accumulated files from the editing session.
     files: Vec<PathBuf>,
@@ -442,33 +445,147 @@ struct HandoffContext {
     /// `process_files_batched`, linking them into one TUI scope.
     parent_id: String,
     /// Owned semaphore permit — dropped when the `HandoffContext`
-    /// is dropped (slot consumed or timeout), releasing the lock.
+    /// is dropped (slot consumed or timeout), releasing the per-key lock.
     /// Never read directly; held purely for RAII drop semantics.
     #[allow(dead_code, reason = "RAII guard — held for drop, not read")]
     permit: tokio::sync::OwnedSemaphorePermit,
 }
 
-/// Spawns a background task that clears the handoff slot after 5 seconds.
+/// Correlation key for the hook→CLI handoff — the catenary subcommand alone
+/// (ADR 014).
 ///
-/// Handles the case where the CLI command never connects (e.g., the host
-/// kills the subprocess between `PreToolUse` and command execution).
-/// Dropping the `HandoffContext` drops the owned permit, releasing the
-/// semaphore.
-fn spawn_handoff_timeout(slot: Arc<std::sync::Mutex<Option<HandoffContext>>>) {
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(5)).await;
-        let mut s = slot
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if s.is_some() {
-            // Dropping the HandoffContext drops the owned permit.
-            *s = None;
-            warn!(
-                source = Source::DaemonDispatch.as_str(),
-                "diagnostics handoff timeout — discarding file list",
-            );
+/// `cwd`, pattern, and path are recorded for observability bucketing but are
+/// *not* key material. Only the two load-bearing, bare-only commands stage a
+/// handoff; stateless `grep`/`glob` self-scope with a daemon-minted UUID and
+/// never correlate here.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum HandoffKey {
+    /// `catenary diagnostics` — data-back: the hook stages the accumulated
+    /// file set, the CLI drains it.
+    Diagnostics,
+    /// `catenary sed` — identity-forward: the hook stages session identity,
+    /// the sed process reports its runtime-changed set. Wired by ticket 08;
+    /// the key and its semaphore exist now so 08 plugs into the final
+    /// mechanism rather than rebuilding it.
+    Sed,
+}
+
+impl HandoffKey {
+    /// Every handoff key — used to eagerly create the per-key semaphores.
+    /// Cardinality is ≤ 2 by design (ADR 014).
+    const ALL: [Self; 2] = [Self::Diagnostics, Self::Sed];
+}
+
+/// Per-key handoff self-heal timeout.
+///
+/// The `PreToolUse` hook stages, then the CLI subprocess connects to consume —
+/// a cache-hot binary spawn (tens of ms; the hook just ran the same binary).
+/// Sub-second per ADR 014: scoped to one [`HandoffKey`], a stuck stage only
+/// delays the next *same-key* handoff (never a daemon-wide stall, unlike the
+/// old global lock's 5s timeout), so the bound is tight while leaving ample
+/// headroom over the spawn.
+const HANDOFF_TIMEOUT: Duration = Duration::from_millis(750);
+
+/// Per-key hook→CLI handoff registry (ADR 014).
+///
+/// Replaces the single global slot + 1-permit semaphore. Each [`HandoffKey`]
+/// gets its own 1-permit semaphore — **same-key in-order serialization** (a
+/// second `diagnostics` stage blocks until the first is consumed; no
+/// overwrite, no double-consume) — and its own slot + timeout — **per-key
+/// independence** (a `diagnostics` handoff and a `sed` handoff proceed
+/// concurrently, and neither can stall the daemon as the old global lock
+/// could). Cardinality ≤ 2.
+#[derive(Clone)]
+struct KeyedHandoff {
+    /// Per-key serialization semaphores (1 permit each), created eagerly for
+    /// every [`HandoffKey`]. A stage acquires its key's permit; the owned
+    /// permit rides inside the staged [`HandoffContext`] and releases on
+    /// consume or timeout (RAII).
+    semaphores: Arc<HashMap<HandoffKey, Arc<tokio::sync::Semaphore>>>,
+    /// Per-key staged contexts. A staged handoff lives here until the CLI
+    /// consumes it or the per-key timeout clears it.
+    slots: Arc<std::sync::Mutex<HashMap<HandoffKey, HandoffContext>>>,
+}
+
+impl KeyedHandoff {
+    /// Build the registry with one 1-permit semaphore per [`HandoffKey`].
+    fn new() -> Self {
+        let semaphores: HashMap<HandoffKey, Arc<tokio::sync::Semaphore>> = HandoffKey::ALL
+            .into_iter()
+            .map(|key| (key, Arc::new(tokio::sync::Semaphore::new(1))))
+            .collect();
+        Self {
+            semaphores: Arc::new(semaphores),
+            slots: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
-    });
+    }
+
+    /// Acquire `key`'s serialization permit. Blocks while another handoff under
+    /// the **same** key is in flight; independent across keys. The returned
+    /// permit must be moved into the staged [`HandoffContext`] so it releases
+    /// on consume/timeout.
+    async fn acquire(&self, key: HandoffKey) -> Result<tokio::sync::OwnedSemaphorePermit> {
+        let semaphore = self
+            .semaphores
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| anyhow!("no handoff semaphore for {key:?}"))?;
+        semaphore
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow!("handoff semaphore closed"))
+    }
+
+    /// Deposit `context` under `key` and arm its per-key timeout. The caller
+    /// already holds `key`'s permit (inside `context`), so at most one context
+    /// per key is ever live.
+    fn stage(&self, key: HandoffKey, context: HandoffContext) {
+        {
+            let mut slots = self
+                .slots
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            slots.insert(key, context);
+        }
+        self.spawn_timeout(key);
+    }
+
+    /// Take the staged context for `key`, releasing its permit (the returned
+    /// context owns the permit; dropping it unblocks the next same-key stage).
+    /// Returns `None` when nothing is staged — timed out or already consumed.
+    fn consume(&self, key: HandoffKey) -> Option<HandoffContext> {
+        self.slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&key)
+    }
+
+    /// Spawn a background task that clears `key`'s slot after [`HANDOFF_TIMEOUT`]
+    /// if the CLI never connects (e.g., the host kills the subprocess between
+    /// `PreToolUse` and command execution). Dropping the cleared
+    /// [`HandoffContext`] releases the key's permit. Scoped to `key` — never a
+    /// daemon-wide stall.
+    fn spawn_timeout(&self, key: HandoffKey) {
+        let slots = self.slots.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(HANDOFF_TIMEOUT).await;
+            // Remove under the lock, then drop the guard (and the removed
+            // HandoffContext, releasing its permit) before logging.
+            let cleared = {
+                let mut slots = slots
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                slots.remove(&key).is_some()
+            };
+            if cleared {
+                warn!(
+                    source = Source::DaemonDispatch.as_str(),
+                    handoff_key = ?key,
+                    "handoff timeout — discarding staged context",
+                );
+            }
+        });
+    }
 }
 
 /// Tracks per-contributor workspace root sets for reference counting.
@@ -1106,8 +1223,7 @@ impl SessionManager {
             _logging: self.logging.clone(),
             root_tracker: Some(root_tracker),
             editing_guardrail: Arc::new(EditingGuardrail::new()),
-            handoff_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
-            handoff_slot: Arc::new(std::sync::Mutex::new(None)),
+            handoff: KeyedHandoff::new(),
         });
         self
     }
@@ -1643,14 +1759,10 @@ async fn handle_hook_dispatch(
 
         let router = get_or_create_router(&ctx, &session_id, &raw);
 
-        // Acquire the handoff semaphore (blocks if another session
-        // is mid-handoff — holds for milliseconds at most).
-        let permit = ctx
-            .handoff_semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| anyhow!("handoff semaphore closed"))?;
+        // Acquire the `diagnostics` handoff permit. Blocks only behind another
+        // in-flight *diagnostics* handoff (per-key, ADR 014) — never daemon-wide
+        // — and holds for milliseconds at most.
+        let permit = ctx.handoff.acquire(HandoffKey::Diagnostics).await?;
 
         // Drain accumulated files from EditingManager.
         let (files, filtered) = router.session.editing.drain_all_and_clear();
@@ -1671,22 +1783,18 @@ async fn handle_hook_dispatch(
         // the prepare hook is one scope, the IPC execution is another.
         let handoff_parent_id = uuid::Uuid::new_v4().to_string();
 
-        // Deposit in the handoff slot.
-        {
-            let mut slot = ctx
-                .handoff_slot
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            *slot = Some(HandoffContext {
+        // Stage the file set under `diagnostics` and arm the per-key timeout
+        // (cleared if the CLI never connects). Dropping the context — on
+        // consume or timeout — releases the permit.
+        ctx.handoff.stage(
+            HandoffKey::Diagnostics,
+            HandoffContext {
                 files,
                 filtered,
                 parent_id: handoff_parent_id,
                 permit,
-            });
-        }
-
-        // Spawn timeout to clear the slot if the CLI never connects.
-        spawn_handoff_timeout(ctx.handoff_slot.clone());
+            },
+        );
 
         debug!(
             source = Source::DaemonDispatch.as_str(),
@@ -1722,18 +1830,14 @@ async fn handle_hook_dispatch(
     // command (internal method name unchanged). Takes the file list from the
     // handoff slot, runs process_files_batched, and returns diagnostics.
     if method == "tool/editing-stop" {
-        // Take the file list and parent_id from the handoff slot,
-        // releasing the permit immediately. The permit must not be
-        // held during the diagnostics pipeline (which may take seconds).
-        let handoff = {
-            let mut slot = ctx
-                .handoff_slot
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            // Destructure HandoffContext — dropping it releases the
-            // owned semaphore permit.
-            slot.take().map(|h| (h.files, h.filtered, h.parent_id))
-        };
+        // Take the file list and parent_id from the `diagnostics` slot,
+        // releasing the permit immediately. The permit must not be held during
+        // the diagnostics pipeline (which may take seconds). Consuming the
+        // HandoffContext drops it, releasing the owned semaphore permit.
+        let handoff = ctx
+            .handoff
+            .consume(HandoffKey::Diagnostics)
+            .map(|h| (h.files, h.filtered, h.parent_id));
 
         // Extract scope_id early so we can emit the incoming hook
         // event before running the diagnostics pipeline. This ensures
@@ -3561,6 +3665,150 @@ mod tests {
         );
 
         shutdown.cancel();
+    }
+
+    // ── Keyed handoff structure tests (ADR 014) ───────────────────────
+
+    /// Different keys are independent: holding the `diagnostics` permit must
+    /// not block a `sed` acquire (the `timeout` would only elapse if it did).
+    #[tokio::test]
+    async fn keyed_handoff_keys_are_independent() {
+        let handoff = KeyedHandoff::new();
+
+        // Hold the diagnostics permit for the whole test.
+        let _diag = handoff
+            .acquire(HandoffKey::Diagnostics)
+            .await
+            .expect("acquire diagnostics");
+
+        // A sed acquire proceeds immediately — its own permit, independent key.
+        let sed =
+            tokio::time::timeout(Duration::from_secs(1), handoff.acquire(HandoffKey::Sed)).await;
+        assert!(
+            sed.is_ok(),
+            "sed handoff must not block on a held diagnostics permit",
+        );
+    }
+
+    /// The same key serializes in order: a second `diagnostics` acquire blocks
+    /// until the first permit is released (no overwrite, no double-consume).
+    #[tokio::test]
+    async fn keyed_handoff_same_key_serializes() {
+        let handoff = KeyedHandoff::new();
+
+        let first = handoff
+            .acquire(HandoffKey::Diagnostics)
+            .await
+            .expect("first acquire");
+
+        // A second same-key acquire blocks while the first permit is held —
+        // the timeout elapses rather than completing.
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(200),
+            handoff.acquire(HandoffKey::Diagnostics),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "second diagnostics acquire must block while the first is held",
+        );
+
+        // Releasing the first lets the second proceed.
+        drop(first);
+        let second = tokio::time::timeout(
+            Duration::from_secs(1),
+            handoff.acquire(HandoffKey::Diagnostics),
+        )
+        .await;
+        assert!(
+            second.is_ok(),
+            "second diagnostics acquire must proceed once the first is released",
+        );
+    }
+
+    /// Stage → consume round-trips the payload, frees the permit, and a second
+    /// consume sees the empty slot.
+    #[tokio::test]
+    async fn keyed_handoff_stage_consume_roundtrip() {
+        let handoff = KeyedHandoff::new();
+
+        let permit = handoff
+            .acquire(HandoffKey::Diagnostics)
+            .await
+            .expect("acquire");
+        handoff.stage(
+            HandoffKey::Diagnostics,
+            HandoffContext {
+                files: vec![PathBuf::from("/tmp/a.rs")],
+                filtered: 2,
+                parent_id: "scope-1".to_string(),
+                permit,
+            },
+        );
+
+        let consumed = handoff
+            .consume(HandoffKey::Diagnostics)
+            .expect("consume staged context");
+        assert_eq!(consumed.files, vec![PathBuf::from("/tmp/a.rs")]);
+        assert_eq!(consumed.filtered, 2);
+        assert_eq!(consumed.parent_id, "scope-1");
+
+        // Slot is now empty — a second consume yields None.
+        assert!(
+            handoff.consume(HandoffKey::Diagnostics).is_none(),
+            "double consume must yield None",
+        );
+
+        // Dropping the consumed context frees the permit for the next stage.
+        drop(consumed);
+        let reacquire = tokio::time::timeout(
+            Duration::from_secs(1),
+            handoff.acquire(HandoffKey::Diagnostics),
+        )
+        .await;
+        assert!(reacquire.is_ok(), "permit must be free after consume");
+    }
+
+    /// A never-connecting stage is cleared by its per-key timeout, releasing the
+    /// permit — and only its own key is affected.
+    #[tokio::test]
+    async fn keyed_handoff_timeout_clears_only_its_key() {
+        let handoff = KeyedHandoff::new();
+
+        let permit = handoff
+            .acquire(HandoffKey::Diagnostics)
+            .await
+            .expect("acquire");
+        handoff.stage(
+            HandoffKey::Diagnostics,
+            HandoffContext {
+                files: Vec::new(),
+                filtered: 0,
+                parent_id: "x".to_string(),
+                permit,
+            },
+        );
+
+        // Wait past the per-key timeout; the spawned task clears the slot.
+        tokio::time::sleep(HANDOFF_TIMEOUT + Duration::from_millis(100)).await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            handoff.consume(HandoffKey::Diagnostics).is_none(),
+            "diagnostics stage must be cleared after its timeout",
+        );
+
+        // The permit was released on timeout — a fresh acquire proceeds.
+        let _diag = handoff
+            .acquire(HandoffKey::Diagnostics)
+            .await
+            .expect("permit released on timeout");
+
+        // The untouched `sed` key is unaffected by the diagnostics timeout.
+        let _sed = handoff
+            .acquire(HandoffKey::Sed)
+            .await
+            .expect("sed key independent of diagnostics timeout");
     }
 
     // ── Version handshake tests ──────────────────────────────────────
