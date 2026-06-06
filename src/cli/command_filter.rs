@@ -1627,6 +1627,101 @@ mod tests {
         assert!(check_command("git log | jq .", &rules, None).is_none());
     }
 
+    // ── reads moved to `allow` (Decision 7, drop read-blocking) ───────
+
+    #[test]
+    fn cat_allowed_no_redirect() {
+        // `cat` reads a file to stdout — no write vector, so it is allowed.
+        let rules = recommended_rules();
+        assert!(check_command("cat src/main.rs", &rules, None).is_none());
+    }
+
+    #[test]
+    fn cat_redirect_still_denied() {
+        // Read is fine; the *redirect* is the write vector caught by ticket 01,
+        // not by blocking `cat` itself.
+        let rules = recommended_rules();
+        let denial = check_command("cat foo > bar.rs", &rules, None).expect("redirect denied");
+        assert_eq!(denial.reason, DenialReason::OutputRedirect);
+    }
+
+    #[test]
+    fn reads_allowed_at_position_zero() {
+        // The former `guidance.read` set (cat/head/tail/less/more) plus diff
+        // now live in `allow`, so they pass at pipeline position 0.
+        let rules = recommended_rules();
+        for cmd in [
+            "head -20 src/main.rs",
+            "tail -5 Cargo.toml",
+            "less README.md",
+            "more README.md",
+            "diff a.rs b.rs",
+        ] {
+            assert!(
+                check_command(cmd, &rules, None).is_none(),
+                "{cmd} should be allowed",
+            );
+        }
+    }
+
+    #[test]
+    fn echo_printf_seq_allowed() {
+        // stdout-only generators are allowed; their redirect forms are denied.
+        let rules = recommended_rules();
+        for cmd in ["echo hello", "printf '%s' x", "seq 1 5"] {
+            assert!(check_command(cmd, &rules, None).is_none(), "{cmd} allowed");
+        }
+        for cmd in ["echo hello > f.txt", "printf x > f.txt", "seq 1 5 > f.txt"] {
+            let denial = check_command(cmd, &rules, None).expect("redirect denied");
+            assert_eq!(
+                denial.reason,
+                DenialReason::OutputRedirect,
+                "{cmd} redirect denied",
+            );
+        }
+    }
+
+    #[test]
+    fn guidance_read_removed() {
+        // No "Use {READ} instead" message path remains: reads are allowed, so
+        // they carry no guidance, and no static guidance references {READ}.
+        let rules = recommended_rules();
+        assert!(rules.guidance_for("cat").is_none(), "cat has no guidance");
+        assert!(rules.guidance_for("less").is_none(), "less has no guidance");
+        assert!(rules.guidance_for("more").is_none(), "more has no guidance");
+        assert!(
+            !rules.guidance.values().any(|g| matches!(
+                g,
+                crate::config::GuidanceEntry::Static(msg) if msg.contains("{READ}")
+            )),
+            "no static guidance should reference the read tool",
+        );
+    }
+
+    #[test]
+    fn scan_list_nudges_kept() {
+        // Only the read group is removed — the scan (grep → catenary grep) and
+        // list (ls/find → catenary glob) enrichment nudges survive.
+        let rules = recommended_rules();
+
+        let grep =
+            check_command("grep pattern src", &rules, None).expect("grep denied at position 0");
+        let grep_msg = format_denial_full(&grep.command, &rules, &grep, None, None);
+        assert!(
+            grep_msg.contains("catenary grep"),
+            "grep nudges to catenary grep: {grep_msg}",
+        );
+
+        for cmd in ["ls", "find . -name x"] {
+            let denial = check_command(cmd, &rules, None).expect("scan/list command denied");
+            let msg = format_denial_full(&denial.command, &rules, &denial, None, None);
+            assert!(
+                msg.contains("catenary glob"),
+                "{cmd} nudges to catenary glob: {msg}",
+            );
+        }
+    }
+
     // ── Deny basics ──────────────────────────────────────────────────
 
     #[test]

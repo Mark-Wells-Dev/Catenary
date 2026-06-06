@@ -91,7 +91,7 @@ fn format_build_list(tools: &[String]) -> String {
 #[derive(Debug, Default, Deserialize, Clone)]
 #[serde(default)]
 pub struct GuidanceGroup {
-    /// Static hint message (e.g., `"Use {read} instead"`).
+    /// Static hint message (e.g., `"Use {EDIT} for surgical edits"`).
     /// Absent for the `build` and `redirect` groups.
     pub message: Option<String>,
     /// Catenary subcommand to redirect to (e.g., `"grep"`, `"glob"`).

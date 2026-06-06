@@ -58,10 +58,14 @@ const TEMPLATE: &str = r#"# Catenary recommended config
 # # client_enforcement_only = true
 # # allow_file_redirects = false
 # build = "make"
+# # `allow` includes read/stdout-only tools (cat, head, less, diff,
+# # echo, ...): reads aren't a write vector, and redirected writes
+# # (`cat > f`) are caught by the redirect gate, not by blocking cat.
 # allow = ["git", "gh", "cp", "rm", "mkdir", "mv", "touch",
-#          "chmod", "sleep", "cd", "true", "false", "which"]
-# pipeline = ["grep", "head", "tail", "wc", "jq",
-#             "sort", "tr", "cut", "uniq"]
+#          "chmod", "sleep", "cd", "true", "false", "which",
+#          "cat", "head", "tail", "less", "more", "diff",
+#          "echo", "printf", "seq"]
+# pipeline = ["grep", "wc", "jq", "sort", "tr", "cut", "uniq"]
 #
 # [commands.deny]
 # git = ["grep", "ls-files", "ls-tree"]
@@ -72,11 +76,7 @@ const TEMPLATE: &str = r#"# Catenary recommended config
 # cargo = ["--manifest-path"]
 #
 # # Per-command guidance — optional hints shown when a command is denied.
-# # Groups map commands to a message. {READ} and {EDIT} resolve per-client.
-#
-# [commands.guidance.read]
-# message = "Use {READ} instead"
-# commands = ["cat", "head", "tail", "less", "more"]
+# # Groups map commands to a message. {EDIT} resolves per-client.
 #
 # [commands.guidance.edit]
 # message = "Use {EDIT} for surgical edits, `catenary sed` for sweeps."
@@ -379,6 +379,43 @@ mod tests {
             !TEMPLATE.contains("\"tee\""),
             "template pipeline should not include tee",
         );
+    }
+
+    #[test]
+    fn template_allows_reads() {
+        // Decision 7: read/stdout-only tools live in `allow` (no enforcement
+        // rationale to block reads under the stateless editing model).
+        let allow = test_recommended::config()
+            .allow
+            .expect("recommended config has an allow list");
+        for cmd in [
+            "cat", "head", "tail", "less", "more", "diff", "echo", "printf", "seq",
+        ] {
+            assert!(
+                allow.iter().any(|c| c == cmd),
+                "recommended allow should contain {cmd}",
+            );
+        }
+    }
+
+    #[test]
+    fn template_drops_read_guidance() {
+        // The vestigial read-blocking guidance group is removed (Decision 7) —
+        // no `guidance.read` and no "Use {READ}" message path in the default.
+        assert!(
+            !TEMPLATE.contains("guidance.read"),
+            "template should not define a read guidance group",
+        );
+        assert!(
+            !TEMPLATE.contains("{READ}"),
+            "template should not reference the {{READ}} template var",
+        );
+        if let Some(guidance) = test_recommended::config().guidance {
+            assert!(
+                !guidance.contains_key("read"),
+                "recommended config should have no read guidance group",
+            );
+        }
     }
 
     #[test]
