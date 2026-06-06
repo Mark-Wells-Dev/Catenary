@@ -492,6 +492,25 @@ impl HookRouter {
                 || (is_bash_tool(tool_name) && command.is_some_and(is_filesystem_only_bash))
             {
                 None
+            } else if is_bash_tool(tool_name) {
+                // Defensive: a catenary command reaching the boundary (the
+                // client-side canonical-form matcher normally intercepts these)
+                // gets the matcher's clear message — not the generic boundary
+                // block, which would echo the command the agent just ran
+                // (bugs/16). A canonical catenary command is allowed during
+                // editing; a foreign command hits the boundary as before.
+                use crate::cli::command_filter::CatenaryAction;
+                match command.map(crate::cli::command_filter::analyze_catenary_command) {
+                    Some(CatenaryAction::Deny(msg)) => Some(HookResult::Deny(msg)),
+                    Some(
+                        CatenaryAction::EditingStart
+                        | CatenaryAction::EditingStop
+                        | CatenaryAction::Allow { .. },
+                    ) => None,
+                    Some(CatenaryAction::NotCatenary) | None => Some(HookResult::Deny(
+                        "run `catenary editing stop` to exit editing mode".into(),
+                    )),
+                }
             } else {
                 Some(HookResult::Deny(
                     "run `catenary editing stop` to exit editing mode".into(),
@@ -749,6 +768,52 @@ mod tests {
             unreachable!("expected Deny for Bash, got {result:?}");
         };
         assert!(reason.contains("editing stop"));
+    }
+
+    #[test]
+    fn test_hook_enforce_editing_piped_catenary_bugs16() {
+        let router = test_router();
+        let _ = router.session.editing.start_editing(None, "");
+
+        // bugs/16: a piped lifecycle command during editing must get a clear
+        // pipe-deny from the canonical-form matcher, not the boundary block
+        // that echoes the command the agent just ran.
+        let result = router.handle_enforce_editing(
+            "Bash",
+            None,
+            Some("catenary editing stop | head"),
+            None,
+            "",
+        );
+        let Some(HookResult::Deny(reason)) = result else {
+            unreachable!("expected Deny, got {result:?}");
+        };
+        assert!(
+            !reason.contains("to exit editing mode"),
+            "should not be the boundary block, got: {reason}"
+        );
+        assert!(
+            reason.contains("bare") || reason.contains("owns its output"),
+            "should be the matcher pipe-deny, got: {reason}"
+        );
+
+        // A bare canonical catenary command is allowed during editing.
+        let result =
+            router.handle_enforce_editing("Bash", None, Some("catenary editing stop"), None, "");
+        assert!(
+            result.is_none(),
+            "bare editing stop allowed during editing, got {result:?}"
+        );
+
+        // A foreign non-edit command still hits the boundary block.
+        let result = router.handle_enforce_editing("Bash", None, Some("make test"), None, "");
+        let Some(HookResult::Deny(reason)) = result else {
+            unreachable!("expected Deny for make test, got {result:?}");
+        };
+        assert!(
+            reason.contains("to exit editing mode"),
+            "foreign cmd → boundary block, got: {reason}"
+        );
     }
 
     #[test]

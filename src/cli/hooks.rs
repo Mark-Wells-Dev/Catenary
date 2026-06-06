@@ -509,73 +509,57 @@ pub fn run_pre_tool(format: HostFormat) {
 
     let tool_name = extract_tool_name(&hook_json, format);
 
-    // ── Catenary CLI commands ────────────────────────────────────
-    // Recognize Catenary subcommands invoked via the host's shell
-    // tool. Agent-invocable commands bypass the allowlist. Lifecycle
-    // commands (`hook`, `stop`, `debug`) are unconditionally denied —
-    // they are for host CLI hooks and user use only.
+    // ── Catenary CLI commands (regime 1: canonical-form matcher) ──
+    // Recognize and classify Catenary's own subcommands in any position
+    // (ADR 013). `grep`/`glob`/`sed`/`diagnostics`/`roots`/`primer` are
+    // allowed only in canonical form (no pipe/redirect/substitution/
+    // background; `diagnostics`/`sed` and the editing lifecycle must be
+    // bare); non-agent commands and unrecognized subcommands are denied
+    // with a pedagogical message.
     if let Some(ref shell_cmd) = extract_shell_command(&hook_json, tool_name, format) {
-        // Unconditional deny: `catenary hook` is for host CLI hook
-        // invocation only, `catenary stop` and `catenary debug` are
-        // user-facing commands. None should be invoked by an agent.
-        if is_catenary_command(shell_cmd, &["hook", "stop", "debug"]) {
-            print!(
-                "{}",
-                format_deny(
-                    "catenary hook, stop, and debug commands are not agent-invocable",
-                    format,
-                )
-            );
-            return;
-        }
-        // editing start: send IPC to daemon to enter editing mode,
-        // then allow the command to execute (it prints confirmation).
-        if is_catenary_command(shell_cmd, &["editing start"]) {
-            handle_start_editing_hook(&hook_json, format);
-            return;
-        }
-        // editing stop: send IPC to daemon to prepare the handoff
-        // (drain files, release guardrail, deposit in handoff slot),
-        // then allow the command to execute (it retrieves diagnostics).
-        if is_catenary_command(shell_cmd, &["editing stop"]) {
-            handle_done_editing_hook(&hook_json, format);
-            return;
-        }
-        // Search commands: always allowed, including during editing.
-        // The CLI commands handle IPC to the daemon directly.
-        if is_catenary_command(shell_cmd, &["grep", "glob"]) {
-            return;
-        }
-        // Root management: allow through without IPC — the CLI
-        // command handles root management via daemon IPC directly.
-        if is_root_command(shell_cmd) {
-            return;
+        use crate::cli::command_filter::CatenaryAction;
+        match crate::cli::command_filter::analyze_catenary_command(shell_cmd) {
+            CatenaryAction::Deny(reason) => {
+                print!("{}", format_deny(&reason, format));
+                return;
+            }
+            // editing start/stop send IPC to the daemon, then allow the
+            // command to execute (it prints confirmation / diagnostics).
+            CatenaryAction::EditingStart => {
+                handle_start_editing_hook(&hook_json, format);
+                return;
+            }
+            CatenaryAction::EditingStop => {
+                handle_done_editing_hook(&hook_json, format);
+                return;
+            }
+            // Canonical search/tool command. A `cd`/foreign-chained search
+            // (or an arg-substitution carrying a foreign command) still has
+            // its foreign segments allowlist-checked (regime 2); `catenary`
+            // segments are skipped by `check_command`. Always allowed,
+            // including during editing, so we never fall through to
+            // editing-state enforcement.
+            CatenaryAction::Allow { has_foreign } => {
+                if has_foreign
+                    && let Some(reason) = foreign_command_denial(&hook_json, shell_cmd, format)
+                {
+                    print!("{}", format_deny(&reason, format));
+                }
+                return;
+            }
+            CatenaryAction::NotCatenary => {}
         }
     }
 
-    // ── Command filter ──────────────────────────────────────────
+    // ── Command filter (regime 2: foreign allowlist) ─────────────
     // Try session-side check first (full multi-root merged config).
     // Fall back to client-side check (user config + cwd's project
     // config) when the session is unreachable.
-    if let Some(shell_cmd) = extract_shell_command(&hook_json, tool_name, format) {
-        if let Some(reason) = ipc_check_command(&hook_json, &shell_cmd, format) {
-            print!("{}", format_deny(&reason, format));
-            return;
-        }
-        // IPC failed or session unreachable — try client-side.
-        if let Some((denial, resolved)) = check_shell_command(&hook_json, &shell_cmd, format) {
-            let build_hint =
-                resolve_client_build_hint(&hook_json, &denial.command, &resolved, format);
-            let reason = crate::cli::command_filter::format_denial_full(
-                &denial.command,
-                &resolved,
-                &denial,
-                Some(format),
-                build_hint.as_deref(),
-            );
-            print!("{}", format_deny(&reason, format));
-            return;
-        }
+    if let Some(shell_cmd) = extract_shell_command(&hook_json, tool_name, format)
+        && let Some(reason) = foreign_command_denial(&hook_json, &shell_cmd, format)
+    {
+        print!("{}", format_deny(&reason, format));
+        return;
     }
 
     // ── Editing state enforcement (IPC to daemon / session) ──────
@@ -613,6 +597,33 @@ pub fn run_pre_tool(format: HostFormat) {
     {
         print!("{}", format_deny(reason, format));
     }
+}
+
+/// Run the foreign-command allowlist filter (regime 2) and return the formatted
+/// denial reason, or `None` when the command is allowed.
+///
+/// Tries the session-side check (full merged config) first, then the
+/// client-side fallback (user config + cwd project config). Catenary's own
+/// commands are skipped by [`check_command`](crate::cli::command_filter::check_command)
+/// — they run under the canonical-form matcher (regime 1), not the allowlist.
+fn foreign_command_denial(
+    hook_json: &serde_json::Value,
+    shell_cmd: &str,
+    format: HostFormat,
+) -> Option<String> {
+    if let Some(reason) = ipc_check_command(hook_json, shell_cmd, format) {
+        return Some(reason);
+    }
+    // IPC failed or session unreachable — try client-side.
+    let (denial, resolved) = check_shell_command(hook_json, shell_cmd, format)?;
+    let build_hint = resolve_client_build_hint(hook_json, &denial.command, &resolved, format);
+    Some(crate::cli::command_filter::format_denial_full(
+        &denial.command,
+        &resolved,
+        &denial,
+        Some(format),
+        build_hint.as_deref(),
+    ))
 }
 
 /// Check a shell command against the configured allowlist.
@@ -796,56 +807,6 @@ fn extract_shell_command(
         .and_then(|ti| ti.get("command").or_else(|| ti.get("CommandLine")))
         .and_then(|c| c.as_str())
         .map(String::from)
-}
-
-/// Returns `true` if the shell command is a standalone `catenary`
-/// invocation with one of the given subcommands.
-///
-/// Matches the command after trimming, with or without a path prefix
-/// (e.g., `/usr/local/bin/catenary`). Does **not** match compound
-/// commands (`foo && catenary editing start`) — the command must be
-/// a single invocation.
-///
-/// The subcommand match is prefix-based: `catenary roots add /tmp/foo`
-/// matches subcommand `"roots add"`. Multi-word subcommands like
-/// `"editing start"` are supported.
-fn is_catenary_command(shell_cmd: &str, subcommands: &[&str]) -> bool {
-    let trimmed = shell_cmd.trim();
-
-    // Reject compound commands: any shell operator means the catenary
-    // invocation is embedded in a larger command. Use the command
-    // filter's tokenizer to check — it handles quoting correctly.
-    let names = crate::cli::command_filter::extract_command_names(trimmed);
-    if names.len() != 1 {
-        return false;
-    }
-
-    // The single command name must be "catenary".
-    if names[0] != "catenary" {
-        return false;
-    }
-
-    // Read the subcommand from the tokens *after* the command token.
-    // Locating it positionally (not via `rfind("catenary")`) avoids
-    // matching the literal word "catenary" inside an argument — e.g.
-    // `catenary grep '("catenary")'` must still resolve to `grep`.
-    let Some(after_catenary) = crate::cli::command_filter::args_after_command(trimmed) else {
-        return false;
-    };
-
-    subcommands
-        .iter()
-        .any(|sub| after_catenary == *sub || after_catenary.starts_with(&format!("{sub} ")))
-}
-
-/// Returns `true` if the shell command is a `catenary roots add` or
-/// `catenary roots rm` invocation.
-///
-/// These are Catenary's own management commands — they bypass the
-/// command filter allowlist. The CLI command handles root management
-/// directly via daemon IPC.
-fn is_root_command(shell_cmd: &str) -> bool {
-    is_catenary_command(shell_cmd, &["roots add", "roots rm"])
 }
 
 // ── Catenary CLI command hooks ──────────────────────────────────────────
@@ -1372,235 +1333,6 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let sock_path = dir.path().join("nonexistent.sock");
         assert!(notify_connect(&sock_path).is_none());
-    }
-
-    // ── is_catenary_command tests ───────────────────────────────────
-
-    #[test]
-    fn catenary_command_editing_start() {
-        assert!(is_catenary_command(
-            "catenary editing start",
-            &["editing start"]
-        ));
-    }
-
-    #[test]
-    fn catenary_command_with_path_prefix() {
-        assert!(is_catenary_command(
-            "/usr/local/bin/catenary editing start",
-            &["editing start"],
-        ));
-    }
-
-    #[test]
-    fn catenary_command_with_home_path_prefix() {
-        assert!(is_catenary_command(
-            "/home/user/.local/bin/catenary editing start",
-            &["editing start"],
-        ));
-    }
-
-    #[test]
-    fn catenary_command_relative_path_prefix() {
-        assert!(is_catenary_command(
-            "./catenary editing start",
-            &["editing start"],
-        ));
-    }
-
-    #[test]
-    fn catenary_command_with_whitespace() {
-        assert!(is_catenary_command(
-            "  catenary editing start  ",
-            &["editing start"],
-        ));
-    }
-
-    #[test]
-    fn catenary_command_compound_not_matched() {
-        assert!(!is_catenary_command(
-            "echo hello && catenary editing start",
-            &["editing start"],
-        ));
-    }
-
-    #[test]
-    fn catenary_command_pipe_not_matched() {
-        assert!(!is_catenary_command(
-            "echo foo | catenary editing start",
-            &["editing start"],
-        ));
-    }
-
-    #[test]
-    fn catenary_command_semicolon_not_matched() {
-        assert!(!is_catenary_command(
-            "echo foo; catenary editing start",
-            &["editing start"],
-        ));
-    }
-
-    #[test]
-    fn catenary_command_wrong_subcommand() {
-        assert!(!is_catenary_command("catenary doctor", &["editing start"]));
-    }
-
-    #[test]
-    fn catenary_command_not_catenary() {
-        assert!(!is_catenary_command("ls -la", &["editing start"]));
-    }
-
-    #[test]
-    fn catenary_command_multiple_subcommands() {
-        assert!(is_catenary_command(
-            "catenary roots add /tmp/project",
-            &["roots add", "roots rm"],
-        ));
-        assert!(is_catenary_command(
-            "catenary roots rm /tmp/project",
-            &["roots add", "roots rm"],
-        ));
-        assert!(!is_catenary_command(
-            "catenary doctor",
-            &["roots add", "roots rm"],
-        ));
-    }
-
-    #[test]
-    fn catenary_grep_arg_contains_literal_catenary() {
-        // Regression: the subcommand was located with `rfind("catenary")`,
-        // which matched the literal word inside the search pattern (or any
-        // argument), so `catenary grep` was not recognized and fell through
-        // to editing enforcement — denying a read-only search mid-edit.
-        assert!(is_catenary_command(
-            r#"catenary grep 'let config_dir = tmp.path\(\).join\("catenary"\);' tests/cli_integration.rs"#,
-            &["grep", "glob"],
-        ));
-        assert!(is_catenary_command(
-            "catenary grep catenary src",
-            &["grep", "glob"],
-        ));
-    }
-
-    #[test]
-    fn catenary_grep_path_prefix_with_literal_catenary_arg() {
-        // Path prefix containing "catenary" *and* an argument containing
-        // "catenary": neither `find` nor `rfind` would land on the command
-        // token, but positional tokenization does.
-        assert!(is_catenary_command(
-            r#"/opt/catenary/bin/catenary grep "catenary" src"#,
-            &["grep", "glob"],
-        ));
-    }
-
-    // ── is_root_command tests ─────────────────────────────────────
-
-    #[test]
-    fn is_root_command_add() {
-        assert!(is_root_command("catenary roots add /tmp/project"));
-    }
-
-    #[test]
-    fn is_root_command_rm() {
-        assert!(is_root_command("catenary roots rm /tmp/project"));
-    }
-
-    #[test]
-    fn is_root_command_with_whitespace() {
-        assert!(is_root_command("  catenary roots add /tmp/root  "));
-    }
-
-    #[test]
-    fn is_root_command_with_path_prefix() {
-        assert!(is_root_command(
-            "/usr/local/bin/catenary roots add /tmp/root"
-        ));
-    }
-
-    #[test]
-    fn is_root_command_non_matching() {
-        assert!(!is_root_command("catenary doctor"));
-        assert!(!is_root_command("ls -la"));
-        assert!(!is_root_command("catenary stop"));
-        assert!(!is_root_command("catenary editing start"));
-    }
-
-    #[test]
-    fn is_root_command_compound_not_matched() {
-        assert!(!is_root_command("echo hello && catenary roots add /tmp"));
-    }
-
-    // ── editing stop command recognition tests ──────────────────────
-
-    #[test]
-    fn catenary_command_editing_stop() {
-        assert!(is_catenary_command(
-            "catenary editing stop",
-            &["editing stop"],
-        ));
-    }
-
-    #[test]
-    fn catenary_command_editing_stop_with_path_prefix() {
-        assert!(is_catenary_command(
-            "/usr/local/bin/catenary editing stop",
-            &["editing stop"],
-        ));
-    }
-
-    #[test]
-    fn catenary_command_editing_stop_with_home_prefix() {
-        assert!(is_catenary_command(
-            "~/.local/bin/catenary editing stop",
-            &["editing stop"],
-        ));
-    }
-
-    #[test]
-    fn catenary_command_editing_stop_compound_not_matched() {
-        assert!(!is_catenary_command(
-            "echo hello && catenary editing stop",
-            &["editing stop"],
-        ));
-    }
-
-    // ── unconditional deny tests ────────────────────────────────────
-
-    #[test]
-    fn catenary_hook_subcommand_detected() {
-        assert!(is_catenary_command(
-            "catenary hook pre-tool --format=claude",
-            &["hook", "stop", "debug"],
-        ));
-    }
-
-    #[test]
-    fn catenary_stop_subcommand_detected() {
-        assert!(is_catenary_command(
-            "catenary stop",
-            &["hook", "stop", "debug"],
-        ));
-    }
-
-    #[test]
-    fn catenary_debug_subcommand_detected() {
-        assert!(is_catenary_command(
-            "catenary debug list",
-            &["hook", "stop", "debug"],
-        ));
-    }
-
-    #[test]
-    fn catenary_hook_with_path_prefix_detected() {
-        assert!(is_catenary_command(
-            "/usr/local/bin/catenary hook post-tool --format=gemini",
-            &["hook", "stop", "debug"],
-        ));
-    }
-
-    #[test]
-    fn catenary_stop_not_matched_as_editing_start() {
-        assert!(!is_catenary_command("catenary stop", &["editing start"]));
     }
 
     // ── Antigravity extraction tests ──────────────────────────────────

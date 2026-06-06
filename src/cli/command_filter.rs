@@ -474,6 +474,15 @@ pub fn check_command(
                 .and_then(|n| n.to_str())
                 .unwrap_or(token_refs[cmd_idx]);
 
+            // Catenary's own commands run under the canonical-form matcher
+            // (regime 1, `analyze_catenary_command`), not the foreign
+            // allowlist. Skip them here so a search chain's foreign segments
+            // (e.g. `cd src && catenary grep p`) are still validated without
+            // `catenary` itself tripping the denylist.
+            if name == "catenary" {
+                continue;
+            }
+
             // Output redirection to a file bypasses the tracked Edit/Write
             // path, making the diagnostics batch incomplete. Deny it before
             // the allow/deny decision (and before the heredoc exception) so
@@ -608,29 +617,6 @@ pub fn extract_command_names(cmd: &str) -> Vec<String> {
     names
 }
 
-/// Return the argument tokens following the command token in a single
-/// shell command, joined by single spaces.
-///
-/// Tokenizes `cmd` with the same quote-aware splitter as
-/// [`extract_command_names`] and skips leading `VAR=value` env
-/// assignments, so the command token is located positionally rather than
-/// by substring search. Returns `None` if there is no command token
-/// (e.g. an all-assignments line).
-///
-/// Hook command recognition uses this to read a Catenary subcommand
-/// without being fooled by the command name appearing literally inside a
-/// quoted argument — `catenary grep '("catenary")'` must still resolve
-/// its subcommand to `grep`, which `str::rfind("catenary")` would not.
-/// Quoted arguments are dropped by the tokenizer, so this is only
-/// suitable for reading leading subcommand words, not full arguments.
-#[must_use]
-pub fn args_after_command(cmd: &str) -> Option<String> {
-    let tokens = shell_split(cmd);
-    let token_refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
-    let cmd_idx = find_command(&token_refs)?;
-    Some(token_refs[cmd_idx + 1..].join(" "))
-}
-
 /// Recursive helper for [`extract_command_names`].
 fn collect_command_names(cmd: &str, names: &mut Vec<String>) {
     let cmd_string = strip_heredoc_bodies(cmd);
@@ -673,6 +659,513 @@ fn collect_command_names(cmd: &str, names: &mut Vec<String>) {
             names.push(name.to_string());
         }
     }
+}
+
+// ── Catenary command canonical-form matcher (ADR 013/014) ───────────────
+//
+// Catenary's own commands run under a *fail-closed canonical-form* regime
+// (ADR 013), separate from the foreign allowlist: only recognized subcommands,
+// in a bare canonical shape, split by correlation class.
+//
+// - `diagnostics`/`sed` (load-bearing, correlated) must be **bare** — the sole
+//   command in the call — so their hook→CLI handoff (ticket 17) consumes fast.
+// - `grep`/`glob` (stateless, self-scoping) may `cd`-prefix and `&&`/`;`/`||`
+//   chain with allowlisted foreign commands, any count.
+//
+// Both classes reject output-ownership violations (pipe, redirect,
+// command/process-substitution *wrapping*, backgrounding `&`) and deny with a
+// pedagogical message naming the right tool/flag. The matcher only recognizes
+// and classifies; it performs no IO. Foreign commands keep the allowlist regime
+// ([`check_command`]).
+
+/// Correlation class of a recognized catenary subcommand (ADR 013/014).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CatenaryClass {
+    /// `grep`/`glob` — stateless, self-scoping; may chain/`cd`, any count.
+    Search,
+    /// `diagnostics`/`sed` (and `editing stop`, today's diagnostics) —
+    /// load-bearing, correlated; bare only.
+    Correlated,
+    /// `editing start`/`roots`/`primer` — bare lifecycle/management.
+    Lifecycle,
+}
+
+/// A recognized agent-facing catenary subcommand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sub {
+    Grep,
+    Glob,
+    /// Forward-registered (CLI command lands in ticket 08).
+    Sed,
+    /// Forward-registered (CLI command lands in ticket 05; today's command is
+    /// `editing stop`).
+    Diagnostics,
+    EditingStart,
+    EditingStop,
+    Roots,
+    Primer,
+}
+
+impl Sub {
+    /// Correlation class governing the canonical-form rules.
+    const fn class(self) -> CatenaryClass {
+        match self {
+            Self::Grep | Self::Glob => CatenaryClass::Search,
+            Self::Sed | Self::Diagnostics | Self::EditingStop => CatenaryClass::Correlated,
+            Self::EditingStart | Self::Roots | Self::Primer => CatenaryClass::Lifecycle,
+        }
+    }
+
+    /// Display form for deny messages (the canonical subcommand words).
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Grep => "grep",
+            Self::Glob => "glob",
+            Self::Sed => "sed",
+            Self::Diagnostics => "diagnostics",
+            Self::EditingStart => "editing start",
+            Self::EditingStop => "editing stop",
+            Self::Roots => "roots",
+            Self::Primer => "primer",
+        }
+    }
+}
+
+/// Recognition outcome for the words following `catenary`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Recog {
+    /// An agent-facing subcommand.
+    Agent(Sub),
+    /// A real catenary subcommand reserved for host hooks / interactive use.
+    NotAgent,
+    /// Not a recognized subcommand (typo, bare `catenary`, `$VAR`, …).
+    Unknown,
+}
+
+/// Classify the tokens following the `catenary` command word.
+///
+/// Multi-word subcommands (`editing start`, `roots add`) are matched before bare
+/// words. Quotes were masked away by the tokenizer, so a literal `catenary`
+/// inside an argument cannot be read as the subcommand.
+fn recognize_catenary_sub(rest: &[&str]) -> Recog {
+    match (rest.first().copied(), rest.get(1).copied()) {
+        (Some("editing"), Some("start")) => Recog::Agent(Sub::EditingStart),
+        (Some("editing"), Some("stop")) => Recog::Agent(Sub::EditingStop),
+        (Some("roots"), Some("add" | "rm" | "ls")) => Recog::Agent(Sub::Roots),
+        (Some("grep"), _) => Recog::Agent(Sub::Grep),
+        (Some("glob"), _) => Recog::Agent(Sub::Glob),
+        (Some("sed"), _) => Recog::Agent(Sub::Sed),
+        (Some("diagnostics"), _) => Recog::Agent(Sub::Diagnostics),
+        (Some("primer"), _) => Recog::Agent(Sub::Primer),
+        (
+            Some("hook" | "stop" | "debug" | "config" | "doctor" | "install" | "update" | "daemon"),
+            _,
+        ) => Recog::NotAgent,
+        _ => Recog::Unknown,
+    }
+}
+
+/// The basename of a segment's command word (env prefix + path stripped), or
+/// `None` if the segment has no command word.
+fn segment_command_name(seg: &str) -> Option<String> {
+    let tokens = shell_split(seg);
+    let token_refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
+    let idx = find_command(&token_refs)?;
+    Some(
+        std::path::Path::new(token_refs[idx])
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(token_refs[idx])
+            .to_string(),
+    )
+}
+
+/// If `seg`'s command word is `catenary`, classify its subcommand; else `None`.
+fn recognize_segment_catenary(seg: &str) -> Option<Recog> {
+    let tokens = shell_split(seg);
+    let token_refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
+    let idx = find_command(&token_refs)?;
+    let name = std::path::Path::new(token_refs[idx])
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(token_refs[idx]);
+    if name != "catenary" {
+        return None;
+    }
+    Some(recognize_catenary_sub(&token_refs[idx + 1..]))
+}
+
+/// Whether a segment carries a bare backgrounding `&` (not `&&`, `&>`, `>&`,
+/// or `N>&`). Scans the quote-masked segment so a `&` inside quotes is ignored.
+fn has_background_operator(segment: &str) -> bool {
+    let masked = mask_quotes(segment);
+    let b = masked.as_bytes();
+    let n = b.len();
+    let mut i = 0;
+    while i < n {
+        if b[i] != b'&' {
+            i += 1;
+            continue;
+        }
+        // `&&` — sequential operator.
+        if i + 1 < n && b[i + 1] == b'&' {
+            i += 2;
+            continue;
+        }
+        if i > 0 && b[i - 1] == b'&' {
+            i += 1;
+            continue;
+        }
+        // `&>` redirect.
+        if i + 1 < n && b[i + 1] == b'>' {
+            i += 2;
+            continue;
+        }
+        // `>&` / `N>&` fd duplication.
+        if i > 0 && b[i - 1] == b'>' {
+            i += 1;
+            continue;
+        }
+        return true;
+    }
+    false
+}
+
+/// One recognized occurrence of a `catenary` command within a bash call, with
+/// the output-ownership context of its segment.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "orthogonal per-occurrence output-ownership flags; a state machine \
+              would obscure the independent checks"
+)]
+struct CatenaryOcc {
+    recog: Recog,
+    /// Catenary is downstream of a pipe (`… | catenary X`).
+    piped_in: bool,
+    /// Catenary pipes into a downstream command — its basename, if any.
+    piped_out: Option<String>,
+    /// The segment redirects output to a file (non-device-sink).
+    redirected: bool,
+    /// The segment is backgrounded with `&`.
+    backgrounded: bool,
+    /// Catenary is *wrapped* in a `$()`/`<()`/backtick substitution.
+    wrapped: bool,
+}
+
+/// What the `PreToolUse` hook should do with a shell command, after recognizing
+/// and validating any catenary command it contains.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatenaryAction {
+    /// No catenary command — hand to the foreign allowlist / editing regime.
+    NotCatenary,
+    /// A catenary command in a non-canonical form (or an unrecognized
+    /// subcommand). The string is the pedagogical deny reason.
+    Deny(String),
+    /// A bare, canonical `catenary editing start` — route to the IPC handler.
+    EditingStart,
+    /// A bare, canonical `catenary editing stop` — route to the IPC handler.
+    EditingStop,
+    /// A canonical catenary command (`grep`/`glob`/`roots`/`primer`/`sed`/
+    /// `diagnostics`). `has_foreign` is true when the call also contains foreign
+    /// segments (a search chain) whose allowlist must still be checked.
+    Allow {
+        /// Whether foreign segments are present and need allowlist validation.
+        has_foreign: bool,
+    },
+}
+
+/// Recognize, classify, and validate any `catenary` command in a shell call
+/// (regime 1 of ADR 013). Pure — no IO. See [`CatenaryAction`].
+///
+/// The two regimes are split by correlation class: `grep`/`glob` may be `cd`-
+/// prefixed and `&&`/`;`/`||`-chained with allowlisted foreign commands;
+/// `diagnostics`/`sed`/`editing`/`roots`/`primer` must be the sole command in
+/// the call. Both classes reject pipes, file redirects, substitution-wrapping,
+/// and backgrounding. Unrecognized or non-agent subcommands are denied.
+#[must_use]
+pub fn analyze_catenary_command(cmd: &str) -> CatenaryAction {
+    let stripped = strip_heredoc_bodies(cmd);
+    let stripped = strip_echo_separators(&stripped);
+
+    let mut occs: Vec<CatenaryOcc> = Vec::new();
+    let mut foreign_segments = 0usize;
+    let mut total_segments = 0usize;
+    // A foreign command inside an arg-substitution (`catenary grep "$(foo)"`)
+    // is permitted by hygiene but still allowlist-checked (regime 2, via the
+    // subshell recursion in `check_command`). Flag it so the caller runs that
+    // check even when there is no top-level foreign segment.
+    let mut inner_foreign_substitution = false;
+
+    for seq in quote_aware_split(&stripped, &SEQ_SPLIT_RE) {
+        let stages = pipe_split(seq);
+        let stage_count = stages.len();
+        for (pipe_pos, stage_raw) in stages.iter().enumerate() {
+            let stage = stage_raw.trim();
+            if stage.is_empty() {
+                continue;
+            }
+
+            // Catenary *wrapped* in a substitution inside this stage.
+            for m in SUBSHELL_RE.captures_iter(stage) {
+                let inner = m
+                    .get(1)
+                    .or_else(|| m.get(2))
+                    .or_else(|| m.get(3))
+                    .map_or("", |g| g.as_str().trim());
+                if let Some(recog) = recognize_segment_catenary(inner) {
+                    occs.push(CatenaryOcc {
+                        recog,
+                        piped_in: false,
+                        piped_out: None,
+                        redirected: false,
+                        backgrounded: false,
+                        wrapped: true,
+                    });
+                } else if segment_command_name(inner).is_some() {
+                    inner_foreign_substitution = true;
+                }
+            }
+
+            // The stage's own command word.
+            let Some(name) = segment_command_name(stage) else {
+                continue;
+            };
+            if name == "catenary" {
+                total_segments += 1;
+                let recog = recognize_segment_catenary(stage).unwrap_or(Recog::Unknown);
+                let piped_out = if pipe_pos + 1 < stage_count {
+                    segment_command_name(stages[pipe_pos + 1])
+                } else {
+                    None
+                };
+                occs.push(CatenaryOcc {
+                    recog,
+                    piped_in: pipe_pos > 0,
+                    piped_out,
+                    redirected: redirects_to_file(stage),
+                    backgrounded: has_background_operator(stage),
+                    wrapped: false,
+                });
+            } else {
+                foreign_segments += 1;
+                total_segments += 1;
+            }
+        }
+    }
+
+    if occs.is_empty() {
+        return CatenaryAction::NotCatenary;
+    }
+
+    // First occurrence with a per-command problem wins (document order).
+    for occ in &occs {
+        if let Some(msg) = catenary_occ_denial(occ) {
+            return CatenaryAction::Deny(msg);
+        }
+    }
+
+    // Every occurrence is a clean, agent-invocable command.
+    let subs: Vec<Sub> = occs
+        .iter()
+        .filter_map(|o| match o.recog {
+            Recog::Agent(s) => Some(s),
+            Recog::NotAgent | Recog::Unknown => None,
+        })
+        .collect();
+
+    let has_foreign = foreign_segments > 0 || inner_foreign_substitution;
+
+    if subs.iter().any(|s| s.class() != CatenaryClass::Search) {
+        // A correlated/lifecycle command must be bare: the only command anywhere
+        // (an arg-substitution is not a separate segment, so it stays bare).
+        if total_segments != 1 || occs.len() != 1 {
+            return CatenaryAction::Deny(bare_only_denial(&subs));
+        }
+        return match subs.first() {
+            Some(Sub::EditingStart) => CatenaryAction::EditingStart,
+            Some(Sub::EditingStop) => CatenaryAction::EditingStop,
+            _ => CatenaryAction::Allow { has_foreign },
+        };
+    }
+
+    // All occurrences are search commands — chaining/`cd`/count all allowed.
+    CatenaryAction::Allow { has_foreign }
+}
+
+/// Convenience for the editing-boundary defense (`hook_router`): the deny reason
+/// when `cmd` is a non-canonical catenary command, else `None`.
+#[must_use]
+pub fn catenary_command_denial(cmd: &str) -> Option<String> {
+    match analyze_catenary_command(cmd) {
+        CatenaryAction::Deny(msg) => Some(msg),
+        CatenaryAction::NotCatenary
+        | CatenaryAction::EditingStart
+        | CatenaryAction::EditingStop
+        | CatenaryAction::Allow { .. } => None,
+    }
+}
+
+/// Per-occurrence deny reason in priority order, or `None` if the occurrence is
+/// a clean, agent-invocable command.
+fn catenary_occ_denial(occ: &CatenaryOcc) -> Option<String> {
+    let sub = match occ.recog {
+        Recog::Unknown => return Some(unknown_subcommand_denial()),
+        Recog::NotAgent => return Some(not_agent_invocable_denial()),
+        Recog::Agent(s) => s,
+    };
+    if occ.wrapped {
+        return Some(substitution_denial(sub));
+    }
+    if occ.piped_in {
+        return Some(stdin_denial(sub));
+    }
+    if let Some(down) = &occ.piped_out {
+        return Some(out_pipe_denial(sub, down));
+    }
+    if occ.redirected {
+        return Some(redirect_denial(sub));
+    }
+    if occ.backgrounded {
+        return Some(background_denial(sub));
+    }
+    None
+}
+
+/// The recognized agent-facing command surface, for "unknown subcommand" denials.
+const CATENARY_SURFACE: &str = "Available: `grep`, `glob`, `sed`, `diagnostics`, \
+     `editing start`, `editing stop`, `roots add/rm/ls`, `primer`. Run `catenary \
+     primer` for the workflow.";
+
+fn unknown_subcommand_denial() -> String {
+    format!("That isn't a recognized `catenary` command. {CATENARY_SURFACE}")
+}
+
+fn not_agent_invocable_denial() -> String {
+    format!(
+        "That `catenary` command is for host CLI hooks and interactive use, not \
+         agents. {CATENARY_SURFACE}"
+    )
+}
+
+fn substitution_denial(sub: Sub) -> String {
+    format!(
+        "Don't capture `catenary {}` output with `$(…)` or backticks — run it bare \
+         and read the result directly.",
+        sub.label()
+    )
+}
+
+/// `… | catenary X` — catenary does not read stdin.
+fn stdin_denial(sub: Sub) -> String {
+    match sub {
+        Sub::Grep => "`catenary grep` doesn't read stdin — it searches the filesystem. \
+             Give it a glob pattern path and narrow with `--exclude-pattern`, e.g. \
+             `catenary grep \"p\" 'src/**/*.rs' --exclude-pattern 'tests/**'`."
+            .to_string(),
+        Sub::Glob => "`catenary glob` doesn't read stdin — it browses the filesystem. \
+             Give it a path or glob pattern, e.g. `catenary glob 'src/**/*.rs'`."
+            .to_string(),
+        Sub::Sed => "`catenary sed` takes `<pattern> <replacement> [paths]`, not stdin. \
+             Pass a glob pattern path."
+            .to_string(),
+        Sub::Diagnostics => "`catenary diagnostics` takes no input — run it bare.".to_string(),
+        Sub::EditingStart | Sub::EditingStop | Sub::Roots | Sub::Primer => {
+            format!("`catenary {}` takes no stdin — run it bare.", sub.label())
+        }
+    }
+}
+
+/// `catenary X | downstream` — catenary owns its (structured, budgeted) output.
+fn out_pipe_denial(sub: Sub, downstream: &str) -> String {
+    let tool = sub.label();
+    match sub {
+        Sub::Grep | Sub::Glob => match downstream {
+            "head" | "tail" => format!(
+                "`catenary {tool}` output is paged — use `--page N` (default 1), not \
+                 `{downstream}`."
+            ),
+            "wc" => format!(
+                "Use `--count` for totals — piping `catenary {tool}` into `wc` also \
+                 counts headers and context lines."
+            ),
+            "grep" | "egrep" | "fgrep" | "rg" | "ag" | "sort" | "uniq" | "cut" | "awk" | "sed" => {
+                format!(
+                    "`catenary {tool}` returns structured, enriched results — don't \
+                 post-filter with `{downstream}`. Narrow the query: tighten the \
+                 pattern or add `--exclude-pattern`."
+                )
+            }
+            _ => format!(
+                "`catenary {tool}` owns its output — don't pipe it into `{downstream}`. \
+                 Size output with `--page`, narrow with `--exclude-pattern`, and read \
+                 the result directly."
+            ),
+        },
+        Sub::Sed => format!(
+            "`catenary sed` output is structured (file list + match counts) — don't \
+             pipe it into `{downstream}`. Use `--page N`; narrow with \
+             `--exclude-pattern`. `--in-place` writes the files directly."
+        ),
+        Sub::Diagnostics => format!(
+            "`catenary diagnostics` clears on run and writes the full report to a \
+             runtime-dir file (path printed); the preview is already budgeted, errors \
+             first. Don't pipe it into `{downstream}` — read the preview, or `catenary \
+             grep \"pattern\" <report-file>` to filter the full set."
+        ),
+        Sub::EditingStart | Sub::EditingStop | Sub::Roots | Sub::Primer => format!(
+            "`catenary {tool}` owns its output — run it bare, don't pipe it into \
+             `{downstream}`."
+        ),
+    }
+}
+
+fn redirect_denial(sub: Sub) -> String {
+    match sub {
+        Sub::Grep | Sub::Glob => format!(
+            "`catenary {}` results are printed for you to read — don't redirect them to \
+             a file. Page large output with `--page N`.",
+            sub.label()
+        ),
+        Sub::Sed => "`catenary sed` edits files directly with `--in-place` (or previews \
+             to you) — there's nothing to redirect."
+            .to_string(),
+        Sub::Diagnostics => "`catenary diagnostics` already writes its full report to a \
+             runtime-dir file (path printed) — run it bare and read the printed path."
+            .to_string(),
+        Sub::EditingStart | Sub::EditingStop | Sub::Roots | Sub::Primer => format!(
+            "`catenary {}` output is delivered to you directly — don't redirect it.",
+            sub.label()
+        ),
+    }
+}
+
+fn background_denial(sub: Sub) -> String {
+    format!(
+        "Don't background `catenary {}` with `&` — its output is delivered to you \
+         directly and backgrounding drops it. Run it in the foreground.",
+        sub.label()
+    )
+}
+
+/// Bare-only violation for a correlated/lifecycle command sharing the call.
+fn bare_only_denial(subs: &[Sub]) -> String {
+    let correlated = subs
+        .iter()
+        .filter(|s| s.class() == CatenaryClass::Correlated)
+        .count();
+    if correlated >= 2 || subs.len() >= 2 {
+        return "Run each catenary command on its own line — `diagnostics`/`sed` (and \
+             the editing lifecycle) can't share a command with anything else; they must \
+             reach the daemon immediately to attribute correctly."
+            .to_string();
+    }
+    let label = subs.first().map_or("diagnostics", |s| s.label());
+    format!(
+        "Run `catenary {label}` as its own command — it can't be combined with other \
+         commands (no `cd` prefix, no `&&`/`;`/`||` chain). It must reach the daemon \
+         promptly to attribute correctly; it takes no paths, so the working directory \
+         doesn't matter."
+    )
 }
 
 /// Top-level CLI command, set once at binary startup by [`set_cli_command`].
@@ -1771,40 +2264,6 @@ mod tests {
         assert_eq!(find_command(&["A=1", "B=2"]), None);
     }
 
-    // ── args_after_command tests ─────────────────────────────────────
-
-    #[test]
-    fn args_after_command_simple() {
-        assert_eq!(
-            args_after_command("catenary grep foo src"),
-            Some("grep foo src".to_string())
-        );
-    }
-
-    #[test]
-    fn args_after_command_skips_env_and_path_prefix() {
-        assert_eq!(
-            args_after_command("DEBUG=1 /usr/local/bin/catenary editing start"),
-            Some("editing start".to_string())
-        );
-    }
-
-    #[test]
-    fn args_after_command_ignores_quoted_command_name() {
-        // The quoted argument is dropped by the tokenizer, but the
-        // subcommand token is still read positionally — not by matching
-        // the literal "catenary" inside the quotes.
-        assert_eq!(
-            args_after_command(r#"catenary grep "catenary" src"#),
-            Some("grep src".to_string())
-        );
-    }
-
-    #[test]
-    fn args_after_command_all_env_vars() {
-        assert_eq!(args_after_command("A=1 B=2"), None);
-    }
-
     // ── pipe_split tests ─────────────────────────────────────────────
 
     #[test]
@@ -2804,5 +3263,240 @@ mod tests {
             resolve_cd_target("src", Some(std::path::Path::new("/project"))),
             Some(std::path::PathBuf::from("/project/src")),
         );
+    }
+
+    // ── Catenary canonical-form matcher (ADR 013 / ticket 16) ────────
+
+    /// The deny reason for `cmd`, or empty string when it was not denied (so the
+    /// substring assertions below fail with a readable message instead of
+    /// panicking).
+    fn deny_text(cmd: &str) -> String {
+        match analyze_catenary_command(cmd) {
+            CatenaryAction::Deny(m) => m,
+            _ => String::new(),
+        }
+    }
+
+    // ---- Accept table ----
+
+    #[test]
+    fn matcher_accepts_bare_search() {
+        assert_eq!(
+            analyze_catenary_command("catenary grep \"p\" src"),
+            CatenaryAction::Allow { has_foreign: false },
+        );
+        assert_eq!(
+            analyze_catenary_command("catenary glob src"),
+            CatenaryAction::Allow { has_foreign: false },
+        );
+    }
+
+    #[test]
+    fn matcher_accepts_bare_correlated_and_lifecycle() {
+        for cmd in [
+            "catenary diagnostics",
+            "catenary sed --in-place a b src",
+            "catenary roots add /tmp/p",
+            "catenary roots ls",
+            "catenary primer",
+        ] {
+            assert_eq!(
+                analyze_catenary_command(cmd),
+                CatenaryAction::Allow { has_foreign: false },
+                "{cmd} should be a bare allow",
+            );
+        }
+    }
+
+    #[test]
+    fn matcher_routes_editing_lifecycle() {
+        assert_eq!(
+            analyze_catenary_command("catenary editing start"),
+            CatenaryAction::EditingStart,
+        );
+        assert_eq!(
+            analyze_catenary_command("catenary editing stop"),
+            CatenaryAction::EditingStop,
+        );
+        assert_eq!(
+            analyze_catenary_command("/usr/local/bin/catenary editing stop"),
+            CatenaryAction::EditingStop,
+        );
+        assert_eq!(
+            analyze_catenary_command("DEBUG=1 catenary editing start"),
+            CatenaryAction::EditingStart,
+        );
+    }
+
+    #[test]
+    fn matcher_accepts_search_chains() {
+        assert_eq!(
+            analyze_catenary_command("cd src && catenary grep p"),
+            CatenaryAction::Allow { has_foreign: true },
+        );
+        assert_eq!(
+            analyze_catenary_command("catenary grep a && catenary grep b"),
+            CatenaryAction::Allow { has_foreign: false },
+        );
+        assert_eq!(
+            analyze_catenary_command("catenary glob x ; catenary glob y"),
+            CatenaryAction::Allow { has_foreign: false },
+        );
+    }
+
+    #[test]
+    fn matcher_accepts_arg_substitution() {
+        // `$VAR` is not a substitution — bare allow.
+        assert_eq!(
+            analyze_catenary_command("catenary grep \"$PAT\""),
+            CatenaryAction::Allow { has_foreign: false },
+        );
+        // `$(cmd)` inside an arg is permitted; the inner command is flagged for
+        // regime-2 allowlist validation (`has_foreign: true`), not denied here.
+        assert_eq!(
+            analyze_catenary_command("catenary grep \"$(rg-config)\""),
+            CatenaryAction::Allow { has_foreign: true },
+        );
+    }
+
+    #[test]
+    fn matcher_path_prefix_and_quoted_literal() {
+        // Path prefix + a literal "catenary" inside the pattern: positional
+        // tokenization still resolves the subcommand to grep.
+        assert_eq!(
+            analyze_catenary_command(r#"/opt/catenary/bin/catenary grep "catenary" src"#),
+            CatenaryAction::Allow { has_foreign: false },
+        );
+    }
+
+    // ---- Deny table: output ownership (both classes) ----
+
+    #[test]
+    fn matcher_denies_pipe_out() {
+        assert!(deny_text("catenary grep p | head").contains("--page"));
+        assert!(deny_text("catenary grep p | wc -l").contains("--count"));
+        assert!(deny_text("catenary glob src | tail").contains("--page"));
+        // post-filtering structured output
+        assert!(deny_text("catenary grep p | grep foo").contains("post-filter"));
+    }
+
+    #[test]
+    fn matcher_denies_pipe_in() {
+        assert!(deny_text("chezmoi managed | catenary grep p").contains("stdin"));
+        assert!(deny_text("ls | catenary glob src").contains("stdin"));
+    }
+
+    #[test]
+    fn matcher_denies_redirect() {
+        assert!(deny_text("catenary grep p > out.txt").contains("redirect"));
+        assert!(deny_text("catenary diagnostics > out.txt").contains("runtime-dir"));
+    }
+
+    #[test]
+    fn matcher_denies_background() {
+        assert!(deny_text("catenary grep p &").contains("background"));
+        assert!(deny_text("catenary editing stop &").contains("background"));
+    }
+
+    #[test]
+    fn matcher_denies_substitution_wrap() {
+        assert!(deny_text("$(catenary grep p)").contains("capture"));
+        assert!(deny_text("echo `catenary glob src`").contains("capture"));
+    }
+
+    // ---- Deny table: bare-only (correlated/lifecycle) ----
+
+    #[test]
+    fn matcher_denies_correlated_prefix_and_chain() {
+        assert!(deny_text("cd src && catenary diagnostics").contains("its own"));
+        assert!(deny_text("catenary diagnostics && make test").contains("its own"));
+        assert!(deny_text("make x && catenary sed a b f").contains("its own"));
+    }
+
+    #[test]
+    fn matcher_denies_two_correlated_in_one_call() {
+        let msg = deny_text("catenary sed a b f && catenary diagnostics");
+        assert!(msg.contains("on its own line"), "got: {msg}");
+    }
+
+    #[test]
+    fn matcher_denies_search_mixed_with_correlated() {
+        // grep is unrestricted, but diagnostics is not bare → deny.
+        assert!(deny_text("catenary grep p && catenary diagnostics").contains("its own"));
+    }
+
+    // ---- Deny table: recognition ----
+
+    #[test]
+    fn matcher_denies_unknown_subcommand() {
+        assert!(deny_text("catenary frobnicate").contains("isn't a recognized"));
+        assert!(deny_text("catenary $FOO").contains("isn't a recognized"));
+        assert!(deny_text("catenary").contains("isn't a recognized"));
+        assert!(deny_text("catenary editing").contains("isn't a recognized"));
+    }
+
+    #[test]
+    fn matcher_denies_not_agent_invocable() {
+        for cmd in [
+            "catenary hook pre-tool",
+            "catenary stop",
+            "catenary debug list",
+            "catenary config",
+            "catenary daemon",
+        ] {
+            assert!(
+                deny_text(cmd).contains("host CLI hooks"),
+                "{cmd} should be not-agent-invocable",
+            );
+        }
+    }
+
+    // ---- Foreign regime unaffected ----
+
+    #[test]
+    fn matcher_passes_foreign_through() {
+        for cmd in [
+            "make test",
+            "git status",
+            "make x | tail",
+            "make test | grep error",
+            "git log | grep x",
+            "someprog > file.rs",
+        ] {
+            assert_eq!(
+                analyze_catenary_command(cmd),
+                CatenaryAction::NotCatenary,
+                "{cmd} has no catenary command",
+            );
+        }
+    }
+
+    // ---- bugs/16 regression ----
+
+    #[test]
+    fn matcher_bugs16_piped_lifecycle_is_clear_pipe_deny() {
+        // A piped lifecycle command yields a clear pipe-deny, not a routed
+        // EditingStop and not (downstream) the boundary block.
+        let msg = deny_text("catenary editing stop | head");
+        assert!(
+            msg.contains("run it bare") || msg.contains("owns its output"),
+            "got: {msg}"
+        );
+        assert!(deny_text("catenary diagnostics | head").contains("preview"));
+    }
+
+    // ---- check_command skips catenary segments ----
+
+    #[test]
+    fn check_command_skips_catenary_segment() {
+        let rules = basic_rules();
+        // `catenary` is not in any allowlist, but the foreign filter must skip
+        // it (regime 1 owns it) so a search chain's foreign part is validated
+        // without `catenary` itself being denied. `echo` is allowed in
+        // `basic_rules`; `cd` is not, so use `echo` for the allowed-foreign case.
+        assert!(check_command("echo hi && catenary grep p", &rules, None).is_none());
+        assert!(check_command("catenary grep p", &rules, None).is_none());
+        // The foreign segment is still checked: `cargo` is denied.
+        assert!(check_command("cargo build && catenary grep p", &rules, None).is_some());
     }
 }
