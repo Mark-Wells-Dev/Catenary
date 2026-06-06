@@ -23,6 +23,8 @@ mod pagination;
 pub mod path_security;
 /// Single-slot paginated result cache for grep and glob servers.
 mod result_cache;
+/// `catenary sed` — the tracked mass-edit surface.
+pub mod sed;
 /// Shared container for tool servers and cross-tool infrastructure.
 pub mod session;
 

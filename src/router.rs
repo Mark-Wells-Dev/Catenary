@@ -66,6 +66,9 @@ pub const METHOD_GREP: &str = "tool/grep";
 /// IPC method string for glob requests.
 pub const METHOD_GLOB: &str = "tool/glob";
 
+/// IPC method string for sed requests.
+pub const METHOD_SED: &str = "tool/sed";
+
 /// IPC request payload for `catenary grep`.
 ///
 /// Sent as a JSON line over the daemon IPC socket with
@@ -303,6 +306,118 @@ pub struct GlobResponse {
     pub paths: Option<usize>,
 }
 
+/// IPC request payload for `catenary sed`.
+///
+/// Sent as a JSON line over the daemon IPC socket with `"method": "tool/sed"`.
+/// [`to_input`](Self::to_input) resolves relative paths and the exclude pattern
+/// against `cwd` before dispatching to the substitute engine.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "orthogonal CLI flags, 1:1 with the clap-parsed sed surface"
+)]
+pub struct SedRequest {
+    /// Working directory from the CLI process (for resolving relative paths).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
+    /// Search pattern (`regex`-crate dialect).
+    pub pattern: String,
+    /// Replacement text (`$1` captures; C-escapes interpreted; sed escapes
+    /// rejected by the daemon-side validator).
+    pub replacement: String,
+    /// File/directory paths and glob patterns to scope the edit.
+    #[serde(default)]
+    pub paths: Vec<PathBuf>,
+    /// Apply the edit in place; otherwise preview only.
+    #[serde(default)]
+    pub in_place: bool,
+    /// Case-insensitive matching.
+    #[serde(default)]
+    pub ignore_case: bool,
+    /// Case the replacement to match each hit.
+    #[serde(default)]
+    pub preserve_case: bool,
+    /// Replace only the first match per file.
+    #[serde(default)]
+    pub first: bool,
+    /// Glob pattern to exclude from the edit set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclude: Option<String>,
+    /// Include files ignored by `.gitignore`.
+    #[serde(default)]
+    pub include_gitignored: bool,
+    /// Include hidden files and directories.
+    #[serde(default)]
+    pub include_hidden: bool,
+    /// Page number for the paged preview (1-based, default: 1).
+    #[serde(default = "ipc_default_page")]
+    pub page: usize,
+}
+
+impl SedRequest {
+    /// Resolves relative paths and the exclude pattern against `cwd`, producing
+    /// the daemon-side [`crate::bridge::sed::SedInput`] for the substitute
+    /// engine.
+    ///
+    /// Mirrors [`GlobRequest::to_params`]: paths become absolute, an explicit
+    /// hidden target auto-enables `include_hidden`, and a basename `exclude`
+    /// (no `/`) gets a `**/` prefix for depth-independent matching.
+    fn to_input(&self) -> crate::bridge::sed::SedInput {
+        let mut include_hidden = self.include_hidden;
+        let mut paths = Vec::with_capacity(self.paths.len());
+        for p in &self.paths {
+            if !p.is_absolute()
+                && crate::bridge::session::ResolvedGlob::targets_hidden(&p.to_string_lossy())
+            {
+                include_hidden = true;
+            }
+            if p.is_absolute() {
+                paths.push(p.clone());
+            } else {
+                paths.push(
+                    self.cwd
+                        .as_ref()
+                        .map_or_else(|| p.clone(), |cwd| cwd.join(p)),
+                );
+            }
+        }
+
+        let exclude = self.exclude.as_ref().map(|exclude| {
+            if exclude.contains('/') {
+                self.cwd
+                    .as_ref()
+                    .map_or_else(|| exclude.clone(), |cwd| resolve_relative(exclude, cwd))
+            } else {
+                format!("**/{exclude}")
+            }
+        });
+
+        crate::bridge::sed::SedInput {
+            pattern: self.pattern.clone(),
+            replacement: self.replacement.clone(),
+            paths,
+            in_place: self.in_place,
+            ignore_case: self.ignore_case,
+            preserve_case: self.preserve_case,
+            first: self.first,
+            exclude,
+            include_gitignored: self.include_gitignored,
+            include_hidden,
+            page: self.page,
+        }
+    }
+}
+
+/// IPC response for `catenary sed`.
+///
+/// Returned as a single JSON line over the daemon IPC socket.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct SedResponse {
+    /// Rendered preview / write summary.
+    #[serde(default)]
+    pub output: String,
+}
+
 /// Default page number for IPC tool requests (1-based).
 const fn ipc_default_page() -> usize {
     1
@@ -428,27 +543,47 @@ struct HookDispatchContext {
 /// A staged hook→CLI handoff, deposited under a [`HandoffKey`] by the
 /// `PreToolUse` hook and consumed by the matching CLI command.
 ///
-/// Today's only wired key is `diagnostics`, whose payload is *data-back*: the
-/// drained file set that `catenary diagnostics` retrieves. (Ticket 08 adds the
-/// `sed` *identity-forward* payload — see [`HandoffKey`].)
+/// The payload direction differs by key (see [`HandoffPayload`]): `diagnostics`
+/// is *data-back* (the drained file set), `sed` is *identity-forward* (the
+/// session identity the daemon keys the runtime-changed set under).
 ///
 /// Dropping this struct drops the owned semaphore permit, releasing the key's
 /// serialization lock for the next same-key stage.
 struct HandoffContext {
-    /// Accumulated files from the editing session.
-    files: Vec<PathBuf>,
-    /// Number of files skipped because they were outside tracked
-    /// workspace roots (no LSP coverage).
-    filtered: usize,
     /// Scope UUID minted at prepare time. Used as `parent_id` for the
-    /// IPC request/response events and all LSP children from
-    /// `process_files_batched`, linking them into one TUI scope.
+    /// IPC request/response events and all LSP children, linking them into
+    /// one TUI scope.
     parent_id: String,
+    /// The staged payload, keyed by direction.
+    payload: HandoffPayload,
     /// Owned semaphore permit — dropped when the `HandoffContext`
     /// is dropped (slot consumed or timeout), releasing the per-key lock.
     /// Never read directly; held purely for RAII drop semantics.
     #[allow(dead_code, reason = "RAII guard — held for drop, not read")]
     permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+/// The direction-specific payload of a staged [`HandoffContext`].
+enum HandoffPayload {
+    /// `diagnostics` — *data-back*: the hook drains the accumulated set and the
+    /// `catenary diagnostics` CLI command retrieves it.
+    Diagnostics {
+        /// Accumulated files from the editing session.
+        files: Vec<PathBuf>,
+        /// Number of files skipped because they were outside tracked workspace
+        /// roots (no LSP coverage).
+        filtered: usize,
+    },
+    /// `sed` — *identity-forward*: the hook (the only holder of identity for
+    /// this tool-use) stages it; the `catenary sed --in-place` process connects,
+    /// performs the write, and the daemon accumulates the runtime-changed set
+    /// under this identity.
+    SedIdentity {
+        /// Session ID from the host payload (`None` for hooks without one).
+        session_id: Option<String>,
+        /// Agent ID from the host payload.
+        agent_id: String,
+    },
 }
 
 /// Correlation key for the hook→CLI handoff — the catenary subcommand alone
@@ -1789,9 +1924,8 @@ async fn handle_hook_dispatch(
         ctx.handoff.stage(
             HandoffKey::Diagnostics,
             HandoffContext {
-                files,
-                filtered,
                 parent_id: handoff_parent_id,
+                payload: HandoffPayload::Diagnostics { files, filtered },
                 permit,
             },
         );
@@ -1834,10 +1968,15 @@ async fn handle_hook_dispatch(
         // releasing the permit immediately. The permit must not be held during
         // the diagnostics pipeline (which may take seconds). Consuming the
         // HandoffContext drops it, releasing the owned semaphore permit.
-        let handoff = ctx
-            .handoff
-            .consume(HandoffKey::Diagnostics)
-            .map(|h| (h.files, h.filtered, h.parent_id));
+        let handoff = ctx.handoff.consume(HandoffKey::Diagnostics).and_then(|h| {
+            match h.payload {
+                HandoffPayload::Diagnostics { files, filtered } => {
+                    Some((files, filtered, h.parent_id))
+                }
+                // The diagnostics key only ever carries a diagnostics payload.
+                HandoffPayload::SedIdentity { .. } => None,
+            }
+        });
 
         // Extract scope_id early so we can emit the incoming hook
         // event before running the diagnostics pipeline. This ensures
@@ -1887,6 +2026,176 @@ async fn handle_hook_dispatch(
 
         writer.write_all(response.as_bytes()).await?;
         writer.write_all(b"\n").await?;
+        writer.shutdown().await?;
+        return Ok(());
+    }
+
+    // ── Sed handoff: prepare (identity-forward) ──────────────────
+    //
+    // `pre-tool/sed` is sent by the PreToolUse hook when the agent runs
+    // `catenary sed --in-place`. The hook is the only holder of
+    // `(session_id, agent_id)` for this tool-use, but the changed set is a
+    // runtime result the daemon computes — so the hook stages the *identity*
+    // and the sed process reports its changed set back (the inverse of the
+    // diagnostics data-back handoff).
+    if method == "pre-tool/sed" {
+        let scope_id = uuid::Uuid::new_v4().to_string();
+
+        // Ensure the session exists for TUI discovery and host_payload cwd.
+        let _ = get_or_create_router(&ctx, &session_id, &raw);
+
+        let agent_id = raw
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        // Acquire the `sed` handoff permit. Per-key (ADR 014): blocks only behind
+        // another in-flight *sed* handoff, never daemon-wide, for milliseconds.
+        let permit = ctx.handoff.acquire(HandoffKey::Sed).await?;
+        let handoff_parent_id = uuid::Uuid::new_v4().to_string();
+
+        ctx.handoff.stage(
+            HandoffKey::Sed,
+            HandoffContext {
+                parent_id: handoff_parent_id,
+                payload: HandoffPayload::SedIdentity {
+                    session_id: Some(session_id.clone()),
+                    agent_id,
+                },
+                permit,
+            },
+        );
+
+        debug!(
+            source = Source::DaemonDispatch.as_str(),
+            session_id = %session_id,
+            "sed identity handoff staged",
+        );
+
+        emit_hook_event(
+            tracing::Level::DEBUG,
+            &session_id,
+            &method,
+            Some(&scope_id),
+            &raw.to_string(),
+            "incoming hook",
+        );
+        emit_hook_event(
+            tracing::Level::DEBUG,
+            &session_id,
+            &method,
+            Some(&scope_id),
+            "{\"status\":\"ok\"}",
+            "outgoing hook response",
+        );
+
+        writer.write_all(b"{\"status\":\"ok\"}\n").await?;
+        writer.shutdown().await?;
+        return Ok(());
+    }
+
+    // ── Sed: run ─────────────────────────────────────────────────
+    //
+    // `tool/sed` is sent by the `catenary sed` CLI command. Resolves paths
+    // against `cwd`, runs the substitute engine on a blocking thread, and (for
+    // `--in-place`) consumes the staged identity to accumulate the changed set
+    // into the editing manager through the same `has_lsp_coverage` gate the Edit
+    // hook uses.
+    if method == METHOD_SED {
+        let sed_req: SedRequest =
+            serde_json::from_value(raw.clone()).map_err(|e| anyhow!("invalid sed request: {e}"))?;
+        let in_place = sed_req.in_place;
+        let input = sed_req.to_input();
+        let parent_id = uuid::Uuid::new_v4().to_string();
+
+        emit_hook_event(
+            tracing::Level::INFO,
+            "cli",
+            &method,
+            Some(&parent_id),
+            &raw.to_string(),
+            "incoming hook",
+        );
+
+        let budget = ctx
+            .primary
+            .config
+            .tools
+            .as_ref()
+            .map_or(4000, |t| t.grep.budget as usize);
+
+        // The substitute engine does only blocking filesystem IO; run it off the
+        // async reactor so a broad sweep can't stall the daemon.
+        let outcome =
+            match tokio::task::spawn_blocking(move || crate::bridge::sed::execute(&input, budget))
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(e) => crate::bridge::sed::SedOutcome {
+                    output: format!("sed error: {e}"),
+                    changed: Vec::new(),
+                },
+            };
+
+        // Identity-forward accumulation: consume the staged identity (releasing
+        // the per-key permit) and route the LSP-covered changed files into the
+        // editing set, exactly like an Edit/Write would.
+        if in_place
+            && let Some(handoff) = ctx.handoff.consume(HandoffKey::Sed)
+            && let HandoffPayload::SedIdentity {
+                session_id: sid,
+                agent_id,
+            } = handoff.payload
+            && !outcome.changed.is_empty()
+        {
+            let route_id = sid.as_deref().unwrap_or("default");
+            let router = get_or_create_router(&ctx, route_id, &raw);
+            let mut started = false;
+            let mut accumulated = 0usize;
+            for file in &outcome.changed {
+                if router.session.has_lsp_coverage(file) {
+                    if !started {
+                        let _ = router
+                            .session
+                            .editing
+                            .start_editing(sid.as_deref(), &agent_id);
+                        started = true;
+                    }
+                    router
+                        .session
+                        .editing
+                        .add_file(sid.as_deref(), &agent_id, file.clone());
+                    accumulated += 1;
+                } else {
+                    router.session.editing.increment_filtered();
+                }
+            }
+            debug!(
+                source = Source::DaemonDispatch.as_str(),
+                session_id = %route_id,
+                changed = outcome.changed.len(),
+                accumulated,
+                "sed: accumulated changed files for diagnostics",
+            );
+        }
+
+        let response = SedResponse {
+            output: outcome.output,
+        };
+        let mut payload = serde_json::to_vec(&response)?;
+
+        emit_hook_event(
+            tracing::Level::INFO,
+            "cli",
+            &method,
+            Some(&parent_id),
+            std::str::from_utf8(&payload).unwrap_or_default(),
+            "outgoing hook response",
+        );
+
+        payload.push(b'\n');
+        writer.write_all(&payload).await?;
         writer.shutdown().await?;
         return Ok(());
     }
@@ -3181,6 +3490,12 @@ mod tests {
 
     /// Create a `SessionManager` with a real `Session` for hook dispatch tests.
     fn bind_with_session(dir: &Path) -> SessionManager {
+        bind_with_session_roots(dir, vec![])
+    }
+
+    /// Like [`bind_with_session`] but registers `roots` as workspace roots, so
+    /// files under them have LSP coverage (tiers 1–2) for editing accumulation.
+    fn bind_with_session_roots(dir: &Path, roots: Vec<PathBuf>) -> SessionManager {
         let db_path = dir.join("catenary").join("catenary.db");
         let conn = crate::db::open_and_migrate_at(&db_path).expect("open test DB");
         let conn = Arc::new(std::sync::Mutex::new(conn));
@@ -3204,7 +3519,7 @@ mod tests {
         );
         let session = Arc::new(crate::bridge::session::Session::new(
             crate::config::Config::default(),
-            vec![],
+            roots,
             logging.clone(),
             conn.clone(),
             instance_id,
@@ -3681,6 +3996,76 @@ mod tests {
         shutdown.cancel();
     }
 
+    /// `catenary sed --in-place` writes the file and the daemon accumulates the
+    /// runtime-changed set under the hook-staged `(session_id, agent_id)`
+    /// (the identity-forward handoff, ADR 014 / ticket 08).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sed_identity_handoff() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let ipc_path = ipc_socket_in(dir.path());
+
+        // Root the session at the tempdir so the edited file has LSP coverage
+        // (tier 1–2) and is accumulated rather than filtered.
+        let manager = Arc::new(bind_with_session_roots(
+            dir.path(),
+            vec![dir.path().to_path_buf()],
+        ));
+        let shutdown = manager.shutdown_token();
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        let file = dir.path().join("rename_me.rs");
+        std::fs::write(&file, "let omni = 1;\n").expect("write file");
+
+        // The PreToolUse hook stages the identity forward.
+        let stage = serde_json::json!({
+            "method": "pre-tool/sed",
+            "agent_id": "",
+            "session_id": "sess-1",
+        });
+        let line = hook_roundtrip(&ipc_path, &stage).await;
+        assert!(line.contains("ok"), "stage should succeed, got: {line}");
+
+        // The sed process connects, writes, and reports its changed set.
+        let run = serde_json::json!({
+            "method": "tool/sed",
+            "pattern": "omni",
+            "replacement": "lattice",
+            "paths": [file.to_string_lossy()],
+            "in_place": true,
+        });
+        let response = hook_roundtrip(&ipc_path, &run).await;
+        let parsed: SedResponse =
+            serde_json::from_str(response.trim()).expect("parse sed response");
+        assert!(
+            parsed.output.contains("replacements"),
+            "in-place run reports replacements, got: {}",
+            parsed.output
+        );
+
+        // The write landed.
+        assert_eq!(
+            std::fs::read_to_string(&file).expect("read"),
+            "let lattice = 1;\n"
+        );
+
+        // The changed file is accumulated under the staged (session_id, agent_id).
+        let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
+        let sessions = ctx.sessions.lock().expect("lock sessions");
+        let router = Arc::clone(&sessions.get("sess-1").expect("session sess-1").router);
+        drop(sessions);
+        let tracked = router.session.editing.files(Some("sess-1"), "");
+        assert_eq!(
+            tracked,
+            vec![file],
+            "the changed file is keyed under the staged identity",
+        );
+
+        shutdown.cancel();
+    }
+
     // ── Keyed handoff structure tests (ADR 014) ───────────────────────
 
     /// Different keys are independent: holding the `diagnostics` permit must
@@ -3753,9 +4138,11 @@ mod tests {
         handoff.stage(
             HandoffKey::Diagnostics,
             HandoffContext {
-                files: vec![PathBuf::from("/tmp/a.rs")],
-                filtered: 2,
                 parent_id: "scope-1".to_string(),
+                payload: HandoffPayload::Diagnostics {
+                    files: vec![PathBuf::from("/tmp/a.rs")],
+                    filtered: 2,
+                },
                 permit,
             },
         );
@@ -3763,9 +4150,13 @@ mod tests {
         let consumed = handoff
             .consume(HandoffKey::Diagnostics)
             .expect("consume staged context");
-        assert_eq!(consumed.files, vec![PathBuf::from("/tmp/a.rs")]);
-        assert_eq!(consumed.filtered, 2);
         assert_eq!(consumed.parent_id, "scope-1");
+        if let HandoffPayload::Diagnostics { files, filtered } = &consumed.payload {
+            assert_eq!(files, &vec![PathBuf::from("/tmp/a.rs")]);
+            assert_eq!(*filtered, 2);
+        } else {
+            unreachable!("expected diagnostics payload");
+        }
 
         // Slot is now empty — a second consume yields None.
         assert!(
@@ -3796,9 +4187,11 @@ mod tests {
         handoff.stage(
             HandoffKey::Diagnostics,
             HandoffContext {
-                files: Vec::new(),
-                filtered: 0,
                 parent_id: "x".to_string(),
+                payload: HandoffPayload::Diagnostics {
+                    files: Vec::new(),
+                    filtered: 0,
+                },
                 permit,
             },
         );

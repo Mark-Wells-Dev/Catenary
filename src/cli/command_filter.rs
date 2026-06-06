@@ -851,6 +851,10 @@ struct CatenaryOcc {
     backgrounded: bool,
     /// Catenary is *wrapped* in a `$()`/`<()`/backtick substitution.
     wrapped: bool,
+    /// `catenary sed --in-place` (the write form). `--in-place` is a literal
+    /// flag (no shell expansion), so it reads identically hook-side and
+    /// CLI-side — the hook stages an identity handoff only for the write form.
+    in_place: bool,
 }
 
 /// What the `PreToolUse` hook should do with a shell command, after recognizing
@@ -867,7 +871,15 @@ pub enum CatenaryAction {
     /// A bare, canonical `catenary diagnostics` — stage the done-editing handoff
     /// (internal `pre-tool/editing-stop`), then allow the command to run.
     Diagnostics,
-    /// A canonical catenary command (`grep`/`glob`/`roots`/`primer`/`sed`).
+    /// A bare, canonical `catenary sed`. `--in-place` is the write form: the
+    /// hook stages an identity-forward handoff (internal `pre-tool/sed`) so the
+    /// daemon can attribute the runtime-changed set. A preview (`in_place =
+    /// false`) is a stateless query — no handoff. Either way the command runs.
+    Sed {
+        /// Whether `--in-place` was passed (write vs preview).
+        in_place: bool,
+    },
+    /// A canonical catenary command (`grep`/`glob`/`roots`/`primer`).
     /// `has_foreign` is true when the call also contains foreign segments (a
     /// search chain) whose allowlist must still be checked.
     Allow {
@@ -922,6 +934,7 @@ pub fn analyze_catenary_command(cmd: &str) -> CatenaryAction {
                         redirected: false,
                         backgrounded: false,
                         wrapped: true,
+                        in_place: false,
                     });
                 } else if segment_command_name(inner).is_some() {
                     inner_foreign_substitution = true;
@@ -940,6 +953,8 @@ pub fn analyze_catenary_command(cmd: &str) -> CatenaryAction {
                 } else {
                     None
                 };
+                let in_place = matches!(recog, Recog::Agent(Sub::Sed))
+                    && shell_split(stage).iter().any(|t| t == "--in-place");
                 occs.push(CatenaryOcc {
                     recog,
                     piped_in: pipe_pos > 0,
@@ -947,6 +962,7 @@ pub fn analyze_catenary_command(cmd: &str) -> CatenaryAction {
                     redirected: redirects_to_file(stage),
                     backgrounded: has_background_operator(stage),
                     wrapped: false,
+                    in_place,
                 });
             } else {
                 foreign_segments += 1;
@@ -997,6 +1013,11 @@ pub fn analyze_catenary_command(cmd: &str) -> CatenaryAction {
         return match subs.first() {
             Some(Sub::EditingStart) => CatenaryAction::EditingStart,
             Some(Sub::Diagnostics) => CatenaryAction::Diagnostics,
+            // Bare-only already enforced above, so `occs` holds exactly the sed
+            // occurrence — read `--in-place` off it to pick the handoff path.
+            Some(Sub::Sed) => CatenaryAction::Sed {
+                in_place: occs.first().is_some_and(|o| o.in_place),
+            },
             _ => CatenaryAction::Allow { has_foreign },
         };
     }
@@ -1014,6 +1035,7 @@ pub fn catenary_command_denial(cmd: &str) -> Option<String> {
         CatenaryAction::NotCatenary
         | CatenaryAction::EditingStart
         | CatenaryAction::Diagnostics
+        | CatenaryAction::Sed { .. }
         | CatenaryAction::Allow { .. } => None,
     }
 }
@@ -3475,7 +3497,6 @@ mod tests {
     #[test]
     fn matcher_accepts_bare_correlated_and_lifecycle() {
         for cmd in [
-            "catenary sed --in-place a b src",
             "catenary roots add /tmp/p",
             "catenary roots ls",
             "catenary primer",
@@ -3486,6 +3507,22 @@ mod tests {
                 "{cmd} should be a bare allow",
             );
         }
+    }
+
+    #[test]
+    fn matcher_routes_bare_sed() {
+        // `--in-place` is the write form → identity handoff staged by the hook.
+        assert_eq!(
+            analyze_catenary_command("catenary sed --in-place a b src"),
+            CatenaryAction::Sed { in_place: true },
+        );
+        // A bare preview is a stateless query → no handoff.
+        assert_eq!(
+            analyze_catenary_command("catenary sed a b src"),
+            CatenaryAction::Sed { in_place: false },
+        );
+        // Still bare-only: a prefix/chain is denied before the action is read.
+        assert!(deny_text("cd src && catenary sed --in-place a b .").contains("its own"));
     }
 
     #[test]

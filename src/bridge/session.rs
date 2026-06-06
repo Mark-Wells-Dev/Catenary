@@ -194,6 +194,17 @@ pub fn expand_search_paths(
     resolved
 }
 
+/// Whether a single `path` is excluded by `.gitignore`, repo-scoped.
+///
+/// Standalone convenience over [`is_gitignored`] for callers checking one path
+/// (e.g. `catenary sed`'s explicit-file drop reporting) with no batch to
+/// amortize the per-parent cache over.
+#[must_use]
+pub(crate) fn path_is_gitignored(path: &Path) -> bool {
+    let mut cache = HashMap::new();
+    is_gitignored(path, &mut cache)
+}
+
 /// Whether `path` is excluded by `.gitignore`, repo-scoped like ripgrep.
 ///
 /// Outside a git repository nothing is gitignored, so the directory walk is
