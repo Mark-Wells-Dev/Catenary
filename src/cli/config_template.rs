@@ -60,8 +60,8 @@ const TEMPLATE: &str = r#"# Catenary recommended config
 # build = "make"
 # allow = ["git", "gh", "cp", "rm", "mkdir", "mv", "touch",
 #          "chmod", "sleep", "cd", "true", "false", "which"]
-# pipeline = ["grep", "head", "tail", "wc", "jq", "awk",
-#             "sort", "sed", "tr", "cut", "uniq"]
+# pipeline = ["grep", "head", "tail", "wc", "jq",
+#             "sort", "tr", "cut", "uniq"]
 #
 # [commands.deny]
 # git = ["grep", "ls-files", "ls-tree"]
@@ -79,7 +79,7 @@ const TEMPLATE: &str = r#"# Catenary recommended config
 # commands = ["cat", "head", "tail", "less", "more"]
 #
 # [commands.guidance.edit]
-# message = "Use {EDIT} instead"
+# message = "Use {EDIT} for surgical edits, `catenary sed` for sweeps."
 # commands = ["sed"]
 #
 # [commands.guidance.scan]
@@ -225,27 +225,25 @@ fn generate_defaults_section() -> String {
     out
 }
 
+/// Test-only access to the recommended `[commands]` config embedded in
+/// [`TEMPLATE`]. The single source of truth for the shipped default
+/// command-filter config: this module's own tests *and* `command_filter`'s
+/// behavioral tests both derive from it, so neither hand-maintains a mirror
+/// that could drift from the template.
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
-    reason = "tests use expect for readable assertions"
+    reason = "test-only helper; expect gives a readable failure"
 )]
-mod tests {
-    use super::*;
+pub(crate) mod test_recommended {
+    use crate::config::CommandsConfig;
 
-    #[test]
-    fn template_is_valid_toml() {
-        // The template with all comments is trivially valid TOML (empty doc).
-        toml::from_str::<toml::Value>(TEMPLATE).expect("template should be valid TOML");
-    }
-
-    #[test]
-    fn template_commands_block_is_valid_toml() {
-        // Extract the commented-out [commands] block (between "# [commands]"
-        // and the next section separator) and verify it parses when uncommented.
+    /// The commented-out `[commands]` block from [`super::TEMPLATE`] (between
+    /// `# [commands]` and the next section separator), uncommented.
+    pub fn block() -> String {
         let mut in_block = false;
         let mut lines = Vec::new();
-        for line in TEMPLATE.lines() {
+        for line in super::TEMPLATE.lines() {
             if line == "# [commands]" {
                 in_block = true;
             } else if in_block && line.starts_with("# ── ") {
@@ -258,10 +256,87 @@ mod tests {
                 );
             }
         }
-        assert!(!lines.is_empty(), "should find commented [commands] block");
-        let block = lines.join("\n");
+        lines.join("\n")
+    }
+
+    /// Parse the recommended `[commands]` block into a [`CommandsConfig`].
+    pub fn config() -> CommandsConfig {
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            commands: CommandsConfig,
+        }
+        let wrapper: Wrapper =
+            toml::from_str(&block()).expect("recommended [commands] block is valid TOML");
+        wrapper.commands
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::literal_string_with_formatting_args,
+    reason = "tests use expect for readable assertions; {EDIT} is a template var, not a format arg"
+)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn template_is_valid_toml() {
+        // The template with all comments is trivially valid TOML (empty doc).
+        toml::from_str::<toml::Value>(TEMPLATE).expect("template should be valid TOML");
+    }
+
+    #[test]
+    fn template_commands_block_is_valid_toml() {
+        // The commented-out [commands] block should parse when uncommented.
+        let block = test_recommended::block();
+        assert!(!block.is_empty(), "should find commented [commands] block");
         toml::from_str::<toml::Value>(&block)
             .expect("uncommented [commands] block should be valid TOML");
+    }
+
+    #[test]
+    fn template_pipeline_drops_awk_and_sed() {
+        // awk and sed are interpreters whose program string is a quoted
+        // argument the filter quote-masks before parsing, so it can't see
+        // their in-band exec/write side effects (awk system()/print>, sed
+        // -i/w, GNU sed e). Same unparseable hazard python is denied for, so
+        // they are dropped from the recommended pipeline (bugs/12 / Decision
+        // 6). The mass-edit slice is rehomed onto `catenary sed`.
+        let pipeline = test_recommended::config()
+            .pipeline
+            .expect("recommended config has a pipeline list");
+        let has = |c: &str| pipeline.iter().any(|p| p == c);
+        assert!(!has("awk"), "pipeline should not include awk");
+        assert!(!has("sed"), "pipeline should not include sed");
+        // Pure filters that cannot exec/write stay.
+        assert!(has("cut"), "cut stays in pipeline");
+        assert!(has("jq"), "jq stays in pipeline");
+        assert!(has("grep"), "grep stays in pipeline");
+    }
+
+    #[test]
+    fn template_edit_guidance_points_to_catenary_sed() {
+        // With sed out of the pipeline it is denied at every position, so the
+        // edit guidance always fires. It names both surfaces: the host edit
+        // tool for surgical edits and `catenary sed` for sweeps (the redirect
+        // that makes the removal a rehome, not a capability loss).
+        let guidance = test_recommended::config()
+            .guidance
+            .expect("recommended config has guidance groups");
+        let edit = guidance.get("edit").expect("edit guidance group");
+        let msg = edit
+            .message
+            .as_deref()
+            .expect("edit guidance group has a message");
+        assert!(
+            msg.contains("catenary sed"),
+            "edit guidance should name catenary sed: {msg:?}",
+        );
+        assert!(
+            msg.contains("{EDIT}"),
+            "edit guidance should keep the per-client edit-tool template var: {msg:?}",
+        );
     }
 
     #[test]

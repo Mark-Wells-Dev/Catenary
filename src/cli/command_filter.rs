@@ -1485,7 +1485,8 @@ pub fn format_denial_short(
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
-    reason = "tests use expect for readable assertions"
+    clippy::literal_string_with_formatting_args,
+    reason = "tests use expect for readable assertions; awk/sed program strings contain brace literals that are not format args"
 )]
 mod tests {
     use std::collections::{HashMap, HashSet};
@@ -1560,6 +1561,70 @@ mod tests {
             client_enforcement_only: false,
             ..ResolvedCommands::default()
         }
+    }
+
+    /// Rule set built from the *shipped* recommended config (`catenary
+    /// config`). Derived from the template via
+    /// [`config_template::test_recommended`](crate::cli::config_template) so
+    /// these behavioral tests track the real default — no hand-maintained
+    /// mirror to drift (bugs/12). After ticket 02 the template pipeline
+    /// excludes `awk`/`sed` and the edit guidance points `sed` at `catenary
+    /// sed`. (The `python_equivalent`/`basic` fixtures keep a permissive
+    /// pipeline on purpose — they test parser mechanics, not the default.)
+    fn recommended_rules() -> ResolvedCommands {
+        let mut rules = ResolvedCommands::default();
+        rules.merge(&crate::cli::config_template::test_recommended::config());
+        rules
+    }
+
+    // ── awk/sed dropped from the recommended pipeline (bugs/12) ───────
+
+    #[test]
+    fn awk_denied_any_pipe_position() {
+        // awk's program string is quote-masked, hiding system()/print> — so
+        // it is out of the pipeline and denied at every position, including
+        // mid-pipeline where any allowed command + a pipe would supply the
+        // prefix (`true | awk ...`).
+        let rules = recommended_rules();
+        assert!(
+            check_command("awk 'BEGIN{system(\"x\")}'", &rules, None).is_some(),
+            "awk denied at position 0",
+        );
+        assert!(
+            check_command("true | awk 'BEGIN{system(\"x\")}'", &rules, None).is_some(),
+            "awk denied mid-pipeline",
+        );
+    }
+
+    #[test]
+    fn sed_denied_mid_pipeline() {
+        // sed's `w`/GNU `e` and `-i` write/exec from the program string; with
+        // sed out of the pipeline, the mid-pipeline allowance no longer lets
+        // `… | sed 'w file'` through.
+        let rules = recommended_rules();
+        assert!(check_command("git log | sed -n 'w /tmp/x'", &rules, None).is_some());
+    }
+
+    #[test]
+    fn sed_deny_guidance_names_catenary_sed() {
+        let rules = recommended_rules();
+        let denial = check_command("git log | sed -n 'w /tmp/x'", &rules, None)
+            .expect("sed denied mid-pipeline");
+        let msg = format_denial_full(&denial.command, &rules, &denial, None, None);
+        assert!(msg.contains("Edit"), "names the edit tool: {msg}");
+        assert!(
+            msg.contains("catenary sed"),
+            "points at catenary sed: {msg}"
+        );
+    }
+
+    #[test]
+    fn filters_still_allowed() {
+        // Pure filters that cannot exec/write stay in the pipeline.
+        let rules = recommended_rules();
+        assert!(check_command("git log | cut -d: -f1", &rules, None).is_none());
+        assert!(check_command("git log | sort", &rules, None).is_none());
+        assert!(check_command("git log | jq .", &rules, None).is_none());
     }
 
     // ── Deny basics ──────────────────────────────────────────────────
