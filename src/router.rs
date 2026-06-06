@@ -3311,17 +3311,31 @@ mod tests {
             let _ = m.accept_loop().await;
         });
 
-        // Session A enters editing mode (implicit start would also work; an
-        // explicit start keeps the intent clear).
+        // Session A enters editing mode and accumulates a covered file. The
+        // boundary block gates on a non-empty *covered* tracked set, not the
+        // mode bit, so a file must be tracked for the gate to fire. This
+        // harness configures no covered root, so accumulate via the session's
+        // editing manager directly.
         let req = serde_json::json!({
             "method": "pre-tool/editing-start",
             "agent_id": "",
             "session_id": "session-a"
         });
         let _ = hook_roundtrip(&ipc_path, &req).await;
+        {
+            let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
+            let sessions = ctx.sessions.lock().expect("lock");
+            let router_a = Arc::clone(&sessions.get("session-a").expect("session-a").router);
+            drop(sessions);
+            router_a.session.editing.add_file(
+                Some("session-a"),
+                "",
+                std::path::PathBuf::from("/src/main.rs"),
+            );
+        }
 
-        // Session A is editing: a non-filesystem Bash command is gated
-        // (the agent must run `catenary diagnostics` first).
+        // Session A has a covered set pending: a non-filesystem Bash command is
+        // gated (the agent must run `catenary diagnostics` first).
         let req = serde_json::json!({
             "method": "pre-tool/editing-state",
             "tool_name": "Bash",
@@ -3334,7 +3348,7 @@ mod tests {
             serde_json::from_str(line.trim()).expect("parse response");
         assert!(
             matches!(envelope.result, Some(crate::hook::HookResult::Deny(_))),
-            "session A (editing) should gate non-filesystem Bash, got: {envelope:?}"
+            "session A (covered set pending) should gate non-filesystem Bash, got: {envelope:?}"
         );
 
         // Session B never entered editing mode: the same command is allowed,

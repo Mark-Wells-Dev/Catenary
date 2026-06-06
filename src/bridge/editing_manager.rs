@@ -102,6 +102,22 @@ impl EditingManager {
             .is_some_and(|files| !files.is_empty())
     }
 
+    /// Returns a snapshot of the accumulated file paths without draining them.
+    ///
+    /// Unlike [`drain_files`](Self::drain_files) this leaves the editing state
+    /// intact — used to render the boundary-block message, which lists the
+    /// tracked files while the set must remain for `catenary diagnostics`.
+    #[must_use]
+    pub fn files(&self, session_id: Option<&str>, agent_id: &str) -> Vec<PathBuf> {
+        let key = editing_key(session_id, agent_id);
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// Accumulates a modified file path for an agent in editing mode.
     ///
     /// Idempotent — duplicate paths are not added.
@@ -251,6 +267,29 @@ mod tests {
     fn has_files_false_when_not_editing() {
         let em = EditingManager::new();
         assert!(!em.has_files(None, "ghost"));
+    }
+
+    #[test]
+    fn files_snapshots_without_draining() {
+        let em = EditingManager::new();
+        em.start_editing(None, "").expect("start");
+        em.add_file(None, "", PathBuf::from("/src/main.rs"));
+        em.add_file(None, "", PathBuf::from("/src/lib.rs"));
+
+        let snapshot = em.files(None, "");
+        assert_eq!(
+            snapshot,
+            vec![PathBuf::from("/src/main.rs"), PathBuf::from("/src/lib.rs")],
+        );
+        // Snapshot did not drain — the files are still tracked.
+        assert!(em.has_files(None, ""), "files() must not drain");
+        assert_eq!(em.drain_files(None, "").len(), 2);
+    }
+
+    #[test]
+    fn files_empty_when_not_editing() {
+        let em = EditingManager::new();
+        assert!(em.files(None, "ghost").is_empty());
     }
 
     #[test]

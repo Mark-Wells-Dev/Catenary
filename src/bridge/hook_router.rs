@@ -468,12 +468,17 @@ impl HookRouter {
     ///
     /// The first Edit/Write to a covered file *implicitly* enters editing
     /// mode and is allowed in the same invocation — there is no separate
-    /// `editing start` step to race against parallel tool calls. While in
-    /// editing mode, only Edit/Read/Write, Catenary search tools, and
-    /// filesystem-only Bash commands are allowed; everything else is denied
-    /// until `catenary diagnostics`. Edits to files without known LSP
-    /// coverage are always allowed and never enter editing mode (no
-    /// diagnostics would be produced for them).
+    /// `editing start` step to race against parallel tool calls. Edits to
+    /// files without known LSP coverage are always allowed and never enter
+    /// editing mode (no diagnostics would be produced for them).
+    ///
+    /// The boundary block — denying non-edit commands until `catenary
+    /// diagnostics` runs — gates on a **non-empty covered tracked set**, not
+    /// the editing-mode bit (Decision 4). An empty set (doc-only / no-server
+    /// edits, or an explicit `editing start` with no coverable edit yet) flows
+    /// free: friction tracks value. While a covered set is pending, Read/Write,
+    /// `ToolSearch`, filesystem-only Bash, and canonical Catenary commands
+    /// (search/`sed`/lifecycle) stay allowed; everything else is blocked.
     fn handle_enforce_editing(
         &self,
         tool_name: &str,
@@ -482,48 +487,16 @@ impl HookRouter {
         session_id: Option<&str>,
         agent_id: &str,
     ) -> Option<HookResult> {
-        let agent_editing = self.session.editing.is_editing(session_id, agent_id);
-
-        if agent_editing {
-            if is_edit_tool(tool_name) {
-                self.acquire_editing_guardrail(file_path)
-            } else if is_allowed_during_editing(tool_name)
-                || is_read_tool(tool_name)
-                || (is_bash_tool(tool_name) && command.is_some_and(is_filesystem_only_bash))
-            {
-                None
-            } else if is_bash_tool(tool_name) {
-                // Defensive: a catenary command reaching the boundary (the
-                // client-side canonical-form matcher normally intercepts these)
-                // gets the matcher's clear message — not the generic boundary
-                // block, which would echo the command the agent just ran
-                // (bugs/16). A canonical catenary command is allowed during
-                // editing; a foreign command hits the boundary as before.
-                use crate::cli::command_filter::CatenaryAction;
-                match command.map(crate::cli::command_filter::analyze_catenary_command) {
-                    Some(CatenaryAction::Deny(msg)) => Some(HookResult::Deny(msg)),
-                    Some(
-                        CatenaryAction::EditingStart
-                        | CatenaryAction::Diagnostics
-                        | CatenaryAction::Allow { .. },
-                    ) => None,
-                    Some(CatenaryAction::NotCatenary) | None => Some(HookResult::Deny(
-                        "run `catenary diagnostics` to exit editing mode".into(),
-                    )),
-                }
-            } else {
-                Some(HookResult::Deny(
-                    "run `catenary diagnostics` to exit editing mode".into(),
-                ))
-            }
-        } else if is_edit_tool(tool_name) {
-            // Skip implicit start for files without known LSP coverage.
-            // In-root files always have coverage. Out-of-root files have
-            // coverage only after a single-file server has successfully
-            // initialized (positive cache). Files with no cache entry or
-            // a negative cache entry are allowed without entering editing
-            // mode — no diagnostics would be produced, so tracking them is
-            // pointless.
+        // Edit tools are handled identically whether or not editing mode is
+        // already active. A covered edit implicitly enters editing mode and
+        // acquires the per-root guardrail; an uncovered edit flows free without
+        // entering editing mode. In-root files always have coverage; out-of-root
+        // files have coverage only after a single-file server has successfully
+        // initialized (positive cache). `start_editing` is idempotent, so a
+        // covered edit arriving while already editing simply re-affirms the
+        // mode and the root lock — parallel first-edits all succeed and none can
+        // reject the others (race-free by construction).
+        if is_edit_tool(tool_name) {
             if file_path.is_some_and(|p| !self.session.has_lsp_coverage(Path::new(p))) {
                 return None;
             }
@@ -532,16 +505,77 @@ impl HookRouter {
             if let Some(deny) = self.acquire_editing_guardrail(file_path) {
                 return Some(deny);
             }
-            // Implicit start: mark editing mode and allow the edit in the
-            // same invocation. The set is treated as idempotent — an
-            // "already editing" error from a racing concurrent first-edit
-            // is ignored — so parallel first-edits all succeed and none can
-            // reject the others. Race-free by construction.
             let _ = self.session.editing.start_editing(session_id, agent_id);
-            None
-        } else {
-            None
+            return None;
         }
+
+        // Reads, `ToolSearch`, and filesystem-only Bash never produce code
+        // diagnostics, so they are always allowed — independent of editing
+        // state (`ToolSearch` must pass because Catenary tools are deferred in
+        // Claude Code).
+        if is_read_tool(tool_name)
+            || is_allowed_during_editing(tool_name)
+            || (is_bash_tool(tool_name) && command.is_some_and(is_filesystem_only_bash))
+        {
+            return None;
+        }
+
+        // Boundary block gates on a non-empty *covered* tracked set, not the
+        // mode bit. Empty set ⇒ nothing to diagnose ⇒ flow free.
+        if !self.session.editing.has_files(session_id, agent_id) {
+            return None;
+        }
+
+        // A Catenary command reaching the boundary (the client-side
+        // canonical-form matcher normally intercepts these) is classified by
+        // the matcher rather than the generic boundary block, which would echo
+        // the command the agent just ran (bugs/16). Canonical search/`sed`/
+        // lifecycle commands are allowed during editing; a non-canonical form
+        // gets the matcher's clear message.
+        if is_bash_tool(tool_name) {
+            use crate::cli::command_filter::CatenaryAction;
+            match command.map(crate::cli::command_filter::analyze_catenary_command) {
+                Some(CatenaryAction::Deny(msg)) => return Some(HookResult::Deny(msg)),
+                Some(
+                    CatenaryAction::EditingStart
+                    | CatenaryAction::Diagnostics
+                    | CatenaryAction::Allow { .. },
+                ) => return None,
+                Some(CatenaryAction::NotCatenary) | None => {}
+            }
+        }
+
+        Some(HookResult::Deny(self.boundary_block_message(
+            session_id, agent_id, command, tool_name,
+        )))
+    }
+
+    /// Build the intent-neutral boundary-block deny message.
+    ///
+    /// Names the blocked command (the shell command when present, else the tool
+    /// name), lists the covered files currently tracked for diagnostics, and
+    /// points at `catenary diagnostics`. It carries no inferred intent
+    /// ("before testing"/"before building" are guesses and often wrong) — it
+    /// anchors only on what Catenary knows: coverable edits exist and have not
+    /// been diagnosed.
+    fn boundary_block_message(
+        &self,
+        session_id: Option<&str>,
+        agent_id: &str,
+        command: Option<&str>,
+        tool_name: &str,
+    ) -> String {
+        use std::fmt::Write as _;
+        let what = command.unwrap_or(tool_name);
+        let mut msg = format!(
+            "command `{what}` is blocked\n\
+             The following files are tracked via a language server:\n"
+        );
+        for file in self.session.editing.files(session_id, agent_id) {
+            let _ = writeln!(msg, "  {}", file.display());
+        }
+        msg.push_str("Call `catenary diagnostics` to proceed.");
+        msg
     }
 
     /// Acquires the cross-session editing guardrail for `file_path`'s root.
@@ -751,8 +785,14 @@ mod tests {
     #[test]
     fn test_hook_enforce_editing_allow() {
         let router = test_router();
-        // Enter editing mode directly (CLI path enters via PreToolStartEditing).
+        // Enter editing mode with a covered file pending — the boundary block
+        // gates on a non-empty tracked set, so a file must be accumulated for a
+        // non-edit command to be denied.
         let _ = router.session.editing.start_editing(None, "");
+        router
+            .session
+            .editing
+            .add_file(None, "", PathBuf::from("/src/main.rs"));
 
         // Edit tool — should allow during editing mode
         let result = router.handle_enforce_editing("Edit", None, None, None, "");
@@ -762,7 +802,7 @@ mod tests {
         let result = router.handle_enforce_editing("Read", None, None, None, "");
         assert!(result.is_none(), "expected allow for Read, got {result:?}");
 
-        // Non-edit, non-read tool while editing — should deny
+        // Non-edit, non-read tool with a covered set pending — should deny
         let result = router.handle_enforce_editing("Bash", None, None, None, "");
         let Some(HookResult::Deny(reason)) = result else {
             unreachable!("expected Deny for Bash, got {result:?}");
@@ -773,7 +813,12 @@ mod tests {
     #[test]
     fn test_hook_enforce_editing_piped_catenary_bugs16() {
         let router = test_router();
+        // A covered file must be pending for the boundary block to fire.
         let _ = router.session.editing.start_editing(None, "");
+        router
+            .session
+            .editing
+            .add_file(None, "", PathBuf::from("/src/main.rs"));
 
         // bugs/16: a piped lifecycle command during editing must get a clear
         // pipe-deny from the canonical-form matcher, not the boundary block
@@ -789,7 +834,7 @@ mod tests {
             unreachable!("expected Deny, got {result:?}");
         };
         assert!(
-            !reason.contains("to exit editing mode"),
+            !reason.contains("is blocked"),
             "should not be the boundary block, got: {reason}"
         );
         assert!(
@@ -814,13 +859,14 @@ mod tests {
             "bare diagnostics allowed during editing, got {result:?}"
         );
 
-        // A foreign non-edit command still hits the boundary block.
+        // A foreign non-edit command still hits the boundary block, which now
+        // names the command and lists the tracked file.
         let result = router.handle_enforce_editing("Bash", None, Some("make test"), None, "");
         let Some(HookResult::Deny(reason)) = result else {
             unreachable!("expected Deny for make test, got {result:?}");
         };
         assert!(
-            reason.contains("to exit editing mode"),
+            reason.contains("`make test` is blocked") && reason.contains("catenary diagnostics"),
             "foreign cmd → boundary block, got: {reason}"
         );
     }
@@ -1345,7 +1391,12 @@ mod tests {
     #[test]
     fn test_enforce_editing_allows_filesystem_bash() {
         let router = test_router();
+        // A covered file is pending — filesystem-only Bash is still allowed.
         let _ = router.session.editing.start_editing(None, "");
+        router
+            .session
+            .editing
+            .add_file(None, "", PathBuf::from("/src/main.rs"));
 
         // Filesystem-only Bash — should allow during editing
         let result = router.handle_enforce_editing("Bash", None, Some("rm -rf target/"), None, "");
@@ -1371,7 +1422,12 @@ mod tests {
     #[test]
     fn test_enforce_editing_denies_non_filesystem_bash() {
         let router = test_router();
+        // Covered set pending → non-filesystem Bash is gated.
         let _ = router.session.editing.start_editing(None, "");
+        router
+            .session
+            .editing
+            .add_file(None, "", PathBuf::from("/src/main.rs"));
 
         // Non-filesystem Bash — should deny during editing
         let result = router.handle_enforce_editing("Bash", None, Some("cargo build"), None, "");
@@ -1384,13 +1440,152 @@ mod tests {
     #[test]
     fn test_enforce_editing_denies_bash_without_command() {
         let router = test_router();
+        // Covered set pending → a Bash call we cannot inspect must deny.
         let _ = router.session.editing.start_editing(None, "");
+        router
+            .session
+            .editing
+            .add_file(None, "", PathBuf::from("/src/main.rs"));
 
         // Bash without command string — cannot verify, must deny
         let result = router.handle_enforce_editing("Bash", None, None, None, "");
         let Some(HookResult::Deny(_)) = result else {
             unreachable!("expected Deny for Bash without command, got {result:?}");
         };
+    }
+
+    // ── Boundary block (covered-set gate) tests ─────────────────────────
+
+    #[test]
+    fn boundary_blocks_on_covered_set() {
+        let (router, root) = test_router_with_root();
+        let in_root = format!("{}/src/main.rs", root.display());
+
+        // A covered edit (dispatched end-to-end) enters editing mode and
+        // accumulates the file.
+        router.dispatch(crate::hook::HookRequest::PreTool {
+            tool_name: "Edit".to_string(),
+            file_path: Some(in_root.clone()),
+            command: None,
+            agent_id: String::new(),
+            session_id: None,
+        });
+        assert!(router.session.editing.has_files(None, ""));
+
+        // A non-edit command is now blocked; the message names the command,
+        // lists the tracked file, and points at `catenary diagnostics`.
+        let result = router.handle_enforce_editing("Bash", None, Some("make test"), None, "");
+        let Some(HookResult::Deny(reason)) = result else {
+            unreachable!("expected boundary block, got {result:?}");
+        };
+        assert!(
+            reason.contains("`make test` is blocked"),
+            "message should name the command, got: {reason}"
+        );
+        assert!(
+            reason.contains(&in_root),
+            "message should list the tracked file, got: {reason}"
+        );
+        assert!(
+            reason.contains("catenary diagnostics"),
+            "message should name `catenary diagnostics`, got: {reason}"
+        );
+    }
+
+    #[test]
+    fn empty_set_not_blocked() {
+        // Editing mode active (e.g. an explicit `editing start`) but no covered
+        // edit yet → the boundary block must not fire.
+        let router = test_router();
+        let _ = router.session.editing.start_editing(None, "");
+        assert!(!router.session.editing.has_files(None, ""));
+
+        let result = router.handle_enforce_editing("Bash", None, Some("make test"), None, "");
+        assert!(
+            result.is_none(),
+            "empty covered set should flow free, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn doc_only_edit_flows_free() {
+        // A no-server file outside every root is uncovered: the edit never
+        // enters editing mode, so a following non-edit command flows free.
+        let router = test_router();
+        let res = router.dispatch(crate::hook::HookRequest::PreTool {
+            tool_name: "Edit".to_string(),
+            file_path: Some("/outside/notes.md".to_string()),
+            command: None,
+            agent_id: String::new(),
+            session_id: None,
+        });
+        assert!(res.result.is_none(), "uncovered edit allowed");
+        assert!(
+            !router.session.editing.has_files(None, ""),
+            "uncovered edit must not accumulate a covered set"
+        );
+
+        let result = router.handle_enforce_editing("Bash", None, Some("make test"), None, "");
+        assert!(
+            result.is_none(),
+            "doc-only edit should leave the boundary unblocked, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn catenary_subcommands_not_blocked() {
+        let (router, root) = test_router_with_root();
+        let in_root = format!("{}/src/main.rs", root.display());
+        router.dispatch(crate::hook::HookRequest::PreTool {
+            tool_name: "Edit".to_string(),
+            file_path: Some(in_root),
+            command: None,
+            agent_id: String::new(),
+            session_id: None,
+        });
+        assert!(router.session.editing.has_files(None, ""));
+
+        // Canonical Catenary commands stay allowed mid-editing even with a
+        // covered set pending: search, the renamed boundary command, and the
+        // `sed --in-place` edit op (ticket 08).
+        for cmd in [
+            "catenary grep needle",
+            "catenary glob foo.rs",
+            "catenary diagnostics",
+            "catenary sed --in-place foo bar src/main.rs",
+        ] {
+            let result = router.handle_enforce_editing("Bash", None, Some(cmd), None, "");
+            assert!(
+                result.is_none(),
+                "`{cmd}` should not be blocked mid-editing, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn coverage_resolves_to_root_instance() {
+        // The test harness spawns no LSP server instances, so coverage must
+        // resolve from root membership alone — a warm language's cold per-root
+        // instance must not silently drop the file (Decision 3 granularity).
+        let (router, root) = test_router_with_root();
+        let in_root = format!("{}/src/main.rs", root.display());
+        assert!(
+            router.session.has_lsp_coverage(Path::new(&in_root)),
+            "in-root file must be covered with no running instance"
+        );
+
+        // The edit is therefore tracked, arming the boundary block.
+        router.dispatch(crate::hook::HookRequest::PreTool {
+            tool_name: "Edit".to_string(),
+            file_path: Some(in_root),
+            command: None,
+            agent_id: String::new(),
+            session_id: None,
+        });
+        assert!(
+            router.session.editing.has_files(None, ""),
+            "covered in-root edit accumulated despite cold per-root instance"
+        );
     }
 
     // ── Test helpers ────────────────────────────────────────────────────
