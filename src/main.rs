@@ -101,7 +101,17 @@ enum Command {
         include_hidden: bool,
     },
 
-    /// Editing mode (start, stop).
+    /// Print diagnostics for the files you've edited, then clear the set.
+    ///
+    /// Runs the LSP diagnostics pipeline over every file edited since the
+    /// last run: prints errors and warnings (or `[clean]` when none), then
+    /// resets so the next edit starts a fresh set. Editing begins implicitly
+    /// on the first edit — there is no separate start step. Invoke via the
+    /// host's shell tool.
+    Diagnostics,
+
+    /// Editing mode (start). Optional — editing starts implicitly on the
+    /// first edit; `catenary diagnostics` ends it and prints diagnostics.
     Editing {
         #[command(subcommand)]
         command: EditingCommand,
@@ -187,8 +197,6 @@ enum EditingCommand {
     /// first edit; this remains as an idempotent confirmation so a stray
     /// invocation never errors. Invoke via the host's shell tool.
     Start,
-    /// Exit editing mode and print diagnostics. Invoke via the host's shell tool.
-    Stop,
 }
 
 /// Workspace root management subcommands.
@@ -365,7 +373,7 @@ fn main() -> Result<()> {
             // For agent-facing subcommands, append `-h` output so the
             // agent sees correct usage without a second round-trip.
             let raw = e.to_string();
-            let subcommand = ["grep", "glob", "editing", "roots"]
+            let subcommand = ["grep", "glob", "diagnostics", "editing", "roots"]
                 .into_iter()
                 .find(|cmd| raw.contains(&format!("catenary {cmd}")));
             if let Some(cmd) = subcommand
@@ -456,12 +464,17 @@ fn main() -> Result<()> {
         #[cfg(not(unix))]
         Some(Command::Glob { .. }) => Err(anyhow::anyhow!("daemon mode requires Unix")),
         #[cfg(unix)]
+        Some(Command::Diagnostics) => {
+            let mut out = cli::Output::stdout(false);
+            build_runtime()?.block_on(run_done_editing(&mut out))
+        }
+        #[cfg(not(unix))]
+        Some(Command::Diagnostics) => Err(anyhow::anyhow!("daemon mode requires Unix")),
+        #[cfg(unix)]
         Some(Command::Editing { command }) => {
             let mut out = cli::Output::stdout(false);
-            match command {
-                EditingCommand::Start => build_runtime()?.block_on(run_start_editing(&mut out)),
-                EditingCommand::Stop => build_runtime()?.block_on(run_done_editing(&mut out)),
-            }
+            let EditingCommand::Start = command;
+            build_runtime()?.block_on(run_start_editing(&mut out))
         }
         #[cfg(not(unix))]
         Some(Command::Editing { .. }) => Err(anyhow::anyhow!("daemon mode requires Unix")),
@@ -769,7 +782,7 @@ fn render_search_outcome(
 fn run_primer(out: &mut cli::Output) {
     use clap::CommandFactory;
     let app = Args::command();
-    let agent_commands = ["editing", "grep", "glob", "roots"];
+    let agent_commands = ["diagnostics", "editing", "grep", "glob", "roots"];
     let mut first = true;
     for name in agent_commands {
         let Some(sub) = app.find_subcommand(name) else {
@@ -1291,9 +1304,11 @@ async fn run_start_editing(out: &mut cli::Output) -> Result<()> {
     Ok(())
 }
 
-/// Exits editing mode and prints diagnostics to stdout.
+/// Implements `catenary diagnostics`: prints diagnostics for the edited
+/// files and clears the tracked set.
 ///
-/// Connects to the daemon's IPC socket and sends `tool/editing-stop`.
+/// Connects to the daemon's IPC socket and sends `tool/editing-stop` (the
+/// internal handoff method name is unchanged by the user-facing rename).
 /// The `PreToolUse` hook has already prepared the handoff — this command
 /// retrieves the diagnostics and prints them.
 ///
@@ -1594,16 +1609,19 @@ mod tests {
     }
 
     #[test]
-    fn test_cli_editing_stop() {
+    fn test_cli_diagnostics() {
         use clap::Parser;
-        let args = Args::try_parse_from(["catenary", "editing", "stop"]);
-        let args = args.expect("editing stop should parse");
-        assert!(matches!(
-            args.command,
-            Some(Command::Editing {
-                command: EditingCommand::Stop
-            })
-        ));
+        let args = Args::try_parse_from(["catenary", "diagnostics"]);
+        let args = args.expect("diagnostics should parse");
+        assert!(matches!(args.command, Some(Command::Diagnostics)));
+    }
+
+    #[test]
+    fn editing_stop_retired() {
+        // `catenary editing stop` was renamed to `catenary diagnostics`; the
+        // old subcommand no longer parses.
+        use clap::Parser;
+        assert!(Args::try_parse_from(["catenary", "editing", "stop"]).is_err());
     }
 
     // ── CLI grep subcommand tests ──────────────────────────────────
@@ -1897,6 +1915,10 @@ mod tests {
         assert!(
             text.contains("catenary glob"),
             "primer should document glob"
+        );
+        assert!(
+            text.contains("catenary diagnostics"),
+            "primer should document diagnostics"
         );
         assert!(
             text.contains("catenary editing"),

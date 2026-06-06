@@ -447,7 +447,7 @@ fn spawn_handoff_timeout(slot: Arc<std::sync::Mutex<Option<HandoffContext>>>) {
             *s = None;
             warn!(
                 source = Source::DaemonDispatch.as_str(),
-                "editing stop handoff timeout — discarding file list",
+                "diagnostics handoff timeout — discarding file list",
             );
         }
     });
@@ -1598,9 +1598,10 @@ async fn handle_hook_dispatch(
     // ── Done editing handoff: prepare ────────────────────────────
     //
     // `pre-tool/editing-stop` is sent by the PreToolUse hook when
-    // the agent runs `catenary editing stop`. Acquires
-    // the handoff lock, drains files, releases the editing guardrail,
-    // and deposits the file list for the subsequent CLI command.
+    // the agent runs `catenary diagnostics` (internal method name
+    // unchanged). Acquires the handoff lock, drains files, releases the
+    // editing guardrail, and deposits the file list for the subsequent
+    // CLI command.
     if method == "pre-tool/editing-stop" {
         let scope_id = uuid::Uuid::new_v4().to_string();
 
@@ -1623,7 +1624,7 @@ async fn handle_hook_dispatch(
             session_id = %session_id,
             file_count = files.len(),
             filtered,
-            "editing stop: drained files from EditingManager",
+            "diagnostics: drained files from EditingManager",
         );
 
         // Release the editing guardrail.
@@ -1654,7 +1655,7 @@ async fn handle_hook_dispatch(
         debug!(
             source = Source::DaemonDispatch.as_str(),
             session_id = %session_id,
-            "editing stop handoff prepared",
+            "diagnostics handoff prepared",
         );
 
         emit_hook_event(
@@ -1681,9 +1682,9 @@ async fn handle_hook_dispatch(
 
     // ── Done editing handoff: run ────────────────────────────────
     //
-    // `tool/editing-stop` is sent by `catenary editing stop` CLI
-    // command. Takes the file list from the handoff slot, runs
-    // process_files_batched, and returns diagnostics.
+    // `tool/editing-stop` is sent by the `catenary diagnostics` CLI
+    // command (internal method name unchanged). Takes the file list from the
+    // handoff slot, runs process_files_batched, and returns diagnostics.
     if method == "tool/editing-stop" {
         // Take the file list and parent_id from the handoff slot,
         // releasing the permit immediately. The permit must not be
@@ -1732,7 +1733,7 @@ async fn handle_hook_dispatch(
             }
         } else {
             // Handoff slot was empty — timeout expired or double-consume.
-            "editing stop handoff expired — no files available\n".to_string()
+            "diagnostics handoff expired — no files available\n".to_string()
         };
 
         emit_hook_event(
@@ -3180,7 +3181,7 @@ mod tests {
         let _ = hook_roundtrip(&ipc_path, &req).await;
 
         // Session A is editing: a non-filesystem Bash command is gated
-        // (the agent must run `catenary editing stop` first).
+        // (the agent must run `catenary diagnostics` first).
         let req = serde_json::json!({
             "method": "pre-tool/editing-state",
             "tool_name": "Bash",

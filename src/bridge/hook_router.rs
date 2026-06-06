@@ -471,7 +471,7 @@ impl HookRouter {
     /// `editing start` step to race against parallel tool calls. While in
     /// editing mode, only Edit/Read/Write, Catenary search tools, and
     /// filesystem-only Bash commands are allowed; everything else is denied
-    /// until `catenary editing stop`. Edits to files without known LSP
+    /// until `catenary diagnostics`. Edits to files without known LSP
     /// coverage are always allowed and never enter editing mode (no
     /// diagnostics would be produced for them).
     fn handle_enforce_editing(
@@ -504,16 +504,16 @@ impl HookRouter {
                     Some(CatenaryAction::Deny(msg)) => Some(HookResult::Deny(msg)),
                     Some(
                         CatenaryAction::EditingStart
-                        | CatenaryAction::EditingStop
+                        | CatenaryAction::Diagnostics
                         | CatenaryAction::Allow { .. },
                     ) => None,
                     Some(CatenaryAction::NotCatenary) | None => Some(HookResult::Deny(
-                        "run `catenary editing stop` to exit editing mode".into(),
+                        "run `catenary diagnostics` to exit editing mode".into(),
                     )),
                 }
             } else {
                 Some(HookResult::Deny(
-                    "run `catenary editing stop` to exit editing mode".into(),
+                    "run `catenary diagnostics` to exit editing mode".into(),
                 ))
             }
         } else if is_edit_tool(tool_name) {
@@ -630,7 +630,7 @@ impl HookRouter {
         if self.session.editing.is_editing(session_id, agent_id) {
             if self.session.editing.has_files(session_id, agent_id) {
                 Some(HookResult::Block(
-                    "run `catenary editing stop` before finishing".into(),
+                    "run `catenary diagnostics` before finishing".into(),
                 ))
             } else {
                 // No files modified — silently clear editing state.
@@ -767,7 +767,7 @@ mod tests {
         let Some(HookResult::Deny(reason)) = result else {
             unreachable!("expected Deny for Bash, got {result:?}");
         };
-        assert!(reason.contains("editing stop"));
+        assert!(reason.contains("diagnostics"));
     }
 
     #[test]
@@ -781,7 +781,7 @@ mod tests {
         let result = router.handle_enforce_editing(
             "Bash",
             None,
-            Some("catenary editing stop | head"),
+            Some("catenary editing start | head"),
             None,
             "",
         );
@@ -799,10 +799,19 @@ mod tests {
 
         // A bare canonical catenary command is allowed during editing.
         let result =
-            router.handle_enforce_editing("Bash", None, Some("catenary editing stop"), None, "");
+            router.handle_enforce_editing("Bash", None, Some("catenary editing start"), None, "");
         assert!(
             result.is_none(),
-            "bare editing stop allowed during editing, got {result:?}"
+            "bare editing start allowed during editing, got {result:?}"
+        );
+
+        // `catenary diagnostics` (the renamed boundary command) is likewise
+        // allowed during editing — it ends the session and prints diagnostics.
+        let result =
+            router.handle_enforce_editing("Bash", None, Some("catenary diagnostics"), None, "");
+        assert!(
+            result.is_none(),
+            "bare diagnostics allowed during editing, got {result:?}"
         );
 
         // A foreign non-edit command still hits the boundary block.
@@ -849,7 +858,7 @@ mod tests {
         let Some(HookResult::Block(reason)) = result else {
             unreachable!("expected Block, got {result:?}");
         };
-        assert!(reason.contains("editing stop"));
+        assert!(reason.contains("diagnostics"));
     }
 
     #[test]
@@ -1369,7 +1378,7 @@ mod tests {
         let Some(HookResult::Deny(reason)) = result else {
             unreachable!("expected Deny for non-filesystem Bash, got {result:?}");
         };
-        assert!(reason.contains("editing stop"));
+        assert!(reason.contains("diagnostics"));
     }
 
     #[test]

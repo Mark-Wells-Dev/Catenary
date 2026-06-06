@@ -37,12 +37,13 @@ surfaces share the same LSP server pool. None depends on the others.
   `plugins/catenary/hooks/hooks.json` (Claude Code), `hooks/hooks.json`
   (Gemini CLI), and `plugins/catenary-antigravity/hooks.json` (Antigravity CLI).
 - **CLI commands:** Editing lifecycle invoked via the host's shell tool:
-  - `catenary editing start` — enter editing mode (diagnostics deferred).
-  - `catenary editing stop` — exit editing mode, print LSP diagnostics for all
-    modified files to stdout.
+  - Editing starts implicitly on the first edit — there is no explicit start
+    step (`catenary editing start` remains as an idempotent no-op).
+  - `catenary diagnostics` — exit editing mode, print LSP diagnostics for all
+    modified files to stdout, and clear the tracked set.
   - `catenary roots add <path>` / `catenary roots rm <path>` — manage workspace
     roots.
-- **Diagnostics:** `catenary editing stop` triggers the diagnostics pipeline:
+- **Diagnostics:** `catenary diagnostics` triggers the diagnostics pipeline:
   batch all modified files, send to LSP servers, collect diagnostics, print to
   stdout. The agent sees diagnostics in the shell tool output. Diagnostic events
   are stored in the SQLite database for later querying via `catenary debug query`.

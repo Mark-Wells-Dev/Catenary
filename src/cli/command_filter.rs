@@ -683,8 +683,7 @@ fn collect_command_names(cmd: &str, names: &mut Vec<String>) {
 enum CatenaryClass {
     /// `grep`/`glob` — stateless, self-scoping; may chain/`cd`, any count.
     Search,
-    /// `diagnostics`/`sed` (and `editing stop`, today's diagnostics) —
-    /// load-bearing, correlated; bare only.
+    /// `diagnostics`/`sed` — load-bearing, correlated; bare only.
     Correlated,
     /// `editing start`/`roots`/`primer` — bare lifecycle/management.
     Lifecycle,
@@ -697,10 +696,12 @@ enum Sub {
     Glob,
     /// Forward-registered (CLI command lands in ticket 08).
     Sed,
-    /// Forward-registered (CLI command lands in ticket 05; today's command is
-    /// `editing stop`).
+    /// `catenary diagnostics` — prints diagnostics for the edited files.
     Diagnostics,
     EditingStart,
+    /// Retired: `editing stop` was renamed to `diagnostics` (ticket 05). Still
+    /// recognized so a stray invocation gets a redirect, not a generic
+    /// "unknown command".
     EditingStop,
     Roots,
     Primer,
@@ -863,11 +864,12 @@ pub enum CatenaryAction {
     Deny(String),
     /// A bare, canonical `catenary editing start` — route to the IPC handler.
     EditingStart,
-    /// A bare, canonical `catenary editing stop` — route to the IPC handler.
-    EditingStop,
-    /// A canonical catenary command (`grep`/`glob`/`roots`/`primer`/`sed`/
-    /// `diagnostics`). `has_foreign` is true when the call also contains foreign
-    /// segments (a search chain) whose allowlist must still be checked.
+    /// A bare, canonical `catenary diagnostics` — stage the done-editing handoff
+    /// (internal `pre-tool/editing-stop`), then allow the command to run.
+    Diagnostics,
+    /// A canonical catenary command (`grep`/`glob`/`roots`/`primer`/`sed`).
+    /// `has_foreign` is true when the call also contains foreign segments (a
+    /// search chain) whose allowlist must still be checked.
     Allow {
         /// Whether foreign segments are present and need allowlist validation.
         has_foreign: bool,
@@ -957,6 +959,17 @@ pub fn analyze_catenary_command(cmd: &str) -> CatenaryAction {
         return CatenaryAction::NotCatenary;
     }
 
+    // `catenary editing stop` is retired — renamed to `catenary diagnostics`
+    // (ticket 05). Catch it in any form, before the output-ownership and
+    // bare-only denials, so the agent always learns the new name rather than a
+    // generic output-ownership complaint.
+    if occs
+        .iter()
+        .any(|o| matches!(o.recog, Recog::Agent(Sub::EditingStop)))
+    {
+        return CatenaryAction::Deny(editing_stop_retired_denial());
+    }
+
     // First occurrence with a per-command problem wins (document order).
     for occ in &occs {
         if let Some(msg) = catenary_occ_denial(occ) {
@@ -983,7 +996,7 @@ pub fn analyze_catenary_command(cmd: &str) -> CatenaryAction {
         }
         return match subs.first() {
             Some(Sub::EditingStart) => CatenaryAction::EditingStart,
-            Some(Sub::EditingStop) => CatenaryAction::EditingStop,
+            Some(Sub::Diagnostics) => CatenaryAction::Diagnostics,
             _ => CatenaryAction::Allow { has_foreign },
         };
     }
@@ -1000,7 +1013,7 @@ pub fn catenary_command_denial(cmd: &str) -> Option<String> {
         CatenaryAction::Deny(msg) => Some(msg),
         CatenaryAction::NotCatenary
         | CatenaryAction::EditingStart
-        | CatenaryAction::EditingStop
+        | CatenaryAction::Diagnostics
         | CatenaryAction::Allow { .. } => None,
     }
 }
@@ -1033,8 +1046,8 @@ fn catenary_occ_denial(occ: &CatenaryOcc) -> Option<String> {
 
 /// The recognized agent-facing command surface, for "unknown subcommand" denials.
 const CATENARY_SURFACE: &str = "Available: `grep`, `glob`, `sed`, `diagnostics`, \
-     `editing start`, `editing stop`, `roots add/rm/ls`, `primer`. Run `catenary \
-     primer` for the workflow.";
+     `editing start`, `roots add/rm/ls`, `primer`. Run `catenary primer` for the \
+     workflow.";
 
 fn unknown_subcommand_denial() -> String {
     format!("That isn't a recognized `catenary` command. {CATENARY_SURFACE}")
@@ -1166,6 +1179,14 @@ fn bare_only_denial(subs: &[Sub]) -> String {
          promptly to attribute correctly; it takes no paths, so the working directory \
          doesn't matter."
     )
+}
+
+/// Redirect for the retired `catenary editing stop` — renamed to
+/// `catenary diagnostics` (ticket 05).
+fn editing_stop_retired_denial() -> String {
+    "`catenary editing stop` is now `catenary diagnostics` — run `catenary \
+     diagnostics` to print diagnostics for your edits."
+        .to_string()
 }
 
 /// Top-level CLI command, set once at binary startup by [`set_cli_command`].
@@ -3294,7 +3315,6 @@ mod tests {
     #[test]
     fn matcher_accepts_bare_correlated_and_lifecycle() {
         for cmd in [
-            "catenary diagnostics",
             "catenary sed --in-place a b src",
             "catenary roots add /tmp/p",
             "catenary roots ls",
@@ -3315,17 +3335,36 @@ mod tests {
             CatenaryAction::EditingStart,
         );
         assert_eq!(
-            analyze_catenary_command("catenary editing stop"),
-            CatenaryAction::EditingStop,
+            analyze_catenary_command("catenary diagnostics"),
+            CatenaryAction::Diagnostics,
         );
         assert_eq!(
-            analyze_catenary_command("/usr/local/bin/catenary editing stop"),
-            CatenaryAction::EditingStop,
+            analyze_catenary_command("/usr/local/bin/catenary diagnostics"),
+            CatenaryAction::Diagnostics,
         );
         assert_eq!(
             analyze_catenary_command("DEBUG=1 catenary editing start"),
             CatenaryAction::EditingStart,
         );
+    }
+
+    #[test]
+    fn editing_stop_retired() {
+        // `editing stop` was renamed to `diagnostics`; a stray invocation is
+        // denied with a redirect to the new name in every form — never routed,
+        // never a generic "unknown command".
+        for cmd in [
+            "catenary editing stop",
+            "/usr/local/bin/catenary editing stop",
+            "catenary editing stop | head",
+            "cd src && catenary editing stop",
+        ] {
+            let msg = deny_text(cmd);
+            assert!(
+                msg.contains("catenary diagnostics"),
+                "{cmd} should redirect to diagnostics, got: {msg}",
+            );
+        }
     }
 
     #[test]
@@ -3395,7 +3434,7 @@ mod tests {
     #[test]
     fn matcher_denies_background() {
         assert!(deny_text("catenary grep p &").contains("background"));
-        assert!(deny_text("catenary editing stop &").contains("background"));
+        assert!(deny_text("catenary editing start &").contains("background"));
     }
 
     #[test]
@@ -3476,8 +3515,8 @@ mod tests {
     #[test]
     fn matcher_bugs16_piped_lifecycle_is_clear_pipe_deny() {
         // A piped lifecycle command yields a clear pipe-deny, not a routed
-        // EditingStop and not (downstream) the boundary block.
-        let msg = deny_text("catenary editing stop | head");
+        // action and not (downstream) the boundary block.
+        let msg = deny_text("catenary editing start | head");
         assert!(
             msg.contains("run it bare") || msg.contains("owns its output"),
             "got: {msg}"

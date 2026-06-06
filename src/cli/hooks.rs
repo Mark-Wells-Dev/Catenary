@@ -523,13 +523,15 @@ pub fn run_pre_tool(format: HostFormat) {
                 print!("{}", format_deny(&reason, format));
                 return;
             }
-            // editing start/stop send IPC to the daemon, then allow the
-            // command to execute (it prints confirmation / diagnostics).
+            // `editing start` and `diagnostics` send IPC to the daemon, then
+            // allow the command to execute (it prints confirmation /
+            // diagnostics). The internal handoff method (`pre-tool/editing-stop`)
+            // is unchanged — only the user-facing command was renamed.
             CatenaryAction::EditingStart => {
                 handle_start_editing_hook(&hook_json, format);
                 return;
             }
-            CatenaryAction::EditingStop => {
+            CatenaryAction::Diagnostics => {
                 handle_done_editing_hook(&hook_json, format);
                 return;
             }
@@ -844,12 +846,13 @@ fn handle_start_editing_hook(hook_json: &serde_json::Value, format: HostFormat) 
     }
 }
 
-/// Handle `PreToolUse` for `catenary editing stop`.
+/// Handle `PreToolUse` for `catenary diagnostics`.
 ///
-/// Sends `pre-tool/editing-stop` IPC to the daemon to prepare
-/// the handoff: drain accumulated files, release the editing guardrail,
-/// and deposit the file list in the handoff slot. Returns allow (silent)
-/// or deny (prints denial reason to stdout for the host CLI).
+/// Sends `pre-tool/editing-stop` IPC to the daemon to prepare the handoff
+/// (the internal method name is unchanged by the user-facing rename): drain
+/// accumulated files, release the editing guardrail, and deposit the file
+/// list in the handoff slot. Returns allow (silent) or deny (prints denial
+/// reason to stdout for the host CLI).
 fn handle_done_editing_hook(hook_json: &serde_json::Value, format: HostFormat) {
     let Some(stream) = hook_connect(hook_json) else {
         return;
