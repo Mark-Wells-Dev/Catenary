@@ -1814,6 +1814,77 @@ fn test_grep_basic_output() -> Result<()> {
     Ok(())
 }
 
+/// `--count` is a dumb `grep -c`-style tally straight from ripgrep — no LSP,
+/// no symbol classification. The response carries exact `matches`/`files` and
+/// an empty `output` (no tree, no pagination). Run against a server-less
+/// daemon to prove the count never touches the symbol pipeline.
+#[test]
+fn test_grep_count_reports_totals() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(
+        dir.path().join("data.txt"),
+        "say_hello here\nand say_hello again\nunrelated line\n",
+    )?;
+
+    let root = dir.path().to_str().context("root path")?;
+    let mut bridge = BridgeProcess::spawn(&[], root)?;
+    bridge.initialize()?;
+
+    let resp = bridge.call_search_raw(
+        "tool/grep",
+        &json!({ "pattern": "say_hello", "count": true }),
+    )?;
+
+    assert_eq!(
+        resp.get("matches").and_then(serde_json::Value::as_u64),
+        Some(2),
+        "two lines match the pattern: {resp}"
+    );
+    assert_eq!(
+        resp.get("files").and_then(serde_json::Value::as_u64),
+        Some(1),
+        "one file holds the matches: {resp}"
+    );
+    // Count short-circuits rendering — no tree output.
+    assert_eq!(
+        resp.get("output").and_then(serde_json::Value::as_str),
+        Some(""),
+        "count response carries no rendered output: {resp}"
+    );
+
+    Ok(())
+}
+
+/// Alternation counts a line matching multiple arms once — a single ripgrep
+/// pass over `a|b`, not per-arm passes summed (the old double-count). Matches
+/// `rg -c 'a|b'`.
+#[test]
+fn test_grep_count_alternation_counts_lines_once() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(
+        dir.path().join("data.txt"),
+        "foo bar\nfoo only\nbar only\nnothing\n",
+    )?;
+
+    let root = dir.path().to_str().context("root path")?;
+    let mut bridge = BridgeProcess::spawn(&[], root)?;
+    bridge.initialize()?;
+
+    let resp =
+        bridge.call_search_raw("tool/grep", &json!({ "pattern": "foo|bar", "count": true }))?;
+
+    // Three matching lines: "foo bar" (matches both arms — counted once),
+    // "foo only", "bar only". Not four — the old per-arm sum double-counted
+    // the overlapping line.
+    assert_eq!(
+        resp.get("matches").and_then(serde_json::Value::as_u64),
+        Some(3),
+        "alternation overlap counts the line once: {resp}"
+    );
+
+    Ok(())
+}
+
 /// Narrow pattern: name at column 0 with kind label.
 #[test]
 fn test_grep_narrow_pattern() -> Result<()> {

@@ -37,6 +37,8 @@ use crate::symbol_index::SymbolIndex;
 pub use diagnostics_server::DiagnosticsServer;
 pub use editing_guardrail::EditingGuardrail;
 pub use editing_manager::EditingManager;
+pub use file_tools::GlobOutcome;
+pub use grep_server::GrepOutcome;
 pub use handler::expand_tilde;
 pub use hook_router::HookRouter;
 pub use path_security::PathValidator;

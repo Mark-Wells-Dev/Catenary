@@ -16,7 +16,6 @@
 use anyhow::{Result, anyhow};
 use ignore::WalkBuilder;
 use serde::Deserialize;
-use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
@@ -51,6 +50,12 @@ pub struct GlobInput {
     /// Working directory for cwd-scoped searches (relative patterns).
     #[serde(default)]
     pub cwd: Option<PathBuf>,
+    /// Return a path count instead of rendered results (default: false).
+    ///
+    /// Short-circuits pagination and LSP enrichment: the pipeline reports the
+    /// number of resolved filesystem paths, never a page.
+    #[serde(default)]
+    pub count: bool,
 }
 
 /// Default page number (1-based).
@@ -86,6 +91,21 @@ struct GlobEntry {
     is_snapshot: bool,
 }
 
+/// Outcome of a glob query.
+///
+/// Normal queries render a paginated tree; `--count` (`GlobInput::count`)
+/// short-circuits to a path count instead of a page.
+pub enum GlobOutcome {
+    /// Rendered, paginated tree output.
+    Rendered(String),
+    /// `--count` summary: number of resolved filesystem paths.
+    Count {
+        /// Number of paths the query resolves to (files counted once each,
+        /// directories counted by their listed entries).
+        paths: usize,
+    },
+}
+
 // ─── Glob tool server ─────────────────────────────────────────────────
 
 /// Glob tool server: file/directory browsing.
@@ -111,7 +131,7 @@ impl GlobServer {
         params: &serde_json::Value,
         parent_id: Option<&str>,
         _cancel: &tokio_util::sync::CancellationToken,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<GlobOutcome> {
         use super::pagination::paginate;
         use super::result_cache::{GlobCacheParams, cache_key};
 
@@ -136,11 +156,13 @@ impl GlobServer {
             budget: self.budget,
         });
 
-        // Check cache before running the pipeline.
-        if let Ok(cache) = self.cache.lock()
+        // Check cache before running the pipeline. Count queries bypass it:
+        // the cache stores rendered pages, and a count is a different shape.
+        if !input.count
+            && let Ok(cache) = self.cache.lock()
             && let Some(cached) = cache.get(key, page, &self.fs_manager)
         {
-            return Ok(Value::String(cached));
+            return Ok(GlobOutcome::Rendered(cached));
         }
 
         // Compile exclude pattern via ResolvedGlob. The CLI router
@@ -152,6 +174,13 @@ impl GlobServer {
             .filter(|s| !s.is_empty())
             .map(ResolvedGlob::new)
             .transpose()?;
+
+        // Count mode short-circuits pagination and enrichment — report the
+        // number of resolved paths, not a page.
+        if input.count {
+            let paths = self.count_paths(&input, exclude.as_ref())?;
+            return Ok(GlobOutcome::Count { paths });
+        }
 
         // cwd-scoped search: present when the original pattern was relative.
         let cwd = input.cwd.as_deref();
@@ -170,7 +199,7 @@ impl GlobServer {
             cache.put(key, full_output, &roots, &self.fs_manager);
         }
 
-        Ok(Value::String(paginated))
+        Ok(GlobOutcome::Rendered(paginated))
     }
 
     /// Single file: header with defensive map (if symbols available).
@@ -324,7 +353,6 @@ impl GlobServer {
     /// Collects immediate children, applies visibility and exclude filters,
     /// detects flags (gitignored, snapshot, broken). Output shape is
     /// capability-driven, not volume-driven. Returns the full unpaginated output.
-    #[allow(clippy::too_many_lines, reason = "sequential pipeline steps")]
     #[allow(
         clippy::significant_drop_tightening,
         reason = "guard must live for all index queries"
@@ -341,112 +369,7 @@ impl GlobServer {
             .canonicalize()
             .map_err(|e| anyhow!("Path does not exist: {}: {e}", dir.display()))?;
 
-        // Build non-gitignored set for flag detection.
-        let non_ignored: HashSet<PathBuf> = if input.include_gitignored {
-            WalkBuilder::new(&canonical)
-                .max_depth(Some(1))
-                .git_ignore(true)
-                .hidden(!input.include_hidden)
-                .build()
-                .flatten()
-                .map(ignore::DirEntry::into_path)
-                .collect()
-        } else {
-            HashSet::new()
-        };
-
-        let walker = WalkBuilder::new(&canonical)
-            .max_depth(Some(1))
-            .git_ignore(!input.include_gitignored)
-            .hidden(!input.include_hidden)
-            .build();
-
-        let mut entries = Vec::new();
-
-        for entry in walker.flatten() {
-            let entry_path = entry.into_path();
-            if entry_path == canonical {
-                continue;
-            }
-
-            let name = entry_path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-
-            // Apply exclude filter against the entry path.
-            if let Some(rg) = exclude
-                && rg.is_match(&entry_path, &canonical)
-            {
-                continue;
-            }
-
-            let is_gitignored = input.include_gitignored && !non_ignored.contains(&entry_path);
-            let is_snap = is_snapshot(&name);
-
-            let metadata = entry_path
-                .symlink_metadata()
-                .map_err(|e| anyhow!("Failed to read metadata for {name}: {e}"))?;
-
-            if metadata.file_type().is_symlink() {
-                let target = std::fs::read_link(&entry_path)
-                    .map_or_else(|_| "?".to_string(), |t| t.to_string_lossy().to_string());
-                let resolved_meta = std::fs::metadata(&entry_path).ok();
-                let is_broken = resolved_meta.is_none();
-
-                let (line_count, binary_size) = if is_broken || is_snap {
-                    (None, None)
-                } else {
-                    self.file_info(&entry_path, resolved_meta.as_ref())
-                };
-
-                entries.push(GlobEntry {
-                    name,
-                    abs_path: entry_path,
-                    is_dir: resolved_meta
-                        .as_ref()
-                        .is_some_and(std::fs::Metadata::is_dir),
-                    line_count,
-                    binary_size,
-                    is_symlink: true,
-                    symlink_target: Some(target),
-                    is_broken_symlink: is_broken,
-                    is_gitignored,
-                    is_snapshot: is_snap,
-                });
-            } else if metadata.is_dir() {
-                entries.push(GlobEntry {
-                    name: format!("{name}/"),
-                    abs_path: entry_path,
-                    is_dir: true,
-                    line_count: None,
-                    binary_size: None,
-                    is_symlink: false,
-                    symlink_target: None,
-                    is_broken_symlink: false,
-                    is_gitignored,
-                    is_snapshot: false,
-                });
-            } else {
-                let (line_count, binary_size) = if is_snap {
-                    (None, None)
-                } else {
-                    self.file_info(&entry_path, Some(&metadata))
-                };
-                entries.push(GlobEntry {
-                    name,
-                    abs_path: entry_path,
-                    is_dir: false,
-                    line_count,
-                    binary_size,
-                    is_symlink: false,
-                    symlink_target: None,
-                    is_broken_symlink: false,
-                    is_gitignored,
-                    is_snapshot: is_snap,
-                });
-            }
-        }
+        let entries = self.collect_dir_entries(&canonical, input, exclude)?;
 
         if entries.is_empty() {
             return Ok("Directory is empty".to_string());
@@ -521,6 +444,153 @@ impl GlobServer {
                 |lc| (Some(lc), None),
             )
         })
+    }
+
+    /// Collects the immediate children of a directory as `GlobEntry` rows.
+    ///
+    /// Applies the visibility (hidden), gitignore, and `exclude` filters and
+    /// detects per-entry flags (gitignored, snapshot, symlink, broken). Shared
+    /// by [`Self::handle_glob_dir`] (which renders the rows) and
+    /// [`Self::count_paths`] (which counts them) so the two never diverge.
+    /// `canonical` must be the canonicalized directory path.
+    #[allow(clippy::too_many_lines, reason = "sequential per-entry classification")]
+    fn collect_dir_entries(
+        &self,
+        canonical: &Path,
+        input: &GlobInput,
+        exclude: Option<&ResolvedGlob>,
+    ) -> Result<Vec<GlobEntry>> {
+        // Build non-gitignored set for flag detection.
+        let non_ignored: HashSet<PathBuf> = if input.include_gitignored {
+            WalkBuilder::new(canonical)
+                .max_depth(Some(1))
+                .git_ignore(true)
+                .hidden(!input.include_hidden)
+                .build()
+                .flatten()
+                .map(ignore::DirEntry::into_path)
+                .collect()
+        } else {
+            HashSet::new()
+        };
+
+        let walker = WalkBuilder::new(canonical)
+            .max_depth(Some(1))
+            .git_ignore(!input.include_gitignored)
+            .hidden(!input.include_hidden)
+            .build();
+
+        let mut entries = Vec::new();
+
+        for entry in walker.flatten() {
+            let entry_path = entry.into_path();
+            if entry_path.as_path() == canonical {
+                continue;
+            }
+
+            let name = entry_path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+
+            // Apply exclude filter against the entry path.
+            if let Some(rg) = exclude
+                && rg.is_match(&entry_path, canonical)
+            {
+                continue;
+            }
+
+            let is_gitignored = input.include_gitignored && !non_ignored.contains(&entry_path);
+            let is_snap = is_snapshot(&name);
+
+            let metadata = entry_path
+                .symlink_metadata()
+                .map_err(|e| anyhow!("Failed to read metadata for {name}: {e}"))?;
+
+            if metadata.file_type().is_symlink() {
+                let target = std::fs::read_link(&entry_path)
+                    .map_or_else(|_| "?".to_string(), |t| t.to_string_lossy().to_string());
+                let resolved_meta = std::fs::metadata(&entry_path).ok();
+                let is_broken = resolved_meta.is_none();
+
+                let (line_count, binary_size) = if is_broken || is_snap {
+                    (None, None)
+                } else {
+                    self.file_info(&entry_path, resolved_meta.as_ref())
+                };
+
+                entries.push(GlobEntry {
+                    name,
+                    abs_path: entry_path,
+                    is_dir: resolved_meta
+                        .as_ref()
+                        .is_some_and(std::fs::Metadata::is_dir),
+                    line_count,
+                    binary_size,
+                    is_symlink: true,
+                    symlink_target: Some(target),
+                    is_broken_symlink: is_broken,
+                    is_gitignored,
+                    is_snapshot: is_snap,
+                });
+            } else if metadata.is_dir() {
+                entries.push(GlobEntry {
+                    name: format!("{name}/"),
+                    abs_path: entry_path,
+                    is_dir: true,
+                    line_count: None,
+                    binary_size: None,
+                    is_symlink: false,
+                    symlink_target: None,
+                    is_broken_symlink: false,
+                    is_gitignored,
+                    is_snapshot: false,
+                });
+            } else {
+                let (line_count, binary_size) = if is_snap {
+                    (None, None)
+                } else {
+                    self.file_info(&entry_path, Some(&metadata))
+                };
+                entries.push(GlobEntry {
+                    name,
+                    abs_path: entry_path,
+                    is_dir: false,
+                    line_count,
+                    binary_size,
+                    is_symlink: false,
+                    symlink_target: None,
+                    is_broken_symlink: false,
+                    is_gitignored,
+                    is_snapshot: is_snap,
+                });
+            }
+        }
+
+        Ok(entries)
+    }
+
+    /// Counts the filesystem paths a glob query resolves to (`--count`).
+    ///
+    /// Mirrors [`Self::handle_literal_paths`] dispatch: each resolved file or
+    /// symlink counts once; each directory contributes its listed entry count
+    /// (the same filtered set [`Self::handle_glob_dir`] renders). LSP
+    /// enrichment is skipped — a count is pure filesystem.
+    fn count_paths(&self, input: &GlobInput, exclude: Option<&ResolvedGlob>) -> Result<usize> {
+        let resolved =
+            expand_search_paths(&input.paths, input.include_gitignored, input.include_hidden);
+        let mut total = 0usize;
+        for path in &resolved {
+            if path.is_file() || path.is_symlink() {
+                total += 1;
+            } else if path.is_dir() {
+                let canonical = path
+                    .canonicalize()
+                    .map_err(|e| anyhow!("Path does not exist: {}: {e}", path.display()))?;
+                total += self.collect_dir_entries(&canonical, input, exclude)?.len();
+            }
+        }
+        Ok(total)
     }
 }
 

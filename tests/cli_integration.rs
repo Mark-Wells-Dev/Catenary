@@ -1251,3 +1251,61 @@ fn test_glob_quoted_zero_match_exits_zero_loud() -> Result<()> {
     drop(bridge);
     Ok(())
 }
+
+// ── --count path counting ─────────────────────────────────────────
+
+/// End-to-end: `catenary glob <dir> --count` reports "N paths" for the
+/// directory's listed entries. The `glob` binary talks to a live daemon;
+/// no LSP server is needed because the count is pure filesystem.
+#[test]
+fn test_glob_count_reports_paths() -> Result<()> {
+    let state_dir = tempfile::tempdir()?;
+    let state_home = state_dir.path().to_str().context("state dir")?;
+
+    let root = tempfile::tempdir()?;
+    let root_str = root.path().to_str().context("root path")?;
+    std::fs::write(root.path().join("a.txt"), "x")?;
+    std::fs::write(root.path().join("b.txt"), "y")?;
+    std::fs::write(root.path().join("c.txt"), "z")?;
+
+    // Start a daemon bound to this state dir (no LSP servers needed).
+    let mut bridge = common::BridgeProcess::spawn_in_state(state_home, |cmd| {
+        cmd.env("CATENARY_ROOTS", root_str);
+    })?;
+    bridge.initialize()?;
+
+    // Wait for the IPC socket the `glob` binary will connect to.
+    let ipc_sock = common::xdg_state_home(state_dir.path())
+        .join("catenary")
+        .join("catenary.sock");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !ipc_sock.exists() && std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
+    isolate_env(&mut cmd, state_home);
+    cmd.current_dir(root.path())
+        .args(["glob", root_str, "--count"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = cmd
+        .output()
+        .context("failed to run catenary glob --count")?;
+
+    assert!(
+        output.status.success(),
+        "glob --count must exit 0, got {:?}; stderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout.trim(),
+        "3 paths",
+        "expected the three listed files counted, got:\n{stdout}"
+    );
+
+    drop(bridge);
+    Ok(())
+}

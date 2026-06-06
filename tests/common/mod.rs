@@ -618,6 +618,23 @@ impl BridgeProcess {
         Ok(output.to_string())
     }
 
+    /// Calls grep/glob via IPC and returns the full parsed response object.
+    ///
+    /// Unlike [`Self::call_grep`]/[`Self::call_glob`] (which extract only
+    /// `output`), this returns the entire response — including the `--count`
+    /// fields (`matches`/`files` for grep, `paths` for glob). `method` is the
+    /// IPC method string (`tool/grep` or `tool/glob`).
+    pub fn call_search_raw(&self, method: &str, args: &Value) -> Result<Value> {
+        let socket_path = self.wait_for_ipc_socket()?;
+        let mut request = args.clone();
+        let obj = request.as_object_mut().context("args must be an object")?;
+        obj.insert("method".to_string(), json!(method));
+        self.resolve_ipc_cwd(obj);
+
+        let response = ipc_tool_request(&socket_path, &Value::Object(obj.clone()))?;
+        serde_json::from_str(&response).context("failed to parse search response")
+    }
+
     /// Calls a tool via the IPC socket and returns the raw result object.
     ///
     /// Wraps the IPC text output in an MCP-style content structure for

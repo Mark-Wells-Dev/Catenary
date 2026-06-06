@@ -63,6 +63,10 @@ enum Command {
         #[arg(long, default_value = "1")]
         page: usize,
 
+        /// Report the match count ("N matches in M files") instead of results.
+        #[arg(long)]
+        count: bool,
+
         /// Include files ignored by .gitignore.
         #[arg(long)]
         include_gitignored: bool,
@@ -91,6 +95,10 @@ enum Command {
         /// Page number for paged results.
         #[arg(long, default_value = "1")]
         page: usize,
+
+        /// Report the path count ("N paths") instead of results.
+        #[arg(long)]
+        count: bool,
 
         /// Include files ignored by .gitignore.
         #[arg(long)]
@@ -425,6 +433,7 @@ fn main() -> Result<()> {
             scope,
             exclude,
             page,
+            count,
             include_gitignored,
             include_hidden,
         }) => {
@@ -436,6 +445,7 @@ fn main() -> Result<()> {
                 paths,
                 exclude,
                 page,
+                count,
                 include_gitignored,
                 include_hidden,
             ))
@@ -447,6 +457,7 @@ fn main() -> Result<()> {
             paths,
             exclude,
             page,
+            count,
             include_gitignored,
             include_hidden,
         }) => {
@@ -457,6 +468,7 @@ fn main() -> Result<()> {
                 paths,
                 exclude,
                 page,
+                count,
                 include_gitignored,
                 include_hidden,
             ))
@@ -1109,12 +1121,17 @@ async fn run_stop(out: &mut cli::Output) -> Result<()> {
 ///
 /// Returns an error if no daemon is running or the query fails.
 #[cfg(unix)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "1:1 with the clap-parsed grep flags"
+)]
 async fn run_grep(
     out: &mut cli::Output,
     pattern: String,
     paths: Vec<PathBuf>,
     exclude: Option<String>,
     page: usize,
+    count: bool,
     include_gitignored: bool,
     include_hidden: bool,
 ) -> Result<()> {
@@ -1131,47 +1148,89 @@ async fn run_grep(
         bre_alternation: pattern.contains("\\|"),
     };
 
-    let daemon_output = if queried {
+    let response = if queried {
         let request = GrepRequest {
             cwd: Some(cwd.clone()),
             pattern,
             paths: resolved.forward.clone(),
             exclude,
             page,
+            count,
             include_gitignored,
             include_hidden,
         };
         search_ipc(METHOD_GREP, &request).await?
     } else {
-        String::new()
+        SearchResponse::default()
     };
 
-    render_search_outcome(out, &cwd, &resolved, &daemon_output, queried, &kind);
+    if count {
+        render_grep_count(
+            out,
+            response.matches.unwrap_or(0),
+            response.files.unwrap_or(0),
+        );
+    } else {
+        render_search_outcome(out, &cwd, &resolved, &response.output, queried, &kind);
+    }
     Ok(())
 }
 
+/// Parsed daemon response for `catenary grep`/`glob` over IPC.
+///
+/// A normal query carries rendered `output`; a `--count` query carries the
+/// totals instead (`matches`/`files` for grep, `paths` for glob) with an
+/// empty `output`. Fields absent from the wire default to empty/`None`, so an
+/// empty response line deserializes to [`SearchResponse::default`].
+#[cfg(unix)]
+#[derive(Default, serde::Deserialize)]
+struct SearchResponse {
+    /// Rendered tree output (empty for a count response).
+    #[serde(default)]
+    output: String,
+    /// grep `--count`: matching-line total.
+    #[serde(default)]
+    matches: Option<usize>,
+    /// grep `--count`: distinct-file total.
+    #[serde(default)]
+    files: Option<usize>,
+    /// glob `--count`: resolved-path total.
+    #[serde(default)]
+    paths: Option<usize>,
+}
+
+/// Renders the `catenary grep --count` summary: `N matches in M files`.
+///
+/// `matches` is the matching-line total (one per rendered leaf row, keywords
+/// dropped); `files` is the number of distinct files holding them.
+fn render_grep_count(out: &mut cli::Output, matches: usize, files: usize) {
+    let _ = out.writeln(format_args!("{matches} matches in {files} files"));
+}
+
+/// Renders the `catenary glob --count` summary: `N paths`.
+fn render_glob_count(out: &mut cli::Output, paths: usize) {
+    let _ = out.writeln(format_args!("{paths} paths"));
+}
+
 /// Sends a `tool/grep` or `tool/glob` request to the daemon and returns the
-/// rendered output text.
+/// parsed [`SearchResponse`].
 ///
 /// Connects to the daemon IPC socket, serializes `request` with `method`
 /// injected, and reads the single response line. An empty response line maps
-/// to an empty string (the caller renders the empty outcome). A non-zero exit
-/// is reserved for genuine faults — no daemon, transport failure, or a
-/// malformed response — so soft conditions never cancel a parallel tool batch.
+/// to a default [`SearchResponse`] (the caller renders the empty outcome). A
+/// non-zero exit is reserved for genuine faults — no daemon, transport
+/// failure, or a malformed response — so soft conditions never cancel a
+/// parallel tool batch.
 ///
 /// # Errors
 ///
 /// Returns an error if no daemon is running or the query fails.
 #[cfg(unix)]
-async fn search_ipc<R: serde::Serialize + Sync>(method: &str, request: &R) -> Result<String> {
+async fn search_ipc<R: serde::Serialize + Sync>(
+    method: &str,
+    request: &R,
+) -> Result<SearchResponse> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-
-    /// Shared response shape — both `GrepResponse` and `GlobResponse` are
-    /// `{ "output": String }`.
-    #[derive(serde::Deserialize)]
-    struct SearchResponse {
-        output: String,
-    }
 
     let ipc_path = catenary_mcp::router::socket_path();
     let stream = tokio::net::UnixStream::connect(&ipc_path)
@@ -1197,11 +1256,9 @@ async fn search_ipc<R: serde::Serialize + Sync>(method: &str, request: &R) -> Re
 
     let trimmed = line.trim();
     if trimmed.is_empty() {
-        return Ok(String::new());
+        return Ok(SearchResponse::default());
     }
-    let response: SearchResponse =
-        serde_json::from_str(trimmed).context("invalid search response from daemon")?;
-    Ok(response.output)
+    serde_json::from_str(trimmed).context("invalid search response from daemon")
 }
 
 /// Runs a glob query against the running daemon.
@@ -1219,6 +1276,7 @@ async fn run_glob(
     paths: Vec<PathBuf>,
     exclude: Option<String>,
     page: usize,
+    count: bool,
     include_gitignored: bool,
     include_hidden: bool,
 ) -> Result<()> {
@@ -1231,28 +1289,33 @@ async fn run_glob(
     // only when at least one argument resolved to a path or pattern.
     let queried = !resolved.forward.is_empty();
 
-    let daemon_output = if queried {
+    let response = if queried {
         let request = GlobRequest {
             cwd: Some(cwd.clone()),
             paths: resolved.forward.clone(),
             exclude,
             page,
+            count,
             include_gitignored,
             include_hidden,
         };
         search_ipc(METHOD_GLOB, &request).await?
     } else {
-        String::new()
+        SearchResponse::default()
     };
 
-    render_search_outcome(
-        out,
-        &cwd,
-        &resolved,
-        &daemon_output,
-        queried,
-        &SearchKind::Glob,
-    );
+    if count {
+        render_glob_count(out, response.paths.unwrap_or(0));
+    } else {
+        render_search_outcome(
+            out,
+            &cwd,
+            &resolved,
+            &response.output,
+            queried,
+            &SearchKind::Glob,
+        );
+    }
     Ok(())
 }
 
@@ -1636,6 +1699,7 @@ mod tests {
             scope,
             exclude,
             page,
+            count,
             include_gitignored,
             include_hidden,
         }) = args.command
@@ -1646,6 +1710,7 @@ mod tests {
         assert!(scope.is_empty());
         assert!(exclude.is_none());
         assert_eq!(page, 1);
+        assert!(!count);
         assert!(!include_gitignored);
         assert!(!include_hidden);
     }
@@ -1692,6 +1757,7 @@ mod tests {
             "tests/",
             "--page",
             "3",
+            "--count",
             "--include-gitignored",
             "--include-hidden",
         ]);
@@ -1701,6 +1767,7 @@ mod tests {
             scope,
             exclude,
             page,
+            count,
             include_gitignored,
             include_hidden,
         }) = args.command
@@ -1711,6 +1778,7 @@ mod tests {
         assert_eq!(scope, vec!["src/"]);
         assert_eq!(exclude.as_deref(), Some("tests/"));
         assert_eq!(page, 3);
+        assert!(count);
         assert!(include_gitignored);
         assert!(include_hidden);
     }
@@ -1733,6 +1801,7 @@ mod tests {
             paths,
             exclude,
             page,
+            count,
             include_gitignored,
             include_hidden,
         }) = args.command
@@ -1742,6 +1811,7 @@ mod tests {
         assert_eq!(paths, vec!["src/"]);
         assert!(exclude.is_none());
         assert_eq!(page, 1);
+        assert!(!count);
         assert!(!include_gitignored);
         assert!(!include_hidden);
     }
@@ -1777,6 +1847,7 @@ mod tests {
             "target/**",
             "--page",
             "2",
+            "--count",
             "--include-gitignored",
             "--include-hidden",
         ]);
@@ -1785,6 +1856,7 @@ mod tests {
             paths,
             exclude,
             page,
+            count,
             include_gitignored,
             include_hidden,
         }) = args.command
@@ -1794,6 +1866,7 @@ mod tests {
         assert_eq!(paths, vec!["src/"]);
         assert_eq!(exclude.as_deref(), Some("target/**"));
         assert_eq!(page, 2);
+        assert!(count);
         assert!(include_gitignored);
         assert!(include_hidden);
     }
@@ -2315,5 +2388,28 @@ mod tests {
         );
         assert!(!text.contains("no matches for"), "{text}");
         assert!(text.contains("path does not exist: gone.rs"), "{text}");
+    }
+
+    // ── --count rendering tests ────────────────────────────────────
+
+    #[test]
+    fn grep_count_matches_in_files() {
+        let mut out = cli::Output::buffer(80);
+        render_grep_count(&mut out, 12, 3);
+        assert_eq!(out.into_string(), "12 matches in 3 files\n");
+    }
+
+    #[test]
+    fn grep_count_zero_is_well_formed() {
+        let mut out = cli::Output::buffer(80);
+        render_grep_count(&mut out, 0, 0);
+        assert_eq!(out.into_string(), "0 matches in 0 files\n");
+    }
+
+    #[test]
+    fn glob_count_paths() {
+        let mut out = cli::Output::buffer(80);
+        render_glob_count(&mut out, 7);
+        assert_eq!(out.into_string(), "7 paths\n");
     }
 }

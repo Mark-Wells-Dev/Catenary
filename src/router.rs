@@ -22,6 +22,7 @@ use tracing::{Instrument, debug, error, info, warn};
 use crate::bridge::EditingGuardrail;
 use crate::bridge::HookRouter;
 use crate::bridge::session::Session;
+use crate::bridge::{GlobOutcome, GrepOutcome};
 use crate::hook::{HookRequest, HookResponseEnvelope, emit_hook_event, hook_outcome_level};
 use crate::logging::LoggingServer;
 use crate::mcp::McpServer;
@@ -106,6 +107,9 @@ pub struct GrepRequest {
     /// Include hidden files and directories.
     #[serde(default)]
     pub include_hidden: bool,
+    /// Return a match/file count instead of rendered results (`--count`).
+    #[serde(default)]
+    pub count: bool,
 }
 
 impl GrepRequest {
@@ -123,6 +127,7 @@ impl GrepRequest {
             "pattern": self.pattern,
             "page": self.page,
             "include_gitignored": self.include_gitignored,
+            "count": self.count,
         });
 
         if self.paths.is_empty() {
@@ -174,8 +179,14 @@ impl GrepRequest {
 /// Returned as a JSON line over the daemon IPC socket.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct GrepResponse {
-    /// Rendered grep output.
+    /// Rendered grep output (empty for a `--count` response).
     pub output: String,
+    /// Matching-line count, present only for a `--count` response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matches: Option<usize>,
+    /// Distinct-file count, present only for a `--count` response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files: Option<usize>,
 }
 
 /// IPC request payload for `catenary glob`.
@@ -215,6 +226,9 @@ pub struct GlobRequest {
     /// Include hidden files and directories.
     #[serde(default)]
     pub include_hidden: bool,
+    /// Return a path count instead of rendered results (`--count`).
+    #[serde(default)]
+    pub count: bool,
 }
 
 impl GlobRequest {
@@ -233,6 +247,7 @@ impl GlobRequest {
         let mut params = serde_json::json!({
             "page": self.page,
             "include_gitignored": self.include_gitignored,
+            "count": self.count,
         });
 
         // Check for hidden targeting on relative paths.
@@ -281,8 +296,11 @@ impl GlobRequest {
 /// Returned as a JSON line over the daemon IPC socket.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct GlobResponse {
-    /// Rendered glob output.
+    /// Rendered glob output (empty for a `--count` response).
     pub output: String,
+    /// Resolved-path count, present only for a `--count` response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paths: Option<usize>,
 }
 
 /// Default page number for IPC tool requests (1-based).
@@ -1476,11 +1494,24 @@ async fn handle_hook_dispatch(
         // Race grep execution against client disconnect so a killed
         // CLI process doesn't leave the pipeline running indefinitely.
         let cancel_on_disconnect = cancel.clone();
-        let output = tokio::select! {
+        let response = tokio::select! {
             result = ctx.primary.grep.execute(&params, Some(&parent_id), &cancel) => {
                 match result {
-                    Ok(v) => v.as_str().unwrap_or("").to_string(),
-                    Err(e) => format!("grep error: {e}"),
+                    Ok(GrepOutcome::Rendered(output)) => GrepResponse {
+                        output,
+                        matches: None,
+                        files: None,
+                    },
+                    Ok(GrepOutcome::Count { matches, files }) => GrepResponse {
+                        output: String::new(),
+                        matches: Some(matches),
+                        files: Some(files),
+                    },
+                    Err(e) => GrepResponse {
+                        output: format!("grep error: {e}"),
+                        matches: None,
+                        files: None,
+                    },
                 }
             }
             () = async {
@@ -1505,7 +1536,6 @@ async fn handle_hook_dispatch(
             }
         };
 
-        let response = GrepResponse { output };
         let mut payload = serde_json::to_vec(&response)?;
 
         emit_hook_event(
@@ -1548,11 +1578,18 @@ async fn handle_hook_dispatch(
         // Race glob execution against client disconnect so a killed
         // CLI process doesn't leave the pipeline running indefinitely.
         let cancel_on_disconnect = cancel.clone();
-        let output = tokio::select! {
+        let response = tokio::select! {
             result = ctx.primary.glob.execute(&params, Some(&parent_id), &cancel) => {
                 match result {
-                    Ok(v) => v.as_str().unwrap_or("").to_string(),
-                    Err(e) => format!("glob error: {e}"),
+                    Ok(GlobOutcome::Rendered(output)) => GlobResponse { output, paths: None },
+                    Ok(GlobOutcome::Count { paths }) => GlobResponse {
+                        output: String::new(),
+                        paths: Some(paths),
+                    },
+                    Err(e) => GlobResponse {
+                        output: format!("glob error: {e}"),
+                        paths: None,
+                    },
                 }
             }
             () = async {
@@ -1577,7 +1614,6 @@ async fn handle_hook_dispatch(
             }
         };
 
-        let response = GlobResponse { output };
         let mut payload = serde_json::to_vec(&response)?;
 
         emit_hook_event(
@@ -3960,6 +3996,7 @@ mod tests {
             page: 2,
             include_gitignored: true,
             include_hidden: false,
+            count: false,
         };
         let json = serde_json::to_string(&req).expect("serialize");
         let parsed: GrepRequest = serde_json::from_str(&json).expect("deserialize");
@@ -3999,6 +4036,7 @@ mod tests {
             page: 1,
             include_gitignored: false,
             include_hidden: false,
+            count: false,
         };
         let json = serde_json::to_string(&req).expect("serialize");
         assert!(!json.contains("paths"), "empty paths should be skipped");
@@ -4010,10 +4048,14 @@ mod tests {
     fn grep_response_roundtrip() {
         let resp = GrepResponse {
             output: "file.rs:10 matched line".to_string(),
+            matches: None,
+            files: None,
         };
         let json = serde_json::to_string(&resp).expect("serialize");
         let parsed: GrepResponse = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed.output, "file.rs:10 matched line");
+        assert!(parsed.matches.is_none());
+        assert!(parsed.files.is_none());
     }
 
     /// `GlobRequest` roundtrips through JSON with all fields.
@@ -4026,6 +4068,7 @@ mod tests {
             page: 3,
             include_gitignored: false,
             include_hidden: true,
+            count: false,
         };
         let json = serde_json::to_string(&req).expect("serialize");
         let parsed: GlobRequest = serde_json::from_str(&json).expect("deserialize");
@@ -4058,10 +4101,12 @@ mod tests {
     fn glob_response_roundtrip() {
         let resp = GlobResponse {
             output: "src/\n  main.rs (42 lines)".to_string(),
+            paths: None,
         };
         let json = serde_json::to_string(&resp).expect("serialize");
         let parsed: GlobResponse = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed.output, "src/\n  main.rs (42 lines)");
+        assert!(parsed.paths.is_none());
     }
 
     /// IPC method constants match expected wire values.

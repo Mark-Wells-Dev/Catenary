@@ -55,6 +55,13 @@ pub struct GrepInput {
     /// Working directory for cwd-scoped searches.
     #[serde(default)]
     pub cwd: Option<PathBuf>,
+    /// Return a match/file count instead of rendered results (default: false).
+    ///
+    /// A dumb, `grep -c`-style count taken straight from the ripgrep pass —
+    /// no symbol classification, no LSP, no enrichment. Reports matching
+    /// lines and distinct files, never a page.
+    #[serde(default)]
+    pub count: bool,
 }
 
 /// Default page number for grep (1-based).
@@ -83,6 +90,23 @@ enum HitClass {
     Keyword,
 }
 
+/// Outcome of a grep query.
+///
+/// Normal queries render a paginated tree; `--count` (`GrepInput::count`)
+/// short-circuits to a numeric summary instead of a page.
+pub enum GrepOutcome {
+    /// Rendered, paginated tree output.
+    Rendered(String),
+    /// `--count` summary: a dumb `grep -c`-style tally from the ripgrep pass.
+    Count {
+        /// Number of matching lines (a line with multiple matches counts
+        /// once, like `grep -c`).
+        matches: usize,
+        /// Number of distinct files holding a match.
+        files: usize,
+    },
+}
+
 /// Grep tool server: ripgrep + symbol index pipeline with LSP enrichment.
 pub struct GrepServer {
     pub(super) client_manager: Arc<LspClientManager>,
@@ -103,7 +127,7 @@ impl GrepServer {
         params: &serde_json::Value,
         parent_id: Option<&str>,
         cancel: &tokio_util::sync::CancellationToken,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<GrepOutcome> {
         use super::result_cache::{GrepCacheParams, cache_key};
 
         let input: GrepInput = serde_json::from_value(params.clone())
@@ -128,11 +152,13 @@ impl GrepServer {
             budget: self.budget,
         });
 
-        // Check cache before running the pipeline.
-        if let Ok(cache) = self.cache.lock()
+        // Check cache before running the pipeline. Count queries bypass it:
+        // the cache stores rendered pages, and a count is a different shape.
+        if !input.count
+            && let Ok(cache) = self.cache.lock()
             && let Some(cached) = cache.get(key, input.page, &self.fs_manager)
         {
-            return Ok(Value::String(cached));
+            return Ok(GrepOutcome::Rendered(cached));
         }
 
         // cwd-scoped search: present when no glob or relative glob.
@@ -151,10 +177,25 @@ impl GrepServer {
                 input.include_hidden,
             );
             if expanded.is_empty() {
-                return Ok(Value::String(String::new()));
+                return Ok(if input.count {
+                    GrepOutcome::Count {
+                        matches: 0,
+                        files: 0,
+                    }
+                } else {
+                    GrepOutcome::Rendered(String::new())
+                });
             }
             expanded
         };
+
+        // Count mode is a dumb, `grep -c`-style tally: a single ripgrep pass
+        // over the whole pattern, no alternation split, no symbol
+        // classification, no LSP. Matching lines (a line counts once) and the
+        // distinct files holding them, straight from the ripgrep result.
+        if input.count {
+            return self.count_matches(&input, &search_paths, cwd.as_deref());
+        }
 
         // Split top-level alternation into independent arms
         let arms = split_alternation(&input.pattern);
@@ -169,6 +210,7 @@ impl GrepServer {
                 include_hidden: input.include_hidden,
                 page: input.page,
                 cwd: cwd.clone(),
+                count: false,
             };
             let output = self
                 .run(arm_input, parent_id, cancel, cwd.as_deref())
@@ -182,7 +224,7 @@ impl GrepServer {
         }
 
         if all_output.is_empty() {
-            return Ok(Value::String(String::new()));
+            return Ok(GrepOutcome::Rendered(String::new()));
         }
 
         // Paginate first (borrows), then move output into cache.
@@ -192,7 +234,51 @@ impl GrepServer {
             cache.put(key, all_output, &roots, &self.fs_manager);
         }
 
-        Ok(Value::String(paginated))
+        Ok(GrepOutcome::Rendered(paginated))
+    }
+
+    /// Dumb `grep -c`-style count: one ripgrep pass, tally matching lines and
+    /// distinct files.
+    ///
+    /// Deliberately skips alternation splitting, symbol classification, LSP
+    /// readiness, and enrichment — a count is a cheap, deterministic "how many
+    /// lines match" answer, not the symbol-aware tree. A line with multiple
+    /// matches counts once (`file_line_texts` is keyed by line), matching
+    /// `grep -c`. `cwd` and `search_paths` scope the walk exactly as
+    /// [`Self::run`] does.
+    fn count_matches(
+        &self,
+        input: &GrepInput,
+        search_paths: &[PathBuf],
+        cwd: Option<&Path>,
+    ) -> Result<GrepOutcome> {
+        let effective_roots = if search_paths.is_empty() {
+            cwd.map_or_else(
+                || self.client_manager.roots(),
+                |cwd| vec![cwd.to_path_buf()],
+            )
+        } else {
+            search_paths.to_vec()
+        };
+        let resolved_exclude = input
+            .exclude
+            .as_deref()
+            .map(ResolvedGlob::new)
+            .transpose()?
+            .map(Arc::new);
+
+        let rg = Self::ripgrep_matches(
+            &input.pattern,
+            &effective_roots,
+            resolved_exclude.as_ref(),
+            input.include_gitignored,
+            input.include_hidden,
+            &self.fs_manager,
+        )?;
+
+        let matches: usize = rg.file_line_texts.values().map(HashMap::len).sum();
+        let files = rg.file_line_texts.len();
+        Ok(GrepOutcome::Count { matches, files })
     }
 
     /// Grep pipeline: ripgrep + `documentSymbol` index + hit classification.
