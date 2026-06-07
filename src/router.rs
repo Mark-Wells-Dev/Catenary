@@ -2097,11 +2097,12 @@ async fn handle_hook_dispatch(
 
     // ── Sed: run ─────────────────────────────────────────────────
     //
-    // `tool/sed` is sent by the `catenary sed` CLI command. Resolves paths
-    // against `cwd`, runs the substitute engine on a blocking thread, and (for
-    // `--in-place`) consumes the staged identity to accumulate the changed set
-    // into the editing manager through the same `has_lsp_coverage` gate the Edit
-    // hook uses.
+    // `tool/sed` is sent by the `catenary sed` CLI command. For `--in-place` the
+    // staged identity is consumed *up front* — the per-session `Session` both
+    // guards writes (the cross-session per-root editing guardrail, exactly as
+    // Edit/Write do) and, after the run, accumulates the changed set through the
+    // same `has_lsp_coverage` gate. The substitute engine itself runs on a
+    // blocking thread so a broad sweep can't stall the daemon.
     if method == METHOD_SED {
         let sed_req: SedRequest =
             serde_json::from_value(raw.clone()).map_err(|e| anyhow!("invalid sed request: {e}"))?;
@@ -2125,32 +2126,58 @@ async fn handle_hook_dispatch(
             .as_ref()
             .map_or(4000, |t| t.grep.budget as usize);
 
-        // The substitute engine does only blocking filesystem IO; run it off the
-        // async reactor so a broad sweep can't stall the daemon.
-        let outcome =
-            match tokio::task::spawn_blocking(move || crate::bridge::sed::execute(&input, budget))
-                .await
-            {
-                Ok(outcome) => outcome,
-                Err(e) => crate::bridge::sed::SedOutcome {
-                    output: format!("sed error: {e}"),
-                    changed: Vec::new(),
-                },
-            };
+        // Consume the staged identity before the write so the session can both
+        // guard and accumulate. `None` ⇒ preview, or an expired/absent handoff
+        // (writes proceed unguarded and untracked — the same degradation as an
+        // expired diagnostics handoff).
+        let identity = if in_place {
+            ctx.handoff
+                .consume(HandoffKey::Sed)
+                .and_then(|h| match h.payload {
+                    HandoffPayload::SedIdentity {
+                        session_id,
+                        agent_id,
+                    } => Some((session_id, agent_id)),
+                    HandoffPayload::Diagnostics { .. } => None,
+                })
+        } else {
+            None
+        };
+        let router = identity
+            .as_ref()
+            .map(|(sid, _)| get_or_create_router(&ctx, sid.as_deref().unwrap_or("default"), &raw));
+        let guard_session = router.as_ref().map(|r| r.session.clone());
 
-        // Identity-forward accumulation: consume the staged identity (releasing
-        // the per-key permit) and route the LSP-covered changed files into the
-        // editing set, exactly like an Edit/Write would.
-        if in_place
-            && let Some(handoff) = ctx.handoff.consume(HandoffKey::Sed)
-            && let HandoffPayload::SedIdentity {
-                session_id: sid,
-                agent_id,
-            } = handoff.payload
+        let outcome = match tokio::task::spawn_blocking(move || {
+            // Per-file write guard: deny files whose root another session holds.
+            // Rootless files (single-file coverage) carry no guardrail.
+            let guard = |path: &Path| -> bool {
+                guard_session.as_ref().is_none_or(|session| {
+                    session.resolve_root(path).is_none_or(|root| {
+                        session
+                            .editing_guardrail
+                            .as_ref()
+                            .is_none_or(|g| g.try_acquire(&root, &session.instance_id).is_ok())
+                    })
+                })
+            };
+            crate::bridge::sed::execute(&input, budget, guard)
+        })
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(e) => crate::bridge::sed::SedOutcome {
+                output: format!("sed error: {e}"),
+                changed: Vec::new(),
+            },
+        };
+
+        // Identity-forward accumulation: route the LSP-covered changed files
+        // into the editing set, exactly like an Edit/Write would.
+        if let Some((sid, agent_id)) = identity
+            && let Some(router) = router.as_ref()
             && !outcome.changed.is_empty()
         {
-            let route_id = sid.as_deref().unwrap_or("default");
-            let router = get_or_create_router(&ctx, route_id, &raw);
             let mut started = false;
             let mut accumulated = 0usize;
             for file in &outcome.changed {
@@ -2173,7 +2200,6 @@ async fn handle_hook_dispatch(
             }
             debug!(
                 source = Source::DaemonDispatch.as_str(),
-                session_id = %route_id,
                 changed = outcome.changed.len(),
                 accumulated,
                 "sed: accumulated changed files for diagnostics",

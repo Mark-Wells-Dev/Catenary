@@ -63,8 +63,9 @@ pub const REQUIRES_PATH_MSG: &str = "catenary sed needs an explicit path — it 
 pub struct SedInput {
     /// Search pattern (`regex`-crate dialect, shared with `catenary grep`).
     pub pattern: String,
-    /// Replacement text. `$1`/`${name}` reference capture groups; the C-escapes
-    /// `\n`/`\t`/`\r`/`\\` are interpreted; sed-style `\1`/`&`/`\L` are rejected.
+    /// Replacement text. `$1`/`${name}` reference capture groups, `$0` the whole
+    /// match, `$$` a literal `$`; the C-escapes `\n`/`\t`/`\r`/`\\` are
+    /// interpreted; sed-style `\1`/`\L` are rejected, and `&` is a literal `&`.
     pub replacement: String,
     /// Absolute paths and glob patterns to resolve into the edit set.
     pub paths: Vec<PathBuf>,
@@ -109,12 +110,20 @@ impl SedOutcome {
 /// Files dropped from the edit set, by reason (reported, never silent).
 #[derive(Default)]
 struct Drops {
-    /// Skipped because gitignored (and `--include-gitignored` was not set).
+    /// Explicitly named paths that were gitignored (and `--include-gitignored`
+    /// was not set). This is the Decision 9 convergence guard: a shell-expanded
+    /// `**/*.rs` arrives as concrete gitignored paths and is dropped here, so it
+    /// matches the set a quoted `"**/*.rs"` produces (the gitignore-aware walker
+    /// never emits gitignored entries in the first place — there is nothing to
+    /// count for that path, and nothing was ever a candidate to drop).
     gitignored: usize,
     /// Skipped because the path lies inside a VCS metadata directory.
     vcs: usize,
     /// Skipped because the file is binary (or too large / unreadable).
     binary: usize,
+    /// Skipped because another session holds the cross-session editing
+    /// guardrail on that file's root.
+    locked: usize,
 }
 
 impl Drops {
@@ -130,6 +139,9 @@ impl Drops {
         }
         if self.binary > 0 {
             parts.push(format!("{} skipped binary", self.binary));
+        }
+        if self.locked > 0 {
+            parts.push(format!("{} skipped (another session editing)", self.locked));
         }
         parts.join(", ")
     }
@@ -148,12 +160,21 @@ struct FileHit {
 ///
 /// Synchronous and self-contained (only filesystem IO) so the caller can run it
 /// on a blocking thread. `budget` is the per-page character budget for the
-/// preview.
+/// preview. `guard` decides whether a given file may be written (the
+/// cross-session editing guardrail) — it is consulted *only* on the
+/// `--in-place` write path, so a preview never acquires a lock.
 #[must_use]
-pub fn execute(input: &SedInput, budget: usize) -> SedOutcome {
+pub fn execute(input: &SedInput, budget: usize, guard: impl Fn(&Path) -> bool) -> SedOutcome {
     if input.paths.is_empty() {
         return SedOutcome::message(REQUIRES_PATH_MSG);
     }
+
+    // Compile the pattern first (a bad regex fails loudly, like grep's `\|`) so
+    // the replacement validator can cross-check capture references against it.
+    let regex = match compile(&input.pattern, input.ignore_case) {
+        Ok(re) => re,
+        Err(e) => return SedOutcome::message(format!("invalid pattern: {e}")),
+    };
 
     // Validate + interpret the replacement before any walk: a bad replacement
     // is a loud correction, not a silent corruption.
@@ -161,12 +182,9 @@ pub fn execute(input: &SedInput, budget: usize) -> SedOutcome {
         Ok(r) => r,
         Err(hint) => return SedOutcome::message(hint),
     };
-
-    // Compile the pattern (a bad regex fails loudly, like grep's `\|`).
-    let regex = match compile(&input.pattern, input.ignore_case) {
-        Ok(re) => re,
-        Err(e) => return SedOutcome::message(format!("invalid pattern: {e}")),
-    };
+    if let Err(hint) = validate_captures(&replacement, &regex) {
+        return SedOutcome::message(hint);
+    }
 
     // Resolve the edit set, refusing explicitly named VCS paths.
     let (files, drops) = match resolve_targets(input) {
@@ -192,6 +210,12 @@ pub fn execute(input: &SedInput, budget: usize) -> SedOutcome {
             continue;
         }
         if input.in_place {
+            // Cross-session guardrail: skip files in a root another session is
+            // editing — reported, not silently dropped.
+            if !guard(&path) {
+                drops.locked += 1;
+                continue;
+            }
             let new = substitute(
                 &regex,
                 &content,
@@ -199,7 +223,7 @@ pub fn execute(input: &SedInput, budget: usize) -> SedOutcome {
                 input.first,
                 input.preserve_case,
             );
-            if std::fs::write(&path, new.as_bytes()).is_ok() {
+            if atomic_write(&path, new.as_bytes()).is_ok() {
                 changed.push(path.clone());
                 hits.push(FileHit { path, count });
             }
@@ -214,12 +238,15 @@ pub fn execute(input: &SedInput, budget: usize) -> SedOutcome {
 
 /// Validates and interprets a replacement string.
 ///
-/// Rejects sed-style capture/case escapes (`\1`–`\9`, `&`, `\L \U \l \u \E`)
-/// with a hint naming the `regex`-dialect equivalent — turning a silent
-/// repo-wide corruption into a grep-style loud correction. Interprets the
-/// unambiguous C-escapes (`\n`, `\t`, `\r`, `\\`); a literal backslash-n is
-/// `\\n`. `&`→`$0` is deliberately *not* auto-translated (it collides with a
-/// literal `&`).
+/// Rejects sed-style capture/case escapes (`\1`–`\9`, `\L \U \l \u \E`) with a
+/// hint naming the `regex`-dialect equivalent — turning a silent repo-wide
+/// corruption into a grep-style loud correction. Interprets the unambiguous
+/// C-escapes (`\n`, `\t`, `\r`, `\\`); a literal backslash-n is `\\n`.
+///
+/// `&` carries no special meaning in this dialect — it passes through as a
+/// literal `&` (the whole match is `$0`, taught by the primer). Capture
+/// *references* (`$1`/`$name`) are cross-checked separately by
+/// [`validate_captures`], which needs the compiled pattern.
 ///
 /// # Errors
 ///
@@ -229,12 +256,6 @@ fn prepare_replacement(raw: &str) -> Result<String, String> {
     let mut out = String::with_capacity(raw.len());
     let mut chars = raw.chars();
     while let Some(c) = chars.next() {
-        if c == '&' {
-            return Err("`catenary sed` doesn't use `&` for the whole match — \
-                 use `$0`. (A literal `&` is rejected to avoid silently inserting \
-                 it; reach for Edit if you need a literal `&`.)"
-                .to_string());
-        }
         if c != '\\' {
             out.push(c);
             continue;
@@ -275,6 +296,108 @@ fn compile(pattern: &str, ignore_case: bool) -> Result<Regex, regex::Error> {
     RegexBuilder::new(pattern)
         .case_insensitive(ignore_case)
         .build()
+}
+
+/// Cross-checks every `$`-capture reference in the (already C-escape-interpreted)
+/// replacement against the compiled pattern's groups.
+///
+/// The `regex` crate expands an out-of-range `$5` or an unknown `$name` to the
+/// *empty string*, silently — the `$`-dialect twin of the `\1` corruption
+/// [`prepare_replacement`] catches. This walks the replacement with the same
+/// `$`-token rules the engine uses (`$$` is a literal `$`; a name is the longest
+/// `[0-9A-Za-z_]` run, or `${…}`) and rejects any reference the pattern can't
+/// satisfy. `$0` (the whole match) is always valid.
+///
+/// # Errors
+///
+/// Returns a pedagogical hint when a reference names a group the pattern lacks.
+fn validate_captures(replacement: &str, regex: &Regex) -> Result<(), String> {
+    let group_count = regex.captures_len(); // includes group 0 (whole match)
+    let names: HashSet<&str> = regex.capture_names().flatten().collect();
+
+    let bytes = replacement.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'$' {
+            i += 1;
+            continue;
+        }
+        // Trailing `$`, or `$$` (literal `$`) — neither is a reference.
+        let Some(&next) = bytes.get(i + 1) else { break };
+        if next == b'$' {
+            i += 2;
+            continue;
+        }
+
+        let name = if next == b'{' {
+            // `${name}` — read to the closing brace.
+            let Some(close) = replacement[i + 2..].find('}') else {
+                i += 2;
+                continue;
+            };
+            let name = &replacement[i + 2..i + 2 + close];
+            i += 2 + close + 1;
+            name
+        } else {
+            // `$name` — the longest `[0-9A-Za-z_]` run.
+            let start = i + 1;
+            let mut end = start;
+            while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+                end += 1;
+            }
+            if end == start {
+                // `$` followed by a non-name char — a literal `$`.
+                i += 1;
+                continue;
+            }
+            let name = &replacement[start..end];
+            i = end;
+            name
+        };
+
+        if name.is_empty() {
+            continue;
+        }
+        if name.bytes().all(|b| b.is_ascii_digit()) {
+            if name.parse::<usize>().is_ok_and(|idx| idx >= group_count) {
+                return Err(format!(
+                    "`catenary sed`: the pattern has no capture group `${name}` — \
+                     use `$$` for a literal `$` (or `${{N}}` to delimit a group)."
+                ));
+            }
+        } else if !names.contains(name) {
+            return Err(format!(
+                "`catenary sed`: the pattern has no capture group named `${name}` — \
+                 use `$$` for a literal `$`."
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Atomically writes `content` to `path`: a temp file in the same directory is
+/// renamed over the target, so a crash mid-write can never leave a truncated
+/// file. The original file's permissions are preserved.
+///
+/// # Errors
+///
+/// Returns an IO error if the temp file cannot be created/written or the rename
+/// fails (e.g. the parent directory is read-only).
+fn atomic_write(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    // Same directory ⇒ same filesystem ⇒ the rename is atomic.
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    tmp.write_all(content)?;
+    tmp.flush()?;
+    if let Ok(meta) = path.metadata() {
+        let _ = tmp.as_file().set_permissions(meta.permissions());
+    }
+    tmp.persist(path).map_err(|e| e.error)?;
+    Ok(())
 }
 
 /// Counts the matches a substitution would touch (1 at most under `--first`).
@@ -566,7 +689,7 @@ mod tests {
 
     #[test]
     fn requires_explicit_path() {
-        let outcome = execute(&input("a", "b", Vec::new()), 4000);
+        let outcome = execute(&input("a", "b", Vec::new()), 4000, |_| true);
         assert!(
             outcome.output.contains("explicit path"),
             "got: {}",
@@ -582,9 +705,31 @@ mod tests {
     }
 
     #[test]
-    fn rejects_ampersand_whole_match() {
-        let err = prepare_replacement("x & y").expect_err("& must be rejected");
-        assert!(err.contains("$0"), "hint must name $0, got: {err}");
+    fn ampersand_is_literal() {
+        // `&` carries no special meaning in the regex dialect — it passes through.
+        assert_eq!(prepare_replacement("a && b").expect("ok"), "a && b");
+        assert_eq!(prepare_replacement("&mut x").expect("ok"), "&mut x");
+    }
+
+    #[test]
+    fn rejects_out_of_range_capture_ref() {
+        let re = compile(r"(\w+)", false).expect("compile");
+        let err = validate_captures("$2", &re).expect_err("$2 has no group");
+        assert!(err.contains("$$"), "hint must teach $$, got: {err}");
+    }
+
+    #[test]
+    fn rejects_unknown_named_ref() {
+        let re = compile(r"(\w+)", false).expect("compile");
+        let err = validate_captures("$missing", &re).expect_err("no such named group");
+        assert!(err.contains("missing"), "hint names the group, got: {err}");
+    }
+
+    #[test]
+    fn accepts_valid_capture_refs() {
+        let re = compile(r"(?P<key>\w+)=(\w+)", false).expect("compile");
+        // $0 (whole match), a named group, a numbered group, and a literal $$.
+        validate_captures("$0 $key=$2 costs $$5", &re).expect("all refs valid");
     }
 
     #[test]
@@ -631,7 +776,7 @@ mod tests {
         let file = dir.path().join("a.txt");
         std::fs::write(&file, "foo foo bar\nfoo\n").expect("write");
 
-        let outcome = execute(&input("foo", "baz", vec![file.clone()]), 4000);
+        let outcome = execute(&input("foo", "baz", vec![file.clone()]), 4000, |_| true);
         assert!(outcome.changed.is_empty(), "preview writes nothing");
         assert!(
             outcome.output.contains("a.txt"),
@@ -658,7 +803,7 @@ mod tests {
 
         let mut sed = input("foo", "baz", vec![file.clone()]);
         sed.in_place = true;
-        let outcome = execute(&sed, 4000);
+        let outcome = execute(&sed, 4000, |_| true);
 
         assert_eq!(outcome.changed, vec![file.clone()]);
         assert_eq!(std::fs::read_to_string(&file).expect("read"), "baz baz\n");
@@ -675,7 +820,7 @@ mod tests {
         let mut sed = input("x", "y", vec![config.clone()]);
         sed.in_place = true;
         sed.include_hidden = true;
-        let outcome = execute(&sed, 4000);
+        let outcome = execute(&sed, 4000, |_| true);
 
         assert!(
             outcome.output.contains("refused"),
@@ -698,7 +843,7 @@ mod tests {
         let mut sed = input("url", "URL", vec![dir.path().to_path_buf()]);
         sed.in_place = true;
         sed.include_hidden = true;
-        let outcome = execute(&sed, 4000);
+        let outcome = execute(&sed, 4000, |_| true);
 
         assert_eq!(outcome.changed, vec![dir.path().join("real.txt")]);
         // .git/config untouched.
@@ -716,7 +861,7 @@ mod tests {
 
         let mut sed = input("foo", "baz", vec![bin.clone()]);
         sed.in_place = true;
-        let outcome = execute(&sed, 4000);
+        let outcome = execute(&sed, 4000, |_| true);
 
         assert!(outcome.changed.is_empty(), "binary file not edited");
         assert!(
@@ -728,6 +873,48 @@ mod tests {
     }
 
     #[test]
+    fn guard_skips_locked_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "foo\n").expect("write");
+
+        let mut sed = input("foo", "bar", vec![file.clone()]);
+        sed.in_place = true;
+        // The guard denies every write (simulating another session's lock).
+        let outcome = execute(&sed, 4000, |_| false);
+
+        assert!(outcome.changed.is_empty(), "locked file not edited");
+        assert!(
+            outcome.output.contains("another session"),
+            "locked drop reported: {}",
+            outcome.output
+        );
+        assert_eq!(std::fs::read_to_string(&file).expect("read"), "foo\n");
+    }
+
+    #[test]
+    fn atomic_write_preserves_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("script.sh");
+        std::fs::write(&file, "echo foo\n").expect("write");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let mut sed = input("foo", "bar", vec![file.clone()]);
+        sed.in_place = true;
+        let outcome = execute(&sed, 4000, |_| true);
+
+        assert_eq!(outcome.changed, vec![file.clone()]);
+        assert_eq!(std::fs::read_to_string(&file).expect("read"), "echo bar\n");
+        let mode = std::fs::metadata(&file).expect("meta").permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o755,
+            "permissions preserved across atomic write"
+        );
+    }
+
+    #[test]
     fn reports_gitignored_drop() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(dir.path().join(".git")).expect("mkdir .git");
@@ -736,7 +923,7 @@ mod tests {
         std::fs::write(&ignored, "foo\n").expect("write");
 
         // Explicitly named gitignored file → dropped and reported.
-        let outcome = execute(&input("foo", "baz", vec![ignored]), 4000);
+        let outcome = execute(&input("foo", "baz", vec![ignored]), 4000, |_| true);
         assert!(
             outcome.output.contains("skipped gitignored"),
             "gitignored drop reported: {}",
@@ -750,7 +937,7 @@ mod tests {
         let file = dir.path().join("a.txt");
         std::fs::write(&file, "nothing here\n").expect("write");
 
-        let outcome = execute(&input("absent", "x", vec![file]), 4000);
+        let outcome = execute(&input("absent", "x", vec![file]), 4000, |_| true);
         assert!(
             outcome.output.contains("no matches for: absent"),
             "loud zero: {}",
@@ -764,7 +951,7 @@ mod tests {
         let file = dir.path().join("a.txt");
         std::fs::write(&file, "x\n").expect("write");
 
-        let outcome = execute(&input("(unclosed", "y", vec![file]), 4000);
+        let outcome = execute(&input("(unclosed", "y", vec![file]), 4000, |_| true);
         assert!(
             outcome.output.contains("invalid pattern"),
             "bad regex is loud: {}",

@@ -120,7 +120,8 @@ enum Command {
         /// Regex pattern (Rust/PCRE syntax, | for alternation).
         pattern: String,
 
-        /// Replacement text ($1 for capture groups; \n/\t/\r interpreted).
+        /// Replacement text. $1 references a capture group, $0 the whole match,
+        /// $$ a literal $; \n/\t/\r are interpreted. (`&` is a literal `&`.)
         replacement: String,
 
         /// File or directory path(s), or quoted glob pattern(s).
