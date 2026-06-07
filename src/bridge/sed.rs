@@ -19,12 +19,14 @@
 //! (no backreferences/lookaround) guarantees no catastrophic-backtracking hang
 //! on an agent-supplied pattern run across a whole repo.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::path::{Component, Path, PathBuf};
 
 use ignore::WalkBuilder;
 use regex::{Captures, Regex, RegexBuilder};
+use similar::{ChangeTag, TextDiff};
 
 use super::pagination::paginate;
 use super::session::{ResolvedGlob, path_is_gitignored};
@@ -41,6 +43,30 @@ const VCS_DIRS: [&str; 4] = [".git", ".jj", ".hg", ".svn"];
 /// binary and skipped — a regex rewrite of a multi-megabyte blob is far more
 /// likely corruption than an intended edit.
 const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Lines of unchanged context shown around each hunk in a preview diff.
+const DIFF_CONTEXT: usize = 3;
+
+/// Maximum changed (`+`/`-`) lines rendered for a single file in a preview diff
+/// before truncating with a "… N more changed lines" marker. Bounds any one file
+/// so a repo-wide rename can't bury the preview; `paginate` then pages the
+/// (bounded-per-file) body across files.
+const MAX_DIFF_LINES_PER_FILE: usize = 40;
+
+/// Maximum number of files whose diffs are rendered into a preview. Matches are
+/// still *counted* across every file (the totals stay honest), but the diff body
+/// is built for at most this many — the remainder is summarized. Together with
+/// [`MAX_DIFF_LINES_PER_FILE`] and [`MAX_PREVIEW_DIFF_LINE`] this hard-bounds the
+/// preview's peak memory regardless of how many files a pattern sweeps, so a
+/// broad pattern can never OOM the daemon.
+const MAX_PREVIEW_FILES: usize = 200;
+
+/// Maximum characters of a single diff line rendered in a preview; longer lines
+/// are clipped with `…`. A text file may be up to [`MAX_FILE_BYTES`] on one line,
+/// so without this the per-file/per-count caps alone would not bound memory.
+/// Display-only — the `--in-place` write is computed from the substitution, not
+/// this rendering, so a clipped preview line never affects what gets written.
+const MAX_PREVIEW_DIFF_LINE: usize = 500;
 
 /// Loud error when `catenary sed` is invoked without an explicit path.
 ///
@@ -147,11 +173,11 @@ impl Drops {
     }
 }
 
-/// Per-file substitution result.
+/// Per-file write result, accumulated on the `--in-place` path.
 struct FileHit {
     /// The edited file.
     path: PathBuf,
-    /// Number of matches (replacements applied for `--in-place`).
+    /// Number of replacements applied.
     count: usize,
 }
 
@@ -195,6 +221,7 @@ pub fn execute(input: &SedInput, budget: usize, guard: impl Fn(&Path) -> bool) -
     let mut drops = drops;
     let mut hits: Vec<FileHit> = Vec::new();
     let mut changed: Vec<PathBuf> = Vec::new();
+    let mut preview = Preview::default();
 
     for path in files {
         let content = match read_text_file(&path) {
@@ -228,11 +255,27 @@ pub fn execute(input: &SedInput, budget: usize, guard: impl Fn(&Path) -> bool) -
                 hits.push(FileHit { path, count });
             }
         } else {
-            hits.push(FileHit { path, count });
+            // Preview: run the real substitution (preserve-case/first included)
+            // so the diff reflects the exact transformation. Matches are counted
+            // for every file (totals stay honest), but the diff body is rendered
+            // for at most MAX_PREVIEW_FILES — peak memory is bounded no matter how
+            // many files the pattern sweeps. Nothing is written.
+            let new = substitute(
+                &regex,
+                &content,
+                &replacement,
+                input.first,
+                input.preserve_case,
+            );
+            preview.observe(&path, count, &content, &new);
         }
     }
 
-    let output = render(input, &hits, &drops, budget);
+    let output = if input.in_place {
+        render_in_place(input, &hits, &drops, budget)
+    } else {
+        preview.render(input, &drops, budget)
+    };
     SedOutcome { output, changed }
 }
 
@@ -623,33 +666,197 @@ fn read_text_file(path: &Path) -> Result<String, ReadSkip> {
     String::from_utf8(bytes).map_err(|_| ReadSkip::Binary)
 }
 
-/// Renders the preview / write summary (the no-match case is a loud zero).
-fn render(input: &SedInput, hits: &[FileHit], drops: &Drops, budget: usize) -> String {
+/// Accumulates the bare-preview result while staying memory-bounded.
+///
+/// Every matched file is *counted* (`total_matches` / `matched_files` /
+/// `unchanged_files` are exact), but the rendered `body` is built for at most
+/// [`MAX_PREVIEW_FILES`] files. Combined with the per-file
+/// ([`MAX_DIFF_LINES_PER_FILE`]) and per-line ([`MAX_PREVIEW_DIFF_LINE`]) caps,
+/// the body has a hard size ceiling independent of how many files the pattern
+/// sweeps — a broad preview cannot OOM the daemon. The remainder is summarized
+/// in the header so the agent learns it was truncated.
+#[derive(Default)]
+struct Preview {
+    /// Rendered diff sections + `unchanged` markers (bounded; see above).
+    body: String,
+    /// Total matches across *all* matched files.
+    total_matches: usize,
+    /// Files with at least one match (changed or not).
+    matched_files: usize,
+    /// Files that matched but whose substitution reproduced the original text.
+    unchanged_files: usize,
+    /// Files actually rendered into `body` (`≤ MAX_PREVIEW_FILES`).
+    rendered_files: usize,
+}
+
+impl Preview {
+    /// Records one matched file: always counts it, and renders its diff (or a
+    /// no-op marker) into `body` while under the render cap.
+    fn observe(&mut self, path: &Path, count: usize, old: &str, new: &str) {
+        self.total_matches += count;
+        self.matched_files += 1;
+        let is_noop = old == new;
+        if is_noop {
+            self.unchanged_files += 1;
+        }
+        if self.rendered_files >= MAX_PREVIEW_FILES {
+            return;
+        }
+        if is_noop {
+            // Flagged, not hidden: the agent learns the pattern matched but the
+            // replacement reproduces the existing text, so nothing would change.
+            let _ = writeln!(
+                self.body,
+                "{} ({}) — unchanged (replacement matches existing text)",
+                path.display(),
+                matches_label(count)
+            );
+        } else {
+            append_file_diff(&mut self.body, path, count, old, new);
+        }
+        self.rendered_files += 1;
+    }
+
+    /// Renders the preview: totals + flags in the header (repeated on every
+    /// page), the bounded diff body paged by `--page`. The no-match case is a
+    /// loud zero.
+    fn render(&self, input: &SedInput, drops: &Drops, budget: usize) -> String {
+        if self.matched_files == 0 {
+            return render_zero(input, drops);
+        }
+        let mut header = summary_header(self.total_matches, "matches", self.matched_files, drops);
+        if self.unchanged_files > 0 {
+            let _ = writeln!(
+                header,
+                "{} matched but unchanged (replacement reproduces the match)",
+                self.unchanged_files
+            );
+        }
+        let not_rendered = self.matched_files - self.rendered_files;
+        if not_rendered > 0 {
+            let _ = writeln!(
+                header,
+                "{not_rendered} more files matched (diff not shown) — narrow the pattern or run --in-place"
+            );
+        }
+        format!(
+            "{header}{}",
+            paginate(&self.body, budget, input.page.max(1))
+        )
+    }
+}
+
+/// Renders the `--in-place` write summary: totals header + per-file replacement
+/// counts (the write already happened). The no-match case is a loud zero.
+fn render_in_place(input: &SedInput, hits: &[FileHit], drops: &Drops, budget: usize) -> String {
     if hits.is_empty() {
         return render_zero(input, drops);
     }
-
     let total: usize = hits.iter().map(|h| h.count).sum();
-    let noun = if input.in_place {
-        "replacements"
-    } else {
-        "matches"
-    };
-
-    let mut header = String::new();
-    let _ = writeln!(header, "{total} {noun} in {} files", hits.len());
-    let drop_summary = drops.summary();
-    if !drop_summary.is_empty() {
-        let _ = writeln!(header, "{drop_summary}");
-    }
-
+    let header = summary_header(total, "replacements", hits.len(), drops);
     let mut list = String::new();
     for hit in hits {
         let _ = writeln!(list, "  {}: {}", hit.path.display(), hit.count);
     }
-
     // Header (totals + drops) is always shown; the per-file list is paged.
     format!("{header}{}", paginate(&list, budget, input.page.max(1)))
+}
+
+/// Builds the leading `{total} {noun} in {files} files` line plus the drop
+/// summary — the at-a-glance counts that lead every page.
+fn summary_header(total: usize, noun: &str, files: usize, drops: &Drops) -> String {
+    let mut header = String::new();
+    let _ = writeln!(header, "{total} {noun} in {files} files");
+    let drop_summary = drops.summary();
+    if !drop_summary.is_empty() {
+        let _ = writeln!(header, "{drop_summary}");
+    }
+    header
+}
+
+/// Pluralizes a per-file match count for a diff header (`1 match` / `3 matches`).
+fn matches_label(count: usize) -> String {
+    if count == 1 {
+        "1 match".to_string()
+    } else {
+        format!("{count} matches")
+    }
+}
+
+/// Appends one previewed file's unified diff to `out`: a `path (N matches)`
+/// header followed by `similar` hunks (`-old` / `+new` / context lines).
+///
+/// The caller renders only genuinely-changed files here (no-ops are flagged
+/// separately), so there is always at least one hunk. Two caps keep the output
+/// bounded: a file's changed (`+`/`-`) lines stop at [`MAX_DIFF_LINES_PER_FILE`]
+/// (overflow → a "… N more changed lines" marker), and each rendered line is
+/// clipped at [`MAX_PREVIEW_DIFF_LINE`] characters — together these bound a
+/// single file's contribution regardless of its size.
+fn append_file_diff(out: &mut String, path: &Path, count: usize, old: &str, new: &str) {
+    let diff = TextDiff::from_lines(old, new);
+    let total_changed = diff
+        .iter_all_changes()
+        .filter(|c| c.tag() != ChangeTag::Equal)
+        .count();
+    if total_changed == 0 {
+        return;
+    }
+
+    let cap = MAX_DIFF_LINES_PER_FILE;
+    let _ = writeln!(out, "{} ({})", path.display(), matches_label(count));
+
+    let mut shown = 0usize;
+    let mut udiff = diff.unified_diff();
+    udiff.context_radius(DIFF_CONTEXT);
+    for hunk in udiff.iter_hunks() {
+        // Already at the cap — don't open another hunk; its leading context would
+        // add bulk with no new change to show.
+        if shown >= cap {
+            break;
+        }
+        let mut header_written = false;
+        for change in hunk.iter_changes() {
+            let changed = change.tag() != ChangeTag::Equal;
+            if changed && shown >= cap {
+                break;
+            }
+            // Defer the `@@ … @@` header until a line is actually emitted, so a
+            // hunk we stop before never leaves a dangling header behind.
+            if !header_written {
+                let _ = writeln!(out, "{}", hunk.header());
+                header_written = true;
+            }
+            let sign = match change.tag() {
+                ChangeTag::Delete => '-',
+                ChangeTag::Insert => '+',
+                ChangeTag::Equal => ' ',
+            };
+            // `from_lines` change values carry their trailing newline; normalize
+            // to one output line per change so `paginate` splits cleanly, then
+            // clip an over-long line so one giant line can't blow the budget.
+            let line = change.value();
+            let line = line.strip_suffix('\n').unwrap_or(line);
+            let _ = writeln!(out, "{sign}{}", clip_line(line));
+            if changed {
+                shown += 1;
+            }
+        }
+    }
+
+    if total_changed > cap {
+        let _ = writeln!(out, "… {} more changed lines", total_changed - cap);
+    }
+}
+
+/// Clips a rendered diff line to [`MAX_PREVIEW_DIFF_LINE`] characters, appending
+/// `…` when truncated. Borrows the line unchanged when it already fits.
+fn clip_line(line: &str) -> Cow<'_, str> {
+    match line.char_indices().nth(MAX_PREVIEW_DIFF_LINE) {
+        // There is a character at index `MAX_PREVIEW_DIFF_LINE`, so the line has
+        // more than that many chars — clip on the char boundary at `idx`.
+        Some((idx, _)) => Cow::Owned(format!("{}…", &line[..idx])),
+        None => Cow::Borrowed(line),
+    }
 }
 
 /// Renders the loud-zero result: no matches anywhere, plus any filter drops.
@@ -771,21 +978,33 @@ mod tests {
     }
 
     #[test]
-    fn preview_lists_files_and_counts_without_writing() {
+    fn sed_preview_shows_diff() {
         let dir = tempfile::tempdir().expect("tempdir");
         let file = dir.path().join("a.txt");
         std::fs::write(&file, "foo foo bar\nfoo\n").expect("write");
 
         let outcome = execute(&input("foo", "baz", vec![file.clone()]), 4000, |_| true);
         assert!(outcome.changed.is_empty(), "preview writes nothing");
+        // Totals header + per-file header carry the counts.
         assert!(
-            outcome.output.contains("a.txt"),
-            "lists the file: {}",
+            outcome.output.contains("3 matches in 1 files"),
+            "totals header: {}",
             outcome.output
         );
         assert!(
-            outcome.output.contains('3'),
-            "shows the per-file count: {}",
+            outcome.output.contains("a.txt (3 matches)"),
+            "per-file diff header: {}",
+            outcome.output
+        );
+        // The substitution itself shows as a unified diff (before/after).
+        assert!(
+            outcome.output.contains("-foo foo bar"),
+            "shows the old line: {}",
+            outcome.output
+        );
+        assert!(
+            outcome.output.contains("+baz baz bar"),
+            "shows the new line: {}",
             outcome.output
         );
         // File untouched.
@@ -793,6 +1012,229 @@ mod tests {
             std::fs::read_to_string(&file).expect("read"),
             "foo foo bar\nfoo\n"
         );
+    }
+
+    #[test]
+    fn sed_preview_diff_budgeted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("big.txt");
+        // 20 changed lines (== the per-file cap, so no truncation marker); the
+        // rendered diff easily exceeds a tiny budget and pages.
+        let mut content = String::new();
+        for i in 0..20 {
+            let _ = writeln!(content, "line{i:02} foo");
+        }
+        std::fs::write(&file, &content).expect("write");
+
+        let mut sed = input("foo", "bar", vec![file.clone()]);
+        sed.page = 1;
+        let page1 = execute(&sed, 200, |_| true);
+        assert!(page1.changed.is_empty(), "preview writes nothing");
+        assert!(
+            page1.output.contains("matches in 1 files"),
+            "page 1 carries the totals header: {}",
+            page1.output
+        );
+        assert!(
+            page1.output.contains("[page 1/"),
+            "preview pages under a small budget: {}",
+            page1.output
+        );
+
+        sed.page = 2;
+        let page2 = execute(&sed, 200, |_| true);
+        assert!(
+            page2.output.contains("[page 2/"),
+            "page 2 reachable: {}",
+            page2.output
+        );
+        // Totals survive paging.
+        assert!(
+            page2.output.contains("matches in 1 files"),
+            "page 2 also carries the totals header: {}",
+            page2.output
+        );
+        assert_eq!(std::fs::read_to_string(&file).expect("read"), content);
+    }
+
+    #[test]
+    fn sed_preview_diff_preserve_case() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "Omni omni OMNI\n").expect("write");
+
+        let mut sed = input("omni", "lattice", vec![file.clone()]);
+        sed.ignore_case = true;
+        sed.preserve_case = true;
+        let outcome = execute(&sed, 4000, |_| true);
+
+        assert!(outcome.changed.is_empty(), "preview writes nothing");
+        // The `+` line reflects the real per-hit cased substitution.
+        assert!(
+            outcome.output.contains("+Lattice lattice LATTICE"),
+            "preserve-case applied per hit in the diff: {}",
+            outcome.output
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file).expect("read"),
+            "Omni omni OMNI\n"
+        );
+    }
+
+    #[test]
+    fn sed_preview_diff_first() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "x\nx\nx\n").expect("write");
+
+        let mut sed = input("x", "y", vec![file.clone()]);
+        sed.first = true;
+        let outcome = execute(&sed, 4000, |_| true);
+
+        assert!(
+            outcome.output.contains("(1 match)"),
+            "first-only counts a single match: {}",
+            outcome.output
+        );
+        assert_eq!(
+            outcome.output.matches("+y").count(),
+            1,
+            "only the first match is shown changed: {}",
+            outcome.output
+        );
+        assert_eq!(std::fs::read_to_string(&file).expect("read"), "x\nx\nx\n");
+    }
+
+    #[test]
+    fn sed_preview_noop_no_hunk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "foo bar\n").expect("write");
+
+        // Replacement reproduces the match exactly → unchanged file → no hunk.
+        let outcome = execute(&input("foo", "foo", vec![file.clone()]), 4000, |_| true);
+        assert!(outcome.changed.is_empty(), "preview writes nothing");
+        // Still counted as a match, but nothing to diff.
+        assert!(
+            outcome.output.contains("1 matches in 1 files"),
+            "no-op still counts the match: {}",
+            outcome.output
+        );
+        assert!(
+            !outcome.output.contains("@@"),
+            "no diff hunk for a no-op substitution: {}",
+            outcome.output
+        );
+        // Flagged, not silently dropped: the agent learns the op matched but
+        // changes nothing (header summary + per-file marker).
+        assert!(
+            outcome.output.contains("matched but unchanged"),
+            "no-op is flagged in the header: {}",
+            outcome.output
+        );
+        assert!(
+            outcome.output.contains("a.txt (1 match) — unchanged"),
+            "no-op file is flagged inline: {}",
+            outcome.output
+        );
+        assert_eq!(std::fs::read_to_string(&file).expect("read"), "foo bar\n");
+    }
+
+    #[test]
+    fn sed_preview_caps_rendered_file_count() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // More matched files than the render cap: every match is counted, but the
+        // diff body is bounded and the remainder is summarized (no OOM on a broad
+        // pattern).
+        let extra = 5;
+        let total = MAX_PREVIEW_FILES + extra;
+        let mut paths = Vec::new();
+        for i in 0..total {
+            let file = dir.path().join(format!("f{i:04}.txt"));
+            std::fs::write(&file, "foo\n").expect("write");
+            paths.push(file);
+        }
+
+        let outcome = execute(&input("foo", "bar", paths), 1_000_000, |_| true);
+        assert!(outcome.changed.is_empty(), "preview writes nothing");
+        // Totals count every file…
+        assert!(
+            outcome
+                .output
+                .contains(&format!("{total} matches in {total} files")),
+            "totals count all matched files: {}",
+            outcome.output
+        );
+        // …but only the cap is rendered, and the overflow is reported.
+        assert!(
+            outcome
+                .output
+                .contains(&format!("{extra} more files matched (diff not shown)")),
+            "overflow beyond the render cap is summarized: {}",
+            outcome.output
+        );
+        // The body holds at most the cap's worth of per-file diff headers.
+        let rendered = outcome.output.matches(" (1 match)").count();
+        assert!(
+            rendered <= MAX_PREVIEW_FILES,
+            "rendered file diffs are bounded by the cap: {rendered}"
+        );
+    }
+
+    #[test]
+    fn sed_preview_clips_long_line() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("long.txt");
+        // One line far longer than the per-line clip (a text file may be up to
+        // MAX_FILE_BYTES on a single line — without clipping the per-file/count
+        // caps alone would not bound memory).
+        let long = "foo ".repeat(2000);
+        std::fs::write(&file, format!("{long}\n")).expect("write");
+
+        let outcome = execute(&input("foo", "bar", vec![file.clone()]), 10_000_000, |_| {
+            true
+        });
+        assert!(
+            outcome.output.contains('…'),
+            "an over-long diff line is clipped with an ellipsis"
+        );
+        // No rendered line exceeds the clip (+ a little slack for sign/ellipsis).
+        let longest = outcome
+            .output
+            .lines()
+            .map(|l| l.chars().count())
+            .max()
+            .unwrap_or(0);
+        assert!(
+            longest <= MAX_PREVIEW_DIFF_LINE + 2,
+            "every rendered line is bounded; longest was {longest}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file).expect("read"),
+            format!("{long}\n"),
+            "preview writes nothing"
+        );
+    }
+
+    #[test]
+    fn sed_preview_diff_truncates_large_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("huge.txt");
+        // 25 distinct changed lines → 50 changed (`-`/`+`) diff lines, over the
+        // 40-line per-file cap, so the overflow is summarized.
+        let mut content = String::new();
+        for i in 0..25 {
+            let _ = writeln!(content, "line{i:02} foo");
+        }
+        std::fs::write(&file, &content).expect("write");
+
+        let outcome = execute(&input("foo", "bar", vec![file.clone()]), 100_000, |_| true);
+        assert!(
+            outcome.output.contains("10 more changed lines"),
+            "per-file cap summarizes the overflow (50 changed - 40 cap = 10): {}",
+            outcome.output
+        );
+        assert_eq!(std::fs::read_to_string(&file).expect("read"), content);
     }
 
     #[test]
