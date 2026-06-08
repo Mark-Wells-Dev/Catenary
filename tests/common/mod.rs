@@ -51,11 +51,18 @@ pub fn isolate_env(cmd: &mut Command, root: &str) {
     cmd.env("XDG_DATA_HOME", xdg_data_home(root));
     cmd.env("XDG_RUNTIME_DIR", xdg_runtime_dir(root));
     cmd.env("PATH", "");
-    cmd.env_remove("CATENARY_STATE_DIR");
-    cmd.env_remove("CATENARY_DATA_DIR");
-    cmd.env_remove("CATENARY_CONFIG");
-    cmd.env_remove("CATENARY_SERVERS");
-    cmd.env_remove("CATENARY_ROOTS");
+    // Clear every inherited `CATENARY_*` var so the user's shell can't leak
+    // settings (state/runtime/config dirs, server defs, `CATENARY_NOTIFY`,
+    // `CATENARY_LOG_RETENTION_DAYS`, `CATENARY_DOCTOR_TIMEOUT_SECS`, …) into the
+    // subprocess. Prefix-based, not a hand-maintained list, so a newly-added var
+    // is covered for free — an enumerated list silently drifted before (e.g.
+    // `CATENARY_RUNTIME_DIR`, added by ticket 11, went unguarded). Callers re-add
+    // `CATENARY_SERVERS` / `CATENARY_ROOTS` / `CATENARY_CONFIG` after this call.
+    for (key, _) in std::env::vars_os() {
+        if key.to_str().is_some_and(|k| k.starts_with("CATENARY_")) {
+            cmd.env_remove(&key);
+        }
+    }
 }
 
 /// The `XDG_CONFIG_HOME` subdir [`isolate_env`] configures under `root`.

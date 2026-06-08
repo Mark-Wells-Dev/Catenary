@@ -1700,10 +1700,7 @@ async fn handle_hook_dispatch(
         // authoritative GC is the daemon-startup sweep (no teardown signal is
         // reliable — Antigravity has no session-end), but a graceful end lets
         // us reclaim the runtime-dir file immediately.
-        crate::bridge::diagnostics_server::remove_overflow_file(
-            &crate::db::runtime_dir(),
-            &session_id,
-        );
+        crate::bridge::overflow::remove_diagnostics(&crate::db::runtime_dir(), &session_id);
 
         if let Some(ref tracker) = ctx.root_tracker {
             // Sync the reduced root set.
@@ -2205,6 +2202,16 @@ async fn handle_hook_dispatch(
             .map(|(sid, _)| get_or_create_router(&ctx, sid.as_deref().unwrap_or("default"), &raw));
         let guard_session = router.as_ref().map(|r| r.session.clone());
 
+        // The bare preview streams its full diff to a per-invocation overflow
+        // file (ticket 11a) when its in-memory render caps truncate. Stateless
+        // (grep-class): a daemon-minted UUID names `sed-<uuid>.txt`, swept at
+        // startup + bounded by an in-lifetime cap. `--in-place` has no preview,
+        // so it carries no overflow context.
+        let overflow = (!in_place).then(|| crate::bridge::sed::PreviewOverflow {
+            base: crate::db::runtime_dir(),
+            id: uuid::Uuid::new_v4().to_string(),
+        });
+
         let outcome = match tokio::task::spawn_blocking(move || {
             // Per-file write guard: deny files whose root another session holds.
             // Rootless files (single-file coverage) carry no guardrail.
@@ -2218,7 +2225,7 @@ async fn handle_hook_dispatch(
                     })
                 })
             };
-            crate::bridge::sed::execute(&input, budget, guard)
+            crate::bridge::sed::execute_with_overflow(&input, budget, guard, overflow)
         })
         .await
         {

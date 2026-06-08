@@ -18,7 +18,7 @@ use crate::symbol_index::SymbolIndex;
 use anyhow::{Result, anyhow};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -297,7 +297,11 @@ impl DiagnosticsServer {
             // `catenary grep` it, and point at it. If the write fails, fall
             // back to the full report inline — losing the tail silently would
             // break the complete-batch guarantee.
-            match write_overflow_file(&crate::db::runtime_dir(), session_id, &budgeted.full) {
+            match crate::bridge::overflow::write_diagnostics(
+                &crate::db::runtime_dir(),
+                session_id,
+                &budgeted.full,
+            ) {
                 Ok(path) => format!(
                     "{}\u{2026} {} more \u{2014} full report at {}\n",
                     budgeted.preview,
@@ -1172,79 +1176,6 @@ fn budget_diagnostics(
     }
 }
 
-/// The directory holding per-session diagnostics overflow files under `base`.
-fn overflow_dir(base: &Path) -> PathBuf {
-    base.join("catenary")
-}
-
-/// Path to a session's diagnostics overflow file under `base`.
-///
-/// Stable per session (`diagnostics-<session_id>.txt`), so each run overwrites
-/// the previous one — at most one file per session.
-#[must_use]
-pub fn overflow_file_path(base: &Path, session_id: &str) -> PathBuf {
-    overflow_dir(base).join(format!("diagnostics-{session_id}.txt"))
-}
-
-/// Write the complete diagnostics report to a session's overflow file,
-/// overwriting any previous run. Returns the path written.
-///
-/// Catenary writes this itself (it owns the full set and the session id), so it
-/// never passes through the host's edit tool or a shell redirect.
-///
-/// # Errors
-///
-/// Returns an error if the runtime directory cannot be created or the file
-/// cannot be written.
-pub fn write_overflow_file(
-    base: &Path,
-    session_id: &str,
-    contents: &str,
-) -> std::io::Result<PathBuf> {
-    let dir = overflow_dir(base);
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("diagnostics-{session_id}.txt"));
-    std::fs::write(&path, contents)?;
-    Ok(path)
-}
-
-/// Best-effort removal of a session's overflow file (e.g. on session end).
-pub fn remove_overflow_file(base: &Path, session_id: &str) {
-    let _ = std::fs::remove_file(overflow_file_path(base, session_id));
-}
-
-/// Remove diagnostics overflow files whose session id is not in `live_ids`.
-///
-/// This is the lazy GC the design specifies: it rides the session prune
-/// (daemon startup) to clear crash leftovers and files from ended sessions.
-/// Returns the number of files removed. A missing overflow directory is not an
-/// error (nothing to sweep).
-#[must_use]
-pub fn sweep_overflow_files<S: std::hash::BuildHasher>(
-    base: &Path,
-    live_ids: &HashSet<String, S>,
-) -> usize {
-    let dir = overflow_dir(base);
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return 0;
-    };
-    let mut removed = 0;
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        let Some(id) = name
-            .strip_prefix("diagnostics-")
-            .and_then(|rest| rest.strip_suffix(".txt"))
-        else {
-            continue;
-        };
-        if !live_ids.contains(id) && std::fs::remove_file(entry.path()).is_ok() {
-            removed += 1;
-        }
-    }
-    removed
-}
-
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
@@ -1777,49 +1708,5 @@ mod tests {
         assert!(!budget_diagnostics(&diag_files, &[], &[], 50, 1).dirty);
         // ...but dirty when the threshold is lowered to warning.
         assert!(budget_diagnostics(&diag_files, &[], &[], 50, 2).dirty);
-    }
-
-    #[test]
-    fn overflow_file_written_and_overwritten() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let base = dir.path();
-        let p1 = write_overflow_file(base, "sess-1", "first").expect("write");
-        assert_eq!(p1, overflow_file_path(base, "sess-1"));
-        assert_eq!(std::fs::read_to_string(&p1).expect("read"), "first");
-        // A second run overwrites rather than appends.
-        let p2 = write_overflow_file(base, "sess-1", "second").expect("write");
-        assert_eq!(p1, p2);
-        assert_eq!(std::fs::read_to_string(&p2).expect("read"), "second");
-    }
-
-    #[test]
-    fn sweep_overflow_files_removes_orphans() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let base = dir.path();
-        write_overflow_file(base, "live-1", "x").expect("write");
-        write_overflow_file(base, "dead-2", "x").expect("write");
-        write_overflow_file(base, "orphan-3", "x").expect("write");
-        let live: HashSet<String> = std::iter::once("live-1".to_string()).collect();
-        let removed = sweep_overflow_files(base, &live);
-        assert_eq!(removed, 2);
-        assert!(overflow_file_path(base, "live-1").exists());
-        assert!(!overflow_file_path(base, "dead-2").exists());
-        assert!(!overflow_file_path(base, "orphan-3").exists());
-    }
-
-    #[test]
-    fn sweep_missing_dir_is_noop() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        assert_eq!(sweep_overflow_files(dir.path(), &HashSet::new()), 0);
-    }
-
-    #[test]
-    fn remove_overflow_file_deletes() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let base = dir.path();
-        write_overflow_file(base, "s", "x").expect("write");
-        assert!(overflow_file_path(base, "s").exists());
-        remove_overflow_file(base, "s");
-        assert!(!overflow_file_path(base, "s").exists());
     }
 }

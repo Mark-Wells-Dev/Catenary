@@ -1309,3 +1309,97 @@ fn test_glob_count_reports_paths() -> Result<()> {
     drop(bridge);
     Ok(())
 }
+
+// ── sed preview overflow file ──────────────────────────────────────
+
+/// End-to-end: a bare `catenary sed` preview that truncates spills the complete
+/// diff to a per-invocation `sed-<uuid>.txt` under the isolated runtime dir, and
+/// the preview points the agent at it (cli-prerelease ticket 11a). Exercises the
+/// daemon-side UUID minting + `runtime_dir()` wiring the unit tests can't reach.
+#[test]
+fn test_sed_preview_writes_overflow_file() -> Result<()> {
+    let state_dir = tempfile::tempdir()?;
+    let state_home = state_dir.path().to_str().context("state dir")?;
+
+    // More matched files than the in-memory render cap (MAX_PREVIEW_FILES = 200),
+    // so the preview truncates and spills the full set to disk.
+    let root = tempfile::tempdir()?;
+    let root_str = root.path().to_str().context("root path")?;
+    let total = 205;
+    for i in 0..total {
+        std::fs::write(root.path().join(format!("f{i:04}.txt")), "foo\n")?;
+    }
+
+    // Start a daemon bound to this state dir (no LSP servers needed — sed is pure
+    // filesystem).
+    let mut bridge = common::BridgeProcess::spawn_in_state(state_home, |cmd| {
+        cmd.env("CATENARY_ROOTS", root_str);
+    })?;
+    bridge.initialize()?;
+
+    let ipc_sock = common::xdg_state_home(state_dir.path())
+        .join("catenary")
+        .join("catenary.sock");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !ipc_sock.exists() && std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    // Bare preview (no --in-place) sweeping the whole dir.
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
+    isolate_env(&mut cmd, state_home);
+    cmd.current_dir(root.path())
+        .args(["sed", "foo", "bar", root_str])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = cmd.output().context("failed to run catenary sed")?;
+    assert!(
+        output.status.success(),
+        "sed preview must exit 0, got {:?}; stderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // The daemon wrote exactly one sed-<uuid>.txt under the isolated runtime dir.
+    let overflow_dir = common::xdg_runtime_dir(state_dir.path()).join("catenary");
+    let mut sed_files: Vec<_> = std::fs::read_dir(&overflow_dir)
+        .context("read overflow dir")?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("txt"))
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("sed-"))
+        })
+        .collect();
+    assert_eq!(
+        sed_files.len(),
+        1,
+        "exactly one overflow file written; stdout:\n{stdout}"
+    );
+    let on_disk = sed_files.remove(0);
+    let name = on_disk
+        .file_name()
+        .and_then(|n| n.to_str())
+        .context("overflow file name")?;
+
+    // The preview points the agent at that file by name…
+    assert!(
+        stdout.contains("full diff at") && stdout.contains(name),
+        "preview points at the on-disk overflow file ({name}); stdout:\n{stdout}"
+    );
+    // …and the file holds the complete set (one diff section per matched file,
+    // beyond what the bounded in-memory preview rendered).
+    let contents = std::fs::read_to_string(&on_disk)?;
+    assert_eq!(
+        contents.matches(" (1 match)").count(),
+        total,
+        "overflow file holds every matched file's diff"
+    );
+
+    drop(bridge);
+    Ok(())
+}

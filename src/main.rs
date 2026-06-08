@@ -1055,11 +1055,13 @@ fn run_daemon_main() -> Result<()> {
             info!("session pruning at daemon start: {e}");
         }
 
-        // Sweep diagnostics overflow files left by crashed/ended sessions
-        // (ticket 11). Rides the session prune: any file whose session id is
-        // not currently alive is reclaimed. Authoritative GC — no teardown
-        // signal is reliable across hosts.
+        // Sweep runtime-dir overflow files left by crashed/ended sessions
+        // (tickets 11 + 11a). Diagnostics rides the session prune (reclaim any
+        // file whose session id is not currently alive); sed previews are
+        // per-invocation and unreferenced, so a previous daemon's are all
+        // reaped. Authoritative GC — no teardown signal is reliable across hosts.
         sweep_diagnostics_overflow(&conn);
+        sweep_sed_overflow();
 
         // Insert a session row so MessageDbSink's FK constraint
         // (messages.session_id → sessions.id) is satisfied. Without
@@ -1198,12 +1200,23 @@ fn sweep_diagnostics_overflow(conn: &rusqlite::Connection) {
         };
         rows.flatten().collect()
     };
-    let removed = catenary_mcp::bridge::diagnostics_server::sweep_overflow_files(
-        &catenary_mcp::db::runtime_dir(),
-        &live,
-    );
+    let removed =
+        catenary_mcp::bridge::overflow::sweep_diagnostics(&catenary_mcp::db::runtime_dir(), &live);
     if removed > 0 {
         info!("swept {removed} stale diagnostics overflow file(s)");
+    }
+}
+
+/// Remove `sed-*` preview overflow files left by a previous daemon.
+///
+/// Each preview mints a fresh per-invocation UUID (no session to key on), so a
+/// prior daemon's previews are unreferenced and reaped wholesale at startup
+/// (ticket 11a). An in-lifetime last-N cap bounds the dir while the daemon runs.
+#[cfg(unix)]
+fn sweep_sed_overflow() {
+    let removed = catenary_mcp::bridge::overflow::sweep_sed(&catenary_mcp::db::runtime_dir());
+    if removed > 0 {
+        info!("swept {removed} stale sed preview overflow file(s)");
     }
 }
 

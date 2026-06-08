@@ -17,6 +17,8 @@ mod grep_server;
 mod handler;
 /// Application dispatch for hook requests.
 mod hook_router;
+/// Shared runtime-dir overflow reports (diagnostics + sed preview).
+pub mod overflow;
 /// Shared page-based output pagination.
 mod pagination;
 /// Path validation for LSP-aware operations and config file protection.
