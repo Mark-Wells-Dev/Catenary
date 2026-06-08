@@ -1580,6 +1580,32 @@ fn get_or_create_router(
         .clone()
 }
 
+/// Appends the "outside tracked roots" advisory to a diagnostics `output`
+/// when `filtered` edits were dropped for lack of LSP coverage.
+///
+/// This keeps the diagnostics batch honest. A mixed batch — some edited
+/// files covered, some not — otherwise renders results for the covered
+/// files alone, with no signal that the rest went unchecked; a silent,
+/// incomplete batch is the "lying batch" the editing workflow exists to
+/// avoid. The all-uncovered case (empty `output`, `filtered > 0`) reduces
+/// to the note alone, matching the prior behavior. Returns `output`
+/// unchanged when nothing was filtered.
+#[cfg(unix)]
+fn with_out_of_roots_note(output: String, filtered: usize) -> String {
+    if filtered == 0 {
+        return output;
+    }
+    let note = format!(
+        "({filtered} edit{} outside tracked roots \u{2014} not checked; see `catenary roots -h`)",
+        if filtered == 1 { "" } else { "s" },
+    );
+    if output.is_empty() {
+        note
+    } else {
+        format!("{output}\n{note}")
+    }
+}
+
 /// Handles a single hook connection with session-aware dispatch.
 ///
 /// Reads the JSON request, extracts `session_id` for routing, looks up
@@ -2040,19 +2066,20 @@ async fn handle_hook_dispatch(
         // daemon only ever reports clean or dirty here.
         let (dirty, output) = if let Some((files, filtered, session_id, _)) = handoff {
             if files.is_empty() {
-                let msg = if filtered > 0 {
-                    "(edits outside tracked roots \u{2014} see `catenary roots -h`)".to_string()
-                } else {
-                    String::new()
-                };
-                (false, msg)
+                // Nothing covered to diagnose — the note (if any) stands alone.
+                (false, with_out_of_roots_note(String::new(), filtered))
             } else {
                 let outcome = ctx
                     .primary
                     .diagnostics
                     .process_files_batched(&files, Some(&scope_id), &session_id)
                     .await;
-                (outcome.dirty, outcome.output)
+                // Surface any filtered edits alongside the covered-file results,
+                // so a mixed batch never silently hides the unchecked files.
+                (
+                    outcome.dirty,
+                    with_out_of_roots_note(outcome.output, filtered),
+                )
             }
         } else {
             // Handoff slot was empty — timeout expired or double-consume.
@@ -3919,6 +3946,35 @@ mod tests {
         shutdown.cancel();
     }
 
+    #[test]
+    fn out_of_roots_note_appended_to_mixed_batch() {
+        // Nothing filtered → output is untouched.
+        assert_eq!(
+            with_out_of_roots_note("src/main.rs\n\t[clean]".to_string(), 0),
+            "src/main.rs\n\t[clean]",
+        );
+
+        // Mixed batch: the covered-file results are preserved and the note
+        // is appended so the unchecked edits are not silently hidden.
+        let mixed = with_out_of_roots_note("src/main.rs\n\t[clean]".to_string(), 2);
+        assert!(
+            mixed.starts_with("src/main.rs\n\t[clean]\n"),
+            "got: {mixed}"
+        );
+        assert!(
+            mixed.contains("2 edits outside tracked roots"),
+            "got: {mixed}"
+        );
+        assert!(mixed.contains("not checked"), "got: {mixed}");
+
+        // All-uncovered batch: the note stands alone, no stray leading newline.
+        let alone = with_out_of_roots_note(String::new(), 1);
+        assert_eq!(
+            alone,
+            "(1 edit outside tracked roots \u{2014} not checked; see `catenary roots -h`)",
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn done_editing_handoff_out_of_roots() {
         let dir = tempfile::tempdir().expect("create tempdir");
@@ -3962,8 +4018,12 @@ mod tests {
         let req = serde_json::json!({"method": "tool/editing-stop"});
         let response = hook_roundtrip_full(&ipc_path, &req).await;
         assert!(
-            response.contains("edits outside tracked roots"),
+            response.contains("outside tracked roots"),
             "expected out-of-roots message, got: {response}",
+        );
+        assert!(
+            response.contains("1 edit "),
+            "out-of-roots message should report the filtered count, got: {response}",
         );
 
         shutdown.cancel();
