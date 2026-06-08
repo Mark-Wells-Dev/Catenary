@@ -613,13 +613,21 @@ impl HandoffKey {
 
 /// Per-key handoff self-heal timeout.
 ///
-/// The `PreToolUse` hook stages, then the CLI subprocess connects to consume —
-/// a cache-hot binary spawn (tens of ms; the hook just ran the same binary).
-/// Sub-second per ADR 014: scoped to one [`HandoffKey`], a stuck stage only
-/// delays the next *same-key* handoff (never a daemon-wide stall, unlike the
-/// old global lock's 5s timeout), so the bound is tight while leaving ample
-/// headroom over the spawn.
-const HANDOFF_TIMEOUT: Duration = Duration::from_millis(750);
+/// Clears a staged handoff the CLI never consumes — e.g. the host killed the
+/// `catenary diagnostics` / `catenary sed` subprocess between `PreToolUse` and
+/// command execution — so a stuck stage can't hold its key's permit forever.
+/// Scoped to one [`HandoffKey`] (ADR 014): clearing frees only the *next
+/// same-key* handoff, never a daemon-wide stall.
+///
+/// The live stage→consume path is a subprocess **spawn + socket connect**,
+/// which on a loaded machine can take well over a second. An earlier sub-second
+/// bound falsely expired *live* handoffs under heavy parallel load — the
+/// diagnostics integration test flaked with "handoff expired", and a real user
+/// on a busy box could get that instead of diagnostics. The bound is therefore
+/// generous: erring long is cheap (it only delays the next same-key handoff
+/// after a genuinely abandoned stage, which is rare), so 10s leaves ample
+/// headroom over the worst-case spawn while still self-healing in bounded time.
+const HANDOFF_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Per-key hook→CLI handoff registry (ADR 014).
 ///
@@ -640,11 +648,23 @@ struct KeyedHandoff {
     /// Per-key staged contexts. A staged handoff lives here until the CLI
     /// consumes it or the per-key timeout clears it.
     slots: Arc<std::sync::Mutex<HashMap<HandoffKey, HandoffContext>>>,
+    /// Self-heal timeout for a staged-but-unconsumed handoff. Production uses
+    /// [`HANDOFF_TIMEOUT`] (via [`Self::new`]); tests inject a short value via
+    /// [`Self::with_timeout`] to exercise the clear-on-timeout path quickly.
+    timeout: Duration,
 }
 
 impl KeyedHandoff {
-    /// Build the registry with one 1-permit semaphore per [`HandoffKey`].
+    /// Build the registry with one 1-permit semaphore per [`HandoffKey`] and the
+    /// production self-heal timeout ([`HANDOFF_TIMEOUT`]).
     fn new() -> Self {
+        Self::with_timeout(HANDOFF_TIMEOUT)
+    }
+
+    /// Build the registry with an explicit self-heal timeout. [`Self::new`] is
+    /// the production entry point; tests pass a short timeout to drive the
+    /// clear-on-timeout path without a real-time wait.
+    fn with_timeout(timeout: Duration) -> Self {
         let semaphores: HashMap<HandoffKey, Arc<tokio::sync::Semaphore>> = HandoffKey::ALL
             .into_iter()
             .map(|key| (key, Arc::new(tokio::sync::Semaphore::new(1))))
@@ -652,6 +672,7 @@ impl KeyedHandoff {
         Self {
             semaphores: Arc::new(semaphores),
             slots: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            timeout,
         }
     }
 
@@ -702,8 +723,9 @@ impl KeyedHandoff {
     /// daemon-wide stall.
     fn spawn_timeout(&self, key: HandoffKey) {
         let slots = self.slots.clone();
+        let timeout = self.timeout;
         tokio::spawn(async move {
-            tokio::time::sleep(HANDOFF_TIMEOUT).await;
+            tokio::time::sleep(timeout).await;
             // Remove under the lock, then drop the guard (and the removed
             // HandoffContext, releasing its permit) before logging.
             let cleared = {
@@ -4202,9 +4224,13 @@ mod tests {
 
     /// A never-connecting stage is cleared by its per-key timeout, releasing the
     /// permit — and only its own key is affected.
+    ///
+    /// Injects a short self-heal timeout via [`KeyedHandoff::with_timeout`] so
+    /// the clear-on-timeout path runs fast, independent of the production
+    /// [`HANDOFF_TIMEOUT`].
     #[tokio::test]
     async fn keyed_handoff_timeout_clears_only_its_key() {
-        let handoff = KeyedHandoff::new();
+        let handoff = KeyedHandoff::with_timeout(Duration::from_millis(50));
 
         let permit = handoff
             .acquire(HandoffKey::Diagnostics)
@@ -4222,8 +4248,9 @@ mod tests {
             },
         );
 
-        // Wait past the per-key timeout; the spawned task clears the slot.
-        tokio::time::sleep(HANDOFF_TIMEOUT + Duration::from_millis(100)).await;
+        // Wait past the (short, test-only) per-key timeout; the spawned task
+        // clears the slot.
+        tokio::time::sleep(Duration::from_millis(200)).await;
         tokio::task::yield_now().await;
 
         assert!(
