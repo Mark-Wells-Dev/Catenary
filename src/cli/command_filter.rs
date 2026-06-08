@@ -160,11 +160,10 @@ fn pipe_split(cmd: &str) -> Vec<&str> {
 /// heredoc markers, so heredoc handling (e.g. the `git commit` heredoc form)
 /// is untouched.
 ///
-/// The other bare separator — a newline — is **not** split here: the heredoc
-/// machinery relies on newlines staying joined within a segment, so splitting
-/// on `\n` needs a heredoc-aware rework (deferred follow-up). A command after a
-/// newline is therefore still missed; see the `known_gap_newline_not_a_separator`
-/// test.
+/// The other bare separator — a newline — is split by [`newline_split`], a
+/// sibling pass applied right after this one. It lives in its own function
+/// because a newline never backgrounds the piece before it, so it can't share
+/// this function's piece-is-backgrounded bookkeeping.
 fn background_split(cmd: &str) -> Vec<&str> {
     let masked = mask_quotes(cmd);
     let b = masked.as_bytes();
@@ -233,6 +232,54 @@ fn background_split(cmd: &str) -> Vec<&str> {
     parts
 }
 
+/// Split `cmd` on a bare newline — the loosest list separator — ignoring
+/// newlines inside quotes or within a `(…)`/backtick grouping.
+///
+/// In bash a newline terminates a list element exactly like `;`
+/// (`make test\ncargo build` runs both), so a command on the next line must
+/// reach the filter too. Mirrors [`background_split`]'s top-level discipline:
+/// quotes are masked first, so a newline inside a quoted argument — or the
+/// multi-line `git commit -m "$(cat <<'EOF'…)"` form, whose body newlines live
+/// inside the `"…"` — is never a separator; and a newline inside a `(…)`
+/// grouping or backticks is left in place so the [`SUBSHELL_RE`] recursion owns
+/// that inner list (a wrapped catenary command stays intact for precise
+/// denial). Unlike `&`, a newline never backgrounds the preceding element, so
+/// this is a plain separator with none of `background_split`'s operator
+/// disambiguation.
+///
+/// Safe only because [`strip_heredoc_bodies`] runs first and removes heredoc
+/// bodies *and their closing-delimiter lines*: the only newlines reaching here
+/// are genuine separators (or quoted/grouped ones, masked or skipped). Were a
+/// stray closing `EOF` left on its own line, this would slice it into a bogus
+/// command — which is exactly why the body-strip drops the delimiter line.
+fn newline_split(cmd: &str) -> Vec<&str> {
+    let masked = mask_quotes(cmd);
+    let b = masked.as_bytes();
+    let n = b.len();
+    let mut parts = Vec::new();
+    let mut last = 0;
+    let mut i = 0;
+    // Don't split inside a `(…)` grouping or backticks — those newlines separate
+    // an inner list owned by the substitution recursion, not a top-level one.
+    let mut paren_depth: u32 = 0;
+    let mut in_backtick = false;
+    while i < n {
+        match b[i] {
+            b'`' => in_backtick = !in_backtick,
+            b'(' if !in_backtick => paren_depth += 1,
+            b')' if !in_backtick => paren_depth = paren_depth.saturating_sub(1),
+            b'\n' if !in_backtick && paren_depth == 0 => {
+                parts.push(&cmd[last..i]);
+                last = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    parts.push(&cmd[last..]);
+    parts
+}
+
 /// Strip echo separators between sequential operators.
 ///
 /// Agents insert `&& echo "---" &&` as visual separators. This replaces
@@ -250,11 +297,18 @@ fn strip_echo_separators(s: &str) -> String {
     result
 }
 
-/// Remove heredoc bodies, keeping the marker line and closing delimiter.
+/// Remove heredoc bodies *and their closing-delimiter lines*, keeping the
+/// marker line (e.g. `cat <<EOF`) intact.
 ///
-/// Heredoc bodies are literal text, not shell commands. Without stripping
-/// them, the recursive subshell checker would parse their content as
-/// commands — triggering false denials on natural language.
+/// Heredoc bodies are literal text, not shell commands. Without stripping them,
+/// the recursive subshell checker would parse their content as commands —
+/// triggering false denials on natural language. The closing-delimiter line (a
+/// bare `EOF`) is dropped too, not kept: once [`newline_split`] treats a
+/// newline as a command separator, a surviving `EOF` line would slice out as a
+/// bogus command and false-deny. Dropping it also lets a real command *after*
+/// the heredoc (`cat <<EOF…EOF\ncargo build`) split out and reach the filter
+/// rather than being glued onto the marker token. The marker line is preserved
+/// so the `has_heredoc` stdin exception in [`check_command`] still fires.
 fn strip_heredoc_bodies(cmd_string: &str) -> String {
     let mut result = Vec::new();
     let mut skip_until: Option<String> = None;
@@ -263,8 +317,8 @@ fn strip_heredoc_bodies(cmd_string: &str) -> String {
         if let Some(ref marker) = skip_until {
             if line.trim() == marker {
                 skip_until = None;
-                result.push(line);
             }
+            // Drop the body lines and the closing-delimiter line alike.
             continue;
         }
         result.push(line);
@@ -538,13 +592,15 @@ pub fn check_command(
     let mut effective_cwd: Option<std::path::PathBuf> = cwd.map(std::path::PathBuf::from);
     let mut saw_unresolved_cd = false;
 
-    // Split on bare `&` (backgrounding) first — it is the loosest separator, so
-    // a command after `&` runs as its own list element and must be checked too
-    // (`make test & cargo build` runs both). Backgrounding a *foreign* command
-    // is fine; we only need each command name to reach the allowlist.
+    // Split on the loose list separators first — bare `&` (backgrounding) and a
+    // bare newline — so a command after either runs as its own list element and
+    // is checked too (`make test & cargo build` and `make test\ncargo build`
+    // both run both). Backgrounding a *foreign* command is fine; we only need
+    // each command name to reach the allowlist.
     let sequential: Vec<&str> = background_split(&cmd_string)
         .into_iter()
-        .flat_map(|bg| quote_aware_split(bg, &SEQ_SPLIT_RE))
+        .flat_map(|bg| newline_split(bg))
+        .flat_map(|nl| quote_aware_split(nl, &SEQ_SPLIT_RE))
         .collect();
     for seq in sequential {
         let stages = pipe_split(seq);
@@ -729,12 +785,14 @@ fn collect_command_names(cmd: &str, names: &mut Vec<String>) {
     let cmd_string = strip_heredoc_bodies(cmd);
     let cmd_string = strip_echo_separators(&cmd_string);
 
-    // Bare `&` (backgrounding) is the loosest separator — split on it first so
-    // a command after `&` is still enumerated (editing enforcement must see
-    // every command, not just the one before the background operator).
+    // Bare `&` (backgrounding) and a bare newline are the loosest separators —
+    // split on both first so a command after either is still enumerated
+    // (editing enforcement must see every command, not just the one before the
+    // separator).
     let sequential: Vec<&str> = background_split(&cmd_string)
         .into_iter()
-        .flat_map(|bg| quote_aware_split(bg, &SEQ_SPLIT_RE))
+        .flat_map(|bg| newline_split(bg))
+        .flat_map(|nl| quote_aware_split(nl, &SEQ_SPLIT_RE))
         .collect();
     for seq in sequential {
         let stages = pipe_split(seq);
@@ -1003,8 +1061,11 @@ pub fn analyze_catenary_command(cmd: &str) -> CatenaryAction {
         .enumerate()
         .flat_map(|(idx, bg)| {
             let backgrounded = idx + 1 < piece_count;
-            quote_aware_split(bg, &SEQ_SPLIT_RE)
+            // A newline within the piece separates further commands but never
+            // backgrounds them — they inherit the piece's `&` backgrounding.
+            newline_split(bg)
                 .into_iter()
+                .flat_map(|nl| quote_aware_split(nl, &SEQ_SPLIT_RE))
                 .map(move |seq| (seq, backgrounded))
         })
         .collect();
@@ -4018,30 +4079,61 @@ mod tests {
         assert!(check_command("`cargo build & make`", &rules, None).is_some());
     }
 
-    // ── KNOWN GAP: newline is not yet a command separator ────────────
+    // ── Newline command separator (ticket 20 / bugs/20) ──────────────
     //
-    // A bare newline separates commands in bash (`a\nb` runs both), but the
-    // parser keeps newlines joined within a segment because the heredoc
-    // machinery (`strip_heredoc_bodies`) depends on it — naively splitting on
-    // `\n` would break the multi-line `git commit` heredoc form. So a command
-    // after a newline is currently invisible to both regimes. The `&` sibling
-    // of this hole was closed in ticket 14; the newline half is deferred to its
-    // own follow-up (heredoc-safe newline splitting) — CatenaryInternal
-    // bugs/20. These assertions PIN the present (leaky) behavior so the fix has
-    // an explicit toggle point; flip them when newline splitting lands.
+    // A bare newline separates commands in bash (`a\nb` runs both). The `&`
+    // sibling of this hole was closed in ticket 14; this closes the newline
+    // half. The fix is heredoc-aware: `strip_heredoc_bodies` drops the body
+    // *and* the closing-delimiter line, and `newline_split` masks quotes and
+    // skips `(…)`/backtick groupings — so a newline inside a quoted arg or the
+    // multi-line `git commit` heredoc form is never split. These assertions
+    // were the `known_gap_newline_not_a_separator` pins (CatenaryInternal
+    // bugs/20); they are now flipped to the closed behavior.
 
     #[test]
-    fn known_gap_newline_not_a_separator() {
+    fn newline_separates_foreign_commands() {
         let rules = recommended_rules();
+        // The command after the newline is no longer smuggled: cargo is seen.
+        let d = check_command("make test\ncargo build", &rules, None)
+            .expect("cargo after a newline must be denied");
+        assert_eq!(d.reason, DenialReason::NotAllowed);
+    }
+
+    #[test]
+    fn newline_surfaces_correlated_catenary_command() {
+        // `catenary diagnostics` on a later line is now seen. It shares the call
+        // with `make test`, so it is a bare-only violation (not invisible).
+        let msg = deny_text("make test\ncatenary diagnostics");
         assert!(
-            check_command("make test\ncargo build", &rules, None).is_none(),
-            "KNOWN GAP (bugs/20): once newline splits, cargo must be denied",
+            msg.contains("its own"),
+            "diagnostics after a newline must surface as bare-only: {msg:?}",
         );
-        assert_eq!(
-            analyze_catenary_command("make test\ncatenary diagnostics"),
-            CatenaryAction::NotCatenary,
-            "KNOWN GAP (bugs/20): once newline splits, diagnostics must be seen",
-        );
+    }
+
+    #[test]
+    fn newline_table() {
+        use DenialReason::NotAllowed;
+        use Outcome::{Allow, DenyCatenary, DenyForeign};
+        let rules = recommended_rules();
+        let cases: &[(&str, Outcome)] = &[
+            // Two foreign commands on separate lines — the denied one is caught.
+            ("make test\ncargo build", DenyForeign(NotAllowed)),
+            ("git status\ngit log", Allow),
+            // A catenary command on a later line is seen (bare-only deny).
+            ("make test\ncatenary diagnostics", DenyCatenary),
+            ("foo\ncatenary sed --in-place a b src", DenyCatenary),
+            // A newline *inside* a quoted arg is not a separator.
+            ("git commit -m \"line one\nline two\"", Allow),
+            // A denied command smuggled after a heredoc body is now caught: the
+            // closing `EOF` is dropped, so `cargo build` splits out cleanly.
+            ("cat <<EOF\nbody\nEOF\ncargo build", DenyForeign(NotAllowed)),
+            // The multi-line `git commit` heredoc form still balances — the body
+            // newlines live inside the `"…"`, so they are never split.
+            ("git commit -m \"$(cat <<'EOF'\nmsg line\nEOF\n)\"", Allow),
+        ];
+        for (cmd, want) in cases {
+            assert_eq!(&outcome(cmd, &rules), want, "outcome for {cmd:?}");
+        }
     }
 
     // ── bugs/17: backtick subcommand inside a quoted prose arg ───────
