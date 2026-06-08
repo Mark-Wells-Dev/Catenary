@@ -557,6 +557,39 @@ impl BridgeProcess {
         Ok(diagnostics_output(&text))
     }
 
+    /// Drives the real `catenary hook pre-tool` binary (the `run_pre_tool`
+    /// dispatch) for a Claude `Bash` `tool_input.command`, against this test's
+    /// daemon, and returns the hook's stdout — a deny JSON, or empty on allow.
+    ///
+    /// Unlike the raw `pre-tool/*` IPC helpers, this exercises the actual
+    /// dispatch in `run_pre_tool` (regime 1 matcher → routed action / deny →
+    /// regime 2), which is the only place the ordering between a piped-
+    /// diagnostics deny and the editing-stop prepare-drain is decided.
+    ///
+    /// The payload carries no `session_id`/`agent_id`, so the hook resolves to
+    /// agent `""` / session `None` — matching the raw-IPC editing setup used in
+    /// [`call_diagnostics`](Self::call_diagnostics), so both share one
+    /// editing-state key.
+    pub fn run_pre_tool_bash(&self, command: &str) -> Result<String> {
+        let payload = json!({
+            "tool_name": "Bash",
+            "tool_input": { "command": command },
+        });
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
+        isolate_env(&mut cmd, &self.state_home);
+        cmd.args(["hook", "pre-tool", "--format=claude"]);
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = cmd.spawn().context("spawn `hook pre-tool`")?;
+        {
+            let mut stdin = child.stdin.take().context("hook stdin")?;
+            writeln!(stdin, "{payload}").context("write hook payload")?;
+        }
+        let out = child.wait_with_output().context("wait for hook")?;
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
     /// Resolves the working directory for IPC tool queries.
     ///
     /// Priority: explicit `directory` arg > `ipc_cwd` (from spawn roots) >

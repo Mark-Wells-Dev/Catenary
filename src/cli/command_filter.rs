@@ -133,6 +133,106 @@ fn pipe_split(cmd: &str) -> Vec<&str> {
     parts
 }
 
+/// Split `cmd` on bare backgrounding `&` (not `&&`, `&>`, `>&`, or `N>&`),
+/// ignoring `&` inside quotes.
+///
+/// A bare `&` terminates a list element and runs it in the background, so it
+/// is a command separator just like `;` — `make test & cargo build` runs both.
+/// In bash grammar `&` binds *looser* than `|`, `&&`, and `||`, so this is the
+/// **outermost** split: applied before sequential (`&&`/`||`/`;`) and pipe
+/// splitting, so every command around a `&` is seen by the filter rather than
+/// swallowed into the previous command's arguments. A piece is *backgrounded*
+/// iff it is not the last piece (the trailing `&` detaches it).
+///
+/// Operator disambiguation mirrors the (now-removed) background detector: `&&`
+/// is sequential, `&>` is a redirect, and `>&`/`N>&` are fd duplications —
+/// none split. Quotes are masked first, so a `&` inside an argument (a commit
+/// message, a sed program) is never a separator. Scans the masked string and
+/// slices the original, like [`pipe_split`].
+///
+/// Only **top-level** `&` split: a `&` inside a `(…)` grouping (`$(…)`, `<(…)`,
+/// `>(…)`, a plain subshell) or backticks is left in place, so a wrapped
+/// catenary command (`$(catenary grep p & foo)`) stays intact for the
+/// `SUBSHELL_RE` recursion to recognize and deny precisely, and the inner list
+/// is checked by that recursion rather than by a mid-substitution slice.
+///
+/// Heredoc bodies are stripped before this runs, and `&` does not occur in
+/// heredoc markers, so heredoc handling (e.g. the `git commit` heredoc form)
+/// is untouched.
+///
+/// The other bare separator — a newline — is **not** split here: the heredoc
+/// machinery relies on newlines staying joined within a segment, so splitting
+/// on `\n` needs a heredoc-aware rework (deferred follow-up). A command after a
+/// newline is therefore still missed; see the `known_gap_newline_not_a_separator`
+/// test.
+fn background_split(cmd: &str) -> Vec<&str> {
+    let masked = mask_quotes(cmd);
+    let b = masked.as_bytes();
+    let n = b.len();
+    let mut parts = Vec::new();
+    let mut last = 0;
+    let mut i = 0;
+    // Don't split inside a `(…)` grouping or backticks — that `&` separates an
+    // inner list, handled by the substitution recursion, not a top-level one.
+    let mut paren_depth: u32 = 0;
+    let mut in_backtick = false;
+    while i < n {
+        match b[i] {
+            b'`' => {
+                in_backtick = !in_backtick;
+                i += 1;
+                continue;
+            }
+            b'(' if !in_backtick => {
+                paren_depth += 1;
+                i += 1;
+                continue;
+            }
+            b')' if !in_backtick => {
+                paren_depth = paren_depth.saturating_sub(1);
+                i += 1;
+                continue;
+            }
+            b'&' => {}
+            _ => {
+                i += 1;
+                continue;
+            }
+        }
+        // From here `b[i] == b'&'`. Skip it entirely while nested.
+        if in_backtick || paren_depth > 0 {
+            i += 1;
+            continue;
+        }
+        // `&&` — sequential operator, not a split point.
+        if i + 1 < n && b[i + 1] == b'&' {
+            i += 2;
+            continue;
+        }
+        // Second `&` of a `&&` we already stepped past.
+        if i > 0 && b[i - 1] == b'&' {
+            i += 1;
+            continue;
+        }
+        // `&>` redirect.
+        if i + 1 < n && b[i + 1] == b'>' {
+            i += 2;
+            continue;
+        }
+        // `>&` / `N>&` fd duplication.
+        if i > 0 && b[i - 1] == b'>' {
+            i += 1;
+            continue;
+        }
+        // Bare top-level `&` — split here (the preceding piece is backgrounded).
+        parts.push(&cmd[last..i]);
+        last = i + 1;
+        i += 1;
+    }
+    parts.push(&cmd[last..]);
+    parts
+}
+
 /// Strip echo separators between sequential operators.
 ///
 /// Agents insert `&& echo "---" &&` as visual separators. This replaces
@@ -438,7 +538,14 @@ pub fn check_command(
     let mut effective_cwd: Option<std::path::PathBuf> = cwd.map(std::path::PathBuf::from);
     let mut saw_unresolved_cd = false;
 
-    let sequential = quote_aware_split(&cmd_string, &SEQ_SPLIT_RE);
+    // Split on bare `&` (backgrounding) first — it is the loosest separator, so
+    // a command after `&` runs as its own list element and must be checked too
+    // (`make test & cargo build` runs both). Backgrounding a *foreign* command
+    // is fine; we only need each command name to reach the allowlist.
+    let sequential: Vec<&str> = background_split(&cmd_string)
+        .into_iter()
+        .flat_map(|bg| quote_aware_split(bg, &SEQ_SPLIT_RE))
+        .collect();
     for seq in sequential {
         let stages = pipe_split(seq);
         for (pipe_pos, segment) in stages.iter().enumerate() {
@@ -622,7 +729,13 @@ fn collect_command_names(cmd: &str, names: &mut Vec<String>) {
     let cmd_string = strip_heredoc_bodies(cmd);
     let cmd_string = strip_echo_separators(&cmd_string);
 
-    let sequential = quote_aware_split(&cmd_string, &SEQ_SPLIT_RE);
+    // Bare `&` (backgrounding) is the loosest separator — split on it first so
+    // a command after `&` is still enumerated (editing enforcement must see
+    // every command, not just the one before the background operator).
+    let sequential: Vec<&str> = background_split(&cmd_string)
+        .into_iter()
+        .flat_map(|bg| quote_aware_split(bg, &SEQ_SPLIT_RE))
+        .collect();
     for seq in sequential {
         let stages = pipe_split(seq);
         for segment in &stages {
@@ -796,42 +909,6 @@ fn recognize_segment_catenary(seg: &str) -> Option<Recog> {
     Some(recognize_catenary_sub(&token_refs[idx + 1..]))
 }
 
-/// Whether a segment carries a bare backgrounding `&` (not `&&`, `&>`, `>&`,
-/// or `N>&`). Scans the quote-masked segment so a `&` inside quotes is ignored.
-fn has_background_operator(segment: &str) -> bool {
-    let masked = mask_quotes(segment);
-    let b = masked.as_bytes();
-    let n = b.len();
-    let mut i = 0;
-    while i < n {
-        if b[i] != b'&' {
-            i += 1;
-            continue;
-        }
-        // `&&` — sequential operator.
-        if i + 1 < n && b[i + 1] == b'&' {
-            i += 2;
-            continue;
-        }
-        if i > 0 && b[i - 1] == b'&' {
-            i += 1;
-            continue;
-        }
-        // `&>` redirect.
-        if i + 1 < n && b[i + 1] == b'>' {
-            i += 2;
-            continue;
-        }
-        // `>&` / `N>&` fd duplication.
-        if i > 0 && b[i - 1] == b'>' {
-            i += 1;
-            continue;
-        }
-        return true;
-    }
-    false
-}
-
 /// One recognized occurrence of a `catenary` command within a bash call, with
 /// the output-ownership context of its segment.
 #[allow(
@@ -897,6 +974,11 @@ pub enum CatenaryAction {
 /// the call. Both classes reject pipes, file redirects, substitution-wrapping,
 /// and backgrounding. Unrecognized or non-agent subcommands are denied.
 #[must_use]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one linear recognize→classify→validate pass; splitting it would \
+              scatter the occurrence-collection state across helpers"
+)]
 pub fn analyze_catenary_command(cmd: &str) -> CatenaryAction {
     let stripped = strip_heredoc_bodies(cmd);
     let stripped = strip_echo_separators(&stripped);
@@ -910,7 +992,23 @@ pub fn analyze_catenary_command(cmd: &str) -> CatenaryAction {
     // check even when there is no top-level foreign segment.
     let mut inner_foreign_substitution = false;
 
-    for seq in quote_aware_split(&stripped, &SEQ_SPLIT_RE) {
+    // Bare `&` is the loosest separator and detaches the piece before it. Split
+    // on it first (outermost) so a catenary command after `&` is still seen
+    // (`foo & catenary diagnostics`), and a catenary command *before* a `&` is
+    // marked backgrounded. A piece is backgrounded iff it is not the last one.
+    let bg_pieces = background_split(&stripped);
+    let piece_count = bg_pieces.len();
+    let sequential: Vec<(&str, bool)> = bg_pieces
+        .into_iter()
+        .enumerate()
+        .flat_map(|(idx, bg)| {
+            let backgrounded = idx + 1 < piece_count;
+            quote_aware_split(bg, &SEQ_SPLIT_RE)
+                .into_iter()
+                .map(move |seq| (seq, backgrounded))
+        })
+        .collect();
+    for (seq, backgrounded) in sequential {
         let stages = pipe_split(seq);
         let stage_count = stages.len();
         for (pipe_pos, stage_raw) in stages.iter().enumerate() {
@@ -959,8 +1057,10 @@ pub fn analyze_catenary_command(cmd: &str) -> CatenaryAction {
                     recog,
                     piped_in: pipe_pos > 0,
                     piped_out,
+                    // `background_split` already consumed every bare `&`, so the
+                    // stage holds none; backgrounding is a property of the piece.
                     redirected: redirects_to_file(stage),
-                    backgrounded: has_background_operator(stage),
+                    backgrounded,
                     wrapped: false,
                     in_place,
                 });
@@ -3764,5 +3864,210 @@ mod tests {
         assert!(check_command("catenary grep p", &rules, None).is_none());
         // The foreign segment is still checked: `cargo` is denied.
         assert!(check_command("cargo build && catenary grep p", &rules, None).is_some());
+    }
+
+    // ── Consolidated composition guard (ticket 14) ───────────────────
+    //
+    // One table over the *combined* filter. It mirrors `run_pre_tool`'s
+    // dispatch — regime 1 (`analyze_catenary_command`) first, then regime 2
+    // (`check_command`) on the foreign segments — so each row exercises how the
+    // rules piled on by tickets 01/02/03/09/11/16 *compose*, not each in
+    // isolation. This is the regression guard that no rule masks another.
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum Outcome {
+        /// The command runs (incl. routed catenary actions that allow it).
+        Allow,
+        /// Regime 1 (the canonical-form matcher) denied it.
+        DenyCatenary,
+        /// Regime 2 (the foreign allowlist) denied it, with this reason.
+        DenyForeign(DenialReason),
+    }
+
+    /// Resolve a command to its combined verdict, mirroring `run_pre_tool`: the
+    /// catenary matcher runs first; only `NotCatenary`/`Allow` falls through to
+    /// the foreign allowlist, and a canonical search command with foreign
+    /// segments still runs them through it.
+    fn outcome(cmd: &str, rules: &ResolvedCommands) -> Outcome {
+        let foreign = |cmd: &str| {
+            check_command(cmd, rules, None)
+                .map_or(Outcome::Allow, |d| Outcome::DenyForeign(d.reason))
+        };
+        match analyze_catenary_command(cmd) {
+            CatenaryAction::Deny(_) => Outcome::DenyCatenary,
+            CatenaryAction::NotCatenary | CatenaryAction::Allow { has_foreign: true } => {
+                foreign(cmd)
+            }
+            CatenaryAction::Allow { has_foreign: false }
+            | CatenaryAction::EditingStart
+            | CatenaryAction::Diagnostics
+            | CatenaryAction::Sed { .. } => Outcome::Allow,
+        }
+    }
+
+    #[test]
+    fn composition_table() {
+        use DenialReason::{NotAllowed, OutputRedirect, PipelinePosition};
+        use Outcome::{Allow, DenyCatenary, DenyForeign};
+        let rules = recommended_rules();
+        let cases: &[(&str, Outcome)] = &[
+            // ── Foreign allowlist + redirect gate (01) + reads (03) ──
+            ("git status", Allow),
+            ("cat src/main.rs", Allow),
+            ("git status > out.txt", DenyForeign(OutputRedirect)),
+            ("cat foo > bar.rs", DenyForeign(OutputRedirect)),
+            ("make test 2>&1", Allow),
+            ("make test > /dev/null", Allow),
+            (
+                "cat <<'EOF' > f.rs\nfn x(){}\nEOF",
+                DenyForeign(OutputRedirect),
+            ),
+            // ── awk/sed out of the pipeline (02) ──
+            ("git log | sed -n 'w /tmp/x'", DenyForeign(NotAllowed)),
+            ("git log | sort", Allow),
+            // ── positional grep-nudge (09/16/bugs19) ──
+            ("grep pattern src", DenyForeign(PipelinePosition)),
+            ("make test | grep error", Allow),
+            ("ls", DenyForeign(NotAllowed)),
+            // ── background `&` smuggle CLOSED (ticket 14 / ADR 013) ──
+            ("make test & cargo build", DenyForeign(NotAllowed)),
+            ("git status & git log", Allow),
+            ("make test 2>&1 & git log", Allow),
+            ("git commit -m \"fix a & b\"", Allow), // quoted `&` is not a separator
+            // ── catenary regime 1: search ──
+            ("catenary grep p src", Allow),
+            ("catenary grep p | head", DenyCatenary),
+            ("catenary grep p | wc -l", DenyCatenary),
+            ("chezmoi managed | catenary grep p", DenyCatenary), // bugs/19
+            ("cd src && catenary grep p", Allow),
+            ("$(catenary grep p)", DenyCatenary),
+            ("catenary grep p &", DenyCatenary),
+            ("catenary grep a & catenary grep b", DenyCatenary),
+            // ── catenary regime 1: correlated/lifecycle (bare-only) ──
+            ("catenary diagnostics", Allow),
+            ("catenary diagnostics | head", DenyCatenary), // 11: deny before drain
+            ("catenary diagnostics && make test", DenyCatenary), // bare-only
+            ("catenary diagnostics > out.txt", DenyCatenary),
+            ("make x & catenary diagnostics", DenyCatenary), // & seen → bare-only
+            ("catenary sed --in-place a b src", Allow),
+            ("catenary editing stop", DenyCatenary), // retired → diagnostics
+            ("catenary frobnicate", DenyCatenary),
+            ("catenary daemon", DenyCatenary), // not agent-invocable
+        ];
+        for (cmd, want) in cases {
+            assert_eq!(&outcome(cmd, &rules), want, "outcome for {cmd:?}");
+        }
+    }
+
+    // ── Background `&` fix (ticket 14): smuggle closed, care preserved ──
+
+    #[test]
+    fn background_amp_denials_are_specific() {
+        let rules = recommended_rules();
+        // A denied foreign command after `&` is checked, not smuggled.
+        let d = check_command("make test & cargo publish", &rules, None)
+            .expect("cargo after `&` must be denied");
+        assert_eq!(d.reason, DenialReason::NotAllowed);
+        // A correlated catenary command after `&` → bare-only guidance.
+        assert!(deny_text("make x & catenary diagnostics").contains("its own"));
+        // Backgrounding a search command is still denied as backgrounding.
+        assert!(deny_text("catenary grep p &").contains("background"));
+    }
+
+    #[test]
+    fn background_fix_preserves_quotes_and_heredoc() {
+        let rules = recommended_rules();
+        // A `&` inside a quoted commit message is not a separator.
+        assert!(check_command("git commit -m \"fix a & b\"", &rules, None).is_none());
+        // The heredoc commit form is untouched: the body (with its `&`) is
+        // stripped before splitting, so the `&` fix can't disturb it.
+        assert!(
+            check_command(
+                "git commit -m \"$(cat <<'EOF'\nfix & ship\nEOF\n)\"",
+                &rules,
+                None
+            )
+            .is_none(),
+            "the `&` fix must not break the git-commit heredoc form",
+        );
+        // Operators that merely contain `&` are not split.
+        assert!(check_command("make test 2>&1", &rules, None).is_none());
+        assert!(check_command("make test >&2", &rules, None).is_none());
+        assert!(check_command("make test &>/dev/null", &rules, None).is_none());
+        // `extract_command_names` sees commands on both sides of a `&`.
+        assert_eq!(
+            extract_command_names("rm a & cargo build"),
+            vec!["rm", "cargo"],
+        );
+    }
+
+    #[test]
+    fn background_amp_inside_substitution_not_split() {
+        let rules = recommended_rules();
+        // A `&` inside `$(…)` is not a top-level split, so the wrapped catenary
+        // command stays intact and is denied with the precise capture message
+        // (not a generic NotAllowed on a sliced `$(catenary` token).
+        assert!(
+            deny_text("$(catenary grep p & foo)").contains("capture"),
+            "wrapped catenary keeps the capture message: {}",
+            deny_text("$(catenary grep p & foo)"),
+        );
+        // A denied command inside `$(… & …)` / backticks is still caught via
+        // the substitution recursion (which background-splits the inner list).
+        assert!(check_command("$(cargo build & make)", &rules, None).is_some());
+        assert!(check_command("`cargo build & make`", &rules, None).is_some());
+    }
+
+    // ── KNOWN GAP: newline is not yet a command separator ────────────
+    //
+    // A bare newline separates commands in bash (`a\nb` runs both), but the
+    // parser keeps newlines joined within a segment because the heredoc
+    // machinery (`strip_heredoc_bodies`) depends on it — naively splitting on
+    // `\n` would break the multi-line `git commit` heredoc form. So a command
+    // after a newline is currently invisible to both regimes. The `&` sibling
+    // of this hole was closed in ticket 14; the newline half is deferred to its
+    // own follow-up (heredoc-safe newline splitting) — CatenaryInternal
+    // bugs/20. These assertions PIN the present (leaky) behavior so the fix has
+    // an explicit toggle point; flip them when newline splitting lands.
+
+    #[test]
+    fn known_gap_newline_not_a_separator() {
+        let rules = recommended_rules();
+        assert!(
+            check_command("make test\ncargo build", &rules, None).is_none(),
+            "KNOWN GAP (bugs/20): once newline splits, cargo must be denied",
+        );
+        assert_eq!(
+            analyze_catenary_command("make test\ncatenary diagnostics"),
+            CatenaryAction::NotCatenary,
+            "KNOWN GAP (bugs/20): once newline splits, diagnostics must be seen",
+        );
+    }
+
+    // ── bugs/17: backtick subcommand inside a quoted prose arg ───────
+    //
+    // `git commit -m "... `editing start` ..."` is DENIED: a backtick inside
+    // double quotes is live command substitution in bash, so the parser
+    // recurses and finds `editing` (not allowlisted). This is shell-correct —
+    // the backtick WOULD execute at the shell and corrupt the commit — and a
+    // carve-out (skipping backtick content inside `-m` args) would be a real
+    // hole, since `git commit -m "`cargo publish`"` must stay denied too.
+    // Settled by the ticket 14 review: ACCEPT as working-as-designed; agents
+    // single-quote the body or use the heredoc commit form. Pinned here.
+
+    #[test]
+    fn bugs17_backtick_subcommand_in_commit_message_denied() {
+        let rules = recommended_rules();
+        assert!(
+            check_command("git commit -m \"see `editing start` first\"", &rules, None).is_some(),
+            "backtick substitution is live shell — stays denied (shell-correct)",
+        );
+        // A genuine hazard in the same shape must also stay denied (no carve-out).
+        assert!(check_command("git commit -m \"oops `cargo publish`\"", &rules, None).is_some());
+        // The same message WITHOUT backticks is prose, not substitution — allowed.
+        assert!(
+            check_command("git commit -m \"run editing start first\"", &rules, None).is_none(),
+            "plain prose mentioning a subcommand is allowed",
+        );
     }
 }
