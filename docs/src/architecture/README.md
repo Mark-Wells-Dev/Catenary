@@ -12,9 +12,11 @@ Every external interaction crosses one of four boundaries:
 
 - **CLI** — agent ↔ Catenary. The agent invokes CLI commands via the
   host's shell tool: `catenary grep`, `catenary glob` for search;
-  `catenary editing start`, `catenary editing stop` for batched
-  diagnostics. Commands connect to the daemon over a Unix domain socket,
-  send a request, and print the result to stdout.
+  `catenary sed` for tracked mass edits; `catenary diagnostics` for the
+  batched diagnostic report (editing is tracked implicitly — the first
+  edit starts it, there is no start step). Commands connect to the daemon
+  over a Unix domain socket, send a request, and print the result to
+  stdout.
 - **MCP** — agent ↔ Catenary. A pure connection surface for session
   management and workspace root discovery. No application-level tools.
 - **LSP** — Catenary ↔ language servers. Catenary spawns and manages
@@ -67,10 +69,10 @@ went in and came out are linked by `parent_id` at the database level.
                 ┌─────────────────────────────────────────────────────┐
                 │                    Catenary daemon                  │
                 │                                                     │
-Agent ◄──CLI──► │  IPC router ──► GrepServer / GlobServer            │
+Agent ◄──CLI──► │  IPC router ──► GrepServer / GlobServer / sed       │
   (grep, glob,  │                  DiagnosticsServer                  │
-   editing)     │                       │                             │
-                │                 LspClientManager                    │
+   sed,         │                       │                             │
+   diagnostics) │                 LspClientManager                    │
                 │                 ┌─────┴──────┐                     │
                 │            LspClient    LspClient                  │
                 │                 │            │                      │

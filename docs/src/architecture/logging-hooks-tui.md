@@ -194,7 +194,7 @@ Five hook methods, each corresponding to a host CLI lifecycle event:
 | `pre-agent/turn-start` | `UserPromptSubmit` / `BeforeAgent` | Increment the turn counter (debounce boundary) |
 | `pre-tool/editing-state` | `PreToolUse` / `BeforeTool` | Editing state enforcement — deny or allow a tool call |
 | `pre-tool/command-denied` | `PreToolUse` / `BeforeTool` | Command filter debounce — full or short denial message |
-| `post-agent/require-release` | `Stop` / `AfterAgent` | Force `editing stop` if the agent stops while editing |
+| `post-agent/require-release` | `Stop` / `AfterAgent` | Force `catenary diagnostics` if the agent stops with covered edits pending |
 
 ### Hook contracts by host
 
@@ -215,16 +215,16 @@ command selects the output format for the host's expected JSON structure.
 
 ### Diagnostic delivery path
 
-Diagnostics flow through `catenary editing stop` stdout output. The
+Diagnostics flow through `catenary diagnostics` stdout output. The
 `PreToolUse` hook tracks which files the agent modifies during editing
-mode; `editing stop` collects those paths and runs the batched
+mode; `catenary diagnostics` collects those paths and runs the batched
 diagnostic pipeline.
 
 The current path:
 
 1. `PreToolUse` hooks track modified file paths in `EditingManager`
    (via `HookRouter`) during editing mode.
-2. The agent calls `catenary editing stop` (CLI command via the host's
+2. The agent runs `catenary diagnostics` (CLI command via the host's
    shell tool).
 3. `DiagnosticsServer` runs the batched diagnostic pipeline across all
    accumulated files.
@@ -236,12 +236,18 @@ them) and hook responses in the user channel (where operational
 information belongs). See [Document Lifecycle & File
 Watching](documents.md#editing-mode) for the full diagnostic pipeline.
 
-## TUI — `catenary monitor`
+## TUI — the `catenary` dashboard
 
-The TUI is `catenary monitor <id>`. It connects to a session's SQLite
-database (not to the running process) and renders the protocol message
-stream. It is a read-only observer — monitoring cannot affect the
-running session.
+Running `catenary` with no subcommand in an interactive terminal launches
+the TUI dashboard. (When stdin and stdout are pipes — an MCP client
+launched it — the same binary serves MCP instead, no flag needed.) The
+dashboard connects to the SQLite database (not to the running daemon
+process) and renders the protocol message stream across all sessions. It
+is a read-only observer — it cannot affect a running session.
+
+For a single session's events as plain text instead of the full TUI, use
+`catenary debug monitor <id>` — see
+[CLI & Dashboard](../cli.md#catenary-debug).
 
 ### Data source
 
@@ -312,21 +318,31 @@ Unicode (default), Nerd Font, and emoji.
 
 ### Layout
 
-The TUI uses a BSP (binary space partition) panel system:
+The dashboard places a sidebar on the left and the message stream on the
+right (the default *quadrant* layout):
 
-- **Sessions tree** (left pane) — workspace grouping, active/dead
-  indicators, server status, expand/collapse navigation.
-- **Events grid** (right pane) — multi-panel display with scrollbars,
-  filtering, visual selection, and yank support.
-- **Expansion panel** — when a message or scope is expanded, a detail
-  view shows the full JSON payload.
+- **Workspaces** (left, top) — connected sessions grouped by workspace
+  root, each with its language servers nested beneath. Server rows show
+  lifecycle state, `$/progress` percentages, and `window/logMessage`
+  content. Selecting a session or server filters the stream; combining
+  selections intersects.
+- **Keybinds** (left, bottom) — a help panel, collapsed by default to a
+  single "Keybinds — `?` to expand" line.
+- **Traffic** (right) — the unified, chronological message stream, with
+  search (`/`, then `n`/`N`), filtering, visual selection, and yank via
+  OSC 52. Expanding a message or scope reveals the full JSON payload.
 
-The layout degrades responsively for small terminals, collapsing panels
-when there is not enough space. Mouse support is available for
-scrolling, selection, and pane resizing. All colors use the terminal's
-ANSI palette, so the TUI inherits the user's theme.
+This unified stream + sidebar replaced the earlier per-session BSP panel
+layout: with a shared daemon and many concurrent sessions, per-session
+panels did not scale. The layout degrades responsively — on short
+terminals the left column collapses to a tab stack, and on narrow
+terminals every panel (Traffic included) stacks into one full-width tab
+strip. Mouse support covers scrolling, selection, and dragging the
+sidebar/stream divider. All colors use the terminal's ANSI palette, so
+the TUI inherits the user's theme.
 
-For keybindings and usage, see the [CLI & Dashboard](../cli.md) page.
+For keybindings and usage, see the
+[CLI & Dashboard](../cli.md#dashboard-tui) page.
 
 ## Tracing conventions
 
@@ -351,7 +367,7 @@ all code must follow. Key rules:
 - [Configuration Model](configuration.md) — `[notifications]` threshold
   configuration.
 - [Document Lifecycle & File Watching](documents.md) — editing mode
-  enforcement and the `editing stop` diagnostic pipeline.
+  enforcement and the `catenary diagnostics` pipeline.
 - [Routing & Dispatch](routing.md) — dispatch errors surface via
   `warn!()` through the tracing pipeline.
 - [LSP Client Layer](lsp-client.md) — server lifecycle state

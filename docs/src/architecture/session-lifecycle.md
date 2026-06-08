@@ -90,7 +90,7 @@ language detection.
 ## Serving
 
 Once initialized, the daemon serves requests from two sources: CLI
-commands over the IPC socket (grep, glob, editing lifecycle) and MCP
+commands over the IPC socket (grep, glob, sed, diagnostics) and MCP
 messages over stdin (session management, roots). Each CLI command
 follows this sequence:
 
@@ -106,9 +106,11 @@ follows this sequence:
      search, LSP enrichment.
    - `glob` → `GlobServer` — file listing with structural symbol
      outlines from LSP `documentSymbol`.
-   - `editing start` → enters editing mode (defers diagnostics).
-   - `editing stop` → exits editing mode, runs batched diagnostics
-     across all modified files.
+   - `sed --in-place` → regex find-and-replace, folding the changed
+     files into the tracked editing batch.
+   - `diagnostics` → ends the editing batch, runs batched diagnostics
+     across all modified files (editing starts implicitly on the first
+     covered edit — there is no separate start command).
 
 3. **LSP interaction.** Application servers use `LspClientManager` to
    find the right server(s) for each file, wait for readiness, open
@@ -122,17 +124,19 @@ follows this sequence:
 
 ### Editing mode
 
-`catenary editing start` and `catenary editing stop` bracket a batch of
-file edits. The host CLI's Edit/Write tools modify files directly;
-Catenary's `PreToolUse` hook tracks which files are modified. When
-`catenary editing stop` is called, `DiagnosticsServer` opens all
-modified files on their respective language servers, waits for each
-server to settle, retrieves diagnostics, and prints a consolidated
-report to stdout.
+Editing mode brackets a batch of file edits. It starts implicitly on the
+first edit to a server-covered file — there is no separate start command
+— and ends when the agent runs `catenary diagnostics`. The host CLI's
+Edit/Write tools (and `catenary sed`) modify files directly; Catenary's
+`PreToolUse` hook tracks which files are modified. When `catenary
+diagnostics` runs, `DiagnosticsServer` opens all modified files on their
+respective language servers, waits for each server to settle, retrieves
+diagnostics, and prints a consolidated report to stdout.
 
-During editing mode, the `PreToolUse` hook enforces boundaries: only
-edit-related tools (Edit, Write, and filesystem Bash commands) are
-allowed without calling `editing stop` first.
+While covered edits are pending, the `PreToolUse` hook enforces
+boundaries: only edit-related tools (Edit, Write, filesystem Bash
+commands, and canonical Catenary commands) are allowed without running
+`catenary diagnostics` first.
 
 ## Mid-session root addition
 
@@ -168,18 +172,21 @@ or SIGTERM:
 
 ## TUI monitoring
 
-`catenary monitor <id>` connects to a session's database (not to the
-running process). It reads protocol messages from the `messages` table
-using WAL-based change notification and applies the display pipeline:
+Running `catenary` with no subcommand in an interactive terminal launches
+the read-only TUI dashboard. It connects to the SQLite database (not to
+the running daemon), reads protocol messages from the `messages` table
+using WAL-based change notification, and applies the display pipeline:
 
 1. **Pair merge** — joins request/response messages that share a
    `request_id`.
-2. **Run collapse** — groups consecutive messages in the same category
+2. **Scope collapse** — groups LSP messages behind the CLI command that
+   produced them, using `parent_id`.
+3. **Run collapse** — groups consecutive messages in the same category
    into a single summary line.
-3. **Scope collapse** — groups LSP messages behind their parent MCP
-   tool call using `parent_id`.
 
-The TUI renders a BSP layout with a session tree, events panels,
-scrollbar, selection, filter, and responsive degradation. It operates
-read-only against the database — monitoring cannot affect the running
-session.
+The dashboard renders a left sidebar — a **Workspaces** panel (sessions
+with their servers nested) plus a collapsible **Keybinds** panel — and
+the unified **Traffic** stream on the right, degrading responsively on
+small terminals. It operates read-only against the database; monitoring
+cannot affect the running session. For a single session's events as plain
+text, use `catenary debug monitor <id>`.

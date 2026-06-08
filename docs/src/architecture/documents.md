@@ -37,7 +37,7 @@ never gets an open.
 
 ### `diagnostic_servers` — broadcast open
 
-Used by the `editing stop` pipeline. `diagnostic_servers` on
+Used by the `catenary diagnostics` pipeline. `diagnostic_servers` on
 `LspClientManager` returns every server where `diagnostics_enabled`
 is true for the file's language binding. It applies both the
 capability gate (`supports_diagnostics`) and the config-level filter
@@ -98,30 +98,36 @@ by the next edit.
 
 ### The solution
 
-`editing start` and `editing stop` bracket a batch of file edits.
-During editing mode:
+Editing mode brackets a batch of file edits. It starts **implicitly** on
+the first edit to a server-covered file — there is no separate `editing
+start` step to race against parallel tool calls — and ends when the agent
+runs `catenary diagnostics`. During editing mode:
 
 - **No LSP traffic for intermediate edits.** The agent edits freely
-  with the host CLI's native Edit/Write tools. No `didOpen`,
-  no `didChange`, no diagnostic retrieval per edit.
+  with the host CLI's native Edit/Write tools (or `catenary sed`). No
+  `didOpen`, no `didChange`, no diagnostic retrieval per edit.
 - **Path accumulation.** The `PreToolUse` hook detects edit-tool
   calls and accumulates the modified file paths in `EditingManager`.
   Paths are deduplicated — editing the same file twice records it
-  once.
-- **Boundary enforcement.** The `PreToolUse` hook enforces editing
-  mode boundaries. Only edit-related tools (Edit, Write, Read, and
-  filesystem Bash commands like `rm`, `cp`, `mv`) are allowed during
-  editing. Attempting to call grep, glob, or any other tool produces
-  a denial message telling the agent to call `editing stop` first.
-  Conversely, attempting to use Edit/Write on workspace files without
-  `editing start` first produces a denial.
-- **Batched diagnostics.** When the agent calls `editing stop`, the
-  `DiagnosticsServer` runs a single consolidated diagnostic pipeline
+  once. A path is tracked only if a configured server would cover it
+  (coverage-gated): doc-only or no-server edits accumulate nothing and
+  never enter editing mode, so no diagnostics would be produced for them.
+- **Boundary enforcement.** While a **non-empty covered tracked set**
+  is pending, the `PreToolUse` hook blocks tool calls that would leave
+  the edit batch. Read/Write, `ToolSearch`, filesystem-only Bash (`rm`,
+  `cp`, `mv`), and canonical Catenary commands (`grep`/`glob`/`sed`,
+  the lifecycle commands) stay allowed; everything else is denied with a
+  message that lists the tracked files and tells the agent to run
+  `catenary diagnostics`. The block gates on the tracked set, not an
+  editing-mode bit — an empty set flows free, so friction tracks value.
+- **Batched diagnostics.** When the agent runs `catenary diagnostics`,
+  the `DiagnosticsServer` runs a single consolidated diagnostic pipeline
   across all modified files.
 
-### The `editing stop` pipeline
+### The `catenary diagnostics` pipeline
 
-`editing stop` triggers a multi-phase pipeline on `DiagnosticsServer`:
+`catenary diagnostics` triggers a multi-phase pipeline on
+`DiagnosticsServer`:
 
 1. **File change notifications.** `notify_file_changes()` runs first,
    so servers know about any filesystem changes (new files, deletes)
@@ -170,12 +176,14 @@ reflect the fully consistent state.
 has the real `agent_id` from the host CLI) and the IPC router (which
 handles CLI commands) access it through `Session`.
 
-`catenary editing start` and `catenary editing stop` are CLI commands
-invoked via the host's shell tool. The `PreToolUse` hook owns the
-state transition for `editing start` (because it has the `agent_id`),
-and the IPC router handles the diagnostic pipeline for `editing stop`
-(because it produces the stdout output). `SessionStart` clears any
-stale editing state from a previous agent context.
+Editing state transitions are owned by the `PreToolUse` hook (because it
+has the `agent_id`): the first covered edit implicitly enters editing
+mode and accumulates the path. `catenary diagnostics` is a CLI command
+invoked via the host's shell tool; the IPC router handles its diagnostic
+pipeline (because it produces the stdout output) and clears the tracked
+set. `SessionStart` clears any stale editing state from a previous agent
+context. (`catenary editing start` survives only as an idempotent no-op
+for a stray invocation — it is not part of the agent-facing workflow.)
 
 ## File watching
 
@@ -244,7 +252,7 @@ glob matching and notification loop.
 
 ### Interaction with editing mode
 
-`editing stop` calls `FilesystemManager::mark_current()` after
+`catenary diagnostics` calls `FilesystemManager::mark_current()` after
 processing diagnostics. This re-stats every processed file and
 updates its mtime in the cache. Without this step, the next
 `diff()` at the next tool boundary would report every edited file
@@ -264,8 +272,8 @@ the cache — the next `diff()` will not report them as deleted again.
   change notification before dispatching grep and glob requests. This
   ensures servers have up-to-date awareness of the filesystem state
   before the agent queries them.
-- **At the start of `editing stop`.** The diagnostic pipeline calls
-  `notify_file_changes()` first, so servers know about any file
+- **At the start of `catenary diagnostics`.** The diagnostic pipeline
+  calls `notify_file_changes()` first, so servers know about any file
   creates or deletes before receiving `didOpen` for modified files.
 
 The notification is a no-op when `diff()` returns an empty change

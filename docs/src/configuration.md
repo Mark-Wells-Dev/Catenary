@@ -232,9 +232,10 @@ args = ["start"]
 single_file = true
 ```
 
-Servers configured with `single_file = true` also gate out-of-root
-edits with `editing start`/`editing stop`, so agents receive diagnostics
-for files outside the workspace. If the server rejects null-workspace
+Servers configured with `single_file = true` also track out-of-root
+edits through the implicit editing batch, so `catenary diagnostics`
+reports errors for files outside the workspace. If the server rejects
+null-workspace
 initialization at runtime, the failure is cached and the server is not
 retried for the remainder of the session.
 
@@ -578,15 +579,28 @@ the agent knows its surface area.
 ```toml
 [commands]
 build = "make"
+# `allow` includes read/stdout-only tools (cat, head, less, diff, ...):
+# reads aren't a write vector, and redirected writes (`cat > f`) are
+# caught by the redirect gate, not by blocking cat.
 allow = ["git", "gh", "cp", "rm", "mkdir", "mv", "touch",
-         "chmod", "sleep", "cd", "true", "false", "which"]
-pipeline = ["grep", "head", "tail", "wc", "jq", "awk",
-            "sort", "sed", "tr", "cut", "uniq", "tee"]
+         "chmod", "sleep", "cd", "true", "false", "which",
+         "cat", "head", "tail", "less", "more", "diff",
+         "echo", "printf", "seq"]
+pipeline = ["grep", "wc", "jq", "sort", "tr", "cut", "uniq"]
 
 [commands.deny]
 git = ["grep", "ls-files", "ls-tree"]
 sqlite3 = ["-cmd"]
 ```
+
+Read and stdout-only tools (`cat`, `head`, `tail`, `less`, `diff`, …)
+live in `allow`, not `pipeline`: reads are not a write vector, and a
+redirected write like `cat > f` is caught by the redirect gate (see
+`allow_file_redirects` below), so there is no need to block them.
+`awk` and `sed` are deliberately **absent** from the default `pipeline` —
+both can execute arbitrary code and write files (`sed -i`, `awk`'s
+`system()`/`print > file`), which would bypass the tracked Edit/Write
+path. Route sweeping edits through `catenary sed` instead.
 
 ### Keys
 
@@ -594,9 +608,12 @@ sqlite3 = ["-cmd"]
 |-----|-------------|
 | `client_enforcement_only` | Deliberate opt-out — no enforcement, no hint notification. |
 | `build` | The project's build tool (e.g., `"make"`). On denial of a build-related command, the response directs the agent to the configured build tool. |
-| `allow` | Commands the agent can run unconditionally. |
+| `allow` | Commands the agent can run unconditionally (including read/stdout-only tools — reads are not a write vector). |
 | `pipeline` | Commands allowed mid-pipeline (reading stdin) but denied at pipeline position 0 (reading files directly). Prevents `grep foo bar.rs` while allowing `make test \| grep FAIL`. |
 | `deny.<cmd>` | Subcommand denylist within an allowed command. `git` is allowed, but `git grep` is denied. |
+| `deny_flags.<cmd>` | Flag denylist within an allowed command. `make` is allowed, but `make -C` is denied. |
+| `allow_file_redirects` | Permit `>`/`>>`/`2>file` redirects (default `false`). A redirected write bypasses the tracked Edit/Write path, so the diagnostics batch can be incomplete. fd-dups (`2>&1`, `>&2`) and device sinks (`/dev/null`, …) are always allowed regardless. |
+| `guidance.<group>` | Optional per-command hint shown on denial — a `message`, or a `redirect` naming the Catenary command to use instead (`grep` → `catenary grep`, `glob` → `catenary glob`). |
 
 ### Project-scoped commands
 
@@ -658,6 +675,23 @@ threshold = "warn"    # default
 | Option | Default | Description |
 |--------|---------|-------------|
 | `threshold` | `"warn"` | Minimum severity for notification delivery. One of `"debug"`, `"info"`, `"warn"`, `"error"`. |
+
+## Diagnostics
+
+The `[tools]` table tunes `catenary diagnostics` (the command that ends an
+edit batch and reports errors and warnings — see
+[CLI & Dashboard](cli.md#catenary-diagnostics)).
+
+```toml
+[tools]
+diagnostics_per_page = 50         # default
+diagnostics_severity = "error"    # default
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `diagnostics_per_page` | `50` | Single-shot preview budget. When a run produces more than this many diagnostics, the preview shows the first N (errors before warnings) and the complete set is written to a per-session file under the runtime dir, named in a trailing "… N more — full report at `<path>`" line. |
+| `diagnostics_severity` | `"error"` | Minimum severity that marks a run "dirty" (exit code `1`). One of `"error"`, `"warning"`, `"info"`, `"hint"`. With the default, the exit code means "does it compile" — warnings still print but exit `0`. |
 
 ## Icons
 
