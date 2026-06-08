@@ -4,6 +4,7 @@
 
 ---
 
+- [Migrating to 2.0](migrating-to-2.0.md)
 - [Installation](installation.md)
 - [Configuration](configuration.md)
 - [Notifications](notifications.md)
