@@ -2,9 +2,9 @@
 
 LSP-powered code intelligence for AI coding agents. Catenary manages a
 pool of language servers and exposes them through CLI commands (`grep`,
-`glob`, `editing start`, `editing stop`) and hooks (editing enforcement,
-command filtering). Multiple agents share the same LSP servers via a
-single daemon.
+`glob`, `sed`, `diagnostics`) and hooks (editing enforcement, command
+filtering). Multiple agents share the same LSP servers via a single
+daemon. Run `catenary primer` for the full agent-facing workflow.
 
 ## Installation
 

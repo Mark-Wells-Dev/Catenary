@@ -1050,4 +1050,29 @@ mod tests {
         let output = out.into_string();
         assert!(output.contains("Detected hosts:"), "output: {output}");
     }
+
+    // ── Per-host primer pointer ─────────────────────────────────────
+
+    #[test]
+    fn install_writes_pointer_per_host() {
+        // The primer (`catenary primer`) is the single source of agent-facing
+        // guidance (Decision 12 / ticket 10). Each host's always-on
+        // instruction surface carries a thin pointer to it, not a copy — so a
+        // new or changed host is a one-line pointer, never a re-authoring.
+        // These are the files the marketplace/extension serve (Claude, Gemini)
+        // or the install embeds verbatim (Antigravity, `AGY_RULES`).
+        const CLAUDE_SKILL: &str = include_str!("../../plugins/catenary/skills/primer/SKILL.md");
+        const GEMINI_CONTEXT: &str = include_str!("../../gemini-context.md");
+
+        for (host, surface) in [
+            ("claude", CLAUDE_SKILL),
+            ("gemini", GEMINI_CONTEXT),
+            ("antigravity", AGY_RULES),
+        ] {
+            assert!(
+                surface.contains("catenary primer"),
+                "{host} instruction surface should point at `catenary primer`",
+            );
+        }
+    }
 }
