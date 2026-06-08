@@ -497,7 +497,7 @@ impl BridgeProcess {
             }),
         )?;
 
-        Ok(text)
+        Ok(diagnostics_output(&text))
     }
 
     /// Enters editing mode, accumulates multiple files, then runs
@@ -547,7 +547,7 @@ impl BridgeProcess {
             }),
         )?;
 
-        Ok(text)
+        Ok(diagnostics_output(&text))
     }
 
     /// Resolves the working directory for IPC tool queries.
@@ -848,6 +848,18 @@ pub fn ipc_tool_request(socket_path: &Path, request: &Value) -> Result<String> {
         .read_line(&mut line)
         .context("read from IPC socket")?;
     Ok(line)
+}
+
+/// Extract the diagnostics text from a `tool/editing-stop` response.
+///
+/// The daemon returns a `{"status","output"}` JSON envelope (ticket 11); tests
+/// assert on the rendered `output`. Falls back to the raw response if it is not
+/// the expected envelope, so assertions get something meaningful either way.
+pub fn diagnostics_output(response: &str) -> String {
+    serde_json::from_str::<Value>(response.trim())
+        .ok()
+        .and_then(|v| v.get("output").and_then(Value::as_str).map(str::to_string))
+        .unwrap_or_else(|| response.to_string())
 }
 
 /// Sends a one-shot IPC request to the hook server. Returns the response.

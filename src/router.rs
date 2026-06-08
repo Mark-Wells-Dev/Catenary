@@ -573,6 +573,10 @@ enum HandoffPayload {
         /// Number of files skipped because they were outside tracked workspace
         /// roots (no LSP coverage).
         filtered: usize,
+        /// Host session id (from the staging hook). The bare `catenary
+        /// diagnostics` process is identity-less, so the session id rides the
+        /// handoff — the daemon names the per-session overflow file with it.
+        session_id: String,
     },
     /// `sed` — *identity-forward*: the hook (the only holder of identity for
     /// this tool-use) stages it; the `catenary sed --in-place` process connects,
@@ -1692,6 +1696,15 @@ async fn handle_hook_dispatch(
             );
         }
 
+        // Best-effort removal of this session's diagnostics overflow file. The
+        // authoritative GC is the daemon-startup sweep (no teardown signal is
+        // reliable — Antigravity has no session-end), but a graceful end lets
+        // us reclaim the runtime-dir file immediately.
+        crate::bridge::diagnostics_server::remove_overflow_file(
+            &crate::db::runtime_dir(),
+            &session_id,
+        );
+
         if let Some(ref tracker) = ctx.root_tracker {
             // Sync the reduced root set.
             let global = tracker.global_roots();
@@ -1947,7 +1960,11 @@ async fn handle_hook_dispatch(
             HandoffKey::Diagnostics,
             HandoffContext {
                 parent_id: handoff_parent_id,
-                payload: HandoffPayload::Diagnostics { files, filtered },
+                payload: HandoffPayload::Diagnostics {
+                    files,
+                    filtered,
+                    session_id: session_id.clone(),
+                },
                 permit,
             },
         );
@@ -1992,9 +2009,11 @@ async fn handle_hook_dispatch(
         // HandoffContext drops it, releasing the owned semaphore permit.
         let handoff = ctx.handoff.consume(HandoffKey::Diagnostics).and_then(|h| {
             match h.payload {
-                HandoffPayload::Diagnostics { files, filtered } => {
-                    Some((files, filtered, h.parent_id))
-                }
+                HandoffPayload::Diagnostics {
+                    files,
+                    filtered,
+                    session_id,
+                } => Some((files, filtered, session_id, h.parent_id)),
                 // The diagnostics key only ever carries a diagnostics payload.
                 HandoffPayload::SedIdentity { .. } => None,
             }
@@ -2006,7 +2025,7 @@ async fn handle_hook_dispatch(
         // parent_id group, making it the scope header in the TUI
         // (matching the grep/glob pattern).
         let scope_id = match &handoff {
-            Some((_, _, parent_id)) => parent_id.clone(),
+            Some((_, _, _, parent_id)) => parent_id.clone(),
             None => uuid::Uuid::new_v4().to_string(),
         };
 
@@ -2019,22 +2038,31 @@ async fn handle_hook_dispatch(
             "incoming hook",
         );
 
-        let response = if let Some((files, filtered, _)) = handoff {
+        // `dirty` drives the CLI's clean/dirty exit code (ticket 11). Faults
+        // (no daemon, IPC/parse failure) are detected CLI-side and exit 2; the
+        // daemon only ever reports clean or dirty here.
+        let (dirty, output) = if let Some((files, filtered, session_id, _)) = handoff {
             if files.is_empty() {
-                if filtered > 0 {
-                    "(edits outside tracked roots \u{2014} see `catenary roots -h`)\n".to_string()
+                let msg = if filtered > 0 {
+                    "(edits outside tracked roots \u{2014} see `catenary roots -h`)".to_string()
                 } else {
                     String::new()
-                }
+                };
+                (false, msg)
             } else {
-                ctx.primary
+                let outcome = ctx
+                    .primary
                     .diagnostics
-                    .process_files_batched(&files, Some(&scope_id))
-                    .await
+                    .process_files_batched(&files, Some(&scope_id), &session_id)
+                    .await;
+                (outcome.dirty, outcome.output)
             }
         } else {
             // Handoff slot was empty — timeout expired or double-consume.
-            "diagnostics handoff expired — no files available\n".to_string()
+            (
+                false,
+                "diagnostics handoff expired — no files available".to_string(),
+            )
         };
 
         emit_hook_event(
@@ -2042,12 +2070,19 @@ async fn handle_hook_dispatch(
             "cli",
             &method,
             Some(&scope_id),
-            &response,
+            &output,
             "outgoing hook response",
         );
 
-        writer.write_all(response.as_bytes()).await?;
-        writer.write_all(b"\n").await?;
+        // Structured response so the CLI can map status → exit code while still
+        // printing the diagnostics text. Mirrors the grep/glob JSON envelope.
+        let envelope = serde_json::json!({
+            "status": if dirty { "dirty" } else { "clean" },
+            "output": output,
+        });
+        let mut payload = serde_json::to_vec(&envelope)?;
+        payload.push(b'\n');
+        writer.write_all(&payload).await?;
         writer.shutdown().await?;
         return Ok(());
     }
@@ -3859,12 +3894,19 @@ mod tests {
         let line = hook_roundtrip(&ipc_path, &req).await;
         assert!(line.contains("ok"), "prepare should succeed, got: {line}");
 
-        // Execute done_editing/run — no edits at all, silent output.
+        // Execute done_editing/run — no edits at all. The response is the JSON
+        // envelope with a clean status and empty diagnostics output.
         let req = serde_json::json!({"method": "tool/editing-stop"});
         let response = hook_roundtrip_full(&ipc_path, &req).await;
-        assert!(
-            response.trim().is_empty(),
-            "expected empty output for no edits, got: {response}",
+        let parsed: serde_json::Value =
+            serde_json::from_str(response.trim()).expect("valid diagnostics envelope");
+        assert_eq!(
+            parsed["status"], "clean",
+            "no edits is clean, got: {response}"
+        );
+        assert_eq!(
+            parsed["output"], "",
+            "expected empty diagnostics output for no edits, got: {response}",
         );
 
         shutdown.cancel();
@@ -4190,6 +4232,7 @@ mod tests {
                 payload: HandoffPayload::Diagnostics {
                     files: vec![PathBuf::from("/tmp/a.rs")],
                     filtered: 2,
+                    session_id: "sess-1".to_string(),
                 },
                 permit,
             },
@@ -4199,9 +4242,15 @@ mod tests {
             .consume(HandoffKey::Diagnostics)
             .expect("consume staged context");
         assert_eq!(consumed.parent_id, "scope-1");
-        if let HandoffPayload::Diagnostics { files, filtered } = &consumed.payload {
+        if let HandoffPayload::Diagnostics {
+            files,
+            filtered,
+            session_id,
+        } = &consumed.payload
+        {
             assert_eq!(files, &vec![PathBuf::from("/tmp/a.rs")]);
             assert_eq!(*filtered, 2);
+            assert_eq!(session_id, "sess-1");
         } else {
             unreachable!("expected diagnostics payload");
         }
@@ -4243,6 +4292,7 @@ mod tests {
                 payload: HandoffPayload::Diagnostics {
                     files: Vec::new(),
                     filtered: 0,
+                    session_id: "x".to_string(),
                 },
                 permit,
             },

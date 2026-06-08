@@ -17,17 +17,43 @@ use crate::lsp::{LspClient, LspClientManager};
 use crate::symbol_index::SymbolIndex;
 use anyhow::{Result, anyhow};
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
+/// A single rendered diagnostic together with its LSP severity.
+///
+/// The severity drives two policies that operate after rendering: the
+/// errors-before-warnings preview budget, and the clean/dirty exit-code
+/// threshold ([`ToolsConfig::dirty_severity`](crate::config::ToolsConfig::dirty_severity)).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DiagEntry {
+    /// LSP severity (1=Error … 4=Hint, 5=unknown). Lower is more severe, so
+    /// sorting ascending puts errors first.
+    severity: u8,
+    /// Rendered entry text — position, severity label, message, and any
+    /// indented quick-fix lines. May span multiple lines.
+    text: String,
+}
+
+/// Outcome of a `catenary diagnostics` run: the budgeted preview text plus the
+/// clean/dirty status the CLI maps to its exit code.
+pub struct DiagnosticsOutcome {
+    /// Preview text for stdout. Includes the `… N more — full report at <path>`
+    /// pointer line when the full set spilled to the overflow file.
+    pub output: String,
+    /// `true` when at least one diagnostic met the dirty severity threshold
+    /// (exit code 1); `false` is clean (exit code 0).
+    pub dirty: bool,
+}
+
 /// Per-server diagnostics result from [`DiagnosticsServer::run_server_batch`].
 struct ServerDiagnostics {
     /// Formatted diagnostic entries (one per diagnostic, position order).
-    entries: Vec<String>,
+    entries: Vec<DiagEntry>,
 }
 
 /// File with diagnostics for root-grouped output.
@@ -38,7 +64,7 @@ struct DiagnosticFile {
     root: PathBuf,
     /// All formatted entries, combined across all servers in
     /// server-name order.
-    entries: Vec<String>,
+    entries: Vec<DiagEntry>,
 }
 
 /// Clean file entry for root-grouped output.
@@ -65,7 +91,7 @@ struct UncoveredEntry {
 #[derive(Debug, PartialEq, Eq)]
 enum FileOutcome {
     /// At least one server returned diagnostic entries.
-    HasDiagnostics(Vec<String>),
+    HasDiagnostics(Vec<DiagEntry>),
     /// All servers returned empty diagnostics — file is clean.
     Clean,
     /// File was validated but absent from server results (server died
@@ -118,9 +144,13 @@ impl DiagnosticsServer {
         &self,
         files: &[PathBuf],
         parent_id: Option<&str>,
-    ) -> String {
+        session_id: &str,
+    ) -> DiagnosticsOutcome {
         if files.is_empty() {
-            return String::new();
+            return DiagnosticsOutcome {
+                output: String::new(),
+                dirty: false,
+            };
         }
 
         // Ensure servers exist for all files before looking them up.
@@ -193,26 +223,32 @@ impl DiagnosticsServer {
                 .await;
         }
 
-        // ── Phase 3: classify and format ─────────────────────────
-        let output = self.format_output(&canonical_paths, &file_results, &uncovered);
+        // ── Phase 3: classify, budget, and format ────────────────
+        let outcome = self.format_output(&canonical_paths, &file_results, &uncovered, session_id);
 
         // ── Phase 4: invalidate caches ────────────────────────────
         self.fs.bump_generations(&canonical_paths);
 
-        output
+        outcome
     }
 
-    /// Classifies files from server results and formats the full output.
+    /// Classifies files from server results, applies the single-shot preview
+    /// budget, writes the overflow file when needed, and reports the
+    /// clean/dirty status.
     ///
-    /// Root-grouped file entries with diagnostics, `[clean]` markers,
-    /// or `[no LSP coverage]` notes. Root headers are collapsed when
-    /// only one file exists under that root.
+    /// Root-grouped file entries with diagnostics, `[clean]` markers, or
+    /// `[no LSP coverage]` notes. Root headers are collapsed when only one
+    /// file exists under that root. On overflow (more diagnostics than the
+    /// configured budget) the complete report is written to the per-session
+    /// runtime-dir file and the preview ends with a `… N more — full report
+    /// at <path>` pointer line.
     fn format_output(
         &self,
         canonical_paths: &[PathBuf],
         file_results: &BTreeMap<String, (String, Vec<ServerDiagnostics>)>,
         uncovered: &[UncoveredEntry],
-    ) -> String {
+        session_id: &str,
+    ) -> DiagnosticsOutcome {
         let mut diag_files: Vec<DiagnosticFile> = Vec::new();
         let mut clean: Vec<CleanEntry> = Vec::new();
 
@@ -238,7 +274,50 @@ impl DiagnosticsServer {
             }
         }
 
-        format_diagnostics(&diag_files, &clean, uncovered)
+        // `[tools]` is absent in many configs — fall back to defaults so the
+        // budget (50) and dirty threshold (error) always apply.
+        let tools = self
+            .client_manager
+            .config()
+            .tools
+            .clone()
+            .unwrap_or_default();
+        let budgeted = budget_diagnostics(
+            &diag_files,
+            &clean,
+            uncovered,
+            tools.diagnostics_budget(),
+            tools.dirty_severity(),
+        );
+
+        let output = if budgeted.overflow_count == 0 {
+            budgeted.preview
+        } else {
+            // Overflow: persist the complete report so the agent can read or
+            // `catenary grep` it, and point at it. If the write fails, fall
+            // back to the full report inline — losing the tail silently would
+            // break the complete-batch guarantee.
+            match write_overflow_file(&crate::db::runtime_dir(), session_id, &budgeted.full) {
+                Ok(path) => format!(
+                    "{}\u{2026} {} more \u{2014} full report at {}\n",
+                    budgeted.preview,
+                    budgeted.overflow_count,
+                    path.display(),
+                ),
+                Err(e) => {
+                    warn!(
+                        session_id = %session_id,
+                        "failed to write diagnostics overflow file: {e}",
+                    );
+                    budgeted.full
+                }
+            }
+        };
+
+        DiagnosticsOutcome {
+            output,
+            dirty: budgeted.dirty,
+        }
     }
 
     /// Runs the batched diagnostics lifecycle on a single server.
@@ -694,7 +773,7 @@ fn classify_file(segments: Option<&[ServerDiagnostics]>) -> FileOutcome {
         return FileOutcome::NoResults;
     };
 
-    let entries: Vec<String> = segments
+    let entries: Vec<DiagEntry> = segments
         .iter()
         .flat_map(|s| s.entries.iter().cloned())
         .collect();
@@ -821,18 +900,22 @@ pub(crate) fn format_diagnostics_entries(
     server_version: Option<&str>,
     language_id: &str,
     enclosing_symbols: &[Option<String>],
-) -> Vec<String> {
+) -> Vec<DiagEntry> {
     diagnostics
         .iter()
         .enumerate()
         .filter_map(|(i, d)| {
-            let severity = match crate::lsp::extract::diagnostic_severity(d) {
+            let severity_num = crate::lsp::extract::diagnostic_severity(d);
+            let severity = match severity_num {
                 Some(1) => "error",
                 Some(2) => "warning",
                 Some(3) => "info",
                 Some(4) => "hint",
                 _ => "unknown",
             };
+            // Numeric severity for budgeting/dirty: 1..=4 as-is, anything
+            // else (including a missing severity) ranks last and never gates.
+            let severity_rank = severity_num.filter(|s| (1..=4).contains(s)).unwrap_or(5);
             let (line, col) = crate::lsp::extract::diagnostic_range(d)
                 .map_or((0, 0), |r| (r.start.line + 1, r.start.character + 1));
             let source = d.get("source").and_then(Value::as_str);
@@ -884,7 +967,10 @@ pub(crate) fn format_diagnostics_entries(
                 }
             }
 
-            Some(result)
+            Some(DiagEntry {
+                severity: severity_rank,
+                text: result,
+            })
         })
         .collect()
 }
@@ -904,7 +990,7 @@ fn format_diagnostics(
 ) -> String {
     use std::fmt::Write;
 
-    let mut root_diag: BTreeMap<&PathBuf, Vec<(&str, &[String])>> = BTreeMap::new();
+    let mut root_diag: BTreeMap<&PathBuf, Vec<(&str, &[DiagEntry])>> = BTreeMap::new();
     let mut root_clean: BTreeMap<&PathBuf, Vec<&str>> = BTreeMap::new();
     let mut root_uncovered: BTreeMap<&PathBuf, Vec<&str>> = BTreeMap::new();
 
@@ -948,7 +1034,7 @@ fn format_diagnostics(
                 for (display, entries) in files {
                     _ = writeln!(output, "{}:", root.join(display).display());
                     for entry in *entries {
-                        for line in entry.lines() {
+                        for line in entry.text.lines() {
                             _ = writeln!(output, "\t{line}");
                         }
                     }
@@ -973,7 +1059,7 @@ fn format_diagnostics(
                 for (display, entries) in files {
                     _ = writeln!(output, "\t{display}:");
                     for entry in *entries {
-                        for line in entry.lines() {
+                        for line in entry.text.lines() {
                             _ = writeln!(output, "\t\t{line}");
                         }
                     }
@@ -997,6 +1083,168 @@ fn format_diagnostics(
     output
 }
 
+/// Result of applying the single-shot preview budget to a diagnostics run.
+struct BudgetedDiagnostics {
+    /// The complete report (every diagnostic). Written to the overflow file
+    /// when `overflow_count > 0`.
+    full: String,
+    /// The budgeted preview (first N diagnostics, errors before warnings). Equal
+    /// to `full` when nothing overflowed. Carries no overflow pointer line — the
+    /// caller appends it once it knows the written path.
+    preview: String,
+    /// Diagnostics dropped from the preview (`total - budget`), or `0` when the
+    /// full set fit.
+    overflow_count: usize,
+    /// `true` when at least one diagnostic met `dirty_threshold`.
+    dirty: bool,
+}
+
+/// Apply the errors-first single-shot budget to the classified diagnostics.
+///
+/// Pure: renders both the complete report and a preview capped at `budget`
+/// diagnostics, with errors selected before warnings so a truncation never
+/// hides an error behind a warning. Within each file the surviving entries keep
+/// their original position order. Clean / uncovered files are not budgeted —
+/// they are one line each and always shown. `dirty` is `true` when any
+/// diagnostic's severity meets `dirty_threshold` (LSP encoding: lower = more
+/// severe).
+fn budget_diagnostics(
+    diag_files: &[DiagnosticFile],
+    clean: &[CleanEntry],
+    uncovered: &[UncoveredEntry],
+    budget: usize,
+    dirty_threshold: u8,
+) -> BudgetedDiagnostics {
+    let full = format_diagnostics(diag_files, clean, uncovered);
+
+    let dirty = diag_files
+        .iter()
+        .flat_map(|f| &f.entries)
+        .any(|e| crate::filter::severity_passes(e.severity, dirty_threshold));
+
+    let total: usize = diag_files.iter().map(|f| f.entries.len()).sum();
+
+    if total <= budget {
+        return BudgetedDiagnostics {
+            preview: full.clone(),
+            full,
+            overflow_count: 0,
+            dirty,
+        };
+    }
+
+    // Globally select the `budget` most-severe entries (stable → ties keep
+    // document order), then rebuild each file with its selected entries in
+    // original position order. `sort_by_key` is stable, so errors come first
+    // and equal-severity entries retain their (file, position) order.
+    let mut ranked: Vec<(usize, usize)> = diag_files
+        .iter()
+        .enumerate()
+        .flat_map(|(fi, f)| f.entries.iter().enumerate().map(move |(ei, _)| (fi, ei)))
+        .collect();
+    ranked.sort_by_key(|&(fi, ei)| diag_files[fi].entries[ei].severity);
+    let selected: HashSet<(usize, usize)> = ranked.into_iter().take(budget).collect();
+
+    let preview_files: Vec<DiagnosticFile> = diag_files
+        .iter()
+        .enumerate()
+        .filter_map(|(fi, f)| {
+            let entries: Vec<DiagEntry> = f
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(ei, _)| selected.contains(&(fi, *ei)))
+                .map(|(_, e)| e.clone())
+                .collect();
+            (!entries.is_empty()).then(|| DiagnosticFile {
+                display: f.display.clone(),
+                root: f.root.clone(),
+                entries,
+            })
+        })
+        .collect();
+
+    BudgetedDiagnostics {
+        preview: format_diagnostics(&preview_files, clean, uncovered),
+        full,
+        overflow_count: total - budget,
+        dirty,
+    }
+}
+
+/// The directory holding per-session diagnostics overflow files under `base`.
+fn overflow_dir(base: &Path) -> PathBuf {
+    base.join("catenary")
+}
+
+/// Path to a session's diagnostics overflow file under `base`.
+///
+/// Stable per session (`diagnostics-<session_id>.txt`), so each run overwrites
+/// the previous one — at most one file per session.
+#[must_use]
+pub fn overflow_file_path(base: &Path, session_id: &str) -> PathBuf {
+    overflow_dir(base).join(format!("diagnostics-{session_id}.txt"))
+}
+
+/// Write the complete diagnostics report to a session's overflow file,
+/// overwriting any previous run. Returns the path written.
+///
+/// Catenary writes this itself (it owns the full set and the session id), so it
+/// never passes through the host's edit tool or a shell redirect.
+///
+/// # Errors
+///
+/// Returns an error if the runtime directory cannot be created or the file
+/// cannot be written.
+pub fn write_overflow_file(
+    base: &Path,
+    session_id: &str,
+    contents: &str,
+) -> std::io::Result<PathBuf> {
+    let dir = overflow_dir(base);
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("diagnostics-{session_id}.txt"));
+    std::fs::write(&path, contents)?;
+    Ok(path)
+}
+
+/// Best-effort removal of a session's overflow file (e.g. on session end).
+pub fn remove_overflow_file(base: &Path, session_id: &str) {
+    let _ = std::fs::remove_file(overflow_file_path(base, session_id));
+}
+
+/// Remove diagnostics overflow files whose session id is not in `live_ids`.
+///
+/// This is the lazy GC the design specifies: it rides the session prune
+/// (daemon startup) to clear crash leftovers and files from ended sessions.
+/// Returns the number of files removed. A missing overflow directory is not an
+/// error (nothing to sweep).
+#[must_use]
+pub fn sweep_overflow_files<S: std::hash::BuildHasher>(
+    base: &Path,
+    live_ids: &HashSet<String, S>,
+) -> usize {
+    let dir = overflow_dir(base);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(id) = name
+            .strip_prefix("diagnostics-")
+            .and_then(|rest| rest.strip_suffix(".txt"))
+        else {
+            continue;
+        };
+        if !live_ids.contains(id) && std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
@@ -1006,16 +1254,24 @@ mod tests {
     use super::*;
     use std::path::Path;
 
+    /// Build a [`DiagEntry`] from a severity and text (test ergonomics).
+    fn de(severity: u8, text: &str) -> DiagEntry {
+        DiagEntry {
+            severity,
+            text: text.to_string(),
+        }
+    }
+
     // ── classify_file tests ─────────────────────────────────────
 
     #[test]
     fn classify_file_with_diagnostics() {
         let segments = vec![ServerDiagnostics {
-            entries: vec![":1:1 [error] test: msg".to_string()],
+            entries: vec![de(1, ":1:1 [error] test: msg")],
         }];
         assert_eq!(
             classify_file(Some(&segments)),
-            FileOutcome::HasDiagnostics(vec![":1:1 [error] test: msg".to_string()]),
+            FileOutcome::HasDiagnostics(vec![de(1, ":1:1 [error] test: msg")]),
         );
     }
 
@@ -1034,17 +1290,17 @@ mod tests {
     fn classify_file_multi_server_merges_entries() {
         let segments = vec![
             ServerDiagnostics {
-                entries: vec![":1:1 [error] server-a: msg".to_string()],
+                entries: vec![de(1, ":1:1 [error] server-a: msg")],
             },
             ServerDiagnostics {
-                entries: vec![":2:1 [warning] server-b: msg".to_string()],
+                entries: vec![de(2, ":2:1 [warning] server-b: msg")],
             },
         ];
         assert_eq!(
             classify_file(Some(&segments)),
             FileOutcome::HasDiagnostics(vec![
-                ":1:1 [error] server-a: msg".to_string(),
-                ":2:1 [warning] server-b: msg".to_string(),
+                de(1, ":1:1 [error] server-a: msg"),
+                de(2, ":2:1 [warning] server-b: msg"),
             ]),
         );
     }
@@ -1055,12 +1311,12 @@ mod tests {
         let segments = vec![
             ServerDiagnostics { entries: vec![] },
             ServerDiagnostics {
-                entries: vec![":1:1 [error] test: msg".to_string()],
+                entries: vec![de(1, ":1:1 [error] test: msg")],
             },
         ];
         assert_eq!(
             classify_file(Some(&segments)),
-            FileOutcome::HasDiagnostics(vec![":1:1 [error] test: msg".to_string()]),
+            FileOutcome::HasDiagnostics(vec![de(1, ":1:1 [error] test: msg")]),
         );
     }
 
@@ -1081,7 +1337,7 @@ mod tests {
         let diag_files = vec![DiagnosticFile {
             display: "file.rs".to_string(),
             root: PathBuf::from("/test"),
-            entries: vec![":1:1 [error] test: msg".to_string()],
+            entries: vec![de(1, ":1:1 [error] test: msg")],
         }];
         let output = format_diagnostics(&diag_files, &[], &[]);
         assert!(!output.contains("[LSP available]"), "output: {output}");
@@ -1092,8 +1348,8 @@ mod tests {
 
     #[test]
     fn format_all_entries_shown() {
-        let entries: Vec<String> = (0..5)
-            .map(|i| format!(":{i}:1 [warning] test: msg {i}"))
+        let entries: Vec<DiagEntry> = (0..5)
+            .map(|i| de(2, &format!(":{i}:1 [warning] test: msg {i}")))
             .collect();
         let diag_files = vec![DiagnosticFile {
             display: "file.rs".to_string(),
@@ -1126,12 +1382,12 @@ mod tests {
             DiagnosticFile {
                 display: "src/lib.rs".to_string(),
                 root: PathBuf::from("/alpha"),
-                entries: vec![":1:1 [error] test: alpha error".to_string()],
+                entries: vec![de(1, ":1:1 [error] test: alpha error")],
             },
             DiagnosticFile {
                 display: "src/lib.rs".to_string(),
                 root: PathBuf::from("/beta"),
-                entries: vec![":5:1 [warning] test: beta warning".to_string()],
+                entries: vec![de(2, ":5:1 [warning] test: beta warning")],
             },
         ];
         let clean = vec![CleanEntry {
@@ -1159,7 +1415,7 @@ mod tests {
         let diag_files = vec![DiagnosticFile {
             display: "scratch.sh".to_string(),
             root: PathBuf::from("/tmp"),
-            entries: vec![":3:1 [warning] test: standalone warning".to_string()],
+            entries: vec![de(2, ":3:1 [warning] test: standalone warning")],
         }];
         let output = format_diagnostics(&diag_files, &[], &[]);
         // Single file → collapsed path.
@@ -1176,7 +1432,7 @@ mod tests {
         let diag_files = vec![DiagnosticFile {
             display: "file.rs".to_string(),
             root: PathBuf::from("/test"),
-            entries: vec![":1:1 [error] test: msg".to_string()],
+            entries: vec![de(1, ":1:1 [error] test: msg")],
         }];
         let output = format_diagnostics(&diag_files, &[], &[]);
         // No status header — output starts directly with file content.
@@ -1272,13 +1528,22 @@ mod tests {
         let entries =
             format_diagnostics_entries(&diags, &[], filter, "test", None, "rust", &symbols);
         assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].severity, 2, "warning severity");
         // 0-indexed (15, 5) → 1-indexed (16, 6)
-        assert!(entries[0].starts_with(":16:6 "), "line/col: {}", entries[0]);
-        assert!(entries[0].contains("[warning]"), "severity: {}", entries[0]);
         assert!(
-            entries[0].ends_with("(in my_function)"),
+            entries[0].text.starts_with(":16:6 "),
+            "line/col: {}",
+            entries[0].text
+        );
+        assert!(
+            entries[0].text.contains("[warning]"),
+            "severity: {}",
+            entries[0].text
+        );
+        assert!(
+            entries[0].text.ends_with("(in my_function)"),
             "entry: {}",
-            entries[0]
+            entries[0].text
         );
     }
 
@@ -1360,10 +1625,11 @@ mod tests {
             let entries =
                 format_diagnostics_entries(&diags, &[], filter, "test", None, "rust", &[]);
             assert_eq!(entries.len(), 1, "severity {sev}");
+            assert_eq!(entries[0].severity, sev, "numeric severity {sev}");
             assert!(
-                entries[0].contains(&format!("[{label}]")),
+                entries[0].text.contains(&format!("[{label}]")),
                 "severity {sev}: {}",
-                entries[0]
+                entries[0].text
             );
         }
     }
@@ -1383,11 +1649,15 @@ mod tests {
         let filter = crate::filter::get_filter("");
         let entries = format_diagnostics_entries(&[diag], &[], filter, "test", None, "rust", &[]);
         assert_eq!(entries.len(), 1);
-        assert!(entries[0].starts_with(":4:8 "), "line/col: {}", entries[0]);
         assert!(
-            entries[0].contains("rustc(E0308)"),
+            entries[0].text.starts_with(":4:8 "),
+            "line/col: {}",
+            entries[0].text
+        );
+        assert!(
+            entries[0].text.contains("rustc(E0308)"),
             "source(code): {}",
-            entries[0]
+            entries[0].text
         );
     }
 
@@ -1426,24 +1696,130 @@ mod tests {
         );
         // 0-indexed (10, 5) → 1-indexed (11, 6)
         assert!(
-            with_empty[0].starts_with(":11:6 "),
+            with_empty[0].text.starts_with(":11:6 "),
             "line/col: {}",
-            with_empty[0]
+            with_empty[0].text
         );
         assert!(
-            with_empty[0].contains("[error]"),
+            with_empty[0].text.contains("[error]"),
             "severity: {}",
-            with_empty[0]
+            with_empty[0].text
         );
         assert!(
-            with_empty[0].contains("some error"),
+            with_empty[0].text.contains("some error"),
             "message: {}",
-            with_empty[0]
+            with_empty[0].text
         );
         assert!(
-            !with_empty[0].contains("(in "),
+            !with_empty[0].text.contains("(in "),
             "no symbol suffix: {}",
-            with_empty[0]
+            with_empty[0].text
         );
+    }
+
+    // ── budget + overflow tests ─────────────────────────────────────
+
+    #[test]
+    fn budget_diagnostics_under_budget_no_overflow() {
+        let diag_files = vec![DiagnosticFile {
+            display: "a.rs".to_string(),
+            root: PathBuf::from("/r"),
+            entries: vec![de(1, ":1:1 [error] e: one"), de(2, ":2:1 [warning] w: two")],
+        }];
+        let b = budget_diagnostics(&diag_files, &[], &[], 50, 1);
+        assert_eq!(b.overflow_count, 0);
+        assert_eq!(b.preview, b.full);
+        assert!(b.dirty, "an error is dirty at threshold error");
+        assert!(b.preview.contains("one") && b.preview.contains("two"));
+    }
+
+    #[test]
+    fn budget_diagnostics_errors_before_warnings() {
+        // warning, error, warning — a budget of 1 must keep the error.
+        let diag_files = vec![DiagnosticFile {
+            display: "a.rs".to_string(),
+            root: PathBuf::from("/r"),
+            entries: vec![
+                de(2, ":1:1 [warning] w: warn-a"),
+                de(1, ":2:1 [error] e: err-b"),
+                de(2, ":3:1 [warning] w: warn-c"),
+            ],
+        }];
+        let b = budget_diagnostics(&diag_files, &[], &[], 1, 1);
+        assert_eq!(b.overflow_count, 2);
+        assert!(b.preview.contains("err-b"), "error survives: {}", b.preview);
+        assert!(
+            !b.preview.contains("warn-a"),
+            "warning dropped: {}",
+            b.preview
+        );
+        assert!(
+            !b.preview.contains("warn-c"),
+            "warning dropped: {}",
+            b.preview
+        );
+        // The complete set is preserved in `full`.
+        assert!(
+            b.full.contains("warn-a") && b.full.contains("err-b") && b.full.contains("warn-c"),
+            "full keeps everything: {}",
+            b.full
+        );
+    }
+
+    #[test]
+    fn budget_diagnostics_dirty_threshold() {
+        let diag_files = vec![DiagnosticFile {
+            display: "a.rs".to_string(),
+            root: PathBuf::from("/r"),
+            entries: vec![de(2, ":1:1 [warning] w: warn")],
+        }];
+        // Warnings-only is clean at the default error threshold.
+        assert!(!budget_diagnostics(&diag_files, &[], &[], 50, 1).dirty);
+        // ...but dirty when the threshold is lowered to warning.
+        assert!(budget_diagnostics(&diag_files, &[], &[], 50, 2).dirty);
+    }
+
+    #[test]
+    fn overflow_file_written_and_overwritten() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path();
+        let p1 = write_overflow_file(base, "sess-1", "first").expect("write");
+        assert_eq!(p1, overflow_file_path(base, "sess-1"));
+        assert_eq!(std::fs::read_to_string(&p1).expect("read"), "first");
+        // A second run overwrites rather than appends.
+        let p2 = write_overflow_file(base, "sess-1", "second").expect("write");
+        assert_eq!(p1, p2);
+        assert_eq!(std::fs::read_to_string(&p2).expect("read"), "second");
+    }
+
+    #[test]
+    fn sweep_overflow_files_removes_orphans() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path();
+        write_overflow_file(base, "live-1", "x").expect("write");
+        write_overflow_file(base, "dead-2", "x").expect("write");
+        write_overflow_file(base, "orphan-3", "x").expect("write");
+        let live: HashSet<String> = std::iter::once("live-1".to_string()).collect();
+        let removed = sweep_overflow_files(base, &live);
+        assert_eq!(removed, 2);
+        assert!(overflow_file_path(base, "live-1").exists());
+        assert!(!overflow_file_path(base, "dead-2").exists());
+        assert!(!overflow_file_path(base, "orphan-3").exists());
+    }
+
+    #[test]
+    fn sweep_missing_dir_is_noop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(sweep_overflow_files(dir.path(), &HashSet::new()), 0);
+    }
+
+    #[test]
+    fn remove_overflow_file_deletes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path();
+        write_overflow_file(base, "s", "x").expect("write");
+        assert!(overflow_file_path(base, "s").exists());
+        remove_overflow_file(base, "s");
+        assert!(!overflow_file_path(base, "s").exists());
     }
 }

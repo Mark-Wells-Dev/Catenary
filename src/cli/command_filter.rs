@@ -3546,6 +3546,36 @@ mod tests {
     }
 
     #[test]
+    fn diagnostics_deny_precedes_drain() {
+        // Ordering constraint (ticket 11): a piped `catenary diagnostics` must
+        // classify as `Deny`, never `Diagnostics`. `run_pre_tool` dispatches
+        // `Deny` (print + return) *before* `Diagnostics` (which issues the
+        // `pre-tool/editing-stop` prepare that drains the tracked set), so the
+        // deny fires first and the set stays intact — never "denied *and*
+        // cleared". The bare form still routes to the prepare.
+        assert!(
+            matches!(
+                analyze_catenary_command("catenary diagnostics | head"),
+                CatenaryAction::Deny(_)
+            ),
+            "piped diagnostics must deny before the prepare drains the set",
+        );
+        assert!(matches!(
+            analyze_catenary_command("catenary diagnostics > out.txt"),
+            CatenaryAction::Deny(_)
+        ));
+        assert!(matches!(
+            analyze_catenary_command("catenary diagnostics && make test"),
+            CatenaryAction::Deny(_)
+        ));
+        // The bare form is the only one that reaches the drain.
+        assert_eq!(
+            analyze_catenary_command("catenary diagnostics"),
+            CatenaryAction::Diagnostics,
+        );
+    }
+
+    #[test]
     fn editing_stop_retired() {
         // `editing stop` was renamed to `diagnostics`; a stray invocation is
         // denied with a redirect to the new name in every form — never routed,

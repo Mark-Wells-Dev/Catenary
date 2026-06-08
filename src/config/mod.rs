@@ -252,9 +252,14 @@ impl Default for TuiConfig {
     }
 }
 
-/// Default diagnostics per page per file per server.
+/// Default diagnostics preview budget.
 const fn default_diagnostics_per_page() -> usize {
     50
+}
+
+/// Default dirty-severity threshold for `catenary diagnostics`.
+fn default_diagnostics_severity() -> String {
+    "error".to_string()
 }
 
 /// Per-tool configuration.
@@ -277,12 +282,22 @@ pub struct ToolsConfig {
     pub grep: GrepConfig,
     /// Glob tool configuration.
     pub glob: GlobConfig,
-    /// Diagnostics per page per file per server. When a file produces
-    /// more than this many diagnostics, higher-severity items are shown
-    /// first and a truncation summary is appended. Subsequent pages
-    /// are available via `done_editing { "page": N }`. Default: 50.
+    /// Single-shot preview budget for `catenary diagnostics`. When the run
+    /// produces more than this many diagnostics, the preview shows the first
+    /// N (errors before warnings, so a truncation never hides an error behind
+    /// a warning) and the **complete** set is written to a per-session file
+    /// under the runtime dir, named in a trailing `… N more — full report at
+    /// <path>` line. Not a replayable page — the set clears on run. Default: 50.
     #[serde(default = "default_diagnostics_per_page")]
     pub diagnostics_per_page: usize,
+    /// Minimum diagnostic severity that marks a `catenary diagnostics` run
+    /// "dirty" (exit code 1) — one of `error`, `warning`, `info`, `hint`.
+    /// Default `error`, so the exit code means "does it compile": only
+    /// error-severity diagnostics gate, and a server's constant unused-var
+    /// warnings don't block every test run. Warnings still print; they just
+    /// exit 0. An unrecognized value falls back to `error`.
+    #[serde(default = "default_diagnostics_severity")]
+    pub diagnostics_severity: String,
 }
 
 impl Default for ToolsConfig {
@@ -291,11 +306,34 @@ impl Default for ToolsConfig {
             grep: GrepConfig::default(),
             glob: GlobConfig::default(),
             diagnostics_per_page: default_diagnostics_per_page(),
+            diagnostics_severity: default_diagnostics_severity(),
         }
     }
 }
 
 impl ToolsConfig {
+    /// The LSP severity (1=Error … 4=Hint) at or above which a diagnostic
+    /// marks a `catenary diagnostics` run dirty (exit code 1).
+    ///
+    /// Parses [`Self::diagnostics_severity`], falling back to
+    /// [`SEVERITY_ERROR`](crate::filter::SEVERITY_ERROR) for an unrecognized
+    /// value.
+    #[must_use]
+    pub fn dirty_severity(&self) -> u8 {
+        crate::filter::parse_severity(&self.diagnostics_severity)
+            .unwrap_or(crate::filter::SEVERITY_ERROR)
+    }
+
+    /// The single-shot diagnostics preview budget, clamped to a minimum of 1.
+    #[must_use]
+    pub const fn diagnostics_budget(&self) -> usize {
+        if self.diagnostics_per_page == 0 {
+            1
+        } else {
+            self.diagnostics_per_page
+        }
+    }
+
     /// Clamp budgets to their minimum values, warning on adjustment.
     pub(crate) fn clamp_budgets(&mut self) {
         if self.grep.budget < 2000 {
@@ -2539,6 +2577,39 @@ servers = ["nonexistent"]
         assert_eq!(default_diagnostics_per_page(), 50);
     }
 
+    #[test]
+    fn diagnostics_severity_default_is_error() {
+        let tc = ToolsConfig::default();
+        assert_eq!(tc.diagnostics_severity, "error");
+        assert_eq!(tc.dirty_severity(), crate::filter::SEVERITY_ERROR);
+    }
+
+    #[test]
+    fn dirty_severity_parses_and_falls_back() {
+        let mut tc = ToolsConfig {
+            diagnostics_severity: "warning".to_string(),
+            ..ToolsConfig::default()
+        };
+        assert_eq!(tc.dirty_severity(), crate::filter::SEVERITY_WARNING);
+        // An unrecognized value falls back to error rather than disabling the gate.
+        tc.diagnostics_severity = "bogus".to_string();
+        assert_eq!(tc.dirty_severity(), crate::filter::SEVERITY_ERROR);
+    }
+
+    #[test]
+    fn diagnostics_budget_clamps_zero_to_one() {
+        let tc = ToolsConfig {
+            diagnostics_per_page: 0,
+            ..ToolsConfig::default()
+        };
+        assert_eq!(tc.diagnostics_budget(), 1);
+        let tc = ToolsConfig {
+            diagnostics_per_page: 25,
+            ..ToolsConfig::default()
+        };
+        assert_eq!(tc.diagnostics_budget(), 25);
+    }
+
     // ── clamp_budgets tests ─────────────────────────────────────────
 
     #[test]
@@ -2550,6 +2621,7 @@ servers = ["nonexistent"]
                 ..GlobConfig::default()
             },
             diagnostics_per_page: 50,
+            ..ToolsConfig::default()
         };
         tc.clamp_budgets();
         assert_eq!(tc.grep.budget, 4000);
@@ -2566,6 +2638,7 @@ servers = ["nonexistent"]
                 ..GlobConfig::default()
             },
             diagnostics_per_page: 0,
+            ..ToolsConfig::default()
         };
         tc.clamp_budgets();
         assert_eq!(tc.grep.budget, 2000, "grep budget should clamp to 2000");
@@ -2582,6 +2655,7 @@ servers = ["nonexistent"]
                 ..GlobConfig::default()
             },
             diagnostics_per_page: 1,
+            ..ToolsConfig::default()
         };
         tc.clamp_budgets();
         assert_eq!(tc.grep.budget, 2000, "at minimum should stay");

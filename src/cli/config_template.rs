@@ -173,6 +173,21 @@ const TEMPLATE: &str = r#"# Catenary recommended config
 # [tools.glob]
 # budget = 2000
 # outline_threshold = 200
+
+# ── Diagnostics (`catenary diagnostics`) ─────────────────────────
+#
+# diagnostics_per_page: single-shot preview budget. When a run produces
+#   more than this many diagnostics, the preview shows the first N (errors
+#   before warnings) and the complete set is written to a per-session file
+#   under the runtime dir, named in a trailing "… N more — full report at
+#   <path>" line. Default: 50.
+# diagnostics_severity: the minimum severity that marks a run "dirty"
+#   (exit code 1) — one of error, warning, info, hint. Default "error", so
+#   the exit code means "does it compile"; warnings still print but exit 0.
+
+# [tools]
+# diagnostics_per_page = 50
+# diagnostics_severity = "error"
 "#;
 
 /// Print the recommended config template to stdout.

@@ -30,6 +30,27 @@ pub fn state_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/tmp"))
 }
 
+/// Resolve the Catenary runtime directory.
+///
+/// Home for ephemeral, regenerable runtime files (e.g. the per-session
+/// diagnostics overflow report) — tmpfs-backed and OS-cleared on logout on
+/// Linux, which is the semantically-correct place for them. Unlike sockets and
+/// the database (which live under [`state_dir`]), these files do not need to
+/// survive a logout.
+///
+/// Resolution order:
+/// 1. `CATENARY_RUNTIME_DIR` environment variable (cross-platform override).
+/// 2. `dirs::runtime_dir()` (`XDG_RUNTIME_DIR` on Linux).
+/// 3. [`state_dir`] as a fallback when no runtime dir is configured (macOS /
+///    Windows, or `XDG_RUNTIME_DIR` unset).
+#[must_use]
+pub fn runtime_dir() -> PathBuf {
+    std::env::var_os("CATENARY_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .or_else(dirs::runtime_dir)
+        .unwrap_or_else(state_dir)
+}
+
 /// Returns the path to the Catenary database file.
 ///
 /// Uses [`state_dir`] for the base directory.

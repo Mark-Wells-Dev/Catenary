@@ -565,7 +565,18 @@ fn main() -> Result<()> {
         #[cfg(unix)]
         Some(Command::Diagnostics) => {
             let mut out = cli::Output::stdout(false);
-            build_runtime()?.block_on(run_done_editing(&mut out))
+            // Exit-code contract (ticket 11): 0 clean / 1 dirty / 2 fault. A
+            // fault (no daemon, IPC failure, malformed response) surfaces as
+            // `Err` and is distinct from a dirty `1` so the agent can tell
+            // "found errors" from "the tool broke".
+            match build_runtime().and_then(|rt| rt.block_on(run_done_editing(&mut out))) {
+                Ok(DiagnosticsExit::Clean) => Ok(()),
+                Ok(DiagnosticsExit::Dirty) => std::process::exit(1),
+                Err(e) => {
+                    eprintln!("{e:#}");
+                    std::process::exit(2);
+                }
+            }
         }
         #[cfg(not(unix))]
         Some(Command::Diagnostics) => Err(anyhow::anyhow!("daemon mode requires Unix")),
@@ -1044,6 +1055,12 @@ fn run_daemon_main() -> Result<()> {
             info!("session pruning at daemon start: {e}");
         }
 
+        // Sweep diagnostics overflow files left by crashed/ended sessions
+        // (ticket 11). Rides the session prune: any file whose session id is
+        // not currently alive is reclaimed. Authoritative GC — no teardown
+        // signal is reliable across hosts.
+        sweep_diagnostics_overflow(&conn);
+
         // Insert a session row so MessageDbSink's FK constraint
         // (messages.session_id → sessions.id) is satisfied. Without
         // this, every tracing event after activate() triggers an FK
@@ -1163,6 +1180,31 @@ fn run_daemon_main() -> Result<()> {
     info!(source = Source::DaemonLifecycle.as_str(), "daemon stopped",);
 
     result
+}
+
+/// Remove diagnostics overflow files whose session is no longer alive.
+///
+/// Reads the live session id set from the database and sweeps the runtime dir
+/// (ticket 11). Best-effort: a query or filesystem error leaves files in place
+/// — they are tiny and reaped on a later run.
+#[cfg(unix)]
+fn sweep_diagnostics_overflow(conn: &rusqlite::Connection) {
+    let live: std::collections::HashSet<String> = {
+        let Ok(mut stmt) = conn.prepare("SELECT id FROM sessions WHERE alive = 1") else {
+            return;
+        };
+        let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) else {
+            return;
+        };
+        rows.flatten().collect()
+    };
+    let removed = catenary_mcp::bridge::diagnostics_server::sweep_overflow_files(
+        &catenary_mcp::db::runtime_dir(),
+        &live,
+    );
+    if removed > 0 {
+        info!("swept {removed} stale diagnostics overflow file(s)");
+    }
 }
 
 /// Stops the running Catenary daemon.
@@ -1592,19 +1634,46 @@ async fn run_start_editing(out: &mut cli::Output) -> Result<()> {
     Ok(())
 }
 
+/// Clean/dirty outcome of `catenary diagnostics`, mapped to the process exit
+/// code by the dispatcher (`0` clean / `1` dirty). A genuine fault (no daemon,
+/// IPC failure, malformed response) propagates as `Err` and exits `2`.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiagnosticsExit {
+    /// No diagnostic met the dirty severity threshold.
+    Clean,
+    /// At least one diagnostic met the dirty severity threshold.
+    Dirty,
+}
+
+/// The daemon's `tool/editing-stop` response envelope (mirrors the grep/glob
+/// JSON pattern): a clean/dirty `status` plus the rendered diagnostics `output`.
+#[cfg(unix)]
+#[derive(Default, serde::Deserialize)]
+struct DiagnosticsResponse {
+    /// `"clean"` or `"dirty"`. Anything else is treated as clean.
+    #[serde(default)]
+    status: String,
+    /// Rendered diagnostics preview (may include the overflow pointer line).
+    #[serde(default)]
+    output: String,
+}
+
 /// Implements `catenary diagnostics`: prints diagnostics for the edited
 /// files and clears the tracked set.
 ///
 /// Connects to the daemon's IPC socket and sends `tool/editing-stop` (the
 /// internal handoff method name is unchanged by the user-facing rename).
 /// The `PreToolUse` hook has already prepared the handoff — this command
-/// retrieves the diagnostics and prints them.
+/// retrieves the diagnostics, prints them, and returns the clean/dirty status
+/// so the caller can set the exit code.
 ///
 /// # Errors
 ///
-/// Returns an error if no daemon is running or the response is invalid.
+/// Returns an error (mapped to a fault exit code) if no daemon is running, the
+/// IPC fails, or the response is malformed.
 #[cfg(unix)]
-async fn run_done_editing(out: &mut cli::Output) -> Result<()> {
+async fn run_done_editing(out: &mut cli::Output) -> Result<DiagnosticsExit> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     let ipc_path = catenary_mcp::router::socket_path();
@@ -1619,24 +1688,43 @@ async fn run_done_editing(out: &mut cli::Output) -> Result<()> {
     payload.push('\n');
     writer.write_all(payload.as_bytes()).await?;
 
-    // Read all response lines (diagnostics output may be multi-line).
+    // Read the full response (a single JSON line; read to EOF defensively).
     let mut buf_reader = BufReader::new(reader);
-    let mut output = String::new();
+    let mut response = String::new();
     loop {
         let mut line = String::new();
         let n = buf_reader.read_line(&mut line).await?;
         if n == 0 {
             break;
         }
-        output.push_str(&line);
+        response.push_str(&line);
     }
 
-    let trimmed = output.trim();
+    emit_diagnostics_response(out, &response)
+}
+
+/// Parse a `tool/editing-stop` response, print its diagnostics text, and map
+/// `status` to the clean/dirty exit. Split from the IPC for unit testing.
+///
+/// # Errors
+///
+/// Returns an error if the response is not valid JSON — a malformed response is
+/// a fault.
+#[cfg(unix)]
+fn emit_diagnostics_response(out: &mut cli::Output, response: &str) -> Result<DiagnosticsExit> {
+    let parsed: DiagnosticsResponse = serde_json::from_str(response.trim())
+        .context("invalid diagnostics response from daemon")?;
+
+    let trimmed = parsed.output.trim();
     if !trimmed.is_empty() {
         let _ = out.writeln(format_args!("{trimmed}"));
     }
 
-    Ok(())
+    Ok(if parsed.status == "dirty" {
+        DiagnosticsExit::Dirty
+    } else {
+        DiagnosticsExit::Clean
+    })
 }
 
 /// Sends an add-root or rm-root request to the running daemon.
@@ -2636,5 +2724,53 @@ mod tests {
         let mut out = cli::Output::buffer(80);
         render_glob_count(&mut out, 7);
         assert_eq!(out.into_string(), "7 paths\n");
+    }
+
+    // ── diagnostics exit-code contract (ticket 11) ─────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn diagnostics_clean_exit_0() {
+        let mut out = cli::Output::buffer(80);
+        let status =
+            emit_diagnostics_response(&mut out, r#"{"status":"clean","output":"[clean]"}"#)
+                .expect("clean response parses");
+        assert_eq!(status, DiagnosticsExit::Clean);
+        assert!(out.into_string().contains("[clean]"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn diagnostics_dirty_exit_1() {
+        let mut out = cli::Output::buffer(80);
+        let status = emit_diagnostics_response(
+            &mut out,
+            r#"{"status":"dirty","output":":1:1 [error] e: boom"}"#,
+        )
+        .expect("dirty response parses");
+        assert_eq!(status, DiagnosticsExit::Dirty);
+        assert!(out.into_string().contains("boom"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn diagnostics_warnings_only_exit_0() {
+        // A warnings-only run is reported clean by the daemon → exit 0.
+        let mut out = cli::Output::buffer(80);
+        let status = emit_diagnostics_response(
+            &mut out,
+            r#"{"status":"clean","output":":2:1 [warning] w: meh"}"#,
+        )
+        .expect("response parses");
+        assert_eq!(status, DiagnosticsExit::Clean);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn diagnostics_malformed_response_is_fault() {
+        // A malformed response is a fault (mapped to exit 2 by the dispatcher),
+        // not silently treated as clean.
+        let mut out = cli::Output::buffer(80);
+        assert!(emit_diagnostics_response(&mut out, "not json").is_err());
     }
 }
