@@ -5,7 +5,7 @@ Catenary loads configuration from multiple sources, in order of priority
 
 1. **Built-in defaults**: Server definitions (`defaults/servers.toml`) and language classification with server bindings (`defaults/languages.toml`). Common language servers work without any config — if the binary is on PATH, Catenary uses it.
 2. **User config**: `~/.config/catenary/config.toml`.
-3. **Project config**: `.catenary.toml` in each workspace root. Discovered when roots are added (at startup or via `catenary roots add`). Scoped to `[language.*]`, `[server.*]`, and `[commands]` — other sections are user-level.
+3. **Project config**: `.catenary.toml` in each workspace root. Discovered when roots are added (at startup or via `catenary roots add`). Scoped to `[language.*]`, `[server.*]`, and `[commands]` `build` only — every other `[commands]` key and all other sections are user-level (see [Project-scoped commands](#project-scoped-commands)).
 4. **Explicit file**: `--config <path>`.
 5. **Environment variables**: Prefixed with `CATENARY_` (e.g., `CATENARY_LOG_RETENTION_DAYS=30`). Use `__` for nested keys (e.g., `CATENARY_ICONS__PRESET=nerd`).
 
