@@ -45,7 +45,8 @@ enum Command {
     /// Searches from the current working directory. Results within tracked
     /// workspace roots include symbol context from LSP servers.
     Grep {
-        /// Regex pattern (Rust/PCRE syntax, | for alternation).
+        /// Regex pattern (Rust `regex` syntax, | for alternation; no look-around —
+        /// unlike `catenary sed`, grep runs the linear ripgrep engine).
         pattern: String,
 
         /// File or directory path(s) to scope the search.
@@ -117,11 +118,13 @@ enum Command {
     /// are `$1` (not `\1`); `\n`/`\t`/`\r` are interpreted. Quote glob patterns
     /// so Catenary expands them gitignore-aware. Invoke via the host's shell tool.
     Sed {
-        /// Regex pattern (Rust/PCRE syntax, | for alternation).
+        /// Regex pattern: Rust `regex` syntax plus look-around and
+        /// back-references (`Dft(?!Norm)`), | for alternation.
         pattern: String,
 
         /// Replacement text. $1 references a capture group, $0 the whole match,
         /// $$ a literal $; \n/\t/\r are interpreted. (`&` is a literal `&`.)
+        /// Single pass — replacement text is never re-scanned for further matches.
         replacement: String,
 
         /// File or directory path(s), or quoted glob pattern(s).

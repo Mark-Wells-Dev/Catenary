@@ -11,21 +11,29 @@
 //! feeds straight into the editing-accumulation set (cli-prerelease ticket 08,
 //! Decision 10).
 //!
-//! The engine is the [`regex`] crate (one dialect across search and substitute,
-//! shared with `catenary grep`). It is *not* full GNU sed: the interface is
-//! positional (`<pattern> <replacement> [paths]`), capture groups are `$1` (not
-//! `\1`), and a replacement validator turns the silent sed-escape corruption
-//! vector into a loud, grep-style correction. The linear-time `regex` engine
-//! (no backreferences/lookaround) guarantees no catastrophic-backtracking hang
-//! on an agent-supplied pattern run across a whole repo.
+//! The engine is the [`fancy_regex`] crate — the `regex` dialect (shared with
+//! `catenary grep`) plus look-around and back-references, the two features mass
+//! identifier renames reach for (`Dft(?!Norm)` rewrites `Dft` everywhere but
+//! `DftNorm`, in one pass). It is *not* full GNU sed: the interface is positional
+//! (`<pattern> <replacement> [paths]`), capture groups are `$1` (not `\1`), and a
+//! replacement validator turns the silent sed-escape corruption vector into a
+//! loud, grep-style correction.
+//!
+//! Patterns without fancy features run on the linear `regex` engine; only
+//! look-around / back-references engage the backtracking VM, bounded by a
+//! backtrack limit — an over-complex pattern returns a loud error (rendered as
+//! `invalid pattern`) instead of hanging the daemon on a repo-wide sweep.
+//! Substitution routes through `try_replacen` (never the panic-on-runtime-error
+//! `replacen`), so that limit stays a clean, reported failure and `--in-place`
+//! never half-writes a file.
 
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::path::{Component, Path, PathBuf};
 
+use fancy_regex::{Captures, Regex, RegexBuilder};
 use ignore::WalkBuilder;
-use regex::{Captures, Regex, RegexBuilder};
 use similar::{ChangeTag, TextDiff};
 
 use super::pagination::paginate;
@@ -87,7 +95,8 @@ pub const REQUIRES_PATH_MSG: &str = "catenary sed needs an explicit path — it 
               --first/--include-gitignored/--include-hidden), 1:1 with clap"
 )]
 pub struct SedInput {
-    /// Search pattern (`regex`-crate dialect, shared with `catenary grep`).
+    /// Search pattern (`fancy-regex`: the `regex` dialect plus look-around and
+    /// back-references).
     pub pattern: String,
     /// Replacement text. `$1`/`${name}` reference capture groups, `$0` the whole
     /// match, `$$` a literal `$`; the C-escapes `\n`/`\t`/`\r`/`\\` are
@@ -261,6 +270,7 @@ pub fn execute_with_overflow(
         overflow.map(|o| crate::bridge::overflow::SedOverflowWriter::new(o.base, o.id)),
     );
 
+    let mut runtime_err: Option<String> = None;
     for path in files {
         let content = match read_text_file(&path) {
             Ok(c) => c,
@@ -270,7 +280,13 @@ pub fn execute_with_overflow(
             }
             Err(ReadSkip::Skip) => continue,
         };
-        let count = count_matches(&regex, &content, input.first);
+        let count = match count_matches(&regex, &content, input.first) {
+            Ok(c) => c,
+            Err(e) => {
+                runtime_err = Some(runtime_pattern_error(&path, &e));
+                break;
+            }
+        };
         if count == 0 {
             continue;
         }
@@ -281,13 +297,19 @@ pub fn execute_with_overflow(
                 drops.locked += 1;
                 continue;
             }
-            let new = substitute(
+            let new = match substitute(
                 &regex,
                 &content,
                 &replacement,
                 input.first,
                 input.preserve_case,
-            );
+            ) {
+                Ok(new) => new,
+                Err(e) => {
+                    runtime_err = Some(runtime_pattern_error(&path, &e));
+                    break;
+                }
+            };
             if atomic_write(&path, new.as_bytes()).is_ok() {
                 changed.push(path.clone());
                 hits.push(FileHit { path, count });
@@ -298,15 +320,31 @@ pub fn execute_with_overflow(
             // for every file (totals stay honest), but the diff body is rendered
             // for at most MAX_PREVIEW_FILES — peak memory is bounded no matter how
             // many files the pattern sweeps. Nothing is written.
-            let new = substitute(
+            let new = match substitute(
                 &regex,
                 &content,
                 &replacement,
                 input.first,
                 input.preserve_case,
-            );
+            ) {
+                Ok(new) => new,
+                Err(e) => {
+                    runtime_err = Some(runtime_pattern_error(&path, &e));
+                    break;
+                }
+            };
             preview.observe(&path, count, &content, &new);
         }
+    }
+
+    // A backtracking blow-up on an over-complex look-around / back-reference is a
+    // loud, terminal failure. Any files already written on the `--in-place` path
+    // stay in `changed`, so the editing-accumulation handoff never under-reports.
+    if let Some(err) = runtime_err {
+        return SedOutcome {
+            output: err,
+            changed,
+        };
     }
 
     let output = if input.in_place {
@@ -375,10 +413,15 @@ fn prepare_replacement(raw: &str) -> Result<String, String> {
 
 /// Compiles the search pattern with optional case-insensitivity.
 ///
+/// Look-around and back-references are accepted (unlike the plain `regex`
+/// engine); a pattern that uses them runs on the backtracking VM, bounded by
+/// fancy-regex's backtrack limit (a runtime blow-up is surfaced loudly by
+/// [`count_matches`] / [`substitute`], never a hang).
+///
 /// # Errors
 ///
-/// Returns the `regex` compile error string when the pattern is invalid.
-fn compile(pattern: &str, ignore_case: bool) -> Result<Regex, regex::Error> {
+/// Returns the `fancy_regex` compile error when the pattern is malformed.
+fn compile(pattern: &str, ignore_case: bool) -> Result<Regex, fancy_regex::Error> {
     RegexBuilder::new(pattern)
         .case_insensitive(ignore_case)
         .build()
@@ -387,7 +430,7 @@ fn compile(pattern: &str, ignore_case: bool) -> Result<Regex, regex::Error> {
 /// Cross-checks every `$`-capture reference in the (already C-escape-interpreted)
 /// replacement against the compiled pattern's groups.
 ///
-/// The `regex` crate expands an out-of-range `$5` or an unknown `$name` to the
+/// The engine expands an out-of-range `$5` or an unknown `$name` to the
 /// *empty string*, silently — the `$`-dialect twin of the `\1` corruption
 /// [`prepare_replacement`] catches. This walks the replacement with the same
 /// `$`-token rules the engine uses (`$$` is a literal `$`; a name is the longest
@@ -486,13 +529,34 @@ fn atomic_write(path: &Path, content: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Renders a `fancy_regex` runtime error (e.g. the backtrack limit exceeded by an
+/// over-complex look-around / back-reference) into the agent-facing
+/// `invalid pattern` message, naming the file the engine gave up on so a repo-wide
+/// sweep points at the offender.
+fn runtime_pattern_error(path: &Path, err: &fancy_regex::Error) -> String {
+    format!(
+        "invalid pattern: {err} on {} — simplify the look-around or back-reference.",
+        path.display()
+    )
+}
+
 /// Counts the matches a substitution would touch (1 at most under `--first`).
-fn count_matches(regex: &Regex, content: &str, first: bool) -> usize {
+///
+/// # Errors
+///
+/// Propagates a `fancy_regex` runtime error (the backtrack limit exceeded by an
+/// over-complex look-around / back-reference) so the caller fails loudly rather
+/// than under-counting a partially-scanned file.
+fn count_matches(regex: &Regex, content: &str, first: bool) -> Result<usize, fancy_regex::Error> {
     if first {
-        usize::from(regex.is_match(content))
-    } else {
-        regex.find_iter(content).count()
+        return Ok(usize::from(regex.is_match(content)?));
     }
+    let mut count = 0;
+    for found in regex.find_iter(content) {
+        found?;
+        count += 1;
+    }
+    Ok(count)
 }
 
 /// Applies the substitution, returning the rewritten content.
@@ -500,13 +564,22 @@ fn count_matches(regex: &Regex, content: &str, first: bool) -> usize {
 /// Under `--preserve-case` each hit's casing (all-lower / all-UPPER / Title) is
 /// applied to the expanded replacement via a `replace`-closure; mixed casing is
 /// left as authored.
+///
+/// Routes through `try_replacen` (limit `0` ⇒ all, `1` ⇒ first) rather than
+/// `replace_all` / `replacen`, which *panic* on a `fancy_regex` runtime error.
+/// `try_replacen` returns it instead, so a backtrack-limit blow-up is a clean,
+/// reported failure and `--in-place` never leaves a half-substituted file.
+///
+/// # Errors
+///
+/// Propagates a `fancy_regex` runtime error from the backtracking engine.
 fn substitute(
     regex: &Regex,
     content: &str,
     replacement: &str,
     first: bool,
     preserve_case: bool,
-) -> String {
+) -> Result<String, fancy_regex::Error> {
     let replacer = |caps: &Captures<'_>| -> String {
         let mut expanded = String::new();
         caps.expand(replacement, &mut expanded);
@@ -517,11 +590,9 @@ fn substitute(
             expanded
         }
     };
-    if first {
-        regex.replacen(content, 1, replacer).into_owned()
-    } else {
-        regex.replace_all(content, replacer).into_owned()
-    }
+    // `try_replacen` treats limit 0 as "replace all"; 1 is `--first`.
+    let limit = usize::from(first);
+    Ok(regex.try_replacen(content, limit, replacer)?.into_owned())
 }
 
 /// Casing class of a matched span, for `--preserve-case`.
@@ -1092,21 +1163,49 @@ mod tests {
     #[test]
     fn preserve_case_three_cases() {
         let re = compile("omni", true).expect("compile");
-        let out = substitute(&re, "Omni omni OMNI", "lattice", false, true);
+        let out = substitute(&re, "Omni omni OMNI", "lattice", false, true).expect("substitute");
         assert_eq!(out, "Lattice lattice LATTICE");
     }
 
     #[test]
     fn first_only_replaces_once() {
         let re = compile("x", false).expect("compile");
-        assert_eq!(substitute(&re, "x x x", "y", true, false), "y x x");
-        assert_eq!(substitute(&re, "x x x", "y", false, false), "y y y");
+        assert_eq!(
+            substitute(&re, "x x x", "y", true, false).expect("substitute"),
+            "y x x"
+        );
+        assert_eq!(
+            substitute(&re, "x x x", "y", false, false).expect("substitute"),
+            "y y y"
+        );
     }
 
     #[test]
     fn capture_group_expansion() {
         let re = compile(r"(\w+)=(\w+)", false).expect("compile");
-        assert_eq!(substitute(&re, "a=b", "$2=$1", false, false), "b=a");
+        assert_eq!(
+            substitute(&re, "a=b", "$2=$1", false, false).expect("substitute"),
+            "b=a"
+        );
+    }
+
+    #[test]
+    fn lookahead_excludes_suffix() {
+        // The feedback's motivating case: rename `Dft` everywhere *except*
+        // `DftNorm`, in one pass via negative look-ahead — impossible on the plain
+        // `regex` engine, which rejects look-around at compile time.
+        let re = compile(r"Dft(?!Norm)", false).expect("compile look-ahead");
+        let out =
+            substitute(&re, "Dft DftNorm DftPlan", "DftC2c", false, false).expect("substitute");
+        assert_eq!(out, "DftC2c DftNorm DftC2cPlan");
+    }
+
+    #[test]
+    fn backreference_collapses_repeat() {
+        // Back-references are likewise supported by the backtracking engine.
+        let re = compile(r"(\w+) \1", false).expect("compile back-reference");
+        let out = substitute(&re, "the the end", "$1", false, false).expect("substitute");
+        assert_eq!(out, "the end");
     }
 
     #[test]
@@ -1693,5 +1792,23 @@ mod tests {
             "bad regex is loud: {}",
             outcome.output
         );
+    }
+
+    #[test]
+    fn runtime_error_names_the_file() {
+        // A backtracking blow-up (e.g. the backtrack limit) is rendered loudly,
+        // naming the offending file and pointing at the fix. Any `fancy_regex`
+        // error exercises the message shape — reliably *triggering* catastrophic
+        // backtracking is engine-version-dependent (fancy-regex delegates linear
+        // sub-expressions to the `regex` engine), so we pin the contract, not the
+        // trigger.
+        let err = compile("(unclosed", false).expect_err("malformed pattern");
+        let msg = runtime_pattern_error(Path::new("src/huge.rs"), &err);
+        assert!(msg.contains("invalid pattern"), "loud prefix: {msg}");
+        assert!(
+            msg.contains("src/huge.rs"),
+            "names the offending file: {msg}"
+        );
+        assert!(msg.contains("simplify"), "points at the fix: {msg}");
     }
 }

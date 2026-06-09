@@ -320,7 +320,8 @@ pub struct SedRequest {
     /// Working directory from the CLI process (for resolving relative paths).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<PathBuf>,
-    /// Search pattern (`regex`-crate dialect).
+    /// Search pattern (`fancy-regex`: the `regex` dialect plus look-around and
+    /// back-references).
     pub pattern: String,
     /// Replacement text (`$1` captures; C-escapes interpreted; sed escapes
     /// rejected by the daemon-side validator).
