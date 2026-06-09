@@ -32,9 +32,14 @@
 //! A project subtree can be re-added later without touching the record format,
 //! since `cwd` is in every line.)
 //!
-//! **Additive.** This ticket lands the sink, the [`Record`] schema, the [`Scope`]
-//! resolver, and the path layout. Wiring it into the active sink set (alongside,
-//! then in place of, `MessageDbSink`) is the firehose cutover (ticket 02).
+//! **The live firehose sink.** Wired into the [`LoggingServer`](super) active
+//! sink set in place of the retired `MessageDbSink` (firehose cutover, ticket
+//! 02). The write path is decoupled from the emitting thread: `handle` does only
+//! cheap work (resolve the scope, build the record, serialize) and enqueues onto
+//! a bounded channel; a single dedicated writer thread owns the file handles and
+//! drains the channel, so disk latency never couples to LSP/MCP dispatch. A
+//! saturated channel drops (counted, surfaced) rather than blocking — the daemon
+//! is structurally unwedgeable on the writer side too, not just the readers.
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -45,6 +50,11 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+use std::sync::mpsc::Receiver;
+use std::sync::mpsc::SyncSender;
+use std::thread::JoinHandle;
 
 use chrono::SecondsFormat;
 use chrono::Utc;
@@ -65,6 +75,20 @@ use crate::db::encode_cwd;
 /// least-recently-used handle is closed. Sized generously — a busy daemon has a
 /// handful of live scopes, not dozens.
 const HANDLE_CACHE_CAP: usize = 64;
+
+/// Bounded capacity of the write queue between [`JsonlSink::handle`] and the
+/// dedicated writer thread.
+///
+/// `handle` runs on the thread that emitted the tracing event (an LSP-dispatch
+/// thread, the MCP reader, …); a synchronous file write there would couple disk
+/// latency to dispatch — the residual wedge vector once size-driven growth is
+/// gone. So `handle` only enqueues and the writer thread owns the I/O. When the
+/// queue is full (writer stalled on slow/blocked storage) sends are **dropped,
+/// never blocked** — telemetry is regenerable; blocking dispatch is the failure
+/// being eliminated. Sized for bursty LSP traffic after the emission-side level
+/// filter; at a few hundred bytes per line the cap bounds the queue well under
+/// ~8 MB.
+const CHANNEL_CAP: usize = 8192;
 
 /// Which stateless search command produced a [`Scope::Search`] record. Selects
 /// the per-tool subdirectory (`grep/` or `glob/`) under the cwd shard.
@@ -174,8 +198,8 @@ impl Scope {
 
 /// Resolve the scope of an event, daemon-side, at write time.
 ///
-/// Generalizes the degenerate selector the old DB sink used
-/// (`session_id.unwrap_or(instance_id)`, `message_db.rs`) into the four-way
+/// Generalizes the degenerate selector the retired DB sink used
+/// (`session_id.unwrap_or(instance_id)`) into the four-way
 /// `session → search → server → instance` rule:
 ///
 /// - **Session** — the event carries a `session_id` (hook-correlated work, plus
@@ -184,8 +208,9 @@ impl Scope {
 ///   per-request UUID at the IPC boundary and tags the invocation's events (the
 ///   command record and any LSP it triggers) with the structured fields
 ///   `search_id` (UUID), `tool` (`grep`|`glob`), and optionally `search_ts`. No
-///   hook handoff — search self-scopes. (Field emission is wired daemon-side at
-///   the firehose cutover, ticket 02; the resolver reads the contract here.)
+///   hook handoff — search self-scopes. (Field emission is wired daemon-side
+///   where the daemon mints the per-request id; the resolver reads the contract
+///   here.)
 /// - **Server** — an autonomous LSP event (`kind = "lsp"`, names a `server`, no
 ///   session/search scope): `$/progress`, `window/logMessage`, spawn,
 ///   `initialize`. Triggered LSP rides its command's file via the session/search
@@ -251,8 +276,8 @@ fn non_empty(s: Option<&str>) -> Option<String> {
 ///
 /// Prefers the search contract's explicit `cwd` field (the CLI-side `getcwd`),
 /// falling back to the LSP routing `scope_root`. Empty when neither is present
-/// (e.g. instance-global streams). A session's true `getcwd` is threaded at the
-/// firehose cutover (ticket 02); until then `scope_root` is the proxy.
+/// (e.g. instance-global streams). When a session does not carry an explicit
+/// CLI-side `getcwd`, `scope_root` is the proxy.
 fn event_cwd<'a>(event: &'a LogEvent<'_>) -> &'a str {
     event
         .fields
@@ -391,9 +416,9 @@ fn parse_payload(raw: &str) -> Value {
 
 /// A tiny bounded LRU over open append [`File`] handles.
 ///
-/// Single-writer (the daemon), so the only synchronization is the enclosing
-/// [`Mutex`]; appends are torn-write-safe because each line is written in one
-/// `write_all` to an `O_APPEND` handle (readers skip an unterminated tail).
+/// Owned exclusively by the single writer thread, so it needs no
+/// synchronization. Appends are torn-write-safe because each line is written in
+/// one `write_all` to an `O_APPEND` handle (readers skip an unterminated tail).
 #[derive(Default)]
 struct HandleCache {
     files: HashMap<PathBuf, File>,
@@ -455,30 +480,87 @@ impl HandleCache {
 /// Append-only JSONL firehose sink. Writes one record per line to the file
 /// selected by the record's resolved scope.
 ///
-/// **Additive:** runs alongside `MessageDbSink` until the firehose cutover
-/// (ticket 02) wires it into the active sink set and retires the DB writes.
+/// The write path is decoupled from the emitting thread. [`Sink::handle`] runs
+/// on whatever thread emitted the tracing event (an LSP-dispatch thread, the MCP
+/// reader, …); it does only cheap work — resolve the scope, build the record,
+/// serialize — then enqueues the `(path, line)` onto a bounded channel and
+/// returns. A single dedicated writer thread drains the channel, owns the
+/// [`HandleCache`], and batches one `write_all` per file per drain. A saturated
+/// channel **drops** (counted, surfaced) rather than blocking dispatch — the one
+/// residual wedge vector once size-driven growth is gone (a stalled NFS-mounted
+/// cache dir or a full disk must not stall the daemon).
 pub struct JsonlSink {
     /// Firehose root: `<cache_dir>/catenary/<instance_id>`.
     root: PathBuf,
     /// Daemon instance id — the `scope_id` for instance-global streams.
     instance_id: Arc<str>,
-    /// LRU of open append handles, keyed by absolute file path.
-    handles: Mutex<HandleCache>,
+    /// Bounded write queue to the writer thread. The sink is the sole producer
+    /// facade and is itself shared as `Arc<JsonlSink>`, so no sender cloning.
+    tx: SyncSender<Job>,
+    /// Writer thread handle, taken and joined by [`JsonlSink::shutdown`].
+    /// `None` if the thread failed to spawn (degrades to drop-everything).
+    writer: Mutex<Option<JoinHandle<()>>>,
+    /// Count of lines dropped because the queue was full (or the writer is
+    /// gone). Surfaced periodically by the writer; never silent.
+    dropped: Arc<AtomicU64>,
+}
+
+/// A unit of work for the writer thread.
+enum Job {
+    /// Append `line` to the file at `path`.
+    Write { path: PathBuf, line: Vec<u8> },
+    /// Drain everything queued, then exit (clean-shutdown sentinel).
+    Shutdown,
 }
 
 impl JsonlSink {
-    /// Create a sink rooted at `<cache_dir>/catenary/<instance_id>`.
+    /// Create a sink rooted at `<cache_dir>/catenary/<instance_id>` and spawn
+    /// its writer thread.
     ///
     /// `cache_dir` is the resolved cache base (production: [`crate::db::cache_dir`]);
     /// tests inject a tempdir so the firehose never escapes into `~/.cache`.
     #[must_use]
     pub fn new(cache_dir: &Path, instance_id: Arc<str>) -> Arc<Self> {
         let root = cache_dir.join("catenary").join(instance_id.as_ref());
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Job>(CHANNEL_CAP);
+        let dropped = Arc::new(AtomicU64::new(0));
+        let writer_dropped = Arc::clone(&dropped);
+        let writer = std::thread::Builder::new()
+            .name("catenary-jsonl".to_string())
+            .spawn(move || writer_loop(&rx, &writer_dropped))
+            .ok();
         Arc::new(Self {
             root,
             instance_id,
-            handles: Mutex::new(HandleCache::default()),
+            tx,
+            writer: Mutex::new(writer),
+            dropped,
         })
+    }
+
+    /// Drain any queued lines and stop the writer thread.
+    ///
+    /// Called on clean daemon shutdown. Sends the [`Job::Shutdown`] sentinel — a
+    /// blocking send, because at shutdown we wait for the writer to make room and
+    /// drain rather than drop — and joins the writer, so every line enqueued
+    /// before this call is on disk when it returns. A crash skips this and may
+    /// lose the unflushed tail (acceptable; the per-instance dir isolates a torn
+    /// tail from the next daemon). Idempotent: a second call is a no-op.
+    pub fn shutdown(&self) {
+        // Err means the writer already exited (prior shutdown / spawn failure).
+        let _ = self.tx.send(Job::Shutdown);
+        // Take the handle out (releasing the lock) before joining, so the join
+        // never happens under the mutex.
+        let handle = lock_writer(&self.writer).take();
+        if let Some(handle) = handle {
+            let _ = handle.join();
+        }
+    }
+
+    /// Lines dropped so far under queue backpressure (test accessor).
+    #[cfg(test)]
+    fn dropped_count(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
     }
 }
 
@@ -498,19 +580,74 @@ impl Sink for JsonlSink {
         };
         line.push('\n');
 
-        let result = {
-            let mut guard = lock_handles(&self.handles);
-            guard.append(&path, line.as_bytes())
-        };
-        if let Err(e) = result {
-            tracing::trace!(error = %e, path = %path.display(), "jsonl_sink: append failed");
+        // Enqueue and return — never block the emitting (dispatch) thread. A
+        // full queue (writer stalled) or a gone writer drops the line.
+        if self
+            .tx
+            .try_send(Job::Write {
+                path,
+                line: line.into_bytes(),
+            })
+            .is_err()
+        {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
 
-/// Recover a poisoned handle-cache lock by taking the inner guard, so logging
-/// keeps working after an unrelated panic.
-fn lock_handles(m: &Mutex<HandleCache>) -> std::sync::MutexGuard<'_, HandleCache> {
+/// The writer thread: drain [`Job`]s, batching one `write_all` per file per
+/// wakeup, until the [`Job::Shutdown`] sentinel (or all senders drop).
+fn writer_loop(rx: &Receiver<Job>, dropped: &AtomicU64) {
+    let mut cache = HandleCache::default();
+    let mut last_reported = 0u64;
+    let mut stop = false;
+    while !stop {
+        // Block for at least one job, then absorb everything currently queued
+        // into a per-file batch so each file takes a single `write_all`.
+        let Ok(first) = rx.recv() else { break };
+        let mut batch: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+        merge_job(&mut batch, first, &mut stop);
+        while let Ok(job) = rx.try_recv() {
+            merge_job(&mut batch, job, &mut stop);
+        }
+        for (path, bytes) in &batch {
+            if let Err(e) = cache.append(path, bytes) {
+                tracing::trace!(error = %e, path = %path.display(), "jsonl_sink: append failed");
+            }
+        }
+        report_drops(dropped, &mut last_reported);
+    }
+}
+
+/// Fold one [`Job`] into the current drain batch. [`Job::Shutdown`] sets `stop`.
+fn merge_job(batch: &mut HashMap<PathBuf, Vec<u8>>, job: Job, stop: &mut bool) {
+    match job {
+        Job::Write { path, line } => batch.entry(path).or_default().extend_from_slice(&line),
+        Job::Shutdown => *stop = true,
+    }
+}
+
+/// Surface newly-dropped lines once per drain cycle, so backpressure loss is
+/// never silent. `debug!` (not `trace!`, which the level filter drops, and not
+/// `warn!`, which would reach the user notification queue) lands it in
+/// `trace.jsonl`.
+fn report_drops(dropped: &AtomicU64, last_reported: &mut u64) {
+    let total = dropped.load(Ordering::Relaxed);
+    if total > *last_reported {
+        let delta = total - *last_reported;
+        *last_reported = total;
+        tracing::debug!(
+            source = crate::source::Source::LoggingFirehose.as_str(),
+            dropped = total,
+            "jsonl firehose dropped {delta} line(s) under backpressure (total {total})",
+        );
+    }
+}
+
+/// Recover a poisoned writer-handle lock so shutdown still joins the thread.
+fn lock_writer(
+    m: &Mutex<Option<JoinHandle<()>>>,
+) -> std::sync::MutexGuard<'_, Option<JoinHandle<()>>> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
@@ -808,6 +945,8 @@ mod tests {
         sink.handle(&e);
         e.message = "second".into();
         sink.handle(&e);
+        // Flush the async writer before reading the file back.
+        sink.shutdown();
 
         let file = dir
             .path()
@@ -839,6 +978,7 @@ mod tests {
         server.kind = Some("lsp".into());
         server.server = Some("taplo".into());
         sink.handle(&server);
+        sink.shutdown();
 
         let base = dir.path().join("catenary").join(INSTANCE);
         assert!(base.join("sessions").join("s1.jsonl").exists());
@@ -859,11 +999,63 @@ mod tests {
         let mut e2 = blank_event();
         e2.message = "trace".into();
         sink.handle(&e2);
+        sink.shutdown();
 
         // Both instance streams exist, both under the tempdir.
         let base = dir.path().join("catenary").join(INSTANCE);
         assert!(base.join("mcp.jsonl").exists());
         assert!(base.join("trace.jsonl").exists());
+    }
+
+    // ── Bounded write queue + flush-on-shutdown ──────────────────────
+
+    #[test]
+    fn shutdown_flushes_all_queued_lines() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sink = JsonlSink::new(dir.path(), INSTANCE.into());
+
+        let mut e = blank_event();
+        e.session_id = Some("s1".into());
+        for i in 0..100 {
+            e.message = format!("line {i}");
+            sink.handle(&e);
+        }
+        // shutdown() drains the queue and joins the writer: every enqueued line
+        // is on disk afterward.
+        sink.shutdown();
+
+        let file = dir
+            .path()
+            .join("catenary")
+            .join(INSTANCE)
+            .join("sessions")
+            .join("s1.jsonl");
+        let contents = fs::read_to_string(&file).expect("read jsonl");
+        assert_eq!(
+            contents.lines().count(),
+            100,
+            "all queued lines flushed on shutdown"
+        );
+    }
+
+    #[test]
+    fn post_shutdown_sends_drop_and_count_without_blocking() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sink = JsonlSink::new(dir.path(), INSTANCE.into());
+        // Stop the writer first: subsequent sends have nowhere to go and must be
+        // dropped (counted), never block the emitting thread.
+        sink.shutdown();
+
+        let mut e = blank_event();
+        e.session_id = Some("s1".into());
+        for _ in 0..3 {
+            sink.handle(&e);
+        }
+        assert_eq!(
+            sink.dropped_count(),
+            3,
+            "post-shutdown sends are dropped and counted"
+        );
     }
 
     #[test]

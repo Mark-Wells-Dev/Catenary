@@ -5,7 +5,7 @@
 //!
 //! [`LoggingServer`] is a [`tracing_subscriber::Layer`] that subscribes to every
 //! tracing event in the process and dispatches structured events to registered
-//! sinks (notification queue, protocol-message DB, trace DB). It supports
+//! sinks (notification queue, JSONL firehose). It supports
 //! two-phase construction: the Layer is installed at binary entry in a buffering
 //! state, and [`LoggingServer::activate`] transitions to active once sinks are
 //! ready, draining any buffered events through the new sinks.
@@ -21,7 +21,6 @@
 //! Layer impl. Concrete sinks are added in subsequent tickets.
 
 pub mod jsonl_sink;
-pub mod message_db;
 pub mod notification_queue;
 pub mod notification_router;
 
@@ -703,108 +702,169 @@ pub mod test_support {
     use std::sync::Arc;
     use std::sync::Mutex;
 
+    use serde_json::Value;
     use tracing_subscriber::layer::SubscriberExt;
 
+    use super::LogEvent;
     use super::LoggingServer;
-    use super::message_db::MessageDbSink;
+    use super::Severity;
+    use super::Sink;
 
-    /// Row projection from the `messages` table.
+    /// Row projection mirroring the retired `MessageDbSink` write shape.
+    ///
+    /// The observability rewrite (workstream 27) retired the `messages` table
+    /// and `MessageDbSink`; tests that used to query that table now read the
+    /// [`MessageRecorder`]. Keeping the projection identical lets the firehose
+    /// field-routing assertions port over unchanged.
+    #[derive(Clone)]
     pub struct MsgRow {
         pub r#type: String,
         pub level: String,
         pub method: String,
+        pub server: String,
         pub client: String,
         pub parent_id: Option<String>,
+        pub payload: String,
     }
 
-    /// Create an in-memory DB with `sessions` and `messages` table schema.
-    pub fn logging_test_db() -> Arc<Mutex<rusqlite::Connection>> {
-        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory db");
-        conn.execute_batch(
-            "CREATE TABLE sessions (
-                 id           TEXT PRIMARY KEY,
-                 pid          INTEGER NOT NULL,
-                 display_name TEXT NOT NULL,
-                 started_at   TEXT NOT NULL
-             );
-             INSERT INTO sessions (id, pid, display_name, started_at)
-                 VALUES ('s1', 1, 'test', '2026-01-01T00:00:00Z');
-             CREATE TABLE messages (
-                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                 session_id  TEXT NOT NULL,
-                 timestamp   TEXT NOT NULL,
-                 type        TEXT NOT NULL,
-                 level       TEXT NOT NULL DEFAULT 'info',
-                 method      TEXT NOT NULL,
-                 server      TEXT NOT NULL,
-                 client      TEXT NOT NULL,
-                 parent_id   TEXT,
-                 scope_root  TEXT NOT NULL DEFAULT '',
-                 payload     TEXT NOT NULL
-             );",
-        )
-        .expect("create schema");
-        Arc::new(Mutex::new(conn))
+    /// In-memory [`Sink`] that captures each event as a [`MsgRow`].
+    ///
+    /// Replaces the DB-backed test harness. The projection
+    /// (type/level/method/server/client/payload) is the retired `MessageDbSink`'s
+    /// exactly, so logging tests assert the same field routing without a
+    /// database — the JSONL write path itself is covered by `jsonl_sink`'s own
+    /// unit tests.
+    #[derive(Default)]
+    pub struct MessageRecorder {
+        rows: Mutex<Vec<MsgRow>>,
     }
 
-    /// Create a `LoggingServer` with `MessageDbSink` backed by an in-memory
-    /// DB, installed as the thread-local tracing subscriber.
+    impl MessageRecorder {
+        /// Create an empty recorder.
+        #[must_use]
+        pub fn new() -> Arc<Self> {
+            Arc::new(Self::default())
+        }
+
+        /// Snapshot of captured rows in arrival order.
+        #[must_use]
+        pub fn rows(&self) -> Vec<MsgRow> {
+            self.rows
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    impl Sink for MessageRecorder {
+        fn handle(&self, event: &LogEvent<'_>) {
+            let row = project_row(event);
+            self.rows
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(row);
+        }
+    }
+
+    /// Project a [`LogEvent`] to a [`MsgRow`], replicating the retired
+    /// `MessageDbSink` column mapping (protocol → kind/method/client/payload;
+    /// internal → "internal"/target/"catenary"/trace-payload).
+    fn project_row(event: &LogEvent<'_>) -> MsgRow {
+        let type_val = match event.kind.as_deref() {
+            Some("lsp") => "lsp",
+            Some("mcp") => "mcp",
+            Some("hook") => "hook",
+            _ => "internal",
+        };
+        let level = match event.severity {
+            Severity::Error => "error",
+            Severity::Warn => "warn",
+            Severity::Info => "info",
+            Severity::Debug => "debug",
+        };
+        let is_protocol = type_val != "internal";
+        let payload = if is_protocol {
+            event.payload.as_deref().unwrap_or("").to_string()
+        } else {
+            build_trace_payload(event)
+        };
+        let method = if is_protocol {
+            event.method.as_deref().unwrap_or("")
+        } else {
+            event.target
+        };
+        let client = if is_protocol {
+            event.client.as_deref().unwrap_or("")
+        } else {
+            "catenary"
+        };
+        MsgRow {
+            r#type: type_val.to_string(),
+            level: level.to_string(),
+            method: method.to_string(),
+            server: event.server.as_deref().unwrap_or("").to_string(),
+            client: client.to_string(),
+            parent_id: event.parent_id.clone(),
+            payload,
+        }
+    }
+
+    /// Build the internal-event payload JSON, matching the retired sink's
+    /// `build_trace_payload` shape (`level`, `message`, optional
+    /// `source`/`language`/`fields`).
+    fn build_trace_payload(event: &LogEvent<'_>) -> String {
+        let mut obj = serde_json::Map::new();
+        obj.insert("level".into(), event.severity.tag().into());
+        obj.insert("message".into(), event.message.clone().into());
+        if let Some(source) = &event.source {
+            obj.insert("source".into(), source.clone().into());
+        }
+        if let Some(language) = &event.language {
+            obj.insert("language".into(), language.clone().into());
+        }
+        if !event.fields.is_empty() {
+            obj.insert("fields".into(), Value::Object(event.fields.clone()));
+        }
+        Value::Object(obj).to_string()
+    }
+
+    /// Create a `LoggingServer` with a `MessageRecorder` sink, installed as the
+    /// thread-local tracing subscriber.
     pub fn setup_logging() -> (
         LoggingServer,
-        Arc<Mutex<rusqlite::Connection>>,
+        Arc<MessageRecorder>,
         tracing::subscriber::DefaultGuard,
     ) {
-        let conn = logging_test_db();
-
+        let recorder = MessageRecorder::new();
         let logging = LoggingServer::new();
-        let message_db = MessageDbSink::new(conn.clone(), "s1".into());
-        logging.activate(vec![message_db]);
+        logging.activate(vec![recorder.clone()]);
 
         let subscriber = tracing_subscriber::registry().with(logging.clone());
         let guard = tracing::subscriber::set_default(subscriber);
 
-        (logging, conn, guard)
+        (logging, recorder, guard)
     }
 
-    /// Query all messages ordered by id.
-    #[allow(
-        clippy::significant_drop_tightening,
-        reason = "MutexGuard must outlive the prepared statement"
-    )]
-    pub fn query_all_messages(conn: &Arc<Mutex<rusqlite::Connection>>) -> Vec<MsgRow> {
-        let c = conn.lock().expect("lock");
-        c.prepare(
-            "SELECT type, level, method, client, parent_id \
-             FROM messages ORDER BY id",
-        )
-        .expect("prepare")
-        .query_map([], |row| {
-            Ok(MsgRow {
-                r#type: row.get(0)?,
-                level: row.get(1)?,
-                method: row.get(2)?,
-                client: row.get(3)?,
-                parent_id: row.get(4)?,
-            })
-        })
-        .expect("query")
-        .filter_map(std::result::Result::ok)
-        .collect()
+    /// All captured messages in arrival order.
+    #[must_use]
+    pub fn query_all_messages(recorder: &Arc<MessageRecorder>) -> Vec<MsgRow> {
+        recorder.rows()
     }
 
-    /// Query protocol messages only (`type IN ('lsp', 'mcp', 'hook')`).
-    pub fn query_protocol_messages(conn: &Arc<Mutex<rusqlite::Connection>>) -> Vec<MsgRow> {
-        query_all_messages(conn)
+    /// Captured protocol messages only (`type IN ('lsp', 'mcp', 'hook')`).
+    #[must_use]
+    pub fn query_protocol_messages(recorder: &Arc<MessageRecorder>) -> Vec<MsgRow> {
+        recorder
+            .rows()
             .into_iter()
             .filter(|m| matches!(m.r#type.as_str(), "lsp" | "mcp" | "hook"))
             .collect()
     }
 
-    /// Count total rows in the `messages` table.
-    pub fn message_count(conn: &Arc<Mutex<rusqlite::Connection>>) -> i64 {
-        let c = conn.lock().expect("lock");
-        c.query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
-            .expect("count messages")
+    /// Count of captured messages.
+    #[must_use]
+    pub fn message_count(recorder: &Arc<MessageRecorder>) -> i64 {
+        i64::try_from(recorder.rows().len()).unwrap_or(i64::MAX)
     }
 
     /// Spawn mockls with a `LoggingServer` and initialize it.

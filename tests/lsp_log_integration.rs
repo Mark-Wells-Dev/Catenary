@@ -6,7 +6,8 @@
     clippy::expect_used,
     reason = "tests use expect for readable assertions"
 )]
-//! Integration tests for LSP message logging via `LoggingServer` + `MessageDbSink`.
+//! Integration tests for LSP message logging via `LoggingServer` + the
+//! in-memory `MessageRecorder` test sink.
 
 use anyhow::Result;
 

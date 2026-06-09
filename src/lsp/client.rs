@@ -1060,10 +1060,10 @@ impl LspClient {
 )]
 mod tests {
     use super::*;
-    use crate::logging::test_support::setup_logging;
+    use crate::logging::test_support::{MessageRecorder, setup_logging};
     use crate::lsp::state::ServerLifecycle;
     use crate::lsp::test_support::mockls_bin;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     const MOCK_LANG: &str = "tCl1x";
 
@@ -1071,21 +1071,16 @@ mod tests {
         LoggingServer::new()
     }
 
-    /// Poll DB until a stderr message appears, returning its payload.
-    async fn poll_stderr_payload(db: &Arc<Mutex<rusqlite::Connection>>) -> Option<String> {
+    /// Poll the recorder until a stderr message appears, returning its payload.
+    async fn poll_stderr_payload(recorder: &Arc<MessageRecorder>) -> Option<String> {
         for _ in 0..50 {
             tokio::time::sleep(Duration::from_millis(20)).await;
-            let c = db.lock().expect("lock");
-            let result: Result<String, _> = c.query_row(
-                "SELECT payload FROM messages \
-                 WHERE type = 'lsp' AND method = 'stderr' \
-                 LIMIT 1",
-                [],
-                |row| row.get(0),
-            );
-            drop(c);
-            if let Ok(payload) = result {
-                return Some(payload);
+            if let Some(row) = recorder
+                .rows()
+                .into_iter()
+                .find(|m| m.r#type == "lsp" && m.method == "stderr")
+            {
+                return Some(row.payload);
             }
         }
         None

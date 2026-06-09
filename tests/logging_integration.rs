@@ -13,18 +13,23 @@
 //! tracing Layer pipeline — scenarios that span multiple tickets and
 //! don't fit naturally inside a single module's test suite.
 //!
+//! The firehose half is captured by an in-memory `MessageRecorder` (the
+//! observability rewrite retired the `messages` DB sink); the JSONL write
+//! path itself is covered by `jsonl_sink`'s own unit tests.
+//!
 //! Each test uses `tracing::subscriber::with_default` (scoped per-test)
 //! to avoid global subscriber conflicts in parallel test execution.
+
+use std::time::Duration;
 
 use anyhow::Result;
 use catenary_mcp::source::Source;
 use tempfile::tempdir;
 use tracing_subscriber::layer::SubscriberExt;
 
-use catenary_mcp::logging::message_db::MessageDbSink;
 use catenary_mcp::logging::notification_queue::NotificationQueueSink;
 use catenary_mcp::logging::test_support::{
-    MsgRow, logging_test_db, message_count, query_all_messages,
+    MessageRecorder, MsgRow, message_count, query_all_messages,
 };
 use catenary_mcp::logging::{LoggingServer, Severity};
 
@@ -32,20 +37,19 @@ const MOCK_LANG_A: &str = "yX4Za";
 
 // ── Multi-sink dispatch ────────────────────────────────────────────────
 
-/// Verify that both sinks (notification queue, message DB) receive their
-/// respective events through a single `LoggingServer` Layer.
+/// Verify that both sinks (notification queue, message recorder) receive
+/// their respective events through a single `LoggingServer` Layer.
 #[test]
 fn multi_sink_dispatch_routes_correctly() {
-    let db = logging_test_db();
+    let recorder = MessageRecorder::new();
     let notifications = NotificationQueueSink::new(Severity::Warn);
-    let message_db = MessageDbSink::new(db.clone(), "s1".into());
 
     let server = LoggingServer::new();
     let subscriber = tracing_subscriber::registry().with(server.clone());
     tracing::subscriber::with_default(subscriber, || {
-        server.activate(vec![notifications.clone(), message_db]);
+        server.activate(vec![notifications.clone(), recorder.clone()]);
 
-        // Protocol event (kind="lsp") → message DB with type "lsp".
+        // Protocol event (kind="lsp") → recorder with type "lsp".
         tracing::info!(
             kind = "lsp",
             method = "textDocument/hover",
@@ -54,17 +58,17 @@ fn multi_sink_dispatch_routes_correctly() {
             "outgoing"
         );
 
-        // Warn event without kind → message DB with type "internal" + notification queue.
+        // Warn event without kind → recorder with type "internal" + notification queue.
         tracing::warn!(source = Source::LspLifecycle.as_str(), "server crashed");
 
-        // Debug event without kind → message DB with type "internal" only (below notification threshold).
+        // Debug event without kind → recorder with type "internal" only (below notification threshold).
         tracing::debug!("verbose trace");
     });
 
-    let msgs = query_all_messages(&db);
+    let msgs = query_all_messages(&recorder);
 
-    // All 3 events go to the unified message DB.
-    assert_eq!(msgs.len(), 3, "expected 3 DB rows, got {}", msgs.len());
+    // All 3 events go to the recorder.
+    assert_eq!(msgs.len(), 3, "expected 3 rows, got {}", msgs.len());
 
     // Protocol event is type "lsp".
     assert_eq!(msgs[0].r#type, "lsp");
@@ -133,10 +137,9 @@ fn notification_dedup_through_layer() {
 /// MCP tool call's correlation ID appears as the LSP request's `parent_id`.
 #[tokio::test]
 async fn lsp_request_scope_chain() -> Result<()> {
-    let db = logging_test_db();
-    let message_db = MessageDbSink::new(db.clone(), "s1".into());
+    let recorder = MessageRecorder::new();
     let server = LoggingServer::new();
-    server.activate(vec![message_db]);
+    server.activate(vec![recorder.clone()]);
 
     let subscriber = tracing_subscriber::registry().with(server.clone());
     let guard = tracing::subscriber::set_default(subscriber);
@@ -168,7 +171,7 @@ async fn lsp_request_scope_chain() -> Result<()> {
 
     let _def = client.definition(&uri, 0, 4).await?;
 
-    let msgs = query_all_messages(&db);
+    let msgs = query_all_messages(&recorder);
     let def_msgs: Vec<&MsgRow> = msgs
         .iter()
         .filter(|m| m.method == "textDocument/definition")
@@ -205,10 +208,9 @@ async fn lsp_request_scope_chain() -> Result<()> {
 /// share the same `parent_id`. Without a tool-call scope, both are `None`.
 #[tokio::test]
 async fn pair_merge_still_works() -> Result<()> {
-    let db = logging_test_db();
-    let message_db = MessageDbSink::new(db.clone(), "s1".into());
+    let recorder = MessageRecorder::new();
     let server = LoggingServer::new();
-    server.activate(vec![message_db]);
+    server.activate(vec![recorder.clone()]);
 
     let subscriber = tracing_subscriber::registry().with(server.clone());
     let guard = tracing::subscriber::set_default(subscriber);
@@ -237,7 +239,7 @@ async fn pair_merge_still_works() -> Result<()> {
     let _def = client.definition(&uri, 0, 4).await?;
 
     // Find the definition request/response pair.
-    let msgs = query_all_messages(&db);
+    let msgs = query_all_messages(&recorder);
     let def_msgs: Vec<&MsgRow> = msgs
         .iter()
         .filter(|m| m.method == "textDocument/definition")
@@ -261,13 +263,12 @@ async fn pair_merge_still_works() -> Result<()> {
 /// get `type = "internal"`.
 #[test]
 fn unified_sink_type_column_correct() {
-    let db = logging_test_db();
-    let message_db = MessageDbSink::new(db.clone(), "s1".into());
+    let recorder = MessageRecorder::new();
     let server = LoggingServer::new();
 
     let subscriber = tracing_subscriber::registry().with(server.clone());
     tracing::subscriber::with_default(subscriber, || {
-        server.activate(vec![message_db]);
+        server.activate(vec![recorder.clone()]);
 
         // 3 protocol events.
         for kind in &["lsp", "mcp", "hook"] {
@@ -279,7 +280,7 @@ fn unified_sink_type_column_correct() {
         tracing::info!("trace event 2");
     });
 
-    let msgs = query_all_messages(&db);
+    let msgs = query_all_messages(&recorder);
 
     let protocol_count = msgs
         .iter()
@@ -297,9 +298,8 @@ fn unified_sink_type_column_correct() {
 /// sinks on activation.
 #[test]
 fn bootstrap_buffer_drains_to_all_sinks() {
-    let db = logging_test_db();
+    let recorder = MessageRecorder::new();
     let notifications = NotificationQueueSink::new(Severity::Warn);
-    let message_db = MessageDbSink::new(db.clone(), "s1".into());
     let server = LoggingServer::new();
 
     let subscriber = tracing_subscriber::registry().with(server.clone());
@@ -314,12 +314,12 @@ fn bootstrap_buffer_drains_to_all_sinks() {
         assert_eq!(server.buffered_len(), 2);
 
         // Activate: buffer drains to sinks.
-        server.activate(vec![notifications.clone(), message_db]);
+        server.activate(vec![notifications.clone(), recorder.clone()]);
         assert_eq!(server.buffered_len(), 0);
     });
 
-    // Message DB got both events.
-    assert_eq!(message_count(&db), 2);
+    // Recorder got both events.
+    assert_eq!(message_count(&recorder), 2);
 
     // Notification queue got both (both are warn, distinct keys).
     let drained = notifications.drain();
@@ -327,13 +327,12 @@ fn bootstrap_buffer_drains_to_all_sinks() {
 }
 
 /// Verify that LSP server stderr output is captured as attributed tracing
-/// events stored in the message DB with `source = "lsp.stderr"`.
+/// events recorded with `method = "stderr"` and the server name attached.
 #[tokio::test]
 async fn stderr_captured_with_source_and_server() -> Result<()> {
-    let db = logging_test_db();
-    let message_db = MessageDbSink::new(db.clone(), "s1".into());
+    let recorder = MessageRecorder::new();
     let server = LoggingServer::new();
-    server.activate(vec![message_db]);
+    server.activate(vec![recorder.clone()]);
 
     let subscriber = tracing_subscriber::registry().with(server.clone());
     let guard = tracing::subscriber::set_default(subscriber);
@@ -354,49 +353,25 @@ async fn stderr_captured_with_source_and_server() -> Result<()> {
     client.initialize(&[dir.path().to_path_buf()], None).await?;
 
     // Poll for the stderr event to appear (async reader task).
-    let mut found = false;
+    let mut stderr_row: Option<MsgRow> = None;
     for _ in 0..50 {
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        let c = db.lock().expect("lock");
-        let count: i64 = c
-            .query_row(
-                "SELECT COUNT(*) FROM messages \
-                 WHERE type = 'lsp' AND level = 'debug' \
-                   AND payload LIKE '%test stderr capture%'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("count");
-        drop(c);
-        if count > 0 {
-            found = true;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if let Some(row) = query_all_messages(&recorder).into_iter().find(|m| {
+            m.r#type == "lsp" && m.level == "debug" && m.payload.contains("test stderr capture")
+        }) {
+            stderr_row = Some(row);
             break;
         }
     }
-    assert!(found, "stderr line should appear in message DB");
 
-    // Verify server attribution, method, and payload.
-    let c = db.lock().expect("lock");
-    let (stored_server, stored_method, stored_payload): (String, String, String) = c
-        .query_row(
-            "SELECT server, method, payload FROM messages \
-             WHERE type = 'lsp' AND level = 'debug' \
-               AND payload LIKE '%test stderr capture%' \
-             LIMIT 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .expect("query stderr row");
-    drop(c);
+    let row = stderr_row.expect("stderr line should appear in the recorder");
 
-    assert_eq!(
-        stored_server, MOCK_LANG_A,
-        "server should be the mockls name"
-    );
-    assert_eq!(stored_method, "stderr", "method should be 'stderr'");
+    assert_eq!(row.server, MOCK_LANG_A, "server should be the mockls name");
+    assert_eq!(row.method, "stderr", "method should be 'stderr'");
     assert!(
-        stored_payload.contains(stderr_text),
-        "payload should contain the stderr text, got: {stored_payload}"
+        row.payload.contains(stderr_text),
+        "payload should contain the stderr text, got: {}",
+        row.payload
     );
 
     drop(guard);

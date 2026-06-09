@@ -23,6 +23,7 @@
 //!
 //! - `bootstrap` — startup sequencing
 //! - `dispatch` — message routing, method dispatch, capability checks
+//! - `firehose` — JSONL firehose sink write path
 //! - `lifecycle` — spawn, init, crash, recovery, shutdown
 //! - `logging` — forwarded log streams (e.g., server's `window/logMessage`)
 //! - `parse` — parsing and deserialization
@@ -47,6 +48,8 @@ pub enum Source {
     HookDispatch,
     /// Logging infrastructure startup sequencing.
     LoggingBootstrap,
+    /// JSONL firehose sink write path (e.g. backpressure drops).
+    LoggingFirehose,
     /// LSP message routing, method dispatch, and capability checks.
     LspDispatch,
     /// LSP server spawn, init, crash, recovery, and shutdown.
@@ -70,6 +73,7 @@ impl Source {
             Self::DaemonLifecycle => "daemon.lifecycle",
             Self::HookDispatch => "hook.dispatch",
             Self::LoggingBootstrap => "logging.bootstrap",
+            Self::LoggingFirehose => "logging.firehose",
             Self::LspDispatch => "lsp.dispatch",
             Self::LspLifecycle => "lsp.lifecycle",
             Self::LspLogging => "lsp.logging",
@@ -96,6 +100,7 @@ impl FromStr for Source {
             "daemon.lifecycle" => Ok(Self::DaemonLifecycle),
             "hook.dispatch" => Ok(Self::HookDispatch),
             "logging.bootstrap" => Ok(Self::LoggingBootstrap),
+            "logging.firehose" => Ok(Self::LoggingFirehose),
             "lsp.dispatch" => Ok(Self::LspDispatch),
             "lsp.lifecycle" => Ok(Self::LspLifecycle),
             "lsp.logging" => Ok(Self::LspLogging),
@@ -138,6 +143,7 @@ mod tests {
             Source::DaemonLifecycle,
             Source::HookDispatch,
             Source::LoggingBootstrap,
+            Source::LoggingFirehose,
             Source::LspDispatch,
             Source::LspLifecycle,
             Source::LspLogging,

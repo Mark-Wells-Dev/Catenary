@@ -17,7 +17,7 @@
 //! Integration benchmark for LSP message throughput via `LoggingServer`.
 //!
 //! Spawns mockls, fires rounds of hover + definition requests, and measures
-//! wall-clock elapsed and DB write throughput (messages/sec). Run with:
+//! wall-clock elapsed and event-capture throughput (messages/sec). Run with:
 //!
 //! ```text
 //! make test T=logging_throughput
@@ -32,7 +32,7 @@ use catenary_mcp::logging::test_support::{message_count, setup_logging, spawn_in
 const MOCK_LANG_A: &str = "yX4Za";
 
 /// End-to-end benchmark: hover + definition requests through mockls with
-/// `LoggingServer` + `MessageDbSink`.
+/// `LoggingServer` + the in-memory `MessageRecorder` test sink.
 ///
 /// Prints throughput numbers. Does not assert a hard regression bound
 /// because absolute timing varies by machine — the synthetic bench
@@ -65,7 +65,7 @@ async fn bench_lsp_message_throughput() -> Result<()> {
     let tool_msgs = post_count - pre_count;
 
     println!();
-    println!("LSP message throughput (mockls, in-memory DB)");
+    println!("LSP message throughput (mockls, in-memory recorder)");
     println!("==============================================");
     println!("Rounds:           {rounds} (hover + definition each)");
     println!("Elapsed:          {:.2} ms", elapsed.as_secs_f64() * 1000.0);

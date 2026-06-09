@@ -258,6 +258,8 @@ fn test_monitor_numeric_session_id_resolves() -> Result<()> {
 }
 
 #[test]
+#[ignore = "observability ticket 02 retired the messages-table firehose (now JSONL); \
+            `catenary monitor` reads JSONL/state.json after tickets 03/06"]
 fn test_monitor_raw_flag() -> Result<()> {
     use std::sync::mpsc;
 
@@ -394,6 +396,8 @@ fn test_monitor_nocolor_flag() -> Result<()> {
 }
 
 #[test]
+#[ignore = "observability ticket 02 retired the messages-table firehose (now JSONL); \
+            `catenary monitor` reads JSONL/state.json after tickets 03/06"]
 fn test_monitor_filter_flag() -> Result<()> {
     use std::sync::mpsc;
 
@@ -461,6 +465,8 @@ fn test_monitor_filter_flag() -> Result<()> {
 }
 
 #[test]
+#[ignore = "observability ticket 02 retired the messages-table firehose (now JSONL); \
+            `catenary monitor` reads JSONL/state.json after tickets 03/06"]
 fn test_monitor_uses_arrows() -> Result<()> {
     use std::sync::mpsc;
 

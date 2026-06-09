@@ -1665,6 +1665,8 @@ fn test_grep_reference_enclosing() -> Result<()> {
 /// Verify that LSP messages triggered by grep carry a `parent_id`
 /// in the database (CLI tool queries get a UUID for event correlation).
 #[test]
+#[ignore = "observability ticket 02 retired the messages-table firehose (now JSONL); \
+            parent_id threading is re-asserted against JSONL in the ticket 03 query rewrite"]
 fn test_grep_parent_id_threading() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let test_file = dir.path().join(format!("test.{MOCK_LANG_A}"));

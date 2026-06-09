@@ -1111,10 +1111,11 @@ fn run_daemon_main() -> Result<()> {
         sweep_diagnostics_overflow(&conn);
         sweep_sed_overflow();
 
-        // Insert a session row so MessageDbSink's FK constraint
-        // (messages.session_id → sessions.id) is satisfied. Without
-        // this, every tracing event after activate() triggers an FK
-        // violation → trace!() → recursive on_event → stack overflow.
+        // Insert the daemon's own session row. The firehose no longer writes
+        // the `messages` table (it goes to JSONL now), but the `language_servers`
+        // server-board persistence keys on this session id and the TUI/session
+        // listing reads it, so the row is still required until SQLite is dropped
+        // (ticket 07).
         let started_at = chrono::Utc::now().to_rfc3339();
         conn.execute(
             "INSERT INTO sessions \
@@ -1224,6 +1225,9 @@ fn run_daemon_main() -> Result<()> {
             "shutting down LSP servers",
         );
         rt.block_on(session.shutdown());
+        // Flush the JSONL firehose (drain queue + join writer) after LSP
+        // shutdown so its final telemetry is captured before exit.
+        session.flush_telemetry();
     }
 
     // Drop removes socket files.

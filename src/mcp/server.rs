@@ -37,9 +37,9 @@ const SUPPORTED_MCP_VERSIONS: &[&str] = &["2025-11-25", "2024-11-05"];
 
 /// Emit an MCP protocol event at the given tracing level.
 ///
-/// Protocol routing is by `kind` field — `MessageDbSink` matches
-/// `kind in {lsp, mcp, hook}` regardless of tracing level.
-/// The level controls DB `level` column and TUI filtering threshold.
+/// Protocol routing is by `kind` field — the JSONL firehose sink keys
+/// `kind in {lsp, mcp, hook}` regardless of tracing level. The level sets
+/// the record's `level` and the TUI filtering threshold.
 fn emit_mcp_event(
     level: tracing::Level,
     client_name: &str,
@@ -1258,11 +1258,13 @@ mod tests {
 
     // ── Protocol logging integration tests ────────────────────────────
 
-    use crate::logging::test_support::{MsgRow, query_all_messages, setup_logging};
+    use crate::logging::test_support::{
+        MessageRecorder, MsgRow, query_all_messages, setup_logging,
+    };
 
     /// Filter to MCP protocol rows only.
-    fn mcp_messages(conn: &Arc<std::sync::Mutex<rusqlite::Connection>>) -> Vec<MsgRow> {
-        query_all_messages(conn)
+    fn mcp_messages(recorder: &Arc<MessageRecorder>) -> Vec<MsgRow> {
+        query_all_messages(recorder)
             .into_iter()
             .filter(|m| m.r#type == "mcp")
             .collect()

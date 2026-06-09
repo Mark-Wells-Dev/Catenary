@@ -32,9 +32,9 @@ use crate::protocol::category::hook_category;
 
 /// Emit a hook protocol event at the given tracing level.
 ///
-/// Protocol routing is by `kind` field — `MessageDbSink` matches
-/// `kind in {lsp, mcp, hook}` regardless of tracing level.
-/// The level controls DB `level` column and TUI filtering threshold.
+/// Protocol routing is by `kind` field — the JSONL firehose sink keys
+/// `kind in {lsp, mcp, hook}` regardless of tracing level. The level sets
+/// the record's `level` and the TUI filtering threshold.
 pub(crate) fn emit_hook_event(
     level: tracing::Level,
     client_name: &str,
@@ -704,11 +704,13 @@ mod tests {
 
     // ── Logging tests ───────────────────────────────────────────────────
 
-    use crate::logging::test_support::{MsgRow, query_all_messages, setup_logging};
+    use crate::logging::test_support::{
+        MessageRecorder, MsgRow, query_all_messages, setup_logging,
+    };
 
     /// Filter to hook protocol rows only.
-    fn hook_messages(conn: &Arc<std::sync::Mutex<rusqlite::Connection>>) -> Vec<MsgRow> {
-        query_all_messages(conn)
+    fn hook_messages(recorder: &Arc<MessageRecorder>) -> Vec<MsgRow> {
+        query_all_messages(recorder)
             .into_iter()
             .filter(|m| m.r#type == "hook")
             .collect()
@@ -1064,16 +1066,9 @@ mod tests {
         let rows = hook_messages(&conn);
         assert_eq!(rows.len(), 1);
 
-        // Verify the stored payload contains the nested host data.
-        let stored_payload: String = {
-            let c = conn.lock().expect("lock");
-            c.query_row("SELECT payload FROM messages WHERE id = 1", [], |row| {
-                row.get(0)
-            })
-            .expect("query payload")
-        };
+        // Verify the captured payload contains the nested host data.
         let stored: serde_json::Value =
-            serde_json::from_str(&stored_payload).expect("parse stored payload");
+            serde_json::from_str(&rows[0].payload).expect("parse stored payload");
         assert_eq!(
             stored["host_payload"]["transcript_path"].as_str(),
             Some("/tmp/transcript.jsonl"),

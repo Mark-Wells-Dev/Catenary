@@ -25,6 +25,7 @@ use super::handler::expand_tilde;
 use super::path_security::PathValidator;
 use crate::config::Config;
 use crate::logging::LoggingServer;
+use crate::logging::jsonl_sink::JsonlSink;
 use crate::logging::notification_router::NotificationRouter;
 use crate::lsp::LspClientManager;
 use crate::lsp::glob::LspGlob;
@@ -299,6 +300,10 @@ pub struct Session {
     pub instance_id: Arc<str>,
     /// Tokio runtime handle for blocking dispatch.
     pub runtime: Handle,
+    /// JSONL firehose sink, owned by the primary daemon session so clean
+    /// shutdown can flush + join its writer thread. `None` for per-connection
+    /// sessions, which share the already-activated `LoggingServer`.
+    jsonl_sink: Option<Arc<JsonlSink>>,
 }
 
 impl Session {
@@ -328,8 +333,8 @@ impl Session {
     ) -> Self {
         let config = Arc::new(config);
 
-        let message_db =
-            crate::logging::message_db::MessageDbSink::new(conn.clone(), instance_id.clone());
+        // JSONL firehose sink (replaces MessageDbSink); owned for flush-on-shutdown.
+        let jsonl_sink = JsonlSink::new(&crate::db::cache_dir(), instance_id.clone());
         let desktop_enabled = config
             .notifications
             .as_ref()
@@ -339,8 +344,11 @@ impl Session {
 
         // Activate — drains bootstrap buffer, enables direct dispatch. The
         // snapshot writer (daemon mode) joins as an alert-ring sink.
-        let mut sinks: Vec<Arc<dyn crate::logging::Sink>> =
-            vec![notification_router.clone(), message_db, desktop_sink];
+        let mut sinks: Vec<Arc<dyn crate::logging::Sink>> = vec![
+            notification_router.clone(),
+            jsonl_sink.clone(),
+            desktop_sink,
+        ];
         if let Some(writer) = &snapshot {
             sinks.push(writer.clone());
         }
@@ -430,6 +438,7 @@ impl Session {
             symbol_index,
             instance_id,
             runtime,
+            jsonl_sink: Some(jsonl_sink),
         }
     }
 
@@ -510,6 +519,7 @@ impl Session {
             symbol_index: primary.symbol_index.clone(),
             instance_id: session_id,
             runtime: primary.runtime.clone(),
+            jsonl_sink: None,
         }
     }
 
@@ -641,6 +651,18 @@ impl Session {
     /// Shuts down all active LSP servers gracefully.
     pub async fn shutdown(&self) {
         self.client_manager.shutdown_all().await;
+    }
+
+    /// Flush the JSONL firehose and stop its writer thread on clean shutdown.
+    ///
+    /// Drains the queued lines and joins the writer so the firehose tail lands
+    /// on disk before the daemon exits. Only the primary daemon session owns the
+    /// sink; per-connection sessions hold `None` and this is a no-op. Call after
+    /// [`Session::shutdown`] so LSP-shutdown telemetry is captured too.
+    pub fn flush_telemetry(&self) {
+        if let Some(sink) = &self.jsonl_sink {
+            sink.shutdown();
+        }
     }
 }
 

@@ -35,9 +35,9 @@ struct PendingRequest {
 
 /// Emit an LSP protocol event at the given tracing level.
 ///
-/// Protocol routing is by `kind` field, not by level — `MessageDbSink`
-/// matches `kind in {lsp, mcp, hook}` regardless of tracing level.
-/// The level controls DB `level` column and TUI filtering threshold.
+/// Protocol routing is by `kind` field, not by level — the JSONL firehose
+/// sink keys `kind in {lsp, mcp, hook}` regardless of tracing level. The
+/// level sets the record's `level` and the TUI filtering threshold.
 ///
 /// `source` is an optional subsystem tag (e.g., `lsp.logging`). Most
 /// callers pass `None`; `window/logMessage` passes its source tag.
