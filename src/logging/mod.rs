@@ -20,6 +20,7 @@
 //! This module provides the scaffolding — types, field extraction, and the
 //! Layer impl. Concrete sinks are added in subsequent tickets.
 
+pub mod jsonl_sink;
 pub mod message_db;
 pub mod notification_queue;
 pub mod notification_router;

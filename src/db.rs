@@ -51,6 +51,46 @@ pub fn runtime_dir() -> PathBuf {
         .unwrap_or_else(state_dir)
 }
 
+/// Resolve the Catenary cache directory.
+///
+/// Home for the regenerable JSONL telemetry firehose — safe to delete, never
+/// holds durable state. Unlike [`state_dir`] (DB, sockets) and [`runtime_dir`]
+/// (small ephemeral runtime reports), the cache dir holds high-volume,
+/// append-mostly logs that can be discarded at any time without affecting
+/// correctness.
+///
+/// Resolution order:
+/// 1. `CATENARY_CACHE_DIR` environment variable (cross-platform override).
+/// 2. `dirs::cache_dir()` (`XDG_CACHE_HOME` on Linux).
+/// 3. [`state_dir`] as a fallback when no cache dir is configured.
+#[must_use]
+pub fn cache_dir() -> PathBuf {
+    std::env::var_os("CATENARY_CACHE_DIR")
+        .map(PathBuf::from)
+        .or_else(dirs::cache_dir)
+        .unwrap_or_else(state_dir)
+}
+
+/// Flatten an absolute path into one filesystem-safe directory-name component.
+///
+/// Matches the encoding Claude Code uses for `~/.claude/projects/`: every
+/// character that is not ASCII alphanumeric (path separators, `.`, `_`,
+/// spaces, …) becomes `-`.
+///
+/// `/home/mark/Projects/Catenary` → `-home-mark-Projects-Catenary`.
+///
+/// Used as the per-root shard key in the JSONL firehose tree. The encoding is
+/// stable but intentionally lossy — it is a shard key, not a reversible
+/// encoding, so distinct paths can collide (e.g. `a/b` and `a.b`), which is
+/// acceptable for a regenerable cache.
+#[must_use]
+pub fn encode_cwd(path: &Path) -> String {
+    path.to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
 /// Returns the path to the Catenary database file.
 ///
 /// Uses [`state_dir`] for the base directory.
@@ -1129,6 +1169,31 @@ mod tests {
             .expect("failed to query foreign_keys");
 
         assert_eq!(fk, 1, "foreign keys should be enabled");
+    }
+
+    #[test]
+    fn encode_cwd_matches_claude_code_form() {
+        assert_eq!(
+            encode_cwd(Path::new("/home/mark/Projects/Catenary")),
+            "-home-mark-Projects-Catenary"
+        );
+    }
+
+    #[test]
+    fn encode_cwd_replaces_dots_underscores_and_preserves_dashes() {
+        // `/` `.` `_` and spaces all map to `-`; existing `-` and alphanumerics
+        // survive (mirrors Claude Code's `[^a-zA-Z0-9] -> -` rule).
+        assert_eq!(
+            encode_cwd(Path::new("/home/mark/.local/share/dot_local")),
+            "-home-mark--local-share-dot-local"
+        );
+        assert_eq!(encode_cwd(Path::new("/p/Catenary-00")), "-p-Catenary-00");
+    }
+
+    #[test]
+    fn encode_cwd_is_stable() {
+        let p = Path::new("/a/b/c");
+        assert_eq!(encode_cwd(p), encode_cwd(p));
     }
 
     // Grammar/symbol/parse_state tables removed from schema in SEARCHv2

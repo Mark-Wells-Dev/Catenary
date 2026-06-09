@@ -24,12 +24,13 @@ use serde_json::{Value, json};
 ///
 /// Points each XDG base dir at a *distinct* subdir of the given root —
 /// `XDG_CONFIG_HOME` → `<root>/config`, `XDG_STATE_HOME` → `<root>/state`,
-/// `XDG_DATA_HOME` → `<root>/data`, `XDG_RUNTIME_DIR` → `<root>/runtime` —
-/// so the process uses the test's tempdir instead of `~/.config`,
-/// `~/.local/state`, `~/.local/share`, or the host runtime dir. Keeping
-/// the four bases distinct makes `isolate_env` a mislocation detector:
-/// code that writes under the *wrong* base no longer silently lands in
-/// the one shared directory.
+/// `XDG_DATA_HOME` → `<root>/data`, `XDG_CACHE_HOME` → `<root>/cache`,
+/// `XDG_RUNTIME_DIR` → `<root>/runtime` — so the process uses the test's
+/// tempdir instead of `~/.config`, `~/.local/state`, `~/.local/share`,
+/// `~/.cache`, or the host runtime dir. Keeping the bases distinct makes
+/// `isolate_env` a mislocation detector: code that writes under the *wrong*
+/// base no longer silently lands in the one shared directory. The cache base
+/// homes the JSONL firehose (`db::cache_dir()`).
 ///
 /// Clears all `CATENARY_*` env vars that could leak from the user's
 /// shell and override test-specific settings. Clears `PATH` so built-in
@@ -49,6 +50,7 @@ pub fn isolate_env(cmd: &mut Command, root: &str) {
     cmd.env("XDG_CONFIG_HOME", xdg_config_home(root));
     cmd.env("XDG_STATE_HOME", xdg_state_home(root));
     cmd.env("XDG_DATA_HOME", xdg_data_home(root));
+    cmd.env("XDG_CACHE_HOME", xdg_cache_home(root));
     cmd.env("XDG_RUNTIME_DIR", xdg_runtime_dir(root));
     cmd.env("PATH", "");
     // Clear every inherited `CATENARY_*` var so the user's shell can't leak
@@ -86,6 +88,15 @@ pub fn xdg_state_home(root: impl AsRef<Path>) -> PathBuf {
 /// The `XDG_DATA_HOME` subdir [`isolate_env`] configures under `root`.
 pub fn xdg_data_home(root: impl AsRef<Path>) -> PathBuf {
     root.as_ref().join("data")
+}
+
+/// The `XDG_CACHE_HOME` subdir [`isolate_env`] configures under `root`.
+///
+/// `db::cache_dir()` resolves here, so the JSONL firehose lives under
+/// `$XDG_CACHE_HOME/catenary/`. Test-side code computing firehose paths must
+/// resolve through this helper.
+pub fn xdg_cache_home(root: impl AsRef<Path>) -> PathBuf {
+    root.as_ref().join("cache")
 }
 
 /// The `XDG_RUNTIME_DIR` [`isolate_env`] configures under `root`.
