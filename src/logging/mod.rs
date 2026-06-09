@@ -438,34 +438,76 @@ fn dispatch_to_sinks(sinks: &[Arc<dyn Sink>], event: &LogEvent<'_>) {
     }
 }
 
-/// Span extension for `session_id` propagation.
+/// Search-scope context propagated from a `grep`/`glob` dispatch span.
+///
+/// The daemon mints a per-invocation id at the IPC boundary and opens a span
+/// carrying these fields around the command record and the triggered LSP
+/// requests. The fields are injected into [`LogEvent::fields`] so the
+/// [`JsonlSink`](jsonl_sink) resolver (which reads `search_id`/`tool`/
+/// `search_ts`/`cwd` from `fields`) routes those events to the per-invocation
+/// `grep/`/`glob/` file. (`tool` selects the dir; `search_id` + `search_ts`
+/// name the file; `cwd` is the project record field.)
+#[derive(Default, Clone)]
+struct SearchSpan {
+    search_id: Option<String>,
+    tool: Option<String>,
+    search_ts: Option<String>,
+    cwd: Option<String>,
+}
+
+impl SearchSpan {
+    /// `true` when the span carries no search fields (the common case — only
+    /// `grep`/`glob` dispatch spans set them).
+    const fn is_empty(&self) -> bool {
+        self.search_id.is_none()
+            && self.tool.is_none()
+            && self.search_ts.is_none()
+            && self.cwd.is_none()
+    }
+}
+
+/// Span extension for scope propagation (`session_id` + search context).
 ///
 /// Stored in each span's extensions when it (or an ancestor) carries a
-/// `session_id` field. The [`LoggingServer`] Layer populates this on
-/// `on_new_span` and `on_record`, then reads it in `on_event` to attach
-/// the session context to [`LogEvent`].
+/// `session_id` field or the `grep`/`glob` search fields. The [`LoggingServer`]
+/// Layer populates this on `on_new_span` and `on_record`, then reads it in
+/// `on_event` to attach the scope context to [`LogEvent`].
 #[derive(Default)]
 struct SpanFields {
     session_id: Option<String>,
+    search: SearchSpan,
 }
 
-/// Visitor for extracting `session_id` from span attributes.
+/// Visitor for extracting scope fields (`session_id` + search context) from
+/// span attributes.
 #[derive(Default)]
 struct SpanFieldVisitor {
     session_id: Option<String>,
+    search: SearchSpan,
+}
+
+impl SpanFieldVisitor {
+    /// Record one span field by name. The `%`/`?` sigils route through
+    /// `record_debug` and bare strings through `record_str`; both funnel here.
+    fn set(&mut self, name: &str, value: String) {
+        match name {
+            "session_id" => self.session_id = Some(value),
+            "search_id" => self.search.search_id = Some(value),
+            "tool" => self.search.tool = Some(value),
+            "search_ts" => self.search.search_ts = Some(value),
+            "cwd" => self.search.cwd = Some(value),
+            _ => {}
+        }
+    }
 }
 
 impl tracing::field::Visit for SpanFieldVisitor {
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        if field.name() == "session_id" {
-            self.session_id = Some(value.to_string());
-        }
+        self.set(field.name(), value.to_string());
     }
 
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        if field.name() == "session_id" {
-            self.session_id = Some(format!("{value:?}"));
-        }
+        self.set(field.name(), format!("{value:?}"));
     }
 }
 
@@ -484,6 +526,7 @@ where
         if let Some(span) = ctx.span(id) {
             span.extensions_mut().insert(SpanFields {
                 session_id: visitor.session_id,
+                search: visitor.search,
             });
         }
     }
@@ -528,10 +571,23 @@ where
             })
         };
 
+        // Walk the span chain for `grep`/`glob` search context. Injected into
+        // the event's `fields` in finish() so the JsonlSink resolver routes the
+        // event to the per-invocation file. Cheap: returns None for every event
+        // outside a search dispatch (the overwhelming majority).
+        let span_search = ctx.event_span(event).and_then(|span| {
+            span.scope().find_map(|s| {
+                s.extensions()
+                    .get::<SpanFields>()
+                    .map(|f| f.search.clone())
+                    .filter(|sc| !sc.is_empty())
+            })
+        });
+
         // Fast path: sinks set (post-activate). Single atomic load — no
         // Mutex, no Vec clone, no refcount bumps.
         if let Some(sinks) = self.inner.sinks.get() {
-            let log_event = visitor.finish(severity, target, span_session_id);
+            let log_event = visitor.finish(severity, target, span_session_id, span_search);
             dispatch_to_sinks(sinks, &log_event);
             return;
         }
@@ -543,7 +599,7 @@ where
         // and lock acquisition.
         if let Some(sinks) = self.inner.sinks.get() {
             drop(guard);
-            let log_event = visitor.finish(severity, target, span_session_id);
+            let log_event = visitor.finish(severity, target, span_session_id, span_search);
             dispatch_to_sinks(sinks, &log_event);
             return;
         }
@@ -610,11 +666,15 @@ impl FieldVisitor {
     }
 
     fn finish(
-        self,
+        mut self,
         severity: Severity,
         target: &str,
         span_session_id: Option<String>,
+        span_search: Option<SearchSpan>,
     ) -> LogEvent<'_> {
+        if let Some(search) = span_search {
+            merge_search_fields(&mut self.fields, &search);
+        }
         LogEvent {
             severity,
             target,
@@ -650,6 +710,30 @@ impl FieldVisitor {
             scope_root: self.scope_root,
             session_id: self.session_id,
             fields: self.fields,
+        }
+    }
+}
+
+/// Inject a span's [`SearchSpan`] fields into an event's `fields` map.
+///
+/// The [`JsonlSink`](jsonl_sink) resolver reads `search_id`/`tool`/`search_ts`
+/// (and `cwd`) from `fields` to route a `grep`/`glob` invocation's events to its
+/// per-invocation file. Uses `entry().or_insert_with()` so a field the event set
+/// itself wins over the span's.
+fn merge_search_fields(
+    fields: &mut serde_json::Map<String, serde_json::Value>,
+    search: &SearchSpan,
+) {
+    for (key, value) in [
+        ("search_id", &search.search_id),
+        ("tool", &search.tool),
+        ("search_ts", &search.search_ts),
+        ("cwd", &search.cwd),
+    ] {
+        if let Some(val) = value {
+            fields
+                .entry(key.to_string())
+                .or_insert_with(|| serde_json::Value::String(val.clone()));
         }
     }
 }
@@ -1486,5 +1570,58 @@ mod tests {
         let events = sink.snapshot();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].session_id.as_deref(), Some("event-sess"));
+    }
+
+    #[test]
+    fn search_span_fields_propagate_to_event_fields() {
+        // Mirrors the grep/glob dispatch span: `tool` literal (record_str),
+        // dynamic fields via `%` (record_debug). The JsonlSink resolver reads
+        // these from `fields` to route the event to the per-invocation file.
+        let server = LoggingServer::new();
+        let sink = Arc::new(RecorderSink::default());
+        let uuid = "00000000-0000-4000-8000-000000000001";
+        with_subscriber(server.clone(), || {
+            server.activate(vec![sink.clone()]);
+            let span = tracing::info_span!(
+                "search",
+                search_id = %uuid,
+                tool = "grep",
+                search_ts = %"20260609T120000000Z",
+                cwd = %"/home/mark/Projects/Catenary",
+            );
+            let _guard = span.enter();
+            // A triggered LSP request emitted within the dispatch span.
+            tracing::info!(
+                kind = "lsp",
+                method = "textDocument/documentSymbol",
+                server = "rust-analyzer",
+                payload = "{}",
+                "outgoing"
+            );
+        });
+        let events = sink.snapshot();
+        assert_eq!(events.len(), 1);
+        let f = &events[0].fields;
+        // Clean values (no Debug quotes) — search_id must parse as a UUID.
+        assert_eq!(f["search_id"], uuid);
+        assert_eq!(f["tool"], "grep");
+        assert_eq!(f["search_ts"], "20260609T120000000Z");
+        assert_eq!(f["cwd"], "/home/mark/Projects/Catenary");
+    }
+
+    #[test]
+    fn event_search_field_takes_priority_over_span() {
+        // If the event sets a search field itself, it wins over the span's.
+        let server = LoggingServer::new();
+        let sink = Arc::new(RecorderSink::default());
+        with_subscriber(server.clone(), || {
+            server.activate(vec![sink.clone()]);
+            let span = tracing::info_span!("search", cwd = %"/span/cwd");
+            let _guard = span.enter();
+            tracing::info!(cwd = "/event/cwd", "with own cwd");
+        });
+        let events = sink.snapshot();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].fields["cwd"], "/event/cwd");
     }
 }

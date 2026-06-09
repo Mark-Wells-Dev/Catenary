@@ -69,6 +69,21 @@ pub const METHOD_GLOB: &str = "tool/glob";
 /// IPC method string for sed requests.
 pub const METHOD_SED: &str = "tool/sed";
 
+/// Compact, lexically-sortable UTC timestamp prefix for per-invocation search
+/// files (`grep/<ts>_<uuid>.jsonl`).
+///
+/// The firehose's per-tool reaper evicts oldest-first by this prefix, so it must
+/// sort lexically — millisecond UTC, no separators (e.g. `20260609T143210123Z`).
+fn search_timestamp() -> String {
+    chrono::Utc::now().format("%Y%m%dT%H%M%S%3fZ").to_string()
+}
+
+/// CLI-side cwd string for a search record's project field; empty when the
+/// caller reported no cwd.
+fn search_cwd(cwd: Option<&Path>) -> String {
+    cwd.map(|p| p.display().to_string()).unwrap_or_default()
+}
+
 /// IPC request payload for `catenary grep`.
 ///
 /// Sent as a JSON line over the daemon IPC socket with
@@ -1792,20 +1807,37 @@ async fn handle_hook_dispatch(
         let parent_id = uuid::Uuid::new_v4().to_string();
         let cancel = CancellationToken::new();
 
-        emit_hook_event(
-            tracing::Level::INFO,
-            "cli",
-            &method,
-            Some(&parent_id),
-            &raw.to_string(),
-            "incoming hook",
+        // Per-invocation search scope: the firehose shards this grep into its
+        // own grep/<ts>_<uuid>.jsonl. The span carries the scope fields onto the
+        // command record and the LSP requests it instruments. (Responses, emitted
+        // on the shared LSP reader loop, fall back to the server file — same as
+        // session-scoped LSP responses.)
+        let search_ts = search_timestamp();
+        let cwd = search_cwd(grep_req.cwd.as_deref());
+        let span = tracing::info_span!(
+            "search",
+            search_id = %parent_id,
+            tool = "grep",
+            search_ts = %search_ts,
+            cwd = %cwd,
         );
+
+        span.in_scope(|| {
+            emit_hook_event(
+                tracing::Level::INFO,
+                "cli",
+                &method,
+                Some(&parent_id),
+                &raw.to_string(),
+                "incoming hook",
+            );
+        });
 
         // Race grep execution against client disconnect so a killed
         // CLI process doesn't leave the pipeline running indefinitely.
         let cancel_on_disconnect = cancel.clone();
         let response = tokio::select! {
-            result = ctx.primary.grep.execute(&params, Some(&parent_id), &cancel) => {
+            result = ctx.primary.grep.execute(&params, Some(&parent_id), &cancel).instrument(span.clone()) => {
                 match result {
                     Ok(GrepOutcome::Rendered(output)) => GrepResponse {
                         output,
@@ -1834,28 +1866,32 @@ async fn handle_hook_dispatch(
                     source = Source::DaemonDispatch.as_str(),
                     "grep client disconnected — query cancelled",
                 );
-                emit_hook_event(
-                    tracing::Level::INFO,
-                    "cli",
-                    &method,
-                    Some(&parent_id),
-                    "client disconnected",
-                    "outgoing hook response",
-                );
+                span.in_scope(|| {
+                    emit_hook_event(
+                        tracing::Level::INFO,
+                        "cli",
+                        &method,
+                        Some(&parent_id),
+                        "client disconnected",
+                        "outgoing hook response",
+                    );
+                });
                 return Ok(());
             }
         };
 
         let mut payload = serde_json::to_vec(&response)?;
 
-        emit_hook_event(
-            tracing::Level::INFO,
-            "cli",
-            &method,
-            Some(&parent_id),
-            std::str::from_utf8(&payload).unwrap_or_default(),
-            "outgoing hook response",
-        );
+        span.in_scope(|| {
+            emit_hook_event(
+                tracing::Level::INFO,
+                "cli",
+                &method,
+                Some(&parent_id),
+                std::str::from_utf8(&payload).unwrap_or_default(),
+                "outgoing hook response",
+            );
+        });
 
         payload.push(b'\n');
         writer.write_all(&payload).await?;
@@ -1876,20 +1912,37 @@ async fn handle_hook_dispatch(
         let parent_id = uuid::Uuid::new_v4().to_string();
         let cancel = CancellationToken::new();
 
-        emit_hook_event(
-            tracing::Level::INFO,
-            "cli",
-            &method,
-            Some(&parent_id),
-            &raw.to_string(),
-            "incoming hook",
+        // Per-invocation search scope: the firehose shards this glob into its
+        // own glob/<ts>_<uuid>.jsonl. The span carries the scope fields onto the
+        // command record and the LSP requests it instruments. (Responses, emitted
+        // on the shared LSP reader loop, fall back to the server file — same as
+        // session-scoped LSP responses.)
+        let search_ts = search_timestamp();
+        let cwd = search_cwd(glob_req.cwd.as_deref());
+        let span = tracing::info_span!(
+            "search",
+            search_id = %parent_id,
+            tool = "glob",
+            search_ts = %search_ts,
+            cwd = %cwd,
         );
+
+        span.in_scope(|| {
+            emit_hook_event(
+                tracing::Level::INFO,
+                "cli",
+                &method,
+                Some(&parent_id),
+                &raw.to_string(),
+                "incoming hook",
+            );
+        });
 
         // Race glob execution against client disconnect so a killed
         // CLI process doesn't leave the pipeline running indefinitely.
         let cancel_on_disconnect = cancel.clone();
         let response = tokio::select! {
-            result = ctx.primary.glob.execute(&params, Some(&parent_id), &cancel) => {
+            result = ctx.primary.glob.execute(&params, Some(&parent_id), &cancel).instrument(span.clone()) => {
                 match result {
                     Ok(GlobOutcome::Rendered(output)) => GlobResponse { output, paths: None },
                     Ok(GlobOutcome::Count { paths }) => GlobResponse {
@@ -1912,28 +1965,32 @@ async fn handle_hook_dispatch(
                     source = Source::DaemonDispatch.as_str(),
                     "glob client disconnected — query cancelled",
                 );
-                emit_hook_event(
-                    tracing::Level::INFO,
-                    "cli",
-                    &method,
-                    Some(&parent_id),
-                    "client disconnected",
-                    "outgoing hook response",
-                );
+                span.in_scope(|| {
+                    emit_hook_event(
+                        tracing::Level::INFO,
+                        "cli",
+                        &method,
+                        Some(&parent_id),
+                        "client disconnected",
+                        "outgoing hook response",
+                    );
+                });
                 return Ok(());
             }
         };
 
         let mut payload = serde_json::to_vec(&response)?;
 
-        emit_hook_event(
-            tracing::Level::INFO,
-            "cli",
-            &method,
-            Some(&parent_id),
-            std::str::from_utf8(&payload).unwrap_or_default(),
-            "outgoing hook response",
-        );
+        span.in_scope(|| {
+            emit_hook_event(
+                tracing::Level::INFO,
+                "cli",
+                &method,
+                Some(&parent_id),
+                std::str::from_utf8(&payload).unwrap_or_default(),
+                "outgoing hook response",
+            );
+        });
 
         payload.push(b'\n');
         writer.write_all(&payload).await?;
