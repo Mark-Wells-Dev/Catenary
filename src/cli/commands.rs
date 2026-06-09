@@ -13,7 +13,7 @@ use chrono::{Local, Utc};
 use regex::Regex;
 use std::time::Duration;
 
-use crate::cli::{self, ColorConfig, ColumnWidths, Output, QueryFormat};
+use crate::cli::{self, ColorConfig, ColumnWidths, Output, QueryFormat, jsonl_reader};
 use crate::session::{self, SessionMessage};
 
 /// List all active sessions.
@@ -364,243 +364,235 @@ pub(crate) fn parse_since(s: &str) -> Result<chrono::DateTime<Utc>> {
     Ok(Utc::now() - duration)
 }
 
-/// Query events from the database.
+/// Parsed `catenary query` arguments, threaded from the top-level CLI surface
+/// in `main.rs` into the JSONL firehose reader.
 ///
-/// Supports structured filters (`--session`, `--since`, `--kind`, `--search`)
-/// and raw SQL (`--sql`). Results are printed in the chosen format.
+/// File-selection axes (`session`/`server`/`tool`/`instance`) and in-record
+/// filters (`cwd`/`since`/`level`/`kind`/`search`) are forwarded verbatim;
+/// duration/level/tool parsing happens in [`run_query`].
+pub struct QueryArgs<'a> {
+    /// Session id (or prefix) → `sessions/<id>.jsonl`.
+    pub session: Option<&'a str>,
+    /// Server name → `servers/<server>[@root].jsonl`.
+    pub server: Option<&'a str>,
+    /// `grep` or `glob` → that tool's invocation dir.
+    pub tool: Option<&'a str>,
+    /// Record-field filter: keep records whose `cwd` equals or is under this.
+    pub cwd: Option<&'a str>,
+    /// Time filter (`1h`, `today`, `7d`, `30m`).
+    pub since: Option<&'a str>,
+    /// Specific instance dir id; default is the freshest instance.
+    pub instance: Option<&'a str>,
+    /// Include every instance dir, not just the freshest one.
+    pub all_instances: bool,
+    /// Minimum severity (`error`/`warn`/`info`/`debug`).
+    pub level: Option<&'a str>,
+    /// Exact record kind (`lsp`/`mcp`/`hook`/`internal`).
+    pub kind: Option<&'a str>,
+    /// Case-insensitive free-text substring.
+    pub search: Option<&'a str>,
+    /// Live-tail mode.
+    pub follow: bool,
+    /// Max rows rendered (0 = unlimited).
+    pub limit: usize,
+    /// Output format.
+    pub format: QueryFormat,
+}
+
+/// Poll cadence for `--follow`.
+const FOLLOW_POLL: Duration = Duration::from_millis(200);
+
+/// Query the JSONL firehose.
+///
+/// Reads the sharded append-only logs directly (no daemon, no socket — works
+/// even when the daemon is down), selecting files by the scope axes and
+/// filtering records by the in-record dimensions. Output is raw: one-shot mode
+/// renders the most recent `limit` records in chronological order, nothing
+/// merged or collapsed; `--follow` tails the selection live.
 ///
 /// # Errors
 ///
-/// Returns an error if the database cannot be opened or the query fails.
-#[allow(
-    clippy::too_many_lines,
-    reason = "Sequential query building and output formatting"
-)]
-#[allow(
-    clippy::too_many_arguments,
-    reason = "Output adds one parameter to existing signature"
-)]
-pub fn run_query(
-    out: &mut Output,
-    conn: &rusqlite::Connection,
-    session_filter: Option<&str>,
-    since: Option<&str>,
-    kind: Option<&str>,
-    search: Option<&str>,
-    raw_sql: Option<&str>,
-    format: QueryFormat,
-) -> Result<()> {
-    if let Some(sql) = raw_sql {
-        let mut stmt = conn.prepare(sql)?;
-        let col_count = stmt.column_count();
-        let col_names: Vec<String> = (0..col_count)
-            .map(|i| stmt.column_name(i).unwrap_or("?").to_string())
-            .collect();
+/// Returns an error only for malformed filter arguments (`--since`, `--level`,
+/// `--tool`). A missing/unreadable firehose is not an error — it yields no
+/// results.
+pub fn run_query(out: &mut Output, args: &QueryArgs<'_>) -> Result<()> {
+    let since = args.since.map(parse_since).transpose()?;
+    let tool = args
+        .tool
+        .map(|t| {
+            jsonl_reader::Tool::parse(t)
+                .ok_or_else(|| anyhow::anyhow!("unknown --tool {t} (expected grep or glob)"))
+        })
+        .transpose()?;
+    let level = args.level.map(jsonl_reader::parse_level).transpose()?;
 
-        let mut rows_out: Vec<Vec<String>> = Vec::new();
-        let mut db_rows = stmt.query([])?;
-        while let Some(row) = db_rows.next()? {
-            let mut vals = Vec::with_capacity(col_count);
-            for i in 0..col_count {
-                let val: String = row
-                    .get::<_, rusqlite::types::Value>(i)
-                    .map(|v| format_sql_value(&v))
-                    .unwrap_or_default();
-                vals.push(val);
-            }
-            rows_out.push(vals);
-        }
-        drop(db_rows);
-
-        print_query_results(out, &col_names, &rows_out, format);
-        return Ok(());
-    }
-
-    // Build structured query against messages table
-    let mut conditions: Vec<String> = Vec::new();
-    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-
-    if let Some(sid) = session_filter {
-        let resolved = resolve_session_id(conn, sid)?;
-        conditions.push(format!("m.session_id = ?{}", params.len() + 1));
-        params.push(Box::new(resolved.id));
-    }
-
-    if let Some(since_str) = since {
-        let cutoff = parse_since(since_str)?;
-        conditions.push(format!("m.timestamp > ?{}", params.len() + 1));
-        params.push(Box::new(cutoff.to_rfc3339()));
-    }
-
-    if let Some(k) = kind {
-        conditions.push(format!("m.type = ?{}", params.len() + 1));
-        params.push(Box::new(k.to_string()));
-    }
-
-    if let Some(s) = search {
-        conditions.push(format!("m.payload LIKE ?{}", params.len() + 1));
-        params.push(Box::new(format!("%{s}%")));
-    }
-
-    let where_clause = if conditions.is_empty() {
-        String::new()
-    } else {
-        format!(" WHERE {}", conditions.join(" AND "))
+    let sel = jsonl_reader::Selection {
+        instance: args.instance,
+        all_instances: args.all_instances,
+        session: args.session,
+        server: args.server,
+        tool,
+        since,
+        level,
+        kind: args.kind,
+        search: args.search,
+        cwd: args.cwd,
     };
 
-    let sql = format!(
-        "SELECT m.id, m.session_id, m.timestamp, m.type, m.method, m.server, \
-         m.payload \
-         FROM messages m{where_clause} ORDER BY m.id DESC LIMIT 100"
-    );
+    let root = jsonl_reader::firehose_root();
 
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(AsRef::as_ref).collect();
-    let mut stmt = conn.prepare(&sql)?;
-    let mut db_rows = stmt.query(param_refs.as_slice())?;
-
-    let col_names = vec![
-        "ID".to_string(),
-        "SESSION".to_string(),
-        "TIME".to_string(),
-        "TYPE".to_string(),
-        "METHOD".to_string(),
-        "SERVER".to_string(),
-        "PAYLOAD".to_string(),
-    ];
-    let mut rows_out: Vec<Vec<String>> = Vec::new();
-    while let Some(row) = db_rows.next()? {
-        let id: i64 = row.get(0)?;
-        let sid: String = row.get(1)?;
-        let ts: String = row.get(2)?;
-        let r#type: String = row.get(3)?;
-        let method: String = row.get(4)?;
-        let server: String = row.get(5)?;
-        let payload: String = row.get(6)?;
-
-        // Shorten session ID and timestamp for table display
-        let short_sid = if sid.len() > 8 { &sid[..8] } else { &sid };
-        let short_ts = chrono::DateTime::parse_from_rfc3339(&ts)
-            .map(|dt| dt.with_timezone(&Local).format("%H:%M:%S").to_string())
-            .unwrap_or(ts);
-
-        rows_out.push(vec![
-            id.to_string(),
-            short_sid.to_string(),
-            short_ts,
-            r#type,
-            method,
-            server,
-            payload,
-        ]);
+    if args.follow {
+        return run_follow(out, &root, sel);
     }
 
-    print_query_results(out, &col_names, &rows_out, format);
+    let mut records = jsonl_reader::gather(&root, &sel);
+    // Keep the most recent `limit` records (0 = unlimited) — a tail — but render
+    // them in chronological order, consistent with `--follow`.
+    if args.limit != 0 && records.len() > args.limit {
+        records = records.split_off(records.len() - args.limit);
+    }
+    render_rows(out, &records, args.format);
     Ok(())
 }
 
-/// Format a `rusqlite` value as a display string.
-fn format_sql_value(val: &rusqlite::types::Value) -> String {
-    match val {
-        rusqlite::types::Value::Null => "NULL".to_string(),
-        rusqlite::types::Value::Integer(i) => i.to_string(),
-        rusqlite::types::Value::Real(f) => f.to_string(),
-        rusqlite::types::Value::Text(s) => s.clone(),
-        rusqlite::types::Value::Blob(b) => format!("<blob {} bytes>", b.len()),
+/// Live-tail loop: poll the selection and print each newly-appended record as a
+/// single line until interrupted. Returns only on a write error; Ctrl-C ends it.
+fn run_follow(
+    out: &mut Output,
+    root: &std::path::Path,
+    sel: jsonl_reader::Selection<'_>,
+) -> Result<()> {
+    use std::io::Write as _;
+    let mut follower = jsonl_reader::Follower::new(root, sel);
+    loop {
+        for rec in follower.poll() {
+            out.writeln(format_args!("{}", follow_line(&rec)))?;
+        }
+        out.flush().ok();
+        std::thread::sleep(FOLLOW_POLL);
     }
 }
 
-/// Print query results in the chosen format.
-fn print_query_results(
-    out: &mut Output,
-    col_names: &[String],
-    rows: &[Vec<String>],
-    format: QueryFormat,
-) {
-    if rows.is_empty() {
+/// Table column headers, in cell order.
+const QUERY_HEADERS: [&str; 7] = [
+    "TIME", "LEVEL", "KIND", "SCOPE", "SERVER", "METHOD", "SUMMARY",
+];
+
+/// Render the gathered records in the chosen format.
+fn render_rows(out: &mut Output, records: &[jsonl_reader::Record], format: QueryFormat) {
+    match format {
+        QueryFormat::Table => render_table(out, records),
+        QueryFormat::Json => render_json(out, records),
+    }
+}
+
+/// Render records as an aligned table (the default surface) — one line each,
+/// raw and chronological.
+fn render_table(out: &mut Output, records: &[jsonl_reader::Record]) {
+    if records.is_empty() {
         let _ = out.writeln(format_args!("No results"));
         return;
     }
 
-    match format {
-        QueryFormat::Table => {
-            // Calculate column widths
-            let mut widths: Vec<usize> = col_names.iter().map(String::len).collect();
-            for row in rows {
-                for (i, val) in row.iter().enumerate() {
-                    if i < widths.len() {
-                        widths[i] = widths[i].max(val.len());
-                    }
-                }
-            }
-
-            // Cap payload column at 80 chars
-            if let Some(last) = widths.last_mut() {
-                *last = (*last).min(80);
-            }
-
-            // Header
-            let header: Vec<String> = col_names
-                .iter()
-                .zip(&widths)
-                .map(|(name, w)| format!("{name:<w$}"))
-                .collect();
-            let _ = out.writeln(format_args!("{}", header.join("  ")));
-            let _ = out.writeln(format_args!(
-                "{}",
-                widths
-                    .iter()
-                    .map(|w| "-".repeat(*w))
-                    .collect::<Vec<_>>()
-                    .join("  ")
-            ));
-
-            // Rows
-            for row in rows {
-                let formatted: Vec<String> = row
-                    .iter()
-                    .zip(&widths)
-                    .map(|(val, w)| {
-                        if val.len() > *w {
-                            format!("{}...", &val[..w.saturating_sub(3)])
-                        } else {
-                            format!("{val:<w$}")
-                        }
-                    })
-                    .collect();
-                let _ = out.writeln(format_args!("{}", formatted.join("  ")));
-            }
-        }
-        QueryFormat::Json => {
-            let arr: Vec<serde_json::Value> = rows
-                .iter()
-                .map(|row| {
-                    let mut obj = serde_json::Map::new();
-                    for (name, val) in col_names.iter().zip(row) {
-                        obj.insert(name.to_lowercase(), serde_json::Value::String(val.clone()));
-                    }
-                    serde_json::Value::Object(obj)
-                })
-                .collect();
-            let json = serde_json::to_string_pretty(&arr).unwrap_or_default();
-            let _ = out.writeln(format_args!("{json}"));
-        }
-        QueryFormat::Csv => {
-            let _ = out.writeln(format_args!("{}", col_names.join(",")));
-            for row in rows {
-                let escaped: Vec<String> = row
-                    .iter()
-                    .map(|v| {
-                        if v.contains(',') || v.contains('"') || v.contains('\n') {
-                            format!("\"{}\"", v.replace('"', "\"\""))
-                        } else {
-                            v.clone()
-                        }
-                    })
-                    .collect();
-                let _ = out.writeln(format_args!("{}", escaped.join(",")));
+    let cells: Vec<Vec<String>> = records.iter().map(record_cells).collect();
+    let mut widths: Vec<usize> = QUERY_HEADERS.iter().map(|h| h.chars().count()).collect();
+    for row in &cells {
+        for (i, val) in row.iter().enumerate() {
+            if let Some(w) = widths.get_mut(i) {
+                *w = (*w).max(val.chars().count());
             }
         }
     }
+    // Cap the free-form SUMMARY column.
+    if let Some(last) = widths.last_mut() {
+        *last = (*last).min(80);
+    }
+
+    let header: Vec<String> = QUERY_HEADERS
+        .iter()
+        .zip(&widths)
+        .map(|(name, w)| format!("{name:<w$}"))
+        .collect();
+    let _ = out.writeln(format_args!("{}", header.join("  ")));
+    let _ = out.writeln(format_args!(
+        "{}",
+        widths
+            .iter()
+            .map(|w| "-".repeat(*w))
+            .collect::<Vec<_>>()
+            .join("  ")
+    ));
+
+    for row in &cells {
+        let formatted: Vec<String> = row
+            .iter()
+            .zip(&widths)
+            .map(|(val, w)| {
+                let clipped = clip(val, *w);
+                format!("{clipped:<w$}")
+            })
+            .collect();
+        let _ = out.writeln(format_args!("{}", formatted.join("  ")));
+    }
+}
+
+/// Render records as a JSON array — the raw firehose lines (empty keys omitted,
+/// matching the on-disk shape), in chronological order.
+fn render_json(out: &mut Output, records: &[jsonl_reader::Record]) {
+    let json = serde_json::to_string_pretty(records).unwrap_or_default();
+    let _ = out.writeln(format_args!("{json}"));
+}
+
+/// The seven table cells for one record.
+fn record_cells(rec: &jsonl_reader::Record) -> Vec<String> {
+    vec![
+        local_hms(&rec.ts),
+        rec.level.clone(),
+        rec.kind.clone(),
+        clip(&rec.scope_id, 14),
+        rec.server.clone(),
+        rec.method.clone(),
+        summary(rec).unwrap_or_default(),
+    ]
+}
+
+/// A single follow-mode line for a record.
+fn follow_line(rec: &jsonl_reader::Record) -> String {
+    record_cells(rec).join("  ")
+}
+
+/// The SUMMARY cell: the rendered message for internal events, or a compact
+/// payload (`params` when present) for protocol events. `None` when there is
+/// nothing useful to show (the row still renders, with an empty summary).
+fn summary(rec: &jsonl_reader::Record) -> Option<String> {
+    if rec.kind == "internal" {
+        return rec.message.clone().filter(|m| !m.is_empty());
+    }
+    let payload = rec.payload.as_ref()?;
+    let target = payload.get("params").unwrap_or(payload);
+    Some(clip(&target.to_string(), 160))
+}
+
+/// Format an RFC3339 timestamp as a local `HH:MM:SS`, falling back to the raw
+/// string when it does not parse.
+fn local_hms(ts: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(ts).map_or_else(
+        |_| ts.to_string(),
+        |dt| dt.with_timezone(&Local).format("%H:%M:%S").to_string(),
+    )
+}
+
+/// Char-safe clip to at most `max` characters, appending `...` when truncated.
+/// Operates on `char` boundaries so multi-byte payloads never panic.
+fn clip(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    if max <= 3 {
+        return ".".repeat(max);
+    }
+    let kept: String = s.chars().take(max - 3).collect();
+    format!("{kept}...")
 }
 
 /// Garbage-collect old session data.
@@ -1119,113 +1111,105 @@ mod tests {
         assert!(parse_since("5x").is_err());
     }
 
-    // ── query tests ─────────────────────────────────────────────────
+    // ── query rendering tests ───────────────────────────────────────
+    //
+    // The read path (file selection, filtering, ordering) is unit-tested in
+    // `jsonl_reader`; these cover the `commands.rs` raw rendering layer.
 
-    /// Insert a test message row directly into the `messages` table.
-    fn insert_test_message(
-        conn: &rusqlite::Connection,
-        session_id: &str,
-        r#type: &str,
-        method: &str,
-        server: &str,
-        client: &str,
-        payload: &str,
-    ) {
-        conn.execute(
-            "INSERT INTO messages \
-             (session_id, timestamp, type, method, server, client, \
-              parent_id, payload) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7)",
-            rusqlite::params![
-                session_id,
-                "2026-01-01T00:00:00.000Z",
-                r#type,
-                method,
-                server,
-                client,
-                payload,
-            ],
-        )
-        .expect("insert test message");
+    /// A protocol record for rendering assertions.
+    fn proto_record(method: &str) -> jsonl_reader::Record {
+        jsonl_reader::Record {
+            ts: "2026-06-09T10:11:12.000Z".into(),
+            kind: "lsp".into(),
+            level: "info".into(),
+            scope_id: "rust-analyzer@/p".into(),
+            parent_id: Some("p-1".into()),
+            server: "rust-analyzer".into(),
+            scope_root: String::new(),
+            cwd: String::new(),
+            method: method.into(),
+            source: None,
+            payload: Some(serde_json::json!({"id": 1, "method": method, "params": {"q": "x"}})),
+            message: None,
+            language: None,
+            fields: serde_json::Map::new(),
+        }
     }
 
     #[test]
-    fn test_query_with_type_filter() -> anyhow::Result<()> {
-        let (_dir, _path, conn) = test_db();
-
-        conn.execute(
-            "INSERT INTO sessions (id, pid, display_name, started_at) \
-             VALUES ('s1', 1, 'test', '2026-01-01T00:00:00Z')",
-            [],
-        )?;
-
-        insert_test_message(
-            &conn,
-            "s1",
-            "mcp",
-            "tools/call",
-            "catenary",
-            "claude-code",
-            r#"{"params":{"name":"grep"}}"#,
-        );
-        insert_test_message(
-            &conn,
-            "s1",
-            "lsp",
-            "textDocument/hover",
-            "rust-analyzer",
-            "catenary",
-            "{}",
-        );
-
-        // Query with --kind mcp should work (now --type)
-        let mut out = Output::buffer(120);
-        run_query(
+    fn table_render_has_headers_and_a_row() {
+        let mut out = Output::buffer(200);
+        render_rows(
             &mut out,
-            &conn,
-            Some("s1"),
-            None,
-            Some("mcp"),
-            None,
-            None,
+            &[proto_record("textDocument/hover")],
             QueryFormat::Table,
-        )?;
-        Ok(())
+        );
+        let text = out.into_string();
+        assert!(text.contains("METHOD"), "header present: {text}");
+        assert!(text.contains("textDocument/hover"), "row rendered: {text}");
     }
 
     #[test]
-    fn test_query_with_search() -> anyhow::Result<()> {
-        let (_dir, _path, conn) = test_db();
+    fn table_render_empty_says_no_results() {
+        let mut out = Output::buffer(80);
+        render_rows(&mut out, &[], QueryFormat::Table);
+        assert!(out.into_string().contains("No results"));
+    }
 
-        conn.execute(
-            "INSERT INTO sessions (id, pid, display_name, started_at) \
-             VALUES ('s1', 1, 'test', '2026-01-01T00:00:00Z')",
-            [],
-        )?;
-
-        insert_test_message(
-            &conn,
-            "s1",
-            "mcp",
-            "tools/call",
-            "catenary",
-            "claude-code",
-            r#"{"params":{"name":"grep"}}"#,
+    #[test]
+    fn json_render_emits_raw_records_no_adornments() {
+        let mut out = Output::buffer(200);
+        render_rows(&mut out, &[proto_record("tools/call")], QueryFormat::Json);
+        let v: serde_json::Value =
+            serde_json::from_str(&out.into_string()).expect("valid json array");
+        let first = &v[0];
+        // Raw firehose record — no merge adornments.
+        assert_eq!(first["method"], "tools/call");
+        assert_eq!(first["payload"]["params"]["q"], "x");
+        assert!(first.get("outcome").is_none(), "no merge outcome: {first}");
+        assert!(first.get("count").is_none(), "no collapse count: {first}");
+        // Empty keys omitted (matches on-disk shape).
+        assert!(
+            first.get("scope_root").is_none(),
+            "empty key omitted: {first}"
         );
+    }
 
-        // Search for "grep" in payload should succeed
-        let mut out = Output::buffer(120);
-        run_query(
-            &mut out,
-            &conn,
-            Some("s1"),
-            None,
-            None,
-            Some("grep"),
-            None,
-            QueryFormat::Table,
-        )?;
-        Ok(())
+    #[test]
+    fn json_render_empty_is_empty_array() {
+        let mut out = Output::buffer(80);
+        render_rows(&mut out, &[], QueryFormat::Json);
+        let v: serde_json::Value = serde_json::from_str(&out.into_string()).expect("json");
+        assert_eq!(v, serde_json::json!([]));
+    }
+
+    #[test]
+    fn summary_prefers_params_for_protocol_records() {
+        let cells = record_cells(&proto_record("tools/call"));
+        let summary = cells.last().expect("summary cell");
+        assert!(summary.contains("\"q\""), "shows params: {summary}");
+    }
+
+    #[test]
+    fn summary_uses_message_for_internal_records() {
+        let mut rec = proto_record("crate::mod");
+        rec.kind = "internal".into();
+        rec.payload = None;
+        rec.message = Some("rust-analyzer exited".into());
+        let cells = record_cells(&rec);
+        assert_eq!(
+            cells.last().map(String::as_str),
+            Some("rust-analyzer exited")
+        );
+    }
+
+    #[test]
+    fn clip_is_char_safe_on_multibyte() {
+        // Must not panic on a non-ASCII boundary, and must shorten.
+        let s = "héllo wörld with áccénts everywhere indeed";
+        let out = clip(s, 10);
+        assert!(out.chars().count() <= 10);
+        assert!(out.ends_with("..."));
     }
 
     // ── gc tests ────────────────────────────────────────────────────
@@ -1289,38 +1273,6 @@ mod tests {
         assert_eq!(format_bytes(500), "500 B");
         assert_eq!(format_bytes(1536), "1.5 KB");
         assert_eq!(format_bytes(2_621_440), "2.5 MB");
-    }
-
-    // ── format_sql_value tests ──────────────────────────────────────
-
-    #[test]
-    fn format_sql_value_null() {
-        assert_eq!(format_sql_value(&rusqlite::types::Value::Null), "NULL",);
-    }
-
-    #[test]
-    fn format_sql_value_integer() {
-        assert_eq!(format_sql_value(&rusqlite::types::Value::Integer(42)), "42",);
-    }
-
-    #[test]
-    fn format_sql_value_real() {
-        assert_eq!(format_sql_value(&rusqlite::types::Value::Real(1.5)), "1.5",);
-    }
-
-    #[test]
-    fn format_sql_value_text() {
-        assert_eq!(
-            format_sql_value(&rusqlite::types::Value::Text("hello".into())),
-            "hello",
-        );
-    }
-
-    #[test]
-    fn format_sql_value_blob() {
-        let result = format_sql_value(&rusqlite::types::Value::Blob(vec![1, 2, 3]));
-        assert!(result.contains('3'), "should contain byte count");
-        assert!(result.contains("blob"), "should indicate blob type");
     }
 
     // ── resolve_session_id tests ────────────────────────────────────

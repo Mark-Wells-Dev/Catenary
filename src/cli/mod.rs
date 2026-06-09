@@ -9,6 +9,7 @@ pub mod config_template;
 pub mod doctor;
 pub mod hooks;
 pub mod install;
+pub mod jsonl_reader;
 pub mod update;
 
 use clap::ValueEnum;
@@ -68,10 +69,8 @@ impl HostFormat {
 pub enum QueryFormat {
     /// Human-readable table.
     Table,
-    /// JSON array.
+    /// JSON array of structured rows.
     Json,
-    /// Comma-separated values with headers.
-    Csv,
 }
 
 /// Configuration for color output.

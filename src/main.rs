@@ -237,7 +237,68 @@ enum Command {
     /// Stop the running Catenary daemon.
     Stop,
 
-    /// Diagnostic and debugging tools (list, monitor, status, query, gc).
+    /// Query the JSONL telemetry firehose (LSP/MCP/hook protocol + trace).
+    ///
+    /// Reads the append-only logs directly, so it works even when the daemon
+    /// is down. Filters select which shards to read — `--session` / `--server`
+    /// / `--tool` resolve by file name, `--cwd` / `--level` / `--kind` /
+    /// `--search` filter records after open. `--follow` tails the selection
+    /// live.
+    Query {
+        /// Filter by session id (or prefix) → that session's file.
+        #[arg(long)]
+        session: Option<String>,
+
+        /// Filter by LSP server name (rootless file + all rootful instances).
+        #[arg(long)]
+        server: Option<String>,
+
+        /// Filter by search tool invocation dir ("grep" or "glob").
+        #[arg(long)]
+        tool: Option<String>,
+
+        /// Keep only records whose recorded cwd is this path or under it.
+        #[arg(long)]
+        cwd: Option<String>,
+
+        /// Time filter (e.g., "1h", "today", "7d", "30m").
+        #[arg(long)]
+        since: Option<String>,
+
+        /// Read a specific daemon instance dir (default: the freshest one).
+        #[arg(long)]
+        instance: Option<String>,
+
+        /// Read every instance dir, not just the freshest one.
+        #[arg(long)]
+        all_instances: bool,
+
+        /// Minimum severity to show (error, warn, info, debug).
+        #[arg(long)]
+        level: Option<String>,
+
+        /// Filter by record kind (lsp, mcp, hook, internal).
+        #[arg(long)]
+        kind: Option<String>,
+
+        /// Free-text substring over method, message, and payload.
+        #[arg(long)]
+        search: Option<String>,
+
+        /// Live-tail the selected files instead of a one-shot read.
+        #[arg(long)]
+        follow: bool,
+
+        /// Maximum rows to show (0 = unlimited).
+        #[arg(long, default_value = "100")]
+        limit: usize,
+
+        /// Output format.
+        #[arg(long, value_enum, default_value = "table")]
+        format: QueryFormat,
+    },
+
+    /// Diagnostic and debugging tools (list, monitor, status, gc).
     Debug {
         #[command(subcommand)]
         command: DebugCommand,
@@ -309,33 +370,6 @@ enum DebugCommand {
     Status {
         /// Session ID (use 'catenary debug list' to see available sessions).
         id: String,
-    },
-
-    /// Query events from the database.
-    Query {
-        /// Filter by session ID or prefix.
-        #[arg(long)]
-        session: Option<String>,
-
-        /// Time filter (e.g., "1h", "today", "7d", "30m").
-        #[arg(long)]
-        since: Option<String>,
-
-        /// Filter by event kind (e.g., `tool_call`, `diagnostics`).
-        #[arg(long)]
-        kind: Option<String>,
-
-        /// Free-text search in event payload.
-        #[arg(long)]
-        search: Option<String>,
-
-        /// Raw SQL query (power users).
-        #[arg(long)]
-        sql: Option<String>,
-
-        /// Output format.
-        #[arg(long, value_enum, default_value = "table")]
-        format: QueryFormat,
     },
 
     /// Garbage-collect old session data.
@@ -657,6 +691,41 @@ fn main() -> Result<()> {
         }
         #[cfg(not(unix))]
         Some(Command::Stop) => Err(anyhow::anyhow!("daemon mode requires Unix")),
+        Some(Command::Query {
+            session,
+            server,
+            tool,
+            cwd,
+            since,
+            instance,
+            all_instances,
+            level,
+            kind,
+            search,
+            follow,
+            limit,
+            format,
+        }) => {
+            let mut out = cli::Output::stdout(false);
+            cli::commands::run_query(
+                &mut out,
+                &cli::commands::QueryArgs {
+                    session: session.as_deref(),
+                    server: server.as_deref(),
+                    tool: tool.as_deref(),
+                    cwd: cwd.as_deref(),
+                    since: since.as_deref(),
+                    instance: instance.as_deref(),
+                    all_instances,
+                    level: level.as_deref(),
+                    kind: kind.as_deref(),
+                    search: search.as_deref(),
+                    follow,
+                    limit,
+                    format,
+                },
+            )
+        }
         Some(Command::Debug { command }) => match command {
             DebugCommand::List => {
                 let mut out = cli::Output::stdout(false);
@@ -674,27 +743,6 @@ fn main() -> Result<()> {
             DebugCommand::Status { id } => {
                 let mut out = cli::Output::stdout(false);
                 cli::commands::run_status(&mut out, &id)
-            }
-            DebugCommand::Query {
-                session,
-                since,
-                kind,
-                search,
-                sql,
-                format,
-            } => {
-                let conn = catenary_mcp::db::open_and_migrate()?;
-                let mut out = cli::Output::stdout(false);
-                cli::commands::run_query(
-                    &mut out,
-                    &conn,
-                    session.as_deref(),
-                    since.as_deref(),
-                    kind.as_deref(),
-                    search.as_deref(),
-                    sql.as_deref(),
-                    format,
-                )
             }
             DebugCommand::Gc {
                 older_than,

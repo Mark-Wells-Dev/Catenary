@@ -833,26 +833,29 @@ impl ServerProcess {
         self.send(&init_request)?;
         let _response = self.recv()?;
 
-        let output = Command::new(env!("CARGO_BIN_EXE_catenary"))
-            .args(["debug", "query"])
-            .arg("--sql")
-            .arg("SELECT id FROM sessions WHERE id LIKE 'mcp:%' LIMIT 1")
-            .arg("--format")
-            .arg("json")
-            .env("CATENARY_STATE_DIR", self.state_dir_path())
-            .output()
-            .context("Failed to run query command")?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let parsed: Vec<Value> = serde_json::from_str(stdout.trim())
-            .with_context(|| format!("Failed to parse query JSON: {stdout}"))?;
-        let id = parsed
-            .first()
-            .and_then(|obj| obj["id"].as_str())
-            .ok_or_else(|| anyhow!("No 'id' field in query output: {stdout}"))?
-            .to_string();
-
-        Ok(id)
+        // Read the MCP session id straight from the sessions table (read-only).
+        // The firehose `query` no longer exposes raw SQL (observability ticket
+        // 03), and the daemon still writes the `sessions` table until SQLite is
+        // dropped (ticket 07). The row is inserted just after `initialize`, so
+        // poll briefly until it appears.
+        let db_file = self.state_dir_path().join("catenary").join("catenary.db");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if db_file.exists()
+                && let Ok(conn) = catenary_mcp::db::open_read_only_at(&db_file)
+                && let Ok(sessions) = catenary_mcp::session::list_sessions_with_conn(&conn)
+                && let Some(id) = sessions
+                    .into_iter()
+                    .map(|(s, _)| s.id)
+                    .find(|id| id.starts_with("mcp:"))
+            {
+                return Ok(id);
+            }
+            if std::time::Instant::now() >= deadline {
+                bail!("MCP session did not appear in the sessions table within timeout");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     pub fn send(&mut self, request: &Value) -> Result<()> {
