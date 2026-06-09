@@ -515,10 +515,97 @@ pub fn bind_daemon_sockets() -> Result<DaemonSockets> {
 
 // ── Session registry ───────────────────────────────────────────────
 
-/// Per-session state: the [`HookRouter`] (which owns the `Session`).
+/// Per-session state: the [`HookRouter`] (which owns the `Session`) plus the
+/// board metadata captured at session creation.
 #[cfg(unix)]
 struct SessionEntry {
     router: Arc<HookRouter>,
+    /// Identity captured from the session's first hook payload, surfaced on
+    /// the snapshot session board (observability ticket 05).
+    meta: SessionMeta,
+}
+
+/// Snapshot session-board metadata, captured from a session's own hook payload
+/// at creation time.
+///
+/// `status` and `last_action` are *not* here — they are read live from the
+/// per-session [`Session`] at snapshot-build time (status derived from the
+/// editing accumulator, `last_action` stored on the session). Only the
+/// create-time identity that the payload carries lives here.
+#[cfg(unix)]
+#[derive(Clone)]
+struct SessionMeta {
+    /// Host CLI name from the hook `format` field (`claude`/`gemini`/…).
+    client_name: Option<String>,
+    /// When the session first connected (ISO 8601).
+    started_at: String,
+    /// Workspace roots from the session's own payload (`cwd` /
+    /// `workspacePaths`) — never correlated to MCP roots.
+    roots: Vec<String>,
+}
+
+/// Extracts a session's workspace roots from its hook payload.
+///
+/// Host-agnostic: Antigravity sends `workspacePaths` (array), Claude Code and
+/// Gemini CLI send `cwd` (string). Returns an empty vec when neither is
+/// present. Deliberately reads only the session's *own* payload — per the
+/// design, the board does not correlate `session_id` to MCP roots.
+#[cfg(unix)]
+fn extract_session_roots(raw: &serde_json::Value) -> Vec<String> {
+    let Some(hp) = raw.get("host_payload") else {
+        return Vec::new();
+    };
+    if let Some(paths) = hp.get("workspacePaths").and_then(|v| v.as_array()) {
+        return paths
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+    }
+    hp.get("cwd")
+        .and_then(|v| v.as_str())
+        .map(|cwd| vec![cwd.to_string()])
+        .unwrap_or_default()
+}
+
+/// Live session board over the daemon's per-session registry.
+///
+/// Implements [`crate::state_snapshot::SessionBoard`]: at each snapshot flush
+/// it walks the live sessions and builds one entry each, deriving `status`
+/// from the editing accumulator and reading `last_action` off the session.
+/// Wired onto the [`SnapshotWriter`](crate::state_snapshot::SnapshotWriter) in
+/// [`SessionManager::with_session`].
+#[cfg(unix)]
+struct SessionBoardImpl {
+    sessions: Arc<std::sync::Mutex<HashMap<String, SessionEntry>>>,
+}
+
+#[cfg(unix)]
+impl crate::state_snapshot::SessionBoard for SessionBoardImpl {
+    fn sessions(&self) -> Vec<crate::state_snapshot::SessionEntry> {
+        let sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        sessions
+            .iter()
+            .map(|(id, entry)| crate::state_snapshot::SessionEntry {
+                id: id.clone(),
+                client: crate::state_snapshot::ClientInfo {
+                    name: entry
+                        .meta
+                        .client_name
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    // The hook payloads Catenary receives carry no version.
+                    version: None,
+                },
+                started_at: entry.meta.started_at.clone(),
+                roots: entry.meta.roots.clone(),
+                status: entry.router.session.status(),
+                last_action: entry.router.session.last_action(),
+            })
+            .collect()
+    }
 }
 
 /// Shared context for session-aware hook dispatch.
@@ -1393,8 +1480,19 @@ impl SessionManager {
         self.db_conn = Some(conn.clone());
         let root_tracker = RootTracker::new();
         self.root_tracker = Some(root_tracker.clone());
+
+        let sessions = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        // Wire the live session board onto the daemon snapshot so `state.json`
+        // carries the rich session board (observability ticket 05). The writer
+        // pulls this at each flush; `None` outside daemon mode.
+        if let Some(snapshot) = &session.snapshot {
+            snapshot.set_session_board(Arc::new(SessionBoardImpl {
+                sessions: sessions.clone(),
+            }));
+        }
+
         self.hook_ctx = Some(HookDispatchContext {
-            sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sessions,
             primary: session,
             conn,
             _logging: self.logging.clone(),
@@ -1562,8 +1660,10 @@ fn get_or_create_router(
                 .and_then(|v| v.as_str())
                 .unwrap_or(session_id);
             let client_name = raw.get("format").and_then(|v| v.as_str());
+            // One ISO format across the snapshot (now_iso → millis + 'Z'); also
+            // valid rfc3339 for the DB row below.
+            let started_at = crate::state_snapshot::now_iso();
             if let Ok(conn) = ctx.conn.lock() {
-                let started_at = chrono::Utc::now().to_rfc3339();
                 let _ = conn.execute(
                     "INSERT INTO sessions \
                      (id, pid, display_name, client_name, started_at, alive) \
@@ -1584,13 +1684,26 @@ fn get_or_create_router(
                 );
             }
 
+            // Board metadata from this session's own hook payload (ticket 05):
+            // host name, connect time, and the session's own workspace roots.
+            let meta = SessionMeta {
+                client_name: client_name.map(str::to_string),
+                started_at,
+                roots: extract_session_roots(raw),
+            };
+
             let router = Arc::new(HookRouter::new(
                 session.clone(),
                 ctx.conn.clone(),
                 session.instance_id.clone(),
                 session_id.to_string(),
             ));
-            SessionEntry { router }
+
+            // A new live session changes the board — mark the snapshot dirty so
+            // the next flush serializes it.
+            ctx.primary.touch_snapshot();
+
+            SessionEntry { router, meta }
         })
         .router
         .clone()
@@ -1728,6 +1841,10 @@ async fn handle_hook_dispatch(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&session_id);
+
+        // The session left the board — mark the snapshot dirty so the next
+        // flush drops it (live-only board, observability ticket 05).
+        ctx.primary.touch_snapshot();
 
         // Mark session dead in DB so the TUI drops it from the sidebar.
         if let Ok(conn) = ctx.conn.lock() {
@@ -2127,11 +2244,32 @@ async fn handle_hook_dispatch(
                 // Nothing covered to diagnose — the note (if any) stands alone.
                 (false, with_out_of_roots_note(String::new(), filtered))
             } else {
+                // Reflect the run on the session board: status → diagnostics
+                // for its duration (the editing accumulator already drained at
+                // the prepare step), then record the result as last_action
+                // (observability ticket 05). Clone the session Arc and drop the
+                // registry lock before the await.
+                let board_session = ctx
+                    .sessions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&session_id)
+                    .map(|e| e.router.session.clone());
+                if let Some(s) = &board_session {
+                    s.set_diagnostics_in_flight(true);
+                }
                 let outcome = ctx
                     .primary
                     .diagnostics
                     .process_files_batched(&files, Some(&scope_id), &session_id)
                     .await;
+                if let Some(s) = &board_session {
+                    s.set_diagnostics_in_flight(false);
+                    s.set_last_action(format!(
+                        "diagnostics: {} errors, {} warnings",
+                        outcome.errors, outcome.warnings
+                    ));
+                }
                 // Surface any filtered edits alongside the covered-file results,
                 // so a mixed batch never silently hides the unchecked files.
                 (
@@ -2361,6 +2499,14 @@ async fn handle_hook_dispatch(
                 accumulated,
                 "sed: accumulated changed files for diagnostics",
             );
+
+            // Surface the sed write on the snapshot session board (ticket 05).
+            let summary = if outcome.changed.len() == 1 {
+                format!("sed {}", router.session.display_path(&outcome.changed[0]))
+            } else {
+                format!("sed {} files", outcome.changed.len())
+            };
+            router.session.set_last_action(summary);
         }
 
         let response = SedResponse {
@@ -3714,6 +3860,91 @@ mod tests {
         SessionManager::bind_at(&mcp_socket_in(dir), &ipc_socket_in(dir), logging)
             .expect("bind")
             .with_session(session, conn)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_board_builds_rich_entries() {
+        use crate::state_snapshot::{SessionBoard, SessionStatus};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("catenary").join("catenary.db");
+        let conn = crate::db::open_and_migrate_at(&db_path).expect("open test DB");
+        let conn = Arc::new(std::sync::Mutex::new(conn));
+        conn.lock()
+            .expect("lock")
+            .execute(
+                "INSERT INTO sessions (id, pid, display_name, started_at) \
+                 VALUES ('sess-1', 1, 'test', '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .expect("insert session");
+
+        let instance_id: Arc<str> = "sess-1".into();
+        let notification_router = Arc::new(
+            crate::logging::notification_router::NotificationRouter::new(
+                crate::logging::Severity::Warn,
+            ),
+        );
+        let session = Arc::new(crate::bridge::session::Session::new(
+            crate::config::Config::default(),
+            vec![],
+            LoggingServer::new(),
+            conn.clone(),
+            instance_id.clone(),
+            tokio::runtime::Handle::current(),
+            notification_router,
+            None,
+        ));
+        let router = Arc::new(HookRouter::new(
+            session.clone(),
+            conn,
+            instance_id,
+            "sess-1".to_string(),
+        ));
+
+        let sessions = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        sessions.lock().expect("lock").insert(
+            "sess-1".to_string(),
+            SessionEntry {
+                router,
+                meta: SessionMeta {
+                    client_name: Some("claude".to_string()),
+                    started_at: "2026-06-08T13:10:00.000Z".to_string(),
+                    roots: vec!["/p/A".to_string(), "/p/B".to_string()],
+                },
+            },
+        );
+        let board = SessionBoardImpl { sessions };
+
+        // Idle to start: no editing accumulator, no last_action. Client name
+        // from the payload `format`; version unknown (omitted).
+        let entries = board.sessions();
+        assert_eq!(entries.len(), 1);
+        let e = &entries[0];
+        assert_eq!(e.id, "sess-1");
+        assert_eq!(e.client.name, "claude");
+        assert!(e.client.version.is_none());
+        assert_eq!(e.roots, vec!["/p/A".to_string(), "/p/B".to_string()]);
+        assert_eq!(e.status, SessionStatus::Idle);
+        assert!(e.last_action.is_none());
+
+        // An active editing accumulator → status `editing`.
+        session
+            .editing
+            .start_editing(Some("sess-1"), "")
+            .expect("start editing");
+        assert_eq!(board.sessions()[0].status, SessionStatus::Editing);
+
+        // An in-flight diagnostics run shows `diagnostics`; completion records
+        // last_action with the counts.
+        session.set_diagnostics_in_flight(true);
+        assert_eq!(board.sessions()[0].status, SessionStatus::Diagnostics);
+        session.set_diagnostics_in_flight(false);
+        session.set_last_action("diagnostics: 2 errors, 1 warnings");
+        let after = board.sessions();
+        let la = after[0].last_action.as_ref().expect("last_action set");
+        assert_eq!(la.summary, "diagnostics: 2 errors, 1 warnings");
+        assert!(!la.at.is_empty(), "last_action carries a timestamp");
     }
 
     /// Send a hook JSON request and read the response line.

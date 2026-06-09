@@ -371,6 +371,8 @@ impl HookRouter {
                     .session
                     .editing
                     .start_editing(session_id.as_deref(), &agent_id);
+                // Status may flip to `editing` — refresh the board (ticket 05).
+                self.session.touch_snapshot();
                 DispatchResult {
                     result: None,
                     system_message: None,
@@ -411,6 +413,9 @@ impl HookRouter {
                 self.store_client_session_id(session_id.as_deref());
                 let result =
                     self.handle_require_release(session_id.as_deref(), &agent_id, stop_hook_active);
+                // Editing state may have cleared (status → idle) — refresh the
+                // board (ticket 05).
+                self.session.touch_snapshot();
                 // Drain at stationary point: only when allowing the stop.
                 let system_message = if matches!(result, Some(HookResult::Block(_))) {
                     None
@@ -425,6 +430,9 @@ impl HookRouter {
             HookRequest::SessionStart { session_id } => {
                 self.store_client_session_id(session_id.as_deref());
                 let result = self.handle_clear_editing();
+                // Stale editing state may have cleared (status → idle) —
+                // refresh the board (ticket 05).
+                self.session.touch_snapshot();
                 // Drain at stationary point: session start.
                 let system_message = self.drain_notifications();
                 DispatchResult {
@@ -625,6 +633,11 @@ impl HookRouter {
             self.session
                 .editing
                 .add_file(session_id, agent_id, PathBuf::from(file_path));
+            // Surface the edit on the snapshot session board (ticket 05): the
+            // first covered edit also makes status `editing` (the accumulator
+            // is now active), and set_last_action marks the snapshot dirty.
+            self.session
+                .set_last_action(format!("edited {}", self.session.display_path(path)));
             debug!(
                 source = Source::HookDispatch.as_str(),
                 file = file_path,

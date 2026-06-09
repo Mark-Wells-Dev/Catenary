@@ -48,6 +48,12 @@ pub struct DiagnosticsOutcome {
     /// `true` when at least one diagnostic met the dirty severity threshold
     /// (exit code 1); `false` is clean (exit code 0).
     pub dirty: bool,
+    /// Number of error-severity (LSP severity 1) diagnostics across the batch.
+    /// Counts the complete set, not the budgeted preview — feeds the session
+    /// board's `last_action` summary (observability ticket 05).
+    pub errors: usize,
+    /// Number of warning-severity (LSP severity 2) diagnostics across the batch.
+    pub warnings: usize,
 }
 
 /// Per-server diagnostics result from [`DiagnosticsServer::run_server_batch`].
@@ -150,6 +156,8 @@ impl DiagnosticsServer {
             return DiagnosticsOutcome {
                 output: String::new(),
                 dirty: false,
+                errors: 0,
+                warnings: 0,
             };
         }
 
@@ -291,6 +299,19 @@ impl DiagnosticsServer {
             }
         }
 
+        // Count severities across the complete set (before the preview budget
+        // truncates), so the session board's `last_action` reports the real
+        // totals (observability ticket 05). Severity 1 = error, 2 = warning.
+        let (errors, warnings) =
+            diag_files
+                .iter()
+                .flat_map(|f| &f.entries)
+                .fold((0usize, 0usize), |(e, w), entry| match entry.severity {
+                    1 => (e + 1, w),
+                    2 => (e, w + 1),
+                    _ => (e, w),
+                });
+
         // `[tools]` is absent in many configs — fall back to defaults so the
         // budget (50) and dirty threshold (error) always apply.
         let tools = self
@@ -338,6 +359,8 @@ impl DiagnosticsServer {
         DiagnosticsOutcome {
             output,
             dirty: budgeted.dirty,
+            errors,
+            warnings,
         }
     }
 

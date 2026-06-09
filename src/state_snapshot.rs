@@ -28,7 +28,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
 use chrono::{SecondsFormat, Utc};
@@ -158,11 +158,77 @@ pub struct ServerEntry {
     pub died_at: Option<String>,
 }
 
-/// A connected session's board entry. Minimal in ticket 04; enriched in 05.
+/// Host CLI client identity for a session board entry.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ClientInfo {
+    /// Host CLI name (`claude` / `gemini` / `antigravity`), from the hook
+    /// `format` field. `"unknown"` when the session was created without one.
+    pub name: String,
+    /// Host CLI version, when the payload carries it. The hook payloads
+    /// Catenary receives do not include a version, so this is omitted in
+    /// practice (kept for forward-compat with hosts that add it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
+
+/// A session's current activity, derived at snapshot-build time from the
+/// daemon's live editing state.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionStatus {
+    /// The session holds an active editing accumulator (a covered edit is
+    /// pending diagnostics).
+    Editing,
+    /// A `catenary diagnostics` run is in flight for the session.
+    Diagnostics,
+    /// Neither editing nor running diagnostics.
+    Idle,
+}
+
+/// The most recent attributable action a session took.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct LastAction {
+    /// Human-readable summary, e.g. `edited src/db.rs` or
+    /// `diagnostics: 2 errors, 1 warnings`.
+    pub summary: String,
+    /// When the action occurred (ISO 8601).
+    pub at: String,
+}
+
+/// A connected session's board entry — the rich session board (ticket 05).
+///
+/// Live-only: dead sessions vanish on the next overwrite (no `alive` field).
+/// No `pid`: hooks own session identity (ws23) and the hook payloads carry no
+/// agent pid; recovering one would mean correlating to the MCP connection,
+/// which the stateless model deliberately avoids.
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionEntry {
-    /// Session scope id.
+    /// Session scope id (host `session_id`) → `query --session …`; yankable.
     pub id: String,
+    /// Host CLI client identity.
+    pub client: ClientInfo,
+    /// When the session first connected (ISO 8601).
+    pub started_at: String,
+    /// The session's workspace roots, taken from its own hook payload
+    /// (`cwd` / `workspacePaths`) — not correlated to MCP roots.
+    pub roots: Vec<String>,
+    /// Current activity (editing | diagnostics | idle).
+    pub status: SessionStatus,
+    /// The most recent attributable action, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_action: Option<LastAction>,
+}
+
+/// Source of the live session board, pulled at each snapshot flush.
+///
+/// The daemon's [`SessionManager`](crate::router) owns the live session map;
+/// it implements this so the [`SnapshotWriter`] can serialize the rich board
+/// without holding a reference to the manager's internals. Pulled (not pushed)
+/// so `status` always reflects the editing state at write time, with no
+/// transition-tracking to keep in sync.
+pub trait SessionBoard: Send + Sync {
+    /// Builds the current session board. Called outside the snapshot lock.
+    fn sessions(&self) -> Vec<SessionEntry>;
 }
 
 /// A bounded `warn`/`error` alert — "when to look".
@@ -202,10 +268,13 @@ fn server_id(key: &InstanceKey) -> String {
 }
 
 /// The mutable in-memory state behind the snapshot.
+///
+/// Sessions are *not* stored here — they are pulled from the [`SessionBoard`]
+/// at flush time (see [`Inner::flush`]) so `status` always reflects the live
+/// editing state.
 struct SnapshotState {
     daemon: DaemonInfo,
     servers: HashMap<String, ServerEntry>,
-    sessions: Vec<SessionEntry>,
     /// Alert ring, newest-first.
     alerts: VecDeque<Alert>,
     dirty: bool,
@@ -345,14 +414,19 @@ impl SnapshotState {
     }
 
     /// Serializes the current state to a pretty JSON string.
-    fn to_json(&self) -> String {
+    ///
+    /// `sessions` is pulled from the [`SessionBoard`] by the caller (outside
+    /// this struct's lock) and injected here, sorted by id for stable output.
+    fn to_json(&self, sessions: &[SessionEntry]) -> String {
         let mut servers: Vec<&ServerEntry> = self.servers.values().collect();
         servers.sort_by(|a, b| a.id.cmp(&b.id));
+        let mut sessions: Vec<&SessionEntry> = sessions.iter().collect();
+        sessions.sort_by(|a, b| a.id.cmp(&b.id));
         let view = SnapshotView {
             schema: SCHEMA,
             daemon: self.daemon.to_meta(),
             servers,
-            sessions: &self.sessions,
+            sessions,
             alerts: self.alerts.iter().collect(),
         };
         serde_json::to_string_pretty(&view).unwrap_or_else(|e| {
@@ -368,7 +442,7 @@ struct SnapshotView<'a> {
     schema: u32,
     daemon: DaemonMeta<'a>,
     servers: Vec<&'a ServerEntry>,
-    sessions: &'a [SessionEntry],
+    sessions: Vec<&'a SessionEntry>,
     alerts: Vec<&'a Alert>,
 }
 
@@ -379,6 +453,10 @@ struct Inner {
     path: PathBuf,
     coalesce: Duration,
     flush_count: AtomicU64,
+    /// Live session source, wired once after the daemon's `SessionManager`
+    /// exists. Pulled at flush time; absent until set (initial snapshots and
+    /// transport-only tests serialize an empty session board).
+    session_board: OnceLock<Arc<dyn SessionBoard>>,
 }
 
 impl Inner {
@@ -386,20 +464,38 @@ impl Inner {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Serializes (under the lock) then writes atomically (lock released).
-    #[allow(
-        clippy::significant_drop_tightening,
-        reason = "guard must outlive serialization; dropped before file IO"
-    )]
+    /// Pulls the current session board, or an empty list when none is wired.
+    ///
+    /// Called *outside* the snapshot lock — the board acquires the
+    /// `SessionManager`'s own locks, so holding the snapshot lock here would
+    /// invert lock order against the `touch()` path (which takes the snapshot
+    /// lock while a session lock may be held by the caller).
+    fn sessions(&self) -> Vec<SessionEntry> {
+        self.session_board
+            .get()
+            .map(|board| board.sessions())
+            .unwrap_or_default()
+    }
+
+    /// Serializes then writes atomically.
+    ///
+    /// Clears the dirty flag under the lock, pulls the live session board with
+    /// the lock released, then re-takes the lock only to serialize.
     fn flush(&self) {
-        let json = {
+        {
             let mut state = self.lock_state();
             if !state.dirty {
                 return;
             }
             state.dirty = false;
             state.urgent = false;
-            state.to_json()
+        }
+        // Pull sessions with the snapshot lock released (avoids lock-order
+        // inversion with the SessionManager locks the board acquires).
+        let sessions = self.sessions();
+        let json = {
+            let state = self.lock_state();
+            state.to_json(&sessions)
         };
         match write_atomic(&self.path, &json) {
             Ok(()) => {
@@ -450,7 +546,6 @@ impl SnapshotWriter {
             state: Mutex::new(SnapshotState {
                 daemon,
                 servers: HashMap::new(),
-                sessions: Vec::new(),
                 alerts: VecDeque::new(),
                 dirty: false,
                 urgent: false,
@@ -459,6 +554,7 @@ impl SnapshotWriter {
             path: dir.join("state.json"),
             coalesce,
             flush_count: AtomicU64::new(0),
+            session_board: OnceLock::new(),
         });
         let task_inner = inner.clone();
         runtime.spawn(async move { flush_loop(task_inner).await });
@@ -508,6 +604,30 @@ impl SnapshotWriter {
         {
             let mut state = self.inner.lock_state();
             state.update_message(key, level, text);
+            state.dirty = true;
+        }
+        self.inner.notify.notify_one();
+    }
+
+    /// Wires the live session source (the daemon's `SessionManager`).
+    ///
+    /// Called once, after the manager exists. Subsequent calls are ignored
+    /// (the board is set-once). Marks the snapshot dirty so the first flush
+    /// after wiring serializes any already-connected sessions.
+    pub fn set_session_board(&self, board: Arc<dyn SessionBoard>) {
+        if self.inner.session_board.set(board).is_ok() {
+            self.touch();
+        }
+    }
+
+    /// Marks the snapshot dirty and wakes the flush task (coalesced).
+    ///
+    /// Used by session action boundaries (`last_action` updates, status
+    /// transitions) where the changed state lives in the [`SessionBoard`],
+    /// not in this writer's own maps.
+    pub fn touch(&self) {
+        {
+            let mut state = self.inner.lock_state();
             state.dirty = true;
         }
         self.inner.notify.notify_one();
@@ -612,7 +732,6 @@ mod tests {
         SnapshotState {
             daemon: daemon_info(),
             servers: HashMap::new(),
-            sessions: Vec::new(),
             alerts: VecDeque::new(),
             dirty: false,
             urgent: false,
@@ -670,7 +789,8 @@ mod tests {
         state.register_server(&key, "2026-06-08T12:03:44Z");
         state.update_state(&key, &ServerLifecycle::Probing);
 
-        let json: serde_json::Value = serde_json::from_str(&state.to_json()).expect("valid json");
+        let json: serde_json::Value =
+            serde_json::from_str(&state.to_json(&[])).expect("valid json");
         let server = &json["servers"][0];
         // Full lifecycle — NOT the lossy display_state ("initializing").
         assert_eq!(server["state"], "probing");
@@ -988,5 +1108,168 @@ mod tests {
             0,
             "no servers spawned yet"
         );
+    }
+
+    // ── Session board (ticket 05) ──────────────────────────────────────
+
+    /// A `SessionBoard` backed by a mutable vec, so a test can change the
+    /// live board between flushes (e.g. simulate a disconnect).
+    struct MockBoard(Arc<Mutex<Vec<SessionEntry>>>);
+
+    impl SessionBoard for MockBoard {
+        fn sessions(&self) -> Vec<SessionEntry> {
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    fn session_entry(id: &str, status: SessionStatus, roots: Vec<&str>) -> SessionEntry {
+        SessionEntry {
+            id: id.to_string(),
+            client: ClientInfo {
+                name: "claude".to_string(),
+                version: None,
+            },
+            started_at: "2026-06-08T13:10:00.000Z".to_string(),
+            roots: roots.into_iter().map(String::from).collect(),
+            status,
+            last_action: None,
+        }
+    }
+
+    #[test]
+    fn session_entry_serializes_status_lowercase_and_omits_unknowns() {
+        let mut entry = session_entry("s1", SessionStatus::Editing, vec!["/p/Catenary"]);
+        entry.last_action = Some(LastAction {
+            summary: "edited src/db.rs".to_string(),
+            at: "2026-06-08T13:11:00.000Z".to_string(),
+        });
+        let json = serde_json::to_value(&entry).expect("serialize");
+        assert_eq!(json["id"], "s1");
+        assert_eq!(json["status"], "editing");
+        assert_eq!(json["client"]["name"], "claude");
+        // No pid field (hooks own identity; no MCP correlation). client.version
+        // absent (not carried by the hook payload).
+        assert!(json.get("pid").is_none(), "no pid field");
+        assert!(
+            json["client"].get("version").is_none(),
+            "version omitted when unknown"
+        );
+        assert_eq!(json["roots"][0], "/p/Catenary");
+        assert_eq!(json["last_action"]["summary"], "edited src/db.rs");
+        assert_eq!(json["last_action"]["at"], "2026-06-08T13:11:00.000Z");
+    }
+
+    #[tokio::test]
+    async fn session_board_serializes_into_snapshot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let writer = SnapshotWriter::with_coalesce(
+            &Handle::current(),
+            dir.path(),
+            daemon_info(),
+            Duration::from_millis(20),
+        );
+
+        let mut editing = session_entry("sess-A", SessionStatus::Editing, vec!["/p/Catenary"]);
+        editing.last_action = Some(LastAction {
+            summary: "diagnostics: 2 errors, 1 warnings".to_string(),
+            at: "2026-06-08T13:11:00.000Z".to_string(),
+        });
+        let board = Arc::new(Mutex::new(vec![editing]));
+        writer.set_session_board(Arc::new(MockBoard(board.clone())));
+
+        let ready = poll_until(|| {
+            read_snapshot(&writer).is_some_and(|j| {
+                j["sessions"]
+                    .as_array()
+                    .is_some_and(|s| s.len() == 1 && s[0]["status"] == "editing")
+            })
+        })
+        .await;
+        assert!(ready, "session board should serialize into the snapshot");
+
+        let json = read_snapshot(&writer).expect("state.json written");
+        let session = &json["sessions"][0];
+        assert_eq!(session["id"], "sess-A");
+        assert_eq!(session["status"], "editing");
+        assert_eq!(
+            session["last_action"]["summary"],
+            "diagnostics: 2 errors, 1 warnings"
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_root_session_lists_all_roots() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let writer = SnapshotWriter::with_coalesce(
+            &Handle::current(),
+            dir.path(),
+            daemon_info(),
+            Duration::from_millis(20),
+        );
+        let board = Arc::new(Mutex::new(vec![session_entry(
+            "multi",
+            SessionStatus::Idle,
+            vec!["/p/A", "/p/B"],
+        )]));
+        writer.set_session_board(Arc::new(MockBoard(board)));
+
+        let ready = poll_until(|| {
+            read_snapshot(&writer).is_some_and(|j| {
+                j["sessions"][0]["roots"]
+                    .as_array()
+                    .is_some_and(|r| r.len() == 2)
+            })
+        })
+        .await;
+        assert!(ready, "multi-root session should list all roots");
+        let json = read_snapshot(&writer).expect("state.json written");
+        let roots = json["sessions"][0]["roots"]
+            .as_array()
+            .expect("roots array");
+        assert_eq!(roots[0], "/p/A");
+        assert_eq!(roots[1], "/p/B");
+    }
+
+    #[tokio::test]
+    async fn disconnected_session_vanishes_from_snapshot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let writer = SnapshotWriter::with_coalesce(
+            &Handle::current(),
+            dir.path(),
+            daemon_info(),
+            Duration::from_millis(20),
+        );
+        let board = Arc::new(Mutex::new(vec![
+            session_entry("keep", SessionStatus::Idle, vec!["/p/A"]),
+            session_entry("drop", SessionStatus::Idle, vec!["/p/B"]),
+        ]));
+        writer.set_session_board(Arc::new(MockBoard(board.clone())));
+
+        let two = poll_until(|| {
+            read_snapshot(&writer)
+                .is_some_and(|j| j["sessions"].as_array().is_some_and(|s| s.len() == 2))
+        })
+        .await;
+        assert!(two, "both sessions should appear first");
+
+        // Simulate a disconnect: the board now reports only one session.
+        board
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|s| s.id == "keep");
+        writer.touch();
+
+        let one = poll_until(|| {
+            read_snapshot(&writer).is_some_and(|j| {
+                j["sessions"]
+                    .as_array()
+                    .is_some_and(|s| s.len() == 1 && s[0]["id"] == "keep")
+            })
+        })
+        .await;
+        assert!(one, "disconnected session should vanish on the next flush");
     }
 }

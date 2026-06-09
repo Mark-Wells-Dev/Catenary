@@ -304,6 +304,19 @@ pub struct Session {
     /// shutdown can flush + join its writer thread. `None` for per-connection
     /// sessions, which share the already-activated `LoggingServer`.
     jsonl_sink: Option<Arc<JsonlSink>>,
+    /// Daemon-owned live-state snapshot writer, shared from the primary
+    /// session (`None` outside daemon mode). Action boundaries
+    /// ([`Self::set_last_action`]) mark it dirty so the session board reflects
+    /// the change; the writer pulls per-session `status` / `last_action` at
+    /// flush time (observability ticket 05).
+    pub(crate) snapshot: Option<Arc<crate::state_snapshot::SnapshotWriter>>,
+    /// The session's most recent attributable action, surfaced on the snapshot
+    /// session board. Set at edit / diagnostics / sed boundaries.
+    last_action: std::sync::Mutex<Option<crate::state_snapshot::LastAction>>,
+    /// `true` while a `catenary diagnostics` run is in flight for this session
+    /// — drives the board's `diagnostics` status (the editing accumulator has
+    /// already drained by the time the run starts).
+    diagnostics_in_flight: std::sync::atomic::AtomicBool,
 }
 
 impl Session {
@@ -319,7 +332,8 @@ impl Session {
     #[must_use]
     #[allow(
         clippy::too_many_arguments,
-        reason = "session wiring threads shared daemon deps plus the snapshot sink"
+        clippy::too_many_lines,
+        reason = "session wiring threads shared daemon deps, the JSONL sink, and the snapshot sink"
     )]
     pub fn new(
         config: Config,
@@ -381,8 +395,8 @@ impl Session {
         let mut client_manager =
             LspClientManager::new(config.clone(), logging.clone(), fs_manager.clone());
         client_manager.set_db(conn, instance_id.clone());
-        if let Some(writer) = snapshot {
-            client_manager.set_snapshot(writer);
+        if let Some(writer) = &snapshot {
+            client_manager.set_snapshot(writer.clone());
         }
         let client_manager = Arc::new(client_manager);
         let diagnostics = Arc::new(DiagnosticsServer::new(
@@ -439,6 +453,9 @@ impl Session {
             instance_id,
             runtime,
             jsonl_sink: Some(jsonl_sink),
+            snapshot,
+            last_action: std::sync::Mutex::new(None),
+            diagnostics_in_flight: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -520,7 +537,92 @@ impl Session {
             instance_id: session_id,
             runtime: primary.runtime.clone(),
             jsonl_sink: None,
+            snapshot: primary.snapshot.clone(),
+            last_action: std::sync::Mutex::new(None),
+            diagnostics_in_flight: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Records the session's most recent action and marks the snapshot dirty.
+    ///
+    /// Surfaced on the snapshot session board's `last_action` field
+    /// (observability ticket 05). Called at edit, diagnostics, and `sed`
+    /// boundaries. The snapshot lock is taken only after the `last_action`
+    /// guard is dropped, so this never inverts lock order against the flush
+    /// path (which reads `last_action` while pulling the board).
+    pub fn set_last_action(&self, summary: impl Into<String>) {
+        let action = crate::state_snapshot::LastAction {
+            summary: summary.into(),
+            at: crate::state_snapshot::now_iso(),
+        };
+        {
+            let mut guard = self
+                .last_action
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *guard = Some(action);
+        }
+        self.touch_snapshot();
+    }
+
+    /// Returns the session's most recent action, if any.
+    #[must_use]
+    pub fn last_action(&self) -> Option<crate::state_snapshot::LastAction> {
+        self.last_action
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Sets whether a `catenary diagnostics` run is in flight and marks the
+    /// snapshot dirty so the board's status reflects the transition promptly.
+    pub fn set_diagnostics_in_flight(&self, in_flight: bool) {
+        self.diagnostics_in_flight
+            .store(in_flight, std::sync::atomic::Ordering::Release);
+        self.touch_snapshot();
+    }
+
+    /// Derives the session's board status from live editing state.
+    ///
+    /// `diagnostics` while a run is in flight; otherwise `editing` when an
+    /// editing accumulator is active; otherwise `idle`. No transition tracking
+    /// — read at snapshot-build time (observability ticket 05).
+    #[must_use]
+    pub fn status(&self) -> crate::state_snapshot::SessionStatus {
+        use crate::state_snapshot::SessionStatus;
+        if self
+            .diagnostics_in_flight
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            SessionStatus::Diagnostics
+        } else if self.editing.is_active() {
+            SessionStatus::Editing
+        } else {
+            SessionStatus::Idle
+        }
+    }
+
+    /// Marks the snapshot dirty (coalesced flush). No-op outside daemon mode.
+    pub fn touch_snapshot(&self) {
+        if let Some(snapshot) = &self.snapshot {
+            snapshot.touch();
+        }
+    }
+
+    /// Renders a path for a `last_action` summary: relative to its workspace
+    /// root when resolvable (e.g. `src/db.rs`), else the bare file name, else
+    /// the full path.
+    #[must_use]
+    pub fn display_path(&self, path: &Path) -> String {
+        if let Some(root) = self.resolve_root(path)
+            && let Ok(rel) = path.strip_prefix(&root)
+        {
+            return rel.display().to_string();
+        }
+        path.file_name().map_or_else(
+            || path.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        )
     }
 
     /// Builds the merged command filter from user config + all project configs.

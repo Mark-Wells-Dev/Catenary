@@ -81,6 +81,22 @@ impl EditingManager {
         Ok(())
     }
 
+    /// Returns `true` if any agent in this session has an active editing
+    /// accumulator.
+    ///
+    /// Session-wide (not keyed by agent): drives the snapshot session board's
+    /// `editing` status (observability ticket 05). An accumulator is present
+    /// from `start_editing` until `drain_all_and_clear` / `done_editing`, even
+    /// before any file is added.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        !self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+    }
+
     /// Returns `true` if the agent is currently in editing mode.
     #[must_use]
     pub fn is_editing(&self, session_id: Option<&str>, agent_id: &str) -> bool {
@@ -331,6 +347,22 @@ mod tests {
         let (files, filtered) = em.drain_all_and_clear();
         assert!(files.is_empty());
         assert_eq!(filtered, 0);
+    }
+
+    #[test]
+    fn is_active_tracks_any_accumulator() {
+        let em = EditingManager::new();
+        assert!(!em.is_active(), "no accumulator yet");
+        em.start_editing(Some("s1"), "agent").expect("start");
+        assert!(em.is_active(), "active after start, even with no files");
+        let (_, _) = em.drain_all_and_clear();
+        assert!(!em.is_active(), "inactive after drain_all_and_clear");
+
+        // done_editing on the only entry also clears activity.
+        em.start_editing(None, "a").expect("start");
+        assert!(em.is_active());
+        em.done_editing(None, "a");
+        assert!(!em.is_active());
     }
 
     #[test]
