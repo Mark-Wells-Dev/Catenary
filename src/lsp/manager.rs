@@ -16,7 +16,7 @@ use crate::lsp::LspClient;
 use crate::lsp::glob::{self, LspGlob};
 use crate::lsp::instance_key::{InstanceKey, Scope};
 use crate::lsp::server::LspServer;
-use crate::lsp::state::ServerStatus;
+use crate::lsp::state::{ServerLifecycle, ServerStatus};
 use crate::source::Source;
 
 /// Looks up an existing client instance for a `(lang, server, root)` triple.
@@ -153,6 +153,9 @@ pub struct LspClientManager {
     /// DB connection for server noise persistence.
     /// `None` in doctor/test contexts.
     db: Option<(Arc<std::sync::Mutex<rusqlite::Connection>>, Arc<str>)>,
+    /// `state.json` snapshot writer for live server-board mirroring.
+    /// `None` in doctor/test contexts.
+    snapshot: Option<Arc<crate::state_snapshot::SnapshotWriter>>,
 }
 
 impl LspClientManager {
@@ -176,6 +179,7 @@ impl LspClientManager {
             logging,
             fs,
             db: None,
+            snapshot: None,
         }
     }
 
@@ -189,6 +193,14 @@ impl LspClientManager {
         session_id: Arc<str>,
     ) {
         self.db = Some((conn, session_id));
+    }
+
+    /// Sets the `state.json` snapshot writer for live server-board mirroring.
+    ///
+    /// Called by [`crate::bridge::session::Session`] after construction in
+    /// daemon mode. Doctor and test contexts skip this.
+    pub fn set_snapshot(&mut self, writer: Arc<crate::state_snapshot::SnapshotWriter>) {
+        self.snapshot = Some(writer);
     }
 
     /// Returns a reference to the configuration.
@@ -861,6 +873,19 @@ impl LspClientManager {
         // all protocol messages, including the init exchange itself.
         client.server().set_scope(Scope::Root(root.to_path_buf()));
 
+        // The instance key is stable once the scope is set. Wire the snapshot
+        // and register the board entry *before* initialize so the server is
+        // visible as `initializing` during the (sometimes slow) handshake — and
+        // so a failed init surfaces as `failed` instead of never appearing.
+        let key = client
+            .server()
+            .key()
+            .ok_or_else(|| anyhow!("Failed to construct instance key"))?;
+        if let Some(writer) = &self.snapshot {
+            client.server().set_snapshot(writer.clone());
+            writer.register_server(&key, &crate::state_snapshot::now_iso());
+        }
+
         if let Err(e) = client
             .initialize(
                 &[root.to_path_buf()],
@@ -868,24 +893,22 @@ impl LspClientManager {
             )
             .await
         {
+            // Surface the init failure on the board (snapshot-only — the caller
+            // already handles the Err; no extra user notification).
+            if let Some(writer) = &self.snapshot {
+                writer.update_state(&key, &ServerLifecycle::Failed);
+            }
             // Tombstone: insert the dead client so `find_instance` returns
             // `Some` on subsequent calls.  `ensure_clients_for_paths` skips
             // bindings that already have an entry (dead or alive), and
             // `ensure_server` bails with "is dead" — stopping the retry loop.
-            if let Some(key) = client.server().key() {
-                clients.insert(key, Arc::new(Mutex::new(client)));
-            }
+            clients.insert(key, Arc::new(Mutex::new(client)));
             return Err(e);
         }
 
         if let Some((conn, session_id)) = &self.db {
             client.server().set_db(conn.clone(), session_id.clone());
         }
-
-        let key = client
-            .server()
-            .key()
-            .ok_or_else(|| anyhow!("Failed to construct instance key after initialization"))?;
 
         let client_mutex = Arc::new(Mutex::new(client));
         clients.insert(key.clone(), client_mutex.clone());
@@ -920,6 +943,14 @@ impl LspClientManager {
                 &scope_root,
                 &state,
             );
+        }
+
+        // Seed the snapshot's post-probe state. The eager health probe
+        // transitions Probing -> Healthy via `try_transition_probing_to_healthy`,
+        // which bypasses `persist_state`, so mirror the current state here.
+        if let Some(writer) = &self.snapshot {
+            let lifecycle = client_mutex.lock().await.server().lifecycle();
+            writer.update_state(&key, &lifecycle);
         }
 
         Ok((key, client_mutex))

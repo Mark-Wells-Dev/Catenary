@@ -3651,6 +3651,7 @@ mod tests {
             instance_id,
             runtime,
             notification_router,
+            None,
         ));
 
         SessionManager::bind_at(&mcp_socket_in(dir), &ipc_socket_in(dir), logging)

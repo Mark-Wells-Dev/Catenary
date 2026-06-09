@@ -1142,6 +1142,20 @@ fn run_daemon_main() -> Result<()> {
             catenary_mcp::logging::notification_router::NotificationRouter::new(threshold),
         );
 
+        // Daemon-owned live-state snapshot. Mirrors server lifecycle/progress
+        // and the alert ring to runtime_dir()/catenary/state.json — the
+        // out-of-process surface that replaces the language_servers table.
+        let snapshot = catenary_mcp::state_snapshot::SnapshotWriter::new(
+            rt.handle(),
+            &catenary_mcp::db::runtime_dir().join("catenary"),
+            catenary_mcp::state_snapshot::DaemonInfo {
+                instance_id: instance_id.to_string(),
+                pid: std::process::id(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                started_at: catenary_mcp::state_snapshot::now_iso(),
+            },
+        );
+
         let session = Arc::new(catenary_mcp::bridge::session::Session::new(
             config,
             roots,
@@ -1150,6 +1164,7 @@ fn run_daemon_main() -> Result<()> {
             instance_id.clone(),
             rt.handle().clone(),
             notification_router,
+            Some(snapshot),
         ));
 
         // Spawn LSP servers in the background.

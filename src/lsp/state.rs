@@ -64,6 +64,25 @@ impl ServerLifecycle {
             Self::Failed | Self::Dead => "dead",
         }
     }
+
+    /// Returns the non-lossy lifecycle string for the `state.json` snapshot.
+    ///
+    /// Unlike [`Self::display_state`] — which collapses `Probing` into
+    /// `"initializing"` and both terminal states into `"dead"` (the ws25
+    /// "stuck initializing" bug) — this returns the six distinct variants so a
+    /// stuck `probing` is observable. `Busy(_)` maps to `"busy"` regardless of
+    /// the in-flight count, which the snapshot carries separately.
+    #[must_use]
+    pub const fn lifecycle_str(&self) -> &str {
+        match self {
+            Self::Initializing => "initializing",
+            Self::Probing => "probing",
+            Self::Healthy => "healthy",
+            Self::Busy(_) => "busy",
+            Self::Failed => "failed",
+            Self::Dead => "dead",
+        }
+    }
 }
 
 impl Serialize for ServerLifecycle {
@@ -290,6 +309,22 @@ mod tests {
         assert_eq!(ServerLifecycle::Busy(3).display_state(), "busy");
         assert_eq!(ServerLifecycle::Failed.display_state(), "dead");
         assert_eq!(ServerLifecycle::Dead.display_state(), "dead");
+    }
+
+    #[test]
+    fn lifecycle_str_is_non_lossy() {
+        // Unlike display_state, every variant maps to a distinct string and
+        // Probing is not collapsed into "initializing".
+        assert_eq!(
+            ServerLifecycle::Initializing.lifecycle_str(),
+            "initializing"
+        );
+        assert_eq!(ServerLifecycle::Probing.lifecycle_str(), "probing");
+        assert_eq!(ServerLifecycle::Healthy.lifecycle_str(), "healthy");
+        assert_eq!(ServerLifecycle::Busy(1).lifecycle_str(), "busy");
+        assert_eq!(ServerLifecycle::Busy(7).lifecycle_str(), "busy");
+        assert_eq!(ServerLifecycle::Failed.lifecycle_str(), "failed");
+        assert_eq!(ServerLifecycle::Dead.lifecycle_str(), "dead");
     }
 
     #[test]

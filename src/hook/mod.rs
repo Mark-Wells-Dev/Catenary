@@ -1142,6 +1142,7 @@ mod tests {
             instance_id.clone(),
             handle,
             notification_router,
+            None,
         ));
         let server = HookServer::new(session, conn, instance_id, "test".to_string());
 

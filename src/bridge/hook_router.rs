@@ -1249,6 +1249,7 @@ mod tests {
             instance_id.clone(),
             handle,
             notification_router,
+            None,
         ));
 
         if failed {
@@ -1640,6 +1641,7 @@ mod tests {
             instance_id.clone(),
             handle,
             notification_router,
+            None,
         ));
         let router = HookRouter::new(session, conn, instance_id, "test".to_string());
 
@@ -1688,6 +1690,7 @@ mod tests {
             instance_id.clone(),
             handle,
             notification_router,
+            None,
         ));
 
         let router = HookRouter::new(session, conn, instance_id, "test".to_string());
@@ -1751,6 +1754,7 @@ mod tests {
             instance_id.clone(),
             handle,
             notification_router,
+            None,
         );
         let guardrail = Arc::new(crate::bridge::editing_guardrail::EditingGuardrail::new());
         let session = Arc::new(Session::new_for_daemon(
@@ -2076,6 +2080,7 @@ mod tests {
             instance_id.clone(),
             handle,
             notification_router,
+            None,
         ));
         let router = HookRouter::new(session, conn, instance_id, "test".to_string());
         TestHookRouter {

@@ -36,6 +36,8 @@ pub mod router;
 pub mod session;
 /// Canonical `source` taxonomy for structured tracing events.
 pub mod source;
+/// Daemon-owned `state.json` live-state snapshot.
+pub mod state_snapshot;
 /// Symbol index for workspace-wide symbol extraction.
 pub mod symbol_index;
 /// Interactive TUI for session browsing and event tailing.

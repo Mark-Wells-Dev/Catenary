@@ -312,6 +312,10 @@ impl Session {
     /// routes notifications to per-session queues based on `session_id`
     /// from the tracing span hierarchy.
     #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "session wiring threads shared daemon deps plus the snapshot sink"
+    )]
     pub fn new(
         config: Config,
         roots: Vec<PathBuf>,
@@ -320,6 +324,7 @@ impl Session {
         instance_id: Arc<str>,
         runtime: Handle,
         notification_router: Arc<NotificationRouter>,
+        snapshot: Option<Arc<crate::state_snapshot::SnapshotWriter>>,
     ) -> Self {
         let config = Arc::new(config);
 
@@ -332,8 +337,14 @@ impl Session {
             .unwrap_or(true);
         let desktop_sink = crate::notify::DesktopNotificationSink::with_enabled(desktop_enabled);
 
-        // Activate — drains bootstrap buffer, enables direct dispatch.
-        logging.activate(vec![notification_router.clone(), message_db, desktop_sink]);
+        // Activate — drains bootstrap buffer, enables direct dispatch. The
+        // snapshot writer (daemon mode) joins as an alert-ring sink.
+        let mut sinks: Vec<Arc<dyn crate::logging::Sink>> =
+            vec![notification_router.clone(), message_db, desktop_sink];
+        if let Some(writer) = &snapshot {
+            sinks.push(writer.clone());
+        }
+        logging.activate(sinks);
 
         let classification = super::filesystem_manager::ClassificationTables::from_config(&config);
         let fs_manager = Arc::new(FilesystemManager::with_classification(classification));
@@ -362,6 +373,9 @@ impl Session {
         let mut client_manager =
             LspClientManager::new(config.clone(), logging.clone(), fs_manager.clone());
         client_manager.set_db(conn, instance_id.clone());
+        if let Some(writer) = snapshot {
+            client_manager.set_snapshot(writer);
+        }
         let client_manager = Arc::new(client_manager);
         let diagnostics = Arc::new(DiagnosticsServer::new(
             client_manager.clone(),

@@ -107,6 +107,12 @@ pub struct LspServer {
     /// `language_servers`. Set after init via [`Self::set_db`].
     /// `None` in doctor/test contexts.
     db: OnceLock<(Arc<std::sync::Mutex<rusqlite::Connection>>, Arc<str>)>,
+
+    // ── State snapshot ───────────────────────────────────────
+    /// Daemon-owned `state.json` writer. Lifecycle, progress, and message
+    /// transitions mutate the server board and mark the snapshot dirty. Set
+    /// after init via [`Self::set_snapshot`]. `None` in doctor/test contexts.
+    snapshot: OnceLock<Arc<crate::state_snapshot::SnapshotWriter>>,
 }
 
 impl LspServer {
@@ -153,6 +159,7 @@ impl LspServer {
             tree_monitor: Mutex::new(None),
             connection: OnceLock::new(),
             db: OnceLock::new(),
+            snapshot: OnceLock::new(),
         }
     }
 
@@ -405,8 +412,9 @@ impl LspServer {
     /// `warn!()` notification that flows through `LoggingServer` →
     /// `NotificationQueueSink` → `systemMessage`.
     pub(crate) fn set_lifecycle(&self, state: ServerLifecycle) {
-        let display = state.display_state().to_string();
         let is_terminal = state.is_terminal();
+        // Keep a copy for persistence; `state` itself moves into the lock.
+        let persist = state.clone();
         let mut lifecycle = self
             .lifecycle
             .lock()
@@ -415,7 +423,7 @@ impl LspServer {
         *lifecycle = state;
         drop(lifecycle);
 
-        self.persist_state(&display);
+        self.persist_state(&persist);
 
         // Emit user-facing notification on first transition to terminal state.
         if !was_terminal
@@ -449,10 +457,30 @@ impl LspServer {
         let _ = self.db.set((conn, session_id));
     }
 
+    /// Sets the `state.json` snapshot writer for live-state mirroring.
+    ///
+    /// Called once after init by [`super::manager::LspClientManager`].
+    /// Subsequent calls are no-ops (the `OnceLock` ignores them).
+    pub fn set_snapshot(&self, writer: Arc<crate::state_snapshot::SnapshotWriter>) {
+        let _ = self.snapshot.set(writer);
+    }
+
+    /// Mirrors the lifecycle state to the DB and the `state.json` snapshot.
+    ///
+    /// The DB write (`language_servers`) uses the lossy `display_state`; the
+    /// snapshot carries the full [`ServerLifecycle`] variant. Both are no-ops
+    /// when their sink or the instance key is unavailable.
+    fn persist_state(&self, state: &ServerLifecycle) {
+        self.persist_state_db(state.display_state());
+        if let (Some(writer), Some(key)) = (self.snapshot.get(), self.key()) {
+            writer.update_state(&key, state);
+        }
+    }
+
     /// Persists the lifecycle state to the `language_servers` table via upsert.
     ///
     /// No-op if the DB connection or instance key is unavailable.
-    fn persist_state(&self, state: &str) {
+    fn persist_state_db(&self, state: &str) {
         let Some((conn, session_id)) = self.db.get() else {
             return;
         };
@@ -479,10 +507,22 @@ impl LspServer {
         }
     }
 
+    /// Mirrors progress state to the DB and the `state.json` snapshot.
+    ///
+    /// The DB write keeps title + percentage; the snapshot additionally
+    /// carries the current message. Both are no-ops when their sink or the
+    /// instance key is unavailable.
+    fn persist_progress(&self, title: Option<&str>, message: Option<&str>, pct: Option<u32>) {
+        self.persist_progress_db(title, pct);
+        if let (Some(writer), Some(key)) = (self.snapshot.get(), self.key()) {
+            writer.update_progress(&key, title, message, pct);
+        }
+    }
+
     /// Persists progress state to the `language_servers` table.
     ///
     /// No-op if the DB connection or instance key is unavailable.
-    fn persist_progress(&self, title: Option<&str>, pct: Option<u32>) {
+    fn persist_progress_db(&self, title: Option<&str>, pct: Option<u32>) {
         let Some((conn, session_id)) = self.db.get() else {
             return;
         };
@@ -510,10 +550,22 @@ impl LspServer {
         }
     }
 
+    /// Mirrors a server message to the DB and the `state.json` snapshot.
+    ///
+    /// `level` is the LSP `MessageType` mapped to a severity tag; the DB write
+    /// keeps only the text. Both are no-ops when their sink or the instance
+    /// key is unavailable.
+    fn persist_message(&self, level: &str, message: &str) {
+        self.persist_message_db(message);
+        if let (Some(writer), Some(key)) = (self.snapshot.get(), self.key()) {
+            writer.update_message(&key, level, message);
+        }
+    }
+
     /// Persists a server message to the `language_servers` table.
     ///
     /// No-op if the DB connection or instance key is unavailable.
-    fn persist_message(&self, message: &str) {
+    fn persist_message_db(&self, message: &str) {
         let Some((conn, session_id)) = self.db.get() else {
             return;
         };
@@ -714,12 +766,13 @@ impl LspServer {
                     debug!("Progress: {} {}%", p.title, p.percentage.unwrap_or(0));
                 }
 
-                // Persist progress to DB.
+                // Persist progress to DB + snapshot.
                 let primary = tracker.primary_progress();
                 let db_title = primary.map(|p| p.title.clone());
+                let db_message = primary.and_then(|p| p.message.clone());
                 let db_pct = primary.and_then(|p| p.percentage);
                 drop(tracker);
-                self.persist_progress(db_title.as_deref(), db_pct);
+                self.persist_progress(db_title.as_deref(), db_message.as_deref(), db_pct);
 
                 // Update lifecycle based on progress kind
                 let kind = params["value"]["kind"].as_str();
@@ -741,7 +794,7 @@ impl LspServer {
                         };
                         *lifecycle = new_state.clone();
                         drop(lifecycle);
-                        self.persist_state(new_state.display_state());
+                        self.persist_state(&new_state);
                         if first {
                             self.capability_notify.notify_waiters();
                         }
@@ -757,7 +810,7 @@ impl LspServer {
                         };
                         *lifecycle = new_state.clone();
                         drop(lifecycle);
-                        self.persist_state(new_state.display_state());
+                        self.persist_state(&new_state);
                     }
                     _ => {
                         drop(lifecycle);
@@ -770,7 +823,7 @@ impl LspServer {
             "window/logMessage" | "window/showMessage" => {
                 if let Some(message) = params.get("message").and_then(|m| m.as_str()) {
                     debug!("LSP server message: {}", message);
-                    self.persist_message(message);
+                    self.persist_message(message_type_str(params), message);
                 }
             }
             _ => {
@@ -946,6 +999,21 @@ impl LspServer {
                 debug!("server unregistered from workspace/didChangeConfiguration");
             }
         }
+    }
+}
+
+/// Maps an LSP `window/logMessage` / `window/showMessage` `type` field to a
+/// severity tag for the snapshot's `last_message`.
+///
+/// `MessageType`: 1 = Error, 2 = Warning, 3 = Info, 4 = Log, 5 = Debug.
+/// An absent or unrecognized type defaults to `"info"`.
+fn message_type_str(params: &Value) -> &'static str {
+    match params.get("type").and_then(Value::as_u64) {
+        Some(1) => "error",
+        Some(2) => "warning",
+        Some(4) => "log",
+        Some(5) => "debug",
+        _ => "info",
     }
 }
 

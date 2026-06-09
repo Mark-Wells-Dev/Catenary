@@ -107,6 +107,24 @@ fn emit_lsp_event(
     }
 }
 
+/// Whether an incoming notification should be omitted from the firehose.
+///
+/// `$/progress` `report` ticks are the chattiest LSP source; their live
+/// percentage lives in `state.json` (observability ticket 04) instead, so they
+/// are not appended to the JSONL/DB firehose. `begin`/`end` are kept for
+/// forensics, and every other notification emits normally. The notification is
+/// still dispatched to [`LspServer::on_notification`] regardless — only the
+/// firehose line is suppressed.
+fn suppresses_firehose(method: &str, value: &serde_json::Value) -> bool {
+    method == "$/progress"
+        && value
+            .get("params")
+            .and_then(|p| p.get("value"))
+            .and_then(|v| v.get("kind"))
+            .and_then(serde_json::Value::as_str)
+            == Some("report")
+}
+
 /// Extract the scope root path string from an `LspServer`.
 ///
 /// Returns `Some(path)` for `Scope::Root` instances, `None` otherwise.
@@ -801,16 +819,18 @@ impl Connection {
                                     }
                                     _ => format!("{server_name}: {method}"),
                                 };
-                                emit_lsp_event(
-                                    notif_level,
-                                    &server_name,
-                                    method,
-                                    None,
-                                    sr_ref,
-                                    source,
-                                    &value.to_string(),
-                                    &msg,
-                                );
+                                if !suppresses_firehose(method, &value) {
+                                    emit_lsp_event(
+                                        notif_level,
+                                        &server_name,
+                                        method,
+                                        None,
+                                        sr_ref,
+                                        source,
+                                        &value.to_string(),
+                                        &msg,
+                                    );
+                                }
                                 let params =
                                     value.get("params").unwrap_or(&serde_json::Value::Null);
                                 server.on_notification(method, params);
@@ -1022,6 +1042,34 @@ mod tests {
             "parent_id should be present"
         );
         assert_eq!(msgs[1].parent_id, None, "parent_id should be absent");
+    }
+
+    #[test]
+    fn suppresses_firehose_only_for_progress_report() {
+        use serde_json::json;
+
+        // $/progress report → suppressed (lives in state.json instead).
+        let report =
+            json!({"params": {"token": "t", "value": {"kind": "report", "percentage": 50}}});
+        assert!(suppresses_firehose("$/progress", &report));
+
+        // begin / end → kept for forensics.
+        let begin =
+            json!({"params": {"token": "t", "value": {"kind": "begin", "title": "Indexing"}}});
+        assert!(!suppresses_firehose("$/progress", &begin));
+        let end = json!({"params": {"token": "t", "value": {"kind": "end"}}});
+        assert!(!suppresses_firehose("$/progress", &end));
+
+        // Other notifications always emit, even with a report-shaped value.
+        let other = json!({"params": {"value": {"kind": "report"}}});
+        assert!(!suppresses_firehose(
+            "textDocument/publishDiagnostics",
+            &other
+        ));
+
+        // Malformed $/progress (no kind) is not suppressed.
+        let malformed = json!({"params": {"token": "t"}});
+        assert!(!suppresses_firehose("$/progress", &malformed));
     }
 
     #[test]
