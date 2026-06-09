@@ -313,6 +313,13 @@ pub struct Session {
     /// The session's most recent attributable action, surfaced on the snapshot
     /// session board. Set at edit / diagnostics / sed boundaries.
     last_action: std::sync::Mutex<Option<crate::state_snapshot::LastAction>>,
+    /// When the daemon last saw a hook dispatch from this session (ISO 8601),
+    /// surfaced on the snapshot session board. Bumped on **every**
+    /// `get_or_create_router` call — i.e. every non-catenary tool the
+    /// `PreToolUse` hook forwards (`Read`, `Edit`, `Bash`, …) — so it advances
+    /// far more often than `last_action`. It is the recency / liveness signal
+    /// the board has no death event for (ticket 05a).
+    last_seen: std::sync::Mutex<String>,
     /// `true` while a `catenary diagnostics` run is in flight for this session
     /// — drives the board's `diagnostics` status (the editing accumulator has
     /// already drained by the time the run starts).
@@ -455,6 +462,7 @@ impl Session {
             jsonl_sink: Some(jsonl_sink),
             snapshot,
             last_action: std::sync::Mutex::new(None),
+            last_seen: std::sync::Mutex::new(crate::state_snapshot::now_iso()),
             diagnostics_in_flight: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -539,6 +547,7 @@ impl Session {
             jsonl_sink: None,
             snapshot: primary.snapshot.clone(),
             last_action: std::sync::Mutex::new(None),
+            last_seen: std::sync::Mutex::new(crate::state_snapshot::now_iso()),
             diagnostics_in_flight: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -569,6 +578,35 @@ impl Session {
     #[must_use]
     pub fn last_action(&self) -> Option<crate::state_snapshot::LastAction> {
         self.last_action
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Bumps `last_seen` to now and marks the snapshot dirty.
+    ///
+    /// Called on **every** session-bound hook dispatch (the
+    /// `get_or_create_router` chokepoint), so it tracks recency — the only
+    /// uniform liveness signal a hook session has, since the hook side carries
+    /// no authoritative death event (ticket 05a). Distinct from
+    /// [`Self::set_last_action`], which moves only on edit / diagnostics / sed.
+    /// Like that method, the snapshot lock is taken only after the `last_seen`
+    /// guard is dropped, so it never inverts lock order against the flush path.
+    pub fn touch_last_seen(&self) {
+        {
+            let mut guard = self
+                .last_seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *guard = crate::state_snapshot::now_iso();
+        }
+        self.touch_snapshot();
+    }
+
+    /// Returns the session's most recent hook-dispatch time (ISO 8601).
+    #[must_use]
+    pub fn last_seen(&self) -> String {
+        self.last_seen
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()

@@ -197,7 +197,16 @@ pub struct LastAction {
 
 /// A connected session's board entry — the rich session board (ticket 05).
 ///
-/// Live-only: dead sessions vanish on the next overwrite (no `alive` field).
+/// The board lists the sessions currently in the daemon's registry. There is
+/// **no authoritative death signal** from the hook side: Antigravity sends no
+/// `session-end`, and Claude's fires on exit / `/clear` but a session can be
+/// resumed (which just re-creates the entry via `get_or_create_router`). So
+/// `session-end` removal is best-effort, not a tombstone, and no "live-only"
+/// guarantee is claimed. [`Self::last_seen`] is the liveness signal: a cold
+/// session's `last_seen` freezes while `daemon.generated_at` keeps advancing
+/// (driven by other sessions / server events), which is what a reaper
+/// (ticket 01) or the TUI (ticket 06) keys on to judge staleness.
+///
 /// No `pid`: hooks own session identity (ws23) and the hook payloads carry no
 /// agent pid; recovering one would mean correlating to the MCP connection,
 /// which the stateless model deliberately avoids.
@@ -209,6 +218,14 @@ pub struct SessionEntry {
     pub client: ClientInfo,
     /// When the session first connected (ISO 8601).
     pub started_at: String,
+    /// When the daemon last saw a hook dispatch from this session (ISO 8601).
+    ///
+    /// Bumped on **every** `get_or_create_router` call — i.e. every
+    /// non-catenary tool the `PreToolUse` hook forwards (`Read`, `Edit`,
+    /// `Bash`, …) — so it advances far more often than `last_action`, which
+    /// only moves on edit / diagnostics / sed. It is the recency / liveness
+    /// signal the board has no death event for (ticket 05a).
+    pub last_seen: String,
     /// The session's workspace roots, taken from its own hook payload
     /// (`cwd` / `workspacePaths`) — not correlated to MCP roots.
     pub roots: Vec<String>,
@@ -1133,6 +1150,7 @@ mod tests {
                 version: None,
             },
             started_at: "2026-06-08T13:10:00.000Z".to_string(),
+            last_seen: "2026-06-08T13:10:00.000Z".to_string(),
             roots: roots.into_iter().map(String::from).collect(),
             status,
             last_action: None,
@@ -1142,6 +1160,7 @@ mod tests {
     #[test]
     fn session_entry_serializes_status_lowercase_and_omits_unknowns() {
         let mut entry = session_entry("s1", SessionStatus::Editing, vec!["/p/Catenary"]);
+        entry.last_seen = "2026-06-08T13:12:00.000Z".to_string();
         entry.last_action = Some(LastAction {
             summary: "edited src/db.rs".to_string(),
             at: "2026-06-08T13:11:00.000Z".to_string(),
@@ -1150,6 +1169,10 @@ mod tests {
         assert_eq!(json["id"], "s1");
         assert_eq!(json["status"], "editing");
         assert_eq!(json["client"]["name"], "claude");
+        // `last_seen` (recency) serializes as an ISO string, distinct from
+        // `last_action.at` (last meaningful action) — ticket 05a.
+        assert_eq!(json["last_seen"], "2026-06-08T13:12:00.000Z");
+        assert!(json["last_seen"].is_string());
         // No pid field (hooks own identity; no MCP correlation). client.version
         // absent (not carried by the hook payload).
         assert!(json.get("pid").is_none(), "no pid field");

@@ -528,10 +528,10 @@ struct SessionEntry {
 /// Snapshot session-board metadata, captured from a session's own hook payload
 /// at creation time.
 ///
-/// `status` and `last_action` are *not* here — they are read live from the
-/// per-session [`Session`] at snapshot-build time (status derived from the
-/// editing accumulator, `last_action` stored on the session). Only the
-/// create-time identity that the payload carries lives here.
+/// `status`, `last_action`, and `last_seen` are *not* here — they are read live
+/// from the per-session [`Session`] at snapshot-build time (status derived from
+/// the editing accumulator; `last_action` and `last_seen` stored on the
+/// session). Only the create-time identity that the payload carries lives here.
 #[cfg(unix)]
 #[derive(Clone)]
 struct SessionMeta {
@@ -600,6 +600,7 @@ impl crate::state_snapshot::SessionBoard for SessionBoardImpl {
                     version: None,
                 },
                 started_at: entry.meta.started_at.clone(),
+                last_seen: entry.router.session.last_seen(),
                 roots: entry.meta.roots.clone(),
                 status: entry.router.session.status(),
                 last_action: entry.router.session.last_action(),
@@ -1631,7 +1632,8 @@ fn get_or_create_router(
     session_id: &str,
     raw: &serde_json::Value,
 ) -> Arc<HookRouter> {
-    ctx.sessions
+    let router = ctx
+        .sessions
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .entry(session_id.to_string())
@@ -1699,14 +1701,24 @@ fn get_or_create_router(
                 session_id.to_string(),
             ));
 
-            // A new live session changes the board — mark the snapshot dirty so
-            // the next flush serializes it.
-            ctx.primary.touch_snapshot();
-
             SessionEntry { router, meta }
         })
         .router
-        .clone()
+        .clone();
+
+    // Bump `last_seen` on EVERY dispatch, not only on create. Every agent tool
+    // call funnels through here — including the Bash hooks that wrap
+    // `catenary grep`/`glob`/`diagnostics`/`sed` (only those commands' own
+    // subprocess IPC bypasses the session) — so `last_seen` is the one uniform
+    // liveness signal a hook session has, far richer than `last_action`, which
+    // moves only on edit / diagnostics / sed. The bump takes the session's own
+    // lock and marks the snapshot dirty (coalesced, ticket 04's `$/progress`
+    // I/O model) — the registry guard above dropped at the end of its
+    // statement, so the heavily-shared registry lock is never held across it
+    // (ticket 05a).
+    router.session.touch_last_seen();
+
+    router
 }
 
 /// Appends the "outside tracked roots" advisory to a diagnostics `output`
@@ -1842,8 +1854,11 @@ async fn handle_hook_dispatch(
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&session_id);
 
-        // The session left the board — mark the snapshot dirty so the next
-        // flush drops it (live-only board, observability ticket 05).
+        // Best-effort removal from the board — mark the snapshot dirty so the
+        // next flush drops it. Not a tombstone: a Claude resume re-creates the
+        // entry via `get_or_create_router`, and Antigravity sends no
+        // `session-end` at all. `last_seen` is the authoritative liveness signal
+        // (ticket 05a).
         ctx.primary.touch_snapshot();
 
         // Mark session dead in DB so the TUI drops it from the sidebar.
@@ -3927,6 +3942,13 @@ mod tests {
         assert_eq!(e.roots, vec!["/p/A".to_string(), "/p/B".to_string()]);
         assert_eq!(e.status, SessionStatus::Idle);
         assert!(e.last_action.is_none());
+        // `last_seen` (recency) is read live off the session — initialized to a
+        // real ISO timestamp at construction, distinct from `last_action`
+        // (ticket 05a).
+        assert!(
+            !e.last_seen.is_empty(),
+            "last_seen is a non-empty ISO string"
+        );
 
         // An active editing accumulator → status `editing`.
         session
@@ -4024,6 +4046,109 @@ mod tests {
             manager.session_count(),
             2,
             "should have two independent sessions"
+        );
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_last_seen_advances_on_every_dispatch() {
+        use crate::state_snapshot::{SessionBoard, SessionStatus};
+
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let ipc_path = ipc_socket_in(dir.path());
+
+        let manager = Arc::new(bind_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        // A PreToolUse `Read` creates the session and stamps `last_seen`. A
+        // `Read` is a non-action: it leaves status idle and records no
+        // `last_action`.
+        let read_req = serde_json::json!({
+            "method": "pre-tool/editing-state",
+            "tool_name": "Read",
+            "agent_id": "",
+            "session_id": "live",
+        });
+        let _ = hook_roundtrip(&ipc_path, &read_req).await;
+
+        // A board over the live registry, plus the session handle, to read the
+        // rich entry and simulate an action boundary.
+        let (board, session) = {
+            let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
+            let session = ctx
+                .sessions
+                .lock()
+                .expect("lock")
+                .get("live")
+                .expect("session 'live' exists")
+                .router
+                .session
+                .clone();
+            (
+                SessionBoardImpl {
+                    sessions: ctx.sessions.clone(),
+                },
+                session,
+            )
+        };
+
+        let first = board.sessions();
+        assert_eq!(first.len(), 1);
+        let entry = &first[0];
+        assert_eq!(
+            entry.status,
+            SessionStatus::Idle,
+            "a Read leaves status idle"
+        );
+        assert!(entry.last_action.is_none(), "a Read records no last_action");
+        assert!(
+            !entry.last_seen.is_empty(),
+            "last_seen serialized as an ISO string"
+        );
+        let seen_after_first = entry.last_seen.clone();
+
+        // Simulate an earlier meaningful action (an edit): sets `last_action.at`.
+        session.set_last_action("edited src/db.rs");
+        let action_at = board.sessions()[0]
+            .last_action
+            .as_ref()
+            .expect("last_action set")
+            .at
+            .clone();
+
+        // Distinct millisecond so the next bump is observable (millis precision).
+        tokio::time::sleep(Duration::from_millis(2)).await;
+
+        // A later `Read` — status and last_action unchanged — still bumps
+        // `last_seen`.
+        let _ = hook_roundtrip(&ipc_path, &read_req).await;
+        let after = board.sessions();
+        let entry = &after[0];
+        assert!(
+            entry.last_seen > seen_after_first,
+            "last_seen advances on a later hook dispatch ({seen_after_first} -> {})",
+            entry.last_seen,
+        );
+        assert_eq!(
+            entry
+                .last_action
+                .as_ref()
+                .expect("last_action retained")
+                .summary,
+            "edited src/db.rs",
+            "a non-action Read does not change last_action",
+        );
+        // last_seen (latest Read) ≠ last_action.at (earlier edit): recency moved
+        // past the last meaningful action.
+        assert!(
+            entry.last_seen > action_at,
+            "last_seen ({}) should be later than last_action.at ({action_at})",
+            entry.last_seen,
         );
 
         shutdown.cancel();
