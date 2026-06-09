@@ -552,6 +552,32 @@ impl Session {
         lang.is_some_and(|id| self.client_manager.has_single_file_coverage(&id))
     }
 
+    /// Drops cached symbols and bumps the enrichment generation for files
+    /// written outside the diagnostics batch (currently `catenary sed
+    /// --in-place`).
+    ///
+    /// `SymbolIndex` re-populates only files with no rows
+    /// ([`SymbolIndex::needs_population`](crate::symbol_index::SymbolIndex::needs_population)),
+    /// so a write that leaves the rows in place makes `grep`/`glob` enrichment
+    /// serve pre-write enclosing-symbol labels and ranges until a later access
+    /// finds an empty table (bug #23). Deleting the rows forces a fresh
+    /// `documentSymbol` on the next access; bumping the per-root generation
+    /// invalidates the enrichment cache. Both are in-memory — no read-path cost.
+    pub fn invalidate_symbols(&self, files: &[PathBuf]) {
+        if files.is_empty() {
+            return;
+        }
+        if let Some(index) = &self.symbol_index {
+            let idx = index
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for file in files {
+                let _ = idx.invalidate(file);
+            }
+        }
+        self.fs_manager.bump_generations(files);
+    }
+
     /// Returns the shared `LspClientManager`.
     ///
     /// Used by the daemon's `SessionManager` to wire MCP lifecycle

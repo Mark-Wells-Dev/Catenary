@@ -213,6 +213,23 @@ impl DiagnosticsServer {
             self.client_manager.nudge_roots(&nudge_roots).await;
         }
 
+        // ── Phase 1c: drop stale symbol rows ──────────────────────
+        // Bug #23: retrieve_diagnostics only populates files with no rows
+        // (needs_population gate), and Phase 4's bump_generations clears the
+        // enrichment cache but not the symbols table. Without this, diagnostics'
+        // own enclosing-symbol labels — and any later grep/glob on edited files
+        // — keep pre-edit names and ranges. Invalidate here so retrieve
+        // re-populates fresh from documentSymbol (files are about to be opened
+        // and saved on the server, so it is a cheap request, off the read path).
+        if let Some(idx_arc) = &self.symbol_index {
+            let idx = idx_arc
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for path in &canonical_paths {
+                let _ = idx.invalidate(path);
+            }
+        }
+
         // ── Phase 2: per-server batch lifecycle ────────────────────
         // Collect per-file diagnostics across all servers.
         // Key: canonical path string → (display path, Vec<ServerDiagnostics>).

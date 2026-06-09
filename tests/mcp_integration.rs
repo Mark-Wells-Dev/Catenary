@@ -2444,6 +2444,54 @@ fn test_grep_enrichment_cache_hit() -> Result<()> {
     Ok(())
 }
 
+/// Bug #23 (end-to-end): after the enclosing symbol is renamed on disk and a
+/// `catenary diagnostics` batch covers the file, `grep` reports the *new*
+/// enclosing-symbol label. The batch invalidates the stale symbol rows
+/// (`process_files_batched` Phase 1c) so enrichment re-indexes from
+/// `documentSymbol` instead of serving the pre-edit name.
+#[test]
+fn test_grep_enclosing_label_refreshed_after_diagnostics() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().to_str().context("root path")?;
+
+    // `marker()` is a non-definition line enclosed by the function `outer_old`,
+    // so its grep hit is annotated with that function as the enclosing symbol.
+    let file = dir.path().join(format!("rename.{MOCK_LANG_A}"));
+    std::fs::write(&file, "fn outer_old {\nmarker()\n}\n")?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    // First grep populates the symbol index; the marker's enclosing label is
+    // the original function name.
+    let before = bridge.call_tool_text("grep", &json!({ "pattern": "marker" }))?;
+    assert!(
+        before.contains("outer_old"),
+        "enclosing label should be the original function, got:\n{before}"
+    );
+
+    // Rename the enclosing function on disk (as a host Edit/Write would), then
+    // run a diagnostics batch over the file.
+    std::fs::write(&file, "fn outer_new {\nmarker()\n}\n")?;
+    let _ = bridge.call_diagnostics(file.to_str().context("file path")?)?;
+
+    // The next grep must report the refreshed enclosing label. `outer_old` no
+    // longer exists anywhere on disk, so its presence would be pure cache
+    // staleness — the symptom of bug #23.
+    let after = bridge.call_tool_text("grep", &json!({ "pattern": "marker" }))?;
+    assert!(
+        after.contains("outer_new"),
+        "enclosing label should refresh to the renamed function, got:\n{after}"
+    );
+    assert!(
+        !after.contains("outer_old"),
+        "stale pre-rename enclosing label must not survive the diagnostics batch, got:\n{after}"
+    );
+
+    Ok(())
+}
+
 /// Type hierarchy: subtypes section present for interface pattern.
 #[test]
 fn test_grep_type_hierarchy() -> Result<()> {

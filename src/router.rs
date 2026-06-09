@@ -2263,6 +2263,14 @@ async fn handle_hook_dispatch(
             },
         };
 
+        // Bug #23: the daemon performed the write, so refresh the shared
+        // SymbolIndex (and enrichment cache) for the changed files — grep/glob
+        // enrichment would otherwise serve pre-rename enclosing-symbol labels
+        // and ranges until a later access finds an empty table. Unconditional
+        // (independent of the editing handoff identity); empty on preview, where
+        // it is a no-op.
+        ctx.primary.invalidate_symbols(&outcome.changed);
+
         // Identity-forward accumulation: route the LSP-covered changed files
         // into the editing set, exactly like an Edit/Write would.
         if let Some((sid, agent_id)) = identity
@@ -4219,6 +4227,90 @@ mod tests {
             vec![file],
             "the changed file is keyed under the staged identity",
         );
+
+        shutdown.cancel();
+    }
+
+    /// Bug #23: a `catenary sed --in-place` write invalidates the shared
+    /// `SymbolIndex` for the changed files, so `grep`/`glob` enrichment
+    /// re-indexes fresh instead of serving pre-rename enclosing-symbol labels.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sed_in_place_invalidates_symbol_index() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let ipc_path = ipc_socket_in(dir.path());
+
+        let manager = Arc::new(bind_with_session_roots(
+            dir.path(),
+            vec![dir.path().to_path_buf()],
+        ));
+        let shutdown = manager.shutdown_token();
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        let file = dir.path().join("rename_me.rs");
+        std::fs::write(&file, "let omni = 1;\n").expect("write file");
+
+        // Pre-seed the shared symbol index with (synthetic) pre-rename symbols,
+        // as an earlier grep/glob/diagnostics access would have.
+        let index = {
+            let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
+            Arc::clone(ctx.primary.symbol_index.as_ref().expect("symbol index"))
+        };
+        let symbols = serde_json::json!([{
+            "name": "omni",
+            "kind": 13,
+            "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 13 } },
+            "selectionRange": { "start": { "line": 0, "character": 4 }, "end": { "line": 0, "character": 8 } }
+        }]);
+        {
+            let idx = index.lock().expect("lock symbol index");
+            idx.populate_from_document_symbols(&file, &symbols)
+                .expect("populate");
+            assert!(
+                idx.has_symbols_for(&file),
+                "symbols are present before the sed write",
+            );
+        }
+
+        // Stage identity + run the in-place rename.
+        let stage = serde_json::json!({
+            "method": "pre-tool/sed",
+            "agent_id": "",
+            "session_id": "sess-1",
+        });
+        let line = hook_roundtrip(&ipc_path, &stage).await;
+        assert!(line.contains("ok"), "stage should succeed, got: {line}");
+
+        let run = serde_json::json!({
+            "method": "tool/sed",
+            "pattern": "omni",
+            "replacement": "lattice",
+            "paths": [file.to_string_lossy()],
+            "in_place": true,
+        });
+        let response = hook_roundtrip(&ipc_path, &run).await;
+        let parsed: SedResponse =
+            serde_json::from_str(response.trim()).expect("parse sed response");
+        assert!(
+            parsed.output.contains("replacements"),
+            "in-place run reports replacements, got: {}",
+            parsed.output
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file).expect("read"),
+            "let lattice = 1;\n",
+        );
+
+        // The stale rows were dropped — the next enrichment access re-indexes.
+        {
+            let idx = index.lock().expect("lock symbol index");
+            assert!(
+                idx.needs_population(&file),
+                "sed --in-place invalidated the stale symbol rows",
+            );
+        }
 
         shutdown.cancel();
     }
