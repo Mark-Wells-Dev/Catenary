@@ -23,6 +23,7 @@
 pub mod jsonl_sink;
 pub mod notification_queue;
 pub mod notification_router;
+pub mod reaper;
 
 use std::collections::VecDeque;
 use std::sync::Arc;

@@ -66,6 +66,7 @@ use uuid::Uuid;
 use super::LogEvent;
 use super::Severity;
 use super::Sink;
+use super::reaper::ReapPolicy;
 use crate::db::encode_cwd;
 
 /// Max number of open append file handles kept warm.
@@ -125,6 +126,22 @@ impl InstanceStream {
             Self::Trace => "trace.jsonl",
         }
     }
+}
+
+/// How the write path bounds the file a record lands in (ticket 01).
+///
+/// Each [`Scope`] maps to exactly one of these, so the writer applies the right
+/// on-write reaper after appending: streams roll into bounded segments, tool
+/// dirs evict oldest call files under a byte budget, and session files are left
+/// unbounded (append is O(1); the periodic staleness sweep is their only reaper).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReapClass {
+    /// A never-idle stream (`mcp`/`trace`/`servers`): segment rotation.
+    Stream,
+    /// A per-tool dir (`grep`/`glob`): byte-budget eviction of oldest call files.
+    ToolDir,
+    /// No size bound (session files).
+    Unbounded,
 }
 
 /// The top-level scope a record belongs to.
@@ -192,6 +209,15 @@ impl Scope {
                 )
             }
             Self::Instance { id, stream } => (root.join(stream.file_name()), id.clone()),
+        }
+    }
+
+    /// Which on-write reaper bounds this scope's file (ticket 01).
+    const fn reap_class(&self) -> ReapClass {
+        match self {
+            Self::Session { .. } => ReapClass::Unbounded,
+            Self::Search { .. } => ReapClass::ToolDir,
+            Self::Server { .. } | Self::Instance { .. } => ReapClass::Stream,
         }
     }
 }
@@ -414,26 +440,53 @@ fn parse_payload(raw: &str) -> Value {
     serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
 }
 
-/// A tiny bounded LRU over open append [`File`] handles.
+/// One open append handle plus a running byte counter for rotation.
+///
+/// `bytes` is seeded from the file's on-disk length when (re)opened — so a
+/// handle evicted from the LRU and reopened mid-life resumes the correct count —
+/// and incremented per append. No `stat` per line.
+struct FileSlot {
+    file: File,
+    bytes: u64,
+}
+
+/// A tiny bounded LRU over open append [`File`] handles, plus the on-write
+/// reapers (rotation + per-tool byte budget, ticket 01).
 ///
 /// Owned exclusively by the single writer thread, so it needs no
 /// synchronization. Appends are torn-write-safe because each line is written in
 /// one `write_all` to an `O_APPEND` handle (readers skip an unterminated tail).
 #[derive(Default)]
 struct HandleCache {
-    files: HashMap<PathBuf, File>,
+    files: HashMap<PathBuf, FileSlot>,
     /// Recency order; front = least recently used.
     order: VecDeque<PathBuf>,
+    /// Running byte total per tool dir (`grep`/`glob`), for budget eviction.
+    /// Seeded lazily and reset to the authoritative scan total after each evict.
+    tool_dir_bytes: HashMap<PathBuf, u64>,
 }
 
 impl HandleCache {
     /// Append `bytes` to the file at `path`, opening (and creating parent dirs
-    /// for) it on first use. On any IO error the (possibly stale) handle is
-    /// dropped so the next append reopens.
-    fn append(&mut self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    /// for) it on first use, then apply `class`'s on-write reaper. On any IO
+    /// error the (possibly stale) handle is dropped so the next append reopens.
+    fn append(
+        &mut self,
+        path: &Path,
+        class: ReapClass,
+        bytes: &[u8],
+        policy: &ReapPolicy,
+    ) -> std::io::Result<()> {
         let res = self.append_inner(path, bytes);
         if res.is_err() {
             self.files.remove(path);
+            return res;
+        }
+        // Post-write reaping on the just-written file's class.
+        match class {
+            ReapClass::Stream => self.rotate_if_needed(path, policy),
+            ReapClass::ToolDir => self.enforce_tool_budget(path, bytes.len() as u64, policy),
+            ReapClass::Unbounded => {}
         }
         res
     }
@@ -444,15 +497,25 @@ impl HandleCache {
                 std::fs::create_dir_all(parent)?;
             }
             let file = OpenOptions::new().create(true).append(true).open(path)?;
-            self.files.insert(path.to_path_buf(), file);
+            let existing = file.metadata().map_or(0, |m| m.len());
+            self.files.insert(
+                path.to_path_buf(),
+                FileSlot {
+                    file,
+                    bytes: existing,
+                },
+            );
         }
         self.touch(path);
         self.evict_if_needed();
         // Present by construction (just inserted or already there). Degrade to a
         // no-op rather than panic in the unreachable miss.
-        self.files
-            .get_mut(path)
-            .map_or(Ok(()), |file| file.write_all(bytes))
+        let Some(slot) = self.files.get_mut(path) else {
+            return Ok(());
+        };
+        slot.file.write_all(bytes)?;
+        slot.bytes += bytes.len() as u64;
+        Ok(())
     }
 
     /// Move `path` to the most-recently-used end of the recency order.
@@ -475,6 +538,111 @@ impl HandleCache {
             }
         }
     }
+
+    /// Drop a cached handle and its recency slot (the file was rolled or evicted
+    /// from disk).
+    fn forget(&mut self, path: &Path) {
+        self.files.remove(path);
+        if let Some(pos) = self.order.iter().position(|p| p == path) {
+            self.order.remove(pos);
+        }
+    }
+
+    /// Roll a stream's live segment once it reaches `segment_bytes`: close the
+    /// handle and shift `name.jsonl → name.1.jsonl → … → name.{K-1}.jsonl`,
+    /// dropping the oldest. The next append reopens a fresh live file.
+    fn rotate_if_needed(&mut self, path: &Path, policy: &ReapPolicy) {
+        let over = self
+            .files
+            .get(path)
+            .is_some_and(|s| s.bytes >= policy.segment_bytes);
+        if !over {
+            return;
+        }
+        self.forget(path);
+        roll_segments(path, policy.segments_kept);
+    }
+
+    /// Keep a tool dir (`grep`/`glob`) under its byte budget by evicting the
+    /// oldest call files (lexical ts-prefix order). The incremental counter
+    /// decides *when* to scan; eviction itself is authoritative (a real
+    /// `readdir`), and resets the counter to the post-evict total.
+    fn enforce_tool_budget(&mut self, path: &Path, added: u64, policy: &ReapPolicy) {
+        let Some(dir) = path.parent() else {
+            return;
+        };
+        let total = self.tool_dir_bytes.entry(dir.to_path_buf()).or_insert(0);
+        *total += added;
+        if *total <= policy.tool_dir_budget {
+            return;
+        }
+        let remaining = self.evict_tool_dir(dir, path, policy.tool_dir_budget);
+        self.tool_dir_bytes.insert(dir.to_path_buf(), remaining);
+    }
+
+    /// Delete oldest-by-name files in `dir` until its total is under `budget`,
+    /// never evicting `active` (the file just written). Returns the post-evict
+    /// total. Drops cached handles for removed files.
+    fn evict_tool_dir(&mut self, dir: &Path, active: &Path, budget: u64) -> u64 {
+        let Ok(read) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+        let mut files: Vec<(PathBuf, u64)> = read
+            .flatten()
+            .filter_map(|e| {
+                let p = e.path();
+                let len = e.metadata().ok().filter(std::fs::Metadata::is_file)?.len();
+                Some((p, len))
+            })
+            .collect();
+        // Filenames are ts-prefixed, so lexical order is chronological.
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut total: u64 = files.iter().map(|(_, len)| *len).sum();
+        for (p, len) in files {
+            if total <= budget {
+                break;
+            }
+            if p == active {
+                continue; // never evict the file we just wrote
+            }
+            if std::fs::remove_file(&p).is_ok() {
+                total = total.saturating_sub(len);
+                self.forget(&p);
+            }
+        }
+        total
+    }
+}
+
+/// Roll a stream's segments: `name.{K-1}.jsonl` is dropped, each `name.{i}.jsonl`
+/// shifts to `name.{i+1}.jsonl`, and the live `name.jsonl` becomes `name.1.jsonl`.
+///
+/// `keep` (`K`) is the total segments retained **including the live file**, so
+/// rotated segments number `K-1`. `K ≤ 1` keeps no history — the live file is
+/// simply truncated (removed) on roll. Missing intermediate segments are
+/// tolerated (early rolls). Best-effort: rename/remove errors are ignored.
+fn roll_segments(path: &Path, keep: usize) {
+    let rotated = keep.saturating_sub(1);
+    if rotated == 0 {
+        let _ = std::fs::remove_file(path);
+        return;
+    }
+    // Drop the oldest rotated segment, then shift the rest down by one.
+    let _ = std::fs::remove_file(segment_path(path, rotated));
+    for i in (1..rotated).rev() {
+        let from = segment_path(path, i);
+        if from.exists() {
+            let _ = std::fs::rename(&from, segment_path(path, i + 1));
+        }
+    }
+    let _ = std::fs::rename(path, segment_path(path, 1));
+}
+
+/// The rotated-segment path for index `n`: `…/name.jsonl` → `…/name.{n}.jsonl`.
+fn segment_path(path: &Path, n: usize) -> PathBuf {
+    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    let base = name.strip_suffix(".jsonl").unwrap_or(name);
+    path.with_file_name(format!("{base}.{n}.jsonl"))
 }
 
 /// Append-only JSONL firehose sink. Writes one record per line to the file
@@ -507,27 +675,39 @@ pub struct JsonlSink {
 
 /// A unit of work for the writer thread.
 enum Job {
-    /// Append `line` to the file at `path`.
-    Write { path: PathBuf, line: Vec<u8> },
+    /// Append `line` to the file at `path`, then apply `class`'s on-write reaper.
+    Write {
+        path: PathBuf,
+        class: ReapClass,
+        line: Vec<u8>,
+    },
     /// Drain everything queued, then exit (clean-shutdown sentinel).
     Shutdown,
 }
 
 impl JsonlSink {
-    /// Create a sink rooted at `<cache_dir>/catenary/<instance_id>` and spawn
-    /// its writer thread.
+    /// Create a sink rooted at `<cache_dir>/catenary/<instance_id>` with the
+    /// default [`ReapPolicy`], and spawn its writer thread.
     ///
     /// `cache_dir` is the resolved cache base (production: [`crate::db::cache_dir`]);
     /// tests inject a tempdir so the firehose never escapes into `~/.cache`.
     #[must_use]
     pub fn new(cache_dir: &Path, instance_id: Arc<str>) -> Arc<Self> {
+        Self::with_policy(cache_dir, instance_id, ReapPolicy::default())
+    }
+
+    /// Like [`Self::new`] with an explicit [`ReapPolicy`] for the on-write
+    /// reapers (rotation + per-tool byte budget, ticket 01). The daemon passes
+    /// the config-resolved policy; tests inject small knobs to exercise reaping.
+    #[must_use]
+    pub fn with_policy(cache_dir: &Path, instance_id: Arc<str>, policy: ReapPolicy) -> Arc<Self> {
         let root = cache_dir.join("catenary").join(instance_id.as_ref());
         let (tx, rx) = std::sync::mpsc::sync_channel::<Job>(CHANNEL_CAP);
         let dropped = Arc::new(AtomicU64::new(0));
         let writer_dropped = Arc::clone(&dropped);
         let writer = std::thread::Builder::new()
             .name("catenary-jsonl".to_string())
-            .spawn(move || writer_loop(&rx, &writer_dropped))
+            .spawn(move || writer_loop(&rx, &writer_dropped, policy))
             .ok();
         Arc::new(Self {
             root,
@@ -567,6 +747,7 @@ impl JsonlSink {
 impl Sink for JsonlSink {
     fn handle(&self, event: &LogEvent<'_>) {
         let scope = resolve_scope(event, &self.instance_id);
+        let class = scope.reap_class();
         let (path, scope_id) = scope.target(&self.root);
         let record = build_record(event, &scope_id);
 
@@ -586,6 +767,7 @@ impl Sink for JsonlSink {
             .tx
             .try_send(Job::Write {
                 path,
+                class,
                 line: line.into_bytes(),
             })
             .is_err()
@@ -596,8 +778,9 @@ impl Sink for JsonlSink {
 }
 
 /// The writer thread: drain [`Job`]s, batching one `write_all` per file per
-/// wakeup, until the [`Job::Shutdown`] sentinel (or all senders drop).
-fn writer_loop(rx: &Receiver<Job>, dropped: &AtomicU64) {
+/// wakeup, until the [`Job::Shutdown`] sentinel (or all senders drop). Owns the
+/// [`HandleCache`] and applies the on-write reapers per file via `policy`.
+fn writer_loop(rx: &Receiver<Job>, dropped: &AtomicU64, policy: ReapPolicy) {
     let mut cache = HandleCache::default();
     let mut last_reported = 0u64;
     let mut stop = false;
@@ -605,13 +788,13 @@ fn writer_loop(rx: &Receiver<Job>, dropped: &AtomicU64) {
         // Block for at least one job, then absorb everything currently queued
         // into a per-file batch so each file takes a single `write_all`.
         let Ok(first) = rx.recv() else { break };
-        let mut batch: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+        let mut batch: HashMap<PathBuf, (ReapClass, Vec<u8>)> = HashMap::new();
         merge_job(&mut batch, first, &mut stop);
         while let Ok(job) = rx.try_recv() {
             merge_job(&mut batch, job, &mut stop);
         }
-        for (path, bytes) in &batch {
-            if let Err(e) = cache.append(path, bytes) {
+        for (path, (class, bytes)) in &batch {
+            if let Err(e) = cache.append(path, *class, bytes, &policy) {
                 tracing::trace!(error = %e, path = %path.display(), "jsonl_sink: append failed");
             }
         }
@@ -620,9 +803,14 @@ fn writer_loop(rx: &Receiver<Job>, dropped: &AtomicU64) {
 }
 
 /// Fold one [`Job`] into the current drain batch. [`Job::Shutdown`] sets `stop`.
-fn merge_job(batch: &mut HashMap<PathBuf, Vec<u8>>, job: Job, stop: &mut bool) {
+/// A path's [`ReapClass`] is invariant, so the first write fixes it.
+fn merge_job(batch: &mut HashMap<PathBuf, (ReapClass, Vec<u8>)>, job: Job, stop: &mut bool) {
     match job {
-        Job::Write { path, line } => batch.entry(path).or_default().extend_from_slice(&line),
+        Job::Write { path, class, line } => batch
+            .entry(path)
+            .or_insert_with(|| (class, Vec::new()))
+            .1
+            .extend_from_slice(&line),
         Job::Shutdown => *stop = true,
     }
 }
@@ -660,15 +848,19 @@ mod tests {
     use serde_json::Value;
     use uuid::Uuid;
 
+    use super::HandleCache;
     use super::InstanceStream;
     use super::JsonlSink;
+    use super::ReapClass;
     use super::Scope;
     use super::SearchTool;
     use super::build_record;
     use super::resolve_scope;
+    use super::segment_path;
     use crate::logging::LogEvent;
     use crate::logging::Severity;
     use crate::logging::Sink;
+    use crate::logging::reaper::ReapPolicy;
 
     const INSTANCE: &str = "inst-abc";
 
@@ -1066,5 +1258,146 @@ mod tests {
         let rec = build_record(&e, "sid");
         let v = serde_json::to_value(&rec).expect("serialize");
         assert_eq!(v["payload"], "not json");
+    }
+
+    // ── On-write reaping: rotation + per-tool budget (ticket 01) ──────
+
+    /// Count files in `dir` whose name starts with `prefix`.
+    fn count_prefixed(dir: &Path, prefix: &str) -> usize {
+        fs::read_dir(dir)
+            .expect("read_dir")
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with(prefix))
+            })
+            .count()
+    }
+
+    #[test]
+    fn stream_rotation_keeps_k_segments_and_drops_oldest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("trace.jsonl");
+        // ~10 bytes/line, 50-byte segments → ~5 lines/segment; K = 3 total.
+        let policy = ReapPolicy {
+            segment_bytes: 50,
+            segments_kept: 3,
+            ..ReapPolicy::default()
+        };
+        // 38 lines at 10 bytes each → rolls every 5; ends mid-segment (lines
+        // 36–38 in the live file), so the ceiling is exactly populated rather
+        // than caught transiently empty just after a roll.
+        let mut cache = HandleCache::default();
+        for i in 0..38 {
+            let line = format!("line-{i:04}\n");
+            cache
+                .append(&path, ReapClass::Stream, line.as_bytes(), &policy)
+                .expect("append");
+        }
+
+        // Exactly K segments survive (live + 2 rotated); the rest rolled off.
+        assert_eq!(
+            count_prefixed(dir.path(), "trace"),
+            3,
+            "K=3 total segments retained"
+        );
+        // The live file holds the most recent lines.
+        let live = fs::read_to_string(&path).expect("read live");
+        assert!(
+            live.contains("line-0037"),
+            "newest line in the live segment: {live:?}"
+        );
+        // Oldest content is gone (line 0 cannot be in any of the 3 kept segments).
+        let all: String = ["trace.jsonl", "trace.1.jsonl", "trace.2.jsonl"]
+            .iter()
+            .filter_map(|n| fs::read_to_string(dir.path().join(n)).ok())
+            .collect();
+        assert!(!all.contains("line-0000"), "oldest line rolled off");
+    }
+
+    #[test]
+    fn unbounded_class_never_rotates() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("sessions").join("s1.jsonl");
+        let policy = ReapPolicy {
+            segment_bytes: 20,
+            segments_kept: 3,
+            ..ReapPolicy::default()
+        };
+        let mut cache = HandleCache::default();
+        for i in 0..50 {
+            let line = format!("line-{i:04}\n");
+            cache
+                .append(&path, ReapClass::Unbounded, line.as_bytes(), &policy)
+                .expect("append");
+        }
+        // No segment files; session files are append-only and unbounded.
+        assert_eq!(count_prefixed(&dir.path().join("sessions"), "s1"), 1);
+        let body = fs::read_to_string(&path).expect("read");
+        assert_eq!(body.lines().count(), 50, "every line retained");
+    }
+
+    #[test]
+    fn tool_dir_budget_evicts_oldest_by_ts_prefix() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let grep = dir.path().join("grep");
+        let policy = ReapPolicy {
+            tool_dir_budget: 100,
+            ..ReapPolicy::default()
+        };
+        let mut cache = HandleCache::default();
+        // Ten ts-prefixed call files, 30 bytes each → only the newest few fit.
+        let blob = vec![b'x'; 30];
+        for i in 0..10 {
+            let p = grep.join(format!("2026060812000{i}_abc.jsonl"));
+            cache
+                .append(&p, ReapClass::ToolDir, &blob, &policy)
+                .expect("append");
+        }
+
+        // Dir stays under budget (modulo the never-evicted active file).
+        let total: u64 = fs::read_dir(&grep)
+            .expect("read_dir")
+            .flatten()
+            .filter_map(|e| e.metadata().ok().map(|m| m.len()))
+            .sum();
+        assert!(total <= 100, "dir kept under budget: {total}");
+        // Oldest evicted, newest kept (eviction is lexical = chronological).
+        assert!(
+            !grep.join("20260608120000_abc.jsonl").exists(),
+            "oldest call file evicted"
+        );
+        assert!(
+            grep.join("20260608120009_abc.jsonl").exists(),
+            "newest call file kept"
+        );
+    }
+
+    #[test]
+    fn tool_dir_keeps_single_oversized_active_file() {
+        // A single invocation file larger than the budget is tolerated — the
+        // active file is never the eviction victim.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let grep = dir.path().join("grep");
+        let policy = ReapPolicy {
+            tool_dir_budget: 100,
+            ..ReapPolicy::default()
+        };
+        let mut cache = HandleCache::default();
+        let p = grep.join("20260608120000_big.jsonl");
+        cache
+            .append(&p, ReapClass::ToolDir, &vec![b'x'; 250], &policy)
+            .expect("append");
+        assert!(p.exists(), "oversized active file is not self-evicted");
+    }
+
+    #[test]
+    fn segment_path_inserts_index_before_jsonl() {
+        let p = Path::new("/c/servers/rust-analyzer@-p-Catenary.jsonl");
+        assert_eq!(
+            segment_path(p, 2),
+            Path::new("/c/servers/rust-analyzer@-p-Catenary.2.jsonl")
+        );
     }
 }

@@ -11,6 +11,8 @@ use serde::Deserialize;
 
 use crate::source::Source;
 
+use crate::logging::reaper::ReapPolicy;
+
 use super::commands::{self, CommandsConfig};
 use super::{
     Config, IconConfig, LanguageConfig, NotificationConfig, ServerBinding, ServerDef, ToolsConfig,
@@ -56,6 +58,9 @@ struct RawConfig {
 
     #[serde(default)]
     tools: Option<ToolsConfig>,
+
+    #[serde(default)]
+    observability: Option<ReapPolicy>,
 
     #[serde(default)]
     commands: Option<CommandsConfig>,
@@ -388,6 +393,9 @@ fn merge(config: &mut Config, other: RawConfig) {
     }
     if other.tools.is_some() {
         config.tools = other.tools;
+    }
+    if other.observability.is_some() {
+        config.observability = other.observability;
     }
     if let Some(ref cmds) = other.commands {
         config

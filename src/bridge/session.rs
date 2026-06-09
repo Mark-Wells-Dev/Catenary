@@ -355,7 +355,13 @@ impl Session {
         let config = Arc::new(config);
 
         // JSONL firehose sink (replaces MessageDbSink); owned for flush-on-shutdown.
-        let jsonl_sink = JsonlSink::new(&crate::db::cache_dir(), instance_id.clone());
+        // The reap policy bounds on-write growth (rotation + per-tool budget,
+        // ticket 01).
+        let jsonl_sink = JsonlSink::with_policy(
+            &crate::db::cache_dir(),
+            instance_id.clone(),
+            config.reap_policy(),
+        );
         let desktop_enabled = config
             .notifications
             .as_ref()

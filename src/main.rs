@@ -1096,6 +1096,11 @@ fn run_daemon_main() -> Result<()> {
         let conn = catenary_mcp::db::open_and_migrate()?;
         let instance_id: Arc<str> = format!("daemon:{}", uuid::Uuid::new_v4()).into();
 
+        // Firehose reaping knobs, captured before `config` moves into the
+        // session (ticket 01).
+        let reap_policy = config.reap_policy();
+        let retention_days = config.log_retention_days;
+
         // Prune sessions from previous daemon runs whose process is
         // gone. CASCADE deletes their language_servers rows so stale
         // workspace roots don't accumulate in the TUI.
@@ -1171,6 +1176,49 @@ fn run_daemon_main() -> Result<()> {
         // Spawn LSP servers in the background.
         let session_for_spawn = session.clone();
         rt.spawn(async move { session_for_spawn.spawn_all().await });
+
+        // Firehose reaping (ticket 01). Run the startup instance cap once —
+        // every non-self instance dir belongs to a dead daemon (one daemon per
+        // host) — then schedule the periodic staleness sweep. On-write reaping
+        // (rotation + per-tool byte budget) rides the JSONL sink itself.
+        {
+            let cache_root = catenary_mcp::db::cache_dir().join("catenary");
+            let self_inst = instance_id.to_string();
+            rt.spawn_blocking(move || {
+                catenary_mcp::logging::reaper::reap_instances(
+                    &cache_root,
+                    &self_inst,
+                    reap_policy,
+                    std::time::SystemTime::now(),
+                );
+            });
+
+            let firehose_root = catenary_mcp::db::cache_dir()
+                .join("catenary")
+                .join(instance_id.as_ref());
+            let state_json = catenary_mcp::db::runtime_dir()
+                .join("catenary")
+                .join("state.json");
+            rt.spawn(async move {
+                let mut ticker =
+                    tokio::time::interval(catenary_mcp::logging::reaper::STALENESS_SWEEP_INTERVAL);
+                ticker.tick().await; // consume the immediate first tick
+                loop {
+                    ticker.tick().await;
+                    let root = firehose_root.clone();
+                    let state = state_json.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        catenary_mcp::logging::reaper::sweep_stale(
+                            &root,
+                            &state,
+                            retention_days,
+                            std::time::SystemTime::now(),
+                        );
+                    })
+                    .await;
+                }
+            });
+        }
 
         (Some(session), Some(conn), Some(instance_id))
     };

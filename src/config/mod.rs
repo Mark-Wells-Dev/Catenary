@@ -16,6 +16,8 @@ use std::collections::HashMap;
 use anyhow::Result;
 use serde::Deserialize;
 
+use crate::logging::reaper::ReapPolicy;
+
 pub use commands::{BuildContext, BuildGuidance, CommandsConfig, GuidanceEntry, ResolvedCommands};
 pub use language::{DispatchMethod, LanguageConfig, ServerBinding};
 pub use parse::{
@@ -128,6 +130,13 @@ pub struct Config {
     /// specified `[commands]`. Each layer's fields overwrite when present;
     /// `allow` and `pipeline` are replaced, `deny` entries merge per-command.
     pub resolved_commands: Option<ResolvedCommands>,
+
+    /// Firehose reaping knobs (`[observability]`).
+    ///
+    /// `None` when no source specified `[observability]`. Bounds JSONL firehose
+    /// growth at every level (ticket 01); the defaults require no user action.
+    /// Resolve to concrete values via [`Config::reap_policy`].
+    pub observability: Option<ReapPolicy>,
 }
 
 /// Icon preset selecting a base set of icons.
@@ -465,6 +474,13 @@ impl Config {
     pub fn resolve_language(&self, key: &str) -> Option<&LanguageConfig> {
         self.language.get(key)
     }
+
+    /// Resolve the firehose reaping policy, falling back to defaults when no
+    /// `[observability]` section was configured (ticket 01).
+    #[must_use]
+    pub fn reap_policy(&self) -> ReapPolicy {
+        self.observability.unwrap_or_default()
+    }
 }
 
 impl Default for Config {
@@ -478,6 +494,7 @@ impl Default for Config {
             tui: None,
             tools: None,
             resolved_commands: None,
+            observability: None,
         }
     }
 }

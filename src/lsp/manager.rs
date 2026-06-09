@@ -1889,6 +1889,7 @@ mod tests {
             tui: None,
             tools: None,
             resolved_commands: None,
+            observability: None,
         }
     }
 
@@ -1962,6 +1963,7 @@ mod tests {
             tui: None,
             tools: None,
             resolved_commands: None,
+            observability: None,
         })
     }
 
@@ -1994,6 +1996,7 @@ mod tests {
             tui: None,
             tools: None,
             resolved_commands: None,
+            observability: None,
         })
     }
 
@@ -2036,6 +2039,7 @@ mod tests {
             tui: None,
             tools: None,
             resolved_commands: None,
+            observability: None,
         })
     }
 
@@ -2078,6 +2082,7 @@ mod tests {
             tui: None,
             tools: None,
             resolved_commands: None,
+            observability: None,
         })
     }
 
@@ -2123,6 +2128,7 @@ mod tests {
             tui: None,
             tools: None,
             resolved_commands: None,
+            observability: None,
         })
     }
 
@@ -2306,6 +2312,7 @@ mod tests {
             tui: None,
             tools: None,
             resolved_commands: None,
+            observability: None,
         });
 
         let manager = LspClientManager::new(config, test_logging(), test_fs_with_roots(&["/tmp"]));
@@ -2760,6 +2767,7 @@ mod tests {
             tui: None,
             tools: None,
             resolved_commands: None,
+            observability: None,
         });
 
         let fs = test_fs_with_roots(&[
@@ -3213,6 +3221,7 @@ mod tests {
             tui: None,
             tools: None,
             resolved_commands: None,
+            observability: None,
         });
 
         let manager = LspClientManager::new(config, test_logging(), test_fs_with_roots(&["/tmp"]));
@@ -3269,6 +3278,7 @@ mod tests {
             tui: None,
             tools: None,
             resolved_commands: None,
+            observability: None,
         });
 
         let manager = LspClientManager::new(config, test_logging(), test_fs_with_roots(&["/tmp"]));
@@ -3324,6 +3334,7 @@ mod tests {
             tui: None,
             tools: None,
             resolved_commands: None,
+            observability: None,
         });
 
         let manager = LspClientManager::new(config, test_logging(), test_fs_with_roots(&["/tmp"]));
@@ -3415,6 +3426,7 @@ mod tests {
             tui: None,
             tools: None,
             resolved_commands: None,
+            observability: None,
         });
 
         let manager = LspClientManager::new(config, test_logging(), test_fs_with_roots(&["/tmp"]));
@@ -4695,6 +4707,7 @@ mod tests {
             tui: None,
             tools: None,
             resolved_commands: None,
+            observability: None,
         })
     }
 
@@ -4732,6 +4745,7 @@ mod tests {
             tui: None,
             tools: None,
             resolved_commands: None,
+            observability: None,
         })
     }
 
@@ -5782,6 +5796,7 @@ mod tests {
             tui: None,
             tools: None,
             resolved_commands: None,
+            observability: None,
         })
     }
 
@@ -5816,6 +5831,7 @@ mod tests {
             tui: None,
             tools: None,
             resolved_commands: None,
+            observability: None,
         })
     }
 
