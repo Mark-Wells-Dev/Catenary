@@ -1,145 +1,159 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
-//! Interactive TUI for monitoring sessions and tailing events.
+//! Interactive `state.json` dashboard.
 //!
-//! Renders a quadrant layout: Workspaces (upper-left), a collapsible
-//! Keybinds panel (lower-left), and a full-height message stream (right).
+//! The TUI renders three boards from the daemon-owned snapshot — server health
+//! (upper-left), sessions (lower-left), and the alerts ring (right) — with a
+//! collapsible keybinds panel. It is a **pure file reader**: it file-watches the
+//! snapshot and re-loads on change. It never opens the firehose (JSONL) or a
+//! database, which makes it structurally unwedgeable (observability ticket 06).
+//! The bridge to `catenary query` is a yankable scope id (OSC 52).
 
 pub mod app;
 pub mod data;
 pub mod format;
 pub mod hints;
 pub mod icons;
-pub mod popup;
-pub mod scope;
 pub mod scrollbar;
-pub mod sidebar;
-pub mod stream;
 pub mod theme;
 
 pub use app::App;
 pub use data::DataSource;
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseButton,
-    MouseEventKind,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, MouseButton, MouseEventKind,
 };
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use notify::Watcher;
+use ratatui::Frame;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Tabs, Widget};
+use ratatui::widgets::{Block, Borders, Widget};
 use tracing::info;
+use unicode_width::UnicodeWidthStr;
 
 use crate::config::IconConfig;
 
-use self::app::{EffectiveLayout, FocusRegion};
-use self::data::SqliteDataSource;
+use self::app::{Board, Focus};
+use self::data::StateJsonDataSource;
 use self::hints::{KEYBINDS_EXPANDED_HEIGHT, render_keybinds_content};
 use self::icons::IconSet;
-use self::popup::render_server_detail;
-use self::sidebar::render_workspaces;
-use self::stream::render_stream;
+use self::scrollbar::{OverflowCounts, render_overflow_counts};
 use self::theme::Theme;
 
-/// Tick interval for the event loop.
+/// Tick interval for the event loop. The snapshot is re-loaded each tick (a
+/// small file read), so changes surface within this bound even without the
+/// watcher.
 const TICK_INTERVAL: Duration = Duration::from_millis(200);
 
-/// Minimum sidebar width percentage.
+/// Minimum left-column width percentage.
 const MIN_SIDEBAR_PCT: u16 = 10;
-
-/// Maximum sidebar width percentage.
+/// Maximum left-column width percentage.
 const MAX_SIDEBAR_PCT: u16 = 90;
+/// Terminal width below which the layout degrades to three stacked full-width
+/// boards (the right alerts pane folds under the left column).
+const NARROW_THRESHOLD: u16 = 60;
 
-/// Start a file watcher on the WAL file's parent directory.
+/// Rendered lines per server board entry.
+const SERVER_LPE: usize = format::SERVER_ENTRY_LINES;
+/// Rendered lines per session board entry.
+const SESSION_LPE: usize = format::SESSION_ENTRY_LINES;
+/// Rendered lines per alert entry.
+const ALERT_LPE: usize = 1;
+
+/// Start a file watcher on the snapshot's parent directory.
 ///
-/// Watches the parent directory (non-recursive) because the WAL file may not
-/// exist yet (`SQLite` creates it on first write). Events are filtered to the
-/// WAL filename and coalesced into a single `()` signal.
-fn start_wal_watcher(db_path: &Path) -> Result<(notify::RecommendedWatcher, mpsc::Receiver<()>)> {
-    let wal_name = {
-        let mut name = db_path.file_name().unwrap_or_default().to_os_string();
-        name.push("-wal");
-        name
-    };
-
+/// Watches the parent (non-recursive) because `state.json` is replaced by an
+/// atomic temp + rename, and may not exist when the TUI starts. Events are
+/// filtered to the `state.json` filename and coalesced into a `()` signal.
+fn start_state_watcher(
+    snapshot_path: &Path,
+) -> Result<(notify::RecommendedWatcher, mpsc::Receiver<()>)> {
+    let file_name = snapshot_path.file_name().unwrap_or_default().to_os_string();
     let (tx, rx) = mpsc::channel();
 
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         if let Ok(event) = res {
-            let matches_wal = event.paths.iter().any(|p| p.file_name() == Some(&wal_name));
-            if matches_wal {
+            let matches = event
+                .paths
+                .iter()
+                .any(|p| p.file_name() == Some(&file_name));
+            if matches {
                 let _ = tx.send(());
             }
         }
     })?;
 
-    let watch_dir = db_path.parent().unwrap_or_else(|| Path::new("."));
-    watcher.watch(watch_dir, notify::RecursiveMode::NonRecursive)?;
+    let watch_dir = snapshot_path
+        .parent()
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    // The parent may not exist yet (daemon never started); create it so the
+    // watch can attach and fire when the daemon first writes.
+    if !watch_dir.exists() {
+        let _ = std::fs::create_dir_all(&watch_dir);
+    }
+    watcher.watch(&watch_dir, notify::RecursiveMode::NonRecursive)?;
 
     Ok((watcher, rx))
 }
 
-/// Run the interactive TUI with the live data source.
+/// Run the interactive dashboard against the live `state.json`.
 ///
 /// # Errors
 ///
-/// Returns an error if terminal setup fails or session data cannot be read.
+/// Returns an error if terminal setup fails or the initial snapshot read fails.
 pub fn run(icon_config: IconConfig) -> Result<()> {
-    let data = Box::new(SqliteDataSource::new()?);
-    let db_path = crate::db::db_path();
+    let data = StateJsonDataSource::new();
+    let snapshot_path = data.path().to_path_buf();
 
-    let wal_watcher = match start_wal_watcher(&db_path) {
+    let watcher = match start_state_watcher(&snapshot_path) {
         Ok((watcher, rx)) => Some((watcher, rx)),
         Err(e) => {
-            info!("WAL watcher unavailable, falling back to polling: {e}");
+            info!("state.json watcher unavailable, falling back to polling: {e}");
             None
         }
     };
-
-    // Hold _watcher to keep it alive; extract rx for the event loop.
-    let (_watcher, wal_rx) = match wal_watcher {
+    // Hold `_watcher` to keep it alive; extract `rx` for the event loop.
+    let (_watcher, watch_rx) = match watcher {
         Some((w, rx)) => (Some(w), Some(rx)),
         None => (None, None),
     };
 
-    run_with_data_and_watcher(icon_config, data, wal_rx.as_ref())
+    run_with_data_and_watcher(icon_config, Box::new(data), watch_rx.as_ref())
 }
 
-/// Run the interactive TUI with an optional WAL watcher.
+/// Run the dashboard with an explicit data source and optional change signal.
 fn run_with_data_and_watcher(
     icon_config: IconConfig,
     data: Box<dyn DataSource>,
-    wal_rx: Option<&mpsc::Receiver<()>>,
+    watch_rx: Option<&mpsc::Receiver<()>>,
 ) -> Result<()> {
     let theme = Theme::new();
     let icons = IconSet::from_config(icon_config);
 
     let mut app = App::new(&theme, &icons, data)?;
 
-    // Terminal setup.
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     crossterm::execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_loop(&mut terminal, &mut app, wal_rx);
+    let result = run_loop(&mut terminal, &mut app, watch_rx);
 
-    // Terminal teardown.
     disable_raw_mode()?;
     crossterm::execute!(
         terminal.backend_mut(),
@@ -151,244 +165,39 @@ fn run_with_data_and_watcher(
     result
 }
 
-/// Tab label names for the left-column stack.
-const LEFT_TAB_NAMES: &[&str] = &["Workspaces", "Keybinds"];
-/// Tab label names for the full-width stack (includes Traffic).
-const FULL_TAB_NAMES: &[&str] = &["Workspaces", "Keybinds", "Traffic"];
-
-/// Stored panel rectangles and hit maps for mouse dispatch.
+/// Stored panel rectangles for mouse dispatch.
+#[derive(Default)]
 struct PanelLayout {
-    workspaces: Rect,
+    servers: Rect,
+    servers_inner: Rect,
+    sessions: Rect,
+    sessions_inner: Rect,
+    alerts: Rect,
+    alerts_inner: Rect,
     keybinds: Rect,
-    stream: Rect,
-    /// Tab bar area (empty rect when in Quadrant mode).
-    tab_bar: Rect,
-    /// Number of tabs rendered in the tab bar.
-    tab_count: usize,
-    /// Server message detail panel (present when popup is open).
-    detail: Option<Rect>,
-    /// Inner height of the detail panel (for scroll clamping).
-    detail_height: usize,
-    /// Terminal row → `workspace_rows` index.
-    workspace_hits: Vec<(u16, usize)>,
-    /// Column at the right edge of the left panel (divider hit target).
+    /// Column of the vertical divider (0 when there is none, e.g. narrow mode).
     divider_col: u16,
-    /// Total terminal width for percentage computation during drag.
+    /// Total terminal width, for percentage computation during a divider drag.
     total_width: u16,
-    /// Inner height of the stream panel (excludes borders and search bar).
-    stream_inner_height: usize,
 }
 
-/// Handle a key event, dispatching to global or focus-specific handlers.
-#[allow(
-    clippy::too_many_lines,
-    reason = "key dispatch covers popup, search, global, and panel-specific handlers"
-)]
-fn handle_key(
-    app: &mut App<'_>,
-    code: KeyCode,
-    modifiers: KeyModifiers,
-    viewport_height: usize,
-    detail_height: usize,
-) {
-    // Detail panel captures all keys when open.
-    if let Some(ref mut popup) = app.popup {
-        match code {
-            KeyCode::Esc | KeyCode::Char('q') => app.close_popup(),
-            KeyCode::Char('j') | KeyCode::Down => popup.scroll_down(1, detail_height),
-            KeyCode::Char('k') | KeyCode::Up => popup.scroll_up(1),
-            KeyCode::PageDown => popup.scroll_down(detail_height / 2, detail_height),
-            KeyCode::PageUp => popup.scroll_up(detail_height / 2),
-            KeyCode::Char('y') => {
-                if let Some(text) = popup.yank_text() {
-                    osc52_copy(&text);
-                }
-            }
-            _ => {}
-        }
-        return;
-    }
-
-    // Search input mode intercepts all keys.
-    if app.search_active {
-        handle_search_input(app, code, viewport_height);
-        return;
-    }
-
-    // Global keys (always active regardless of focus).
+/// Handle a key event.
+fn handle_key(app: &mut App<'_>, code: KeyCode) {
     match code {
         KeyCode::Char('q') => app.quit = true,
         KeyCode::Char('?') => app.toggle_keybinds(),
-        KeyCode::Char('b') => app.cycle_left_tab(),
-        KeyCode::Tab => {
-            app.stream.exit_visual();
-            app.sidebar.exit_visual();
-            app.cycle_focus();
-        }
-        KeyCode::BackTab => {
-            app.stream.exit_visual();
-            app.sidebar.exit_visual();
-            app.cycle_focus_back();
-        }
-        _ => match app.focus {
-            FocusRegion::Workspaces => {
-                let visible = viewport_height.saturating_sub(1);
-                match code {
-                    KeyCode::Char('j') | KeyCode::Down => {
-                        app.sidebar.cursor_down(1, visible);
-                    }
-                    KeyCode::Char('k') | KeyCode::Up => app.sidebar.cursor_up(1, visible),
-                    KeyCode::Char('h') | KeyCode::Left => {
-                        app.sidebar.hscroll_left();
-                    }
-                    KeyCode::Char('l') | KeyCode::Right => {
-                        app.sidebar.hscroll_right();
-                    }
-                    KeyCode::Enter => {
-                        // Enter on a root: toggle expansion.
-                        // Enter on a server: open popup.
-                        if app.sidebar.cursor_server_index().is_some() {
-                            app.open_server_popup();
-                        } else {
-                            app.sidebar.toggle_expanded();
-                        }
-                    }
-                    KeyCode::Char('f') => {
-                        app.toggle_workspace_selection();
-                    }
-                    KeyCode::Char(' ') => {
-                        if modifiers.contains(KeyModifiers::SHIFT) {
-                            if !app.sidebar.in_visual() {
-                                app.sidebar.start_visual();
-                            }
-                        } else if app.sidebar.in_visual() {
-                            app.sidebar.exit_visual();
-                        } else {
-                            app.sidebar.start_visual();
-                        }
-                    }
-                    KeyCode::Char('y') => {
-                        if let Some(text) = app.sidebar.yank_text() {
-                            osc52_copy(&text);
-                        }
-                        app.sidebar.exit_visual();
-                    }
-                    KeyCode::Esc => {
-                        app.sidebar.exit_visual();
-                    }
-                    _ => {}
-                }
-            }
-            FocusRegion::Keybinds => {
-                // No navigation inside keybinds panel.
-            }
-            FocusRegion::Stream => {
-                handle_stream_key(app, code, modifiers, viewport_height);
-            }
-        },
-    }
-}
-
-/// Handle a key event when the stream is focused.
-fn handle_stream_key(
-    app: &mut App<'_>,
-    code: KeyCode,
-    modifiers: KeyModifiers,
-    viewport_height: usize,
-) {
-    match code {
-        KeyCode::Char('j') | KeyCode::Down => {
-            app.stream.cursor_down(1, viewport_height);
-        }
-        KeyCode::Char('k') | KeyCode::Up => {
-            app.stream.cursor_up(1);
-        }
-        KeyCode::Enter if !app.stream.in_visual() => {
-            app.stream.toggle_expansion();
-        }
-        KeyCode::Char(' ') => {
-            if modifiers.contains(KeyModifiers::SHIFT) {
-                if !app.stream.in_visual() {
-                    app.stream.start_visual();
-                }
-            } else if app.stream.in_visual() {
-                app.stream.exit_visual();
-            } else {
-                app.stream.start_visual();
-            }
-        }
-        KeyCode::Esc => {
-            if app.stream.in_visual() {
-                app.stream.exit_visual();
-            } else {
-                app.stream.clear_search();
-            }
-        }
+        KeyCode::Tab => app.cycle_focus(),
+        KeyCode::BackTab => app.cycle_focus_back(),
+        KeyCode::Char('j') | KeyCode::Down => app.cursor_down(1),
+        KeyCode::Char('k') | KeyCode::Up => app.cursor_up(1),
+        KeyCode::PageDown => app.page_down(),
+        KeyCode::PageUp => app.page_up(),
+        KeyCode::Char('g') | KeyCode::Home => app.jump_home(),
+        KeyCode::Char('G') | KeyCode::End => app.jump_end(),
         KeyCode::Char('y') => {
-            if let Some(text) = app.stream.yank_text(app.icons) {
+            if let Some(text) = app.selected_yank_text() {
                 osc52_copy(&text);
             }
-            app.stream.exit_visual();
-        }
-        KeyCode::Char('/') => {
-            app.search_active = true;
-            app.search_input.clear();
-        }
-        KeyCode::Char('n') => {
-            app.stream.search_next(viewport_height);
-        }
-        KeyCode::Char('N') => {
-            app.stream.search_prev(viewport_height);
-        }
-        KeyCode::PageDown => {
-            app.stream.scroll_down(viewport_height / 2, viewport_height);
-        }
-        KeyCode::PageUp => {
-            app.stream.scroll_up(viewport_height / 2);
-        }
-        KeyCode::Home => {
-            app.jump_to_beginning();
-        }
-        KeyCode::End => {
-            app.stream.pin_to_bottom(viewport_height);
-        }
-        _ => {}
-    }
-}
-
-/// Handle a key event during search input mode.
-fn handle_search_input(app: &mut App<'_>, code: KeyCode, viewport_height: usize) {
-    match code {
-        KeyCode::Char(c) => {
-            app.search_input.push(c);
-            app.stream
-                .set_search(Some(app.search_input.clone()), app.icons);
-        }
-        KeyCode::Backspace => {
-            app.search_input.pop();
-            if app.search_input.is_empty() {
-                app.stream.clear_search();
-            } else {
-                app.stream
-                    .set_search(Some(app.search_input.clone()), app.icons);
-            }
-        }
-        KeyCode::Enter => {
-            app.search_active = false;
-            if app.search_input.is_empty() {
-                app.stream.clear_search();
-            }
-        }
-        KeyCode::Esc => {
-            app.search_active = false;
-            app.search_input.clear();
-            app.stream.clear_search();
-        }
-        KeyCode::Down => {
-            app.stream.search_next(viewport_height);
-        }
-        KeyCode::Up => {
-            app.stream.search_prev(viewport_height);
         }
         _ => {}
     }
@@ -434,11 +243,26 @@ fn base64_encode(input: &[u8]) -> String {
     out
 }
 
-/// Handle a mouse event, dispatching to the correct panel based on position.
+/// Map a terminal row inside a board's content area to an entry index.
+fn entry_at(
+    inner: Rect,
+    row: u16,
+    scroll: usize,
+    lines_per_entry: usize,
+    len: usize,
+) -> Option<usize> {
+    if row < inner.y || row >= inner.y + inner.height || lines_per_entry == 0 {
+        return None;
+    }
+    let rel = (row - inner.y) as usize;
+    let entry = scroll + rel / lines_per_entry;
+    (entry < len).then_some(entry)
+}
+
+/// Handle a mouse event.
 #[allow(
     clippy::cast_possible_truncation,
-    clippy::too_many_lines,
-    reason = "terminal coordinates are always small; mouse dispatch covers many panel regions"
+    reason = "terminal coordinates are always small"
 )]
 fn handle_mouse(
     app: &mut App<'_>,
@@ -446,31 +270,10 @@ fn handle_mouse(
     column: u16,
     row: u16,
     layout: &PanelLayout,
-    viewport_height: usize,
 ) {
-    // Detail panel mouse handling.
-    if app.popup.is_some() {
-        let in_detail = layout
-            .detail
-            .is_some_and(|r| r.contains((column, row).into()));
-        if in_detail {
-            if let Some(ref mut popup) = app.popup {
-                match kind {
-                    MouseEventKind::ScrollUp => popup.scroll_up(3),
-                    MouseEventKind::ScrollDown => popup.scroll_down(3, layout.detail_height),
-                    _ => {}
-                }
-            }
-            return;
-        }
-        if matches!(kind, MouseEventKind::Down(MouseButton::Left)) {
-            app.close_popup();
-        }
-    }
-
-    // ── Divider drag ───────────────────────────────────────────
+    // ── Divider drag (wide layout only) ────────────────────────
     if matches!(kind, MouseEventKind::Down(MouseButton::Left)) {
-        app.dragging_divider = layout.total_width > 0 && column.abs_diff(layout.divider_col) <= 1;
+        app.dragging_divider = layout.divider_col > 0 && column.abs_diff(layout.divider_col) <= 1;
         if app.dragging_divider {
             return;
         }
@@ -486,73 +289,73 @@ fn handle_mouse(
         return;
     }
 
-    // ── Normal panel dispatch ──────────────────────────────────
     let pos = (column, row);
-    let in_tab_bar = layout.tab_bar.contains(pos.into());
-    let in_workspaces = layout.workspaces.contains(pos.into());
-    let in_keybinds = layout.keybinds.contains(pos.into());
-    let in_stream = layout.stream.contains(pos.into());
+    let target = if layout.servers.contains(pos.into()) {
+        Some(Focus::Servers)
+    } else if layout.sessions.contains(pos.into()) {
+        Some(Focus::Sessions)
+    } else if layout.alerts.contains(pos.into()) {
+        Some(Focus::Alerts)
+    } else {
+        None
+    };
 
     match kind {
         MouseEventKind::ScrollUp => {
-            if in_workspaces {
-                app.sidebar.cursor_up(3, viewport_height);
-            } else if in_stream {
-                app.stream.scroll_up(3);
+            if let Some(focus) = target {
+                app.focus = focus;
+                app.cursor_up(3);
             }
         }
         MouseEventKind::ScrollDown => {
-            if in_workspaces {
-                app.sidebar.cursor_down(3, viewport_height);
-            } else if in_stream {
-                app.stream.scroll_down(3, viewport_height);
+            if let Some(focus) = target {
+                app.focus = focus;
+                app.cursor_down(3);
             }
         }
-        MouseEventKind::ScrollLeft if in_workspaces => {
-            app.sidebar.hscroll_left();
-        }
-        MouseEventKind::ScrollRight if in_workspaces => {
-            app.sidebar.hscroll_right();
-        }
-        MouseEventKind::Down(MouseButton::Left) => {
-            if in_tab_bar && layout.tab_count > 0 {
-                let relative_x = column.saturating_sub(layout.tab_bar.x);
-                let clicked =
-                    (relative_x as usize * layout.tab_count) / layout.tab_bar.width.max(1) as usize;
-                let clicked = clicked.min(layout.tab_count - 1);
-                app.set_left_tab(clicked);
-            } else if in_workspaces {
-                app.stream.exit_visual();
-                app.sidebar.exit_visual();
-                app.focus = FocusRegion::Workspaces;
-                if let Some(&(_, idx)) = layout.workspace_hits.iter().find(|(r, _)| *r == row) {
-                    app.sidebar.cursor = idx;
-                    app.toggle_workspace_selection();
+        MouseEventKind::Down(MouseButton::Left) => match target {
+            Some(Focus::Servers) => {
+                app.focus = Focus::Servers;
+                if let Some(i) = entry_at(
+                    layout.servers_inner,
+                    row,
+                    app.servers.scroll,
+                    SERVER_LPE,
+                    app.snapshot.servers.len(),
+                ) {
+                    app.servers.cursor = i;
                 }
-            } else if in_keybinds {
-                app.stream.exit_visual();
-                app.sidebar.exit_visual();
-                if app.effective == EffectiveLayout::Quadrant && !app.keybinds_expanded {
+            }
+            Some(Focus::Sessions) => {
+                app.focus = Focus::Sessions;
+                if let Some(i) = entry_at(
+                    layout.sessions_inner,
+                    row,
+                    app.sessions.scroll,
+                    SESSION_LPE,
+                    app.snapshot.sessions.len(),
+                ) {
+                    app.sessions.cursor = i;
+                }
+            }
+            Some(Focus::Alerts) => {
+                app.focus = Focus::Alerts;
+                if let Some(i) = entry_at(
+                    layout.alerts_inner,
+                    row,
+                    app.alerts.scroll,
+                    ALERT_LPE,
+                    app.snapshot.alerts.len(),
+                ) {
+                    app.alerts.cursor = i;
+                }
+            }
+            None => {
+                if layout.keybinds.contains(pos.into()) {
                     app.keybinds_expanded = true;
                 }
-                app.focus = FocusRegion::Keybinds;
-            } else if in_stream {
-                app.sidebar.exit_visual();
-                app.focus = FocusRegion::Stream;
-                if app.stream.in_visual() {
-                    app.stream.exit_visual();
-                } else {
-                    let inner_top = layout.stream.y as usize + 1; // +1 for top border
-                    let relative_row = (row as usize).saturating_sub(inner_top);
-                    let stream_row = app.stream.scroll_position + relative_row;
-                    if stream_row < app.stream.display_rows.len() {
-                        app.stream.cursor = stream_row;
-                        app.stream.auto_scroll = false;
-                        app.stream.toggle_expansion();
-                    }
-                }
             }
-        }
+        },
         _ => {}
     }
 }
@@ -571,107 +374,130 @@ fn panel_block<'a>(title: &'a str, focused: bool, theme: &'a Theme, borders: Bor
         .title(Span::styled(title, title_style))
 }
 
-/// Render a horizontal separator row in the left column.
-#[allow(
-    clippy::cast_possible_truncation,
-    reason = "terminal coordinates are always small"
-)]
-fn render_left_separator(
-    y: u16,
-    x: u16,
-    width: u16,
-    title: &str,
-    focused: bool,
-    theme: &Theme,
-    buf: &mut Buffer,
-) {
-    let border_style = if focused {
-        theme.border_focused
-    } else {
-        theme.border_unfocused
-    };
-    let title_style = if focused { theme.title } else { theme.muted };
-
-    buf.set_string(x, y, "├", border_style);
-
-    for col in (x + 1)..(x + width) {
-        buf.set_string(col, y, "─", border_style);
-    }
-
-    if !title.is_empty() && width > 2 {
-        let max = (width - 1) as usize;
-        let truncated: String = title.chars().take(max).collect();
-        buf.set_string(x + 1, y, &truncated, title_style);
-    }
+/// Inner content rect for a panel with the given borders.
+fn inner_of(rect: Rect, borders: Borders) -> Rect {
+    Block::default().borders(borders).inner(rect)
 }
 
-/// Render a horizontal separator row in the right column.
+/// Re-style a line for the selection highlight, padding to `width` so the whole
+/// row (including a 2-line entry's sub-line) is highlighted.
+fn highlight_line(line: &Line<'static>, width: usize, style: Style) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = line
+        .spans
+        .iter()
+        .map(|s| Span::styled(s.content.clone(), s.style.patch(style)))
+        .collect();
+    let used: usize = line.spans.iter().map(|s| s.content.width()).sum();
+    if used < width {
+        spans.push(Span::styled(" ".repeat(width - used), style));
+    }
+    Line::from(spans)
+}
+
+/// Render a board (entries are line-groups) into `rect`, with cursor highlight,
+/// scroll, and overflow indicators.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a board render needs frame, content, scroll state, and styling"
+)]
+fn render_board_into(
+    title: &str,
+    focused: bool,
+    entries: &[Vec<Line<'static>>],
+    lines_per_entry: usize,
+    board: &mut Board,
+    rect: Rect,
+    inner: Rect,
+    buf: &mut Buffer,
+    theme: &Theme,
+    borders: Borders,
+) {
+    panel_block(title, focused, theme, borders).render(rect, buf);
+
+    let total = entries.len();
+    let visible = (inner.height as usize) / lines_per_entry.max(1);
+    board.visible = visible;
+    board.settle(total);
+
+    let mut y = inner.y;
+    let end_y = inner.y + inner.height;
+    'outer: for (i, lines) in entries.iter().enumerate().skip(board.scroll).take(visible) {
+        let selected = focused && i == board.cursor;
+        for line in lines {
+            if y >= end_y {
+                break 'outer;
+            }
+            if selected {
+                let hl = highlight_line(line, inner.width as usize, theme.selection);
+                buf.set_line(inner.x, y, &hl, inner.width);
+            } else {
+                buf.set_line(inner.x, y, line, inner.width);
+            }
+            y += 1;
+        }
+    }
+
+    let counts = OverflowCounts {
+        above: board.scroll,
+        below: total.saturating_sub(board.scroll + visible),
+    };
+    render_overflow_counts(&counts, inner, buf, theme.muted);
+}
+
+/// Render a horizontal separator row carrying a panel title.
+///
+/// Always anchors a `├` at the left border; `right_cap` adds a `┤` at the right
+/// edge (full-box, narrow mode). In the wide layout the right end abuts the
+/// vertical divider, which draws the junction instead.
 #[allow(
     clippy::cast_possible_truncation,
     clippy::too_many_arguments,
-    reason = "terminal coordinates are always small; separator needs position, content, style, and border flag"
+    reason = "terminal coordinates are always small; a titled separator needs position, content, style, and the cap flag"
 )]
-fn render_right_separator(
+fn render_separator(
     y: u16,
     x: u16,
     width: u16,
     title: &str,
-    focused: bool,
     theme: &Theme,
     buf: &mut Buffer,
-    has_left_border: bool,
+    right_cap: bool,
 ) {
-    let border_style = if focused {
-        theme.border_focused
-    } else {
-        theme.border_unfocused
-    };
-    let title_style = if focused { theme.title } else { theme.muted };
-
+    if width == 0 {
+        return;
+    }
+    let style = theme.border_unfocused;
     for col in x..(x + width) {
-        buf.set_string(col, y, "─", border_style);
+        buf.set_string(col, y, "─", style);
     }
-
-    if has_left_border && width > 0 {
-        buf.set_string(x, y, "├", border_style);
+    buf.set_string(x, y, "├", style);
+    if right_cap {
+        buf.set_string(x + width - 1, y, "┤", style);
     }
-
-    if width > 0 {
-        buf.set_string(x + width - 1, y, "┤", border_style);
-    }
-
-    let title_offset = u16::from(has_left_border);
-    if !title.is_empty() && width > 2 + title_offset {
-        let max = (width - 2 - title_offset) as usize;
+    if !title.is_empty() && width > 4 {
+        let max = (width - 4) as usize;
         let truncated: String = title.chars().take(max).collect();
-        buf.set_string(x + 1 + title_offset, y, &truncated, title_style);
+        buf.set_string(x + 2, y, &truncated, theme.muted);
     }
 }
 
-/// Render the vertical divider column between the left panels and the
-/// right side, using box-drawing intersection characters.
+/// Render the vertical divider column, using intersection glyphs where the
+/// left-column separators meet it.
 fn render_divider_col(
     col: u16,
     top: u16,
     bottom: u16,
     left_seps: &[u16],
-    right_seps: &[u16],
     style: Style,
     buf: &mut Buffer,
 ) {
     for y in top..=bottom {
-        let has_left = left_seps.contains(&y);
-        let has_right = right_seps.contains(&y);
         let ch = if y == top {
             "┬"
         } else if y == bottom {
             "┴"
-        } else if has_left && has_right {
-            "┼"
-        } else if has_left {
+        } else if left_seps.contains(&y) {
             "┤"
-        } else if has_right {
-            "├"
         } else {
             "│"
         };
@@ -679,529 +505,337 @@ fn render_divider_col(
     }
 }
 
-/// Render the search bar at the bottom of the stream panel.
-#[allow(
-    clippy::cast_possible_truncation,
-    reason = "search input length is always small"
-)]
-fn render_search_bar(
-    area: Rect,
-    buf: &mut Buffer,
+/// The daemon status line shown in the alerts panel title.
+fn daemon_status(snapshot: &crate::state_snapshot::Snapshot) -> String {
+    if snapshot.daemon.generated_at.is_empty() {
+        return " Alerts ".to_string();
+    }
+    let age = format::elapsed_short(&snapshot.daemon.generated_at);
+    let version = if snapshot.daemon.version.is_empty() {
+        "catenary"
+    } else {
+        &snapshot.daemon.version
+    };
+    if age.is_empty() {
+        format!(" Alerts — {version} ")
+    } else {
+        format!(" Alerts — {version} · updated {age} ago ")
+    }
+}
+
+/// Build per-entry line groups for the server board.
+fn build_server_entries(
+    app: &App<'_>,
+    width: u16,
     theme: &Theme,
-    input_active: bool,
-    input: &str,
-    status: Option<&str>,
-) {
-    if area.width < 4 {
-        return;
-    }
-
-    let mut spans = vec![Span::styled("/", theme.accent)];
-    if input_active {
-        spans.push(Span::raw(input.to_string()));
-    } else {
-        spans.push(Span::styled(input.to_string(), theme.text));
-    }
-
-    if let Some(status) = status {
-        let prefix_len = 1 + input.len();
-        let status_len = status.len() + 1;
-        let gap = (area.width as usize).saturating_sub(prefix_len + status_len);
-        if gap > 0 {
-            spans.push(Span::raw(" ".repeat(gap)));
-            spans.push(Span::styled(status.to_string(), theme.muted));
-        }
-    }
-
-    let line = ratatui::text::Line::from(spans);
-    buf.set_line(area.x, area.y, &line, area.width);
+    icons: &IconSet,
+) -> Vec<Vec<Line<'static>>> {
+    app.snapshot
+        .servers
+        .iter()
+        .map(|s| format::server_entry_lines(s, width as usize, theme, icons))
+        .collect()
 }
 
-/// Render a horizontal tab bar with the active tab highlighted.
-fn render_tab_bar(names: &[&str], active: usize, area: Rect, buf: &mut Buffer, theme: &Theme) {
-    let titles: Vec<Line<'_>> = names.iter().map(|n| Line::from(*n)).collect();
-    Tabs::new(titles)
-        .select(active)
-        .highlight_style(theme.title)
-        .style(theme.muted)
-        .divider("│")
-        .render(area, buf);
-}
-
-/// Render Workspaces into `panel_rect`, returning the hit map.
-fn render_workspaces_panel(
+/// Build per-entry line groups for the session board.
+fn build_session_entries(
     app: &App<'_>,
-    panel_rect: Rect,
-    buf: &mut Buffer,
-    layout: &mut PanelLayout,
-    borders: Borders,
-    title: &str,
-) {
-    let focused = app.focus == FocusRegion::Workspaces;
-    let block = panel_block(title, focused, app.theme, borders);
-    let inner = block.inner(panel_rect);
-    block.render(panel_rect, buf);
-    layout.workspace_hits = render_workspaces(&app.sidebar, inner, buf, app.theme, focused);
-    layout.workspaces = panel_rect;
+    width: u16,
+    theme: &Theme,
+    icons: &IconSet,
+) -> Vec<Vec<Line<'static>>> {
+    app.snapshot
+        .sessions
+        .iter()
+        .map(|s| format::session_entry_lines(s, width as usize, theme, icons))
+        .collect()
 }
 
-/// Render the Keybinds panel at full height (for stacked/full-stack mode).
-fn render_keybinds_panel(
+/// Build per-entry line groups for the alerts ring (one line per alert).
+fn build_alert_entries(
     app: &App<'_>,
-    panel_rect: Rect,
-    buf: &mut Buffer,
-    layout: &mut PanelLayout,
-    borders: Borders,
-    title: &str,
-) {
-    let focused = app.focus == FocusRegion::Keybinds;
-    let block = panel_block(title, focused, app.theme, borders);
-    let inner = block.inner(panel_rect);
-    block.render(panel_rect, buf);
-    render_keybinds_content(inner, buf, app.theme);
-    layout.keybinds = panel_rect;
+    width: u16,
+    theme: &Theme,
+    icons: &IconSet,
+) -> Vec<Vec<Line<'static>>> {
+    app.snapshot
+        .alerts
+        .iter()
+        .map(|a| vec![format::alert_line(a, width as usize, theme, icons)])
+        .collect()
 }
 
-/// Render the right side: optional server detail panel above the Traffic panel.
-#[allow(
-    clippy::cast_possible_truncation,
-    reason = "terminal coordinates are always small"
-)]
-fn render_right_side(
-    app: &mut App<'_>,
-    right_rect: Rect,
-    buf: &mut Buffer,
-    layout: &mut PanelLayout,
-    right_borders: Borders,
-) -> (Option<(u16, u16)>, Vec<u16>) {
-    let mut right_seps = Vec::new();
-
-    let (detail_rect, sep_rect, messages_rect, detail_borders, messages_borders) =
-        if app.popup.is_some() {
-            let v = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Fill(1),
-                    Constraint::Length(1),
-                    Constraint::Fill(1),
-                ])
-                .split(right_rect);
-            right_seps.push(v[1].y);
-            (
-                Some(v[0]),
-                Some(v[1]),
-                v[2],
-                (right_borders | Borders::TOP) - Borders::BOTTOM,
-                (right_borders | Borders::BOTTOM) - Borders::TOP,
-            )
-        } else {
-            (None, None, right_rect, Borders::NONE, right_borders)
-        };
-
-    if let (Some(detail_area), Some(popup)) = (detail_rect, &mut app.popup) {
-        render_server_detail(popup, detail_area, buf, app.theme, true, detail_borders);
-        let border_rows = u16::from(detail_borders.contains(Borders::TOP))
-            + u16::from(detail_borders.contains(Borders::BOTTOM));
-        layout.detail_height = detail_area.height.saturating_sub(border_rows) as usize;
-    }
-    layout.detail = detail_rect;
-
-    if let Some(sep) = sep_rect {
-        let focused = app.focus == FocusRegion::Stream;
-        let title = if app.stream.in_visual() {
-            " Traffic  VISUAL "
-        } else {
-            " Traffic "
-        };
-        let has_left = right_borders.contains(Borders::LEFT);
-        render_right_separator(
-            sep.y, sep.x, sep.width, title, focused, app.theme, buf, has_left,
-        );
-    }
-
-    let cursor = render_messages_panel(app, messages_rect, buf, layout, messages_borders);
-    (cursor, right_seps)
-}
-
-/// Render the Traffic stream panel into `panel_rect`.
-#[allow(
-    clippy::cast_possible_truncation,
-    reason = "search input length is always small"
-)]
-fn render_messages_panel(
-    app: &App<'_>,
-    panel_rect: Rect,
-    buf: &mut Buffer,
-    layout: &mut PanelLayout,
-    borders: Borders,
-) -> Option<(u16, u16)> {
-    let focused = app.focus == FocusRegion::Stream;
-    let title = if borders.contains(Borders::TOP) {
-        if app.stream.in_visual() {
-            " Traffic  VISUAL "
-        } else {
-            " Traffic "
-        }
-    } else {
-        ""
-    };
-    let block = panel_block(title, focused, app.theme, borders);
-    let inner = block.inner(panel_rect);
-    block.render(panel_rect, buf);
-
-    let show_search = app.search_active || app.stream.has_search();
-    let (stream_area, search_bar_area) = if show_search && inner.height > 1 {
-        let content_height = inner.height - 1;
-        (
-            Rect {
-                height: content_height,
-                ..inner
-            },
-            Some(Rect {
-                y: inner.y + content_height,
-                height: 1,
-                ..inner
-            }),
-        )
-    } else {
-        (inner, None)
-    };
-
-    render_stream(&app.stream, stream_area, buf, app.theme, app.icons);
-    layout.stream = panel_rect;
-    layout.stream_inner_height = stream_area.height as usize;
-
-    if let Some(bar) = search_bar_area {
-        render_search_bar(
-            bar,
-            buf,
-            app.theme,
-            app.search_active,
-            &app.search_input,
-            app.stream.search_status().as_deref(),
-        );
-        if app.search_active {
-            let cursor_x = bar.x + 1 + app.search_input.len() as u16;
-            return Some((cursor_x.min(bar.x + bar.width - 1), bar.y));
-        }
-    }
-    None
-}
-
-/// Main event loop — renders layout based on effective mode, handles input.
+/// Render a single dashboard frame. Shared by the event loop and tests so both
+/// exercise the same render path.
 #[allow(
     clippy::too_many_lines,
     clippy::cast_possible_truncation,
-    reason = "render loop with three layout modes + empty state in one draw closure; terminal widths are always small"
+    reason = "one draw function covers the waiting state plus the wide and narrow layouts"
 )]
+fn render_dashboard(f: &mut Frame<'_>, app: &mut App<'_>, layout: &mut PanelLayout) {
+    let area = f.area();
+    *layout = PanelLayout::default();
+
+    // ── Too small / waiting states ─────────────────────────────
+    if area.width < 16 || area.height < 4 {
+        return;
+    }
+    if !app.daemon_present() {
+        let msg = "Waiting for daemon\u{2026}";
+        let w = UnicodeWidthStr::width(msg) as u16;
+        let x = area.x + area.width.saturating_sub(w) / 2;
+        let y = area.y + area.height / 2;
+        f.buffer_mut().set_string(x, y, msg, app.theme.muted);
+        return;
+    }
+
+    let theme = app.theme;
+    let icons = app.icons;
+    let focus = app.focus;
+
+    if area.width < NARROW_THRESHOLD {
+        // ── Narrow: three stacked full-width boards ────────────
+        let v = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Fill(1),
+                Constraint::Length(1),
+                Constraint::Fill(1),
+                Constraint::Length(1),
+                Constraint::Fill(1),
+            ])
+            .split(area);
+        let servers_rect = v[0];
+        let sep_a = v[1];
+        let sessions_rect = v[2];
+        let sep_b = v[3];
+        let alerts_rect = v[4];
+
+        let sb = Borders::TOP | Borders::LEFT | Borders::RIGHT;
+        let mb = Borders::LEFT | Borders::RIGHT;
+        let ab = Borders::LEFT | Borders::RIGHT | Borders::BOTTOM;
+        let servers_inner = inner_of(servers_rect, sb);
+        let sessions_inner = inner_of(sessions_rect, mb);
+        let alerts_inner = inner_of(alerts_rect, ab);
+
+        let server_entries = build_server_entries(app, servers_inner.width, theme, icons);
+        let session_entries = build_session_entries(app, sessions_inner.width, theme, icons);
+        let alert_entries = build_alert_entries(app, alerts_inner.width, theme, icons);
+
+        render_board_into(
+            " Servers ",
+            focus == Focus::Servers,
+            &server_entries,
+            SERVER_LPE,
+            &mut app.servers,
+            servers_rect,
+            servers_inner,
+            f.buffer_mut(),
+            theme,
+            sb,
+        );
+        render_separator(
+            sep_a.y,
+            sep_a.x,
+            sep_a.width,
+            " Sessions ",
+            theme,
+            f.buffer_mut(),
+            true,
+        );
+        render_board_into(
+            "",
+            focus == Focus::Sessions,
+            &session_entries,
+            SESSION_LPE,
+            &mut app.sessions,
+            sessions_rect,
+            sessions_inner,
+            f.buffer_mut(),
+            theme,
+            mb,
+        );
+        render_separator(
+            sep_b.y,
+            sep_b.x,
+            sep_b.width,
+            " Alerts ",
+            theme,
+            f.buffer_mut(),
+            true,
+        );
+        render_board_into(
+            "",
+            focus == Focus::Alerts,
+            &alert_entries,
+            ALERT_LPE,
+            &mut app.alerts,
+            alerts_rect,
+            alerts_inner,
+            f.buffer_mut(),
+            theme,
+            ab,
+        );
+
+        layout.servers = servers_rect;
+        layout.servers_inner = servers_inner;
+        layout.sessions = sessions_rect;
+        layout.sessions_inner = sessions_inner;
+        layout.alerts = alerts_rect;
+        layout.alerts_inner = alerts_inner;
+        return;
+    }
+
+    // ── Wide: left column (servers/sessions/keybinds) + alerts ──
+    let h = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(app.sidebar_pct),
+            Constraint::Length(1),
+            Constraint::Fill(1),
+        ])
+        .split(area);
+    let left = h[0];
+    let divider = h[1];
+    let right = h[2];
+
+    let kb_height = if app.keybinds_expanded {
+        KEYBINDS_EXPANDED_HEIGHT + 1
+    } else {
+        1
+    };
+    let v = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Fill(1),
+            Constraint::Length(1),
+            Constraint::Fill(1),
+            Constraint::Length(1),
+            Constraint::Length(kb_height),
+        ])
+        .split(left);
+    let servers_rect = v[0];
+    let sep1 = v[1];
+    let sessions_rect = v[2];
+    let sep2 = v[3];
+    let keybinds_rect = v[4];
+
+    let sb = Borders::TOP | Borders::LEFT;
+    let mb = Borders::LEFT;
+    let ab = Borders::TOP | Borders::RIGHT | Borders::BOTTOM;
+    let servers_inner = inner_of(servers_rect, sb);
+    let sessions_inner = inner_of(sessions_rect, mb);
+    let alerts_inner = inner_of(right, ab);
+
+    let server_entries = build_server_entries(app, servers_inner.width, theme, icons);
+    let session_entries = build_session_entries(app, sessions_inner.width, theme, icons);
+    let alert_entries = build_alert_entries(app, alerts_inner.width, theme, icons);
+    let alerts_title = daemon_status(&app.snapshot);
+
+    render_board_into(
+        " Servers ",
+        focus == Focus::Servers,
+        &server_entries,
+        SERVER_LPE,
+        &mut app.servers,
+        servers_rect,
+        servers_inner,
+        f.buffer_mut(),
+        theme,
+        sb,
+    );
+    render_separator(
+        sep1.y,
+        sep1.x,
+        sep1.width,
+        " Sessions ",
+        theme,
+        f.buffer_mut(),
+        false,
+    );
+    render_board_into(
+        "",
+        focus == Focus::Sessions,
+        &session_entries,
+        SESSION_LPE,
+        &mut app.sessions,
+        sessions_rect,
+        sessions_inner,
+        f.buffer_mut(),
+        theme,
+        mb,
+    );
+
+    // Keybinds separator + (collapsible) content.
+    let kb_title = if app.keybinds_expanded {
+        " Keybinds  ? "
+    } else {
+        " Keybinds  ? to expand "
+    };
+    render_separator(
+        sep2.y,
+        sep2.x,
+        sep2.width,
+        kb_title,
+        theme,
+        f.buffer_mut(),
+        false,
+    );
+    let kb_block = panel_block("", false, theme, Borders::BOTTOM | Borders::LEFT);
+    let kb_inner = kb_block.inner(keybinds_rect);
+    kb_block.render(keybinds_rect, f.buffer_mut());
+    if app.keybinds_expanded {
+        render_keybinds_content(kb_inner, f.buffer_mut(), theme);
+    }
+
+    render_board_into(
+        &alerts_title,
+        focus == Focus::Alerts,
+        &alert_entries,
+        ALERT_LPE,
+        &mut app.alerts,
+        right,
+        alerts_inner,
+        f.buffer_mut(),
+        theme,
+        ab,
+    );
+
+    render_divider_col(
+        divider.x,
+        divider.y,
+        divider.y + divider.height.saturating_sub(1),
+        &[sep1.y, sep2.y],
+        theme.border_unfocused,
+        f.buffer_mut(),
+    );
+
+    layout.servers = servers_rect;
+    layout.servers_inner = servers_inner;
+    layout.sessions = sessions_rect;
+    layout.sessions_inner = sessions_inner;
+    layout.alerts = right;
+    layout.alerts_inner = alerts_inner;
+    layout.keybinds = Rect {
+        y: sep2.y,
+        height: sep2.height + keybinds_rect.height,
+        ..keybinds_rect
+    };
+    layout.divider_col = divider.x;
+    layout.total_width = area.width;
+}
+
+/// Main event loop: re-load the snapshot, render three boards, handle input.
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App<'_>,
-    wal_rx: Option<&mpsc::Receiver<()>>,
+    watch_rx: Option<&mpsc::Receiver<()>>,
 ) -> Result<()> {
     let mut last_tick = Instant::now();
-    let mut layout = PanelLayout {
-        workspaces: Rect::default(),
-        keybinds: Rect::default(),
-        stream: Rect::default(),
-        tab_bar: Rect::default(),
-        tab_count: 0,
-        detail: None,
-        detail_height: 0,
-        workspace_hits: Vec::new(),
-        divider_col: 0,
-        total_width: 0,
-        stream_inner_height: 0,
-    };
+    let mut layout = PanelLayout::default();
 
     loop {
-        let size = terminal.size()?;
-        let stream_height = if layout.stream_inner_height > 0 {
-            layout.stream_inner_height
-        } else {
-            (size.height as usize).saturating_sub(2)
-        };
-        app.stream.recompute_search_if_dirty(app.icons);
-        app.update_effective(size.width, size.height);
-        app.stream.apply_auto_scroll(stream_height);
-
-        terminal.draw(|f| {
-            let area = f.area();
-
-            // Empty state.
-            if app.sidebar.workspaces.is_empty()
-                && app.sidebar.entries.is_empty()
-                && app.sidebar.servers.is_empty()
-                && app.sidebar.dead_servers.is_empty()
-                && app.stream.entries.is_empty()
-            {
-                let msg = "Waiting for connections\u{2026}";
-                let msg_width = unicode_width::UnicodeWidthStr::width(msg) as u16;
-                let x = area.x + area.width.saturating_sub(msg_width) / 2;
-                let y = area.y + area.height / 2;
-                f.buffer_mut().set_string(x, y, msg, app.theme.muted);
-                layout.workspace_hits.clear();
-                layout.workspaces = Rect::default();
-                layout.keybinds = Rect::default();
-                layout.stream = Rect::default();
-                layout.tab_bar = Rect::default();
-                layout.tab_count = 0;
-                layout.divider_col = 0;
-                layout.total_width = 0;
-                layout.detail = None;
-                layout.detail_height = 0;
-                return;
-            }
-
-            // Reset per-frame state.
-            layout.workspace_hits.clear();
-            layout.workspaces = Rect::default();
-            layout.keybinds = Rect::default();
-            layout.stream = Rect::default();
-            layout.tab_bar = Rect::default();
-            layout.tab_count = 0;
-            layout.divider_col = 0;
-            layout.total_width = 0;
-
-            let mut search_cursor: Option<(u16, u16)> = None;
-
-            match app.effective {
-                // ── Quadrant: Workspaces + Keybinds left, Traffic right
-                EffectiveLayout::Quadrant => {
-                    let h_chunks = Layout::default()
-                        .direction(Direction::Horizontal)
-                        .constraints([
-                            Constraint::Percentage(app.sidebar_pct),
-                            Constraint::Length(1),
-                            Constraint::Fill(1),
-                        ])
-                        .split(area);
-
-                    let left = h_chunks[0];
-                    let divider_rect = h_chunks[1];
-                    let right = h_chunks[2];
-
-                    layout.divider_col = divider_rect.x;
-                    layout.total_width = area.width;
-
-                    let keybinds_height = if app.keybinds_expanded {
-                        KEYBINDS_EXPANDED_HEIGHT + 1
-                    } else {
-                        1 // just the BOTTOM border row
-                    };
-
-                    let v_chunks = Layout::default()
-                        .direction(Direction::Vertical)
-                        .constraints([
-                            Constraint::Fill(1),
-                            Constraint::Length(1),
-                            Constraint::Length(keybinds_height),
-                        ])
-                        .split(left);
-
-                    let workspaces_rect = v_chunks[0];
-                    let sep = v_chunks[1];
-                    let keybinds_rect = v_chunks[2];
-
-                    // Workspaces: TOP + LEFT.
-                    render_workspaces_panel(
-                        app,
-                        workspaces_rect,
-                        f.buffer_mut(),
-                        &mut layout,
-                        Borders::TOP | Borders::LEFT,
-                        " Workspaces ",
-                    );
-
-                    // Separator: Keybinds title.
-                    let keybinds_focused = app.focus == FocusRegion::Keybinds;
-                    let keybinds_title = if app.keybinds_expanded {
-                        " Keybinds  ? "
-                    } else {
-                        " Keybinds  ? to expand "
-                    };
-                    render_left_separator(
-                        sep.y,
-                        sep.x,
-                        sep.width,
-                        keybinds_title,
-                        keybinds_focused,
-                        app.theme,
-                        f.buffer_mut(),
-                    );
-
-                    // Keybinds: BOTTOM + LEFT.
-                    let keybinds_block = panel_block(
-                        "",
-                        keybinds_focused,
-                        app.theme,
-                        Borders::BOTTOM | Borders::LEFT,
-                    );
-                    let keybinds_inner = keybinds_block.inner(keybinds_rect);
-                    keybinds_block.render(keybinds_rect, f.buffer_mut());
-                    if app.keybinds_expanded {
-                        render_keybinds_content(keybinds_inner, f.buffer_mut(), app.theme);
-                    }
-                    layout.keybinds = Rect {
-                        y: sep.y,
-                        height: sep.height + keybinds_rect.height,
-                        ..keybinds_rect
-                    };
-
-                    // Right side: Traffic (+ optional detail panel).
-                    let right_borders = Borders::TOP | Borders::RIGHT | Borders::BOTTOM;
-                    let (cursor, right_seps) =
-                        render_right_side(app, right, f.buffer_mut(), &mut layout, right_borders);
-                    search_cursor = cursor;
-
-                    // Vertical divider.
-                    let left_seps = [sep.y];
-                    render_divider_col(
-                        divider_rect.x,
-                        divider_rect.y,
-                        divider_rect.y + divider_rect.height.saturating_sub(1),
-                        &left_seps,
-                        &right_seps,
-                        app.theme.border_unfocused,
-                        f.buffer_mut(),
-                    );
-                }
-
-                // ── Stacked: tab bar + active panel left, Traffic right
-                EffectiveLayout::Stacked => {
-                    let h_chunks = Layout::default()
-                        .direction(Direction::Horizontal)
-                        .constraints([
-                            Constraint::Percentage(app.sidebar_pct),
-                            Constraint::Length(1),
-                            Constraint::Fill(1),
-                        ])
-                        .split(area);
-
-                    let left = h_chunks[0];
-                    let divider_rect = h_chunks[1];
-                    let right = h_chunks[2];
-
-                    layout.divider_col = divider_rect.x;
-                    layout.total_width = area.width;
-
-                    let v_chunks = Layout::default()
-                        .direction(Direction::Vertical)
-                        .constraints([Constraint::Length(1), Constraint::Fill(1)])
-                        .split(left);
-
-                    let tab_bar_rect = v_chunks[0];
-                    let panel_rect = v_chunks[1];
-
-                    render_tab_bar(
-                        LEFT_TAB_NAMES,
-                        app.active_left_tab,
-                        tab_bar_rect,
-                        f.buffer_mut(),
-                        app.theme,
-                    );
-                    layout.tab_bar = tab_bar_rect;
-                    layout.tab_count = LEFT_TAB_NAMES.len();
-
-                    let stacked_borders = Borders::TOP | Borders::LEFT | Borders::BOTTOM;
-                    match app.active_left_tab {
-                        0 => render_workspaces_panel(
-                            app,
-                            panel_rect,
-                            f.buffer_mut(),
-                            &mut layout,
-                            stacked_borders,
-                            " Workspaces ",
-                        ),
-                        _ => render_keybinds_panel(
-                            app,
-                            panel_rect,
-                            f.buffer_mut(),
-                            &mut layout,
-                            stacked_borders,
-                            " Keybinds ",
-                        ),
-                    }
-
-                    // Right side.
-                    let right_borders = Borders::TOP | Borders::RIGHT | Borders::BOTTOM;
-                    let (cursor, right_seps) =
-                        render_right_side(app, right, f.buffer_mut(), &mut layout, right_borders);
-                    search_cursor = cursor;
-
-                    let left_seps = [panel_rect.y];
-                    render_divider_col(
-                        divider_rect.x,
-                        divider_rect.y,
-                        divider_rect.y + divider_rect.height.saturating_sub(1),
-                        &left_seps,
-                        &right_seps,
-                        app.theme.border_unfocused,
-                        f.buffer_mut(),
-                    );
-                }
-
-                // ── FullStack: tab bar + one panel full-width ──────
-                EffectiveLayout::FullStack => {
-                    let v_chunks = Layout::default()
-                        .direction(Direction::Vertical)
-                        .constraints([Constraint::Length(1), Constraint::Fill(1)])
-                        .split(area);
-
-                    let tab_bar_rect = v_chunks[0];
-                    let panel_rect = v_chunks[1];
-
-                    let visible_tab = if matches!(app.focus, FocusRegion::Stream) {
-                        2
-                    } else {
-                        app.active_left_tab
-                    };
-
-                    render_tab_bar(
-                        FULL_TAB_NAMES,
-                        visible_tab,
-                        tab_bar_rect,
-                        f.buffer_mut(),
-                        app.theme,
-                    );
-                    layout.tab_bar = tab_bar_rect;
-                    layout.tab_count = FULL_TAB_NAMES.len();
-
-                    match visible_tab {
-                        0 => render_workspaces_panel(
-                            app,
-                            panel_rect,
-                            f.buffer_mut(),
-                            &mut layout,
-                            Borders::ALL,
-                            " Workspaces ",
-                        ),
-                        1 => render_keybinds_panel(
-                            app,
-                            panel_rect,
-                            f.buffer_mut(),
-                            &mut layout,
-                            Borders::ALL,
-                            " Keybinds ",
-                        ),
-                        _ => {
-                            let (cursor, _) = render_right_side(
-                                app,
-                                panel_rect,
-                                f.buffer_mut(),
-                                &mut layout,
-                                Borders::ALL,
-                            );
-                            search_cursor = cursor;
-                        }
-                    }
-                }
-            }
-
-            if let Some(pos) = search_cursor {
-                f.set_cursor_position(pos);
-            }
-        })?;
+        terminal.draw(|f| render_dashboard(f, app, &mut layout))?;
 
         if app.quit {
             return Ok(());
@@ -1213,38 +847,19 @@ fn run_loop(
 
         if event::poll(timeout)? {
             match event::read()? {
-                Event::Key(key) => {
-                    handle_key(
-                        app,
-                        key.code,
-                        key.modifiers,
-                        stream_height,
-                        layout.detail_height,
-                    );
-                    app.fetch_page_if_needed();
-                }
+                Event::Key(key) => handle_key(app, key.code),
                 Event::Mouse(mouse) => {
-                    handle_mouse(
-                        app,
-                        mouse.kind,
-                        mouse.column,
-                        mouse.row,
-                        &layout,
-                        stream_height,
-                    );
-                    app.fetch_page_if_needed();
+                    handle_mouse(app, mouse.kind, mouse.column, mouse.row, &layout);
                 }
                 _ => {}
             }
         }
 
         if last_tick.elapsed() >= TICK_INTERVAL {
-            if let Some(rx) = wal_rx {
+            if let Some(rx) = watch_rx {
                 while rx.try_recv().is_ok() {}
             }
-            app.drain_tail();
-            app.refresh_sessions();
-            app.refresh_servers();
+            app.reload();
             last_tick = Instant::now();
         }
     }
@@ -1256,208 +871,166 @@ fn run_loop(
     reason = "tests use expect for readable assertions"
 )]
 mod tests {
-    use std::collections::HashMap;
-
-    use crossterm::event::{MouseButton, MouseEventKind};
-    use ratatui::layout::Rect;
-
     use super::*;
-    use crate::config::IconConfig;
+    use crate::state_snapshot::{
+        Alert, ClientInfo, DaemonSnapshot, LastAction, Progress, ServerEntry, SessionEntry,
+        SessionStatus, Snapshot,
+    };
     use crate::tui::data::MockDataSource;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
-    fn make_app<'a>(theme: &'a Theme, icons: &'a IconSet) -> App<'a> {
-        let data: Box<dyn DataSource> = Box::new(MockDataSource {
-            sessions: Vec::new(),
-            messages: HashMap::new(),
-            tail_messages: HashMap::new(),
-            server_statuses: Vec::new(),
-            server_noise: Vec::new(),
-        });
-        App::new(theme, icons, data).expect("mock app creation")
-    }
-
-    fn layout_80_cols() -> PanelLayout {
-        let stream = Rect::new(41, 0, 39, 23);
-        PanelLayout {
-            workspaces: Rect::new(0, 0, 40, 20),
-            keybinds: Rect::new(0, 20, 40, 3),
-            stream_inner_height: stream.height.saturating_sub(2) as usize,
-            stream,
-            tab_bar: Rect::default(),
-            tab_count: 0,
-            detail: None,
-            detail_height: 0,
-            workspace_hits: Vec::new(),
-            divider_col: 40,
-            total_width: 80,
+    fn fixture() -> Snapshot {
+        Snapshot {
+            schema: 1,
+            daemon: DaemonSnapshot {
+                instance_id: "daemon:test".to_string(),
+                pid: 4242,
+                version: "2.0.0".to_string(),
+                started_at: "2026-06-08T12:00:00Z".to_string(),
+                generated_at: chrono::Utc::now()
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            },
+            servers: vec![
+                ServerEntry {
+                    id: "rust-analyzer@/p/Catenary".to_string(),
+                    server: "rust-analyzer".to_string(),
+                    scope_root: "/p/Catenary".to_string(),
+                    state: "probing".to_string(),
+                    // 5m05s ago → growing time-in-state.
+                    state_since: (chrono::Utc::now() - chrono::Duration::seconds(305))
+                        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                    progress: Some(Progress {
+                        title: "Indexing".to_string(),
+                        message: None,
+                        pct: Some(62),
+                    }),
+                    ..ServerEntry::default()
+                },
+                ServerEntry {
+                    id: "pyright@/p/Other".to_string(),
+                    server: "pyright".to_string(),
+                    state: "healthy".to_string(),
+                    state_since: chrono::Utc::now().to_rfc3339(),
+                    ..ServerEntry::default()
+                },
+            ],
+            sessions: vec![SessionEntry {
+                id: "mcp:7f3a".to_string(),
+                client: ClientInfo {
+                    name: "claude".to_string(),
+                    version: None,
+                },
+                status: SessionStatus::Editing,
+                last_seen: chrono::Utc::now().to_rfc3339(),
+                last_action: Some(LastAction {
+                    summary: "edited src/db.rs".to_string(),
+                    at: chrono::Utc::now().to_rfc3339(),
+                }),
+                roots: vec!["/p/Catenary".to_string()],
+                ..SessionEntry::default()
+            }],
+            alerts: vec![Alert {
+                at: "2026-06-08T14:32:00.000Z".to_string(),
+                level: "error".to_string(),
+                source: Some("lsp".to_string()),
+                text: "rust-analyzer exited (code 101)".to_string(),
+                scope: Some("rust-analyzer@/p/Catenary".to_string()),
+            }],
         }
     }
 
-    #[test]
-    fn click_on_divider_starts_drag() {
+    fn app_for<'a>(theme: &'a Theme, icons: &'a IconSet, snap: Snapshot) -> App<'a> {
+        App::new(theme, icons, Box::new(MockDataSource::new(snap))).expect("app")
+    }
+
+    fn render_to_string(snap: Snapshot, width: u16, height: u16) -> String {
         let theme = Theme::new();
         let icons = IconSet::from_config(IconConfig::default());
-        let mut app = make_app(&theme, &icons);
-        let layout = layout_80_cols();
+        let mut app = app_for(&theme, &icons, snap);
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut layout = PanelLayout::default();
+        terminal
+            .draw(|f| render_dashboard(f, &mut app, &mut layout))
+            .expect("draw");
+        buffer_to_string(terminal.backend().buffer())
+    }
 
-        handle_mouse(
-            &mut app,
-            MouseEventKind::Down(MouseButton::Left),
-            40,
-            5,
-            &layout,
-            23,
-        );
-        assert!(app.dragging_divider);
+    fn buffer_to_string(buf: &Buffer) -> String {
+        let mut s = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                s.push_str(buf[(x, y)].symbol());
+            }
+            s.push('\n');
+        }
+        s
     }
 
     #[test]
-    fn click_adjacent_to_divider_starts_drag() {
-        let theme = Theme::new();
-        let icons = IconSet::from_config(IconConfig::default());
-        let mut app = make_app(&theme, &icons);
-        let layout = layout_80_cols();
-
-        handle_mouse(
-            &mut app,
-            MouseEventKind::Down(MouseButton::Left),
-            41,
-            5,
-            &layout,
-            23,
-        );
-        assert!(app.dragging_divider);
+    fn renders_all_three_boards_from_fixture() {
+        let out = render_to_string(fixture(), 100, 24);
+        assert!(out.contains("Servers"), "server board title: {out}");
+        assert!(out.contains("rust-analyzer"), "server row: {out}");
+        assert!(out.contains("pyright"), "second server: {out}");
+        assert!(out.contains("Sessions"), "session board title");
+        assert!(out.contains("claude"), "session client");
+        assert!(out.contains("edited src/db.rs"), "session last action");
+        assert!(out.contains("Alerts"), "alerts title");
+        assert!(out.contains("rust-analyzer exited"), "alert text");
     }
 
     #[test]
-    fn click_away_from_divider_does_not_drag() {
-        let theme = Theme::new();
-        let icons = IconSet::from_config(IconConfig::default());
-        let mut app = make_app(&theme, &icons);
-        let layout = layout_80_cols();
-
-        handle_mouse(
-            &mut app,
-            MouseEventKind::Down(MouseButton::Left),
-            60,
-            5,
-            &layout,
-            23,
-        );
-        assert!(!app.dragging_divider);
+    fn stuck_probing_shows_growing_time_in_state() {
+        let out = render_to_string(fixture(), 100, 24);
+        // The probing server's state_since is 5m05s in the past.
+        assert!(out.contains("5m05s"), "time-in-state visible: {out}");
+        assert!(out.contains("probing"), "probing state shown");
     }
 
     #[test]
-    fn drag_updates_sidebar_pct() {
-        let theme = Theme::new();
-        let icons = IconSet::from_config(IconConfig::default());
-        let mut app = make_app(&theme, &icons);
-        let layout = layout_80_cols();
-
-        handle_mouse(
-            &mut app,
-            MouseEventKind::Down(MouseButton::Left),
-            40,
-            5,
-            &layout,
-            23,
-        );
-        assert!(app.dragging_divider);
-
-        handle_mouse(
-            &mut app,
-            MouseEventKind::Drag(MouseButton::Left),
-            60,
-            5,
-            &layout,
-            23,
-        );
-        assert_eq!(app.sidebar_pct, 75);
-        assert!(app.dragging_divider);
+    fn narrow_layout_still_renders_all_boards() {
+        let out = render_to_string(fixture(), 50, 24);
+        assert!(out.contains("Servers"), "{out}");
+        assert!(out.contains("Sessions"), "{out}");
+        assert!(out.contains("Alerts"), "{out}");
+        assert!(out.contains("rust-analyzer"), "{out}");
     }
 
     #[test]
-    fn drag_clamps_to_min_max() {
-        let theme = Theme::new();
-        let icons = IconSet::from_config(IconConfig::default());
-        let mut app = make_app(&theme, &icons);
-        let layout = layout_80_cols();
-
-        handle_mouse(
-            &mut app,
-            MouseEventKind::Down(MouseButton::Left),
-            40,
-            5,
-            &layout,
-            23,
-        );
-
-        handle_mouse(
-            &mut app,
-            MouseEventKind::Drag(MouseButton::Left),
-            0,
-            5,
-            &layout,
-            23,
-        );
-        assert_eq!(app.sidebar_pct, MIN_SIDEBAR_PCT);
-
-        handle_mouse(
-            &mut app,
-            MouseEventKind::Drag(MouseButton::Left),
-            79,
-            5,
-            &layout,
-            23,
-        );
-        assert_eq!(app.sidebar_pct, MAX_SIDEBAR_PCT);
+    fn waiting_state_when_no_daemon() {
+        let out = render_to_string(Snapshot::default(), 80, 12);
+        assert!(out.contains("Waiting for daemon"), "{out}");
     }
 
     #[test]
-    fn mouse_up_ends_drag() {
+    fn key_navigation_moves_focus_and_cursor() {
         let theme = Theme::new();
         let icons = IconSet::from_config(IconConfig::default());
-        let mut app = make_app(&theme, &icons);
-        let layout = layout_80_cols();
-
-        handle_mouse(
-            &mut app,
-            MouseEventKind::Down(MouseButton::Left),
-            40,
-            5,
-            &layout,
-            23,
-        );
-        assert!(app.dragging_divider);
-
-        handle_mouse(
-            &mut app,
-            MouseEventKind::Up(MouseButton::Left),
-            50,
-            5,
-            &layout,
-            23,
-        );
-        assert!(!app.dragging_divider);
+        let mut app = app_for(&theme, &icons, fixture());
+        app.servers.visible = 10;
+        assert_eq!(app.focus, Focus::Servers);
+        handle_key(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.servers.cursor, 1);
+        handle_key(&mut app, KeyCode::Tab);
+        assert_eq!(app.focus, Focus::Sessions);
+        // 'y' on a session yanks without panicking.
+        handle_key(&mut app, KeyCode::Char('y'));
     }
 
     #[test]
-    fn stale_drag_cleared_by_new_click() {
-        let theme = Theme::new();
-        let icons = IconSet::from_config(IconConfig::default());
-        let mut app = make_app(&theme, &icons);
-        let layout = layout_80_cols();
+    fn watcher_fires_on_rename_into_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.json");
+        let (_watcher, rx) = start_state_watcher(&path).expect("watcher");
 
-        app.dragging_divider = true;
+        // Atomic write: temp + rename, as the daemon does.
+        let tmp = dir.path().join("state.json.tmp");
+        std::fs::write(&tmp, "{}").expect("write tmp");
+        std::fs::rename(&tmp, &path).expect("rename");
 
-        handle_mouse(
-            &mut app,
-            MouseEventKind::Down(MouseButton::Left),
-            60,
-            5,
-            &layout,
-            23,
-        );
-        assert!(!app.dragging_divider);
+        let got = rx.recv_timeout(Duration::from_secs(5));
+        assert!(got.is_ok(), "watcher should signal on rename to state.json");
     }
 }

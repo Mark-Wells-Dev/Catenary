@@ -1,611 +1,339 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
-//! Message formatting helpers for the TUI.
+//! Row formatters for the dashboard boards.
 //!
-//! Styled and plain-text formatters for single messages and scope headers.
+//! Each board entry is turned into one or more styled [`Line`]s here; the panel
+//! renderers in [`super`] only lay out blocks, scroll, and highlight. The
+//! firehose-rendering pipeline (pair-merge, scope-collapse, summarize) is gone
+//! (observability ticket 06) — those transforms now live in `catenary query`,
+//! not the TUI.
 
 use chrono::{DateTime, Local, Utc};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
+use unicode_width::UnicodeWidthStr;
 
-use super::icons::{IconSet, basename, diag_style, tool_icon};
-use super::scope::{Scope, ScopeState};
+use super::icons::{IconSet, basename};
 use super::theme::Theme;
-use crate::session::SessionMessage;
+use crate::state_snapshot::{Alert, ServerEntry, SessionEntry, SessionStatus};
 
-/// Format a UTC timestamp as `HH:MM:SS` in the local timezone.
-fn local_hms(ts: &DateTime<Utc>) -> String {
-    ts.with_timezone(&Local).format("%H:%M:%S").to_string()
+/// Lines rendered per server board entry (fixed, so the board can map an entry
+/// index to a line range for cursor highlight + scroll).
+pub const SERVER_ENTRY_LINES: usize = 2;
+/// Lines rendered per session board entry.
+pub const SESSION_ENTRY_LINES: usize = 2;
+
+// ── Time helpers ─────────────────────────────────────────────────────
+
+/// Parse an ISO 8601 timestamp, returning `None` on any malformed input.
+fn parse_iso(s: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
 }
 
-// ── Single message formatters ────────────────────────────────────────────
-
-/// Build a styled [`Line`] for a protocol message.
+/// Local wall-clock `HH:MM:SS` for an ISO timestamp (empty string on failure).
 ///
-/// Icons are intentionally omitted — single messages are raw protocol
-/// records. Icons appear only on scope headers where they serve as
-/// at-a-glance status signals.
+/// Timestamps in `state.json` are UTC; the dashboard shows them in local time
+/// (the ws25 "timestamps display in UTC" fix).
 #[must_use]
-pub fn format_message_styled(
-    msg: &SessionMessage,
-    icons: &IconSet,
-    theme: &Theme,
-) -> Line<'static> {
-    let ts = local_hms(&msg.timestamp);
-    let ts_span = Span::styled(format!("{ts}  "), theme.timestamp);
-
-    match msg.r#type.as_str() {
-        "lsp" => {
-            let mut spans = vec![
-                ts_span,
-                Span::styled(format!("[{}] ", msg.server), theme.accent),
-                Span::styled(msg.method.clone(), theme.text),
-            ];
-            if msg.method == "$/progress"
-                && let Some(detail) = progress_suffix(&msg.payload)
-            {
-                spans.push(Span::styled(format!(" ({detail})"), theme.muted));
-            }
-            Line::from(spans)
-        }
-        "mcp" => {
-            if msg.method == "tools/call" {
-                let tool_name = msg
-                    .payload
-                    .get("params")
-                    .and_then(|p| p.get("name"))
-                    .and_then(|n| n.as_str())
-                    .unwrap_or(&msg.method);
-                let icon = tool_icon(tool_name, icons);
-                Line::from(vec![
-                    ts_span,
-                    Span::styled(icon.to_string(), theme.success),
-                    Span::styled(tool_name.to_string(), theme.text),
-                ])
-            } else {
-                Line::from(vec![
-                    ts_span,
-                    Span::styled("[mcp] ".to_string(), theme.text),
-                    Span::styled(msg.method.clone(), theme.text),
-                ])
-            }
-        }
-        "hook" => {
-            if let Some(count_val) = msg.payload.get("count") {
-                let count = count_val.as_u64().unwrap_or(0);
-                let file = msg
-                    .payload
-                    .get("file")
-                    .and_then(|f| f.as_str())
-                    .unwrap_or(&msg.method);
-                let base = basename(file);
-                if count == 0 {
-                    Line::from(vec![
-                        ts_span,
-                        Span::styled(icons.diag_ok.clone(), theme.success),
-                        Span::styled(base.to_string(), theme.text),
-                    ])
-                } else {
-                    let preview = msg
-                        .payload
-                        .get("preview")
-                        .and_then(|p| p.as_str())
-                        .unwrap_or("");
-                    #[allow(
-                        clippy::cast_possible_truncation,
-                        reason = "diagnostic count is always small"
-                    )]
-                    let (icon, style) = diag_style(count as usize, preview, icons, theme);
-                    let label = format!("{count} diagnostic{}", if count == 1 { "" } else { "s" });
-                    Line::from(vec![
-                        ts_span,
-                        Span::styled(icon.to_string(), style),
-                        Span::styled(format!("{base}: "), theme.text),
-                        Span::styled(label, style),
-                    ])
-                }
-            } else {
-                Line::from(vec![
-                    ts_span,
-                    Span::styled("[hook] ".to_string(), theme.text),
-                    Span::styled(msg.method.clone(), theme.text),
-                ])
-            }
-        }
-        "internal" => {
-            let level_style = internal_level_style(&msg.payload, theme);
-            let tag = internal_level_tag(&msg.payload);
-            let body = internal_body(msg);
-            Line::from(vec![
-                ts_span,
-                Span::styled(format!("[{tag}] "), level_style),
-                Span::styled(body, theme.text),
-            ])
-        }
-        other => Line::from(vec![
-            ts_span,
-            Span::styled(format!("[{other}] "), theme.text),
-            Span::styled(msg.method.clone(), theme.text),
-        ]),
-    }
+pub fn local_hms(iso: &str) -> String {
+    parse_iso(iso).map_or_else(String::new, |dt| {
+        dt.with_timezone(&Local).format("%H:%M:%S").to_string()
+    })
 }
 
-/// Plain-text message summary (used for filter matching).
-#[must_use]
-pub fn format_message_plain(msg: &SessionMessage) -> String {
-    let ts = local_hms(&msg.timestamp);
-
-    match msg.r#type.as_str() {
-        "lsp" => {
-            let detail = if msg.method == "$/progress" {
-                progress_suffix(&msg.payload)
-            } else {
-                None
-            };
-            detail.map_or_else(
-                || format!("{ts} [{}] {}", msg.server, msg.method),
-                |d| format!("{ts} [{}] {} ({d})", msg.server, msg.method),
-            )
-        }
-        "mcp" => {
-            if msg.method == "tools/call" {
-                let tool_name = msg
-                    .payload
-                    .get("params")
-                    .and_then(|p| p.get("name"))
-                    .and_then(|n| n.as_str())
-                    .unwrap_or(&msg.method);
-                format!("{ts} {tool_name}")
-            } else {
-                format!("{ts} [mcp] {}", msg.method)
-            }
-        }
-        "hook" => msg.payload.get("count").map_or_else(
-            || format!("{ts} [hook] {}", msg.method),
-            |count_val| {
-                let count = count_val.as_u64().unwrap_or(0);
-                let file = msg
-                    .payload
-                    .get("file")
-                    .and_then(|f| f.as_str())
-                    .unwrap_or(&msg.method);
-                let base = basename(file);
-                if count == 0 {
-                    format!("{ts} {base}")
-                } else {
-                    format!("{ts} {base}: {count} diagnostics")
-                }
-            },
-        ),
-        "internal" => {
-            let tag = internal_level_tag(&msg.payload);
-            let body = internal_body(msg);
-            format!("{ts} [{tag}] {body}")
-        }
-        other => format!("{ts} [{other}] {}", msg.method),
-    }
-}
-
-// ── Duration + result helpers ────────────────────────────────────────────
-
-/// Format a timing delta as a compact string.
+/// Compact elapsed time from `since` until now, e.g. `3m12s`, `2h05m`, `4d01h`.
 ///
-/// Sub-10s: one decimal place (`0.5s`, `3.2s`).
-/// 10s+: integer seconds (`12s`, `45s`).
+/// This is the **time-in-state** primitive: a server stuck in `probing` shows a
+/// steadily growing value, which is exactly the ws25 "stuck initializing" bug
+/// made visible. Returns an empty string if `since` is unparseable.
 #[must_use]
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "millisecond timing values never exceed f64 mantissa range"
-)]
-pub fn format_duration_short(millis: i64) -> String {
-    let millis = millis.max(0);
-    if millis < 10_000 {
-        let secs = millis as f64 / 1000.0;
-        format!("{secs:.1}s")
+pub fn elapsed_short(since: &str) -> String {
+    let Some(start) = parse_iso(since) else {
+        return String::new();
+    };
+    let secs = (Utc::now() - start).num_seconds().max(0);
+    format_elapsed_secs(secs)
+}
+
+/// Format a non-negative second count as a compact duration.
+#[must_use]
+fn format_elapsed_secs(secs: i64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    } else if secs < 86_400 {
+        format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
     } else {
-        format!("{}s", millis / 1000)
+        format!("{}d{:02}h", secs / 86_400, (secs % 86_400) / 3600)
     }
 }
 
-/// Outcome of a merged request/response pair.
-enum PairOutcome {
-    Success,
-    Error { message: Option<String> },
-    Cancelled,
+// ── Layout helpers ───────────────────────────────────────────────────
+
+/// Total display width of a span sequence.
+fn spans_width(spans: &[Span<'_>]) -> usize {
+    spans.iter().map(|s| s.content.width()).sum()
 }
 
-/// Determine the outcome of a merged pair from the response payload.
-fn pair_outcome(response: &SessionMessage) -> PairOutcome {
-    if response.method == "notifications/cancelled" {
-        return PairOutcome::Cancelled;
-    }
-    if let Some(msg) = extract_jsonrpc_error(&response.payload) {
-        return PairOutcome::Error { message: Some(msg) };
-    }
-    if response.method == "tools/call" {
-        if let Some(msg) = extract_tool_error(&response.payload) {
-            return PairOutcome::Error { message: Some(msg) };
-        }
-        // Top-level isError without content text.
-        if response
-            .payload
-            .get("result")
-            .and_then(|r| r.get("isError"))
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-        {
-            return PairOutcome::Error { message: None };
-        }
-    }
-    PairOutcome::Success
-}
-
-/// Extract an error message from a JSON-RPC error response.
-fn extract_jsonrpc_error(payload: &serde_json::Value) -> Option<String> {
-    payload
-        .get("error")?
-        .get("message")?
-        .as_str()
-        .map(String::from)
-}
-
-/// Extract an error message from an MCP tool error response.
-///
-/// Looks for `result.content[0].isError == true` and returns the text.
-fn extract_tool_error(payload: &serde_json::Value) -> Option<String> {
-    let content = payload.get("result")?.get("content")?.as_array()?;
-    let first = content.first()?;
-    if first
-        .get("isError")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-    {
-        first.get("text")?.as_str().map(String::from)
-    } else {
-        None
-    }
-}
-
-// ── Tool metric extractors ───────────────────────────────────────────────
-
-/// Extract the total line count from an MCP tool response payload.
-///
-/// Walks `result.content[]` and sums `.lines().count()` for every
-/// `type: "text"` item. Returns `None` if the path doesn't exist
-/// (non-tool response), `Some(0)` for empty text content.
-fn extract_line_count(response: &SessionMessage) -> Option<usize> {
-    let result = response.payload.get("result")?;
-    let content = result.get("content")?.as_array()?;
-    let mut total = 0;
-    for item in content {
-        let is_text = item
-            .get("type")
-            .and_then(|t| t.as_str())
-            .is_some_and(|t| t == "text");
-        if !is_text {
-            continue;
-        }
-        if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-            total += text.lines().count();
-        }
-    }
-    Some(total)
-}
-
-/// Render a JSON value as a compact inline string.
-///
-/// Strings are quoted, numbers/bools/null are literal, and nested
-/// arrays/objects are opaque (`[...]` / `{...}`).
-fn compact_value(v: &serde_json::Value) -> String {
-    match v {
-        serde_json::Value::String(s) => format!("\"{s}\""),
-        serde_json::Value::Number(n) => n.to_string(),
-        serde_json::Value::Bool(b) => b.to_string(),
-        serde_json::Value::Null => "null".to_string(),
-        serde_json::Value::Array(_) => "[...]".to_string(),
-        serde_json::Value::Object(_) => "{...}".to_string(),
-    }
-}
-
-/// Extract tool call arguments from an MCP request payload.
-///
-/// Returns a compact `{key: value, key2: value2}` string where keys are
-/// unquoted and values use [`compact_value`] rendering.
-fn extract_tool_arguments(request: &SessionMessage) -> Option<String> {
-    let args = request.payload.get("params")?.get("arguments")?;
-    let obj = args.as_object()?;
-    if obj.is_empty() {
-        return None;
-    }
-    let pairs: Vec<String> = obj
-        .iter()
-        .map(|(k, v)| format!("{k}: {}", compact_value(v)))
-        .collect();
-    Some(format!("{{{}}}", pairs.join(", ")))
-}
-
-/// Build a metrics parenthetical string for a tool call pair.
-///
-/// Combines optional line count with timing into the parenthetical content.
-fn format_tool_metrics(line_count: Option<usize>, timing: &str) -> String {
-    line_count.map_or_else(
-        || timing.to_string(),
-        |n| format!("{n} line{}, {timing}", if n == 1 { "" } else { "s" }),
-    )
-}
-
-// ── Progress detail ──────────────────────────────────────────────────────
-
-/// Extract payload detail from a single `$/progress` message as a
-/// parenthesized suffix to append after the method name.
-///
-/// Includes title, message, and percentage when present. Returns `None`
-/// when the payload has no extractable detail.
-fn progress_suffix(payload: &serde_json::Value) -> Option<String> {
-    let value = payload.get("value")?;
-    let kind = value.get("kind").and_then(|k| k.as_str());
-    let title = value.get("title").and_then(|t| t.as_str());
-    let message = value.get("message").and_then(|m| m.as_str());
-    let pct = value.get("percentage").and_then(serde_json::Value::as_u64);
-
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(t) = title {
-        parts.push(t.to_string());
-    }
-    if let Some(m) = message {
-        parts.push(m.to_string());
-    }
-    if let Some(p) = pct {
-        parts.push(format!("{p}%"));
-    }
-    if kind == Some("end") && parts.is_empty() {
-        parts.push("done".to_string());
-    }
-
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join(", "))
-    }
-}
-
-// ── Internal message helpers ────────────────────────────────────────────
-
-/// Map the `level` field in an internal message payload to a theme style.
-fn internal_level_style(payload: &serde_json::Value, theme: &Theme) -> ratatui::style::Style {
-    match payload
-        .get("level")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("info")
-    {
-        "error" => theme.error,
-        "warn" => theme.warning,
-        "debug" => theme.muted,
-        _ => theme.info,
-    }
-}
-
-/// Extract a short level tag from an internal message payload.
-///
-/// Returns `"error"`, `"warn"`, `"info"`, or `"debug"`.
-fn internal_level_tag(payload: &serde_json::Value) -> &str {
-    payload
-        .get("level")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("info")
-}
-
-/// Build the summary body for an internal message.
-///
-/// Prefers `payload.message`, falls back to the method (module path).
-fn internal_body(msg: &SessionMessage) -> String {
-    let text = msg
-        .payload
-        .get("message")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("");
-    if text.is_empty() {
-        return msg.method.clone();
-    }
-    if msg.server.is_empty() {
-        text.to_string()
-    } else {
-        format!("{}: {text}", msg.server)
-    }
-}
-
-/// Build detail lines for an expanded internal message.
-///
-/// Returns `(label, value)` pairs for payload fields worth showing:
-/// `source`, `language`, and individual `fields` entries.
+/// Truncate a string to `max` display columns, appending `…` when it was cut.
 #[must_use]
-pub fn internal_detail_lines(msg: &SessionMessage) -> Vec<(String, String)> {
-    let mut lines = Vec::new();
-
-    // Always show the module path (stored in method).
-    if !msg.method.is_empty() {
-        lines.push(("target".to_string(), msg.method.clone()));
+pub fn truncate_to_width(s: &str, max: usize) -> String {
+    if s.width() <= max {
+        return s.to_string();
     }
-
-    if let Some(source) = msg
-        .payload
-        .get("source")
-        .and_then(serde_json::Value::as_str)
-    {
-        lines.push(("source".to_string(), source.to_string()));
+    if max == 0 {
+        return String::new();
     }
-
-    if let Some(lang) = msg
-        .payload
-        .get("language")
-        .and_then(serde_json::Value::as_str)
-    {
-        lines.push(("language".to_string(), lang.to_string()));
-    }
-
-    if let Some(fields) = msg
-        .payload
-        .get("fields")
-        .and_then(serde_json::Value::as_object)
-    {
-        for (k, v) in fields {
-            lines.push((k.clone(), compact_value(v)));
+    let budget = max.saturating_sub(1);
+    let mut out = String::new();
+    let mut w = 0;
+    for ch in s.chars() {
+        let cw = ch.to_string().width();
+        if w + cw > budget {
+            break;
         }
+        out.push(ch);
+        w += cw;
     }
-
-    lines
+    out.push('…');
+    out
 }
 
-// ── Scope lifecycle header ──────────────────────────────────────────────
+/// Build a line with `left` packed left and `right` flushed right within
+/// `width`, padding the gap. When the two would collide, `left` is truncated so
+/// `right` (the at-a-glance status / time) stays visible.
+fn justify(mut left: Vec<Span<'static>>, right: Vec<Span<'static>>, width: usize) -> Line<'static> {
+    let right_w = spans_width(&right);
+    let mut left_w = spans_width(&left);
 
-/// Build a styled [`Line`] for a scope header.
-///
-/// Renders from the scope's request message. Closed scopes with a
-/// response show outcome icon, timing, and line count. Open scopes
-/// show an activity indicator.
-#[must_use]
-pub fn format_scope_header_styled(scope: &Scope, icons: &IconSet, theme: &Theme) -> Line<'static> {
-    let header = scope.header_message();
-    let ts = local_hms(&header.timestamp);
-    let ts_span = Span::styled(format!("{ts}  "), theme.timestamp);
-
-    let child_count = scope.child_count();
-    let children_label = format!(
-        "{child_count} child{}",
-        if child_count == 1 { "" } else { "ren" }
-    );
-
-    // Extract tool name from MCP request payload.
-    let tool_name = Some(&scope.request)
-        .filter(|r| r.method == "tools/call")
-        .and_then(|r| r.payload.get("params"))
-        .and_then(|p| p.get("name"))
-        .and_then(|n| n.as_str());
-
-    let label = tool_name.unwrap_or(&header.method);
-
-    // Closed scopes with a response get outcome-aware rendering.
-    if scope.state == ScopeState::Closed
-        && let Some(resp) = scope.response.as_ref()
-    {
-        let delta_ms = resp
-            .timestamp
-            .signed_duration_since(scope.request.timestamp)
-            .num_milliseconds();
-        let timing = format_duration_short(delta_ms);
-        let outcome = pair_outcome(resp);
-
-        let (icon, icon_style, name_text, meta) = match &outcome {
-            PairOutcome::Cancelled => {
-                let meta = format!(" (cancelled, {children_label}, {timing})");
-                (
-                    icons.cancelled.clone(),
-                    theme.muted,
-                    label.to_string(),
-                    meta,
-                )
-            }
-            PairOutcome::Error { message } => {
-                let error_suffix = message
-                    .as_deref()
-                    .map_or(String::new(), |m| format!(": {m}"));
-                let meta = format!(" ({children_label}, {timing})");
-                (
-                    icons.proto_error.clone(),
-                    theme.error,
-                    format!("{label}{error_suffix}"),
-                    meta,
-                )
-            }
-            PairOutcome::Success => {
-                let line_count = tool_name.and_then(|_| extract_line_count(resp));
-                let metrics = format_tool_metrics(line_count, &timing);
-                let meta = format!(" ({metrics}, {children_label})");
-                let icon = tool_name.map_or_else(
-                    || icons.proto_ok.clone(),
-                    |tn| tool_icon(tn, icons).to_string(),
-                );
-                (icon, theme.success, label.to_string(), meta)
-            }
-        };
-
-        let args = tool_name.and_then(|_| extract_tool_arguments(&scope.request));
-
-        let mut spans = vec![ts_span, Span::styled(icon, icon_style)];
-        spans.push(Span::styled(name_text, theme.text));
-        spans.push(Span::styled(meta, theme.muted));
-        if let Some(args_str) = args {
-            spans.push(Span::styled(format!(" {args_str}"), theme.muted));
-        }
-        return Line::from(spans);
+    // Reserve at least one space between left and right; truncate left if needed.
+    if left_w + right_w + 1 > width && !left.is_empty() {
+        let max_left = width.saturating_sub(right_w + 1);
+        left = truncate_spans(left, max_left);
+        left_w = spans_width(&left);
     }
 
-    // Open scope: activity indicator.
-    let icon = tool_name.map_or_else(
-        || icons.tool_default.clone(),
-        |tn| tool_icon(tn, icons).to_string(),
-    );
-
-    let args = tool_name.and_then(|_| extract_tool_arguments(&scope.request));
-
-    let mut spans = vec![ts_span, Span::styled(icon, theme.accent)];
-    spans.push(Span::styled(label.to_string(), theme.text));
-    spans.push(Span::styled(format!(" ({children_label})"), theme.muted));
-    if let Some(args_str) = args {
-        spans.push(Span::styled(format!(" {args_str}"), theme.muted));
+    let gap = width.saturating_sub(left_w + right_w);
+    let mut spans = left;
+    if gap > 0 {
+        spans.push(Span::raw(" ".repeat(gap)));
     }
+    spans.extend(right);
     Line::from(spans)
 }
 
-/// Plain-text scope header (used for yank/clipboard).
-#[must_use]
-pub fn format_scope_header_plain(scope: &Scope, icons: &IconSet) -> String {
-    let header = scope.header_message();
-    let ts = local_hms(&header.timestamp);
-
-    let tool_name = Some(&scope.request)
-        .filter(|r| r.method == "tools/call")
-        .and_then(|r| r.payload.get("params"))
-        .and_then(|p| p.get("name"))
-        .and_then(|n| n.as_str());
-
-    let label = tool_name.unwrap_or(&header.method);
-
-    if scope.state == ScopeState::Closed
-        && let Some(resp) = scope.response.as_ref()
-    {
-        let delta_ms = resp
-            .timestamp
-            .signed_duration_since(scope.request.timestamp)
-            .num_milliseconds();
-        let timing = format_duration_short(delta_ms);
-        let outcome = pair_outcome(resp);
-
-        let status = match &outcome {
-            PairOutcome::Cancelled => "cancelled".to_string(),
-            PairOutcome::Error { message } => message
-                .as_deref()
-                .map_or_else(|| "error".to_string(), |m| format!("error: {m}")),
-            PairOutcome::Success => {
-                let line_count = tool_name.and_then(|_| extract_line_count(resp));
-                format_tool_metrics(line_count, &timing)
+/// Truncate a span sequence to `max` columns, preserving each span's style and
+/// appending `…` to the last surviving span when content was dropped.
+fn truncate_spans(spans: Vec<Span<'static>>, max: usize) -> Vec<Span<'static>> {
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let mut used = 0;
+    for span in spans {
+        let w = span.content.width();
+        if used + w <= max {
+            used += w;
+            out.push(span);
+        } else {
+            let remaining = max.saturating_sub(used);
+            if remaining > 0 {
+                let style = span.style;
+                out.push(Span::styled(
+                    truncate_to_width(&span.content, remaining),
+                    style,
+                ));
             }
-        };
-
-        let args = tool_name.and_then(|_| extract_tool_arguments(&scope.request));
-        let icon = tool_name.map_or_else(String::new, |tn| tool_icon(tn, icons).to_string());
-        args.map_or_else(
-            || format!("{ts} {icon}{label} ({status})"),
-            |a| format!("{ts} {icon}{label} ({status}) {a}"),
-        )
-    } else {
-        let args = tool_name.and_then(|_| extract_tool_arguments(&scope.request));
-        let icon = tool_name.map_or_else(String::new, |tn| tool_icon(tn, icons).to_string());
-        args.map_or_else(
-            || format!("{ts} {icon}{label}"),
-            |a| format!("{ts} {icon}{label} {a}"),
-        )
+            break;
+        }
     }
+    out
+}
+
+// ── Server board ─────────────────────────────────────────────────────
+
+/// Style + label for a server's lifecycle state.
+fn state_label(state: &str, busy_count: Option<u32>, theme: &Theme) -> (String, Style) {
+    match state {
+        "healthy" => ("healthy".to_string(), theme.success),
+        "busy" => (
+            busy_count.map_or_else(|| "busy".to_string(), |n| format!("busy({n})")),
+            theme.accent,
+        ),
+        "initializing" => ("initializing".to_string(), theme.warning),
+        "probing" => ("probing".to_string(), theme.warning),
+        "failed" => ("failed".to_string(), theme.error),
+        "dead" => ("dead".to_string(), theme.muted),
+        other => (other.to_string(), theme.text),
+    }
+}
+
+/// Render one server board entry as [`SERVER_ENTRY_LINES`] styled lines.
+///
+/// Line 1: `<server>` (left) · `<state>` (right, state-colored).
+/// Line 2 (dim): `<root> · <progress|last message>` (left) · time-in-state
+/// (right) — a stuck `probing` shows a growing time-in-state.
+#[must_use]
+pub fn server_entry_lines(
+    e: &ServerEntry,
+    width: usize,
+    theme: &Theme,
+    icons: &IconSet,
+) -> Vec<Line<'static>> {
+    let (label, label_style) = state_label(&e.state, e.busy_count, theme);
+
+    let dot = match e.state.as_str() {
+        "healthy" | "busy" => icons.ls_active.clone(),
+        _ => icons.ls_inactive.clone(),
+    };
+    let line1 = justify(
+        vec![
+            Span::styled(dot, label_style),
+            Span::styled(e.server.clone(), theme.text),
+        ],
+        vec![Span::styled(label, label_style)],
+        width,
+    );
+
+    // Sub-line: root context + progress or last message, with time-in-state.
+    let mut detail = if e.scope_root.is_empty() {
+        e.scope_kind.clone()
+    } else {
+        basename(&e.scope_root).to_string()
+    };
+    let extra = e.progress.as_ref().map_or_else(
+        || e.last_message.as_ref().map(|m| m.text.replace('\n', " ")),
+        |p| {
+            let pct = p.pct.map_or_else(String::new, |v| format!("{v}% "));
+            let msg = p
+                .message
+                .as_deref()
+                .map_or_else(String::new, |m| format!(" {m}"));
+            Some(format!("{pct}{}{msg}", p.title))
+        },
+    );
+    if let Some(extra) = extra {
+        let extra = extra.trim();
+        if !extra.is_empty() {
+            if !detail.is_empty() {
+                detail.push_str(" · ");
+            }
+            detail.push_str(extra);
+        }
+    }
+
+    let time = elapsed_short(&e.state_since);
+    let line2 = justify(
+        vec![Span::styled(format!("  {detail}"), theme.muted)],
+        if time.is_empty() {
+            vec![]
+        } else {
+            vec![Span::styled(time, theme.muted)]
+        },
+        width,
+    );
+
+    vec![line1, line2]
+}
+
+// ── Session board ────────────────────────────────────────────────────
+
+/// Style + label for a session status.
+const fn session_status_label(status: SessionStatus, theme: &Theme) -> (&'static str, Style) {
+    match status {
+        SessionStatus::Editing => ("editing", theme.accent),
+        SessionStatus::Diagnostics => ("diagnostics", theme.warning),
+        SessionStatus::Idle => ("idle", theme.muted),
+    }
+}
+
+/// Render one session board entry as [`SESSION_ENTRY_LINES`] styled lines.
+///
+/// Line 1: `<client>` (left) · `<status>` (right, status-colored).
+/// Line 2 (dim): `<last action | roots>` (left) · `seen <recency>` (right) —
+/// `last_seen` is the liveness signal a cold session lacks a death event for
+/// (ticket 05a), distinct from `last_action` (ticket 05).
+#[must_use]
+pub fn session_entry_lines(
+    e: &SessionEntry,
+    width: usize,
+    theme: &Theme,
+    icons: &IconSet,
+) -> Vec<Line<'static>> {
+    let (status, status_style) = session_status_label(e.status, theme);
+    let dot = if matches!(e.status, SessionStatus::Idle) {
+        icons.session_shutdown.clone()
+    } else {
+        icons.session_started.clone()
+    };
+    let client = if e.client.name.is_empty() {
+        "unknown".to_string()
+    } else {
+        e.client.name.clone()
+    };
+    let line1 = justify(
+        vec![
+            Span::styled(dot, status_style),
+            Span::styled(client, theme.text),
+        ],
+        vec![Span::styled(status.to_string(), status_style)],
+        width,
+    );
+
+    // Sub-line: last action (preferred) or workspace roots, plus recency.
+    let detail = e.last_action.as_ref().map_or_else(
+        || {
+            let names: Vec<String> = e.roots.iter().map(|r| basename(r).to_string()).collect();
+            names.join(", ")
+        },
+        |a| a.summary.replace('\n', " "),
+    );
+    let recency = elapsed_short(&e.last_seen);
+    let right = if recency.is_empty() {
+        vec![]
+    } else {
+        vec![Span::styled(format!("seen {recency}"), theme.muted)]
+    };
+    let line2 = justify(
+        vec![Span::styled(format!("  {detail}"), theme.muted)],
+        right,
+        width,
+    );
+
+    vec![line1, line2]
+}
+
+// ── Alerts ring ──────────────────────────────────────────────────────
+
+/// Render one alert as a single line: `<icon> <time> <text> (<scope>)`.
+///
+/// Errors and warnings are color-coded; the time is local wall-clock. The
+/// scope (when present) is the yankable bridge into `catenary query`.
+#[must_use]
+pub fn alert_line(a: &Alert, width: usize, theme: &Theme, icons: &IconSet) -> Line<'static> {
+    let (icon, style) = if a.level == "error" {
+        (icons.diag_error.clone(), theme.error)
+    } else {
+        (icons.diag_warn.clone(), theme.warning)
+    };
+    let time = local_hms(&a.at);
+    let mut text = a.text.replace('\n', " ");
+    if let Some(scope) = a.scope.as_deref().filter(|s| !s.is_empty()) {
+        text.push_str(" (");
+        text.push_str(scope);
+        text.push(')');
+    }
+
+    let prefix: Vec<Span<'static>> = vec![
+        Span::styled(icon, style),
+        Span::styled(format!("{time} "), theme.timestamp),
+    ];
+    let prefix_w = spans_width(&prefix);
+    let body = truncate_to_width(&text, width.saturating_sub(prefix_w));
+    let mut spans = prefix;
+    spans.push(Span::styled(body, theme.text));
+    Line::from(spans)
 }
 
 #[cfg(test)]
@@ -615,396 +343,152 @@ pub fn format_scope_header_plain(scope: &Scope, icons: &IconSet) -> String {
 )]
 mod tests {
     use super::*;
+    use crate::state_snapshot::{ClientInfo, LastAction, LastMessage, Progress};
+    use crate::tui::icons::IconSet;
 
-    use crate::config::IconConfig;
-    use crate::session::SessionMessage;
-    use crate::session::test_support;
-
-    fn make_message(r#type: &str, method: &str, server: &str) -> SessionMessage {
-        test_support::message(r#type, method, server)
+    fn icons() -> IconSet {
+        IconSet::from_config(crate::config::IconConfig::default())
     }
 
-    fn make_message_with_payload(
-        r#type: &str,
-        method: &str,
-        server: &str,
-        payload: serde_json::Value,
-    ) -> SessionMessage {
-        test_support::message_with_payload(r#type, method, server, payload)
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
     }
 
     #[test]
-    fn test_format_duration_short() {
-        assert_eq!(format_duration_short(0), "0.0s");
-        assert_eq!(format_duration_short(500), "0.5s");
-        assert_eq!(format_duration_short(3200), "3.2s");
-        assert_eq!(format_duration_short(9999), "10.0s");
-        assert_eq!(format_duration_short(10_000), "10s");
-        assert_eq!(format_duration_short(45_000), "45s");
-        assert_eq!(format_duration_short(-100), "0.0s");
+    fn format_elapsed_buckets() {
+        assert_eq!(format_elapsed_secs(5), "5s");
+        assert_eq!(format_elapsed_secs(72), "1m12s");
+        assert_eq!(format_elapsed_secs(3 * 3600 + 5 * 60), "3h05m");
+        assert_eq!(format_elapsed_secs(2 * 86_400 + 3600), "2d01h");
     }
 
     #[test]
-    fn test_format_message_styled_lsp() {
+    fn elapsed_short_handles_garbage() {
+        assert_eq!(elapsed_short("not-a-date"), "");
+    }
+
+    #[test]
+    fn truncate_appends_ellipsis() {
+        assert_eq!(truncate_to_width("hello world", 5), "hell…");
+        assert_eq!(truncate_to_width("hi", 5), "hi");
+    }
+
+    #[test]
+    fn server_line_shows_state_and_time_in_state() {
         let theme = Theme::new();
-        let icons = IconSet::from_config(IconConfig::default());
-        let msg = make_message("lsp", "textDocument/hover", "rust-analyzer");
-        let line = format_message_styled(&msg, &icons, &theme);
-        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text.contains("[rust-analyzer]"));
-        assert!(text.contains("textDocument/hover"));
-    }
-
-    #[test]
-    fn test_format_message_styled_mcp() {
-        let theme = Theme::new();
-        let icons = IconSet::from_config(IconConfig::default());
-        let msg = make_message_with_payload(
-            "mcp",
-            "tools/call",
-            "catenary",
-            serde_json::json!({"params": {"name": "grep"}}),
-        );
-        let line = format_message_styled(&msg, &icons, &theme);
-        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text.contains("grep"), "should contain tool name");
-    }
-
-    #[test]
-    fn test_format_message_styled_hook() {
-        let theme = Theme::new();
-        let icons = IconSet::from_config(IconConfig::default());
-        let msg = make_message_with_payload(
-            "hook",
-            "post-tool",
-            "catenary",
-            serde_json::json!({"file": "/src/lib.rs", "count": 2, "preview": "\t:12:1 [error] rustc: bad"}),
-        );
-        let line = format_message_styled(&msg, &icons, &theme);
-        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text.contains("lib.rs"));
-        assert!(text.contains("2 diagnostics"));
-    }
-
-    #[test]
-    fn test_format_message_styled_hook_clean() {
-        let theme = Theme::new();
-        let icons = IconSet::from_config(IconConfig::default());
-        let msg = make_message_with_payload(
-            "hook",
-            "post-tool",
-            "catenary",
-            serde_json::json!({"file": "/src/lib.rs", "count": 0}),
-        );
-        let line = format_message_styled(&msg, &icons, &theme);
-        assert!(line.spans.iter().any(|s| s.style == theme.success));
-    }
-
-    #[test]
-    fn test_format_message_plain() {
-        let msg = make_message("lsp", "textDocument/hover", "rust-analyzer");
-        let plain = format_message_plain(&msg);
-        assert!(plain.contains("[rust-analyzer]"));
-        assert!(plain.contains("textDocument/hover"));
-    }
-
-    #[test]
-    fn test_format_message_progress_begin() {
-        let theme = Theme::new();
-        let icons = IconSet::from_config(IconConfig::default());
-        let msg = make_message_with_payload(
-            "lsp",
-            "$/progress",
-            "rust-analyzer",
-            serde_json::json!({"token": "wid/1", "value": {"kind": "begin", "title": "Indexing", "percentage": 0}}),
-        );
-        let styled = format_message_styled(&msg, &icons, &theme);
-        let text: String = styled.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text.contains("Indexing"));
-        assert!(text.contains("0%"));
-
-        let plain = format_message_plain(&msg);
-        assert!(plain.contains("Indexing"));
-        assert!(plain.contains("0%"));
-    }
-
-    #[test]
-    fn test_format_message_progress_end() {
-        let msg = make_message_with_payload(
-            "lsp",
-            "$/progress",
-            "rust-analyzer",
-            serde_json::json!({"token": "wid/1", "value": {"kind": "end"}}),
-        );
-        let plain = format_message_plain(&msg);
-        assert!(plain.contains("done"));
-    }
-
-    #[test]
-    fn test_progress_suffix_bare_report() {
-        let payload = serde_json::json!({"value": {"kind": "report"}});
-        assert_eq!(progress_suffix(&payload), None);
-    }
-
-    #[test]
-    fn test_extract_jsonrpc_error() {
-        let payload = serde_json::json!({"error": {"code": -32601, "message": "Method not found"}});
-        assert_eq!(
-            extract_jsonrpc_error(&payload).as_deref(),
-            Some("Method not found")
-        );
-        assert_eq!(
-            extract_jsonrpc_error(&serde_json::json!({"result": null})),
-            None
-        );
-    }
-
-    #[test]
-    fn test_extract_tool_error() {
-        let payload = serde_json::json!({"result": {"content": [{"type": "text", "text": "bad pattern", "isError": true}]}});
-        assert_eq!(extract_tool_error(&payload).as_deref(), Some("bad pattern"));
-        assert_eq!(
-            extract_tool_error(
-                &serde_json::json!({"result": {"content": [{"type": "text", "text": "ok"}]}})
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn test_extract_line_count() {
-        let msg = make_message_with_payload(
-            "mcp",
-            "tools/call",
-            "catenary",
-            serde_json::json!({"result": {"content": [{"type": "text", "text": "a\nb\nc\nd\ne"}]}}),
-        );
-        assert_eq!(extract_line_count(&msg), Some(5));
-
-        let empty = make_message_with_payload(
-            "mcp",
-            "tools/call",
-            "catenary",
-            serde_json::json!({"result": {"content": [{"type": "text", "text": ""}]}}),
-        );
-        assert_eq!(extract_line_count(&empty), Some(0));
-
-        let no_content = make_message_with_payload(
-            "mcp",
-            "tools/call",
-            "catenary",
-            serde_json::json!({"params": {"name": "grep"}}),
-        );
-        assert_eq!(extract_line_count(&no_content), None);
-    }
-
-    #[test]
-    fn test_extract_tool_arguments() {
-        let msg = make_message_with_payload(
-            "mcp",
-            "tools/call",
-            "catenary",
-            serde_json::json!({"params": {"name": "grep", "arguments": {"pattern": "foo", "glob": "**/*.rs"}}}),
-        );
-        let args = extract_tool_arguments(&msg).expect("should extract arguments");
-        assert!(args.contains("pattern: \"foo\""));
-        assert!(args.contains("glob: \"**/*.rs\""));
-        assert!(args.starts_with('{') && args.ends_with('}'));
-    }
-
-    #[test]
-    fn test_extract_tool_arguments_none() {
-        let msg = make_message_with_payload(
-            "lsp",
-            "textDocument/hover",
-            "rust-analyzer",
-            serde_json::json!({"id": 1}),
-        );
-        assert_eq!(extract_tool_arguments(&msg), None);
-    }
-
-    // ── Internal message tests ──────────────────────────────────────
-
-    #[test]
-    fn test_format_internal_styled_shows_message() {
-        let theme = Theme::new();
-        let icons = IconSet::from_config(IconConfig::default());
-        let msg = make_message_with_payload(
-            "internal",
-            "catenary_mcp::lsp::manager",
-            "rust-analyzer",
-            serde_json::json!({"level": "warn", "message": "Failed to load workspaces"}),
-        );
-        let line = format_message_styled(&msg, &icons, &theme);
-        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(
-            text.contains("Failed to load workspaces"),
-            "should show payload message, got: {text}"
-        );
-        assert!(
-            text.contains("[warn]"),
-            "should show level tag, got: {text}"
-        );
-    }
-
-    #[test]
-    fn test_format_internal_styled_with_server_prefix() {
-        let theme = Theme::new();
-        let icons = IconSet::from_config(IconConfig::default());
-        let msg = make_message_with_payload(
-            "internal",
-            "catenary_mcp::lsp::manager",
-            "rust-analyzer",
-            serde_json::json!({"level": "error", "message": "crashed"}),
-        );
-        let line = format_message_styled(&msg, &icons, &theme);
-        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(
-            text.contains("rust-analyzer: crashed"),
-            "should prefix server name, got: {text}"
-        );
-    }
-
-    #[test]
-    fn test_format_internal_styled_no_server() {
-        let theme = Theme::new();
-        let icons = IconSet::from_config(IconConfig::default());
-        let msg = make_message_with_payload(
-            "internal",
-            "catenary_mcp::session",
-            "",
-            serde_json::json!({"level": "info", "message": "session started"}),
-        );
-        let line = format_message_styled(&msg, &icons, &theme);
-        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(
-            text.contains("session started"),
-            "should show message without server prefix, got: {text}"
-        );
-        assert!(
-            !text.contains(": session started"),
-            "should not have colon prefix without server, got: {text}"
-        );
-    }
-
-    #[test]
-    fn test_format_internal_styled_fallback_to_method() {
-        let theme = Theme::new();
-        let icons = IconSet::from_config(IconConfig::default());
-        let msg = make_message_with_payload(
-            "internal",
-            "catenary_mcp::lsp::manager",
-            "",
-            serde_json::json!({"level": "debug"}),
-        );
-        let line = format_message_styled(&msg, &icons, &theme);
-        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(
-            text.contains("catenary_mcp::lsp::manager"),
-            "should fall back to method when no message, got: {text}"
-        );
-    }
-
-    #[test]
-    fn test_format_internal_plain() {
-        let msg = make_message_with_payload(
-            "internal",
-            "catenary_mcp::lsp::manager",
-            "rust-analyzer",
-            serde_json::json!({"level": "warn", "message": "Failed to load workspaces"}),
-        );
-        let plain = format_message_plain(&msg);
-        assert!(
-            plain.contains("[warn]"),
-            "should contain level tag, got: {plain}"
-        );
-        assert!(
-            plain.contains("Failed to load workspaces"),
-            "should contain message, got: {plain}"
-        );
-    }
-
-    #[test]
-    fn test_format_internal_level_styles() {
-        let theme = Theme::new();
-        let icons = IconSet::from_config(IconConfig::default());
-
-        let warn_msg = make_message_with_payload(
-            "internal",
-            "mod",
-            "",
-            serde_json::json!({"level": "warn", "message": "w"}),
-        );
-        let warn_line = format_message_styled(&warn_msg, &icons, &theme);
-        let warn_tag = warn_line
-            .spans
-            .iter()
-            .find(|s| s.content.contains("[warn]"))
-            .expect("should have warn tag");
-        assert_eq!(warn_tag.style, theme.warning);
-
-        let error_msg = make_message_with_payload(
-            "internal",
-            "mod",
-            "",
-            serde_json::json!({"level": "error", "message": "e"}),
-        );
-        let error_line = format_message_styled(&error_msg, &icons, &theme);
-        let error_tag = error_line
-            .spans
-            .iter()
-            .find(|s| s.content.contains("[error]"))
-            .expect("should have error tag");
-        assert_eq!(error_tag.style, theme.error);
-    }
-
-    #[test]
-    fn test_internal_detail_lines() {
-        let msg = make_message_with_payload(
-            "internal",
-            "catenary_mcp::lsp::manager",
-            "rust-analyzer",
-            serde_json::json!({
-                "level": "warn",
-                "message": "Failed to load workspaces",
-                "source": "server.lifecycle",
-                "language": "rust",
-                "fields": {"error_code": 42}
+        let e = ServerEntry {
+            id: "rust-analyzer@/p/Catenary".to_string(),
+            server: "rust-analyzer".to_string(),
+            scope_root: "/p/Catenary".to_string(),
+            state: "probing".to_string(),
+            // 5m05s ago → time-in-state visible.
+            state_since: (Utc::now() - chrono::Duration::seconds(305))
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            progress: Some(Progress {
+                title: "Indexing".to_string(),
+                message: Some("src/db.rs".to_string()),
+                pct: Some(62),
             }),
-        );
-        let details = internal_detail_lines(&msg);
-        let labels: Vec<&str> = details.iter().map(|(l, _)| l.as_str()).collect();
-        assert!(
-            labels.contains(&"target"),
-            "should include target: {labels:?}"
-        );
-        assert!(
-            labels.contains(&"source"),
-            "should include source: {labels:?}"
-        );
-        assert!(
-            labels.contains(&"language"),
-            "should include language: {labels:?}"
-        );
-        assert!(
-            labels.contains(&"error_code"),
-            "should include field: {labels:?}"
-        );
-
-        let target = details.iter().find(|(l, _)| l == "target").expect("target");
-        assert_eq!(target.1, "catenary_mcp::lsp::manager");
+            ..ServerEntry::default()
+        };
+        let lines = server_entry_lines(&e, 40, &theme, &icons());
+        assert_eq!(lines.len(), SERVER_ENTRY_LINES);
+        let l0 = line_text(&lines[0]);
+        let l1 = line_text(&lines[1]);
+        assert!(l0.contains("rust-analyzer"), "{l0}");
+        assert!(l0.contains("probing"), "{l0}");
+        assert!(l1.contains("5m05s"), "time-in-state: {l1}");
+        assert!(l1.contains("62% Indexing"), "progress: {l1}");
+        assert!(l1.contains("Catenary"), "root basename: {l1}");
     }
 
     #[test]
-    fn test_internal_detail_lines_minimal() {
-        let msg = make_message_with_payload(
-            "internal",
-            "catenary_mcp::session",
-            "",
-            serde_json::json!({"level": "info", "message": "started"}),
-        );
-        let details = internal_detail_lines(&msg);
-        assert_eq!(details.len(), 1, "only target when no extras");
-        assert_eq!(details[0].0, "target");
+    fn server_line_shows_busy_count() {
+        let theme = Theme::new();
+        let e = ServerEntry {
+            server: "ra".to_string(),
+            state: "busy".to_string(),
+            busy_count: Some(3),
+            state_since: Utc::now().to_rfc3339(),
+            ..ServerEntry::default()
+        };
+        let lines = server_entry_lines(&e, 40, &theme, &icons());
+        assert!(line_text(&lines[0]).contains("busy(3)"));
+    }
+
+    #[test]
+    fn server_line_falls_back_to_last_message() {
+        let theme = Theme::new();
+        let e = ServerEntry {
+            server: "ra".to_string(),
+            state: "failed".to_string(),
+            state_since: Utc::now().to_rfc3339(),
+            last_message: Some(LastMessage {
+                level: "error".to_string(),
+                text: "Failed to load workspace".to_string(),
+                at: Utc::now().to_rfc3339(),
+            }),
+            ..ServerEntry::default()
+        };
+        let lines = server_entry_lines(&e, 50, &theme, &icons());
+        assert!(line_text(&lines[1]).contains("Failed to load workspace"));
+    }
+
+    #[test]
+    fn session_line_shows_status_and_action() {
+        let theme = Theme::new();
+        let e = SessionEntry {
+            id: "mcp:7f3a".to_string(),
+            client: ClientInfo {
+                name: "claude".to_string(),
+                version: None,
+            },
+            status: SessionStatus::Editing,
+            last_seen: (Utc::now() - chrono::Duration::seconds(12)).to_rfc3339(),
+            last_action: Some(LastAction {
+                summary: "edited src/db.rs".to_string(),
+                at: Utc::now().to_rfc3339(),
+            }),
+            roots: vec!["/p/Catenary".to_string()],
+            ..SessionEntry::default()
+        };
+        let lines = session_entry_lines(&e, 40, &theme, &icons());
+        assert_eq!(lines.len(), SESSION_ENTRY_LINES);
+        assert!(line_text(&lines[0]).contains("claude"));
+        assert!(line_text(&lines[0]).contains("editing"));
+        assert!(line_text(&lines[1]).contains("edited src/db.rs"));
+        assert!(line_text(&lines[1]).contains("seen 12s"));
+    }
+
+    #[test]
+    fn session_line_unknown_client_and_roots_fallback() {
+        let theme = Theme::new();
+        let e = SessionEntry {
+            id: "s".to_string(),
+            status: SessionStatus::Idle,
+            roots: vec!["/p/A".to_string(), "/p/B".to_string()],
+            ..SessionEntry::default()
+        };
+        let lines = session_entry_lines(&e, 40, &theme, &icons());
+        assert!(line_text(&lines[0]).contains("unknown"));
+        assert!(line_text(&lines[0]).contains("idle"));
+        assert!(line_text(&lines[1]).contains('A'));
+        assert!(line_text(&lines[1]).contains('B'));
+    }
+
+    #[test]
+    fn alert_line_color_codes_and_includes_scope() {
+        let theme = Theme::new();
+        let a = Alert {
+            at: "2026-06-08T14:32:00.000Z".to_string(),
+            level: "error".to_string(),
+            source: Some("lsp".to_string()),
+            text: "rust-analyzer exited (code 101)".to_string(),
+            scope: Some("rust-analyzer@/p/Catenary".to_string()),
+        };
+        let line = alert_line(&a, 80, &theme, &icons());
+        let t = line_text(&line);
+        assert!(t.contains("rust-analyzer exited"), "{t}");
+        assert!(t.contains("(rust-analyzer@/p/Catenary)"), "scope: {t}");
     }
 }

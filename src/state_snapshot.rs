@@ -32,7 +32,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
 use chrono::{SecondsFormat, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
 use tokio::sync::Notify;
 
@@ -97,7 +97,8 @@ struct DaemonMeta<'a> {
 }
 
 /// Live progress for a server entry.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct Progress {
     /// Progress operation title (e.g. `Indexing`).
     pub title: String,
@@ -110,7 +111,8 @@ pub struct Progress {
 }
 
 /// Most recent `window/logMessage` for a server entry.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct LastMessage {
     /// Severity tag (`error` / `warning` / `info` / `log` / `debug`).
     pub level: String,
@@ -121,7 +123,8 @@ pub struct LastMessage {
 }
 
 /// A single LSP server's board entry.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ServerEntry {
     /// Scope id `"<server>@<scope>"` — matches the JSONL file shard and
     /// round-trips into `catenary query --server …`.
@@ -159,7 +162,8 @@ pub struct ServerEntry {
 }
 
 /// Host CLI client identity for a session board entry.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct ClientInfo {
     /// Host CLI name (`claude` / `gemini` / `antigravity`), from the hook
     /// `format` field. `"unknown"` when the session was created without one.
@@ -173,7 +177,7 @@ pub struct ClientInfo {
 
 /// A session's current activity, derived at snapshot-build time from the
 /// daemon's live editing state.
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum SessionStatus {
     /// The session holds an active editing accumulator (a covered edit is
@@ -182,11 +186,13 @@ pub enum SessionStatus {
     /// A `catenary diagnostics` run is in flight for the session.
     Diagnostics,
     /// Neither editing nor running diagnostics.
+    #[default]
     Idle,
 }
 
 /// The most recent attributable action a session took.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct LastAction {
     /// Human-readable summary, e.g. `edited src/db.rs` or
     /// `diagnostics: 2 errors, 1 warnings`.
@@ -210,7 +216,8 @@ pub struct LastAction {
 /// No `pid`: hooks own session identity (ws23) and the hook payloads carry no
 /// agent pid; recovering one would mean correlating to the MCP connection,
 /// which the stateless model deliberately avoids.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SessionEntry {
     /// Session scope id (host `session_id`) → `query --session …`; yankable.
     pub id: String,
@@ -249,7 +256,8 @@ pub trait SessionBoard: Send + Sync {
 }
 
 /// A bounded `warn`/`error` alert — "when to look".
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct Alert {
     /// When the alert fired (ISO 8601).
     pub at: String,
@@ -263,6 +271,46 @@ pub struct Alert {
     /// Associated scope (`<server>@<root>` or `<server>`), if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
+}
+
+/// Reader-side parse of a `state.json` snapshot — the daemon→TUI contract.
+///
+/// The owned counterpart to the writer's borrowed [`SnapshotView`]. Lives here,
+/// beside the writer, so the contract is single-sourced (a round-trip test
+/// keeps the two halves honest). Deserialization is **permissive**: every field
+/// defaults via `#[serde(default)]`, so a missing or newly-added key never fails
+/// the parse — the `schema` tag is a forward-compat hint, not a migration
+/// anchor (nothing is ever read back into the writer).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct Snapshot {
+    /// Forward-compat schema tag (see [`SCHEMA`]).
+    pub schema: u32,
+    /// Daemon identity + generation time.
+    pub daemon: DaemonSnapshot,
+    /// Server health board.
+    pub servers: Vec<ServerEntry>,
+    /// Session board.
+    pub sessions: Vec<SessionEntry>,
+    /// Bounded `warn`/`error` alert ring (newest-first).
+    pub alerts: Vec<Alert>,
+}
+
+/// Reader-side `daemon` block — owned counterpart to [`DaemonMeta`].
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct DaemonSnapshot {
+    /// Per-invocation instance id (`daemon:<uuid>`).
+    pub instance_id: String,
+    /// Daemon process id.
+    pub pid: u32,
+    /// Catenary version string.
+    pub version: String,
+    /// Daemon start time (ISO 8601).
+    pub started_at: String,
+    /// When the snapshot was generated (ISO 8601) — staleness / daemon-down
+    /// detection.
+    pub generated_at: String,
 }
 
 /// Current UTC time as an ISO 8601 string with millisecond precision.
@@ -1294,5 +1342,75 @@ mod tests {
         })
         .await;
         assert!(one, "disconnected session should vanish on the next flush");
+    }
+
+    #[test]
+    fn writer_output_parses_into_reader_snapshot() {
+        // The writer serializes; the reader (`Snapshot`) must parse it back.
+        // This keeps the daemon→TUI contract single-sourced: any field the
+        // writer adds/renames is caught here, not in the TUI at runtime.
+        let mut state = fresh_state();
+        let key = root_key("rust-analyzer", "/p/Catenary");
+        state.register_server(&key, "2026-06-08T12:03:44Z");
+        state.update_state(&key, &ServerLifecycle::Probing);
+        state.update_progress(&key, Some("Indexing"), Some("src/db.rs"), Some(62));
+        state.push_alert(Alert {
+            at: "2026-06-08T14:32:00.000Z".to_string(),
+            level: "error".to_string(),
+            source: Some("lsp".to_string()),
+            text: "rust-analyzer exited".to_string(),
+            scope: Some("rust-analyzer@/p/Catenary".to_string()),
+        });
+
+        let session = session_entry("mcp:7f3a", SessionStatus::Editing, vec!["/p/Catenary"]);
+        let json = state.to_json(std::slice::from_ref(&session));
+
+        let snapshot: Snapshot = serde_json::from_str(&json).expect("reader parses writer output");
+        assert_eq!(snapshot.schema, SCHEMA);
+        assert_eq!(snapshot.daemon.pid, 4242);
+        assert!(!snapshot.daemon.generated_at.is_empty());
+
+        assert_eq!(snapshot.servers.len(), 1);
+        let server = &snapshot.servers[0];
+        assert_eq!(server.id, "rust-analyzer@/p/Catenary");
+        assert_eq!(server.state, "probing");
+        assert!(!server.state_since.is_empty());
+        assert_eq!(
+            server.progress.as_ref().and_then(|p| p.pct),
+            Some(62),
+            "progress round-trips"
+        );
+
+        assert_eq!(snapshot.sessions.len(), 1);
+        assert_eq!(snapshot.sessions[0].id, "mcp:7f3a");
+        assert_eq!(snapshot.sessions[0].status, SessionStatus::Editing);
+
+        assert_eq!(snapshot.alerts.len(), 1);
+        assert_eq!(snapshot.alerts[0].level, "error");
+        assert_eq!(
+            snapshot.alerts[0].scope.as_deref(),
+            Some("rust-analyzer@/p/Catenary")
+        );
+    }
+
+    #[test]
+    fn reader_tolerates_missing_and_extra_keys() {
+        // Forward/back-compat: an empty object parses to defaults; unknown keys
+        // are ignored; a partial server entry fills the rest from Default.
+        let empty: Snapshot = serde_json::from_str("{}").expect("empty object parses");
+        assert_eq!(empty.schema, 0);
+        assert!(empty.servers.is_empty());
+
+        let partial = r#"{
+            "schema": 99,
+            "future_field": {"nested": true},
+            "servers": [{"id": "ra@/p", "state": "healthy", "unknown": 1}]
+        }"#;
+        let snap: Snapshot = serde_json::from_str(partial).expect("partial parses");
+        assert_eq!(snap.schema, 99);
+        assert_eq!(snap.servers.len(), 1);
+        assert_eq!(snap.servers[0].id, "ra@/p");
+        assert_eq!(snap.servers[0].state, "healthy");
+        assert!(snap.servers[0].progress.is_none());
     }
 }

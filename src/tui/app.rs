@@ -1,407 +1,429 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
-//! Application state for the TUI.
+//! Application state for the `state.json` dashboard.
 //!
-//! Owns the data source, stream state, and display configuration.
-//! The event loop in [`super::run_loop`] drives state transitions.
+//! The TUI holds the latest snapshot and renders three boards from it — server
+//! health, sessions, and the alerts ring. It is a pure file reader: a file-watch
+//! on the snapshot drives [`App::reload`]; there is no database, no firehose, no
+//! socket client (observability ticket 06).
 
-use super::data::{DataSource, MessageTail};
+use super::data::DataSource;
 use super::icons::IconSet;
-use super::popup::ServerPopup;
-use super::sidebar::{SessionData, SidebarState};
-use super::stream::{PAGE_SIZE, PageRequest, StreamState};
 use super::theme::Theme;
+use crate::state_snapshot::Snapshot;
 
-/// Which section has keyboard focus.
+/// Which board currently has keyboard focus.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FocusRegion {
-    /// Unified workspace panel (connections + servers).
-    Workspaces,
-    /// Keybinds panel (only focusable when expanded).
-    Keybinds,
-    /// Message stream.
-    Stream,
+pub enum Focus {
+    /// Server health board (top-left).
+    Servers,
+    /// Session board (bottom-left).
+    Sessions,
+    /// Alerts ring (right pane).
+    Alerts,
 }
 
-/// Left-column layout preference set by the user.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum LeftLayout {
-    /// Two panels stacked vertically (Workspaces, Keybinds).
-    #[default]
-    Quadrant,
-    /// Tab-stacked: one panel visible at a time, cycled with `b`.
-    Stacked,
+impl Focus {
+    /// Next board in the cycle (Servers → Sessions → Alerts → Servers).
+    #[must_use]
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Servers => Self::Sessions,
+            Self::Sessions => Self::Alerts,
+            Self::Alerts => Self::Servers,
+        }
+    }
+
+    /// Previous board in the cycle.
+    #[must_use]
+    pub const fn prev(self) -> Self {
+        match self {
+            Self::Servers => Self::Alerts,
+            Self::Sessions => Self::Servers,
+            Self::Alerts => Self::Sessions,
+        }
+    }
 }
 
-/// Effective layout mode, computed from [`LeftLayout`] and terminal size.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum EffectiveLayout {
-    /// Quadrant: left column has two panels, Traffic on right.
-    #[default]
-    Quadrant,
-    /// Stacked sidebar: left column is a tab stack, Traffic on right.
-    Stacked,
-    /// Full-width tab stack: all panels (including Traffic) in one stack.
-    FullStack,
+/// Cursor + scroll for a single board, indexed by **entry** (not by rendered
+/// line — a server/session entry spans two lines).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Board {
+    /// Selected entry index.
+    pub cursor: usize,
+    /// First visible entry index.
+    pub scroll: usize,
+    /// Entries visible in the panel, refreshed each render so key handlers can
+    /// page and keep the cursor on screen without re-deriving panel height.
+    pub visible: usize,
 }
 
-/// Terminal height below which the left column degrades to tab stacking.
-const SHORT_THRESHOLD: u16 = 12;
+impl Board {
+    /// Clamp the cursor and scroll to `len` entries (after a reload may shrink
+    /// the list). An empty list resets both to zero.
+    fn clamp(&mut self, len: usize) {
+        if len == 0 {
+            self.cursor = 0;
+            self.scroll = 0;
+            return;
+        }
+        self.cursor = self.cursor.min(len - 1);
+        self.scroll = self.scroll.min(self.cursor);
+    }
 
-/// Terminal width below which everything degrades to a single full-width
-/// tab stack.
-const NARROW_THRESHOLD: u16 = 50;
+    /// Move the cursor up `n` entries, scrolling to keep it visible.
+    const fn up(&mut self, n: usize) {
+        self.cursor = self.cursor.saturating_sub(n);
+        if self.cursor < self.scroll {
+            self.scroll = self.cursor;
+        }
+    }
 
-/// Application state driving the TUI.
-#[allow(
-    clippy::struct_excessive_bools,
-    reason = "TUI state naturally has independent boolean flags"
-)]
+    /// Move the cursor down `n` entries within `len`, scrolling to keep it
+    /// visible.
+    fn down(&mut self, n: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        self.cursor = (self.cursor + n).min(len - 1);
+        if self.visible > 0 && self.cursor >= self.scroll + self.visible {
+            self.scroll = self.cursor + 1 - self.visible;
+        }
+    }
+
+    /// Re-clamp scroll against the current visible window (called at render with
+    /// the freshly measured `visible`).
+    pub fn settle(&mut self, len: usize) {
+        if len == 0 {
+            self.cursor = 0;
+            self.scroll = 0;
+            return;
+        }
+        self.cursor = self.cursor.min(len - 1);
+        if self.visible > 0 && self.cursor >= self.scroll + self.visible {
+            self.scroll = self.cursor + 1 - self.visible;
+        }
+        if self.cursor < self.scroll {
+            self.scroll = self.cursor;
+        }
+    }
+}
+
+/// Dashboard application state.
 pub struct App<'a> {
     /// Semantic color theme.
     pub theme: &'a Theme,
     /// Resolved icon theme.
     pub icons: &'a IconSet,
-    /// Data source for session and event data.
+    /// Snapshot data source (`state.json` in production).
     pub data: Box<dyn DataSource>,
+    /// The latest snapshot, re-loaded on file-watch / tick.
+    pub snapshot: Snapshot,
     /// Whether the user wants to quit.
     pub quit: bool,
-    /// Which panel has keyboard focus.
-    pub focus: FocusRegion,
+    /// Which board has focus.
+    pub focus: Focus,
+    /// Server board cursor/scroll.
+    pub servers: Board,
+    /// Session board cursor/scroll.
+    pub sessions: Board,
+    /// Alerts ring cursor/scroll.
+    pub alerts: Board,
     /// Whether the keybinds panel is expanded (`?` toggles).
     pub keybinds_expanded: bool,
-    /// User's left-column layout preference.
-    pub left_layout: LeftLayout,
-    /// Active tab in the left-column stack (0=Workspaces, 1=Keybinds).
-    pub active_left_tab: usize,
-    /// Effective layout mode, recomputed each frame from [`left_layout`] and
-    /// terminal dimensions.
-    pub effective: EffectiveLayout,
-    /// Sidebar width as a percentage of the terminal (clamped to 10..=90).
+    /// Left-column width as a percentage of the terminal (clamped 10..=90).
     pub sidebar_pct: u16,
     /// Whether the user is dragging the panel divider.
     pub dragging_divider: bool,
-    /// Unified workspace sidebar state.
-    pub sidebar: SidebarState,
-    /// Unified message stream state.
-    pub stream: StreamState,
-    /// Tail reader for incremental message updates.
-    pub tail: Option<Box<dyn MessageTail>>,
-    /// Whether search input mode is active (`/` was pressed).
-    pub search_active: bool,
-    /// Text being typed into the search bar.
-    pub search_input: String,
-    /// Server message popup overlay (shown when user presses Enter on a server).
-    pub popup: Option<ServerPopup>,
 }
 
 impl<'a> App<'a> {
-    /// Create a new App, loading only the most recent page of scopes.
+    /// Build a new dashboard, loading the initial snapshot.
     ///
     /// # Errors
     ///
-    /// Returns an error if loading messages fails.
+    /// Returns an error if the initial snapshot read fails (a parse error on an
+    /// existing file; a missing file is not an error).
     pub fn new(
         theme: &'a Theme,
         icons: &'a IconSet,
         data: Box<dyn DataSource>,
     ) -> anyhow::Result<Self> {
-        let messages = data.recent_scopes(PAGE_SIZE)?;
-        let tail = data.create_all_message_tail().ok();
-        let mut stream = StreamState::new(messages);
-        stream.reached_beginning = stream.entries.len() < PAGE_SIZE;
-
-        let mut app = Self {
+        let snapshot = data.load()?;
+        Ok(Self {
             theme,
             icons,
             data,
+            snapshot,
             quit: false,
-            focus: FocusRegion::Stream,
+            focus: Focus::Servers,
+            servers: Board::default(),
+            sessions: Board::default(),
+            alerts: Board::default(),
             keybinds_expanded: false,
-            left_layout: LeftLayout::Quadrant,
-            active_left_tab: 0,
-            effective: EffectiveLayout::Quadrant,
             sidebar_pct: 50,
             dragging_divider: false,
-            sidebar: SidebarState::new(),
-            stream,
-            tail,
-            search_active: false,
-            search_input: String::new(),
-            popup: None,
-        };
-
-        app.refresh_sessions();
-        app.refresh_servers();
-
-        Ok(app)
+        })
     }
 
-    /// Drain new messages from the tail reader into the stream.
-    pub fn drain_tail(&mut self) {
-        let Some(tail) = self.tail.as_mut() else {
-            return;
-        };
-        let mut new_messages = Vec::new();
-        while let Ok(Some(msg)) = tail.try_next_message() {
-            new_messages.push(msg);
-        }
-        if !new_messages.is_empty() {
-            self.stream.append(new_messages);
+    /// Re-load the snapshot. On read/parse failure the previous snapshot is
+    /// kept (a transient torn read never blanks the dashboard).
+    pub fn reload(&mut self) {
+        if let Ok(snapshot) = self.data.load() {
+            self.snapshot = snapshot;
+            self.clamp_cursors();
         }
     }
 
-    /// Fetch a page if the cursor is near a paging boundary.
-    pub fn fetch_page_if_needed(&mut self) {
-        let Some(PageRequest::Older(before_id)) = self.stream.check_paging() else {
-            return;
-        };
-
-        if let Ok(messages) = self.data.older_scopes(before_id, PAGE_SIZE) {
-            self.stream.prepend_page(messages);
-        }
+    /// Re-clamp every board against its current entry count.
+    fn clamp_cursors(&mut self) {
+        self.servers.clamp(self.snapshot.servers.len());
+        self.sessions.clamp(self.snapshot.sessions.len());
+        self.alerts.clamp(self.snapshot.alerts.len());
     }
 
-    /// Jump to the top of loaded content (Home key).
-    pub const fn jump_to_beginning(&mut self) {
-        self.stream.scroll_position = 0;
-        self.stream.cursor = 0;
-        self.stream.auto_scroll = false;
-    }
-
-    /// Toggle selection on the sidebar's current cursor item and update
-    /// the stream filters.
-    pub fn toggle_workspace_selection(&mut self) {
-        if self.sidebar.toggle_selected() {
-            self.stream.set_root_filter(self.sidebar.root_filter());
-            self.stream.set_server_filter(self.sidebar.server_filter());
-        }
-    }
-
-    /// Map a left-tab index to the corresponding [`FocusRegion`].
+    /// Whether a daemon snapshot is present (the file existed and parsed with a
+    /// generation timestamp). When false, the dashboard shows a waiting state.
     #[must_use]
-    pub const fn tab_focus(tab: usize) -> FocusRegion {
-        match tab {
-            0 => FocusRegion::Workspaces,
-            _ => FocusRegion::Keybinds,
+    pub const fn daemon_present(&self) -> bool {
+        !self.snapshot.daemon.generated_at.is_empty()
+    }
+
+    /// Entry count for the focused board.
+    #[must_use]
+    pub const fn focused_len(&self) -> usize {
+        match self.focus {
+            Focus::Servers => self.snapshot.servers.len(),
+            Focus::Sessions => self.snapshot.sessions.len(),
+            Focus::Alerts => self.snapshot.alerts.len(),
         }
     }
 
-    /// Recompute `effective` from the user preference and terminal size.
-    pub fn update_effective(&mut self, width: u16, height: u16) {
-        let new = if width < NARROW_THRESHOLD {
-            EffectiveLayout::FullStack
-        } else if height < SHORT_THRESHOLD {
-            EffectiveLayout::Stacked
-        } else {
-            match self.left_layout {
-                LeftLayout::Quadrant => EffectiveLayout::Quadrant,
-                LeftLayout::Stacked => EffectiveLayout::Stacked,
-            }
-        };
-
-        // Entering stacked/fullstack: sync active_left_tab to current focus.
-        if new != EffectiveLayout::Quadrant && self.effective == EffectiveLayout::Quadrant {
-            match self.focus {
-                FocusRegion::Workspaces => self.active_left_tab = 0,
-                FocusRegion::Keybinds => self.active_left_tab = 1,
-                FocusRegion::Stream => {}
-            }
-        }
-
-        // Returning to quadrant: if focused on collapsed keybinds, fall back.
-        if new == EffectiveLayout::Quadrant
-            && self.effective != EffectiveLayout::Quadrant
-            && self.focus == FocusRegion::Keybinds
-            && !self.keybinds_expanded
-        {
-            self.focus = FocusRegion::Workspaces;
-        }
-
-        self.effective = new;
-    }
-
-    /// Cycle the left-column tab (`b` key).
-    ///
-    /// - **Quadrant**: enters stacked mode, showing the current left tab.
-    /// - **Stacked**: cycles tabs (Workspaces → Keybinds), then
-    ///   returns to quadrant if the terminal permits.
-    /// - **`FullStack`**: cycles through all three tabs including Traffic.
-    pub const fn cycle_left_tab(&mut self) {
-        match self.effective {
-            EffectiveLayout::FullStack => {
-                if matches!(self.focus, FocusRegion::Stream) {
-                    self.active_left_tab = 0;
-                    self.focus = FocusRegion::Workspaces;
-                } else if self.active_left_tab >= 1 {
-                    self.focus = FocusRegion::Stream;
-                } else {
-                    self.active_left_tab += 1;
-                    self.focus = Self::tab_focus(self.active_left_tab);
-                }
-            }
-            EffectiveLayout::Stacked => {
-                if self.active_left_tab >= 1 {
-                    self.active_left_tab = 0;
-                    self.left_layout = LeftLayout::Quadrant;
-                } else {
-                    self.active_left_tab += 1;
-                }
-                self.focus = Self::tab_focus(self.active_left_tab);
-            }
-            EffectiveLayout::Quadrant => {
-                self.left_layout = LeftLayout::Stacked;
-                self.focus = Self::tab_focus(self.active_left_tab);
-            }
+    /// Mutable handle to the focused board's cursor/scroll.
+    pub const fn focused_board(&mut self) -> &mut Board {
+        match self.focus {
+            Focus::Servers => &mut self.servers,
+            Focus::Sessions => &mut self.sessions,
+            Focus::Alerts => &mut self.alerts,
         }
     }
 
-    /// Switch directly to a specific left tab, entering stacked mode if needed.
-    pub fn set_left_tab(&mut self, tab: usize) {
-        if tab > 1 {
-            self.focus = FocusRegion::Stream;
-            return;
-        }
-        self.active_left_tab = tab;
-        self.focus = Self::tab_focus(tab);
-        if self.effective == EffectiveLayout::Quadrant {
-            self.left_layout = LeftLayout::Stacked;
-        }
-    }
-
-    /// Cycle focus: in quadrant mode cycles all panels; in stacked/full-stack
-    /// mode toggles between the left stack and Traffic.
+    /// Advance focus to the next board.
     pub const fn cycle_focus(&mut self) {
-        match self.effective {
-            EffectiveLayout::Quadrant => {
-                self.focus = match self.focus {
-                    FocusRegion::Workspaces => {
-                        if self.keybinds_expanded {
-                            FocusRegion::Keybinds
-                        } else {
-                            FocusRegion::Stream
-                        }
-                    }
-                    FocusRegion::Keybinds => FocusRegion::Stream,
-                    FocusRegion::Stream => FocusRegion::Workspaces,
-                };
-            }
-            EffectiveLayout::Stacked | EffectiveLayout::FullStack => {
-                self.focus = if matches!(self.focus, FocusRegion::Stream) {
-                    Self::tab_focus(self.active_left_tab)
-                } else {
-                    FocusRegion::Stream
-                };
-            }
-        }
+        self.focus = self.focus.next();
     }
 
-    /// Cycle focus in reverse.
+    /// Advance focus to the previous board.
     pub const fn cycle_focus_back(&mut self) {
-        match self.effective {
-            EffectiveLayout::Quadrant => {
-                self.focus = match self.focus {
-                    FocusRegion::Workspaces => FocusRegion::Stream,
-                    FocusRegion::Keybinds => FocusRegion::Workspaces,
-                    FocusRegion::Stream => {
-                        if self.keybinds_expanded {
-                            FocusRegion::Keybinds
-                        } else {
-                            FocusRegion::Workspaces
-                        }
-                    }
-                };
-            }
-            EffectiveLayout::Stacked | EffectiveLayout::FullStack => {
-                self.focus = if matches!(self.focus, FocusRegion::Stream) {
-                    Self::tab_focus(self.active_left_tab)
-                } else {
-                    FocusRegion::Stream
-                };
-            }
+        self.focus = self.focus.prev();
+    }
+
+    /// Move the focused cursor up `n` entries.
+    pub const fn cursor_up(&mut self, n: usize) {
+        self.focused_board().up(n);
+    }
+
+    /// Move the focused cursor down `n` entries.
+    pub fn cursor_down(&mut self, n: usize) {
+        let len = self.focused_len();
+        self.focused_board().down(n, len);
+    }
+
+    /// Page up by the focused board's visible window.
+    pub fn page_up(&mut self) {
+        let page = self.focused_board().visible.max(1);
+        self.cursor_up(page);
+    }
+
+    /// Page down by the focused board's visible window.
+    pub fn page_down(&mut self) {
+        let page = self.focused_board().visible.max(1);
+        self.cursor_down(page);
+    }
+
+    /// Jump the focused cursor to the first entry.
+    pub const fn jump_home(&mut self) {
+        let board = self.focused_board();
+        board.cursor = 0;
+        board.scroll = 0;
+    }
+
+    /// Jump the focused cursor to the last entry.
+    pub const fn jump_end(&mut self) {
+        let len = self.focused_len();
+        if len > 0 {
+            self.focused_board().cursor = len - 1;
         }
     }
 
-    /// Toggle keybinds: in quadrant mode toggles expansion; in stacked/full-stack
-    /// mode jumps to the Keybinds tab.
-    pub fn toggle_keybinds(&mut self) {
-        match self.effective {
-            EffectiveLayout::Quadrant => {
-                self.keybinds_expanded = !self.keybinds_expanded;
-                if !self.keybinds_expanded && self.focus == FocusRegion::Keybinds {
-                    self.focus = FocusRegion::Workspaces;
-                }
-            }
-            EffectiveLayout::Stacked | EffectiveLayout::FullStack => {
-                self.active_left_tab = 1;
-                self.focus = FocusRegion::Keybinds;
-            }
+    /// The scope id (or alert text) to yank for the current selection — the
+    /// bridge into `catenary query`. `None` when the focused board is empty.
+    #[must_use]
+    pub fn selected_yank_text(&self) -> Option<String> {
+        match self.focus {
+            Focus::Servers => self
+                .snapshot
+                .servers
+                .get(self.servers.cursor)
+                .map(|s| s.id.clone()),
+            Focus::Sessions => self
+                .snapshot
+                .sessions
+                .get(self.sessions.cursor)
+                .map(|s| s.id.clone()),
+            Focus::Alerts => self.snapshot.alerts.get(self.alerts.cursor).map(|a| {
+                // Prefer the scope (query bridge); fall back to the message.
+                a.scope
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .map_or_else(|| a.text.clone(), ToString::to_string)
+            }),
         }
     }
 
-    /// Refresh the sidebar session list if the alive set has changed.
-    pub fn refresh_sessions(&mut self) {
-        let Ok(current_ids) = self.data.list_alive_session_ids() else {
-            return;
-        };
-        if !self.sidebar.needs_refresh(&current_ids) {
-            return;
-        }
-        let Ok(rows) = self.data.list_sessions() else {
-            return;
-        };
-        let sessions: Vec<_> = rows
-            .into_iter()
-            .filter(|r| r.alive)
-            .map(|r| SessionData {
-                id: r.info.id,
-                client_name: r.info.client_name,
-                workspace: r.info.workspace,
-                languages: r.languages,
-            })
-            .collect();
-        let had_filter = self.sidebar.has_filter();
-        self.sidebar.refresh(sessions, &mut self.stream.badges);
-        if had_filter {
-            self.stream.set_root_filter(self.sidebar.root_filter());
+    /// Toggle the keybinds help panel.
+    pub const fn toggle_keybinds(&mut self) {
+        self.keybinds_expanded = !self.keybinds_expanded;
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "tests use expect for readable assertions"
+)]
+mod tests {
+    use super::*;
+    use crate::state_snapshot::{Alert, ServerEntry, SessionEntry};
+    use crate::tui::data::MockDataSource;
+
+    fn snapshot_with(servers: usize, sessions: usize, alerts: usize) -> Snapshot {
+        Snapshot {
+            schema: 1,
+            servers: (0..servers)
+                .map(|i| ServerEntry {
+                    id: format!("ra-{i}@/p"),
+                    server: format!("ra-{i}"),
+                    state: "healthy".to_string(),
+                    ..ServerEntry::default()
+                })
+                .collect(),
+            sessions: (0..sessions)
+                .map(|i| SessionEntry {
+                    id: format!("mcp:{i}"),
+                    ..SessionEntry::default()
+                })
+                .collect(),
+            alerts: (0..alerts)
+                .map(|i| Alert {
+                    at: "2026-06-08T14:32:00Z".to_string(),
+                    level: "warn".to_string(),
+                    text: format!("alert {i}"),
+                    ..Alert::default()
+                })
+                .collect(),
+            ..Snapshot::default()
         }
     }
 
-    /// Refresh the sidebar server list from the database.
-    pub fn refresh_servers(&mut self) {
-        let Ok(rows) = self.data.list_server_statuses() else {
-            return;
-        };
-        let noise = self.data.list_server_noise().unwrap_or_default();
-        if !self.sidebar.servers_need_refresh(&rows, &noise) {
-            return;
-        }
-        let had_filter = self.sidebar.has_server_filter();
-        self.sidebar.refresh_servers(&rows, &noise);
-        if had_filter {
-            self.stream.set_server_filter(self.sidebar.server_filter());
-        }
+    fn app_with<'a>(theme: &'a Theme, icons: &'a IconSet, snap: Snapshot) -> App<'a> {
+        App::new(theme, icons, Box::new(MockDataSource::new(snap))).expect("app")
     }
 
-    /// Open the server message popup for the server at the current cursor.
-    pub fn open_server_popup(&mut self) {
-        let Some(srv_idx) = self.sidebar.cursor_server_index() else {
-            return;
-        };
-        let entry = &self.sidebar.servers[srv_idx];
-        let server = &entry.name;
-        let scope_root = &entry.scope_root;
-        let root = &entry.root;
-        let messages = self
-            .data
-            .list_server_message_history(server, scope_root)
-            .unwrap_or_default();
-        self.popup = Some(ServerPopup::new(server, root, messages));
+    #[test]
+    fn focus_cycles_through_three_boards() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(crate::config::IconConfig::default());
+        let mut app = app_with(&theme, &icons, snapshot_with(1, 1, 1));
+        assert_eq!(app.focus, Focus::Servers);
+        app.cycle_focus();
+        assert_eq!(app.focus, Focus::Sessions);
+        app.cycle_focus();
+        assert_eq!(app.focus, Focus::Alerts);
+        app.cycle_focus();
+        assert_eq!(app.focus, Focus::Servers);
+        app.cycle_focus_back();
+        assert_eq!(app.focus, Focus::Alerts);
     }
 
-    /// Close the server message popup.
-    pub fn close_popup(&mut self) {
-        self.popup = None;
+    #[test]
+    fn cursor_clamps_to_focused_board_len() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(crate::config::IconConfig::default());
+        let mut app = app_with(&theme, &icons, snapshot_with(3, 0, 0));
+        app.focused_board().visible = 10;
+        app.cursor_down(100);
+        assert_eq!(app.servers.cursor, 2, "clamped to last server");
+        app.jump_home();
+        assert_eq!(app.servers.cursor, 0);
+        app.jump_end();
+        assert_eq!(app.servers.cursor, 2);
+    }
+
+    #[test]
+    fn empty_board_navigation_is_safe() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(crate::config::IconConfig::default());
+        let mut app = app_with(&theme, &icons, snapshot_with(0, 0, 0));
+        app.cursor_down(1);
+        app.cursor_up(1);
+        app.jump_end();
+        assert_eq!(app.servers.cursor, 0);
+        assert!(app.selected_yank_text().is_none());
+    }
+
+    #[test]
+    fn yank_returns_scope_id_per_board() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(crate::config::IconConfig::default());
+        let mut app = app_with(&theme, &icons, snapshot_with(2, 2, 0));
+        assert_eq!(app.selected_yank_text().as_deref(), Some("ra-0@/p"));
+        app.cursor_down(1);
+        assert_eq!(app.selected_yank_text().as_deref(), Some("ra-1@/p"));
+        app.focus = Focus::Sessions;
+        assert_eq!(app.selected_yank_text().as_deref(), Some("mcp:0"));
+    }
+
+    #[test]
+    fn alert_yank_prefers_scope_then_text() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(crate::config::IconConfig::default());
+        let mut snap = snapshot_with(0, 0, 1);
+        snap.alerts[0].scope = Some("rust-analyzer@/p".to_string());
+        let mut app = app_with(&theme, &icons, snap);
+        app.focus = Focus::Alerts;
+        assert_eq!(
+            app.selected_yank_text().as_deref(),
+            Some("rust-analyzer@/p")
+        );
+    }
+
+    #[test]
+    fn reload_clamps_cursor_when_list_shrinks() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(crate::config::IconConfig::default());
+        // Start with 5 servers, cursor at the end, then reload a 2-server
+        // snapshot from the same source by swapping it in.
+        let mut app = app_with(&theme, &icons, snapshot_with(5, 0, 0));
+        app.focused_board().visible = 10;
+        app.jump_end();
+        assert_eq!(app.servers.cursor, 4);
+        app.data = Box::new(MockDataSource::new(snapshot_with(2, 0, 0)));
+        app.reload();
+        assert_eq!(app.servers.cursor, 1, "cursor clamped to new last entry");
+    }
+
+    #[test]
+    fn daemon_present_reflects_generated_at() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(crate::config::IconConfig::default());
+        let app = app_with(&theme, &icons, Snapshot::default());
+        assert!(!app.daemon_present(), "empty snapshot = waiting");
+
+        let mut snap = snapshot_with(1, 0, 0);
+        snap.daemon.generated_at = "2026-06-08T14:32:10Z".to_string();
+        let app = app_with(&theme, &icons, snap);
+        assert!(app.daemon_present());
     }
 }

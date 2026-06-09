@@ -15,15 +15,12 @@ use super::theme::Theme;
 /// All keybindings (flat list, no modal sections).
 const KEYBINDS: &[(&str, &str)] = &[
     ("j/k", "navigate"),
-    ("Enter", "expand/collapse"),
-    ("Space", "select"),
-    ("y", "yank"),
-    ("f", "toggle filter"),
+    ("Tab", "next board"),
+    ("y", "yank scope id"),
     ("PgUp/Dn", "scroll"),
     ("Home/End", "jump"),
-    ("q", "quit"),
     ("?", "toggle keybinds"),
-    ("Tab", "next panel"),
+    ("q", "quit"),
 ];
 
 /// Number of content lines when the keybinds panel is expanded.
@@ -98,7 +95,7 @@ mod tests {
 
         assert!(content.contains("quit"), "should show quit: {content}");
         assert!(
-            content.contains("next panel"),
+            content.contains("next board"),
             "should show Tab hint: {content}"
         );
         assert!(
@@ -110,12 +107,8 @@ mod tests {
             "should show navigate: {content}"
         );
         assert!(content.contains("yank"), "should show yank: {content}");
-        assert!(content.contains("expand"), "should show expand: {content}");
-        assert!(content.contains("select"), "should show select: {content}");
-        assert!(
-            content.contains("toggle filter"),
-            "should show filter: {content}"
-        );
+        assert!(content.contains("scroll"), "should show scroll: {content}");
+        assert!(content.contains("jump"), "should show jump: {content}");
         // No section headers in the flat layout.
         assert!(
             !content.contains("Sidebar"),
@@ -163,13 +156,13 @@ mod tests {
             "should show first keybind: {content}"
         );
         assert!(
-            content.contains("select"),
+            content.contains("yank"),
             "should show third keybind: {content}"
         );
-        // Fourth keybind (yank) shouldn't fit.
+        // Fourth keybind (scroll) shouldn't fit.
         assert!(
-            !content.contains("yank"),
-            "should not show yank in 3 rows: {content}"
+            !content.contains("scroll"),
+            "should not show scroll in 3 rows: {content}"
         );
     }
 }
