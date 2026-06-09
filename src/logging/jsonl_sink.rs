@@ -16,15 +16,21 @@
 //!
 //! ```text
 //! <cache>/catenary/<instance_id>/
-//! ├── mcp.jsonl                       # instance-global MCP heartbeat
-//! ├── trace.jsonl                     # instance-global internal trace (level-filtered)
-//! ├── servers/<server>.jsonl          # rootless server lifecycle (workspace/single-file tiers)
-//! └── <encoded-cwd>/                  # one project root, path flattened CC-style
-//!     ├── <server>.jsonl              #   autonomous lifecycle ($/progress, logMessage, spawn, init)
-//!     ├── grep/<ts>_<uuid>.jsonl      #   one invocation = one file (cmd record + triggered LSP)
-//!     ├── glob/<ts>_<uuid>.jsonl
-//!     └── sessions/<session_id>.jsonl #   hook decisions · edits · diagnostics(+LSP) · sed(+LSP)
+//! ├── mcp.jsonl                          # instance-global MCP heartbeat
+//! ├── trace.jsonl                        # instance-global internal trace (level-filtered)
+//! ├── servers/<server>@<enc-root>.jsonl  # autonomous server lifecycle, sharded by server identity
+//! ├── grep/<ts>_<uuid>.jsonl             # one invocation = one file (cmd record + triggered LSP)
+//! ├── glob/<ts>_<uuid>.jsonl
+//! └── sessions/<session_id>.jsonl        # hook decisions · edits · diagnostics(+LSP) · sed(+LSP)
 //! ```
+//!
+//! **Each scope shards by its own id at the top level**; `cwd` is a *record
+//! field* (a `query` filter dimension), not a directory layer. Servers shard by
+//! their `server@root` identity. (Earlier drafts nested everything under an
+//! `<encoded-cwd>/` project dir — dropped: it split a session's records across
+//! files and made `query --session` a cross-dir scan instead of a direct open.
+//! A project subtree can be re-added later without touching the record format,
+//! since `cwd` is in every line.)
 //!
 //! **Additive.** This ticket lands the sink, the [`Record`] schema, the [`Scope`]
 //! resolver, and the path layout. Wiring it into the active sink set (alongside,
@@ -106,25 +112,22 @@ impl InstanceStream {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Scope {
     /// Hook-correlated work (editing, `diagnostics`, `sed`), keyed by the
-    /// session id. Lives at `<cwd>/sessions/<session_id>.jsonl`, or
-    /// `sessions/<session_id>.jsonl` when no cwd is known.
-    Session {
-        cwd: Option<String>,
-        session_id: String,
-    },
+    /// session id. Lives at `sessions/<session_id>.jsonl` — `session_id` is the
+    /// primary forensic axis, so it shards at the top level (a direct open for
+    /// `query --session`, not a cross-dir scan).
+    Session { session_id: String },
     /// One stateless `grep`/`glob` invocation, keyed by a daemon-minted
     /// per-request UUID (no hook handoff — Decision 4). Lives at
-    /// `<cwd>/<tool>/<ts>_<uuid>.jsonl`.
+    /// `<tool>/<ts>_<uuid>.jsonl`.
     Search {
-        cwd: Option<String>,
         tool: SearchTool,
         ts: String,
         id: Uuid,
     },
     /// A server's *autonomous* lifecycle (`$/progress`, `window/logMessage`,
-    /// spawn, `initialize`) — traffic no request triggered. A project-scoped
-    /// (rootful) instance lives at `<cwd>/<server>.jsonl`; a rootless
-    /// (workspace/single-file tier) instance lives at `servers/<server>.jsonl`.
+    /// spawn, `initialize`) — traffic no request triggered. Sharded by the
+    /// server's own `server@root` identity: rootful → `servers/<server>@<enc-root>.jsonl`,
+    /// rootless (workspace/single-file tier) → `servers/<server>.jsonl`.
     Server {
         server: String,
         scope_root: Option<String>,
@@ -138,52 +141,33 @@ impl Scope {
     /// root (`<cache>/catenary/<instance_id>`).
     fn target(&self, root: &Path) -> (PathBuf, String) {
         match self {
-            Self::Session { cwd, session_id } => (
-                cwd_base(root, cwd.as_deref())
-                    .join("sessions")
-                    .join(format!("{session_id}.jsonl")),
+            Self::Session { session_id } => (
+                root.join("sessions").join(format!("{session_id}.jsonl")),
                 session_id.clone(),
             ),
-            Self::Search { cwd, tool, ts, id } => {
+            Self::Search { tool, ts, id } => {
                 let hex = id.simple().to_string();
                 let name = if ts.is_empty() {
                     format!("{hex}.jsonl")
                 } else {
                     format!("{ts}_{hex}.jsonl")
                 };
-                (
-                    cwd_base(root, cwd.as_deref())
-                        .join(tool.dir_name())
-                        .join(name),
-                    hex,
+                (root.join(tool.dir_name()).join(name), hex)
+            }
+            Self::Server { server, scope_root } => {
+                let servers = root.join("servers");
+                scope_root.as_deref().map_or_else(
+                    || (servers.join(format!("{server}.jsonl")), server.clone()),
+                    |r| {
+                        let enc = encode_cwd(Path::new(r));
+                        (
+                            servers.join(format!("{server}@{enc}.jsonl")),
+                            format!("{server}@{r}"),
+                        )
+                    },
                 )
             }
-            Self::Server { server, scope_root } => scope_root.as_deref().map_or_else(
-                || {
-                    (
-                        root.join("servers").join(format!("{server}.jsonl")),
-                        server.clone(),
-                    )
-                },
-                |r| {
-                    (
-                        root.join(encode_cwd(Path::new(r)))
-                            .join(format!("{server}.jsonl")),
-                        format!("{server}@{r}"),
-                    )
-                },
-            ),
             Self::Instance { id, stream } => (root.join(stream.file_name()), id.clone()),
-        }
-    }
-
-    /// The cwd shard string for the record body (empty when the scope has no
-    /// project root).
-    fn cwd(&self) -> &str {
-        match self {
-            Self::Session { cwd, .. } | Self::Search { cwd, .. } => cwd.as_deref().unwrap_or(""),
-            Self::Server { scope_root, .. } => scope_root.as_deref().unwrap_or(""),
-            Self::Instance { .. } => "",
         }
     }
 }
@@ -199,10 +183,9 @@ impl Scope {
 /// - **Search** — a stateless `grep`/`glob` invocation. The daemon mints a
 ///   per-request UUID at the IPC boundary and tags the invocation's events (the
 ///   command record and any LSP it triggers) with the structured fields
-///   `search_id` (UUID), `tool` (`grep`|`glob`), and optionally `cwd` /
-///   `search_ts`. No hook handoff — search self-scopes. (Field emission is
-///   wired daemon-side at the firehose cutover, ticket 02; the resolver reads
-///   the contract here.)
+///   `search_id` (UUID), `tool` (`grep`|`glob`), and optionally `search_ts`. No
+///   hook handoff — search self-scopes. (Field emission is wired daemon-side at
+///   the firehose cutover, ticket 02; the resolver reads the contract here.)
 /// - **Server** — an autonomous LSP event (`kind = "lsp"`, names a `server`, no
 ///   session/search scope): `$/progress`, `window/logMessage`, spawn,
 ///   `initialize`. Triggered LSP rides its command's file via the session/search
@@ -211,10 +194,7 @@ impl Scope {
 ///   stream; internal trace → the trace stream. The `scope_id` is `instance_id`.
 fn resolve_scope(event: &LogEvent<'_>, instance_id: &str) -> Scope {
     if let Some(session_id) = non_empty(event.session_id.as_deref()) {
-        return Scope::Session {
-            cwd: non_empty(event.scope_root.as_deref()),
-            session_id,
-        };
+        return Scope::Session { session_id };
     }
 
     if let Some(scope) = search_scope(event) {
@@ -252,15 +232,13 @@ fn search_scope(event: &LogEvent<'_>) -> Option<Scope> {
         "glob" => SearchTool::Glob,
         _ => return None,
     };
-    let cwd = non_empty(event.fields.get("cwd").and_then(Value::as_str))
-        .or_else(|| non_empty(event.scope_root.as_deref()));
     let ts = event
         .fields
         .get("search_ts")
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    Some(Scope::Search { cwd, tool, ts, id })
+    Some(Scope::Search { tool, ts, id })
 }
 
 /// `Some(owned)` when `s` is present and non-empty, else `None`.
@@ -268,13 +246,21 @@ fn non_empty(s: Option<&str>) -> Option<String> {
     s.filter(|v| !v.is_empty()).map(ToString::to_string)
 }
 
-/// Build the firehose root path under `<base>/catenary/<encoded-cwd>` (or the
-/// bare root when no cwd is known).
-fn cwd_base(root: &Path, cwd: Option<&str>) -> PathBuf {
-    cwd.map_or_else(
-        || root.to_path_buf(),
-        |c| root.join(encode_cwd(Path::new(c))),
-    )
+/// The cwd shard string for the record body — the project a record belongs to,
+/// as a `query` filter dimension (not a directory level).
+///
+/// Prefers the search contract's explicit `cwd` field (the CLI-side `getcwd`),
+/// falling back to the LSP routing `scope_root`. Empty when neither is present
+/// (e.g. instance-global streams). A session's true `getcwd` is threaded at the
+/// firehose cutover (ticket 02); until then `scope_root` is the proxy.
+fn event_cwd<'a>(event: &'a LogEvent<'_>) -> &'a str {
+    event
+        .fields
+        .get("cwd")
+        .and_then(Value::as_str)
+        .filter(|c| !c.is_empty())
+        .or(event.scope_root.as_deref())
+        .unwrap_or("")
 }
 
 /// Map a [`Severity`] to its firehose level tag.
@@ -336,12 +322,13 @@ struct Record<'a> {
     fields: Map<String, Value>,
 }
 
-/// Build a [`Record`] from an event and its resolved `scope_id` / `cwd`.
+/// Build a [`Record`] from an event and its resolved `scope_id`.
 ///
 /// Protocol events (`kind` in `{lsp, mcp, hook}`) nest their raw JSON `payload`
 /// and use the protocol `method`; internal events carry top-level
-/// `message`/`language`/`fields` and use the module `target` as `method`.
-fn build_record<'a>(event: &'a LogEvent<'_>, scope_id: &'a str, cwd: &'a str) -> Record<'a> {
+/// `message`/`language`/`fields` and use the module `target` as `method`. The
+/// `cwd` filter field is derived from the event via [`event_cwd`].
+fn build_record<'a>(event: &'a LogEvent<'_>, scope_id: &'a str) -> Record<'a> {
     let kind = match event.kind.as_deref() {
         Some("lsp") => "lsp",
         Some("mcp") => "mcp",
@@ -384,7 +371,7 @@ fn build_record<'a>(event: &'a LogEvent<'_>, scope_id: &'a str, cwd: &'a str) ->
         parent_id: event.parent_id.as_deref(),
         server: event.server.as_deref().unwrap_or(""),
         scope_root: event.scope_root.as_deref().unwrap_or(""),
-        cwd,
+        cwd: event_cwd(event),
         method,
         source: event.source.as_deref(),
         payload,
@@ -499,7 +486,7 @@ impl Sink for JsonlSink {
     fn handle(&self, event: &LogEvent<'_>) {
         let scope = resolve_scope(event, &self.instance_id);
         let (path, scope_id) = scope.target(&self.root);
-        let record = build_record(event, &scope_id, scope.cwd());
+        let record = build_record(event, &scope_id);
 
         let mut line = match serde_json::to_string(&record) {
             Ok(s) => s,
@@ -582,7 +569,7 @@ mod tests {
         e.server = Some("rust-analyzer".into());
         e.payload = Some(r#"{"uri":"file:///a.rs","diagnostics":[]}"#.into());
 
-        let rec = build_record(&e, "rust-analyzer@/p", "/p");
+        let rec = build_record(&e, "rust-analyzer@/p");
         let v = serde_json::to_value(&rec).expect("serialize");
 
         assert_eq!(v["kind"], "lsp");
@@ -605,7 +592,7 @@ mod tests {
         e.language = Some("rust".into());
         e.fields.insert("code".into(), Value::Number(101.into()));
 
-        let rec = build_record(&e, INSTANCE, "");
+        let rec = build_record(&e, INSTANCE);
         let v = serde_json::to_value(&rec).expect("serialize");
 
         assert_eq!(v["kind"], "internal");
@@ -623,42 +610,57 @@ mod tests {
     #[test]
     fn empty_keys_are_omitted() {
         let e = blank_event();
-        let rec = build_record(&e, "", "");
+        let rec = build_record(&e, "");
         let v = serde_json::to_value(&rec).expect("serialize");
         for key in ["scope_id", "parent_id", "server", "scope_root", "cwd"] {
             assert!(v.get(key).is_none(), "{key} should be omitted: {v}");
         }
     }
 
+    #[test]
+    fn cwd_field_prefers_explicit_then_scope_root() {
+        // Search contract: explicit `cwd` field is the CLI-side getcwd.
+        let mut e = blank_event();
+        e.scope_root = Some("/marker/root".into());
+        e.fields
+            .insert("cwd".into(), Value::String("/marker/root/src".into()));
+        let v = serde_json::to_value(build_record(&e, "")).expect("serialize");
+        assert_eq!(v["cwd"], "/marker/root/src");
+
+        // Falls back to scope_root when no explicit cwd.
+        let mut e2 = blank_event();
+        e2.scope_root = Some("/marker/root".into());
+        let v2 = serde_json::to_value(build_record(&e2, "")).expect("serialize");
+        assert_eq!(v2["cwd"], "/marker/root");
+    }
+
     // ── Scope resolver → file path + scope_id ─────────────────────────
 
     #[test]
-    fn session_scope_resolves_under_cwd() {
+    fn session_scope_resolves_at_top_level() {
         let mut e = blank_event();
         e.session_id = Some("mcp:7f3a".into());
-        e.scope_root = Some("/home/mark/Projects/Catenary".into());
 
         let scope = resolve_scope(&e, INSTANCE);
         let (path, scope_id) = scope.target(&root());
         assert_eq!(scope_id, "mcp:7f3a");
-        assert_eq!(
-            path,
-            root()
-                .join("-home-mark-Projects-Catenary")
-                .join("sessions")
-                .join("mcp:7f3a.jsonl")
-        );
+        assert_eq!(path, root().join("sessions").join("mcp:7f3a.jsonl"));
     }
 
     #[test]
-    fn session_scope_without_cwd_falls_back_to_root() {
-        let mut e = blank_event();
-        e.session_id = Some("s1".into());
+    fn session_path_ignores_scope_root() {
+        // cwd is a record field, not a directory level: scope_root must not
+        // change where a session's file lives (else its records split).
+        let mut bare = blank_event();
+        bare.session_id = Some("s1".into());
+        let mut rooted = blank_event();
+        rooted.session_id = Some("s1".into());
+        rooted.scope_root = Some("/home/mark/Projects/Catenary".into());
 
-        let scope = resolve_scope(&e, INSTANCE);
-        let (path, scope_id) = scope.target(&root());
-        assert_eq!(scope_id, "s1");
-        assert_eq!(path, root().join("sessions").join("s1.jsonl"));
+        let (bare_path, _) = resolve_scope(&bare, INSTANCE).target(&root());
+        let (rooted_path, _) = resolve_scope(&rooted, INSTANCE).target(&root());
+        assert_eq!(bare_path, rooted_path);
+        assert_eq!(bare_path, root().join("sessions").join("s1.jsonl"));
     }
 
     #[test]
@@ -680,9 +682,13 @@ mod tests {
         assert_eq!(
             path,
             root()
-                .join("-p")
                 .join("grep")
                 .join(format!("20260608T143210123Z_{}.jsonl", id.simple()))
+        );
+        // The search cwd rides as a record field, not in the path.
+        assert_eq!(
+            serde_json::to_value(build_record(&e, &scope_id)).expect("serialize")["cwd"],
+            "/p"
         );
     }
 
@@ -694,7 +700,6 @@ mod tests {
             Value::String("00000000-0000-4000-8000-000000000002".into()),
         );
         e.fields.insert("tool".into(), Value::String("glob".into()));
-        e.scope_root = Some("/p".into());
 
         let scope = resolve_scope(&e, INSTANCE);
         assert!(matches!(
@@ -705,12 +710,12 @@ mod tests {
             }
         ));
         let (path, _) = scope.target(&root());
-        // No search_ts → bare `<uuid>.jsonl`; cwd falls back to scope_root.
-        assert!(path.starts_with(root().join("-p").join("glob")));
+        // No search_ts → bare `<uuid>.jsonl`, directly under the top-level glob dir.
+        assert!(path.starts_with(root().join("glob")));
     }
 
     #[test]
-    fn autonomous_server_rootful_resolves_under_cwd() {
+    fn autonomous_server_rootful_resolves_under_servers() {
         let mut e = blank_event();
         e.kind = Some("lsp".into());
         e.server = Some("rust-analyzer".into());
@@ -719,12 +724,14 @@ mod tests {
 
         let scope = resolve_scope(&e, INSTANCE);
         let (path, scope_id) = scope.target(&root());
+        // scope_id carries the raw root (round-trips into `query --server`); the
+        // filename encodes it (path-safe).
         assert_eq!(scope_id, "rust-analyzer@/home/mark/Projects/Catenary");
         assert_eq!(
             path,
             root()
-                .join("-home-mark-Projects-Catenary")
-                .join("rust-analyzer.jsonl")
+                .join("servers")
+                .join("rust-analyzer@-home-mark-Projects-Catenary.jsonl")
         );
     }
 
@@ -806,7 +813,6 @@ mod tests {
             .path()
             .join("catenary")
             .join(INSTANCE)
-            .join("-p")
             .join("sessions")
             .join("s1.jsonl");
         let contents = fs::read_to_string(&file).expect("read jsonl");
@@ -865,7 +871,7 @@ mod tests {
         let mut e = blank_event();
         e.kind = Some("lsp".into());
         e.payload = Some("not json".into());
-        let rec = build_record(&e, "sid", "");
+        let rec = build_record(&e, "sid");
         let v = serde_json::to_value(&rec).expect("serialize");
         assert_eq!(v["payload"], "not json");
     }
