@@ -17,10 +17,9 @@
 pub mod response;
 
 use anyhow::{Result, anyhow};
-use rusqlite::Connection;
 use serde::Deserialize;
 use serde_json::Value;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 #[cfg(unix)]
 use tokio::net::UnixListener;
@@ -111,6 +110,10 @@ pub(crate) enum HookRequest {
         /// Host CLI session ID. Used by the daemon to route the hook
         /// to the correct per-session `HookRouter`.
         #[serde(default)]
+        #[allow(
+            dead_code,
+            reason = "deserialized from IPC protocol, consumed by serde"
+        )]
         session_id: Option<String>,
     },
 
@@ -167,6 +170,10 @@ pub(crate) enum HookRequest {
         cwd: Option<String>,
         /// Host CLI session ID (Claude Code / Gemini CLI UUID).
         #[serde(default)]
+        #[allow(
+            dead_code,
+            reason = "deserialized from IPC protocol, consumed by serde"
+        )]
         session_id: Option<String>,
         /// Host CLI format (`"claude"` or `"gemini"`), for per-client
         /// template variable resolution in guidance messages.
@@ -208,6 +215,10 @@ pub(crate) enum HookRequest {
         agent_id: String,
         /// Host CLI session ID (Claude Code / Gemini CLI UUID).
         #[serde(default)]
+        #[allow(
+            dead_code,
+            reason = "deserialized from IPC protocol, consumed by serde"
+        )]
         session_id: Option<String>,
     },
 
@@ -225,6 +236,10 @@ pub(crate) enum HookRequest {
     SessionStart {
         /// Host CLI session ID (Claude Code / Gemini CLI UUID).
         #[serde(default)]
+        #[allow(
+            dead_code,
+            reason = "deserialized from IPC protocol, consumed by serde"
+        )]
         session_id: Option<String>,
     },
 
@@ -238,6 +253,10 @@ pub(crate) enum HookRequest {
     SessionEnd {
         /// Host CLI session ID (Claude Code / Gemini CLI UUID).
         #[serde(default)]
+        #[allow(
+            dead_code,
+            reason = "deserialized from IPC protocol, consumed by serde"
+        )]
         session_id: Option<String>,
     },
 }
@@ -290,13 +309,8 @@ pub struct HookServer {
 impl HookServer {
     /// Creates a new `HookServer`.
     #[must_use]
-    pub fn new(
-        session: Arc<Session>,
-        conn: Arc<Mutex<Connection>>,
-        instance_id: Arc<str>,
-        client_name: String,
-    ) -> Self {
-        let router = Arc::new(HookRouter::new(session, conn, instance_id, client_name));
+    pub fn new(session: Arc<Session>, instance_id: Arc<str>, client_name: String) -> Self {
+        let router = Arc::new(HookRouter::new(session, instance_id, client_name));
         Self { router }
     }
 
@@ -1085,19 +1099,11 @@ mod tests {
     use crate::config::Config;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    /// Open an isolated test database in a tempdir.
-    fn test_db() -> (tempfile::TempDir, std::path::PathBuf, rusqlite::Connection) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("catenary").join("catenary.db");
-        let conn = crate::db::open_and_migrate_at(&path).expect("open test DB");
-        (dir, path, conn)
-    }
-
     /// Shared test context holding a `HookServer` and all lifetime-bound
     /// resources.
     struct TestHookServer {
         server: Option<HookServer>,
-        _db_dir: tempfile::TempDir,
+        _dir: tempfile::TempDir,
     }
 
     /// Create a `HookServer` backed by an in-memory session.
@@ -1106,18 +1112,7 @@ mod tests {
     /// router and config version counter — enough to exercise the IPC
     /// dispatch and root sync paths.
     fn test_hook_server() -> TestHookServer {
-        let (db_dir, _path, conn) = test_db();
-        let conn = Arc::new(std::sync::Mutex::new(conn));
-
-        conn.lock()
-            .expect("lock")
-            .execute(
-                "INSERT INTO sessions (id, pid, display_name, started_at) \
-                 VALUES ('test-session', 1, 'test', '2026-01-01T00:00:00Z')",
-                [],
-            )
-            .expect("insert session");
-
+        let dir = tempfile::tempdir().expect("tempdir");
         let config = Config::default();
         let logging = crate::logging::LoggingServer::new();
         let handle = tokio::runtime::Handle::current();
@@ -1133,17 +1128,16 @@ mod tests {
             config,
             vec![],
             logging,
-            conn.clone(),
             instance_id.clone(),
             handle,
             notification_router,
             None,
         ));
-        let server = HookServer::new(session, conn, instance_id, "test".to_string());
+        let server = HookServer::new(session, instance_id, "test".to_string());
 
         TestHookServer {
             server: Some(server),
-            _db_dir: db_dir,
+            _dir: dir,
         }
     }
 

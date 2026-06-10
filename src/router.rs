@@ -31,13 +31,13 @@ use crate::source::Source;
 /// Returns the MCP socket path for the daemon.
 ///
 /// The path is deterministic: `$XDG_STATE_HOME/catenary/catenary-mcp.sock`
-/// (or platform equivalent via [`crate::db::state_dir`]).
+/// (or platform equivalent via [`crate::paths::state_dir`]).
 ///
 /// Only the bridge proxy connects to this socket — it carries MCP
 /// JSON-RPC traffic between the host CLI and the daemon.
 #[must_use]
 pub fn mcp_socket_path() -> PathBuf {
-    crate::db::state_dir()
+    crate::paths::state_dir()
         .join("catenary")
         .join("catenary-mcp.sock")
 }
@@ -45,7 +45,7 @@ pub fn mcp_socket_path() -> PathBuf {
 /// Returns the general-purpose IPC socket path for the daemon.
 ///
 /// The path is deterministic: `$XDG_STATE_HOME/catenary/catenary.sock`
-/// (or platform equivalent via [`crate::db::state_dir`]).
+/// (or platform equivalent via [`crate::paths::state_dir`]).
 ///
 /// This socket carries all non-MCP daemon traffic: hook events
 /// (`pre-tool/*`, `post-agent/*`, etc.) and CLI commands
@@ -53,7 +53,7 @@ pub fn mcp_socket_path() -> PathBuf {
 /// `roots-ls`, `shutdown`).
 #[must_use]
 pub fn socket_path() -> PathBuf {
-    crate::db::state_dir()
+    crate::paths::state_dir()
         .join("catenary")
         .join("catenary.sock")
 }
@@ -627,8 +627,6 @@ struct HookDispatchContext {
     /// Daemon's primary session — used as the template for creating
     /// per-session sessions via [`Session::new_for_daemon`].
     primary: Arc<Session>,
-    /// Shared database connection for `HookRouter` DB writes.
-    conn: Arc<std::sync::Mutex<rusqlite::Connection>>,
     /// Logging server for sink access.
     _logging: LoggingServer,
     /// Root tracker for refcount-aware root management across sessions.
@@ -1017,9 +1015,6 @@ pub struct SessionManager {
     /// Root tracker for refcount-aware root management across sessions.
     /// `None` in transport-only tests; set by [`Self::with_session`].
     root_tracker: Option<RootTracker>,
-    /// Shared DB connection for `on_client_info`. `None` in
-    /// transport-only tests.
-    db_conn: Option<Arc<std::sync::Mutex<rusqlite::Connection>>>,
     shutdown: CancellationToken,
     disconnect: Arc<tokio::sync::Notify>,
 }
@@ -1056,7 +1051,6 @@ impl SessionManager {
             hook_ctx: None,
             lsp: None,
             root_tracker: None,
-            db_conn: None,
             shutdown: CancellationToken::new(),
             disconnect: Arc::new(tokio::sync::Notify::new()),
         }
@@ -1103,7 +1097,6 @@ impl SessionManager {
             hook_ctx: None,
             lsp: None,
             root_tracker: None,
-            db_conn: None,
             shutdown: CancellationToken::new(),
             disconnect: Arc::new(tokio::sync::Notify::new()),
         })
@@ -1212,38 +1205,12 @@ impl SessionManager {
         let lsp = self.lsp.clone();
         let primary_session = self.hook_ctx.as_ref().map(|ctx| ctx.primary.clone());
         let root_tracker = self.root_tracker.clone();
-        let db_conn = self.db_conn.clone();
 
         // Per-connection session key. Monotonic counter avoids
-        // collisions from fd reuse across the daemon's lifetime.
-        // The `mcp:` prefix distinguishes connection sessions from
-        // hook sessions (which remain for internal routing only).
+        // collisions from fd reuse across the daemon's lifetime. The
+        // `mcp:` prefix tags the tracing span for log correlation.
         let conn_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
         let session_key = format!("mcp:{conn_id}");
-
-        // Create the per-connection session row before spawning so the
-        // FK constraint (messages.session_id → sessions.id) is
-        // satisfied for events emitted inside the connection span.
-        if let Some(ref conn) = db_conn
-            && let Ok(c) = conn.lock()
-        {
-            let started_at = chrono::Utc::now().to_rfc3339();
-            let _ = c.execute(
-                "INSERT INTO sessions \
-                 (id, pid, display_name, started_at, alive) \
-                 VALUES (?1, ?2, ?3, ?4, 1) \
-                 ON CONFLICT(id) DO UPDATE SET \
-                   alive = 1, \
-                   display_name = excluded.display_name, \
-                   started_at = excluded.started_at, \
-                   ended_at = NULL",
-                rusqlite::params![&session_key, std::process::id(), "", &started_at,],
-            );
-        }
-
-        // Clone DB connection for disconnect cleanup (originals move
-        // into spawn_blocking for callback closures).
-        let db_conn_cleanup = db_conn.clone();
 
         count.fetch_add(1, Ordering::Relaxed);
 
@@ -1254,7 +1221,6 @@ impl SessionManager {
                 session_id = %session_key,
             );
             let span_for_blocking = span.clone();
-            let session_key_cleanup = session_key.clone();
             async {
                 let _guard = ConnectionGuard { count, disconnect };
 
@@ -1316,27 +1282,8 @@ impl SessionManager {
                     match (root_tracker, lsp, primary_session) {
                         (Some(tracker), Some(_), Some(session)) => {
                             let mcp_key = format!("mcp:{fd}");
-                            let db_for_roots = db_conn.clone();
-                            let key_for_roots = session_key.clone();
                             mcp = mcp.on_roots_changed(Box::new(move |roots| {
                                 let paths = parse_root_uris(&roots);
-                                // Update display_name on the per-connection
-                                // session row so the TUI sidebar shows the
-                                // workspace path(s).
-                                if let Some(ref conn) = db_for_roots
-                                    && let Ok(c) = conn.lock()
-                                {
-                                    let display = paths
-                                        .iter()
-                                        .map(|p| p.to_string_lossy().into_owned())
-                                        .collect::<Vec<_>>()
-                                        .join(", ");
-                                    let _ = c.execute(
-                                        "UPDATE sessions SET display_name = ?1 \
-                                         WHERE id = ?2",
-                                        rusqlite::params![&display, &key_for_roots],
-                                    );
-                                }
                                 tracker.set_roots(&mcp_key, paths);
                                 let global = tracker.global_roots();
                                 tokio::runtime::Handle::current()
@@ -1345,42 +1292,13 @@ impl SessionManager {
                             }));
                         }
                         (None, Some(cm), _) => {
-                            let db_for_roots = db_conn.clone();
-                            let key_for_roots = session_key.clone();
                             mcp = mcp.on_roots_changed(Box::new(move |roots| {
                                 let paths = parse_root_uris(&roots);
-                                if let Some(ref conn) = db_for_roots
-                                    && let Ok(c) = conn.lock()
-                                {
-                                    let display = paths
-                                        .iter()
-                                        .map(|p| p.to_string_lossy().into_owned())
-                                        .collect::<Vec<_>>()
-                                        .join(", ");
-                                    let _ = c.execute(
-                                        "UPDATE sessions SET display_name = ?1 \
-                                         WHERE id = ?2",
-                                        rusqlite::params![&display, &key_for_roots],
-                                    );
-                                }
                                 tokio::runtime::Handle::current().block_on(cm.sync_roots(paths))?;
                                 Ok(())
                             }));
                         }
                         _ => {}
-                    }
-
-                    if let Some(conn) = db_conn {
-                        let key = session_key;
-                        mcp = mcp.on_client_info(Box::new(move |name: &str, version: &str| {
-                            if let Ok(c) = conn.lock() {
-                                let _ = c.execute(
-                                    "UPDATE sessions SET client_name = ?1, \
-                                     client_version = ?2 WHERE id = ?3",
-                                    rusqlite::params![name, version, &key],
-                                );
-                            }
-                        }));
                     }
 
                     mcp.run(reader, writer)
@@ -1404,20 +1322,8 @@ impl SessionManager {
 
                 // ── Disconnect cleanup ────────────────────────────
                 //
-                // Mark the per-connection session dead so the TUI
-                // drops it from the sidebar. Remove roots from the
-                // tracker and sync the reduced root set to LSP servers.
-                if let Some(ref conn) = db_conn_cleanup
-                    && let Ok(c) = conn.lock()
-                {
-                    let ended_at = chrono::Utc::now().to_rfc3339();
-                    let _ = c.execute(
-                        "UPDATE sessions SET alive = 0, ended_at = ?1 \
-                         WHERE id = ?2",
-                        rusqlite::params![&ended_at, &session_key_cleanup],
-                    );
-                }
-
+                // Remove roots from the tracker and sync the reduced root
+                // set to LSP servers.
                 if let Some(ref tracker) = tracker_cleanup {
                     let mcp_key = format!("mcp:{fd}");
                     tracker.remove_contributor(&mcp_key);
@@ -1472,13 +1378,8 @@ impl SessionManager {
     /// session. Without this, hooks receive passthrough responses (test
     /// mode).
     #[must_use]
-    pub fn with_session(
-        mut self,
-        session: Arc<Session>,
-        conn: Arc<std::sync::Mutex<rusqlite::Connection>>,
-    ) -> Self {
+    pub fn with_session(mut self, session: Arc<Session>) -> Self {
         self.lsp = Some(session.lsp_client_manager().clone());
-        self.db_conn = Some(conn.clone());
         let root_tracker = RootTracker::new();
         self.root_tracker = Some(root_tracker.clone());
 
@@ -1495,7 +1396,6 @@ impl SessionManager {
         self.hook_ctx = Some(HookDispatchContext {
             sessions,
             primary: session,
-            conn,
             _logging: self.logging.clone(),
             root_tracker: Some(root_tracker),
             editing_guardrail: Arc::new(EditingGuardrail::new()),
@@ -1624,8 +1524,8 @@ async fn handle_hook_connection(
 /// so `warn!()` / `error!()` events carrying this `session_id` in
 /// their span context route to this session's notification queue.
 ///
-/// Also inserts a row into the `sessions` table on first creation so the
-/// TUI sidebar can discover per-agent sessions.
+/// Populates the session's board metadata on first creation; the daemon
+/// snapshot (`state.json`) surfaces it to the TUI dashboard.
 #[cfg(unix)]
 fn get_or_create_router(
     ctx: &HookDispatchContext,
@@ -1653,41 +1553,13 @@ fn get_or_create_router(
             // events carrying this session_id route to its queue.
             session.notification_router.register_session(session_id);
 
-            // Insert a session row so the TUI can discover this agent.
-            // Uses the cwd from the host payload as display_name, and
-            // the format field as client_name (for sidebar host label).
-            let display_name = raw
-                .get("host_payload")
-                .and_then(|hp| hp.get("cwd"))
-                .and_then(|v| v.as_str())
-                .unwrap_or(session_id);
-            let client_name = raw.get("format").and_then(|v| v.as_str());
-            // One ISO format across the snapshot (now_iso → millis + 'Z'); also
-            // valid rfc3339 for the DB row below.
-            let started_at = crate::state_snapshot::now_iso();
-            if let Ok(conn) = ctx.conn.lock() {
-                let _ = conn.execute(
-                    "INSERT INTO sessions \
-                     (id, pid, display_name, client_name, started_at, alive) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, 1) \
-                     ON CONFLICT(id) DO UPDATE SET \
-                       alive = 1, \
-                       display_name = excluded.display_name, \
-                       client_name = COALESCE(excluded.client_name, sessions.client_name), \
-                       started_at = excluded.started_at, \
-                       ended_at = NULL",
-                    rusqlite::params![
-                        session_id,
-                        std::process::id(),
-                        display_name,
-                        client_name,
-                        &started_at,
-                    ],
-                );
-            }
-
             // Board metadata from this session's own hook payload (ticket 05):
-            // host name, connect time, and the session's own workspace roots.
+            // the `format` field is the host label (client_name), the connect
+            // time, and the session's own workspace roots. The daemon snapshot
+            // (`state.json`) surfaces this to the TUI dashboard.
+            let client_name = raw.get("format").and_then(|v| v.as_str());
+            // One ISO format across the snapshot (now_iso → millis + 'Z').
+            let started_at = crate::state_snapshot::now_iso();
             let meta = SessionMeta {
                 client_name: client_name.map(str::to_string),
                 started_at,
@@ -1696,7 +1568,6 @@ fn get_or_create_router(
 
             let router = Arc::new(HookRouter::new(
                 session.clone(),
-                ctx.conn.clone(),
                 session.instance_id.clone(),
                 session_id.to_string(),
             ));
@@ -1861,20 +1732,11 @@ async fn handle_hook_dispatch(
         // (ticket 05a).
         ctx.primary.touch_snapshot();
 
-        // Mark session dead in DB so the TUI drops it from the sidebar.
-        if let Ok(conn) = ctx.conn.lock() {
-            let ended_at = chrono::Utc::now().to_rfc3339();
-            let _ = conn.execute(
-                "UPDATE sessions SET alive = 0, ended_at = ?1 WHERE id = ?2",
-                rusqlite::params![&ended_at, &session_id],
-            );
-        }
-
         // Best-effort removal of this session's diagnostics overflow file. The
         // authoritative GC is the daemon-startup sweep (no teardown signal is
         // reliable — Antigravity has no session-end), but a graceful end lets
         // us reclaim the runtime-dir file immediately.
-        crate::bridge::overflow::remove_diagnostics(&crate::db::runtime_dir(), &session_id);
+        crate::bridge::overflow::remove_diagnostics(&crate::paths::runtime_dir(), &session_id);
 
         if let Some(ref tracker) = ctx.root_tracker {
             // Sync the reduced root set.
@@ -2478,7 +2340,7 @@ async fn handle_hook_dispatch(
         // startup + bounded by an in-lifetime cap. `--in-place` has no preview,
         // so it carries no overflow context.
         let overflow = (!in_place).then(|| crate::bridge::sed::PreviewOverflow {
-            base: crate::db::runtime_dir(),
+            base: crate::paths::runtime_dir(),
             id: uuid::Uuid::new_v4().to_string(),
         });
 
@@ -2865,7 +2727,7 @@ fn spawn_daemon() -> Result<()> {
 
     let exe = std::env::current_exe().context("resolve current executable path")?;
 
-    let log_dir = crate::db::state_dir().join("catenary");
+    let log_dir = crate::paths::state_dir().join("catenary");
     std::fs::create_dir_all(&log_dir)
         .with_context(|| format!("create daemon log directory: {}", log_dir.display()))?;
     let log_path = log_dir.join("daemon.log");
@@ -3872,19 +3734,6 @@ mod tests {
     /// Like [`bind_with_session`] but registers `roots` as workspace roots, so
     /// files under them have LSP coverage (tiers 1–2) for editing accumulation.
     fn bind_with_session_roots(dir: &Path, roots: Vec<PathBuf>) -> SessionManager {
-        let db_path = dir.join("catenary").join("catenary.db");
-        let conn = crate::db::open_and_migrate_at(&db_path).expect("open test DB");
-        let conn = Arc::new(std::sync::Mutex::new(conn));
-
-        conn.lock()
-            .expect("lock")
-            .execute(
-                "INSERT INTO sessions (id, pid, display_name, started_at) \
-                 VALUES ('daemon', 1, 'test-daemon', '2026-01-01T00:00:00Z')",
-                [],
-            )
-            .expect("insert session");
-
         let logging = LoggingServer::new();
         let runtime = tokio::runtime::Handle::current();
         let instance_id: Arc<str> = "daemon".into();
@@ -3897,7 +3746,6 @@ mod tests {
             crate::config::Config::default(),
             roots,
             logging.clone(),
-            conn.clone(),
             instance_id,
             runtime,
             notification_router,
@@ -3906,25 +3754,12 @@ mod tests {
 
         SessionManager::bind_at(&mcp_socket_in(dir), &ipc_socket_in(dir), logging)
             .expect("bind")
-            .with_session(session, conn)
+            .with_session(session)
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn session_board_builds_rich_entries() {
         use crate::state_snapshot::{SessionBoard, SessionStatus};
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db_path = dir.path().join("catenary").join("catenary.db");
-        let conn = crate::db::open_and_migrate_at(&db_path).expect("open test DB");
-        let conn = Arc::new(std::sync::Mutex::new(conn));
-        conn.lock()
-            .expect("lock")
-            .execute(
-                "INSERT INTO sessions (id, pid, display_name, started_at) \
-                 VALUES ('sess-1', 1, 'test', '2026-01-01T00:00:00Z')",
-                [],
-            )
-            .expect("insert session");
 
         let instance_id: Arc<str> = "sess-1".into();
         let notification_router = Arc::new(
@@ -3936,7 +3771,6 @@ mod tests {
             crate::config::Config::default(),
             vec![],
             LoggingServer::new(),
-            conn.clone(),
             instance_id.clone(),
             tokio::runtime::Handle::current(),
             notification_router,
@@ -3944,7 +3778,6 @@ mod tests {
         ));
         let router = Arc::new(HookRouter::new(
             session.clone(),
-            conn,
             instance_id,
             "sess-1".to_string(),
         ));

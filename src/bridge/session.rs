@@ -346,7 +346,6 @@ impl Session {
         config: Config,
         roots: Vec<PathBuf>,
         logging: LoggingServer,
-        conn: Arc<std::sync::Mutex<rusqlite::Connection>>,
         instance_id: Arc<str>,
         runtime: Handle,
         notification_router: Arc<NotificationRouter>,
@@ -358,7 +357,7 @@ impl Session {
         // The reap policy bounds on-write growth (rotation + per-tool budget,
         // ticket 01).
         let jsonl_sink = JsonlSink::with_policy(
-            &crate::db::cache_dir(),
+            &crate::paths::cache_dir(),
             instance_id.clone(),
             config.reap_policy(),
         );
@@ -407,7 +406,6 @@ impl Session {
         let path_validator = Arc::new(RwLock::new(PathValidator::new(roots)));
         let mut client_manager =
             LspClientManager::new(config.clone(), logging.clone(), fs_manager.clone());
-        client_manager.set_db(conn, instance_id.clone());
         if let Some(writer) = &snapshot {
             client_manager.set_snapshot(writer.clone());
         }

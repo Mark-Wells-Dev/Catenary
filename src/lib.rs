@@ -14,8 +14,6 @@ pub mod bucketing;
 pub mod cli;
 /// Configuration handling for language servers and session settings.
 pub mod config;
-/// SQLite database connection management, schema creation, and migrations.
-pub mod db;
 /// Diagnostic noise filtering for LSP server output.
 pub mod filter;
 /// IPC server for host CLI hook integration (diagnostics and root sync).
@@ -28,12 +26,12 @@ pub mod lsp;
 pub mod mcp;
 /// Desktop notification support (OS-level notifications for error events).
 pub mod notify;
+/// Filesystem path resolvers for Catenary's base directories.
+pub mod paths;
 /// Protocol classification shared by core and display layers.
 pub mod protocol;
 /// Daemon session manager and MCP socket listener.
 pub mod router;
-/// Session management and event broadcasting.
-pub mod session;
 /// Canonical `source` taxonomy for structured tracing events.
 pub mod source;
 /// Daemon-owned `state.json` live-state snapshot.

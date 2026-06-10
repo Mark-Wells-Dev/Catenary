@@ -192,7 +192,7 @@ pub fn parse_level(s: &str) -> anyhow::Result<u8> {
 /// instance dir (`daemon:<uuid>`).
 #[must_use]
 pub fn firehose_root() -> PathBuf {
-    crate::db::cache_dir().join("catenary")
+    crate::paths::cache_dir().join("catenary")
 }
 
 /// Resolve the instance dirs a query reads.

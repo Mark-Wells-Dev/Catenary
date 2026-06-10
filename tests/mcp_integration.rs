@@ -13,7 +13,6 @@
 
 mod common;
 
-use std::process::Command;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -124,53 +123,6 @@ fn test_mcp_ping() -> Result<()> {
 
     assert!(response.get("result").is_some());
     assert!(response.get("error").is_none());
-    Ok(())
-}
-
-#[test]
-fn test_client_info_stored_in_session() -> Result<()> {
-    let dir = tempfile::tempdir().context("Failed to create temp dir")?;
-    let lsp = mockls_lsp_arg(MOCK_LANG_A, "");
-
-    let mut bridge = BridgeProcess::spawn(&[&lsp], dir.path().to_str().context("dir")?)?;
-
-    // Send initialize with specific client info (not bridge.initialize())
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": {
-                "name": "TestClient",
-                "version": "42.0.0"
-            }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    assert!(response.get("result").is_some(), "Initialize failed");
-
-    // Small delay to allow session update
-    std::thread::sleep(Duration::from_millis(200));
-
-    // Run catenary debug list with the bridge's isolated state dir
-    let output = Command::new(env!("CARGO_BIN_EXE_catenary"))
-        .args(["debug", "list"])
-        .env(
-            "XDG_STATE_HOME",
-            common::xdg_state_home(bridge.state_home()),
-        )
-        .output()
-        .context("Failed to run catenary debug list")?;
-
-    let stdout_str = String::from_utf8_lossy(&output.stdout);
-
-    assert!(
-        stdout_str.contains("TestClient"),
-        "Expected client info 'TestClient' in catenary list output, got:\n{stdout_str}"
-    );
     Ok(())
 }
 
@@ -1657,61 +1609,6 @@ fn test_grep_reference_enclosing() -> Result<()> {
     assert!(
         text.contains(":1-3"),
         "Expected enclosing span :1-3, got:\n{text}"
-    );
-
-    Ok(())
-}
-
-/// Verify that LSP messages triggered by grep carry a `parent_id`
-/// in the database (CLI tool queries get a UUID for event correlation).
-#[test]
-#[ignore = "observability ticket 02 retired the messages-table firehose (now JSONL); \
-            parent_id threading is re-asserted against JSONL in the ticket 03 query rewrite"]
-fn test_grep_parent_id_threading() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let test_file = dir.path().join(format!("test.{MOCK_LANG_A}"));
-    std::fs::write(&test_file, "fn hello()\nhello\n")?;
-
-    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
-    let root = dir.path().to_str().context("root path")?;
-    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
-    bridge.initialize()?;
-
-    // Call grep via IPC.
-    let _ = bridge.call_tool_text("grep", &json!({ "pattern": "hello" }))?;
-
-    // Open the database and verify parent_id threading
-    let db_path = common::xdg_state_home(bridge.state_home())
-        .join("catenary")
-        .join("catenary.db");
-    let conn =
-        rusqlite::Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .context("open test database")?;
-
-    // Find the parent_id on the IPC tool/grep hook event.
-    // This UUID is shared with LSP messages from the grep pipeline.
-    let call_uuid: String = conn
-        .query_row(
-            "SELECT parent_id FROM messages \
-             WHERE type = 'hook' AND method = 'tool/grep' \
-             AND parent_id IS NOT NULL LIMIT 1",
-            [],
-            |row| row.get(0),
-        )
-        .context("find tool/grep parent_id (call UUID)")?;
-
-    // LSP messages from the grep pipeline should carry this parent_id
-    let lsp_with_parent: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM messages WHERE type = 'lsp' AND parent_id = ?1",
-            [&call_uuid],
-            |row| row.get(0),
-        )
-        .context("count LSP messages with parent_id")?;
-
-    assert!(
-        lsp_with_parent > 0,
-        "Expected LSP messages with parent_id={call_uuid} from grep, found 0"
     );
 
     Ok(())

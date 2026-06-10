@@ -198,7 +198,7 @@ struct FileHit {
 /// context; [`execute`] omits it entirely (a truncated preview then degrades to
 /// its in-memory summary).
 pub struct PreviewOverflow {
-    /// Runtime-dir base (`db::runtime_dir()`); the file lands under
+    /// Runtime-dir base (`paths::runtime_dir()`); the file lands under
     /// `<base>/catenary/`.
     pub base: PathBuf,
     /// Daemon-minted per-invocation UUID naming the `sed-<uuid>.txt` report.

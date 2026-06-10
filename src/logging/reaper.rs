@@ -34,7 +34,7 @@ use std::time::{Duration, SystemTime};
 
 use serde::Deserialize;
 
-use crate::db::encode_cwd;
+use crate::paths::encode_cwd;
 use crate::source::Source;
 
 /// Seconds in a day, for the day-granularity age/staleness knobs.

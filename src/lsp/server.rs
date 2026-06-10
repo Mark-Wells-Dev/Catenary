@@ -102,12 +102,6 @@ pub struct LspServer {
     // ── Transport ───────────────────────────────────────────────
     connection: OnceLock<Connection>,
 
-    // ── Database persistence ─────────────────────────────────
-    /// DB connection and session ID for writing server noise to
-    /// `language_servers`. Set after init via [`Self::set_db`].
-    /// `None` in doctor/test contexts.
-    db: OnceLock<(Arc<std::sync::Mutex<rusqlite::Connection>>, Arc<str>)>,
-
     // ── State snapshot ───────────────────────────────────────
     /// Daemon-owned `state.json` writer. Lifecycle, progress, and message
     /// transitions mutate the server board and mark the snapshot dirty. Set
@@ -158,7 +152,6 @@ impl LspServer {
             config_change_registrations: Mutex::new(HashSet::new()),
             tree_monitor: Mutex::new(None),
             connection: OnceLock::new(),
-            db: OnceLock::new(),
             snapshot: OnceLock::new(),
         }
     }
@@ -447,15 +440,7 @@ impl LspServer {
         self.state_notify.notify_waiters();
     }
 
-    // ── Database persistence ────────────────────────────────────
-
-    /// Sets the database connection for server noise persistence.
-    ///
-    /// Called once after init by [`super::manager::LspClientManager`].
-    /// Subsequent calls are no-ops (the `OnceLock` ignores them).
-    pub fn set_db(&self, conn: Arc<std::sync::Mutex<rusqlite::Connection>>, session_id: Arc<str>) {
-        let _ = self.db.set((conn, session_id));
-    }
+    // ── State snapshot ───────────────────────────────────────────
 
     /// Sets the `state.json` snapshot writer for live-state mirroring.
     ///
@@ -465,130 +450,33 @@ impl LspServer {
         let _ = self.snapshot.set(writer);
     }
 
-    /// Mirrors the lifecycle state to the DB and the `state.json` snapshot.
+    /// Mirrors the lifecycle state to the `state.json` snapshot.
     ///
-    /// The DB write (`language_servers`) uses the lossy `display_state`; the
-    /// snapshot carries the full [`ServerLifecycle`] variant. Both are no-ops
-    /// when their sink or the instance key is unavailable.
+    /// The snapshot carries the full [`ServerLifecycle`] variant. No-op when
+    /// the snapshot writer or the instance key is unavailable.
     fn persist_state(&self, state: &ServerLifecycle) {
-        self.persist_state_db(state.display_state());
         if let (Some(writer), Some(key)) = (self.snapshot.get(), self.key()) {
             writer.update_state(&key, state);
         }
     }
 
-    /// Persists the lifecycle state to the `language_servers` table via upsert.
+    /// Mirrors progress state to the `state.json` snapshot.
     ///
-    /// No-op if the DB connection or instance key is unavailable.
-    fn persist_state_db(&self, state: &str) {
-        let Some((conn, session_id)) = self.db.get() else {
-            return;
-        };
-        let Some(key) = self.key() else {
-            return;
-        };
-        let scope_root = key
-            .scope
-            .root_path()
-            .map_or_else(String::new, |p| p.display().to_string());
-        let conn = conn
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Err(e) = crate::db::upsert_server_state(
-            &conn,
-            session_id,
-            &key.language_id,
-            &key.server,
-            key.scope.kind_str(),
-            &scope_root,
-            state,
-        ) {
-            debug!("persist_state failed for {}: {e}", key.server);
-        }
-    }
-
-    /// Mirrors progress state to the DB and the `state.json` snapshot.
-    ///
-    /// The DB write keeps title + percentage; the snapshot additionally
-    /// carries the current message. Both are no-ops when their sink or the
-    /// instance key is unavailable.
+    /// The snapshot carries title, current message, and percentage. No-op when
+    /// the snapshot writer or the instance key is unavailable.
     fn persist_progress(&self, title: Option<&str>, message: Option<&str>, pct: Option<u32>) {
-        self.persist_progress_db(title, pct);
         if let (Some(writer), Some(key)) = (self.snapshot.get(), self.key()) {
             writer.update_progress(&key, title, message, pct);
         }
     }
 
-    /// Persists progress state to the `language_servers` table.
+    /// Mirrors a server message to the `state.json` snapshot.
     ///
-    /// No-op if the DB connection or instance key is unavailable.
-    fn persist_progress_db(&self, title: Option<&str>, pct: Option<u32>) {
-        let Some((conn, session_id)) = self.db.get() else {
-            return;
-        };
-        let Some(key) = self.key() else {
-            return;
-        };
-        let scope_root = key
-            .scope
-            .root_path()
-            .map_or_else(String::new, |p| p.display().to_string());
-        let conn = conn
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Err(e) = crate::db::update_server_progress(
-            &conn,
-            session_id,
-            &key.language_id,
-            &key.server,
-            key.scope.kind_str(),
-            &scope_root,
-            title,
-            pct,
-        ) {
-            debug!("persist_progress failed for {}: {e}", key.server);
-        }
-    }
-
-    /// Mirrors a server message to the DB and the `state.json` snapshot.
-    ///
-    /// `level` is the LSP `MessageType` mapped to a severity tag; the DB write
-    /// keeps only the text. Both are no-ops when their sink or the instance
-    /// key is unavailable.
+    /// `level` is the LSP `MessageType` mapped to a severity tag. No-op when
+    /// the snapshot writer or the instance key is unavailable.
     fn persist_message(&self, level: &str, message: &str) {
-        self.persist_message_db(message);
         if let (Some(writer), Some(key)) = (self.snapshot.get(), self.key()) {
             writer.update_message(&key, level, message);
-        }
-    }
-
-    /// Persists a server message to the `language_servers` table.
-    ///
-    /// No-op if the DB connection or instance key is unavailable.
-    fn persist_message_db(&self, message: &str) {
-        let Some((conn, session_id)) = self.db.get() else {
-            return;
-        };
-        let Some(key) = self.key() else {
-            return;
-        };
-        let scope_root = key
-            .scope
-            .root_path()
-            .map_or_else(String::new, |p| p.display().to_string());
-        let conn = conn
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Err(e) = crate::db::update_server_message(
-            &conn,
-            session_id,
-            &key.language_id,
-            &key.server,
-            key.scope.kind_str(),
-            &scope_root,
-            message,
-        ) {
-            debug!("persist_message failed for {}: {e}", key.server);
         }
     }
 

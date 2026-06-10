@@ -93,7 +93,9 @@ impl DataSource for StateJsonDataSource {
 /// so the TUI watches the exact file the daemon overwrites on change.
 #[must_use]
 pub fn default_snapshot_path() -> PathBuf {
-    crate::db::runtime_dir().join("catenary").join("state.json")
+    crate::paths::runtime_dir()
+        .join("catenary")
+        .join("state.json")
 }
 
 // ── Mock (testing) implementation ────────────────────────────────────

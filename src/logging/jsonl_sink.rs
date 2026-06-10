@@ -67,7 +67,7 @@ use super::LogEvent;
 use super::Severity;
 use super::Sink;
 use super::reaper::ReapPolicy;
-use crate::db::encode_cwd;
+use crate::paths::encode_cwd;
 
 /// Max number of open append file handles kept warm.
 ///
@@ -689,7 +689,7 @@ impl JsonlSink {
     /// Create a sink rooted at `<cache_dir>/catenary/<instance_id>` with the
     /// default [`ReapPolicy`], and spawn its writer thread.
     ///
-    /// `cache_dir` is the resolved cache base (production: [`crate::db::cache_dir`]);
+    /// `cache_dir` is the resolved cache base (production: [`crate::paths::cache_dir`]);
     /// tests inject a tempdir so the firehose never escapes into `~/.cache`.
     #[must_use]
     pub fn new(cache_dir: &Path, instance_id: Arc<str>) -> Arc<Self> {

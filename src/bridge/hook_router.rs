@@ -118,7 +118,10 @@ pub struct HookRouter {
     last_config_dump_turn: AtomicU64,
     /// Config version at the time of the last full dump.
     last_config_dump_version: AtomicU64,
-    conn: Arc<std::sync::Mutex<rusqlite::Connection>>,
+    #[allow(
+        dead_code,
+        reason = "per-session router identity; the client-session DB write that read it was removed (observability ticket 07)"
+    )]
     instance_id: Arc<str>,
     /// Host CLI client name (e.g., `"host"`, `"claude-code"`).
     pub(crate) client_name: String,
@@ -127,12 +130,7 @@ pub struct HookRouter {
 impl HookRouter {
     /// Creates a new `HookRouter`.
     #[must_use]
-    pub const fn new(
-        session: Arc<Session>,
-        conn: Arc<std::sync::Mutex<rusqlite::Connection>>,
-        instance_id: Arc<str>,
-        client_name: String,
-    ) -> Self {
+    pub const fn new(session: Arc<Session>, instance_id: Arc<str>, client_name: String) -> Self {
         Self {
             session,
             turn_counter: AtomicU64::new(0),
@@ -140,7 +138,6 @@ impl HookRouter {
             // config dump (turn 0 != MAX).
             last_config_dump_turn: AtomicU64::new(u64::MAX),
             last_config_dump_version: AtomicU64::new(u64::MAX),
-            conn,
             instance_id,
             client_name,
         }
@@ -317,8 +314,7 @@ impl HookRouter {
     #[allow(clippy::too_many_lines, reason = "match arms are sequential and flat")]
     pub(crate) fn dispatch(&self, request: HookRequest) -> DispatchResult {
         match request {
-            HookRequest::PreAgent { session_id } => {
-                self.store_client_session_id(session_id.as_deref());
+            HookRequest::PreAgent { session_id: _ } => {
                 let turn = self.turn_counter.fetch_add(1, Ordering::AcqRel) + 1;
                 debug!(
                     source = Source::HookDispatch.as_str(),
@@ -338,7 +334,6 @@ impl HookRouter {
                 session_id,
                 ..
             } => {
-                self.store_client_session_id(session_id.as_deref());
                 let result = self.handle_enforce_editing(
                     &tool_name,
                     file_path.as_deref(),
@@ -366,7 +361,6 @@ impl HookRouter {
                 agent_id,
                 session_id,
             } => {
-                self.store_client_session_id(session_id.as_deref());
                 let _ = self
                     .session
                     .editing
@@ -378,11 +372,10 @@ impl HookRouter {
                     system_message: None,
                 }
             }
-            HookRequest::PreToolDoneEditingPrepare { session_id, .. } => {
+            HookRequest::PreToolDoneEditingPrepare { .. } => {
                 // Handled at the daemon level (router.rs), not here.
                 // This arm exists for exhaustive matching in the
                 // per-session HookServer path.
-                self.store_client_session_id(session_id.as_deref());
                 DispatchResult {
                     result: None,
                     system_message: None,
@@ -398,10 +391,9 @@ impl HookRouter {
             HookRequest::CheckCommand {
                 command,
                 cwd,
-                session_id,
+                session_id: _,
                 format,
             } => {
-                self.store_client_session_id(session_id.as_deref());
                 let host_format = format.as_deref().and_then(parse_host_format);
                 self.handle_check_command(&command, cwd.as_deref(), host_format)
             }
@@ -410,7 +402,6 @@ impl HookRouter {
                 session_id,
                 stop_hook_active,
             } => {
-                self.store_client_session_id(session_id.as_deref());
                 let result =
                     self.handle_require_release(session_id.as_deref(), &agent_id, stop_hook_active);
                 // Editing state may have cleared (status → idle) — refresh the
@@ -427,8 +418,7 @@ impl HookRouter {
                     system_message,
                 }
             }
-            HookRequest::SessionStart { session_id } => {
-                self.store_client_session_id(session_id.as_deref());
+            HookRequest::SessionStart { session_id: _ } => {
                 let result = self.handle_clear_editing();
                 // Stale editing state may have cleared (status → idle) —
                 // refresh the board (ticket 05).
@@ -440,8 +430,7 @@ impl HookRouter {
                     system_message,
                 }
             }
-            HookRequest::SessionEnd { session_id } => {
-                self.store_client_session_id(session_id.as_deref());
+            HookRequest::SessionEnd { session_id: _ } => {
                 // No-op at the router level — cleanup happens in the
                 // daemon's handle_hook_dispatch (root tracker removal).
                 DispatchResult {
@@ -708,19 +697,6 @@ impl HookRouter {
             Some(HookResult::Cleared(count))
         } else {
             None
-        }
-    }
-
-    /// Store the host CLI's session ID (idempotent — first write wins).
-    fn store_client_session_id(&self, client_session_id: Option<&str>) {
-        if let Some(client_sid) = client_session_id
-            && let Ok(c) = self.conn.lock()
-        {
-            let _ = c.execute(
-                "UPDATE sessions SET client_session_id = ?1 \
-                 WHERE id = ?2 AND client_session_id IS NULL",
-                rusqlite::params![client_sid, &*self.instance_id],
-            );
         }
     }
 }
@@ -1230,17 +1206,7 @@ mod tests {
     /// When `failed` is true, injects a negative-cache entry so the
     /// server appears to have rejected null-workspace initialization.
     fn test_router_with_sf_config(failed: bool) -> TestHookRouter {
-        let (dir, _path, conn) = test_db();
-        let conn = Arc::new(std::sync::Mutex::new(conn));
-
-        conn.lock()
-            .expect("lock")
-            .execute(
-                "INSERT INTO sessions (id, pid, display_name, started_at) \
-                 VALUES ('test-session', 1, 'test', '2026-01-01T00:00:00Z')",
-                [],
-            )
-            .expect("insert session");
+        let dir = tempfile::tempdir().expect("tempdir");
 
         let config = sf_test_config();
         let logging = crate::logging::LoggingServer::new();
@@ -1258,7 +1224,6 @@ mod tests {
             config,
             vec![],
             logging,
-            conn.clone(),
             instance_id.clone(),
             handle,
             notification_router,
@@ -1274,7 +1239,7 @@ mod tests {
                 .insert((SF_LANG.to_string(), SF_SERVER.to_string()));
         }
 
-        let router = HookRouter::new(session, conn, instance_id, "test".to_string());
+        let router = HookRouter::new(session, instance_id, "test".to_string());
 
         TestHookRouter {
             _dir: dir,
@@ -1605,32 +1570,13 @@ mod tests {
 
     // ── Test helpers ────────────────────────────────────────────────────
 
-    /// Open an isolated test database in a tempdir.
-    fn test_db() -> (tempfile::TempDir, std::path::PathBuf, rusqlite::Connection) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("catenary").join("catenary.db");
-        let conn = crate::db::open_and_migrate_at(&path).expect("open test DB");
-        (dir, path, conn)
-    }
-
-    /// Create a `HookRouter` with a test database for handler unit tests.
+    /// Create a `HookRouter` with minimal dependencies for handler unit tests.
     ///
     /// Uses minimal dependencies (no live LSP servers). Editing state is
     /// managed in-memory via [`super::super::editing_manager::EditingManager`]
     /// on the `Session`.
     fn test_router() -> TestHookRouter {
-        let (dir, _path, conn) = test_db();
-        let conn = Arc::new(std::sync::Mutex::new(conn));
-
-        // Insert a session for FK constraints.
-        conn.lock()
-            .expect("lock")
-            .execute(
-                "INSERT INTO sessions (id, pid, display_name, started_at) \
-                 VALUES ('test-session', 1, 'test', '2026-01-01T00:00:00Z')",
-                [],
-            )
-            .expect("insert session");
+        let dir = tempfile::tempdir().expect("tempdir");
 
         let config = Config::default();
         let logging = crate::logging::LoggingServer::new();
@@ -1650,13 +1596,12 @@ mod tests {
             config,
             vec![],
             logging,
-            conn.clone(),
             instance_id.clone(),
             handle,
             notification_router,
             None,
         ));
-        let router = HookRouter::new(session, conn, instance_id, "test".to_string());
+        let router = HookRouter::new(session, instance_id, "test".to_string());
 
         TestHookRouter {
             _dir: dir,
@@ -1667,17 +1612,7 @@ mod tests {
 
     /// Create a `HookRouter` with a workspace root for scope boundary tests.
     fn test_router_with_root() -> (TestHookRouter, PathBuf) {
-        let (dir, _path, conn) = test_db();
-        let conn = Arc::new(std::sync::Mutex::new(conn));
-
-        conn.lock()
-            .expect("lock")
-            .execute(
-                "INSERT INTO sessions (id, pid, display_name, started_at) \
-                 VALUES ('test-session', 1, 'test', '2026-01-01T00:00:00Z')",
-                [],
-            )
-            .expect("insert session");
+        let dir = tempfile::tempdir().expect("tempdir");
 
         let config = Config::default();
         let logging = crate::logging::LoggingServer::new();
@@ -1699,14 +1634,13 @@ mod tests {
             config,
             vec![root.clone()],
             logging,
-            conn.clone(),
             instance_id.clone(),
             handle,
             notification_router,
             None,
         ));
 
-        let router = HookRouter::new(session, conn, instance_id, "test".to_string());
+        let router = HookRouter::new(session, instance_id, "test".to_string());
 
         (
             TestHookRouter {
@@ -1728,17 +1662,7 @@ mod tests {
         PathBuf,
         Arc<crate::bridge::editing_guardrail::EditingGuardrail>,
     ) {
-        let (dir, _path, conn) = test_db();
-        let conn = Arc::new(std::sync::Mutex::new(conn));
-
-        conn.lock()
-            .expect("lock")
-            .execute(
-                "INSERT INTO sessions (id, pid, display_name, started_at) \
-                 VALUES ('test-session', 1, 'test', '2026-01-01T00:00:00Z')",
-                [],
-            )
-            .expect("insert session");
+        let dir = tempfile::tempdir().expect("tempdir");
 
         let config = Config::default();
         let logging = crate::logging::LoggingServer::new();
@@ -1763,7 +1687,6 @@ mod tests {
             config,
             vec![root.clone()],
             logging,
-            conn.clone(),
             instance_id.clone(),
             handle,
             notification_router,
@@ -1776,7 +1699,7 @@ mod tests {
             Some(guardrail.clone()),
         ));
 
-        let router = HookRouter::new(session, conn, instance_id, "test".to_string());
+        let router = HookRouter::new(session, instance_id, "test".to_string());
 
         (
             TestHookRouter {
@@ -2056,17 +1979,7 @@ mod tests {
     ///
     /// Allows only `git` — any other command (e.g., `cargo`) is denied.
     fn test_router_with_commands() -> TestHookRouter {
-        let (dir, _path, conn) = test_db();
-        let conn = Arc::new(std::sync::Mutex::new(conn));
-
-        conn.lock()
-            .expect("lock")
-            .execute(
-                "INSERT INTO sessions (id, pid, display_name, started_at) \
-                 VALUES ('test-session', 1, 'test', '2026-01-01T00:00:00Z')",
-                [],
-            )
-            .expect("insert session");
+        let dir = tempfile::tempdir().expect("tempdir");
 
         let config = Config {
             resolved_commands: Some(crate::config::ResolvedCommands {
@@ -2089,13 +2002,12 @@ mod tests {
             config,
             vec![],
             logging,
-            conn.clone(),
             instance_id.clone(),
             handle,
             notification_router,
             None,
         ));
-        let router = HookRouter::new(session, conn, instance_id, "test".to_string());
+        let router = HookRouter::new(session, instance_id, "test".to_string());
         TestHookRouter {
             _dir: dir,
             _runtime: runtime,

@@ -19,7 +19,6 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 use catenary_mcp::cli::{self, HostFormat, QueryFormat};
 use catenary_mcp::logging::LoggingServer;
-use catenary_mcp::session;
 
 use catenary_mcp::source::Source;
 
@@ -298,12 +297,6 @@ enum Command {
         format: QueryFormat,
     },
 
-    /// Diagnostic and debugging tools (list, monitor, status, gc).
-    Debug {
-        #[command(subcommand)]
-        command: DebugCommand,
-    },
-
     /// Hook subcommands (invoked by host CLI hooks).
     #[command(hide = true)]
     Hook {
@@ -340,52 +333,6 @@ enum RootsCommand {
     },
     /// List all tracked workspace roots with their source.
     Ls,
-}
-
-/// Diagnostic and debugging subcommands.
-#[derive(Subcommand, Debug)]
-enum DebugCommand {
-    /// List active Catenary sessions.
-    List,
-
-    /// Monitor events from a session.
-    Monitor {
-        /// Session ID or row number (use 'catenary debug list' to see available sessions).
-        id: String,
-
-        /// Show raw JSON output.
-        #[arg(long)]
-        raw: bool,
-
-        /// Disable colored output.
-        #[arg(long)]
-        nocolor: bool,
-
-        /// Filter events by regex pattern.
-        #[arg(long, short)]
-        filter: Option<String>,
-    },
-
-    /// Show status of a session.
-    Status {
-        /// Session ID (use 'catenary debug list' to see available sessions).
-        id: String,
-    },
-
-    /// Garbage-collect old session data.
-    Gc {
-        /// Delete events older than this duration (e.g., "7d", "30d").
-        #[arg(long)]
-        older_than: Option<String>,
-
-        /// Delete all data for dead sessions.
-        #[arg(long)]
-        dead: bool,
-
-        /// Delete all data for a specific session.
-        #[arg(long)]
-        session: Option<String>,
-    },
 }
 
 /// Hook subcommands invoked by host CLI hooks.
@@ -726,40 +673,6 @@ fn main() -> Result<()> {
                 },
             )
         }
-        Some(Command::Debug { command }) => match command {
-            DebugCommand::List => {
-                let mut out = cli::Output::stdout(false);
-                cli::commands::run_list(&mut out)
-            }
-            DebugCommand::Monitor {
-                id,
-                raw,
-                nocolor,
-                filter,
-            } => {
-                let mut out = cli::Output::stdout(nocolor);
-                cli::commands::run_monitor(&mut out, &id, raw, filter.as_deref())
-            }
-            DebugCommand::Status { id } => {
-                let mut out = cli::Output::stdout(false);
-                cli::commands::run_status(&mut out, &id)
-            }
-            DebugCommand::Gc {
-                older_than,
-                dead,
-                session,
-            } => {
-                let conn = catenary_mcp::db::open_and_migrate()?;
-                let mut out = cli::Output::stdout(false);
-                cli::commands::run_gc(
-                    &mut out,
-                    &conn,
-                    older_than.as_deref(),
-                    dead,
-                    session.as_deref(),
-                )
-            }
-        },
         Some(Command::Hook { command }) => {
             // Install minimal tracing subscriber for hook CLI: only the
             // desktop notification sink. When the daemon is unreachable,
@@ -1022,21 +935,15 @@ fn build_runtime() -> Result<tokio::runtime::Runtime> {
 
 /// Launch the interactive TUI dashboard.
 ///
-/// Prunes stale sessions based on the configured retention policy, then
-/// enters a two-pane terminal interface showing sessions and events.
+/// Renders the daemon's `state.json` snapshot as a live ops board (server and
+/// session health). The dashboard never reads the firehose — `catenary query`
+/// is the separate firehose surface.
 ///
 /// # Errors
 ///
-/// Returns an error if configuration loading, session pruning, or TUI
-/// initialisation fails.
+/// Returns an error if configuration loading or TUI initialisation fails.
 fn run_dashboard() -> Result<()> {
     let config = catenary_mcp::config::Config::load()?;
-
-    let conn = catenary_mcp::db::open_and_migrate()?;
-    if let Err(e) = session::prune_sessions_with_conn(&conn, config.log_retention_days) {
-        info!("session pruning failed: {e}");
-    }
-
     catenary_mcp::tui::run(config.icons.unwrap_or_default())
 }
 
@@ -1105,6 +1012,10 @@ fn run_daemon_main() -> Result<()> {
         .with(logging.clone())
         .init();
 
+    // One-time reclaim of the legacy SQLite database (observability ticket 07).
+    // Safe here: the socket bind above proved we are the sole daemon.
+    drain_legacy_db();
+
     let config = catenary_mcp::config::Config::load()?;
 
     let raw_roots: Vec<PathBuf> = match std::env::var("CATENARY_ROOTS") {
@@ -1127,7 +1038,7 @@ fn run_daemon_main() -> Result<()> {
         .and_then(|r| catenary_mcp::config::load_project_config(r).ok().flatten())
         .is_some_and(|pc| !pc.lsp);
 
-    let (shared_session, shared_conn, daemon_instance_id) = if disabled {
+    let shared_session = if disabled {
         info!("Catenary disabled by .catenary.toml (lsp = false) in {workspace_display}");
         // Activate with just the desktop notification sink so stale hook
         // detection can still fire OS notifications.
@@ -1139,9 +1050,8 @@ fn run_daemon_main() -> Result<()> {
         let desktop_sink =
             catenary_mcp::notify::DesktopNotificationSink::with_enabled(desktop_enabled);
         logging.activate(vec![desktop_sink]);
-        (None, None, None)
+        None
     } else {
-        let conn = catenary_mcp::db::open_and_migrate()?;
         let instance_id: Arc<str> = format!("daemon:{}", uuid::Uuid::new_v4()).into();
 
         // Firehose reaping knobs, captured before `config` moves into the
@@ -1149,41 +1059,12 @@ fn run_daemon_main() -> Result<()> {
         let reap_policy = config.reap_policy();
         let retention_days = config.log_retention_days;
 
-        // Prune sessions from previous daemon runs whose process is
-        // gone. CASCADE deletes their language_servers rows so stale
-        // workspace roots don't accumulate in the TUI.
-        if let Err(e) = session::prune_sessions_with_conn(&conn, config.log_retention_days) {
-            info!("session pruning at daemon start: {e}");
-        }
-
         // Sweep runtime-dir overflow files left by crashed/ended sessions
-        // (tickets 11 + 11a). Diagnostics rides the session prune (reclaim any
-        // file whose session id is not currently alive); sed previews are
-        // per-invocation and unreferenced, so a previous daemon's are all
+        // (tickets 11 + 11a). At startup no session is connected yet, so every
+        // diagnostics/sed overflow file belongs to a dead prior daemon and is
         // reaped. Authoritative GC — no teardown signal is reliable across hosts.
-        sweep_diagnostics_overflow(&conn);
+        sweep_diagnostics_overflow();
         sweep_sed_overflow();
-
-        // Insert the daemon's own session row. The firehose no longer writes
-        // the `messages` table (it goes to JSONL now), but the `language_servers`
-        // server-board persistence keys on this session id and the TUI/session
-        // listing reads it, so the row is still required until SQLite is dropped
-        // (ticket 07).
-        let started_at = chrono::Utc::now().to_rfc3339();
-        conn.execute(
-            "INSERT INTO sessions \
-             (id, pid, display_name, started_at, alive) \
-             VALUES (?1, ?2, ?3, ?4, 1)",
-            rusqlite::params![
-                &*instance_id,
-                std::process::id(),
-                &workspace_display,
-                &started_at
-            ],
-        )
-        .context("insert daemon session row")?;
-
-        let conn = Arc::new(std::sync::Mutex::new(conn));
 
         let threshold: catenary_mcp::logging::Severity = config
             .notifications
@@ -1201,7 +1082,7 @@ fn run_daemon_main() -> Result<()> {
         // out-of-process surface that replaces the language_servers table.
         let snapshot = catenary_mcp::state_snapshot::SnapshotWriter::new(
             rt.handle(),
-            &catenary_mcp::db::runtime_dir().join("catenary"),
+            &catenary_mcp::paths::runtime_dir().join("catenary"),
             catenary_mcp::state_snapshot::DaemonInfo {
                 instance_id: instance_id.to_string(),
                 pid: std::process::id(),
@@ -1214,7 +1095,6 @@ fn run_daemon_main() -> Result<()> {
             config,
             roots,
             logging.clone(),
-            conn.clone(),
             instance_id.clone(),
             rt.handle().clone(),
             notification_router,
@@ -1230,7 +1110,7 @@ fn run_daemon_main() -> Result<()> {
         // host) — then schedule the periodic staleness sweep. On-write reaping
         // (rotation + per-tool byte budget) rides the JSONL sink itself.
         {
-            let cache_root = catenary_mcp::db::cache_dir().join("catenary");
+            let cache_root = catenary_mcp::paths::cache_dir().join("catenary");
             let self_inst = instance_id.to_string();
             rt.spawn_blocking(move || {
                 catenary_mcp::logging::reaper::reap_instances(
@@ -1241,10 +1121,10 @@ fn run_daemon_main() -> Result<()> {
                 );
             });
 
-            let firehose_root = catenary_mcp::db::cache_dir()
+            let firehose_root = catenary_mcp::paths::cache_dir()
                 .join("catenary")
                 .join(instance_id.as_ref());
-            let state_json = catenary_mcp::db::runtime_dir()
+            let state_json = catenary_mcp::paths::runtime_dir()
                 .join("catenary")
                 .join("state.json");
             rt.spawn(async move {
@@ -1268,15 +1148,15 @@ fn run_daemon_main() -> Result<()> {
             });
         }
 
-        (Some(session), Some(conn), Some(instance_id))
+        Some(session)
     };
 
     let session_for_shutdown = shared_session.clone();
 
     let manager = SessionManager::from_sockets(sockets, logging);
-    let manager = match (shared_session, shared_conn) {
-        (Some(session), Some(conn)) => manager.with_session(session, conn),
-        _ => manager,
+    let manager = match shared_session {
+        Some(session) => manager.with_session(session),
+        None => manager,
     };
 
     info!(
@@ -1329,42 +1209,27 @@ fn run_daemon_main() -> Result<()> {
     // Drop removes socket files.
     drop(manager);
 
-    // Mark the daemon session dead so the TUI stops showing its
-    // workspace roots. On crash, prune_sessions_with_conn detects the
-    // dead PID on the next daemon or TUI startup.
-    if let Some(id) = daemon_instance_id
-        && let Ok(conn) = catenary_mcp::db::open()
-    {
-        let ended_at = chrono::Utc::now().to_rfc3339();
-        let _ = conn.execute(
-            "UPDATE sessions SET alive = 0, ended_at = ?1 WHERE id = ?2",
-            rusqlite::params![&ended_at, &*id],
-        );
-    }
-
     info!(source = Source::DaemonLifecycle.as_str(), "daemon stopped",);
 
     result
 }
 
-/// Remove diagnostics overflow files whose session is no longer alive.
+/// Remove diagnostics overflow files left by previous daemon runs.
 ///
-/// Reads the live session id set from the database and sweeps the runtime dir
-/// (ticket 11). Best-effort: a query or filesystem error leaves files in place
-/// — they are tiny and reaped on a later run.
+/// Runs once at daemon startup, before any session connects, so no overflow
+/// file belongs to a live session — every one is from a dead prior daemon and
+/// is reclaimed (the live set is empty). Authoritative GC: no teardown signal
+/// is reliable across hosts (ticket 11). A graceful per-session end reclaims
+/// its own file immediately (router `handle_hook_dispatch`); this sweeps
+/// whatever a crash left behind. Best-effort: a filesystem error leaves files
+/// in place — they are tiny and reaped on a later run.
 #[cfg(unix)]
-fn sweep_diagnostics_overflow(conn: &rusqlite::Connection) {
-    let live: std::collections::HashSet<String> = {
-        let Ok(mut stmt) = conn.prepare("SELECT id FROM sessions WHERE alive = 1") else {
-            return;
-        };
-        let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) else {
-            return;
-        };
-        rows.flatten().collect()
-    };
-    let removed =
-        catenary_mcp::bridge::overflow::sweep_diagnostics(&catenary_mcp::db::runtime_dir(), &live);
+fn sweep_diagnostics_overflow() {
+    let live: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let removed = catenary_mcp::bridge::overflow::sweep_diagnostics(
+        &catenary_mcp::paths::runtime_dir(),
+        &live,
+    );
     if removed > 0 {
         info!("swept {removed} stale diagnostics overflow file(s)");
     }
@@ -1377,10 +1242,51 @@ fn sweep_diagnostics_overflow(conn: &rusqlite::Connection) {
 /// (ticket 11a). An in-lifetime last-N cap bounds the dir while the daemon runs.
 #[cfg(unix)]
 fn sweep_sed_overflow() {
-    let removed = catenary_mcp::bridge::overflow::sweep_sed(&catenary_mcp::db::runtime_dir());
+    let removed = catenary_mcp::bridge::overflow::sweep_sed(&catenary_mcp::paths::runtime_dir());
     if removed > 0 {
         info!("swept {removed} stale sed preview overflow file(s)");
     }
+}
+
+/// One-time reclaim of the legacy `SQLite` database (observability ticket 07).
+///
+/// Older daemons left a `catenary.db` (plus its `-wal` / `-shm` siblings) under
+/// [`state_dir`](catenary_mcp::paths::state_dir). `SQLite` is gone; the file is
+/// regenerable telemetry the daemon owned, so it is deleted outright on startup
+/// — no prompt, no migration. Safe here: the socket bind earlier proved this is
+/// the sole daemon.
+#[cfg(unix)]
+fn drain_legacy_db() {
+    let db = catenary_mcp::paths::state_dir()
+        .join("catenary")
+        .join("catenary.db");
+    let reclaimed = drain_db_at(&db);
+    if reclaimed > 0 {
+        info!(
+            source = Source::DaemonLifecycle.as_str(),
+            "reclaimed legacy catenary.db ({reclaimed} bytes)",
+        );
+    }
+}
+
+/// Delete `db` plus its `-wal` / `-shm` siblings, returning the total bytes
+/// reclaimed (0 when none exist). Best-effort: a file that cannot be removed is
+/// skipped and not counted.
+#[cfg(unix)]
+fn drain_db_at(db: &Path) -> u64 {
+    let mut reclaimed: u64 = 0;
+    for suffix in ["", "-wal", "-shm"] {
+        let mut os = db.to_path_buf().into_os_string();
+        os.push(suffix);
+        let path = PathBuf::from(os);
+        if let Ok(meta) = std::fs::metadata(&path) {
+            let size = meta.len();
+            if std::fs::remove_file(&path).is_ok() {
+                reclaimed += size;
+            }
+        }
+    }
+    reclaimed
 }
 
 /// Stops the running Catenary daemon.
@@ -2064,6 +1970,32 @@ fn resolve_claude_hooks_path(home: &std::path::Path) -> Option<std::path::PathBu
 mod tests {
     use super::*;
 
+    // ── Legacy DB drain tests (observability ticket 07) ───────────
+
+    #[cfg(unix)]
+    #[test]
+    fn drain_db_at_removes_db_and_wal_shm() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("catenary.db");
+        std::fs::write(&db, vec![b'x'; 100]).expect("write db");
+        std::fs::write(dir.path().join("catenary.db-wal"), vec![b'y'; 50]).expect("write wal");
+        std::fs::write(dir.path().join("catenary.db-shm"), vec![b'z'; 25]).expect("write shm");
+
+        let reclaimed = drain_db_at(&db);
+
+        assert_eq!(reclaimed, 175, "reclaimed bytes = db + wal + shm");
+        assert!(!db.exists(), "db removed");
+        assert!(!dir.path().join("catenary.db-wal").exists(), "wal removed");
+        assert!(!dir.path().join("catenary.db-shm").exists(), "shm removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn drain_db_at_is_noop_when_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(drain_db_at(&dir.path().join("catenary.db")), 0);
+    }
+
     // ── CLI hook subcommand tests ─────────────────────────────────
 
     #[test]
@@ -2408,49 +2340,6 @@ mod tests {
                 command: RootsCommand::Ls
             })
         ));
-    }
-
-    // ── CLI debug subcommand tests ──────────────────────────────────
-
-    #[test]
-    fn test_cli_debug_list() {
-        use clap::Parser;
-        let args = Args::try_parse_from(["catenary", "debug", "list"]);
-        let args = args.expect("debug list should parse");
-        assert!(matches!(
-            args.command,
-            Some(Command::Debug {
-                command: DebugCommand::List
-            })
-        ));
-    }
-
-    #[test]
-    fn test_cli_debug_monitor() {
-        use clap::Parser;
-        let args = Args::try_parse_from(["catenary", "debug", "monitor", "abc123"]);
-        let args = args.expect("debug monitor should parse");
-        let Some(Command::Debug {
-            command: DebugCommand::Monitor { id, .. },
-        }) = args.command
-        else {
-            unreachable!("expected Debug Monitor command");
-        };
-        assert_eq!(id, "abc123");
-    }
-
-    #[test]
-    fn test_cli_debug_status() {
-        use clap::Parser;
-        let args = Args::try_parse_from(["catenary", "debug", "status", "abc123"]);
-        let args = args.expect("debug status should parse");
-        let Some(Command::Debug {
-            command: DebugCommand::Status { id },
-        }) = args.command
-        else {
-            unreachable!("expected Debug Status command");
-        };
-        assert_eq!(id, "abc123");
     }
 
     #[test]

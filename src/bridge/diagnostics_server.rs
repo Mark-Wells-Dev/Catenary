@@ -336,7 +336,7 @@ impl DiagnosticsServer {
             // back to the full report inline — losing the tail silently would
             // break the complete-batch guarantee.
             match crate::bridge::overflow::write_diagnostics(
-                &crate::db::runtime_dir(),
+                &crate::paths::runtime_dir(),
                 session_id,
                 &budgeted.full,
             ) {
