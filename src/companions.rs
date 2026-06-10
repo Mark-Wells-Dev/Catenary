@@ -12,6 +12,14 @@
 //! (see [`crate::router`]); this module owns only the *derivation*: turning a
 //! declared root set plus a user-config rule table into the expanded set.
 //!
+//! Derivation is **silent on the agent surface but traced** at `debug!`
+//! (`source = mcp.dispatch`) for the "user investigating" surface (logs/TUI):
+//! every mount and every drop emits a structured event carrying the reason, so
+//! "why isn't my companion mounting?" is answerable without a debugger. It never
+//! emits `warn!`/`error!` — a dropped candidate is normal operation for a `*`
+//! rule (most code checkouts have no `Internal` sibling), so it must not reach
+//! the notification queue.
+//!
 //! Two properties shape the design:
 //!
 //! - **Off by default.** An empty [`CompanionRules`] is the identity transform —
@@ -25,8 +33,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+use tracing::debug;
 
 use crate::bridge::expand_tilde;
+use crate::source::Source;
 
 /// User-config companion-derivation rules: a matcher → template map.
 ///
@@ -92,6 +102,10 @@ impl CompanionRules {
 /// Derivation runs only on the *declared* set — companions never derive further
 /// companions (no `FooInternalInternal`). An empty rule table returns `declared`
 /// unchanged.
+///
+/// Every mount and every drop is traced at `debug!` (`source = mcp.dispatch`)
+/// with the reason; see the module docs. Tracing is a side effect — the returned
+/// set is unaffected, and nothing here reaches `warn!`/`error!`.
 #[must_use]
 pub fn expand_companions(declared: Vec<PathBuf>, rules: &CompanionRules) -> Vec<PathBuf> {
     if rules.is_empty() {
@@ -100,29 +114,115 @@ pub fn expand_companions(declared: Vec<PathBuf>, rules: &CompanionRules) -> Vec<
 
     // Seed `seen` with the declared roots: a companion equal to a declared root
     // is skipped, and duplicate companions across roots collapse — both fall out
-    // of the single `seen.insert` membership check below.
-    let mut seen: HashSet<PathBuf> = declared.iter().cloned().collect();
+    // of the single `seen.insert` membership check below. `declared_set` is kept
+    // alongside it so a drop can name *which* collision occurred (equal to a
+    // declared root vs. already contributed by another root).
+    let declared_set: HashSet<PathBuf> = declared.iter().cloned().collect();
+    let mut seen = declared_set.clone();
     let mut result = declared.clone();
 
     for root in &declared {
         let canonical = canonical_project_root(root);
+        let mut matched_any = false;
         for (matcher, template) in &rules.rules {
             if !matcher_matches(matcher, &canonical) {
                 continue;
             }
+            matched_any = true;
+
             // `canonicalize` both existence-filters (Err ⇒ missing path) and
             // normalizes, so dedup/equality align with the canonical declared
             // roots.
-            let Ok(resolved) = expand_template(template, &canonical).canonicalize() else {
+            let candidate = expand_template(template, &canonical);
+            let Ok(resolved) = candidate.canonicalize() else {
+                trace_drop(
+                    root,
+                    &canonical,
+                    Some(matcher),
+                    Some(&candidate),
+                    "not an existing directory",
+                );
                 continue;
             };
-            if resolved.is_dir() && seen.insert(resolved.clone()) {
-                result.push(resolved);
+            if !resolved.is_dir() {
+                trace_drop(
+                    root,
+                    &canonical,
+                    Some(matcher),
+                    Some(&resolved),
+                    "not an existing directory",
+                );
+                continue;
             }
+            if declared_set.contains(&resolved) {
+                trace_drop(
+                    root,
+                    &canonical,
+                    Some(matcher),
+                    Some(&resolved),
+                    "equals declared root",
+                );
+                continue;
+            }
+            if !seen.insert(resolved.clone()) {
+                trace_drop(
+                    root,
+                    &canonical,
+                    Some(matcher),
+                    Some(&resolved),
+                    "duplicate companion",
+                );
+                continue;
+            }
+            debug!(
+                source = Source::McpDispatch.as_str(),
+                declared = %root.display(),
+                canonical = %canonical.display(),
+                matcher = matcher.as_str(),
+                companion = %resolved.display(),
+                "companion mounted",
+            );
+            result.push(resolved);
+        }
+        if !matched_any {
+            trace_drop(root, &canonical, None, None, "no rule matched");
         }
     }
 
+    debug!(
+        source = Source::McpDispatch.as_str(),
+        roots = declared.len(),
+        mounted = result.len() - declared.len(),
+        "companion derivation complete",
+    );
+
     result
+}
+
+/// Emits the `debug!` trace for a dropped companion candidate.
+///
+/// `matcher`/`candidate` are `None` only for the `"no rule matched"` outcome,
+/// where neither is known; they render as empty fields. Lives at `debug!`
+/// (never `warn!`/`error!`) — a dropped candidate is normal operation.
+fn trace_drop(
+    declared: &Path,
+    canonical: &Path,
+    matcher: Option<&str>,
+    candidate: Option<&Path>,
+    reason: &'static str,
+) {
+    let candidate = candidate
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    debug!(
+        source = Source::McpDispatch.as_str(),
+        declared = %declared.display(),
+        canonical = %canonical.display(),
+        matcher = matcher.unwrap_or_default(),
+        candidate = candidate.as_str(),
+        reason,
+        "companion candidate dropped",
+    );
 }
 
 /// Resolves a declared root to its **canonical project root** — for a linked
@@ -324,10 +424,14 @@ mod tests {
         CompanionRules, canonical_project_root, expand_companions, expand_env, expand_path_str,
         expand_template, matcher_matches,
     };
+    use std::collections::HashMap;
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
 
     use tempfile::tempdir;
+    use tracing::Level;
+    use tracing_subscriber::layer::SubscriberExt;
 
     /// Canonicalizes a path, failing the test on error (test-only).
     fn canon(p: &Path) -> PathBuf {
@@ -524,6 +628,142 @@ mod tests {
         // Worktree stays; companion is `CatenaryInternal`, NOT
         // `Catenary-companionInternal`.
         assert_eq!(out, vec![worktree, companion]);
+    }
+
+    // ── derivation tracing ────────────────────────────────────────────────
+
+    /// One captured tracing event: its level and string-valued fields.
+    #[derive(Clone, Debug)]
+    struct CapturedEvent {
+        level: Level,
+        fields: HashMap<String, String>,
+    }
+
+    /// Minimal tracing layer that records every event's level and fields.
+    struct CaptureLayer {
+        events: Arc<Mutex<Vec<CapturedEvent>>>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureLayer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Visitor(HashMap<String, String>);
+            impl tracing::field::Visit for Visitor {
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    self.0.insert(field.name().to_string(), value.to_string());
+                }
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0
+                        .insert(field.name().to_string(), format!("{value:?}"));
+                }
+            }
+            let mut v = Visitor(HashMap::new());
+            event.record(&mut v);
+            if let Ok(mut events) = self.events.lock() {
+                events.push(CapturedEvent {
+                    level: *event.metadata().level(),
+                    fields: v.0,
+                });
+            }
+        }
+    }
+
+    /// Runs `expand_companions` under a capturing subscriber, returning the
+    /// derived set together with every tracing event it emitted.
+    fn capture(
+        declared: Vec<PathBuf>,
+        rules: &CompanionRules,
+    ) -> (Vec<PathBuf>, Vec<CapturedEvent>) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let layer = CaptureLayer {
+            events: Arc::clone(&events),
+        };
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let out =
+            tracing::subscriber::with_default(subscriber, || expand_companions(declared, rules));
+        let captured = events.lock().expect("lock captured events").clone();
+        (out, captured)
+    }
+
+    /// The level-discipline invariant: derivation must never reach the
+    /// notification queue.
+    fn assert_no_warn_or_error(events: &[CapturedEvent]) {
+        assert!(
+            events
+                .iter()
+                .all(|e| e.level != Level::WARN && e.level != Level::ERROR),
+            "companion derivation must stay at debug; found warn/error: {events:?}",
+        );
+    }
+
+    #[test]
+    fn mount_emits_debug_event_carrying_companion() {
+        let dir = tempdir().expect("tempdir");
+        let base = canon(dir.path());
+        let foo = base.join("Foo");
+        let foo_internal = base.join("FooInternal");
+        fs::create_dir(&foo).expect("mkdir Foo");
+        fs::create_dir(&foo_internal).expect("mkdir FooInternal");
+
+        let rules = CompanionRules::from_pairs([("*", "{root}Internal")]);
+        let (out, events) = capture(vec![foo.clone()], &rules);
+
+        assert_eq!(out, vec![foo, foo_internal.clone()]);
+        let mount = events
+            .iter()
+            .find(|e| e.fields.contains_key("companion"))
+            .expect("a mount event carrying `companion`");
+        assert_eq!(mount.level, Level::DEBUG);
+        assert_eq!(
+            mount.fields.get("companion"),
+            Some(&foo_internal.display().to_string()),
+        );
+        assert_no_warn_or_error(&events);
+    }
+
+    #[test]
+    fn nonexistent_sibling_emits_not_an_existing_directory() {
+        let dir = tempdir().expect("tempdir");
+        let base = canon(dir.path());
+        let foo = base.join("Foo");
+        fs::create_dir(&foo).expect("mkdir Foo");
+        // No `FooInternal` on disk.
+
+        let rules = CompanionRules::from_pairs([("*", "{root}Internal")]);
+        let (_out, events) = capture(vec![foo], &rules);
+
+        assert!(
+            events.iter().any(|e| e.level == Level::DEBUG
+                && e.fields.get("reason").map(String::as_str) == Some("not an existing directory")),
+            "expected a debug drop with reason 'not an existing directory', got: {events:?}",
+        );
+        assert_no_warn_or_error(&events);
+    }
+
+    #[test]
+    fn companion_equal_to_declared_emits_equals_declared_root() {
+        let dir = tempdir().expect("tempdir");
+        let base = canon(dir.path());
+        let foo = base.join("Foo");
+        fs::create_dir(&foo).expect("mkdir Foo");
+
+        // The template resolves the companion back to the declared root itself.
+        let rules = CompanionRules::from_pairs([("*", "{root}")]);
+        let (_out, events) = capture(vec![foo], &rules);
+
+        assert!(
+            events.iter().any(|e| e.level == Level::DEBUG
+                && e.fields.get("reason").map(String::as_str) == Some("equals declared root")),
+            "expected a debug drop with reason 'equals declared root', got: {events:?}",
+        );
+        assert_no_warn_or_error(&events);
     }
 
     // ── helpers ───────────────────────────────────────────────────────────
