@@ -145,6 +145,23 @@ pub fn expand_companions(declared: Vec<PathBuf>, rules: &CompanionRules) -> Vec<
 ///
 /// The canonical root is used **only** to derive the companion — it is never
 /// itself mounted. Any parse/IO failure falls back to `r`.
+///
+/// **Limitation — a linked worktree of a `--separate-git-dir` repo.** The
+/// worktree branch takes the **parent** of the common git dir as the project
+/// root, which holds only when that git dir lives *inside* the main worktree
+/// (the standard layout). When the git dir is relocated outside the working tree
+/// (`--separate-git-dir`, used in dotfiles/`yadm`-style setups), the parent is an
+/// unrelated directory, and git records the original working tree nowhere
+/// reachable from here — not in the common dir's `config` (`core.worktree` is
+/// unset by `git init --separate-git-dir`), not under `worktrees/` (which lists
+/// only *linked* worktrees). `git` itself can't recover it from this side, so no
+/// `std::fs` parse (or git crate) could either. That intersection — relocated git
+/// dir **and** a linked worktree of it — is unsupported and resolves wrongly;
+/// in practice it degrades to a no-op (the wrong path's sibling won't exist, so
+/// the existence filter drops the companion). Every other case — normal
+/// checkouts, standard linked worktrees, submodules, and a *directly-opened*
+/// `--separate-git-dir` main worktree (its gitdir is not under `worktrees/`, so
+/// it returns `r`) — resolves correctly.
 #[must_use]
 fn canonical_project_root(r: &Path) -> PathBuf {
     let dot_git = r.join(".git");
