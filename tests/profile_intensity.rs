@@ -17,21 +17,25 @@
 //! Intensity profiling integration test.
 //!
 //! Spawns real LSP servers against fixture projects, runs the settle loop
-//! with a recording sink, writes samples to a temp `SQLite` database, and
-//! prints per-server summary statistics.
+//! with a recording sink, appends samples to a temp JSONL file (one JSON
+//! object per line), and prints per-server summary statistics.
 //!
 //! Run with:
 //! ```text
-//! PROFILE_DB=internal_repo/data/intensity.db make test-ignored T=profile_intensity
+//! PROFILE_OUT=internal_repo/data/intensity.jsonl make test-ignored T=profile_intensity
 //! ```
+//!
+//! The log accumulates (append) across servers in one run and across runs;
+//! delete the file for a clean capture. Any prior `.db` captures stay
+//! readable with `sqlite3` — this test no longer writes that format.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use rusqlite::params;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
@@ -136,30 +140,38 @@ const SERVERS: &[ServerDef] = &[
 
 // ── Recording sink ───────────────────────────────────────────────────
 
+/// One recorded sample, serialized as a single JSON line.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Sample {
+    timestamp_ms: i64,
+    server: String,
+    pid: u32,
+    ppid: u32,
+    delta_pfc: u64,
+    delta_utime: u64,
+    delta_stime: u64,
+    in_progress: u32,
+    process_count: u64,
+}
+
+/// Appends samples to a JSONL file, one JSON object per line.
 struct RecordingSink {
-    db: rusqlite::Connection,
+    out: std::fs::File,
     start: Instant,
 }
 
 impl RecordingSink {
     fn new(path: &Path) -> Result<Self> {
-        let db = rusqlite::Connection::open(path)?;
-        db.execute_batch(
-            "CREATE TABLE IF NOT EXISTS intensity_samples (
-                id            INTEGER PRIMARY KEY,
-                timestamp_ms  INTEGER NOT NULL,
-                server        TEXT    NOT NULL,
-                pid           INTEGER NOT NULL,
-                ppid          INTEGER NOT NULL,
-                delta_pfc     INTEGER NOT NULL,
-                delta_utime   INTEGER NOT NULL,
-                delta_stime   INTEGER NOT NULL,
-                in_progress   INTEGER NOT NULL,
-                process_count INTEGER NOT NULL
-            );",
-        )?;
+        // Append, not truncate: the SERVERS loop opens a fresh sink per server
+        // at the same path, so each must accumulate onto the prior server's
+        // samples (mirrors the old `CREATE TABLE IF NOT EXISTS` + INSERT).
+        let out = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .with_context(|| format!("open profile log {}", path.display()))?;
         Ok(Self {
-            db,
+            out,
             start: Instant::now(),
         })
     }
@@ -172,26 +184,27 @@ impl ProfileSink for RecordingSink {
         #[allow(
             clippy::cast_possible_wrap,
             clippy::cast_possible_truncation,
-            reason = "sample values and elapsed ms fit in i64"
+            reason = "elapsed ms fits in i64 for any realistic profiling run"
         )]
-        let result = self.db.execute(
-            "INSERT INTO intensity_samples
-             (timestamp_ms, server, pid, ppid, delta_pfc, delta_utime, delta_stime, in_progress, process_count)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                elapsed_ms as i64,
-                sample.server,
-                sample.pid,
-                sample.ppid,
-                sample.delta_pfc as i64,
-                sample.delta_utime as i64,
-                sample.delta_stime as i64,
-                sample.in_progress_count,
-                sample.process_count as i64,
-            ],
-        );
-        // Recording failure shouldn't crash the loop — just stop.
-        result.is_ok()
+        let record = Sample {
+            timestamp_ms: elapsed_ms as i64,
+            server: sample.server.clone(),
+            pid: sample.pid,
+            ppid: sample.ppid,
+            delta_pfc: sample.delta_pfc,
+            delta_utime: sample.delta_utime,
+            delta_stime: sample.delta_stime,
+            in_progress: sample.in_progress_count,
+            process_count: sample.process_count as u64,
+        };
+
+        let Ok(mut line) = serde_json::to_string(&record) else {
+            return false;
+        };
+        line.push('\n');
+        // Write per-line (File is unbuffered) so a killed run still leaves a
+        // complete prefix. Recording failure shouldn't crash the loop — stop.
+        self.out.write_all(line.as_bytes()).is_ok()
     }
 }
 
@@ -476,82 +489,66 @@ async fn send_did_close(stdin: &mut ChildStdin, uri: &str) -> Result<()> {
 
 // ── Summary output ───────────────────────────────────────────────────
 
-fn print_summary(db_path: &Path) -> Result<()> {
-    let db = rusqlite::Connection::open(db_path)?;
+fn print_summary(out_path: &Path) -> Result<()> {
+    let content = std::fs::read_to_string(out_path)
+        .with_context(|| format!("read profile log {}", out_path.display()))?;
+    let samples: Vec<Sample> = content
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).context("parse sample line"))
+        .collect::<Result<_>>()?;
 
-    let mut stmt = db.prepare("SELECT DISTINCT server FROM intensity_samples ORDER BY server")?;
-    let servers: Vec<String> = stmt
-        .query_map([], |row| row.get(0))?
-        .filter_map(Result::ok)
-        .collect();
+    // Distinct servers, alphabetical (was `SELECT DISTINCT server ORDER BY server`).
+    let mut servers: Vec<&str> = samples.iter().map(|s| s.server.as_str()).collect();
+    servers.sort_unstable();
+    servers.dedup();
 
     println!("\n{}", "=".repeat(60));
     println!("  INTENSITY PROFILING SUMMARY");
     println!("{}\n", "=".repeat(60));
 
-    for server in &servers {
+    for server in servers {
+        // Samples for this server in record order (the old `ORDER BY id`).
+        let rows: Vec<&Sample> = samples.iter().filter(|s| s.server == server).collect();
         println!("--- {server} ---\n");
 
-        // Total samples
-        let total: i64 = db.query_row(
-            "SELECT COUNT(*) FROM intensity_samples WHERE server = ?1",
-            params![server],
-            |row| row.get(0),
-        )?;
-        println!("  Total samples: {total}");
+        println!("  Total samples: {}", rows.len());
 
-        // Max process count
-        let max_procs: i64 = db.query_row(
-            "SELECT COALESCE(MAX(process_count), 0) FROM intensity_samples WHERE server = ?1",
-            params![server],
-            |row| row.get(0),
-        )?;
+        let max_procs = rows.iter().map(|s| s.process_count).max().unwrap_or(0);
         println!("  Max process count: {max_procs}");
 
-        // Aggregate stats
-        let (sum_pfc, sum_utime, sum_stime, max_pfc, max_utime): (i64, i64, i64, i64, i64) = db
-            .query_row(
-                "SELECT
-                    COALESCE(SUM(delta_pfc), 0),
-                    COALESCE(SUM(delta_utime), 0),
-                    COALESCE(SUM(delta_stime), 0),
-                    COALESCE(MAX(delta_pfc), 0),
-                    COALESCE(MAX(delta_utime), 0)
-                 FROM intensity_samples WHERE server = ?1",
-                params![server],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                    ))
-                },
-            )?;
+        let sum_pfc = rows
+            .iter()
+            .map(|s| s.delta_pfc)
+            .fold(0u64, u64::saturating_add);
+        let sum_utime = rows
+            .iter()
+            .map(|s| s.delta_utime)
+            .fold(0u64, u64::saturating_add);
+        let sum_stime = rows
+            .iter()
+            .map(|s| s.delta_stime)
+            .fold(0u64, u64::saturating_add);
+        let max_pfc = rows.iter().map(|s| s.delta_pfc).max().unwrap_or(0);
+        let max_utime = rows.iter().map(|s| s.delta_utime).max().unwrap_or(0);
 
         println!("  Total delta_pfc: {sum_pfc}  (max single: {max_pfc})");
         println!("  Total delta_utime: {sum_utime}  (max single: {max_utime})");
         println!("  Total delta_stime: {sum_stime}");
 
-        // In-progress transitions
-        let progress_changes: i64 = db.query_row(
-            "SELECT COUNT(*) FROM (
-                SELECT in_progress, LAG(in_progress) OVER (ORDER BY id) AS prev
-                FROM intensity_samples WHERE server = ?1
-            ) WHERE in_progress != prev",
-            params![server],
-            |row| row.get(0),
-        )?;
-        println!("  in_progress transitions: {progress_changes}");
+        // in_progress transitions — consecutive samples whose count differs.
+        // The Rust equivalent of `LAG(in_progress) OVER (ORDER BY id)`: the
+        // first sample has no predecessor and is never counted.
+        let transitions = rows
+            .windows(2)
+            .filter(|w| w[0].in_progress != w[1].in_progress)
+            .count();
+        println!("  in_progress transitions: {transitions}");
 
-        // Distinct child PIDs
-        let distinct_pids: i64 = db.query_row(
-            "SELECT COUNT(DISTINCT pid) FROM intensity_samples WHERE server = ?1",
-            params![server],
-            |row| row.get(0),
-        )?;
-        println!("  Distinct PIDs observed: {distinct_pids}");
+        let mut pids: Vec<u32> = rows.iter().map(|s| s.pid).collect();
+        pids.sort_unstable();
+        pids.dedup();
+        println!("  Distinct PIDs observed: {}", pids.len());
 
         println!();
     }
@@ -570,10 +567,10 @@ fn print_summary(db_path: &Path) -> Result<()> {
 async fn profile_intensity() -> Result<()> {
     let fixtures_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/profile");
 
-    // PROFILE_DB=/path/to/output.db persists the database for later analysis.
+    // PROFILE_OUT=/path/to/output.jsonl persists the log for later analysis.
     // Without it, a tempdir is used and cleaned up on exit.
     let tmp_dir_guard;
-    let db_path = if let Ok(path) = std::env::var("PROFILE_DB") {
+    let out_path = if let Ok(path) = std::env::var("PROFILE_OUT") {
         tmp_dir_guard = None;
         let p = PathBuf::from(&path);
         if let Some(parent) = p.parent() {
@@ -582,7 +579,7 @@ async fn profile_intensity() -> Result<()> {
         p
     } else {
         let td = tempfile::tempdir()?;
-        let p = td.path().join("intensity.db");
+        let p = td.path().join("intensity.jsonl");
         tmp_dir_guard = Some(td);
         p
     };
@@ -664,7 +661,7 @@ async fn profile_intensity() -> Result<()> {
         };
 
         // Create recording sink.
-        let mut sink = RecordingSink::new(&db_path)?;
+        let mut sink = RecordingSink::new(&out_path)?;
 
         // Cancellation token shared by settle loop and reader task.
         let cancel = CancellationToken::new();
@@ -762,10 +759,10 @@ async fn profile_intensity() -> Result<()> {
     }
 
     // Print summary.
-    print_summary(&db_path)?;
+    print_summary(&out_path)?;
 
-    // Print DB path so the user can query it manually.
-    println!("Database: {}", db_path.display());
+    // Print the log path so the user can inspect it manually.
+    println!("Profile log: {}", out_path.display());
 
     Ok(())
 }
@@ -820,9 +817,9 @@ async fn profile_intensity_large() -> Result<()> {
     let file_uri = format!("file://{}", target_file.display());
     let root_uri = format!("file://{}", workspace.display());
 
-    // DB path.
+    // Output log path.
     let tmp_dir_guard;
-    let db_path = if let Ok(path) = std::env::var("PROFILE_DB") {
+    let out_path = if let Ok(path) = std::env::var("PROFILE_OUT") {
         tmp_dir_guard = None;
         let p = PathBuf::from(&path);
         if let Some(parent) = p.parent() {
@@ -831,7 +828,7 @@ async fn profile_intensity_large() -> Result<()> {
         p
     } else {
         let td = tempfile::tempdir()?;
-        let p = td.path().join("intensity_large.db");
+        let p = td.path().join("intensity_large.jsonl");
         tmp_dir_guard = Some(td);
         p
     };
@@ -876,7 +873,7 @@ async fn profile_intensity_large() -> Result<()> {
     let mut tree_monitor =
         catenary_proc::TreeMonitor::new(pid).context("Could not create TreeMonitor")?;
 
-    let mut sink = RecordingSink::new(&db_path)?;
+    let mut sink = RecordingSink::new(&out_path)?;
     let cancel = CancellationToken::new();
 
     // Spawn reader task.
@@ -942,8 +939,8 @@ async fn profile_intensity_large() -> Result<()> {
 
     println!("  done.");
 
-    print_summary(&db_path)?;
-    println!("Database: {}", db_path.display());
+    print_summary(&out_path)?;
+    println!("Profile log: {}", out_path.display());
 
     Ok(())
 }

@@ -739,13 +739,20 @@ impl Session {
     /// written outside the diagnostics batch (currently `catenary sed
     /// --in-place`).
     ///
-    /// `SymbolIndex` re-populates only files with no rows
-    /// ([`SymbolIndex::needs_population`](crate::symbol_index::SymbolIndex::needs_population)),
-    /// so a write that leaves the rows in place makes `grep`/`glob` enrichment
-    /// serve pre-write enclosing-symbol labels and ranges until a later access
-    /// finds an empty table (bug #23). Deleting the rows forces a fresh
-    /// `documentSymbol` on the next access; bumping the per-root generation
-    /// invalidates the enrichment cache. Both are in-memory — no read-path cost.
+    /// This eager invalidate is the daemon's *granularity-independent* backstop
+    /// for its own writes. The lazy `grep`/`glob` path (`ensure_symbols`)
+    /// already re-populates when a file's recorded mtime is stale
+    /// ([`SymbolIndex::symbols_outdated`](crate::symbol_index::SymbolIndex::symbols_outdated),
+    /// bug #26), and the result-cache witness path checks mtime too — but both
+    /// rely on the on-disk mtime *visibly advancing*, which a coarse-mtime or
+    /// NFS/SMB/FUSE mount can defeat when `sed` rewrites a file within the
+    /// filesystem's mtime resolution. Clearing the rows unconditionally and
+    /// bumping the per-root generation does not depend on mtime: it forces a
+    /// fresh `documentSymbol` on the next access (bug #23) and invalidates the
+    /// enrichment cache outright. So this is *not* dead redundancy now that the
+    /// lazy backstop exists — it strictly dominates that backstop for the
+    /// daemon's own writes on hostile filesystems. Both effects are in-memory —
+    /// no read-path cost. **Keep it.**
     pub fn invalidate_symbols(&self, files: &[PathBuf]) {
         if files.is_empty() {
             return;

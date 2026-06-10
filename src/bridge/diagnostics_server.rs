@@ -221,14 +221,20 @@ impl DiagnosticsServer {
             self.client_manager.nudge_roots(&nudge_roots).await;
         }
 
-        // ── Phase 1c: drop stale symbol rows ──────────────────────
-        // Bug #23: retrieve_diagnostics only populates files with no rows
-        // (needs_population gate), and Phase 4's bump_generations clears the
-        // enrichment cache but not the symbols table. Without this, diagnostics'
-        // own enclosing-symbol labels — and any later grep/glob on edited files
-        // — keep pre-edit names and ranges. Invalidate here so retrieve
-        // re-populates fresh from documentSymbol (files are about to be opened
-        // and saved on the server, so it is a cheap request, off the read path).
+        // ── Phase 1c: drop stale symbols ──────────────────────────
+        // Bug #23: retrieve_diagnostics gates population on needs_population
+        // *alone* (it does not consult symbols_outdated), and Phase 4's
+        // bump_generations clears the enrichment cache but not the symbols. So
+        // for diagnostics' own enclosing-symbol labels this eager invalidate is
+        // load-bearing, not redundant — without it, present-but-stale symbols
+        // are served. For any later grep/glob the lazy mtime backstop (bug #26,
+        // ensure_symbols) covers the common local-FS case, but this eager path
+        // is granularity-independent on the daemon's own write: it clears the
+        // symbols unconditionally rather than relying on the on-disk mtime
+        // visibly advancing (which a coarse-mtime / NFS / SMB / FUSE mount can
+        // defeat). Invalidate here so retrieve re-populates fresh from
+        // documentSymbol (files are about to be opened and saved on the server,
+        // so it is a cheap request, off the read path). Keep it.
         if let Some(idx_arc) = &self.symbol_index {
             let idx = idx_arc
                 .lock()

@@ -3,18 +3,18 @@
 
 //! Symbol index for workspace-wide symbol extraction.
 //!
-//! Provides [`SymbolIndex`], a SQLite-backed symbol cache populated from
+//! Provides [`SymbolIndex`], an in-memory symbol cache populated from
 //! `textDocument/documentSymbol` LSP responses. The index starts empty and
 //! is filled lazily via [`SymbolIndex::populate_from_document_symbols()`].
 //! Callers are responsible for requesting `documentSymbol` from the LSP
 //! server and feeding the response to the index.
 
-use std::collections::{HashMap, HashSet};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use anyhow::{Context, Result};
-use rusqlite::Connection;
 
 use crate::bridge::filesystem_manager::mtime_nanos;
 
@@ -261,85 +261,70 @@ pub(crate) struct TypeEdge {
     pub deprecated: bool,
 }
 
-/// Workspace-wide symbol index backed by in-memory `SQLite`.
+/// Workspace-wide symbol index held in memory.
 ///
-/// Populated lazily from `textDocument/documentSymbol` LSP responses.
-/// The symbol index is ephemeral — built during a session, discarded
-/// on session end. No dependency on the persistent session database.
+/// Populated lazily from `textDocument/documentSymbol` LSP responses and
+/// stored as per-file symbol lists. The symbol index is ephemeral — built
+/// during a session, discarded on session end. No dependency on any
+/// persistent store.
 ///
 /// Also caches per-position enrichment results (references, call
 /// hierarchy, implementations, type hierarchy) with per-root generation
 /// counter invalidation.
 pub struct SymbolIndex {
-    /// In-memory connection for symbol reads and writes.
-    conn: Connection,
+    /// Per-file symbol lists, each kept sorted by start `line`, plus the
+    /// on-disk mtime each file was populated from.
+    ///
+    /// Wrapped in a [`RefCell`] so
+    /// [`populate_from_document_symbols`](Self::populate_from_document_symbols)
+    /// and [`invalidate`](Self::invalidate) keep their `&self` signature: every
+    /// live caller holds the index behind a `Mutex`, which already serializes
+    /// access, so the cell is never borrowed concurrently.
+    files: RefCell<HashMap<PathBuf, FileEntry>>,
     /// Per-position enrichment cache: `(file, line, col)` → cached result.
     enrichment_cache: HashMap<(PathBuf, u32, u32), CachedEnrichment>,
+}
+
+/// A file's cached symbols and the on-disk mtime they were populated from.
+struct FileEntry {
+    /// Flattened symbols, sorted ascending by start `line`. At most one symbol
+    /// is kept per start line, mirroring the old `PRIMARY KEY (file_path, line)`.
+    symbols: Vec<Symbol>,
+    /// On-disk `mtime_nanos` recorded at population time, or `None` when the
+    /// path could not be stat-ed. Drives
+    /// [`symbols_outdated`](SymbolIndex::symbols_outdated).
+    mtime: Option<i64>,
 }
 
 impl SymbolIndex {
     /// Creates a new empty symbol index.
     ///
-    /// The in-memory database is created with the symbols table schema.
-    /// Symbols are populated lazily via [`populate_from_document_symbols()`](Self::populate_from_document_symbols).
+    /// Symbols are populated lazily via
+    /// [`populate_from_document_symbols()`](Self::populate_from_document_symbols).
     ///
     /// # Errors
     ///
-    /// Returns an error if the in-memory database cannot be created.
+    /// Returns a `Result` for signature stability with callers that construct
+    /// the index fallibly; construction is currently infallible.
     pub fn new() -> Result<Self> {
-        let conn = Connection::open_in_memory().context("failed to open in-memory database")?;
-        conn.execute_batch(
-            "CREATE TABLE symbols (
-                file_path   TEXT NOT NULL,
-                name        TEXT NOT NULL,
-                kind        TEXT NOT NULL,
-                line        INTEGER NOT NULL,
-                end_line    INTEGER NOT NULL,
-                scope       TEXT,
-                scope_kind  TEXT,
-                deprecated  INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (file_path, line)
-            );
-            CREATE INDEX idx_symbols_name ON symbols(name);
-            CREATE INDEX idx_symbols_scope ON symbols(file_path, scope);
-            CREATE TABLE file_mtime (
-                file_path TEXT NOT NULL PRIMARY KEY,
-                mtime     INTEGER NOT NULL
-            );",
-        )
-        .context("failed to create in-memory tables")?;
-
-        conn.create_scalar_function(
-            "regexp",
-            2,
-            rusqlite::functions::FunctionFlags::SQLITE_UTF8
-                | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
-            |ctx| {
-                let pattern = ctx.get_raw(0).as_str()?;
-                let text = ctx.get_raw(1).as_str()?;
-                let re = regex::Regex::new(pattern)
-                    .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
-                Ok(re.is_match(text))
-            },
-        )
-        .context("failed to register REGEXP function")?;
-
         Ok(Self {
-            conn,
+            files: RefCell::new(HashMap::new()),
             enrichment_cache: HashMap::new(),
         })
     }
 
     /// Populates the index for a file from a `documentSymbol` LSP response.
     ///
-    /// Walks the `DocumentSymbol` hierarchy (recursive children), flattens
-    /// into rows. Sets `scope`/`scope_kind` from the parent. Sets
-    /// `deprecated` from `tags` containing `SymbolTag::Deprecated` (value 1).
-    /// Replaces existing symbols for the file (delete + insert in transaction).
+    /// Walks the `DocumentSymbol` hierarchy (recursive children) and flattens
+    /// it into per-file [`Symbol`] entries. Sets `scope`/`scope_kind` from the
+    /// parent. Sets `deprecated` from `tags` containing `SymbolTag::Deprecated`
+    /// (value 1). Replaces any existing symbols for the file. At most one symbol
+    /// is kept per start line (mirrors the old `PRIMARY KEY (file_path, line)`
+    /// with `INSERT OR IGNORE`: the first symbol seen at a given line wins).
     ///
-    /// Records the file's current on-disk mtime alongside the rows so a later
+    /// Records the file's current on-disk mtime alongside the symbols so a later
     /// external write (host `Edit`/`Write`, `git checkout`, formatter) that
-    /// leaves the rows untouched is detected as stale by
+    /// leaves the symbols untouched is detected as stale by
     /// [`symbols_outdated`](Self::symbols_outdated) (bug #26). Capturing it here
     /// means every populate path — `grep`/`glob` and the diagnostics batch —
     /// records it uniformly. A path that cannot be stat-ed (a synthetic test
@@ -349,74 +334,42 @@ impl SymbolIndex {
     ///
     /// # Errors
     ///
-    /// Returns an error if the database transaction fails.
+    /// Returns a `Result` for signature stability; the in-memory swap is
+    /// infallible.
     pub fn populate_from_document_symbols(
         &self,
         file_path: &Path,
         symbols: &serde_json::Value,
     ) -> Result<()> {
-        let path_str = file_path.to_string_lossy();
         let mut flat: Vec<Symbol> = Vec::new();
-
         if let Some(arr) = symbols.as_array() {
             for sym in arr {
                 flatten_document_symbol(sym, None, None, &mut flat);
             }
         }
 
-        // Stat before the transaction. The recorded mtime is the version the
-        // server saw (the caller opened the document from disk before
-        // requesting `documentSymbol`), so a write landing after this point
-        // advances the mtime and is caught on the next access.
+        // Stat before storing. The recorded mtime is the version the server saw
+        // (the caller opened the document from disk before requesting
+        // `documentSymbol`), so a write landing after this point advances the
+        // mtime and is caught on the next access.
         let recorded_mtime: Option<i64> =
             std::fs::metadata(file_path).ok().map(|m| mtime_nanos(&m));
 
-        let tx = self
-            .conn
-            .unchecked_transaction()
-            .context("begin transaction")?;
-
-        tx.execute(
-            "DELETE FROM symbols WHERE file_path = ?1",
-            rusqlite::params![path_str.as_ref() as &str],
-        )
-        .context("failed to delete old symbols")?;
-
-        for sym in &flat {
-            tx.execute(
-                "INSERT OR IGNORE INTO symbols \
-                 (file_path, name, kind, line, end_line, scope, scope_kind, deprecated) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                rusqlite::params![
-                    path_str.as_ref() as &str,
-                    sym.name,
-                    sym.kind,
-                    sym.line,
-                    sym.end_line,
-                    sym.scope,
-                    sym.scope_kind,
-                    sym.deprecated,
-                ],
-            )
-            .with_context(|| format!("failed to insert symbol {} in {}", sym.name, path_str))?;
+        // One symbol per start line, kept ascending — the old store keyed rows
+        // on `(file_path, line)` with `INSERT OR IGNORE`, so the first symbol
+        // seen at a line won and rows read back ordered by line.
+        let mut by_line: BTreeMap<u32, Symbol> = BTreeMap::new();
+        for sym in flat {
+            by_line.entry(sym.line).or_insert(sym);
         }
 
-        match recorded_mtime {
-            Some(mtime) => tx
-                .execute(
-                    "INSERT OR REPLACE INTO file_mtime (file_path, mtime) VALUES (?1, ?2)",
-                    rusqlite::params![path_str.as_ref() as &str, mtime],
-                )
-                .context("failed to record file mtime")?,
-            None => tx
-                .execute(
-                    "DELETE FROM file_mtime WHERE file_path = ?1",
-                    rusqlite::params![path_str.as_ref() as &str],
-                )
-                .context("failed to clear file mtime")?,
-        };
-
-        tx.commit().context("commit transaction")?;
+        self.files.borrow_mut().insert(
+            file_path.to_path_buf(),
+            FileEntry {
+                symbols: by_line.into_values().collect(),
+                mtime: recorded_mtime,
+            },
+        );
         Ok(())
     }
 
@@ -434,17 +387,13 @@ impl SymbolIndex {
         paths.iter().filter(|p| self.needs_population(p)).collect()
     }
 
-    /// Returns `true` if the file has any rows in the `symbols` table.
+    /// Returns `true` if the file has any cached symbols.
     #[must_use]
     pub fn has_symbols_for(&self, path: &Path) -> bool {
-        let path_str = path.to_string_lossy();
-        self.conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM symbols WHERE file_path = ?1)",
-                rusqlite::params![path_str.as_ref() as &str],
-                |row| row.get::<_, bool>(0),
-            )
-            .unwrap_or(false)
+        self.files
+            .borrow()
+            .get(path)
+            .is_some_and(|entry| !entry.symbols.is_empty())
     }
 
     /// Deletes all symbols (and the recorded mtime) for the file. Next access
@@ -452,24 +401,10 @@ impl SymbolIndex {
     ///
     /// # Errors
     ///
-    /// Returns an error if the delete fails.
+    /// Returns a `Result` for signature stability; the in-memory swap is
+    /// infallible.
     pub fn invalidate(&self, path: &Path) -> Result<()> {
-        let path_str = path.to_string_lossy();
-        let tx = self
-            .conn
-            .unchecked_transaction()
-            .context("begin invalidate transaction")?;
-        tx.execute(
-            "DELETE FROM symbols WHERE file_path = ?1",
-            rusqlite::params![path_str.as_ref() as &str],
-        )
-        .context("failed to invalidate symbols")?;
-        tx.execute(
-            "DELETE FROM file_mtime WHERE file_path = ?1",
-            rusqlite::params![path_str.as_ref() as &str],
-        )
-        .context("failed to clear file mtime")?;
-        tx.commit().context("commit invalidate transaction")?;
+        self.files.borrow_mut().remove(path);
         Ok(())
     }
 
@@ -477,7 +412,7 @@ impl SymbolIndex {
     /// older than `current_mtime` — an external write the daemon never
     /// invalidated (host `Edit`/`Write`, `git checkout`, formatter; bug #26).
     ///
-    /// Reports *staleness* of present rows; *absence* is reported by
+    /// Reports *staleness* of present symbols; *absence* is reported by
     /// [`needs_population`](Self::needs_population). A file with no recorded
     /// mtime (never populated, or populated from a path that could not be
     /// stat-ed) returns `false`: there is nothing to compare against, and
@@ -485,125 +420,86 @@ impl SymbolIndex {
     /// current `mtime_nanos` (nanoseconds since epoch).
     #[must_use]
     pub fn symbols_outdated(&self, path: &Path, current_mtime: i64) -> bool {
-        let path_str = path.to_string_lossy();
-        let recorded: Option<i64> = self
-            .conn
-            .query_row(
-                "SELECT mtime FROM file_mtime WHERE file_path = ?1",
-                rusqlite::params![path_str.as_ref() as &str],
-                |row| row.get(0),
-            )
-            .ok();
-        recorded.is_some_and(|m| current_mtime > m)
+        self.files
+            .borrow()
+            .get(path)
+            .and_then(|entry| entry.mtime)
+            .is_some_and(|recorded| current_mtime > recorded)
     }
 
     /// Query the index for symbols whose names match a regex pattern.
     ///
-    /// If `files` is `Some`, only symbols from those files are returned.
+    /// If `files` is `Some` and non-empty, only symbols from those files are
+    /// returned; otherwise the whole index is scanned. Results are unordered.
     ///
     /// # Errors
     ///
-    /// Returns an error if the regex is invalid or the query fails.
+    /// Returns an error if `pattern` is not a valid regular expression.
     pub fn query(
         &self,
         pattern: &str,
         files: Option<&[PathBuf]>,
     ) -> Result<Vec<(PathBuf, Symbol)>> {
+        let re = regex::Regex::new(pattern).context("invalid query regex")?;
+        let store = self.files.borrow();
         let mut results = Vec::new();
+        let mut collect = |path: &PathBuf, entry: &FileEntry| {
+            for sym in &entry.symbols {
+                if re.is_match(&sym.name) {
+                    results.push((path.clone(), sym.clone()));
+                }
+            }
+        };
 
         match files {
             Some(file_list) if !file_list.is_empty() => {
-                let placeholders: String = (0..file_list.len())
-                    .map(|i| format!("?{}", i + 2))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let sql = format!(
-                    "SELECT file_path, name, kind, line, end_line, scope, scope_kind, deprecated \
-                     FROM symbols WHERE name REGEXP ?1 AND file_path IN ({placeholders})"
-                );
-                let mut stmt = self.conn.prepare(&sql).context("failed to prepare query")?;
-
-                let mut params: Vec<Box<dyn rusqlite::types::ToSql>> =
-                    Vec::with_capacity(1 + file_list.len());
-                params.push(Box::new(pattern.to_string()));
-                for f in file_list {
-                    params.push(Box::new(f.to_string_lossy().to_string()));
-                }
-                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-                    params.iter().map(AsRef::as_ref).collect();
-
-                let rows = stmt
-                    .query_map(param_refs.as_slice(), Self::row_to_symbol)
-                    .context("failed to execute query")?;
-                for row in rows {
-                    results.push(row.context("failed to read symbol row")?);
+                for path in file_list {
+                    if let Some(entry) = store.get(path) {
+                        collect(path, entry);
+                    }
                 }
             }
             _ => {
-                let mut stmt = self
-                    .conn
-                    .prepare(
-                        "SELECT file_path, name, kind, line, end_line, scope, scope_kind, deprecated \
-                         FROM symbols WHERE name REGEXP ?1",
-                    )
-                    .context("failed to prepare query")?;
-                let rows = stmt
-                    .query_map([pattern], Self::row_to_symbol)
-                    .context("failed to execute query")?;
-                for row in rows {
-                    results.push(row.context("failed to read symbol row")?);
+                for (path, entry) in store.iter() {
+                    collect(path, entry);
                 }
             }
         }
 
-        Ok(results
-            .into_iter()
-            .map(|(p, sym)| (PathBuf::from(p), sym))
-            .collect())
+        Ok(results)
     }
 
     /// Query depth-0 (outline) symbols for a batch of files.
     ///
-    /// Returns symbols with `scope IS NULL` grouped by file path,
-    /// ordered by line number within each file. Used by the glob tool
-    /// for defensive maps.
+    /// Returns top-level symbols (`scope` is `None`) grouped by file path,
+    /// ordered by line number within each file. Files with no top-level
+    /// symbols are omitted. Used by the glob tool for defensive maps.
     ///
     /// # Errors
     ///
-    /// Returns an error if the query fails.
+    /// Returns a `Result` for signature stability; the in-memory scan is
+    /// infallible.
     pub fn query_outline_batch(&self, files: &[&Path]) -> Result<HashMap<PathBuf, Vec<Symbol>>> {
         if files.is_empty() {
             return Ok(HashMap::new());
         }
 
-        let placeholders: String = (0..files.len())
-            .map(|i| format!("?{}", i + 1))
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        let sql = format!(
-            "SELECT file_path, name, kind, line, end_line, scope, scope_kind, deprecated \
-             FROM symbols \
-             WHERE file_path IN ({placeholders}) AND scope IS NULL \
-             ORDER BY file_path, line"
-        );
-
-        let mut stmt = self.conn.prepare(&sql).context("prepare outline batch")?;
-        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::with_capacity(files.len());
-        for f in files {
-            params.push(Box::new(f.to_string_lossy().to_string()));
-        }
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params.iter().map(AsRef::as_ref).collect();
-
-        let rows = stmt
-            .query_map(param_refs.as_slice(), Self::row_to_symbol)
-            .context("execute outline batch")?;
-
+        let store = self.files.borrow();
         let mut result: HashMap<PathBuf, Vec<Symbol>> = HashMap::new();
-        for row in rows {
-            let (path_str, sym) = row.context("read outline row")?;
-            result.entry(PathBuf::from(path_str)).or_default().push(sym);
+        for &file in files {
+            let Some(entry) = store.get(file) else {
+                continue;
+            };
+            // `entry.symbols` is sorted by line; filtering preserves order.
+            let outline: Vec<Symbol> = entry
+                .symbols
+                .iter()
+                .filter(|sym| sym.scope.is_none())
+                .cloned()
+                .collect();
+            if !outline.is_empty() {
+                result.insert(file.to_path_buf(), outline);
+            }
         }
 
         Ok(result)
@@ -612,58 +508,23 @@ impl SymbolIndex {
     /// Finds the innermost symbol enclosing a line in a file.
     ///
     /// Returns the tightest definition (smallest span) containing the given
-    /// 0-based line.
+    /// 0-based line, or `None` if no symbol covers it.
     ///
     /// # Errors
     ///
-    /// Returns an error if the query fails.
+    /// Returns a `Result` for signature stability; the in-memory scan is
+    /// infallible.
     pub fn find_enclosing(&self, file_path: &Path, line_0: u32) -> Result<Option<Symbol>> {
-        let path_str = file_path.to_string_lossy();
-        let mut stmt = self.conn.prepare(
-            "SELECT name, kind, line, end_line, scope, scope_kind, deprecated \
-             FROM symbols \
-             WHERE file_path = ?1 AND line <= ?2 AND end_line >= ?2 \
-             ORDER BY (end_line - line) ASC \
-             LIMIT 1",
-        )?;
-
-        let result = stmt
-            .query_row(
-                rusqlite::params![path_str.as_ref() as &str, line_0],
-                |row| {
-                    Ok(Symbol {
-                        name: row.get(0)?,
-                        kind: row.get(1)?,
-                        line: row.get(2)?,
-                        end_line: row.get(3)?,
-                        scope: row.get(4)?,
-                        scope_kind: row.get(5)?,
-                        deprecated: row.get::<_, i32>(6).unwrap_or(0) != 0,
-                    })
-                },
-            )
-            .ok();
-
+        let store = self.files.borrow();
+        let result = store.get(file_path).and_then(|entry| {
+            entry
+                .symbols
+                .iter()
+                .filter(|sym| sym.line <= line_0 && sym.end_line >= line_0)
+                .min_by_key(|sym| sym.end_line - sym.line)
+                .cloned()
+        });
         Ok(result)
-    }
-
-    /// Map a database row to a `(file_path, Symbol)` pair.
-    ///
-    /// Expected column order:
-    /// `file_path, name, kind, line, end_line, scope, scope_kind, deprecated`
-    fn row_to_symbol(row: &rusqlite::Row<'_>) -> rusqlite::Result<(String, Symbol)> {
-        Ok((
-            row.get(0)?,
-            Symbol {
-                name: row.get(1)?,
-                kind: row.get(2)?,
-                line: row.get(3)?,
-                end_line: row.get(4)?,
-                scope: row.get(5)?,
-                scope_kind: row.get(6)?,
-                deprecated: row.get::<_, i32>(7).unwrap_or(0) != 0,
-            },
-        ))
     }
 
     /// Check whether a scope (container) has children in the given file.
@@ -672,24 +533,23 @@ impl SymbolIndex {
     /// within the given file path.
     #[must_use]
     pub fn has_children(&self, file_path: &Path, scope_name: &str) -> bool {
-        let path_str = file_path.to_string_lossy();
-        self.conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM symbols WHERE file_path = ?1 AND scope = ?2)",
-                rusqlite::params![path_str.as_ref() as &str, scope_name],
-                |row| row.get::<_, bool>(0),
-            )
-            .unwrap_or(false)
+        self.files.borrow().get(file_path).is_some_and(|entry| {
+            entry
+                .symbols
+                .iter()
+                .any(|sym| sym.scope.as_deref() == Some(scope_name))
+        })
     }
 
     /// Query symbols filtered by scope, name glob, kind, and deprecated status.
     ///
     /// Used by the `into` pipeline for segment-by-segment symbol tree navigation.
-    /// Results are grouped by file path and ordered by line number.
+    /// Results are grouped by file path and ordered by line number; files with
+    /// no matching symbols are omitted.
     ///
     /// # Errors
     ///
-    /// Returns an error if the query fails.
+    /// Returns an error if `name_glob` is not a valid glob pattern.
     pub fn query_scoped(
         &self,
         files: &[&Path],
@@ -702,80 +562,33 @@ impl SymbolIndex {
             return Ok(HashMap::new());
         }
 
-        let placeholders: String = (0..files.len())
-            .map(|i| format!("?{}", i + 1))
-            .collect::<Vec<_>>()
-            .join(", ");
+        // The old store used SQLite's `GLOB` operator; `globset` matches the
+        // same `*`/`?`/`[…]` syntax against symbol names (which carry no `/`).
+        let matcher = globset::Glob::new(name_glob)
+            .context("invalid name glob")?
+            .compile_matcher();
 
-        let mut conditions = vec![format!("file_path IN ({placeholders})")];
-
-        let scope_extra: usize = match scope {
-            ScopeFilter::TopLevel | ScopeFilter::AnyDepth => 0,
-            ScopeFilter::ChildrenOf(_) => 1,
-            ScopeFilter::WithinSpan(_, _) => 2,
-        };
-
-        match scope {
-            ScopeFilter::TopLevel => conditions.push("scope IS NULL".to_string()),
-            ScopeFilter::ChildrenOf(_) => {
-                conditions.push(format!("scope = ?{}", files.len() + 1));
-            }
-            ScopeFilter::AnyDepth => {}
-            ScopeFilter::WithinSpan(_, _) => {
-                let base = files.len() + 1;
-                conditions.push(format!("line >= ?{base}"));
-                conditions.push(format!("line <= ?{}", base + 1));
-            }
-        }
-
-        conditions.push(format!("name GLOB ?{}", files.len() + scope_extra + 1));
-
-        if let Some(_kind) = kind_filter {
-            conditions.push(format!("kind = ?{}", files.len() + scope_extra + 2));
-        }
-
-        if deprecated_only {
-            conditions.push("deprecated = 1".to_string());
-        }
-
-        let sql = format!(
-            "SELECT file_path, name, kind, line, end_line, scope, scope_kind, deprecated \
-             FROM symbols WHERE {} ORDER BY file_path, line",
-            conditions.join(" AND ")
-        );
-
-        let mut stmt = self.conn.prepare(&sql).context("prepare scoped query")?;
-
-        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        for f in files {
-            params.push(Box::new(f.to_string_lossy().to_string()));
-        }
-        match scope {
-            ScopeFilter::ChildrenOf(name) => {
-                params.push(Box::new(name.to_string()));
-            }
-            ScopeFilter::WithinSpan(start, end) => {
-                params.push(Box::new(*start));
-                params.push(Box::new(*end));
-            }
-            _ => {}
-        }
-        params.push(Box::new(name_glob.to_string()));
-        if let Some(kind) = kind_filter {
-            params.push(Box::new(kind.to_string()));
-        }
-
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params.iter().map(AsRef::as_ref).collect();
-
-        let rows = stmt
-            .query_map(param_refs.as_slice(), Self::row_to_symbol)
-            .context("execute scoped query")?;
-
+        let store = self.files.borrow();
         let mut result: HashMap<PathBuf, Vec<Symbol>> = HashMap::new();
-        for row in rows {
-            let (path_str, sym) = row.context("read scoped query row")?;
-            result.entry(PathBuf::from(path_str)).or_default().push(sym);
+        for &file in files {
+            let Some(entry) = store.get(file) else {
+                continue;
+            };
+            // `entry.symbols` is sorted by line; filtering preserves order.
+            let selected: Vec<Symbol> = entry
+                .symbols
+                .iter()
+                .filter(|&sym| {
+                    scope_matches(scope, sym)
+                        && matcher.is_match(&sym.name)
+                        && kind_filter.is_none_or(|kind| sym.kind == kind)
+                        && (!deprecated_only || sym.deprecated)
+                })
+                .cloned()
+                .collect();
+            if !selected.is_empty() {
+                result.insert(file.to_path_buf(), selected);
+            }
         }
 
         Ok(result)
@@ -830,7 +643,17 @@ impl SymbolIndex {
     }
 }
 
-/// Recursively flattens a `DocumentSymbol` JSON node into [`Symbol`] rows.
+/// Tests whether a symbol satisfies a [`ScopeFilter`].
+fn scope_matches(scope: &ScopeFilter<'_>, sym: &Symbol) -> bool {
+    match scope {
+        ScopeFilter::TopLevel => sym.scope.is_none(),
+        ScopeFilter::ChildrenOf(name) => sym.scope.as_deref() == Some(*name),
+        ScopeFilter::AnyDepth => true,
+        ScopeFilter::WithinSpan(lo, hi) => sym.line >= *lo && sym.line <= *hi,
+    }
+}
+
+/// Recursively flattens a `DocumentSymbol` JSON node into [`Symbol`] entries.
 fn flatten_document_symbol(
     node: &serde_json::Value,
     parent_name: Option<&str>,
