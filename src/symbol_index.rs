@@ -16,6 +16,8 @@ use std::sync::LazyLock;
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 
+use crate::bridge::filesystem_manager::mtime_nanos;
+
 /// A symbol extracted from the symbol index.
 #[derive(Clone)]
 pub struct Symbol {
@@ -299,7 +301,11 @@ impl SymbolIndex {
                 PRIMARY KEY (file_path, line)
             );
             CREATE INDEX idx_symbols_name ON symbols(name);
-            CREATE INDEX idx_symbols_scope ON symbols(file_path, scope);",
+            CREATE INDEX idx_symbols_scope ON symbols(file_path, scope);
+            CREATE TABLE file_mtime (
+                file_path TEXT NOT NULL PRIMARY KEY,
+                mtime     INTEGER NOT NULL
+            );",
         )
         .context("failed to create in-memory tables")?;
 
@@ -331,6 +337,14 @@ impl SymbolIndex {
     /// `deprecated` from `tags` containing `SymbolTag::Deprecated` (value 1).
     /// Replaces existing symbols for the file (delete + insert in transaction).
     ///
+    /// Records the file's current on-disk mtime alongside the rows so a later
+    /// external write (host `Edit`/`Write`, `git checkout`, formatter) that
+    /// leaves the rows untouched is detected as stale by
+    /// [`symbols_outdated`](Self::symbols_outdated) (bug #26). Capturing it here
+    /// means every populate path — `grep`/`glob` and the diagnostics batch —
+    /// records it uniformly. A path that cannot be stat-ed (a synthetic test
+    /// path) records no mtime, degrading to the prior absence-only behavior.
+    ///
     /// The `symbols` parameter is the JSON array from the LSP response.
     ///
     /// # Errors
@@ -349,6 +363,13 @@ impl SymbolIndex {
                 flatten_document_symbol(sym, None, None, &mut flat);
             }
         }
+
+        // Stat before the transaction. The recorded mtime is the version the
+        // server saw (the caller opened the document from disk before
+        // requesting `documentSymbol`), so a write landing after this point
+        // advances the mtime and is caught on the next access.
+        let recorded_mtime: Option<i64> =
+            std::fs::metadata(file_path).ok().map(|m| mtime_nanos(&m));
 
         let tx = self
             .conn
@@ -379,6 +400,21 @@ impl SymbolIndex {
             )
             .with_context(|| format!("failed to insert symbol {} in {}", sym.name, path_str))?;
         }
+
+        match recorded_mtime {
+            Some(mtime) => tx
+                .execute(
+                    "INSERT OR REPLACE INTO file_mtime (file_path, mtime) VALUES (?1, ?2)",
+                    rusqlite::params![path_str.as_ref() as &str, mtime],
+                )
+                .context("failed to record file mtime")?,
+            None => tx
+                .execute(
+                    "DELETE FROM file_mtime WHERE file_path = ?1",
+                    rusqlite::params![path_str.as_ref() as &str],
+                )
+                .context("failed to clear file mtime")?,
+        };
 
         tx.commit().context("commit transaction")?;
         Ok(())
@@ -411,20 +447,54 @@ impl SymbolIndex {
             .unwrap_or(false)
     }
 
-    /// Deletes all symbols for the file. Next access should re-populate.
+    /// Deletes all symbols (and the recorded mtime) for the file. Next access
+    /// should re-populate.
     ///
     /// # Errors
     ///
     /// Returns an error if the delete fails.
     pub fn invalidate(&self, path: &Path) -> Result<()> {
         let path_str = path.to_string_lossy();
-        self.conn
-            .execute(
-                "DELETE FROM symbols WHERE file_path = ?1",
-                rusqlite::params![path_str.as_ref() as &str],
-            )
-            .context("failed to invalidate symbols")?;
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .context("begin invalidate transaction")?;
+        tx.execute(
+            "DELETE FROM symbols WHERE file_path = ?1",
+            rusqlite::params![path_str.as_ref() as &str],
+        )
+        .context("failed to invalidate symbols")?;
+        tx.execute(
+            "DELETE FROM file_mtime WHERE file_path = ?1",
+            rusqlite::params![path_str.as_ref() as &str],
+        )
+        .context("failed to clear file mtime")?;
+        tx.commit().context("commit invalidate transaction")?;
         Ok(())
+    }
+
+    /// Returns `true` when `path` has cached symbols whose recorded mtime is
+    /// older than `current_mtime` — an external write the daemon never
+    /// invalidated (host `Edit`/`Write`, `git checkout`, formatter; bug #26).
+    ///
+    /// Reports *staleness* of present rows; *absence* is reported by
+    /// [`needs_population`](Self::needs_population). A file with no recorded
+    /// mtime (never populated, or populated from a path that could not be
+    /// stat-ed) returns `false`: there is nothing to compare against, and
+    /// absence already forces population. `current_mtime` is the file's
+    /// current `mtime_nanos` (nanoseconds since epoch).
+    #[must_use]
+    pub fn symbols_outdated(&self, path: &Path, current_mtime: i64) -> bool {
+        let path_str = path.to_string_lossy();
+        let recorded: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT mtime FROM file_mtime WHERE file_path = ?1",
+                rusqlite::params![path_str.as_ref() as &str],
+                |row| row.get(0),
+            )
+            .ok();
+        recorded.is_some_and(|m| current_mtime > m)
     }
 
     /// Query the index for symbols whose names match a regex pattern.
@@ -1020,6 +1090,76 @@ mod tests {
             .populate_from_document_symbols(path, &symbols)
             .expect("re-populate");
         assert!(index.has_symbols_for(path));
+    }
+
+    /// Bug #26: populating a real file records its mtime, and a later write
+    /// (newer mtime) is reported by `symbols_outdated` so `ensure_symbols`
+    /// re-requests `documentSymbol`. Invalidation clears the recorded mtime.
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    #[test]
+    fn populate_records_mtime_and_symbols_outdated_detects_external_write() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("outline.rs");
+        std::fs::write(&file, "fn alpha() {}\n").expect("write file");
+
+        let index = SymbolIndex::new().expect("create index");
+        let symbols = serde_json::json!([{
+            "name": "alpha",
+            "kind": 12,
+            "range": { "start": { "line": 0 }, "end": { "line": 0 } },
+            "selectionRange": { "start": { "line": 0 }, "end": { "line": 0 } }
+        }]);
+        index
+            .populate_from_document_symbols(&file, &symbols)
+            .expect("populate");
+        assert!(index.has_symbols_for(&file));
+
+        let recorded = crate::bridge::filesystem_manager::mtime_nanos(
+            &std::fs::metadata(&file).expect("metadata"),
+        );
+        // Just populated — current rows are not outdated at the recorded mtime.
+        assert!(
+            !index.symbols_outdated(&file, recorded),
+            "freshly populated symbols are current"
+        );
+        // A later external write (strictly newer mtime) is detected as stale.
+        assert!(
+            index.symbols_outdated(&file, recorded + 1),
+            "a newer on-disk mtime marks the symbols outdated"
+        );
+
+        // Invalidation drops both the rows and the recorded mtime.
+        index.invalidate(&file).expect("invalidate");
+        assert!(index.needs_population(&file), "rows dropped");
+        assert!(
+            !index.symbols_outdated(&file, recorded + 1),
+            "the recorded mtime is cleared on invalidate"
+        );
+    }
+
+    /// A path that cannot be stat-ed (a synthetic test path) records no mtime,
+    /// so `symbols_outdated` is always `false` — staleness degrades to the
+    /// prior absence-only behavior rather than spuriously re-populating.
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    #[test]
+    fn symbols_outdated_false_without_recorded_mtime() {
+        let index = SymbolIndex::new().expect("create index");
+        let path = std::path::Path::new("/nonexistent/synthetic/file.rs");
+        let symbols = serde_json::json!([{
+            "name": "x",
+            "kind": 12,
+            "range": { "start": { "line": 0 }, "end": { "line": 0 } },
+            "selectionRange": { "start": { "line": 0 }, "end": { "line": 0 } }
+        }]);
+        index
+            .populate_from_document_symbols(path, &symbols)
+            .expect("populate");
+
+        assert!(index.has_symbols_for(path), "rows are stored regardless");
+        assert!(
+            !index.symbols_outdated(path, i64::MAX),
+            "no recorded mtime → never reported outdated"
+        );
     }
 
     #[allow(clippy::expect_used, reason = "test assertions")]

@@ -201,6 +201,7 @@ impl GrepServer {
         let arms = split_alternation(&input.pattern);
 
         let mut all_output = String::new();
+        let mut touched: Vec<PathBuf> = Vec::new();
         for arm in &arms {
             let arm_input = GrepInput {
                 pattern: arm.clone(),
@@ -212,7 +213,7 @@ impl GrepServer {
                 cwd: cwd.clone(),
                 count: false,
             };
-            let output = self
+            let (output, witnesses) = self
                 .run(arm_input, parent_id, cancel, cwd.as_deref())
                 .await?;
             if !output.is_empty() {
@@ -221,17 +222,23 @@ impl GrepServer {
                 }
                 all_output.push_str(&output);
             }
+            touched.extend(witnesses);
         }
 
         if all_output.is_empty() {
             return Ok(GrepOutcome::Rendered(String::new()));
         }
 
-        // Paginate first (borrows), then move output into cache.
+        // Paginate first (borrows), then move output into cache. `touched` is the
+        // union of witnesses across alternation arms — matched files (content)
+        // and walked directories (membership) — so a host edit or a new matching
+        // file invalidates the cache (bug #26 residual).
+        touched.sort();
+        touched.dedup();
         let paginated = paginate(&all_output, self.budget, input.page);
         let roots = self.client_manager.roots();
         if let Ok(mut cache) = self.cache.lock() {
-            cache.put(key, all_output, &roots, &self.fs_manager);
+            cache.put(key, all_output, &roots, &touched, &self.fs_manager);
         }
 
         Ok(GrepOutcome::Rendered(paginated))
@@ -289,7 +296,7 @@ impl GrepServer {
         parent_id: Option<&str>,
         cancel: &tokio_util::sync::CancellationToken,
         cwd: Option<&Path>,
-    ) -> Result<String> {
+    ) -> Result<(String, Vec<PathBuf>)> {
         debug!("Grep request: pattern={}", input.pattern);
 
         // All paths are literal — no glob interpretation. When no paths
@@ -320,10 +327,12 @@ impl GrepServer {
         )?;
 
         if rg.file_lines.is_empty() {
-            return Ok(String::new());
+            return Ok((String::new(), Vec::new()));
         }
 
         // Step 2: Ensure servers exist for matched files and wait for readiness.
+        // `rg_paths` is also the cache's file-mtime snapshot set (the files
+        // whose content the rendered output depends on).
         let rg_paths: Vec<PathBuf> = rg.file_lines.keys().map(PathBuf::from).collect();
         self.client_manager
             .ensure_and_wait_for_paths(&rg_paths)
@@ -348,10 +357,11 @@ impl GrepServer {
         // Step 2a: Nudge servers with flat readdir of effective roots.
         self.client_manager.nudge_roots(&effective_roots).await;
 
-        // Step 2b: Populate symbol index for matched files.
+        // Step 2b: Populate (or refresh) symbol index for matched files.
         super::ensure_symbols(
             self.symbol_index.as_ref(),
             &self.client_manager,
+            &self.fs_manager,
             &rg_paths,
             parent_id,
         )
@@ -473,7 +483,7 @@ impl GrepServer {
         hits.retain(|h| !matches!(h.classification, HitClass::Keyword));
 
         if hits.is_empty() {
-            return Ok(String::new());
+            return Ok((String::new(), Vec::new()));
         }
 
         // Enrich definition-like hits (Symbol, PrepareRenameSymbol).
@@ -497,12 +507,22 @@ impl GrepServer {
             enrichments.push((hit, enrichment));
         }
 
-        Ok(render_results(
+        let rendered = render_results(
             &enrichments,
             self.symbol_index.as_ref(),
             &self.fs_manager,
             cwd,
-        ))
+        );
+        // Witnesses = matched files (content) + every directory the output's
+        // membership depends on: the search roots and the subdirectories the
+        // walk descended into. A file added directly to a root bumps the root's
+        // mtime; one added deeper bumps its parent (which the walk visited). The
+        // walker does not reliably surface the root entry itself, so include the
+        // roots explicitly.
+        let mut witnesses = rg_paths;
+        witnesses.extend(rg.dirs);
+        witnesses.extend(effective_roots);
+        Ok((rendered, witnesses))
     }
 
     /// Checks `prepareRename` at a position to distinguish symbols from keywords.
@@ -1109,6 +1129,12 @@ impl GrepServer {
                         return WalkState::Continue;
                     };
                     let path = entry.path();
+                    // Record traversed directories as result-cache membership
+                    // witnesses (a new file added here bumps this dir's mtime).
+                    if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+                        state.local.dirs.push(path.to_path_buf());
+                        return WalkState::Continue;
+                    }
                     if !path.is_file() {
                         return WalkState::Continue;
                     }
@@ -1807,6 +1833,12 @@ struct RipgrepMatches {
     /// `(matched_text, column_byte_offset)` for hit classification
     /// and for no-grammar `prepareRename` positions.
     file_line_texts: HashMap<String, HashMap<u32, Vec<(String, u32)>>>,
+    /// Directories the walk traversed. Their mtimes are the result cache's
+    /// membership witnesses: a new matching file added anywhere under the scope
+    /// bumps its parent directory's mtime (which the walk visited), so a stale
+    /// cached page is invalidated even though no existing match's mtime moved
+    /// (bug #26 add/remove gap).
+    dirs: Vec<PathBuf>,
 }
 
 impl RipgrepMatches {
@@ -1814,6 +1846,7 @@ impl RipgrepMatches {
     fn merge(parts: Vec<ThreadMatches>) -> Self {
         let mut file_lines: BTreeMap<String, Vec<u32>> = BTreeMap::new();
         let mut file_line_texts: HashMap<String, HashMap<u32, Vec<(String, u32)>>> = HashMap::new();
+        let mut dirs: Vec<PathBuf> = Vec::new();
 
         for part in parts {
             for (file, lines) in part.file_lines {
@@ -1825,11 +1858,13 @@ impl RipgrepMatches {
                     entry.entry(line).or_default().extend(texts);
                 }
             }
+            dirs.extend(part.dirs);
         }
 
         Self {
             file_lines,
             file_line_texts,
+            dirs,
         }
     }
 }
@@ -1841,6 +1876,8 @@ struct ThreadMatches {
     file_lines: BTreeMap<String, Vec<u32>>,
     /// Per-file, per-line matched texts with column offsets.
     file_line_texts: HashMap<String, HashMap<u32, Vec<(String, u32)>>>,
+    /// Directories visited by this thread (result-cache membership witnesses).
+    dirs: Vec<PathBuf>,
 }
 
 /// Splits a regex pattern on top-level `|` alternation.

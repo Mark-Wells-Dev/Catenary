@@ -5,14 +5,22 @@
 //!
 //! Caches the full unpaginated output of a query so that sequential
 //! page fetches (page 1 → page 2 → …) don't re-run the pipeline.
-//! Invalidated on parameter change or filesystem change (generation
-//! mismatch on any searched root). Single-page results skip caching.
+//! Invalidated on parameter change, a searched root's generation bump
+//! (`sed`/diagnostics/explicit invalidation), or any *witness path's* mtime
+//! changing. The witness set is the files and directories the output depends
+//! on: a **file's** mtime moves on a content edit; a **directory's** mtime moves
+//! when an entry is added/removed/renamed in it (POSIX), which is the signal for
+//! a membership change the per-file check can't see (a *new* file has no prior
+//! entry to stat). Both are what catch a host `Edit`/`Write` between two
+//! identical multi-page queries — host edits don't bump root generations, so
+//! generation-gating alone would serve a stale cached page (bug #26 residual).
+//! Single-page results skip caching.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
-use super::filesystem_manager::FilesystemManager;
+use super::filesystem_manager::{FilesystemManager, mtime_nanos};
 use super::pagination::paginate;
 
 /// Cache key: hash of query parameters (excluding page number).
@@ -26,6 +34,15 @@ struct CachedResult {
     output: String,
     /// Generation snapshot: `(root, generation)` at query time.
     generations: Vec<(PathBuf, u64)>,
+    /// mtime snapshot (`mtime_nanos`) of each *witness path* the output depends
+    /// on, taken at query time: the rendered **files** (content) and the
+    /// **directories** that were listed/walked (membership). A host
+    /// `Edit`/`Write` does not bump a root generation (only `sed`/diagnostics
+    /// do), so without this an identical repeated multi-page query after an
+    /// external edit — or an add/remove that a per-file check can't see — would
+    /// serve a stale page (bug #26 residual). Validated by re-stat on
+    /// [`ResultCache::get`].
+    witness_mtimes: Vec<(PathBuf, i64)>,
 }
 
 /// Single-slot result cache.
@@ -46,8 +63,8 @@ impl ResultCache {
 
     /// Attempts to serve a page from the cache.
     ///
-    /// Returns `Some(paginated_output)` on cache hit with valid
-    /// generations, `None` on miss or stale data.
+    /// Returns `Some(paginated_output)` on cache hit with valid generations
+    /// **and** unchanged witness mtimes, `None` on miss or stale data.
     pub(super) fn get(
         &self,
         key: CacheKey,
@@ -59,9 +76,22 @@ impl ResultCache {
             return None;
         }
 
-        // Validate generations — any mismatch means filesystem changed.
+        // Validate generations — a bump means a sed/diagnostics/explicit
+        // invalidation touched a searched root.
         for (root, snapshot_gen) in &entry.generations {
             if fs_manager.root_generation(root) != *snapshot_gen {
+                return None;
+            }
+        }
+
+        // Validate witness mtimes — catches a host Edit/Write (file content) and
+        // an add/remove/rename in a listed/walked directory (membership), neither
+        // of which bumps a generation. A removed path (stat fails → `None`) also
+        // misses. Re-stat cost is bounded by the witness count and far below
+        // re-running the pipeline.
+        for (path, snapshot_mtime) in &entry.witness_mtimes {
+            let current = std::fs::metadata(path).ok().map(|m| mtime_nanos(&m));
+            if current != Some(*snapshot_mtime) {
                 return None;
             }
         }
@@ -72,12 +102,17 @@ impl ResultCache {
     /// Stores a query result in the cache.
     ///
     /// Skips caching when the result fits in a single page (no page 2
-    /// request will follow).
+    /// request will follow). `witnesses` is the set of paths the output depends
+    /// on — the rendered files (content) and the directories that were
+    /// listed/walked (membership); their mtimes are snapshotted so a later host
+    /// edit, or an add/remove in one of those directories, invalidates the cache
+    /// even without a generation bump.
     pub(super) fn put(
         &mut self,
         key: CacheKey,
         output: String,
         roots: &[PathBuf],
+        witnesses: &[PathBuf],
         fs_manager: &FilesystemManager,
     ) {
         let total_pages = count_pages(&output, self.budget);
@@ -92,10 +127,20 @@ impl ResultCache {
             .map(|r| (r.clone(), fs_manager.root_generation(r)))
             .collect();
 
+        let witness_mtimes: Vec<(PathBuf, i64)> = witnesses
+            .iter()
+            .filter_map(|p| {
+                std::fs::metadata(p)
+                    .ok()
+                    .map(|m| (p.clone(), mtime_nanos(&m)))
+            })
+            .collect();
+
         self.slot = Some(CachedResult {
             key,
             output,
             generations,
+            witness_mtimes,
         });
     }
 }
@@ -178,6 +223,7 @@ mod tests {
             key,
             "line 1\nline 2\nline 3\nline 4\nline 5\n".to_string(),
             &[root],
+            &[],
             &fs,
         );
 
@@ -202,6 +248,7 @@ mod tests {
             key_a,
             "line 1\nline 2\nline 3\nline 4\nline 5\n".to_string(),
             &[root],
+            &[],
             &fs,
         );
 
@@ -223,10 +270,11 @@ mod tests {
             key,
             "line 1\nline 2\nline 3\nline 4\nline 5\n".to_string(),
             std::slice::from_ref(&root),
+            &[],
             &fs,
         );
 
-        // Bump the generation (simulates a file change detected by diff()).
+        // Bump the generation (simulates a sed/diagnostics invalidation).
         fs.bump_generation_for_test(&root);
 
         let result = cache.get(key, 1, &fs);
@@ -243,11 +291,121 @@ mod tests {
         let key = 42;
 
         // Short output that fits in one page.
-        cache.put(key, "hello\n".to_string(), &[root], &fs);
+        cache.put(key, "hello\n".to_string(), &[root], &[], &fs);
 
         // Single-page results should not be cached.
         let result = cache.get(key, 1, &fs);
         assert!(result.is_none(), "single-page result should not be cached");
+    }
+
+    /// A host `Edit`/`Write` to a rendered file advances its mtime but does not
+    /// bump a root generation; the cache must still miss (bug #26 residual).
+    #[test]
+    fn cache_miss_on_file_mtime_change() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("rendered.txt");
+        std::fs::write(&file, "original\n").expect("write");
+
+        let fs = make_fs_manager();
+        fs.set_roots(vec![dir.path().to_path_buf()]);
+
+        let mut cache = ResultCache::new(20);
+        let key = 42;
+
+        cache.put(
+            key,
+            "line 1\nline 2\nline 3\nline 4\nline 5\n".to_string(),
+            &[dir.path().to_path_buf()],
+            std::slice::from_ref(&file),
+            &fs,
+        );
+        assert!(
+            cache.get(key, 1, &fs).is_some(),
+            "fresh cache should hit before any edit"
+        );
+
+        // Rewrite the rendered file with a strictly-newer mtime (no generation
+        // bump — mirrors a host Edit/Write).
+        std::fs::write(&file, "edited\n").expect("rewrite");
+        let f = std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .expect("open");
+        f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(10))
+            .expect("set mtime");
+        drop(f);
+
+        assert!(
+            cache.get(key, 1, &fs).is_none(),
+            "an edit to a rendered file must invalidate the cache"
+        );
+    }
+
+    /// A removed rendered file (stat fails) also invalidates the cache.
+    #[test]
+    fn cache_miss_on_rendered_file_removed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("rendered.txt");
+        std::fs::write(&file, "original\n").expect("write");
+
+        let fs = make_fs_manager();
+        fs.set_roots(vec![dir.path().to_path_buf()]);
+
+        let mut cache = ResultCache::new(20);
+        let key = 42;
+        cache.put(
+            key,
+            "line 1\nline 2\nline 3\nline 4\nline 5\n".to_string(),
+            &[dir.path().to_path_buf()],
+            std::slice::from_ref(&file),
+            &fs,
+        );
+
+        std::fs::remove_file(&file).expect("remove");
+        assert!(
+            cache.get(key, 1, &fs).is_none(),
+            "a removed rendered file must invalidate the cache"
+        );
+    }
+
+    /// A directory witness invalidates the cache when its mtime moves — the
+    /// signal for an entry being added/removed/renamed in it (a membership
+    /// change the per-file check can't see, since a new file has no prior entry
+    /// to stat).
+    #[test]
+    fn cache_miss_on_witness_dir_change() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let listed = dir.path().join("listed");
+        std::fs::create_dir(&listed).expect("mkdir");
+        std::fs::write(listed.join("a.txt"), "x\n").expect("seed entry");
+
+        let fs = make_fs_manager();
+        fs.set_roots(vec![dir.path().to_path_buf()]);
+
+        let mut cache = ResultCache::new(20);
+        let key = 7;
+        cache.put(
+            key,
+            "line 1\nline 2\nline 3\nline 4\nline 5\n".to_string(),
+            &[dir.path().to_path_buf()],
+            std::slice::from_ref(&listed),
+            &fs,
+        );
+        assert!(
+            cache.get(key, 1, &fs).is_some(),
+            "fresh cache should hit before the directory changes"
+        );
+
+        // Bump the listed directory's mtime, as adding/removing an entry would.
+        let d = std::fs::File::open(&listed).expect("open dir");
+        d.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(10))
+            .expect("set dir mtime");
+        drop(d);
+
+        assert!(
+            cache.get(key, 1, &fs).is_none(),
+            "a witnessed directory's mtime change must invalidate the cache"
+        );
     }
 
     #[test]

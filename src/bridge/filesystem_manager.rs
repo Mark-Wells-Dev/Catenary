@@ -268,10 +268,15 @@ pub struct FilesystemManager {
 
 /// Cache entry storing classification results keyed by mtime.
 ///
+/// `mtime` is nanosecond-resolution ([`mtime_nanos`]) so a same-second content
+/// edit (a host `Edit`/`Write` immediately followed by `glob`) is detected as a
+/// change rather than served stale — without this the line count, binary flag,
+/// and language id could lag a sub-second edit (same family as bug #26).
+///
 /// `kind` is `None` for seed-only entries (stat-only, no classification).
 /// [`FilesystemManager::classify`] overwrites these on first access.
 struct CachedEntry {
-    mtime: u64,
+    mtime: i64,
     kind: Option<FileKind>,
 }
 
@@ -318,6 +323,8 @@ impl FilesystemManager {
     /// Classification precedence: shebang > filename > extension.
     pub fn classify(&self, path: &Path, metadata: &std::fs::Metadata) -> FileInfo {
         let mtime = mtime_secs(metadata);
+        // Cache key uses nanosecond resolution so a same-second edit invalidates.
+        let mtime_ns = mtime_nanos(metadata);
         let size = metadata.len();
         let root = self.resolve_root(path);
         let cache_key = (path.to_path_buf(), root.clone());
@@ -325,7 +332,7 @@ impl FilesystemManager {
         // Check cache — skip unclassified (seed-only) entries.
         if let Ok(cache) = self.cache.lock()
             && let Some(entry) = cache.get(&cache_key)
-            && entry.mtime == mtime
+            && entry.mtime == mtime_ns
             && let Some(ref kind) = entry.kind
         {
             return FileInfo {
@@ -375,7 +382,7 @@ impl FilesystemManager {
             cache.insert(
                 cache_key,
                 CachedEntry {
-                    mtime,
+                    mtime: mtime_ns,
                     kind: Some(kind.clone()),
                 },
             );
@@ -613,6 +620,23 @@ fn mtime_secs(metadata: &std::fs::Metadata) -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+/// Extracts mtime as nanoseconds since epoch, or `0` if unavailable.
+///
+/// Higher resolution than [`mtime_secs`]: the symbol-index staleness backstop
+/// (bug #26) compares the populated mtime against the file's current mtime, and
+/// a host `Edit`/`Write` immediately followed by `grep`/`glob` can land within
+/// one wall-clock second. Nanosecond precision detects that change; on a
+/// second-resolution filesystem the sub-second part is zero and it degrades to
+/// the same granularity as [`mtime_secs`]. Saturates at `i64::MAX` (year 2262)
+/// to fit a `SQLite` `INTEGER`.
+pub(crate) fn mtime_nanos(metadata: &std::fs::Metadata) -> i64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
+}
+
 /// Intermediate result from a single-pass file scan.
 struct ScanResult {
     lines: usize,
@@ -705,6 +729,46 @@ mod tests {
     use std::io::Write;
 
     // --- Classification (migrated from FilesystemCache) ---
+
+    /// A content edit that lands in the same wall-clock second as the cached
+    /// classification must still invalidate the cache — the key is nanosecond
+    /// resolution (same family as bug #26, where second-resolution would serve a
+    /// stale line count after a fast host edit).
+    #[test]
+    fn classify_cache_invalidates_on_same_second_edit() {
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("f.rs");
+        let fs = FilesystemManager::new();
+
+        // One line; pin mtime to a fixed instant.
+        std::fs::write(&file, "one\n").expect("write");
+        let base = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        set_mtime(&file, base);
+        let lc1 = fs.line_count(&file, &std::fs::metadata(&file).expect("meta"));
+        assert_eq!(lc1, Some(1), "initial line count");
+
+        // Two lines; pin mtime to the SAME whole second (+1ms) — second-resolution
+        // would treat this as unchanged and serve the stale count.
+        std::fs::write(&file, "one\ntwo\n").expect("rewrite");
+        set_mtime(&file, base + Duration::from_millis(1));
+        let lc2 = fs.line_count(&file, &std::fs::metadata(&file).expect("meta"));
+        assert_eq!(
+            lc2,
+            Some(2),
+            "same-second edit must invalidate the classify cache"
+        );
+    }
+
+    /// Sets a file's mtime to an explicit instant (test helper).
+    fn set_mtime(path: &std::path::Path, t: std::time::SystemTime) {
+        let f = std::fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("open for set_modified");
+        f.set_modified(t).expect("set mtime");
+    }
 
     #[test]
     fn classify_binary_file() {

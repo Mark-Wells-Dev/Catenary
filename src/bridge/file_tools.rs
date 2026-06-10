@@ -185,18 +185,23 @@ impl GlobServer {
         // cwd-scoped search: present when the original pattern was relative.
         let cwd = input.cwd.as_deref();
 
-        // Run pipeline — handlers return full unpaginated output.
-        // Existing paths dispatch directly; unexpanded glob patterns are
-        // expanded daemon-side. Dispatch each through the appropriate handler.
-        let full_output = self
+        // Run pipeline — handlers return full unpaginated output plus the set
+        // of files the output depends on. Existing paths dispatch directly;
+        // unexpanded glob patterns are expanded daemon-side.
+        let (full_output, mut touched) = self
             .handle_literal_paths(&input.paths, &input, exclude.as_ref(), cwd, parent_id)
             .await?;
 
-        // Paginate first (borrows), then move output into cache.
+        // Paginate first (borrows), then move output into cache. `touched` is the
+        // witness set (rendered files + their directories); dedup so repeated
+        // dirs aren't re-statted. Their mtimes invalidate the cache on a host
+        // edit or a sibling add/remove (bug #26 residual).
+        touched.sort();
+        touched.dedup();
         let paginated = paginate(&full_output, self.budget, page);
         let roots = self.client_manager.roots();
         if let Ok(mut cache) = self.cache.lock() {
-            cache.put(key, full_output, &roots, &self.fs_manager);
+            cache.put(key, full_output, &roots, &touched, &self.fs_manager);
         }
 
         Ok(GlobOutcome::Rendered(paginated))
@@ -320,9 +325,15 @@ impl GlobServer {
         exclude: Option<&ResolvedGlob>,
         cwd: Option<&Path>,
         parent_id: Option<&str>,
-    ) -> Result<String> {
+    ) -> Result<(String, Vec<PathBuf>)> {
         let resolved = expand_search_paths(paths, input.include_gitignored, input.include_hidden);
         let mut full = String::new();
+        // Result-cache witnesses: files (content) and the directories they're
+        // listed in (membership) — so a host edit *or* an add/remove of a
+        // sibling invalidates a cached page (bug #26). A directory's mtime moves
+        // only on a direct entry add/remove/rename, not on a content edit, so
+        // witnessing it doesn't cause spurious misses.
+        let mut touched: Vec<PathBuf> = Vec::new();
         for path in &resolved {
             if path.is_file() || path.is_symlink() {
                 self.client_manager
@@ -331,21 +342,31 @@ impl GlobServer {
                 super::ensure_symbols(
                     self.symbol_index.as_ref(),
                     &self.client_manager,
+                    &self.fs_manager,
                     std::slice::from_ref(path),
                     parent_id,
                 )
                 .await;
                 full.push_str(&self.handle_glob_file(path, cwd));
+                touched.push(path.clone());
+                // Parent dir: catches a new sibling from a pattern-glob expansion.
+                if let Some(parent) = path.parent() {
+                    touched.push(parent.to_path_buf());
+                }
             } else if path.is_dir() {
-                let output = self
+                let (output, files) = self
                     .handle_glob_dir(path, input, exclude, cwd, parent_id)
                     .await?;
                 full.push_str(&output);
+                touched.extend(files);
+                // The listed dir itself: catches add/remove/rename of an
+                // immediate entry (including subdirs) in the rendered listing.
+                touched.push(path.clone());
             }
             // Skip non-existent paths silently — shell expansion
             // shouldn't produce them, but be defensive.
         }
-        Ok(full)
+        Ok((full, touched))
     }
 
     /// Directory listing: enriched (maps) where LSP available, plain (flags) otherwise.
@@ -364,7 +385,7 @@ impl GlobServer {
         exclude: Option<&ResolvedGlob>,
         cwd: Option<&Path>,
         parent_id: Option<&str>,
-    ) -> Result<String> {
+    ) -> Result<(String, Vec<PathBuf>)> {
         let canonical = dir
             .canonicalize()
             .map_err(|e| anyhow!("Path does not exist: {}: {e}", dir.display()))?;
@@ -372,7 +393,7 @@ impl GlobServer {
         let entries = self.collect_dir_entries(&canonical, input, exclude)?;
 
         if entries.is_empty() {
-            return Ok("Directory is empty".to_string());
+            return Ok(("Directory is empty".to_string(), Vec::new()));
         }
 
         // Populate symbol index for eligible files.
@@ -387,6 +408,7 @@ impl GlobServer {
         super::ensure_symbols(
             self.symbol_index.as_ref(),
             &self.client_manager,
+            &self.fs_manager,
             &file_paths,
             parent_id,
         )
@@ -429,7 +451,9 @@ impl GlobServer {
             "\t",
         );
         full.push_str(&content);
-        Ok(full)
+        // `file_paths` (the dir's eligible files) is the cache's mtime-snapshot
+        // set — editing any listed file invalidates the cached listing.
+        Ok((full, file_paths))
     }
 
     /// Extracts file info: `(line_count, binary_size)`.

@@ -2391,6 +2391,129 @@ fn test_grep_enclosing_label_refreshed_after_diagnostics() -> Result<()> {
     Ok(())
 }
 
+/// Forces `path`'s mtime to a clearly-future instant so a rewrite is detected
+/// as newer regardless of the filesystem's timestamp resolution (avoids a
+/// same-second flake on coarse filesystems).
+fn bump_mtime(path: &std::path::Path) -> Result<()> {
+    let f = std::fs::File::options().write(true).open(path)?;
+    f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(10))?;
+    Ok(())
+}
+
+/// Bug #26 (end-to-end): after the enclosing symbol is renamed on disk through
+/// a host `Edit`/`Write`, the *next* `grep` reports the new enclosing-symbol
+/// label with **no** intervening `catenary diagnostics` pass. The mtime backstop
+/// in `ensure_symbols` detects the file changed since its rows were populated
+/// and re-requests `documentSymbol` — closing bug #23's documented residual
+/// (a `grep` between a host edit and the next diagnostics served stale labels).
+#[test]
+fn test_grep_enclosing_label_refreshed_after_host_edit() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().to_str().context("root path")?;
+
+    // `marker()` is a non-definition line enclosed by `outer_old`, so its grep
+    // hit is annotated with that function as the enclosing symbol.
+    let file = dir.path().join(format!("rename.{MOCK_LANG_A}"));
+    std::fs::write(&file, "fn outer_old {\nmarker()\n}\n")?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    // First grep populates the symbol index and records the file's mtime.
+    let before = bridge.call_tool_text("grep", &json!({ "pattern": "marker" }))?;
+    assert!(
+        before.contains("outer_old"),
+        "enclosing label should be the original function, got:\n{before}"
+    );
+
+    // Rename the enclosing function on disk (as a host Edit/Write would). No
+    // diagnostics/sed pass runs — the daemon's only post-write signal is the
+    // mtime advancing. Force a strictly-newer mtime so the test does not depend
+    // on the filesystem's timestamp resolution (a same-second rewrite on a
+    // coarse FS would not advance it).
+    std::fs::write(&file, "fn outer_new {\nmarker()\n}\n")?;
+    bump_mtime(&file)?;
+
+    // The next grep must report the refreshed label purely from the mtime
+    // backstop. `outer_old` exists nowhere on disk, so its presence would be
+    // pure cache staleness — the symptom of bug #26.
+    let after = bridge.call_tool_text("grep", &json!({ "pattern": "marker" }))?;
+    assert!(
+        after.contains("outer_new"),
+        "enclosing label should refresh after a host edit, got:\n{after}"
+    );
+    assert!(
+        !after.contains("outer_old"),
+        "stale pre-edit enclosing label must not survive the next grep, got:\n{after}"
+    );
+
+    Ok(())
+}
+
+/// Bug #26 (add/remove): a *new* matching file added to the searched tree must
+/// appear on the next identical grep. There's no prior match to stat, so this is
+/// caught by the directory witnesses — grep snapshots every directory it walked,
+/// and the OS bumps a directory's mtime when a file is added to it.
+#[test]
+fn test_grep_multipage_cache_invalidates_on_file_added() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().to_str().context("root path")?;
+
+    // One file with many reference matches → a multi-page result (grep budget
+    // 4000), with only a single `documentSymbol` round-trip to populate it.
+    let mut content = String::from("fn anchor\n");
+    for i in 0..200 {
+        let _ = std::fmt::Write::write_fmt(&mut content, format_args!("marker_{i:04}\n"));
+    }
+    std::fs::write(dir.path().join(format!("m.{MOCK_LANG_A}")), &content)?;
+
+    // No `--scan-roots`: mockls answers documentSymbol from the opened document,
+    // so a file added mid-session is recognized (its match isn't dropped as a
+    // keyword). This isolates the cache-invalidation behavior under test.
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "");
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    let _p1 = bridge.call_tool_text("grep", &json!({ "pattern": "marker" }))?;
+    let p2 = bridge.call_tool_text("grep", &json!({ "pattern": "marker", "page": 2 }))?;
+    assert!(
+        !p2.trim().is_empty(),
+        "result should span multiple pages (cache active), got empty page 2"
+    );
+
+    // Add a new matching file. Force a strictly-newer directory mtime for
+    // resolution-independence.
+    std::fs::write(
+        dir.path().join(format!("a.{MOCK_LANG_A}")),
+        "fn anchor2\nmarker_NEW\n",
+    )?;
+    {
+        let d = std::fs::File::open(dir.path())?;
+        d.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(10))?;
+    }
+
+    // The repeated query must now reflect the new file. Its single match can
+    // land on any page (the parallel walk order isn't sorted), so scan all
+    // pages: the page-1 fetch misses the cache (dir mtime changed) and re-runs;
+    // later pages hit the freshly re-cached result.
+    let mut combined = String::new();
+    for page in 1..=8 {
+        let p = bridge.call_tool_text("grep", &json!({ "pattern": "marker", "page": page }))?;
+        if p.trim().is_empty() {
+            break;
+        }
+        combined.push_str(&p);
+        combined.push('\n');
+    }
+    assert!(
+        combined.contains("marker_NEW"),
+        "a newly added matching file must appear (cache must miss on dir change), got:\n{combined}"
+    );
+
+    Ok(())
+}
+
 /// Type hierarchy: subtypes section present for interface pattern.
 #[test]
 fn test_grep_type_hierarchy() -> Result<()> {
