@@ -1289,11 +1289,7 @@ impl SessionManager {
                                 // REPLACE the contributor set — recomputing from
                                 // the full declared set on every change tracks
                                 // add/remove for free (no provenance bookkeeping).
-                                let declared = parse_root_uris(&roots);
-                                let paths = match session.config.companion_rules() {
-                                    Some(rules) => expand_companions(declared, rules),
-                                    None => declared,
-                                };
+                                let paths = companion_expanded_roots(&roots, &session.config);
                                 tracker.set_roots(&mcp_key, paths);
                                 let global = tracker.global_roots();
                                 tokio::runtime::Handle::current()
@@ -1470,6 +1466,25 @@ fn parse_root_uris(roots: &[crate::mcp::Root]) -> Vec<PathBuf> {
             })
         })
         .collect()
+}
+
+/// Expands an MCP client's declared roots with any configured companions.
+///
+/// This is the body of the `mcp:{fd}` `on_roots_changed` callback (workstream
+/// 29), factored out so it can be tested without a live socket: parse the
+/// client's root URIs, then — when `[roots.companions]` is configured — union in
+/// each root's derived companion via [`expand_companions`]. With no rules
+/// configured it is exactly [`parse_root_uris`].
+#[cfg(unix)]
+fn companion_expanded_roots(
+    roots: &[crate::mcp::Root],
+    config: &crate::config::Config,
+) -> Vec<PathBuf> {
+    let declared = parse_root_uris(roots);
+    match config.companion_rules() {
+        Some(rules) => expand_companions(declared, rules),
+        None => declared,
+    }
 }
 
 /// Handles a single hook connection.
@@ -5157,6 +5172,65 @@ mod tests {
         tracker.remove_contributor("mcp:2");
         assert_eq!(tracker.refcount(&foo_internal), 0);
         assert!(tracker.global_roots().is_empty());
+    }
+
+    /// Build a `file://` MCP root for `path`.
+    fn mcp_root(path: &Path) -> crate::mcp::Root {
+        crate::mcp::Root {
+            uri: format!("file://{}", path.display()),
+            name: None,
+        }
+    }
+
+    #[test]
+    fn companion_expanded_roots_off_by_default() {
+        // The exact glue the `on_roots_changed` callback runs: with a default
+        // config (no `[roots.companions]`), expansion is identity over the
+        // client's declared roots.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().canonicalize().expect("canonicalize");
+        let foo = base.join("Foo");
+        let foo_internal = base.join("FooInternal");
+        std::fs::create_dir(&foo).expect("mkdir Foo");
+        std::fs::create_dir(&foo_internal).expect("mkdir FooInternal");
+
+        let config = crate::config::Config::default();
+        let out = companion_expanded_roots(&[mcp_root(&foo)], &config);
+
+        assert_eq!(out, vec![foo], "no rules ⇒ declared roots only");
+        assert!(
+            !out.contains(&foo_internal),
+            "companion must NOT mount when the feature is off",
+        );
+    }
+
+    #[test]
+    fn companion_expanded_roots_reads_session_config() {
+        // With `[roots.companions]` on the config, the callback glue derives the
+        // companion from the client's declared root URIs.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().canonicalize().expect("canonicalize");
+        let foo = base.join("Foo");
+        let foo_internal = base.join("FooInternal");
+        std::fs::create_dir(&foo).expect("mkdir Foo");
+        std::fs::create_dir(&foo_internal).expect("mkdir FooInternal");
+
+        let config = crate::config::Config {
+            roots: Some(crate::config::RootsConfig {
+                companions: Some(crate::companions::CompanionRules::from_pairs([(
+                    "*",
+                    "{root}Internal",
+                )])),
+            }),
+            ..crate::config::Config::default()
+        };
+        let out = companion_expanded_roots(&[mcp_root(&foo)], &config);
+
+        assert_eq!(
+            out,
+            vec![foo, foo_internal],
+            "declared root plus its derived companion",
+        );
     }
 
     #[test]
