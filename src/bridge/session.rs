@@ -651,6 +651,21 @@ impl Session {
         }
     }
 
+    /// Records a curated milestone on the snapshot's activity ring. No-op
+    /// outside daemon mode (observability ticket 08). Used by session /
+    /// editing / diagnostics boundaries to promote a significant event into the
+    /// dashboard's live glimpse without tailing the firehose.
+    pub fn record_milestone(
+        &self,
+        kind: crate::state_snapshot::MilestoneKind,
+        summary: impl Into<String>,
+        scope: Option<String>,
+    ) {
+        if let Some(snapshot) = &self.snapshot {
+            snapshot.record_milestone(kind, summary, scope);
+        }
+    }
+
     /// Renders a path for a `last_action` summary: relative to its workspace
     /// root when resolvable (e.g. `src/db.rs`), else the bare file name, else
     /// the full path.

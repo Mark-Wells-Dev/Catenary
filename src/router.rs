@@ -1532,6 +1532,11 @@ fn get_or_create_router(
     session_id: &str,
     raw: &serde_json::Value,
 ) -> Arc<HookRouter> {
+    // Set inside `or_insert_with` (first creation only) so the `session_connect`
+    // milestone is emitted *after* the registry lock drops below — never under
+    // it, since `record_milestone` takes the snapshot lock (ticket 05a's
+    // lock-order rule).
+    let mut connect_summary: Option<String> = None;
     let router = ctx
         .sessions
         .lock()
@@ -1558,6 +1563,10 @@ fn get_or_create_router(
             // time, and the session's own workspace roots. The daemon snapshot
             // (`state.json`) surfaces this to the TUI dashboard.
             let client_name = raw.get("format").and_then(|v| v.as_str());
+            connect_summary = Some(format!(
+                "session connected ({})",
+                client_name.unwrap_or("unknown")
+            ));
             // One ISO format across the snapshot (now_iso → millis + 'Z').
             let started_at = crate::state_snapshot::now_iso();
             let meta = SessionMeta {
@@ -1576,6 +1585,17 @@ fn get_or_create_router(
         })
         .router
         .clone();
+
+    // Registry guard dropped at the statement above. A first-creation emits the
+    // `session_connect` milestone now, with the snapshot lock taken clear of the
+    // registry lock (ticket 08).
+    if let Some(summary) = connect_summary {
+        router.session.record_milestone(
+            crate::state_snapshot::MilestoneKind::SessionConnect,
+            summary,
+            Some(session_id.to_string()),
+        );
+    }
 
     // Bump `last_seen` on EVERY dispatch, not only on create. Every agent tool
     // call funnels through here — including the Bash hooks that wrap
@@ -1729,7 +1749,13 @@ async fn handle_hook_dispatch(
         // next flush drops it. Not a tombstone: a Claude resume re-creates the
         // entry via `get_or_create_router`, and Antigravity sends no
         // `session-end` at all. `last_seen` is the authoritative liveness signal
-        // (ticket 05a).
+        // (ticket 05a). The disconnect milestone records the (best-effort) end on
+        // the activity ring (ticket 08).
+        ctx.primary.record_milestone(
+            crate::state_snapshot::MilestoneKind::SessionDisconnect,
+            "session disconnected",
+            Some(session_id.clone()),
+        );
         ctx.primary.touch_snapshot();
 
         // Best-effort removal of this session's diagnostics overflow file. The
@@ -2119,6 +2145,16 @@ async fn handle_hook_dispatch(
         let (dirty, output) = if let Some((files, filtered, session_id, _)) = handoff {
             if files.is_empty() {
                 // Nothing covered to diagnose — the note (if any) stands alone.
+                // If edits were made but none had LSP coverage, the editing
+                // session still ended: record an `editing_done` milestone so the
+                // activity ring shows the transition (ticket 08).
+                if filtered > 0 {
+                    ctx.primary.record_milestone(
+                        crate::state_snapshot::MilestoneKind::EditingDone,
+                        "editing done · no covered files",
+                        Some(session_id.clone()),
+                    );
+                }
                 (false, with_out_of_roots_note(String::new(), filtered))
             } else {
                 // Reflect the run on the session board: status → diagnostics
@@ -2179,6 +2215,20 @@ async fn handle_hook_dispatch(
                         outcome.errors, outcome.warnings
                     ));
                 }
+                // Promote the completed run to the activity ring with the result
+                // counts and the covered-file count (ticket 08). Emitted via the
+                // primary's shared snapshot writer so it lands even if the session
+                // already left the registry.
+                ctx.primary.record_milestone(
+                    crate::state_snapshot::MilestoneKind::Diagnostics,
+                    format!(
+                        "{} errors, {} warnings · {} files",
+                        outcome.errors,
+                        outcome.warnings,
+                        files.len()
+                    ),
+                    Some(session_id.clone()),
+                );
                 // Surface any filtered edits alongside the covered-file results,
                 // so a mixed batch never silently hides the unchecked files.
                 (

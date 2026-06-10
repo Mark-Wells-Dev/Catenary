@@ -20,17 +20,21 @@ pub enum Focus {
     Servers,
     /// Session board (bottom-left).
     Sessions,
-    /// Alerts ring (right pane).
+    /// Activity ring (top-right pane) — curated milestones.
+    Activity,
+    /// Alerts ring (bottom-right pane).
     Alerts,
 }
 
 impl Focus {
-    /// Next board in the cycle (Servers → Sessions → Alerts → Servers).
+    /// Next board in the cycle
+    /// (Servers → Sessions → Activity → Alerts → Servers).
     #[must_use]
     pub const fn next(self) -> Self {
         match self {
             Self::Servers => Self::Sessions,
-            Self::Sessions => Self::Alerts,
+            Self::Sessions => Self::Activity,
+            Self::Activity => Self::Alerts,
             Self::Alerts => Self::Servers,
         }
     }
@@ -41,7 +45,8 @@ impl Focus {
         match self {
             Self::Servers => Self::Alerts,
             Self::Sessions => Self::Servers,
-            Self::Alerts => Self::Sessions,
+            Self::Activity => Self::Sessions,
+            Self::Alerts => Self::Activity,
         }
     }
 }
@@ -128,6 +133,8 @@ pub struct App<'a> {
     pub servers: Board,
     /// Session board cursor/scroll.
     pub sessions: Board,
+    /// Activity ring cursor/scroll.
+    pub activity: Board,
     /// Alerts ring cursor/scroll.
     pub alerts: Board,
     /// Whether the keybinds panel is expanded (`?` toggles).
@@ -160,6 +167,7 @@ impl<'a> App<'a> {
             focus: Focus::Servers,
             servers: Board::default(),
             sessions: Board::default(),
+            activity: Board::default(),
             alerts: Board::default(),
             keybinds_expanded: false,
             sidebar_pct: 50,
@@ -180,6 +188,7 @@ impl<'a> App<'a> {
     fn clamp_cursors(&mut self) {
         self.servers.clamp(self.snapshot.servers.len());
         self.sessions.clamp(self.snapshot.sessions.len());
+        self.activity.clamp(self.snapshot.activity.len());
         self.alerts.clamp(self.snapshot.alerts.len());
     }
 
@@ -196,6 +205,7 @@ impl<'a> App<'a> {
         match self.focus {
             Focus::Servers => self.snapshot.servers.len(),
             Focus::Sessions => self.snapshot.sessions.len(),
+            Focus::Activity => self.snapshot.activity.len(),
             Focus::Alerts => self.snapshot.alerts.len(),
         }
     }
@@ -205,6 +215,7 @@ impl<'a> App<'a> {
         match self.focus {
             Focus::Servers => &mut self.servers,
             Focus::Sessions => &mut self.sessions,
+            Focus::Activity => &mut self.activity,
             Focus::Alerts => &mut self.alerts,
         }
     }
@@ -272,6 +283,13 @@ impl<'a> App<'a> {
                 .sessions
                 .get(self.sessions.cursor)
                 .map(|s| s.id.clone()),
+            Focus::Activity => self.snapshot.activity.get(self.activity.cursor).map(|m| {
+                // Prefer the scope (query bridge); fall back to the summary.
+                m.scope
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .map_or_else(|| m.summary.clone(), ToString::to_string)
+            }),
             Focus::Alerts => self.snapshot.alerts.get(self.alerts.cursor).map(|a| {
                 // Prefer the scope (query bridge); fall back to the message.
                 a.scope
@@ -332,13 +350,15 @@ mod tests {
     }
 
     #[test]
-    fn focus_cycles_through_three_boards() {
+    fn focus_cycles_through_four_boards() {
         let theme = Theme::new();
         let icons = IconSet::from_config(crate::config::IconConfig::default());
         let mut app = app_with(&theme, &icons, snapshot_with(1, 1, 1));
         assert_eq!(app.focus, Focus::Servers);
         app.cycle_focus();
         assert_eq!(app.focus, Focus::Sessions);
+        app.cycle_focus();
+        assert_eq!(app.focus, Focus::Activity);
         app.cycle_focus();
         assert_eq!(app.focus, Focus::Alerts);
         app.cycle_focus();

@@ -3,9 +3,10 @@
 
 //! Interactive `state.json` dashboard.
 //!
-//! The TUI renders three boards from the daemon-owned snapshot — server health
-//! (upper-left), sessions (lower-left), and the alerts ring (right) — with a
-//! collapsible keybinds panel. It is a **pure file reader**: it file-watches the
+//! The TUI renders four boards from the daemon-owned snapshot — server health
+//! (upper-left), sessions (lower-left), the activity ring of milestones
+//! (upper-right), and the alerts ring (lower-right) — with a collapsible
+//! keybinds panel. It is a **pure file reader**: it file-watches the
 //! snapshot and re-loads on change. It never opens the firehose (JSONL) or a
 //! database, which makes it structurally unwedgeable (observability ticket 06).
 //! The bridge to `catenary query` is a yankable scope id (OSC 52).
@@ -71,6 +72,8 @@ const NARROW_THRESHOLD: u16 = 60;
 const SERVER_LPE: usize = format::SERVER_ENTRY_LINES;
 /// Rendered lines per session board entry.
 const SESSION_LPE: usize = format::SESSION_ENTRY_LINES;
+/// Rendered lines per activity (milestone) entry.
+const ACTIVITY_LPE: usize = 1;
 /// Rendered lines per alert entry.
 const ALERT_LPE: usize = 1;
 
@@ -172,6 +175,8 @@ struct PanelLayout {
     servers_inner: Rect,
     sessions: Rect,
     sessions_inner: Rect,
+    activity: Rect,
+    activity_inner: Rect,
     alerts: Rect,
     alerts_inner: Rect,
     keybinds: Rect,
@@ -294,6 +299,8 @@ fn handle_mouse(
         Some(Focus::Servers)
     } else if layout.sessions.contains(pos.into()) {
         Some(Focus::Sessions)
+    } else if layout.activity.contains(pos.into()) {
+        Some(Focus::Activity)
     } else if layout.alerts.contains(pos.into()) {
         Some(Focus::Alerts)
     } else {
@@ -336,6 +343,18 @@ fn handle_mouse(
                     app.snapshot.sessions.len(),
                 ) {
                     app.sessions.cursor = i;
+                }
+            }
+            Some(Focus::Activity) => {
+                app.focus = Focus::Activity;
+                if let Some(i) = entry_at(
+                    layout.activity_inner,
+                    row,
+                    app.activity.scroll,
+                    ACTIVITY_LPE,
+                    app.snapshot.activity.len(),
+                ) {
+                    app.activity.cursor = i;
                 }
             }
             Some(Focus::Alerts) => {
@@ -446,13 +465,16 @@ fn render_board_into(
 
 /// Render a horizontal separator row carrying a panel title.
 ///
-/// Always anchors a `├` at the left border; `right_cap` adds a `┤` at the right
-/// edge (full-box, narrow mode). In the wide layout the right end abuts the
-/// vertical divider, which draws the junction instead.
+/// `left_cap` anchors a `├` at the left border (full-box / left-column
+/// separators); when false the left end stays `─` so the vertical divider draws
+/// the junction instead (the right column's separator). `right_cap` adds a `┤`
+/// at the right edge (full-box, narrow mode); in the wide left column the right
+/// end abuts the divider, which draws that junction.
 #[allow(
     clippy::cast_possible_truncation,
     clippy::too_many_arguments,
-    reason = "terminal coordinates are always small; a titled separator needs position, content, style, and the cap flag"
+    clippy::fn_params_excessive_bools,
+    reason = "terminal coordinates are always small; a titled separator needs position, content, style, and the two cap flags"
 )]
 fn render_separator(
     y: u16,
@@ -461,6 +483,7 @@ fn render_separator(
     title: &str,
     theme: &Theme,
     buf: &mut Buffer,
+    left_cap: bool,
     right_cap: bool,
 ) {
     if width == 0 {
@@ -470,7 +493,9 @@ fn render_separator(
     for col in x..(x + width) {
         buf.set_string(col, y, "─", style);
     }
-    buf.set_string(x, y, "├", style);
+    if left_cap {
+        buf.set_string(x, y, "├", style);
+    }
     if right_cap {
         buf.set_string(x + width - 1, y, "┤", style);
     }
@@ -482,22 +507,29 @@ fn render_separator(
 }
 
 /// Render the vertical divider column, using intersection glyphs where the
-/// left-column separators meet it.
+/// left-column separators (`┤`) and the right-column separator (`├`) meet it.
 fn render_divider_col(
     col: u16,
     top: u16,
     bottom: u16,
     left_seps: &[u16],
+    right_seps: &[u16],
     style: Style,
     buf: &mut Buffer,
 ) {
     for y in top..=bottom {
+        let left = left_seps.contains(&y);
+        let right = right_seps.contains(&y);
         let ch = if y == top {
             "┬"
         } else if y == bottom {
             "┴"
-        } else if left_seps.contains(&y) {
+        } else if left && right {
+            "┼"
+        } else if left {
             "┤"
+        } else if right {
+            "├"
         } else {
             "│"
         };
@@ -565,6 +597,20 @@ fn build_alert_entries(
         .collect()
 }
 
+/// Build per-entry line groups for the activity ring (one line per milestone).
+fn build_activity_entries(
+    app: &App<'_>,
+    width: u16,
+    theme: &Theme,
+    icons: &IconSet,
+) -> Vec<Vec<Line<'static>>> {
+    app.snapshot
+        .activity
+        .iter()
+        .map(|m| vec![format::milestone_line(m, width as usize, theme, icons)])
+        .collect()
+}
+
 /// Render a single dashboard frame. Shared by the event loop and tests so both
 /// exercise the same render path.
 #[allow(
@@ -594,10 +640,12 @@ fn render_dashboard(f: &mut Frame<'_>, app: &mut App<'_>, layout: &mut PanelLayo
     let focus = app.focus;
 
     if area.width < NARROW_THRESHOLD {
-        // ── Narrow: three stacked full-width boards ────────────
+        // ── Narrow: four stacked full-width boards ─────────────
         let v = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
+                Constraint::Fill(1),
+                Constraint::Length(1),
                 Constraint::Fill(1),
                 Constraint::Length(1),
                 Constraint::Fill(1),
@@ -609,17 +657,21 @@ fn render_dashboard(f: &mut Frame<'_>, app: &mut App<'_>, layout: &mut PanelLayo
         let sep_a = v[1];
         let sessions_rect = v[2];
         let sep_b = v[3];
-        let alerts_rect = v[4];
+        let activity_rect = v[4];
+        let sep_c = v[5];
+        let alerts_rect = v[6];
 
         let sb = Borders::TOP | Borders::LEFT | Borders::RIGHT;
         let mb = Borders::LEFT | Borders::RIGHT;
         let ab = Borders::LEFT | Borders::RIGHT | Borders::BOTTOM;
         let servers_inner = inner_of(servers_rect, sb);
         let sessions_inner = inner_of(sessions_rect, mb);
+        let activity_inner = inner_of(activity_rect, mb);
         let alerts_inner = inner_of(alerts_rect, ab);
 
         let server_entries = build_server_entries(app, servers_inner.width, theme, icons);
         let session_entries = build_session_entries(app, sessions_inner.width, theme, icons);
+        let activity_entries = build_activity_entries(app, activity_inner.width, theme, icons);
         let alert_entries = build_alert_entries(app, alerts_inner.width, theme, icons);
 
         render_board_into(
@@ -642,6 +694,7 @@ fn render_dashboard(f: &mut Frame<'_>, app: &mut App<'_>, layout: &mut PanelLayo
             theme,
             f.buffer_mut(),
             true,
+            true,
         );
         render_board_into(
             "",
@@ -659,9 +712,32 @@ fn render_dashboard(f: &mut Frame<'_>, app: &mut App<'_>, layout: &mut PanelLayo
             sep_b.y,
             sep_b.x,
             sep_b.width,
+            " Activity ",
+            theme,
+            f.buffer_mut(),
+            true,
+            true,
+        );
+        render_board_into(
+            "",
+            focus == Focus::Activity,
+            &activity_entries,
+            ACTIVITY_LPE,
+            &mut app.activity,
+            activity_rect,
+            activity_inner,
+            f.buffer_mut(),
+            theme,
+            mb,
+        );
+        render_separator(
+            sep_c.y,
+            sep_c.x,
+            sep_c.width,
             " Alerts ",
             theme,
             f.buffer_mut(),
+            true,
             true,
         );
         render_board_into(
@@ -681,12 +757,15 @@ fn render_dashboard(f: &mut Frame<'_>, app: &mut App<'_>, layout: &mut PanelLayo
         layout.servers_inner = servers_inner;
         layout.sessions = sessions_rect;
         layout.sessions_inner = sessions_inner;
+        layout.activity = activity_rect;
+        layout.activity_inner = activity_inner;
         layout.alerts = alerts_rect;
         layout.alerts_inner = alerts_inner;
         return;
     }
 
-    // ── Wide: left column (servers/sessions/keybinds) + alerts ──
+    // ── Wide: left column (servers/sessions/keybinds) + right
+    //    column (activity over alerts) ─────────────────────────
     let h = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -720,15 +799,31 @@ fn render_dashboard(f: &mut Frame<'_>, app: &mut App<'_>, layout: &mut PanelLayo
     let sep2 = v[3];
     let keybinds_rect = v[4];
 
+    // Right column: activity (top) over alerts (bottom).
+    let rv = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Fill(1),
+            Constraint::Length(1),
+            Constraint::Fill(1),
+        ])
+        .split(right);
+    let activity_rect = rv[0];
+    let sep_r = rv[1];
+    let alerts_rect = rv[2];
+
     let sb = Borders::TOP | Borders::LEFT;
     let mb = Borders::LEFT;
-    let ab = Borders::TOP | Borders::RIGHT | Borders::BOTTOM;
+    let atb = Borders::TOP | Borders::RIGHT;
+    let alb = Borders::RIGHT | Borders::BOTTOM;
     let servers_inner = inner_of(servers_rect, sb);
     let sessions_inner = inner_of(sessions_rect, mb);
-    let alerts_inner = inner_of(right, ab);
+    let activity_inner = inner_of(activity_rect, atb);
+    let alerts_inner = inner_of(alerts_rect, alb);
 
     let server_entries = build_server_entries(app, servers_inner.width, theme, icons);
     let session_entries = build_session_entries(app, sessions_inner.width, theme, icons);
+    let activity_entries = build_activity_entries(app, activity_inner.width, theme, icons);
     let alert_entries = build_alert_entries(app, alerts_inner.width, theme, icons);
     let alerts_title = daemon_status(&app.snapshot);
 
@@ -751,6 +846,7 @@ fn render_dashboard(f: &mut Frame<'_>, app: &mut App<'_>, layout: &mut PanelLayo
         " Sessions ",
         theme,
         f.buffer_mut(),
+        true,
         false,
     );
     render_board_into(
@@ -779,6 +875,7 @@ fn render_dashboard(f: &mut Frame<'_>, app: &mut App<'_>, layout: &mut PanelLayo
         kb_title,
         theme,
         f.buffer_mut(),
+        true,
         false,
     );
     let kb_block = panel_block("", false, theme, Borders::BOTTOM | Borders::LEFT);
@@ -788,17 +885,41 @@ fn render_dashboard(f: &mut Frame<'_>, app: &mut App<'_>, layout: &mut PanelLayo
         render_keybinds_content(kb_inner, f.buffer_mut(), theme);
     }
 
+    // Right column: activity board (top), then the alerts board (bottom) with
+    // the daemon-status line carried on the separator between them.
     render_board_into(
+        " Activity ",
+        focus == Focus::Activity,
+        &activity_entries,
+        ACTIVITY_LPE,
+        &mut app.activity,
+        activity_rect,
+        activity_inner,
+        f.buffer_mut(),
+        theme,
+        atb,
+    );
+    render_separator(
+        sep_r.y,
+        sep_r.x,
+        sep_r.width,
         &alerts_title,
+        theme,
+        f.buffer_mut(),
+        false,
+        true,
+    );
+    render_board_into(
+        "",
         focus == Focus::Alerts,
         &alert_entries,
         ALERT_LPE,
         &mut app.alerts,
-        right,
+        alerts_rect,
         alerts_inner,
         f.buffer_mut(),
         theme,
-        ab,
+        alb,
     );
 
     render_divider_col(
@@ -806,6 +927,7 @@ fn render_dashboard(f: &mut Frame<'_>, app: &mut App<'_>, layout: &mut PanelLayo
         divider.y,
         divider.y + divider.height.saturating_sub(1),
         &[sep1.y, sep2.y],
+        &[sep_r.y],
         theme.border_unfocused,
         f.buffer_mut(),
     );
@@ -814,7 +936,9 @@ fn render_dashboard(f: &mut Frame<'_>, app: &mut App<'_>, layout: &mut PanelLayo
     layout.servers_inner = servers_inner;
     layout.sessions = sessions_rect;
     layout.sessions_inner = sessions_inner;
-    layout.alerts = right;
+    layout.activity = activity_rect;
+    layout.activity_inner = activity_inner;
+    layout.alerts = alerts_rect;
     layout.alerts_inner = alerts_inner;
     layout.keybinds = Rect {
         y: sep2.y,
@@ -825,7 +949,7 @@ fn render_dashboard(f: &mut Frame<'_>, app: &mut App<'_>, layout: &mut PanelLayo
     layout.total_width = area.width;
 }
 
-/// Main event loop: re-load the snapshot, render three boards, handle input.
+/// Main event loop: re-load the snapshot, render the boards, handle input.
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App<'_>,
@@ -873,8 +997,8 @@ fn run_loop(
 mod tests {
     use super::*;
     use crate::state_snapshot::{
-        Alert, ClientInfo, DaemonSnapshot, LastAction, Progress, ServerEntry, SessionEntry,
-        SessionStatus, Snapshot,
+        Alert, ClientInfo, DaemonSnapshot, LastAction, Milestone, MilestoneKind, Progress,
+        ServerEntry, SessionEntry, SessionStatus, Snapshot,
     };
     use crate::tui::data::MockDataSource;
     use ratatui::Terminal;
@@ -937,6 +1061,12 @@ mod tests {
                 text: "rust-analyzer exited (code 101)".to_string(),
                 scope: Some("rust-analyzer@/p/Catenary".to_string()),
             }],
+            activity: vec![Milestone {
+                at: "2026-06-08T14:31:00.000Z".to_string(),
+                kind: MilestoneKind::Diagnostics,
+                summary: "3 errors, 12 warnings · 4 files".to_string(),
+                scope: Some("mcp:7f3a".to_string()),
+            }],
         }
     }
 
@@ -969,7 +1099,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_all_three_boards_from_fixture() {
+    fn renders_all_four_boards_from_fixture() {
         let out = render_to_string(fixture(), 100, 24);
         assert!(out.contains("Servers"), "server board title: {out}");
         assert!(out.contains("rust-analyzer"), "server row: {out}");
@@ -977,6 +1107,11 @@ mod tests {
         assert!(out.contains("Sessions"), "session board title");
         assert!(out.contains("claude"), "session client");
         assert!(out.contains("edited src/db.rs"), "session last action");
+        assert!(out.contains("Activity"), "activity board title: {out}");
+        assert!(
+            out.contains("3 errors, 12 warnings"),
+            "milestone summary: {out}"
+        );
         assert!(out.contains("Alerts"), "alerts title");
         assert!(out.contains("rust-analyzer exited"), "alert text");
     }
@@ -991,9 +1126,10 @@ mod tests {
 
     #[test]
     fn narrow_layout_still_renders_all_boards() {
-        let out = render_to_string(fixture(), 50, 24);
+        let out = render_to_string(fixture(), 50, 32);
         assert!(out.contains("Servers"), "{out}");
         assert!(out.contains("Sessions"), "{out}");
+        assert!(out.contains("Activity"), "{out}");
         assert!(out.contains("Alerts"), "{out}");
         assert!(out.contains("rust-analyzer"), "{out}");
     }

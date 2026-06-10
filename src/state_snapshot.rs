@@ -59,6 +59,11 @@ const MAX_ALERTS: usize = 128;
 /// 01's reaping owns the firehose side.
 const MAX_DEAD_SERVERS: usize = 64;
 
+/// Maximum milestones retained in the activity ring (newest-first). A curated
+/// feed, so a modest window is enough to glimpse recent daemon activity
+/// (observability ticket 08).
+const MAX_ACTIVITY: usize = 64;
+
 /// Immutable daemon identity, recorded once at startup.
 #[derive(Debug, Clone)]
 pub struct DaemonInfo {
@@ -273,6 +278,56 @@ pub struct Alert {
     pub scope: Option<String>,
 }
 
+/// A curated activity-ring milestone kind — a *significant* daemon event
+/// promoted out of the firehose into the bounded activity ring (observability
+/// ticket 08).
+///
+/// Unlike [`Alert`] ("when to look"), a milestone is a neutral "what happened"
+/// signal: indexing finished, a diagnostics run completed, a session connected.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MilestoneKind {
+    /// A server's `$/progress` burst (indexing, build-graph, …) drained.
+    IndexingDone,
+    /// A `catenary diagnostics` run completed (carries the result counts).
+    Diagnostics,
+    /// Editing mode began — the first covered edit was accumulated.
+    EditingStart,
+    /// Editing mode ended with no covered files to diagnose.
+    EditingDone,
+    /// A server became ready (`initializing`/`probing` → `healthy`).
+    ServerReady,
+    /// A server entered a terminal state (`failed` / `dead`).
+    ServerFailed,
+    /// A session connected.
+    SessionConnect,
+    /// A session disconnected (best-effort; the hook side has no authoritative
+    /// death signal — see [`SessionEntry`]).
+    SessionDisconnect,
+    /// Forward-compat catch-all: a kind a newer daemon emits that this reader
+    /// does not recognize. Never produced by the writer.
+    #[serde(other)]
+    #[default]
+    Unknown,
+}
+
+/// A single activity-ring milestone — `at`, `kind`, a one-line `summary`, and a
+/// yankable `scope` pointer (the bridge into `catenary query`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct Milestone {
+    /// When the milestone occurred (ISO 8601).
+    pub at: String,
+    /// What kind of milestone this is.
+    pub kind: MilestoneKind,
+    /// Human-readable one-line summary (e.g. `3 errors, 12 warnings · 4 files`).
+    pub summary: String,
+    /// Yankable scope id — `session_id` or `<server>@<root>` — or `None` when
+    /// the milestone has no natural scope.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+}
+
 /// Reader-side parse of a `state.json` snapshot — the daemon→TUI contract.
 ///
 /// The owned counterpart to the writer's borrowed [`SnapshotView`]. Lives here,
@@ -294,6 +349,8 @@ pub struct Snapshot {
     pub sessions: Vec<SessionEntry>,
     /// Bounded `warn`/`error` alert ring (newest-first).
     pub alerts: Vec<Alert>,
+    /// Bounded curated activity ring (milestones, newest-first).
+    pub activity: Vec<Milestone>,
 }
 
 /// Reader-side `daemon` block — owned counterpart to [`DaemonMeta`].
@@ -342,6 +399,8 @@ struct SnapshotState {
     servers: HashMap<String, ServerEntry>,
     /// Alert ring, newest-first.
     alerts: VecDeque<Alert>,
+    /// Activity ring (curated milestones), newest-first.
+    activity: VecDeque<Milestone>,
     dirty: bool,
     urgent: bool,
 }
@@ -410,14 +469,37 @@ impl SnapshotState {
         let now = now_iso();
 
         let entry = self.ensure_entry(key);
+        let prev_state = entry.state.clone();
         let transitioned = entry.state != new_state;
         if transitioned {
-            entry.state = new_state;
+            entry.state.clone_from(&new_state);
             entry.state_since.clone_from(&now);
         }
         entry.busy_count = busy_count;
         if terminal && entry.died_at.is_none() {
-            entry.died_at = Some(now);
+            entry.died_at = Some(now.clone());
+        }
+
+        // Promote significant lifecycle transitions to the activity ring. This
+        // is the single site that mirrors server state, so it is the natural
+        // place to detect readiness/failure regardless of which path drove the
+        // transition (probe vs. `$/progress` drain) — ticket 08.
+        if transitioned {
+            if new_state == "healthy" && matches!(prev_state.as_str(), "initializing" | "probing") {
+                self.push_milestone(Milestone {
+                    at: now.clone(),
+                    kind: MilestoneKind::ServerReady,
+                    summary: format!("{} ready", key.server),
+                    scope: Some(server_id(key)),
+                });
+            } else if terminal && !matches!(prev_state.as_str(), "failed" | "dead") {
+                self.push_milestone(Milestone {
+                    at: now.clone(),
+                    kind: MilestoneKind::ServerFailed,
+                    summary: format!("{} {new_state}", key.server),
+                    scope: Some(server_id(key)),
+                });
+            }
         }
 
         if terminal {
@@ -435,11 +517,34 @@ impl SnapshotState {
         pct: Option<u32>,
     ) {
         let entry = self.ensure_entry(key);
+        // A `None` title clears progress: if the entry was mid-progress, this is
+        // the burst draining (the `$/progress` "end" for the last active token),
+        // which is the `indexing_done` milestone (ticket 08). Capture the ended
+        // title before overwriting.
+        let ended_title = if title.is_none() {
+            entry.progress.as_ref().map(|p| p.title.clone())
+        } else {
+            None
+        };
         entry.progress = title.map(|t| Progress {
             title: t.to_string(),
             message: message.map(str::to_string),
             pct,
         });
+
+        if let Some(ended) = ended_title {
+            let summary = if ended.is_empty() {
+                format!("{} finished indexing", key.server)
+            } else {
+                format!("{ended} complete")
+            };
+            self.push_milestone(Milestone {
+                at: now_iso(),
+                kind: MilestoneKind::IndexingDone,
+                summary,
+                scope: Some(server_id(key)),
+            });
+        }
     }
 
     /// Records a server's most recent message.
@@ -458,6 +563,15 @@ impl SnapshotState {
         self.alerts.push_front(alert);
         while self.alerts.len() > MAX_ALERTS {
             self.alerts.pop_back();
+        }
+    }
+
+    /// Pushes a milestone onto the newest-first activity ring, dropping the
+    /// oldest past [`MAX_ACTIVITY`].
+    fn push_milestone(&mut self, milestone: Milestone) {
+        self.activity.push_front(milestone);
+        while self.activity.len() > MAX_ACTIVITY {
+            self.activity.pop_back();
         }
     }
 
@@ -493,6 +607,7 @@ impl SnapshotState {
             servers,
             sessions,
             alerts: self.alerts.iter().collect(),
+            activity: self.activity.iter().collect(),
         };
         serde_json::to_string_pretty(&view).unwrap_or_else(|e| {
             tracing::debug!(error = %e, "state.json serialization failed");
@@ -509,6 +624,7 @@ struct SnapshotView<'a> {
     servers: Vec<&'a ServerEntry>,
     sessions: Vec<&'a SessionEntry>,
     alerts: Vec<&'a Alert>,
+    activity: Vec<&'a Milestone>,
 }
 
 /// Shared inner state plus flush coordination.
@@ -612,6 +728,7 @@ impl SnapshotWriter {
                 daemon,
                 servers: HashMap::new(),
                 alerts: VecDeque::new(),
+                activity: VecDeque::new(),
                 dirty: false,
                 urgent: false,
             }),
@@ -683,6 +800,32 @@ impl SnapshotWriter {
         if self.inner.session_board.set(board).is_ok() {
             self.touch();
         }
+    }
+
+    /// Records a curated milestone on the activity ring (coalesced flush).
+    ///
+    /// Server lifecycle milestones (`server_ready`, `server_failed`,
+    /// `indexing_done`) are detected internally by [`Self::update_state`] /
+    /// [`Self::update_progress`] — the same sites that mirror server state. This
+    /// entry point is for the session / editing / diagnostics milestones whose
+    /// detection lives in the router and hook layers (ticket 08).
+    pub fn record_milestone(
+        &self,
+        kind: MilestoneKind,
+        summary: impl Into<String>,
+        scope: Option<String>,
+    ) {
+        {
+            let mut state = self.inner.lock_state();
+            state.push_milestone(Milestone {
+                at: now_iso(),
+                kind,
+                summary: summary.into(),
+                scope,
+            });
+            state.dirty = true;
+        }
+        self.inner.notify.notify_one();
     }
 
     /// Marks the snapshot dirty and wakes the flush task (coalesced).
@@ -798,6 +941,7 @@ mod tests {
             daemon: daemon_info(),
             servers: HashMap::new(),
             alerts: VecDeque::new(),
+            activity: VecDeque::new(),
             dirty: false,
             urgent: false,
         }
@@ -995,6 +1139,117 @@ mod tests {
         assert_eq!(entry.started_at, "t1");
     }
 
+    // ── Activity ring (ticket 08) ──────────────────────────────────────
+
+    #[test]
+    fn probing_to_healthy_pushes_server_ready_milestone() {
+        let mut state = fresh_state();
+        let key = root_key("rust-analyzer", "/p/Catenary");
+        state.register_server(&key, "t0");
+        // initializing -> probing: not a milestone.
+        state.update_state(&key, &ServerLifecycle::Probing);
+        assert!(
+            state.activity.is_empty(),
+            "probing alone is not a milestone"
+        );
+        // probing -> healthy: server_ready.
+        state.update_state(&key, &ServerLifecycle::Healthy);
+        assert_eq!(state.activity.len(), 1);
+        let m = state.activity.front().expect("milestone");
+        assert_eq!(m.kind, MilestoneKind::ServerReady);
+        assert_eq!(m.summary, "rust-analyzer ready");
+        assert_eq!(m.scope.as_deref(), Some("rust-analyzer@/p/Catenary"));
+    }
+
+    #[test]
+    fn busy_to_healthy_does_not_repeat_server_ready() {
+        let mut state = fresh_state();
+        let key = root_key("ra", "/p");
+        state.register_server(&key, "t0");
+        state.update_state(&key, &ServerLifecycle::Probing);
+        state.update_state(&key, &ServerLifecycle::Healthy);
+        // The server cycles healthy -> busy -> healthy on later work; that
+        // Busy -> Healthy transition must not emit another server_ready.
+        state.update_state(&key, &ServerLifecycle::Busy(1));
+        state.update_state(&key, &ServerLifecycle::Healthy);
+        let ready = state
+            .activity
+            .iter()
+            .filter(|m| m.kind == MilestoneKind::ServerReady)
+            .count();
+        assert_eq!(ready, 1, "server_ready fires only on the first readiness");
+    }
+
+    #[test]
+    fn terminal_transition_pushes_server_failed_milestone() {
+        let mut state = fresh_state();
+        let key = root_key("ra", "/p");
+        state.register_server(&key, "t0");
+        state.update_state(&key, &ServerLifecycle::Healthy);
+        state.update_state(&key, &ServerLifecycle::Dead);
+        let m = state.activity.front().expect("milestone");
+        assert_eq!(m.kind, MilestoneKind::ServerFailed);
+        assert_eq!(m.summary, "ra dead");
+        // A redundant terminal update does not push a second failure.
+        state.update_state(&key, &ServerLifecycle::Dead);
+        let failed = state
+            .activity
+            .iter()
+            .filter(|m| m.kind == MilestoneKind::ServerFailed)
+            .count();
+        assert_eq!(failed, 1);
+    }
+
+    #[test]
+    fn progress_drain_pushes_indexing_done_milestone() {
+        let mut state = fresh_state();
+        let key = root_key("rust-analyzer", "/p/Catenary");
+        state.update_progress(&key, Some("Indexing"), Some("src/db.rs"), Some(62));
+        assert!(
+            state.activity.is_empty(),
+            "active progress is not a milestone"
+        );
+        // Clearing progress (the last `$/progress` "end") drains the burst.
+        state.update_progress(&key, None, None, None);
+        let m = state.activity.front().expect("milestone");
+        assert_eq!(m.kind, MilestoneKind::IndexingDone);
+        assert_eq!(m.summary, "Indexing complete");
+        assert_eq!(m.scope.as_deref(), Some("rust-analyzer@/p/Catenary"));
+    }
+
+    #[test]
+    fn activity_ring_is_bounded_and_newest_first() {
+        let mut state = fresh_state();
+        for i in 0..(MAX_ACTIVITY + 10) {
+            state.push_milestone(Milestone {
+                at: format!("2026-06-08T12:00:{i:04}Z"),
+                kind: MilestoneKind::Diagnostics,
+                summary: format!("run {i}"),
+                scope: None,
+            });
+        }
+        assert_eq!(state.activity.len(), MAX_ACTIVITY);
+        // Newest-first: the most recently pushed is at the front.
+        assert_eq!(
+            state.activity.front().expect("non-empty").summary,
+            format!("run {}", MAX_ACTIVITY + 9)
+        );
+    }
+
+    #[test]
+    fn milestone_kind_round_trips_and_tolerates_unknown() {
+        // Known kinds serialize to snake_case and parse back.
+        let json = serde_json::to_string(&MilestoneKind::IndexingDone).expect("serialize");
+        assert_eq!(json, "\"indexing_done\"");
+        let back: MilestoneKind = serde_json::from_str(&json).expect("parse");
+        assert_eq!(back, MilestoneKind::IndexingDone);
+        // A future kind this reader does not know falls back to Unknown, not a
+        // parse error (forward-compat).
+        let unknown: MilestoneKind =
+            serde_json::from_str("\"some_future_kind\"").expect("unknown tolerated");
+        assert_eq!(unknown, MilestoneKind::Unknown);
+    }
+
     #[test]
     fn alert_scope_built_from_server_and_root() {
         let mut event = make_event(Severity::Error, "boom");
@@ -1153,6 +1408,36 @@ mod tests {
         assert_eq!(alerts[0]["level"], "error");
         assert_eq!(alerts[0]["text"], "an error");
         assert_eq!(alerts[1]["level"], "warn");
+    }
+
+    #[tokio::test]
+    async fn record_milestone_reaches_snapshot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let writer = SnapshotWriter::with_coalesce(
+            &Handle::current(),
+            dir.path(),
+            daemon_info(),
+            Duration::from_millis(20),
+        );
+
+        writer.record_milestone(
+            MilestoneKind::Diagnostics,
+            "3 errors, 12 warnings · 4 files",
+            Some("mcp:abc".to_string()),
+        );
+
+        let ready = poll_until(|| {
+            read_snapshot(&writer)
+                .is_some_and(|j| j["activity"].as_array().is_some_and(|a| a.len() == 1))
+        })
+        .await;
+        assert!(ready, "milestone should reach the snapshot");
+
+        let json = read_snapshot(&writer).expect("state.json written");
+        let m = &json["activity"][0];
+        assert_eq!(m["kind"], "diagnostics");
+        assert_eq!(m["summary"], "3 errors, 12 warnings · 4 files");
+        assert_eq!(m["scope"], "mcp:abc");
     }
 
     #[tokio::test]
@@ -1361,6 +1646,12 @@ mod tests {
             text: "rust-analyzer exited".to_string(),
             scope: Some("rust-analyzer@/p/Catenary".to_string()),
         });
+        state.push_milestone(Milestone {
+            at: "2026-06-08T14:31:00.000Z".to_string(),
+            kind: MilestoneKind::Diagnostics,
+            summary: "2 errors, 1 warnings · 3 files".to_string(),
+            scope: Some("mcp:7f3a".to_string()),
+        });
 
         let session = session_entry("mcp:7f3a", SessionStatus::Editing, vec!["/p/Catenary"]);
         let json = state.to_json(std::slice::from_ref(&session));
@@ -1391,6 +1682,14 @@ mod tests {
             snapshot.alerts[0].scope.as_deref(),
             Some("rust-analyzer@/p/Catenary")
         );
+
+        assert_eq!(snapshot.activity.len(), 1);
+        assert_eq!(snapshot.activity[0].kind, MilestoneKind::Diagnostics);
+        assert_eq!(
+            snapshot.activity[0].summary,
+            "2 errors, 1 warnings · 3 files"
+        );
+        assert_eq!(snapshot.activity[0].scope.as_deref(), Some("mcp:7f3a"));
     }
 
     #[test]

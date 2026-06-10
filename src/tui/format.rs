@@ -16,7 +16,9 @@ use unicode_width::UnicodeWidthStr;
 
 use super::icons::{IconSet, basename};
 use super::theme::Theme;
-use crate::state_snapshot::{Alert, ServerEntry, SessionEntry, SessionStatus};
+use crate::state_snapshot::{
+    Alert, Milestone, MilestoneKind, ServerEntry, SessionEntry, SessionStatus,
+};
 
 /// Lines rendered per server board entry (fixed, so the board can map an entry
 /// index to a line range for cursor highlight + scroll).
@@ -320,6 +322,68 @@ pub fn alert_line(a: &Alert, width: usize, theme: &Theme, icons: &IconSet) -> Li
     let time = local_hms(&a.at);
     let mut text = a.text.replace('\n', " ");
     if let Some(scope) = a.scope.as_deref().filter(|s| !s.is_empty()) {
+        text.push_str(" (");
+        text.push_str(scope);
+        text.push(')');
+    }
+
+    let prefix: Vec<Span<'static>> = vec![
+        Span::styled(icon, style),
+        Span::styled(format!("{time} "), theme.timestamp),
+    ];
+    let prefix_w = spans_width(&prefix);
+    let body = truncate_to_width(&text, width.saturating_sub(prefix_w));
+    let mut spans = prefix;
+    spans.push(Span::styled(body, theme.text));
+    Line::from(spans)
+}
+
+// ── Activity ring ────────────────────────────────────────────────────
+
+/// Icon for a milestone kind, reusing the existing icon vocabulary.
+fn milestone_icon(kind: MilestoneKind, icons: &IconSet) -> String {
+    match kind {
+        MilestoneKind::ServerReady => icons.ls_active.clone(),
+        MilestoneKind::ServerFailed => icons.diag_error.clone(),
+        MilestoneKind::IndexingDone => icons.diag_ok.clone(),
+        MilestoneKind::Diagnostics => icons.proto_ok.clone(),
+        MilestoneKind::EditingStart | MilestoneKind::EditingDone => icons.tool_sed.clone(),
+        MilestoneKind::SessionConnect => icons.session_started.clone(),
+        MilestoneKind::SessionDisconnect => icons.session_shutdown.clone(),
+        MilestoneKind::Unknown => icons.tool_default.clone(),
+    }
+}
+
+/// Accent color for a milestone kind.
+const fn milestone_style(kind: MilestoneKind, theme: &Theme) -> Style {
+    match kind {
+        MilestoneKind::ServerReady
+        | MilestoneKind::IndexingDone
+        | MilestoneKind::SessionConnect => theme.success,
+        MilestoneKind::ServerFailed => theme.error,
+        MilestoneKind::Diagnostics | MilestoneKind::EditingStart => theme.accent,
+        MilestoneKind::EditingDone | MilestoneKind::SessionDisconnect | MilestoneKind::Unknown => {
+            theme.muted
+        }
+    }
+}
+
+/// Render one milestone as a single line: `<icon> <time> <summary> (<scope>)`.
+///
+/// The kind drives the icon + accent color; the time is local wall-clock. The
+/// scope (when present) is the yankable bridge into `catenary query`.
+#[must_use]
+pub fn milestone_line(
+    m: &Milestone,
+    width: usize,
+    theme: &Theme,
+    icons: &IconSet,
+) -> Line<'static> {
+    let icon = milestone_icon(m.kind, icons);
+    let style = milestone_style(m.kind, theme);
+    let time = local_hms(&m.at);
+    let mut text = m.summary.replace('\n', " ");
+    if let Some(scope) = m.scope.as_deref().filter(|s| !s.is_empty()) {
         text.push_str(" (");
         text.push_str(scope);
         text.push(')');

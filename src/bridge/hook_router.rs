@@ -502,7 +502,22 @@ impl HookRouter {
             if let Some(deny) = self.acquire_editing_guardrail(file_path) {
                 return Some(deny);
             }
-            let _ = self.session.editing.start_editing(session_id, agent_id);
+            // The first covered edit implicitly enters editing mode. `Ok` means
+            // this call created the editing entry (not a re-affirm by a parallel
+            // edit), so promote exactly one `editing_start` milestone per editing
+            // batch (ticket 08).
+            if self
+                .session
+                .editing
+                .start_editing(session_id, agent_id)
+                .is_ok()
+            {
+                self.session.record_milestone(
+                    crate::state_snapshot::MilestoneKind::EditingStart,
+                    "editing started",
+                    session_id.map(str::to_string),
+                );
+            }
             return None;
         }
 
