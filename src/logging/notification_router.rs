@@ -404,12 +404,12 @@ mod tests {
         router.register_session("s2");
 
         // Only s1 touches the markdown server.
-        router.record_affinity("s1", "marksman");
+        router.record_affinity("s1", "lattice");
 
         router.handle(&make_event(
             Severity::Warn,
-            "marksman offline",
-            Some("marksman"),
+            "lattice offline",
+            Some("lattice"),
             None,
         ));
 

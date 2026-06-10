@@ -113,9 +113,9 @@ agents. Valid values: `"error"`, `"warning"`, `"information"`, `"hint"`.
 When absent, all severities are delivered.
 
 ```toml
-[server.marksman]
-command = "marksman"
-args = ["server"]
+[server.lattice]
+command = "lattice"
+args = ["serve"]
 min_severity = "warning"
 ```
 
@@ -164,7 +164,7 @@ language entry:
 
 ```toml
 [language.markdown]
-servers = ["marksman"]
+servers = ["lattice"]
 diagnostics = false
 ```
 
@@ -257,10 +257,12 @@ the server config maintainers who know which servers handle it well.
 label (e.g., `Class`, `Struct`, `Module`) in `catenary glob` output.
 Useful for non-programming language servers where the symbol name already
 embeds structural context — for example, markdown servers that map
-headings to `Class` and code blocks to `Object`.
+headings to `Class` and code blocks to `Object`. Catenary's built-in
+`lattice` default (the markdown server) ships with this enabled; set it
+yourself when binding another such server.
 
 ```toml
-[server.marksman]
+[server.lattice]
 suppress_symbol_kind = true
 ```
 

@@ -11,7 +11,7 @@ Catenary configuration.
 | Go                 | [Go](go.md)                        | gopls                        |
 | JavaScript         | [JavaScript](javascript.md)        | typescript-language-server   |
 | Julia              | [Julia](julia.md)                  | LanguageServer.jl            |
-| Markdown           | [Markdown](markdown.md)            | marksman                     |
+| Markdown           | [Markdown](markdown.md)            | lattice                      |
 | PHP                | [PHP](php.md)                      | intelephense                 |
 | Python             | [Python](python.md)                | pyright                      |
 | Rust               | [Rust](rust.md)                    | rust-analyzer                |

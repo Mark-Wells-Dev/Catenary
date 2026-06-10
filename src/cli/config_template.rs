@@ -135,7 +135,8 @@ const TEMPLATE: &str = r#"# Catenary recommended config
 #
 # # Suppress SymbolKind prefix in glob output. Useful for servers
 # # where the symbol name embeds structural context (e.g., H1:, CodeBlock:).
-# [server.marksman]
+# # The built-in `lattice` markdown default already sets this.
+# [server.lattice]
 # suppress_symbol_kind = true
 
 # ── Root markers ──────────────────────────────────────────────────
@@ -478,6 +479,7 @@ mod tests {
             "zls",
             "pyright",
             "taplo",
+            "lattice",
             "marksman",
             "intelephense",
             "vscode-css",

@@ -88,9 +88,9 @@ const SERVERS: &[ServerDef] = &[
         clean_file: None,
     },
     ServerDef {
-        name: "marksman",
-        binary: "marksman",
-        args: &["server"],
+        name: "lattice",
+        binary: "lattice",
+        args: &["serve"],
         language_id: "markdown",
         fixture_dir: "markdown",
         bad_file: "doc.md",

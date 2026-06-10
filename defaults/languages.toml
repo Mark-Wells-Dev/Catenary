@@ -287,7 +287,8 @@ extensions = ["proto"]
 
 [language.markdown]
 extensions = ["md", "mdx"]
-servers = ["marksman"]
+servers = ["lattice"]
+root_markers = [".lattice.toml", ".git"]
 
 [language.restructuredtext]
 extensions = ["rst"]

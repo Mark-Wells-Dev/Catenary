@@ -334,12 +334,10 @@ def print_cross_server(all_data):
 
 
 def classify_runtime(server):
-    if server in ("rust-analyzer", "taplo"):
+    if server in ("rust-analyzer", "taplo", "lattice"):
         return "Rust"
     if server == "clangd":
         return "C++"
-    if server == "marksman":
-        return ".NET"
     if server == "pyright-langserver":
         return "Python"
     if server in ("bash-language-server", "vscode-json-language-server",

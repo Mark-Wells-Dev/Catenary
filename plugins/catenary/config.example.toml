@@ -79,8 +79,8 @@ command = "clangd"
 # args = ["--stdio"]
 
 # [language.markdown]
-# command = "marksman"
-# args = ["server"]
+# command = "lattice"
+# args = ["serve"]
 
 # [language.css]
 # command = "tailwindcss-language-server"
