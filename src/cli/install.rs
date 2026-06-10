@@ -62,7 +62,12 @@ struct HostStatus {
 
 /// Detect all hosts and their install status.
 fn detect_hosts() -> Vec<HostStatus> {
-    vec![detect_claude(), detect_gemini(), detect_antigravity()]
+    vec![
+        detect_claude(),
+        detect_gemini(),
+        detect_antigravity(),
+        detect_opencode(),
+    ]
 }
 
 /// Detect Claude Code install status.
@@ -200,6 +205,34 @@ fn detect_antigravity() -> HostStatus {
 
     HostStatus {
         name: "antigravity",
+        detected,
+        status,
+    }
+}
+
+/// Detect OpenCode install status.
+fn detect_opencode() -> HostStatus {
+    let binary = binary_exists("opencode");
+    let plugin = dirs::home_dir().map(|h| h.join(".config/opencode/plugin/catenary.js"));
+    let linked = plugin.as_ref().is_some_and(|p| p.is_symlink());
+    // `is_file()` follows symlinks, so check `linked` first to distinguish.
+    let bundled = plugin
+        .as_ref()
+        .is_some_and(|p| !p.is_symlink() && p.is_file());
+    let detected = binary || linked || bundled;
+
+    let status = if !detected {
+        "not detected".to_string()
+    } else if linked {
+        "linked (global)".to_string()
+    } else if bundled {
+        "installed (global)".to_string()
+    } else {
+        "not installed".to_string()
+    };
+
+    HostStatus {
+        name: "opencode",
         detected,
         status,
     }
@@ -874,6 +907,354 @@ fn install_antigravity_bundled(out: &mut Output, target: &Path, dry_run: bool) -
     Ok(())
 }
 
+// ── OpenCode install ───────────────────────────────────────────────
+
+/// Embedded OpenCode plugin files.
+const OC_PLUGIN_JS: &str = include_str!("../../plugins/catenary-opencode/catenary.js");
+const OC_RULES: &str = include_str!("../../plugins/catenary-opencode/catenary.md");
+
+/// Resolved install targets for OpenCode. Unlike the command-hook hosts,
+/// OpenCode's plugin and rules land in different places, and the MCP heartbeat
+/// + rules reference merge into a user-owned `opencode.json`.
+struct OpenCodeTargets {
+    /// Auto-discovered plugin file (`plugin/catenary.js`).
+    plugin: PathBuf,
+    /// Catenary-owned agent rules (`catenary.md`). Referenced from
+    /// `opencode.json`'s `instructions` array rather than written into a
+    /// user-authored `AGENTS.md` — matching how every other host ships its own
+    /// rules file.
+    rules: PathBuf,
+    /// User-owned config the MCP heartbeat + rules reference merge into
+    /// (`opencode.json`).
+    config: PathBuf,
+    /// The rules path written into `opencode.json`'s `instructions` array.
+    /// OpenCode resolves instruction paths relative to the config file's
+    /// directory, so this is relative to `config`'s parent (no home-path leak,
+    /// portable across machines).
+    instructions: &'static str,
+}
+
+/// Resolve OpenCode install targets for the global (`~/.config/opencode/`) or
+/// workspace (`<cwd>/.opencode/`) location.
+fn opencode_targets(workspace: bool) -> Result<OpenCodeTargets> {
+    if workspace {
+        let root = std::env::current_dir().context("cannot determine current directory")?;
+        Ok(OpenCodeTargets {
+            plugin: root.join(".opencode/plugin/catenary.js"),
+            rules: root.join(".opencode/catenary.md"),
+            config: root.join("opencode.json"),
+            // Config dir is `<root>`; rules live under `.opencode/`.
+            instructions: ".opencode/catenary.md",
+        })
+    } else {
+        let home = dirs::home_dir().context("cannot determine home directory")?;
+        let base = home.join(".config/opencode");
+        Ok(OpenCodeTargets {
+            plugin: base.join("plugin/catenary.js"),
+            rules: base.join("catenary.md"),
+            config: base.join("opencode.json"),
+            // Config dir is `~/.config/opencode`; rules sit beside the config.
+            instructions: "catenary.md",
+        })
+    }
+}
+
+/// Run `catenary install opencode [--workspace]`.
+///
+/// Writes (or symlinks) the auto-discovered plugin file, writes the
+/// Catenary-owned rules file, and merges the load-bearing MCP heartbeat plus
+/// the rules `instructions` reference into `opencode.json` — never touching a
+/// user-authored `AGENTS.md`.
+///
+/// # Errors
+///
+/// Returns an error if file operations fail or `opencode.json` is malformed.
+pub fn run_install_opencode(
+    out: &mut Output,
+    source: Option<&str>,
+    workspace: bool,
+    dry_run: bool,
+) -> Result<()> {
+    let _ = out.writeln(format_args!("OpenCode:"));
+
+    let targets = opencode_targets(workspace)?;
+
+    match source.map(parse_source) {
+        Some(InstallSource::Local(path)) => {
+            install_opencode_local(out, &path, &targets, dry_run)?;
+        }
+        Some(InstallSource::Remote(_)) | None => {
+            install_opencode_bundled(out, &targets, dry_run)?;
+        }
+    }
+
+    // Rules and the config merge are independent of the plugin source mode. The
+    // rules file is Catenary-owned (written like the plugin); the config merge
+    // is the one required write to the user's `opencode.json` in every mode —
+    // it carries both the MCP heartbeat and the rules `instructions` pointer.
+    install_opencode_rules(out, &targets.rules, dry_run)?;
+    merge_opencode_config(out, &targets.config, targets.instructions, dry_run)
+}
+
+/// Install the OpenCode plugin by symlinking to a local path (dev mode).
+fn install_opencode_local(
+    out: &mut Output,
+    source: &Path,
+    targets: &OpenCodeTargets,
+    dry_run: bool,
+) -> Result<()> {
+    // Resolve the source plugin file: a repo root, the plugin dir, or the file.
+    let in_repo = source.join("plugins/catenary-opencode/catenary.js");
+    let in_dir = source.join("catenary.js");
+    let source_file = if in_repo.is_file() {
+        in_repo
+    } else if in_dir.is_file() {
+        in_dir
+    } else {
+        source.to_path_buf()
+    };
+
+    let target = &targets.plugin;
+
+    if dry_run {
+        let _ = out.writeln(format_args!(
+            "  {} symlink {} → {}",
+            out.colors.dim("(dry-run)"),
+            target.display(),
+            source_file.display(),
+        ));
+        return Ok(());
+    }
+
+    // Remove any existing plugin file or symlink.
+    if target.is_symlink() || target.exists() {
+        std::fs::remove_file(target)
+            .with_context(|| format!("remove existing plugin at {}", target.display()))?;
+    }
+
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create plugin directory {}", parent.display()))?;
+    }
+
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&source_file, target)
+        .with_context(|| format!("symlink {} → {}", target.display(), source_file.display()))?;
+
+    #[cfg(not(unix))]
+    {
+        anyhow::bail!("symlink install not supported on this platform");
+    }
+
+    let _ = out.writeln(format_args!(
+        "  {} plugin symlinked → {}",
+        out.colors.green("✓"),
+        source_file.display(),
+    ));
+
+    Ok(())
+}
+
+/// Install the OpenCode plugin by writing the embedded file (bundled mode).
+fn install_opencode_bundled(
+    out: &mut Output,
+    targets: &OpenCodeTargets,
+    dry_run: bool,
+) -> Result<()> {
+    let target = &targets.plugin;
+
+    // A symlink means a dev install — don't overwrite it.
+    if target.is_symlink() {
+        let link_target = std::fs::read_link(target).unwrap_or_default();
+        let _ = out.writeln(format_args!(
+            "  {} plugin symlinked → {} (use explicit source to switch)",
+            out.colors.green("✓"),
+            link_target.display(),
+        ));
+        return Ok(());
+    }
+
+    let up_to_date = std::fs::read_to_string(target).is_ok_and(|c| c == OC_PLUGIN_JS);
+    if up_to_date {
+        let _ = out.writeln(format_args!(
+            "  {} plugin up to date",
+            out.colors.green("✓"),
+        ));
+        return Ok(());
+    }
+
+    if dry_run {
+        let _ = out.writeln(format_args!(
+            "  {} write plugin to {}",
+            out.colors.dim("(dry-run)"),
+            target.display(),
+        ));
+        return Ok(());
+    }
+
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create plugin directory {}", parent.display()))?;
+    }
+    std::fs::write(target, OC_PLUGIN_JS).with_context(|| format!("write {}", target.display()))?;
+
+    let _ = out.writeln(format_args!(
+        "  {} wrote plugin to {}",
+        out.colors.green("✓"),
+        target.display(),
+    ));
+
+    Ok(())
+}
+
+/// Write the Catenary-owned rules file (`catenary.md`). Unlike a user-authored
+/// `AGENTS.md`, this file belongs to Catenary, so it is written and
+/// staleness-checked like the plugin — a symlink (dev install) is left alone.
+/// It is surfaced to the agent via `opencode.json`'s `instructions` array
+/// (see [`merge_opencode_config`]), so the user's own rules files are untouched.
+fn install_opencode_rules(out: &mut Output, rules: &Path, dry_run: bool) -> Result<()> {
+    // A symlink means a dev install — don't overwrite it.
+    if rules.is_symlink() {
+        let link_target = std::fs::read_link(rules).unwrap_or_default();
+        let _ = out.writeln(format_args!(
+            "  {} rules symlinked → {}",
+            out.colors.green("✓"),
+            link_target.display(),
+        ));
+        return Ok(());
+    }
+
+    let up_to_date = std::fs::read_to_string(rules).is_ok_and(|c| c == OC_RULES);
+    if up_to_date {
+        let _ = out.writeln(format_args!("  {} rules up to date", out.colors.green("✓")));
+        return Ok(());
+    }
+
+    if dry_run {
+        let _ = out.writeln(format_args!(
+            "  {} write rules to {}",
+            out.colors.dim("(dry-run)"),
+            rules.display(),
+        ));
+        return Ok(());
+    }
+
+    if let Some(parent) = rules.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create rules directory {}", parent.display()))?;
+    }
+    std::fs::write(rules, OC_RULES).with_context(|| format!("write {}", rules.display()))?;
+
+    let _ = out.writeln(format_args!(
+        "  {} wrote rules to {}",
+        out.colors.green("✓"),
+        rules.display(),
+    ));
+
+    Ok(())
+}
+
+/// Desired `mcp.catenary` entry for `opencode.json`. The persistent MCP
+/// connection is the long-lived client that keeps the daemon + warm LSP pool
+/// alive for the session (the daemon exits on last client disconnect).
+fn opencode_mcp_entry() -> serde_json::Value {
+    serde_json::json!({
+        "type": "local",
+        "command": ["catenary"],
+        "enabled": true,
+    })
+}
+
+/// Merge the MCP heartbeat and the rules `instructions` reference into
+/// `opencode.json` without clobbering other keys or instructions. Creates the
+/// file (with `$schema`) if absent.
+fn merge_opencode_config(
+    out: &mut Output,
+    config: &Path,
+    instructions: &str,
+    dry_run: bool,
+) -> Result<()> {
+    let desired_mcp = opencode_mcp_entry();
+
+    let mut root = match std::fs::read_to_string(config) {
+        Ok(s) => serde_json::from_str::<serde_json::Value>(&s)
+            .with_context(|| format!("parse {}", config.display()))?,
+        Err(_) => serde_json::json!({ "$schema": "https://opencode.ai/config.json" }),
+    };
+
+    let obj = root
+        .as_object_mut()
+        .with_context(|| format!("{} is not a JSON object", config.display()))?;
+
+    let mcp_present = obj
+        .get("mcp")
+        .and_then(|m| m.get("catenary"))
+        .is_some_and(|c| *c == desired_mcp);
+    let instructions_present = obj
+        .get("instructions")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|arr| arr.iter().any(|v| v.as_str() == Some(instructions)));
+
+    if mcp_present && instructions_present {
+        let _ = out.writeln(format_args!(
+            "  {} config up to date in {}",
+            out.colors.green("✓"),
+            config.display(),
+        ));
+        return Ok(());
+    }
+
+    if dry_run {
+        let _ = out.writeln(format_args!(
+            "  {} merge mcp.catenary + instructions into {}",
+            out.colors.dim("(dry-run)"),
+            config.display(),
+        ));
+        return Ok(());
+    }
+
+    // MCP heartbeat — set/replace `mcp.catenary`.
+    {
+        let mcp = obj
+            .entry("mcp")
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        let mcp_obj = mcp
+            .as_object_mut()
+            .with_context(|| format!("`mcp` in {} is not a JSON object", config.display()))?;
+        mcp_obj.insert("catenary".to_string(), desired_mcp);
+    }
+
+    // Rules reference — append to `instructions`, preserving existing entries.
+    {
+        let instr = obj
+            .entry("instructions")
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+        let arr = instr.as_array_mut().with_context(|| {
+            format!("`instructions` in {} is not a JSON array", config.display())
+        })?;
+        if !arr.iter().any(|v| v.as_str() == Some(instructions)) {
+            arr.push(serde_json::Value::String(instructions.to_string()));
+        }
+    }
+
+    if let Some(parent) = config.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create config directory {}", parent.display()))?;
+    }
+    let serialized = serde_json::to_string_pretty(&root)
+        .with_context(|| format!("serialize {}", config.display()))?;
+    std::fs::write(config, format!("{serialized}\n"))
+        .with_context(|| format!("write {}", config.display()))?;
+
+    let _ = out.writeln(format_args!(
+        "  {} merged MCP heartbeat + rules into {}",
+        out.colors.green("✓"),
+        config.display(),
+    ));
+
+    Ok(())
+}
+
 // ── Post-update refresh ───────────────────────────────────────────
 
 /// Refresh all hosts that have an existing Catenary installation.
@@ -892,6 +1273,9 @@ pub fn refresh_installed_hosts(out: &mut Output) -> Result<()> {
     let antigravity = dirs::home_dir()
         .map(|h| h.join(".gemini/config/plugins/catenary"))
         .is_some_and(|p| p.is_dir() || p.is_symlink());
+    let opencode = dirs::home_dir()
+        .map(|h| h.join(".config/opencode/plugin/catenary.js"))
+        .is_some_and(|p| p.is_file() || p.is_symlink());
 
     if claude {
         run_install_claude(out, None, false)?;
@@ -902,8 +1286,11 @@ pub fn refresh_installed_hosts(out: &mut Output) -> Result<()> {
     if antigravity {
         run_install_antigravity(out, None, false)?;
     }
+    if opencode {
+        run_install_opencode(out, None, false, false)?;
+    }
 
-    if !claude && !gemini && !antigravity {
+    if !claude && !gemini && !antigravity && !opencode {
         let _ = out.writeln(format_args!(
             "  {} no hosts have Catenary installed",
             out.colors.dim("—"),
@@ -1041,6 +1428,237 @@ mod tests {
         assert!(target.is_symlink(), "target should be a symlink");
     }
 
+    // ── OpenCode bundled files ─────────────────────────────────────
+
+    fn oc_targets(base: &Path) -> OpenCodeTargets {
+        OpenCodeTargets {
+            plugin: base.join("plugin/catenary.js"),
+            rules: base.join("catenary.md"),
+            config: base.join("opencode.json"),
+            instructions: "catenary.md",
+        }
+    }
+
+    #[test]
+    fn embedded_opencode_files_not_empty() {
+        assert!(!OC_PLUGIN_JS.is_empty(), "plugin js should not be empty");
+        assert!(!OC_RULES.is_empty(), "rules should not be empty");
+    }
+
+    #[test]
+    fn opencode_bundled_creates_plugin() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let targets = oc_targets(dir.path());
+
+        let mut out = Output::buffer(80);
+        install_opencode_bundled(&mut out, &targets, false).expect("install should succeed");
+
+        let content = std::fs::read_to_string(&targets.plugin).expect("plugin should exist");
+        assert_eq!(content, OC_PLUGIN_JS);
+        assert!(out.into_string().contains("wrote plugin"));
+    }
+
+    #[test]
+    fn opencode_bundled_idempotent() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let targets = oc_targets(dir.path());
+
+        let mut out = Output::buffer(80);
+        install_opencode_bundled(&mut out, &targets, false).expect("first install");
+
+        let mut out2 = Output::buffer(80);
+        install_opencode_bundled(&mut out2, &targets, false).expect("second install");
+        assert!(out2.into_string().contains("up to date"));
+    }
+
+    #[test]
+    fn opencode_bundled_staleness_rewrites() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let targets = oc_targets(dir.path());
+        std::fs::create_dir_all(targets.plugin.parent().expect("parent"))
+            .expect("create plugin dir");
+        std::fs::write(&targets.plugin, "// stale").expect("write stale plugin");
+
+        let mut out = Output::buffer(80);
+        install_opencode_bundled(&mut out, &targets, false).expect("rewrite stale");
+
+        let content = std::fs::read_to_string(&targets.plugin).expect("plugin should exist");
+        assert_eq!(content, OC_PLUGIN_JS);
+        assert!(out.into_string().contains("wrote plugin"));
+    }
+
+    #[test]
+    fn opencode_bundled_dry_run_no_files() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let targets = oc_targets(dir.path());
+
+        let mut out = Output::buffer(80);
+        install_opencode_bundled(&mut out, &targets, true).expect("dry run");
+
+        assert!(!targets.plugin.exists(), "dry run should not write plugin");
+        assert!(out.into_string().contains("(dry-run)"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opencode_local_creates_symlink() {
+        let source_dir = tempfile::tempdir().expect("create source dir");
+        let source_file = source_dir.path().join("catenary.js");
+        std::fs::write(&source_file, OC_PLUGIN_JS).expect("write source plugin");
+
+        let target_dir = tempfile::tempdir().expect("create target dir");
+        let targets = oc_targets(target_dir.path());
+
+        let mut out = Output::buffer(80);
+        install_opencode_local(&mut out, source_dir.path(), &targets, false)
+            .expect("symlink install should succeed");
+
+        assert!(targets.plugin.is_symlink(), "plugin should be a symlink");
+        assert!(out.into_string().contains("symlinked"));
+    }
+
+    #[test]
+    fn opencode_rules_written() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let rules = dir.path().join(".opencode/catenary.md");
+
+        let mut out = Output::buffer(80);
+        install_opencode_rules(&mut out, &rules, false).expect("write rules");
+
+        let content = std::fs::read_to_string(&rules).expect("rules should exist");
+        assert_eq!(content, OC_RULES);
+        assert!(out.into_string().contains("wrote rules"));
+    }
+
+    #[test]
+    fn opencode_rules_idempotent() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let rules = dir.path().join("catenary.md");
+
+        let mut out = Output::buffer(80);
+        install_opencode_rules(&mut out, &rules, false).expect("first write");
+
+        let mut out2 = Output::buffer(80);
+        install_opencode_rules(&mut out2, &rules, false).expect("second write");
+        assert!(out2.into_string().contains("up to date"));
+    }
+
+    #[test]
+    fn opencode_rules_staleness_rewrites() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let rules = dir.path().join("catenary.md");
+        // A Catenary-owned file with stale content is overwritten — it is ours,
+        // referenced via `instructions`, not a user-authored rules file.
+        std::fs::write(&rules, "# stale catenary rules\n").expect("write stale rules");
+
+        let mut out = Output::buffer(80);
+        install_opencode_rules(&mut out, &rules, false).expect("rewrite stale");
+
+        let content = std::fs::read_to_string(&rules).expect("rules should exist");
+        assert_eq!(content, OC_RULES);
+        assert!(out.into_string().contains("wrote rules"));
+    }
+
+    #[test]
+    fn opencode_rules_dry_run_no_file() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let rules = dir.path().join("catenary.md");
+
+        let mut out = Output::buffer(80);
+        install_opencode_rules(&mut out, &rules, true).expect("dry run");
+
+        assert!(!rules.exists(), "dry run should not write rules");
+        assert!(out.into_string().contains("(dry-run)"));
+    }
+
+    // ── OpenCode config merge (MCP heartbeat + rules instructions) ──
+
+    #[test]
+    fn merge_opencode_config_creates_file() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let config = dir.path().join("opencode.json");
+
+        let mut out = Output::buffer(80);
+        merge_opencode_config(&mut out, &config, "catenary.md", false).expect("create config");
+
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&config).expect("config exists"))
+                .expect("valid json");
+        assert_eq!(json["mcp"]["catenary"], opencode_mcp_entry());
+        assert_eq!(json["instructions"][0], "catenary.md");
+        assert_eq!(json["$schema"], "https://opencode.ai/config.json");
+    }
+
+    #[test]
+    fn merge_opencode_config_preserves_existing_keys_and_instructions() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let config = dir.path().join("opencode.json");
+        std::fs::write(
+            &config,
+            r#"{"theme":"dark","instructions":["CONTRIBUTING.md"],"mcp":{"other":{"type":"local","command":["other"]}}}"#,
+        )
+        .expect("write existing config");
+
+        let mut out = Output::buffer(80);
+        merge_opencode_config(&mut out, &config, "catenary.md", false).expect("merge");
+
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&config).expect("config exists"))
+                .expect("valid json");
+        assert_eq!(json["theme"], "dark", "top-level key preserved");
+        assert_eq!(
+            json["mcp"]["other"]["command"][0], "other",
+            "sibling mcp server preserved",
+        );
+        assert_eq!(json["mcp"]["catenary"], opencode_mcp_entry());
+        let instructions = json["instructions"].as_array().expect("instructions array");
+        assert!(
+            instructions.iter().any(|v| v == "CONTRIBUTING.md"),
+            "existing instruction preserved",
+        );
+        assert!(
+            instructions.iter().any(|v| v == "catenary.md"),
+            "catenary rules appended",
+        );
+    }
+
+    #[test]
+    fn merge_opencode_config_idempotent() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let config = dir.path().join("opencode.json");
+
+        let mut out = Output::buffer(80);
+        merge_opencode_config(&mut out, &config, "catenary.md", false).expect("first merge");
+
+        let mut out2 = Output::buffer(80);
+        merge_opencode_config(&mut out2, &config, "catenary.md", false).expect("second merge");
+        assert!(out2.into_string().contains("up to date"));
+
+        // The instruction must not be duplicated on re-run.
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&config).expect("config exists"))
+                .expect("valid json");
+        let count = json["instructions"]
+            .as_array()
+            .expect("instructions array")
+            .iter()
+            .filter(|v| *v == "catenary.md")
+            .count();
+        assert_eq!(count, 1, "instruction should appear exactly once");
+    }
+
+    #[test]
+    fn merge_opencode_config_dry_run_no_file() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let config = dir.path().join("opencode.json");
+
+        let mut out = Output::buffer(80);
+        merge_opencode_config(&mut out, &config, "catenary.md", true).expect("dry run");
+
+        assert!(!config.exists(), "dry run should not write config");
+        assert!(out.into_string().contains("(dry-run)"));
+    }
+
     // ── List subcommand ────────────────────────────────────────────
 
     #[test]
@@ -1068,6 +1686,7 @@ mod tests {
             ("claude", CLAUDE_SKILL),
             ("gemini", GEMINI_CONTEXT),
             ("antigravity", AGY_RULES),
+            ("opencode", OC_RULES),
         ] {
             assert!(
                 surface.contains("catenary primer"),

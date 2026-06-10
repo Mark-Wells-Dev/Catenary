@@ -1,0 +1,4 @@
+# Proper nouns that look like code identifiers to `clippy::doc_markdown`.
+# `..` splices in clippy's default list (OpenGL, OpenSSL, OpenTelemetry, …)
+# rather than replacing it, so existing allowed idents keep working.
+doc-valid-idents = ["OpenCode", ".."]

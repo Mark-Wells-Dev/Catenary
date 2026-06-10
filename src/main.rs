@@ -398,6 +398,17 @@ enum InstallHost {
         /// Source: local path (dev install) or repo identifier (release install).
         source: Option<String>,
     },
+    /// Install the Catenary plugin for OpenCode.
+    #[command(name = "opencode")]
+    OpenCode {
+        /// Source: local path (dev install) or repo identifier (release install).
+        source: Option<String>,
+
+        /// Install into the current workspace (`<root>/.opencode/`) instead of
+        /// the global `~/.config/opencode/` location.
+        #[arg(long)]
+        workspace: bool,
+    },
 }
 
 /// Entry point for the Catenary binary.
@@ -633,6 +644,14 @@ fn main() -> Result<()> {
                 }
                 Some(InstallHost::Antigravity { source }) => {
                     cli::install::run_install_antigravity(&mut out, source.as_deref(), dry_run)
+                }
+                Some(InstallHost::OpenCode { source, workspace }) => {
+                    cli::install::run_install_opencode(
+                        &mut out,
+                        source.as_deref(),
+                        workspace,
+                        dry_run,
+                    )
                 }
             }
         }
@@ -2489,6 +2508,37 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn test_cli_install_opencode() {
+        use clap::Parser;
+        let args = Args::try_parse_from(["catenary", "install", "opencode"]);
+        let args = args.expect("install opencode should parse");
+        let Some(Command::Install {
+            host: Some(InstallHost::OpenCode { source, workspace }),
+            ..
+        }) = args.command
+        else {
+            unreachable!("expected Install OpenCode command");
+        };
+        assert!(source.is_none());
+        assert!(!workspace, "workspace should default to false");
+    }
+
+    #[test]
+    fn test_cli_install_opencode_workspace() {
+        use clap::Parser;
+        let args = Args::try_parse_from(["catenary", "install", "opencode", "--workspace"]);
+        let args = args.expect("install opencode --workspace should parse");
+        let Some(Command::Install {
+            host: Some(InstallHost::OpenCode { workspace, .. }),
+            ..
+        }) = args.command
+        else {
+            unreachable!("expected Install OpenCode command");
+        };
+        assert!(workspace, "--workspace should set the flag");
     }
 
     #[test]
