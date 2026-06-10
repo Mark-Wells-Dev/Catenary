@@ -293,10 +293,18 @@ impl LspClient {
 
     /// Runs the health probe: sends `documentSymbol` to verify the server
     /// can respond. Transitions `Probing` → `Healthy` on success, `Probing` →
-    /// `Failed` on error/timeout.
+    /// `Failed` on error.
     ///
     /// Uses the same file the diagnostics pipeline is processing — the
     /// `didOpen` that the pipeline sends serves as the probe's `didOpen`.
+    ///
+    /// No wall-clock timeout wraps the request: under heavy CPU load a
+    /// starved-but-alive server can take well over a minute to answer, and a
+    /// wall clock would falsely mark it `Failed` (it fails in production, not
+    /// just flakes). The bound is catenary-proc instead — [`Connection::request`]
+    /// detects server death (`ProcessMonitor`) and a genuinely stuck server
+    /// (CPU-tick budget), and the connection's cancellation token tears the
+    /// request down if the diagnostics client disconnects.
     ///
     /// Returns `true` if the server is now `Healthy`.
     pub async fn run_health_probe(&self, uri: &str) -> bool {
@@ -306,25 +314,17 @@ impl LspClient {
 
         debug!("Running health probe on {uri}");
 
-        let result = tokio::time::timeout(
-            Duration::from_mins(1),
-            self.request("textDocument/documentSymbol", params::document_symbols(uri)),
-        )
-        .await;
-
-        match result {
-            Ok(Ok(_)) => {
+        match self
+            .request("textDocument/documentSymbol", params::document_symbols(uri))
+            .await
+        {
+            Ok(_) => {
                 // request() already called try_transition_probing_to_healthy
                 debug!("Health probe succeeded — server is Healthy");
                 true
             }
-            Ok(Err(e)) => {
+            Err(e) => {
                 debug!("Health probe failed: {e}");
-                self.server.set_lifecycle(ServerLifecycle::Failed);
-                false
-            }
-            Err(_) => {
-                debug!("Health probe timed out (60s)");
                 self.server.set_lifecycle(ServerLifecycle::Failed);
                 false
             }

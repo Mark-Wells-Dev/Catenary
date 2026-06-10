@@ -2273,11 +2273,43 @@ async fn handle_hook_dispatch(
                 if let Some(s) = &board_session {
                     s.set_diagnostics_in_flight(true);
                 }
-                let outcome = ctx
-                    .primary
-                    .diagnostics
-                    .process_files_batched(&files, Some(&scope_id), &session_id)
-                    .await;
+                // Race the diagnostics pipeline against client disconnect. If the
+                // `catenary diagnostics` process is killed mid-settle (e.g. the host
+                // tool-call timeout fires while a server sits in a `$/progress`
+                // bracket), the socket closes, the read below returns EOF, and we
+                // drop the pipeline future instead of leaving a settle wait pinned on
+                // a Busy server (bug 24). Mirrors the grep/glob cancel-on-disconnect
+                // path. The dropped batch self-heals: `open_document_on` sends
+                // `didChange` (not a duplicate `didOpen`) for an already-open doc.
+                let outcome = tokio::select! {
+                    outcome = ctx
+                        .primary
+                        .diagnostics
+                        .process_files_batched(&files, Some(&scope_id), &session_id) => outcome,
+                    () = async {
+                        use tokio::io::AsyncReadExt;
+                        let mut probe = [0u8; 1];
+                        let _ = buf_reader.read(&mut probe).await;
+                    } => {
+                        if let Some(s) = &board_session {
+                            s.set_diagnostics_in_flight(false);
+                        }
+                        debug!(
+                            source = Source::DaemonDispatch.as_str(),
+                            session_id = %session_id,
+                            "diagnostics client disconnected — pipeline cancelled",
+                        );
+                        emit_hook_event(
+                            tracing::Level::INFO,
+                            "cli",
+                            &method,
+                            Some(&scope_id),
+                            "client disconnected",
+                            "outgoing hook response",
+                        );
+                        return Ok(());
+                    }
+                };
                 if let Some(s) = &board_session {
                     s.set_diagnostics_in_flight(false);
                     s.set_last_action(format!(
@@ -4302,6 +4334,13 @@ mod tests {
 
     /// Send a hook JSON request and read all response data (may be
     /// multi-line, unlike `hook_roundtrip` which reads a single line).
+    ///
+    /// Does NOT shutdown the write side after sending. `tool/editing-stop`
+    /// races its diagnostics pipeline against client disconnect (bug 24); a
+    /// write-shutdown reads as EOF on the daemon side and would trip the
+    /// disconnect branch before the response is sent. EOF still arrives — the
+    /// daemon shuts down its write half after every response. Mirrors the
+    /// production client, which keeps the write half open while reading.
     async fn hook_roundtrip_full(ipc_path: &Path, request: &serde_json::Value) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -4312,7 +4351,6 @@ mod tests {
         let mut payload = serde_json::to_string(request).expect("serialize");
         payload.push('\n');
         stream.write_all(payload.as_bytes()).await.expect("write");
-        stream.shutdown().await.expect("shutdown write");
 
         let mut response = String::new();
         stream

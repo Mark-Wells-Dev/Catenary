@@ -925,13 +925,28 @@ pub fn ipc_request(socket_path: &Path, request: &Value) -> Result<String> {
     ipc_request_with_timeout(socket_path, request, Duration::from_secs(10))
 }
 
-/// Like [`ipc_request`], but with a 60-second read timeout.
+/// Like [`ipc_request`], but with a 60-second read timeout and — crucially — it
+/// does NOT shutdown the write side after sending.
 ///
-/// Used for `tool/editing-stop` which blocks on the diagnostics pipeline.
-/// Under parallel test load, CPU contention stretches flycheck wall time
-/// well past the default 10-second timeout.
+/// Used for `tool/editing-stop`, which blocks on the diagnostics pipeline.
+/// Under parallel test load, CPU contention stretches flycheck wall time well
+/// past the default 10-second timeout. The daemon races that pipeline against
+/// client disconnect (bug 24); a write-shutdown reads as EOF on the daemon side
+/// and would trip the disconnect branch before the response is sent. This
+/// mirrors the production `catenary diagnostics` client (`run_done_editing`),
+/// which keeps the write half open while awaiting the response — same
+/// non-half-closing contract as [`ipc_tool_request`].
 pub fn ipc_request_long(socket_path: &Path, request: &Value) -> Result<String> {
-    ipc_request_with_timeout(socket_path, request, Duration::from_mins(1))
+    use std::io::Read as _;
+    let mut stream =
+        std::os::unix::net::UnixStream::connect(socket_path).context("connect to notify socket")?;
+    stream.set_read_timeout(Some(Duration::from_mins(1)))?;
+    writeln!(stream, "{request}").context("write to notify socket")?;
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .context("read from notify socket")?;
+    Ok(response)
 }
 
 fn ipc_request_with_timeout(

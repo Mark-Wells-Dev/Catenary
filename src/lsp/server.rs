@@ -918,10 +918,15 @@ impl LspServer {
     ///
     /// Used by `Connection::request` to pause failure detection budget
     /// drain during explained work (e.g., indexing, flycheck).
+    ///
+    /// Reads the authoritative `Busy(n)` lifecycle — the same open-bracket
+    /// signal `await_idle` uses — rather than `try_lock`ing the progress
+    /// tracker. A prior `try_lock` fail-safe returned `true` on lock
+    /// *contention* (not just genuine progress), which could spuriously pause
+    /// `request()`'s stuck-server budget and stop it self-bounding. The
+    /// lifecycle lock is only ever held briefly, so this reads the real state.
     pub fn is_progress_active(&self) -> bool {
-        self.progress
-            .try_lock()
-            .map_or(true, |tracker| tracker.is_busy())
+        matches!(self.lifecycle(), ServerLifecycle::Busy(_))
     }
 
     /// Returns a reference to the state-change notifier.
