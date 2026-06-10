@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use anyhow::Result;
 use serde::Deserialize;
 
+use crate::companions::CompanionRules;
 use crate::logging::reaper::ReapPolicy;
 
 pub use commands::{BuildContext, BuildGuidance, CommandsConfig, GuidanceEntry, ResolvedCommands};
@@ -79,6 +80,24 @@ impl From<SeverityConfig> for crate::logging::Severity {
     }
 }
 
+/// Workspace-root configuration (`[roots]`).
+///
+/// User-level only. The lone field today is [`companions`](Self::companions);
+/// the section exists so companion-root rules have a stable home as more
+/// root-policy knobs land.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct RootsConfig {
+    /// Companion-root derivation rules (`[roots.companions]`).
+    ///
+    /// A matcher → template map (see [`CompanionRules`]). **Absent ⇒ feature
+    /// off** — Catenary ships no table and assumes no naming convention. Parsed
+    /// only from the user config; a project `.catenary.toml` carrying `[roots]`
+    /// is warned-and-ignored (it is not a project-allowed key) so a public repo
+    /// cannot leak a private sibling path.
+    pub companions: Option<CompanionRules>,
+}
+
 /// Overall configuration for Catenary.
 ///
 /// This is the resolved form produced by config loading. TOML
@@ -137,6 +156,12 @@ pub struct Config {
     /// growth at every level (ticket 01); the defaults require no user action.
     /// Resolve to concrete values via [`Config::reap_policy`].
     pub observability: Option<ReapPolicy>,
+
+    /// Workspace-root policy (`[roots]`), including companion-root derivation.
+    ///
+    /// `None` when no source specified `[roots]`. User-config only. Read via
+    /// [`Config::companion_rules`].
+    pub roots: Option<RootsConfig>,
 }
 
 /// Icon preset selecting a base set of icons.
@@ -481,6 +506,16 @@ impl Config {
     pub fn reap_policy(&self) -> ReapPolicy {
         self.observability.unwrap_or_default()
     }
+
+    /// Returns the configured companion-root rules, or `None` when the feature
+    /// is off (`[roots.companions]` absent).
+    ///
+    /// Used by the MCP root callback to expand a connection's declared roots
+    /// with their derived companions (workstream 29).
+    #[must_use]
+    pub fn companion_rules(&self) -> Option<&CompanionRules> {
+        self.roots.as_ref()?.companions.as_ref()
+    }
 }
 
 impl Default for Config {
@@ -495,6 +530,7 @@ impl Default for Config {
             tools: None,
             resolved_commands: None,
             observability: None,
+            roots: None,
         }
     }
 }
@@ -1250,6 +1286,50 @@ command = "rust-analyzer"
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn roots_companions_absent_is_off() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "")?;
+
+        let config = Config::load_from_sources(&[path])?;
+        assert!(config.roots.is_none());
+        assert!(config.companion_rules().is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    #[allow(
+        clippy::literal_string_with_formatting_args,
+        reason = "`{root}Internal` is a companion-template placeholder in TOML, not a format arg"
+    )]
+    fn roots_companions_parses() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "[roots.companions]\n\
+             \"*\" = \"{root}Internal\"\n\
+             \"~/Projects/homelab\" = \"~/.local/share/chezmoi\"\n",
+        )?;
+
+        let config = Config::load_from_sources(&[path])?;
+        let rules = config.companion_rules().expect("companions configured");
+        assert!(!rules.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn roots_rejects_unknown_field() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "[roots]\nbogus = true\n").expect("write");
+
+        assert!(Config::load_from_sources(&[path]).is_err());
     }
 
     #[test]

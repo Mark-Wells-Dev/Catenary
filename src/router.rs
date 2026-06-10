@@ -23,6 +23,7 @@ use crate::bridge::EditingGuardrail;
 use crate::bridge::HookRouter;
 use crate::bridge::session::Session;
 use crate::bridge::{GlobOutcome, GrepOutcome};
+use crate::companions::expand_companions;
 use crate::hook::{HookRequest, HookResponseEnvelope, emit_hook_event, hook_outcome_level};
 use crate::logging::LoggingServer;
 use crate::mcp::McpServer;
@@ -1283,7 +1284,16 @@ impl SessionManager {
                         (Some(tracker), Some(_), Some(session)) => {
                             let mcp_key = format!("mcp:{fd}");
                             mcp = mcp.on_roots_changed(Box::new(move |roots| {
-                                let paths = parse_root_uris(&roots);
+                                // Expand the client's declared roots with any
+                                // configured companions (workstream 29), then
+                                // REPLACE the contributor set — recomputing from
+                                // the full declared set on every change tracks
+                                // add/remove for free (no provenance bookkeeping).
+                                let declared = parse_root_uris(&roots);
+                                let paths = match session.config.companion_rules() {
+                                    Some(rules) => expand_companions(declared, rules),
+                                    None => declared,
+                                };
                                 tracker.set_roots(&mcp_key, paths);
                                 let global = tracker.global_roots();
                                 tokio::runtime::Handle::current()
@@ -3000,6 +3010,10 @@ fn read_json_line(socket: &std::os::unix::net::UnixStream) -> Result<String> {
 #[allow(
     clippy::significant_drop_tightening,
     reason = "tests intentionally hold SessionManager alive for socket lifetime"
+)]
+#[allow(
+    clippy::literal_string_with_formatting_args,
+    reason = "`{root}Internal` companion templates are placeholders, not format args"
 )]
 mod tests {
     use super::*;
@@ -5058,6 +5072,91 @@ mod tests {
         tracker.remove_contributor("mcp:99");
 
         assert_eq!(tracker.global_roots().len(), 1);
+    }
+
+    // ── Companion roots (workstream 29) ──────────────────────────────────
+    //
+    // These exercise the `on_roots_changed` seam: the callback recomputes
+    // `expand_companions(declared, rules)` and `set_roots`-REPLACEs the
+    // `mcp:{fd}` set on every change. Driving the tracker the same way the
+    // callback does proves companions ride `global_roots`, track add/remove
+    // for free, and refcount across connections.
+
+    #[test]
+    fn companion_rides_global_roots_and_tracks_add_remove() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().canonicalize().expect("canonicalize");
+        let foo = base.join("Foo");
+        let foo_internal = base.join("FooInternal");
+        let bar = base.join("Bar");
+        std::fs::create_dir(&foo).expect("mkdir Foo");
+        std::fs::create_dir(&foo_internal).expect("mkdir FooInternal");
+        std::fs::create_dir(&bar).expect("mkdir Bar");
+
+        let rules = crate::companions::CompanionRules::from_pairs([("*", "{root}Internal")]);
+        let tracker = RootTracker::new();
+
+        // Declared = [Foo] → companion FooInternal joins the global set.
+        tracker.set_roots("mcp:1", expand_companions(vec![foo.clone()], &rules));
+        let global = tracker.global_roots();
+        assert!(global.contains(&foo));
+        assert!(global.contains(&foo_internal), "companion mounted");
+        assert!(!global.contains(&bar));
+
+        // Client adds Bar (no Internal sibling): recompute over the full set.
+        tracker.set_roots(
+            "mcp:1",
+            expand_companions(vec![foo.clone(), bar.clone()], &rules),
+        );
+        let global = tracker.global_roots();
+        assert!(global.contains(&bar));
+        assert!(
+            global.contains(&foo_internal),
+            "Foo's companion survives add"
+        );
+
+        // Client removes Foo: recompute over [Bar] drops Foo's companion with
+        // no provenance bookkeeping.
+        tracker.set_roots("mcp:1", expand_companions(vec![bar.clone()], &rules));
+        let global = tracker.global_roots();
+        assert!(global.contains(&bar));
+        assert!(!global.contains(&foo), "removed root gone");
+        assert!(
+            !global.contains(&foo_internal),
+            "removed root's companion gone via recompute",
+        );
+    }
+
+    #[test]
+    fn shared_companion_refcounts_across_connections() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().canonicalize().expect("canonicalize");
+        let foo = base.join("Foo");
+        let foo_internal = base.join("FooInternal");
+        std::fs::create_dir(&foo).expect("mkdir Foo");
+        std::fs::create_dir(&foo_internal).expect("mkdir FooInternal");
+
+        let rules = crate::companions::CompanionRules::from_pairs([("*", "{root}Internal")]);
+        let tracker = RootTracker::new();
+
+        // Two connections both declare Foo → both derive FooInternal.
+        tracker.set_roots("mcp:1", expand_companions(vec![foo.clone()], &rules));
+        tracker.set_roots("mcp:2", expand_companions(vec![foo], &rules));
+        assert_eq!(
+            tracker.refcount(&foo_internal),
+            2,
+            "companion shared by both"
+        );
+
+        // One disconnects: companion survives for the other.
+        tracker.remove_contributor("mcp:1");
+        assert_eq!(tracker.refcount(&foo_internal), 1);
+        assert!(tracker.global_roots().contains(&foo_internal));
+
+        // Last disconnect drops the whole set, companion included.
+        tracker.remove_contributor("mcp:2");
+        assert_eq!(tracker.refcount(&foo_internal), 0);
+        assert!(tracker.global_roots().is_empty());
     }
 
     #[test]

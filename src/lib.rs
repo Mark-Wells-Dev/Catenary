@@ -12,6 +12,8 @@ pub mod bridge;
 pub mod bucketing;
 /// Command-line interface definitions and utilities.
 pub mod cli;
+/// Companion-root derivation (auto-mounted sibling planning repos).
+pub mod companions;
 /// Configuration handling for language servers and session settings.
 pub mod config;
 /// Diagnostic noise filtering for LSP server output.

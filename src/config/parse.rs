@@ -15,8 +15,8 @@ use crate::logging::reaper::ReapPolicy;
 
 use super::commands::{self, CommandsConfig};
 use super::{
-    Config, IconConfig, LanguageConfig, NotificationConfig, ServerBinding, ServerDef, ToolsConfig,
-    TuiConfig, default_log_retention_days,
+    Config, IconConfig, LanguageConfig, NotificationConfig, RootsConfig, ServerBinding, ServerDef,
+    ToolsConfig, TuiConfig, default_log_retention_days,
 };
 
 /// Embedded default classification config (lowest-priority layer).
@@ -61,6 +61,9 @@ struct RawConfig {
 
     #[serde(default)]
     observability: Option<ReapPolicy>,
+
+    #[serde(default)]
+    roots: Option<RootsConfig>,
 
     #[serde(default)]
     commands: Option<CommandsConfig>,
@@ -358,11 +361,11 @@ fn parse_server_defaults(contents: &str) -> Result<HashMap<String, ServerDef>> {
 /// **Maps** (`language`, `server`): key-level merge. Later source wins
 /// per-key; keys absent from the later source are preserved.
 ///
-/// **Structured sections** (`notifications`, `icons`, `tui`, `tools`):
-/// `Option<T>` on `Config`. `None` means the source did not mention the
-/// section; `Some` means it was present (even if all values match defaults).
-/// Merge only overwrites when the later source is `Some`, so an earlier
-/// source's explicit setting survives an unrelated later source.
+/// **Structured sections** (`notifications`, `icons`, `tui`, `tools`,
+/// `observability`, `roots`): `Option<T>` on `Config`. `None` means the source
+/// did not mention the section; `Some` means it was present (even if all values
+/// match defaults). Merge only overwrites when the later source is `Some`, so an
+/// earlier source's explicit setting survives an unrelated later source.
 ///
 /// **Commands** (`commands`): layered merge via `ResolvedCommands::merge`.
 /// `allow` and `pipeline` replace; `deny` entries merge per-command;
@@ -396,6 +399,9 @@ fn merge(config: &mut Config, other: RawConfig) {
     }
     if other.observability.is_some() {
         config.observability = other.observability;
+    }
+    if other.roots.is_some() {
+        config.roots = other.roots;
     }
     if let Some(ref cmds) = other.commands {
         config

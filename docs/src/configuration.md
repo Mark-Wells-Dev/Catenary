@@ -677,6 +677,64 @@ a commented-out `[commands]` section.
 |--------|---------|-------------|
 | `log_retention_days` | `7` | Days to keep dead session data. `0` = remove on startup. `-1` = retain forever. |
 
+## Companion Roots
+
+The `[roots.companions]` table auto-mounts a **derived sibling root** alongside
+each workspace root a host declares — so opening `~/Projects/Catenary` (the code)
+also mounts `~/Projects/CatenaryInternal` (the planning repo) for LSP
+intelligence, with no manual `catenary roots add` each session.
+
+**Off by default.** Catenary ships no table and assumes no naming convention; an
+absent `[roots.companions]` disables the feature entirely.
+
+```toml
+[roots.companions]
+"*"                  = "{root}Internal"          # any root → its <path>Internal sibling
+"~/Projects/homelab" = "~/.local/share/chezmoi"  # explicit, unrelated path
+```
+
+Each entry maps a **matcher** (key) to a **companion template** (value):
+
+| Side | Form | Meaning |
+|------|------|---------|
+| Matcher | `"*"` | Matches any declared root. |
+| Matcher | literal path | Matches that one root exactly (after `~`/env expansion). |
+| Template | `{root}` | The canonical root path — `"{root}Internal"` appends `Internal`. |
+| Template | `{name}` | The root's basename — `"~/docs/{name}"` mounts a cross-parent companion. |
+| Template | literal path | A fully explicit companion path. |
+
+`~` and `$VAR`/`${VAR}` expand on **both** sides. Semantics are a **union**, not
+first-match: every matching rule contributes a candidate, candidates are
+**existence-filtered** (a companion is mounted only if it resolves to an existing
+directory), de-duplicated, and never added if it equals a declared root. So
+`"*" = "{root}Internal"` is safe to leave on globally — roots without an
+`Internal` sibling simply contribute nothing.
+
+**Worktree-aware.** A git worktree's companion derives from its *upstream
+project*, not its checkout path: a worktree at
+`~/Projects/Worktrees/Catenary-bug24` mounts `~/Projects/CatenaryInternal`, not
+`…Catenary-bug24Internal`. The upstream project is found by reading git's own
+`.git`/`gitdir`/`commondir` pointer files — no git binary or library is required.
+The canonical project root is used only to *derive* the companion; it is never
+itself mounted (you keep working in your worktree).
+
+**Lifecycle.** Companions are scoped to the MCP connection that pulled them in.
+They are recomputed from the connection's full declared-root set on every change,
+so adding a root adds its companion and removing a root drops its companion
+automatically. A companion shared by several connections (same project, multiple
+agents) stays mounted until the last connection closes, then drops with it.
+
+**User config only.** `[roots.companions]` is read only from your user config
+(`~/.config/catenary/config.toml`), never from a project `.catenary.toml` — a
+public repository must not be able to leak a private sibling path. A `[roots]`
+section placed in a project config is warned about and ignored.
+
+**Why it matters (Lattice synergy).** With markdown defaulting to
+[Lattice](lsp/markdown.md), auto-mounting the `*Internal` planning repo lights up
+its predicate/backlink intelligence: grep/glob enrichment across the planning
+graph, and `catenary diagnostics` link/predicate checks on planning edits — for
+free, every session.
+
 ## Notifications
 
 The `[notifications]` table controls which tracing events are promoted
