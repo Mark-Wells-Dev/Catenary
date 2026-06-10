@@ -2052,11 +2052,11 @@ mod tests {
         };
         assert!(
             msg.contains("cargo"),
-            "full dump should name denied command"
+            "full denial should name denied command"
         );
         assert!(
-            msg.contains("Allowed:"),
-            "full dump should list allowed commands"
+            msg.contains("catenary commands"),
+            "full denial should point at the `catenary commands` surface"
         );
     }
 
@@ -2072,8 +2072,12 @@ mod tests {
             unreachable!("expected Deny, got {:?}", result.result);
         };
         assert!(
-            msg.contains("see earlier message"),
-            "subsequent denial should be short"
+            msg.contains("cargo"),
+            "short denial still names the command"
+        );
+        assert!(
+            !msg.contains("catenary commands"),
+            "subsequent denial is terse — the pointer rode the first denial this turn"
         );
     }
 
@@ -2090,8 +2094,8 @@ mod tests {
             unreachable!("expected Deny, got {:?}", result.result);
         };
         assert!(
-            msg.contains("Allowed:"),
-            "new turn should reset to full dump"
+            msg.contains("catenary commands"),
+            "new turn should reset to the full denial (pointer present)"
         );
     }
 
@@ -2108,8 +2112,8 @@ mod tests {
             unreachable!("expected Deny, got {:?}", result.result);
         };
         assert!(
-            msg.contains("Allowed:"),
-            "config version change should force full dump"
+            msg.contains("catenary commands"),
+            "config version change should force the full denial (pointer present)"
         );
     }
 

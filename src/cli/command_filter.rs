@@ -876,6 +876,8 @@ enum Sub {
     EditingStop,
     Roots,
     Primer,
+    /// `catenary commands` — prints the allowed-command surface.
+    Commands,
 }
 
 impl Sub {
@@ -884,7 +886,9 @@ impl Sub {
         match self {
             Self::Grep | Self::Glob => CatenaryClass::Search,
             Self::Sed | Self::Diagnostics | Self::EditingStop => CatenaryClass::Correlated,
-            Self::EditingStart | Self::Roots | Self::Primer => CatenaryClass::Lifecycle,
+            Self::EditingStart | Self::Roots | Self::Primer | Self::Commands => {
+                CatenaryClass::Lifecycle
+            }
         }
     }
 
@@ -899,6 +903,7 @@ impl Sub {
             Self::EditingStop => "editing stop",
             Self::Roots => "roots",
             Self::Primer => "primer",
+            Self::Commands => "commands",
         }
     }
 }
@@ -929,6 +934,7 @@ fn recognize_catenary_sub(rest: &[&str]) -> Recog {
         (Some("sed"), _) => Recog::Agent(Sub::Sed),
         (Some("diagnostics"), _) => Recog::Agent(Sub::Diagnostics),
         (Some("primer"), _) => Recog::Agent(Sub::Primer),
+        (Some("commands"), _) => Recog::Agent(Sub::Commands),
         (
             Some("hook" | "stop" | "debug" | "config" | "doctor" | "install" | "update" | "daemon"),
             _,
@@ -1229,8 +1235,8 @@ fn catenary_occ_denial(occ: &CatenaryOcc) -> Option<String> {
 
 /// The recognized agent-facing command surface, for "unknown subcommand" denials.
 const CATENARY_SURFACE: &str = "Available: `grep`, `glob`, `sed`, `diagnostics`, \
-     `editing start`, `roots add/rm/ls`, `primer`. Run `catenary primer` for the \
-     workflow.";
+     `editing start`, `roots add/rm/ls`, `commands`, `primer`. Run `catenary primer` \
+     for the workflow.";
 
 fn unknown_subcommand_denial() -> String {
     format!("That isn't a recognized `catenary` command. {CATENARY_SURFACE}")
@@ -1265,7 +1271,7 @@ fn stdin_denial(sub: Sub) -> String {
              Pass a glob pattern path."
             .to_string(),
         Sub::Diagnostics => "`catenary diagnostics` takes no input — run it bare.".to_string(),
-        Sub::EditingStart | Sub::EditingStop | Sub::Roots | Sub::Primer => {
+        Sub::EditingStart | Sub::EditingStop | Sub::Roots | Sub::Primer | Sub::Commands => {
             format!("`catenary {}` takes no stdin — run it bare.", sub.label())
         }
     }
@@ -1308,10 +1314,12 @@ fn out_pipe_denial(sub: Sub, downstream: &str) -> String {
              first. Don't pipe it into `{downstream}` — read the preview, or `catenary \
              grep \"pattern\" <report-file>` to filter the full set."
         ),
-        Sub::EditingStart | Sub::EditingStop | Sub::Roots | Sub::Primer => format!(
-            "`catenary {tool}` owns its output — run it bare, don't pipe it into \
-             `{downstream}`."
-        ),
+        Sub::EditingStart | Sub::EditingStop | Sub::Roots | Sub::Primer | Sub::Commands => {
+            format!(
+                "`catenary {tool}` owns its output — run it bare, don't pipe it into \
+                 `{downstream}`."
+            )
+        }
     }
 }
 
@@ -1328,10 +1336,12 @@ fn redirect_denial(sub: Sub) -> String {
         Sub::Diagnostics => "`catenary diagnostics` already writes its full report to a \
              runtime-dir file (path printed) — run it bare and read the printed path."
             .to_string(),
-        Sub::EditingStart | Sub::EditingStop | Sub::Roots | Sub::Primer => format!(
-            "`catenary {}` output is delivered to you directly — don't redirect it.",
-            sub.label()
-        ),
+        Sub::EditingStart | Sub::EditingStop | Sub::Roots | Sub::Primer | Sub::Commands => {
+            format!(
+                "`catenary {}` output is delivered to you directly — don't redirect it.",
+                sub.label()
+            )
+        }
     }
 }
 
@@ -1459,19 +1469,75 @@ fn format_opening_line(denied_cmd: &str, reason: DenialReason) -> String {
     }
 }
 
-/// Format the full denial response with the complete allowlist configuration.
+/// One-line pointer to `catenary commands`, where the full allow / pipeline /
+/// deny surface now lives. Denials reference this instead of dumping the whole
+/// surface inline on the first denial of every turn (bug 25).
+const SURFACE_POINTER: &str = "Run `catenary commands` for the allowed command surface.";
+
+/// Render the allowed-command surface as sorted lines: `Allowed`, `Allowed in
+/// pipelines`, `Denied subcommands`, and `Denied flags`. Sections with no
+/// entries are omitted.
 ///
-/// Used on the first denial in a new turn (or after a config change) to give
-/// the agent full visibility into its allowed command surface.
-///
-/// Lists are sorted alphabetically. Sections with no entries are omitted.
-/// The denied command is always named in the opening line. `build_hint` is
-/// a pre-resolved build guidance string from the caller (when available).
+/// This is the canonical surface listing — `catenary commands` prints it and
+/// denial messages point there rather than inlining it. Build tools are
+/// deliberately excluded: per-cwd build context rides the denial's `Hint`
+/// line, not this surface.
 #[must_use]
-#[allow(
-    clippy::too_many_lines,
-    reason = "redirect guidance expanded the format string"
-)]
+pub fn format_command_surface(commands: &ResolvedCommands) -> Vec<String> {
+    let mut parts = Vec::new();
+
+    if !commands.allow.is_empty() {
+        let mut sorted: Vec<&str> = commands.allow.iter().map(String::as_str).collect();
+        sorted.sort_unstable();
+        parts.push(format!("Allowed: {}", sorted.join(", ")));
+    }
+
+    if !commands.pipeline.is_empty() {
+        let mut sorted: Vec<&str> = commands.pipeline.iter().map(String::as_str).collect();
+        sorted.sort_unstable();
+        parts.push(format!(
+            "Allowed in pipelines (not first): {}",
+            sorted.join(", ")
+        ));
+    }
+
+    if !commands.deny.is_empty() {
+        let mut denied_pairs: Vec<String> = Vec::new();
+        for (cmd, subs) in &commands.deny {
+            let mut sorted_subs: Vec<&str> = subs.iter().map(String::as_str).collect();
+            sorted_subs.sort_unstable();
+            for sub in sorted_subs {
+                denied_pairs.push(format!("{cmd} {sub}"));
+            }
+        }
+        denied_pairs.sort_unstable();
+        parts.push(format!("Denied subcommands: {}", denied_pairs.join(", ")));
+    }
+
+    if !commands.deny_flags.is_empty() {
+        let mut flag_pairs: Vec<String> = Vec::new();
+        for (cmd, flags) in &commands.deny_flags {
+            let mut sorted_flags: Vec<&str> = flags.iter().map(String::as_str).collect();
+            sorted_flags.sort_unstable();
+            for flag in sorted_flags {
+                flag_pairs.push(format!("{cmd} {flag}"));
+            }
+        }
+        flag_pairs.sort_unstable();
+        parts.push(format!("Denied flags: {}", flag_pairs.join(", ")));
+    }
+
+    parts
+}
+
+/// Format the full denial response shown on the first denial in a turn.
+///
+/// Names the denied command, adds the cwd-resolved build `Hint` (when the
+/// command has build guidance), and points the agent at `catenary commands`
+/// for the full allow / pipeline / deny surface — the surface itself is no
+/// longer dumped inline (see [`format_command_surface`]). `build_hint` is a
+/// pre-resolved build guidance string from the caller (when available).
+#[must_use]
 pub fn format_denial_full(
     denied_cmd: &str,
     commands: &ResolvedCommands,
@@ -1527,70 +1593,10 @@ pub fn format_denial_full(
         }
     }
 
-    if !commands.allow.is_empty() {
-        let mut sorted: Vec<&str> = commands.allow.iter().map(String::as_str).collect();
-        sorted.sort_unstable();
-        parts.push(format!("Allowed: {}", sorted.join(", ")));
-    }
-
-    if !commands.pipeline.is_empty() {
-        let mut sorted: Vec<&str> = commands.pipeline.iter().map(String::as_str).collect();
-        sorted.sort_unstable();
-        parts.push(format!(
-            "Allowed in pipelines (not first): {}",
-            sorted.join(", ")
-        ));
-    }
-
-    if !commands.deny.is_empty() {
-        let mut denied_pairs: Vec<String> = Vec::new();
-        for (cmd, subs) in &commands.deny {
-            let mut sorted_subs: Vec<&str> = subs.iter().map(String::as_str).collect();
-            sorted_subs.sort_unstable();
-            for sub in sorted_subs {
-                denied_pairs.push(format!("{cmd} {sub}"));
-            }
-        }
-        denied_pairs.sort_unstable();
-        parts.push(format!("Denied subcommands: {}", denied_pairs.join(", ")));
-    }
-
-    if !commands.deny_flags.is_empty() {
-        let mut flag_pairs: Vec<String> = Vec::new();
-        for (cmd, flags) in &commands.deny_flags {
-            let mut sorted_flags: Vec<&str> = flags.iter().map(String::as_str).collect();
-            sorted_flags.sort_unstable();
-            for flag in sorted_flags {
-                flag_pairs.push(format!("{cmd} {flag}"));
-            }
-        }
-        flag_pairs.sort_unstable();
-        parts.push(format!("Denied flags: {}", flag_pairs.join(", ")));
-    }
-
-    // Per-root build tools, then default. Each line is explicit about scope.
-    let mut root_entries: Vec<(&std::path::Path, &[String])> = commands
-        .build
-        .iter()
-        .map(|(root, tools)| (root.as_path(), tools.as_slice()))
-        .collect();
-    root_entries.sort_unstable_by_key(|(root, _)| *root);
-    for (root, tools) in &root_entries {
-        let tool_list: Vec<String> = tools.iter().map(|t| format!("`{t}`")).collect();
-        parts.push(format!(
-            "Build tool for `{}`: {}",
-            root.display(),
-            tool_list.join(", ")
-        ));
-    }
-    if !commands.default_build.is_empty() {
-        let tool_list: Vec<String> = commands
-            .default_build
-            .iter()
-            .map(|t| format!("`{t}`"))
-            .collect();
-        parts.push(format!("Default build tool: {}", tool_list.join(", ")));
-    }
+    // The allow / pipeline / deny surface lives behind `catenary commands` now
+    // (a pointer, not an inline dump); per-cwd build context already rides the
+    // `Hint` line above. See `format_command_surface`.
+    parts.push(SURFACE_POINTER.to_string());
 
     if denial.unresolved_cd {
         parts.push(
@@ -1607,9 +1613,11 @@ pub fn format_denial_full(
 
 /// Format the short denial response for subsequent denials in the same turn.
 ///
-/// After the full config has been shown once in a turn, subsequent denials
-/// use this shorter form to reduce noise. Includes guidance hint when
-/// available. `build_hint` is a pre-resolved short build guidance string.
+/// After the first denial in a turn (which carries the `catenary commands`
+/// pointer via [`format_denial_full`]), subsequent denials use this terser
+/// form to reduce noise: the reason plus the command's guidance hint when
+/// available, and no repeated pointer. `build_hint` is a pre-resolved short
+/// build guidance string.
 #[must_use]
 pub fn format_denial_short(
     denied_cmd: &str,
@@ -1625,16 +1633,19 @@ pub fn format_denial_short(
 
     let lookup_cmd = denied_cmd.split_whitespace().next().unwrap_or(denied_cmd);
 
-    let no_guidance = " — see earlier message for the current Catenary command configuration.";
-    let suffix = commands.guidance_for(lookup_cmd).map_or_else(
-        || String::from(no_guidance),
-        |entry| match entry {
+    // Subsequent denials in a turn stay terse: just the reason, plus the
+    // command's own guidance hint when it has one. The first denial this turn
+    // already carried the `catenary commands` pointer (see `format_denial_full`),
+    // so the short form does not repeat it.
+    let suffix = commands
+        .guidance_for(lookup_cmd)
+        .map_or_else(String::new, |entry| match entry {
             crate::config::GuidanceEntry::Static(msg) => {
                 let resolved = resolve_client_vars(msg, format);
                 format!(" — {resolved}")
             }
             crate::config::GuidanceEntry::Build(_) => {
-                build_hint.map_or_else(|| String::from(no_guidance), |hint| format!(" — {hint}"))
+                build_hint.map_or_else(String::new, |hint| format!(" — {hint}"))
             }
             crate::config::GuidanceEntry::Redirect { command, .. } => {
                 format!(
@@ -1642,8 +1653,7 @@ pub fn format_denial_short(
                      Works on any path (LSP enrichment only within tracked roots)."
                 )
             }
-        },
-    );
+        });
 
     let opening = match denial.reason {
         DenialReason::NotAllowed => format!("`{denied_cmd}` isn't allowed"),
@@ -2710,25 +2720,29 @@ mod tests {
     }
 
     #[test]
-    fn format_full_all_sections() {
+    fn format_full_points_to_commands() {
         let rules = python_equivalent_rules();
         let msg = format_denial_full("ls", &rules, &no_cd_denial("ls"), None, None);
 
-        assert!(msg.starts_with("`ls` isn't allowed"), "opening line");
-        assert!(msg.contains("Allowed:"), "allow section");
+        assert!(msg.starts_with("`ls` isn't allowed"), "opening line: {msg}");
         assert!(
-            msg.contains("Allowed in pipelines (not first):"),
-            "pipeline section"
+            msg.contains("Run `catenary commands` for the allowed command surface."),
+            "should point at `catenary commands`: {msg}",
         );
-        assert!(msg.contains("Denied subcommands:"), "deny section");
+        // The surface itself moved behind `catenary commands` — no inline dump.
+        assert!(!msg.contains("Allowed:"), "no inline allow section: {msg}");
         assert!(
-            msg.contains("Default build tool: `make`"),
-            "build section: {msg}",
+            !msg.contains("Allowed in pipelines"),
+            "no inline pipeline section: {msg}",
+        );
+        assert!(
+            !msg.contains("Denied subcommands"),
+            "no inline deny section: {msg}",
         );
     }
 
     #[test]
-    fn format_full_multi_build_tools() {
+    fn format_full_omits_build_dump() {
         let rules = ResolvedCommands {
             allow: HashSet::from(["git".into()]),
             default_build: vec!["make".into(), "npm".into()],
@@ -2739,23 +2753,40 @@ mod tests {
             ..ResolvedCommands::default()
         };
         let msg = format_denial_full("ls", &rules, &no_cd_denial("ls"), None, None);
+        // Per-root / default build tools are no longer dumped — the cwd build
+        // context rides the `Hint` line (build-command denials only).
         assert!(
-            msg.contains("Default build tool: `make`, `npm`"),
-            "multi default: {msg}",
+            !msg.contains("Default build tool"),
+            "no default build line: {msg}",
         );
         assert!(
-            msg.contains("Build tool for `/project`: `cargo`, `npm`"),
-            "multi per-root: {msg}",
+            !msg.contains("Build tool for"),
+            "no per-root build line: {msg}",
         );
     }
 
     #[test]
-    fn format_full_sorted_alphabetically() {
+    fn surface_all_sections() {
         let rules = python_equivalent_rules();
-        let msg = format_denial_full("ls", &rules, &no_cd_denial("ls"), None, None);
+        let surface = format_command_surface(&rules).join("\n");
 
-        // Extract the Allowed line and verify sorting.
-        let allowed_line = msg
+        assert!(surface.contains("Allowed:"), "allow section: {surface}");
+        assert!(
+            surface.contains("Allowed in pipelines (not first):"),
+            "pipeline section: {surface}",
+        );
+        assert!(
+            surface.contains("Denied subcommands:"),
+            "deny section: {surface}",
+        );
+    }
+
+    #[test]
+    fn surface_sorted_alphabetically() {
+        let rules = python_equivalent_rules();
+        let surface = format_command_surface(&rules).join("\n");
+
+        let allowed_line = surface
             .lines()
             .find(|l| l.starts_with("Allowed:"))
             .expect("Allowed line");
@@ -2770,30 +2801,30 @@ mod tests {
     }
 
     #[test]
-    fn format_full_omits_empty_sections() {
+    fn surface_omits_empty_sections() {
         let rules = ResolvedCommands {
             allow: HashSet::from(["git".into()]),
             ..ResolvedCommands::default()
         };
-        let msg = format_denial_full("ls", &rules, &no_cd_denial("ls"), None, None);
+        let surface = format_command_surface(&rules).join("\n");
 
-        assert!(msg.contains("Allowed: git"));
+        assert!(surface.contains("Allowed: git"));
         assert!(
-            !msg.contains("Allowed in pipelines"),
+            !surface.contains("Allowed in pipelines"),
             "empty pipeline should be omitted"
         );
         assert!(
-            !msg.contains("Denied subcommands"),
+            !surface.contains("Denied subcommands"),
             "empty deny should be omitted"
         );
         assert!(
-            !msg.contains("Build tool"),
-            "absent build should be omitted"
+            !surface.contains("Denied flags"),
+            "empty deny_flags should be omitted"
         );
     }
 
     #[test]
-    fn format_full_deny_pairs_sorted() {
+    fn surface_deny_pairs_sorted() {
         let rules = ResolvedCommands {
             allow: HashSet::from(["git".into(), "sqlite3".into()]),
             deny: HashMap::from([
@@ -2805,9 +2836,9 @@ mod tests {
             ]),
             ..ResolvedCommands::default()
         };
-        let msg = format_denial_full("ls", &rules, &no_cd_denial("ls"), None, None);
+        let surface = format_command_surface(&rules).join("\n");
 
-        let deny_line = msg
+        let deny_line = surface
             .lines()
             .find(|l| l.starts_with("Denied subcommands:"))
             .expect("deny line");
@@ -2827,7 +2858,12 @@ mod tests {
         let denial = no_cd_denial("cargo");
         let msg = format_denial_short("cargo", &denial, &rules, None, None);
         assert!(msg.contains("`cargo`"));
-        assert!(msg.contains("see earlier message"));
+        // Terse: no guidance, and the pointer is not repeated (it rode the
+        // first denial of the turn via `format_denial_full`).
+        assert!(
+            !msg.contains("catenary commands"),
+            "short form should not repeat the pointer: {msg}",
+        );
     }
 
     #[test]
@@ -3192,9 +3228,16 @@ mod tests {
         let rules = basic_rules();
         let denial = no_cd_denial("ls");
         let msg = format_denial_short("ls", &denial, &rules, None, None);
+        // No guidance → just the reason, no surface dump, no repeated pointer,
+        // no stale "see earlier message" reference to a dump that no longer runs.
+        assert!(msg.starts_with("`ls` isn't allowed"), "opening line: {msg}");
         assert!(
-            msg.contains("see earlier message"),
-            "no guidance should show fallback: {msg}",
+            !msg.contains("catenary commands"),
+            "short form should not repeat the pointer: {msg}",
+        );
+        assert!(
+            !msg.contains("see earlier"),
+            "no stale 'see earlier' reference: {msg}",
         );
     }
 
@@ -3310,18 +3353,21 @@ mod tests {
     }
 
     #[test]
-    fn format_full_denied_flags_section() {
+    fn surface_denied_flags_section() {
         let rules = rules_with_deny_flags();
-        let msg = format_denial_full("ls", &rules, &no_cd_denial("ls"), None, None);
+        let surface = format_command_surface(&rules).join("\n");
         assert!(
-            msg.contains("Denied flags:"),
-            "should have denied flags section: {msg}",
+            surface.contains("Denied flags:"),
+            "should have denied flags section: {surface}",
         );
         assert!(
-            msg.contains("cargo --manifest-path"),
-            "should list cargo --manifest-path: {msg}",
+            surface.contains("cargo --manifest-path"),
+            "should list cargo --manifest-path: {surface}",
         );
-        assert!(msg.contains("make -C"), "should list make -C: {msg}");
+        assert!(
+            surface.contains("make -C"),
+            "should list make -C: {surface}"
+        );
     }
 
     #[test]
@@ -3661,6 +3707,7 @@ mod tests {
             "catenary roots add /tmp/p",
             "catenary roots ls",
             "catenary primer",
+            "catenary commands",
         ] {
             assert_eq!(
                 analyze_catenary_command(cmd),
@@ -3668,6 +3715,19 @@ mod tests {
                 "{cmd} should be a bare allow",
             );
         }
+    }
+
+    #[test]
+    fn matcher_denies_commands_pipe_and_chain() {
+        // `catenary commands` is lifecycle/bare-only and owns its output.
+        assert!(
+            matches!(
+                analyze_catenary_command("catenary commands | grep git"),
+                CatenaryAction::Deny(_),
+            ),
+            "piping `catenary commands` should deny",
+        );
+        assert!(deny_text("cd src && catenary commands").contains("its own"));
     }
 
     #[test]

@@ -739,7 +739,12 @@ fn resolve_client_build_hint(
 /// Returns `(root_path, ProjectConfig)` if found. Errors are silently
 /// ignored — a broken project config should not prevent the command
 /// filter from running with the user config.
-fn find_project_config(cwd: &std::path::Path) -> Option<(PathBuf, crate::config::ProjectConfig)> {
+///
+/// Shared with `catenary commands` (`cli::commands::run_commands`) so its
+/// per-cwd build resolution matches this client-side denial path exactly.
+pub(crate) fn find_project_config(
+    cwd: &std::path::Path,
+) -> Option<(PathBuf, crate::config::ProjectConfig)> {
     let home = dirs::home_dir();
     let mut dir = Some(cwd);
     while let Some(d) = dir {

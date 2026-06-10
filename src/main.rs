@@ -190,6 +190,11 @@ enum Command {
     /// Output a recommended annotated config template.
     Config,
 
+    /// Print the allowed-command surface (allow / pipeline / denied) the
+    /// command filter enforces. Invoke via the host's shell tool to see which
+    /// shell commands Catenary permits; the denial message points here.
+    Commands,
+
     /// Check language server health. Tests all configured servers by default.
     /// Pass a server name for verbose single-server diagnostics.
     Doctor {
@@ -594,6 +599,10 @@ fn main() -> Result<()> {
             cli::config_template::print_template(&mut out);
             Ok(())
         }
+        Some(Command::Commands) => {
+            let mut out = cli::Output::stdout(false);
+            cli::commands::run_commands(&mut out)
+        }
         Some(Command::Doctor {
             server,
             root,
@@ -905,7 +914,7 @@ fn run_primer(out: &mut cli::Output) {
     use clap::CommandFactory;
     let _ = out.writeln(format_args!("{PRIMER_PREAMBLE}"));
     let app = Args::command();
-    let agent_commands = ["grep", "glob", "sed", "diagnostics", "roots"];
+    let agent_commands = ["grep", "glob", "sed", "diagnostics", "roots", "commands"];
     for name in agent_commands {
         let Some(sub) = app.find_subcommand(name) else {
             continue;
@@ -2378,6 +2387,7 @@ mod tests {
             "catenary sed",
             "catenary diagnostics",
             "catenary roots",
+            "catenary commands",
             "--count",
             "--page",
         ] {

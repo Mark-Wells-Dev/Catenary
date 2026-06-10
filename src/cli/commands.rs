@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
-//! CLI subcommands: query and ls-roots.
+//! CLI subcommands: query, ls-roots, and commands.
 
 use anyhow::{Context, Result};
 use chrono::{Local, Utc};
@@ -70,6 +70,94 @@ pub async fn run_ls_roots(out: &mut Output) -> Result<()> {
         ));
     }
 
+    Ok(())
+}
+
+/// Render the `catenary commands` output lines for a resolved command set and
+/// the build tool(s) resolved for the current directory.
+///
+/// Mirrors the states the `PreToolUse` hook distinguishes: a deliberate
+/// opt-out (`client_enforcement_only`), an active allowlist (the cwd build
+/// tool plus the surface sections), or no `[commands]` section at all. Pure —
+/// the IO (config load + cwd build resolution) lives in [`run_commands`] — so
+/// the branching is unit-testable. `build_tools` is the already-resolved set
+/// for the cwd (empty when none applies).
+fn render_command_lines(
+    resolved: Option<&crate::config::ResolvedCommands>,
+    build_tools: &[String],
+) -> Vec<String> {
+    match resolved {
+        Some(r) if r.client_enforcement_only => vec![
+            "Catenary command enforcement is disabled (client_enforcement_only); the \
+             host CLI's own permissions apply."
+                .to_string(),
+        ],
+        Some(r) if r.is_active() => {
+            let mut lines = Vec::new();
+            // Lead with the build tool: an agent running `catenary commands`
+            // eagerly learns the cwd's build tool here rather than only on a
+            // build-command denial.
+            if !build_tools.is_empty() {
+                lines.push(format!("Build tool: {}", build_tools.join(", ")));
+            }
+            lines.extend(crate::cli::command_filter::format_command_surface(r));
+            if lines.is_empty() {
+                vec!["No build tool, allow, pipeline, or deny rules are configured.".to_string()]
+            } else {
+                lines
+            }
+        }
+        Some(_) | None => vec![
+            "No [commands] section is configured — Catenary does not filter shell commands."
+                .to_string(),
+        ],
+    }
+}
+
+/// Print the active allowed-command surface for the current configuration.
+///
+/// Loads the user-level command-filter config — the same `[commands]` surface
+/// the `PreToolUse` hook enforces — merges the nearest `.catenary.toml`'s
+/// per-root build tool for the current directory (reusing the same
+/// [`find_project_config`](crate::cli::hooks::find_project_config) walk as the
+/// client-side denial path, so the build tool shown here matches the denial
+/// hint), and prints the cwd build tool plus the allow / pipeline / denied
+/// sections. Stateless: no daemon connection, matching `catenary doctor`'s
+/// command-filter check. Denial messages point the agent here so the full
+/// surface lives in one place instead of being dumped inline on every first
+/// denial.
+///
+/// # Errors
+///
+/// Returns an error if the configuration cannot be loaded or parsed.
+pub fn run_commands(out: &mut Output) -> Result<()> {
+    let config = crate::config::Config::load().context("load Catenary configuration")?;
+    let cwd = std::env::current_dir().ok();
+
+    // Resolve the cwd's effective build tool the way the client-side hook does:
+    // user config + the nearest `.catenary.toml`'s per-root `build`.
+    let resolved = config.resolved_commands.map(|mut r| {
+        if let Some(ref cwd_path) = cwd
+            && let Some((root, pc)) = crate::cli::hooks::find_project_config(cwd_path)
+        {
+            let mut project_commands = std::collections::HashMap::new();
+            if let Some(cmds) = pc.commands {
+                project_commands.insert(root.clone(), cmds);
+            }
+            r = r.merge_project_commands(std::slice::from_ref(&root), &project_commands);
+        }
+        r
+    });
+
+    let build_tools: Vec<String> = resolved
+        .as_ref()
+        .filter(|r| r.is_active())
+        .map(|r| r.build_for_cwd(cwd.as_deref()).to_vec())
+        .unwrap_or_default();
+
+    for line in render_command_lines(resolved.as_ref(), &build_tools) {
+        let _ = out.writeln(format_args!("{line}"));
+    }
     Ok(())
 }
 
@@ -358,6 +446,122 @@ fn clip(s: &str, max: usize) -> String {
 )]
 mod tests {
     use super::*;
+
+    // ── render_command_lines tests ───────────────────────────────────
+
+    #[test]
+    fn commands_active_lists_surface() {
+        let resolved = crate::config::ResolvedCommands {
+            allow: std::collections::HashSet::from(["git".into(), "make".into()]),
+            pipeline: std::collections::HashSet::from(["grep".into()]),
+            ..crate::config::ResolvedCommands::default()
+        };
+        let joined = render_command_lines(Some(&resolved), &[]).join("\n");
+        assert!(joined.contains("Allowed: git, make"), "{joined}");
+        assert!(
+            joined.contains("Allowed in pipelines (not first): grep"),
+            "{joined}",
+        );
+        // No build tool resolved for the cwd → no build line.
+        assert!(!joined.contains("Build tool:"), "{joined}");
+    }
+
+    #[test]
+    fn commands_active_leads_with_build_tool() {
+        let resolved = crate::config::ResolvedCommands {
+            allow: std::collections::HashSet::from(["git".into()]),
+            ..crate::config::ResolvedCommands::default()
+        };
+        let lines = render_command_lines(Some(&resolved), &["make".to_string()]);
+        assert_eq!(lines.first().map(String::as_str), Some("Build tool: make"));
+        assert!(
+            lines.iter().any(|l| l.contains("Allowed: git")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn commands_client_enforcement_only() {
+        let resolved = crate::config::ResolvedCommands {
+            client_enforcement_only: true,
+            ..crate::config::ResolvedCommands::default()
+        };
+        let lines = render_command_lines(Some(&resolved), &[]);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("client_enforcement_only"), "{lines:?}");
+    }
+
+    #[test]
+    fn commands_absent_section() {
+        let lines = render_command_lines(None, &[]);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("No [commands] section"), "{lines:?}");
+    }
+
+    #[test]
+    fn commands_build_only_shows_build_line() {
+        // Active via a build tool, no allow / pipeline / deny rules: the build
+        // line is all there is to show.
+        let resolved = crate::config::ResolvedCommands {
+            default_build: vec!["make".into()],
+            ..crate::config::ResolvedCommands::default()
+        };
+        assert!(resolved.is_active());
+        let lines = render_command_lines(Some(&resolved), &["make".to_string()]);
+        assert_eq!(lines, vec!["Build tool: make".to_string()]);
+    }
+
+    #[test]
+    fn commands_active_but_nothing_to_show() {
+        // Defensive: active (per-root build map populated) yet no surface and no
+        // cwd build resolved → a single explanatory line, never empty output.
+        let resolved = crate::config::ResolvedCommands {
+            build: std::collections::HashMap::from([(
+                std::path::PathBuf::from("/elsewhere"),
+                vec!["make".into()],
+            )]),
+            ..crate::config::ResolvedCommands::default()
+        };
+        assert!(resolved.is_active());
+        let lines = render_command_lines(Some(&resolved), &[]);
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].contains("No build tool, allow, pipeline, or deny rules"),
+            "{lines:?}",
+        );
+    }
+
+    #[test]
+    fn project_build_override_resolves_for_cwd() {
+        // Mirrors `run_commands`' resolution: the nearest `.catenary.toml`'s
+        // build overrides the user default for a cwd inside that root.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join(".catenary.toml"),
+            "[commands]\nbuild = \"ninja\"\n",
+        )
+        .expect("write project config");
+
+        let user = crate::config::ResolvedCommands {
+            allow: std::collections::HashSet::from(["git".into()]),
+            default_build: vec!["make".into()],
+            ..crate::config::ResolvedCommands::default()
+        };
+
+        let (root, pc) =
+            crate::cli::hooks::find_project_config(dir.path()).expect("project config found");
+        let mut project_commands = std::collections::HashMap::new();
+        if let Some(cmds) = pc.commands {
+            project_commands.insert(root.clone(), cmds);
+        }
+        let merged = user.merge_project_commands(std::slice::from_ref(&root), &project_commands);
+
+        assert_eq!(
+            merged.build_for_cwd(Some(dir.path())),
+            ["ninja".to_string()],
+            "project build should override the user default for the cwd",
+        );
+    }
 
     // ── parse_since tests ────────────────────────────────────────────
 

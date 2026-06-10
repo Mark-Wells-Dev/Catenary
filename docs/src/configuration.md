@@ -563,8 +563,11 @@ If it starts with `#!`, the interpreter name is matched:
 
 The `[commands]` section defines which shell commands an agent may run.
 Allowlist-based: only explicitly permitted commands can execute.
-Everything else is denied with a dump of the allowed configuration so
-the agent knows its surface area.
+Everything else is denied. The denial names the blocked command, shows the
+cwd's build tool when the command is build-related, and points the agent at
+[`catenary commands`](#inspecting-the-surface) — which prints the active
+allow / pipeline / denied surface — so the full configuration lives in one
+place instead of being dumped inline on every denial.
 
 ### Three states
 
@@ -614,6 +617,18 @@ path. Route sweeping edits through `catenary sed` instead.
 | `deny_flags.<cmd>` | Flag denylist within an allowed command. `make` is allowed, but `make -C` is denied. |
 | `allow_file_redirects` | Permit `>`/`>>`/`2>file` redirects (default `false`). A redirected write bypasses the tracked Edit/Write path, so the diagnostics batch can be incomplete. fd-dups (`2>&1`, `>&2`) and device sinks (`/dev/null`, …) are always allowed regardless. |
 | `guidance.<group>` | Optional per-command hint shown on denial — a `message`, or a `redirect` naming the Catenary command to use instead (`grep` → `catenary grep`, `glob` → `catenary glob`). |
+
+### Inspecting the surface
+
+`catenary commands` prints the active command surface for the current
+configuration — the cwd's build tool, then the allow / pipeline / denied
+sections, the same `[commands]` rules the `PreToolUse` hook enforces. Run it
+(via the host's shell tool) to see what's permitted; denial messages point
+here rather than dumping the whole surface inline. The build tool is resolved
+for the current directory the same way the denial hint is — the nearest
+`.catenary.toml`'s per-root `build`, falling back to the user default — so an
+agent that runs `catenary commands` eagerly learns its build tool up front.
+It is a stateless read, so it runs even while the command filter is active.
 
 ### Project-scoped commands
 
