@@ -141,6 +141,14 @@ struct Args {
     #[arg(long)]
     flycheck_ticks: Option<u64>,
 
+    /// Run the flycheck subprocess WITHOUT a `$/progress` Begin/End bracket
+    /// (bug 28). The child burns CPU while the server lifecycle stays `Healthy`,
+    /// so the settle's failure budget accrues on the child's (tree-summed) CPU
+    /// — reproducing a settle that bails (`BudgetExhausted`) on legitimate
+    /// flycheck work that has no open progress bracket.
+    #[arg(long)]
+    flycheck_no_progress: bool,
+
     /// Scan workspace roots on initialize and workspace folder changes.
     /// Indexes all text files into `documents`, making them visible to
     /// `workspace/symbol` without a prior `didOpen`.
@@ -1800,6 +1808,7 @@ impl MockServer {
         let no_diagnostics = self.args.no_push_diagnostics;
         let publish_version = self.args.publish_version;
         let flycheck_ticks = self.args.flycheck_ticks;
+        let no_progress = self.args.flycheck_no_progress;
         let line_count = self.documents.get(uri).map_or(0, |c| c.lines().count());
         let open_count = if self.args.report_open_count {
             Some(self.documents.len())
@@ -1815,32 +1824,34 @@ impl MockServer {
         std::thread::spawn(move || {
             let token = "mockls-flycheck";
 
-            // Create progress token
-            let req_id = next_id.fetch_add(1, Ordering::SeqCst);
-            send_message(
-                &writer,
-                &serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "method": "window/workDoneProgress/create",
-                    "params": { "token": token }
-                }),
-            );
+            if !no_progress {
+                // Create progress token
+                let req_id = next_id.fetch_add(1, Ordering::SeqCst);
+                send_message(
+                    &writer,
+                    &serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "method": "window/workDoneProgress/create",
+                        "params": { "token": token }
+                    }),
+                );
 
-            std::thread::sleep(Duration::from_millis(50));
+                std::thread::sleep(Duration::from_millis(50));
 
-            // Progress Begin
-            send_message(
-                &writer,
-                &serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "method": "$/progress",
-                    "params": {
-                        "token": token,
-                        "value": { "kind": "begin", "title": "Flycheck", "percentage": 0 }
-                    }
-                }),
-            );
+                // Progress Begin
+                send_message(
+                    &writer,
+                    &serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "method": "$/progress",
+                        "params": {
+                            "token": token,
+                            "value": { "kind": "begin", "title": "Flycheck", "percentage": 0 }
+                        }
+                    }),
+                );
+            }
 
             // Spawn the flycheck subprocess and wait for it to exit.
             // This is where mockls goes to Sleeping while mockc burns CPU.
@@ -1863,18 +1874,20 @@ impl MockServer {
 
             std::thread::sleep(Duration::from_millis(50));
 
-            // Progress End
-            send_message(
-                &writer,
-                &serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "method": "$/progress",
-                    "params": {
-                        "token": token,
-                        "value": { "kind": "end", "message": "Flycheck complete" }
-                    }
-                }),
-            );
+            if !no_progress {
+                // Progress End
+                send_message(
+                    &writer,
+                    &serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "method": "$/progress",
+                        "params": {
+                            "token": token,
+                            "value": { "kind": "end", "message": "Flycheck complete" }
+                        }
+                    }),
+                );
+            }
         });
     }
 
@@ -2393,6 +2406,7 @@ mod tests {
             cpu_on_initialized: None,
             log_init_params: None,
             flycheck_ticks: None,
+            flycheck_no_progress: false,
             scan_roots: false,
             no_code_actions: false,
             no_rename: false,

@@ -33,9 +33,6 @@ use super::state::ServerLifecycle;
 /// Polling interval for tree walks (validated by profiling).
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// Budget: 60 seconds of server CPU time in centiseconds (100 Hz).
-const CPUTIME_BUDGET: u64 = 6000;
-
 // ── IdleDetector ─────────────────────────────────────────────────────
 
 /// Outcome of the idle detection operation.
@@ -43,8 +40,6 @@ const CPUTIME_BUDGET: u64 = 6000;
 pub enum SettleResult {
     /// Server settled — all processes quiet.
     Settled,
-    /// Budget exhausted — server consumed 60s of CPU time.
-    BudgetExhausted,
     /// Root process died.
     RootDied,
 }
@@ -177,23 +172,26 @@ impl IdleDetector {
 
 /// Waits for the server to go idle using the provided detector.
 ///
-/// Runs a 50ms polling loop, handles budget tracking, root death detection,
-/// `Busy(n)` lifecycle pausing, and cancellation. Delegates idle detection
-/// to [`IdleDetector::check`].
+/// Runs a 50ms polling loop, skipping the tree walk while the server is
+/// `Busy(n)` (an open `$/progress` bracket — explained work), and delegating
+/// idle detection to [`IdleDetector::check`].
 ///
-/// Returns when the server is idle, the cputime budget is exhausted,
-/// the root process dies, or the cancel token fires.
-#[allow(
-    clippy::similar_names,
-    reason = "delta_utime/delta_stime are standard counter names"
-)]
+/// There is deliberately **no CPU-time cap**: the detector watches the whole
+/// subtree, so a flycheck burning CPU in `cargo`/`rustc` children keeps the
+/// settle open until that work finishes — which is the point. The only bounds
+/// are a quiet tree (settled), root death, and the cancel token. The caller
+/// owns liveness: the diagnostics batch runs under cancel-on-disconnect, so a
+/// genuinely-wedged server is torn down when the client gives up (bug 24).
+/// A tree-summed CPU budget here used to bail on the legitimate parallel
+/// flycheck and report `[clean]` (bug 28).
+///
+/// Returns when the server is idle, the root process dies, or the cancel
+/// token fires.
 pub async fn await_idle(
     server: &Arc<LspServer>,
     mut detector: IdleDetector,
     cancel: CancellationToken,
 ) -> SettleResult {
-    let mut cumulative_cputime: u64 = 0;
-
     loop {
         tokio::select! {
             () = tokio::time::sleep(POLL_INTERVAL) => {}
@@ -226,42 +224,13 @@ pub async fn await_idle(
             return result;
         }
 
-        // Budget tracking
-        cumulative_cputime += interval_cost(&snapshot);
-        if cumulative_cputime >= CPUTIME_BUDGET {
-            debug!("idle_detector: budget exhausted ({cumulative_cputime} centiseconds)");
-            return SettleResult::BudgetExhausted;
-        }
-
-        // Idle check
+        // Idle check — the whole subtree must be quiet (children/grandchildren
+        // included), so a busy flycheck child holds the settle open.
         if detector.check(&snapshot) {
             debug!("idle_detector: server idle");
             return SettleResult::Settled;
         }
     }
-}
-
-/// Computes the CPU-time cost of a single polling interval.
-///
-/// Each process contributes `delta_utime + delta_stime` centiseconds.
-/// Processes with zero CPU time but nonzero page faults are charged a
-/// minimum of 1 centisecond (they were scheduled but didn't accumulate
-/// a full tick).
-#[allow(
-    clippy::similar_names,
-    reason = "delta_utime/delta_stime are standard counter names"
-)]
-fn interval_cost(snapshot: &catenary_proc::TreeSnapshot) -> u64 {
-    let mut cost: u64 = 0;
-    for ts in &snapshot.samples {
-        let cputime = ts.delta_utime + ts.delta_stime;
-        cost += if cputime == 0 && ts.delta_pfc > 0 {
-            1
-        } else {
-            cputime
-        };
-    }
-    cost
 }
 
 /// Pure root-death detection logic — determines whether the root process
@@ -583,77 +552,6 @@ mod tests {
         // Now quiet — idle
         let quiet = make_snapshot(vec![quiet_sample(100)]);
         assert!(detector.check(&quiet));
-    }
-
-    // ── interval_cost unit tests ──────────────────────────────────────
-
-    #[test]
-    fn interval_cost_sums_cputime() {
-        let snapshot = make_snapshot(vec![
-            TreeSample {
-                pid: 1,
-                ppid: 0,
-                delta_utime: 10,
-                delta_stime: 3,
-                delta_pfc: 0,
-                state: ProcessState::Running,
-            },
-            TreeSample {
-                pid: 2,
-                ppid: 1,
-                delta_utime: 5,
-                delta_stime: 2,
-                delta_pfc: 0,
-                state: ProcessState::Running,
-            },
-        ]);
-        assert_eq!(interval_cost(&snapshot), 20);
-    }
-
-    #[test]
-    fn interval_cost_pfc_only_charges_minimum() {
-        let snapshot = make_snapshot(vec![TreeSample {
-            pid: 1,
-            ppid: 0,
-            delta_utime: 0,
-            delta_stime: 0,
-            delta_pfc: 50,
-            state: ProcessState::Running,
-        }]);
-        assert_eq!(interval_cost(&snapshot), 1);
-    }
-
-    #[test]
-    fn interval_cost_zero_activity() {
-        let snapshot = make_snapshot(vec![quiet_sample(1)]);
-        assert_eq!(interval_cost(&snapshot), 0);
-    }
-
-    #[test]
-    fn interval_cost_mixed_processes() {
-        let snapshot = make_snapshot(vec![
-            // CPU active: contributes 7
-            TreeSample {
-                pid: 1,
-                ppid: 0,
-                delta_utime: 4,
-                delta_stime: 3,
-                delta_pfc: 100,
-                state: ProcessState::Running,
-            },
-            // PFC only: contributes 1
-            TreeSample {
-                pid: 2,
-                ppid: 1,
-                delta_utime: 0,
-                delta_stime: 0,
-                delta_pfc: 20,
-                state: ProcessState::Running,
-            },
-            // Idle: contributes 0
-            quiet_sample(3),
-        ]);
-        assert_eq!(interval_cost(&snapshot), 8);
     }
 
     // ── root_state unit tests ─────────────────────────────────────────

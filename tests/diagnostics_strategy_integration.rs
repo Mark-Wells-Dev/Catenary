@@ -339,6 +339,48 @@ fn test_diagnostics_flycheck_multi_round() -> Result<()> {
     Ok(())
 }
 
+/// Bug 28: the settle must hold while a flycheck child burns CPU **without** an
+/// open `$/progress` bracket, then report the diagnostic the child publishes.
+///
+/// mockls runs the flycheck subprocess (mockc) with `--flycheck-no-progress`, so
+/// the lifecycle stays `Healthy` for the child's whole run. The idle detector
+/// watches the full subtree, so cargo/rustc-style child CPU keeps it from
+/// settling until the child exits and publishes. This regressed when the settle
+/// grew a tree-summed CPU budget that bailed (`BudgetExhausted`, treated as a
+/// successful settle) on exactly this legitimate child CPU and returned
+/// `[clean]`; failure detection no longer bounds the settle on tree CPU.
+#[test]
+fn test_diagnostics_settle_holds_through_unbracketed_child_flycheck() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
+    std::fs::write(&file, "echo hello\n")?;
+
+    let mockc_bin = env!("CARGO_BIN_EXE_mockc");
+    let mut bridge = spawn_mockls(
+        &[
+            "--advertise-save",
+            "--diagnostics-on-save",
+            "--flycheck-command",
+            mockc_bin,
+            "--flycheck-no-progress",
+            "--flycheck-ticks",
+            "120",
+        ],
+        dir.path().to_str().context("path")?,
+    )?;
+    bridge.initialize()?;
+
+    let text = bridge.call_diagnostics(file.to_str().context("path")?)?;
+
+    assert!(
+        text.contains("mock diagnostic"),
+        "settle must hold while the flycheck child burns CPU and report its \
+         diagnostic, not settle over the busy child and return [clean]. Got: {text}"
+    );
+
+    Ok(())
+}
+
 /// mockls with `--progress-on-change --no-push-diagnostics`: server sends
 /// progress tokens but never publishes diagnostics. After settle, the push
 /// cache is empty and pull is not supported → `[clean]`.
