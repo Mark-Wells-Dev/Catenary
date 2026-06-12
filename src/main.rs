@@ -409,6 +409,11 @@ enum InstallHost {
         /// Source: local path (dev install) or repo identifier (release install).
         source: Option<String>,
     },
+    /// Install the Catenary plugin for OpenCode.
+    Opencode {
+        /// Source: local path (dev install) or repo identifier (release install).
+        source: Option<String>,
+    },
 }
 
 /// Entry point for the Catenary binary.
@@ -640,6 +645,9 @@ fn main() -> Result<()> {
                 }
                 Some(InstallHost::Antigravity { source }) => {
                     cli::install::run_install_antigravity(&mut out, source.as_deref(), dry_run)
+                }
+                Some(InstallHost::Opencode { source }) => {
+                    cli::install::run_install_opencode(&mut out, source.as_deref(), dry_run)
                 }
             }
         }

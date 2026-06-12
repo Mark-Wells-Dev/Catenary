@@ -125,6 +125,11 @@ fn format_deny(reason: &str, format: HostFormat) -> String {
             "reason": reason
         })
         .to_string(),
+        HostFormat::Opencode => serde_json::json!({
+            "decision": "deny",
+            "reason": reason
+        })
+        .to_string(),
     }
 }
 
@@ -146,6 +151,11 @@ fn format_stop_block(reason: &str, format: HostFormat) -> String {
             "reason": reason
         })
         .to_string(),
+        HostFormat::Opencode => serde_json::json!({
+            "decision": "block",
+            "reason": reason
+        })
+        .to_string(),
     }
 }
 
@@ -156,6 +166,7 @@ fn extract_session_id(hook_json: &serde_json::Value, format: HostFormat) -> Opti
     match format {
         HostFormat::Claude | HostFormat::Gemini => hook_json.get("session_id"),
         HostFormat::Antigravity => hook_json.get("conversationId"),
+        HostFormat::Opencode => hook_json.get("session_id"),
     }
     .and_then(|v| v.as_str())
 }
@@ -171,6 +182,7 @@ fn extract_cwd_str(hook_json: &serde_json::Value, format: HostFormat) -> Option<
             .and_then(|v| v.as_array())
             .and_then(|a| a.first())
             .and_then(|v| v.as_str()),
+        HostFormat::Opencode => hook_json.get("cwd").and_then(|v| v.as_str()),
     }
 }
 
@@ -186,6 +198,7 @@ fn extract_tool_name(hook_json: &serde_json::Value, format: HostFormat) -> &str 
             .get("toolCall")
             .and_then(|tc| tc.get("name"))
             .and_then(|v| v.as_str()),
+        HostFormat::Opencode => hook_json.get("tool_name").and_then(|v| v.as_str()),
     }
     .unwrap_or("")
 }
@@ -211,6 +224,10 @@ fn extract_file_path(hook_json: &serde_json::Value, format: HostFormat) -> Optio
             .get("toolCall")
             .and_then(|tc| tc.get("args"))
             .and_then(|a| a.get("TargetFile"))
+            .and_then(|fp| fp.as_str()),
+        HostFormat::Opencode => hook_json
+            .get("tool_input")
+            .and_then(|ti| ti.get("file_path").or_else(|| ti.get("filePath")).or_else(|| ti.get("path")))
             .and_then(|fp| fp.as_str()),
     }?;
 
@@ -402,7 +419,7 @@ fn emit_system_message(builder: crate::hook::response::SystemMessageBuilder, for
 /// Format a `systemMessage` for hook responses.
 fn format_system_message(msg: &str, format: HostFormat) -> String {
     match format {
-        HostFormat::Claude | HostFormat::Gemini | HostFormat::Antigravity => {
+        HostFormat::Claude | HostFormat::Gemini | HostFormat::Antigravity | HostFormat::Opencode => {
             serde_json::json!({ "systemMessage": msg }).to_string()
         }
     }
@@ -806,6 +823,7 @@ fn extract_shell_command(
         HostFormat::Claude => tool_name == "Bash",
         HostFormat::Gemini => tool_name == "run_shell_command",
         HostFormat::Antigravity => tool_name == "run_command",
+        HostFormat::Opencode => tool_name == "bash",
     };
     if !is_shell_tool {
         return None;
@@ -1604,5 +1622,115 @@ mod tests {
             }
         });
         assert!(extract_shell_command(&json, "write_to_file", HostFormat::Antigravity).is_none(),);
+    }
+
+    // ── OpenCode format tests ────────────────────────────────────────
+
+    #[test]
+    fn extract_session_id_opencode() {
+        let json = serde_json::json!({
+            "session_id": "opencode-session-123",
+            "cwd": "/project"
+        });
+        assert_eq!(
+            extract_session_id(&json, HostFormat::Opencode),
+            Some("opencode-session-123"),
+        );
+    }
+
+    #[test]
+    fn extract_cwd_str_opencode() {
+        let json = serde_json::json!({
+            "cwd": "/workspace/myproject"
+        });
+        assert_eq!(
+            extract_cwd_str(&json, HostFormat::Opencode),
+            Some("/workspace/myproject"),
+        );
+    }
+
+    #[test]
+    fn extract_tool_name_opencode() {
+        let json = serde_json::json!({
+            "tool_name": "Edit"
+        });
+        assert_eq!(extract_tool_name(&json, HostFormat::Opencode), "Edit",);
+    }
+
+    #[test]
+    fn extract_file_path_opencode() {
+        let json = serde_json::json!({
+            "tool_name": "Edit",
+            "tool_input": { "file_path": "/project/src/main.rs" }
+        });
+        assert_eq!(
+            extract_file_path(&json, HostFormat::Opencode),
+            Some("/project/src/main.rs".to_string()),
+        );
+    }
+
+    #[test]
+    fn extract_file_path_opencode_path_field() {
+        let json = serde_json::json!({
+            "tool_name": "Write",
+            "tool_input": { "path": "/project/newfile.ts" }
+        });
+        assert_eq!(
+            extract_file_path(&json, HostFormat::Opencode),
+            Some("/project/newfile.ts".to_string()),
+        );
+    }
+
+    #[test]
+    fn extract_shell_command_opencode_bash() {
+        let json = serde_json::json!({
+            "tool_name": "bash",
+            "tool_input": { "command": "cargo build" }
+        });
+        assert_eq!(
+            extract_shell_command(&json, "bash", HostFormat::Opencode),
+            Some("cargo build".to_string()),
+        );
+    }
+
+    #[test]
+    fn extract_shell_command_opencode_non_shell_returns_none() {
+        let json = serde_json::json!({
+            "tool_name": "Edit",
+            "tool_input": { "file_path": "/src/main.rs" }
+        });
+        assert!(extract_shell_command(&json, "Edit", HostFormat::Opencode).is_none(),);
+    }
+
+    #[test]
+    fn format_deny_opencode_structure() {
+        let output = format_deny("call editing start first", HostFormat::Opencode);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).expect("should produce valid JSON");
+        assert_eq!(parsed["decision"], "deny");
+        assert_eq!(parsed["reason"], "call editing start first");
+    }
+
+    #[test]
+    fn format_stop_block_opencode_structure() {
+        let output = format_stop_block("files still in editing state", HostFormat::Opencode);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).expect("should produce valid JSON");
+        assert_eq!(parsed["decision"], "block");
+        assert_eq!(parsed["reason"], "files still in editing state");
+    }
+
+    #[test]
+    fn format_system_message_opencode() {
+        let output = format_system_message(
+            "─── background ───\n[warn] ra offline",
+            HostFormat::Opencode,
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).expect("should produce valid JSON");
+        assert_eq!(
+            parsed["systemMessage"].as_str(),
+            Some("─── background ───\n[warn] ra offline"),
+        );
     }
 }

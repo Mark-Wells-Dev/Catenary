@@ -27,6 +27,8 @@ pub enum HostFormat {
     Gemini,
     /// Antigravity CLI hooks (`PreToolUse` / `Stop`).
     Antigravity,
+    /// OpenCode plugin hooks (`tool.execute.before` / `tool.execute.after`).
+    Opencode,
 }
 
 impl HostFormat {
@@ -40,6 +42,7 @@ impl HostFormat {
             Self::Claude => "claude",
             Self::Gemini => "gemini",
             Self::Antigravity => "antigravity",
+            Self::Opencode => "opencode",
         }
     }
 
@@ -49,6 +52,7 @@ impl HostFormat {
         match self {
             Self::Claude => "Read",
             Self::Gemini | Self::Antigravity => "read_file",
+            Self::Opencode => "Read",
         }
     }
 
@@ -59,6 +63,7 @@ impl HostFormat {
             Self::Claude => "Edit",
             Self::Gemini => "write_file",
             Self::Antigravity => "write_to_file",
+            Self::Opencode => "Edit",
         }
     }
 }
@@ -393,6 +398,7 @@ mod tests {
         assert_eq!(HostFormat::Claude.edit_tool(), "Edit");
         assert_eq!(HostFormat::Gemini.edit_tool(), "write_file");
         assert_eq!(HostFormat::Antigravity.edit_tool(), "write_to_file");
+        assert_eq!(HostFormat::Opencode.edit_tool(), "Edit");
     }
 
     #[test]
@@ -400,6 +406,7 @@ mod tests {
         assert_eq!(HostFormat::Claude.read_tool(), "Read");
         assert_eq!(HostFormat::Gemini.read_tool(), "read_file");
         assert_eq!(HostFormat::Antigravity.read_tool(), "read_file");
+        assert_eq!(HostFormat::Opencode.read_tool(), "Read");
     }
 
     #[test]

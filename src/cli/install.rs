@@ -703,6 +703,126 @@ fn gemini_current_install() -> Option<(String, Option<String>)> {
     Some((install_type, source))
 }
 
+// ── OpenCode plugin install ────────────────────────────────────────
+
+/// Embedded OpenCode plugin file.
+const OC_PLUGIN: &str = include_str!("../../plugins/catenary-opencode/catenary.mjs");
+
+/// OpenCode plugin file set for installation.
+const OC_FILES: &[(&str, &str)] = &[("catenary.mjs", OC_PLUGIN)];
+
+/// Run `catenary install opencode`.
+///
+/// Installs the Catenary OpenCode plugin to `~/.config/opencode/plugin/catenary.mjs`.
+pub fn run_install_opencode(
+    out: &mut Output,
+    source: Option<&str>,
+    dry_run: bool,
+) -> Result<()> {
+    let _ = out.writeln(format_args!("OpenCode plugin:"));
+
+    let parsed_source = source.map(parse_source);
+
+    let home = dirs::home_dir().context("cannot determine home directory")?;
+    let target_dir = home.join(".config/opencode/plugin");
+
+    match parsed_source {
+        Some(InstallSource::Local(path)) => {
+            install_opencode_local(out, &path, &target_dir, dry_run)?;
+        }
+        Some(InstallSource::Remote(_)) | None => {
+            install_opencode_bundled(out, &target_dir, dry_run)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn install_opencode_local(
+    out: &mut Output,
+    source: &Path,
+    target_dir: &Path,
+    dry_run: bool,
+) -> Result<()> {
+    let plugin_file = source.join("plugins/catenary-opencode/catenary.mjs");
+    let source_file = if plugin_file.is_file() {
+        plugin_file
+    } else if source.join("catenary.mjs").is_file() {
+        source.join("catenary.mjs")
+    } else {
+        source.to_path_buf()
+    };
+
+    if dry_run {
+        let _ = out.writeln(format_args!(
+            "  {} copy {} → {}",
+            out.colors.dim("(dry-run)"),
+            source_file.display(),
+            target_dir.display(),
+        ));
+        return Ok(());
+    }
+
+    if let Some(parent) = target_dir.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create parent directory {}", parent.display()))?;
+    }
+    std::fs::create_dir_all(target_dir)
+        .with_context(|| format!("create plugin directory {}", target_dir.display()))?;
+
+    let target_file = target_dir.join("catenary.mjs");
+    std::fs::copy(&source_file, &target_file)
+        .with_context(|| format!("copy {} → {}", source_file.display(), target_file.display()))?;
+
+    let _ = out.writeln(format_args!(
+        "  {} installed → {}",
+        out.colors.green("✓"),
+        target_file.display(),
+    ));
+
+    Ok(())
+}
+
+fn install_opencode_bundled(out: &mut Output, target_dir: &Path, dry_run: bool) -> Result<()> {
+    let target_file = target_dir.join("catenary.mjs");
+
+    // Check staleness
+    let up_to_date = OC_FILES.iter().all(|(rel_path, expected)| {
+        let file_path = target_dir.join(rel_path);
+        std::fs::read_to_string(&file_path).map_or(false, |current| current == *expected)
+    });
+
+    if up_to_date && target_file.is_file() {
+        let _ = out.writeln(format_args!(
+            "  {} up to date → {}",
+            out.colors.green("✓"),
+            target_file.display(),
+        ));
+        return Ok(());
+    }
+
+    if dry_run {
+        let _ = out.writeln(format_args!(
+            "  {} write {}",
+            out.colors.dim("(dry-run)"),
+            target_file.display(),
+        ));
+        return Ok(());
+    }
+
+    std::fs::create_dir_all(target_dir)
+        .with_context(|| format!("create plugin directory {}", target_dir.display()))?;
+
+    for (rel_path, content) in OC_FILES {
+        let file_path = target_dir.join(rel_path);
+        std::fs::write(&file_path, *content)
+            .with_context(|| format!("write {}", file_path.display()))?;
+        let _ = out.writeln(format_args!("  {} wrote → {}", out.colors.green("✓"), file_path.display()));
+    }
+
+    Ok(())
+}
+
 // ── Antigravity CLI install ────────────────────────────────────────
 
 /// Embedded Antigravity plugin files.
