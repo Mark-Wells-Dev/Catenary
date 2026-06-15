@@ -46,6 +46,7 @@ pub use file_tools::GlobOutcome;
 pub use grep_server::GrepOutcome;
 pub use handler::expand_tilde;
 pub use hook_router::HookRouter;
+pub use hook_router::is_edit_tool;
 pub use path_security::PathValidator;
 
 /// Compresses a path by replacing the `$HOME` prefix with `~`.

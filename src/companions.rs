@@ -263,7 +263,7 @@ fn trace_drop(
 /// `--separate-git-dir` main worktree (its gitdir is not under `worktrees/`, so
 /// it returns `r`) — resolves correctly.
 #[must_use]
-fn canonical_project_root(r: &Path) -> PathBuf {
+pub fn canonical_project_root(r: &Path) -> PathBuf {
     let dot_git = r.join(".git");
     let Ok(meta) = std::fs::symlink_metadata(&dot_git) else {
         return r.to_path_buf(); // no `.git`
@@ -300,6 +300,27 @@ fn canonical_project_root(r: &Path) -> PathBuf {
                 .map_or_else(|| r.to_path_buf(), Path::to_path_buf)
         },
     )
+}
+
+/// Resolves a file path to the toplevel of its enclosing git worktree.
+///
+/// Walks the path's ancestors looking for a `.git` entry — a **directory**
+/// (normal checkout / main worktree) or a **file** (`gitdir:` pointer for a
+/// linked worktree). The first ancestor that has one is the worktree toplevel.
+/// Returns `None` if no ancestor carries a `.git` (the file is outside any
+/// checkout).
+///
+/// This is the worktree-root analogue of [`canonical_project_root`]: the latter
+/// maps a worktree root to its *canonical project*; this maps a *file* to the
+/// worktree root that [`canonical_project_root`] then resolves. Used by the
+/// auto-mount path to find the worktree an edited file lives in. Parsing is pure
+/// [`std::fs`] — no git crate, no subprocess — and tolerates a non-existent
+/// `.git` (the ancestor simply doesn't match).
+#[must_use]
+pub fn enclosing_worktree_root(file: &Path) -> Option<PathBuf> {
+    file.ancestors()
+        .find(|dir| std::fs::symlink_metadata(dir.join(".git")).is_ok())
+        .map(Path::to_path_buf)
 }
 
 /// Reads the `gitdir: <path>` pointer from a `.git` file.
@@ -421,8 +442,8 @@ fn expand_env(s: &str) -> String {
 )]
 mod tests {
     use super::{
-        CompanionRules, canonical_project_root, expand_companions, expand_env, expand_path_str,
-        expand_template, matcher_matches,
+        CompanionRules, canonical_project_root, enclosing_worktree_root, expand_companions,
+        expand_env, expand_path_str, expand_template, matcher_matches,
     };
     use std::collections::HashMap;
     use std::fs;
@@ -478,6 +499,45 @@ mod tests {
         .expect("write .git file");
 
         assert_eq!(canonical_project_root(&checkout), project);
+    }
+
+    // ── enclosing_worktree_root ───────────────────────────────────────────
+
+    #[test]
+    fn enclosing_worktree_root_finds_dir_dot_git() {
+        let dir = tempdir().expect("tempdir");
+        let root = canon(dir.path());
+        fs::create_dir(root.join(".git")).expect("mkdir .git");
+        let src = root.join("src");
+        fs::create_dir(&src).expect("mkdir src");
+        let file = src.join("lib.rs");
+        fs::write(&file, "").expect("write file");
+
+        assert_eq!(enclosing_worktree_root(&file), Some(root));
+    }
+
+    #[test]
+    fn enclosing_worktree_root_finds_file_dot_git() {
+        // A linked worktree's toplevel carries a `.git` *file*, not a dir.
+        let dir = tempdir().expect("tempdir");
+        let root = canon(dir.path());
+        fs::write(root.join(".git"), "gitdir: /somewhere\n").expect("write .git file");
+        let nested = root.join("a").join("b");
+        fs::create_dir_all(&nested).expect("mkdir nested");
+        let file = nested.join("mod.rs");
+        fs::write(&file, "").expect("write file");
+
+        assert_eq!(enclosing_worktree_root(&file), Some(root));
+    }
+
+    #[test]
+    fn enclosing_worktree_root_none_outside_checkout() {
+        let dir = tempdir().expect("tempdir");
+        let root = canon(dir.path());
+        let file = root.join("loose.rs");
+        fs::write(&file, "").expect("write file");
+
+        assert_eq!(enclosing_worktree_root(&file), None);
     }
 
     #[test]

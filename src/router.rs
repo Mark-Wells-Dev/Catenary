@@ -864,6 +864,10 @@ impl KeyedHandoff {
 /// Contributor keys:
 /// - `"mcp:{fd}"` — roots from MCP `roots/list` for a connection
 /// - `"hook"` — roots from `catenary add-root` CLI commands
+/// - `"agent:{session_id}:{agent_id}"` — a worktree auto-mounted for a
+///   subagent edit (workstream 30, ADR 016); refcounted per `(session_id,
+///   agent_id)`, so a worktree held only by its agent key shuts its
+///   rust-analyzer down when that key drops.
 #[cfg(unix)]
 #[derive(Clone)]
 struct RootTracker {
@@ -1660,6 +1664,55 @@ fn with_out_of_roots_note(output: String, filtered: usize) -> String {
         note
     } else {
         format!("{output}\n{note}")
+    }
+}
+
+/// Decides whether an edited file should auto-mount its enclosing git worktree.
+///
+/// Implements the subagent auto-mount predicate (workstream 30, ticket 1a): a
+/// `PreToolUse` edit landing in a worktree of a project this session already
+/// tracks should mount that worktree so it gets its own rust-analyzer. Returns
+/// the **worktree toplevel** to mount, or `None` when no mount is warranted.
+///
+/// Returns `Some(worktree)` iff all hold:
+///
+/// - the file resolves to an enclosing git worktree
+///   ([`crate::companions::enclosing_worktree_root`]);
+/// - that worktree is **not already** a tracked root (idempotent — already
+///   mounted, by any contributor);
+/// - the worktree's [`canonical_project_root`](crate::companions::canonical_project_root)
+///   **is** a tracked root and is **distinct** from the worktree itself.
+///
+/// The canonical root only *authorizes* the mount (per ADR 016 — a worktree of
+/// a project the session already works on); it is never itself returned for
+/// mounting. The distinctness check makes the main agent editing inside an
+/// already-tracked checkout a no-op: there the worktree *is* its canonical root,
+/// which is already tracked, so the "not already tracked" clause rejects it.
+///
+/// `tracked` is the current global root set; membership is compared after
+/// canonicalizing the worktree path so it lines up with the canonicalized roots
+/// the tracker stores.
+#[cfg(unix)]
+fn worktree_to_auto_mount(file_path: &Path, tracked: &HashSet<PathBuf>) -> Option<PathBuf> {
+    let worktree = crate::companions::enclosing_worktree_root(file_path)?;
+    // Canonicalize so the comparison matches the tracker's canonicalized roots
+    // (falls back to the raw path when the worktree no longer exists on disk).
+    let worktree = worktree.canonicalize().unwrap_or(worktree);
+
+    // Idempotent: already mounted (by this agent or any other contributor).
+    if tracked.contains(&worktree) {
+        return None;
+    }
+
+    let canonical = crate::companions::canonical_project_root(&worktree);
+    let canonical = canonical.canonicalize().unwrap_or(canonical);
+
+    // Authorize the mount iff the worktree's canonical project root is tracked
+    // and distinct from the worktree (a linked worktree, not the main checkout).
+    if canonical != worktree && tracked.contains(&canonical) {
+        Some(worktree)
+    } else {
+        None
     }
 }
 
@@ -2672,6 +2725,57 @@ async fn handle_hook_dispatch(
     }
 
     let router = get_or_create_router(&ctx, &session_id, &raw);
+
+    // ── Subagent worktree auto-mount (workstream 30, ticket 1a) ───
+    //
+    // A `PreToolUse` edit landing in a git worktree whose canonical project
+    // root is already tracked, but the worktree itself is not, auto-mounts the
+    // *worktree* (not the canonical root — that would collapse every worktree
+    // onto one rust-analyzer). Routing keys on `Scope::Root(worktree)`, so each
+    // worktree gets its own server. Contributed under `agent:{sid}:{aid}` (ADR
+    // 016) — a per-`(session_id, agent_id)` namespace beside `mcp:{fd}`/`hook`.
+    // Runs before `dispatch` so the worktree is a root when accumulation's
+    // `has_lsp_coverage` gate evaluates the same edit. Mirrors the `roots-add`
+    // mount: `set_roots` then sync the union (`ctx.primary.sync_roots`).
+    if method == "pre-tool/editing-state"
+        && let Some(ref tracker) = ctx.root_tracker
+        && let Some(tool_name) = raw.get("tool_name").and_then(|v| v.as_str())
+        && crate::bridge::is_edit_tool(tool_name)
+        && let Some(file_path) = raw.get("file_path").and_then(|v| v.as_str())
+    {
+        let roots: HashSet<PathBuf> = tracker.global_roots().into_iter().collect();
+        if let Some(worktree) = worktree_to_auto_mount(Path::new(file_path), &roots) {
+            let agent_id = raw
+                .get("agent_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let contributor = format!("agent:{session_id}:{agent_id}");
+            tracker.set_roots(&contributor, vec![worktree.clone()]);
+            let global = tracker.global_roots();
+            if let Err(e) = ctx.primary.sync_roots(global).await {
+                debug!(
+                    source = Source::DaemonDispatch.as_str(),
+                    "root sync after worktree auto-mount failed: {e}",
+                );
+            }
+            debug!(
+                source = Source::DaemonDispatch.as_str(),
+                session_id = %session_id,
+                agent_id = %agent_id,
+                worktree = %worktree.display(),
+                contributor = %contributor,
+                "auto-mounted worktree root for subagent edit",
+            );
+        } else {
+            debug!(
+                source = Source::DaemonDispatch.as_str(),
+                session_id = %session_id,
+                file = file_path,
+                "worktree auto-mount skipped (not in a worktree of a tracked project, or already tracked)",
+            );
+        }
+    }
 
     // Span with session_id so warn!/error! events emitted during
     // hook dispatch route to the correct notification queue.
@@ -5347,6 +5451,167 @@ mod tests {
             out,
             vec![foo, foo_internal],
             "declared root plus its derived companion",
+        );
+    }
+
+    // ── Subagent worktree auto-mount (workstream 30, ticket 1a) ──────────
+    //
+    // These exercise `worktree_to_auto_mount` — the pure predicate that decides
+    // whether an edited file's enclosing worktree should mount — and the
+    // `agent:{sid}:{aid}` `RootTracker` wiring the dispatch layer drives on top
+    // of it. Mirrors `companions::canonical_project_root_linked_worktree_is_main`
+    // for the on-disk worktree layout.
+
+    /// Builds a main checkout + one linked worktree on disk, returning
+    /// `(canonical_project_root, worktree_root)`.
+    ///
+    /// Layout mirrors git's: `<base>/project/.git/worktrees/wt/commondir` → `../..`
+    /// and `<base>/checkout/.git` is a file pointing at the worktree gitdir.
+    fn linked_worktree_layout(base: &Path) -> (PathBuf, PathBuf) {
+        let project = base.join("project");
+        let wt_gitdir = project.join(".git").join("worktrees").join("wt");
+        std::fs::create_dir_all(&wt_gitdir).expect("mkdir worktree gitdir");
+        std::fs::write(wt_gitdir.join("commondir"), "../..\n").expect("write commondir");
+
+        let checkout = base.join("checkout");
+        std::fs::create_dir(&checkout).expect("mkdir checkout");
+        std::fs::write(
+            checkout.join(".git"),
+            format!("gitdir: {}\n", wt_gitdir.display()),
+        )
+        .expect("write .git file");
+
+        (project, checkout)
+    }
+
+    #[test]
+    fn auto_mount_worktree_when_canonical_root_tracked() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().canonicalize().expect("canonicalize");
+        let (project, worktree) = linked_worktree_layout(&base);
+        let file = worktree.join("src").join("lib.rs");
+        std::fs::create_dir_all(file.parent().expect("parent")).expect("mkdir src");
+        std::fs::write(&file, "").expect("write file");
+
+        // The session already tracks the canonical project root.
+        let tracker = RootTracker::new();
+        tracker.set_roots("mcp:1", vec![project.clone()]);
+        let roots: HashSet<PathBuf> = tracker.global_roots().into_iter().collect();
+
+        // The predicate selects the *worktree*, never the canonical root.
+        let mount = worktree_to_auto_mount(&file, &roots).expect("worktree should auto-mount");
+        assert_eq!(
+            mount, worktree,
+            "mounts the worktree, not the canonical root"
+        );
+
+        // Drive the `agent:{sid}:{aid}` wiring the dispatch layer uses.
+        tracker.set_roots("agent:sid-1:aid-7", vec![mount]);
+        let global = tracker.global_roots();
+        assert!(global.contains(&worktree), "worktree mounted");
+        assert!(
+            global.contains(&project),
+            "canonical root still tracked (its own contributor)",
+        );
+        // The worktree rides ONLY the agent key — not the canonical root's set.
+        assert_eq!(
+            tracker.refcount(&worktree),
+            1,
+            "worktree held by agent key only"
+        );
+        let sources: Vec<String> = tracker
+            .list_roots()
+            .into_iter()
+            .find(|(p, _)| p == &worktree)
+            .map(|(_, s)| s)
+            .expect("worktree present");
+        assert_eq!(sources, vec!["agent:sid-1:aid-7".to_string()]);
+    }
+
+    #[test]
+    fn no_auto_mount_when_canonical_root_untracked() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().canonicalize().expect("canonicalize");
+        let (_project, worktree) = linked_worktree_layout(&base);
+        let file = worktree.join("src.rs");
+        std::fs::write(&file, "").expect("write file");
+
+        // An *unrelated* repo is tracked — not this worktree's canonical root.
+        let unrelated = base.join("unrelated");
+        std::fs::create_dir(&unrelated).expect("mkdir unrelated");
+        let tracker = RootTracker::new();
+        tracker.set_roots("mcp:1", vec![unrelated]);
+        let roots: HashSet<PathBuf> = tracker.global_roots().into_iter().collect();
+
+        assert_eq!(
+            worktree_to_auto_mount(&file, &roots),
+            None,
+            "an edit in a worktree of an untracked project must not auto-mount",
+        );
+    }
+
+    #[test]
+    fn no_auto_mount_for_main_agent_in_tracked_root() {
+        // The main agent editing a plain checkout that is already a tracked root:
+        // the worktree IS its canonical root and is already tracked, so the
+        // "not already tracked" clause rejects it — no spurious mount.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().canonicalize().expect("canonicalize");
+        let root = base.join("repo");
+        std::fs::create_dir_all(root.join(".git")).expect("mkdir .git");
+        let file = root.join("src").join("main.rs");
+        std::fs::create_dir_all(file.parent().expect("parent")).expect("mkdir src");
+        std::fs::write(&file, "").expect("write file");
+
+        let tracker = RootTracker::new();
+        tracker.set_roots("mcp:1", vec![root]);
+        let roots: HashSet<PathBuf> = tracker.global_roots().into_iter().collect();
+
+        assert_eq!(
+            worktree_to_auto_mount(&file, &roots),
+            None,
+            "main agent editing inside an already-tracked checkout is a no-op",
+        );
+    }
+
+    #[test]
+    fn no_auto_mount_when_worktree_already_tracked() {
+        // Idempotency: the worktree is already a tracked root (e.g. a prior edit
+        // mounted it) — even though its canonical root is also tracked, re-edits
+        // must not re-trigger.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().canonicalize().expect("canonicalize");
+        let (project, worktree) = linked_worktree_layout(&base);
+        let file = worktree.join("again.rs");
+        std::fs::write(&file, "").expect("write file");
+
+        let tracker = RootTracker::new();
+        tracker.set_roots("mcp:1", vec![project]);
+        tracker.set_roots("agent:sid-1:aid-7", vec![worktree]);
+        let roots: HashSet<PathBuf> = tracker.global_roots().into_iter().collect();
+
+        assert_eq!(
+            worktree_to_auto_mount(&file, &roots),
+            None,
+            "an already-mounted worktree must not re-trigger a mount",
+        );
+    }
+
+    #[test]
+    fn no_auto_mount_for_file_outside_any_checkout() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().canonicalize().expect("canonicalize");
+        let file = base.join("loose.rs");
+        std::fs::write(&file, "").expect("write file");
+
+        let tracker = RootTracker::new();
+        tracker.set_roots("mcp:1", vec![base.join("project")]);
+        let roots: HashSet<PathBuf> = tracker.global_roots().into_iter().collect();
+
+        assert_eq!(
+            worktree_to_auto_mount(&file, &roots),
+            None,
+            "a file outside any git checkout has no worktree to mount",
         );
     }
 

@@ -35,7 +35,8 @@ fn parse_host_format(s: &str) -> Option<crate::cli::HostFormat> {
 ///
 /// Checks all known edit tool names across host CLIs (Claude Code, Gemini CLI,
 /// and Antigravity CLI).
-fn is_edit_tool(tool_name: &str) -> bool {
+#[must_use]
+pub fn is_edit_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
         "Edit"
