@@ -1716,6 +1716,25 @@ fn worktree_to_auto_mount(file_path: &Path, tracked: &HashSet<PathBuf>) -> Optio
     }
 }
 
+/// Decides whether a `post-agent/require-release` result authorizes worktree
+/// teardown (workstream 30, ticket 1b).
+///
+/// Teardown binds to the **allow** branch only. A `decision: "block"` does not
+/// stop the subagent — it makes it *continue* to run `catenary diagnostics`, so
+/// the subagent still needs its worktree root; tearing it down on a block would
+/// pull the root out from under the very diagnostics run the block exists to
+/// force. Every other result (`None` allow, `Cleared`, a hypothetical `Deny`)
+/// is an allow.
+///
+/// This is the same classification the dispatch layer already uses to decide
+/// whether to drain notifications ([`crate::bridge::HookRouter::dispatch`],
+/// which drains only when the result is not a `Block`) — reused verbatim so the
+/// teardown and the drain agree on what "blocked" means.
+#[cfg(unix)]
+const fn require_release_allows(result: Option<&crate::hook::HookResult>) -> bool {
+    !matches!(result, Some(crate::hook::HookResult::Block(_)))
+}
+
 /// Handles a single hook connection with session-aware dispatch.
 ///
 /// Reads the JSON request, extracts `session_id` for routing, looks up
@@ -2797,6 +2816,66 @@ async fn handle_hook_dispatch(
         result: result.result,
         system_message: result.system_message,
     };
+
+    // ── Subagent worktree teardown (workstream 30, ticket 1b) ─────
+    //
+    // Post-dispatch counterpart to 1a's pre-dispatch mount: when a subagent
+    // actually stops, tear down the worktree root it auto-mounted so its
+    // rust-analyzer shuts down. `handle_require_release` (run inside `dispatch`)
+    // already decided allow vs block per `(session_id, agent_id)`; the teardown
+    // reads that decision FROM the dispatch result, so it MUST run after
+    // `dispatch` (1a mounts before; 1b tears down after — opposite sides on
+    // purpose). Teardown binds to the allow branch only — a `block` *continues*
+    // the subagent, which still needs its root for the `catenary diagnostics`
+    // run the block forces (`require_release_allows`). Removal is the
+    // `agent:{sid}:{aid}` namespace (ADR 016); refcounting is unchanged — a
+    // worktree also held by the session's `mcp:{fd}` backstop survives. A no-op
+    // when the agent mounted nothing (main agent, read-only subagent).
+    if method == "post-agent/require-release"
+        && let Some(ref tracker) = ctx.root_tracker
+        && require_release_allows(envelope.result.as_ref())
+    {
+        let agent_id = raw
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let stop_hook_active = raw
+            .get("stop_hook_active")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let contributor = format!("agent:{session_id}:{agent_id}");
+        tracker.remove_contributor(&contributor);
+        let global = tracker.global_roots();
+        if let Err(e) = ctx.primary.sync_roots(global).await {
+            debug!(
+                source = Source::DaemonDispatch.as_str(),
+                "root sync after worktree teardown failed: {e}",
+            );
+        }
+        if stop_hook_active {
+            // The subagent ignored the block and stopped again — its edits were
+            // never diagnosed. They remain on the worktree branch for the
+            // orchestrator to merge. User-actionable, so warn (reaches the
+            // notification queue), then tear down.
+            warn!(
+                source = Source::DaemonDispatch.as_str(),
+                session_id = %session_id,
+                agent_id = %agent_id,
+                contributor = %contributor,
+                "subagent stopped with undiagnosed edits; tearing down worktree root (edits remain on the worktree branch)",
+            );
+        } else {
+            debug!(
+                source = Source::DaemonDispatch.as_str(),
+                session_id = %session_id,
+                agent_id = %agent_id,
+                contributor = %contributor,
+                "tore down worktree root on subagent stop (allow)",
+            );
+        }
+    }
+
     let response = if envelope.result.is_some() || envelope.system_message.is_some() {
         serde_json::to_string(&envelope)?
     } else {
@@ -5613,6 +5692,172 @@ mod tests {
             None,
             "a file outside any git checkout has no worktree to mount",
         );
+    }
+
+    // ── Subagent worktree teardown (workstream 30, ticket 1b) ────────────
+    //
+    // These exercise `require_release_allows` — the pure allow-vs-block
+    // classification the dispatch layer applies to a `post-agent/require-release`
+    // result — and the `agent:{sid}:{aid}` `RootTracker` teardown the dispatch
+    // layer drives on top of it: on allow, `remove_contributor` the agent's key;
+    // on block, leave it. Mirrors the 1a auto-mount wiring tests.
+
+    #[test]
+    fn require_release_allows_classifies_block_vs_allow() {
+        use crate::hook::HookResult;
+        // A block is the only non-allow result — the subagent keeps running.
+        let block = HookResult::Block("run `catenary diagnostics` before finishing".into());
+        assert!(!require_release_allows(Some(&block)));
+        // `None` (clean stop / no editing state) is allow.
+        assert!(require_release_allows(None));
+        // Cleared (stale state cleared) is allow.
+        let cleared = HookResult::Cleared(2);
+        assert!(require_release_allows(Some(&cleared)));
+    }
+
+    #[test]
+    fn teardown_removes_only_the_stopping_agents_worktree() {
+        // Two subagents under one session, each editing its own worktree, each
+        // mounted under its own `agent:{sid}:{aid}` key. Agent A's stop (allow)
+        // tears down ONLY A's contributor; B's worktree survives.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().canonicalize().expect("canonicalize");
+        let (project, worktree_a) = linked_worktree_layout(&base.join("a"));
+        let (_project_b, worktree_b) = linked_worktree_layout(&base.join("b"));
+
+        let tracker = RootTracker::new();
+        tracker.set_roots("mcp:1", vec![project]);
+        tracker.set_roots("agent:sid-1:aid-a", vec![worktree_a.clone()]);
+        tracker.set_roots("agent:sid-1:aid-b", vec![worktree_b.clone()]);
+        assert_eq!(tracker.refcount(&worktree_a), 1);
+        assert_eq!(tracker.refcount(&worktree_b), 1);
+
+        // Agent A stops with an allow result → its key is torn down.
+        assert!(require_release_allows(None), "clean stop is allow");
+        tracker.remove_contributor("agent:sid-1:aid-a");
+
+        assert_eq!(
+            tracker.refcount(&worktree_a),
+            0,
+            "A's worktree torn down — its rust-analyzer can shut down",
+        );
+        assert_eq!(
+            tracker.refcount(&worktree_b),
+            1,
+            "B's worktree survives A's stop — per-agent teardown",
+        );
+        let global = tracker.global_roots();
+        assert!(!global.contains(&worktree_a));
+        assert!(global.contains(&worktree_b));
+    }
+
+    #[test]
+    fn block_keeps_the_worktree_root() {
+        use crate::hook::HookResult;
+        // A blocked stop continues the subagent so it can run `catenary
+        // diagnostics`; the dispatch layer must NOT remove the contributor.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().canonicalize().expect("canonicalize");
+        let (project, worktree) = linked_worktree_layout(&base);
+
+        let tracker = RootTracker::new();
+        tracker.set_roots("mcp:1", vec![project]);
+        tracker.set_roots("agent:sid-1:aid-a", vec![worktree.clone()]);
+
+        let result = Some(HookResult::Block(
+            "run `catenary diagnostics` before finishing".into(),
+        ));
+        // The gate the dispatch layer applies: only an allow tears down.
+        assert!(
+            !require_release_allows(result.as_ref()),
+            "block is not an allow"
+        );
+        if require_release_allows(result.as_ref()) {
+            tracker.remove_contributor("agent:sid-1:aid-a");
+        }
+
+        assert_eq!(
+            tracker.refcount(&worktree),
+            1,
+            "block keeps the worktree root for the forced diagnostics run",
+        );
+    }
+
+    #[test]
+    fn retry_allows_tears_down_and_takes_warn_branch() {
+        // `stop_hook_active = true`: the subagent ignored the block and stopped
+        // again. `handle_require_release` allows (force-clearing the orphaned
+        // editing set), so the dispatch layer tears down — and because
+        // `stop_hook_active` is set, takes the warn branch (undiagnosed edits).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().canonicalize().expect("canonicalize");
+        let (project, worktree) = linked_worktree_layout(&base);
+
+        let tracker = RootTracker::new();
+        tracker.set_roots("mcp:1", vec![project]);
+        tracker.set_roots("agent:sid-1:aid-a", vec![worktree.clone()]);
+
+        // The retry always allows (handle_require_release returns None on
+        // stop_hook_active), so the teardown fires.
+        let result: Option<crate::hook::HookResult> = None;
+        let stop_hook_active = true;
+        assert!(require_release_allows(result.as_ref()), "retry allows");
+        if require_release_allows(result.as_ref()) {
+            tracker.remove_contributor("agent:sid-1:aid-a");
+        }
+        // The dispatch layer's warn-vs-debug split keys on stop_hook_active.
+        assert!(stop_hook_active, "retry takes the warn branch");
+        assert_eq!(
+            tracker.refcount(&worktree),
+            0,
+            "retry tears the worktree down despite the undiagnosed edits",
+        );
+    }
+
+    #[test]
+    fn teardown_for_agent_that_mounted_nothing_is_noop() {
+        // Idempotent: the main agent (or a read-only subagent) mounted no
+        // worktree. require-release allows and removes nothing — no error.
+        let tracker = RootTracker::new();
+        tracker.set_roots("mcp:1", vec![PathBuf::from("/project")]);
+
+        assert!(require_release_allows(None));
+        // The main agent's key is `agent:{sid}:` (empty agent_id) — never set.
+        tracker.remove_contributor("agent:sid-1:");
+
+        let global = tracker.global_roots();
+        assert_eq!(global.len(), 1, "nothing removed");
+        assert!(global.contains(&PathBuf::from("/project")));
+    }
+
+    #[test]
+    fn refcount_backstop_survives_agent_teardown() {
+        // The worktree is also held by the session's `mcp:{fd}` contributor (the
+        // session-end backstop). Tearing down the `agent:` key drops only that
+        // key, so the still-referenced root survives — its rust-analyzer shuts
+        // down only when the last contributor drops it (existing refcount).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().canonicalize().expect("canonicalize");
+        let (_project, worktree) = linked_worktree_layout(&base);
+
+        let tracker = RootTracker::new();
+        tracker.set_roots("mcp:1", vec![worktree.clone()]);
+        tracker.set_roots("agent:sid-1:aid-a", vec![worktree.clone()]);
+        assert_eq!(tracker.refcount(&worktree), 2, "held by both contributors");
+
+        // Agent stops (allow): drop only the agent key.
+        tracker.remove_contributor("agent:sid-1:aid-a");
+        assert_eq!(
+            tracker.refcount(&worktree),
+            1,
+            "mcp backstop still holds the root — it survives the agent teardown",
+        );
+        assert!(tracker.global_roots().contains(&worktree));
+
+        // Session end drops the backstop → the root finally goes.
+        tracker.remove_contributor("mcp:1");
+        assert_eq!(tracker.refcount(&worktree), 0);
+        assert!(tracker.global_roots().is_empty());
     }
 
     #[test]
