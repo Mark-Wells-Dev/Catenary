@@ -2055,17 +2055,39 @@ async fn handle_hook_dispatch(
 
         let router = get_or_create_router(&ctx, &session_id, &raw);
 
+        // The PreToolUse hook forwards the real `agent_id` from the host CLI
+        // (mirrors the sed-handoff prepare path). Drain only the requesting
+        // agent's bucket — flattening every agent's bucket would consume a
+        // sibling subagent's accumulated set, since subagents share the
+        // parent's `session_id` and differ only by `agent_id` (bug 37).
+        let agent_id = raw
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        // Derive the EditingManager session key the same way the accumulation
+        // path does: the raw `session_id` Option (absent → None), NOT the
+        // `"default"`-fallback `session_id` used for the handoff payload and
+        // guardrail. The accumulation hook (`pre-tool/editing-state`) keys via
+        // `HookRequest.session_id.as_deref()`, so the drain must match exactly
+        // or it would look up the wrong key and drain nothing.
+        let editing_session = raw.get("session_id").and_then(|v| v.as_str());
+
         // Acquire the `diagnostics` handoff permit. Blocks only behind another
         // in-flight *diagnostics* handoff (per-key, ADR 014) — never daemon-wide
         // — and holds for milliseconds at most.
         let permit = ctx.handoff.acquire(HandoffKey::Diagnostics).await?;
 
-        // Drain accumulated files from EditingManager.
-        let (files, filtered) = router.session.editing.drain_all_and_clear();
+        // Drain this agent's accumulated files from EditingManager.
+        let (files, filtered) = router
+            .session
+            .editing
+            .drain_and_clear(editing_session, &agent_id);
 
         debug!(
             source = Source::DaemonDispatch.as_str(),
             session_id = %session_id,
+            agent_id = %agent_id,
             file_count = files.len(),
             filtered,
             "diagnostics: drained files from EditingManager",
@@ -2459,6 +2481,7 @@ async fn handle_hook_dispatch(
         {
             let mut started = false;
             let mut accumulated = 0usize;
+            let mut filtered = 0usize;
             for file in &outcome.changed {
                 if router.session.has_lsp_coverage(file) {
                     if !started {
@@ -2474,13 +2497,28 @@ async fn handle_hook_dispatch(
                         .add_file(sid.as_deref(), &agent_id, file.clone());
                     accumulated += 1;
                 } else {
-                    router.session.editing.increment_filtered();
+                    filtered += 1;
+                }
+            }
+            // `increment_filtered` is per-agent and a no-op until the agent's
+            // editing entry exists. Apply the buffered count only once the
+            // entry has been started by a covered file — this also makes the
+            // count independent of changed-file ordering. A sed that touches
+            // only uncovered files starts no entry and reports no filtered
+            // count (there is nothing to drain for this agent).
+            if started {
+                for _ in 0..filtered {
+                    router
+                        .session
+                        .editing
+                        .increment_filtered(sid.as_deref(), &agent_id);
                 }
             }
             debug!(
                 source = Source::DaemonDispatch.as_str(),
                 changed = outcome.changed.len(),
                 accumulated,
+                filtered,
                 "sed: accumulated changed files for diagnostics",
             );
 
@@ -4477,6 +4515,85 @@ mod tests {
             !response.contains("handoff expired"),
             "handoff should not be expired, got: {response}",
         );
+
+        shutdown.cancel();
+    }
+
+    /// Regression guard for bug 37: two agents share one Catenary session
+    /// (a subagent and the main agent, distinguished only by `agent_id`).
+    /// A `pre-tool/editing-stop` for one `agent_id` must drain ONLY that
+    /// agent's accumulated set — the sibling agent's set must survive so its
+    /// own later `catenary diagnostics` still reports its edits. Before the
+    /// fix the drain flattened every agent's bucket, silently emptying the
+    /// others.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn done_editing_handoff_drains_only_requesting_agent() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let ipc_path = ipc_socket_in(dir.path());
+
+        let manager = Arc::new(bind_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        // Both agents enter editing mode under the same session. Sending the
+        // editing-start hooks creates the session and its EditingManager.
+        for agent in ["sub-a", ""] {
+            let req = serde_json::json!({
+                "method": "pre-tool/editing-start",
+                "agent_id": agent,
+                "session_id": "sess-1"
+            });
+            let _ = hook_roundtrip(&ipc_path, &req).await;
+        }
+
+        // Stage distinct accumulated files per agent. This harness configures
+        // no covered root, so accumulate via the session's editing manager
+        // directly (mirrors session_state_editing_per_session).
+        {
+            let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
+            let sessions = ctx.sessions.lock().expect("lock");
+            let router = Arc::clone(&sessions.get("sess-1").expect("sess-1").router);
+            drop(sessions);
+            router.session.editing.add_file(
+                Some("sess-1"),
+                "sub-a",
+                std::path::PathBuf::from("/src/a.rs"),
+            );
+            router.session.editing.add_file(
+                Some("sess-1"),
+                "",
+                std::path::PathBuf::from("/src/b.rs"),
+            );
+        }
+
+        // Prepare the handoff for the subagent only.
+        let req = serde_json::json!({
+            "method": "pre-tool/editing-stop",
+            "agent_id": "sub-a",
+            "session_id": "sess-1"
+        });
+        let line = hook_roundtrip(&ipc_path, &req).await;
+        assert!(line.contains("ok"), "prepare should succeed, got: {line}");
+
+        // The subagent's bucket is drained; the main agent's set survives.
+        {
+            let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
+            let sessions = ctx.sessions.lock().expect("lock");
+            let router = Arc::clone(&sessions.get("sess-1").expect("sess-1").router);
+            drop(sessions);
+            assert!(
+                !router.session.editing.has_files(Some("sess-1"), "sub-a"),
+                "subagent's set should be drained after its editing-stop"
+            );
+            assert_eq!(
+                router.session.editing.files(Some("sess-1"), ""),
+                vec![std::path::PathBuf::from("/src/b.rs")],
+                "main agent's set must survive the subagent's drain (bug 37)"
+            );
+        }
 
         shutdown.cancel();
     }

@@ -179,7 +179,7 @@ impl DiagnosticsServer {
         for file in files {
             let file_str = file.to_string_lossy();
 
-            // Resolve to absolute if needed (drain_all_and_clear
+            // Resolve to absolute if needed (the editing-manager drain
             // already returns absolute paths, but be defensive).
             let Ok(path) = resolve_path(&file_str) else {
                 continue;

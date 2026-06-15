@@ -11,7 +11,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Result, anyhow};
 
@@ -27,6 +26,22 @@ fn editing_key(session_id: Option<&str>, agent_id: &str) -> String {
     }
 }
 
+/// Per-agent editing accumulator.
+///
+/// Holds both the accumulated covered file paths and the count of files
+/// skipped during accumulation because they lacked LSP coverage (outside
+/// tracked roots). Keeping the filtered count alongside the file set — rather
+/// than as a single session-global counter — means a per-agent drain reports
+/// the requesting agent's own skipped-no-coverage count, never another agent's
+/// (bug 37).
+#[derive(Default)]
+struct EditingState {
+    /// Accumulated covered file paths for this agent.
+    files: Vec<PathBuf>,
+    /// Files skipped during accumulation for lack of LSP coverage.
+    filtered: usize,
+}
+
 /// In-memory editing state manager.
 ///
 /// Owns editing state for a single Catenary session.
@@ -36,23 +51,10 @@ fn editing_key(session_id: Option<&str>, agent_id: &str) -> String {
 /// State is keyed by a composite of `(session_id, agent_id)` to prevent
 /// cross-session collisions when multiple host CLI sessions share a
 /// workspace and route hooks to the same Catenary instance.
+#[derive(Default)]
 pub struct EditingManager {
-    /// Active editing sessions: composite key → accumulated file paths.
-    state: Mutex<HashMap<String, Vec<PathBuf>>>,
-    /// Number of files skipped during accumulation because they lacked
-    /// LSP coverage (outside tracked roots). Reset by
-    /// [`drain_all_and_clear`](Self::drain_all_and_clear) and
-    /// [`clear_all`](Self::clear_all).
-    filtered_count: AtomicUsize,
-}
-
-impl Default for EditingManager {
-    fn default() -> Self {
-        Self {
-            state: Mutex::new(HashMap::new()),
-            filtered_count: AtomicUsize::new(0),
-        }
-    }
+    /// Active editing sessions: composite key → per-agent accumulator.
+    state: Mutex<HashMap<String, EditingState>>,
 }
 
 impl EditingManager {
@@ -76,7 +78,7 @@ impl EditingManager {
         if state.contains_key(&key) {
             return Err(anyhow!("agent is already in editing mode"));
         }
-        state.insert(key, Vec::new());
+        state.insert(key, EditingState::default());
         drop(state);
         Ok(())
     }
@@ -115,7 +117,7 @@ impl EditingManager {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&key)
-            .is_some_and(|files| !files.is_empty())
+            .is_some_and(|state| !state.files.is_empty())
     }
 
     /// Returns a snapshot of the accumulated file paths without draining them.
@@ -130,7 +132,7 @@ impl EditingManager {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&key)
-            .cloned()
+            .map(|state| state.files.clone())
             .unwrap_or_default()
     }
 
@@ -143,10 +145,10 @@ impl EditingManager {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(files) = state.get_mut(&key)
-            && !files.contains(&path)
+        if let Some(entry) = state.get_mut(&key)
+            && !entry.files.contains(&path)
         {
-            files.push(path);
+            entry.files.push(path);
         }
     }
 
@@ -157,7 +159,10 @@ impl EditingManager {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.get_mut(&key).map(std::mem::take).unwrap_or_default()
+        state
+            .get_mut(&key)
+            .map(|entry| std::mem::take(&mut entry.files))
+            .unwrap_or_default()
     }
 
     /// Exits editing mode for an agent, removing the entry entirely.
@@ -172,27 +177,46 @@ impl EditingManager {
 
     /// Records that a file was skipped during accumulation because it
     /// lacked LSP coverage (outside tracked workspace roots).
-    pub fn increment_filtered(&self) {
-        self.filtered_count.fetch_add(1, Ordering::Relaxed);
+    ///
+    /// Counted per `(session_id, agent_id)` so the drain reports the
+    /// requesting agent's own skipped count (bug 37). A no-op if the agent
+    /// is not in editing mode — the accumulation path only calls this for an
+    /// agent already known to be editing.
+    pub fn increment_filtered(&self, session_id: Option<&str>, agent_id: &str) {
+        let key = editing_key(session_id, agent_id);
+        if let Some(entry) = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(&key)
+        {
+            entry.filtered += 1;
+        }
     }
 
-    /// Drains accumulated file paths from all agents and clears all
-    /// editing state. Returns the combined file list and the number of
-    /// files that were filtered (skipped due to no LSP coverage).
+    /// Drains accumulated file paths for a single agent and removes its
+    /// editing entry. Returns the agent's file list and its own filtered
+    /// count (files skipped during accumulation for lack of LSP coverage).
     ///
-    /// Used by the MCP `done_editing` tool, which does not carry an
-    /// `agent_id` and cannot rely on [`active_agent`] to find the
-    /// correct key.
-    pub fn drain_all_and_clear(&self) -> (Vec<PathBuf>, usize) {
+    /// Scoped to one `(session_id, agent_id)` key so one agent's
+    /// `catenary diagnostics` does not consume a sibling agent's accumulated
+    /// set when both share a Catenary session (bug 37). This is the drain the
+    /// `pre-tool/editing-stop` hook uses: the hook carries the real
+    /// `agent_id` from the host CLI.
+    pub fn drain_and_clear(
+        &self,
+        session_id: Option<&str>,
+        agent_id: &str,
+    ) -> (Vec<PathBuf>, usize) {
+        let key = editing_key(session_id, agent_id);
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let files: Vec<PathBuf> = state.values_mut().flat_map(std::mem::take).collect();
-        state.clear();
-        drop(state);
-        let filtered = self.filtered_count.swap(0, Ordering::Relaxed);
-        (files, filtered)
+        state
+            .remove(&key)
+            .map(|entry| (entry.files, entry.filtered))
+            .unwrap_or_default()
     }
 
     /// Clears all editing state. Returns the number of entries removed.
@@ -206,8 +230,6 @@ impl EditingManager {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let count = state.len();
         state.clear();
-        drop(state);
-        self.filtered_count.store(0, Ordering::Relaxed);
         count
     }
 }
@@ -331,20 +353,20 @@ mod tests {
     }
 
     #[test]
-    fn drain_all_and_clear_collects_and_clears() {
+    fn drain_and_clear_collects_and_clears() {
         let em = EditingManager::new();
         em.start_editing(None, "agent-a").expect("start");
         em.add_file(None, "agent-a", PathBuf::from("/src/main.rs"));
         em.add_file(None, "agent-a", PathBuf::from("/src/lib.rs"));
-        em.increment_filtered();
+        em.increment_filtered(None, "agent-a");
 
-        let (files, filtered) = em.drain_all_and_clear();
+        let (files, filtered) = em.drain_and_clear(None, "agent-a");
         assert_eq!(files.len(), 2);
         assert_eq!(filtered, 1);
         assert!(!em.is_editing(None, "agent-a"));
 
         // Empty when nothing is editing
-        let (files, filtered) = em.drain_all_and_clear();
+        let (files, filtered) = em.drain_and_clear(None, "agent-a");
         assert!(files.is_empty());
         assert_eq!(filtered, 0);
     }
@@ -355,8 +377,8 @@ mod tests {
         assert!(!em.is_active(), "no accumulator yet");
         em.start_editing(Some("s1"), "agent").expect("start");
         assert!(em.is_active(), "active after start, even with no files");
-        let (_, _) = em.drain_all_and_clear();
-        assert!(!em.is_active(), "inactive after drain_all_and_clear");
+        let (_, _) = em.drain_and_clear(Some("s1"), "agent");
+        assert!(!em.is_active(), "inactive after drain_and_clear");
 
         // done_editing on the only entry also clears activity.
         em.start_editing(None, "a").expect("start");
@@ -409,6 +431,49 @@ mod tests {
 
         let s2_files = em.drain_files(Some("s2"), "");
         assert_eq!(s2_files, vec![PathBuf::from("/b.rs")]);
+    }
+
+    /// Two agents within ONE session (a subagent and the main agent, which
+    /// share `session_id` and differ only by `agent_id`) accumulate into
+    /// separate buckets. Draining one agent's bucket must leave the other's
+    /// files — and filtered count — intact. Regression guard for bug 37,
+    /// where the diagnostics drain flattened every agent's bucket.
+    #[test]
+    fn agent_scoped_drain_within_one_session() {
+        let em = EditingManager::new();
+        em.start_editing(Some("S"), "subA").expect("subA start");
+        em.start_editing(Some("S"), "").expect("main start");
+
+        // Distinct covered files per agent.
+        em.add_file(Some("S"), "subA", PathBuf::from("/a.rs"));
+        em.add_file(Some("S"), "", PathBuf::from("/b.rs"));
+        // Distinct skipped-no-coverage counts per agent.
+        em.increment_filtered(Some("S"), "subA");
+        em.increment_filtered(Some("S"), "subA");
+        em.increment_filtered(Some("S"), "");
+
+        // Drain only the subagent's bucket.
+        let (sub_files, sub_filtered) = em.drain_and_clear(Some("S"), "subA");
+        assert_eq!(sub_files, vec![PathBuf::from("/a.rs")]);
+        assert_eq!(sub_filtered, 2, "filtered attributed to subA, not shared");
+        assert!(
+            !em.is_editing(Some("S"), "subA"),
+            "subA entry removed after its drain"
+        );
+
+        // The main agent's bucket survives untouched.
+        assert!(
+            em.is_editing(Some("S"), ""),
+            "main agent still editing after subA drained"
+        );
+        assert_eq!(
+            em.files(Some("S"), ""),
+            vec![PathBuf::from("/b.rs")],
+            "main agent's file set survives subA's drain"
+        );
+        let (main_files, main_filtered) = em.drain_and_clear(Some("S"), "");
+        assert_eq!(main_files, vec![PathBuf::from("/b.rs")]);
+        assert_eq!(main_filtered, 1, "main agent keeps its own filtered count");
     }
 
     #[test]

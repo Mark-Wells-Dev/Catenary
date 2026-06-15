@@ -648,7 +648,9 @@ impl HookRouter {
                 "file accumulated for diagnostics",
             );
         } else {
-            self.session.editing.increment_filtered();
+            self.session
+                .editing
+                .increment_filtered(session_id, agent_id);
             debug!(
                 source = Source::HookDispatch.as_str(),
                 file = file_path,
@@ -1134,7 +1136,7 @@ mod tests {
             !router.session.editing.is_editing(None, ""),
             "uncovered edit must not enter editing mode"
         );
-        let (files, filtered) = router.session.editing.drain_all_and_clear();
+        let (files, filtered) = router.session.editing.drain_and_clear(None, "");
         assert!(files.is_empty(), "uncovered file not accumulated");
         // Not in editing mode → accumulation returns early, so the file is
         // not even counted as filtered.
@@ -1168,7 +1170,7 @@ mod tests {
             files.is_empty(),
             "out-of-root file should not be accumulated"
         );
-        let (_, filtered) = router.session.editing.drain_all_and_clear();
+        let (_, filtered) = router.session.editing.drain_and_clear(None, "");
         assert_eq!(filtered, 1, "out-of-root edit should increment filtered");
     }
 
@@ -2193,7 +2195,7 @@ mod tests {
             !router.session.editing.is_editing(None, ""),
             "denied first edit must not enter editing mode"
         );
-        let (files, _) = router.session.editing.drain_all_and_clear();
+        let (files, _) = router.session.editing.drain_and_clear(None, "");
         assert!(files.is_empty(), "denied edit should not accumulate file");
     }
 
