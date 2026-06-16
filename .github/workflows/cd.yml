@@ -1,3 +1,26 @@
+# CD — on a vX.Y.Z tag push:
+#   1. build-release   cross-platform binaries (Linux / macOS x64+arm64 / Windows)
+#   2. create-release  cut a GitHub Release with the binaries attached
+#   3. publish-crate   publish to crates.io via Trusted Publishing (OIDC — no
+#                      stored token): catenary-proc, then catenary-mcp
+#
+# Triggered ONLY by tag pushes (which require write access), so a fork PR can
+# never trigger it — the publish credential is never exposed to untrusted code.
+#
+# Crates published: `catenary-proc` (workspace member) and `catenary-mcp` (the
+# root package — provides the `catenary` binary). There is no `catenary-ts`.
+#
+# One-time setup before the first Trusted-Publishing run:
+#   - crates.io → for EACH crate (`catenary-mcp` AND `catenary-proc`):
+#       crate Settings → Trusted Publishing → add a publisher with
+#         repository   TwoWells/Catenary
+#         workflow     cd.yml
+#         environment  release
+#   - GitHub → repo Settings → Environments → create `release` (optionally add
+#       required-reviewer / tag-protection rules). If skipped, GitHub auto-creates
+#       it (unprotected) on first run.
+#   - After the first successful run, the old `CRATES_IO_TOKEN` repo secret is no
+#     longer used and can be deleted.
 name: CD
 
 on:
@@ -6,7 +29,8 @@ on:
       - 'v*'
 
 permissions:
-  contents: write
+  contents: write # create-release: cut the GitHub Release
+  id-token: write # publish-crate: OIDC token for crates.io Trusted Publishing
 
 jobs:
   build-release:
@@ -74,19 +98,32 @@ jobs:
           GH_TOKEN: ${{ github.token }}
 
   publish-crate:
-    name: Publish to Crates.io
+    name: Publish to crates.io (Trusted Publishing)
     needs: build-release
     runs-on: ubuntu-latest
+    # Must match the Environment registered in crates.io Trusted Publishing.
+    # Scopes the OIDC token's subject to this environment and is the hook for any
+    # required-reviewer / tag-protection rules (repo Settings → Environments).
+    environment: release
     steps:
       - uses: actions/checkout@v4
       - run: rustup show
-      - name: Publish Crates
+
+      # OIDC: exchange the GitHub id-token for a short-lived crates.io token.
+      # Nothing long-lived is stored in secrets or on the runner. Requires the
+      # Trusted Publishing config above on BOTH catenary-mcp and catenary-proc;
+      # one minted token then authorizes publishing both.
+      - name: Authenticate to crates.io (Trusted Publishing)
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+
+      - name: Publish crates
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: |
-          # Subcrates: skip if version already published
+          # Workspace subcrate first; skip if its version is already published.
           cargo publish -p catenary-proc || echo "catenary-proc: already published, skipping"
-          cargo publish -p catenary-ts || echo "catenary-ts: already published, skipping"
-          # Wait for crates.io index to propagate
+          # Wait for the crates.io index to propagate before the dependent crate.
           sleep 30
+          # Root package (catenary-mcp).
           cargo publish --allow-dirty

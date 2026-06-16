@@ -118,6 +118,16 @@ from the latest `v*` tag, so any docs changes on `main` only reach
 `/stable/` after a tagged release. Dev docs at `/dev/` update on
 every push to `main`.
 
+**crates.io publishing uses Trusted Publishing (OIDC), not a stored API
+token.** The `publish-crate` job in `.github/workflows/cd.yml` runs in the
+GitHub `release` environment and mints a short-lived token via
+`rust-lang/crates-io-auth-action`. Two crates are published —
+`catenary-proc` (workspace member) then `catenary-mcp` (root package) — so
+**both** must have a Trusted Publishing entry on crates.io (repository
+`TwoWells/Catenary`, workflow `cd.yml`, environment `release`). The one-time
+setup is documented in the `cd.yml` header comment. No `CRATES_IO_TOKEN`
+secret is required once Trusted Publishing is configured.
+
 ### Pre-release checklist
 
 Before running `make release-*`:
