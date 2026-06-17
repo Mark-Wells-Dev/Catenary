@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::debug;
 
-use super::filesystem_manager::FilesystemManager;
+use super::filesystem_manager::{FilesystemManager, mtime_nanos};
 use super::handler::display_path;
 use super::pagination::paginate;
 use crate::config::DispatchMethod;
@@ -747,7 +747,16 @@ impl GrepServer {
             && let Ok(mut idx) = idx_arc.lock()
         {
             let generation = self.fs_manager.root_generation(&root);
-            idx.cache_enrichment(path, line_0, col, root, generation, enrichment.clone());
+            let source_mtime = std::fs::metadata(path).ok().map(|m| mtime_nanos(&m));
+            idx.cache_enrichment(
+                path,
+                line_0,
+                col,
+                root,
+                generation,
+                source_mtime,
+                enrichment.clone(),
+            );
         }
 
         Some(enrichment)

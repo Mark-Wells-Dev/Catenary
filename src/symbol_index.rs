@@ -206,6 +206,12 @@ struct CachedEnrichment {
     root: PathBuf,
     /// Generation counter at cache time.
     generation: u64,
+    /// `mtime_nanos` of the enriched position's source file at cache time,
+    /// or `None` if it could not be stat-ed. Re-stat on read: a change
+    /// (or a stat failure ⇒ file gone) misses, catching a host
+    /// `Edit`/`Write` that does not bump a generation. Mirrors the outline
+    /// cache's `FileEntry::mtime` and the result cache's witness mtimes.
+    source_mtime: Option<i64>,
 }
 
 /// Enrichment data for a single symbol from LSP queries.
@@ -594,12 +600,19 @@ impl SymbolIndex {
         Ok(result)
     }
 
-    /// Returns a cached enrichment result if the generation still matches.
+    /// Returns a cached enrichment result if it is still fresh.
     ///
-    /// Checks the per-root generation counter against the current value from
-    /// `FilesystemManager`. Returns `None` on miss or stale generation
-    /// (evicts the stale entry). Returns a clone because a stale hit requires
-    /// mutable access to evict the entry.
+    /// Two gates, both must pass:
+    /// 1. The per-root generation counter against the current value from
+    ///    `FilesystemManager` — catches `sed`/diagnostics/explicit
+    ///    invalidation that bumps a root generation.
+    /// 2. The source file's `mtime_nanos`, re-stat-ed and compared (`!=`)
+    ///    against the value recorded at cache time — catches a host
+    ///    `Edit`/`Write` that bumps no generation, and a stat failure (file
+    ///    removed). Mirrors [`ResultCache`]'s witness-mtime check.
+    ///
+    /// Returns `None` on miss or staleness (evicts the stale entry). Returns
+    /// a clone because a stale hit requires mutable access to evict the entry.
     pub(crate) fn get_enrichment(
         &mut self,
         file: &Path,
@@ -609,19 +622,32 @@ impl SymbolIndex {
     ) -> Option<SymbolEnrichment> {
         let key = (file.to_path_buf(), line, col);
         let entry = self.enrichment_cache.get(&key)?;
-        let current_gen = fs_manager.root_generation(&entry.root);
-        if entry.generation == current_gen {
-            Some(entry.enrichment.clone())
-        } else {
+
+        // Generation gate — catches sed/diagnostics/explicit invalidation.
+        if entry.generation != fs_manager.root_generation(&entry.root) {
             self.enrichment_cache.remove(&key);
-            None
+            return None;
         }
+
+        // mtime floor — catches a host Edit/Write that bumps no generation.
+        let current = std::fs::metadata(file).ok().map(|m| mtime_nanos(&m));
+        if current != entry.source_mtime {
+            self.enrichment_cache.remove(&key);
+            return None;
+        }
+
+        Some(entry.enrichment.clone())
     }
 
     /// Stores an enrichment result in the cache.
     ///
-    /// Records the current root generation from `FilesystemManager` so that
-    /// future lookups can detect staleness.
+    /// Records the current root generation and the source file's
+    /// `source_mtime` (from `FilesystemManager` / a stat at the call site) so
+    /// that future lookups can detect staleness via both gates.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "position key (file/line/col) plus both staleness witnesses (root/generation/source_mtime) and the payload"
+    )]
     pub(crate) fn cache_enrichment(
         &mut self,
         file: &Path,
@@ -629,6 +655,7 @@ impl SymbolIndex {
         col: u32,
         root: PathBuf,
         generation: u64,
+        source_mtime: Option<i64>,
         enrichment: SymbolEnrichment,
     ) {
         let key = (file.to_path_buf(), line, col);
@@ -638,6 +665,7 @@ impl SymbolIndex {
                 enrichment,
                 root,
                 generation,
+                source_mtime,
             },
         );
     }
@@ -1445,8 +1473,9 @@ mod tests {
         let root = std::path::PathBuf::from("/workspace");
         let file = std::path::Path::new("/workspace/src/main.rs");
 
-        // Cache an enrichment at generation 0.
-        index.cache_enrichment(file, 10, 5, root, 0, dummy_enrichment());
+        // Cache an enrichment at generation 0. Synthetic path → source_mtime
+        // None at cache time and on re-stat, so the floor matches (None == None).
+        index.cache_enrichment(file, 10, 5, root, 0, None, dummy_enrichment());
 
         // Should hit — generation matches (both 0).
         let hit = index.get_enrichment(file, 10, 5, &fs);
@@ -1465,7 +1494,7 @@ mod tests {
         let file = std::path::Path::new("/workspace/src/main.rs");
 
         // Cache at generation 5 — but FilesystemManager returns 0 (no bumps).
-        index.cache_enrichment(file, 10, 5, root, 5, dummy_enrichment());
+        index.cache_enrichment(file, 10, 5, root, 5, None, dummy_enrichment());
 
         // Should miss — stale generation.
         let miss = index.get_enrichment(file, 10, 5, &fs);
@@ -1493,13 +1522,22 @@ mod tests {
 
         let mut index = SymbolIndex::new().expect("create index");
 
-        // Cache entries in both roots at generation 0.
+        // Cache entries in both roots at generation 0, recording each file's
+        // current mtime so the floor passes on read (the test mutates only
+        // the generation, not the files).
+        let mtime_a = std::fs::metadata(&file_a)
+            .ok()
+            .map(|m| crate::bridge::filesystem_manager::mtime_nanos(&m));
+        let mtime_b = std::fs::metadata(&file_b)
+            .ok()
+            .map(|m| crate::bridge::filesystem_manager::mtime_nanos(&m));
         index.cache_enrichment(
             &file_a,
             1,
             0,
             dir_a.path().to_path_buf(),
             0,
+            mtime_a,
             dummy_enrichment(),
         );
         index.cache_enrichment(
@@ -1508,6 +1546,7 @@ mod tests {
             0,
             dir_b.path().to_path_buf(),
             0,
+            mtime_b,
             dummy_enrichment(),
         );
 
@@ -1522,6 +1561,160 @@ mod tests {
         assert!(
             index.get_enrichment(&file_b, 1, 0, &fs).is_some(),
             "root B should survive"
+        );
+    }
+
+    /// A host `Edit`/`Write` to the enriched position's source file advances its
+    /// mtime but does not bump a root generation; the floor must still miss
+    /// (bug-26-sibling enrichment-staleness gap) and evict the stale entry.
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    #[test]
+    fn enrichment_floor_misses_after_source_mtime_change() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("src.rs");
+        std::fs::write(&file, "fn original() {}\n").expect("write");
+
+        let fs = crate::bridge::filesystem_manager::FilesystemManager::new();
+        fs.set_roots(vec![dir.path().to_path_buf()]);
+
+        let mut index = SymbolIndex::new().expect("create index");
+        let source_mtime = std::fs::metadata(&file)
+            .ok()
+            .map(|m| crate::bridge::filesystem_manager::mtime_nanos(&m));
+        index.cache_enrichment(
+            &file,
+            1,
+            0,
+            dir.path().to_path_buf(),
+            0,
+            source_mtime,
+            dummy_enrichment(),
+        );
+        assert!(
+            index.get_enrichment(&file, 1, 0, &fs).is_some(),
+            "fresh cache should hit before any edit"
+        );
+
+        // Rewrite the source file with a strictly-newer mtime (no generation
+        // bump — mirrors a host Edit/Write).
+        std::fs::write(&file, "fn edited() {}\n").expect("rewrite");
+        let f = std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .expect("open");
+        f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(10))
+            .expect("set mtime");
+        drop(f);
+
+        assert!(
+            index.get_enrichment(&file, 1, 0, &fs).is_none(),
+            "an edit to the source file must miss"
+        );
+        assert!(
+            index.enrichment_cache.is_empty(),
+            "stale entry should be evicted"
+        );
+    }
+
+    /// A removed source file (stat fails → `current = None != Some(stored)`)
+    /// also misses.
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    #[test]
+    fn enrichment_floor_misses_when_source_removed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("src.rs");
+        std::fs::write(&file, "fn original() {}\n").expect("write");
+
+        let fs = crate::bridge::filesystem_manager::FilesystemManager::new();
+        fs.set_roots(vec![dir.path().to_path_buf()]);
+
+        let mut index = SymbolIndex::new().expect("create index");
+        let source_mtime = std::fs::metadata(&file)
+            .ok()
+            .map(|m| crate::bridge::filesystem_manager::mtime_nanos(&m));
+        index.cache_enrichment(
+            &file,
+            1,
+            0,
+            dir.path().to_path_buf(),
+            0,
+            source_mtime,
+            dummy_enrichment(),
+        );
+
+        std::fs::remove_file(&file).expect("remove");
+        assert!(
+            index.get_enrichment(&file, 1, 0, &fs).is_none(),
+            "a removed source file must miss"
+        );
+    }
+
+    /// Cache then immediately read: same generation and unchanged mtime ⇒ hit.
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    #[test]
+    fn enrichment_hit_when_unchanged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("src.rs");
+        std::fs::write(&file, "fn alpha() {}\n").expect("write");
+
+        let fs = crate::bridge::filesystem_manager::FilesystemManager::new();
+        fs.set_roots(vec![dir.path().to_path_buf()]);
+
+        let mut index = SymbolIndex::new().expect("create index");
+        let source_mtime = std::fs::metadata(&file)
+            .ok()
+            .map(|m| crate::bridge::filesystem_manager::mtime_nanos(&m));
+        index.cache_enrichment(
+            &file,
+            1,
+            0,
+            dir.path().to_path_buf(),
+            0,
+            source_mtime,
+            dummy_enrichment(),
+        );
+
+        let hit = index.get_enrichment(&file, 1, 0, &fs);
+        assert!(hit.is_some(), "unchanged generation and mtime should hit");
+        assert_eq!(hit.expect("just checked").implementations.len(), 1);
+    }
+
+    /// Regression guard for the existing generation gate: bumping the root
+    /// generation (no mtime change) still misses.
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    #[test]
+    fn enrichment_generation_gate_still_applies() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("src.rs");
+        std::fs::write(&file, "fn alpha() {}\n").expect("write");
+
+        let fs = crate::bridge::filesystem_manager::FilesystemManager::new();
+        fs.set_roots(vec![dir.path().to_path_buf()]);
+
+        let mut index = SymbolIndex::new().expect("create index");
+        let source_mtime = std::fs::metadata(&file)
+            .ok()
+            .map(|m| crate::bridge::filesystem_manager::mtime_nanos(&m));
+        index.cache_enrichment(
+            &file,
+            1,
+            0,
+            dir.path().to_path_buf(),
+            0,
+            source_mtime,
+            dummy_enrichment(),
+        );
+
+        // Bump the generation without touching the file (sed/diagnostics path).
+        fs.bump_generation_for_test(dir.path());
+
+        assert!(
+            index.get_enrichment(&file, 1, 0, &fs).is_none(),
+            "a generation bump must miss even with an unchanged mtime"
+        );
+        assert!(
+            index.enrichment_cache.is_empty(),
+            "stale entry should be evicted"
         );
     }
 }
