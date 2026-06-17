@@ -228,6 +228,116 @@ fn ws31_review_r1_incomplete_observation_not_reaped() -> Result<()> {
     Ok(())
 }
 
+// ── R2 (H2) — traversed symlink-to-file is skipped by default ─────────────
+
+/// H2 — a traversed symlink-to-a-file is skipped (not searched), while real
+/// files are searched. GREEN guard, NOT `#[ignore]`d.
+///
+/// WS31 ticket 01 switched the walker's file decision from `path.is_file()`
+/// (follows symlinks, fresh stat) to `entry.file_type()` (cached `d_type`).
+/// Because `follow_links` is never set on the `WalkBuilder`, a traversed symlink
+/// entry reports its OWN type (`is_symlink()==true`, `is_file()==false`) and is
+/// dropped at `grep_server.rs`'s `debug!("grep: skipping non-file entry")`. The
+/// review RESOLVED this as ripgrep-parity: the default-skip is CORRECT. An
+/// in-tree symlink target's content is still found via its real path, and
+/// following would produce DUPLICATE matches under both the link and the target;
+/// the only gap (a target outside the walked set) becomes the opt-in
+/// `--follow-links` in WS31-review ticket 07. This test pins that parity and
+/// guards against an accidental re-regression to following. The `d_type`
+/// precondition the R1/H1 test relies on does NOT matter here — that gates only
+/// the unreachable walker *retry* branch, not this default-skip; `file_type()`
+/// returns the symlink's own type on every filesystem.
+#[test]
+fn ws31_review_r2_traversed_symlink_file_is_skipped() -> Result<()> {
+    use std::os::unix::fs;
+
+    let dir = tempfile::tempdir()?;
+    let log_path = dir.path().join("notifications.jsonl");
+
+    // A real file at the root carrying the needle — ensures grep returns matches
+    // and runs the full directory walk (so the symlink IS traversed/decided).
+    let real_hit = dir.path().join(format!("real_hit.{MOCK_LANG}"));
+    std::fs::write(&real_hit, "needle\n")?;
+
+    // In sub/: a real target carrying the needle, plus a RELATIVE symlink to the
+    // sibling target. The walker traverses the link entry; with no follow_links
+    // its own type is `symlink` (not `file`) → skipped. The target is still found
+    // directly under `sub/target`.
+    let sub = dir.path().join("sub");
+    std::fs::create_dir(&sub)?;
+    let target = sub.join(format!("target.{MOCK_LANG}"));
+    std::fs::write(&target, "needle\n")?;
+    let link = sub.join(format!("link.{MOCK_LANG}"));
+    fs::symlink(format!("target.{MOCK_LANG}"), &link)?;
+
+    let log_arg = log_path.to_str().context("log path")?;
+    // A watcher-registering mockls so grep runs its full enriched pipeline (same
+    // minimal spawn as the changed_set.rs suite). H2 asserts on grep's own RESULT
+    // TEXT, not on the notification log — the watcher is just to exercise the
+    // full walk, not because the assertion reads notifications.
+    let lsp = mockls_lsp_arg(
+        MOCK_LANG,
+        &format!(
+            "--register-file-watchers --watcher-glob **/*.{MOCK_LANG} \
+             --notification-log {log_arg}"
+        ),
+    );
+    let root = dir.path().to_str().context("root path")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    // Pathless grep → the harness injects cwd=root → directory traversal. Result
+    // paths are rendered cwd-relative (e.g. `real_hit.<LANG>`, `sub/target.<LANG>`).
+    let out = bridge.call_tool_text("grep", &json!({ "pattern": "needle" }))?;
+
+    drop(bridge);
+    std::thread::sleep(Duration::from_millis(150));
+
+    // Real files are searched and their matches appear.
+    assert!(
+        out.contains(&format!("real_hit.{MOCK_LANG}")),
+        "the real root file must be searched and listed. out:\n{out}"
+    );
+    assert!(
+        out.contains(&format!("target.{MOCK_LANG}")),
+        "the real symlink TARGET (found directly under sub/) must be listed. \
+         out:\n{out}"
+    );
+    // Key guard (GREEN today): the traversed symlink is skipped by default, so
+    // `link.<LANG>` must NOT appear as a result path. (`link.<LANG>` is not a
+    // substring of `target.<LANG>`, so this can't false-pass on the target hit.)
+    // Pins ripgrep-parity default-skip (WS31-review H2); following is opt-in via
+    // ticket 07. A re-regression to follow_links would surface `link.<LANG>` here.
+    assert!(
+        !out.contains(&format!("link.{MOCK_LANG}")),
+        "a traversed symlink-to-file must be SKIPPED by default (ripgrep-parity, \
+         WS31-review H2); `link.{MOCK_LANG}` must not be listed. out:\n{out}"
+    );
+    Ok(())
+}
+
+// ── R2 (L4) — live-retry transient-miss recovery: NOT WRITTEN ─────────────
+//
+// L4 asks for a test proving the live retry helpers actually RETRY — a transient
+// miss-then-hit that recovers, such that the test would FAIL if
+// `STAT_RETRY_ATTEMPTS` were 1. This was NOT written: it cannot be done
+// deterministically and test-only without a production change.
+//
+// Both live helpers —
+//   `session.rs::path_exists_with_retry`        (uses `symlink_metadata`)
+//   `file_tools.rs::path_is_file_or_symlink_with_retry` (uses `is_file`/`is_symlink`)
+// — and the (dead, walker-only) `grep_server.rs::stat_is_file_with_retry` loop
+// `0..STAT_RETRY_ATTEMPTS` with NO sleep and NO yield between attempts (their
+// doc-comments are explicit: "the rename window is sub-millisecond" → tight
+// back-to-back syscalls). With no inter-attempt window there is no deterministic
+// way for a background thread to flip a path from miss→hit between attempt 1 and
+// a later attempt: any such race is timing-dependent and would be flaky, not a
+// GREEN guard. The helpers are private `fn`s taking `&Path` with no injectable
+// stat/clock seam. So a retry-count-sensitive test (one that fails at
+// `STAT_RETRY_ATTEMPTS == 1`) requires a production change — out of scope for
+// this add-tests-only pass. See the scout report for the proposed minimal seam
+// and alternatives.
+
 /// Probes whether the directory-permission seam is ineffective in this
 /// environment — i.e. a fresh stat of a file under a `0o400` (no-execute) parent
 /// still succeeds. That is true when running as root (which bypasses the execute
