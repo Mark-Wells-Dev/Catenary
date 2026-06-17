@@ -7,6 +7,10 @@
     clippy::expect_used,
     reason = "tests use expect for readable assertions"
 )]
+#![allow(
+    clippy::similar_names,
+    reason = "parallel server-P/server-S bindings read clearly with the _p/_s suffix"
+)]
 //! WS31-review ticket R1 — reaping must never run over a partial observation set.
 //!
 //! Two RED tests demonstrating bugs C1 and H1 (both in
@@ -34,6 +38,8 @@ use serde_json::{Value, json};
 use common::{BridgeProcess, ipc_request, mockls_lsp_arg};
 
 const MOCK_LANG: &str = "yX4Za";
+/// Second mock language for the L5 nested-root test (a distinct server).
+const MOCK_LANG_S: &str = "z9Qw7";
 
 /// Reads the notification log and returns every `(uri, type)` pair from every
 /// `workspace/didChangeWatchedFiles` notification recorded.
@@ -419,7 +425,10 @@ fn ws31_review_r3_resultcache_not_served_for_untracked_root() -> Result<()> {
     // every name a distinct group with a single outgoing edge.
     let mut body = String::new();
     for i in 0..PAIRS {
-        let _ = write!(body, "fn callee_{i:04}\nfn caller_{i:04} {{\ncallee_{i:04}\n}}\n");
+        let _ = write!(
+            body,
+            "fn callee_{i:04}\nfn caller_{i:04} {{\ncallee_{i:04}\n}}\n"
+        );
     }
     let file = sibling.path().join(format!("warm.{MOCK_LANG}"));
     std::fs::write(&file, &body)?;
@@ -499,6 +508,342 @@ fn ws31_review_r3_resultcache_not_served_for_untracked_root() -> Result<()> {
     assert!(
         after.contains("caller_0000"),
         "re-grep must still surface the raw match; got:\n{after}"
+    );
+
+    Ok(())
+}
+
+// ── R4 (M2) — eviction witnessed un-spoofably via cold re-query ─────────────
+
+/// Body that makes `mockls --scan-roots` report an outgoing call: a callee
+/// defined first, then a caller whose body names the callee. An enriched grep
+/// on the caller renders a `calls:` section. Mirrors
+/// `cache_eviction.rs::caller_callee`.
+fn caller_callee(callee: &str, entry: &str) -> String {
+    format!("fn {callee}\nfn {entry} {{\n{callee}\n}}\n")
+}
+
+/// Counts the request-log lines whose `method` equals `target`. The mockls
+/// `--request-log` appends one `{"method":"..."}` object per handled request.
+fn request_method_count(log: &str, target: &str) -> usize {
+    log.lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|entry| entry.get("method").and_then(Value::as_str) == Some(target))
+        .count()
+}
+
+/// M2 — witnesses `evict_root` un-spoofably: a re-added root must be a genuine
+/// COLD touch, so the daemon re-issues `textDocument/documentSymbol` against the
+/// re-spawned server.
+///
+/// The existing `cache_eviction.rs` tests assert `!contains("calls:")` on a grep
+/// against the now-UNTRACKED path — but `enrich_at_position` gates the cache read
+/// on `resolve_root(path).is_some()` and the per-root server is shut down on
+/// removal, so two independent backstops suppress `calls:` even if `evict_root`
+/// were a no-op. This test instead removes AND re-adds the root, then proves the
+/// re-grep was cold by reading a request counter on the re-spawned server: a
+/// no-op evict would leave the daemon-lived `SymbolIndex` warm, the re-grep would
+/// short-circuit on the cache, and the re-spawned server would see ZERO
+/// `textDocument/documentSymbol`. Because the re-add `File::create`-truncates the
+/// request-log, the window covers only the re-grep's server.
+///
+/// GREEN today: `evict_root` is correct ⇒ the re-grep is cold ⇒ documentSymbol
+/// is re-issued. The mutation check (Phase-A writer stubbed `evict_root` to a
+/// no-op) confirms this FAILS when eviction is broken.
+#[test]
+fn ws31_review_r4_eviction_witnessed_via_request_count() -> Result<()> {
+    // The base root keeps the daemon alive across the rm/add cycle.
+    let base = tempfile::tempdir()?;
+    let base_str = base.path().to_str().context("base path")?;
+
+    // The warmed root is a sibling directory. Canonicalize so it matches the
+    // form `roots-add` stores and `roots-ls` reports.
+    let work = tempfile::tempdir()?;
+    let work_path = work.path().canonicalize()?;
+    let work_str = work_path.to_str().context("work path")?;
+    let file = work.path().join(format!("warm.{MOCK_LANG}"));
+    std::fs::write(&file, caller_callee("callee_x", "caller_x"))?;
+
+    // The re-spawned server truncates this on `File::create`, so after the re-add
+    // it records ONLY the re-grep's requests.
+    let req_log_path = work_path.join("requests.jsonl");
+    let req_log_arg = req_log_path.to_str().context("request log path")?;
+    let lsp = mockls_lsp_arg(
+        MOCK_LANG,
+        &format!("--scan-roots --request-log {req_log_arg}"),
+    );
+
+    let mut bridge = BridgeProcess::spawn(&[&lsp], base_str)?;
+    bridge.initialize()?;
+    let socket = bridge.wait_for_ipc_socket()?;
+
+    // Add and warm the work root.
+    ipc_request(
+        &socket,
+        &json!({ "method": "tool/roots-add", "path": work_str }),
+    )?;
+    bridge.wait_for_root(work_str, Duration::from_secs(5))?;
+    std::thread::sleep(Duration::from_millis(300));
+
+    let warm = bridge.call_tool_text(
+        "grep",
+        &json!({ "pattern": "caller_x", "directory": work_str }),
+    )?;
+    // Precondition — the setup is genuinely enriched.
+    assert!(
+        warm.contains("calls:"),
+        "warming grep must be enriched (calls: section), got:\n{warm}"
+    );
+
+    // Remove the root, then poll until untracked.
+    ipc_request(
+        &socket,
+        &json!({ "method": "tool/roots-rm", "path": work_str }),
+    )?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let ls = ipc_request(&socket, &json!({ "method": "tool/roots-ls" }))?;
+        if !ls.contains(work_str) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "work root still tracked after roots-rm: {ls}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Re-add the root. The per-root server re-spawns and `File::create`-truncates
+    // the request-log, opening a clean window over just the re-grep's server.
+    ipc_request(
+        &socket,
+        &json!({ "method": "tool/roots-add", "path": work_str }),
+    )?;
+    bridge.wait_for_root(work_str, Duration::from_secs(5))?;
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Re-grep. With a correct evict, the daemon-lived SymbolIndex was emptied for
+    // this root, so this is a genuine cold touch: the daemon re-queries the outline.
+    let cold = bridge.call_tool_text(
+        "grep",
+        &json!({ "pattern": "caller_x", "directory": work_str }),
+    )?;
+    // Anti-vacuous: the re-grep still surfaces the symbol AND re-resolves enrichment.
+    assert!(
+        cold.contains("caller_x"),
+        "re-added root must serve the raw match; got:\n{cold}"
+    );
+    assert!(
+        cold.contains("calls:"),
+        "cold first touch after eviction must re-resolve enrichment; got:\n{cold}"
+    );
+
+    drop(bridge);
+    std::thread::sleep(Duration::from_millis(300));
+
+    // The re-grep was cold ⇒ the daemon re-issued documentSymbol against the
+    // re-spawned server. A no-op evict would leave the cache warm ⇒ count 0.
+    let req_log = std::fs::read_to_string(&req_log_path).unwrap_or_default();
+    let doc_symbol_count = request_method_count(&req_log, "textDocument/documentSymbol");
+    assert!(
+        doc_symbol_count >= 1,
+        "re-add must be a genuine cold touch — the daemon must re-query the \
+         outline (textDocument/documentSymbol) at least once. count={doc_symbol_count}, \
+         request log:\n{req_log}"
+    );
+    // The outgoingCalls re-query is the enrichment edge; its presence corroborates
+    // a cold enrichment rather than a stale warm hit.
+    let outgoing_count = request_method_count(&req_log, "callHierarchy/outgoingCalls");
+    assert!(
+        outgoing_count >= 1,
+        "cold re-enrichment must re-query callHierarchy/outgoingCalls at least \
+         once. count={outgoing_count}, request log:\n{req_log}"
+    );
+
+    Ok(())
+}
+
+// ── R4 (M4) — second walk emits an empty changeset ──────────────────────────
+
+/// M4 — a second walk with no FS change must emit ZERO new
+/// `didChangeWatchedFiles` (the bug-38 no-repeat property), positively encoded.
+///
+/// Strengthens the weak `changed_set.rs::second_walk_sends_only_delta`, which
+/// compared only notification COUNTS after a fixed sleep — an under-counted first
+/// could equal an under-counted total (false pass), and it never asserted the
+/// second changeset was empty. Here the first walk's emitted URIs are captured,
+/// the second walk runs with no FS change, and the full log must be IDENTICAL to
+/// the first — any re-announced URI is listed. The single append-only server log
+/// is order-stable, so equality is exact.
+///
+/// GREEN today.
+#[test]
+fn ws31_review_r4_second_walk_emits_empty_changeset() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let log_path = dir.path().join("notifications.jsonl");
+    std::fs::write(dir.path().join(format!("a.{MOCK_LANG}")), "needle\n")?;
+    std::fs::write(dir.path().join(format!("b.{MOCK_LANG}")), "other\n")?;
+
+    let log_arg = log_path.to_str().context("log path")?;
+    let lsp = mockls_lsp_arg(
+        MOCK_LANG,
+        &format!(
+            "--register-file-watchers --watcher-glob **/*.{MOCK_LANG} \
+             --notification-log {log_arg}"
+        ),
+    );
+    let root = dir.path().to_str().context("root path")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    // Walk #1 — the cold-start full candidate set.
+    let _ = bridge.call_tool_text("grep", &json!({ "pattern": "needle" }))?;
+    std::thread::sleep(Duration::from_millis(150));
+    let log_after_first = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let after_first = watched_file_changes(&log_after_first);
+    // Anti-vacuous: the first walk announced something.
+    assert!(
+        !after_first.is_empty(),
+        "first walk must announce the cold candidate set. log:\n{log_after_first}"
+    );
+
+    // Walk #2 — NO FS change.
+    let _ = bridge.call_tool_text("grep", &json!({ "pattern": "needle" }))?;
+
+    drop(bridge);
+    std::thread::sleep(Duration::from_millis(300));
+
+    let full_log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let total = watched_file_changes(&full_log);
+    // Positively encodes bug-38 no-repeat: the second walk added zero changes, so
+    // the full set equals the first walk's set. Order-stable single-server log.
+    assert_eq!(
+        total,
+        after_first,
+        "second walk with no FS change must emit zero new didChangeWatchedFiles; \
+         extra: {:?}",
+        &total[after_first.len().min(total.len())..]
+    );
+
+    Ok(())
+}
+
+// ── R4 (L5) — covering_watchers subdir/parent scope prefix matching ─────────
+
+/// L5 — `covering_watchers` includes a subdir-scoped server for a parent walk and
+/// excludes a parent-scoped server for a child walk
+/// (`scope.root_path().starts_with(root)`).
+///
+/// Two canonicalized tracked roots `parent` and `parent/sub`, each with its own
+/// mockls language/server registering its own glob + its own notification log.
+///
+/// - **Positive:** a grep over `parent` matches `parent/top.<LANG_S>` (resolving
+///   to root `parent`). Server S — scoped to `parent/sub` — is included in that
+///   parent walk because `parent/sub` `starts_with` `parent`, so S's log records
+///   the `top.<LANG_S>` change.
+/// - **Negative:** a SEPARATE grep tightly scoped to `parent/sub` matches
+///   `parent/sub/inner.<LANG_P>` (resolving to root `parent/sub`). Server P —
+///   scoped to `parent` — is EXCLUDED because `parent` `starts_with` `parent/sub`
+///   is false, so P's log records nothing for that walk.
+///
+/// The two greps are kept separate so a single grep can't span both roots.
+/// GREEN today.
+#[test]
+fn ws31_review_r4_covering_watchers_subdir_scope() -> Result<()> {
+    // Parent root and a nested child root. Canonicalize both so the literal
+    // `starts_with` prefix relationship holds in the form roots are stored.
+    let parent = tempfile::tempdir()?;
+    let parent_path = parent.path().canonicalize()?;
+    let parent_str = parent_path.to_str().context("parent path")?;
+
+    let sub_path = parent_path.join("sub");
+    std::fs::create_dir(&sub_path)?;
+    let sub_str = sub_path.to_str().context("sub path")?;
+
+    // Server P (lang = MOCK_LANG) is scoped to `parent`; server S (lang =
+    // MOCK_LANG_S) is scoped to `parent/sub`. Two distinct langs ⇒ two servers.
+    let log_p = parent_path.join("notifications_p.jsonl");
+    let log_s = parent_path.join("notifications_s.jsonl");
+    let log_p_arg = log_p.to_str().context("log p path")?;
+    let log_s_arg = log_s.to_str().context("log s path")?;
+
+    let lsp_p = mockls_lsp_arg(
+        MOCK_LANG,
+        &format!(
+            "--register-file-watchers --watcher-glob **/*.{MOCK_LANG} \
+             --watcher-kind 7 --notification-log {log_p_arg}"
+        ),
+    );
+    let lsp_s = mockls_lsp_arg(
+        MOCK_LANG_S,
+        &format!(
+            "--register-file-watchers --watcher-glob **/*.{MOCK_LANG_S} \
+             --watcher-kind 7 --notification-log {log_s_arg}"
+        ),
+    );
+
+    // Positive fixture: a file matching S's glob under `parent` (so S's scope
+    // `parent/sub` is covered by a `parent` walk), plus a P-glob file so the
+    // parent-scoped grep walks `parent`.
+    let top_s = parent_path.join(format!("top.{MOCK_LANG_S}"));
+    let top_p = parent_path.join(format!("top.{MOCK_LANG}"));
+    std::fs::write(&top_s, "needle\n")?;
+    std::fs::write(&top_p, "needle\n")?;
+    // Negative fixture: a P-glob file under `parent/sub`, matched only by the
+    // tightly-scoped child grep.
+    let inner_p = sub_path.join(format!("inner.{MOCK_LANG}"));
+    std::fs::write(&inner_p, "needle\n")?;
+
+    // Both roots tracked: `parent` and `parent/sub`. Declare them via MCP
+    // `roots/list` so they enter the daemon's RootTracker (a plain `initialize`
+    // would leave the tracker empty, so `roots-ls` would never report them).
+    let mut bridge = BridgeProcess::spawn_multi_root(&[&lsp_p, &lsp_s], &[parent_str, sub_str])?;
+    bridge.initialize_with_roots(&[parent_str, sub_str])?;
+    bridge.wait_for_root(parent_str, Duration::from_secs(5))?;
+    bridge.wait_for_root(sub_str, Duration::from_secs(5))?;
+    std::thread::sleep(Duration::from_millis(300));
+
+    // POSITIVE walk: grep over `parent`. The walk root is `parent`; S (scoped to
+    // `parent/sub`) is a covering watcher because `parent/sub`.starts_with(`parent`).
+    let _ = bridge.call_tool_text(
+        "grep",
+        &json!({ "pattern": "needle", "directory": parent_str }),
+    )?;
+
+    // NEGATIVE walk: a SEPARATE grep tightly scoped to `parent/sub`. The walk root
+    // is `parent/sub`; P (scoped to `parent`) is EXCLUDED because
+    // `parent`.starts_with(`parent/sub`) is false.
+    let _ = bridge.call_tool_text(
+        "grep",
+        &json!({ "pattern": "needle", "directory": sub_str }),
+    )?;
+
+    drop(bridge);
+    std::thread::sleep(Duration::from_millis(300));
+
+    let top_s_uri = format!("file://{}/top.{MOCK_LANG_S}", parent_path.display());
+    let inner_p_uri = format!("file://{}/sub/inner.{MOCK_LANG}", parent_path.display());
+
+    // Positive: the subdir-scoped server S was included in the parent walk and
+    // recorded its globbed file.
+    let log_s_text = std::fs::read_to_string(&log_s).unwrap_or_default();
+    let s_changes = watched_file_changes(&log_s_text);
+    assert!(
+        s_changes.iter().any(|(u, _)| *u == top_s_uri),
+        "subdir-scoped server (parent/sub) must be INCLUDED in the parent walk \
+         (parent/sub starts_with parent) and receive top.{MOCK_LANG_S}. \
+         s_changes={s_changes:?}, log:\n{log_s_text}"
+    );
+
+    // Negative: the parent-scoped server P must have received NO change for the
+    // child-scoped walk's file (parent does not start_with parent/sub).
+    let log_p_text = std::fs::read_to_string(&log_p).unwrap_or_default();
+    let p_changes = watched_file_changes(&log_p_text);
+    assert!(
+        !p_changes.iter().any(|(u, _)| *u == inner_p_uri),
+        "parent-scoped server (parent) must be EXCLUDED from the child walk \
+         (parent does NOT start_with parent/sub) and must not receive \
+         sub/inner.{MOCK_LANG}. p_changes={p_changes:?}, log:\n{log_p_text}"
     );
 
     Ok(())

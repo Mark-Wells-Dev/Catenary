@@ -116,6 +116,12 @@ struct Args {
     #[arg(long)]
     notification_log: Option<String>,
 
+    /// Write every handled request method to a JSONL file.
+    /// Each line is `{"method":"..."}`. Tests read after shutdown to verify
+    /// which requests the daemon issued (e.g. a cold `textDocument/documentSymbol`).
+    #[arg(long)]
+    request_log: Option<String>,
+
     /// Return `ContentModified` (-32801) on the first `textDocument/definition`
     /// request, then succeed on retry. Tests the retry path.
     #[arg(long)]
@@ -309,6 +315,8 @@ struct MockServer {
     next_request_id: Arc<AtomicU64>,
     /// Optional notification log file for test verification.
     notification_log: Option<std::fs::File>,
+    /// Optional request log file for test verification.
+    request_log: Option<std::fs::File>,
     /// Whether the first definition request has been seen (for `--content-modified-once`).
     definition_failed_once: bool,
     /// Workspace roots parsed from `initialize` params.
@@ -319,6 +327,11 @@ impl MockServer {
     fn new(args: Args, writer: Writer) -> Self {
         let notification_log = args
             .notification_log
+            .as_ref()
+            .and_then(|path| std::fs::File::create(path).ok());
+
+        let request_log = args
+            .request_log
             .as_ref()
             .and_then(|path| std::fs::File::create(path).ok());
 
@@ -333,6 +346,7 @@ impl MockServer {
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             next_request_id: Arc::new(AtomicU64::new(1)),
             notification_log,
+            request_log,
             definition_failed_once: false,
             workspace_roots: Vec::new(),
         }
@@ -444,6 +458,11 @@ impl MockServer {
     )]
     fn handle_request(&mut self, method: &str, request: Request) {
         let Some(id) = request.id else { return };
+
+        // Log request method if configured (mirrors notification_log).
+        if let Some(ref mut log) = self.request_log {
+            let _ = writeln!(log, "{}", serde_json::json!({ "method": method }));
+        }
 
         // Check hang_on — never respond
         if self.args.hang_on.iter().any(|m| m == method) {
@@ -2401,6 +2420,7 @@ mod tests {
             flycheck_command: None,
             advertise_save: false,
             notification_log: None,
+            request_log: None,
             content_modified_once: false,
             cpu_on_workspace_change: None,
             cpu_on_initialized: None,
