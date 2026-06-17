@@ -10,6 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use ignore::WalkBuilder;
 
@@ -60,6 +61,69 @@ pub enum FileKind {
     /// deletion.
     Folder,
 }
+
+/// Semantic change kind for a baseline diff entry (WS31 Consumer A).
+///
+/// Drives **both** the per-server watch-**kind** mask filter and the wire
+/// `FileChangeType` sent in `workspace/didChangeWatchedFiles` (Created ⇒ 1,
+/// Changed ⇒ 2). The two now agree: a path routed as `Created` carries
+/// `FileChangeType` 1 and is gated by the watcher's `Create` bit; a path routed
+/// as `Changed` carries 2 and is gated by the `Change` bit. Per the LSP spec,
+/// `didChangeWatchedFiles` is Catenary's channel for filesystem-observed
+/// changes and its payload is meant to carry the real Created/Changed/Deleted
+/// distinction (`didCreateFiles` is a *different*, editor-initiated notification
+/// Catenary does not use). See
+/// [decision 018](../../decisions/018_filesystem_coherence_changed_set.md).
+///
+/// The first walk for a root is the cold snapshot: those files pre-exist and the
+/// server already indexed them at startup, so they are `Changed`, not `Created`
+/// (nothing was created relative to the server's knowledge). Only a path that
+/// appears on a *later* walk — absent from a baseline that already existed — is a
+/// genuine `Created`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChangeKind {
+    /// The path was absent from a baseline that already existed (a genuine
+    /// creation on a later walk). Gated by the watcher's `Create` kind bit and
+    /// emitted as `FileChangeType` 1.
+    Created,
+    /// The path's mtime advanced, or it was observed on the first walk (the cold
+    /// snapshot of pre-existing, already-indexed files). Gated by the watcher's
+    /// `Change` kind bit and emitted as `FileChangeType` 2.
+    Changed,
+}
+
+/// One diffed change from a coherence walk: a root-relative path plus its
+/// semantic [`ChangeKind`]. Produced by
+/// [`FilesystemManager::diff_and_update`] and routed per server.
+#[derive(Debug, Clone)]
+pub(crate) struct Change {
+    /// Path relative to the owning root.
+    pub rel: PathBuf,
+    /// Whether the path was created (absent) or changed (mtime advanced).
+    pub kind: ChangeKind,
+}
+
+/// The delta a single coherence walk produces for one root: the per-server
+/// router fans these out filtered by each server's registered globs + kind
+/// mask. Empty when nothing changed since the last walk (the bug-38 no-repeat
+/// property).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ChangeSet {
+    /// Diffed changes, each a root-relative path + semantic kind.
+    pub changes: Vec<Change>,
+}
+
+impl ChangeSet {
+    /// Returns `true` when no path changed since the last walk.
+    pub const fn is_empty(&self) -> bool {
+        self.changes.is_empty()
+    }
+}
+
+/// Per-root last-seen baseline: an outer map from root to a per-root inner
+/// `Arc<Mutex<…>>` of `relative-path → mtime`. The per-root inner lock keeps
+/// parallel-subagent worktrees from contending on a single global lock.
+type LastSeen = Mutex<HashMap<PathBuf, Arc<Mutex<HashMap<PathBuf, i64>>>>>;
 
 /// Pre-built classification lookup tables derived from merged config.
 ///
@@ -264,6 +328,14 @@ pub struct FilesystemManager {
     /// modified. Used by [`SymbolIndex`] enrichment cache and
     /// [`ResultCache`] for invalidation.
     root_generations: std::sync::Mutex<HashMap<PathBuf, u64>>,
+    /// Per-root last-seen mtimes for the LSP changed-set nudge (WS31 Consumer A).
+    /// Inner key is the path **relative to the root** (the root prefix is the
+    /// outer key, not repeated per entry). Tracks what the servers have been
+    /// told — distinct from the Consumer-B cache floors, which track each cache
+    /// entry's build mtime. Per-root inner lock so parallel-subagent worktrees
+    /// don't contend; the outer lock only fetches/creates the inner `Arc<Mutex>`
+    /// and is never held across the walk or an `.await`.
+    last_seen: LastSeen,
 }
 
 /// Cache entry storing classification results keyed by mtime.
@@ -288,6 +360,7 @@ impl Default for FilesystemManager {
             classification: ClassificationTables::default(),
             per_root_classification: std::sync::Mutex::new(HashMap::new()),
             root_generations: std::sync::Mutex::new(HashMap::new()),
+            last_seen: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -311,6 +384,7 @@ impl FilesystemManager {
             classification,
             per_root_classification: std::sync::Mutex::new(HashMap::new()),
             root_generations: std::sync::Mutex::new(HashMap::new()),
+            last_seen: Mutex::new(HashMap::new()),
         }
     }
 
@@ -577,6 +651,131 @@ impl FilesystemManager {
         if let Ok(mut gens) = self.root_generations.lock() {
             *gens.entry(root.to_path_buf()).or_insert(0) += 1;
         }
+    }
+
+    // ── Changed-set baseline (WS31 Consumer A) ────────────────────────
+
+    /// Diffs a coherence walk's observations against the per-root baseline and
+    /// merges the new mtimes in, returning the [`ChangeSet`] to route per server.
+    ///
+    /// `observed` is the set of `(relative-path, mtime)` pairs the walk visited
+    /// for files matching some server's registered watch glob. Classification
+    /// keys off whether this is the **first walk** for the root — the per-root
+    /// key being absent from `last_seen` *before this diff*:
+    ///
+    /// - **first walk** (root key created here): every observed path is the cold
+    ///   snapshot of pre-existing, already-indexed files ⇒ [`ChangeKind::Changed`]
+    ///   (nothing was "created" relative to the server's startup knowledge; the
+    ///   wire `FileChangeType` 2 and a `Change`-only watcher correctly receives
+    ///   it while a `Create`-only watcher does not). Per the LSP spec,
+    ///   `didChangeWatchedFiles` carries the true `FileChangeType`;
+    ///   `didCreateFiles` is a different, editor-initiated notification we do not
+    ///   use;
+    /// - **populated baseline, absent** ⇒ [`ChangeKind::Created`] (a genuine
+    ///   creation on a later walk; wire `FileChangeType` 1), record its mtime;
+    /// - **present, mtime advanced** ⇒ [`ChangeKind::Changed`], update;
+    /// - **present, unchanged** ⇒ nothing.
+    ///
+    /// The first walk *is* the snapshot — no separate seed. The first-walk marker
+    /// also handles an initially-empty repo: the first walk creates the (possibly
+    /// empty) key, so a file appearing on a later walk finds the key present ⇒ is
+    /// a genuine `Created`. Deletion reaping (a baseline entry the walk did not
+    /// visit) is a full-walk property specified with the gate in ticket 04; this
+    /// records and updates only.
+    ///
+    /// **Lock discipline:** the outer `last_seen` lock is held only to test the
+    /// first-walk marker (`contains_key`) and fetch-or-create the per-root
+    /// `Arc<Mutex<…>>`; the inner per-root lock is held only for the short merge
+    /// critical section. Neither is held across the walk (the walk runs in the
+    /// caller, before this is called) nor across an `.await`.
+    pub(crate) fn diff_and_update(&self, root: &Path, observed: &[(PathBuf, i64)]) -> ChangeSet {
+        // Test the first-walk marker and fetch-or-create the per-root inner map
+        // under the outer lock, then immediately release the outer lock — only
+        // the inner lock is held for the merge. The marker is the root key being
+        // absent *before* this get-or-insert: first walk ⇒ cold snapshot.
+        let (inner, first_walk) = {
+            let mut outer = self
+                .last_seen
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let first_walk = !outer.contains_key(root);
+            let inner = Arc::clone(
+                outer
+                    .entry(root.to_path_buf())
+                    .or_insert_with(|| Arc::new(Mutex::new(HashMap::new()))),
+            );
+            drop(outer);
+            (inner, first_walk)
+        };
+
+        let mut baseline = inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut changes = Vec::new();
+        for (rel, mtime) in observed {
+            match baseline.get(rel) {
+                None => {
+                    baseline.insert(rel.clone(), *mtime);
+                    // First walk ⇒ cold snapshot of already-indexed files ⇒
+                    // Changed; absent on a populated baseline ⇒ genuine Created.
+                    let kind = if first_walk {
+                        ChangeKind::Changed
+                    } else {
+                        ChangeKind::Created
+                    };
+                    changes.push(Change {
+                        rel: rel.clone(),
+                        kind,
+                    });
+                }
+                Some(&prev) if *mtime > prev => {
+                    baseline.insert(rel.clone(), *mtime);
+                    changes.push(Change {
+                        rel: rel.clone(),
+                        kind: ChangeKind::Changed,
+                    });
+                }
+                Some(_) => {}
+            }
+        }
+        drop(baseline);
+        ChangeSet { changes }
+    }
+
+    /// Drops a root's changed-set baseline and generation counter.
+    ///
+    /// Called from the `sync_roots` `to_remove` cleanup when a root leaves the
+    /// tracked set. Without this, removed-root entries accumulate (a memory
+    /// leak) and a path later re-mounted by a different project would diff
+    /// against a stale baseline. Re-adding the root starts fresh: the next walk
+    /// is a cold-start full-candidate snapshot. Also drops the long-standing
+    /// `root_generations` leak (inserted/bumped but never removed on root drop).
+    pub fn remove_root_baseline(&self, root: &Path) {
+        self.last_seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(root);
+        self.root_generations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(root);
+    }
+
+    /// Returns `true` if a changed-set baseline exists for the root (test-only).
+    #[cfg(test)]
+    pub(crate) fn has_baseline_for_test(&self, root: &Path) -> bool {
+        self.last_seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains_key(root)
+    }
+
+    /// Returns `true` if a generation counter entry exists for the root
+    /// (test-only).
+    #[cfg(test)]
+    pub(crate) fn has_generation_for_test(&self, root: &Path) -> bool {
+        self.root_generations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains_key(root)
     }
 }
 
@@ -1422,5 +1621,127 @@ mod tests {
         mgr.bump_generations(&[file_a, file_b]);
         assert_eq!(mgr.root_generation(dir_a.path()), 2);
         assert_eq!(mgr.root_generation(dir_b.path()), 1);
+    }
+
+    // ── Changed-set baseline (diff_and_update / remove_root_baseline) ──
+
+    /// The first diff against an empty baseline yields every observed path as a
+    /// `Changed` candidate — the cold snapshot of pre-existing, already-indexed
+    /// files (nothing was "created" relative to the server's startup knowledge).
+    #[test]
+    fn diff_and_update_first_walk_is_full_candidate_set() {
+        let mgr = FilesystemManager::new();
+        let root = PathBuf::from("/root");
+        let observed = vec![
+            (PathBuf::from("a.rs"), 100),
+            (PathBuf::from("src/b.rs"), 200),
+        ];
+        let set = mgr.diff_and_update(&root, &observed);
+        assert_eq!(set.changes.len(), 2, "cold baseline ⇒ all observed");
+        assert!(
+            set.changes.iter().all(|c| c.kind == ChangeKind::Changed),
+            "first-walk cold snapshot ⇒ Changed (not Created)"
+        );
+    }
+
+    /// A file absent from a baseline that *already existed* (a later walk, not the
+    /// first) is a genuine `Created`: seed via a first walk, then walk again with
+    /// a brand-new rel path present.
+    #[test]
+    fn diff_and_update_new_file_after_seed_is_created() {
+        let mgr = FilesystemManager::new();
+        let root = PathBuf::from("/root");
+
+        // First walk seeds the baseline (the root key now exists).
+        let _ = mgr.diff_and_update(&root, &[(PathBuf::from("a.rs"), 100)]);
+
+        // Second walk: a NEW path absent from the populated baseline ⇒ Created.
+        let set = mgr.diff_and_update(
+            &root,
+            &[(PathBuf::from("a.rs"), 100), (PathBuf::from("b.rs"), 200)],
+        );
+        assert_eq!(set.changes.len(), 1, "only the new path is a change");
+        assert_eq!(set.changes[0].rel, PathBuf::from("b.rs"));
+        assert_eq!(
+            set.changes[0].kind,
+            ChangeKind::Created,
+            "absent on a populated baseline ⇒ genuine Created"
+        );
+    }
+
+    /// A second diff with no mtime change yields an empty set (bug-38 no-repeat).
+    #[test]
+    fn diff_and_update_second_walk_no_change_is_empty() {
+        let mgr = FilesystemManager::new();
+        let root = PathBuf::from("/root");
+        let observed = vec![(PathBuf::from("a.rs"), 100)];
+        let _ = mgr.diff_and_update(&root, &observed);
+        let set = mgr.diff_and_update(&root, &observed);
+        assert!(set.is_empty(), "unchanged mtime ⇒ nothing");
+    }
+
+    /// An advanced mtime on a previously-seen path yields a `Changed` (not
+    /// `Created`) candidate; a regressed/equal mtime yields nothing.
+    #[test]
+    fn diff_and_update_advanced_mtime_is_changed() {
+        let mgr = FilesystemManager::new();
+        let root = PathBuf::from("/root");
+        let _ = mgr.diff_and_update(&root, &[(PathBuf::from("a.rs"), 100)]);
+
+        let set = mgr.diff_and_update(&root, &[(PathBuf::from("a.rs"), 150)]);
+        assert_eq!(set.changes.len(), 1);
+        assert_eq!(set.changes[0].kind, ChangeKind::Changed);
+
+        // Equal mtime ⇒ nothing; a stale (lower) mtime ⇒ nothing.
+        assert!(
+            mgr.diff_and_update(&root, &[(PathBuf::from("a.rs"), 150)])
+                .is_empty()
+        );
+        assert!(
+            mgr.diff_and_update(&root, &[(PathBuf::from("a.rs"), 120)])
+                .is_empty()
+        );
+    }
+
+    /// `remove_root_baseline` drops both the `last_seen` baseline and the
+    /// `root_generations` entry; re-seeding the root yields a fresh first-walk
+    /// full set.
+    #[test]
+    fn remove_root_baseline_drops_both_and_resets() {
+        let mgr = FilesystemManager::new();
+        let root = PathBuf::from("/root");
+
+        let _ = mgr.diff_and_update(&root, &[(PathBuf::from("a.rs"), 100)]);
+        mgr.bump_generation_for_test(&root);
+        assert!(mgr.has_baseline_for_test(&root));
+        assert!(mgr.has_generation_for_test(&root));
+
+        mgr.remove_root_baseline(&root);
+        assert!(!mgr.has_baseline_for_test(&root), "last_seen entry dropped");
+        assert!(
+            !mgr.has_generation_for_test(&root),
+            "root_generations entry dropped"
+        );
+
+        // Re-seed ⇒ fresh cold-start full set (a first walk again ⇒ Changed).
+        let set = mgr.diff_and_update(&root, &[(PathBuf::from("a.rs"), 100)]);
+        assert_eq!(set.changes.len(), 1);
+        assert_eq!(set.changes[0].kind, ChangeKind::Changed);
+    }
+
+    /// Baselines are per-root: identical relative paths under different roots
+    /// diff independently.
+    #[test]
+    fn diff_and_update_is_per_root() {
+        let mgr = FilesystemManager::new();
+        let root_a = PathBuf::from("/a");
+        let root_b = PathBuf::from("/b");
+        let observed = vec![(PathBuf::from("x.rs"), 100)];
+
+        assert_eq!(mgr.diff_and_update(&root_a, &observed).changes.len(), 1);
+        // Same rel path, different root ⇒ still a fresh candidate.
+        assert_eq!(mgr.diff_and_update(&root_b, &observed).changes.len(), 1);
+        // Re-walking root A with the same mtime ⇒ nothing.
+        assert!(mgr.diff_and_update(&root_a, &observed).is_empty());
     }
 }

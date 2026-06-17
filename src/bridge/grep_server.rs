@@ -354,8 +354,29 @@ impl GrepServer {
             }
         }
 
-        // Step 2a: Nudge servers with flat readdir of effective roots.
-        self.client_manager.nudge_roots(&effective_roots).await;
+        // Step 2a: Route the changed-set nudge (WS31 Consumer A). The ripgrep
+        // walk already statted every visited file; group those observations by
+        // workspace root (root-relative), diff against the per-root baseline,
+        // and route the delta per server. No edited-set exclusion for grep.
+        {
+            let mut by_root: HashMap<PathBuf, Vec<(PathBuf, i64)>> = HashMap::new();
+            for (abs, mtime) in &rg.files {
+                if let Some(root) = self.fs_manager.resolve_root(abs)
+                    && let Ok(rel) = abs.strip_prefix(&root)
+                {
+                    by_root
+                        .entry(root)
+                        .or_default()
+                        .push((rel.to_path_buf(), *mtime));
+                }
+            }
+            let no_exclude: HashSet<PathBuf> = HashSet::new();
+            for (root, observed) in &by_root {
+                self.client_manager
+                    .nudge_changed_set(root, observed, &no_exclude)
+                    .await;
+            }
+        }
 
         // Step 2b: Populate (or refresh) symbol index for matched files.
         super::ensure_symbols(
@@ -1159,6 +1180,19 @@ impl GrepServer {
                         return WalkState::Continue;
                     }
 
+                    // Record this file's mtime for the WS31 changed-set baseline
+                    // (Consumer A) — every visited file, before the query-level
+                    // `exclude` and binary skips, so coherence coverage is the
+                    // full tree (the manager scopes it to registered globs). The
+                    // stat is free: the binary check below reuses this metadata.
+                    let metadata = path.metadata().ok();
+                    if let Some(md) = &metadata {
+                        state
+                            .local
+                            .files
+                            .push((path.to_path_buf(), mtime_nanos(md)));
+                    }
+
                     if let Some(rg) = &exclude
                         && rg.is_match(path, &root)
                     {
@@ -1166,8 +1200,8 @@ impl GrepServer {
                     }
 
                     // Skip binary files — no meaningful text matches
-                    if let Ok(metadata) = path.metadata()
-                        && fs_manager.is_binary(path, &metadata)
+                    if let Some(md) = &metadata
+                        && fs_manager.is_binary(path, md)
                     {
                         return WalkState::Continue;
                     }
@@ -1809,7 +1843,10 @@ struct CollectOnDrop {
 impl Drop for CollectOnDrop {
     fn drop(&mut self) {
         let local = std::mem::take(&mut self.local);
-        if local.file_lines.is_empty() {
+        // Flush when this thread saw any matches OR any files: the changed-set
+        // baseline (WS31) needs every visited file, even from a thread whose
+        // files held no pattern match.
+        if local.file_lines.is_empty() && local.files.is_empty() {
             return;
         }
         // Recover a poisoned mutex rather than silently discard this thread's
@@ -1888,6 +1925,13 @@ struct RipgrepMatches {
     /// cached page is invalidated even though no existing match's mtime moved
     /// (bug #26 add/remove gap).
     dirs: Vec<PathBuf>,
+    /// Every regular file the walk visited, with its `(absolute path, mtime)`
+    /// — not just the files that matched the pattern. Feeds the WS31 changed-set
+    /// baseline diff (Consumer A): the manager filters these to the union of
+    /// registered watch globs, diffs against the per-root baseline, and routes
+    /// the delta per server. The stat is free here — the walk already reads each
+    /// file (`grep_server.rs` ripgrep walk).
+    files: Vec<(PathBuf, i64)>,
 }
 
 impl RipgrepMatches {
@@ -1896,6 +1940,7 @@ impl RipgrepMatches {
         let mut file_lines: BTreeMap<String, Vec<u32>> = BTreeMap::new();
         let mut file_line_texts: HashMap<String, HashMap<u32, Vec<(String, u32)>>> = HashMap::new();
         let mut dirs: Vec<PathBuf> = Vec::new();
+        let mut files: Vec<(PathBuf, i64)> = Vec::new();
 
         for part in parts {
             for (file, lines) in part.file_lines {
@@ -1908,12 +1953,14 @@ impl RipgrepMatches {
                 }
             }
             dirs.extend(part.dirs);
+            files.extend(part.files);
         }
 
         Self {
             file_lines,
             file_line_texts,
             dirs,
+            files,
         }
     }
 }
@@ -1927,6 +1974,9 @@ struct ThreadMatches {
     file_line_texts: HashMap<String, HashMap<u32, Vec<(String, u32)>>>,
     /// Directories visited by this thread (result-cache membership witnesses).
     dirs: Vec<PathBuf>,
+    /// Every regular file this thread visited, `(absolute path, mtime)` — the
+    /// WS31 changed-set baseline observation set.
+    files: Vec<(PathBuf, i64)>,
 }
 
 /// Splits a regex pattern on top-level `|` alternation.

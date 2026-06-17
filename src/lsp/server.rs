@@ -18,6 +18,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::Notify;
 use tracing::{debug, info, trace};
 
+use crate::bridge::filesystem_manager::ChangeKind;
+
 use super::client::DiagnosticsCache;
 use super::connection::Connection;
 use super::extract;
@@ -38,9 +40,8 @@ const WATCH_KIND_ALL: u8 = WATCH_KIND_CREATE | WATCH_KIND_CHANGE | WATCH_KIND_DE
 /// registration: a resolved glob plus the change kinds it cares about.
 #[derive(Clone)]
 #[allow(
-    dead_code,
     clippy::redundant_pub_crate,
-    reason = "pub(crate) + fields consumed by WS31 ticket 03 (changed-set nudge)"
+    reason = "pub(crate) consumed by WS31 ticket 03 (changed-set nudge)"
 )]
 pub(crate) struct ParsedWatcher {
     /// Compiled glob (absolute or base-relative pattern).
@@ -53,6 +54,37 @@ pub(crate) struct ParsedWatcher {
 }
 
 impl ParsedWatcher {
+    /// Returns whether this watcher covers a changed path of the given
+    /// semantic [`ChangeKind`].
+    ///
+    /// `rel` is the path relative to the workspace root; `abs` is the absolute
+    /// path. The change is gated by both the watcher's kind mask
+    /// ([`ChangeKind::Created`] needs the `Create` bit, [`ChangeKind::Changed`]
+    /// needs the `Change` bit) and its glob. A base-relative pattern (`base`
+    /// set) matches against the path relative to that base; a workspace-relative
+    /// pattern matches the root-relative path, with the absolute path as a
+    /// fallback (servers register both forms).
+    pub(crate) fn covers(
+        &self,
+        rel: &std::path::Path,
+        abs: &std::path::Path,
+        kind: ChangeKind,
+    ) -> bool {
+        let required = match kind {
+            ChangeKind::Created => WATCH_KIND_CREATE,
+            ChangeKind::Changed => WATCH_KIND_CHANGE,
+        };
+        if self.kind & required == 0 {
+            return false;
+        }
+        if let Some(base) = &self.base {
+            return abs
+                .strip_prefix(base)
+                .is_ok_and(|sub| self.glob.is_match(sub));
+        }
+        self.glob.is_match(rel) || self.glob.is_match(abs)
+    }
+
     /// Parses a single `FileSystemWatcher` JSON value into a [`ParsedWatcher`].
     ///
     /// The `globPattern` is either a string (workspace-relative or absolute)
@@ -929,7 +961,6 @@ impl LspServer {
     ///
     /// Clones the parsed watchers under the lock so callers can match without
     /// holding it during I/O. Consumed by the WS31 conditional nudge.
-    #[allow(dead_code, reason = "consumed by WS31 ticket 03 (changed-set nudge)")]
     pub(crate) fn watched_files_snapshot(&self) -> Vec<ParsedWatcher> {
         self.watched_files_registrations
             .lock()
@@ -1094,6 +1125,47 @@ mod tests {
         let server = test_server();
         server.set_capabilities(caps);
         server
+    }
+
+    // ── ParsedWatcher::covers tests (WS31 changed-set routing) ────────
+
+    #[test]
+    fn parsed_watcher_covers_glob_and_kind() {
+        // Default kind (all 7) watcher on `**/*.rs`.
+        let w =
+            ParsedWatcher::from_value(&json!({ "globPattern": "**/*.rs" })).expect("valid watcher");
+        let rel = std::path::Path::new("src/lib.rs");
+        let abs = std::path::Path::new("/root/src/lib.rs");
+        assert!(w.covers(rel, abs, ChangeKind::Created));
+        assert!(w.covers(rel, abs, ChangeKind::Changed));
+
+        // A non-matching extension is not covered.
+        let toml_rel = std::path::Path::new("Cargo.toml");
+        let toml_abs = std::path::Path::new("/root/Cargo.toml");
+        assert!(!w.covers(toml_rel, toml_abs, ChangeKind::Changed));
+    }
+
+    #[test]
+    fn parsed_watcher_covers_kind_mask_filters() {
+        // Watcher registered with Change-only (kind 2) suppresses creations.
+        let w = ParsedWatcher::from_value(&json!({ "globPattern": "**/*.rs", "kind": 2 }))
+            .expect("valid watcher");
+        let rel = std::path::Path::new("src/lib.rs");
+        let abs = std::path::Path::new("/root/src/lib.rs");
+        assert!(
+            !w.covers(rel, abs, ChangeKind::Created),
+            "Change-only watcher must not cover a Created candidate"
+        );
+        assert!(
+            w.covers(rel, abs, ChangeKind::Changed),
+            "Change-only watcher covers a Changed candidate"
+        );
+
+        // Create-only (kind 1) suppresses changes.
+        let w = ParsedWatcher::from_value(&json!({ "globPattern": "**/*.rs", "kind": 1 }))
+            .expect("valid watcher");
+        assert!(w.covers(rel, abs, ChangeKind::Created));
+        assert!(!w.covers(rel, abs, ChangeKind::Changed));
     }
 
     // ── Identity accessor tests ──────────────────────────────────────

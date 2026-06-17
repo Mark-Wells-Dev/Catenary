@@ -9,13 +9,16 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
-use crate::bridge::filesystem_manager::{ClassificationTables, FilesystemManager};
+use tokio_util::sync::CancellationToken;
+
+use crate::bridge::filesystem_manager::{ChangeKind, ClassificationTables, FilesystemManager};
 use crate::config::{Config, DispatchMethod, LanguageConfig, ServerDef};
 use crate::logging::LoggingServer;
 use crate::lsp::LspClient;
 use crate::lsp::glob::{self, LspGlob};
 use crate::lsp::instance_key::{InstanceKey, Scope};
 use crate::lsp::server::LspServer;
+use crate::lsp::settle::{IdleDetector, SettleResult, await_idle};
 use crate::lsp::state::{ServerLifecycle, ServerStatus};
 use crate::source::Source;
 
@@ -48,6 +51,33 @@ fn file_matches_patterns(path: &Path, patterns: &[LspGlob]) -> bool {
     };
     let file_path = Path::new(file_name);
     patterns.iter().any(|g| g.is_match(file_path))
+}
+
+/// Builds the `file://` URI for a changed-set entry from its owning root and
+/// root-relative path (WS31 Consumer A).
+///
+/// The baseline stores paths relative to the root (the root prefix is the outer
+/// key); routing rebuilds the absolute path via `root.join(rel)` before
+/// formatting the URI sent in `workspace/didChangeWatchedFiles`.
+fn changed_file_uri(root: &Path, rel: &Path) -> String {
+    format!("file://{}", root.join(rel).display())
+}
+
+/// Maps a semantic [`ChangeKind`] to its LSP `FileChangeType` wire value:
+/// Created ⇒ 1, Changed ⇒ 2 (Deleted ⇒ 3 is out of scope until ticket 04).
+///
+/// The wire type carries the true semantic kind so it agrees with each server's
+/// watch-kind mask: a `Created` change rides `FileChangeType` 1 (gated by the
+/// `Create` bit), a `Changed` change rides 2 (gated by the `Change` bit). Per the
+/// LSP spec, `workspace/didChangeWatchedFiles` is Catenary's channel for
+/// filesystem-observed changes and its payload carries the real distinction;
+/// `workspace/didCreateFiles` is a different, editor-initiated notification
+/// Catenary does not use.
+const fn change_kind_wire_type(kind: ChangeKind) -> u8 {
+    match kind {
+        ChangeKind::Created => 1,
+        ChangeKind::Changed => 2,
+    }
 }
 
 /// Walks up from `file` toward `workspace_root`, returning the first
@@ -402,6 +432,9 @@ impl LspClientManager {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(root);
         self.fs.remove_root_classification(root);
+        // Drop the changed-set baseline and generation counter for the removed
+        // root (same leak/staleness reasons as the sync_roots cleanup).
+        self.fs.remove_root_baseline(root);
 
         // Shut down per-root instances bound to the removed root.
         self.shutdown_root_instances(root).await;
@@ -465,6 +498,10 @@ impl LspClientManager {
             drop(configs);
             for removed in &to_remove {
                 self.fs.remove_root_classification(removed);
+                // Drop the changed-set baseline and generation counter so
+                // removed-root entries don't accumulate (a leak) and a later
+                // re-mount diffs against a fresh baseline (cold-start full set).
+                self.fs.remove_root_baseline(removed);
             }
         }
 
@@ -1360,56 +1397,165 @@ impl LspClientManager {
             .collect()
     }
 
-    /// Sends a flat `readdir` nudge to rooted LSP servers.
+    /// Diffs one coherence walk's observations against the per-root baseline and
+    /// routes the resulting changed set to each covering server, then settles
+    /// every server that received changes (WS31 Consumer A — the precise,
+    /// per-server changed-set nudge that replaces the coarse `nudge_roots`).
     ///
-    /// For each root, reads top-level directory entries and sends them
-    /// as `didChangeWatchedFiles` notifications with `Changed` type to
-    /// servers whose scope root is within `roots`. Gives servers a
-    /// chance to notice files modified by Bash commands (sed, git
-    /// checkout, build tools) without diffing or caching.
-    pub async fn nudge_roots(&self, roots: &[PathBuf]) {
-        if roots.is_empty() {
+    /// `observed` is the set of `(root-relative path, mtime)` pairs the walk
+    /// visited; `exclude` is the set of root-relative paths to drop from the
+    /// emission but **not** from the baseline (the diagnostics edited-set, which
+    /// rides document-sync). The pipeline:
+    ///
+    /// 1. Snapshot the rooted servers whose scope root is within `root`, with
+    ///    each server's registered watchers ([`watched_files_snapshot`]).
+    /// 2. Filter `observed` to the **union** of those servers' watch globs — the
+    ///    baseline tracks only files some server asked to watch.
+    /// 3. [`diff_and_update`](FilesystemManager::diff_and_update) the filtered
+    ///    set into the baseline → the
+    ///    [`ChangeSet`](crate::bridge::filesystem_manager::ChangeSet). The first
+    ///    walk runs against an empty baseline ⇒ the cold-start full candidate set.
+    /// 4. Fan out: each server receives only the changes matching **its** globs
+    ///    and watch-**kind** mask (via
+    ///    [`covers`](crate::lsp::server::ParsedWatcher::covers)), minus
+    ///    `exclude`, as `workspace/didChangeWatchedFiles`. The wire
+    ///    `FileChangeType` carries the true semantic [`ChangeKind`] (Created ⇒ 1,
+    ///    Changed ⇒ 2), agreeing with the kind-mask filter. The first walk's cold
+    ///    snapshot is `Changed`; only a path absent from an already-populated
+    ///    baseline is `Created`
+    ///    ([decision 018](../../decisions/018_filesystem_coherence_changed_set.md)).
+    /// 5. Settle each notified server (idle + drain) so the caller's enrichment /
+    ///    diagnostics read reflects the post-nudge state.
+    ///
+    /// A server that registered nothing, or whose globs/kinds match nothing,
+    /// gets nothing. With no changes since the last walk, step 3 yields an empty
+    /// set and nothing is sent (the bug-38 no-repeat property).
+    ///
+    /// [`watched_files_snapshot`]: crate::lsp::server::LspServer::watched_files_snapshot
+    pub async fn nudge_changed_set(
+        &self,
+        root: &Path,
+        observed: &[(PathBuf, i64)],
+        exclude: &HashSet<PathBuf>,
+    ) {
+        // Step 1: snapshot covering servers + their watchers. Lock each client
+        // only briefly to clone the (server Arc, name, watcher list) — no lock
+        // is held across the diff, the union filter, the notify, or the settle.
+        struct Covering {
+            server: Arc<LspServer>,
+            name: String,
+            watchers: Vec<crate::lsp::server::ParsedWatcher>,
+        }
+        let mut covering: Vec<Covering> = Vec::new();
+        for (key, client_mutex) in self.rooted_clients().await {
+            if !key.scope.root_path().is_some_and(|r| r.starts_with(root)) {
+                continue;
+            }
+            let client = client_mutex.lock().await;
+            if !client.is_alive() {
+                drop(client);
+                continue;
+            }
+            let watchers = client.server().watched_files_snapshot();
+            if watchers.is_empty() {
+                drop(client);
+                continue;
+            }
+            covering.push(Covering {
+                server: client.server().clone(),
+                name: client.server_name().to_string(),
+                watchers,
+            });
+            drop(client);
+        }
+
+        if covering.is_empty() {
             return;
         }
 
-        let clients = self.rooted_clients().await;
-        let relevant: Vec<Arc<Mutex<LspClient>>> = clients
-            .into_iter()
-            .filter(|(k, _)| {
-                k.scope
-                    .root_path()
-                    .is_some_and(|r| roots.iter().any(|root| r.starts_with(root)))
+        // Step 2: filter observations to the union of registered watch globs —
+        // the baseline tracks a file if some covering server watches it for a
+        // kind the changed-set can emit (Created **or** Changed). Probe both:
+        // a Change-only watcher (no Create bit) must still keep its files in the
+        // baseline so their first-walk snapshot and later mtime advances route as
+        // `Changed`; a Create-only watcher keeps its files so new paths route as
+        // `Created`. Probing only one kind would drop the other watcher's files.
+        let watched: Vec<(PathBuf, i64)> = observed
+            .iter()
+            .filter(|(rel, _)| {
+                let abs = root.join(rel);
+                covering.iter().any(|c| {
+                    c.watchers.iter().any(|w| {
+                        w.covers(rel, &abs, ChangeKind::Created)
+                            || w.covers(rel, &abs, ChangeKind::Changed)
+                    })
+                })
             })
-            .map(|(_, v)| v)
+            .cloned()
             .collect();
 
-        if relevant.is_empty() {
+        // Step 3: diff + merge into the per-root baseline.
+        let change_set = self.fs.diff_and_update(root, &watched);
+        if change_set.is_empty() {
             return;
         }
 
-        let mut uris: Vec<String> = Vec::new();
-        for root in roots {
-            let Ok(entries) = std::fs::read_dir(root) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                uris.push(format!("file://{}", path.display()));
+        // Step 4 + 5: per-server routing then settle.
+        for c in &covering {
+            // Each routed entry carries its true wire `FileChangeType`, matching
+            // the semantic kind that passed this server's watch-kind mask.
+            let mut routed: Vec<(String, u8)> = Vec::new();
+            for change in &change_set.changes {
+                if exclude.contains(&change.rel) {
+                    continue;
+                }
+                let abs = root.join(&change.rel);
+                if c.watchers
+                    .iter()
+                    .any(|w| w.covers(&change.rel, &abs, change.kind))
+                {
+                    routed.push((
+                        changed_file_uri(root, &change.rel),
+                        change_kind_wire_type(change.kind),
+                    ));
+                }
             }
-        }
 
-        if uris.is_empty() {
-            return;
-        }
+            if routed.is_empty() {
+                continue;
+            }
 
-        // FileChangeType::Changed = 2
-        let changes: Vec<(&str, u8)> = uris.iter().map(|u| (u.as_str(), 2)).collect();
+            let changes: Vec<(&str, u8)> = routed.iter().map(|(u, t)| (u.as_str(), *t)).collect();
+            let _ = c
+                .server
+                .notify(
+                    "workspace/didChangeWatchedFiles",
+                    crate::lsp::params::did_change_watched_files(&changes),
+                    None,
+                )
+                .await;
 
-        for client in &relevant {
-            let locked = client.lock().await;
-            if locked.is_alive() {
-                let _ = locked.did_change_watched_files(&changes).await;
-                drop(locked);
+            // Settle: wait for the server to go idle after the nudge, then drain
+            // the stdio pipe so its post-nudge state is visible before the read.
+            let result = await_idle(
+                &c.server,
+                IdleDetector::unconditional(),
+                CancellationToken::new(),
+            )
+            .await;
+            debug!(
+                source = Source::LspDispatch.as_str(),
+                server = c.name.as_str(),
+                "changed-set nudge settle: {result:?}",
+            );
+            if result != SettleResult::RootDied
+                && let Err(e) = c.server.drain().await
+            {
+                debug!(
+                    source = Source::LspDispatch.as_str(),
+                    server = c.name.as_str(),
+                    "changed-set nudge drain: {e}",
+                );
             }
         }
     }
@@ -6097,90 +6243,57 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_nudge_roots_empty_is_noop() {
-        let manager = LspClientManager::new(
-            mockls_config(),
-            test_logging(),
-            test_fs_with_roots(&["/tmp"]),
-        );
+    /// The changed-set router rebuilds the `file://` URI from the owning root
+    /// plus the root-relative path the baseline stores (WS31 Consumer A). The
+    /// join round-trips: `root` + `rel` reconstructs the original absolute path.
+    #[test]
+    fn relative_path_roundtrips_to_uri() {
+        let root = PathBuf::from("/home/user/project");
+        let rel = PathBuf::from("src/bridge/handler.rs");
+        let uri = changed_file_uri(&root, &rel);
+        assert_eq!(uri, "file:///home/user/project/src/bridge/handler.rs");
 
-        // No roots → immediate return, no clients touched.
-        manager.nudge_roots(&[]).await;
+        // A nested relative path with no directory component also round-trips.
+        let rel_top = PathBuf::from("Cargo.toml");
+        assert_eq!(
+            changed_file_uri(&root, &rel_top),
+            "file:///home/user/project/Cargo.toml"
+        );
     }
 
+    /// Removing a root via `sync_roots` drops its changed-set baseline and
+    /// generation counter; re-adding it yields a fresh first-walk snapshot.
     #[tokio::test]
-    async fn test_nudge_roots_sends_to_matching_server() -> Result<()> {
-        use crate::logging::test_support::{query_protocol_messages, setup_logging};
-
+    async fn baseline_dropped_on_root_removal() -> Result<()> {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().to_path_buf();
-
-        // Create some files so readdir has entries.
-        std::fs::write(root.join("a.txt"), "hello").expect("write a");
-        std::fs::write(root.join("b.txt"), "world").expect("write b");
-
-        let (logging, conn, _guard) = setup_logging();
         let root_str = root.to_str().expect("root path");
-        let manager =
-            LspClientManager::new(mockls_config(), logging, test_fs_with_roots(&[root_str]));
 
-        let client = ensure_first_server(&manager, MOCK_LANG_A).await?;
-        assert!(client.lock().await.is_alive());
+        let fs = test_fs_with_roots(&[root_str]);
+        // Seed a baseline + generation for the root (simulating a prior walk).
+        let _ = fs.diff_and_update(&root, &[(PathBuf::from("a.rs"), 100)]);
+        fs.bump_generation_for_test(&root);
+        assert!(fs.has_baseline_for_test(&root));
+        assert!(fs.has_generation_for_test(&root));
 
-        let before = query_protocol_messages(&conn)
-            .iter()
-            .filter(|m| m.method == "workspace/didChangeWatchedFiles")
-            .count();
+        let manager = LspClientManager::new(mockls_config(), test_logging(), Arc::clone(&fs));
 
-        manager.nudge_roots(&[root]).await;
+        // Remove the root via sync_roots (new set excludes it).
+        manager.sync_roots(vec![]).await?;
 
-        let after = query_protocol_messages(&conn)
-            .iter()
-            .filter(|m| m.method == "workspace/didChangeWatchedFiles")
-            .count();
-        assert_eq!(
-            after - before,
-            1,
-            "nudge should send exactly one didChangeWatchedFiles notification"
+        assert!(
+            !fs.has_baseline_for_test(&root),
+            "last_seen entry should be dropped on root removal"
+        );
+        assert!(
+            !fs.has_generation_for_test(&root),
+            "root_generations entry should be dropped on root removal"
         );
 
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_nudge_roots_skips_non_matching_server() -> Result<()> {
-        use crate::logging::test_support::{query_protocol_messages, setup_logging};
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = dir.path().to_path_buf();
-        std::fs::write(root.join("a.txt"), "hello").expect("write");
-
-        let (logging, conn, _guard) = setup_logging();
-        let root_str = root.to_str().expect("root path");
-        let manager =
-            LspClientManager::new(mockls_config(), logging, test_fs_with_roots(&[root_str]));
-
-        let client = ensure_first_server(&manager, MOCK_LANG_A).await?;
-        assert!(client.lock().await.is_alive());
-
-        let before = query_protocol_messages(&conn)
-            .iter()
-            .filter(|m| m.method == "workspace/didChangeWatchedFiles")
-            .count();
-
-        // Nudge with a completely different root — server should not
-        // be selected (scope root doesn't start with the nudge root).
-        manager.nudge_roots(&[PathBuf::from("/nonexistent")]).await;
-
-        let after = query_protocol_messages(&conn)
-            .iter()
-            .filter(|m| m.method == "workspace/didChangeWatchedFiles")
-            .count();
-        assert_eq!(
-            after, before,
-            "nudge with non-matching root should send no notifications"
-        );
+        // Re-add the root and walk again ⇒ fresh cold-start full set.
+        manager.sync_roots(vec![root.clone()]).await?;
+        let set = fs.diff_and_update(&root, &[(PathBuf::from("a.rs"), 100)]);
+        assert_eq!(set.changes.len(), 1, "re-added root ⇒ fresh first walk");
 
         Ok(())
     }

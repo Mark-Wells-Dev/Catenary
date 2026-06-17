@@ -8,7 +8,7 @@
 //! first, pull fallback), severity filtering, noise filtering, quick-fix
 //! collection, and compact formatting.
 
-use super::filesystem_manager::FilesystemManager;
+use super::filesystem_manager::{FilesystemManager, mtime_nanos};
 use super::path_security::PathValidator;
 use crate::lsp::server::LspServer;
 use crate::lsp::settle::{IdleDetector, SettleResult, await_idle};
@@ -16,6 +16,7 @@ use crate::lsp::state::ServerLifecycle;
 use crate::lsp::{LspClient, LspClientManager};
 use crate::symbol_index::SymbolIndex;
 use anyhow::{Result, anyhow};
+use ignore::WalkBuilder;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::PathBuf;
@@ -210,15 +211,30 @@ impl DiagnosticsServer {
         }
         drop(validator);
 
-        // ── Phase 1b: nudge servers with flat readdir ────────────
+        // ── Phase 1b: route the changed-set nudge (WS31 Consumer A) ──
+        // Pull diagnostics read the server's index, so an external change the
+        // server never saw (a `git checkout` between edits) yields stale
+        // diagnostics. A dedicated stat-walk of each affected root's
+        // registered-glob set diffs against the per-root baseline; the delta is
+        // routed per server before the batch. The edited-set rides document-sync
+        // (didOpen/didSave), so it is excluded from the emission — but its mtime
+        // is still recorded in the baseline (so a later walk won't re-flag it).
         {
-            let nudge_roots: Vec<PathBuf> = canonical_paths
+            let roots: std::collections::BTreeSet<PathBuf> = canonical_paths
                 .iter()
                 .filter_map(|p| self.fs.resolve_root(p))
-                .collect::<std::collections::BTreeSet<_>>()
-                .into_iter()
                 .collect();
-            self.client_manager.nudge_roots(&nudge_roots).await;
+            for root in &roots {
+                // Edited paths (relative to this root) to exclude from emission.
+                let exclude: HashSet<PathBuf> = canonical_paths
+                    .iter()
+                    .filter_map(|p| p.strip_prefix(root).ok().map(std::path::Path::to_path_buf))
+                    .collect();
+                let observed = stat_walk(root);
+                self.client_manager
+                    .nudge_changed_set(root, &observed, &exclude)
+                    .await;
+            }
         }
 
         // ── Phase 1c: drop stale symbols ──────────────────────────
@@ -387,8 +403,8 @@ impl DiagnosticsServer {
             return;
         };
 
-        // The readdir nudge (Phase 1b) sends didChangeWatchedFiles for
-        // top-level root entries. Servers may re-scan subdirectories,
+        // The changed-set nudge (Phase 1b) sends didChangeWatchedFiles for
+        // externally-changed registered-glob files. Servers may re-scan,
         // discover new files, and emit stale diagnostics (e.g.,
         // rust-analyzer's "unlinked-file" for a .rs file whose parent
         // mod declaration hasn't been seen yet). pre_open_settle waits
@@ -799,6 +815,32 @@ async fn drain_pipe(server: &LspServer) {
     if let Err(e) = server.drain().await {
         debug!("drain_pipe: {e}");
     }
+}
+
+/// Stat-walks a workspace root, returning every regular file as a
+/// `(root-relative path, mtime)` pair for the WS31 changed-set baseline diff.
+///
+/// Respects `.gitignore` and skips hidden files (the same scope as the grep
+/// walk and `detect_workspace_languages`). Unlike `grep`, `diagnostics` reads
+/// the server's index rather than file contents, so this is a dedicated
+/// stat-walk — the per-file `mtime` is the only thing read. The manager scopes
+/// the result to the union of registered watch globs before diffing.
+fn stat_walk(root: &std::path::Path) -> Vec<(PathBuf, i64)> {
+    let mut observed = Vec::new();
+    let walker = WalkBuilder::new(root).git_ignore(true).hidden(true).build();
+    for entry in walker.flatten() {
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(rel) = path.strip_prefix(root) else {
+            continue;
+        };
+        if let Ok(md) = path.metadata() {
+            observed.push((rel.to_path_buf(), mtime_nanos(&md)));
+        }
+    }
+    observed
 }
 
 /// Resolves a file path to an absolute path.
