@@ -12,6 +12,7 @@
 use anyhow::Result;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::Notify;
@@ -23,6 +24,85 @@ use super::extract;
 use super::instance_key::{InstanceKey, Scope};
 use super::protocol::RpcError;
 use super::state::{ProgressTracker, ServerLifecycle};
+
+/// LSP `WatchKind` bit: a new file matching the pattern was created.
+const WATCH_KIND_CREATE: u8 = 1;
+/// LSP `WatchKind` bit: a file matching the pattern was changed.
+const WATCH_KIND_CHANGE: u8 = 2;
+/// LSP `WatchKind` bit: a file matching the pattern was deleted.
+const WATCH_KIND_DELETE: u8 = 4;
+/// LSP `WatchKind` default when the registration omits `kind`: all three.
+const WATCH_KIND_ALL: u8 = WATCH_KIND_CREATE | WATCH_KIND_CHANGE | WATCH_KIND_DELETE;
+
+/// One registered `FileSystemWatcher` from a `didChangeWatchedFiles`
+/// registration: a resolved glob plus the change kinds it cares about.
+#[derive(Clone)]
+#[allow(
+    dead_code,
+    clippy::redundant_pub_crate,
+    reason = "pub(crate) + fields consumed by WS31 ticket 03 (changed-set nudge)"
+)]
+pub(crate) struct ParsedWatcher {
+    /// Compiled glob (absolute or base-relative pattern).
+    glob: globset::GlobMatcher,
+    /// Base directory for a relative pattern, else `None` (workspace-relative).
+    base: Option<PathBuf>,
+    /// Bitmask of watched kinds: Create=1, Change=2, Delete=4 (LSP
+    /// `WatchKind`); absent ⇒ all three (LSP default 7).
+    kind: u8,
+}
+
+impl ParsedWatcher {
+    /// Parses a single `FileSystemWatcher` JSON value into a [`ParsedWatcher`].
+    ///
+    /// The `globPattern` is either a string (workspace-relative or absolute)
+    /// or a relative-pattern object `{ baseUri, pattern }` (Catenary
+    /// advertises `relativePatternSupport: true`). The optional `kind` field
+    /// is an LSP `WatchKind` bitmask; absent ⇒ [`WATCH_KIND_ALL`].
+    ///
+    /// Returns `None` for a malformed entry (missing/invalid `globPattern`),
+    /// which the caller skips with a `debug!` rather than failing the whole
+    /// registration.
+    fn from_value(watcher: &Value) -> Option<Self> {
+        let glob_value = watcher.get("globPattern")?;
+        let (pattern, base) = match glob_value {
+            Value::String(s) => (s.as_str(), None),
+            Value::Object(_) => {
+                let pattern = glob_value.get("pattern").and_then(Value::as_str)?;
+                let base = glob_value
+                    .get("baseUri")
+                    .and_then(uri_to_path)
+                    .map(PathBuf::from);
+                (pattern, base)
+            }
+            _ => return None,
+        };
+
+        let glob = globset::Glob::new(pattern).ok()?.compile_matcher();
+
+        let kind = watcher
+            .get("kind")
+            .and_then(Value::as_u64)
+            .and_then(|v| u8::try_from(v).ok())
+            .unwrap_or(WATCH_KIND_ALL);
+
+        Some(Self { glob, base, kind })
+    }
+}
+
+/// Extracts a filesystem path from a relative-pattern `baseUri`.
+///
+/// `baseUri` is either a `file://` URI string or a `WorkspaceFolder`
+/// object `{ uri, name }`. Returns the decoded path, or `None` if absent
+/// or not a `file://` URI.
+fn uri_to_path(base_uri: &Value) -> Option<String> {
+    let uri = match base_uri {
+        Value::String(s) => s.as_str(),
+        Value::Object(_) => base_uri.get("uri").and_then(Value::as_str)?,
+        _ => return None,
+    };
+    uri.strip_prefix("file://").map(ToOwned::to_owned)
+}
 
 /// Complete representation of a remote LSP server.
 ///
@@ -99,6 +179,10 @@ pub struct LspServer {
     /// when a server holds multiple registrations.
     config_change_registrations: Mutex<HashSet<String>>,
 
+    /// `workspace/didChangeWatchedFiles` registrations, keyed by registration
+    /// id. The conditional nudge (WS31 Consumer A) fires from these.
+    watched_files_registrations: Mutex<HashMap<String, Vec<ParsedWatcher>>>,
+
     // ── Transport ───────────────────────────────────────────────
     connection: OnceLock<Connection>,
 
@@ -150,6 +234,7 @@ impl LspServer {
             scope: OnceLock::new(),
             settings,
             config_change_registrations: Mutex::new(HashSet::new()),
+            watched_files_registrations: Mutex::new(HashMap::new()),
             tree_monitor: Mutex::new(None),
             connection: OnceLock::new(),
             snapshot: OnceLock::new(),
@@ -840,6 +925,21 @@ impl LspServer {
             .is_empty()
     }
 
+    /// Snapshot of all currently-registered file watchers across registrations.
+    ///
+    /// Clones the parsed watchers under the lock so callers can match without
+    /// holding it during I/O. Consumed by the WS31 conditional nudge.
+    #[allow(dead_code, reason = "consumed by WS31 ticket 03 (changed-set nudge)")]
+    pub(crate) fn watched_files_snapshot(&self) -> Vec<ParsedWatcher> {
+        self.watched_files_registrations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .flatten()
+            .cloned()
+            .collect()
+    }
+
     /// Parses `client/registerCapability` params and stores
     /// registrations for supported methods.
     fn handle_register_capability(&self, params: &Value) {
@@ -864,6 +964,40 @@ impl LspServer {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .insert(id);
                 debug!("server registered for workspace/didChangeConfiguration");
+                continue;
+            }
+
+            if method == "workspace/didChangeWatchedFiles" {
+                let id = reg
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+
+                let watchers = reg
+                    .get("registerOptions")
+                    .and_then(|opts| opts.get("watchers"))
+                    .and_then(Value::as_array);
+
+                let Some(watchers) = watchers else {
+                    debug!("watched-files registration {id} missing registerOptions.watchers");
+                    continue;
+                };
+
+                let mut parsed = Vec::with_capacity(watchers.len());
+                for watcher in watchers {
+                    if let Some(w) = ParsedWatcher::from_value(watcher) {
+                        parsed.push(w);
+                    } else {
+                        debug!("skipping malformed watcher in registration {id}");
+                    }
+                }
+
+                self.watched_files_registrations
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(id, parsed);
+                debug!("server registered for workspace/didChangeWatchedFiles");
             }
         }
     }
@@ -890,6 +1024,16 @@ impl LspServer {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .remove(id);
                 debug!("server unregistered from workspace/didChangeConfiguration");
+            }
+
+            if method == "workspace/didChangeWatchedFiles"
+                && let Some(id) = unreg.get("id").and_then(Value::as_str)
+            {
+                self.watched_files_registrations
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(id);
+                debug!("server unregistered from workspace/didChangeWatchedFiles");
             }
         }
     }
@@ -1632,6 +1776,148 @@ mod tests {
 
         server.on_shutdown();
         assert!(!server.wants_did_change_configuration());
+    }
+
+    // ── didChangeWatchedFiles registration tests ────────────────
+
+    #[test]
+    fn register_watched_files_stores_watchers() {
+        let server = test_server();
+        server
+            .on_request(
+                "client/registerCapability",
+                &json!({"registrations": [{
+                    "id": "watch-1",
+                    "method": "workspace/didChangeWatchedFiles",
+                    "registerOptions": {"watchers": [
+                        {"globPattern": "**/*.rs"},
+                        {"globPattern": {
+                            "baseUri": "file:///project",
+                            "pattern": "**/*.toml"
+                        }}
+                    ]}
+                }]}),
+            )
+            .expect("should succeed");
+
+        let snapshot = server.watched_files_snapshot();
+        assert_eq!(snapshot.len(), 2);
+
+        // The string glob has no base; the relative one resolves its baseUri.
+        let string_watcher = snapshot
+            .iter()
+            .find(|w| w.base.is_none())
+            .expect("string-glob watcher present");
+        assert!(string_watcher.glob.is_match("src/lib.rs"));
+
+        let relative_watcher = snapshot
+            .iter()
+            .find(|w| w.base.is_some())
+            .expect("relative-pattern watcher present");
+        assert_eq!(
+            relative_watcher.base.as_deref(),
+            Some(std::path::Path::new("/project"))
+        );
+        assert!(relative_watcher.glob.is_match("Cargo.toml"));
+    }
+
+    #[test]
+    fn register_watched_files_default_kind_is_all() {
+        let server = test_server();
+        server
+            .on_request(
+                "client/registerCapability",
+                &json!({"registrations": [{
+                    "id": "watch-1",
+                    "method": "workspace/didChangeWatchedFiles",
+                    "registerOptions": {"watchers": [
+                        {"globPattern": "**/*.rs"}
+                    ]}
+                }]}),
+            )
+            .expect("should succeed");
+
+        let snapshot = server.watched_files_snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].kind, WATCH_KIND_ALL);
+        assert_eq!(snapshot[0].kind, 7);
+    }
+
+    #[test]
+    fn unregister_watched_files_removes_by_id() {
+        let server = test_server();
+        server
+            .on_request(
+                "client/registerCapability",
+                &json!({"registrations": [{
+                    "id": "watch-1",
+                    "method": "workspace/didChangeWatchedFiles",
+                    "registerOptions": {"watchers": [
+                        {"globPattern": "**/*.rs"}
+                    ]}
+                }]}),
+            )
+            .expect("should succeed");
+        assert_eq!(server.watched_files_snapshot().len(), 1);
+
+        server
+            .on_request(
+                "client/unregisterCapability",
+                &json!({"unregisterations": [{
+                    "id": "watch-1",
+                    "method": "workspace/didChangeWatchedFiles"
+                }]}),
+            )
+            .expect("should succeed");
+
+        assert!(server.watched_files_snapshot().is_empty());
+    }
+
+    #[test]
+    fn register_malformed_watcher_is_skipped() {
+        let server = test_server();
+        server
+            .on_request(
+                "client/registerCapability",
+                &json!({"registrations": [{
+                    "id": "watch-1",
+                    "method": "workspace/didChangeWatchedFiles",
+                    "registerOptions": {"watchers": [
+                        {"kind": 1},
+                        {"globPattern": "**/*.rs"}
+                    ]}
+                }]}),
+            )
+            .expect("should succeed");
+
+        // The watcher missing globPattern is skipped; the valid one survives.
+        let snapshot = server.watched_files_snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert!(snapshot[0].glob.is_match("src/main.rs"));
+    }
+
+    #[test]
+    fn config_change_registration_still_works() {
+        let server = test_server();
+        assert!(!server.wants_did_change_configuration());
+
+        // A registration carrying both methods must populate both stores.
+        server
+            .on_request(
+                "client/registerCapability",
+                &json!({"registrations": [
+                    {"id": "cfg-1", "method": "workspace/didChangeConfiguration"},
+                    {
+                        "id": "watch-1",
+                        "method": "workspace/didChangeWatchedFiles",
+                        "registerOptions": {"watchers": [{"globPattern": "**/*.rs"}]}
+                    }
+                ]}),
+            )
+            .expect("should succeed");
+
+        assert!(server.wants_did_change_configuration());
+        assert_eq!(server.watched_files_snapshot().len(), 1);
     }
 
     // ── Mutant audit: supports_diagnostics OR logic ──────────────
