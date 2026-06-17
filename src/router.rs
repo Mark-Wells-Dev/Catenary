@@ -1345,7 +1345,7 @@ impl SessionManager {
                     let sync_result = if let Some(ref session) = session_cleanup {
                         session.sync_roots(global).await
                     } else if let Some(ref cm) = lsp_cleanup {
-                        cm.sync_roots(global).await
+                        cm.sync_roots(global).await.map(|_| ())
                     } else {
                         Ok(())
                     };

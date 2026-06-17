@@ -841,8 +841,24 @@ impl Session {
     pub async fn sync_roots(&self, roots: Vec<PathBuf>) -> Result<()> {
         // sync_roots updates FilesystemManager roots first (before any
         // async work), then reacts to the diff.
-        self.client_manager.sync_roots(roots.clone()).await?;
+        let removed = self.client_manager.sync_roots(roots.clone()).await?;
         self.path_validator.write().await.update_roots(roots);
+
+        // Evict the per-root `SymbolIndex` entries for every removed root —
+        // the manager owns no handle to the index, so this is the only layer
+        // where both the removed set and the index are visible. Without it the
+        // daemon-lived cache outlives a root's tracked lifetime and serves
+        // enrichment for a path `catenary roots ls` reports as untracked
+        // (bug #36). The per-root baseline / `root_generations` teardown for the
+        // same removed roots already happens inside `LspClientManager`.
+        if let Some(index) = &self.symbol_index {
+            let mut idx = index
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for root in &removed {
+                idx.evict_root(root);
+            }
+        }
 
         // Root changes may expand the merged command allowlist —
         // bump config version so the next denial shows a fresh full dump.

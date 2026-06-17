@@ -503,10 +503,15 @@ impl LspClientManager {
     /// roots get new `Scope::Root` instances spawned for languages
     /// that already have active instances.
     ///
+    /// Returns the set of removed roots (old set − new set) so the caller can
+    /// react to removal without recomputing the diff — `Session::sync_roots`
+    /// uses it as the single source of truth for evicting per-root
+    /// `SymbolIndex` entries (bug #36).
+    ///
     /// # Errors
     ///
     /// Returns an error if any root path cannot be converted to a valid URI.
-    pub async fn sync_roots(&self, new_roots: Vec<PathBuf>) -> Result<()> {
+    pub async fn sync_roots(&self, new_roots: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
         // Snapshot before updating so the diff is computed against old state.
         let current_roots = self.fs.roots();
         self.fs.set_roots(new_roots.clone());
@@ -523,7 +528,7 @@ impl LspClientManager {
             .collect();
 
         if to_add.is_empty() && to_remove.is_empty() {
-            return Ok(());
+            return Ok(to_remove);
         }
 
         info!(
@@ -575,7 +580,7 @@ impl LspClientManager {
             self.spawn_for_added_roots(&to_add).await;
         }
 
-        Ok(())
+        Ok(to_remove)
     }
 
     /// Returns clients for a file path, filtered by capability,

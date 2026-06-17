@@ -414,6 +414,24 @@ impl SymbolIndex {
         Ok(())
     }
 
+    /// Drops all cached outlines and enrichment for files under `root` — a
+    /// prefix sweep of both backing maps.
+    ///
+    /// Called when `root` leaves the tracked set (MCP disconnect,
+    /// `catenary roots rm`, `SubagentStop`) so an untracked path can no longer
+    /// serve enrichment from a dead session's cache (bug #36), and so caches
+    /// for gone roots do not accumulate across sessions (a leak). Aligns the
+    /// `SymbolIndex` lifetime with the tracked-root set.
+    ///
+    /// Takes `&mut self` because `enrichment_cache` is a plain field (unlike the
+    /// `RefCell`-wrapped `files`); both are reached through the outer `Mutex`,
+    /// which serializes access.
+    pub fn evict_root(&mut self, root: &Path) {
+        self.files.borrow_mut().retain(|p, _| !p.starts_with(root));
+        self.enrichment_cache
+            .retain(|(p, _, _), _| !p.starts_with(root));
+    }
+
     /// Returns `true` when `path` has cached symbols whose recorded mtime is
     /// older than `current_mtime` — an external write the daemon never
     /// invalidated (host `Edit`/`Write`, `git checkout`, formatter; bug #26).
@@ -941,6 +959,75 @@ mod tests {
             .populate_from_document_symbols(path, &symbols)
             .expect("re-populate");
         assert!(index.has_symbols_for(path));
+    }
+
+    /// `evict_root` is a prefix sweep: it drops every outline AND enrichment
+    /// entry under the removed root while leaving sibling roots untouched
+    /// (bug #36). Exercises both backing maps directly.
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    #[test]
+    fn evict_root_prefix_sweep_drops_under_root_keeps_siblings() {
+        let mut index = SymbolIndex::new().expect("create index");
+
+        let symbols = serde_json::json!([{
+            "name": "foo",
+            "kind": 12,
+            "range": { "start": { "line": 0 }, "end": { "line": 0 } },
+            "selectionRange": { "start": { "line": 0 }, "end": { "line": 0 } }
+        }]);
+
+        let under = std::path::Path::new("/proj/a/file.rs");
+        let sibling = std::path::Path::new("/proj/b/file.rs");
+        index
+            .populate_from_document_symbols(under, &symbols)
+            .expect("populate under");
+        index
+            .populate_from_document_symbols(sibling, &symbols)
+            .expect("populate sibling");
+
+        // Seed the enrichment cache for one position under each path.
+        let empty = || super::SymbolEnrichment {
+            ref_lines: std::collections::HashMap::new(),
+            incoming_calls: Vec::new(),
+            outgoing_calls: Vec::new(),
+            implementations: Vec::new(),
+            supertypes: Vec::new(),
+            subtypes: Vec::new(),
+        };
+        index.cache_enrichment(under, 0, 0, "/proj/a".into(), 0, None, empty());
+        index.cache_enrichment(sibling, 0, 0, "/proj/b".into(), 0, None, empty());
+
+        // Both maps carry an entry for each path before eviction.
+        assert!(index.has_symbols_for(under));
+        assert!(index.has_symbols_for(sibling));
+        assert!(
+            index
+                .enrichment_cache
+                .contains_key(&(under.to_path_buf(), 0, 0))
+        );
+        assert!(
+            index
+                .enrichment_cache
+                .contains_key(&(sibling.to_path_buf(), 0, 0))
+        );
+
+        index.evict_root(std::path::Path::new("/proj/a"));
+
+        // The under-root entries are gone from BOTH maps; the sibling survives.
+        assert!(!index.has_symbols_for(under), "outline under root evicted");
+        assert!(index.has_symbols_for(sibling), "sibling outline retained");
+        assert!(
+            !index
+                .enrichment_cache
+                .contains_key(&(under.to_path_buf(), 0, 0)),
+            "enrichment under root evicted"
+        );
+        assert!(
+            index
+                .enrichment_cache
+                .contains_key(&(sibling.to_path_buf(), 0, 0)),
+            "sibling enrichment retained"
+        );
     }
 
     /// Bug #26: populating a real file records its mtime, and a later write
