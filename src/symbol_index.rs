@@ -1804,4 +1804,42 @@ mod tests {
             "stale entry should be evicted"
         );
     }
+
+    /// WS31-review R5 (finding L2): an entry whose `source_mtime` was cached as
+    /// `None` (stat failed at cache time) and whose file is STILL unstattable on
+    /// read must MISS, not be served forever. The mtime floor compares
+    /// `current != entry.source_mtime`; when both sides are `None` the `!=` is
+    /// false, so the floor falls through and returns `Some(hit)` — the
+    /// generation gate is the only remaining guard. The generation is pinned to
+    /// the root's current value (0 for a never-bumped root) so the gen gate
+    /// passes and the test isolates the both-`None` mtime floor.
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    #[test]
+    #[ignore = "RED: WS31-review R5; un-ignore in fix"]
+    fn ws31_review_r5_unstattable_floor_entry_misses() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+
+        let fs = crate::bridge::filesystem_manager::FilesystemManager::new();
+        fs.set_roots(vec![root.clone()]);
+
+        let mut index = SymbolIndex::new().expect("create index");
+
+        // A path that does NOT exist — its source mtime is genuinely None at
+        // cache time and remains None on read (still unstattable).
+        let absent = root.join("absent.rs");
+
+        // Cache at generation 0 (matches the never-bumped root, neutralizing
+        // the generation gate) with source_mtime = None.
+        index.cache_enrichment(&absent, 1, 0, root, 0, None, dummy_enrichment());
+
+        assert!(
+            index.get_enrichment(&absent, 1, 0, &fs).is_none(),
+            "a cached enrichment whose source mtime is None and whose file is still unstattable must MISS, not be served forever"
+        );
+        assert!(
+            index.enrichment_cache.is_empty(),
+            "the unstattable entry should be evicted"
+        );
+    }
 }
