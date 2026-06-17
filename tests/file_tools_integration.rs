@@ -1743,3 +1743,74 @@ fn test_glob_outside_roots_lsp_warning() -> Result<()> {
     );
     Ok(())
 }
+
+// ─── walk hardening (bugs 34/35) ──────────────────────────────────────
+
+/// Grep an explicitly-named file that exists must always search it — a
+/// named-but-present path must never silently zero (bug 34/35). The path
+/// is passed directly in `paths`, exercising the daemon's literal-path
+/// resolution and the walker's per-entry file decision.
+#[test]
+fn grep_named_present_file_never_zeros() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join("present.rs");
+    std::fs::write(&file, "let named_present_needle = 1;\n")?;
+
+    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    // Repeat: a cold first-grep under-return that self-heals on retry (bug 35)
+    // would surface as an empty result on one of the early iterations.
+    for i in 0..8 {
+        let text = bridge.call_tool_text(
+            "grep",
+            &json!({
+                "pattern": "named_present_needle",
+                "paths": [file.to_string_lossy().as_ref()],
+            }),
+        )?;
+        assert!(
+            text.contains("named_present_needle"),
+            "named present file must always be searched (iteration {i}): {text:?}"
+        );
+        assert!(
+            !text.trim().is_empty(),
+            "named present file must never zero (iteration {i})"
+        );
+    }
+    Ok(())
+}
+
+/// A file written via atomic rename (write temp + `rename`), then grepped
+/// sequentially in the same workflow, must return its match — the bug-34
+/// in-workflow case. The fresh stat must not drop an entry the walker
+/// enumerated just because it raced the rename window.
+#[test]
+fn grep_atomic_rename_in_workflow_returns_match() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    // Each iteration writes a fresh file via atomic rename, then greps it
+    // sequentially — the exact in-workflow ordering that bug 34 reported.
+    for i in 0..16 {
+        let target = dir.path().join(format!("renamed_{i}.rs"));
+        let tmp = dir.path().join(format!(".renamed_{i}.rs.tmp"));
+        std::fs::write(&tmp, format!("let atomic_rename_needle_{i} = 1;\n"))?;
+        std::fs::rename(&tmp, &target)?;
+
+        let text = bridge.call_tool_text(
+            "grep",
+            &json!({
+                "pattern": format!("atomic_rename_needle_{i}"),
+                "paths": [target.to_string_lossy().as_ref()],
+            }),
+        )?;
+        assert!(
+            text.contains(&format!("atomic_rename_needle_{i}")),
+            "atomic-rename write must be searched in-workflow (iteration {i}): {text:?}"
+        );
+    }
+    Ok(())
+}

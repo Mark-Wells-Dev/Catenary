@@ -335,7 +335,11 @@ impl GlobServer {
         // witnessing it doesn't cause spurious misses.
         let mut touched: Vec<PathBuf> = Vec::new();
         for path in &resolved {
-            if path.is_file() || path.is_symlink() {
+            // Re-stat with a bounded retry: a transient `is_file()`/`is_symlink()`
+            // miss (an atomic-rename write racing this fresh stat) must not
+            // silently skip a named file that `expand_search_paths` already
+            // confirmed present on disk.
+            if path_is_file_or_symlink_with_retry(path) {
                 self.client_manager
                     .ensure_and_wait_for_paths(std::slice::from_ref(path))
                     .await;
@@ -1119,6 +1123,29 @@ fn build_children_sets(
         }
     }
     result
+}
+
+/// Number of fresh-stat attempts before treating a file/symlink miss as genuine.
+///
+/// Mirrors the bounded re-stat in `expand_search_paths`: a transient miss races
+/// a sub-millisecond atomic-rename window, so a few tight retries (no sleep)
+/// close the in-workflow case.
+const STAT_RETRY_ATTEMPTS: u32 = 3;
+
+/// Whether `path` is a regular file or a symlink, retrying a transient miss.
+///
+/// A fresh `is_file()`/`is_symlink()` can transiently fail when an atomic-rename
+/// write replaces the entry between `expand_search_paths` (which already
+/// confirmed the path present) and this dispatch. Retrying a bounded number of
+/// times (no sleep — the rename window is sub-millisecond) avoids silently
+/// skipping a named file that is present on disk.
+fn path_is_file_or_symlink_with_retry(path: &Path) -> bool {
+    for _ in 0..STAT_RETRY_ATTEMPTS {
+        if path.is_file() || path.is_symlink() {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]

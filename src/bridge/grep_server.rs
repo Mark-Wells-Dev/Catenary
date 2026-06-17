@@ -1144,7 +1144,18 @@ impl GrepServer {
                         state.local.dirs.push(path.to_path_buf());
                         return WalkState::Continue;
                     }
-                    if !path.is_file() {
+                    // File decision: trust the walker's cached `d_type` (no
+                    // fresh stat); only re-stat when the type is unknown, and
+                    // retry a transient miss before dropping the entry — never
+                    // drop a file solely because a fresh stat raced a rename.
+                    let is_file = entry
+                        .file_type()
+                        .map_or_else(|| stat_is_file_with_retry(path), |ft| ft.is_file());
+                    if !is_file {
+                        // A named/enumerated entry that still isn't a file after
+                        // retry is a genuine non-file (socket, broken symlink) —
+                        // debug, not a user-facing warning.
+                        debug!("grep: skipping non-file entry {}", path.display());
                         return WalkState::Continue;
                     }
 
@@ -1184,6 +1195,31 @@ impl GrepServer {
 
         Ok(RipgrepMatches::merge(parts))
     }
+}
+
+/// Number of fresh-stat attempts before treating a miss as genuine.
+///
+/// A transient `is_file()`/`stat` miss races a sub-millisecond atomic-rename
+/// window (write temp + `rename`), so a few tight retries (no sleep) close the
+/// in-workflow case; a residual under a saturating concurrent-writer hammer is
+/// the documented concurrent-writer non-goal.
+const STAT_RETRY_ATTEMPTS: u32 = 3;
+
+/// Whether `path` resolves to a regular file, retrying a transient stat miss.
+///
+/// Used by the parallel walker when the `ignore` walker could not supply a
+/// cached `d_type`: a fresh `is_file()` can transiently fail when the entry it
+/// just enumerated is replaced by an atomic rename. Retrying a bounded number
+/// of times (no sleep — the rename window is sub-millisecond) avoids dropping a
+/// file that is present on disk. A path that still isn't a file after the last
+/// attempt is a genuine non-file.
+fn stat_is_file_with_retry(path: &Path) -> bool {
+    for _ in 0..STAT_RETRY_ATTEMPTS {
+        if path.is_file() {
+            return true;
+        }
+    }
+    false
 }
 
 // ─── Rendering ─────────────────────────────────────────────────────────
@@ -1776,9 +1812,13 @@ impl Drop for CollectOnDrop {
         if local.file_lines.is_empty() {
             return;
         }
-        if let Ok(mut vec) = self.collected.lock() {
-            vec.push(local);
-        }
+        // Recover a poisoned mutex rather than silently discard this thread's
+        // matches — a panicked sibling thread must not lose our results.
+        let mut vec = self
+            .collected
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        vec.push(local);
     }
 }
 
@@ -3253,6 +3293,67 @@ mod tests {
         let merged = RipgrepMatches::merge(vec![]);
         assert!(merged.file_lines.is_empty());
         assert!(merged.file_line_texts.is_empty());
+    }
+
+    // ─── CollectOnDrop poison recovery ──────────────────────────────────
+
+    /// A poisoned `collected` mutex must still receive a dropping thread's
+    /// matches — recovering the lock instead of silently discarding them.
+    #[test]
+    fn collect_on_drop_recovers_poisoned_lock() {
+        let collected = Arc::new(std::sync::Mutex::new(Vec::<ThreadMatches>::new()));
+
+        // Poison the mutex: panic in another thread while holding the guard.
+        // `expect` on a `None` panics (and `expect` is allowed in tests),
+        // avoiding the denied bare `panic!` macro.
+        let poisoner = Arc::clone(&collected);
+        let handle = std::thread::spawn(move || {
+            let _guard = poisoner.lock().expect("lock to poison");
+            // A runtime-empty iterator yields `None`; `expect` panics on it
+            // (clippy can't const-fold this into a bare `panic!`).
+            let empty: Vec<()> = Vec::new();
+            empty
+                .into_iter()
+                .next()
+                .expect("intentional panic to poison the mutex");
+        });
+        assert!(
+            handle.join().is_err(),
+            "poisoning thread should have panicked"
+        );
+        assert!(
+            collected.lock().is_err(),
+            "mutex should be poisoned after the panic"
+        );
+
+        // A CollectOnDrop carrying matches, dropped against the poisoned mutex.
+        let mut local = ThreadMatches::default();
+        local
+            .file_lines
+            .entry("poisoned.rs".to_string())
+            .or_default()
+            .push(7);
+        let state = CollectOnDrop {
+            local,
+            collected: Arc::clone(&collected),
+        };
+        drop(state);
+
+        // The matches were recovered, not discarded.
+        let (len, has_key) = {
+            let recovered = collected
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (
+                recovered.len(),
+                recovered[0].file_lines.contains_key("poisoned.rs"),
+            )
+        };
+        assert_eq!(len, 1, "dropped thread's matches must survive");
+        assert!(
+            has_key,
+            "recovered matches must include the dropped accumulator"
+        );
     }
 
     // ─── MatchSink::matched ─────────────────────────────────────────────

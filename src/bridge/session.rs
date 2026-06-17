@@ -184,15 +184,57 @@ pub fn expand_search_paths(
     // shell-expanded siblings only walks their directory once.
     let mut visible: HashMap<PathBuf, HashSet<PathBuf>> = HashMap::new();
     for path in paths {
-        if path.symlink_metadata().is_ok() {
+        // Re-stat with a bounded retry before treating a literal path as a
+        // glob — a transient stat miss (e.g. an atomic-rename write between the
+        // CLI probe and here) must never silently zero a path that is present
+        // on disk.
+        if path_exists_with_retry(path) {
             if include_gitignored || !is_gitignored(path, &mut visible) {
                 resolved.push(path.clone());
             }
-        } else if let Ok(glob) = ResolvedGlob::new(&path.to_string_lossy()) {
-            resolved.extend(glob.expand(include_gitignored, include_hidden));
+        } else if has_glob_metachar(&path.to_string_lossy()) {
+            // Only metachar-bearing args expand as globs. A metachar-free path
+            // that still does not resolve is a genuine "not found" — it is the
+            // CLI's loud `path does not exist` (collected before dispatch), not
+            // a glob that silently expands to an empty set.
+            if let Ok(glob) = ResolvedGlob::new(&path.to_string_lossy()) {
+                resolved.extend(glob.expand(include_gitignored, include_hidden));
+            }
         }
     }
     resolved
+}
+
+/// Number of `symlink_metadata` attempts before treating a miss as genuine.
+///
+/// A transient stat miss races a sub-millisecond atomic-rename window
+/// (write temp + `rename`); a few tight retries (no sleep) close the
+/// in-workflow case without masking a path that is genuinely absent.
+const STAT_RETRY_ATTEMPTS: u32 = 3;
+
+/// Whether `path` resolves on disk, retrying a transient `symlink_metadata`
+/// miss a bounded number of times.
+///
+/// Existence is probed via `symlink_metadata` so a broken symlink still counts
+/// as present (matching the literal-first contract). The retry never sleeps —
+/// the rename window is sub-millisecond — so a present path that lost a single
+/// stat race is kept rather than silently treated as a missing glob.
+fn path_exists_with_retry(path: &Path) -> bool {
+    for _ in 0..STAT_RETRY_ATTEMPTS {
+        if path.symlink_metadata().is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether `s` contains a shell glob metacharacter (`* ? [ {`).
+///
+/// Mirrors the CLI's `contains_glob_metachar` classifier so a metachar-free
+/// argument is treated as a literal path (and reported missing if absent)
+/// rather than compiled into a glob that silently expands to nothing.
+fn has_glob_metachar(s: &str) -> bool {
+    s.contains(['*', '?', '[', '{'])
 }
 
 /// Whether a single `path` is excluded by `.gitignore`, repo-scoped.
@@ -1038,5 +1080,63 @@ mod tests {
         let expanded = expand_search_paths(&[root.join("*.rs")], false, false);
         assert!(expanded.contains(&root.join("real.rs")), "{expanded:?}");
         assert!(expanded.contains(&root.join("other.rs")), "{expanded:?}");
+    }
+
+    #[test]
+    fn path_exists_with_retry_succeeds_for_present_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let file = tmp.path().join("present.rs");
+        std::fs::write(&file, "x").expect("write");
+        assert!(
+            path_exists_with_retry(&file),
+            "a present file resolves through the bounded retry"
+        );
+    }
+
+    #[test]
+    fn path_exists_with_retry_fails_for_absent_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ghost = tmp.path().join("ghost.rs");
+        assert!(
+            !path_exists_with_retry(&ghost),
+            "a genuinely absent path stays absent after the bounded retry"
+        );
+    }
+
+    #[test]
+    fn path_exists_with_retry_keeps_broken_symlink() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let link = tmp.path().join("dangling");
+        std::os::unix::fs::symlink(tmp.path().join("missing-target"), &link).expect("symlink");
+        assert!(
+            path_exists_with_retry(&link),
+            "a broken symlink is present (symlink_metadata succeeds)"
+        );
+    }
+
+    #[test]
+    fn has_glob_metachar_matches_cli_classifier() {
+        assert!(has_glob_metachar("*.rs"));
+        assert!(has_glob_metachar("a?b"));
+        assert!(has_glob_metachar("[abc].rs"));
+        assert!(has_glob_metachar("{a,b}.rs"));
+        assert!(!has_glob_metachar("plain.rs"));
+        assert!(!has_glob_metachar("src/bridge/session.rs"));
+    }
+
+    #[test]
+    fn expand_search_paths_metachar_free_absent_is_not_glob_expanded() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::write(root.join("real.rs"), "x").expect("write");
+
+        // A metachar-free, non-existent literal must NOT be compiled into a
+        // glob (which could silently expand to a non-empty set); it is the
+        // CLI's loud `path does not exist`. Here it simply contributes nothing.
+        let resolved = expand_search_paths(&[root.join("ghost.rs")], false, false);
+        assert!(
+            resolved.is_empty(),
+            "metachar-free absent path is not glob-expanded: {resolved:?}"
+        );
     }
 }
