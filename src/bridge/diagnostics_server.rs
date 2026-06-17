@@ -13,7 +13,7 @@ use super::path_security::PathValidator;
 use crate::lsp::server::LspServer;
 use crate::lsp::settle::{IdleDetector, SettleResult, await_idle};
 use crate::lsp::state::ServerLifecycle;
-use crate::lsp::{LspClient, LspClientManager};
+use crate::lsp::{LspClient, LspClientManager, WalkBreadth};
 use crate::symbol_index::SymbolIndex;
 use anyhow::{Result, anyhow};
 use ignore::WalkBuilder;
@@ -214,9 +214,13 @@ impl DiagnosticsServer {
         // ── Phase 1b: route the changed-set nudge (WS31 Consumer A) ──
         // Pull diagnostics read the server's index, so an external change the
         // server never saw (a `git checkout` between edits) yields stale
-        // diagnostics. A dedicated stat-walk of each affected root's
-        // registered-glob set diffs against the per-root baseline; the delta is
-        // routed per server before the batch. The edited-set rides document-sync
+        // diagnostics. Under the walk-breadth gate (ticket 04), `diagnostics` is
+        // always a `Full` walk for a covered root: a dedicated stat-walk of each
+        // affected root's registered-glob set diffs against the per-root
+        // baseline, the delta is routed per server before the batch, AND
+        // deletions are reaped (a baseline entry the full walk did not visit ⇒
+        // `Deleted`). A root with no covering server is `WalkBreadth::None` and
+        // is skipped (no stat-walk, no nudge). The edited-set rides document-sync
         // (didOpen/didSave), so it is excluded from the emission — but its mtime
         // is still recorded in the baseline (so a later walk won't re-flag it).
         {
@@ -225,6 +229,14 @@ impl DiagnosticsServer {
                 .filter_map(|p| self.fs.resolve_root(p))
                 .collect();
             for root in &roots {
+                let breadth = if self.client_manager.has_covering_watchers(root).await {
+                    WalkBreadth::Full
+                } else {
+                    WalkBreadth::None
+                };
+                if !breadth.runs_engine() {
+                    continue;
+                }
                 // Edited paths (relative to this root) to exclude from emission.
                 let exclude: HashSet<PathBuf> = canonical_paths
                     .iter()
@@ -232,7 +244,7 @@ impl DiagnosticsServer {
                     .collect();
                 let observed = stat_walk(root);
                 self.client_manager
-                    .nudge_changed_set(root, &observed, &exclude)
+                    .nudge_changed_set(root, &observed, &exclude, breadth.reaps())
                     .await;
             }
         }

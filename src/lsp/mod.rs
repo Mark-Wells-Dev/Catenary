@@ -65,5 +65,6 @@ pub mod test_support {
 pub use client::LspClient;
 pub use instance_key::{InstanceKey, Scope};
 pub use manager::LspClientManager;
+pub(crate) use manager::WalkBreadth;
 pub use server::LspServer;
 pub use state::{ProgressTracker, ServerLifecycle, ServerStatus};

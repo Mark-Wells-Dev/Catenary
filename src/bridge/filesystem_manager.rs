@@ -90,6 +90,12 @@ pub(crate) enum ChangeKind {
     /// snapshot of pre-existing, already-indexed files). Gated by the watcher's
     /// `Change` kind bit and emitted as `FileChangeType` 2.
     Changed,
+    /// A baseline entry that a **full** walk did not visit — the file is gone
+    /// from disk. Gated by the watcher's `Delete` kind bit and emitted as
+    /// `FileChangeType` 3. Reaped only on a full walk
+    /// ([`diff_update_and_reap`](FilesystemManager::diff_update_and_reap)); a
+    /// scoped walk cannot assert a baseline entry outside its pattern is gone.
+    Deleted,
 }
 
 /// One diffed change from a coherence walk: a root-relative path plus its
@@ -734,6 +740,99 @@ impl FilesystemManager {
                     });
                 }
                 Some(_) => {}
+            }
+        }
+        drop(baseline);
+        ChangeSet { changes }
+    }
+
+    /// Like [`diff_and_update`](Self::diff_and_update), but additionally **reaps
+    /// deletions** — a full-walk-only property (WS31 ticket 04).
+    ///
+    /// `observed` is the **complete** set of `(relative-path, mtime)` pairs a
+    /// *full* walk visited for watched files under `root`. After merging the
+    /// Created/Changed deltas (identical to `diff_and_update`), any baseline
+    /// entry whose relative path is **not** in `observed` is a file the walk
+    /// did not see — it is gone from disk ⇒ a [`ChangeKind::Deleted`] change
+    /// (wire `FileChangeType` 3, gated per server by the `Delete` watch-kind
+    /// bit) — and it is dropped from the baseline so a later walk does not
+    /// re-emit it.
+    ///
+    /// A scoped walk MUST NOT call this: it cannot assert that a baseline entry
+    /// outside its pattern is gone (the file may simply be out of the scoped
+    /// walk's breadth). Scoped callers use the non-reaping
+    /// [`diff_and_update`](Self::diff_and_update).
+    ///
+    /// **Lock discipline:** identical to `diff_and_update` — the outer
+    /// `last_seen` lock is held only to test the first-walk marker and
+    /// fetch-or-create the per-root inner `Arc<Mutex<…>>`; the inner per-root
+    /// lock is held only for the merge **and** the deletion sweep, with no
+    /// `.await` and no walk inside it (the walk runs in the caller, before
+    /// this is called).
+    pub(crate) fn diff_update_and_reap(
+        &self,
+        root: &Path,
+        observed: &[(PathBuf, i64)],
+    ) -> ChangeSet {
+        let (inner, first_walk) = {
+            let mut outer = self
+                .last_seen
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let first_walk = !outer.contains_key(root);
+            let inner = Arc::clone(
+                outer
+                    .entry(root.to_path_buf())
+                    .or_insert_with(|| Arc::new(Mutex::new(HashMap::new()))),
+            );
+            drop(outer);
+            (inner, first_walk)
+        };
+
+        let mut baseline = inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut changes = Vec::new();
+        let observed_rels: HashSet<&Path> = observed.iter().map(|(rel, _)| rel.as_path()).collect();
+        for (rel, mtime) in observed {
+            match baseline.get(rel) {
+                None => {
+                    baseline.insert(rel.clone(), *mtime);
+                    let kind = if first_walk {
+                        ChangeKind::Changed
+                    } else {
+                        ChangeKind::Created
+                    };
+                    changes.push(Change {
+                        rel: rel.clone(),
+                        kind,
+                    });
+                }
+                Some(&prev) if *mtime > prev => {
+                    baseline.insert(rel.clone(), *mtime);
+                    changes.push(Change {
+                        rel: rel.clone(),
+                        kind: ChangeKind::Changed,
+                    });
+                }
+                Some(_) => {}
+            }
+        }
+
+        // Deletion sweep: any baseline entry the full walk did not visit is gone
+        // from disk ⇒ Deleted. On the first walk the baseline is created empty
+        // (or is being populated above), so there is nothing to reap. Drop reaped
+        // entries from the baseline so a later walk does not re-emit them.
+        if !first_walk {
+            let deleted: Vec<PathBuf> = baseline
+                .keys()
+                .filter(|rel| !observed_rels.contains(rel.as_path()))
+                .cloned()
+                .collect();
+            for rel in deleted {
+                baseline.remove(&rel);
+                changes.push(Change {
+                    rel,
+                    kind: ChangeKind::Deleted,
+                });
             }
         }
         drop(baseline);
@@ -1727,6 +1826,66 @@ mod tests {
         let set = mgr.diff_and_update(&root, &[(PathBuf::from("a.rs"), 100)]);
         assert_eq!(set.changes.len(), 1);
         assert_eq!(set.changes[0].kind, ChangeKind::Changed);
+    }
+
+    /// A full-walk reap drops a baseline entry the walk did not visit and emits
+    /// it as `Deleted`. On the first walk there is nothing to reap.
+    #[test]
+    fn diff_update_and_reap_emits_deleted_for_unvisited_baseline_entry() {
+        let mgr = FilesystemManager::new();
+        let root = PathBuf::from("/root");
+
+        // First walk seeds the baseline with two files (cold snapshot, no reap).
+        let first = mgr.diff_update_and_reap(
+            &root,
+            &[(PathBuf::from("a.rs"), 100), (PathBuf::from("b.rs"), 100)],
+        );
+        assert!(
+            first.changes.iter().all(|c| c.kind == ChangeKind::Changed),
+            "first walk is the cold snapshot ⇒ all Changed, none Deleted"
+        );
+
+        // Second walk visits only a.rs ⇒ b.rs is gone ⇒ Deleted, and dropped.
+        let second = mgr.diff_update_and_reap(&root, &[(PathBuf::from("a.rs"), 100)]);
+        let deleted: Vec<&PathBuf> = second
+            .changes
+            .iter()
+            .filter(|c| c.kind == ChangeKind::Deleted)
+            .map(|c| &c.rel)
+            .collect();
+        assert_eq!(
+            deleted,
+            vec![&PathBuf::from("b.rs")],
+            "unvisited baseline entry b.rs must be reaped as Deleted"
+        );
+
+        // Third walk (a.rs still present, b.rs already reaped) ⇒ nothing.
+        let third = mgr.diff_update_and_reap(&root, &[(PathBuf::from("a.rs"), 100)]);
+        assert!(
+            third.is_empty(),
+            "a reaped entry must not re-emit on a later walk: {:?}",
+            third.changes
+        );
+    }
+
+    /// The non-reaping `diff_and_update` (the scoped glob path) never emits a
+    /// `Deleted`, even when a previously-seen baseline entry is absent.
+    #[test]
+    fn diff_and_update_never_reaps() {
+        let mgr = FilesystemManager::new();
+        let root = PathBuf::from("/root");
+
+        let _ = mgr.diff_and_update(
+            &root,
+            &[(PathBuf::from("a.rs"), 100), (PathBuf::from("b.rs"), 100)],
+        );
+        // Second walk omits b.rs — a scoped walk cannot assert it's gone.
+        let set = mgr.diff_and_update(&root, &[(PathBuf::from("a.rs"), 100)]);
+        assert!(
+            set.changes.iter().all(|c| c.kind != ChangeKind::Deleted),
+            "diff_and_update (scoped) must never reap: {:?}",
+            set.changes
+        );
     }
 
     /// Baselines are per-root: identical relative paths under different roots

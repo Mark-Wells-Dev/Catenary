@@ -64,11 +64,12 @@ fn changed_file_uri(root: &Path, rel: &Path) -> String {
 }
 
 /// Maps a semantic [`ChangeKind`] to its LSP `FileChangeType` wire value:
-/// Created ⇒ 1, Changed ⇒ 2 (Deleted ⇒ 3 is out of scope until ticket 04).
+/// Created ⇒ 1, Changed ⇒ 2, Deleted ⇒ 3.
 ///
 /// The wire type carries the true semantic kind so it agrees with each server's
 /// watch-kind mask: a `Created` change rides `FileChangeType` 1 (gated by the
-/// `Create` bit), a `Changed` change rides 2 (gated by the `Change` bit). Per the
+/// `Create` bit), a `Changed` change rides 2 (gated by the `Change` bit), a
+/// `Deleted` change rides 3 (gated by the `Delete` bit, full walks only). Per the
 /// LSP spec, `workspace/didChangeWatchedFiles` is Catenary's channel for
 /// filesystem-observed changes and its payload carries the real distinction;
 /// `workspace/didCreateFiles` is a different, editor-initiated notification
@@ -77,6 +78,59 @@ const fn change_kind_wire_type(kind: ChangeKind) -> u8 {
     match kind {
         ChangeKind::Created => 1,
         ChangeKind::Changed => 2,
+        ChangeKind::Deleted => 3,
+    }
+}
+
+/// One alive rooted server covering a walked root, with its registered file
+/// watchers (WS31 Consumer A). Produced by
+/// [`LspClientManager::covering_watchers`] and consumed by the changed-set
+/// routing and the walk-breadth gate's coverage check.
+struct Covering {
+    server: Arc<LspServer>,
+    name: String,
+    watchers: Vec<crate::lsp::server::ParsedWatcher>,
+}
+
+/// How wide the changed-set engine should walk for a given command — the
+/// per-command pre-check gate (WS31 ticket 04,
+/// [decision 018](../../decisions/018_filesystem_coherence_changed_set.md)).
+///
+/// Computed *before* the walk from two inputs: whether an active server covers
+/// the scope ([`LspClientManager::has_covering_watchers`]) and what the command
+/// needs fresh (its query type):
+///
+/// ```text
+/// None    ⇔  no covering server, OR raw/--count grep, OR a (no LSP) path
+/// Full    ⇔  covering server ∧ (enriched grep ∨ diagnostics)
+/// Scoped  ⇔  covering server ∧ glob   (breadth = the glob pattern)
+/// ```
+///
+/// `None` ⇒ skip the engine entirely (raw grep, `--count`, `(no LSP)` pay
+/// nothing). `Full` ⇒ walk the registered-glob set in the root and reap
+/// deletions. `Scoped` ⇒ walk only the glob pattern, add/update only (a scoped
+/// walk cannot assert a baseline entry outside its pattern is gone).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WalkBreadth {
+    /// Skip the engine: no walk, no nudge.
+    None,
+    /// Full walk of the registered-glob set; reaps deletions.
+    Full,
+    /// Scoped walk of the glob pattern; add/update only, never reaps.
+    Scoped,
+}
+
+impl WalkBreadth {
+    /// Whether this breadth runs the changed-set engine at all.
+    #[must_use]
+    pub(crate) const fn runs_engine(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    /// Whether this breadth reaps deletions (full walks only).
+    #[must_use]
+    pub(crate) const fn reaps(self) -> bool {
+        matches!(self, Self::Full)
     }
 }
 
@@ -1397,6 +1451,54 @@ impl LspClientManager {
             .collect()
     }
 
+    /// Snapshots the alive rooted servers whose scope root is within `root` and
+    /// that registered at least one file watcher (WS31 Consumer A).
+    ///
+    /// Each client lock is held only briefly — long enough to clone the
+    /// `(server Arc, name, watcher list)` — so no lock is held across the diff,
+    /// the union filter, the notify, or the settle. Shared by
+    /// [`nudge_changed_set`](Self::nudge_changed_set) (which routes to them) and
+    /// [`has_covering_watchers`](Self::has_covering_watchers) (the walk-breadth
+    /// gate's coverage input).
+    async fn covering_watchers(&self, root: &Path) -> Vec<Covering> {
+        let mut covering: Vec<Covering> = Vec::new();
+        for (key, client_mutex) in self.rooted_clients().await {
+            if !key.scope.root_path().is_some_and(|r| r.starts_with(root)) {
+                continue;
+            }
+            let client = client_mutex.lock().await;
+            if !client.is_alive() {
+                drop(client);
+                continue;
+            }
+            let watchers = client.server().watched_files_snapshot();
+            if watchers.is_empty() {
+                drop(client);
+                continue;
+            }
+            covering.push(Covering {
+                server: client.server().clone(),
+                name: client.server_name().to_string(),
+                watchers,
+            });
+            drop(client);
+        }
+        covering
+    }
+
+    /// Returns whether any alive rooted server under `root` registered a file
+    /// watcher — the coverage input to the walk-breadth pre-check gate (WS31
+    /// ticket 04).
+    ///
+    /// `false` ⇒ no server cares about filesystem changes under this root, so a
+    /// coherence walk would route nothing: the gate classifies the query as
+    /// [`WalkBreadth::None`] and the caller skips the engine entirely (no walk,
+    /// no nudge). `true` ⇒ a covering server exists, so the gate is `Full`
+    /// (enriched `grep` / `diagnostics`) or `Scoped` (`glob`) per the query.
+    pub async fn has_covering_watchers(&self, root: &Path) -> bool {
+        !self.covering_watchers(root).await.is_empty()
+    }
+
     /// Diffs one coherence walk's observations against the per-root baseline and
     /// routes the resulting changed set to each covering server, then settles
     /// every server that received changes (WS31 Consumer A — the precise,
@@ -1420,9 +1522,10 @@ impl LspClientManager {
     ///    [`covers`](crate::lsp::server::ParsedWatcher::covers)), minus
     ///    `exclude`, as `workspace/didChangeWatchedFiles`. The wire
     ///    `FileChangeType` carries the true semantic [`ChangeKind`] (Created ⇒ 1,
-    ///    Changed ⇒ 2), agreeing with the kind-mask filter. The first walk's cold
-    ///    snapshot is `Changed`; only a path absent from an already-populated
-    ///    baseline is `Created`
+    ///    Changed ⇒ 2, Deleted ⇒ 3), agreeing with the kind-mask filter. The
+    ///    first walk's cold snapshot is `Changed`; only a path absent from an
+    ///    already-populated baseline is `Created`; a baseline entry a full walk
+    ///    did not visit (only when `reap`) is `Deleted`
     ///    ([decision 018](../../decisions/018_filesystem_coherence_changed_set.md)).
     /// 5. Settle each notified server (idle + drain) so the caller's enrichment /
     ///    diagnostics read reflects the post-nudge state.
@@ -1431,55 +1534,42 @@ impl LspClientManager {
     /// gets nothing. With no changes since the last walk, step 3 yields an empty
     /// set and nothing is sent (the bug-38 no-repeat property).
     ///
+    /// `reap` selects the diff variant (WS31 ticket 04): a **full** walk
+    /// ([`WalkBreadth::Full`] — enriched `grep`, `diagnostics`) passes `true`,
+    /// so any baseline entry the walk did not visit is reaped as
+    /// [`ChangeKind::Deleted`] (wire `FileChangeType` 3, gated by the `Delete`
+    /// watch-kind bit). A **scoped** walk ([`WalkBreadth::Scoped`] — `glob`)
+    /// passes `false` (add/update only): it cannot assert a baseline entry
+    /// outside its pattern is gone, so it must never reap.
+    ///
     /// [`watched_files_snapshot`]: crate::lsp::server::LspServer::watched_files_snapshot
     pub async fn nudge_changed_set(
         &self,
         root: &Path,
         observed: &[(PathBuf, i64)],
         exclude: &HashSet<PathBuf>,
+        reap: bool,
     ) {
         // Step 1: snapshot covering servers + their watchers. Lock each client
         // only briefly to clone the (server Arc, name, watcher list) — no lock
         // is held across the diff, the union filter, the notify, or the settle.
-        struct Covering {
-            server: Arc<LspServer>,
-            name: String,
-            watchers: Vec<crate::lsp::server::ParsedWatcher>,
-        }
-        let mut covering: Vec<Covering> = Vec::new();
-        for (key, client_mutex) in self.rooted_clients().await {
-            if !key.scope.root_path().is_some_and(|r| r.starts_with(root)) {
-                continue;
-            }
-            let client = client_mutex.lock().await;
-            if !client.is_alive() {
-                drop(client);
-                continue;
-            }
-            let watchers = client.server().watched_files_snapshot();
-            if watchers.is_empty() {
-                drop(client);
-                continue;
-            }
-            covering.push(Covering {
-                server: client.server().clone(),
-                name: client.server_name().to_string(),
-                watchers,
-            });
-            drop(client);
-        }
+        let covering = self.covering_watchers(root).await;
 
         if covering.is_empty() {
             return;
         }
 
         // Step 2: filter observations to the union of registered watch globs —
-        // the baseline tracks a file if some covering server watches it for a
-        // kind the changed-set can emit (Created **or** Changed). Probe both:
-        // a Change-only watcher (no Create bit) must still keep its files in the
-        // baseline so their first-walk snapshot and later mtime advances route as
-        // `Changed`; a Create-only watcher keeps its files so new paths route as
-        // `Created`. Probing only one kind would drop the other watcher's files.
+        // the baseline tracks a file if SOME covering server's glob matches it,
+        // regardless of kind. To ever reap a `Deleted` for a path it must have
+        // been baselined while present, so a Delete-only watcher (mask 4, no
+        // Create/Change bit) must still get its files into the baseline — else
+        // the reaping sweep can never emit their deletion. Probe all three kinds
+        // (Created OR Changed OR Deleted): a present, observed file passing
+        // `covers(.., Deleted)` means some watcher's glob matches it AND wants
+        // deletes — exactly the membership question. Per-event-kind filtering is
+        // still done at routing (Step 4), so a Create-only watcher never sees a
+        // delete and vice versa; widening here only affects baseline membership.
         let watched: Vec<(PathBuf, i64)> = observed
             .iter()
             .filter(|(rel, _)| {
@@ -1488,14 +1578,21 @@ impl LspClientManager {
                     c.watchers.iter().any(|w| {
                         w.covers(rel, &abs, ChangeKind::Created)
                             || w.covers(rel, &abs, ChangeKind::Changed)
+                            || w.covers(rel, &abs, ChangeKind::Deleted)
                     })
                 })
             })
             .cloned()
             .collect();
 
-        // Step 3: diff + merge into the per-root baseline.
-        let change_set = self.fs.diff_and_update(root, &watched);
+        // Step 3: diff + merge into the per-root baseline. A full walk reaps
+        // deletions (baseline entries the complete walk did not visit); a scoped
+        // walk records and updates only.
+        let change_set = if reap {
+            self.fs.diff_update_and_reap(root, &watched)
+        } else {
+            self.fs.diff_and_update(root, &watched)
+        };
         if change_set.is_empty() {
             return;
         }

@@ -60,10 +60,12 @@ impl ParsedWatcher {
     /// `rel` is the path relative to the workspace root; `abs` is the absolute
     /// path. The change is gated by both the watcher's kind mask
     /// ([`ChangeKind::Created`] needs the `Create` bit, [`ChangeKind::Changed`]
-    /// needs the `Change` bit) and its glob. A base-relative pattern (`base`
-    /// set) matches against the path relative to that base; a workspace-relative
-    /// pattern matches the root-relative path, with the absolute path as a
-    /// fallback (servers register both forms).
+    /// needs the `Change` bit, [`ChangeKind::Deleted`] needs the `Delete` bit)
+    /// and its glob. A base-relative pattern (`base` set) matches against the
+    /// path relative to that base; a workspace-relative pattern matches the
+    /// root-relative path, with the absolute path as a fallback (servers
+    /// register both forms). For a deletion the file is already gone from disk,
+    /// but the stored `rel`/`abs` paths still match the registered glob.
     pub(crate) fn covers(
         &self,
         rel: &std::path::Path,
@@ -73,6 +75,7 @@ impl ParsedWatcher {
         let required = match kind {
             ChangeKind::Created => WATCH_KIND_CREATE,
             ChangeKind::Changed => WATCH_KIND_CHANGE,
+            ChangeKind::Deleted => WATCH_KIND_DELETE,
         };
         if self.kind & required == 0 {
             return false;

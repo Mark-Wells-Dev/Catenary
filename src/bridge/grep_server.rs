@@ -20,8 +20,8 @@ use super::filesystem_manager::{FilesystemManager, mtime_nanos};
 use super::handler::display_path;
 use super::pagination::paginate;
 use crate::config::DispatchMethod;
-use crate::lsp::LspClientManager;
 use crate::lsp::server::LspServer;
+use crate::lsp::{LspClientManager, WalkBreadth};
 use crate::source::Source;
 use crate::symbol_index::{
     CallEdge, Symbol, SymbolEnrichment, SymbolIndex, TypeEdge, format_symbol_kind,
@@ -354,10 +354,16 @@ impl GrepServer {
             }
         }
 
-        // Step 2a: Route the changed-set nudge (WS31 Consumer A). The ripgrep
-        // walk already statted every visited file; group those observations by
-        // workspace root (root-relative), diff against the per-root baseline,
-        // and route the delta per server. No edited-set exclusion for grep.
+        // Step 2a: Route the changed-set nudge (WS31 Consumer A) under the
+        // walk-breadth gate (ticket 04). Enriched `grep`'s reverse-direction
+        // enrichment is whole-tree, so a covered root is a `Full` walk: the
+        // ripgrep walk already statted every visited file, so the engine reuses
+        // those observations (group by root, root-relative), diffs against the
+        // per-root baseline, routes the delta per server, AND reaps deletions
+        // (a baseline entry the full walk did not visit). A root with no
+        // covering server is `WalkBreadth::None` — the `(no LSP)` case — and is
+        // skipped entirely (no diff, no nudge). `--count` grep never reaches
+        // `run`, so it pays nothing. No edited-set exclusion for grep.
         {
             let mut by_root: HashMap<PathBuf, Vec<(PathBuf, i64)>> = HashMap::new();
             for (abs, mtime) in &rg.files {
@@ -372,8 +378,16 @@ impl GrepServer {
             }
             let no_exclude: HashSet<PathBuf> = HashSet::new();
             for (root, observed) in &by_root {
+                let breadth = if self.client_manager.has_covering_watchers(root).await {
+                    WalkBreadth::Full
+                } else {
+                    WalkBreadth::None
+                };
+                if !breadth.runs_engine() {
+                    continue;
+                }
                 self.client_manager
-                    .nudge_changed_set(root, observed, &no_exclude)
+                    .nudge_changed_set(root, observed, &no_exclude, breadth.reaps())
                     .await;
             }
         }

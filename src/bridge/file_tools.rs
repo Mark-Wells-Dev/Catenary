@@ -21,9 +21,9 @@ use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use super::filesystem_manager::{FilesystemManager, format_file_size};
+use super::filesystem_manager::{FilesystemManager, format_file_size, mtime_nanos};
 use super::session::{ResolvedGlob, expand_search_paths};
-use crate::lsp::LspClientManager;
+use crate::lsp::{LspClientManager, WalkBreadth};
 use crate::symbol_index::{Symbol, SymbolIndex, format_symbol_kind};
 
 /// Input for the `glob` tool.
@@ -327,6 +327,19 @@ impl GlobServer {
         parent_id: Option<&str>,
     ) -> Result<(String, Vec<PathBuf>)> {
         let resolved = expand_search_paths(paths, input.include_gitignored, input.include_hidden);
+
+        // Scoped changed-set nudge (WS31 ticket 04): glob enriches with
+        // `documentSymbol` (outlines) only, so coherence is needed just for the
+        // files it lists — a `WalkBreadth::Scoped` walk of the glob pattern. Feed
+        // the pattern's files into the ticket-03 diff (add/update only — a scoped
+        // walk MUST NOT reap deletions, as it cannot assert a baseline entry
+        // outside its pattern is gone), route the delta to covering servers, and
+        // settle, BEFORE the outline queries below so they read the post-nudge
+        // state. A root with no covering server is `WalkBreadth::None` and is
+        // skipped. This runs before `ensure_symbols` for the same reason the
+        // grep/diagnostics nudges precede their reads.
+        self.nudge_scoped(&resolved, input, exclude).await;
+
         let mut full = String::new();
         // Result-cache witnesses: files (content) and the directories they're
         // listed in (membership) — so a host edit *or* an add/remove of a
@@ -371,6 +384,63 @@ impl GlobServer {
             // shouldn't produce them, but be defensive.
         }
         Ok((full, touched))
+    }
+
+    /// Routes glob's scoped changed-set nudge (WS31 ticket 04,
+    /// [`WalkBreadth::Scoped`](crate::lsp::WalkBreadth::Scoped)).
+    ///
+    /// `resolved` is the glob pattern's resolved path set (from
+    /// [`expand_search_paths`]). The breadth of a glob walk is exactly the
+    /// pattern, so the observation set is: each resolved file, and each resolved
+    /// directory's **immediate** entries (the files glob lists) — the same
+    /// visibility (`include_gitignored`/`include_hidden`) and `exclude` filters
+    /// the listing applies, so the nudge tracks only files the query surfaces.
+    /// Each observed file is statted (the per-file stat is the portable
+    /// correctness path). The set is grouped by workspace root and routed via
+    /// [`nudge_changed_set`](crate::lsp::LspClientManager::nudge_changed_set)
+    /// with `reap = false`: a scoped walk adds/updates only and never reaps a
+    /// deletion. Roots with no covering server are skipped
+    /// ([`WalkBreadth::None`](crate::lsp::WalkBreadth::None)).
+    async fn nudge_scoped(
+        &self,
+        resolved: &[PathBuf],
+        input: &GlobInput,
+        exclude: Option<&ResolvedGlob>,
+    ) {
+        let observations = collect_scoped_observations(resolved, input, exclude);
+        if observations.is_empty() {
+            return;
+        }
+
+        // Group by owning workspace root (root-relative path + mtime).
+        let mut by_root: HashMap<PathBuf, Vec<(PathBuf, i64)>> = HashMap::new();
+        for (abs, mtime) in observations {
+            if let Some(root) = self.fs_manager.resolve_root(&abs)
+                && let Ok(rel) = abs.strip_prefix(&root)
+            {
+                by_root
+                    .entry(root)
+                    .or_default()
+                    .push((rel.to_path_buf(), mtime));
+            }
+        }
+
+        let no_exclude: HashSet<PathBuf> = HashSet::new();
+        for (root, observed) in &by_root {
+            // Walk-breadth gate: a covered root is `Scoped` for glob, an
+            // uncovered one is `None` (skip). A scoped walk never reaps.
+            let breadth = if self.client_manager.has_covering_watchers(root).await {
+                WalkBreadth::Scoped
+            } else {
+                WalkBreadth::None
+            };
+            if !breadth.runs_engine() {
+                continue;
+            }
+            self.client_manager
+                .nudge_changed_set(root, observed, &no_exclude, breadth.reaps())
+                .await;
+        }
     }
 
     /// Directory listing: enriched (maps) where LSP available, plain (flags) otherwise.
@@ -1146,6 +1216,58 @@ fn path_is_file_or_symlink_with_retry(path: &Path) -> bool {
         }
     }
     false
+}
+
+/// Collects the `(absolute path, mtime)` observations for glob's scoped walk —
+/// the files within the glob pattern (WS31 ticket 04).
+///
+/// For a resolved **file** path: the file itself. For a resolved **directory**
+/// path: its immediate entries (max depth 1), honoring the query's
+/// gitignore/hidden visibility and the `exclude` filter so the observation set
+/// matches what the listing surfaces. Per-file stats are the portable
+/// correctness path (a content edit advances the file mtime, not the parent dir
+/// mtime). Unreadable entries are skipped.
+fn collect_scoped_observations(
+    resolved: &[PathBuf],
+    input: &GlobInput,
+    exclude: Option<&ResolvedGlob>,
+) -> Vec<(PathBuf, i64)> {
+    let mut observed: Vec<(PathBuf, i64)> = Vec::new();
+    for path in resolved {
+        if path_is_file_or_symlink_with_retry(path) {
+            if let Ok(md) = std::fs::metadata(path) {
+                observed.push((path.clone(), mtime_nanos(&md)));
+            }
+        } else if path.is_dir() {
+            let Ok(canonical) = path.canonicalize() else {
+                continue;
+            };
+            let walker = WalkBuilder::new(&canonical)
+                .max_depth(Some(1))
+                .git_ignore(!input.include_gitignored)
+                .hidden(!input.include_hidden)
+                .build();
+            for entry in walker.flatten() {
+                let entry_path = entry.into_path();
+                if entry_path.as_path() == canonical {
+                    continue;
+                }
+                if let Some(rg) = exclude
+                    && rg.is_match(&entry_path, &canonical)
+                {
+                    continue;
+                }
+                // Only regular files carry an mtime worth diffing; the per-file
+                // stat is the correctness path.
+                if let Ok(md) = std::fs::metadata(&entry_path)
+                    && md.is_file()
+                {
+                    observed.push((entry_path, mtime_nanos(&md)));
+                }
+            }
+        }
+    }
+    observed
 }
 
 #[cfg(test)]
