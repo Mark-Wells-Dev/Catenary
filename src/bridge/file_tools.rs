@@ -21,6 +21,7 @@ use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use super::NO_LSP_LABEL;
 use super::filesystem_manager::{FilesystemManager, format_file_size, mtime_nanos};
 use super::session::{ResolvedGlob, expand_search_paths};
 use crate::lsp::{LspClientManager, WalkBreadth};
@@ -229,10 +230,7 @@ impl GlobServer {
             if self.fs_manager.resolve_root(cwd).is_some() {
                 let _ = writeln!(full, "cwd: {compressed}");
             } else {
-                let _ = writeln!(
-                    full,
-                    "cwd: {compressed} (no LSP \u{2014} see `catenary roots -h`)"
-                );
+                let _ = writeln!(full, "cwd: {compressed} {NO_LSP_LABEL}");
             }
             path.strip_prefix(cwd).map_or_else(
                 |_| path.to_string_lossy().to_string(),
@@ -241,7 +239,7 @@ impl GlobServer {
         } else {
             // Absolute pattern outside workspace roots: LSP warning.
             if self.fs_manager.resolve_root(path).is_none() {
-                let _ = writeln!(full, "(no LSP \u{2014} see `catenary roots -h`)");
+                let _ = writeln!(full, "{NO_LSP_LABEL}");
             }
             path.to_string_lossy().to_string()
         };
@@ -497,10 +495,7 @@ impl GlobServer {
             if self.fs_manager.resolve_root(cwd).is_some() {
                 let _ = writeln!(full, "cwd: {compressed}");
             } else {
-                let _ = writeln!(
-                    full,
-                    "cwd: {compressed} (no LSP \u{2014} see `catenary roots -h`)"
-                );
+                let _ = writeln!(full, "cwd: {compressed} {NO_LSP_LABEL}");
             }
             let display = canonical.strip_prefix(cwd).map_or_else(
                 |_| canonical.to_string_lossy().to_string(),
@@ -510,7 +505,7 @@ impl GlobServer {
         } else {
             // Absolute pattern outside workspace roots: LSP warning.
             if self.fs_manager.resolve_root(&canonical).is_none() {
-                let _ = writeln!(full, "(no LSP \u{2014} see `catenary roots -h`)");
+                let _ = writeln!(full, "{NO_LSP_LABEL}");
             }
             let _ = writeln!(full, "{}/", canonical.display());
         }

@@ -1744,6 +1744,149 @@ fn test_glob_outside_roots_lsp_warning() -> Result<()> {
     Ok(())
 }
 
+// ─── `.`/cwd deterministic root resolution (bug 31) ───────────────────
+
+/// `grep "<pat>" .` from inside the repo, with a `/tmp`-style probe dir also
+/// registered as a workspace root, returns **only** the repo's matches — never
+/// the probe's — even when the repo's language server is still warming up
+/// (busy on `initialized`) while the probe (no LSP) is trivially "ready".
+///
+/// This pins the bug-31 invariant: a `.`-scoped grep binds to the invoking cwd
+/// and never substitutes a *different* registered root, regardless of which
+/// root's LSP is ready first. The probe-only failure mode (a silent
+/// false-negative on the real matches) is the highest-severity class under
+/// decision 019.
+#[test]
+fn dot_grep_scopes_to_cwd_root_not_another() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    let probe = tempfile::tempdir()?;
+
+    // Same needle in both roots; only the repo's hit must surface.
+    std::fs::write(
+        repo.path().join(format!("real.{MOCK_LANG_A}")),
+        "fn dot_scope_needle()\n",
+    )?;
+    std::fs::write(
+        probe.path().join("anchor_probe.md"),
+        "dot_scope_needle in the probe dir\n",
+    )?;
+
+    let repo_str = repo.path().to_string_lossy().to_string();
+    let probe_str = probe.path().to_string_lossy().to_string();
+
+    // Repo's LSP is busy warming up on `initialized` while the probe has no
+    // LSP — the original race that made bug 31 intermittent.
+    let lsp = common::mockls_lsp_arg(MOCK_LANG_A, "--scan-roots --cpu-on-initialized 2000");
+    let mut bridge = BridgeProcess::spawn_multi_root(&[&lsp], &[&repo_str, &probe_str])?;
+    bridge.initialize()?;
+
+    // Pathless grep — cwd defaults to the first root (the repo).
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "dot_scope_needle" }))?;
+
+    assert!(
+        text.contains("real."),
+        "`.`-scoped grep must return the repo's match: {text}"
+    );
+    assert!(
+        !text.contains("anchor_probe.md") && !text.contains("probe dir"),
+        "`.`-scoped grep must NOT leak the other registered root's matches: {text}"
+    );
+    Ok(())
+}
+
+/// `grep "<pat>" .` with a cwd outside every workspace root searches that cwd
+/// and labels the result `(no LSP …)` — and never returns a *different*
+/// registered root's matches in its place.
+///
+/// The loud label is the same partial-result annotation `glob` emits; a
+/// silently-substituted root would be a wrong answer that reads as authoritative
+/// (bug 31, decision 019).
+#[test]
+fn dot_grep_cwd_outside_roots_is_labeled() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    let probe = tempfile::tempdir()?;
+    let outside = tempfile::tempdir()?;
+
+    // The registered roots hold the needle; the searched (outside) cwd holds
+    // its own distinct copy. Only the outside copy must surface.
+    std::fs::write(repo.path().join("in_repo.txt"), "outside_scope_needle\n")?;
+    std::fs::write(probe.path().join("in_probe.txt"), "outside_scope_needle\n")?;
+    std::fs::write(
+        outside.path().join("loose.txt"),
+        "outside_scope_needle here\n",
+    )?;
+
+    let repo_str = repo.path().to_string_lossy().to_string();
+    let probe_str = probe.path().to_string_lossy().to_string();
+
+    let mut bridge = BridgeProcess::spawn_multi_root(&[], &[&repo_str, &probe_str])?;
+    bridge.initialize()?;
+
+    // Search from a directory outside all roots.
+    let text = bridge.call_tool_text(
+        "grep",
+        &json!({
+            "pattern": "outside_scope_needle",
+            "directory": outside.path().to_string_lossy().as_ref(),
+        }),
+    )?;
+
+    assert!(
+        text.contains("no LSP"),
+        "grep outside all roots must carry the loud `(no LSP)` label: {text}"
+    );
+    assert!(
+        text.contains("loose.txt"),
+        "grep must search the literal cwd and find its match: {text}"
+    );
+    assert!(
+        !text.contains("in_repo.txt") && !text.contains("in_probe.txt"),
+        "grep outside roots must NOT substitute a registered root's matches: {text}"
+    );
+    Ok(())
+}
+
+/// `grep "<pat>" .` runs the ripgrep pass against the **correct** (cwd's) root
+/// and returns its raw matches even while that root's language server is not
+/// yet ready — it never falls back to a different root that happens to be ready.
+///
+/// The repo's LSP burns CPU on `initialized` (not ready at query time); the
+/// probe root has no LSP. Raw matches are LSP-independent, so the repo's hit
+/// must surface and the probe's must not.
+#[test]
+fn dot_grep_lsp_not_ready_uses_correct_root() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    let probe = tempfile::tempdir()?;
+
+    std::fs::write(
+        repo.path().join(format!("src.{MOCK_LANG_A}")),
+        "fn not_ready_needle()\n",
+    )?;
+    std::fs::write(probe.path().join("probe.md"), "not_ready_needle in probe\n")?;
+
+    let repo_str = repo.path().to_string_lossy().to_string();
+    let probe_str = probe.path().to_string_lossy().to_string();
+
+    // Repo LSP is mid-warmup (not ready) when grep is issued; probe has none.
+    let lsp = common::mockls_lsp_arg(MOCK_LANG_A, "--scan-roots --cpu-on-initialized 2000");
+    let mut bridge = BridgeProcess::spawn_multi_root(&[&lsp], &[&repo_str, &probe_str])?;
+    bridge.initialize()?;
+
+    // Pathless grep immediately after init — cwd is the repo, LSP still warming.
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "not_ready_needle" }))?;
+
+    assert!(
+        text.contains("src."),
+        "raw ripgrep matches from the correct root must surface even when its \
+         LSP is not ready: {text}"
+    );
+    assert!(
+        !text.contains("probe.md") && !text.contains("in probe"),
+        "a not-ready cwd root must NOT be replaced by a different ready root: {text}"
+    );
+    Ok(())
+}
+
 // ─── walk hardening (bugs 34/35) ──────────────────────────────────────
 
 /// Grep an explicitly-named file that exists must always search it — a

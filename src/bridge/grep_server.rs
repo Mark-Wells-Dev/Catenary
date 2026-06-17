@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::debug;
 
+use super::NO_LSP_LABEL;
 use super::filesystem_manager::{FilesystemManager, mtime_nanos};
 use super::handler::display_path;
 use super::pagination::paginate;
@@ -244,6 +245,37 @@ impl GrepServer {
         Ok(GrepOutcome::Rendered(paginated))
     }
 
+    /// Resolves the concrete filesystem roots a pathless (`.`/cwd-scoped) or
+    /// path-scoped grep walks — the single point that binds `.` to a root, so
+    /// `count_matches` and [`Self::run`] can never drift (bug 31).
+    ///
+    /// - **Path arguments present** ⇒ those literal paths, verbatim.
+    /// - **No path arguments, `cwd` present** ⇒ exactly `[cwd]`, the literal
+    ///   invoking directory. A `.`-scoped grep searches the cwd and nothing
+    ///   else: a *different* registered root is **never** substituted, even
+    ///   when the cwd's own root has no language server or its server is not
+    ///   yet ready (raw ripgrep matches are LSP-independent, so the correct
+    ///   root is always walked; LSP coverage is decided separately, for
+    ///   labeling, via [`FilesystemManager::resolve_root`]). This is the fix
+    ///   for the silent wrong-root false-negative in bug 31.
+    /// - **No path arguments, `cwd` absent** ⇒ all registered workspace roots.
+    ///   This is the deliberate "search everywhere" mode used when the caller
+    ///   genuinely has no working directory (e.g. test fixtures); it is **not**
+    ///   a fallback that masquerades as a `.`-scoped search. The CLI always
+    ///   supplies `cwd`, so a real `.` grep never reaches this arm. Each root's
+    ///   matches are rendered under its own header (and labeled `(no LSP)` when
+    ///   uncovered), so the result never reads as a single cwd-scoped answer.
+    fn effective_search_roots(&self, paths: &[PathBuf], cwd: Option<&Path>) -> Vec<PathBuf> {
+        if paths.is_empty() {
+            cwd.map_or_else(
+                || self.client_manager.roots(),
+                |cwd| vec![cwd.to_path_buf()],
+            )
+        } else {
+            paths.to_vec()
+        }
+    }
+
     /// Dumb `grep -c`-style count: one ripgrep pass, tally matching lines and
     /// distinct files.
     ///
@@ -259,14 +291,7 @@ impl GrepServer {
         search_paths: &[PathBuf],
         cwd: Option<&Path>,
     ) -> Result<GrepOutcome> {
-        let effective_roots = if search_paths.is_empty() {
-            cwd.map_or_else(
-                || self.client_manager.roots(),
-                |cwd| vec![cwd.to_path_buf()],
-            )
-        } else {
-            search_paths.to_vec()
-        };
+        let effective_roots = self.effective_search_roots(search_paths, cwd);
         let resolved_exclude = input
             .exclude
             .as_deref()
@@ -299,16 +324,11 @@ impl GrepServer {
     ) -> Result<(String, Vec<PathBuf>)> {
         debug!("Grep request: pattern={}", input.pattern);
 
-        // All paths are literal — no glob interpretation. When no paths
-        // are provided, scope to cwd or all workspace roots.
-        let effective_roots = if input.paths.is_empty() {
-            cwd.map_or_else(
-                || self.client_manager.roots(),
-                |cwd| vec![cwd.to_path_buf()],
-            )
-        } else {
-            input.paths.clone()
-        };
+        // All paths are literal — no glob interpretation. When no paths are
+        // provided, bind to the invoking cwd (never another root) or, when the
+        // caller has no cwd, the explicit all-roots mode. See
+        // [`Self::effective_search_roots`] (bug 31).
+        let effective_roots = self.effective_search_roots(&input.paths, cwd);
         let resolved_exclude = input
             .exclude
             .as_deref()
@@ -1298,10 +1318,7 @@ fn render_results(
         if fs_manager.resolve_root(cwd).is_some() {
             let _ = writeln!(full, "cwd: {compressed}");
         } else {
-            let _ = writeln!(
-                full,
-                "cwd: {compressed} (no LSP \u{2014} see `catenary roots -h`)"
-            );
+            let _ = writeln!(full, "cwd: {compressed} {NO_LSP_LABEL}");
         }
         let all_indices: Vec<usize> = (0..enrichments.len()).collect();
         render_section(
@@ -1325,7 +1342,7 @@ fn render_results(
 
         // LSP warning when all results are outside workspace roots.
         if root_items.is_empty() && !oor_items.is_empty() {
-            let _ = writeln!(full, "(no LSP \u{2014} see `catenary roots -h`)");
+            let _ = writeln!(full, "{NO_LSP_LABEL}");
         }
 
         for (root, indices) in &root_items {

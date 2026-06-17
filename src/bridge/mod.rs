@@ -49,6 +49,18 @@ pub use hook_router::HookRouter;
 pub use hook_router::is_edit_tool;
 pub use path_security::PathValidator;
 
+/// Partial-result annotation emitted by `grep` and `glob` when a searched
+/// scope has no LSP coverage — the scope is outside every workspace root, or
+/// its owning root has no language server backing it.
+///
+/// This is the single source of truth for the label so both search surfaces
+/// emit it byte-for-byte identically (bug 31): a divergent wording would let an
+/// agent treat one surface's "incomplete" signal as authoritative. It is a
+/// result annotation, not a `warn!`/`error!` — it rides in the rendered output
+/// next to the affected scope, never silently dropped and never a substitution
+/// of another root's matches.
+pub(crate) const NO_LSP_LABEL: &str = "(no LSP \u{2014} see `catenary roots -h`)";
+
 /// Compresses a path by replacing the `$HOME` prefix with `~`.
 pub(crate) fn compress_home(path: &Path) -> String {
     if let Ok(home) = std::env::var("HOME") {
