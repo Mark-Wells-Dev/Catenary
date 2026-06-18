@@ -1194,6 +1194,54 @@ mod tests {
         );
     }
 
+    #[test]
+    #[ignore = "RED: WS31-review-D D3; un-ignore in fix"]
+    fn ws31_review_d_object_watcher_no_baseuri_degrades() {
+        // An object-form globPattern with NO baseUri must degrade gracefully to
+        // a Plain workspace-relative watcher on its `pattern` (the pre-C2
+        // behavior). C2 routed every object through `GlobPattern::from_value`,
+        // which `Err`s on a missing baseUri, so `.ok()?` drops the WHOLE
+        // watcher. RED: returns None / no covering watcher.
+        let w = ParsedWatcher::from_value(&json!({
+            "globPattern": { "pattern": "**/*.rs" }
+        }))
+        .expect("object watcher with no baseUri should degrade to workspace-relative");
+
+        let rel = std::path::Path::new("foo.rs");
+        let abs = std::path::Path::new("/root/foo.rs");
+        assert!(
+            w.covers(rel, abs, ChangeKind::Changed),
+            "degraded workspace-relative watcher must cover a matching foo.rs"
+        );
+
+        // A non-`file://` baseUri likewise degrades to workspace-relative on its
+        // pattern rather than dropping the watcher.
+        let w = ParsedWatcher::from_value(&json!({
+            "globPattern": { "baseUri": "vscode-vfs://host/proj", "pattern": "**/*.rs" }
+        }))
+        .expect("object watcher with non-file:// baseUri should degrade");
+        assert!(
+            w.covers(rel, abs, ChangeKind::Changed),
+            "non-file:// baseUri must degrade to a workspace-relative matcher"
+        );
+    }
+
+    #[test]
+    #[ignore = "RED: WS31-review-D D3; un-ignore in fix"]
+    fn ws31_review_d_object_watcher_uncompilable_pattern_drops() {
+        // Graceful degradation must NOT extend to a pattern that cannot compile:
+        // an object with no baseUri whose `pattern` is an invalid glob still
+        // drops (no degradation to a broken matcher). A bare unclosed `[`
+        // character class fails `LspGlob::new`.
+        let w = ParsedWatcher::from_value(&json!({
+            "globPattern": { "pattern": "[" }
+        }));
+        assert!(
+            w.is_none(),
+            "an object watcher whose pattern won't compile must drop, not degrade"
+        );
+    }
+
     // ── Identity accessor tests ──────────────────────────────────────
 
     #[test]
@@ -1874,6 +1922,31 @@ mod tests {
 
         server.on_shutdown();
         assert!(!server.wants_did_change_configuration());
+    }
+
+    #[test]
+    fn ws31_review_d_on_shutdown_clears_watched_files() {
+        // lsp-4 guard: shutdown must clear the watched-files registrations so a
+        // dead server is never consulted for change routing. Green guard — the
+        // clear landed in C2; this test makes it load-bearing.
+        let server = test_server();
+        server
+            .on_request(
+                "client/registerCapability",
+                &json!({"registrations": [{
+                    "id": "watch-1",
+                    "method": "workspace/didChangeWatchedFiles",
+                    "registerOptions": {"watchers": [{"globPattern": "**/*.rs"}]}
+                }]}),
+            )
+            .expect("should succeed");
+        assert_eq!(server.watched_files_snapshot().len(), 1);
+
+        server.on_shutdown();
+        assert!(
+            server.watched_files_snapshot().is_empty(),
+            "on_shutdown must clear watched-files registrations"
+        );
     }
 
     // ── didChangeWatchedFiles registration tests ────────────────
