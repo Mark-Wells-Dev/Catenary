@@ -11,7 +11,9 @@ use tracing::{debug, info, warn};
 
 use tokio_util::sync::CancellationToken;
 
-use crate::bridge::filesystem_manager::{ChangeKind, ClassificationTables, FilesystemManager};
+use crate::bridge::filesystem_manager::{
+    Change, ChangeKind, ClassificationTables, FilesystemManager,
+};
 use crate::config::{Config, DispatchMethod, LanguageConfig, ServerDef};
 use crate::logging::LoggingServer;
 use crate::lsp::LspClient;
@@ -1547,6 +1549,20 @@ impl LspClientManager {
     /// passes `false` (add/update only): it cannot assert a baseline entry
     /// outside its pattern is gone, so it must never reap.
     ///
+    /// **Delivery is best-effort and the per-root baseline is shared.** Step 3
+    /// advances the baseline **once**, *before* the per-server notify loop, and
+    /// that baseline is keyed by **root only** — shared across every server
+    /// covering the root, not isolated per server. So a `didChangeWatchedFiles`
+    /// notify that fails for one covering server (a dying/broken-pipe server)
+    /// would otherwise lose those changes for it permanently: the next walk diffs
+    /// against the advanced baseline and emits nothing. To recover, a failed
+    /// notify reverts the entries it routed via
+    /// [`revert_baseline_changes`](FilesystemManager::revert_baseline_changes) so
+    /// the **next** walk re-emits them to **all** covering servers — a duplicate
+    /// `didChangeWatchedFiles` to a server that already received it is
+    /// harmless/idempotent. A `Deleted` only re-emits on the next *full* walk (see
+    /// `revert_baseline_changes` for that limitation, WS31-review F4).
+    ///
     /// [`watched_files_snapshot`]: crate::lsp::server::LspServer::watched_files_snapshot
     pub async fn nudge_changed_set(
         &self,
@@ -1605,8 +1621,10 @@ impl LspClientManager {
         // Step 4 + 5: per-server routing then settle.
         for c in &covering {
             // Each routed entry carries its true wire `FileChangeType`, matching
-            // the semantic kind that passed this server's watch-kind mask.
-            let mut routed: Vec<(String, u8)> = Vec::new();
+            // the semantic kind that passed this server's watch-kind mask. The
+            // `&Change` is retained so a failed delivery can revert exactly the
+            // entries this server should have received (F4 recovery, below).
+            let mut routed: Vec<(String, u8, &Change)> = Vec::new();
             for change in &change_set.changes {
                 if exclude.contains(&change.rel) {
                     continue;
@@ -1619,6 +1637,7 @@ impl LspClientManager {
                     routed.push((
                         changed_file_uri(root, &change.rel),
                         change_kind_wire_type(change.kind),
+                        change,
                     ));
                 }
             }
@@ -1627,7 +1646,8 @@ impl LspClientManager {
                 continue;
             }
 
-            let changes: Vec<(&str, u8)> = routed.iter().map(|(u, t)| (u.as_str(), *t)).collect();
+            let changes: Vec<(&str, u8)> =
+                routed.iter().map(|(u, t, _)| (u.as_str(), *t)).collect();
             if let Err(e) = c
                 .server
                 .notify(
@@ -1642,6 +1662,18 @@ impl LspClientManager {
                     server = c.name.as_str(),
                     "changed-set nudge notify dropped: {e}",
                 );
+                // F4: the per-root baseline already advanced (step 3) and is
+                // shared across every covering server, so a dropped notify would
+                // otherwise lose these changes for this server permanently — the
+                // next walk diffs against the advanced baseline and emits nothing
+                // (even across respawn; the baseline is torn down only on
+                // `roots rm`). Revert exactly the entries routed here so the NEXT
+                // walk re-emits them to all covering servers (an idempotent
+                // duplicate to servers that did receive it). Best-effort: see
+                // `revert_baseline_changes` for the Deleted (full-walk-only)
+                // limitation.
+                let reverted: Vec<Change> = routed.iter().map(|(_, _, ch)| (*ch).clone()).collect();
+                self.fs.revert_baseline_changes(root, &reverted);
             }
 
             // Settle: wait for the server to go idle after the nudge, then drain

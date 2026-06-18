@@ -858,6 +858,68 @@ impl FilesystemManager {
             .remove(root);
     }
 
+    /// Reverts a set of just-merged changes in a root's baseline so the **next**
+    /// walk re-emits them (WS31-review F4 — best-effort delivery recovery).
+    ///
+    /// [`nudge_changed_set`](crate::lsp::manager::LspClientManager::nudge_changed_set)
+    /// advances the per-root baseline **once** (steps via
+    /// [`diff_and_update`](Self::diff_and_update) /
+    /// [`diff_update_and_reap`](Self::diff_update_and_reap)) *before* the
+    /// per-server notify loop, and that baseline is **shared** across every server
+    /// covering the root. So a `workspace/didChangeWatchedFiles` notify that fails
+    /// for one covering server would otherwise lose those changes for it
+    /// permanently: the next walk diffs against the already-advanced shared
+    /// baseline and emits nothing (even across a respawn — the baseline is torn
+    /// down only by [`remove_root_baseline`](Self::remove_root_baseline) on
+    /// `roots rm`). Reverting the affected entries makes the next walk re-emit them
+    /// to **all** covering servers; a duplicate `didChangeWatchedFiles` to a server
+    /// that already received the change is harmless/idempotent.
+    ///
+    /// Per change kind:
+    /// - [`ChangeKind::Created`] / [`ChangeKind::Changed`] — the entry was inserted
+    ///   or its mtime advanced, so the entry is **removed**. The next walk finds it
+    ///   absent from a populated baseline ⇒ re-emits it (as `Created`, or `Changed`
+    ///   if it is the only baselined path on a fresh root — both are safe
+    ///   re-notifications that no longer lose the change).
+    /// - [`ChangeKind::Deleted`] — the reaping sweep already **removed** the entry,
+    ///   and the file is gone from disk, so removal would not re-emit anything (the
+    ///   next walk never observes a deleted file). Instead the entry is
+    ///   **re-inserted** with the [`OBSERVED_STAT_MISS_MTIME`] sentinel so the next
+    ///   **full** walk's reaping sweep — which reaps any baseline entry the walk did
+    ///   not visit — re-emits the `Deleted`. **Limitation:** this only re-emits on a
+    ///   *full* walk (`reap = true`); a subsequent scoped walk never reaps, so a
+    ///   Deleted lost to a notify failure waits for the next full walk
+    ///   (`grep`/`diagnostics`). If the file reappears before that walk, the
+    ///   sentinel (`i64::MIN`, below every real mtime) makes it re-emit as `Changed`
+    ///   rather than a spurious nothing — a safe over-notification.
+    pub(crate) fn revert_baseline_changes(&self, root: &Path, changes: &[Change]) {
+        let inner = {
+            let outer = self
+                .last_seen
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            // No baseline for the root ⇒ nothing to revert (it was torn down, or
+            // the root was never walked).
+            let Some(inner) = outer.get(root).map(Arc::clone) else {
+                return;
+            };
+            drop(outer);
+            inner
+        };
+
+        let mut baseline = inner.lock().unwrap_or_else(PoisonError::into_inner);
+        for change in changes {
+            match change.kind {
+                ChangeKind::Created | ChangeKind::Changed => {
+                    baseline.remove(&change.rel);
+                }
+                ChangeKind::Deleted => {
+                    baseline.insert(change.rel.clone(), OBSERVED_STAT_MISS_MTIME);
+                }
+            }
+        }
+    }
+
     /// Returns `true` if a changed-set baseline exists for the root (test-only).
     #[cfg(test)]
     pub(crate) fn has_baseline_for_test(&self, root: &Path) -> bool {
@@ -1979,6 +2041,143 @@ mod tests {
         assert_eq!(mgr.diff_and_update(&root_b, &observed).changes.len(), 1);
         // Re-walking root A with the same mtime ⇒ nothing.
         assert!(mgr.diff_and_update(&root_a, &observed).is_empty());
+    }
+
+    /// WS31-review C3 (F4) — land-with-fix unit on the evict-on-failure logic.
+    ///
+    /// `nudge_changed_set` advances the per-root baseline once (step 3), then
+    /// fans the delta out to each covering server (step 4); the baseline is
+    /// **shared** across all covering servers. A notify failure to one server
+    /// would, absent recovery, lose those changes for it permanently — the next
+    /// walk diffs against the already-advanced baseline and emits nothing. The fix
+    /// reverts exactly the changes routed to the failed server via
+    /// [`revert_baseline_changes`], so a re-diff against an **unchanged** FS
+    /// re-emits them. This pins that re-emit contract directly (the integration
+    /// path can't observe a forced notify failure without a new mockls capability
+    /// — see the C3 ticket testability note — so this lands with the fix, the same
+    /// precedent as L1/L4/N2/C1-F1).
+    ///
+    /// Covers all three [`ChangeKind`]s: a Created/Changed entry is removed so the
+    /// next diff re-emits it; a Deleted entry (already dropped by the reap sweep)
+    /// is re-inserted with the sentinel so the next **full** walk's reap sweep
+    /// re-emits the deletion while the file stays gone.
+    #[test]
+    fn ws31_review_c3_notify_failure_reemits() {
+        let mgr = FilesystemManager::new();
+        let root = PathBuf::from("/root");
+
+        // ── Created/Changed: revert removes the entry ⇒ next walk re-emits ──
+        // First walk seeds the baseline (cold snapshot). The root key now exists,
+        // so a later-walk absent path is a genuine Created.
+        let _ = mgr.diff_update_and_reap(&root, &[(PathBuf::from("a.rs"), 100)]);
+        // Second walk: a new file `b.rs` ⇒ Created, merged into the baseline.
+        let observed = vec![(PathBuf::from("a.rs"), 100), (PathBuf::from("b.rs"), 200)];
+        let set = mgr.diff_update_and_reap(&root, &observed);
+        let created: Vec<&Change> = set
+            .changes
+            .iter()
+            .filter(|c| c.kind == ChangeKind::Created)
+            .collect();
+        assert_eq!(created.len(), 1, "b.rs is the only Created");
+        assert_eq!(created[0].rel, PathBuf::from("b.rs"));
+
+        // Pre-revert sanity: a re-diff against the SAME observation is empty (the
+        // baseline already absorbed b.rs — exactly the bug-38 no-repeat property
+        // that loses the change if delivery failed).
+        assert!(
+            mgr.diff_update_and_reap(&root, &observed).is_empty(),
+            "without revert, the advanced baseline silently swallows the change"
+        );
+
+        // Simulate the failed-notify recovery: revert the change routed to the
+        // failed server. The next walk over the UNCHANGED FS must re-emit it.
+        let reverted = vec![Change {
+            rel: PathBuf::from("b.rs"),
+            kind: ChangeKind::Created,
+        }];
+        mgr.revert_baseline_changes(&root, &reverted);
+        let reemit = mgr.diff_update_and_reap(&root, &observed);
+        let reemit_rels: Vec<&PathBuf> = reemit.changes.iter().map(|c| &c.rel).collect();
+        assert_eq!(
+            reemit_rels,
+            vec![&PathBuf::from("b.rs")],
+            "the reverted Created must re-emit on the next walk; a.rs must not"
+        );
+
+        // ── Deleted: revert re-inserts the entry ⇒ next full walk re-reaps ──
+        // Drop b.rs from disk: a full walk reaps it (Deleted, baseline entry
+        // removed).
+        let reaped = mgr.diff_update_and_reap(&root, &[(PathBuf::from("a.rs"), 100)]);
+        assert!(
+            reaped
+                .changes
+                .iter()
+                .any(|c| c.rel == Path::new("b.rs") && c.kind == ChangeKind::Deleted),
+            "b.rs gone from disk ⇒ reaped as Deleted: {:?}",
+            reaped.changes
+        );
+        // Without revert, the Deleted does not re-emit (entry already dropped).
+        assert!(
+            mgr.diff_update_and_reap(&root, &[(PathBuf::from("a.rs"), 100)])
+                .is_empty(),
+            "a reaped Deleted does not re-emit on its own"
+        );
+
+        // Simulate the failed-notify recovery for the Deleted change.
+        let reverted_del = vec![Change {
+            rel: PathBuf::from("b.rs"),
+            kind: ChangeKind::Deleted,
+        }];
+        mgr.revert_baseline_changes(&root, &reverted_del);
+        // Next full walk with b.rs still absent ⇒ Deleted re-emitted.
+        let reemit_del = mgr.diff_update_and_reap(&root, &[(PathBuf::from("a.rs"), 100)]);
+        assert!(
+            reemit_del
+                .changes
+                .iter()
+                .any(|c| c.rel == Path::new("b.rs") && c.kind == ChangeKind::Deleted),
+            "the reverted Deleted must re-reap on the next full walk: {:?}",
+            reemit_del.changes
+        );
+    }
+
+    /// `revert_baseline_changes` is a no-op for an unknown root and for an empty
+    /// change set — it must never spuriously re-emit unrelated baseline entries.
+    #[test]
+    fn revert_baseline_changes_is_scoped_and_safe() {
+        let mgr = FilesystemManager::new();
+        let root = PathBuf::from("/root");
+
+        // No baseline yet ⇒ reverting against an unknown root is a no-op.
+        mgr.revert_baseline_changes(
+            &root,
+            &[Change {
+                rel: PathBuf::from("a.rs"),
+                kind: ChangeKind::Created,
+            }],
+        );
+        assert!(
+            !mgr.has_baseline_for_test(&root),
+            "reverting against an unknown root must not create a baseline"
+        );
+
+        // Seed two files, then revert only `a.rs`: `b.rs` must stay quiet.
+        let observed = vec![(PathBuf::from("a.rs"), 100), (PathBuf::from("b.rs"), 100)];
+        let _ = mgr.diff_and_update(&root, &observed);
+        mgr.revert_baseline_changes(
+            &root,
+            &[Change {
+                rel: PathBuf::from("a.rs"),
+                kind: ChangeKind::Changed,
+            }],
+        );
+        let reemit = mgr.diff_and_update(&root, &observed);
+        let reemit_rels: Vec<&PathBuf> = reemit.changes.iter().map(|c| &c.rel).collect();
+        assert_eq!(
+            reemit_rels,
+            vec![&PathBuf::from("a.rs")],
+            "only the reverted entry re-emits; an empty revert leaves the rest quiet"
+        );
     }
 
     /// C1/F1 — the shared per-file observation step (now used by `stat_walk`,
