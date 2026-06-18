@@ -848,3 +848,88 @@ fn ws31_review_r4_covering_watchers_subdir_scope() -> Result<()> {
 
     Ok(())
 }
+
+// ── R5 (L6) — an edited-then-deleted file's Deleted is routed, not suppressed ──
+
+/// L6 — a file that is baselined and then deleted from disk is reaped as
+/// `Deleted` (wire `FileChangeType` 3) and that Delete is ROUTED, not suppressed
+/// — even when the same diagnostics batch carries a live edited sibling.
+///
+/// The review's L6 premise was that an edited path placed in the diagnostics
+/// `exclude` set would suppress a reaped `Deleted` for that path. Verified
+/// WRONG: `process_files_batched` builds `exclude` from `canonical_paths`, and a
+/// path only enters `canonical_paths` after passing `validate_read`
+/// (`diagnostics_server.rs:189`). `validate_read` calls `path.canonicalize()`,
+/// which FAILS for a file no longer on disk — so a deleted file never enters
+/// `canonical_paths`, never enters `exclude`, and its reaped `Deleted` is routed
+/// by `nudge_changed_set` (the `exclude.contains(&change.rel)` guard is false).
+///
+/// This is a GREEN guard (NOT `#[ignore]`d): it pins that `validate_read` keeps
+/// deleted files out of `exclude`, so reaped Deletes for them stay routed. If a
+/// future change put raw edited paths into `exclude` BEFORE the existence check
+/// (so an edited-then-deleted path landed in `exclude`), this guard would fail —
+/// which is exactly the L6 suppression the review feared (and which does NOT
+/// occur today).
+///
+/// Modeled on `changed_set.rs::diagnostics_full_walk_reaps_deletion` /
+/// `diagnostics_excludes_edited_set`: the live sibling rides the edited-set (via
+/// `call_diagnostics`, which seeds the file through the `pre-tool/editing-state`
+/// path) and keeps the root in the diagnostics batch's `roots` set so the
+/// stat-walk runs over the root (a deleted-only batch would not walk it). kind 7
+/// (ALL) registers Delete, so a routed `Deleted` IS recorded in the log.
+#[test]
+fn ws31_review_r5_edited_then_deleted_routes_delete() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let log_path = dir.path().join("notifications.jsonl");
+    let live = dir.path().join(format!("live.{MOCK_LANG}"));
+    let gone = dir.path().join(format!("gone.{MOCK_LANG}"));
+    std::fs::write(&live, "one\n")?;
+    std::fs::write(&gone, "one\n")?;
+
+    let log_arg = log_path.to_str().context("log path")?;
+    // kind 7 (ALL) ⇒ registers Delete, so a routed `Deleted` IS recorded.
+    // `--advertise-save` lets the edited live sibling ride document-sync.
+    let lsp = mockls_lsp_arg(
+        MOCK_LANG,
+        &format!(
+            "--register-file-watchers --watcher-glob **/*.{MOCK_LANG} \
+             --watcher-kind 7 --advertise-save --notification-log {log_arg}"
+        ),
+    );
+    let root = dir.path().to_str().context("root path")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    // Seed the per-root baseline with BOTH files present: the first diagnostics
+    // run's full stat-walk observes the whole root, so `live` and `gone` both
+    // enter the baseline.
+    let _ = bridge.call_diagnostics(live.to_str().context("live path")?)?;
+    std::thread::sleep(Duration::from_millis(150));
+
+    // Delete `gone` from disk; `live` stays present and is re-driven through the
+    // edited-set below (it keeps the root in the diagnostics batch's `roots` set,
+    // so the stat-walk reaps `gone`).
+    std::fs::remove_file(&gone)?;
+
+    // Second diagnostics run on `live`: drains the edited-set ⇒ a batch over the
+    // root ⇒ the full stat-walk reaps `gone` (baselined but no longer observed).
+    let _ = bridge.call_diagnostics(live.to_str().context("live path")?)?;
+
+    drop(bridge);
+    std::thread::sleep(Duration::from_millis(300));
+
+    let gone_uri = format!("file://{}/gone.{MOCK_LANG}", dir.path().display());
+    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let changes = watched_file_changes(&log);
+
+    // GREEN today: the deleted file's `Deleted` must be ROUTED. It is not in the
+    // exclude set — `validate_read` drops it (canonicalize fails for a missing
+    // path) before it could enter `canonical_paths`/`exclude` — so the reaped
+    // `Deleted` is delivered (the review's L6 suppression does NOT occur).
+    assert!(
+        changes.iter().any(|(u, t)| *u == gone_uri && *t == 3),
+        "an edited-then-deleted file's Deleted must be routed (it is not in the \
+         exclude set — validate_read drops it); got:\n{changes:?}"
+    );
+    Ok(())
+}
