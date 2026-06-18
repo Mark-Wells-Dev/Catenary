@@ -2643,4 +2643,77 @@ mod tests {
              once glob canonicalizes its entries; got: {observed:?}"
         );
     }
+
+    // ─── count_paths — dispatch parity with handle_literal_paths (WS31-review D1) ──
+
+    /// Builds a minimal [`GlobServer`] for unit tests. No LSP servers are
+    /// spawned — [`LspClientManager::new`] only stores the config/logging/fs
+    /// ports — so this is cheap and exercises the real filesystem dispatch in
+    /// [`GlobServer::count_paths`] / [`GlobServer::collect_dir_entries`].
+    fn test_glob_server() -> GlobServer {
+        use crate::config::Config;
+        use crate::logging::LoggingServer;
+        use crate::lsp::LspClientManager;
+
+        let fs_manager = Arc::new(FilesystemManager::new());
+        let client_manager = Arc::new(LspClientManager::new(
+            Config::default(),
+            LoggingServer::new(),
+            fs_manager.clone(),
+        ));
+        GlobServer {
+            client_manager,
+            fs_manager,
+            symbol_index: None,
+            budget: 2000,
+            outline_threshold: 200,
+            outline_suppress: vec![],
+            cache: std::sync::Mutex::new(crate::bridge::result_cache::ResultCache::new(2000)),
+        }
+    }
+
+    /// T1 — `count_paths` must classify a symlink-to-dir the same way the listing
+    /// (`handle_literal_paths`, dir-first since the C1 walk-2 reorder) does:
+    /// follow the link and count the directory's listed entries (`N`), not treat
+    /// it as a single file/symlink (`1`). Pre-fix (file/symlink branch first) the
+    /// symlink-to-dir hits the `is_symlink()` branch → count `1` while the
+    /// listing renders `N` — `glob count:true` desyncs from the listing.
+    #[test]
+    #[cfg(unix)]
+    #[ignore = "RED: WS31-review-D D1; un-ignore in fix"]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn ws31_review_d_count_matches_listing_symlink_dir() {
+        use std::os::unix::fs::symlink;
+
+        const N: usize = 3;
+
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let base = tmp.path().canonicalize().expect("canonicalize base");
+
+        // A real dir with N files.
+        let realdir = base.join("realdir");
+        std::fs::create_dir(&realdir).expect("create realdir");
+        for i in 0..N {
+            std::fs::write(realdir.join(format!("f{i}.ws31ext")), "x\n").expect("write file");
+        }
+
+        // An in-tree symlink pointing at that dir.
+        let linkdir = base.join("linkdir");
+        symlink(&realdir, &linkdir).expect("create linkdir symlink");
+
+        let server = test_glob_server();
+        let input: GlobInput = serde_json::from_value(serde_json::json!({
+            "paths": [linkdir.to_string_lossy()],
+            "count": true,
+        }))
+        .expect("deserialize GlobInput");
+
+        let count = server.count_paths(&input, None).expect("count_paths");
+
+        assert_eq!(
+            count, N,
+            "count for a symlink-to-dir arg must equal the listing entry count \
+             (N={N}, the dir's files), not 1 (the symlink-as-file count); got {count}"
+        );
+    }
 }
