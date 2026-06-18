@@ -195,23 +195,49 @@ pub const fn symbol_kind_to_string(kind: u32) -> &'static str {
     }
 }
 
-/// Cached enrichment result for a symbol position.
+/// Per-position enrichment cache key: a source file path plus the 0-based
+/// line and column of the enriched symbol.
 ///
-/// Wraps `SymbolEnrichment` with the root and generation counter at
-/// cache time for staleness checking against [`FilesystemManager::root_generation`].
-struct CachedEnrichment {
-    /// The enrichment data.
-    enrichment: SymbolEnrichment,
+/// Names the bare `(PathBuf, u32, u32)` tuple that previously keyed the
+/// enrichment cache, grouping the two adjacent swappable `u32`s (line/col)
+/// behind named fields.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(crate) struct EnrichmentKey {
+    /// Source file the enriched position belongs to.
+    pub file: PathBuf,
+    /// 0-based line number of the enriched position.
+    pub line: u32,
+    /// 0-based column of the enriched position.
+    pub col: u32,
+}
+
+/// Staleness witnesses recorded alongside a cached enrichment.
+///
+/// Groups the root/generation generation-gate inputs and the source-file
+/// mtime floor input checked on read by [`SymbolIndex::get_enrichment`].
+pub(crate) struct Witness {
     /// Workspace root this position belongs to.
-    root: PathBuf,
+    pub root: PathBuf,
     /// Generation counter at cache time.
-    generation: u64,
+    pub generation: u64,
     /// `mtime_nanos` of the enriched position's source file at cache time,
     /// or `None` if it could not be stat-ed. Re-stat on read: a change
     /// (or a stat failure ⇒ file gone) misses, catching a host
     /// `Edit`/`Write` that does not bump a generation. Mirrors the outline
     /// cache's `FileEntry::mtime` and the result cache's witness mtimes.
-    source_mtime: Option<i64>,
+    pub source_mtime: Option<i64>,
+}
+
+/// Cached enrichment result for a symbol position.
+///
+/// Wraps `SymbolEnrichment` with the [`Witness`] (root, generation counter,
+/// and source-file mtime) at cache time for staleness checking against
+/// [`FilesystemManager::root_generation`].
+struct CachedEnrichment {
+    /// The enrichment data.
+    enrichment: SymbolEnrichment,
+    /// Staleness witnesses recorded at cache time.
+    witness: Witness,
 }
 
 /// Enrichment data for a single symbol from LSP queries.
@@ -287,8 +313,8 @@ pub struct SymbolIndex {
     /// live caller holds the index behind a `Mutex`, which already serializes
     /// access, so the cell is never borrowed concurrently.
     files: RefCell<HashMap<PathBuf, FileEntry>>,
-    /// Per-position enrichment cache: `(file, line, col)` → cached result.
-    enrichment_cache: HashMap<(PathBuf, u32, u32), CachedEnrichment>,
+    /// Per-position enrichment cache: [`EnrichmentKey`] → cached result.
+    enrichment_cache: HashMap<EnrichmentKey, CachedEnrichment>,
 }
 
 /// A file's cached symbols and the on-disk mtime they were populated from.
@@ -429,7 +455,7 @@ impl SymbolIndex {
     pub fn evict_root(&mut self, root: &Path) {
         self.files.borrow_mut().retain(|p, _| !p.starts_with(root));
         self.enrichment_cache
-            .retain(|(p, _, _), _| !p.starts_with(root));
+            .retain(|k, _| !k.file.starts_with(root));
     }
 
     /// Returns `true` when `path` has cached symbols whose recorded mtime is
@@ -633,24 +659,21 @@ impl SymbolIndex {
     /// a clone because a stale hit requires mutable access to evict the entry.
     pub(crate) fn get_enrichment(
         &mut self,
-        file: &Path,
-        line: u32,
-        col: u32,
+        key: &EnrichmentKey,
         fs_manager: &super::bridge::filesystem_manager::FilesystemManager,
     ) -> Option<SymbolEnrichment> {
-        let key = (file.to_path_buf(), line, col);
-        let entry = self.enrichment_cache.get(&key)?;
+        let entry = self.enrichment_cache.get(key)?;
 
         // Generation gate — catches sed/diagnostics/explicit invalidation.
-        if entry.generation != fs_manager.root_generation(&entry.root) {
-            self.enrichment_cache.remove(&key);
+        if entry.witness.generation != fs_manager.root_generation(&entry.witness.root) {
+            self.enrichment_cache.remove(key);
             return None;
         }
 
         // mtime floor — catches a host Edit/Write that bumps no generation.
-        let current = std::fs::metadata(file).ok().map(|m| mtime_nanos(&m));
-        if current != entry.source_mtime {
-            self.enrichment_cache.remove(&key);
+        let current = std::fs::metadata(&key.file).ok().map(|m| mtime_nanos(&m));
+        if current != entry.witness.source_mtime {
+            self.enrichment_cache.remove(key);
             return None;
         }
 
@@ -659,31 +682,20 @@ impl SymbolIndex {
 
     /// Stores an enrichment result in the cache.
     ///
-    /// Records the current root generation and the source file's
-    /// `source_mtime` (from `FilesystemManager` / a stat at the call site) so
+    /// Records the [`Witness`] (current root generation and the source file's
+    /// `source_mtime`, from `FilesystemManager` / a stat at the call site) so
     /// that future lookups can detect staleness via both gates.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "position key (file/line/col) plus both staleness witnesses (root/generation/source_mtime) and the payload"
-    )]
     pub(crate) fn cache_enrichment(
         &mut self,
-        file: &Path,
-        line: u32,
-        col: u32,
-        root: PathBuf,
-        generation: u64,
-        source_mtime: Option<i64>,
+        key: EnrichmentKey,
+        witness: Witness,
         enrichment: SymbolEnrichment,
     ) {
-        let key = (file.to_path_buf(), line, col);
         self.enrichment_cache.insert(
             key,
             CachedEnrichment {
                 enrichment,
-                root,
-                generation,
-                source_mtime,
+                witness,
             },
         );
     }
@@ -994,22 +1006,40 @@ mod tests {
             supertypes: Vec::new(),
             subtypes: Vec::new(),
         };
-        index.cache_enrichment(under, 0, 0, "/proj/a".into(), 0, None, empty());
-        index.cache_enrichment(sibling, 0, 0, "/proj/b".into(), 0, None, empty());
+        let key_under = super::EnrichmentKey {
+            file: under.to_path_buf(),
+            line: 0,
+            col: 0,
+        };
+        let key_sibling = super::EnrichmentKey {
+            file: sibling.to_path_buf(),
+            line: 0,
+            col: 0,
+        };
+        index.cache_enrichment(
+            key_under.clone(),
+            super::Witness {
+                root: "/proj/a".into(),
+                generation: 0,
+                source_mtime: None,
+            },
+            empty(),
+        );
+        index.cache_enrichment(
+            key_sibling.clone(),
+            super::Witness {
+                root: "/proj/b".into(),
+                generation: 0,
+                source_mtime: None,
+            },
+            empty(),
+        );
 
         // Both maps carry an entry for each path before eviction.
         assert!(index.has_symbols_for(under));
         assert!(index.has_symbols_for(sibling));
-        assert!(
-            index
-                .enrichment_cache
-                .contains_key(&(under.to_path_buf(), 0, 0))
-        );
-        assert!(
-            index
-                .enrichment_cache
-                .contains_key(&(sibling.to_path_buf(), 0, 0))
-        );
+        assert!(index.enrichment_cache.contains_key(&key_under));
+        assert!(index.enrichment_cache.contains_key(&key_sibling));
 
         index.evict_root(std::path::Path::new("/proj/a"));
 
@@ -1017,15 +1047,11 @@ mod tests {
         assert!(!index.has_symbols_for(under), "outline under root evicted");
         assert!(index.has_symbols_for(sibling), "sibling outline retained");
         assert!(
-            !index
-                .enrichment_cache
-                .contains_key(&(under.to_path_buf(), 0, 0)),
+            !index.enrichment_cache.contains_key(&key_under),
             "enrichment under root evicted"
         );
         assert!(
-            index
-                .enrichment_cache
-                .contains_key(&(sibling.to_path_buf(), 0, 0)),
+            index.enrichment_cache.contains_key(&key_sibling),
             "sibling enrichment retained"
         );
     }
@@ -1562,10 +1588,23 @@ mod tests {
 
         // Cache an enrichment at generation 0. Synthetic path → source_mtime
         // None at cache time and on re-stat, so the floor matches (None == None).
-        index.cache_enrichment(file, 10, 5, root, 0, None, dummy_enrichment());
+        let key = super::EnrichmentKey {
+            file: file.to_path_buf(),
+            line: 10,
+            col: 5,
+        };
+        index.cache_enrichment(
+            key.clone(),
+            super::Witness {
+                root,
+                generation: 0,
+                source_mtime: None,
+            },
+            dummy_enrichment(),
+        );
 
         // Should hit — generation matches (both 0).
-        let hit = index.get_enrichment(file, 10, 5, &fs);
+        let hit = index.get_enrichment(&key, &fs);
         assert!(hit.is_some(), "expected cache hit");
         let enrichment = hit.expect("just checked");
         assert_eq!(enrichment.implementations.len(), 1);
@@ -1581,10 +1620,23 @@ mod tests {
         let file = std::path::Path::new("/workspace/src/main.rs");
 
         // Cache at generation 5 — but FilesystemManager returns 0 (no bumps).
-        index.cache_enrichment(file, 10, 5, root, 5, None, dummy_enrichment());
+        let key = super::EnrichmentKey {
+            file: file.to_path_buf(),
+            line: 10,
+            col: 5,
+        };
+        index.cache_enrichment(
+            key.clone(),
+            super::Witness {
+                root,
+                generation: 5,
+                source_mtime: None,
+            },
+            dummy_enrichment(),
+        );
 
         // Should miss — stale generation.
-        let miss = index.get_enrichment(file, 10, 5, &fs);
+        let miss = index.get_enrichment(&key, &fs);
         assert!(miss.is_none(), "expected cache miss on stale generation");
 
         // Entry should have been evicted.
@@ -1618,22 +1670,32 @@ mod tests {
         let mtime_b = std::fs::metadata(&file_b)
             .ok()
             .map(|m| crate::bridge::filesystem_manager::mtime_nanos(&m));
+        let key_a = super::EnrichmentKey {
+            file: file_a.clone(),
+            line: 1,
+            col: 0,
+        };
+        let key_b = super::EnrichmentKey {
+            file: file_b,
+            line: 1,
+            col: 0,
+        };
         index.cache_enrichment(
-            &file_a,
-            1,
-            0,
-            dir_a.path().to_path_buf(),
-            0,
-            mtime_a,
+            key_a.clone(),
+            super::Witness {
+                root: dir_a.path().to_path_buf(),
+                generation: 0,
+                source_mtime: mtime_a,
+            },
             dummy_enrichment(),
         );
         index.cache_enrichment(
-            &file_b,
-            1,
-            0,
-            dir_b.path().to_path_buf(),
-            0,
-            mtime_b,
+            key_b.clone(),
+            super::Witness {
+                root: dir_b.path().to_path_buf(),
+                generation: 0,
+                source_mtime: mtime_b,
+            },
             dummy_enrichment(),
         );
 
@@ -1642,11 +1704,11 @@ mod tests {
 
         // Root A entry should be stale, root B should survive.
         assert!(
-            index.get_enrichment(&file_a, 1, 0, &fs).is_none(),
+            index.get_enrichment(&key_a, &fs).is_none(),
             "root A should be stale after diff"
         );
         assert!(
-            index.get_enrichment(&file_b, 1, 0, &fs).is_some(),
+            index.get_enrichment(&key_b, &fs).is_some(),
             "root B should survive"
         );
     }
@@ -1668,17 +1730,22 @@ mod tests {
         let source_mtime = std::fs::metadata(&file)
             .ok()
             .map(|m| crate::bridge::filesystem_manager::mtime_nanos(&m));
+        let key = super::EnrichmentKey {
+            file: file.clone(),
+            line: 1,
+            col: 0,
+        };
         index.cache_enrichment(
-            &file,
-            1,
-            0,
-            dir.path().to_path_buf(),
-            0,
-            source_mtime,
+            key.clone(),
+            super::Witness {
+                root: dir.path().to_path_buf(),
+                generation: 0,
+                source_mtime,
+            },
             dummy_enrichment(),
         );
         assert!(
-            index.get_enrichment(&file, 1, 0, &fs).is_some(),
+            index.get_enrichment(&key, &fs).is_some(),
             "fresh cache should hit before any edit"
         );
 
@@ -1694,7 +1761,7 @@ mod tests {
         drop(f);
 
         assert!(
-            index.get_enrichment(&file, 1, 0, &fs).is_none(),
+            index.get_enrichment(&key, &fs).is_none(),
             "an edit to the source file must miss"
         );
         assert!(
@@ -1719,19 +1786,24 @@ mod tests {
         let source_mtime = std::fs::metadata(&file)
             .ok()
             .map(|m| crate::bridge::filesystem_manager::mtime_nanos(&m));
+        let key = super::EnrichmentKey {
+            file: file.clone(),
+            line: 1,
+            col: 0,
+        };
         index.cache_enrichment(
-            &file,
-            1,
-            0,
-            dir.path().to_path_buf(),
-            0,
-            source_mtime,
+            key.clone(),
+            super::Witness {
+                root: dir.path().to_path_buf(),
+                generation: 0,
+                source_mtime,
+            },
             dummy_enrichment(),
         );
 
         std::fs::remove_file(&file).expect("remove");
         assert!(
-            index.get_enrichment(&file, 1, 0, &fs).is_none(),
+            index.get_enrichment(&key, &fs).is_none(),
             "a removed source file must miss"
         );
     }
@@ -1751,17 +1823,22 @@ mod tests {
         let source_mtime = std::fs::metadata(&file)
             .ok()
             .map(|m| crate::bridge::filesystem_manager::mtime_nanos(&m));
+        let key = super::EnrichmentKey {
+            file,
+            line: 1,
+            col: 0,
+        };
         index.cache_enrichment(
-            &file,
-            1,
-            0,
-            dir.path().to_path_buf(),
-            0,
-            source_mtime,
+            key.clone(),
+            super::Witness {
+                root: dir.path().to_path_buf(),
+                generation: 0,
+                source_mtime,
+            },
             dummy_enrichment(),
         );
 
-        let hit = index.get_enrichment(&file, 1, 0, &fs);
+        let hit = index.get_enrichment(&key, &fs);
         assert!(hit.is_some(), "unchanged generation and mtime should hit");
         assert_eq!(hit.expect("just checked").implementations.len(), 1);
     }
@@ -1782,13 +1859,18 @@ mod tests {
         let source_mtime = std::fs::metadata(&file)
             .ok()
             .map(|m| crate::bridge::filesystem_manager::mtime_nanos(&m));
+        let key = super::EnrichmentKey {
+            file,
+            line: 1,
+            col: 0,
+        };
         index.cache_enrichment(
-            &file,
-            1,
-            0,
-            dir.path().to_path_buf(),
-            0,
-            source_mtime,
+            key.clone(),
+            super::Witness {
+                root: dir.path().to_path_buf(),
+                generation: 0,
+                source_mtime,
+            },
             dummy_enrichment(),
         );
 
@@ -1796,7 +1878,7 @@ mod tests {
         fs.bump_generation_for_test(dir.path());
 
         assert!(
-            index.get_enrichment(&file, 1, 0, &fs).is_none(),
+            index.get_enrichment(&key, &fs).is_none(),
             "a generation bump must miss even with an unchanged mtime"
         );
         assert!(
@@ -1831,10 +1913,23 @@ mod tests {
 
         // Cache at generation 0 (matches the never-bumped root, neutralizing
         // the generation gate) with source_mtime = None.
-        index.cache_enrichment(&absent, 1, 0, root, 0, None, dummy_enrichment());
+        let key = super::EnrichmentKey {
+            file: absent,
+            line: 1,
+            col: 0,
+        };
+        index.cache_enrichment(
+            key.clone(),
+            super::Witness {
+                root,
+                generation: 0,
+                source_mtime: None,
+            },
+            dummy_enrichment(),
+        );
 
         assert!(
-            index.get_enrichment(&absent, 1, 0, &fs).is_none(),
+            index.get_enrichment(&key, &fs).is_none(),
             "a cached enrichment whose source mtime is None and whose file is still unstattable must MISS, not be served forever"
         );
         assert!(

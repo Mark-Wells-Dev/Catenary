@@ -25,7 +25,8 @@ use crate::lsp::server::LspServer;
 use crate::lsp::{LspClientManager, WalkBreadth};
 use crate::source::Source;
 use crate::symbol_index::{
-    CallEdge, Symbol, SymbolEnrichment, SymbolIndex, TypeEdge, format_symbol_kind,
+    CallEdge, EnrichmentKey, Symbol, SymbolEnrichment, SymbolIndex, TypeEdge, Witness,
+    format_symbol_kind,
 };
 
 /// Input for grep tool.
@@ -668,10 +669,15 @@ impl GrepServer {
     ) -> Option<SymbolEnrichment> {
         // Check the enrichment cache for workspace-rooted files.
         let resolved_root = self.fs_manager.resolve_root(path);
+        let key = EnrichmentKey {
+            file: path.to_path_buf(),
+            line: line_0,
+            col,
+        };
         if resolved_root.is_some()
             && let Some(ref idx_arc) = self.symbol_index
             && let Ok(mut idx) = idx_arc.lock()
-            && let Some(cached) = idx.get_enrichment(path, line_0, col, &self.fs_manager)
+            && let Some(cached) = idx.get_enrichment(&key, &self.fs_manager)
         {
             return Some(cached);
         }
@@ -804,12 +810,12 @@ impl GrepServer {
             let generation = self.fs_manager.root_generation(&root);
             let source_mtime = std::fs::metadata(path).ok().map(|m| mtime_nanos(&m));
             idx.cache_enrichment(
-                path,
-                line_0,
-                col,
-                root,
-                generation,
-                source_mtime,
+                key,
+                Witness {
+                    root,
+                    generation,
+                    source_mtime,
+                },
                 enrichment.clone(),
             );
         }
