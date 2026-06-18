@@ -2338,12 +2338,14 @@ mod tests {
         }
     }
 
-    /// C1/F1 — the shared per-file observation step (now used by `stat_walk`,
-    /// the diagnostics surface that lacked the H1 retry/sentinel) must NEVER omit
-    /// an enumerated present file on a stat miss: a residual miss yields the
-    /// `OBSERVED_STAT_MISS_MTIME` sentinel, not an omission. An omission would
-    /// drop the file from the observation set and a `reap=true` full walk would
-    /// then false-reap the live file as `Deleted` (WS31-review F1/H1).
+    /// C1/F1 (helper isolation unit) — the shared per-file observation step
+    /// `observe_mtime_with` (used by both the grep walker and `stat_walk`) must
+    /// NEVER omit an enumerated present file on a stat miss: a residual miss
+    /// yields the `OBSERVED_STAT_MISS_MTIME` sentinel, not an omission. This unit
+    /// pins the helper's contract in ISOLATION; the diagnostics-surface
+    /// behavioral guard that the omission would false-reap a present file through
+    /// `stat_walk` → `reap=true` lives in
+    /// `tests/ws31_review.rs::ws31_review_d_diagnostics_stat_miss_not_reaped`.
     ///
     /// Driven via the `#[cfg(test)]` injectable probe seam (mirrors R2/L4): a
     /// stateful probe deterministically fails the first call and succeeds later,
@@ -2351,7 +2353,7 @@ mod tests {
     /// the full retry budget, and (c) retry-count sensitivity — a regression to
     /// a single attempt would surface the sentinel where recovery is expected.
     #[test]
-    fn ws31_review_c1_diagnostics_stat_miss_not_reaped() {
+    fn observe_mtime_with_emits_sentinel_never_omits() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         const {

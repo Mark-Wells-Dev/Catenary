@@ -1059,3 +1059,138 @@ fn ws31_review_c1_symlink_dir_glob_single_canonical_key() -> Result<()> {
     );
     Ok(())
 }
+
+// ── D4 (T4) — diagnostics stat-miss must not false-reap a present file ──────
+
+/// T4 — the diagnostics full stat-walk must not reap a present file whose fresh
+/// `metadata()` stat races (EACCES).
+///
+/// This is the **diagnostics-surface** counterpart of the grep H1 guard
+/// (`ws31_review_r1_incomplete_observation_not_reaped`): it drives the same
+/// EACCES seam through `catenary diagnostics` instead of `grep`, exercising
+/// `diagnostics_server.rs::stat_walk` → `nudge_changed_set(..., reap=true)`. The
+/// C1/F1 fix wired `stat_walk` to the shared `observe_mtime` helper
+/// (sentinel-on-miss, never omit); the only prior guard tested the
+/// `observe_mtime_with` helper in isolation, so reverting `stat_walk` to a bare
+/// `if let Ok(md) = path.metadata()` (omit-on-miss) failed NO test. This guard
+/// closes that gap: it FAILS (a phantom `Deleted(3)` for the present file) if
+/// `stat_walk` regresses to omit-on-miss.
+///
+/// Mechanism mirrors H1 exactly. PRECONDITION: the tempdir lives on a filesystem
+/// that populates `d_type` in readdir (tmpfs, where `tempfile::tempdir()` lands
+/// by default). `stat_walk` uses the same `WalkBuilder` + cached-`d_type`
+/// `is_file` decision as the grep walker, so `sub/locked` passes `is_file` from
+/// `d_type` even when `sub` has no execute bit, but the separate fresh
+/// `metadata()` (which needs execute on `sub`) fails EACCES — pre-fix dropping it
+/// from the observation set → false-reaped on the full walk. On a `DT_UNKNOWN`
+/// filesystem the failing stat would route through the `is_file` gate
+/// (skip-as-non-file), masking the bug; the tmpfs default avoids that. The
+/// `seam_is_ineffective()` probe skips under root / a permission-ignoring FS
+/// (where the EACCES seam never fires → false GREEN).
+///
+/// The edited file that drives the batch (`anchor`) is deliberately NOT the
+/// non-vacuous companion: diagnostics excludes edited paths from watched-file
+/// routing (they ride document-sync), so an edited file never appears in
+/// `didChangeWatchedFiles`. Instead a separate non-edited `witness` is created
+/// AFTER the baseline seed, so it routes `Created(1)` on the SECOND walk only —
+/// an unambiguous proof the second full stat-walk + reap sweep ran over the root.
+#[test]
+fn ws31_review_d_diagnostics_stat_miss_not_reaped() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Root / permission-ignoring-FS guard (shared with the grep H1 test): the
+    // EACCES seam cannot be exercised there, so skip rather than false-GREEN.
+    if seam_is_ineffective() {
+        return Ok(());
+    }
+
+    // DEFAULT tempdir() → tmpfs, which populates d_type. See precondition.
+    let dir = tempfile::tempdir()?;
+    let log_path = dir.path().join("notifications.jsonl");
+
+    let sub = dir.path().join("sub");
+    std::fs::create_dir(&sub)?;
+    let locked = sub.join(format!("locked.{MOCK_LANG}"));
+    // The edited file: it drives the diagnostics batch's `roots` set (built from
+    // canonicalizable edited paths) so the full stat-walk + reap sweep fires.
+    // Diagnostics excludes edited paths from watched-file routing, so `anchor`
+    // never appears in the log — that is why a separate `witness` proves the walk.
+    let anchor = dir.path().join(format!("anchor.{MOCK_LANG}"));
+    std::fs::write(&locked, "needle\n")?;
+    std::fs::write(&anchor, "needle\n")?;
+
+    let log_arg = log_path.to_str().context("log path")?;
+    // kind 7 (ALL) ⇒ registers Delete, so a spurious `Deleted` IS routed/recorded.
+    // A kind without the Delete bit would mask the bug at routing.
+    let lsp = mockls_lsp_arg(
+        MOCK_LANG,
+        &format!(
+            "--register-file-watchers --watcher-glob **/*.{MOCK_LANG} \
+             --watcher-kind 7 --notification-log {log_arg}"
+        ),
+    );
+    let root = dir.path().to_str().context("root path")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    // Seed the per-root baseline with a first diagnostics run over `anchor`: its
+    // full stat-walk observes the whole root, so BOTH `anchor` and `sub/locked`
+    // enter the baseline.
+    let anchor_str = anchor.to_str().context("anchor path")?;
+    let _ = bridge.call_diagnostics(anchor_str)?;
+    std::thread::sleep(Duration::from_millis(150));
+
+    // Create a non-edited `witness` AFTER the baseline seed: on the SECOND walk it
+    // is absent-on-a-populated-baseline ⇒ routed as Created(1). A Created(1) can
+    // only come from the second walk, so it unambiguously proves the second full
+    // stat-walk (the reap sweep) ran over the root — the key assertion below
+    // cannot pass by an early empty-change-set return.
+    let witness = dir.path().join(format!("witness.{MOCK_LANG}"));
+    std::fs::write(&witness, "needle\n")?;
+
+    // Strip execute (search) from sub: readdir still works (read granted) so
+    // sub/locked is enumerated with cached d_type and passes `is_file`, but a
+    // fresh metadata() stat on it needs execute on sub → EACCES. Pre-fix it is
+    // omitted from observations → false-reaped on the full walk. sub/locked is
+    // still on disk.
+    std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o400))?;
+
+    // Second diagnostics run over `anchor`: full stat-walk over the covered root
+    // ⇒ the reap sweep fires. `witness` is observed (Created); `sub/locked` is
+    // enumerated but its fresh stat races EACCES.
+    let diag_result = bridge.call_diagnostics(anchor_str);
+
+    // RESTORE execute immediately, in the test BODY, before drop(bridge): the
+    // tempdir's Drop must recurse into sub to clean up, which needs execute.
+    std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o700))?;
+    diag_result?;
+
+    drop(bridge);
+    std::thread::sleep(Duration::from_millis(300));
+
+    let locked_uri = format!("file://{}/sub/locked.{MOCK_LANG}", dir.path().display());
+    let witness_uri = format!("file://{}/witness.{MOCK_LANG}", dir.path().display());
+    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let changes = watched_file_changes(&log);
+
+    // Key assertion (green guard): a present file whose fresh metadata() raced
+    // (EACCES) must NOT be reaped by the diagnostics full stat-walk. Pre-fix
+    // (`stat_walk` omitting on stat miss) routed a phantom `Deleted(3)`.
+    assert!(
+        !changes.iter().any(|(u, t)| *u == locked_uri && *t == 3),
+        "the diagnostics full stat-walk must not reap a present file whose fresh \
+         metadata() raced (EACCES); sub/locked is present on disk. \
+         changes={changes:?}, log:\n{log}"
+    );
+    // Companion guard (non-vacuous): the non-edited `witness`, created after the
+    // baseline seed, is routed as Created(1) by the SECOND full stat-walk. This
+    // pins that the walk + reap sweep ran over the root, so the key assertion
+    // can't pass by walking/routing nothing.
+    assert!(
+        changes.iter().any(|(u, t)| *u == witness_uri && *t == 1),
+        "the non-edited `witness` (created after the seed) must be routed as \
+         Created(1) by the second full stat-walk, proving the reap sweep ran. \
+         changes={changes:?}, log:\n{log}"
+    );
+    Ok(())
+}
