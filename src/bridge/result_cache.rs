@@ -99,6 +99,17 @@ impl ResultCache {
         Some(paginate(&entry.output, self.budget, page))
     }
 
+    /// Empties the single cache slot.
+    ///
+    /// Called on root removal: the cached page may carry enrichment for a path
+    /// that is no longer tracked, and the [`Self::get`] generation/witness gates
+    /// can both still validate it (a read-only root's generation reverts to 0 on
+    /// removal and unchanged witnesses re-stat equal), so the slot must be
+    /// dropped outright rather than left for those gates to catch (bug M1).
+    pub(super) fn clear(&mut self) {
+        self.slot = None;
+    }
+
     /// Stores a query result in the cache.
     ///
     /// Skips caching when the result fits in a single page (no page 2

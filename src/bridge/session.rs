@@ -860,6 +860,27 @@ impl Session {
             }
         }
 
+        // Clear the daemon-lived `ResultCache` slots on any removal. The
+        // `SymbolIndex` eviction above is keyed per root, but the single-slot
+        // result cache short-circuits in `GrepServer`/`GlobServer::execute`
+        // *before* root resolution, and on removal a read-only root's generation
+        // reverts to 0 so the cached page's generation/witness gates can both
+        // still validate — serving cached enrichment for an untracked path
+        // (bug M1). A single-slot cache makes an unconditional clear cheap, so
+        // drop both slots whenever a root left the tracked set.
+        if !removed.is_empty() {
+            self.grep
+                .cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+            self.glob
+                .cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+        }
+
         // Root changes may expand the merged command allowlist —
         // bump config version so the next denial shows a fresh full dump.
         self.config_version

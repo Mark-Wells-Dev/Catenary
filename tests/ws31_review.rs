@@ -398,7 +398,6 @@ fn seam_is_ineffective() -> bool {
 /// no callee name is a substring of another (`callee_0001` does not contain
 /// `callee_0000`).
 #[test]
-#[ignore = "RED: WS31-review R3; un-ignore in fix"]
 fn ws31_review_r3_resultcache_not_served_for_untracked_root() -> Result<()> {
     use std::fmt::Write as _;
 
