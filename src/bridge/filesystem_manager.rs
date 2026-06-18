@@ -858,7 +858,9 @@ impl FilesystemManager {
     }
 
     /// Reverts a set of just-merged changes in a root's baseline so the **next**
-    /// walk re-emits them (WS31-review F4 — best-effort delivery recovery).
+    /// walk re-emits them with the **same `FileChangeType`** they originally
+    /// carried (WS31-review F4 / WS31-review-D D2 — best-effort, kind-faithful
+    /// delivery recovery).
     ///
     /// [`nudge_changed_set`](crate::lsp::manager::LspClientManager::nudge_changed_set)
     /// advances the per-root baseline **once** (steps via
@@ -872,25 +874,46 @@ impl FilesystemManager {
     /// down only by [`remove_root_baseline`](Self::remove_root_baseline) on
     /// `roots rm`). Reverting the affected entries makes the next walk re-emit them
     /// to **all** covering servers; a duplicate `didChangeWatchedFiles` to a server
-    /// that already received the change is harmless/idempotent.
+    /// that already received the change is harmless/idempotent. Delivery is
+    /// **best-effort**, and because the baseline is shared a revert may re-notify a
+    /// *healthy* covering server too (an idempotent duplicate, not a loss).
     ///
-    /// Per change kind:
-    /// - [`ChangeKind::Created`] / [`ChangeKind::Changed`] — the entry was inserted
-    ///   or its mtime advanced, so the entry is **removed**. The next walk finds it
-    ///   absent from a populated baseline ⇒ re-emits it (as `Created`, or `Changed`
-    ///   if it is the only baselined path on a fresh root — both are safe
-    ///   re-notifications that no longer lose the change).
-    /// - [`ChangeKind::Deleted`] — the reaping sweep already **removed** the entry,
-    ///   and the file is gone from disk, so removal would not re-emit anything (the
-    ///   next walk never observes a deleted file). Instead the entry is
-    ///   **re-inserted** with the [`OBSERVED_STAT_MISS_MTIME`] sentinel so the next
-    ///   **full** walk's reaping sweep — which reaps any baseline entry the walk did
-    ///   not visit — re-emits the `Deleted`. **Limitation:** this only re-emits on a
-    ///   *full* walk (`reap = true`); a subsequent scoped walk never reaps, so a
-    ///   Deleted lost to a notify failure waits for the next full walk
-    ///   (`grep`/`diagnostics`). If the file reappears before that walk, the
-    ///   sentinel (`i64::MIN`, below every real mtime) makes it re-emit as `Changed`
-    ///   rather than a spurious nothing — a safe over-notification.
+    /// The revert is **kind-faithful**: it branches on the original
+    /// [`ChangeKind`] so the next walk re-derives the same wire `FileChangeType`
+    /// rather than collapsing every kind to a re-`Created`:
+    /// - [`ChangeKind::Created`] — the entry was newly inserted, so it is
+    ///   **removed**. The next walk finds it absent from a populated baseline ⇒
+    ///   re-emits [`ChangeKind::Created`].
+    /// - [`ChangeKind::Changed`] — the entry's mtime advanced. It is **re-inserted
+    ///   at the [`OBSERVED_STAT_MISS_MTIME`] sentinel** (`i64::MIN`, below every
+    ///   real mtime), NOT removed. The next walk sees the key **present** with a
+    ///   real `mtime > sentinel` ⇒ re-emits [`ChangeKind::Changed`]. (Removing it
+    ///   would key it absent and re-emit a spurious `Created`, mis-serving a
+    ///   single-kind watcher — the bug this fix closes.)
+    /// - [`ChangeKind::Deleted`] — the reaping sweep already removed the entry and
+    ///   the file is gone from disk, so removal would re-emit nothing (a walk never
+    ///   observes a deleted file). The entry is **re-inserted** at the sentinel so
+    ///   the next **full** walk's reaping sweep — which reaps any baseline entry
+    ///   the walk did not visit — re-routes [`ChangeKind::Deleted`].
+    ///
+    /// Two inherent residuals (not fully closable; documented honestly):
+    /// 1. A reverted `Deleted` re-routes only on a **full** walk (`reap = true`);
+    ///    a scoped walk never reaps, so a `Deleted` lost to a notify failure on a
+    ///    scoped-only surface waits for the next `grep`/`diagnostics` full walk. If
+    ///    the file **reappears** before that full walk, a scoped walk that observes
+    ///    it re-emits [`ChangeKind::Changed`] (key present at the sentinel,
+    ///    `mtime > sentinel`), not [`ChangeKind::Created`] — a present key cannot
+    ///    also signal "absent". For a Create-only watcher this is an
+    ///    *under*-notification (no creation event), not a duplicate.
+    /// 2. **Scoped-only orphan sentinel.** A reverted `Deleted` on a root that is
+    ///    only ever *globbed* (scoped, never reaps) leaves the sentinel entry in
+    ///    the baseline indefinitely: a scoped walk that does not observe the path
+    ///    cannot reap it (reaping an unobserved entry is exactly the phantom-reap a
+    ///    scoped walk is forbidden from doing, and would also evict a
+    ///    legitimately-pending `Deleted` awaiting a full walk). The entry is
+    ///    self-healing only if the path reappears and a scoped walk observes it
+    ///    (then re-emitted as `Changed` per residual 1) or a full walk eventually
+    ///    runs. Eviction-on-scoped-walk was rejected for this reason.
     pub(crate) fn revert_baseline_changes(&self, root: &Path, changes: &[Change]) {
         let inner = {
             let outer = self
@@ -909,10 +932,19 @@ impl FilesystemManager {
         let mut baseline = inner.lock().unwrap_or_else(PoisonError::into_inner);
         for change in changes {
             match change.kind {
-                ChangeKind::Created | ChangeKind::Changed => {
+                ChangeKind::Created => {
+                    // Key absent ⇒ the next walk re-derives Created. (A populated
+                    // baseline + an absent key is a genuine `Created`.)
                     baseline.remove(&change.rel);
                 }
-                ChangeKind::Deleted => {
+                ChangeKind::Changed | ChangeKind::Deleted => {
+                    // Key PRESENT at the `i64::MIN` sentinel (below every real
+                    // mtime). For a reverted Changed the next walk sees the key
+                    // present with `mtime > sentinel` ⇒ re-emits Changed (NOT
+                    // Created — the kind-faithful fix). For a reverted Deleted the
+                    // file is gone, so the next FULL walk's reaping sweep — which
+                    // reaps any baseline entry the walk did not visit — re-routes
+                    // Deleted.
                     baseline.insert(change.rel.clone(), OBSERVED_STAT_MISS_MTIME);
                 }
             }
@@ -2193,12 +2225,11 @@ mod tests {
     /// re-emitted kind matches the original.
     ///
     /// The load-bearing case is **Changed**: a reverted Changed must re-emit as
-    /// Changed, not Created. Pre-fix this is RED — the revert collapsed
-    /// Created/Changed both to `baseline.remove`, so the next walk found the key
-    /// absent and re-derived `Created`, mis-kinding the change for a Change-only
-    /// watcher (and delivering a spurious creation to a Create-only one).
+    /// Changed, not Created. The fix re-inserts a reverted Changed at the
+    /// `OBSERVED_STAT_MISS_MTIME` sentinel (key present, `mtime > sentinel` ⇒
+    /// Changed) instead of removing it (key absent ⇒ a spurious Created that
+    /// mis-served a single-kind watcher).
     #[test]
-    #[ignore = "RED: WS31-review-D D2; un-ignore in fix"]
     fn ws31_review_d_revert_preserves_change_kind() {
         // ── Created: a reverted Created re-emits Created. ──────────────────
         {
@@ -2274,7 +2305,10 @@ mod tests {
             let root = PathBuf::from("/root");
             // First walk seeds two files; the gone.rs entry is reaped when the
             // next full walk omits it.
-            let both = vec![(PathBuf::from("a.rs"), 100), (PathBuf::from("gone.rs"), 100)];
+            let both = vec![
+                (PathBuf::from("a.rs"), 100),
+                (PathBuf::from("gone.rs"), 100),
+            ];
             let _ = mgr.diff_update_and_reap(&root, &both);
             let only_a = vec![(PathBuf::from("a.rs"), 100)];
             let deleted = mgr.diff_update_and_reap(&root, &only_a);

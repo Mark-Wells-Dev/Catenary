@@ -1560,8 +1560,14 @@ impl LspClientManager {
     /// [`revert_baseline_changes`](FilesystemManager::revert_baseline_changes) so
     /// the **next** walk re-emits them to **all** covering servers — a duplicate
     /// `didChangeWatchedFiles` to a server that already received it is
-    /// harmless/idempotent. A `Deleted` only re-emits on the next *full* walk (see
-    /// `revert_baseline_changes` for that limitation, WS31-review F4).
+    /// harmless/idempotent (this may re-notify a *healthy* covering server too,
+    /// since the baseline is shared). The revert is **kind-faithful**: a re-emit
+    /// preserves the original `FileChangeType` (a reverted Created re-emits
+    /// Created, a reverted Changed re-emits Changed, a reverted Deleted re-routes
+    /// Deleted), so a single-kind watcher is not mis-served (WS31-review-D D2).
+    /// A `Deleted` only re-routes on the next *full* walk, and a Deleted whose file
+    /// reappears before that walk re-emits as `Changed` — see
+    /// `revert_baseline_changes` for both inherent residuals (WS31-review F4).
     ///
     /// [`watched_files_snapshot`]: crate::lsp::server::LspServer::watched_files_snapshot
     pub async fn nudge_changed_set(
