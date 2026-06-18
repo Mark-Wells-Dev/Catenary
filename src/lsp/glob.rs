@@ -112,6 +112,21 @@ impl GlobPattern {
         Ok(Self::Relative { base, pattern })
     }
 
+    /// Compiles `pattern` as a [`Plain`](Self::Plain) workspace-relative glob.
+    ///
+    /// Used to gracefully degrade an object-form `globPattern` whose `baseUri`
+    /// is missing or non-`file://`: the `baseUri` is dropped and the `pattern`
+    /// is matched workspace-relative (the pre-relative-pattern behavior). A
+    /// pattern that itself won't compile still surfaces the error so the caller
+    /// can drop the watcher rather than build a broken matcher.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `pattern` is not a valid glob.
+    pub fn plain(pattern: &str) -> Result<Self> {
+        Ok(Self::Plain(LspGlob::new(pattern)?))
+    }
+
     /// Tests whether an absolute path matches this pattern.
     ///
     /// For `Plain`, tries stripping each root as a prefix and matches the
@@ -168,6 +183,10 @@ fn uri_to_path(uri: &str) -> Result<PathBuf> {
 /// Decodes valid `%`-escapes to their byte value and reassembles the result as
 /// UTF-8; an invalid or truncated escape is left verbatim. Sufficient for the
 /// `file://` paths Catenary handles without pulling in a dependency.
+///
+/// Path separators are decoded too: `%2F` becomes `/`, consistent with standard
+/// URL path decoding. A `baseUri` that encodes a slash therefore resolves to a
+/// real path separator rather than a literal `%2F` segment.
 fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());

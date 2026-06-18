@@ -91,14 +91,33 @@ impl ParsedWatcher {
     /// advertises `relativePatternSupport: true`). The optional `kind` field
     /// is an LSP `WatchKind` bitmask; absent ⇒ [`WATCH_KIND_ALL`].
     ///
-    /// Returns `None` for a malformed entry (missing/invalid `globPattern`),
-    /// which the caller skips with a `debug!` rather than failing the whole
-    /// registration. The `globPattern` (string or `{ baseUri, pattern }`) is
-    /// parsed via [`crate::lsp::glob::GlobPattern`], which compiles with LSP
-    /// 3.17 semantics and percent-decodes the `baseUri`.
+    /// Returns `None` for a malformed entry (missing `globPattern`, or an
+    /// object whose `pattern` is missing or won't compile), which the caller
+    /// skips with a `debug!` rather than failing the whole registration. The
+    /// `globPattern` (string or `{ baseUri, pattern }`) is parsed via
+    /// [`crate::lsp::glob::GlobPattern`], which compiles with LSP 3.17 semantics
+    /// and percent-decodes the `baseUri`.
+    ///
+    /// An object-form `globPattern` whose `baseUri` is missing or non-`file://`
+    /// degrades gracefully: the `baseUri` is dropped and the `pattern` is
+    /// matched workspace-relative (the pre-relative-pattern behavior) rather
+    /// than discarding the whole watcher. A `pattern` that won't *compile* still
+    /// drops — degradation never builds a broken matcher.
     fn from_value(watcher: &Value) -> Option<Self> {
         let glob_value = watcher.get("globPattern")?;
-        let glob = crate::lsp::glob::GlobPattern::from_value(glob_value).ok()?;
+        let glob = match crate::lsp::glob::GlobPattern::from_value(glob_value) {
+            Ok(glob) => glob,
+            // `from_value` failed. If the value is an object with a `pattern`
+            // string, the failure was the `baseUri` (missing / non-`file://`) —
+            // degrade to a workspace-relative Plain glob on the `pattern`. A
+            // pattern that won't compile makes `plain` fail too, so the watcher
+            // still drops.
+            Err(_) => glob_value
+                .as_object()
+                .and_then(|obj| obj.get("pattern"))
+                .and_then(Value::as_str)
+                .and_then(|pattern| crate::lsp::glob::GlobPattern::plain(pattern).ok())?,
+        };
 
         let kind = watcher
             .get("kind")
@@ -1195,7 +1214,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "RED: WS31-review-D D3; un-ignore in fix"]
     fn ws31_review_d_object_watcher_no_baseuri_degrades() {
         // An object-form globPattern with NO baseUri must degrade gracefully to
         // a Plain workspace-relative watcher on its `pattern` (the pre-C2
@@ -1227,7 +1245,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "RED: WS31-review-D D3; un-ignore in fix"]
     fn ws31_review_d_object_watcher_uncompilable_pattern_drops() {
         // Graceful degradation must NOT extend to a pattern that cannot compile:
         // an object with no baseUri whose `pattern` is an invalid glob still
