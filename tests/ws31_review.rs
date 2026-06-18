@@ -79,7 +79,6 @@ fn watched_file_changes(log: &str) -> Vec<(String, u64)> {
 /// `WalkBreadth::Full` and calls `diff_update_and_reap` with `reap=true` — which
 /// reaps `b/keep` (present on disk!) as `Deleted(3)`. RED today.
 #[test]
-#[ignore = "RED: WS31-review R1; un-ignore in fix"]
 fn ws31_review_r1_scoped_grep_no_spurious_delete() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let log_path = dir.path().join("notifications.jsonl");
@@ -156,7 +155,6 @@ fn ws31_review_r1_scoped_grep_no_spurious_delete() -> Result<()> {
 /// stat would instead route through the `is_file` gate (skip-as-non-file), which
 /// would mask the bug → false GREEN; that is why we rely on the tmpfs default.
 #[test]
-#[ignore = "RED: WS31-review R1; un-ignore in fix"]
 fn ws31_review_r1_incomplete_observation_not_reaped() -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 

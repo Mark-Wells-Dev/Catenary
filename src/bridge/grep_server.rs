@@ -385,6 +385,17 @@ impl GrepServer {
         // covering server is `WalkBreadth::None` — the `(no LSP)` case — and is
         // skipped entirely (no diff, no nudge). `--count` grep never reaches
         // `run`, so it pays nothing. No edited-set exclusion for grep.
+        //
+        // Reaping is gated per-root by whether the walk actually spanned the
+        // whole registered root (WS31-review C1): a `Full` breadth only means a
+        // covering server exists, not that the walk covered the root. A
+        // path-scoped grep (`!input.paths.is_empty()`) or a pathless grep whose
+        // cwd is a *subdir* of the root walked only a subtree, so it cannot
+        // assert that an unvisited baseline entry is gone — it is add/update
+        // only (`reap = false`), exactly like a scoped `glob`. Only a pathless
+        // grep whose walked scope is an ancestor-or-equal of the registered root
+        // reaps. The walked scopes are canonicalized so they compare against the
+        // canonicalized roots `resolve_root` returns.
         {
             let mut by_root: HashMap<PathBuf, Vec<(PathBuf, i64)>> = HashMap::new();
             for (abs, mtime) in &rg.files {
@@ -397,6 +408,12 @@ impl GrepServer {
                         .push((rel.to_path_buf(), *mtime));
                 }
             }
+            // The scopes the walk actually covered, canonicalized to match the
+            // canonical form of registered roots (see `run_daemon_main`).
+            let walked_scopes: Vec<PathBuf> = effective_roots
+                .iter()
+                .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()))
+                .collect();
             let no_exclude: HashSet<PathBuf> = HashSet::new();
             for (root, observed) in &by_root {
                 let breadth = if self.client_manager.has_covering_watchers(root).await {
@@ -407,8 +424,15 @@ impl GrepServer {
                 if !breadth.runs_engine() {
                     continue;
                 }
+                // Only reap when the walk truly covered the whole root: a
+                // pathless grep whose walked scope is an ancestor-or-equal of
+                // this registered root. A path-scoped grep, or a cwd below the
+                // root, walked only a subtree → add/update only.
+                let covered_whole_root = input.paths.is_empty()
+                    && walked_scopes.iter().any(|scope| root.starts_with(scope));
+                let reap = breadth.reaps() && covered_whole_root;
                 self.client_manager
-                    .nudge_changed_set(root, observed, &no_exclude, breadth.reaps())
+                    .nudge_changed_set(root, observed, &no_exclude, reap)
                     .await;
             }
         }
@@ -1224,14 +1248,20 @@ impl GrepServer {
                     // (Consumer A) — every visited file, before the query-level
                     // `exclude` and binary skips, so coherence coverage is the
                     // full tree (the manager scopes it to registered globs). The
-                    // stat is free: the binary check below reuses this metadata.
-                    let metadata = path.metadata().ok();
-                    if let Some(md) = &metadata {
-                        state
-                            .local
-                            .files
-                            .push((path.to_path_buf(), mtime_nanos(md)));
-                    }
+                    // metadata is retried (a fresh stat can race an atomic rename
+                    // even when `d_type` already proved the entry a file) and
+                    // reused by the binary check below.
+                    //
+                    // An enumerated present file whose stat still misses is
+                    // recorded with the `OBSERVED_STAT_MISS_MTIME` sentinel, NOT
+                    // omitted: omitting it would drop it from the observation set
+                    // and a full walk would then false-reap it as `Deleted`
+                    // (WS31-review H1). A stat-miss must never reach the reap set.
+                    let metadata = stat_with_retry(path);
+                    let observed_mtime = metadata
+                        .as_ref()
+                        .map_or(OBSERVED_STAT_MISS_MTIME, mtime_nanos);
+                    state.local.files.push((path.to_path_buf(), observed_mtime));
 
                     if let Some(rg) = &exclude
                         && rg.is_match(path, &root)
@@ -1295,6 +1325,34 @@ fn stat_is_file_with_retry(path: &Path) -> bool {
     }
     false
 }
+
+/// Fetches `path`'s metadata, retrying a transient stat miss.
+///
+/// The observation push (WS31 changed-set baseline) must not drop an enumerated
+/// present file just because its *fresh* `metadata()` raced an atomic rename (or
+/// briefly returned `EACCES`). Same bounded, sleepless retry as
+/// [`stat_is_file_with_retry`]: the rename window is sub-millisecond. A residual
+/// miss after the last attempt is handled by the caller with the
+/// [`OBSERVED_STAT_MISS_MTIME`] sentinel — never by omitting the file from the
+/// observation set (WS31-review H1).
+fn stat_with_retry(path: &Path) -> Option<std::fs::Metadata> {
+    for _ in 0..STAT_RETRY_ATTEMPTS {
+        if let Ok(md) = path.metadata() {
+            return Some(md);
+        }
+    }
+    None
+}
+
+/// Sentinel mtime for an enumerated present file whose observation stat missed.
+///
+/// Recorded in the changed-set observation set for a file the walk *enumerated
+/// as present* (passed the `is_file` decision) but whose fresh `metadata()`
+/// failed even after [`stat_with_retry`]. Keeping the file in the observation
+/// set means the reaping sweep never treats it as deleted (WS31-review H1);
+/// `i64::MIN` is below every real `mtime_nanos`, so the diff never spuriously
+/// routes it as `Changed` against an existing baseline entry.
+const OBSERVED_STAT_MISS_MTIME: i64 = i64::MIN;
 
 // ─── Rendering ─────────────────────────────────────────────────────────
 
