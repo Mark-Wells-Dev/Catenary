@@ -2185,6 +2185,125 @@ mod tests {
         );
     }
 
+    /// WS31-review-D D2 (T3) — the notify-failure revert must be **kind-faithful**:
+    /// a reverted change re-emits on the next walk with the SAME `ChangeKind` it
+    /// originally carried, so a single-kind watcher is not mis-served. Seeds a
+    /// baseline, drives each of the three kinds through a diff, reverts it, then
+    /// re-diffs against the **same unchanged** observation set and asserts the
+    /// re-emitted kind matches the original.
+    ///
+    /// The load-bearing case is **Changed**: a reverted Changed must re-emit as
+    /// Changed, not Created. Pre-fix this is RED — the revert collapsed
+    /// Created/Changed both to `baseline.remove`, so the next walk found the key
+    /// absent and re-derived `Created`, mis-kinding the change for a Change-only
+    /// watcher (and delivering a spurious creation to a Create-only one).
+    #[test]
+    #[ignore = "RED: WS31-review-D D2; un-ignore in fix"]
+    fn ws31_review_d_revert_preserves_change_kind() {
+        // ── Created: a reverted Created re-emits Created. ──────────────────
+        {
+            let mgr = FilesystemManager::new();
+            let root = PathBuf::from("/root");
+            // First walk seeds the baseline (cold snapshot); the new path on the
+            // second walk is a genuine Created.
+            let seed = vec![(PathBuf::from("a.rs"), 100)];
+            let _ = mgr.diff_and_update(&root, &seed);
+            let with_new = vec![(PathBuf::from("a.rs"), 100), (PathBuf::from("new.rs"), 100)];
+            let created = mgr.diff_and_update(&root, &with_new);
+            let new_change = created
+                .changes
+                .iter()
+                .find(|c| c.rel == Path::new("new.rs"))
+                .expect("new.rs routed");
+            assert_eq!(
+                new_change.kind,
+                ChangeKind::Created,
+                "a path absent from a populated baseline is Created"
+            );
+            mgr.revert_baseline_changes(&root, std::slice::from_ref(new_change));
+            let reemit = mgr.diff_and_update(&root, &with_new);
+            let reemitted = reemit
+                .changes
+                .iter()
+                .find(|c| c.rel == Path::new("new.rs"))
+                .expect("reverted Created re-emits");
+            assert_eq!(
+                reemitted.kind,
+                ChangeKind::Created,
+                "a reverted Created must re-emit as Created"
+            );
+        }
+
+        // ── Changed: a reverted Changed re-emits Changed (THE fix). ────────
+        {
+            let mgr = FilesystemManager::new();
+            let root = PathBuf::from("/root");
+            let at_100 = vec![(PathBuf::from("a.rs"), 100)];
+            let _ = mgr.diff_and_update(&root, &at_100);
+            let at_200 = vec![(PathBuf::from("a.rs"), 200)];
+            let changed = mgr.diff_and_update(&root, &at_200);
+            let change = changed
+                .changes
+                .iter()
+                .find(|c| c.rel == Path::new("a.rs"))
+                .expect("a.rs routed as a mtime advance");
+            assert_eq!(
+                change.kind,
+                ChangeKind::Changed,
+                "an mtime advance on an existing baseline entry is Changed"
+            );
+            mgr.revert_baseline_changes(&root, std::slice::from_ref(change));
+            // Re-diff against the SAME unchanged observation (mtime 200).
+            let reemit = mgr.diff_and_update(&root, &at_200);
+            let reemitted = reemit
+                .changes
+                .iter()
+                .find(|c| c.rel == Path::new("a.rs"))
+                .expect("reverted Changed re-emits");
+            assert_eq!(
+                reemitted.kind,
+                ChangeKind::Changed,
+                "a reverted Changed must re-emit as Changed, not Created"
+            );
+        }
+
+        // ── Deleted: a reverted Deleted re-routes Deleted on the next full
+        //    walk's reaping sweep. ───────────────────────────────────────────
+        {
+            let mgr = FilesystemManager::new();
+            let root = PathBuf::from("/root");
+            // First walk seeds two files; the gone.rs entry is reaped when the
+            // next full walk omits it.
+            let both = vec![(PathBuf::from("a.rs"), 100), (PathBuf::from("gone.rs"), 100)];
+            let _ = mgr.diff_update_and_reap(&root, &both);
+            let only_a = vec![(PathBuf::from("a.rs"), 100)];
+            let deleted = mgr.diff_update_and_reap(&root, &only_a);
+            let del = deleted
+                .changes
+                .iter()
+                .find(|c| c.rel == Path::new("gone.rs"))
+                .expect("gone.rs reaped as Deleted");
+            assert_eq!(
+                del.kind,
+                ChangeKind::Deleted,
+                "a baseline entry a full walk did not visit is Deleted"
+            );
+            mgr.revert_baseline_changes(&root, std::slice::from_ref(del));
+            // The next full walk still omits gone.rs ⇒ re-reaps it as Deleted.
+            let reemit = mgr.diff_update_and_reap(&root, &only_a);
+            let reemitted = reemit
+                .changes
+                .iter()
+                .find(|c| c.rel == Path::new("gone.rs"))
+                .expect("reverted Deleted re-routes on the next full walk");
+            assert_eq!(
+                reemitted.kind,
+                ChangeKind::Deleted,
+                "a reverted Deleted must re-route as Deleted"
+            );
+        }
+    }
+
     /// C1/F1 — the shared per-file observation step (now used by `stat_walk`,
     /// the diagnostics surface that lacked the H1 retry/sentinel) must NEVER omit
     /// an enumerated present file on a stat miss: a residual miss yields the
