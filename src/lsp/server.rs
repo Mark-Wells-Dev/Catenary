@@ -12,7 +12,6 @@
 use anyhow::Result;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::Notify;
@@ -44,10 +43,10 @@ const WATCH_KIND_ALL: u8 = WATCH_KIND_CREATE | WATCH_KIND_CHANGE | WATCH_KIND_DE
     reason = "pub(crate) consumed by WS31 ticket 03 (changed-set nudge)"
 )]
 pub(crate) struct ParsedWatcher {
-    /// Compiled glob (absolute or base-relative pattern).
-    glob: globset::GlobMatcher,
-    /// Base directory for a relative pattern, else `None` (workspace-relative).
-    base: Option<PathBuf>,
+    /// Compiled pattern (plain workspace-relative or base-relative), using LSP
+    /// 3.17 glob semantics (`literal_separator(true)`, so `*` does not cross
+    /// `/`). Shared with the rest of Catenary via [`crate::lsp::glob`].
+    glob: crate::lsp::glob::GlobPattern,
     /// Bitmask of watched kinds: Create=1, Change=2, Delete=4 (LSP
     /// `WatchKind`); absent ⇒ all three (LSP default 7).
     kind: u8,
@@ -61,11 +60,13 @@ impl ParsedWatcher {
     /// path. The change is gated by both the watcher's kind mask
     /// ([`ChangeKind::Created`] needs the `Create` bit, [`ChangeKind::Changed`]
     /// needs the `Change` bit, [`ChangeKind::Deleted`] needs the `Delete` bit)
-    /// and its glob. A base-relative pattern (`base` set) matches against the
-    /// path relative to that base; a workspace-relative pattern matches the
-    /// root-relative path, with the absolute path as a fallback (servers
-    /// register both forms). For a deletion the file is already gone from disk,
-    /// but the stored `rel`/`abs` paths still match the registered glob.
+    /// and its glob. The glob/base matching is delegated to
+    /// [`crate::lsp::glob::GlobPattern::matches_paths`] (LSP 3.17 semantics): a
+    /// base-relative pattern matches the path relative to its base; a
+    /// workspace-relative pattern matches the root-relative path with the
+    /// absolute path as a fallback (servers register both forms). For a
+    /// deletion the file is already gone from disk, but the stored `rel`/`abs`
+    /// paths still match the registered glob.
     pub(crate) fn covers(
         &self,
         rel: &std::path::Path,
@@ -80,12 +81,7 @@ impl ParsedWatcher {
         if self.kind & required == 0 {
             return false;
         }
-        if let Some(base) = &self.base {
-            return abs
-                .strip_prefix(base)
-                .is_ok_and(|sub| self.glob.is_match(sub));
-        }
-        self.glob.is_match(rel) || self.glob.is_match(abs)
+        self.glob.matches_paths(rel, abs)
     }
 
     /// Parses a single `FileSystemWatcher` JSON value into a [`ParsedWatcher`].
@@ -97,23 +93,12 @@ impl ParsedWatcher {
     ///
     /// Returns `None` for a malformed entry (missing/invalid `globPattern`),
     /// which the caller skips with a `debug!` rather than failing the whole
-    /// registration.
+    /// registration. The `globPattern` (string or `{ baseUri, pattern }`) is
+    /// parsed via [`crate::lsp::glob::GlobPattern`], which compiles with LSP
+    /// 3.17 semantics and percent-decodes the `baseUri`.
     fn from_value(watcher: &Value) -> Option<Self> {
         let glob_value = watcher.get("globPattern")?;
-        let (pattern, base) = match glob_value {
-            Value::String(s) => (s.as_str(), None),
-            Value::Object(_) => {
-                let pattern = glob_value.get("pattern").and_then(Value::as_str)?;
-                let base = glob_value
-                    .get("baseUri")
-                    .and_then(uri_to_path)
-                    .map(PathBuf::from);
-                (pattern, base)
-            }
-            _ => return None,
-        };
-
-        let glob = globset::Glob::new(pattern).ok()?.compile_matcher();
+        let glob = crate::lsp::glob::GlobPattern::from_value(glob_value).ok()?;
 
         let kind = watcher
             .get("kind")
@@ -121,22 +106,8 @@ impl ParsedWatcher {
             .and_then(|v| u8::try_from(v).ok())
             .unwrap_or(WATCH_KIND_ALL);
 
-        Some(Self { glob, base, kind })
+        Some(Self { glob, kind })
     }
-}
-
-/// Extracts a filesystem path from a relative-pattern `baseUri`.
-///
-/// `baseUri` is either a `file://` URI string or a `WorkspaceFolder`
-/// object `{ uri, name }`. Returns the decoded path, or `None` if absent
-/// or not a `file://` URI.
-fn uri_to_path(base_uri: &Value) -> Option<String> {
-    let uri = match base_uri {
-        Value::String(s) => s.as_str(),
-        Value::Object(_) => base_uri.get("uri").and_then(Value::as_str)?,
-        _ => return None,
-    };
-    uri.strip_prefix("file://").map(ToOwned::to_owned)
 }
 
 /// Complete representation of a remote LSP server.
@@ -903,6 +874,10 @@ impl LspServer {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
+        self.watched_files_registrations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         self.diagnostics_notify.notify_waiters();
     }
 
@@ -1172,7 +1147,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "RED: WS31-review-C C2; un-ignore in fix"]
     fn ws31_review_c2_watcher_star_no_cross_segment() {
         // A single-`*` segment-scoped pattern must NOT cross `/` (LSP 3.17
         // semantics, `literal_separator(true)`). Today `ParsedWatcher` compiles
@@ -1199,7 +1173,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "RED: WS31-review-C C2; un-ignore in fix"]
     fn ws31_review_c2_watcher_baseuri_percent_decoded() {
         // A relative-pattern watcher whose baseUri is percent-encoded must
         // decode to the real path so its base prefix strips against the actual
@@ -1928,22 +1901,26 @@ mod tests {
         let snapshot = server.watched_files_snapshot();
         assert_eq!(snapshot.len(), 2);
 
-        // The string glob has no base; the relative one resolves its baseUri.
-        let string_watcher = snapshot
-            .iter()
-            .find(|w| w.base.is_none())
-            .expect("string-glob watcher present");
-        assert!(string_watcher.glob.is_match("src/lib.rs"));
-
-        let relative_watcher = snapshot
-            .iter()
-            .find(|w| w.base.is_some())
-            .expect("relative-pattern watcher present");
-        assert_eq!(
-            relative_watcher.base.as_deref(),
-            Some(std::path::Path::new("/project"))
+        // The plain `**/*.rs` watcher matches a root-relative `.rs` path.
+        let rs_rel = std::path::Path::new("src/lib.rs");
+        let rs_abs = std::path::Path::new("/root/src/lib.rs");
+        assert!(
+            snapshot
+                .iter()
+                .any(|w| w.covers(rs_rel, rs_abs, ChangeKind::Changed)),
+            "plain **/*.rs watcher should cover src/lib.rs"
         );
-        assert!(relative_watcher.glob.is_match("Cargo.toml"));
+
+        // The relative `**/*.toml` watcher (baseUri file:///project) matches a
+        // `.toml` file under /project but not a `.rs` file.
+        let toml_rel = std::path::Path::new("Cargo.toml");
+        let toml_abs = std::path::Path::new("/project/Cargo.toml");
+        assert!(
+            snapshot
+                .iter()
+                .any(|w| w.covers(toml_rel, toml_abs, ChangeKind::Changed)),
+            "relative **/*.toml watcher should cover /project/Cargo.toml"
+        );
     }
 
     #[test]
@@ -2018,7 +1995,11 @@ mod tests {
         // The watcher missing globPattern is skipped; the valid one survives.
         let snapshot = server.watched_files_snapshot();
         assert_eq!(snapshot.len(), 1);
-        assert!(snapshot[0].glob.is_match("src/main.rs"));
+        assert!(snapshot[0].covers(
+            std::path::Path::new("src/main.rs"),
+            std::path::Path::new("/root/src/main.rs"),
+            ChangeKind::Changed
+        ));
     }
 
     #[test]

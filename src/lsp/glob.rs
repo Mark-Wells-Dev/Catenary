@@ -131,13 +131,66 @@ impl GlobPattern {
                 .is_ok_and(|rel| pattern.is_match(rel)),
         }
     }
+
+    /// Tests whether a change at `rel`/`abs` matches this pattern, where `rel`
+    /// is the path relative to its workspace root and `abs` is the absolute
+    /// path.
+    ///
+    /// For `Plain`, the root-relative `rel` is matched directly; the absolute
+    /// `abs` is also tried as a fallback because servers register patterns in
+    /// both forms. For `Relative`, `base` is stripped from `abs` and the
+    /// remainder is matched. Unlike [`is_match`](Self::is_match) this needs no
+    /// workspace-root list — the caller already supplies the root-relative path.
+    #[must_use]
+    pub fn matches_paths(&self, rel: &Path, abs: &Path) -> bool {
+        match self {
+            Self::Plain(glob) => glob.is_match(rel) || glob.is_match(abs),
+            Self::Relative { base, pattern } => abs
+                .strip_prefix(base)
+                .is_ok_and(|sub| pattern.is_match(sub)),
+        }
+    }
 }
 
 /// Converts a `file://` URI to a filesystem path.
+///
+/// The URI is percent-decoded (e.g. `%20` → a space) so a `baseUri` like
+/// `file:///home/u/my%20project` resolves to the real `/home/u/my project`.
 fn uri_to_path(uri: &str) -> Result<PathBuf> {
-    uri.strip_prefix("file://")
-        .map(PathBuf::from)
-        .ok_or_else(|| anyhow!("expected file:// URI, got: {uri}"))
+    let encoded = uri
+        .strip_prefix("file://")
+        .ok_or_else(|| anyhow!("expected file:// URI, got: {uri}"))?;
+    Ok(PathBuf::from(percent_decode(encoded)))
+}
+
+/// Percent-decodes a URI path component (`%XX` → byte).
+///
+/// Decodes valid `%`-escapes to their byte value and reassembles the result as
+/// UTF-8; an invalid or truncated escape is left verbatim. Sufficient for the
+/// `file://` paths Catenary handles without pulling in a dependency.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (
+                (bytes[i + 1] as char).to_digit(16),
+                (bytes[i + 2] as char).to_digit(16),
+            )
+        {
+            // Both nibbles parsed as hex; `hi`/`lo` are each < 16 so the
+            // combined value fits in a u8.
+            #[allow(clippy::cast_possible_truncation, reason = "hi<16, lo<16 ⇒ byte")]
+            out.push(((hi << 4) | lo) as u8);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 #[cfg(test)]
@@ -254,6 +307,43 @@ mod tests {
         }))
         .expect("valid pattern");
         assert!(matches!(pattern, GlobPattern::Relative { .. }));
+    }
+
+    // ── matches_paths (WS31 review C2) ───────────────────────────
+
+    #[test]
+    fn ws31_review_c2_matches_paths_plain_no_cross_segment() {
+        let pattern = GlobPattern::from_value(&serde_json::json!("*.json")).expect("valid pattern");
+        // Top-level root-relative path matches.
+        assert!(pattern.matches_paths(Path::new("b.json"), Path::new("/root/b.json")));
+        // Nested path must not match — `*` does not cross `/`.
+        assert!(!pattern.matches_paths(Path::new("a/b.json"), Path::new("/root/a/b.json")));
+    }
+
+    #[test]
+    fn ws31_review_c2_matches_paths_relative_strips_base() {
+        let pattern = GlobPattern::from_value(&serde_json::json!({
+            "baseUri": "file:///project",
+            "pattern": "**/*.rs"
+        }))
+        .expect("valid pattern");
+        assert!(pattern.matches_paths(Path::new("src/main.rs"), Path::new("/project/src/main.rs")));
+        assert!(!pattern.matches_paths(Path::new("src/main.rs"), Path::new("/other/src/main.rs")));
+    }
+
+    // ── uri_to_path percent-decoding (WS31 review C2 / lsp-3) ─────
+
+    #[test]
+    fn ws31_review_c2_uri_to_path_percent_decodes() {
+        let path = uri_to_path("file:///home/u/my%20project").expect("valid uri");
+        assert_eq!(path, PathBuf::from("/home/u/my project"));
+    }
+
+    #[test]
+    fn ws31_review_c2_uri_to_path_truncated_escape_left_verbatim() {
+        // A `%` with no following hex pair is left as-is rather than dropped.
+        let path = uri_to_path("file:///a/100%").expect("valid uri");
+        assert_eq!(path, PathBuf::from("/a/100%"));
     }
 
     // ── is_glob_pattern ─────────────────────────────────────────
