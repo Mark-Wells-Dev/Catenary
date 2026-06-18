@@ -231,9 +231,15 @@ fn path_exists_with_retry(path: &Path) -> bool {
 /// 1, hit thereafter) to prove the loop actually retries — a regression to a
 /// single attempt would no longer recover a transient miss.
 fn path_exists_with_retry_with(path: &Path, attempts: u32, probe: impl Fn(&Path) -> bool) -> bool {
-    for _ in 0..attempts {
+    for attempt in 0..attempts {
         if probe(path) {
             return true;
+        }
+        // Yield between attempts (not after the last) so the scheduler can advance
+        // the racing writer past its sub-µs atomic-rename window before the
+        // re-stat. Cheap and `.await`-free (this is a sync helper). (walk-3)
+        if attempt + 1 < attempts {
+            std::thread::yield_now();
         }
     }
     false
@@ -879,6 +885,15 @@ impl Session {
         // still validate — serving cached enrichment for an untracked path
         // (bug M1). A single-slot cache makes an unconditional clear cheap, so
         // drop both slots whenever a root left the tracked set.
+        //
+        // Logical TOCTOU (conc-4): an in-flight grep/glob that started against the
+        // old root set can `cache.put` *after* this clear, re-populating the slot
+        // for one query window. Each op takes the cache `Mutex` correctly
+        // (poison-consistent), so this is not a data race, and the single-slot
+        // last-writer-wins cache already tolerates this class of staleness — the
+        // next generation/witness mismatch (or removal) clears it. No mitigation
+        // unless concurrent root mutation during an in-flight search becomes a
+        // supported scenario.
         if !removed.is_empty() {
             self.grep
                 .cache

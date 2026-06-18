@@ -95,8 +95,8 @@ struct Covering {
 }
 
 /// How wide the changed-set engine should walk for a given command — the
-/// per-command pre-check gate (WS31 ticket 04,
-/// [decision 018](../../decisions/018_filesystem_coherence_changed_set.md)).
+/// per-command pre-check gate (WS31 ticket 04, decision 018 —
+/// filesystem-coherence changed-set).
 ///
 /// Computed *before* the walk from two inputs: whether an active server covers
 /// the scope ([`LspClientManager::has_covering_watchers`]) and what the command
@@ -1509,7 +1509,7 @@ impl LspClientManager {
     /// Diffs one coherence walk's observations against the per-root baseline and
     /// routes the resulting changed set to each covering server, then settles
     /// every server that received changes (WS31 Consumer A — the precise,
-    /// per-server changed-set nudge that replaces the coarse `nudge_roots`).
+    /// per-server changed-set nudge).
     ///
     /// `observed` is the set of `(root-relative path, mtime)` pairs the walk
     /// visited; `exclude` is the set of root-relative paths to drop from the
@@ -1533,7 +1533,7 @@ impl LspClientManager {
     ///    first walk's cold snapshot is `Changed`; only a path absent from an
     ///    already-populated baseline is `Created`; a baseline entry a full walk
     ///    did not visit (only when `reap`) is `Deleted`
-    ///    ([decision 018](../../decisions/018_filesystem_coherence_changed_set.md)).
+    ///    (decision 018 — filesystem-coherence changed-set).
     /// 5. Settle each notified server (idle + drain) so the caller's enrichment /
     ///    diagnostics read reflects the post-nudge state.
     ///

@@ -13,20 +13,21 @@
 )]
 //! WS31-review ticket R1 — reaping must never run over a partial observation set.
 //!
-//! Two RED tests demonstrating bugs C1 and H1 (both in
-//! `src/bridge/grep_server.rs`'s ticket-04 reaping path). Both are
-//! `#[ignore]`d so the default gate stays green; un-ignore them in the fix.
+//! Two regression guards pinning the fixes for bugs C1 and H1 (both in
+//! `src/bridge/grep_server.rs`'s ticket-04 reaping path). The bugs are fixed
+//! (commit `7b9b847`) and both guards run in the normal suite (no `#[ignore]`d
+//! `ws31_review` tests remain); each FAILS if its fix regresses.
 //!
 //! - **C1** (`ws31_review_r1_scoped_grep_no_spurious_delete`): a path-scoped
-//!   enriched grep takes `WalkBreadth::Full` whenever the root has covering
-//!   watchers, so its partial observation set (only the scoped subtree) is fed
-//!   to `diff_update_and_reap`, which reaps every baselined file outside the
-//!   scope as `Deleted(3)`.
+//!   enriched grep took `WalkBreadth::Full` whenever the root had covering
+//!   watchers, so its partial observation set (only the scoped subtree) was fed
+//!   to `diff_update_and_reap`, which reaped every baselined file outside the
+//!   scope as `Deleted(3)`. The guard pins that out-of-scope files survive.
 //! - **H1** (`ws31_review_r1_incomplete_observation_not_reaped`): a present file
 //!   passing `is_file` via cached `d_type` whose *fresh* `metadata()` stat then
-//!   races (here, EACCES from a parent with no execute bit) is omitted from the
+//!   races (here, EACCES from a parent with no execute bit) was omitted from the
 //!   observation set with no retry / no prior-mtime fallback, so a full walk
-//!   false-reaps it as `Deleted(3)`.
+//!   false-reaped it as `Deleted(3)`. The guard pins that it is no longer reaped.
 
 mod common;
 
@@ -75,9 +76,11 @@ fn watched_file_changes(log: &str) -> Vec<(String, u64)> {
 /// The baseline is seeded by a pathless full grep (the harness injects cwd=root,
 /// so the walk covers both `a/` and `b/`, baselining `a/match` and `b/keep`).
 /// A second grep scoped to `a/` walks only `a/`, so its observation set omits
-/// `b/keep`. Because the root has covering watchers, that scoped walk still takes
-/// `WalkBreadth::Full` and calls `diff_update_and_reap` with `reap=true` — which
-/// reaps `b/keep` (present on disk!) as `Deleted(3)`. RED today.
+/// `b/keep`. Pre-fix, because the root has covering watchers, that scoped walk
+/// still took `WalkBreadth::Full` and called `diff_update_and_reap` with
+/// `reap=true` — which reaped `b/keep` (present on disk!) as `Deleted(3)`. The
+/// fix (commit `7b9b847`) gates the reap on whether the walk spanned the root;
+/// this guard pins it green.
 #[test]
 fn ws31_review_r1_scoped_grep_no_spurious_delete() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -112,6 +115,16 @@ fn ws31_review_r1_scoped_grep_no_spurious_delete() -> Result<()> {
     let _ = bridge.call_tool_text("grep", &json!({ "pattern": "needle" }))?;
     std::thread::sleep(Duration::from_millis(150));
 
+    // Advance a/match's mtime so the SCOPED walk itself observes it as changed and
+    // routes a fresh `Changed(2)`. Without this the companion guard below would be
+    // satisfied by walk #1's cold-start emission alone (a/match is unchanged on
+    // the second walk ⇒ empty change-set ⇒ early return), so the companion would
+    // pass even if the scoped walk routed nothing — making it non-load-bearing.
+    // Re-writing the file bumps its mtime; the scoped grep then diffs it as
+    // Changed against the baseline.
+    std::fs::write(&a_match, "needle\nneedle\n")?;
+    std::thread::sleep(Duration::from_millis(50));
+
     // Scoped grep: ripgrep walks only a/. Its observation set omits b/keep.
     let a_str = a.to_str().context("a path")?;
     let _ = bridge.call_tool_text("grep", &json!({ "pattern": "needle", "paths": [a_str] }))?;
@@ -124,19 +137,21 @@ fn ws31_review_r1_scoped_grep_no_spurious_delete() -> Result<()> {
     let log = std::fs::read_to_string(&log_path).unwrap_or_default();
     let changes = watched_file_changes(&log);
 
-    // Key assertion (RED today): the scoped grep must NOT reap b/keep — it is
+    // Key assertion (green guard): the scoped grep must NOT reap b/keep — it is
     // present on disk and merely outside the scoped walk's breadth.
     assert!(
         !changes.iter().any(|(u, t)| *u == b_keep_uri && *t == 3),
         "scoped grep must not reap files outside its scope; b/keep is present. \
          changes={changes:?}, log:\n{log}"
     );
-    // Companion guard: a/match IS still routed (present, e.g. Changed(2)) so the
-    // fix can't trivially pass by making grep stop nudging entirely.
+    // Companion guard: the SCOPED walk itself must route a/match as Changed(2)
+    // (its mtime was advanced above), so the fix can't trivially pass by making
+    // the scoped grep stop nudging entirely — the change-set is non-empty and the
+    // scoped walk is exercised, not just walk #1's cold-start emission.
     assert!(
         changes.iter().any(|(u, t)| *u == a_match_uri && *t == 2),
-        "the in-scope file a/match must still be routed as Changed(2). \
-         changes={changes:?}, log:\n{log}"
+        "the in-scope file a/match must still be routed as Changed(2) by the \
+         scoped walk. changes={changes:?}, log:\n{log}"
     );
     Ok(())
 }
@@ -222,7 +237,7 @@ fn ws31_review_r1_incomplete_observation_not_reaped() -> Result<()> {
     let log = std::fs::read_to_string(&log_path).unwrap_or_default();
     let changes = watched_file_changes(&log);
 
-    // Key assertion (RED today): a present file whose fresh metadata() raced
+    // Key assertion (green guard): a present file whose fresh metadata() raced
     // (EACCES) must not be reaped.
     assert!(
         !changes.iter().any(|(u, t)| *u == locked_uri && *t == 3),
@@ -849,36 +864,45 @@ fn ws31_review_r4_covering_watchers_subdir_scope() -> Result<()> {
     Ok(())
 }
 
-// ── R5 (L6) — an edited-then-deleted file's Deleted is routed, not suppressed ──
+// ── C4 (L6) — an edited-then-deleted file's Deleted is routed, not suppressed ──
 
-/// L6 — a file that is baselined and then deleted from disk is reaped as
-/// `Deleted` (wire `FileChangeType` 3) and that Delete is ROUTED, not suppressed
-/// — even when the same diagnostics batch carries a live edited sibling.
+/// L6 — a file that is in the diagnostics edited-set AND then deleted from disk
+/// must still be reaped as `Deleted` (wire `FileChangeType` 3) and that Delete
+/// ROUTED, not suppressed by the diagnostics `exclude` set — even when the same
+/// batch carries a live edited sibling.
 ///
 /// The review's L6 premise was that an edited path placed in the diagnostics
 /// `exclude` set would suppress a reaped `Deleted` for that path. Verified
 /// WRONG: `process_files_batched` builds `exclude` from `canonical_paths`, and a
 /// path only enters `canonical_paths` after passing `validate_read`
-/// (`diagnostics_server.rs:189`). `validate_read` calls `path.canonicalize()`,
-/// which FAILS for a file no longer on disk — so a deleted file never enters
+/// (`diagnostics_server.rs:189`/`:201`). `validate_read` calls
+/// `path.canonicalize()` (`path_security.rs:79`), which FAILS for a file no
+/// longer on disk — so an edited-then-deleted file never enters
 /// `canonical_paths`, never enters `exclude`, and its reaped `Deleted` is routed
 /// by `nudge_changed_set` (the `exclude.contains(&change.rel)` guard is false).
 ///
-/// This is a GREEN guard (NOT `#[ignore]`d): it pins that `validate_read` keeps
-/// deleted files out of `exclude`, so reaped Deletes for them stay routed. If a
-/// future change put raw edited paths into `exclude` BEFORE the existence check
-/// (so an edited-then-deleted path landed in `exclude`), this guard would fail —
-/// which is exactly the L6 suppression the review feared (and which does NOT
-/// occur today).
+/// This is a GREEN guard (NOT `#[ignore]`d) that is **load-bearing for the L6
+/// fix**: `gone` is driven through the edited-set INTERSECTION the fix is about.
+/// It is accumulated into the edited-set via `call_diagnostics_multi` (the
+/// `pre-tool/editing-state` `Edit` path) AND deleted from disk, so on the
+/// diagnostics stop it flows through `validate_read` exactly where the L6
+/// suppression would land. If a future change put raw edited paths into
+/// `exclude` BEFORE the existence/canonicalize check (so an edited-then-deleted
+/// path landed in `exclude`), the `exclude.contains` guard would fire and this
+/// guard would FAIL — which is exactly the L6 suppression the review feared (and
+/// which does NOT occur today). The prior version deleted `gone` externally and
+/// never passed it to diagnostics, so `gone` never entered the edited-set and
+/// reverting the L6 fix would not have failed it (it only re-proved the
+/// externally-deleted reap already covered by
+/// `changed_set.rs::diagnostics_full_walk_reaps_deletion`).
 ///
-/// Modeled on `changed_set.rs::diagnostics_full_walk_reaps_deletion` /
-/// `diagnostics_excludes_edited_set`: the live sibling rides the edited-set (via
-/// `call_diagnostics`, which seeds the file through the `pre-tool/editing-state`
-/// path) and keeps the root in the diagnostics batch's `roots` set so the
-/// stat-walk runs over the root (a deleted-only batch would not walk it). kind 7
-/// (ALL) registers Delete, so a routed `Deleted` IS recorded in the log.
+/// The live sibling rides the same batch via the edited-set and keeps the root
+/// in the diagnostics batch's `roots` set (built from `canonical_paths`) so the
+/// full stat-walk runs over the root and the reap sweep fires — a batch with no
+/// canonicalizable file would walk nothing. kind 7 (ALL) registers Delete, so a
+/// routed `Deleted` IS recorded in the log.
 #[test]
-fn ws31_review_r5_edited_then_deleted_routes_delete() -> Result<()> {
+fn ws31_review_c4_edited_then_deleted_drives_exclude() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let log_path = dir.path().join("notifications.jsonl");
     let live = dir.path().join(format!("live.{MOCK_LANG}"));
@@ -903,17 +927,24 @@ fn ws31_review_r5_edited_then_deleted_routes_delete() -> Result<()> {
     // Seed the per-root baseline with BOTH files present: the first diagnostics
     // run's full stat-walk observes the whole root, so `live` and `gone` both
     // enter the baseline.
-    let _ = bridge.call_diagnostics(live.to_str().context("live path")?)?;
+    let live_str = live.to_str().context("live path")?;
+    let gone_str = gone.to_str().context("gone path")?;
+    let _ = bridge.call_diagnostics(live_str)?;
     std::thread::sleep(Duration::from_millis(150));
 
-    // Delete `gone` from disk; `live` stays present and is re-driven through the
-    // edited-set below (it keeps the root in the diagnostics batch's `roots` set,
-    // so the stat-walk reaps `gone`).
+    // Delete `gone` from disk while it is about to ride the edited-set: the
+    // second diagnostics batch carries BOTH `live` (present) and `gone` (deleted)
+    // as edited files. `gone` is the edited-then-deleted INTERSECTION — it drives
+    // through `validate_read`, whose canonicalize FAILS, so it never lands in the
+    // `exclude` set. `live` keeps the root in the batch's `roots` set so the full
+    // stat-walk runs and reaps `gone`.
     std::fs::remove_file(&gone)?;
 
-    // Second diagnostics run on `live`: drains the edited-set ⇒ a batch over the
-    // root ⇒ the full stat-walk reaps `gone` (baselined but no longer observed).
-    let _ = bridge.call_diagnostics(live.to_str().context("live path")?)?;
+    // Second diagnostics run over the edited-set {live, gone}: drains the
+    // edited-set ⇒ a batch over the root ⇒ the full stat-walk reaps `gone`
+    // (baselined but no longer observed) ⇒ routed because `gone` is NOT in
+    // `exclude`.
+    let _ = bridge.call_diagnostics_multi(&[live_str, gone_str])?;
 
     drop(bridge);
     std::thread::sleep(Duration::from_millis(300));
@@ -922,14 +953,16 @@ fn ws31_review_r5_edited_then_deleted_routes_delete() -> Result<()> {
     let log = std::fs::read_to_string(&log_path).unwrap_or_default();
     let changes = watched_file_changes(&log);
 
-    // GREEN today: the deleted file's `Deleted` must be ROUTED. It is not in the
-    // exclude set — `validate_read` drops it (canonicalize fails for a missing
-    // path) before it could enter `canonical_paths`/`exclude` — so the reaped
-    // `Deleted` is delivered (the review's L6 suppression does NOT occur).
+    // GREEN today, load-bearing for L6: the edited-then-deleted file's `Deleted`
+    // must be ROUTED. `gone` is in the edited-set but NOT in `exclude` —
+    // `validate_read` drops it (canonicalize fails for a missing path) before it
+    // could enter `canonical_paths`/`exclude` — so the reaped `Deleted` is
+    // delivered. Putting raw edited paths into `exclude` before the existence
+    // check (the L6 regression) would suppress this and FAIL the assert.
     assert!(
         changes.iter().any(|(u, t)| *u == gone_uri && *t == 3),
-        "an edited-then-deleted file's Deleted must be routed (it is not in the \
-         exclude set — validate_read drops it); got:\n{changes:?}"
+        "an edited-then-deleted file's Deleted must be routed (it is in the \
+         edited-set but NOT in exclude — validate_read drops it); got:\n{changes:?}"
     );
     Ok(())
 }

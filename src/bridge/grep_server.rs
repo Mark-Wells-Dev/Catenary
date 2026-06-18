@@ -1886,6 +1886,17 @@ fn split_dir_file(rel: &str) -> (String, String) {
 /// Wrapper that pushes per-thread match data into a shared collector on drop.
 /// Each parallel walker thread owns one of these; when `run()` returns and the
 /// closures are dropped, each thread's accumulated matches are flushed.
+///
+/// The poison recovery in [`Drop::drop`] (and the matching
+/// [`PoisonError::into_inner`](std::sync::PoisonError::into_inner) in
+/// [`harvest`]) is a **test-profile safety net**: it only fires when a sibling
+/// walker thread *unwinds*, which requires `panic = "unwind"`. The release
+/// profile sets `panic = "abort"` (`Cargo.toml`), so a walker panic aborts the
+/// whole daemon and this recovery never runs in production. Correctness in
+/// release therefore relies on the walker closure being panic-free — it is: every
+/// fallible op inside the closure is `Result`-handled. The recovery still earns
+/// its keep under the (unwind) test profile, where a panicking test walker must
+/// not silently discard the matches its siblings already pushed.
 struct CollectOnDrop {
     local: ThreadMatches,
     collected: Arc<std::sync::Mutex<Vec<ThreadMatches>>>,
@@ -2024,6 +2035,12 @@ impl RipgrepMatches {
 /// so the matches its siblings already pushed survive instead of being lost to
 /// a hard grep error. Errors only if a walker thread still holds a reference to
 /// the `Arc`, which never happens once `walker.run` has returned.
+///
+/// Like [`CollectOnDrop`]'s recovery, this poison handling is a **test-profile
+/// safety net**: poisoning requires a sibling *unwind* (`panic = "unwind"`). The
+/// release profile is `panic = "abort"` (`Cargo.toml`), so a walker panic aborts
+/// the daemon and this branch never runs in production; release correctness
+/// relies on the (panic-free) walker closure.
 ///
 /// # Errors
 ///

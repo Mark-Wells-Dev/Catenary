@@ -72,8 +72,7 @@ pub enum FileKind {
 /// `didChangeWatchedFiles` is Catenary's channel for filesystem-observed
 /// changes and its payload is meant to carry the real Created/Changed/Deleted
 /// distinction (`didCreateFiles` is a *different*, editor-initiated notification
-/// Catenary does not use). See
-/// [decision 018](../../decisions/018_filesystem_coherence_changed_set.md).
+/// Catenary does not use). See decision 018 — filesystem-coherence changed-set.
 ///
 /// The first walk for a root is the cold snapshot: those files pre-exist and the
 /// server already indexed them at startup, so they are `Changed`, not `Created`
@@ -1066,9 +1065,15 @@ fn observe_metadata_with(
     attempts: u32,
     probe: impl Fn(&Path) -> Option<std::fs::Metadata>,
 ) -> Option<std::fs::Metadata> {
-    for _ in 0..attempts {
+    for attempt in 0..attempts {
         if let Some(md) = probe(path) {
             return Some(md);
+        }
+        // Yield between attempts (not after the last) so the scheduler can advance
+        // the racing writer past its sub-µs atomic-rename window before the
+        // re-stat. Cheap and `.await`-free (this is a sync helper). (walk-3)
+        if attempt + 1 < attempts {
+            std::thread::yield_now();
         }
     }
     None

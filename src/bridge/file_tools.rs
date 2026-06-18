@@ -1227,9 +1227,16 @@ fn path_is_file_or_symlink_with_retry_with(
     attempts: u32,
     probe: impl Fn(&Path) -> bool,
 ) -> bool {
-    for _ in 0..attempts {
+    for attempt in 0..attempts {
         if probe(path) {
             return true;
+        }
+        // Yield between attempts (not after the last) so the scheduler can advance
+        // the racing writer past its sub-µs atomic-rename window before the
+        // re-stat — back-to-back syscalls almost never straddle that window. Cheap
+        // and `.await`-free (this is a sync helper). (walk-3)
+        if attempt + 1 < attempts {
+            std::thread::yield_now();
         }
     }
     false
