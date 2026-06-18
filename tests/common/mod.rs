@@ -856,3 +856,221 @@ pub fn mockls_lsp_arg(lang: &str, flags: &str) -> String {
         format!("{lang}:{bin} {lang} {flags}")
     }
 }
+
+// ── Contention-resistant signal polling ──────────────────────────────
+//
+// The maintainer runs many agents rebuilding/testing concurrently, so heavy
+// *external* CPU contention is the normal operating condition. A fixed
+// `sleep(N ms)` used as a "the server/notification is surely ready by now"
+// guess flakes under that load. These helpers replace the guess with
+// signal-polling: success completes as soon as the observable signal appears,
+// and the deadline is a generous backstop that only trips on a genuine hang
+// (≫ any plausible contention stall) — never on the happy path. The short
+// spacing between attempts is poll cadence, not a readiness guess.
+
+/// Generous backstop for every signal poll. On a healthy machine the awaited
+/// signal appears in milliseconds; this only trips on a real hang.
+///
+/// Sized to absorb even pathological *external* CPU contention (e.g. several
+/// full test suites stress-running concurrently on top of the maintainer's
+/// normal multi-agent load), under which a real per-root LSP server respawn +
+/// `--scan-roots` reindex can legitimately take well over a minute. It stays
+/// under nextest's `slow-timeout` absolute kill (`.config/nextest.toml`:
+/// 60s × 5 = 300s), which is the true runaway backstop. A correct test under
+/// heavy load completes as soon as its signal appears — just slower — and never
+/// trips this; only a genuine hang does. (Measured: the R4 eviction test, whose
+/// cold re-grep forces a full server respawn + reindex, needed > 60s under a
+/// 3×-overcommit stress; 2 min gives comfortable margin below the 300s kill.)
+pub const POLL_BACKSTOP: Duration = Duration::from_mins(2);
+
+/// Spacing between poll attempts — poll cadence, not a readiness guess.
+/// Matches the 50 ms cadence of the existing `roots-ls` poll loops.
+pub const POLL_SPACING: Duration = Duration::from_millis(50);
+
+/// Reads the notification log and returns every `(uri, type)` pair from every
+/// `workspace/didChangeWatchedFiles` notification recorded.
+///
+/// Mockls writes each notification to its `--notification-log` file with a
+/// direct (unbuffered) `writeln!` the moment it processes the notification, so
+/// reading the file mid-session reflects everything mockls has handled so far.
+pub fn watched_file_changes(log: &str) -> Vec<(String, u64)> {
+    let mut out = Vec::new();
+    for line in log.lines() {
+        let Ok(entry) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if entry.get("method").and_then(Value::as_str) != Some("workspace/didChangeWatchedFiles") {
+            continue;
+        }
+        let Some(changes) = entry.get("changes").and_then(Value::as_array) else {
+            continue;
+        };
+        for change in changes {
+            let uri = change
+                .get("uri")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let typ = change.get("type").and_then(Value::as_u64).unwrap_or(0);
+            out.push((uri, typ));
+        }
+    }
+    out
+}
+
+/// Counts the number of `workspace/didChangeWatchedFiles` notifications (not
+/// individual changes) recorded in the log.
+pub fn watched_file_notification_count(log: &str) -> usize {
+    log.lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|entry| {
+            entry.get("method").and_then(Value::as_str) == Some("workspace/didChangeWatchedFiles")
+        })
+        .count()
+}
+
+/// Reads the per-instance `--log-pid-suffix` file (`<base>.<pid>`) whose
+/// `__instance_root` marker equals `root`, or `String::new()` if none exists yet.
+///
+/// One language spawns one instance per tracked root; each writes its primary
+/// workspace root as the first `__instance_root` log line (mockls). This selects
+/// the file for a SPECIFIC root so a test can assert against the
+/// `parent`-scoped vs `parent/sub`-scoped instance of one language — which the
+/// merged view cannot distinguish.
+pub fn read_instance_log_for_root(base: &Path, root: &str) -> String {
+    let Some(dir) = base.parent() else {
+        return String::new();
+    };
+    let Some(name) = base.file_name().and_then(|n| n.to_str()) else {
+        return String::new();
+    };
+    let prefix = format!("{name}.");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return String::new();
+    };
+    for entry in entries.flatten() {
+        if !entry
+            .file_name()
+            .to_str()
+            .is_some_and(|f| f.starts_with(&prefix))
+        {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let marks_root = text.lines().any(|line| {
+            serde_json::from_str::<Value>(line).is_ok_and(|e| {
+                e.get("method").and_then(Value::as_str) == Some("__instance_root")
+                    && e.get("uri").and_then(Value::as_str) == Some(root)
+            })
+        });
+        if marks_root {
+            return text;
+        }
+    }
+    String::new()
+}
+
+/// Polls the per-instance log for a SPECIFIC root (see
+/// [`read_instance_log_for_root`]) until `pred` holds over its parsed changes,
+/// then returns that snapshot.
+pub fn poll_instance_log_until<P>(base: &Path, root: &str, mut pred: P) -> Vec<(String, u64)>
+where
+    P: FnMut(&[(String, u64)]) -> bool,
+{
+    let deadline = std::time::Instant::now() + POLL_BACKSTOP;
+    loop {
+        let changes = watched_file_changes(&read_instance_log_for_root(base, root));
+        if pred(&changes) || std::time::Instant::now() >= deadline {
+            return changes;
+        }
+        std::thread::sleep(POLL_SPACING);
+    }
+}
+
+/// Like [`wait_for_change`] but over the per-instance log of a SPECIFIC root
+/// (see [`read_instance_log_for_root`]).
+pub fn wait_for_change_in_root(base: &Path, root: &str, uri: &str, typ: u64) -> Vec<(String, u64)> {
+    poll_instance_log_until(base, root, |changes| {
+        changes.iter().any(|(u, t)| u == uri && *t == typ)
+    })
+}
+
+/// Polls a notification log until the parsed `(uri, type)` changes satisfy
+/// `pred`, then returns that snapshot. Re-reads + re-parses the file each
+/// attempt (mockls writes it live), so the returned snapshot is the first one
+/// for which `pred` held. On a missing/empty log the parsed set is empty.
+///
+/// Used to gate a *positive* assertion on the observable signal that the
+/// expected change has been routed and recorded — not on a fixed delay. The
+/// deadline is the generous [`POLL_BACKSTOP`]; the caller should still assert on
+/// the returned snapshot so a deadline reached with `pred` unmet fails loudly.
+pub fn poll_log_until<P>(log_path: &Path, mut pred: P) -> Vec<(String, u64)>
+where
+    P: FnMut(&[(String, u64)]) -> bool,
+{
+    let deadline = std::time::Instant::now() + POLL_BACKSTOP;
+    loop {
+        let log = std::fs::read_to_string(log_path).unwrap_or_default();
+        let changes = watched_file_changes(&log);
+        if pred(&changes) || std::time::Instant::now() >= deadline {
+            return changes;
+        }
+        std::thread::sleep(POLL_SPACING);
+    }
+}
+
+/// Polls a notification log until a specific `(uri, type)` change appears, then
+/// returns the full snapshot. Convenience over [`poll_log_until`] for the common
+/// "wait for this exact change, then assert over the snapshot" case (including a
+/// companion-anchored negative assertion: wait for an expected positive change,
+/// then assert the unwanted change is absent in the SAME snapshot).
+pub fn wait_for_change(log_path: &Path, uri: &str, typ: u64) -> Vec<(String, u64)> {
+    poll_log_until(log_path, |changes| {
+        changes.iter().any(|(u, t)| u == uri && *t == typ)
+    })
+}
+
+/// Rewrites `path` with `content` and confirms its mtime strictly advanced past
+/// what it was before the write, retrying until it does (or [`POLL_BACKSTOP`]).
+///
+/// The changed-set engine keys a modification on a strictly-greater mtime, so a
+/// test that wants the next walk to diff a file as `Changed` must guarantee the
+/// new mtime exceeds the baselined one. This gates on the *observed* mtime
+/// advance — the change signal itself — rather than a fixed `sleep` to span the
+/// filesystem's mtime granularity, so it is correct on coarse-granularity
+/// filesystems and unaffected by CPU contention. On tmpfs (nanosecond mtime)
+/// the first write already advances, so the loop runs once.
+pub fn rewrite_advancing_mtime(path: &Path, content: &str) -> Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+    let before = std::fs::metadata(path).map_or(i64::MIN, |m| m.mtime());
+    let deadline = std::time::Instant::now() + POLL_BACKSTOP;
+    loop {
+        std::fs::write(path, content).context("rewrite file to advance mtime")?;
+        let now = std::fs::metadata(path).map_or(i64::MIN, |m| m.mtime());
+        if now > before || std::time::Instant::now() >= deadline {
+            return Ok(());
+        }
+        std::thread::sleep(POLL_SPACING);
+    }
+}
+
+/// Retries an enriched grep until its output contains the `calls:` enrichment
+/// signal, then returns that output. The enrichment-present output *is* the
+/// readiness signal for the (re-)spawned server + its `--scan-roots` index — a
+/// contention-resistant replacement for `sleep(N) + grep-once` (which guesses
+/// the server is ready and races a cold grep against server readiness under
+/// load). Polls on the generous [`POLL_BACKSTOP`]; if the deadline passes the
+/// last (un-enriched) output is returned so the caller's `calls:` precondition
+/// fails loudly rather than hanging.
+pub fn grep_until_enriched(bridge: &BridgeProcess, args: &Value) -> Result<String> {
+    let deadline = std::time::Instant::now() + POLL_BACKSTOP;
+    loop {
+        let out = bridge.call_tool_text("grep", args)?;
+        if out.contains("calls:") || std::time::Instant::now() >= deadline {
+            return Ok(out);
+        }
+        std::thread::sleep(POLL_SPACING);
+    }
+}

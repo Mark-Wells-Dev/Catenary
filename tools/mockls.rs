@@ -116,6 +116,19 @@ struct Args {
     #[arg(long)]
     notification_log: Option<String>,
 
+    /// Append this process's PID to the `--notification-log` and
+    /// `--request-log` paths (`<path>.<pid>`).
+    ///
+    /// Under the per-root server architecture, one language spawns one instance
+    /// per tracked root, and every instance is handed the SAME `CATENARY_SERVERS`
+    /// log path. Multiple instances appending to one file produce byte-interleaved
+    /// (torn) JSONL lines that no reader can reliably parse — which makes a
+    /// contention-resistant signal poll impossible. With this flag each instance
+    /// writes its OWN file (one writer ⇒ no torn lines); a test reads all files
+    /// matching `<path>.*` and merges them (see `common::merge_logs`).
+    #[arg(long)]
+    log_pid_suffix: bool,
+
     /// Write every handled request method to a JSONL file.
     /// Each line is `{"method":"..."}`. Tests read after shutdown to verify
     /// which requests the daemon issued (e.g. a cold `textDocument/documentSymbol`).
@@ -325,15 +338,26 @@ struct MockServer {
 
 impl MockServer {
     fn new(args: Args, writer: Writer) -> Self {
+        // With `--log-pid-suffix`, each per-root instance writes its OWN file
+        // (`<path>.<pid>`) so concurrent instances of one language never share a
+        // file and tear each other's JSONL lines. The test merges `<path>.*`.
+        let log_path = |path: &str| -> String {
+            if args.log_pid_suffix {
+                format!("{path}.{}", std::process::id())
+            } else {
+                path.to_string()
+            }
+        };
+
         let notification_log = args
             .notification_log
             .as_ref()
-            .and_then(|path| std::fs::File::create(path).ok());
+            .and_then(|path| std::fs::File::create(log_path(path)).ok());
 
         let request_log = args
             .request_log
             .as_ref()
-            .and_then(|path| std::fs::File::create(path).ok());
+            .and_then(|path| std::fs::File::create(log_path(path)).ok());
 
         Self {
             args,
@@ -798,6 +822,23 @@ impl MockServer {
             self.rebuild_imports();
         }
         self.workspace_roots = roots;
+
+        // Record this instance's primary workspace root as the FIRST line of the
+        // notification log. Under the per-root server architecture one language
+        // spawns one instance per tracked root; `--log-pid-suffix` already gives
+        // each instance its own `<base>.<pid>` file, and this marker lets a test
+        // identify WHICH root an instance is scoped to (so it can assert against
+        // the right instance's log — e.g. the `parent`-scoped vs `parent/sub`-
+        // scoped instance of one language). The leading `__instance_root` method
+        // is ignored by the `workspace/didChangeWatchedFiles` parsers.
+        if let Some(ref mut log) = self.notification_log {
+            let root = self.workspace_roots.first().map_or("", String::as_str);
+            let _ = writeln!(
+                log,
+                "{}",
+                serde_json::json!({ "method": "__instance_root", "uri": root })
+            );
+        }
 
         let mut text_doc_sync = serde_json::json!({
             "openClose": true,
@@ -2420,6 +2461,7 @@ mod tests {
             flycheck_command: None,
             advertise_save: false,
             notification_log: None,
+            log_pid_suffix: false,
             request_log: None,
             content_modified_once: false,
             cpu_on_workspace_change: None,

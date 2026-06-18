@@ -30,7 +30,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use serde_json::json;
 
-use common::{BridgeProcess, ipc_request, mockls_lsp_arg};
+use common::{BridgeProcess, grep_until_enriched, ipc_request, mockls_lsp_arg};
 
 const MOCK_LANG: &str = "evict_test";
 
@@ -73,12 +73,13 @@ fn enrichment_evicted_on_root_removal() -> Result<()> {
         &json!({ "method": "tool/roots-add", "path": sibling_str }),
     )?;
     bridge.wait_for_root(sibling_str, Duration::from_secs(5))?;
-    // Give the per-root server a moment to spawn before the enriching grep.
-    std::thread::sleep(Duration::from_millis(300));
 
-    // Warm the SymbolIndex: enriched grep on the sibling root.
-    let warm = bridge.call_tool_text(
-        "grep",
+    // Warm the SymbolIndex: enriched grep on the sibling root. Retry until the
+    // `calls:` enrichment signal appears instead of sleeping to guess the per-root
+    // server + `--scan-roots` index is ready — the enrichment-present output IS the
+    // readiness signal, so the grep can't race server readiness under contention.
+    let warm = grep_until_enriched(
+        &bridge,
         &json!({ "pattern": "caller_evict", "directory": sibling_str }),
     )?;
     assert!(
@@ -160,11 +161,11 @@ fn untracked_root_does_not_serve_cached_enrichment() -> Result<()> {
     })?;
     warmer.initialize_with_roots(&[dropped_str])?;
     warmer.wait_for_root(dropped_str, Duration::from_secs(5))?;
-    std::thread::sleep(Duration::from_millis(300));
 
-    // Warm the SymbolIndex via the warming bridge.
-    let warm = warmer.call_tool_text(
-        "grep",
+    // Warm the SymbolIndex via the warming bridge. Retry until the `calls:`
+    // enrichment signal appears (the readiness signal) instead of a fixed sleep.
+    let warm = grep_until_enriched(
+        &warmer,
         &json!({ "pattern": "caller_drop", "directory": dropped_str }),
     )?;
     assert!(
@@ -230,9 +231,9 @@ fn cold_first_touch_is_actually_cold_after_eviction() -> Result<()> {
         &json!({ "method": "tool/roots-add", "path": work_str }),
     )?;
     bridge.wait_for_root(work_str, Duration::from_secs(5))?;
-    std::thread::sleep(Duration::from_millis(300));
-    let warm = bridge.call_tool_text(
-        "grep",
+    // Retry until the `calls:` enrichment signal appears (readiness signal).
+    let warm = grep_until_enriched(
+        &bridge,
         &json!({ "pattern": "caller_cold", "directory": work_str }),
     )?;
     assert!(
@@ -266,9 +267,11 @@ fn cold_first_touch_is_actually_cold_after_eviction() -> Result<()> {
         &json!({ "method": "tool/roots-add", "path": work_str }),
     )?;
     bridge.wait_for_root(work_str, Duration::from_secs(5))?;
-    std::thread::sleep(Duration::from_millis(300));
-    let cold = bridge.call_tool_text(
-        "grep",
+    // Retry until the `calls:` enrichment signal appears — the genuine cold first
+    // touch re-resolves enrichment from the live server; polling on that signal
+    // (not a fixed sleep) makes it contention-safe.
+    let cold = grep_until_enriched(
+        &bridge,
         &json!({ "pattern": "caller_cold", "directory": work_str }),
     )?;
     assert!(

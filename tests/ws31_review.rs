@@ -36,40 +36,14 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
-use common::{BridgeProcess, ipc_request, mockls_lsp_arg};
+use common::{
+    BridgeProcess, grep_until_enriched, ipc_request, mockls_lsp_arg, poll_log_until,
+    rewrite_advancing_mtime, wait_for_change, wait_for_change_in_root,
+};
 
 const MOCK_LANG: &str = "yX4Za";
 /// Second mock language for the L5 nested-root test (a distinct server).
 const MOCK_LANG_S: &str = "z9Qw7";
-
-/// Reads the notification log and returns every `(uri, type)` pair from every
-/// `workspace/didChangeWatchedFiles` notification recorded.
-///
-/// Copied verbatim from `tests/changed_set.rs` so this RED suite stands alone.
-fn watched_file_changes(log: &str) -> Vec<(String, u64)> {
-    let mut out = Vec::new();
-    for line in log.lines() {
-        let Ok(entry) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        if entry.get("method").and_then(Value::as_str) != Some("workspace/didChangeWatchedFiles") {
-            continue;
-        }
-        let Some(changes) = entry.get("changes").and_then(Value::as_array) else {
-            continue;
-        };
-        for change in changes {
-            let uri = change
-                .get("uri")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            let typ = change.get("type").and_then(Value::as_u64).unwrap_or(0);
-            out.push((uri, typ));
-        }
-    }
-    out
-}
 
 /// C1 — a path-scoped enriched grep must not reap files outside its scope.
 ///
@@ -111,47 +85,51 @@ fn ws31_review_r1_scoped_grep_no_spurious_delete() -> Result<()> {
 
     // Seed the per-root baseline with a PATHLESS full grep — the harness injects
     // cwd=root, so ripgrep walks the whole tree and BOTH a/match and b/keep enter
-    // the baseline.
+    // the baseline. The baseline is recorded synchronously inside the grep call's
+    // `nudge_changed_set`, so no settle wait is needed after it returns.
     let _ = bridge.call_tool_text("grep", &json!({ "pattern": "needle" }))?;
-    std::thread::sleep(Duration::from_millis(150));
 
     // Advance a/match's mtime so the SCOPED walk itself observes it as changed and
     // routes a fresh `Changed(2)`. Without this the companion guard below would be
     // satisfied by walk #1's cold-start emission alone (a/match is unchanged on
     // the second walk ⇒ empty change-set ⇒ early return), so the companion would
     // pass even if the scoped walk routed nothing — making it non-load-bearing.
-    // Re-writing the file bumps its mtime; the scoped grep then diffs it as
-    // Changed against the baseline.
-    std::fs::write(&a_match, "needle\nneedle\n")?;
-    std::thread::sleep(Duration::from_millis(50));
+    // `rewrite_advancing_mtime` gates on the observed mtime advance (the change
+    // signal) instead of a fixed sleep to span mtime granularity.
+    rewrite_advancing_mtime(&a_match, "needle\nneedle\n")?;
 
     // Scoped grep: ripgrep walks only a/. Its observation set omits b/keep.
     let a_str = a.to_str().context("a path")?;
     let _ = bridge.call_tool_text("grep", &json!({ "pattern": "needle", "paths": [a_str] }))?;
 
-    drop(bridge);
-    std::thread::sleep(Duration::from_millis(300));
-
     let a_match_uri = format!("file://{}/a/match.{MOCK_LANG}", dir.path().display());
     let b_keep_uri = format!("file://{}/b/keep.{MOCK_LANG}", dir.path().display());
-    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
-    let changes = watched_file_changes(&log);
 
+    // Anchor on the positive completion signal: poll the live log until the
+    // scoped walk's Changed(2) for the in-scope a/match appears (proving the
+    // scoped walk ran and its notifications flushed to mockls), then assert the
+    // out-of-scope b/keep is NOT reaped in that SAME snapshot. The bridge stays
+    // alive while polling — mockls writes the log on receipt — so there is no
+    // shutdown/flush race. No fixed sleep guesses "long enough".
+    let changes = wait_for_change(&log_path, &a_match_uri, 2);
+    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+
+    // Companion guard: the SCOPED walk itself must route a/match as Changed(2)
+    // (its mtime was advanced above), so the fix can't trivially pass by making
+    // the scoped grep stop nudging entirely — the change-set is non-empty and the
+    // scoped walk is exercised, not just walk #1's cold-start emission. This is
+    // also the positive anchor the negative below relies on.
+    assert!(
+        changes.iter().any(|(u, t)| *u == a_match_uri && *t == 2),
+        "the in-scope file a/match must still be routed as Changed(2) by the \
+         scoped walk. changes={changes:?}, log:\n{log}"
+    );
     // Key assertion (green guard): the scoped grep must NOT reap b/keep — it is
     // present on disk and merely outside the scoped walk's breadth.
     assert!(
         !changes.iter().any(|(u, t)| *u == b_keep_uri && *t == 3),
         "scoped grep must not reap files outside its scope; b/keep is present. \
          changes={changes:?}, log:\n{log}"
-    );
-    // Companion guard: the SCOPED walk itself must route a/match as Changed(2)
-    // (its mtime was advanced above), so the fix can't trivially pass by making
-    // the scoped grep stop nudging entirely — the change-set is non-empty and the
-    // scoped walk is exercised, not just walk #1's cold-start emission.
-    assert!(
-        changes.iter().any(|(u, t)| *u == a_match_uri && *t == 2),
-        "the in-scope file a/match must still be routed as Changed(2) by the \
-         scoped walk. changes={changes:?}, log:\n{log}"
     );
     Ok(())
 }
@@ -212,9 +190,17 @@ fn ws31_review_r1_incomplete_observation_not_reaped() -> Result<()> {
     bridge.initialize()?;
 
     // Seed the baseline with a pathless full grep (normal perms) → both
-    // sub/locked and keep baselined.
+    // sub/locked and keep baselined. The baseline is recorded synchronously
+    // inside the grep call, so no settle wait is needed after it returns.
     let _ = bridge.call_tool_text("grep", &json!({ "pattern": "needle" }))?;
-    std::thread::sleep(Duration::from_millis(150));
+
+    // Create a non-edited `witness` AFTER the baseline seed: on the SECOND walk
+    // it is absent-on-a-populated-baseline ⇒ routed as Created(1). A Created(1)
+    // can only come from the second full walk, so it is the positive completion
+    // signal that the reap sweep ran over the root — the anchor the negative
+    // (absence) assertion below polls on, since absence itself cannot be polled.
+    let witness = dir.path().join(format!("witness.{MOCK_LANG}"));
+    std::fs::write(&witness, "needle\n")?;
 
     // Strip execute (search) from sub: readdir still works (read granted) so
     // sub/locked is enumerated with cached d_type and passes `is_file`, but a
@@ -225,18 +211,32 @@ fn ws31_review_r1_incomplete_observation_not_reaped() -> Result<()> {
     // Pathless full grep again — covers the whole tree; reap sweep fires.
     let grep_result = bridge.call_tool_text("grep", &json!({ "pattern": "needle" }));
 
-    // RESTORE execute immediately, in the test BODY, before drop(bridge): the
-    // tempdir's Drop must recurse into sub to clean up, which needs execute.
+    // RESTORE execute immediately, in the test BODY: the tempdir's Drop must
+    // recurse into sub to clean up, which needs execute.
     std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o700))?;
     grep_result?;
 
-    drop(bridge);
-    std::thread::sleep(Duration::from_millis(300));
-
     let locked_uri = format!("file://{}/sub/locked.{MOCK_LANG}", dir.path().display());
-    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
-    let changes = watched_file_changes(&log);
+    let witness_uri = format!("file://{}/witness.{MOCK_LANG}", dir.path().display());
 
+    // Anchor on the positive completion signal: poll the live log until the
+    // second walk routes `witness` as Created(1) (proving the full stat-walk +
+    // reap sweep ran and flushed), then assert the present-but-unstattable
+    // sub/locked is NOT reaped in that SAME snapshot. The bridge stays alive
+    // while polling — mockls writes the log on receipt — so no shutdown race and
+    // no fixed-time "long enough" guess.
+    let changes = wait_for_change(&log_path, &witness_uri, 1);
+    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+
+    // Companion guard (non-vacuous): the `witness`, created after the seed, must
+    // be routed Created(1) by the second full walk, pinning that the walk + reap
+    // sweep ran so the key assertion can't pass by walking/routing nothing.
+    assert!(
+        changes.iter().any(|(u, t)| *u == witness_uri && *t == 1),
+        "the non-edited `witness` (created after the seed) must be routed as \
+         Created(1) by the second full walk, proving the reap sweep ran. \
+         changes={changes:?}, log:\n{log}"
+    );
     // Key assertion (green guard): a present file whose fresh metadata() raced
     // (EACCES) must not be reaped.
     assert!(
@@ -307,10 +307,10 @@ fn ws31_review_r2_traversed_symlink_file_is_skipped() -> Result<()> {
 
     // Pathless grep → the harness injects cwd=root → directory traversal. Result
     // paths are rendered cwd-relative (e.g. `real_hit.<LANG>`, `sub/target.<LANG>`).
+    // The assertions read only this grep's OWN result text (returned
+    // synchronously), not the notification log, so no settle wait is needed —
+    // there is no async signal to wait for. The bridge drops at end of scope.
     let out = bridge.call_tool_text("grep", &json!({ "pattern": "needle" }))?;
-
-    drop(bridge);
-    std::thread::sleep(Duration::from_millis(150));
 
     // Real files are searched and their matches appear.
     assert!(
@@ -449,13 +449,15 @@ fn ws31_review_r3_resultcache_not_served_for_untracked_root() -> Result<()> {
         &json!({ "method": "tool/roots-add", "path": sibling_str }),
     )?;
     bridge.wait_for_root(sibling_str, Duration::from_secs(5))?;
-    // Give the per-root server a moment to spawn before the enriching grep.
-    std::thread::sleep(Duration::from_millis(300));
 
     // Warm the ResultCache (generation stays 0 — no edit/sed/diagnostics, the
     // only generation-bumpers). Page 1 of an enriched grep on the sibling root.
-    let warm = bridge.call_tool_text(
-        "grep",
+    // Retry the grep until it returns the `calls:` enrichment signal instead of
+    // sleeping to guess the per-root server + `--scan-roots` index is ready: the
+    // enrichment-present output IS the readiness signal, so a cold grep can no
+    // longer race server readiness under CPU contention.
+    let warm = grep_until_enriched(
+        &bridge,
         &json!({ "pattern": "caller_", "directory": sibling_str }),
     )?;
     // Preconditions — these MUST pass; they prove the setup is genuinely
@@ -578,16 +580,18 @@ fn ws31_review_r4_eviction_witnessed_via_request_count() -> Result<()> {
     bridge.initialize()?;
     let socket = bridge.wait_for_ipc_socket()?;
 
-    // Add and warm the work root.
+    // Add and warm the work root. Retry the warming grep until the `calls:`
+    // enrichment signal appears instead of sleeping to guess the per-root server
+    // + `--scan-roots` index is ready — the enrichment-present output IS the
+    // readiness signal, so the warm grep can't race server readiness under load.
     ipc_request(
         &socket,
         &json!({ "method": "tool/roots-add", "path": work_str }),
     )?;
     bridge.wait_for_root(work_str, Duration::from_secs(5))?;
-    std::thread::sleep(Duration::from_millis(300));
 
-    let warm = bridge.call_tool_text(
-        "grep",
+    let warm = grep_until_enriched(
+        &bridge,
         &json!({ "pattern": "caller_x", "directory": work_str }),
     )?;
     // Precondition — the setup is genuinely enriched.
@@ -621,12 +625,17 @@ fn ws31_review_r4_eviction_witnessed_via_request_count() -> Result<()> {
         &json!({ "method": "tool/roots-add", "path": work_str }),
     )?;
     bridge.wait_for_root(work_str, Duration::from_secs(5))?;
-    std::thread::sleep(Duration::from_millis(300));
 
     // Re-grep. With a correct evict, the daemon-lived SymbolIndex was emptied for
-    // this root, so this is a genuine cold touch: the daemon re-queries the outline.
-    let cold = bridge.call_tool_text(
-        "grep",
+    // this root, so this is a genuine cold touch: the daemon re-queries the
+    // outline. Retry until the `calls:` enrichment signal appears rather than
+    // sleeping to guess the re-spawned server is ready — that guess (300 ms) was
+    // the flake source under CPU contention, racing a cold grep against the
+    // re-spawn + `--scan-roots` index so the request counts came up empty. Each
+    // retry re-issues documentSymbol/outgoingCalls into the (truncated) request
+    // log, so the `>= 1` counts below only strengthen.
+    let cold = grep_until_enriched(
+        &bridge,
         &json!({ "pattern": "caller_x", "directory": work_str }),
     )?;
     // Anti-vacuous: the re-grep still surfaces the symbol AND re-resolves enrichment.
@@ -644,15 +653,15 @@ fn ws31_review_r4_eviction_witnessed_via_request_count() -> Result<()> {
     // removes the fixed-time GUESS for when that flush becomes visible to this
     // reader: under heavy parallel load the re-spawned server's requests may not
     // be flushed/visible to the file by a fixed delay, so we re-read + re-parse
-    // until both expected counts hold (or the deadline passes). Cadence/cap match
-    // the `roots-ls` poll loops above (50 ms between attempts, ~5 s total).
+    // until both expected counts hold (or the GENEROUS backstop passes). 50 ms
+    // cadence between attempts; the backstop only trips on a genuine hang.
     drop(bridge);
-    let req_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let req_deadline = std::time::Instant::now() + common::POLL_BACKSTOP;
     let mut req_log = std::fs::read_to_string(&req_log_path).unwrap_or_default();
     let mut doc_symbol_count = request_method_count(&req_log, "textDocument/documentSymbol");
     let mut outgoing_count = request_method_count(&req_log, "callHierarchy/outgoingCalls");
     while (doc_symbol_count < 1 || outgoing_count < 1) && std::time::Instant::now() < req_deadline {
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(common::POLL_SPACING);
         req_log = std::fs::read_to_string(&req_log_path).unwrap_or_default();
         doc_symbol_count = request_method_count(&req_log, "textDocument/documentSymbol");
         outgoing_count = request_method_count(&req_log, "callHierarchy/outgoingCalls");
@@ -691,6 +700,15 @@ fn ws31_review_r4_eviction_witnessed_via_request_count() -> Result<()> {
 /// the first — any re-announced URI is listed. The single append-only server log
 /// is order-stable, so equality is exact.
 ///
+/// Contention-safe absence anchor: "walk #2 emitted nothing" is an absence,
+/// which cannot be polled directly. So a THIRD walk over a genuinely-new file
+/// (`tail`) routes a `Created(1)` whose appearance is the positive completion
+/// signal. The single mockls input pipe is FIFO and mockls is single-threaded,
+/// so once `tail`'s Created(1) is in the log, any change walk #2 had (wrongly)
+/// emitted — sent earlier on the same pipe — is already written too. The final
+/// log must be EXACTLY `after_first` followed by `tail`'s single Created(1): no
+/// re-announce from walk #2 in between. No fixed sleep guesses "long enough".
+///
 /// GREEN today.
 #[test]
 fn ws31_review_r4_second_walk_emits_empty_changeset() -> Result<()> {
@@ -700,44 +718,59 @@ fn ws31_review_r4_second_walk_emits_empty_changeset() -> Result<()> {
     std::fs::write(dir.path().join(format!("b.{MOCK_LANG}")), "other\n")?;
 
     let log_arg = log_path.to_str().context("log path")?;
+    // kind 7 (ALL) registers Create, so walk #3's `tail` Created(1) anchor is
+    // routed/recorded (the coherence walk observes every visited file, so b is in
+    // the candidate set regardless of its `other` content not matching `needle`).
     let lsp = mockls_lsp_arg(
         MOCK_LANG,
         &format!(
             "--register-file-watchers --watcher-glob **/*.{MOCK_LANG} \
-             --notification-log {log_arg}"
+             --watcher-kind 7 --notification-log {log_arg}"
         ),
     );
     let root = dir.path().to_str().context("root path")?;
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    // Walk #1 — the cold-start full candidate set.
+    let a_uri = format!("file://{}/a.{MOCK_LANG}", dir.path().display());
+    let b_uri = format!("file://{}/b.{MOCK_LANG}", dir.path().display());
+
+    // Walk #1 — the cold-start full candidate set. Poll the live log until BOTH
+    // a and b are announced (the positive signal that walk #1 flushed), then
+    // snapshot that as `after_first`.
     let _ = bridge.call_tool_text("grep", &json!({ "pattern": "needle" }))?;
-    std::thread::sleep(Duration::from_millis(150));
-    let log_after_first = std::fs::read_to_string(&log_path).unwrap_or_default();
-    let after_first = watched_file_changes(&log_after_first);
-    // Anti-vacuous: the first walk announced something.
+    let after_first = poll_log_until(&log_path, |changes| {
+        changes.iter().any(|(u, _)| *u == a_uri) && changes.iter().any(|(u, _)| *u == b_uri)
+    });
+    // Anti-vacuous: the first walk announced the cold candidate set.
     assert!(
         !after_first.is_empty(),
-        "first walk must announce the cold candidate set. log:\n{log_after_first}"
+        "first walk must announce the cold candidate set. after_first={after_first:?}"
     );
 
-    // Walk #2 — NO FS change.
+    // Walk #2 — NO FS change. Must emit zero new changes.
     let _ = bridge.call_tool_text("grep", &json!({ "pattern": "needle" }))?;
 
-    drop(bridge);
-    std::thread::sleep(Duration::from_millis(300));
+    // Walk #3 over a genuinely-new file: routes `tail` as Created(1), the FIFO
+    // completion anchor that proves walk #2's (absent) emissions are already
+    // written to the log.
+    let tail = dir.path().join(format!("tail.{MOCK_LANG}"));
+    std::fs::write(&tail, "needle\n")?;
+    let tail_uri = format!("file://{}/tail.{MOCK_LANG}", dir.path().display());
+    let _ = bridge.call_tool_text("grep", &json!({ "pattern": "needle" }))?;
+    let total = wait_for_change(&log_path, &tail_uri, 1);
 
-    let full_log = std::fs::read_to_string(&log_path).unwrap_or_default();
-    let total = watched_file_changes(&full_log);
-    // Positively encodes bug-38 no-repeat: the second walk added zero changes, so
-    // the full set equals the first walk's set. Order-stable single-server log.
+    // Positively encodes bug-38 no-repeat: walks #2 added zero changes, so the
+    // full set is EXACTLY `after_first` followed by walk #3's single Created(1)
+    // for `tail`. Order-stable single-server log. Any re-announce by walk #2
+    // would appear between `after_first` and `tail` and break this equality.
+    let mut expected = after_first;
+    expected.push((tail_uri, 1));
     assert_eq!(
-        total,
-        after_first,
-        "second walk with no FS change must emit zero new didChangeWatchedFiles; \
-         extra: {:?}",
-        &total[after_first.len().min(total.len())..]
+        total, expected,
+        "the no-change walk #2 must emit zero new didChangeWatchedFiles (only \
+         walk #3's tail Created(1) is appended after the first walk's set). \
+         total={total:?}, expected={expected:?}"
     );
 
     Ok(())
@@ -746,22 +779,30 @@ fn ws31_review_r4_second_walk_emits_empty_changeset() -> Result<()> {
 // ── R4 (L5) — covering_watchers subdir/parent scope prefix matching ─────────
 
 /// L5 — `covering_watchers` includes a subdir-scoped server for a parent walk and
-/// excludes a parent-scoped server for a child walk
+/// excludes a parent-scoped server for a child-grouped file
 /// (`scope.root_path().starts_with(root)`).
 ///
-/// Two canonicalized tracked roots `parent` and `parent/sub`, each with its own
-/// mockls language/server registering its own glob + its own notification log.
+/// Two canonicalized tracked roots `parent` and `parent/sub`, each language
+/// registering its own glob. Under the per-root server architecture (one instance
+/// per tracked root), each language has TWO instances — one at `parent`, one at
+/// `parent/sub` — all handed the SAME `--notification-log` path. Two instances
+/// appending to one file tear each other's JSONL lines, which no signal poll can
+/// parse, so `--log-pid-suffix` gives each instance its OWN `<base>.<pid>` file;
+/// the test merges all of a language's files (`common::*_merged`) to ask "did ANY
+/// instance of this server record change X".
 ///
-/// - **Positive:** a grep over `parent` matches `parent/top.<LANG_S>` (resolving
-///   to root `parent`). Server S — scoped to `parent/sub` — is included in that
-///   parent walk because `parent/sub` `starts_with` `parent`, so S's log records
-///   the `top.<LANG_S>` change.
-/// - **Negative:** a SEPARATE grep tightly scoped to `parent/sub` matches
-///   `parent/sub/inner.<LANG_P>` (resolving to root `parent/sub`). Server P —
-///   scoped to `parent` — is EXCLUDED because `parent` `starts_with` `parent/sub`
-///   is false, so P's log records nothing for that walk.
+/// - **Positive:** a grep over `parent` observes `parent/top.<LANG_S>` (root
+///   `parent`). An S instance scoped to `parent/sub` is INCLUDED in the
+///   `parent`-root nudge because `parent/sub` `starts_with` `parent`, so some S
+///   file records the `top.<LANG_S>` change.
+/// - **Negative:** `parent/sub/inner.<LANG_P>` resolves (longest-prefix) to root
+///   `parent/sub`. `covering_watchers(parent/sub)` EXCLUDES the P instance scoped
+///   to `parent` (`parent` does NOT `starts_with` `parent/sub`), and S's glob
+///   excludes `.<LANG_P>`, so NO P file ever records `inner.<LANG_P>`. The
+///   absence is anchored on a positive P signal (a fresh `anchor.<LANG_P>` under
+///   `parent`, routed Created(1) to a P instance) so the negative is asserted
+///   only after a P walk provably ran and flushed — not after a fixed sleep.
 ///
-/// The two greps are kept separate so a single grep can't span both roots.
 /// GREEN today.
 #[test]
 fn ws31_review_r4_covering_watchers_subdir_scope() -> Result<()> {
@@ -775,8 +816,9 @@ fn ws31_review_r4_covering_watchers_subdir_scope() -> Result<()> {
     std::fs::create_dir(&sub_path)?;
     let sub_str = sub_path.to_str().context("sub path")?;
 
-    // Server P (lang = MOCK_LANG) is scoped to `parent`; server S (lang =
-    // MOCK_LANG_S) is scoped to `parent/sub`. Two distinct langs ⇒ two servers.
+    // Server P (lang = MOCK_LANG) and server S (lang = MOCK_LANG_S). Each spawns
+    // one instance per tracked root, so each log BASE is split into `<base>.<pid>`
+    // per instance via `--log-pid-suffix` (read merged below).
     let log_p = parent_path.join("notifications_p.jsonl");
     let log_s = parent_path.join("notifications_s.jsonl");
     let log_p_arg = log_p.to_str().context("log p path")?;
@@ -786,26 +828,32 @@ fn ws31_review_r4_covering_watchers_subdir_scope() -> Result<()> {
         MOCK_LANG,
         &format!(
             "--register-file-watchers --watcher-glob **/*.{MOCK_LANG} \
-             --watcher-kind 7 --notification-log {log_p_arg}"
+             --watcher-kind 7 --log-pid-suffix --notification-log {log_p_arg}"
         ),
     );
     let lsp_s = mockls_lsp_arg(
         MOCK_LANG_S,
         &format!(
             "--register-file-watchers --watcher-glob **/*.{MOCK_LANG_S} \
-             --watcher-kind 7 --notification-log {log_s_arg}"
+             --watcher-kind 7 --log-pid-suffix --notification-log {log_s_arg}"
         ),
     );
 
-    // Positive fixture: a file matching S's glob under `parent` (so S's scope
-    // `parent/sub` is covered by a `parent` walk), plus a P-glob file so the
-    // parent-scoped grep walks `parent`.
+    // Positive fixture: top_s (S-glob, directly under `parent`) is grouped under
+    // root `parent`; an `inner.<LANG_S>` under `parent/sub` makes the daemon spawn
+    // an S instance ROOTED at `parent/sub` (per-root instances are spawned where
+    // matching files are found). That parent/sub-scoped S instance must then be
+    // INCLUDED in the `parent`-root nudge (parent/sub starts_with parent) and so
+    // receive top_s — that is the inclusion the positive proves. top_p (P-glob)
+    // makes the parent grep walk `parent`.
     let top_s = parent_path.join(format!("top.{MOCK_LANG_S}"));
     let top_p = parent_path.join(format!("top.{MOCK_LANG}"));
+    let inner_s = sub_path.join(format!("inner.{MOCK_LANG_S}"));
     std::fs::write(&top_s, "needle\n")?;
     std::fs::write(&top_p, "needle\n")?;
-    // Negative fixture: a P-glob file under `parent/sub`, matched only by the
-    // tightly-scoped child grep.
+    std::fs::write(&inner_s, "needle\n")?;
+    // Negative fixture: a P-glob file under `parent/sub`, grouped under root
+    // `parent/sub` (longest-prefix), whose covering set excludes the `parent` P.
     let inner_p = sub_path.join(format!("inner.{MOCK_LANG}"));
     std::fs::write(&inner_p, "needle\n")?;
 
@@ -816,47 +864,78 @@ fn ws31_review_r4_covering_watchers_subdir_scope() -> Result<()> {
     bridge.initialize_with_roots(&[parent_str, sub_str])?;
     bridge.wait_for_root(parent_str, Duration::from_secs(5))?;
     bridge.wait_for_root(sub_str, Duration::from_secs(5))?;
-    std::thread::sleep(Duration::from_millis(300));
 
-    // POSITIVE walk: grep over `parent`. The walk root is `parent`; S (scoped to
-    // `parent/sub`) is a covering watcher because `parent/sub`.starts_with(`parent`).
+    // POSITIVE walk: grep over `parent`. The walk covers root `parent`; the S
+    // instance scoped to `parent/sub` is a covering watcher because
+    // `parent/sub`.starts_with(`parent`). `inner_p` (`.MOCK_LANG` under
+    // `parent/sub`) resolves to root `parent/sub`, whose covering set EXCLUDES the
+    // `parent`-scoped P, so no P instance ever receives it.
     let _ = bridge.call_tool_text(
         "grep",
         &json!({ "pattern": "needle", "directory": parent_str }),
     )?;
 
     // NEGATIVE walk: a SEPARATE grep tightly scoped to `parent/sub`. The walk root
-    // is `parent/sub`; P (scoped to `parent`) is EXCLUDED because
+    // is `parent/sub`; the `parent`-scoped P is EXCLUDED because
     // `parent`.starts_with(`parent/sub`) is false.
     let _ = bridge.call_tool_text(
         "grep",
         &json!({ "pattern": "needle", "directory": sub_str }),
     )?;
 
-    drop(bridge);
-    std::thread::sleep(Duration::from_millis(300));
-
     let top_s_uri = format!("file://{}/top.{MOCK_LANG_S}", parent_path.display());
     let inner_p_uri = format!("file://{}/sub/inner.{MOCK_LANG}", parent_path.display());
 
-    // Positive: the subdir-scoped server S was included in the parent walk and
-    // recorded its globbed file.
-    let log_s_text = std::fs::read_to_string(&log_s).unwrap_or_default();
-    let s_changes = watched_file_changes(&log_s_text);
+    // Positive: the S instance scoped to `parent/sub` must be INCLUDED in the
+    // `parent`-root nudge (parent/sub starts_with parent) and record top.<LANG_S>
+    // (top_s is directly under `parent`, root `parent`). Read the SPECIFIC
+    // parent/sub-scoped S instance's log — not the merged view — so the inclusion
+    // of THAT instance (not just any S) is what's proven. Poll until top_s
+    // appears: the positive completion signal, no fixed settle wait.
+    let s_changes = wait_for_change_in_root(&log_s, sub_str, &top_s_uri, 2);
+    let log_s_text = common::read_instance_log_for_root(&log_s, sub_str);
     assert!(
         s_changes.iter().any(|(u, _)| *u == top_s_uri),
-        "subdir-scoped server (parent/sub) must be INCLUDED in the parent walk \
-         (parent/sub starts_with parent) and receive top.{MOCK_LANG_S}. \
+        "the S instance scoped to parent/sub must be INCLUDED in the parent-root \
+         nudge (parent/sub starts_with parent) and receive top.{MOCK_LANG_S}. \
          s_changes={s_changes:?}, log:\n{log_s_text}"
     );
 
-    // Negative: the parent-scoped server P must have received NO change for the
-    // child-scoped walk's file (parent does not start_with parent/sub).
-    let log_p_text = std::fs::read_to_string(&log_p).unwrap_or_default();
-    let p_changes = watched_file_changes(&log_p_text);
+    // Negative anchor: the `parent`-scoped P instance never receiving inner_p is
+    // an absence (un-pollable). inner_p resolves (longest-prefix) to root
+    // `parent/sub`, whose covering set EXCLUDES the `parent`-scoped P. (The
+    // `parent/sub`-scoped P instance DOES receive it — which is correct, and why
+    // the per-instance log read below targets the `parent` instance only; reading
+    // a merged P log would wrongly see the parent/sub instance's copy.) Both walks
+    // have returned, so any hypothetical buggy inner_p→P@parent nudge was already
+    // sent. Route a FRESH legitimate change to P@parent and wait for it: a new
+    // P-glob file directly under `parent` resolves to root `parent` (covering set
+    // INCLUDES P@parent) and is routed Created(1). Polling P@parent's own log
+    // until that anchor appears proves P@parent's walk ran and flushed, so the
+    // absence is asserted over a snapshot that has seen everything up to it.
+    let p_anchor = parent_path.join(format!("anchor.{MOCK_LANG}"));
+    std::fs::write(&p_anchor, "needle\n")?;
+    let p_anchor_uri = format!("file://{}/anchor.{MOCK_LANG}", parent_path.display());
+    let _ = bridge.call_tool_text(
+        "grep",
+        &json!({ "pattern": "needle", "directory": parent_str }),
+    )?;
+    let p_changes = wait_for_change_in_root(&log_p, parent_str, &p_anchor_uri, 1);
+    let log_p_text = common::read_instance_log_for_root(&log_p, parent_str);
+
+    // Companion (proves the parent-scoped P instance's walk/pipe is drained past
+    // the anchor point).
+    assert!(
+        p_changes.iter().any(|(u, t)| *u == p_anchor_uri && *t == 1),
+        "the parent-scoped P instance must receive the fresh anchor.{MOCK_LANG} \
+         (under root parent) as Created(1), proving its nudge pipe is drained. \
+         p_changes={p_changes:?}, log:\n{log_p_text}"
+    );
+    // Negative: the parent-scoped P instance must NOT have received the
+    // child-grouped file (parent does NOT start_with parent/sub).
     assert!(
         !p_changes.iter().any(|(u, _)| *u == inner_p_uri),
-        "parent-scoped server (parent) must be EXCLUDED from the child walk \
+        "the parent-scoped P instance must be EXCLUDED from the parent/sub root \
          (parent does NOT start_with parent/sub) and must not receive \
          sub/inner.{MOCK_LANG}. p_changes={p_changes:?}, log:\n{log_p_text}"
     );
@@ -926,11 +1005,11 @@ fn ws31_review_c4_edited_then_deleted_drives_exclude() -> Result<()> {
 
     // Seed the per-root baseline with BOTH files present: the first diagnostics
     // run's full stat-walk observes the whole root, so `live` and `gone` both
-    // enter the baseline.
+    // enter the baseline. The baseline is recorded synchronously inside the
+    // diagnostics call, so no settle wait is needed after it returns.
     let live_str = live.to_str().context("live path")?;
     let gone_str = gone.to_str().context("gone path")?;
     let _ = bridge.call_diagnostics(live_str)?;
-    std::thread::sleep(Duration::from_millis(150));
 
     // Delete `gone` from disk while it is about to ride the edited-set: the
     // second diagnostics batch carries BOTH `live` (present) and `gone` (deleted)
@@ -946,12 +1025,13 @@ fn ws31_review_c4_edited_then_deleted_drives_exclude() -> Result<()> {
     // `exclude`.
     let _ = bridge.call_diagnostics_multi(&[live_str, gone_str])?;
 
-    drop(bridge);
-    std::thread::sleep(Duration::from_millis(300));
-
     let gone_uri = format!("file://{}/gone.{MOCK_LANG}", dir.path().display());
+
+    // Poll the live log until the reaped `gone` Deleted(3) appears (the positive
+    // completion signal that the reap was routed and flushed to mockls), then
+    // assert over that snapshot. No fixed sleep, no shutdown/flush race.
+    let changes = wait_for_change(&log_path, &gone_uri, 3);
     let log = std::fs::read_to_string(&log_path).unwrap_or_default();
-    let changes = watched_file_changes(&log);
 
     // GREEN today, load-bearing for L6: the edited-then-deleted file's `Deleted`
     // must be ROUTED. `gone` is in the edited-set but NOT in `exclude` —
@@ -962,7 +1042,8 @@ fn ws31_review_c4_edited_then_deleted_drives_exclude() -> Result<()> {
     assert!(
         changes.iter().any(|(u, t)| *u == gone_uri && *t == 3),
         "an edited-then-deleted file's Deleted must be routed (it is in the \
-         edited-set but NOT in exclude — validate_read drops it); got:\n{changes:?}"
+         edited-set but NOT in exclude — validate_read drops it); \
+         changes={changes:?}, log:\n{log}"
     );
     Ok(())
 }
@@ -1019,24 +1100,40 @@ fn ws31_review_c1_symlink_dir_glob_single_canonical_key() -> Result<()> {
     bridge.initialize()?;
 
     // Seed the per-root baseline via a glob of the symlinked dir arg. Pre-fix
-    // this keys the contained file under the literal `linkdir/x.<EXT>`.
+    // this keys the contained file under the literal `linkdir/x.<EXT>`. The
+    // baseline is recorded synchronously inside the glob call.
     let linkdir_arg = linkdir.to_str().context("linkdir path")?;
     let _ = bridge.call_tool_text("glob", &json!({ "paths": [linkdir_arg] }))?;
-    std::thread::sleep(Duration::from_millis(150));
 
     // Pathless full grep: the harness injects cwd=root, so ripgrep walks the
     // canonical root WITHOUT following `linkdir`, observing only
     // `realdir/x.<EXT>`. The reap sweep then fires over the baseline.
     let _ = bridge.call_tool_text("grep", &json!({ "pattern": "needle" }))?;
 
-    drop(bridge);
-    std::thread::sleep(Duration::from_millis(300));
-
     let link_uri = format!("file://{}/linkdir/x.{MOCK_LANG}", base.display());
     let real_uri = format!("file://{}/realdir/x.{MOCK_LANG}", base.display());
-    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
-    let changes = watched_file_changes(&log);
 
+    // Anchor on the positive completion signal: poll the live log until the full
+    // grep walk tracks the real file under its canonical realdir key (Created(1)
+    // or Changed(2)) — proving the walk ran and flushed — then assert the orphan
+    // linkdir key is NOT reaped in that SAME snapshot. No fixed sleep.
+    let changes = poll_log_until(&log_path, |c| {
+        c.iter()
+            .any(|(u, t)| *u == real_uri && (*t == 1 || *t == 2))
+    });
+    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+
+    // Companion guard: the real file IS tracked under its canonical key (so the
+    // fix can't trivially pass by making glob stop nudging entirely). It enters
+    // the baseline as Created(1) on the second (full-grep) walk. This is also the
+    // positive anchor the negative below relies on.
+    assert!(
+        changes
+            .iter()
+            .any(|(u, t)| *u == real_uri && (*t == 1 || *t == 2)),
+        "the contained file must be tracked under its canonical realdir key \
+         (Created(1) or Changed(2)). changes={changes:?}, log:\n{log}"
+    );
     // Key assertion (regression guard): the orphan `linkdir/x.<EXT>` baseline
     // key must NOT be reaped — it is the same physical file as `realdir/x.<EXT>`,
     // which is present on disk. Pre-fix (C1/F2) glob keyed it literally and the
@@ -1046,16 +1143,6 @@ fn ws31_review_c1_symlink_dir_glob_single_canonical_key() -> Result<()> {
         "an in-tree symlink-to-dir glob arg must not produce a phantom Deleted \
          for linkdir/x.<EXT> — it is the same file as realdir/x.<EXT>, present on \
          disk. changes={changes:?}, log:\n{log}"
-    );
-    // Companion guard: the real file IS tracked under its canonical key (so the
-    // fix can't trivially pass by making glob stop nudging entirely). It enters
-    // the baseline as Created(1) on the second (full-grep) walk.
-    assert!(
-        changes
-            .iter()
-            .any(|(u, t)| *u == real_uri && (*t == 1 || *t == 2)),
-        "the contained file must be tracked under its canonical realdir key \
-         (Created(1) or Changed(2)). changes={changes:?}, log:\n{log}"
     );
     Ok(())
 }
@@ -1135,10 +1222,9 @@ fn ws31_review_d_diagnostics_stat_miss_not_reaped() -> Result<()> {
 
     // Seed the per-root baseline with a first diagnostics run over `anchor`: its
     // full stat-walk observes the whole root, so BOTH `anchor` and `sub/locked`
-    // enter the baseline.
+    // enter the baseline. The baseline is recorded synchronously inside the call.
     let anchor_str = anchor.to_str().context("anchor path")?;
     let _ = bridge.call_diagnostics(anchor_str)?;
-    std::thread::sleep(Duration::from_millis(150));
 
     // Create a non-edited `witness` AFTER the baseline seed: on the SECOND walk it
     // is absent-on-a-populated-baseline ⇒ routed as Created(1). A Created(1) can
@@ -1160,19 +1246,32 @@ fn ws31_review_d_diagnostics_stat_miss_not_reaped() -> Result<()> {
     // enumerated but its fresh stat races EACCES.
     let diag_result = bridge.call_diagnostics(anchor_str);
 
-    // RESTORE execute immediately, in the test BODY, before drop(bridge): the
-    // tempdir's Drop must recurse into sub to clean up, which needs execute.
+    // RESTORE execute immediately, in the test BODY: the tempdir's Drop must
+    // recurse into sub to clean up, which needs execute.
     std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o700))?;
     diag_result?;
 
-    drop(bridge);
-    std::thread::sleep(Duration::from_millis(300));
-
     let locked_uri = format!("file://{}/sub/locked.{MOCK_LANG}", dir.path().display());
     let witness_uri = format!("file://{}/witness.{MOCK_LANG}", dir.path().display());
-    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
-    let changes = watched_file_changes(&log);
 
+    // Anchor on the positive completion signal: poll the live log until the
+    // second walk routes `witness` Created(1) (proving the full stat-walk + reap
+    // sweep ran and flushed), then assert the present-but-unstattable sub/locked
+    // is NOT reaped in that SAME snapshot. No fixed sleep, no shutdown race.
+    let changes = wait_for_change(&log_path, &witness_uri, 1);
+    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+
+    // Companion guard (non-vacuous): the non-edited `witness`, created after the
+    // baseline seed, is routed as Created(1) by the SECOND full stat-walk. This
+    // pins that the walk + reap sweep ran over the root, so the key assertion
+    // can't pass by walking/routing nothing — it is also the positive anchor the
+    // negative below polls on (absence cannot be polled).
+    assert!(
+        changes.iter().any(|(u, t)| *u == witness_uri && *t == 1),
+        "the non-edited `witness` (created after the seed) must be routed as \
+         Created(1) by the second full stat-walk, proving the reap sweep ran. \
+         changes={changes:?}, log:\n{log}"
+    );
     // Key assertion (green guard): a present file whose fresh metadata() raced
     // (EACCES) must NOT be reaped by the diagnostics full stat-walk. Pre-fix
     // (`stat_walk` omitting on stat miss) routed a phantom `Deleted(3)`.
@@ -1180,16 +1279,6 @@ fn ws31_review_d_diagnostics_stat_miss_not_reaped() -> Result<()> {
         !changes.iter().any(|(u, t)| *u == locked_uri && *t == 3),
         "the diagnostics full stat-walk must not reap a present file whose fresh \
          metadata() raced (EACCES); sub/locked is present on disk. \
-         changes={changes:?}, log:\n{log}"
-    );
-    // Companion guard (non-vacuous): the non-edited `witness`, created after the
-    // baseline seed, is routed as Created(1) by the SECOND full stat-walk. This
-    // pins that the walk + reap sweep ran over the root, so the key assertion
-    // can't pass by walking/routing nothing.
-    assert!(
-        changes.iter().any(|(u, t)| *u == witness_uri && *t == 1),
-        "the non-edited `witness` (created after the seed) must be routed as \
-         Created(1) by the second full stat-walk, proving the reap sweep ran. \
          changes={changes:?}, log:\n{log}"
     );
     Ok(())
