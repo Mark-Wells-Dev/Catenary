@@ -1302,10 +1302,7 @@ impl GrepServer {
             });
         }
 
-        let parts = Arc::into_inner(collected)
-            .ok_or_else(|| anyhow!("walker threads still hold references"))?
-            .into_inner()
-            .map_err(|e| anyhow!("lock poisoned: {e}"))?;
+        let parts = harvest(collected)?;
 
         Ok(RipgrepMatches::merge(parts))
     }
@@ -2050,6 +2047,26 @@ impl RipgrepMatches {
             files,
         }
     }
+}
+
+/// Unwraps the shared collector into the per-thread parts after the parallel
+/// walk completes.
+///
+/// A walker thread that panicked poisons `collected`; recover the poison via
+/// [`std::sync::PoisonError::into_inner`] — matching [`CollectOnDrop::drop`] —
+/// so the matches its siblings already pushed survive instead of being lost to
+/// a hard grep error. Errors only if a walker thread still holds a reference to
+/// the `Arc`, which never happens once `walker.run` has returned.
+///
+/// # Errors
+///
+/// Returns an error if a walker thread still holds an `Arc` reference (the
+/// `Arc::into_inner` returns `None`), which cannot occur after the walk joins.
+fn harvest(collected: Arc<std::sync::Mutex<Vec<ThreadMatches>>>) -> Result<Vec<ThreadMatches>> {
+    Ok(Arc::into_inner(collected)
+        .ok_or_else(|| anyhow!("walker threads still hold references"))?
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner))
 }
 
 /// Per-thread match accumulator used during parallel file walking.
@@ -3490,6 +3507,57 @@ mod tests {
         assert!(
             has_key,
             "recovered matches must include the dropped accumulator"
+        );
+    }
+
+    /// The final harvest in `ripgrep_matches` must recover a poisoned
+    /// `collected` mutex — matching `CollectOnDrop::drop` — instead of erroring
+    /// out and discarding every collected match (WS31-review R6 N2). A walker
+    /// thread that panicked (poisoning the lock) after its siblings already
+    /// pushed matches must not cost the whole grep its partial results.
+    #[test]
+    fn ws31_review_r6_final_collection_recovers_poison() {
+        let collected = Arc::new(std::sync::Mutex::new(Vec::<ThreadMatches>::new()));
+
+        // A sibling thread's matches are already in the collector before the
+        // poison.
+        {
+            let mut local = ThreadMatches::default();
+            local
+                .file_lines
+                .entry("survivor.rs".to_string())
+                .or_default()
+                .push(11);
+            collected.lock().expect("fresh mutex lock").push(local);
+        }
+
+        // Poison the mutex: panic in another thread while holding the guard.
+        // (Same idiom as `collect_on_drop_recovers_poisoned_lock`.)
+        let poisoner = Arc::clone(&collected);
+        let handle = std::thread::spawn(move || {
+            let _guard = poisoner.lock().expect("lock to poison");
+            let empty: Vec<()> = Vec::new();
+            empty
+                .into_iter()
+                .next()
+                .expect("intentional panic to poison the mutex");
+        });
+        assert!(
+            handle.join().is_err(),
+            "poisoning thread should have panicked"
+        );
+        assert!(
+            collected.lock().is_err(),
+            "mutex should be poisoned after the panic"
+        );
+
+        // The harvest must recover the poison and return the pushed matches,
+        // not fail.
+        let parts = harvest(collected).expect("harvest must recover the poisoned lock");
+        assert_eq!(parts.len(), 1, "collected matches must survive the poison");
+        assert!(
+            parts[0].file_lines.contains_key("survivor.rs"),
+            "the surviving accumulator must be returned, not lost to an error"
         );
     }
 

@@ -60,7 +60,7 @@ fn file_matches_patterns(path: &Path, patterns: &[LspGlob]) -> bool {
 /// key); routing rebuilds the absolute path via `root.join(rel)` before
 /// formatting the URI sent in `workspace/didChangeWatchedFiles`.
 fn changed_file_uri(root: &Path, rel: &Path) -> String {
-    format!("file://{}", root.join(rel).display())
+    crate::lsp::lang::path_to_uri(&root.join(rel))
 }
 
 /// Maps a semantic [`ChangeKind`] to its LSP `FileChangeType` wire value:
