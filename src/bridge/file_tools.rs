@@ -346,11 +346,25 @@ impl GlobServer {
         // witnessing it doesn't cause spurious misses.
         let mut touched: Vec<PathBuf> = Vec::new();
         for path in &resolved {
-            // Re-stat with a bounded retry: a transient `is_file()`/`is_symlink()`
-            // miss (an atomic-rename write racing this fresh stat) must not
-            // silently skip a named file that `expand_search_paths` already
-            // confirmed present on disk.
-            if path_is_file_or_symlink_with_retry(path) {
+            // Directories first — `is_dir()` follows symlinks, so a
+            // symlink-to-dir lists its contents (rather than rendering as a
+            // single file header). This dir-first order matches
+            // `collect_scoped_observations` so the listing and the changed-set
+            // nudge classify a symlink-to-dir the same way (WS31-review walk-2).
+            if path.is_dir() {
+                let (output, files) = self
+                    .handle_glob_dir(path, input, exclude, cwd, parent_id)
+                    .await?;
+                full.push_str(&output);
+                touched.extend(files);
+                // The listed dir itself: catches add/remove/rename of an
+                // immediate entry (including subdirs) in the rendered listing.
+                touched.push(path.clone());
+            } else if path_is_file_or_symlink_with_retry(path) {
+                // Re-stat with a bounded retry: a transient
+                // `is_file()`/`is_symlink()` miss (an atomic-rename write racing
+                // this fresh stat) must not silently skip a named file that
+                // `expand_search_paths` already confirmed present on disk.
                 self.client_manager
                     .ensure_and_wait_for_paths(std::slice::from_ref(path))
                     .await;
@@ -368,15 +382,6 @@ impl GlobServer {
                 if let Some(parent) = path.parent() {
                     touched.push(parent.to_path_buf());
                 }
-            } else if path.is_dir() {
-                let (output, files) = self
-                    .handle_glob_dir(path, input, exclude, cwd, parent_id)
-                    .await?;
-                full.push_str(&output);
-                touched.extend(files);
-                // The listed dir itself: catches add/remove/rename of an
-                // immediate entry (including subdirs) in the rendered listing.
-                touched.push(path.clone());
             }
             // Skip non-existent paths silently — shell expansion
             // shouldn't produce them, but be defensive.
@@ -1240,11 +1245,18 @@ fn path_is_file_or_symlink_with_retry_with(
 /// correctness path (a content edit advances the file mtime, not the parent dir
 /// mtime). Unreadable entries are skipped.
 ///
-/// Observations are keyed by the **literal** walked path — never canonicalized —
-/// so they agree with grep's (`WalkBuilder::new(root)`) and diagnostics'
-/// (`stat_walk`) literal walks. A symlink-to-dir arg is routed to the walk
-/// branch first (`is_dir()` follows symlinks) and walked at its literal path,
-/// yielding `linkdir/x` entries rather than the canonicalized `realdir/x`.
+/// Observations are keyed by each entry's **canonical** real path (falling back
+/// to the literal path only if `canonicalize` fails) so they agree with grep's
+/// (`WalkBuilder::new(root)`) and diagnostics' (`stat_walk`) walks, which run
+/// with `follow_links` **off** and therefore never descend an in-tree
+/// symlink-to-dir — they only ever observe the real path. Keying literally
+/// would double-key the same physical file (`linkdir/x` here, `realdir/x`
+/// there): the orphan literal entry is never re-observed by a non-following
+/// walk and gets phantom-reaped `Deleted` (WS31-review F2; reverses the pass-1
+/// "canonicalize-nowhere" call). A symlink target *outside* every root
+/// canonicalizes outside → [`resolve_root`] in the caller returns `None` → the
+/// entry is correctly dropped (following such a target is opt-in via
+/// `--follow-links`, fs-coherence ticket 07).
 fn collect_scoped_observations(
     resolved: &[PathBuf],
     input: &GlobInput,
@@ -1253,8 +1265,10 @@ fn collect_scoped_observations(
     let mut observed: Vec<(PathBuf, i64)> = Vec::new();
     for path in resolved {
         // Directories first — `is_dir()` follows symlinks, so a symlink-to-dir
-        // routes here and is walked at its literal path (no canonicalize),
-        // keeping its rel key consistent with grep/diagnostics.
+        // routes here and is walked at its literal path; each entry is then
+        // canonicalized to its real path so its rel key matches grep/diagnostics.
+        // This dir-first order matches `handle_literal_paths` so the listing and
+        // the nudge classify a symlink-to-dir the same way (WS31-review walk-2).
         if path.is_dir() {
             let walker = WalkBuilder::new(path)
                 .max_depth(Some(1))
@@ -1272,22 +1286,33 @@ fn collect_scoped_observations(
                     continue;
                 }
                 // Only regular files carry an mtime worth diffing; the per-file
-                // stat is the correctness path.
+                // stat is the correctness path. Key by the canonical real path.
                 if let Ok(md) = std::fs::metadata(&entry_path)
                     && md.is_file()
                 {
-                    observed.push((entry_path, mtime_nanos(&md)));
+                    observed.push((canonical_key(entry_path), mtime_nanos(&md)));
                 }
             }
         } else if path_is_file_or_symlink_with_retry(path) {
-            // An actual file or a symlink-to-file: record the literal path.
+            // An actual file or a symlink-to-file: record the canonical path.
             // A broken symlink stats as an error here and is skipped.
             if let Ok(md) = std::fs::metadata(path) {
-                observed.push((path.clone(), mtime_nanos(&md)));
+                observed.push((canonical_key(path.clone()), mtime_nanos(&md)));
             }
         }
     }
     observed
+}
+
+/// Canonicalizes an observed entry's path to its real path, falling back to the
+/// literal path if `canonicalize` fails (e.g. a TOCTOU removal between stat and
+/// canonicalize).
+///
+/// Used to key glob's changed-set observations by the same real path
+/// grep/diagnostics' non-following walks produce, so the same physical file is
+/// never double-keyed (WS31-review F2).
+fn canonical_key(path: PathBuf) -> PathBuf {
+    path.canonicalize().unwrap_or(path)
 }
 
 #[cfg(test)]
@@ -2560,7 +2585,6 @@ mod tests {
     /// path, so all three surfaces agree on `realdir/x.<EXT>`.
     #[test]
     #[cfg(unix)]
-    #[ignore = "RED: WS31-review-C C1; un-ignore in fix"]
     #[allow(clippy::expect_used, reason = "test assertions")]
     fn ws31_review_r5_symlinked_glob_arg_single_baseline_key() {
         use std::os::unix::fs::symlink;

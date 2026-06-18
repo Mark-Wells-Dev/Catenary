@@ -935,6 +935,83 @@ pub(crate) fn mtime_nanos(metadata: &std::fs::Metadata) -> i64 {
         .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
 }
 
+/// Number of fresh-stat attempts before treating a stat miss as genuine.
+///
+/// A transient `stat` miss races a sub-millisecond atomic-rename window (write
+/// temp + `rename`), so a few tight retries (no sleep) close the in-workflow
+/// case; a residual under a saturating concurrent-writer hammer is the
+/// documented concurrent-writer non-goal.
+pub(crate) const STAT_RETRY_ATTEMPTS: u32 = 3;
+
+/// Sentinel mtime for an enumerated present file whose observation stat missed.
+///
+/// Recorded in the changed-set observation set for a file a walk *enumerated as
+/// present* (passed its `is_file` decision) but whose fresh `metadata()` failed
+/// even after [`STAT_RETRY_ATTEMPTS`] retries. Keeping the file in the
+/// observation set means the reaping sweep never treats it as deleted
+/// (WS31-review H1); `i64::MIN` is below every real [`mtime_nanos`], so the diff
+/// never spuriously routes it as `Changed` against an existing baseline entry.
+pub(crate) const OBSERVED_STAT_MISS_MTIME: i64 = i64::MIN;
+
+/// Fetches `path`'s metadata, retrying a transient stat miss.
+///
+/// A changed-set observation push must not drop an enumerated present file just
+/// because its *fresh* `metadata()` raced an atomic rename (or briefly returned
+/// `EACCES`). The retry is bounded and sleepless: the rename window is
+/// sub-millisecond. A residual miss after the last attempt is handled by the
+/// caller with the [`OBSERVED_STAT_MISS_MTIME`] sentinel — never by omitting the
+/// file from the observation set (WS31-review H1).
+pub(crate) fn stat_with_retry(path: &Path) -> Option<std::fs::Metadata> {
+    observe_metadata_with(path, STAT_RETRY_ATTEMPTS, |p| p.metadata().ok())
+}
+
+/// The single per-file changed-set observation step shared by every walk
+/// surface (grep, diagnostics, glob): produce the file's `mtime` with a bounded
+/// retry, falling back to [`OBSERVED_STAT_MISS_MTIME`] on a residual miss so the
+/// enumerated-present file is **never omitted** from the observation set.
+///
+/// Centralizing this here keeps the three hand-rolled walk drivers from drifting
+/// again (WS31-review F1): the walker shape differs (parallel `WalkState` vs
+/// sequential `for entry`), but the per-entry "stat-with-retry, sentinel on
+/// miss, never omit" contract is identical and lives in one place.
+pub(crate) fn observe_mtime(path: &Path) -> i64 {
+    observe_mtime_with(path, STAT_RETRY_ATTEMPTS, |p| p.metadata().ok())
+}
+
+/// Retry loop for [`observe_mtime`], with the per-attempt metadata probe
+/// injected.
+///
+/// Production calls this via [`observe_mtime`] with the real `metadata()` probe
+/// and [`STAT_RETRY_ATTEMPTS`]; tests inject a stateful probe (miss on attempt
+/// 1, hit thereafter) to prove the loop actually retries, and a never-hit probe
+/// to prove the [`OBSERVED_STAT_MISS_MTIME`] sentinel is emitted (never an
+/// omission) — a regression to a single attempt, or to omitting the file, would
+/// surface here (WS31-review F1/H1).
+fn observe_mtime_with(
+    path: &Path,
+    attempts: u32,
+    probe: impl Fn(&Path) -> Option<std::fs::Metadata>,
+) -> i64 {
+    observe_metadata_with(path, attempts, probe)
+        .as_ref()
+        .map_or(OBSERVED_STAT_MISS_MTIME, mtime_nanos)
+}
+
+/// Retry loop for [`stat_with_retry`], with the per-attempt metadata probe
+/// injected.
+fn observe_metadata_with(
+    path: &Path,
+    attempts: u32,
+    probe: impl Fn(&Path) -> Option<std::fs::Metadata>,
+) -> Option<std::fs::Metadata> {
+    for _ in 0..attempts {
+        if let Some(md) = probe(path) {
+            return Some(md);
+        }
+    }
+    None
+}
+
 /// Intermediate result from a single-pass file scan.
 struct ScanResult {
     lines: usize,
@@ -1902,5 +1979,79 @@ mod tests {
         assert_eq!(mgr.diff_and_update(&root_b, &observed).changes.len(), 1);
         // Re-walking root A with the same mtime ⇒ nothing.
         assert!(mgr.diff_and_update(&root_a, &observed).is_empty());
+    }
+
+    /// C1/F1 — the shared per-file observation step (now used by `stat_walk`,
+    /// the diagnostics surface that lacked the H1 retry/sentinel) must NEVER omit
+    /// an enumerated present file on a stat miss: a residual miss yields the
+    /// `OBSERVED_STAT_MISS_MTIME` sentinel, not an omission. An omission would
+    /// drop the file from the observation set and a `reap=true` full walk would
+    /// then false-reap the live file as `Deleted` (WS31-review F1/H1).
+    ///
+    /// Driven via the `#[cfg(test)]` injectable probe seam (mirrors R2/L4): a
+    /// stateful probe deterministically fails the first call and succeeds later,
+    /// so the test pins (a) the sentinel on a never-hit miss, (b) recovery within
+    /// the full retry budget, and (c) retry-count sensitivity — a regression to
+    /// a single attempt would surface the sentinel where recovery is expected.
+    #[test]
+    fn ws31_review_c1_diagnostics_stat_miss_not_reaped() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const {
+            assert!(
+                STAT_RETRY_ATTEMPTS >= 2,
+                "the retry guard assumes more than one attempt"
+            );
+        }
+
+        let path = Path::new("/does/not/matter");
+
+        // (a) A probe that NEVER returns metadata ⇒ the sentinel, never omitted.
+        let sentinel = observe_mtime_with(path, STAT_RETRY_ATTEMPTS, |_| None);
+        assert_eq!(
+            sentinel, OBSERVED_STAT_MISS_MTIME,
+            "an enumerated present file whose stat keeps missing must record the \
+             OBSERVED_STAT_MISS_MTIME sentinel (so the reap sweep never deletes \
+             it), never be omitted"
+        );
+
+        // (b) A probe that misses on call 1 and hits thereafter ⇒ the full
+        // budget recovers the real mtime (a non-sentinel value).
+        let calls = AtomicUsize::new(0);
+        let probe = |p: &Path| {
+            if calls.fetch_add(1, Ordering::Relaxed) >= 1 {
+                std::fs::metadata(p).ok().or_else(|| {
+                    // The path does not exist; synthesize a hit by statting a real
+                    // file (this crate's Cargo.toml) so we get a genuine mtime.
+                    std::fs::metadata(env!("CARGO_MANIFEST_DIR")).ok()
+                })
+            } else {
+                None
+            }
+        };
+        let recovered = observe_mtime_with(path, STAT_RETRY_ATTEMPTS, probe);
+        assert_ne!(
+            recovered, OBSERVED_STAT_MISS_MTIME,
+            "the bounded retry must recover a miss that resolves on a later \
+             attempt (a real mtime, not the sentinel)"
+        );
+
+        // (c) Same fail-first probe, single attempt: no retry ⇒ the sentinel,
+        // pinning retry-count sensitivity (a STAT_RETRY_ATTEMPTS = 1 regression
+        // would surface here).
+        let calls = AtomicUsize::new(0);
+        let probe = |p: &Path| {
+            if calls.fetch_add(1, Ordering::Relaxed) >= 1 {
+                std::fs::metadata(env!("CARGO_MANIFEST_DIR")).ok()
+            } else {
+                let _ = p;
+                None
+            }
+        };
+        let single = observe_mtime_with(path, 1, probe);
+        assert_eq!(
+            single, OBSERVED_STAT_MISS_MTIME,
+            "a single attempt cannot recover a transient miss ⇒ sentinel"
+        );
     }
 }

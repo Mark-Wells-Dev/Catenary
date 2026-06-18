@@ -17,7 +17,9 @@ use std::sync::Arc;
 use tracing::debug;
 
 use super::NO_LSP_LABEL;
-use super::filesystem_manager::{FilesystemManager, mtime_nanos};
+use super::filesystem_manager::{
+    FilesystemManager, OBSERVED_STAT_MISS_MTIME, mtime_nanos, stat_with_retry,
+};
 use super::handler::display_path;
 use super::pagination::paginate;
 use crate::config::DispatchMethod;
@@ -1307,41 +1309,6 @@ impl GrepServer {
         Ok(RipgrepMatches::merge(parts))
     }
 }
-
-/// Number of fresh-stat attempts before treating a miss as genuine.
-///
-/// A transient `is_file()`/`stat` miss races a sub-millisecond atomic-rename
-/// window (write temp + `rename`), so a few tight retries (no sleep) close the
-/// in-workflow case; a residual under a saturating concurrent-writer hammer is
-/// the documented concurrent-writer non-goal.
-const STAT_RETRY_ATTEMPTS: u32 = 3;
-
-/// Fetches `path`'s metadata, retrying a transient stat miss.
-///
-/// The observation push (WS31 changed-set baseline) must not drop an enumerated
-/// present file just because its *fresh* `metadata()` raced an atomic rename (or
-/// briefly returned `EACCES`). The retry is bounded and sleepless: the rename
-/// window is sub-millisecond. A residual miss after the last attempt is handled
-/// by the caller with the [`OBSERVED_STAT_MISS_MTIME`] sentinel — never by
-/// omitting the file from the observation set (WS31-review H1).
-fn stat_with_retry(path: &Path) -> Option<std::fs::Metadata> {
-    for _ in 0..STAT_RETRY_ATTEMPTS {
-        if let Ok(md) = path.metadata() {
-            return Some(md);
-        }
-    }
-    None
-}
-
-/// Sentinel mtime for an enumerated present file whose observation stat missed.
-///
-/// Recorded in the changed-set observation set for a file the walk *enumerated
-/// as present* (passed the `is_file` decision) but whose fresh `metadata()`
-/// failed even after [`stat_with_retry`]. Keeping the file in the observation
-/// set means the reaping sweep never treats it as deleted (WS31-review H1);
-/// `i64::MIN` is below every real `mtime_nanos`, so the diff never spuriously
-/// routes it as `Changed` against an existing baseline entry.
-const OBSERVED_STAT_MISS_MTIME: i64 = i64::MIN;
 
 // ─── Rendering ─────────────────────────────────────────────────────────
 

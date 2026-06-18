@@ -8,7 +8,7 @@
 //! first, pull fallback), severity filtering, noise filtering, quick-fix
 //! collection, and compact formatting.
 
-use super::filesystem_manager::{FilesystemManager, mtime_nanos};
+use super::filesystem_manager::{FilesystemManager, observe_mtime};
 use super::path_security::PathValidator;
 use crate::lsp::server::LspServer;
 use crate::lsp::settle::{IdleDetector, SettleResult, await_idle};
@@ -837,6 +837,16 @@ async fn drain_pipe(server: &LspServer) {
 /// the server's index rather than file contents, so this is a dedicated
 /// stat-walk — the per-file `mtime` is the only thing read. The manager scopes
 /// the result to the union of registered watch globs before diffing.
+///
+/// Every enumerated present file is recorded via the shared
+/// [`observe_mtime`](super::filesystem_manager::observe_mtime) helper: it
+/// retries a transient stat miss and falls back to the
+/// [`OBSERVED_STAT_MISS_MTIME`](super::filesystem_manager::OBSERVED_STAT_MISS_MTIME)
+/// sentinel — it is **never** omitted. Omitting an enumerated present file would
+/// drop it from the observation set, and this result feeds
+/// `nudge_changed_set(..., reap=true)` (a `Full` walk for a covered root), so a
+/// stat-miss omission would false-reap a live file as `Deleted` (WS31-review
+/// F1/H1). The same per-entry contract grep's walker uses.
 fn stat_walk(root: &std::path::Path) -> Vec<(PathBuf, i64)> {
     let mut observed = Vec::new();
     let walker = WalkBuilder::new(root).git_ignore(true).hidden(true).build();
@@ -848,9 +858,7 @@ fn stat_walk(root: &std::path::Path) -> Vec<(PathBuf, i64)> {
         let Ok(rel) = path.strip_prefix(root) else {
             continue;
         };
-        if let Ok(md) = path.metadata() {
-            observed.push((rel.to_path_buf(), mtime_nanos(&md)));
-        }
+        observed.push((rel.to_path_buf(), observe_mtime(path)));
     }
     observed
 }

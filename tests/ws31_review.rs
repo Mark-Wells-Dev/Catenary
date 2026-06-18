@@ -951,11 +951,9 @@ fn ws31_review_r5_edited_then_deleted_routes_delete() -> Result<()> {
 /// reaps the orphan `linkdir/x.<EXT>` as a phantom `Deleted(3)` — telling every
 /// covering server a live file is gone.
 ///
-/// RED today: the full grep routes `Deleted(3)` for `linkdir/x.<EXT>`. The
-/// decided fix canonicalizes glob's observed entries to the real path, so both
+/// The fix canonicalizes glob's observed entries to the real path, so both
 /// surfaces key `realdir/x.<EXT>` and no phantom `Deleted` is routed.
 #[test]
-#[ignore = "RED: WS31-review-C C1; un-ignore in fix"]
 fn ws31_review_c1_symlink_dir_glob_single_canonical_key() -> Result<()> {
     use std::os::unix::fs::symlink;
 
