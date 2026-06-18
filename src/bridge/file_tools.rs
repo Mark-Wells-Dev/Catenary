@@ -2624,9 +2624,10 @@ mod tests {
 
         let observed = collect_scoped_observations(std::slice::from_ref(&linkdir), &input, None);
 
-        // RED today: the contained file must be observed at its CANONICAL
-        // `realdir/x.<EXT>` path (the grep/diagnostics baseline key). Today glob
-        // records the literal link-traversed `linkdir/x.<EXT>` instead.
+        // Regression guard: the contained file must be observed at its CANONICAL
+        // `realdir/x.<EXT>` path (the grep/diagnostics baseline key) — glob
+        // canonicalizes its entries so it matches. Pre-fix (C1/F2) it recorded
+        // the literal link-traversed `linkdir/x.<EXT>` instead.
         assert!(
             observed.iter().any(|(p, _)| *p == canonical_file),
             "glob's scoped observation must record the contained file at its \

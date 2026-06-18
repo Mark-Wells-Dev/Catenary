@@ -1037,10 +1037,10 @@ fn ws31_review_c1_symlink_dir_glob_single_canonical_key() -> Result<()> {
     let log = std::fs::read_to_string(&log_path).unwrap_or_default();
     let changes = watched_file_changes(&log);
 
-    // Key assertion (RED today): the orphan `linkdir/x.<EXT>` baseline key must
-    // NOT be reaped — it is the same physical file as `realdir/x.<EXT>`, which
-    // is present on disk. Pre-fix glob keys it literally and the full grep reaps
-    // it as a phantom `Deleted(3)`.
+    // Key assertion (regression guard): the orphan `linkdir/x.<EXT>` baseline
+    // key must NOT be reaped — it is the same physical file as `realdir/x.<EXT>`,
+    // which is present on disk. Pre-fix (C1/F2) glob keyed it literally and the
+    // full grep reaped it as a phantom `Deleted(3)`.
     assert!(
         !changes.iter().any(|(u, t)| *u == link_uri && *t == 3),
         "an in-tree symlink-to-dir glob arg must not produce a phantom Deleted \
