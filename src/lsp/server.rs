@@ -1171,6 +1171,56 @@ mod tests {
         assert!(!w.covers(rel, abs, ChangeKind::Changed));
     }
 
+    #[test]
+    #[ignore = "RED: WS31-review-C C2; un-ignore in fix"]
+    fn ws31_review_c2_watcher_star_no_cross_segment() {
+        // A single-`*` segment-scoped pattern must NOT cross `/` (LSP 3.17
+        // semantics, `literal_separator(true)`). Today `ParsedWatcher` compiles
+        // with globset's default `literal_separator(false)`, so `*` crosses
+        // segments and the nested path is wrongly covered.
+        let w =
+            ParsedWatcher::from_value(&json!({ "globPattern": "*.json" })).expect("valid watcher");
+
+        // Top-level file matches.
+        let top_rel = std::path::Path::new("b.json");
+        let top_abs = std::path::Path::new("/root/b.json");
+        assert!(
+            w.covers(top_rel, top_abs, ChangeKind::Changed),
+            "*.json must cover a top-level b.json"
+        );
+
+        // Nested file must NOT match — `*` does not cross a segment boundary.
+        let nested_rel = std::path::Path::new("a/b.json");
+        let nested_abs = std::path::Path::new("/root/a/b.json");
+        assert!(
+            !w.covers(nested_rel, nested_abs, ChangeKind::Changed),
+            "*.json must NOT cover a nested a/b.json (single * does not cross /)"
+        );
+    }
+
+    #[test]
+    #[ignore = "RED: WS31-review-C C2; un-ignore in fix"]
+    fn ws31_review_c2_watcher_baseuri_percent_decoded() {
+        // A relative-pattern watcher whose baseUri is percent-encoded must
+        // decode to the real path so its base prefix strips against the actual
+        // absolute path. Today `uri_to_path` leaves the literal `%20`, so the
+        // strip_prefix fails and nothing matches.
+        let w = ParsedWatcher::from_value(&json!({
+            "globPattern": {
+                "baseUri": "file:///home/u/my%20project",
+                "pattern": "**/*.rs"
+            }
+        }))
+        .expect("valid watcher");
+
+        let rel = std::path::Path::new("src/lib.rs");
+        let abs = std::path::Path::new("/home/u/my project/src/lib.rs");
+        assert!(
+            w.covers(rel, abs, ChangeKind::Changed),
+            "baseUri %20 must decode to a space so the base prefix matches"
+        );
+    }
+
     // ── Identity accessor tests ──────────────────────────────────────
 
     #[test]
