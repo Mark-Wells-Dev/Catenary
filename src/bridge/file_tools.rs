@@ -1205,8 +1205,25 @@ const STAT_RETRY_ATTEMPTS: u32 = 3;
 /// times (no sleep — the rename window is sub-millisecond) avoids silently
 /// skipping a named file that is present on disk.
 fn path_is_file_or_symlink_with_retry(path: &Path) -> bool {
-    for _ in 0..STAT_RETRY_ATTEMPTS {
-        if path.is_file() || path.is_symlink() {
+    path_is_file_or_symlink_with_retry_with(path, STAT_RETRY_ATTEMPTS, |p| {
+        p.is_file() || p.is_symlink()
+    })
+}
+
+/// Retry loop body for [`path_is_file_or_symlink_with_retry`], with the
+/// per-attempt file/symlink probe injected.
+///
+/// The production helper calls this with the real `is_file() || is_symlink()`
+/// probe and [`STAT_RETRY_ATTEMPTS`]; tests inject a stateful probe (miss on
+/// attempt 1, hit thereafter) to prove the loop actually retries — a regression
+/// to a single attempt would no longer recover a transient miss.
+fn path_is_file_or_symlink_with_retry_with(
+    path: &Path,
+    attempts: u32,
+    probe: impl Fn(&Path) -> bool,
+) -> bool {
+    for _ in 0..attempts {
+        if probe(path) {
             return true;
         }
     }
@@ -1284,6 +1301,43 @@ mod tests {
         let input: GlobInput =
             serde_json::from_value(serde_json::json!({"paths": ["src/"]})).expect("deserialize");
         assert_eq!(input.page, 1, "default page should be 1");
+    }
+
+    #[test]
+    fn ws31_review_r2_live_retry_recovers_transient_miss() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // A stateful probe that misses on call 1 and hits on every later call —
+        // the deterministic transient miss→hit a real atomic-rename race would
+        // produce. With the full `STAT_RETRY_ATTEMPTS` budget the loop must
+        // recover; with a single attempt it must NOT — so the guard is sensitive
+        // to the retry count (a regression to `attempts == 1` fails here, where a
+        // terminal file/absent test would still pass).
+        const {
+            assert!(
+                STAT_RETRY_ATTEMPTS >= 2,
+                "the retry guard assumes more than one attempt"
+            );
+        }
+
+        let calls = AtomicUsize::new(0);
+        let probe = |_: &Path| calls.fetch_add(1, Ordering::Relaxed) >= 1;
+        let path = Path::new("/does/not/matter");
+
+        assert!(
+            path_is_file_or_symlink_with_retry_with(path, STAT_RETRY_ATTEMPTS, probe),
+            "the bounded retry must recover a miss that resolves on a later attempt"
+        );
+
+        // Same probe, fresh counter, single attempt: the first call misses and
+        // there is no retry, so the loop reports absent — pinning the retry-count
+        // sensitivity (a `STAT_RETRY_ATTEMPTS = 1` regression would surface here).
+        let calls = AtomicUsize::new(0);
+        let probe = |_: &Path| calls.fetch_add(1, Ordering::Relaxed) >= 1;
+        assert!(
+            !path_is_file_or_symlink_with_retry_with(path, 1, probe),
+            "a single attempt cannot recover a transient miss"
+        );
     }
 
     // ─── is_enrichment_eligible_entry ────────────────────────────────

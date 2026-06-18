@@ -220,8 +220,19 @@ const STAT_RETRY_ATTEMPTS: u32 = 3;
 /// the rename window is sub-millisecond — so a present path that lost a single
 /// stat race is kept rather than silently treated as a missing glob.
 fn path_exists_with_retry(path: &Path) -> bool {
-    for _ in 0..STAT_RETRY_ATTEMPTS {
-        if path.symlink_metadata().is_ok() {
+    path_exists_with_retry_with(path, STAT_RETRY_ATTEMPTS, |p| p.symlink_metadata().is_ok())
+}
+
+/// Retry loop body for [`path_exists_with_retry`], with the per-attempt
+/// existence probe injected.
+///
+/// The production helper calls this with the real `symlink_metadata` probe and
+/// [`STAT_RETRY_ATTEMPTS`]; tests inject a stateful probe (e.g. miss on attempt
+/// 1, hit thereafter) to prove the loop actually retries — a regression to a
+/// single attempt would no longer recover a transient miss.
+fn path_exists_with_retry_with(path: &Path, attempts: u32, probe: impl Fn(&Path) -> bool) -> bool {
+    for _ in 0..attempts {
+        if probe(path) {
             return true;
         }
     }
@@ -1148,6 +1159,43 @@ mod tests {
         assert!(
             path_exists_with_retry(&link),
             "a broken symlink is present (symlink_metadata succeeds)"
+        );
+    }
+
+    #[test]
+    fn ws31_review_r2_live_retry_recovers_transient_miss() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // A stateful probe that misses on call 1 and hits on every later call —
+        // the deterministic transient miss→hit a real atomic-rename race would
+        // produce. With the full `STAT_RETRY_ATTEMPTS` budget the loop must
+        // recover; with a single attempt it must NOT — so the guard is sensitive
+        // to the retry count (a regression to `attempts == 1` fails here, where a
+        // terminal present/absent test would still pass).
+        const {
+            assert!(
+                STAT_RETRY_ATTEMPTS >= 2,
+                "the retry guard assumes more than one attempt"
+            );
+        }
+
+        let calls = AtomicUsize::new(0);
+        let probe = |_: &Path| calls.fetch_add(1, Ordering::Relaxed) >= 1;
+        let path = Path::new("/does/not/matter");
+
+        assert!(
+            path_exists_with_retry_with(path, STAT_RETRY_ATTEMPTS, probe),
+            "the bounded retry must recover a miss that resolves on a later attempt"
+        );
+
+        // Same probe, fresh counter, single attempt: the first call misses and
+        // there is no retry, so the loop reports absent — pinning the retry-count
+        // sensitivity (a `STAT_RETRY_ATTEMPTS = 1` regression would surface here).
+        let calls = AtomicUsize::new(0);
+        let probe = |_: &Path| calls.fetch_add(1, Ordering::Relaxed) >= 1;
+        assert!(
+            !path_exists_with_retry_with(path, 1, probe),
+            "a single attempt cannot recover a transient miss"
         );
     }
 

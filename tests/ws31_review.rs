@@ -320,27 +320,16 @@ fn ws31_review_r2_traversed_symlink_file_is_skipped() -> Result<()> {
     Ok(())
 }
 
-// ── R2 (L4) — live-retry transient-miss recovery: NOT WRITTEN ─────────────
+// ── R2 (L4) — live-retry transient-miss recovery (landed in Phase B) ──────
 //
-// L4 asks for a test proving the live retry helpers actually RETRY — a transient
-// miss-then-hit that recovers, such that the test would FAIL if
-// `STAT_RETRY_ATTEMPTS` were 1. This was NOT written: it cannot be done
-// deterministically and test-only without a production change.
-//
-// Both live helpers —
-//   `session.rs::path_exists_with_retry`        (uses `symlink_metadata`)
-//   `file_tools.rs::path_is_file_or_symlink_with_retry` (uses `is_file`/`is_symlink`)
-// — and the (dead, walker-only) `grep_server.rs::stat_is_file_with_retry` loop
-// `0..STAT_RETRY_ATTEMPTS` with NO sleep and NO yield between attempts (their
-// doc-comments are explicit: "the rename window is sub-millisecond" → tight
-// back-to-back syscalls). With no inter-attempt window there is no deterministic
-// way for a background thread to flip a path from miss→hit between attempt 1 and
-// a later attempt: any such race is timing-dependent and would be flaky, not a
-// GREEN guard. The helpers are private `fn`s taking `&Path` with no injectable
-// stat/clock seam. So a retry-count-sensitive test (one that fails at
-// `STAT_RETRY_ATTEMPTS == 1`) requires a production change — out of scope for
-// this add-tests-only pass. See the scout report for the proposed minimal seam
-// and alternatives.
+// The L4 guard `ws31_review_r2_live_retry_recovers_transient_miss` lives next to
+// the helpers it covers, in the `#[cfg(test)]` modules of
+// `src/bridge/session.rs` (`path_exists_with_retry`) and
+// `src/bridge/file_tools.rs` (`path_is_file_or_symlink_with_retry`). Phase B gave
+// each helper a `#[cfg(test)]` injectable-probe seam (an inner `_with(path,
+// attempts, probe)` fn); the guard injects a fail-then-succeed probe to prove the
+// retry loop recovers, and asserts it fails at `attempts == 1` (retry-count-
+// sensitive). The walker's dead `stat_is_file_with_retry` was removed (M3).
 
 /// Probes whether the directory-permission seam is ineffective in this
 /// environment — i.e. a fresh stat of a file under a `0o400` (no-execute) parent

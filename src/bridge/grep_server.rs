@@ -1230,16 +1230,26 @@ impl GrepServer {
                         return WalkState::Continue;
                     }
                     // File decision: trust the walker's cached `d_type` (no
-                    // fresh stat); only re-stat when the type is unknown, and
-                    // retry a transient miss before dropping the entry — never
-                    // drop a file solely because a fresh stat raced a rename.
-                    let is_file = entry
-                        .file_type()
-                        .map_or_else(|| stat_is_file_with_retry(path), |ft| ft.is_file());
-                    if !is_file {
-                        // A named/enumerated entry that still isn't a file after
-                        // retry is a genuine non-file (socket, broken symlink) —
-                        // debug, not a user-facing warning.
+                    // fresh stat). `DirEntry::file_type()` is `None` only for
+                    // stdin, which this filesystem walker never yields, so the
+                    // type is always known here — no re-stat (and no transient
+                    // miss to retry): the cached `d_type` is exactly what fixes
+                    // the rename race (bug 34/35) by never re-statting.
+                    //
+                    // A *traversed* symlink-to-file is reported by the `ignore`
+                    // walker with its **own** type (`is_file()==false`), so it is
+                    // skipped here by default — ripgrep parity (`-L` off). The
+                    // skip is intentional: an in-tree symlink target is still
+                    // searched via its real path (following it would yield
+                    // duplicate matches under both paths), and the only gap (a
+                    // target outside the walked set) is opt-in via
+                    // `--follow-links` (planned, fs-coherence ticket 07).
+                    // Explicitly-named symlink args are unaffected (the root
+                    // entry follows and stores the target type).
+                    if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+                        // A non-file entry (directory handled above, plus
+                        // sockets, broken or traversed symlinks) — debug, not a
+                        // user-facing warning.
                         debug!("grep: skipping non-file entry {}", path.display());
                         return WalkState::Continue;
                     }
@@ -1309,32 +1319,14 @@ impl GrepServer {
 /// the documented concurrent-writer non-goal.
 const STAT_RETRY_ATTEMPTS: u32 = 3;
 
-/// Whether `path` resolves to a regular file, retrying a transient stat miss.
-///
-/// Used by the parallel walker when the `ignore` walker could not supply a
-/// cached `d_type`: a fresh `is_file()` can transiently fail when the entry it
-/// just enumerated is replaced by an atomic rename. Retrying a bounded number
-/// of times (no sleep — the rename window is sub-millisecond) avoids dropping a
-/// file that is present on disk. A path that still isn't a file after the last
-/// attempt is a genuine non-file.
-fn stat_is_file_with_retry(path: &Path) -> bool {
-    for _ in 0..STAT_RETRY_ATTEMPTS {
-        if path.is_file() {
-            return true;
-        }
-    }
-    false
-}
-
 /// Fetches `path`'s metadata, retrying a transient stat miss.
 ///
 /// The observation push (WS31 changed-set baseline) must not drop an enumerated
 /// present file just because its *fresh* `metadata()` raced an atomic rename (or
-/// briefly returned `EACCES`). Same bounded, sleepless retry as
-/// [`stat_is_file_with_retry`]: the rename window is sub-millisecond. A residual
-/// miss after the last attempt is handled by the caller with the
-/// [`OBSERVED_STAT_MISS_MTIME`] sentinel — never by omitting the file from the
-/// observation set (WS31-review H1).
+/// briefly returned `EACCES`). The retry is bounded and sleepless: the rename
+/// window is sub-millisecond. A residual miss after the last attempt is handled
+/// by the caller with the [`OBSERVED_STAT_MISS_MTIME`] sentinel — never by
+/// omitting the file from the observation set (WS31-review H1).
 fn stat_with_retry(path: &Path) -> Option<std::fs::Metadata> {
     for _ in 0..STAT_RETRY_ATTEMPTS {
         if let Ok(md) = path.metadata() {
