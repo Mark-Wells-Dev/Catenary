@@ -933,3 +933,98 @@ fn ws31_review_r5_edited_then_deleted_routes_delete() -> Result<()> {
     );
     Ok(())
 }
+
+// ── C1 (F2) — in-tree symlink-to-dir glob arg double-keys the baseline ─────
+
+/// F2 — a glob of an in-tree symlink-to-dir must key its contained file by the
+/// **canonical** real path, so a later full walk (grep/diagnostics) does not
+/// phantom-reap it as `Deleted`.
+///
+/// `collect_scoped_observations` walks a symlink-to-dir glob arg (`linkdir/`) at
+/// its literal path and (pre-fix) baselines the contained file under
+/// `linkdir/x.<EXT>`. But grep (`WalkBuilder::new(root)`) and diagnostics
+/// (`stat_walk`) walk the canonical root with `follow_links` **off**, so they
+/// never descend the in-tree link — they observe only the real path
+/// `realdir/x.<EXT>`. The same physical file is thus baselined under two keys:
+/// the glob's `linkdir/x.<EXT>` and the others' `realdir/x.<EXT>`. glob never
+/// reaps, but the next pathless full grep observes only `realdir/x.<EXT>` and
+/// reaps the orphan `linkdir/x.<EXT>` as a phantom `Deleted(3)` — telling every
+/// covering server a live file is gone.
+///
+/// RED today: the full grep routes `Deleted(3)` for `linkdir/x.<EXT>`. The
+/// decided fix canonicalizes glob's observed entries to the real path, so both
+/// surfaces key `realdir/x.<EXT>` and no phantom `Deleted` is routed.
+#[test]
+#[ignore = "RED: WS31-review-C C1; un-ignore in fix"]
+fn ws31_review_c1_symlink_dir_glob_single_canonical_key() -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir()?;
+    // Canonicalize the tempdir base so the ONLY symlink in play is `linkdir`
+    // (some platforms route `/tmp` through a symlink; canonicalizing keeps the
+    // root-relative keys robust).
+    let base = dir.path().canonicalize()?;
+    let log_path = base.join("notifications.jsonl");
+
+    let realdir = base.join("realdir");
+    std::fs::create_dir(&realdir)?;
+    let real_file = realdir.join(format!("x.{MOCK_LANG}"));
+    std::fs::write(&real_file, "needle\n")?;
+
+    let linkdir = base.join("linkdir");
+    symlink(&realdir, &linkdir)?;
+
+    let log_arg = log_path.to_str().context("log path")?;
+    // kind 7 (ALL) ⇒ registers Delete, so a spurious `Deleted` IS routed/recorded.
+    let lsp = mockls_lsp_arg(
+        MOCK_LANG,
+        &format!(
+            "--register-file-watchers --watcher-glob **/*.{MOCK_LANG} \
+             --watcher-kind 7 --notification-log {log_arg}"
+        ),
+    );
+    let root = base.to_str().context("root path")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    // Seed the per-root baseline via a glob of the symlinked dir arg. Pre-fix
+    // this keys the contained file under the literal `linkdir/x.<EXT>`.
+    let linkdir_arg = linkdir.to_str().context("linkdir path")?;
+    let _ = bridge.call_tool_text("glob", &json!({ "paths": [linkdir_arg] }))?;
+    std::thread::sleep(Duration::from_millis(150));
+
+    // Pathless full grep: the harness injects cwd=root, so ripgrep walks the
+    // canonical root WITHOUT following `linkdir`, observing only
+    // `realdir/x.<EXT>`. The reap sweep then fires over the baseline.
+    let _ = bridge.call_tool_text("grep", &json!({ "pattern": "needle" }))?;
+
+    drop(bridge);
+    std::thread::sleep(Duration::from_millis(300));
+
+    let link_uri = format!("file://{}/linkdir/x.{MOCK_LANG}", base.display());
+    let real_uri = format!("file://{}/realdir/x.{MOCK_LANG}", base.display());
+    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let changes = watched_file_changes(&log);
+
+    // Key assertion (RED today): the orphan `linkdir/x.<EXT>` baseline key must
+    // NOT be reaped — it is the same physical file as `realdir/x.<EXT>`, which
+    // is present on disk. Pre-fix glob keys it literally and the full grep reaps
+    // it as a phantom `Deleted(3)`.
+    assert!(
+        !changes.iter().any(|(u, t)| *u == link_uri && *t == 3),
+        "an in-tree symlink-to-dir glob arg must not produce a phantom Deleted \
+         for linkdir/x.<EXT> — it is the same file as realdir/x.<EXT>, present on \
+         disk. changes={changes:?}, log:\n{log}"
+    );
+    // Companion guard: the real file IS tracked under its canonical key (so the
+    // fix can't trivially pass by making glob stop nudging entirely). It enters
+    // the baseline as Created(1) on the second (full-grep) walk.
+    assert!(
+        changes
+            .iter()
+            .any(|(u, t)| *u == real_uri && (*t == 1 || *t == 2)),
+        "the contained file must be tracked under its canonical realdir key \
+         (Created(1) or Changed(2)). changes={changes:?}, log:\n{log}"
+    );
+    Ok(())
+}

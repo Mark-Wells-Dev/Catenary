@@ -2544,32 +2544,23 @@ mod tests {
 
     // ─── collect_scoped_observations — canonicalization divergence (R5 L7) ──
 
-    /// L7 (RED) — for a symlinked directory arg, `collect_scoped_observations`
-    /// must yield the contained file at its LITERAL `linkdir/x.<EXT>` path,
-    /// consistent with grep's and diagnostics' literal walks (canonicalize-
-    /// nowhere) — not the canonicalized `realdir/x.<EXT>`.
+    /// C1/F2 — for a symlinked directory arg, `collect_scoped_observations` must
+    /// yield the contained file at its CANONICAL `realdir/x.<EXT>` path, matching
+    /// grep's (`WalkBuilder::new(root)`) and diagnostics' (`stat_walk`) walks,
+    /// which never descend an in-tree symlink-to-dir (`follow_links` off) and so
+    /// observe only the real path.
     ///
-    /// grep and diagnostics walk the literal arg/root (e.g. `stat_walk` uses
-    /// `WalkBuilder::new(root)` with no canonicalize), so their baseline key for
-    /// the file is `linkdir/x.<EXT>`. glob diverges: the dir branch does
-    /// `let Ok(canonical) = path.canonicalize()` and walks `canonical`
-    /// (`file_tools.rs:1237`), so it would surface `realdir/x.<EXT>` — a
-    /// different baseline key. This baseline-key divergence is the L7 bug.
-    ///
-    /// NOTE on the assertion shape (deviation from the ticket's
-    /// `starts_with(&linkdir)`): today the symlinked-dir arg never even reaches
-    /// the dir/canonicalize branch — `path_is_file_or_symlink_with_retry`
-    /// returns true for the symlink itself (`linkdir.is_symlink()`), so the
-    /// FIRST branch pushes the bare `linkdir` symlink leaf (the contained file
-    /// is never observed). A `starts_with(&linkdir)` check would false-PASS on
-    /// that bare-leaf entry, so this test asserts the EXACT file path
-    /// `linkdir/x.<EXT>` instead. That is absent under BOTH current branches
-    /// (bare `linkdir` from the symlink-leaf branch; `realdir/x.<EXT>` from the
-    /// canonicalizing dir branch) ⇒ RED today. The decided canonicalize-nowhere
-    /// fix walks `linkdir` directly and yields `linkdir/x.<EXT>` ⇒ GREEN;
-    /// un-ignore this test in the fix.
+    /// This REVERSES the pass-1 "canonicalize-nowhere" call (L7). The pass-1
+    /// premise — that grep/diagnostics key the file under `linkdir/x.<EXT>` — was
+    /// wrong: those walks never follow the in-tree link, so they only ever
+    /// produce `realdir/x.<EXT>`. Keying glob's observation literally
+    /// (`linkdir/x.<EXT>`) double-keyed the same physical file, and the orphan
+    /// `linkdir/x.<EXT>` baseline entry was phantom-reaped by the next full walk
+    /// (F2). The decided fix canonicalizes glob's observed entries to the real
+    /// path, so all three surfaces agree on `realdir/x.<EXT>`.
     #[test]
     #[cfg(unix)]
+    #[ignore = "RED: WS31-review-C C1; un-ignore in fix"]
     #[allow(clippy::expect_used, reason = "test assertions")]
     fn ws31_review_r5_symlinked_glob_arg_single_baseline_key() {
         use std::os::unix::fs::symlink;
@@ -2587,8 +2578,10 @@ mod tests {
 
         let linkdir = base.join("linkdir");
         symlink(&realdir, &linkdir).expect("create linkdir symlink");
-        // The literal path grep/diagnostics would record for the contained file.
+        // The literal (link-traversed) path glob USED to record — the bug.
         let literal_file = linkdir.join("x.ws31ext");
+        // The canonical path grep/diagnostics record — the single correct key.
+        let canonical_file = realdir.join("x.ws31ext");
 
         // include_hidden / include_gitignored so neither visibility filter hides
         // the entry; the file itself is non-hidden, but this keeps it unambiguous.
@@ -2600,23 +2593,22 @@ mod tests {
 
         let observed = collect_scoped_observations(std::slice::from_ref(&linkdir), &input, None);
 
-        // RED today: the contained file must be observed at its LITERAL
-        // `linkdir/x.<EXT>` path (the grep/diagnostics baseline key). Today it is
-        // not — the symlink-leaf branch records bare `linkdir`, and the dir branch
-        // would record canonicalized `realdir/x.<EXT>`; neither equals this.
+        // RED today: the contained file must be observed at its CANONICAL
+        // `realdir/x.<EXT>` path (the grep/diagnostics baseline key). Today glob
+        // records the literal link-traversed `linkdir/x.<EXT>` instead.
         assert!(
-            observed.iter().any(|(p, _)| *p == literal_file),
+            observed.iter().any(|(p, _)| *p == canonical_file),
             "glob's scoped observation must record the contained file at its \
-             literal path (linkdir/x.<EXT>), consistent with grep/diagnostics — \
-             not the canonicalized realdir path; got: {observed:?}"
+             CANONICAL path (realdir/x.<EXT>), matching grep/diagnostics' \
+             non-following walks; got: {observed:?}"
         );
 
-        // Make the divergence explicit: no observation should surface under the
-        // canonicalized realdir path once glob walks the literal linkdir.
+        // The divergence must be gone: no observation under the literal
+        // link-traversed path once glob canonicalizes its entries.
         assert!(
-            !observed.iter().any(|(p, _)| p.starts_with(&realdir)),
-            "no observation should surface under the canonicalized realdir path \
-             once glob walks the literal linkdir; got: {observed:?}"
+            !observed.iter().any(|(p, _)| *p == literal_file),
+            "no observation should surface under the literal link-traversed path \
+             once glob canonicalizes its entries; got: {observed:?}"
         );
     }
 }
