@@ -1222,6 +1222,12 @@ fn path_is_file_or_symlink_with_retry(path: &Path) -> bool {
 /// matches what the listing surfaces. Per-file stats are the portable
 /// correctness path (a content edit advances the file mtime, not the parent dir
 /// mtime). Unreadable entries are skipped.
+///
+/// Observations are keyed by the **literal** walked path — never canonicalized —
+/// so they agree with grep's (`WalkBuilder::new(root)`) and diagnostics'
+/// (`stat_walk`) literal walks. A symlink-to-dir arg is routed to the walk
+/// branch first (`is_dir()` follows symlinks) and walked at its literal path,
+/// yielding `linkdir/x` entries rather than the canonicalized `realdir/x`.
 fn collect_scoped_observations(
     resolved: &[PathBuf],
     input: &GlobInput,
@@ -1229,26 +1235,22 @@ fn collect_scoped_observations(
 ) -> Vec<(PathBuf, i64)> {
     let mut observed: Vec<(PathBuf, i64)> = Vec::new();
     for path in resolved {
-        if path_is_file_or_symlink_with_retry(path) {
-            if let Ok(md) = std::fs::metadata(path) {
-                observed.push((path.clone(), mtime_nanos(&md)));
-            }
-        } else if path.is_dir() {
-            let Ok(canonical) = path.canonicalize() else {
-                continue;
-            };
-            let walker = WalkBuilder::new(&canonical)
+        // Directories first — `is_dir()` follows symlinks, so a symlink-to-dir
+        // routes here and is walked at its literal path (no canonicalize),
+        // keeping its rel key consistent with grep/diagnostics.
+        if path.is_dir() {
+            let walker = WalkBuilder::new(path)
                 .max_depth(Some(1))
                 .git_ignore(!input.include_gitignored)
                 .hidden(!input.include_hidden)
                 .build();
             for entry in walker.flatten() {
                 let entry_path = entry.into_path();
-                if entry_path.as_path() == canonical {
+                if entry_path.as_path() == path.as_path() {
                     continue;
                 }
                 if let Some(rg) = exclude
-                    && rg.is_match(&entry_path, &canonical)
+                    && rg.is_match(&entry_path, path)
                 {
                     continue;
                 }
@@ -1259,6 +1261,12 @@ fn collect_scoped_observations(
                 {
                     observed.push((entry_path, mtime_nanos(&md)));
                 }
+            }
+        } else if path_is_file_or_symlink_with_retry(path) {
+            // An actual file or a symlink-to-file: record the literal path.
+            // A broken symlink stats as an error here and is skipped.
+            if let Ok(md) = std::fs::metadata(path) {
+                observed.push((path.clone(), mtime_nanos(&md)));
             }
         }
     }
@@ -2507,7 +2515,6 @@ mod tests {
     /// fix walks `linkdir` directly and yields `linkdir/x.<EXT>` ⇒ GREEN;
     /// un-ignore this test in the fix.
     #[test]
-    #[ignore = "RED: WS31-review R5; un-ignore in fix"]
     #[cfg(unix)]
     #[allow(clippy::expect_used, reason = "test assertions")]
     fn ws31_review_r5_symlinked_glob_arg_single_baseline_key() {

@@ -653,7 +653,11 @@ impl SymbolIndex {
     /// 2. The source file's `mtime_nanos`, re-stat-ed and compared (`!=`)
     ///    against the value recorded at cache time — catches a host
     ///    `Edit`/`Write` that bumps no generation, and a stat failure (file
-    ///    removed). Mirrors [`ResultCache`]'s witness-mtime check.
+    ///    removed). Mirrors [`ResultCache`]'s witness-mtime check. A cached
+    ///    `source_mtime` of `None` (the stat failed at cache time) is treated
+    ///    as an always-miss: comparing it to a still-failing read stat would
+    ///    leave `None == None` and serve an unstattable entry forever, so the
+    ///    entry is evicted before the `!=` compare.
     ///
     /// Returns `None` on miss or staleness (evicts the stale entry). Returns
     /// a clone because a stale hit requires mutable access to evict the entry.
@@ -666,6 +670,14 @@ impl SymbolIndex {
 
         // Generation gate — catches sed/diagnostics/explicit invalidation.
         if entry.witness.generation != fs_manager.root_generation(&entry.witness.root) {
+            self.enrichment_cache.remove(key);
+            return None;
+        }
+
+        // A cached `None` source mtime can never be confirmed fresh: a
+        // still-failing read stat leaves `None == None` and would serve an
+        // unstattable entry forever. Treat it as an always-miss.
+        if entry.witness.source_mtime.is_none() {
             self.enrichment_cache.remove(key);
             return None;
         }
@@ -1581,15 +1593,24 @@ mod tests {
     #[allow(clippy::expect_used, reason = "test assertions")]
     #[test]
     fn enrichment_cache_hit() {
-        let mut index = SymbolIndex::new().expect("create index");
-        let fs = crate::bridge::filesystem_manager::FilesystemManager::new();
-        let root = std::path::PathBuf::from("/workspace");
-        let file = std::path::Path::new("/workspace/src/main.rs");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        let file = root.join("main.rs");
+        std::fs::write(&file, "fn main() {}\n").expect("write file");
 
-        // Cache an enrichment at generation 0. Synthetic path → source_mtime
-        // None at cache time and on re-stat, so the floor matches (None == None).
+        let fs = crate::bridge::filesystem_manager::FilesystemManager::new();
+        fs.set_roots(vec![root.clone()]);
+
+        let mut index = SymbolIndex::new().expect("create index");
+
+        // Cache an enrichment at generation 0, recording the file's real mtime
+        // so the floor passes on read (a stattable Some mtime that re-stats
+        // unchanged).
+        let source_mtime = std::fs::metadata(&file)
+            .ok()
+            .map(|m| crate::bridge::filesystem_manager::mtime_nanos(&m));
         let key = super::EnrichmentKey {
-            file: file.to_path_buf(),
+            file,
             line: 10,
             col: 5,
         };
@@ -1598,12 +1619,12 @@ mod tests {
             super::Witness {
                 root,
                 generation: 0,
-                source_mtime: None,
+                source_mtime,
             },
             dummy_enrichment(),
         );
 
-        // Should hit — generation matches (both 0).
+        // Should hit — generation matches (both 0) and the mtime is unchanged.
         let hit = index.get_enrichment(&key, &fs);
         assert!(hit.is_some(), "expected cache hit");
         let enrichment = hit.expect("just checked");
@@ -1897,7 +1918,6 @@ mod tests {
     /// passes and the test isolates the both-`None` mtime floor.
     #[allow(clippy::expect_used, reason = "test assertions")]
     #[test]
-    #[ignore = "RED: WS31-review R5; un-ignore in fix"]
     fn ws31_review_r5_unstattable_floor_entry_misses() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().to_path_buf();

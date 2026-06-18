@@ -1628,14 +1628,21 @@ impl LspClientManager {
             }
 
             let changes: Vec<(&str, u8)> = routed.iter().map(|(u, t)| (u.as_str(), *t)).collect();
-            let _ = c
+            if let Err(e) = c
                 .server
                 .notify(
                     "workspace/didChangeWatchedFiles",
                     crate::lsp::params::did_change_watched_files(&changes),
                     None,
                 )
-                .await;
+                .await
+            {
+                debug!(
+                    source = Source::LspDispatch.as_str(),
+                    server = c.name.as_str(),
+                    "changed-set nudge notify dropped: {e}",
+                );
+            }
 
             // Settle: wait for the server to go idle after the nudge, then drain
             // the stdio pipe so its post-nudge state is visible before the read.
