@@ -22,7 +22,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use super::NO_LSP_LABEL;
-use super::filesystem_manager::{FilesystemManager, format_file_size, mtime_nanos};
+use super::filesystem_manager::{
+    FilesystemManager, STAT_RETRY_ATTEMPTS, format_file_size, mtime_nanos,
+};
 use super::session::{ResolvedGlob, expand_search_paths};
 use crate::lsp::{LspClientManager, WalkBreadth};
 use crate::symbol_index::{Symbol, SymbolIndex, format_symbol_kind};
@@ -670,22 +672,25 @@ impl GlobServer {
 
     /// Counts the filesystem paths a glob query resolves to (`--count`).
     ///
-    /// Mirrors [`Self::handle_literal_paths`] dispatch: each resolved file or
-    /// symlink counts once; each directory contributes its listed entry count
-    /// (the same filtered set [`Self::handle_glob_dir`] renders). LSP
-    /// enrichment is skipped — a count is pure filesystem.
+    /// Mirrors [`Self::handle_literal_paths`] dispatch — **directories first**,
+    /// so a symlink-to-dir (which `is_dir()` follows) contributes its listed
+    /// entry count, exactly as the listing renders it, rather than counting as a
+    /// single file/symlink (WS31-review D1/T1). Each directory contributes the
+    /// same filtered set [`Self::handle_glob_dir`] renders; each remaining
+    /// resolved file or symlink-to-file counts once. LSP enrichment is skipped —
+    /// a count is pure filesystem.
     fn count_paths(&self, input: &GlobInput, exclude: Option<&ResolvedGlob>) -> Result<usize> {
         let resolved =
             expand_search_paths(&input.paths, input.include_gitignored, input.include_hidden);
         let mut total = 0usize;
         for path in &resolved {
-            if path.is_file() || path.is_symlink() {
-                total += 1;
-            } else if path.is_dir() {
+            if path.is_dir() {
                 let canonical = path
                     .canonicalize()
                     .map_err(|e| anyhow!("Path does not exist: {}: {e}", path.display()))?;
                 total += self.collect_dir_entries(&canonical, input, exclude)?.len();
+            } else if path.is_file() || path.is_symlink() {
+                total += 1;
             }
         }
         Ok(total)
@@ -1195,13 +1200,6 @@ fn build_children_sets(
     result
 }
 
-/// Number of fresh-stat attempts before treating a file/symlink miss as genuine.
-///
-/// Mirrors the bounded re-stat in `expand_search_paths`: a transient miss races
-/// a sub-millisecond atomic-rename window, so a few tight retries (no sleep)
-/// close the in-workflow case.
-const STAT_RETRY_ATTEMPTS: u32 = 3;
-
 /// Whether `path` is a regular file or a symlink, retrying a transient miss.
 ///
 /// A fresh `is_file()`/`is_symlink()` can transiently fail when an atomic-rename
@@ -1277,12 +1275,21 @@ fn collect_scoped_observations(
         // This dir-first order matches `handle_literal_paths` so the listing and
         // the nudge classify a symlink-to-dir the same way (WS31-review walk-2).
         if path.is_dir() {
+            // Canonicalize the dir arg ONCE (resolving a symlink-to-dir and any
+            // symlink prefix components). A direct, non-symlink child's real path
+            // is then `canonical_dir.join(leaf)` — no per-entry `canonicalize`
+            // syscall on top of the mandatory `metadata()` (WS31-review c1r-2).
+            // Only a child that is *itself* a symlink still needs a per-entry
+            // canonicalize to resolve its target. `None` when the dir itself
+            // can't canonicalize → fall back to per-entry resolution.
+            let canonical_dir = path.canonicalize().ok();
             let walker = WalkBuilder::new(path)
                 .max_depth(Some(1))
                 .git_ignore(!input.include_gitignored)
                 .hidden(!input.include_hidden)
                 .build();
             for entry in walker.flatten() {
+                let entry_is_symlink = entry.path_is_symlink();
                 let entry_path = entry.into_path();
                 if entry_path.as_path() == path.as_path() {
                     continue;
@@ -1297,29 +1304,57 @@ fn collect_scoped_observations(
                 if let Ok(md) = std::fs::metadata(&entry_path)
                     && md.is_file()
                 {
-                    observed.push((canonical_key(entry_path), mtime_nanos(&md)));
+                    // A non-symlink child under an already-canonical dir: its real
+                    // path is `canonical_dir/leaf`, no extra syscall. Otherwise
+                    // (symlinked child, or the dir didn't canonicalize) resolve
+                    // per-entry. A confirmed-present entry whose canonicalize
+                    // fails is OMITTED, never literal-keyed — a scoped walk that
+                    // drops an entry can't phantom-reap it, and the next clean
+                    // glob re-observes the canonical key (WS31-review T2/F2).
+                    let key = match (&canonical_dir, entry_is_symlink) {
+                        (Some(dir), false) => entry_path
+                            .file_name()
+                            .map(|leaf| dir.join(leaf))
+                            .or_else(|| canonical_key(&entry_path)),
+                        _ => canonical_key(&entry_path),
+                    };
+                    if let Some(key) = key {
+                        observed.push((key, mtime_nanos(&md)));
+                    }
                 }
             }
         } else if path_is_file_or_symlink_with_retry(path) {
             // An actual file or a symlink-to-file: record the canonical path.
-            // A broken symlink stats as an error here and is skipped.
-            if let Ok(md) = std::fs::metadata(path) {
-                observed.push((canonical_key(path.clone()), mtime_nanos(&md)));
+            // A broken symlink stats as an error here and is skipped. A
+            // confirmed-present file whose canonicalize fails is OMITTED, never
+            // literal-keyed, so a later full walk can't phantom-reap it
+            // (WS31-review T2/F2).
+            if let Ok(md) = std::fs::metadata(path)
+                && let Some(key) = canonical_key(path)
+            {
+                observed.push((key, mtime_nanos(&md)));
             }
         }
     }
     observed
 }
 
-/// Canonicalizes an observed entry's path to its real path, falling back to the
-/// literal path if `canonicalize` fails (e.g. a TOCTOU removal between stat and
-/// canonicalize).
+/// Canonicalizes an observed entry's path to its real path, returning `None`
+/// when `canonicalize` fails.
 ///
 /// Used to key glob's changed-set observations by the same real path
 /// grep/diagnostics' non-following walks produce, so the same physical file is
-/// never double-keyed (WS31-review F2).
-fn canonical_key(path: PathBuf) -> PathBuf {
-    path.canonicalize().unwrap_or(path)
+/// never double-keyed (WS31-review F2). The caller invokes this only for an entry
+/// it has already confirmed present (metadata `Ok`), so a `canonicalize` failure
+/// here (EACCES on a parent, a symlink component swapped mid-walk, or a TOCTOU
+/// removal) must NOT fall back to the literal path: literal-keying a
+/// link-traversed orphan re-creates F2 (the orphan is never re-observed by a
+/// non-following walk and is phantom-reaped `Deleted`). Returning `None` makes
+/// the caller OMIT the observation — a scoped walk that drops an entry cannot
+/// phantom-reap it, and the next clean glob re-observes the canonical key
+/// (WS31-review T2).
+fn canonical_key(path: &Path) -> Option<PathBuf> {
+    path.canonicalize().ok()
 }
 
 #[cfg(test)]
@@ -2680,7 +2715,6 @@ mod tests {
     /// listing renders `N` — `glob count:true` desyncs from the listing.
     #[test]
     #[cfg(unix)]
-    #[ignore = "RED: WS31-review-D D1; un-ignore in fix"]
     #[allow(clippy::expect_used, reason = "test assertions")]
     fn ws31_review_d_count_matches_listing_symlink_dir() {
         use std::os::unix::fs::symlink;
@@ -2714,6 +2748,44 @@ mod tests {
             count, N,
             "count for a symlink-to-dir arg must equal the listing entry count \
              (N={N}, the dir's files), not 1 (the symlink-as-file count); got {count}"
+        );
+    }
+
+    /// T2 — `canonical_key`'s present-entry contract: it returns `Some(real)` on
+    /// success and `None` on a canonicalize failure, so the caller OMITS an
+    /// uncanonicalizable-but-present entry rather than literal-keying it (which
+    /// would re-create the F2 phantom-reap). A deterministic canonicalize failure
+    /// on a genuinely *present* file is not portably stageable in a unit test
+    /// (it needs an EACCES-on-parent / mid-walk symlink swap), so this asserts
+    /// the helper's failure path directly: an unresolvable path → `None`
+    /// (the omit signal), a present real path → `Some(canonical)`
+    /// (land-with-fix per the D1 spec).
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn ws31_review_d_present_uncanonicalizable_dropped() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let base = tmp.path().canonicalize().expect("canonicalize base");
+
+        // Unresolvable path (no such entry): canonicalize fails → `None`. This is
+        // the signal the caller turns into an OMIT — never a literal-keyed orphan
+        // (the F2 phantom-reap the literal fallback used to cause).
+        let missing = base.join("does_not_exist.ws31ext");
+        assert_eq!(
+            canonical_key(&missing),
+            None,
+            "an uncanonicalizable path must yield None (omit), not a literal key: {}",
+            missing.display()
+        );
+
+        // A present real file canonicalizes to itself (the dir is already
+        // canonical) → `Some(real)`, so a clean observation is still keyed.
+        let real_file = base.join("present.ws31ext");
+        std::fs::write(&real_file, "x\n").expect("write file");
+        assert_eq!(
+            canonical_key(&real_file),
+            Some(real_file.clone()),
+            "a present, resolvable path must yield Some(canonical): {}",
+            real_file.display()
         );
     }
 }
