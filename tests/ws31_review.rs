@@ -638,13 +638,28 @@ fn ws31_review_r4_eviction_witnessed_via_request_count() -> Result<()> {
         "cold first touch after eviction must re-resolve enrichment; got:\n{cold}"
     );
 
+    // Drop the bridge first to shut the server down — its on-exit flush is the
+    // durability guarantee the request-log read relies on. The poll below only
+    // removes the fixed-time GUESS for when that flush becomes visible to this
+    // reader: under heavy parallel load the re-spawned server's requests may not
+    // be flushed/visible to the file by a fixed delay, so we re-read + re-parse
+    // until both expected counts hold (or the deadline passes). Cadence/cap match
+    // the `roots-ls` poll loops above (50 ms between attempts, ~5 s total).
     drop(bridge);
-    std::thread::sleep(Duration::from_millis(300));
+    let req_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut req_log = std::fs::read_to_string(&req_log_path).unwrap_or_default();
+    let mut doc_symbol_count = request_method_count(&req_log, "textDocument/documentSymbol");
+    let mut outgoing_count = request_method_count(&req_log, "callHierarchy/outgoingCalls");
+    while (doc_symbol_count < 1 || outgoing_count < 1) && std::time::Instant::now() < req_deadline {
+        std::thread::sleep(Duration::from_millis(50));
+        req_log = std::fs::read_to_string(&req_log_path).unwrap_or_default();
+        doc_symbol_count = request_method_count(&req_log, "textDocument/documentSymbol");
+        outgoing_count = request_method_count(&req_log, "callHierarchy/outgoingCalls");
+    }
 
     // The re-grep was cold ⇒ the daemon re-issued documentSymbol against the
     // re-spawned server. A no-op evict would leave the cache warm ⇒ count 0.
-    let req_log = std::fs::read_to_string(&req_log_path).unwrap_or_default();
-    let doc_symbol_count = request_method_count(&req_log, "textDocument/documentSymbol");
+    // A deadline reached with the condition still unmet falls through to FAIL.
     assert!(
         doc_symbol_count >= 1,
         "re-add must be a genuine cold touch — the daemon must re-query the \
@@ -653,7 +668,6 @@ fn ws31_review_r4_eviction_witnessed_via_request_count() -> Result<()> {
     );
     // The outgoingCalls re-query is the enrichment edge; its presence corroborates
     // a cold enrichment rather than a stale warm hit.
-    let outgoing_count = request_method_count(&req_log, "callHierarchy/outgoingCalls");
     assert!(
         outgoing_count >= 1,
         "cold re-enrichment must re-query callHierarchy/outgoingCalls at least \
