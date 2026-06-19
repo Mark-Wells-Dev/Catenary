@@ -85,8 +85,12 @@ deny:
 mutants:
 	@mkdir -p $(CURDIR)/../.catenary-mutants-tmp && ulimit -v 16777216 && TMPDIR=$$(realpath $(CURDIR)/../.catenary-mutants-tmp) cargo mutants $(if $(T),--package catenary-mcp -F $(T),) --timeout 1200 --jobs 8 --features mockls
 
-# Kill a running cargo-mutants and all its children (test binaries, mockls, etc.).
-# Plain `pkill cargo-mutants` leaves orphaned children that run without a timeout.
+# Kill a running cargo-mutants AND all its children (test binaries, mockls, etc.).
+# ALWAYS use this to stop mutation testing — NEVER `pkill cargo-mutants`, which
+# kills only the parent and orphans the test binaries. Orphans keep running with
+# no timeout or memory limit; an orphaned mutant binary once caused a 41.8GB OOM
+# that crashed the GPU driver. (The `mutants` target caps each run at ulimit -v
+# 16G, but a killed-parent orphan can escape the intended lifecycle.)
 mutants-stop:
 	@if pgid=$$(ps -o pgid= -p $$(pgrep -x cargo-mutants 2>/dev/null | head -1) 2>/dev/null | tr -d ' '); then \
 	  kill -- -$$pgid 2>/dev/null && echo "Killed process group $$pgid"; \
