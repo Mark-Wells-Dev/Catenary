@@ -931,13 +931,6 @@ impl RootTracker {
     /// returns nothing and callers re-sync unconditionally; the count here
     /// lets a sweep caller skip `sync_roots` when nothing matched (`0`) and
     /// re-sync only when the union actually changed (`> 0`).
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "wired up by the SessionEnd sweep + daemon root-GC in a later workstream-30 slice"
-        )
-    )]
     fn remove_contributors_with_prefix(&self, prefix: &str) -> usize {
         let mut map = self
             .contributors
@@ -956,13 +949,6 @@ impl RootTracker {
     /// (e.g. the daemon root-GC reading every `worktree:*` contributor's path to
     /// test it against the filesystem). Semantics-free: the tracker stays a pure
     /// data structure with no knowledge of `worktree:` or the filesystem.
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "wired up by the daemon root-GC's reap_missing_worktree_roots"
-        )
-    )]
     fn contributors_with_prefix(&self, prefix: &str) -> Vec<(String, Vec<PathBuf>)> {
         self.contributors
             .lock()
@@ -1063,13 +1049,6 @@ impl RootTracker {
 /// [`RootTracker`]: no async, and no `sync_roots` here — the periodic loop owns
 /// the (single) re-sync once it has the removed set.
 #[cfg(unix)]
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "wired up by the periodic daemon root-GC loop in run_daemon_main"
-    )
-)]
 fn reap_missing_worktree_roots(tracker: &RootTracker) -> Vec<String> {
     let mut removed = Vec::new();
     for (key, roots) in tracker.contributors_with_prefix("worktree:") {
