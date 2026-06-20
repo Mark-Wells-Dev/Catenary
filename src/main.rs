@@ -1208,7 +1208,11 @@ fn run_daemon_main() -> Result<()> {
     // for a session-less (test/transport-only) manager. A detached hourly
     // background task that reaps `worktree:*` roots whose dir is gone on disk (a
     // missed `WorktreeRemove`); the firehose reapers above and the SessionEnd
-    // sweep are the other tiers. The `last_seen` lingering-dir tier is ticket 05a.
+    // sweep are the other tiers. A worktree whose dir *lingers* after a
+    // crash-before-git-cleanup while its session is dead is an accepted residual
+    // (bounded by daemon restart — the in-memory RootTracker is rebuilt on
+    // reconnect): there is no clean per-session "dead" signal, and we don't add a
+    // staleness heuristic.
     manager.spawn_worktree_root_gc(rt.handle());
 
     info!(

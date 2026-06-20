@@ -1491,8 +1491,12 @@ impl SessionManager {
     /// contributor whose worktree directory is gone on disk (path-existence:
     /// direct, correlation-free, session-free, within-session — *not*
     /// MCP-disconnect, which has no host-session correlation) and re-syncs the
-    /// reduced union when anything was removed (ticket 03). The secondary
-    /// `last_seen`-stale lingering-dir tier is deferred to ticket 05a.
+    /// reduced union when anything was removed (ticket 03). A worktree whose dir
+    /// *lingers* after a crash-before-git-cleanup while its session is dead is an
+    /// accepted residual, bounded by daemon restart: there is no clean
+    /// per-session "dead" signal (correlation is structurally unavailable without
+    /// MCP tools, which are themselves precluded by cross-host hook support), and
+    /// we deliberately do not add a staleness heuristic.
     ///
     /// A detached background task on the provided runtime handle, mirroring the
     /// firehose staleness reaper: it consumes the immediate first tick, then runs
