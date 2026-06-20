@@ -852,6 +852,15 @@ impl KeyedHandoff {
     }
 }
 
+/// How often the daemon runs the periodic worktree-root GC
+/// ([`SessionManager::spawn_worktree_root_gc`]).
+///
+/// Hourly, mirroring the firehose staleness sweep
+/// ([`crate::logging::reaper::STALENESS_SWEEP_INTERVAL`]): a missed
+/// `WorktreeRemove` leaks a single root, not a wedge risk, so a coarse cadence
+/// reclaims it without putting `.exists()` probes on any hot path.
+pub const WORKTREE_ROOT_GC_INTERVAL: Duration = Duration::from_hours(1);
+
 /// Tracks per-contributor workspace root sets for reference counting.
 ///
 /// Each MCP connection and CLI command contributes a set of roots
@@ -939,6 +948,31 @@ impl RootTracker {
         before - map.len()
     }
 
+    /// Returns each contributor whose key `starts_with(prefix)`, paired with its
+    /// roots.
+    ///
+    /// `list_roots` inverts to path→sources; this enumerates contributor→roots
+    /// without inverting, so a caller can inspect each contributor's own root set
+    /// (e.g. the daemon root-GC reading every `worktree:*` contributor's path to
+    /// test it against the filesystem). Semantics-free: the tracker stays a pure
+    /// data structure with no knowledge of `worktree:` or the filesystem.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "wired up by the daemon root-GC's reap_missing_worktree_roots"
+        )
+    )]
+    fn contributors_with_prefix(&self, prefix: &str) -> Vec<(String, Vec<PathBuf>)> {
+        self.contributors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|(contributor, _)| contributor.starts_with(prefix))
+            .map(|(contributor, roots)| (contributor.clone(), roots.iter().cloned().collect()))
+            .collect()
+    }
+
     /// Removes a single root from a contributor's set.
     ///
     /// Returns `true` if the root was present and removed, `false` if
@@ -1017,6 +1051,34 @@ impl RootTracker {
             .filter(|roots| roots.contains(root))
             .count()
     }
+}
+
+/// Reaps every `worktree:*` contributor whose worktree directory is gone on
+/// disk (a missed `WorktreeRemove`). Returns the removed contributor keys so the
+/// caller can re-sync + log. Path-existence is a direct, correlation-free,
+/// session-free, within-session signal (ticket 03).
+///
+/// A `worktree:{session_id}:{path}` key holds exactly one path; the contributor
+/// is reaped when none of its paths exist (`!path.exists()`). Pure filesystem +
+/// [`RootTracker`]: no async, and no `sync_roots` here — the periodic loop owns
+/// the (single) re-sync once it has the removed set.
+#[cfg(unix)]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "wired up by the periodic daemon root-GC loop in run_daemon_main"
+    )
+)]
+fn reap_missing_worktree_roots(tracker: &RootTracker) -> Vec<String> {
+    let mut removed = Vec::new();
+    for (key, roots) in tracker.contributors_with_prefix("worktree:") {
+        if !roots.iter().any(|path| path.exists()) {
+            tracker.remove_contributor(&key);
+            removed.push(key);
+        }
+    }
+    removed
 }
 
 /// Core daemon component that manages MCP and hook socket connections.
@@ -1441,6 +1503,54 @@ impl SessionManager {
             handoff: KeyedHandoff::new(),
         });
         self
+    }
+
+    /// Spawns the periodic worktree-root GC — the crash-safe leak backstop for a
+    /// missed `WorktreeRemove`.
+    ///
+    /// Every [`WORKTREE_ROOT_GC_INTERVAL`] it reaps every `worktree:*`
+    /// contributor whose worktree directory is gone on disk (path-existence:
+    /// direct, correlation-free, session-free, within-session — *not*
+    /// MCP-disconnect, which has no host-session correlation) and re-syncs the
+    /// reduced union when anything was removed (ticket 03). The secondary
+    /// `last_seen`-stale lingering-dir tier is deferred to ticket 05a.
+    ///
+    /// A detached background task on the provided runtime handle, mirroring the
+    /// firehose staleness reaper: it consumes the immediate first tick, then runs
+    /// until daemon exit (no `CancellationToken` — the runtime is dropped on
+    /// shutdown). No-op unless [`Self::with_session`] has wired the tracker and
+    /// primary session (daemon mode); test/transport-only managers skip it.
+    pub fn spawn_worktree_root_gc(&self, rt: &tokio::runtime::Handle) {
+        let (Some(tracker), Some(ctx)) = (&self.root_tracker, &self.hook_ctx) else {
+            return;
+        };
+        // `RootTracker` is Arc-backed (Clone) and `primary` is an `Arc<Session>`;
+        // both clones share the live state the request handlers mutate.
+        let tracker = tracker.clone();
+        let session = ctx.primary.clone();
+        rt.spawn(async move {
+            let mut ticker = tokio::time::interval(WORKTREE_ROOT_GC_INTERVAL);
+            ticker.tick().await; // consume the immediate first tick
+            loop {
+                ticker.tick().await;
+                let removed = reap_missing_worktree_roots(&tracker);
+                if !removed.is_empty() {
+                    // Same sync call the request handlers use (`ctx.primary` is
+                    // this `session`): re-sync the (now smaller) union once.
+                    if let Err(e) = session.sync_roots(tracker.global_roots()).await {
+                        debug!(
+                            source = Source::DaemonDispatch.as_str(),
+                            "root sync after worktree-root GC failed: {e}",
+                        );
+                    }
+                    info!(
+                        source = Source::DaemonDispatch.as_str(),
+                        count = removed.len(),
+                        "reaped leaked worktree roots whose dir is gone",
+                    );
+                }
+            }
+        });
     }
 
     /// Returns the number of active sessions in the registry.
@@ -1872,6 +1982,28 @@ async fn handle_hook_dispatch(
         crate::bridge::overflow::remove_diagnostics(&crate::paths::runtime_dir(), &session_id);
 
         if let Some(ref tracker) = ctx.root_tracker {
+            // Leak backstop (workstream 30, ticket 03): reclaim any of THIS
+            // session's worktree roots whose `WorktreeRemove` was missed at a
+            // graceful end. The `session_id` baked into the contributor key lets
+            // the sweep find them without enumerating paths. Routine cleanup, so
+            // debug/info — never warn (which reaches the user notification queue).
+            let removed =
+                tracker.remove_contributors_with_prefix(&format!("worktree:{session_id}:"));
+            if removed > 0 {
+                info!(
+                    source = Source::DaemonDispatch.as_str(),
+                    session_id = %session_id,
+                    count = removed,
+                    "session ended: swept leaked worktree roots",
+                );
+            } else {
+                debug!(
+                    source = Source::DaemonDispatch.as_str(),
+                    session_id = %session_id,
+                    "session ended: no worktree roots to sweep",
+                );
+            }
+
             // Sync the reduced root set.
             let global = tracker.global_roots();
             if let Err(e) = ctx.primary.sync_roots(global).await {
@@ -5494,6 +5626,110 @@ mod tests {
         assert!(tracker.global_roots().is_empty());
     }
 
+    #[test]
+    fn contributors_with_prefix_returns_matching_keys_with_roots() {
+        let tracker = RootTracker::new();
+        tracker.set_roots("worktree:sess-a:/wt1", vec![PathBuf::from("/wt1")]);
+        tracker.set_roots("worktree:sess-b:/wt2", vec![PathBuf::from("/wt2")]);
+        tracker.set_roots("mcp:10", vec![PathBuf::from("/foo")]);
+
+        let mut got = tracker.contributors_with_prefix("worktree:");
+        got.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+        assert_eq!(got.len(), 2, "only the worktree:* contributors enumerated");
+        assert_eq!(got[0].0, "worktree:sess-a:/wt1");
+        assert_eq!(got[0].1, vec![PathBuf::from("/wt1")]);
+        assert_eq!(got[1].0, "worktree:sess-b:/wt2");
+        assert_eq!(got[1].1, vec![PathBuf::from("/wt2")]);
+    }
+
+    #[test]
+    fn contributors_with_prefix_no_match_is_empty() {
+        let tracker = RootTracker::new();
+        tracker.set_roots("mcp:10", vec![PathBuf::from("/foo")]);
+
+        assert!(
+            tracker.contributors_with_prefix("worktree:").is_empty(),
+            "no worktree:* contributor → empty enumeration",
+        );
+    }
+
+    // ── Daemon root-GC: reap_missing_worktree_roots (workstream 30) ───────
+    //
+    // The crash-safe leak backstop's single pass: reap every `worktree:*`
+    // contributor whose dir is gone on disk, keep those whose dir survives, and
+    // never inspect a non-worktree contributor. Real tempdirs make the
+    // path-existence signal authoritative.
+
+    #[test]
+    fn reap_missing_worktree_roots_reaps_only_gone_dirs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().canonicalize().expect("canonicalize");
+
+        // One worktree dir that exists (kept).
+        let existing = base.join("existing");
+        std::fs::create_dir(&existing).expect("mkdir existing");
+
+        // One worktree dir that we create then remove (reaped).
+        let gone = base.join("gone");
+        std::fs::create_dir(&gone).expect("mkdir gone");
+
+        let tracker = RootTracker::new();
+        tracker.set_roots(
+            &format!("worktree:sess:{}", existing.display()),
+            vec![existing.clone()],
+        );
+        tracker.set_roots(
+            &format!("worktree:sess:{}", gone.display()),
+            vec![gone.clone()],
+        );
+        // A non-worktree contributor — never inspected, always kept.
+        tracker.set_roots("mcp:1", vec![base.join("project")]);
+
+        // Now the dir vanishes (a missed WorktreeRemove after the dir is gone).
+        std::fs::remove_dir_all(&gone).expect("remove gone");
+
+        let removed = reap_missing_worktree_roots(&tracker);
+
+        assert_eq!(
+            removed,
+            vec![format!("worktree:sess:{}", gone.display())],
+            "exactly the worktree whose dir is gone is reaped",
+        );
+        let global = tracker.global_roots();
+        assert!(
+            global.contains(&existing),
+            "the existing worktree dir survives",
+        );
+        assert!(
+            !global.contains(&gone),
+            "the gone worktree dir is reclaimed",
+        );
+        assert!(
+            global.contains(&base.join("project")),
+            "the non-worktree (mcp:*) contributor is never inspected",
+        );
+    }
+
+    #[test]
+    fn reap_missing_worktree_roots_noop_when_all_present() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().canonicalize().expect("canonicalize");
+        let wt = base.join("wt");
+        std::fs::create_dir(&wt).expect("mkdir wt");
+
+        let tracker = RootTracker::new();
+        let key = format!("worktree:sess:{}", wt.display());
+        tracker.set_roots(&key, vec![wt]);
+        tracker.set_roots("mcp:1", vec![base.join("project")]);
+
+        assert!(
+            reap_missing_worktree_roots(&tracker).is_empty(),
+            "no worktree dir gone → nothing reaped",
+        );
+        assert_eq!(tracker.global_roots().len(), 2, "both roots survive");
+    }
+
     // ── Companion roots (workstream 29) ──────────────────────────────────
     //
     // These exercise the `on_roots_changed` seam: the callback recomputes
@@ -6071,6 +6307,102 @@ mod tests {
         );
         assert_eq!(after.len(), 1, "only the project root remains: {after:?}");
         assert_eq!(after[0].0, project.display().to_string());
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_end_sweeps_only_that_sessions_worktree_roots() {
+        // Leak backstop (graceful tier): `session-end/cleanup` for session 1
+        // removes every `worktree:sess-1:*` contributor while session 2's
+        // worktree and the project roots survive (the sweep is keyed by the
+        // `session_id` baked into the contributor key).
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let ipc_path = ipc_socket_in(dir.path());
+        let base = dir.path().canonicalize().expect("canonicalize");
+
+        // Two independent main-checkout + linked-worktree layouts, one per
+        // session, in distinct subdirs.
+        let (project_a, worktree_a) = linked_worktree_layout(&base.join("a"));
+        let (project_b, worktree_b) = linked_worktree_layout(&base.join("b"));
+
+        let manager = Arc::new(bind_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        // Seed both canonical project roots (what authorizes each mount).
+        for project in [&project_a, &project_b] {
+            let _ = hook_roundtrip(
+                &ipc_path,
+                &serde_json::json!({
+                    "method": "tool/roots-add",
+                    "path": project.display().to_string(),
+                }),
+            )
+            .await;
+        }
+
+        // Mount worktree_a under sess-1 and worktree_b under sess-2.
+        let _ = hook_roundtrip(
+            &ipc_path,
+            &serde_json::json!({
+                "method": "subagent-start/mount-worktree",
+                "session_id": "sess-1",
+                "cwd": worktree_a.display().to_string(),
+            }),
+        )
+        .await;
+        let _ = hook_roundtrip(
+            &ipc_path,
+            &serde_json::json!({
+                "method": "subagent-start/mount-worktree",
+                "session_id": "sess-2",
+                "cwd": worktree_b.display().to_string(),
+            }),
+        )
+        .await;
+
+        let before = roots_ls(&ipc_path).await;
+        assert!(
+            before.iter().any(|(p, _)| Path::new(p) == worktree_a),
+            "precondition: sess-1 worktree mounted",
+        );
+        assert!(
+            before.iter().any(|(p, _)| Path::new(p) == worktree_b),
+            "precondition: sess-2 worktree mounted",
+        );
+
+        // Graceful end for sess-1 only — sweeps worktree:sess-1:* (no
+        // WorktreeRemove was sent for it).
+        let _ = hook_roundtrip(
+            &ipc_path,
+            &serde_json::json!({
+                "method": "session-end/cleanup",
+                "session_id": "sess-1",
+            }),
+        )
+        .await;
+
+        let after = roots_ls(&ipc_path).await;
+        assert!(
+            !after.iter().any(|(p, _)| Path::new(p) == worktree_a),
+            "sess-1's worktree root swept at session end: {after:?}",
+        );
+        assert!(
+            after.iter().any(|(p, _)| Path::new(p) == worktree_b),
+            "sess-2's worktree (different session prefix) survives: {after:?}",
+        );
+        assert!(
+            after.iter().any(|(p, _)| Path::new(p) == project_a),
+            "project_a (hook contributor) survives the worktree sweep",
+        );
+        assert!(
+            after.iter().any(|(p, _)| Path::new(p) == project_b),
+            "project_b (hook contributor) survives",
+        );
 
         shutdown.cancel();
     }

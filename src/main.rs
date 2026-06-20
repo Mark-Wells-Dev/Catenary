@@ -1203,6 +1203,14 @@ fn run_daemon_main() -> Result<()> {
         None => manager,
     };
 
+    // Worktree-root GC (workstream 30, ticket 03): the crash-safe leak backstop.
+    // Spawned AFTER `with_session` so the root tracker exists — the call no-ops
+    // for a session-less (test/transport-only) manager. A detached hourly
+    // background task that reaps `worktree:*` roots whose dir is gone on disk (a
+    // missed `WorktreeRemove`); the firehose reapers above and the SessionEnd
+    // sweep are the other tiers. The `last_seen` lingering-dir tier is ticket 05a.
+    manager.spawn_worktree_root_gc(rt.handle());
+
     info!(
         source = Source::DaemonLifecycle.as_str(),
         "daemon serving workspace: {workspace_display}",
