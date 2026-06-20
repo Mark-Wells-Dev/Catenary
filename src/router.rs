@@ -910,6 +910,33 @@ impl RootTracker {
             .remove(contributor);
     }
 
+    /// Removes every contributor whose key `starts_with(prefix)`, in one shot.
+    ///
+    /// Sweeps a whole namespace at once — e.g. all `worktree:{session_id}:*`
+    /// roots a session leaked when a `WorktreeRemove` was missed (the
+    /// `SessionEnd` backstop and the daemon root-GC, workstream 30).
+    ///
+    /// Returns the number of contributor keys removed. `remove_contributor`
+    /// returns nothing and callers re-sync unconditionally; the count here
+    /// lets a sweep caller skip `sync_roots` when nothing matched (`0`) and
+    /// re-sync only when the union actually changed (`> 0`).
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "wired up by the SessionEnd sweep + daemon root-GC in a later workstream-30 slice"
+        )
+    )]
+    fn remove_contributors_with_prefix(&self, prefix: &str) -> usize {
+        let mut map = self
+            .contributors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let before = map.len();
+        map.retain(|contributor, _| !contributor.starts_with(prefix));
+        before - map.len()
+    }
+
     /// Removes a single root from a contributor's set.
     ///
     /// Returns `true` if the root was present and removed, `false` if
@@ -5387,6 +5414,74 @@ mod tests {
         tracker.remove_contributor("mcp:99");
 
         assert_eq!(tracker.global_roots().len(), 1);
+    }
+
+    #[test]
+    fn remove_contributors_with_prefix_removes_all_matching_keys() {
+        let tracker = RootTracker::new();
+        tracker.set_roots("worktree:sess-a:/wt1", vec![PathBuf::from("/wt1")]);
+        tracker.set_roots("worktree:sess-a:/wt2", vec![PathBuf::from("/wt2")]);
+
+        let removed = tracker.remove_contributors_with_prefix("worktree:sess-a:");
+
+        assert_eq!(removed, 2, "both worktree keys for the session removed");
+        assert!(
+            tracker.global_roots().is_empty(),
+            "all of the session's worktree roots gone"
+        );
+    }
+
+    #[test]
+    fn remove_contributors_with_prefix_leaves_non_matching_keys() {
+        let tracker = RootTracker::new();
+        tracker.set_roots("worktree:sess-a:/wt1", vec![PathBuf::from("/wt1")]);
+        tracker.set_roots("worktree:sess-b:/wt2", vec![PathBuf::from("/wt2")]);
+        tracker.set_roots("mcp:10", vec![PathBuf::from("/foo")]);
+
+        let removed = tracker.remove_contributors_with_prefix("worktree:sess-a:");
+
+        assert_eq!(removed, 1, "only the matching session's key removed");
+        let global = tracker.global_roots();
+        assert!(
+            !global.contains(&PathBuf::from("/wt1")),
+            "sess-a worktree dropped"
+        );
+        assert!(
+            global.contains(&PathBuf::from("/wt2")),
+            "sess-b worktree (different prefix) untouched"
+        );
+        assert!(
+            global.contains(&PathBuf::from("/foo")),
+            "mcp contributor (different prefix) untouched"
+        );
+    }
+
+    #[test]
+    fn remove_contributors_with_prefix_no_match_is_noop() {
+        let tracker = RootTracker::new();
+        tracker.set_roots("mcp:10", vec![PathBuf::from("/foo")]);
+
+        let removed = tracker.remove_contributors_with_prefix("worktree:sess-z:");
+
+        assert_eq!(removed, 0, "nothing matched the prefix");
+        assert_eq!(
+            tracker.global_roots().len(),
+            1,
+            "non-matching contributor survives"
+        );
+    }
+
+    #[test]
+    fn remove_contributors_with_prefix_empty_prefix_removes_all() {
+        let tracker = RootTracker::new();
+        tracker.set_roots("mcp:10", vec![PathBuf::from("/foo")]);
+        tracker.set_roots("worktree:sess-a:/wt1", vec![PathBuf::from("/wt1")]);
+
+        // An empty prefix is a prefix of every key; the count must reflect it.
+        let removed = tracker.remove_contributors_with_prefix("");
+
+        assert_eq!(removed, 2, "every key starts_with the empty prefix");
+        assert!(tracker.global_roots().is_empty());
     }
 
     // ── Companion roots (workstream 29) ──────────────────────────────────
