@@ -228,6 +228,29 @@ fn extract_file_path(hook_json: &serde_json::Value, format: HostFormat) -> Optio
     Some(abs_path.to_string_lossy().into_owned())
 }
 
+/// Extracts the worktree path from a `WorktreeRemove` hook payload.
+///
+/// The Claude Code `WorktreeRemove` payload carries the absolute path of the
+/// worktree being removed under `worktree_path`. Resolved to an absolute path
+/// against `cwd` (mirroring [`extract_file_path`]) for the rare case the host
+/// sends a relative path; the daemon canonicalizes it to agree with the mount
+/// key by construction.
+fn extract_worktree_path(hook_json: &serde_json::Value, format: HostFormat) -> Option<String> {
+    let worktree_path = hook_json.get("worktree_path").and_then(|v| v.as_str())?;
+
+    let abs_path = if std::path::Path::new(worktree_path).is_absolute() {
+        PathBuf::from(worktree_path)
+    } else {
+        let cwd = extract_cwd_str(hook_json, format).map_or_else(
+            || std::env::current_dir().unwrap_or_default(),
+            PathBuf::from,
+        );
+        cwd.join(worktree_path)
+    };
+
+    Some(abs_path.to_string_lossy().into_owned())
+}
+
 // ── Host payload capture ───────────────────────────────────────────────
 
 /// Maximum character count for string values in the host payload.
@@ -385,6 +408,74 @@ pub fn run_session_end(format: HostFormat) {
     });
     if let Some(sid) = session_id {
         request["session_id"] = serde_json::json!(sid);
+    }
+
+    // Fire and forget — no response processing needed.
+    let _ = ipc_exchange(stream, &request);
+}
+
+/// Mount a subagent's worktree as a workspace root (`SubagentStart` hook handler).
+///
+/// Fires once at subagent spawn. Forwards `cwd` (the worktree of an
+/// `isolation:"worktree"` subagent) and `session_id` to the daemon, which mounts
+/// the worktree under `worktree:{session_id}:{path}` iff its canonical project
+/// root is already tracked (the Explore/Plan self-scoping is enforced
+/// daemon-side). Best effort — the host CLI ignores all flow-control fields.
+pub fn run_subagent_start(format: HostFormat) {
+    let Ok(stdin_data) = std::io::read_to_string(std::io::stdin()) else {
+        return;
+    };
+    let Ok(hook_json) = serde_json::from_str::<serde_json::Value>(&stdin_data) else {
+        return;
+    };
+
+    let Some(stream) = hook_connect(&hook_json) else {
+        return;
+    };
+
+    let mut request = serde_json::json!({
+        "method": "subagent-start/mount-worktree",
+        "format": format.as_str(),
+    });
+    if let Some(sid) = extract_session_id(&hook_json, format) {
+        request["session_id"] = serde_json::json!(sid);
+    }
+    if let Some(cwd) = extract_cwd_str(&hook_json, format) {
+        request["cwd"] = serde_json::json!(cwd);
+    }
+
+    // Fire and forget — no response processing needed.
+    let _ = ipc_exchange(stream, &request);
+}
+
+/// Tear down a subagent's worktree root (`WorktreeRemove` hook handler).
+///
+/// Fires once at the true removal of an `isolation:"worktree"` subagent's
+/// worktree. Forwards `worktree_path` and `session_id` to the daemon, which
+/// removes the `worktree:{session_id}:{path}` contributor so the worktree's
+/// rust-analyzer shuts down. Best effort — the host CLI ignores all
+/// flow-control fields.
+pub fn run_worktree_remove(format: HostFormat) {
+    let Ok(stdin_data) = std::io::read_to_string(std::io::stdin()) else {
+        return;
+    };
+    let Ok(hook_json) = serde_json::from_str::<serde_json::Value>(&stdin_data) else {
+        return;
+    };
+
+    let Some(stream) = hook_connect(&hook_json) else {
+        return;
+    };
+
+    let mut request = serde_json::json!({
+        "method": "worktree-remove/unmount-worktree",
+        "format": format.as_str(),
+    });
+    if let Some(sid) = extract_session_id(&hook_json, format) {
+        request["session_id"] = serde_json::json!(sid);
+    }
+    if let Some(path) = extract_worktree_path(&hook_json, format) {
+        request["worktree_path"] = serde_json::json!(path);
     }
 
     // Fire and forget — no response processing needed.
@@ -1556,6 +1647,39 @@ mod tests {
         let json = serde_json::json!({});
         assert!(extract_cwd_str(&json, HostFormat::Claude).is_none());
         assert!(extract_cwd_str(&json, HostFormat::Antigravity).is_none());
+    }
+
+    // ── extract_worktree_path tests ───────────────────────────────────
+
+    #[test]
+    fn extract_worktree_path_absolute() {
+        let json = serde_json::json!({
+            "session_id": "sess-1",
+            "worktree_path": "/home/user/.claude/worktrees/agent-1",
+        });
+        assert_eq!(
+            extract_worktree_path(&json, HostFormat::Claude),
+            Some("/home/user/.claude/worktrees/agent-1".to_string()),
+        );
+    }
+
+    #[test]
+    fn extract_worktree_path_relative_resolves_against_cwd() {
+        let json = serde_json::json!({
+            "session_id": "sess-1",
+            "cwd": "/home/user/project",
+            "worktree_path": ".claude/worktrees/agent-1",
+        });
+        assert_eq!(
+            extract_worktree_path(&json, HostFormat::Claude),
+            Some("/home/user/project/.claude/worktrees/agent-1".to_string()),
+        );
+    }
+
+    #[test]
+    fn extract_worktree_path_missing() {
+        let json = serde_json::json!({ "session_id": "sess-1" });
+        assert!(extract_worktree_path(&json, HostFormat::Claude).is_none());
     }
 
     // ── extract_tool_name tests ───────────────────────────────────────

@@ -868,6 +868,12 @@ impl KeyedHandoff {
 ///   subagent edit (workstream 30, ADR 016); refcounted per `(session_id,
 ///   agent_id)`, so a worktree held only by its agent key shuts its
 ///   rust-analyzer down when that key drops.
+/// - `"worktree:{session_id}:{canonical path}"` — a subagent's worktree mounted
+///   at `SubagentStart` and torn down at `WorktreeRemove` (workstream 30, ticket
+///   03); keyed by the canonical worktree path (not `agent_id`, which
+///   `WorktreeRemove` does not carry), so the root's lifetime tracks the
+///   worktree's. The `session_id` prefix lets a session-level sweep reclaim
+///   leaked roots without enumerating paths.
 #[cfg(unix)]
 #[derive(Clone)]
 struct RootTracker {
@@ -1902,6 +1908,143 @@ async fn handle_hook_dispatch(
                 source = Source::DaemonDispatch.as_str(),
                 session_id = %session_id,
                 "session ended: roots cleaned up",
+            );
+        }
+
+        emit_hook_event(
+            tracing::Level::DEBUG,
+            &session_id,
+            &method,
+            Some(&scope_id),
+            &raw.to_string(),
+            "incoming hook",
+        );
+        emit_hook_event(
+            tracing::Level::DEBUG,
+            &session_id,
+            &method,
+            Some(&scope_id),
+            "",
+            "outgoing hook response",
+        );
+
+        writer.write_all(b"\n").await?;
+        writer.shutdown().await?;
+        return Ok(());
+    }
+
+    // ── Subagent worktree mount (workstream 30, ticket 03) ─────────
+    //
+    // Fires when the host CLI sends a SubagentStart hook — once at subagent
+    // spawn (a `SendMessage` resume does NOT re-fire). Mounts the subagent's
+    // `cwd` (the worktree of an `isolation:"worktree"` subagent) under
+    // `worktree:{session_id}:{path}` iff its canonical project root is already
+    // tracked and distinct (the same `worktree_to_auto_mount` predicate the
+    // edit-mount uses — this is what closes the read-only-subagent coverage gap
+    // and self-scopes to exactly the worktree subagents: a non-isolated
+    // Explore/Plan subagent spawns with `cwd` = an already-tracked root, so the
+    // predicate returns `None`).
+    //
+    // Short-circuits before get_or_create_router: this is a daemon-level root
+    // concern (RootTracker), with no per-session editing/notification state.
+    if method == "subagent-start/mount-worktree" {
+        let scope_id = uuid::Uuid::new_v4().to_string();
+
+        if let Some(ref tracker) = ctx.root_tracker
+            && let Some(cwd) = raw.get("cwd").and_then(|v| v.as_str())
+        {
+            let roots: HashSet<PathBuf> = tracker.global_roots().into_iter().collect();
+            if let Some(worktree) = worktree_to_auto_mount(Path::new(cwd), &roots) {
+                // Key on the (already-canonical) worktree path so teardown's
+                // `worktree-remove/unmount-worktree` rebuilds the same key by
+                // canonicalizing `worktree_path` identically.
+                let contributor = format!("worktree:{session_id}:{}", worktree.display());
+                tracker.set_roots(&contributor, vec![worktree.clone()]);
+                let global = tracker.global_roots();
+                if let Err(e) = ctx.primary.sync_roots(global).await {
+                    debug!(
+                        source = Source::DaemonDispatch.as_str(),
+                        "root sync after subagent-start worktree mount failed: {e}",
+                    );
+                }
+                debug!(
+                    source = Source::DaemonDispatch.as_str(),
+                    session_id = %session_id,
+                    worktree = %worktree.display(),
+                    contributor = %contributor,
+                    "mounted worktree root at subagent start",
+                );
+            } else {
+                debug!(
+                    source = Source::DaemonDispatch.as_str(),
+                    session_id = %session_id,
+                    cwd = cwd,
+                    "subagent-start worktree mount skipped (cwd not a worktree of a tracked project, or already tracked)",
+                );
+            }
+        }
+
+        emit_hook_event(
+            tracing::Level::DEBUG,
+            &session_id,
+            &method,
+            Some(&scope_id),
+            &raw.to_string(),
+            "incoming hook",
+        );
+        emit_hook_event(
+            tracing::Level::DEBUG,
+            &session_id,
+            &method,
+            Some(&scope_id),
+            "",
+            "outgoing hook response",
+        );
+
+        writer.write_all(b"\n").await?;
+        writer.shutdown().await?;
+        return Ok(());
+    }
+
+    // ── Subagent worktree teardown (workstream 30, ticket 03) ──────
+    //
+    // Fires when the host CLI sends a WorktreeRemove hook — once, at the true
+    // removal of an `isolation:"worktree"` subagent's worktree (NOT on every
+    // stop, so it can't be premature). Removes the `worktree:{session_id}:{path}`
+    // contributor so the worktree's rust-analyzer shuts down.
+    //
+    // The key must agree with the mount key by construction: canonicalize
+    // `worktree_path` with the SAME `.canonicalize().unwrap_or(raw)` fallback
+    // `worktree_to_auto_mount` uses at mount, so when the dir still exists both
+    // ends resolve to the same canonical path. EDGE: if the dir is already gone
+    // at teardown, `canonicalize` falls back to the raw path and the key may not
+    // match the mount key — the slice-D daemon root-GC (reap `worktree:*` whose
+    // dir is gone) is the crash-safe backstop for that.
+    //
+    // Short-circuits before get_or_create_router: daemon-level root concern only.
+    if method == "worktree-remove/unmount-worktree" {
+        let scope_id = uuid::Uuid::new_v4().to_string();
+
+        if let Some(ref tracker) = ctx.root_tracker
+            && let Some(raw_path) = raw.get("worktree_path").and_then(|v| v.as_str())
+        {
+            let raw_path = PathBuf::from(raw_path);
+            let canonical = raw_path.canonicalize().unwrap_or(raw_path);
+            let contributor = format!("worktree:{session_id}:{}", canonical.display());
+            tracker.remove_contributor(&contributor);
+            let global = tracker.global_roots();
+            if let Err(e) = ctx.primary.sync_roots(global).await {
+                debug!(
+                    source = Source::DaemonDispatch.as_str(),
+                    "root sync after worktree-remove teardown failed: {e}",
+                );
+            }
+            debug!(
+                source = Source::DaemonDispatch.as_str(),
+                session_id = %session_id,
+                worktree = %canonical.display(),
+                contributor = %contributor,
+                "tore down worktree root at worktree removal",
             );
         }
 
@@ -5787,6 +5930,278 @@ mod tests {
             None,
             "a file outside any git checkout has no worktree to mount",
         );
+    }
+
+    // ── Subagent worktree lifecycle: SubagentStart / WorktreeRemove ──────
+    //
+    // End-to-end dispatch tests for the workstream-30 ticket-03 re-bracket: the
+    // worktree root is mounted at `subagent-start/mount-worktree` and torn down
+    // at `worktree-remove/unmount-worktree`, keyed by
+    // `worktree:{session_id}:{canonical path}`. They drive the live dispatch
+    // path over the IPC socket (via `hook_roundtrip`) and inspect the resulting
+    // `RootTracker` through a `tool/roots-ls` round-trip — fully black-box.
+    //
+    // The canonical project root is seeded into the tracker via `tool/roots-add`
+    // (the `hook` contributor); the auto-mount predicate only needs it present
+    // in the global root set.
+
+    /// Round-trip `tool/roots-ls` and return the `(path, sources)` pairs.
+    async fn roots_ls(ipc_path: &Path) -> Vec<(String, Vec<String>)> {
+        let resp = hook_roundtrip(ipc_path, &serde_json::json!({"method": "tool/roots-ls"})).await;
+        let json: serde_json::Value = serde_json::from_str(&resp).expect("roots-ls json");
+        json.get("roots")
+            .and_then(|r| r.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .map(|e| {
+                        let path = e
+                            .get("path")
+                            .and_then(serde_json::Value::as_str)
+                            .expect("path")
+                            .to_string();
+                        let sources = e
+                            .get("sources")
+                            .and_then(serde_json::Value::as_array)
+                            .map(|s| {
+                                s.iter()
+                                    .filter_map(|v| v.as_str().map(str::to_string))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        (path, sources)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn subagent_start_mounts_worktree_when_canonical_root_tracked() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let ipc_path = ipc_socket_in(dir.path());
+        let base = dir.path().canonicalize().expect("canonicalize");
+        let (project, worktree) = linked_worktree_layout(&base);
+
+        let manager = Arc::new(bind_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        // Seed the canonical project root (what authorizes the mount).
+        let _ = hook_roundtrip(
+            &ipc_path,
+            &serde_json::json!({
+                "method": "tool/roots-add",
+                "path": project.display().to_string(),
+            }),
+        )
+        .await;
+
+        // SubagentStart with cwd = the linked worktree → mount under
+        // worktree:{sid}:{path}.
+        let _ = hook_roundtrip(
+            &ipc_path,
+            &serde_json::json!({
+                "method": "subagent-start/mount-worktree",
+                "session_id": "sess-1",
+                "cwd": worktree.display().to_string(),
+            }),
+        )
+        .await;
+
+        let roots = roots_ls(&ipc_path).await;
+        let entry = roots
+            .iter()
+            .find(|(p, _)| Path::new(p) == worktree)
+            .expect("worktree should be mounted");
+        assert_eq!(
+            entry.1,
+            vec![format!("worktree:sess-1:{}", worktree.display())],
+            "worktree held by the worktree:{{sid}}:{{path}} contributor",
+        );
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn subagent_start_self_scopes_no_mount_for_tracked_root() {
+        // Explore/Plan self-scoping: a non-isolated subagent spawns with cwd =
+        // an already-tracked root (the main checkout). `worktree_to_auto_mount`
+        // returns None (already tracked AND canonical == cwd), so NO new
+        // contributor is created.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let ipc_path = ipc_socket_in(dir.path());
+        let base = dir.path().canonicalize().expect("canonicalize");
+        let root = base.join("repo");
+        std::fs::create_dir_all(root.join(".git")).expect("mkdir .git");
+
+        let manager = Arc::new(bind_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        let _ = hook_roundtrip(
+            &ipc_path,
+            &serde_json::json!({
+                "method": "tool/roots-add",
+                "path": root.display().to_string(),
+            }),
+        )
+        .await;
+
+        let _ = hook_roundtrip(
+            &ipc_path,
+            &serde_json::json!({
+                "method": "subagent-start/mount-worktree",
+                "session_id": "sess-1",
+                "cwd": root.display().to_string(),
+            }),
+        )
+        .await;
+
+        let roots = roots_ls(&ipc_path).await;
+        // Only the seeded root remains, under the `hook` contributor — no
+        // worktree:* contributor was created.
+        assert_eq!(roots.len(), 1, "no new root mounted: {roots:?}");
+        assert_eq!(roots[0].0, root.display().to_string());
+        assert_eq!(roots[0].1, vec!["hook".to_string()]);
+        assert!(
+            !roots
+                .iter()
+                .any(|(_, s)| s.iter().any(|c| c.starts_with("worktree:"))),
+            "no worktree:* contributor for an already-tracked-root cwd",
+        );
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn worktree_remove_tears_down_mounted_worktree() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let ipc_path = ipc_socket_in(dir.path());
+        let base = dir.path().canonicalize().expect("canonicalize");
+        let (project, worktree) = linked_worktree_layout(&base);
+
+        let manager = Arc::new(bind_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        let _ = hook_roundtrip(
+            &ipc_path,
+            &serde_json::json!({
+                "method": "tool/roots-add",
+                "path": project.display().to_string(),
+            }),
+        )
+        .await;
+        let _ = hook_roundtrip(
+            &ipc_path,
+            &serde_json::json!({
+                "method": "subagent-start/mount-worktree",
+                "session_id": "sess-1",
+                "cwd": worktree.display().to_string(),
+            }),
+        )
+        .await;
+        assert!(
+            roots_ls(&ipc_path)
+                .await
+                .iter()
+                .any(|(p, _)| Path::new(p) == worktree),
+            "precondition: worktree mounted",
+        );
+
+        // WorktreeRemove with the same worktree_path → teardown. The dir still
+        // exists, so canonicalize agrees with the mount key by construction.
+        let _ = hook_roundtrip(
+            &ipc_path,
+            &serde_json::json!({
+                "method": "worktree-remove/unmount-worktree",
+                "session_id": "sess-1",
+                "worktree_path": worktree.display().to_string(),
+            }),
+        )
+        .await;
+
+        let roots = roots_ls(&ipc_path).await;
+        assert!(
+            !roots.iter().any(|(p, _)| Path::new(p) == worktree),
+            "worktree torn down at WorktreeRemove: {roots:?}",
+        );
+        // The seeded project root (other contributor) is untouched.
+        assert!(
+            roots.iter().any(|(p, _)| Path::new(p) == project),
+            "the project root (mcp/hook contributor) survives teardown",
+        );
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn subagent_worktree_mount_remove_round_trip() {
+        // Full round-trip: mount then remove. The worktree root is gone after
+        // removal; a separate project root contributor is untouched throughout.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let ipc_path = ipc_socket_in(dir.path());
+        let base = dir.path().canonicalize().expect("canonicalize");
+        let (project, worktree) = linked_worktree_layout(&base);
+
+        let manager = Arc::new(bind_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        let _ = hook_roundtrip(
+            &ipc_path,
+            &serde_json::json!({
+                "method": "tool/roots-add",
+                "path": project.display().to_string(),
+            }),
+        )
+        .await;
+
+        // Mount.
+        let _ = hook_roundtrip(
+            &ipc_path,
+            &serde_json::json!({
+                "method": "subagent-start/mount-worktree",
+                "session_id": "sess-1",
+                "cwd": worktree.display().to_string(),
+            }),
+        )
+        .await;
+        let mounted = roots_ls(&ipc_path).await;
+        assert!(mounted.iter().any(|(p, _)| Path::new(p) == worktree));
+        assert!(mounted.iter().any(|(p, _)| Path::new(p) == project));
+
+        // Remove.
+        let _ = hook_roundtrip(
+            &ipc_path,
+            &serde_json::json!({
+                "method": "worktree-remove/unmount-worktree",
+                "session_id": "sess-1",
+                "worktree_path": worktree.display().to_string(),
+            }),
+        )
+        .await;
+        let after = roots_ls(&ipc_path).await;
+        assert!(
+            !after.iter().any(|(p, _)| Path::new(p) == worktree),
+            "worktree gone after round-trip",
+        );
+        assert_eq!(after.len(), 1, "only the project root remains: {after:?}");
+        assert_eq!(after[0].0, project.display().to_string());
+
+        shutdown.cancel();
     }
 
     // ── Subagent worktree teardown (workstream 30, ticket 1b) ────────────

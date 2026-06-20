@@ -378,6 +378,20 @@ enum HookCommand {
         #[arg(long, value_enum)]
         format: HostFormat,
     },
+    /// `SubagentStart`: mount the subagent's worktree as a root.
+    #[command(name = "subagent-start")]
+    SubagentStart {
+        /// Output format: "claude", "gemini", or "antigravity".
+        #[arg(long, value_enum)]
+        format: HostFormat,
+    },
+    /// `WorktreeRemove`: tear down the subagent's worktree root.
+    #[command(name = "worktree-remove")]
+    WorktreeRemove {
+        /// Output format: "claude", "gemini", or "antigravity".
+        #[arg(long, value_enum)]
+        format: HostFormat,
+    },
 }
 
 /// Host targets for the install command.
@@ -719,6 +733,8 @@ fn main() -> Result<()> {
                 HookCommand::PostAgent { format } => cli::hooks::run_post_agent(format),
                 HookCommand::SessionStart { format } => cli::hooks::run_session_start(format),
                 HookCommand::SessionEnd { format } => cli::hooks::run_session_end(format),
+                HookCommand::SubagentStart { format } => cli::hooks::run_subagent_start(format),
+                HookCommand::WorktreeRemove { format } => cli::hooks::run_worktree_remove(format),
             }
             Ok(())
         }
@@ -2079,6 +2095,28 @@ mod tests {
             unreachable!("expected Hook command");
         };
         assert!(matches!(command, HookCommand::SessionEnd { .. }));
+    }
+
+    #[test]
+    fn test_cli_hook_subagent_start() {
+        use clap::Parser;
+        let args = Args::try_parse_from(["catenary", "hook", "subagent-start", "--format=claude"]);
+        let args = args.expect("hook subagent-start should parse");
+        let Some(Command::Hook { command }) = args.command else {
+            unreachable!("expected Hook command");
+        };
+        assert!(matches!(command, HookCommand::SubagentStart { .. }));
+    }
+
+    #[test]
+    fn test_cli_hook_worktree_remove() {
+        use clap::Parser;
+        let args = Args::try_parse_from(["catenary", "hook", "worktree-remove", "--format=claude"]);
+        let args = args.expect("hook worktree-remove should parse");
+        let Some(Command::Hook { command }) = args.command else {
+            unreachable!("expected Hook command");
+        };
+        assert!(matches!(command, HookCommand::WorktreeRemove { .. }));
     }
 
     #[test]

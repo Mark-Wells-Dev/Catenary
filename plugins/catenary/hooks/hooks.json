@@ -66,6 +66,28 @@
           }
         ]
       }
+    ],
+    "SubagentStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "catenary hook subagent-start --format=claude"
+          }
+        ]
+      }
+    ],
+    "WorktreeRemove": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "catenary hook worktree-remove --format=claude"
+          }
+        ]
+      }
     ]
   }
 }
