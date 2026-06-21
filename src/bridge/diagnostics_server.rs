@@ -74,14 +74,6 @@ struct DiagnosticFile {
     entries: Vec<DiagEntry>,
 }
 
-/// Clean file entry for root-grouped output.
-struct CleanEntry {
-    display: String,
-    /// Grouping root: workspace root, or parent directory for
-    /// single-file-server files outside all roots.
-    root: PathBuf,
-}
-
 /// File without LSP server coverage.
 struct UncoveredEntry {
     display: String,
@@ -295,12 +287,13 @@ impl DiagnosticsServer {
     /// budget, writes the overflow file when needed, and reports the
     /// clean/dirty status.
     ///
-    /// Root-grouped file entries with diagnostics, `[clean]` markers, or
-    /// `[no LSP coverage]` notes. Root headers are collapsed when only one
-    /// file exists under that root. On overflow (more diagnostics than the
-    /// configured budget) the complete report is written to the per-session
-    /// runtime-dir file and the preview ends with a `… N more — full report
-    /// at <path>` pointer line.
+    /// Root-grouped file entries with diagnostics, or `[no LSP coverage]`
+    /// notes. Clean files are **omitted** — the linter idiom (silent on
+    /// success): a fully-clean batch yields empty output (misc 111). Root
+    /// headers are collapsed when only one printed file exists under that
+    /// root. On overflow (more diagnostics than the configured budget) the
+    /// complete report is written to the per-session runtime-dir file and the
+    /// preview ends with a `… N more — full report at <path>` pointer line.
     fn format_output(
         &self,
         canonical_paths: &[PathBuf],
@@ -309,7 +302,6 @@ impl DiagnosticsServer {
         session_id: &str,
     ) -> DiagnosticsOutcome {
         let mut diag_files: Vec<DiagnosticFile> = Vec::new();
-        let mut clean: Vec<CleanEntry> = Vec::new();
 
         for cp in canonical_paths {
             let key = cp.to_string_lossy().to_string();
@@ -327,9 +319,9 @@ impl DiagnosticsServer {
                         entries,
                     });
                 }
-                FileOutcome::Clean | FileOutcome::NoResults => {
-                    clean.push(CleanEntry { display, root });
-                }
+                // Clean and result-less files are silent (misc 111): they
+                // produce no per-file line and no root header.
+                FileOutcome::Clean | FileOutcome::NoResults => {}
             }
         }
 
@@ -356,7 +348,6 @@ impl DiagnosticsServer {
             .unwrap_or_default();
         let budgeted = budget_diagnostics(
             &diag_files,
-            &clean,
             uncovered,
             tools.diagnostics_budget(),
             tools.dirty_severity(),
@@ -1087,23 +1078,22 @@ pub(crate) fn format_diagnostics_entries(
         .collect()
 }
 
-/// Formats the full diagnostics output.
+/// Formats the diagnostics output.
 ///
-/// Bare root-path section headers. Clean files listed inline with
-/// `[clean]`. Uncovered files noted with `[no LSP coverage]`.
+/// Bare root-path section headers. Files with diagnostics are listed;
+/// uncovered files noted with `[no LSP coverage]`. Clean files are
+/// **omitted entirely** — the linter idiom (silent on success): a
+/// fully-clean batch renders an empty string (misc 111). Clean files
+/// therefore neither produce a line nor count toward the collapse total.
 ///
-/// When a root contains a single file, the root and filename are
-/// collapsed into one path (e.g. `/tmp/scratch.sh`). Multi-file
+/// When a root contains a single (printed) file, the root and filename
+/// are collapsed into one path (e.g. `/tmp/scratch.sh`). Multi-file
 /// roots get a directory header with indented file entries beneath.
-fn format_diagnostics(
-    diag_files: &[DiagnosticFile],
-    clean: &[CleanEntry],
-    uncovered: &[UncoveredEntry],
-) -> String {
+/// Root headers are only emitted for roots that have something to print.
+fn format_diagnostics(diag_files: &[DiagnosticFile], uncovered: &[UncoveredEntry]) -> String {
     use std::fmt::Write;
 
     let mut root_diag: BTreeMap<&PathBuf, Vec<(&str, &[DiagEntry])>> = BTreeMap::new();
-    let mut root_clean: BTreeMap<&PathBuf, Vec<&str>> = BTreeMap::new();
     let mut root_uncovered: BTreeMap<&PathBuf, Vec<&str>> = BTreeMap::new();
 
     for df in diag_files {
@@ -1111,9 +1101,6 @@ fn format_diagnostics(
             .entry(&df.root)
             .or_default()
             .push((&df.display, &df.entries));
-    }
-    for ce in clean {
-        root_clean.entry(&ce.root).or_default().push(&ce.display);
     }
     for ue in uncovered {
         root_uncovered
@@ -1124,16 +1111,14 @@ fn format_diagnostics(
 
     let mut all_roots: BTreeSet<&PathBuf> = BTreeSet::new();
     all_roots.extend(root_diag.keys());
-    all_roots.extend(root_clean.keys());
     all_roots.extend(root_uncovered.keys());
 
     let mut output = String::new();
 
     for root in &all_roots {
         let diag_count = root_diag.get(root).map_or(0, Vec::len);
-        let clean_count = root_clean.get(root).map_or(0, Vec::len);
         let uncovered_count = root_uncovered.get(root).map_or(0, Vec::len);
-        let total = diag_count + clean_count + uncovered_count;
+        let total = diag_count + uncovered_count;
         let collapsed = total == 1;
 
         if !output.is_empty() {
@@ -1150,12 +1135,6 @@ fn format_diagnostics(
                             _ = writeln!(output, "\t{line}");
                         }
                     }
-                }
-            }
-            if let Some(clean_files) = root_clean.get(root) {
-                for f in clean_files {
-                    _ = writeln!(output, "{}", root.join(f).display());
-                    _ = writeln!(output, "\t[clean]");
                 }
             }
             if let Some(uncov_files) = root_uncovered.get(root) {
@@ -1175,12 +1154,6 @@ fn format_diagnostics(
                             _ = writeln!(output, "\t\t{line}");
                         }
                     }
-                }
-            }
-            if let Some(clean_files) = root_clean.get(root) {
-                for f in clean_files {
-                    _ = writeln!(output, "\t{f}");
-                    _ = writeln!(output, "\t\t[clean]");
                 }
             }
             if let Some(uncov_files) = root_uncovered.get(root) {
@@ -1216,18 +1189,16 @@ struct BudgetedDiagnostics {
 /// Pure: renders both the complete report and a preview capped at `budget`
 /// diagnostics, with errors selected before warnings so a truncation never
 /// hides an error behind a warning. Within each file the surviving entries keep
-/// their original position order. Clean / uncovered files are not budgeted —
-/// they are one line each and always shown. `dirty` is `true` when any
-/// diagnostic's severity meets `dirty_threshold` (LSP encoding: lower = more
-/// severe).
+/// their original position order. Uncovered files are not budgeted — they are
+/// one line each and always shown. `dirty` is `true` when any diagnostic's
+/// severity meets `dirty_threshold` (LSP encoding: lower = more severe).
 fn budget_diagnostics(
     diag_files: &[DiagnosticFile],
-    clean: &[CleanEntry],
     uncovered: &[UncoveredEntry],
     budget: usize,
     dirty_threshold: u8,
 ) -> BudgetedDiagnostics {
-    let full = format_diagnostics(diag_files, clean, uncovered);
+    let full = format_diagnostics(diag_files, uncovered);
 
     let dirty = diag_files
         .iter()
@@ -1277,7 +1248,7 @@ fn budget_diagnostics(
         .collect();
 
     BudgetedDiagnostics {
-        preview: format_diagnostics(&preview_files, clean, uncovered),
+        preview: format_diagnostics(&preview_files, uncovered),
         full,
         overflow_count: total - budget,
         dirty,
@@ -1378,7 +1349,7 @@ mod tests {
             root: PathBuf::from("/test"),
             entries: vec![de(1, ":1:1 [error] test: msg")],
         }];
-        let output = format_diagnostics(&diag_files, &[], &[]);
+        let output = format_diagnostics(&diag_files, &[]);
         assert!(!output.contains("[LSP available]"), "output: {output}");
         // Single file under root → collapsed path.
         assert!(output.contains("/test/file.rs:"), "output: {output}");
@@ -1395,7 +1366,7 @@ mod tests {
             root: PathBuf::from("/test"),
             entries,
         }];
-        let output = format_diagnostics(&diag_files, &[], &[]);
+        let output = format_diagnostics(&diag_files, &[]);
         // All entries should be present (no paging).
         for i in 0..5 {
             assert!(output.contains(&format!("msg {i}")), "output: {output}");
@@ -1403,16 +1374,12 @@ mod tests {
     }
 
     #[test]
-    fn format_clean_file() {
-        let clean = vec![CleanEntry {
-            display: "clean.rs".to_string(),
-            root: PathBuf::from("/test"),
-        }];
-        let output = format_diagnostics(&[], &clean, &[]);
-        // Single file → collapsed path with [clean].
-        assert!(output.contains("/test/clean.rs\n"), "output: {output}");
-        assert!(output.contains("\t[clean]"), "output: {output}");
-        assert!(!output.contains("N/A:"), "output: {output}");
+    fn format_clean_batch_is_empty() {
+        // Linter idiom (misc 111): a batch with no diagnostics and no
+        // uncovered files renders nothing — clean files are omitted, not
+        // listed as `[clean]`.
+        let output = format_diagnostics(&[], &[]);
+        assert!(output.is_empty(), "expected empty output, got: {output:?}");
     }
 
     #[test]
@@ -1424,22 +1391,23 @@ mod tests {
                 entries: vec![de(1, ":1:1 [error] test: alpha error")],
             },
             DiagnosticFile {
+                display: "src/util.rs".to_string(),
+                root: PathBuf::from("/alpha"),
+                entries: vec![de(2, ":3:1 [warning] test: alpha warning")],
+            },
+            DiagnosticFile {
                 display: "src/lib.rs".to_string(),
                 root: PathBuf::from("/beta"),
                 entries: vec![de(2, ":5:1 [warning] test: beta warning")],
             },
         ];
-        let clean = vec![CleanEntry {
-            display: "src/main.rs".to_string(),
-            root: PathBuf::from("/alpha"),
-        }];
-        let output = format_diagnostics(&diag_files, &clean, &[]);
-        // /alpha has 2 files (diag + clean) → expanded with directory header.
+        let output = format_diagnostics(&diag_files, &[]);
+        // /alpha has 2 diag files → expanded with directory header.
         let alpha_pos = output.find("/alpha\n").expect("missing /alpha header");
         assert!(output.contains("\tsrc/lib.rs:"), "output: {output}");
         assert!(output.contains("\t\t:1:1 [error]"), "output: {output}");
-        assert!(output.contains("\tsrc/main.rs\n"), "output: {output}");
-        assert!(output.contains("\t\t[clean]"), "output: {output}");
+        assert!(output.contains("\tsrc/util.rs:"), "output: {output}");
+        assert!(output.contains("alpha warning"), "output: {output}");
         // /beta has 1 file → collapsed into single path.
         let beta_pos = output
             .find("/beta/src/lib.rs:")
@@ -1450,13 +1418,32 @@ mod tests {
     }
 
     #[test]
+    fn format_clean_files_omitted_from_mixed_batch() {
+        // Clean files never appear, even alongside files that have
+        // diagnostics: only the dirty file is reported (misc 111).
+        let diag_files = vec![DiagnosticFile {
+            display: "src/lib.rs".to_string(),
+            root: PathBuf::from("/alpha"),
+            entries: vec![de(1, ":1:1 [error] test: alpha error")],
+        }];
+        let output = format_diagnostics(&diag_files, &[]);
+        // Single (printed) file under /alpha → collapsed path; the clean
+        // sibling produces neither a line nor an expanded directory header.
+        assert!(output.contains("/alpha/src/lib.rs:"), "output: {output}");
+        assert!(output.contains(":1:1 [error]"), "output: {output}");
+        assert!(!output.contains("[clean]"), "output: {output}");
+        assert!(!output.contains("src/main.rs"), "output: {output}");
+        assert!(!output.contains("/alpha\n"), "output: {output}");
+    }
+
+    #[test]
     fn format_single_file_server() {
         let diag_files = vec![DiagnosticFile {
             display: "scratch.sh".to_string(),
             root: PathBuf::from("/tmp"),
             entries: vec![de(2, ":3:1 [warning] test: standalone warning")],
         }];
-        let output = format_diagnostics(&diag_files, &[], &[]);
+        let output = format_diagnostics(&diag_files, &[]);
         // Single file → collapsed path.
         assert!(output.contains("/tmp/scratch.sh:"), "output: {output}");
         assert!(output.contains("\t:3:1 [warning]"), "output: {output}");
@@ -1473,7 +1460,7 @@ mod tests {
             root: PathBuf::from("/test"),
             entries: vec![de(1, ":1:1 [error] test: msg")],
         }];
-        let output = format_diagnostics(&diag_files, &[], &[]);
+        let output = format_diagnostics(&diag_files, &[]);
         // No status header — output starts directly with file content.
         assert!(!output.contains("[LSP available]"), "output: {output}");
         // Bare path, no prefix.
@@ -1487,29 +1474,27 @@ mod tests {
             display: "data.csv".to_string(),
             root: PathBuf::from("/project"),
         }];
-        let output = format_diagnostics(&[], &[], &uncovered);
+        let output = format_diagnostics(&[], &uncovered);
         // Single file → collapsed path with [no LSP coverage].
         assert!(output.contains("/project/data.csv\n"), "output: {output}");
         assert!(output.contains("\t[no LSP coverage]"), "output: {output}");
     }
 
     #[test]
-    fn format_mixed_clean_and_uncovered() {
-        let clean = vec![CleanEntry {
-            display: "lib.rs".to_string(),
-            root: PathBuf::from("/project"),
-        }];
+    fn format_clean_omitted_uncovered_preserved() {
+        // A clean covered file plus an uncovered file: the clean file is
+        // omitted, the uncovered note is preserved (misc 111 keeps the
+        // LSP-unavailable signal, tickets 69/80). The uncovered file is the
+        // only printed entry under /project → collapsed path.
         let uncovered = vec![UncoveredEntry {
             display: "data.csv".to_string(),
             root: PathBuf::from("/project"),
         }];
-        let output = format_diagnostics(&[], &clean, &uncovered);
-        // Two files under same root → expanded with directory header.
-        assert!(output.contains("/project\n"), "output: {output}");
-        assert!(output.contains("\tlib.rs\n"), "output: {output}");
-        assert!(output.contains("\t\t[clean]"), "output: {output}");
-        assert!(output.contains("\tdata.csv\n"), "output: {output}");
-        assert!(output.contains("\t\t[no LSP coverage]"), "output: {output}");
+        let output = format_diagnostics(&[], &uncovered);
+        assert!(output.contains("/project/data.csv\n"), "output: {output}");
+        assert!(output.contains("\t[no LSP coverage]"), "output: {output}");
+        assert!(!output.contains("[clean]"), "output: {output}");
+        assert!(!output.contains("lib.rs"), "output: {output}");
     }
 
     // ── enclosing symbol tests ────────────────────────────────────
@@ -1765,7 +1750,7 @@ mod tests {
             root: PathBuf::from("/r"),
             entries: vec![de(1, ":1:1 [error] e: one"), de(2, ":2:1 [warning] w: two")],
         }];
-        let b = budget_diagnostics(&diag_files, &[], &[], 50, 1);
+        let b = budget_diagnostics(&diag_files, &[], 50, 1);
         assert_eq!(b.overflow_count, 0);
         assert_eq!(b.preview, b.full);
         assert!(b.dirty, "an error is dirty at threshold error");
@@ -1784,7 +1769,7 @@ mod tests {
                 de(2, ":3:1 [warning] w: warn-c"),
             ],
         }];
-        let b = budget_diagnostics(&diag_files, &[], &[], 1, 1);
+        let b = budget_diagnostics(&diag_files, &[], 1, 1);
         assert_eq!(b.overflow_count, 2);
         assert!(b.preview.contains("err-b"), "error survives: {}", b.preview);
         assert!(
@@ -1813,8 +1798,8 @@ mod tests {
             entries: vec![de(2, ":1:1 [warning] w: warn")],
         }];
         // Warnings-only is clean at the default error threshold.
-        assert!(!budget_diagnostics(&diag_files, &[], &[], 50, 1).dirty);
+        assert!(!budget_diagnostics(&diag_files, &[], 50, 1).dirty);
         // ...but dirty when the threshold is lowered to warning.
-        assert!(budget_diagnostics(&diag_files, &[], &[], 50, 2).dirty);
+        assert!(budget_diagnostics(&diag_files, &[], 50, 2).dirty);
     }
 }

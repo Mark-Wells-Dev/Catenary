@@ -197,8 +197,8 @@ fn test_diagnostics_in_subroot() -> Result<()> {
     // done_editing triggers ensure_clients_for_paths → lazy spawn.
     let text = bridge.call_diagnostics(file.to_str().context("file")?)?;
     assert!(
-        text.contains("mock diagnostic") || text.contains("[clean]"),
-        "Diagnostics should return results for sub-root file. Got:\n{text}"
+        text.contains("mock diagnostic") || text.trim().is_empty(),
+        "Diagnostics should return results (or be silent when clean) for sub-root file. Got:\n{text}"
     );
 
     Ok(())

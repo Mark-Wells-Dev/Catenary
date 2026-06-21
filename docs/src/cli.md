@@ -152,8 +152,10 @@ Print LSP diagnostics for every file you've edited since the last run,
 then clear the set. Editing is tracked automatically — the first edit to
 a server-covered file starts it, there is no start step — so this command
 is the *end* of an edit batch: it opens all modified files on their
-servers, waits for each to settle, and prints the errors and warnings (or
-`[clean]` when there are none).
+servers, waits for each to settle, and prints the errors and warnings —
+listing only the files that have them. Like a linter (`ruff`, `clippy`,
+`eslint`), it is **silent on success**: a clean batch prints nothing and
+exits 0.
 
 ```bash
 catenary diagnostics

@@ -168,10 +168,11 @@ enum Command {
     /// Print diagnostics for the files you've edited, then clear the set.
     ///
     /// Runs the LSP diagnostics pipeline over every file edited since the
-    /// last run: prints errors and warnings (or `[clean]` when none), then
-    /// resets so the next edit starts a fresh set. Editing begins implicitly
-    /// on the first edit — there is no separate start step. Invoke via the
-    /// host's shell tool.
+    /// last run: prints only the files that have errors or warnings, and
+    /// nothing when the batch is clean (the linter idiom — silent on
+    /// success, exit 0). Then resets so the next edit starts a fresh set.
+    /// Editing begins implicitly on the first edit — there is no separate
+    /// start step. Invoke via the host's shell tool.
     Diagnostics,
 
     /// Editing mode (start). Optional — editing starts implicitly on the
@@ -2929,12 +2930,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn diagnostics_clean_exit_0() {
+        // Silent on clean (misc 111, linter idiom): a clean batch carries
+        // empty output and prints nothing, still exiting 0.
         let mut out = cli::Output::buffer(80);
-        let status =
-            emit_diagnostics_response(&mut out, r#"{"status":"clean","output":"[clean]"}"#)
-                .expect("clean response parses");
+        let status = emit_diagnostics_response(&mut out, r#"{"status":"clean","output":""}"#)
+            .expect("clean response parses");
         assert_eq!(status, DiagnosticsExit::Clean);
-        assert!(out.into_string().contains("[clean]"));
+        assert!(out.into_string().is_empty(), "clean run must print nothing");
     }
 
     #[cfg(unix)]

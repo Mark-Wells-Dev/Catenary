@@ -4694,19 +4694,17 @@ mod tests {
 
     #[test]
     fn out_of_roots_note_appended_to_mixed_batch() {
+        // Covered-file diagnostics output (clean files are silent post
+        // misc 111 — only files with diagnostics render).
+        let covered = "src/main.rs:\n\t:1:1 [error] e: boom";
+
         // Nothing filtered → output is untouched.
-        assert_eq!(
-            with_out_of_roots_note("src/main.rs\n\t[clean]".to_string(), 0),
-            "src/main.rs\n\t[clean]",
-        );
+        assert_eq!(with_out_of_roots_note(covered.to_string(), 0), covered);
 
         // Mixed batch: the covered-file results are preserved and the note
         // is appended so the unchecked edits are not silently hidden.
-        let mixed = with_out_of_roots_note("src/main.rs\n\t[clean]".to_string(), 2);
-        assert!(
-            mixed.starts_with("src/main.rs\n\t[clean]\n"),
-            "got: {mixed}"
-        );
+        let mixed = with_out_of_roots_note(covered.to_string(), 2);
+        assert!(mixed.starts_with(&format!("{covered}\n")), "got: {mixed}");
         assert!(
             mixed.contains("2 edits outside tracked roots"),
             "got: {mixed}"
@@ -4843,9 +4841,9 @@ mod tests {
         // The key test: the handoff consumed the files successfully.
         let req = serde_json::json!({"method": "tool/editing-stop"});
         let response = hook_roundtrip_full(&ipc_path, &req).await;
-        // With no LSP servers, process_files_batched returns "[clean]"
-        // for files without coverage. The response should not be the
-        // expired message.
+        // With no LSP servers the file is uncovered (rendered as
+        // "[no LSP coverage]", not "[clean]" — clean files are silent post
+        // misc 111). The response should not be the expired message.
         assert!(
             !response.contains("handoff expired"),
             "handoff should not be expired, got: {response}",

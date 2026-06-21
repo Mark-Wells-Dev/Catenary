@@ -244,9 +244,10 @@ fn test_batch_file_open_failure() -> Result<()> {
         missing.to_str().context("path missing")?,
     ])?;
 
-    // The good file should still produce results.
+    // The good file should still produce results (or be silent when clean,
+    // post misc 111).
     assert!(
-        text.contains("mock diagnostic") || text.contains("clean"),
+        text.contains("mock diagnostic") || text.trim().is_empty(),
         "Good file should produce output despite missing file. Got:\n{text}"
     );
 
@@ -255,8 +256,8 @@ fn test_batch_file_open_failure() -> Result<()> {
 
 // ─── Clean files ────────────────────────────────────────────────────
 
-/// Files where the server produces no diagnostics appear in the
-/// "clean" group.
+/// Files where the server produces no diagnostics are silent — the linter
+/// idiom (misc 111): a clean batch emits nothing.
 #[test]
 fn test_batch_clean_files() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -277,8 +278,8 @@ fn test_batch_clean_files() -> Result<()> {
     ])?;
 
     assert!(
-        text.contains("clean"),
-        "Files with no diagnostics should be listed as clean. Got:\n{text}"
+        text.trim().is_empty(),
+        "Files with no diagnostics should be silent (clean). Got:\n{text}"
     );
 
     Ok(())

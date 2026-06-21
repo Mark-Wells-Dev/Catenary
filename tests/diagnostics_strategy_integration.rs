@@ -131,11 +131,11 @@ fn test_diagnostics_server_death() -> Result<()> {
         .unwrap_or_default();
 
     // Should either get diagnostics (if server published before dying),
-    // a status message, or a notify error. No raw infrastructure
-    // messages to agent.
+    // a status message, a notify error, or empty output (a clean batch is
+    // silent post misc 111). No raw infrastructure messages to agent.
     let is_acceptable = text.contains("mock diagnostic")
         || text.contains("[no language server]")
-        || text.contains("[clean]")
+        || text.trim().is_empty()
         || text.contains("Notify error");
 
     assert!(
@@ -383,7 +383,8 @@ fn test_diagnostics_settle_holds_through_unbracketed_child_flycheck() -> Result<
 
 /// mockls with `--progress-on-change --no-push-diagnostics`: server sends
 /// progress tokens but never publishes diagnostics. After settle, the push
-/// cache is empty and pull is not supported → `[clean]`.
+/// cache is empty and pull is not supported → clean, which is silent
+/// (empty output) post misc 111.
 #[test]
 fn test_diagnostics_no_push_no_pull_returns_clean() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -399,8 +400,8 @@ fn test_diagnostics_no_push_no_pull_returns_clean() -> Result<()> {
     let text = bridge.call_diagnostics(file.to_str().context("path")?)?;
 
     assert!(
-        text.contains("clean"),
-        "Server with no push and no pull should return clean after settle. Got: {text}"
+        text.trim().is_empty(),
+        "Server with no push and no pull should return clean (silent) after settle. Got: {text}"
     );
 
     Ok(())
@@ -454,8 +455,9 @@ fn test_near_threshold_flycheck() -> Result<()> {
 }
 
 /// mockls with `--pull-diagnostics --fail-pull --no-push-diagnostics`:
-/// pull fails on first call → downgrade to push-only → `[clean]`.
-/// Second call skips pull (downgraded) → `[clean]`.
+/// pull fails on first call → downgrade to push-only → clean (silent).
+/// Second call skips pull (downgraded) → clean (silent). Clean is empty
+/// output post misc 111.
 #[test]
 fn test_pull_downgrade_no_push() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -468,18 +470,18 @@ fn test_pull_downgrade_no_push() -> Result<()> {
     )?;
     bridge.initialize()?;
 
-    // First call: pull fails → downgrade → clean
+    // First call: pull fails → downgrade → clean (silent)
     let text1 = bridge.call_diagnostics(file.to_str().context("path")?)?;
     assert!(
-        text1.contains("clean"),
-        "Failed pull with no push should return clean. Got: {text1}"
+        text1.trim().is_empty(),
+        "Failed pull with no push should return clean (silent). Got: {text1}"
     );
 
-    // Second call: pull skipped (downgraded) → clean
+    // Second call: pull skipped (downgraded) → clean (silent)
     let text2 = bridge.call_diagnostics(file.to_str().context("path")?)?;
     assert!(
-        text2.contains("clean"),
-        "Downgraded server should return clean without retrying pull. Got: {text2}"
+        text2.trim().is_empty(),
+        "Downgraded server should return clean (silent) without retrying pull. Got: {text2}"
     );
 
     Ok(())
@@ -712,9 +714,9 @@ fn test_diagnostics_one_server_dies() -> Result<()> {
 
     // mockls-crash dies after 3 responses (initialize response +
     // initialized ack + didOpen). mockls-stable should still produce
-    // diagnostics.
+    // diagnostics (or be silent when clean, post misc 111).
     assert!(
-        text.contains("mock diagnostic") || text.contains("clean"),
+        text.contains("mock diagnostic") || text.trim().is_empty(),
         "Surviving server should still contribute. Got:\n{text}"
     );
     // Should NOT be entirely "[no language server]"
