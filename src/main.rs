@@ -242,6 +242,14 @@ enum Command {
     /// Stop the running Catenary daemon.
     Stop,
 
+    /// Print the CLI version and the running daemon's version.
+    ///
+    /// `catenary --version` prints only the binary's own version (instant, no
+    /// I/O). This subcommand additionally queries the running daemon — a daemon
+    /// lags a freshly-rebuilt CLI until it is restarted, and this surfaces that
+    /// staleness at a glance.
+    Version,
+
     /// Query the JSONL telemetry firehose (LSP/MCP/hook protocol + trace).
     ///
     /// Reads the append-only logs directly, so it works even when the daemon
@@ -681,6 +689,13 @@ fn main() -> Result<()> {
         }
         #[cfg(not(unix))]
         Some(Command::Stop) => Err(anyhow::anyhow!("daemon mode requires Unix")),
+        #[cfg(unix)]
+        Some(Command::Version) => {
+            let mut out = cli::Output::stdout(false);
+            build_runtime()?.block_on(cli::version::run_version(&mut out))
+        }
+        #[cfg(not(unix))]
+        Some(Command::Version) => Err(anyhow::anyhow!("daemon mode requires Unix")),
         Some(Command::Query {
             session,
             server,
@@ -2185,6 +2200,14 @@ mod tests {
         // old subcommand no longer parses.
         use clap::Parser;
         assert!(Args::try_parse_from(["catenary", "editing", "stop"]).is_err());
+    }
+
+    #[test]
+    fn test_cli_version_subcommand() {
+        use clap::Parser;
+        let args = Args::try_parse_from(["catenary", "version"]);
+        let args = args.expect("version subcommand should parse");
+        assert!(matches!(args.command, Some(Command::Version)));
     }
 
     // ── CLI grep subcommand tests ──────────────────────────────────

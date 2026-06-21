@@ -11,6 +11,7 @@ pub mod hooks;
 pub mod install;
 pub mod jsonl_reader;
 pub mod update;
+pub mod version;
 
 use clap::ValueEnum;
 use crossterm::tty::IsTty;

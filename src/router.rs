@@ -1651,6 +1651,18 @@ async fn handle_hook_connection(
             return Ok(());
         }
 
+        // `tool/version` (from `catenary version`) works without a session:
+        // mirror the session-aware dispatcher so a session-less daemon (e.g.
+        // `lsp = false`) still reports its version.
+        if method == "tool/version" {
+            let response = serde_json::json!({ "version": env!("CATENARY_VERSION") });
+            let mut payload = serde_json::to_vec(&response)?;
+            payload.push(b'\n');
+            writer.write_all(&payload).await?;
+            writer.shutdown().await?;
+            return Ok(());
+        }
+
         info!(
             source = Source::DaemonDispatch.as_str(),
             method, "hook request (passthrough)",
@@ -1877,6 +1889,20 @@ async fn handle_hook_dispatch(
         writer.write_all(b"{\"status\":\"ok\"}\n").await?;
         writer.shutdown().await?;
         shutdown.cancel();
+        return Ok(());
+    }
+
+    // ── Report daemon version ──────────────────────────────────
+    //
+    // `tool/version` is sent by `catenary version`. Returns this
+    // daemon binary's embedded `CATENARY_VERSION` so the CLI can
+    // compare it against its own and flag a stale daemon.
+    if method == "tool/version" {
+        let response = serde_json::json!({ "version": env!("CATENARY_VERSION") });
+        let mut payload = serde_json::to_vec(&response)?;
+        payload.push(b'\n');
+        writer.write_all(&payload).await?;
+        writer.shutdown().await?;
         return Ok(());
     }
 
@@ -4154,6 +4180,72 @@ mod tests {
             !ipc_path.exists(),
             "IPC socket should be removed after stop",
         );
+    }
+
+    #[tokio::test]
+    async fn version_via_ipc_socket() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let ipc_path = ipc_socket_in(dir.path());
+
+        // Session-less manager — exercises the `handle_hook_connection` path,
+        // the transport-only daemon (e.g. `lsp = false`) still answers version.
+        let manager = Arc::new(bind_in(dir.path()));
+        let m = Arc::clone(&manager);
+        let handle = tokio::spawn(async move { m.accept_loop().await });
+
+        let stream = tokio::net::UnixStream::connect(&ipc_path)
+            .await
+            .expect("connect to IPC socket");
+        let (reader, mut writer) = stream.into_split();
+
+        let request = serde_json::json!({"method": "tool/version"});
+        let mut payload = serde_json::to_string(&request).expect("serialize");
+        payload.push('\n');
+        writer.write_all(payload.as_bytes()).await.expect("write");
+
+        let mut buf_reader = BufReader::new(reader);
+        let mut line = String::new();
+        buf_reader.read_line(&mut line).await.expect("read");
+
+        let response: serde_json::Value =
+            serde_json::from_str(line.trim()).expect("version response json");
+        assert_eq!(
+            response.get("version").and_then(serde_json::Value::as_str),
+            Some(env!("CATENARY_VERSION")),
+            "tool/version returns the daemon's CATENARY_VERSION",
+        );
+
+        manager.shutdown_token().cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn version_via_ipc_socket_with_session() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let ipc_path = ipc_socket_in(dir.path());
+
+        // Session-aware manager — exercises the `handle_hook_dispatch` path,
+        // the shape a real daemon serves.
+        let manager = Arc::new(bind_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
+        let m = Arc::clone(&manager);
+        let handle = tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        let resp = hook_roundtrip(&ipc_path, &serde_json::json!({"method": "tool/version"})).await;
+        let response: serde_json::Value =
+            serde_json::from_str(resp.trim()).expect("version response json");
+        assert_eq!(
+            response.get("version").and_then(serde_json::Value::as_str),
+            Some(env!("CATENARY_VERSION")),
+            "tool/version returns the daemon's CATENARY_VERSION",
+        );
+
+        shutdown.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
     }
 
     #[tokio::test]
