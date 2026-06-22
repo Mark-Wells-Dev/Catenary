@@ -38,7 +38,7 @@ use serde_json::{Value, json};
 
 use common::{
     BridgeProcess, grep_until_enriched, ipc_request, mockls_lsp_arg, poll_log_until,
-    rewrite_advancing_mtime, wait_for_change, wait_for_change_in_root,
+    read_merged_log, rewrite_advancing_mtime, wait_for_change, wait_for_change_in_root,
 };
 
 const MOCK_LANG: &str = "yX4Za";
@@ -112,7 +112,7 @@ fn ws31_review_r1_scoped_grep_no_spurious_delete() -> Result<()> {
     // alive while polling — mockls writes the log on receipt — so there is no
     // shutdown/flush race. No fixed sleep guesses "long enough".
     let changes = wait_for_change(&log_path, &a_match_uri, 2);
-    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let log = read_merged_log(&log_path);
 
     // Companion guard: the SCOPED walk itself must route a/match as Changed(2)
     // (its mtime was advanced above), so the fix can't trivially pass by making
@@ -226,7 +226,7 @@ fn ws31_review_r1_incomplete_observation_not_reaped() -> Result<()> {
     // while polling — mockls writes the log on receipt — so no shutdown race and
     // no fixed-time "long enough" guess.
     let changes = wait_for_change(&log_path, &witness_uri, 1);
-    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let log = read_merged_log(&log_path);
 
     // Companion guard (non-vacuous): the `witness`, created after the seed, must
     // be routed Created(1) by the second full walk, pinning that the walk + reap
@@ -609,7 +609,7 @@ fn ws31_review_r4_eviction_witnessed_via_request_count() -> Result<()> {
     let req_log_arg = req_log_base.to_str().context("request log path")?;
     let lsp = mockls_lsp_arg(
         MOCK_LANG,
-        &format!("--scan-roots --log-pid-suffix --request-log {req_log_arg}"),
+        &format!("--scan-roots --request-log {req_log_arg}"),
     );
 
     let mut bridge = BridgeProcess::spawn(&[&lsp], base_str)?;
@@ -879,14 +879,14 @@ fn ws31_review_r4_covering_watchers_subdir_scope() -> Result<()> {
         MOCK_LANG,
         &format!(
             "--register-file-watchers --watcher-glob **/*.{MOCK_LANG} \
-             --watcher-kind 7 --log-pid-suffix --notification-log {log_p_arg}"
+             --watcher-kind 7 --notification-log {log_p_arg}"
         ),
     );
     let lsp_s = mockls_lsp_arg(
         MOCK_LANG_S,
         &format!(
             "--register-file-watchers --watcher-glob **/*.{MOCK_LANG_S} \
-             --watcher-kind 7 --log-pid-suffix --notification-log {log_s_arg}"
+             --watcher-kind 7 --notification-log {log_s_arg}"
         ),
     );
 
@@ -1082,7 +1082,7 @@ fn ws31_review_c4_edited_then_deleted_drives_exclude() -> Result<()> {
     // completion signal that the reap was routed and flushed to mockls), then
     // assert over that snapshot. No fixed sleep, no shutdown/flush race.
     let changes = wait_for_change(&log_path, &gone_uri, 3);
-    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let log = read_merged_log(&log_path);
 
     // GREEN today, load-bearing for L6: the edited-then-deleted file's `Deleted`
     // must be ROUTED. `gone` is in the edited-set but NOT in `exclude` —
@@ -1172,7 +1172,7 @@ fn ws31_review_c1_symlink_dir_glob_single_canonical_key() -> Result<()> {
         c.iter()
             .any(|(u, t)| *u == real_uri && (*t == 1 || *t == 2))
     });
-    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let log = read_merged_log(&log_path);
 
     // Companion guard: the real file IS tracked under its canonical key (so the
     // fix can't trivially pass by making glob stop nudging entirely). It enters
@@ -1310,7 +1310,7 @@ fn ws31_review_d_diagnostics_stat_miss_not_reaped() -> Result<()> {
     // sweep ran and flushed), then assert the present-but-unstattable sub/locked
     // is NOT reaped in that SAME snapshot. No fixed sleep, no shutdown race.
     let changes = wait_for_change(&log_path, &witness_uri, 1);
-    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let log = read_merged_log(&log_path);
 
     // Companion guard (non-vacuous): the non-edited `witness`, created after the
     // baseline seed, is routed as Created(1) by the SECOND full stat-walk. This

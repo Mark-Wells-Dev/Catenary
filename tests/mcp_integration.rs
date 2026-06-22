@@ -18,7 +18,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::json;
 
-use common::{BridgeProcess, mockls_lsp_arg};
+use common::{BridgeProcess, mockls_lsp_arg, read_merged_log};
 
 const MOCK_LANG_A: &str = "yX4Za";
 const MOCK_LANG_B: &str = "d5apI";
@@ -643,7 +643,7 @@ fn test_mockls_did_save_not_sent_without_capability() -> Result<()> {
     drop(bridge);
     std::thread::sleep(Duration::from_millis(200));
 
-    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let log = read_merged_log(&log_path);
     assert!(
         !log.contains("textDocument/didSave"),
         "didSave should NOT be sent without save capability. Log:\n{log}"
@@ -675,7 +675,7 @@ fn test_mockls_did_save_sent_with_capability() -> Result<()> {
     drop(bridge);
     std::thread::sleep(Duration::from_millis(200));
 
-    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let log = read_merged_log(&log_path);
     assert!(
         log.contains("textDocument/didSave"),
         "didSave SHOULD be sent with save capability. Log:\n{log}"

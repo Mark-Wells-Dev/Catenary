@@ -24,8 +24,8 @@ use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
 use common::{
-    BridgeProcess, mockls_lsp_arg, poll_log_until, rewrite_advancing_mtime, wait_for_change,
-    watched_file_notification_count,
+    BridgeProcess, mockls_lsp_arg, poll_log_until, read_merged_log, rewrite_advancing_mtime,
+    wait_for_change, watched_file_notification_count,
 };
 
 const MOCK_LANG_A: &str = "yX4Za";
@@ -64,7 +64,7 @@ fn first_walk_sends_full_candidate_set() -> Result<()> {
         c.iter().any(|(u, t)| *u == a_uri && *t == 2)
             && c.iter().any(|(u, t)| *u == b_uri && *t == 2)
     });
-    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let log = read_merged_log(&log_path);
 
     assert!(
         changes.iter().any(|(u, t)| *u == a_uri && *t == 2),
@@ -104,7 +104,7 @@ fn second_walk_sends_only_delta() -> Result<()> {
     // count — no fixed sleep guessing the flush is done.
     let _ = bridge.call_tool_text("grep", &json!({ "pattern": "needle" }))?;
     poll_log_until(&log_path, |c| c.iter().any(|(u, _)| *u == a_uri));
-    let log_after_first = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let log_after_first = read_merged_log(&log_path);
     let count_after_first = watched_file_notification_count(&log_after_first);
     assert!(
         count_after_first >= 1,
@@ -127,7 +127,7 @@ fn second_walk_sends_only_delta() -> Result<()> {
     let _ = bridge.call_tool_text("grep", &json!({ "pattern": "needle" }))?;
     wait_for_change(&log_path, &tail_uri, 1);
 
-    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let log = read_merged_log(&log_path);
     let count_total = watched_file_notification_count(&log);
     assert_eq!(
         count_total,
@@ -193,7 +193,7 @@ fn external_change_routed_to_matching_server_only() -> Result<()> {
     // Server A: poll its live log until it records the changed .A file (positive
     // completion signal), then assert.
     let a_changes = wait_for_change(&log_a, &changed_uri, 2);
-    let log_a_text = std::fs::read_to_string(&log_a).unwrap_or_default();
+    let log_a_text = read_merged_log(&log_a);
     let a_changed_count = a_changes.iter().filter(|(u, _)| *u == changed_uri).count();
     assert!(
         a_changed_count >= 1,
@@ -205,7 +205,7 @@ fn external_change_routed_to_matching_server_only() -> Result<()> {
     // (other.<LANG_B>) — proving B's walk-#2 routing ran and flushed — then assert
     // in that SAME snapshot that B did NOT receive the .A file.
     let b_changes = wait_for_change(&log_b, &b_anchor_uri, 2);
-    let log_b_text = std::fs::read_to_string(&log_b).unwrap_or_default();
+    let log_b_text = read_merged_log(&log_b);
     assert!(
         b_changes.iter().any(|(u, _)| *u == b_anchor_uri),
         "server B should receive its own .{MOCK_LANG_B} change (the anchor proving \
@@ -282,7 +282,7 @@ fn created_file_routed_with_created_wire_type() -> Result<()> {
     // Create-registering server A: poll until it records the created path as
     // Created(1) — positive completion signal — then assert.
     let create_changes = wait_for_change(&log_create, &created_uri, 1);
-    let log_create_text = std::fs::read_to_string(&log_create).unwrap_or_default();
+    let log_create_text = read_merged_log(&log_create);
     assert!(
         create_changes
             .iter()
@@ -295,7 +295,7 @@ fn created_file_routed_with_created_wire_type() -> Result<()> {
     // B's walk-#2 routing ran and flushed), then assert in that SAME snapshot that
     // B did NOT receive the created path.
     let change_changes = wait_for_change(&log_change, &seed_uri, 2);
-    let log_change_text = std::fs::read_to_string(&log_change).unwrap_or_default();
+    let log_change_text = read_merged_log(&log_change);
     assert!(
         change_changes
             .iter()
@@ -369,7 +369,7 @@ fn changed_file_routed_with_changed_wire_type() -> Result<()> {
     // Change-registering server A: poll until it records the modification as
     // Changed(2) — positive completion signal — then assert.
     let change_changes = wait_for_change(&log_change, &existing_uri, 2);
-    let log_change_text = std::fs::read_to_string(&log_change).unwrap_or_default();
+    let log_change_text = read_merged_log(&log_change);
     assert!(
         change_changes
             .iter()
@@ -382,7 +382,7 @@ fn changed_file_routed_with_changed_wire_type() -> Result<()> {
     // (proving B's walk-#2 routing ran and flushed), then assert in that SAME
     // snapshot that B did NOT receive the modification.
     let create_changes = wait_for_change(&log_create, &fresh_uri, 1);
-    let log_create_text = std::fs::read_to_string(&log_create).unwrap_or_default();
+    let log_create_text = read_merged_log(&log_create);
     assert!(
         create_changes
             .iter()
@@ -440,7 +440,7 @@ fn diagnostics_excludes_edited_set() -> Result<()> {
     // positive completion signal), then assert in that SAME snapshot that the
     // edited file (which rides document-sync, not the nudge) is absent.
     let changes = wait_for_change(&log_path, &external_uri, 2);
-    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let log = read_merged_log(&log_path);
 
     assert!(
         changes.iter().any(|(u, _)| *u == external_uri),
@@ -485,7 +485,7 @@ fn count_grep_does_no_coherence_walk() -> Result<()> {
     // lands — the baseline notification count.
     let _ = bridge.call_tool_text("grep", &json!({ "pattern": "needle" }))?;
     poll_log_until(&log_path, |c| c.iter().any(|(u, _)| *u == a_uri));
-    let baseline = watched_file_notification_count(&std::fs::read_to_string(&log_path)?);
+    let baseline = watched_file_notification_count(&read_merged_log(&log_path));
 
     // A `--count` grep — must NOT run the engine (None breadth), so it must add
     // ZERO notifications.
@@ -508,7 +508,7 @@ fn count_grep_does_no_coherence_walk() -> Result<()> {
     let _ = bridge.call_tool_text("grep", &json!({ "pattern": "needle" }))?;
     wait_for_change(&log_path, &b_uri, 1);
 
-    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let log = read_merged_log(&log_path);
     let count = watched_file_notification_count(&log);
     assert_eq!(
         count,
@@ -550,7 +550,7 @@ fn no_lsp_query_no_nudge() -> Result<()> {
     // sleep, and (uniquely) no anchor is possible or required.
     let _ = bridge.call_tool_text("grep", &json!({ "pattern": "needle" }))?;
 
-    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let log = read_merged_log(&log_path);
     let count = watched_file_notification_count(&log);
     assert_eq!(
         count, 0,
@@ -599,7 +599,7 @@ fn enriched_grep_full_walk_reaps_deletion() -> Result<()> {
     // Poll the live log until the reaped Deleted(3) lands (positive completion
     // signal), then assert. No fixed sleep, no shutdown/flush race.
     let changes = wait_for_change(&log_path, &gone_uri, 3);
-    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let log = read_merged_log(&log_path);
     assert!(
         changes.iter().any(|(u, t)| *u == gone_uri && *t == 3),
         "a full enriched-grep walk must reap the deleted file as Deleted(3). \
@@ -645,7 +645,7 @@ fn diagnostics_full_walk_reaps_deletion() -> Result<()> {
     // Poll the live log until the reaped Deleted(3) lands (positive completion
     // signal), then assert. No fixed sleep, no shutdown/flush race.
     let changes = wait_for_change(&log_path, &gone_uri, 3);
-    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let log = read_merged_log(&log_path);
     assert!(
         changes.iter().any(|(u, t)| *u == gone_uri && *t == 3),
         "a full diagnostics walk must reap the deleted file as Deleted(3). \
@@ -702,7 +702,7 @@ fn delete_only_watcher_reaps_deletion() -> Result<()> {
     // too. That lets the absence below (walk #1 routed no Create/Change for `gone`)
     // be checked over the SAME snapshot — no fixed-sleep absence guess.
     let changes = wait_for_change(&log_path, &gone_uri, 3);
-    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let log = read_merged_log(&log_path);
 
     // The Delete-only watcher's baselined file is reaped as Deleted(3).
     assert!(
@@ -774,7 +774,7 @@ fn glob_scoped_adds_but_never_reaps() -> Result<()> {
     // assert in that SAME snapshot that the out-of-scope deleted `outside` is NOT
     // reaped. No fixed sleep.
     let changes = wait_for_change(&log_path, &inside_uri, 2);
-    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let log = read_merged_log(&log_path);
 
     // The changed inside file must be routed as Changed(2).
     assert!(
@@ -828,7 +828,7 @@ fn glob_routes_changed_then_queries_outline() -> Result<()> {
     // Poll the live log until the externally-changed file is routed Changed(2)
     // (the positive completion signal), then assert. No fixed sleep.
     let changes = wait_for_change(&log_path, &file_uri, 2);
-    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let log = read_merged_log(&log_path);
     assert!(
         changes.iter().any(|(u, t)| *u == file_uri && *t == 2),
         "glob's scoped walk must route the externally-changed file in its \

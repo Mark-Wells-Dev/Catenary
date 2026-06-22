@@ -848,13 +848,56 @@ fn ipc_request_with_timeout(
 }
 
 /// Builds a `CATENARY_SERVERS` spec for [`BridgeProcess::spawn`] using mockls.
+///
+/// Always passes `--log-pid-suffix`, so every per-root mockls instance writes its
+/// OWN `<log>.<pid>` file. Concurrent or transient instances of one language
+/// (multi-root, root churn, or a transient double-spawn under load) therefore
+/// never share — and destructively truncate or byte-interleave — a single log
+/// file. Readers merge `<base>.*` via [`read_merged_log`] (a single-instance test
+/// has exactly one pid file, so the merged content matches the old shared file).
+/// Callers must NOT also pass `--log-pid-suffix`.
 pub fn mockls_lsp_arg(lang: &str, flags: &str) -> String {
     let bin = env!("CARGO_BIN_EXE_mockls");
     if flags.is_empty() {
-        format!("{lang}:{bin} {lang}")
+        format!("{lang}:{bin} {lang} --log-pid-suffix")
     } else {
-        format!("{lang}:{bin} {lang} {flags}")
+        format!("{lang}:{bin} {lang} --log-pid-suffix {flags}")
     }
+}
+
+/// Reads a mockls log written with `--log-pid-suffix`: merges every
+/// `<base>.<pid>` sibling (one writer each ⇒ no torn/truncated lines), plus
+/// `<base>` itself if present. Returns `String::new()` when nothing exists yet.
+///
+/// [`mockls_lsp_arg`] always enables `--log-pid-suffix`, so this is the canonical
+/// way to read a notification/request log: a single-instance test has exactly one
+/// pid file (merged content == the old shared-file content), and a transient
+/// second instance's empty pid file contributes nothing rather than truncating
+/// the serving instance's log.
+pub fn read_merged_log(base: &Path) -> String {
+    let mut buf = std::fs::read_to_string(base).unwrap_or_default();
+    let (Some(dir), Some(name)) = (base.parent(), base.file_name().and_then(|n| n.to_str())) else {
+        return buf;
+    };
+    let prefix = format!("{name}.");
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        let mut paths: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|f| f.starts_with(&prefix))
+            })
+            .collect();
+        paths.sort();
+        for p in paths {
+            if let Ok(t) = std::fs::read_to_string(&p) {
+                buf.push_str(&t);
+            }
+        }
+    }
+    buf
 }
 
 // ── Contention-resistant signal polling ──────────────────────────────
@@ -1012,7 +1055,7 @@ where
 {
     let deadline = std::time::Instant::now() + POLL_BACKSTOP;
     loop {
-        let log = std::fs::read_to_string(log_path).unwrap_or_default();
+        let log = read_merged_log(log_path);
         let changes = watched_file_changes(&log);
         if pred(&changes) || std::time::Instant::now() >= deadline {
             return changes;
