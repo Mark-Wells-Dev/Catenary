@@ -194,6 +194,8 @@ Hook methods, each corresponding to a host CLI lifecycle event:
 | `pre-tool/editing-state` | `PreToolUse` / `BeforeTool` | Editing state enforcement — deny or allow a tool call |
 | `pre-tool/check-command` | `PreToolUse` / `BeforeTool` | Command filter — terse denial message (specific reason + fix + `catenary commands` pointer) |
 | `post-agent/require-release` | `Stop` / `AfterAgent` | Force `catenary diagnostics` if the agent stops with covered edits pending |
+| `subagent-start/mount-worktree` | `SubagentStart` | Mount an `isolation:"worktree"` subagent's git worktree as its own `worktree:{session_id}:{path}` LSP root |
+| `worktree-remove/unmount-worktree` | `WorktreeRemove` | Tear down a `worktree:*` root — fires only for non-git VCS / `--worktree` session exit (see worktree-root teardown below) |
 
 ### Hook contracts by host
 
@@ -208,6 +210,22 @@ live in host-specific JSON files:
 All hooks fire unconditionally (empty matcher). The `PreToolUse` /
 `BeforeTool` hook handles both editing state enforcement and command
 filtering in a single invocation.
+
+### Worktree-root teardown
+
+A worktree subagent's root is mounted at `SubagentStart` and meant to be
+torn down at `WorktreeRemove`. But `WorktreeRemove` **never fires for git
+worktrees**: the host runs `git worktree remove` itself and invokes the
+hook only for the non-git VCS / `--worktree` session-exit path. So for the
+common git case the prompt teardown signal is the **directory deletion**
+itself. The daemon reaps the `worktree:{session_id}:{path}` root via a
+bounded, non-recursive directory-deletion watch (`notify`/inotify) on each
+mounted worktree dir — registered at mount, fired the instant the dir
+disappears (see `src/worktree_watch.rs`). The hourly dir-gone GC
+(`reap_missing_worktree_roots`) and the `SessionEnd` sweep remain as
+crash-safe backstops: the watch is in-memory and dies with the daemon. The
+reap (`remove_contributor` + root re-sync) is identical and idempotent
+across all three paths, so a double-reap is a harmless no-op.
 
 The `--format=claude` / `--format=gemini` flag on each `catenary hook`
 command selects the output format for the host's expected JSON structure.

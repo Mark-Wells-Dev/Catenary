@@ -427,4 +427,55 @@ mod tests {
             "expected a deletion event for the watched worktree within the deadline",
         );
     }
+
+    #[test]
+    fn no_deletion_emits_no_event() {
+        // SendMessage-no-reap (ticket 05): the watch fires only on a `Remove`, so
+        // a resume that reuses the worktree without deleting its dir reaps
+        // nothing. A registered watch with no deletion produces no event within a
+        // bounded poll — the inverse of `deletion_emits_contributor_event`. This
+        // is non-flaky: only a spurious `Remove` could fail it, and the watcher
+        // emits none without an actual deletion. The dir is touched (a file is
+        // created) to confirm non-delete activity under the watched parent does
+        // not reap.
+        let (watcher, mut rx) = WorktreeWatcher::new().expect("create watcher");
+        let parent = tempfile::tempdir().expect("tempdir");
+        let wt = parent.path().join("agent-live");
+        std::fs::create_dir_all(&wt).expect("mkdir wt");
+        let key = format!("worktree:s1:{}", wt.display());
+
+        assert!(watcher.register(&key, &wt));
+
+        // Non-delete activity under the watched parent: create a sibling file and
+        // a file inside the worktree. A `SendMessage` resume reuses the worktree
+        // exactly like this — no dir deletion.
+        std::fs::write(parent.path().join("note.txt"), b"resume").expect("write sibling");
+        std::fs::write(wt.join("edited.rs"), b"fn main() {}").expect("write inside wt");
+
+        // Poll briefly; collect any spurious event. A short bounded window is
+        // enough — the watcher would have delivered a `Remove` within it (the
+        // deletion test observes events in well under this budget), and there is
+        // no deletion to deliver.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let mut spurious: Option<WorktreeDeleted> = None;
+        while std::time::Instant::now() < deadline {
+            match rx.try_recv() {
+                Ok(ev) => {
+                    spurious = Some(ev);
+                    break;
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert!(
+            spurious.is_none(),
+            "no reap event should arrive without a deletion: {spurious:?}",
+        );
+        assert!(
+            watcher.is_registered(&key),
+            "the watch is still live (nothing was reaped)",
+        );
+    }
 }

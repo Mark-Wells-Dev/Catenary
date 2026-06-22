@@ -6575,6 +6575,169 @@ mod tests {
         shutdown.cancel();
     }
 
+    // ── Worktree dir-deletion teardown (workstream 30, ticket 05) ─────────
+    //
+    // `WorktreeRemove` never fires for git worktrees (the host runs
+    // `git worktree remove` itself), so the prompt teardown trigger is the
+    // bounded directory-deletion watch. These tests cover the *reap* the watch
+    // reaper, the GC, and the `SessionEnd` sweep all share — `remove_contributor`
+    // + watch `unregister` + the reduced-union sync — and its idempotence across
+    // those paths. The real-FS deletion→channel half (the OS watch firing on a
+    // `remove_dir_all`) is covered by `worktree_watch::tests`'
+    // `deletion_emits_contributor_event`; here we drive the tracker + watcher
+    // directly so the assertions stay deterministic (no OS-event timing).
+
+    #[test]
+    fn worktree_watch_reap_drops_only_the_deleted_root() {
+        // The reaper's per-event action (see `spawn_worktree_watch_reaper`): on a
+        // `WorktreeDeleted` for one watched worktree, `unregister` its watch and
+        // `remove_contributor`, leaving every other root in `global_roots`
+        // untouched. Mirrors `reap_missing_worktree_roots_reaps_only_gone_dirs`
+        // but for the prompt watch path rather than the hourly GC.
+        let (watcher, _rx) = crate::worktree_watch::WorktreeWatcher::new().expect("create watcher");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().canonicalize().expect("canonicalize");
+
+        let deleted = base.join("agent-deleted");
+        let kept = base.join("agent-kept");
+        std::fs::create_dir(&deleted).expect("mkdir deleted");
+        std::fs::create_dir(&kept).expect("mkdir kept");
+
+        let tracker = RootTracker::new();
+        let key_deleted = format!("worktree:sess:{}", deleted.display());
+        let key_kept = format!("worktree:sess:{}", kept.display());
+        tracker.set_roots(&key_deleted, vec![deleted.clone()]);
+        tracker.set_roots(&key_kept, vec![kept.clone()]);
+        // A non-worktree contributor — must survive an unrelated reap.
+        tracker.set_roots("hook", vec![base.join("project")]);
+        watcher.register(&key_deleted, &deleted);
+        watcher.register(&key_kept, &kept);
+
+        // The reaper's body for a single `WorktreeDeleted { contributor }`.
+        watcher.unregister(&key_deleted);
+        tracker.remove_contributor(&key_deleted);
+
+        let global = tracker.global_roots();
+        assert!(!global.contains(&deleted), "the deleted worktree is reaped");
+        assert!(global.contains(&kept), "the sibling worktree survives");
+        assert!(
+            global.contains(&base.join("project")),
+            "the non-worktree (hook) root is untouched",
+        );
+        // The reaped contributor's watch is gone; the sibling's remains (shared
+        // parent, refcounted down by one).
+        assert!(!watcher.is_registered(&key_deleted));
+        assert!(watcher.is_registered(&key_kept));
+    }
+
+    #[test]
+    fn worktree_reap_is_idempotent_across_watch_gc_and_session_end() {
+        // The watch reaper, the hourly GC, and the `SessionEnd` sweep can all
+        // reap the same `worktree:{sid}:{path}` key without disagreeing: the
+        // second (and third) reap is a harmless no-op — `remove_contributor` of
+        // an absent key changes nothing, the root set is unchanged, and a repeat
+        // `unregister` is a no-op. This is the guarantee that lets the three
+        // teardown paths run concurrently (ticket 05).
+        let (watcher, _rx) = crate::worktree_watch::WorktreeWatcher::new().expect("create watcher");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().canonicalize().expect("canonicalize");
+        let wt = base.join("agent-x");
+        std::fs::create_dir(&wt).expect("mkdir wt");
+
+        let tracker = RootTracker::new();
+        let key = format!("worktree:sess:{}", wt.display());
+        tracker.set_roots(&key, vec![wt.clone()]);
+        tracker.set_roots("hook", vec![base.join("project")]);
+        watcher.register(&key, &wt);
+
+        // First reap (e.g. the watch reaper).
+        watcher.unregister(&key);
+        tracker.remove_contributor(&key);
+        let after_first = tracker.global_roots();
+        assert!(!after_first.contains(&wt), "reaped on the first pass");
+        assert_eq!(
+            after_first.len(),
+            1,
+            "only the unrelated root remains: {after_first:?}",
+        );
+        assert!(!watcher.is_registered(&key));
+
+        // Second reap via a different path (the GC's `unregister` + the
+        // `SessionEnd` sweep's prefix `unregister`) — must change nothing.
+        watcher.unregister(&key);
+        watcher.unregister_with_prefix("worktree:sess:");
+        tracker.remove_contributor(&key);
+        // The prefix sweep the `SessionEnd` backstop runs is also a no-op now.
+        assert_eq!(
+            tracker.remove_contributors_with_prefix("worktree:sess:"),
+            0,
+            "no worktree:sess:* contributors left to sweep",
+        );
+        let after_second = tracker.global_roots();
+        assert_eq!(
+            after_second.len(),
+            after_first.len(),
+            "the root set is unchanged on the second reap",
+        );
+        assert!(
+            !after_second.contains(&wt),
+            "the reaped worktree stays gone on the second reap",
+        );
+        assert!(!watcher.is_registered(&key));
+    }
+
+    #[test]
+    fn worktree_mount_race_guard_reaps_dir_gone_at_registration() {
+        // Race fast-path: the inline `.exists()` guard in the
+        // `subagent-start/mount-worktree` handler. If the worktree dir is removed
+        // in the window between the auto-mount predicate canonicalizing it (dir
+        // present) and the watch registration, the handler reaps the just-mounted
+        // contributor immediately — `unregister` + `remove_contributor` — rather
+        // than leaving a root on a dead dir. This test reproduces that exact branch
+        // deterministically: mount a contributor, register its watch, delete the
+        // dir, then run the guard body.
+        //
+        // The guard's *inline* timing window can't be forced from a round-trip
+        // test (the handler runs synchronously, and `worktree_to_auto_mount`'s
+        // `enclosing_worktree_root` requires `.git` *inside* the worktree, so the
+        // dir necessarily exists when the predicate authorizes the mount). The
+        // OS-event reach of the watch — a real `remove_dir_all` firing the reap —
+        // is covered by `worktree_watch::tests::deletion_emits_contributor_event`.
+        let (watcher, _rx) = crate::worktree_watch::WorktreeWatcher::new().expect("create watcher");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().canonicalize().expect("canonicalize");
+        let worktree = base.join("agent-raced");
+
+        let tracker = RootTracker::new();
+        tracker.set_roots("hook", vec![base.join("project")]);
+        let contributor = format!("worktree:sess:{}", worktree.display());
+
+        // Mount + watch (as the handler does on the authorized predicate). The
+        // worktree dir is already gone by the time the watch is registered — the
+        // race the inline guard exists for. (We delete it before registering so no
+        // live OS delete event is in flight, keeping the test deterministic; the
+        // real OS-event path is covered by `worktree_watch::tests`.)
+        tracker.set_roots(&contributor, vec![worktree.clone()]);
+        watcher.register(&contributor, &worktree);
+        assert!(tracker.global_roots().contains(&worktree), "mounted");
+
+        // The guard body: `if !worktree.exists() { unregister + remove_contributor }`.
+        assert!(!worktree.exists(), "the race-guard precondition holds");
+        watcher.unregister(&contributor);
+        tracker.remove_contributor(&contributor);
+
+        let global = tracker.global_roots();
+        assert!(
+            !global.contains(&worktree),
+            "the dir-gone worktree is reaped immediately, not left mounted",
+        );
+        assert!(
+            global.contains(&base.join("project")),
+            "the project root survives the immediate reap",
+        );
+        assert!(!watcher.is_registered(&contributor), "the watch is dropped");
+    }
+
     #[test]
     fn remove_root_from_hook_contributor() {
         let tracker = RootTracker::new();
