@@ -167,64 +167,69 @@ impl WorktreeWatcher {
             return false;
         };
 
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-
-        // Re-registering the same contributor: refresh the path only. Drop a stale
-        // parent ref first if the path moved to a different parent (rare).
-        if let Some(old) = state
-            .contributors
-            .insert(contributor.to_string(), worktree.to_path_buf())
-        {
-            if old.parent() == Some(parent.as_path()) {
+        // Compute the registration change under `state`, but perform every
+        // `notify` watch/unwatch AFTER dropping the lock — both block on the
+        // watcher's callback thread, which itself locks `state` (see
+        // `release_parent`).
+        let (old_parent_to_unwatch, first) = {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            // Re-registering the same contributor: refresh the path only. Release a
+            // stale parent ref first if the path moved to a different parent (rare).
+            let old_to_unwatch = match state
+                .contributors
+                .insert(contributor.to_string(), worktree.to_path_buf())
+            {
                 // Same parent — the existing parent ref already covers it.
-                return true;
-            }
-            // Path moved parents: release the old parent's ref below by reusing the
-            // unwatch path. Re-insert handled above; decrement the old parent here.
-            self.release_parent(&mut state, old.parent());
+                Some(old) if old.parent() == Some(parent.as_path()) => return true,
+                Some(old) => Self::release_parent(&mut state, old.parent()),
+                None => None,
+            };
+            let new_ref = state.parent_refs.entry(parent.clone()).or_insert(0);
+            *new_ref += 1;
+            let first = *new_ref == 1;
+            drop(state);
+            (old_to_unwatch, first)
+        };
+
+        // Drop a moved contributor's now-childless old parent watch, lock-free.
+        if let Some(old_parent) = old_parent_to_unwatch {
+            let _ = self
+                .watcher
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .unwatch(&old_parent);
         }
 
-        let new_ref = state.parent_refs.entry(parent.clone()).or_insert(0);
-        *new_ref += 1;
-        let first = *new_ref == 1;
-        drop(state);
-
         if first {
-            // Add the OS watch on the parent only on its first child. Bind the
-            // result first so the watcher guard drops before the match body (which
-            // may re-lock state); avoids holding the lock across the arms.
+            // Add the OS watch on the parent only on its first child.
             let watch_result = self
                 .watcher
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .watch(&parent, notify::RecursiveMode::NonRecursive);
-            match watch_result {
-                Ok(()) => {
-                    debug!(
-                        source = Source::DaemonDispatch.as_str(),
-                        contributor,
-                        parent = %parent.display(),
-                        "registered worktree deletion watch",
-                    );
-                }
-                Err(e) => {
-                    // Roll back: drop the contributor entry and its just-added
-                    // parent ref so no phantom registration lingers (the OS watch
-                    // never attached). `parent_refs` removal makes a later
-                    // unregister a clean no-op.
-                    let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-                    state.contributors.remove(contributor);
-                    state.parent_refs.remove(&parent);
-                    drop(state);
-                    debug!(
-                        source = Source::DaemonDispatch.as_str(),
-                        contributor,
-                        parent = %parent.display(),
-                        "worktree deletion watch failed (GC remains the backstop): {e}",
-                    );
-                    return false;
-                }
+            if let Err(e) = watch_result {
+                // Roll back: drop the contributor entry and its just-added parent
+                // ref so no phantom registration lingers (the OS watch never
+                // attached). `parent_refs` removal makes a later unregister a clean
+                // no-op.
+                let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+                state.contributors.remove(contributor);
+                state.parent_refs.remove(&parent);
+                drop(state);
+                debug!(
+                    source = Source::DaemonDispatch.as_str(),
+                    contributor,
+                    parent = %parent.display(),
+                    "worktree deletion watch failed (GC remains the backstop): {e}",
+                );
+                return false;
             }
+            debug!(
+                source = Source::DaemonDispatch.as_str(),
+                contributor,
+                parent = %parent.display(),
+                "registered worktree deletion watch",
+            );
         }
         true
     }
@@ -236,47 +241,72 @@ impl WorktreeWatcher {
     /// `WorktreeRemove` handler, the `SessionEnd` sweep, and the GC can all call it
     /// for the same key without disagreeing.
     pub fn unregister(&self, contributor: &str) {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(worktree) = state.contributors.remove(contributor) {
-            self.release_parent(&mut state, worktree.parent());
+        let to_unwatch = {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            let removed = state.contributors.remove(contributor);
+            let result =
+                removed.and_then(|worktree| Self::release_parent(&mut state, worktree.parent()));
+            drop(state);
+            result
+        };
+        if let Some(parent) = to_unwatch {
+            let _ = self
+                .watcher
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .unwatch(&parent);
         }
     }
 
     /// Unregisters every contributor whose key `starts_with(prefix)` — the
     /// `worktree:{session_id}:` sweep the `SessionEnd` backstop runs.
     pub fn unregister_with_prefix(&self, prefix: &str) {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        let keys: Vec<String> = state
-            .contributors
-            .keys()
-            .filter(|k| k.starts_with(prefix))
-            .cloned()
-            .collect();
-        for key in keys {
-            if let Some(worktree) = state.contributors.remove(&key) {
-                self.release_parent(&mut state, worktree.parent());
+        let to_unwatch: Vec<PathBuf> = {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            let keys: Vec<String> = state
+                .contributors
+                .keys()
+                .filter(|k| k.starts_with(prefix))
+                .cloned()
+                .collect();
+            let mut parents = Vec::new();
+            for key in keys {
+                if let Some(worktree) = state.contributors.remove(&key)
+                    && let Some(parent) = Self::release_parent(&mut state, worktree.parent())
+                {
+                    parents.push(parent);
+                }
             }
-        }
-    }
-
-    /// Decrements a parent's refcount and drops its OS watch when it reaches zero.
-    /// Holds the `state` guard the caller already took (so the refcount and the
-    /// `unwatch` decision are atomic); briefly takes the watcher lock to unwatch.
-    fn release_parent(&self, state: &mut WatchState, parent: Option<&Path>) {
-        let Some(parent) = parent else { return };
-        let Some(count) = state.parent_refs.get_mut(parent) else {
-            return;
+            parents
         };
-        *count -= 1;
-        if *count == 0 {
-            state.parent_refs.remove(parent);
-            // Best-effort: the parent may already be gone (its own dir deleted),
-            // in which case `unwatch` errors harmlessly.
+        for parent in to_unwatch {
             let _ = self
                 .watcher
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .unwatch(parent);
+                .unwatch(&parent);
+        }
+    }
+
+    /// Decrements a parent's refcount under the caller's `state` guard and returns
+    /// the parent path to `unwatch` iff its last watched child just left. The
+    /// caller MUST perform the `unwatch` **after** dropping the `state` lock.
+    ///
+    /// Why the split (deadlock avoidance): `notify`'s `unwatch` blocks until the
+    /// watcher's event thread acknowledges, and that thread runs the deletion
+    /// callback, which locks `state`. Calling `unwatch` while holding `state` thus
+    /// deadlocks against a concurrent callback — e.g. a sibling worktree deleted
+    /// under the same shared `…/worktrees/` parent during batch cleanup. Returning
+    /// the path and unwatching lock-free removes the hazard entirely.
+    fn release_parent(state: &mut WatchState, parent: Option<&Path>) -> Option<PathBuf> {
+        let parent = parent?;
+        let count = state.parent_refs.get_mut(parent)?;
+        *count -= 1;
+        if *count == 0 {
+            state.parent_refs.remove(parent);
+            Some(parent.to_path_buf())
+        } else {
+            None
         }
     }
 
@@ -477,5 +507,40 @@ mod tests {
             watcher.is_registered(&key),
             "the watch is still live (nothing was reaped)",
         );
+    }
+
+    #[test]
+    fn unregister_after_live_deletion_does_not_deadlock() {
+        // Regression (ticket 05): `release_parent`/`unregister` must NOT hold the
+        // `state` lock across `notify`'s blocking `unwatch` — `unwatch` waits on the
+        // watcher callback thread, which locks `state`, so holding it deadlocks.
+        // Deleting a live-watched dir fires that callback; unregistering
+        // concurrently must still complete. Pre-fix this hung indefinitely.
+        let (watcher, _rx) = WorktreeWatcher::new().expect("create watcher");
+        let parent = tempfile::tempdir().expect("tempdir");
+        let wt = parent.path().join("agent-live");
+        std::fs::create_dir_all(&wt).expect("mkdir wt");
+        let key = format!("worktree:s1:{}", wt.display());
+        assert!(watcher.register(&key, &wt));
+
+        // Fire the OS deletion event into the callback, then unregister on another
+        // thread — the previous (unwatch-while-holding-`state`) code deadlocked here.
+        std::fs::remove_dir_all(&wt).expect("rm wt");
+        let unregisterer = watcher.clone();
+        let probe = key.clone();
+        let handle = std::thread::spawn(move || unregisterer.unregister(&probe));
+
+        // Require completion within a bounded window; a regression re-deadlocks and
+        // trips the deadline instead of hanging the whole test binary.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !handle.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "unregister deadlocked after a live-watched deletion",
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        handle.join().expect("unregister thread panicked");
+        assert!(!watcher.is_registered(&key));
     }
 }
