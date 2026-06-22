@@ -1226,10 +1226,13 @@ impl SessionManager {
                 result = self.ipc_listener.accept() => {
                     let (stream, _addr) = result.context("accept IPC connection")?;
                     let shutdown = self.shutdown.clone();
+                    let connections = Arc::clone(&self.connection_count);
                     if let Some(ctx) = &self.hook_ctx {
                         let ctx = ctx.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_hook_dispatch(stream, ctx, shutdown).await {
+                            if let Err(e) =
+                                handle_hook_dispatch(stream, ctx, shutdown, connections).await
+                            {
                                 debug!(
                                     source = Source::DaemonDispatch.as_str(),
                                     "hook connection error: {e}",
@@ -1238,7 +1241,9 @@ impl SessionManager {
                         });
                     } else {
                         tokio::spawn(async move {
-                            if let Err(e) = handle_hook_connection(stream, shutdown).await {
+                            if let Err(e) =
+                                handle_hook_connection(stream, shutdown, connections).await
+                            {
                                 debug!(
                                     source = Source::DaemonDispatch.as_str(),
                                     "hook connection error: {e}",
@@ -1722,11 +1727,14 @@ fn companion_expanded_roots(
 /// Reads the JSON request, logs the method for visibility, and sends an
 /// empty response (which means "allow" in the hook protocol). Recognizes
 /// the `"tool/shutdown"` method from `catenary stop` and cancels the daemon
-/// shutdown token. Used when no shared session is configured (test mode).
+/// shutdown token. The shutdown ack reports the live MCP connection count so
+/// `catenary stop` can warn about sessions that will lose tooling. Used when
+/// no shared session is configured (test mode).
 #[cfg(unix)]
 async fn handle_hook_connection(
     stream: tokio::net::UnixStream,
     shutdown: CancellationToken,
+    connections: Arc<AtomicUsize>,
 ) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -1745,11 +1753,16 @@ async fn handle_hook_connection(
             .unwrap_or("unknown");
 
         if method == "tool/shutdown" {
+            let connected = connections.load(Ordering::Acquire);
             info!(
                 source = Source::DaemonLifecycle.as_str(),
+                connections = connected,
                 "shutdown requested via stop command",
             );
-            writer.write_all(b"{\"status\":\"ok\"}\n").await?;
+            let response = serde_json::json!({ "status": "ok", "connections": connected });
+            let mut payload = serde_json::to_vec(&response)?;
+            payload.push(b'\n');
+            writer.write_all(&payload).await?;
             writer.shutdown().await?;
             shutdown.cancel();
             return Ok(());
@@ -1965,6 +1978,7 @@ async fn handle_hook_dispatch(
     stream: tokio::net::UnixStream,
     ctx: HookDispatchContext,
     shutdown: CancellationToken,
+    connections: Arc<AtomicUsize>,
 ) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -1984,13 +1998,20 @@ async fn handle_hook_dispatch(
         .unwrap_or("unknown")
         .to_string();
 
-    // Handle shutdown from `catenary stop`.
+    // Handle shutdown from `catenary stop`. The ack reports the live MCP
+    // connection count so the CLI can warn that those sessions will lose
+    // tooling until each reconnects via `/mcp`.
     if method == "tool/shutdown" {
+        let connected = connections.load(Ordering::Acquire);
         info!(
             source = Source::DaemonLifecycle.as_str(),
+            connections = connected,
             "shutdown requested via stop command",
         );
-        writer.write_all(b"{\"status\":\"ok\"}\n").await?;
+        let response = serde_json::json!({ "status": "ok", "connections": connected });
+        let mut payload = serde_json::to_vec(&response)?;
+        payload.push(b'\n');
+        writer.write_all(&payload).await?;
         writer.shutdown().await?;
         shutdown.cancel();
         return Ok(());
@@ -4298,6 +4319,15 @@ mod tests {
             "should receive ok response, got: {line}",
         );
 
+        // With no live MCP connection, the ack reports zero — the CLI stays
+        // quiet (no strand warning).
+        let ack: serde_json::Value = serde_json::from_str(line.trim()).expect("parse ack");
+        assert_eq!(
+            ack.get("connections").and_then(serde_json::Value::as_u64),
+            Some(0),
+            "ack should report zero connections, got: {line}",
+        );
+
         // accept_loop should exit.
         let result = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
             .await
@@ -4315,6 +4345,53 @@ mod tests {
             !ipc_path.exists(),
             "IPC socket should be removed after stop",
         );
+    }
+
+    /// The shutdown ack reports the live MCP connection count so `catenary
+    /// stop` can warn that those sessions just lost tooling. Here one bridge
+    /// is "connected" (count bumped directly), so the ack must report 1.
+    #[tokio::test]
+    async fn stop_ack_reports_live_connection_count() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let ipc_path = ipc_socket_in(dir.path());
+
+        let manager = Arc::new(bind_in(dir.path()));
+
+        // Simulate a live MCP connection (the accept loop bumps this on every
+        // accepted MCP stream).
+        manager.connection_count.fetch_add(1, Ordering::Relaxed);
+
+        let m = Arc::clone(&manager);
+        let handle = tokio::spawn(async move { m.accept_loop().await });
+
+        let stream = tokio::net::UnixStream::connect(&ipc_path)
+            .await
+            .expect("connect to IPC socket");
+        let (reader, mut writer) = stream.into_split();
+
+        let request = serde_json::json!({"method": "tool/shutdown"});
+        let mut payload = serde_json::to_string(&request).expect("serialize");
+        payload.push('\n');
+        writer.write_all(payload.as_bytes()).await.expect("write");
+
+        let mut buf_reader = BufReader::new(reader);
+        let mut line = String::new();
+        buf_reader.read_line(&mut line).await.expect("read");
+
+        let ack: serde_json::Value = serde_json::from_str(line.trim()).expect("parse ack");
+        assert_eq!(
+            ack.get("connections").and_then(serde_json::Value::as_u64),
+            Some(1),
+            "ack should report the live connection count, got: {line}",
+        );
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("accept_loop should exit within 5s")
+            .expect("task should not panic");
+        assert!(result.is_ok(), "accept_loop should return Ok");
     }
 
     #[tokio::test]

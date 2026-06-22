@@ -1394,6 +1394,23 @@ async fn run_stop(out: &mut cli::Output) -> Result<()> {
     buf_reader.read_line(&mut line).await?;
 
     let _ = out.writeln(format_args!("Daemon stopped"));
+
+    // The shutdown ack reports how many bridges were connected. Each was
+    // proxying stdin↔daemon-socket and exits when the socket closes, so the
+    // host marks that MCP server failed. A plain host restart does NOT
+    // relaunch it — only a `/mcp` reconnect re-runs the bridge and respawns
+    // the daemon. Warn so the loss isn't silent.
+    let connections = serde_json::from_str::<serde_json::Value>(line.trim())
+        .ok()
+        .and_then(|v| v.get("connections").and_then(serde_json::Value::as_u64))
+        .unwrap_or(0);
+    if connections > 0 {
+        let plural = if connections == 1 { "" } else { "s" };
+        let _ = out.writeln(format_args!(
+            "warning: {connections} connected session{plural} will lose Catenary tooling — \
+             each needs a `/mcp` reconnect (a host restart alone won't respawn the daemon)",
+        ));
+    }
     Ok(())
 }
 
