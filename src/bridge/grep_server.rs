@@ -1205,9 +1205,15 @@ impl GrepServer {
         let skip_hidden = !include_hidden;
 
         for root in roots {
+            // An explicitly-named path that resolves to a file is a direct
+            // request to search that exact file (misc 110, ripgrep parity), so
+            // gitignore/hidden filtering must not gate it — those rules govern
+            // recursive *directory* traversal, not paths the user named. Bypass
+            // the gate for a file root; keep it for directory walks.
+            let root_is_file = root.is_file();
             let walker = WalkBuilder::new(root)
-                .git_ignore(skip_gitignored)
-                .hidden(skip_hidden)
+                .git_ignore(skip_gitignored && !root_is_file)
+                .hidden(skip_hidden && !root_is_file)
                 .build_parallel();
 
             walker.run(|| {
@@ -3624,6 +3630,109 @@ mod tests {
         assert!(
             texts.iter().any(|(t, _)| t.contains('b')),
             "real match 'b' after zero-width should be captured: {texts:?}"
+        );
+    }
+
+    // ─── named-path gitignore bypass (misc 110) ─────────────────────────
+
+    fn git_init(dir: &Path) {
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir)
+            .output()
+            .expect("git init");
+    }
+
+    #[test]
+    fn ripgrep_matches_named_gitignored_file_is_searched() {
+        // A gitignored file named explicitly on the command line is searched
+        // unconditionally — naming it is a direct request for that exact file,
+        // so the gitignore gate does not apply even without
+        // `--include-gitignored` (misc 110, ripgrep parity).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        git_init(root);
+        std::fs::write(root.join(".gitignore"), "ignored.rs\n").expect("write");
+        std::fs::write(root.join("ignored.rs"), "TODO ignored\n").expect("write");
+
+        let file = root.join("ignored.rs");
+        let fs = Arc::new(FilesystemManager::new());
+        let rg = GrepServer::ripgrep_matches(
+            "TODO",
+            std::slice::from_ref(&file),
+            None,
+            false, // include_gitignored = false: the bypass must not depend on it
+            false,
+            &fs,
+        )
+        .expect("ripgrep_matches");
+
+        assert!(
+            rg.file_lines.keys().any(|k| k.ends_with("ignored.rs")),
+            "named gitignored file must be searched without --include-gitignored: {:?}",
+            rg.file_lines
+        );
+    }
+
+    #[test]
+    fn ripgrep_matches_dir_walk_still_gates_gitignored_contents() {
+        // The file-bypass must NOT leak into directory walks: a gitignored file
+        // reached by walking a named DIRECTORY root is still skipped — the gate
+        // governs the recursive walk, where `--include-gitignored` remains the
+        // opt-in (directory-walk behavior unchanged, misc 110). The walk starts
+        // at the repo root so the `.gitignore` rule that excludes `target/` is
+        // in scope for the descent (an `ignore` walk only consults ignore files
+        // at or below its start path).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+        git_init(&root);
+        std::fs::write(root.join(".gitignore"), "target/\n").expect("write");
+        std::fs::write(root.join("kept.rs"), "TODO kept\n").expect("write");
+        std::fs::create_dir_all(root.join("target")).expect("mkdir");
+        std::fs::write(root.join("target/ignored.rs"), "TODO buried\n").expect("write");
+
+        let fs = Arc::new(FilesystemManager::new());
+
+        // Gated walk: the non-ignored file is found, the gitignored one under
+        // `target/` is skipped.
+        let gated = GrepServer::ripgrep_matches(
+            "TODO",
+            std::slice::from_ref(&root),
+            None,
+            false,
+            false,
+            &fs,
+        )
+        .expect("ripgrep_matches");
+        assert!(
+            gated.file_lines.keys().any(|k| k.ends_with("kept.rs")),
+            "the non-ignored file is found in the walk: {:?}",
+            gated.file_lines
+        );
+        assert!(
+            !gated.file_lines.keys().any(|k| k.ends_with("ignored.rs")),
+            "gitignored contents must be skipped in a directory walk without \
+             --include-gitignored: {:?}",
+            gated.file_lines
+        );
+
+        // The escape hatch lifts the directory-walk gate.
+        let with_ignored = GrepServer::ripgrep_matches(
+            "TODO",
+            std::slice::from_ref(&root),
+            None,
+            true,
+            false,
+            &fs,
+        )
+        .expect("ripgrep_matches");
+        assert!(
+            with_ignored
+                .file_lines
+                .keys()
+                .any(|k| k.ends_with("ignored.rs")),
+            "--include-gitignored surfaces the ignored dir's contents: {:?}",
+            with_ignored.file_lines
         );
     }
 

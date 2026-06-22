@@ -163,11 +163,14 @@ impl ResolvedGlob {
 /// expands to nothing — the CLI reports those as `path does not exist` before
 /// they ever reach here.
 ///
-/// Existing concrete paths are still filtered against `.gitignore` unless
-/// `include_gitignored` is set: a shell-expanded `target/*.rs` and a
-/// daemon-expanded `'target/*.rs'` must yield the same set, so a gitignored
-/// path is dropped no matter how it arrived. Gitignore is repo-scoped
-/// (matching ripgrep/editors); outside a git repository nothing is filtered.
+/// An existing concrete **file** is searched/outlined unconditionally —
+/// naming it is a direct request for that exact file, so the gitignore (and
+/// hidden) gate does not apply (misc 110, ripgrep parity: ripgrep searches
+/// files you name even when ignored). Existing **directories** are still
+/// filtered against `.gitignore` unless `include_gitignored` is set: the gate
+/// governs the recursive directory walk, not a named file. Gitignore is
+/// repo-scoped (matching ripgrep/editors); outside a git repository nothing is
+/// filtered.
 ///
 /// Paths are expected to be absolute (the CLI resolves them against `cwd`
 /// before dispatch). An empty input yields an empty result; callers
@@ -189,7 +192,13 @@ pub fn expand_search_paths(
         // CLI probe and here) must never silently zero a path that is present
         // on disk.
         if path_exists_with_retry(path) {
-            if include_gitignored || !is_gitignored(path, &mut visible) {
+            // A named existing file bypasses the gitignore (and hidden) gate —
+            // the user named that exact file, so it is searched unconditionally
+            // (misc 110). The gate still governs directory walks: a named
+            // gitignored directory is dropped here unless `include_gitignored`.
+            // `is_file()` follows symlinks, so a symlink-to-file is a file and a
+            // symlink-to-dir or broken symlink falls into the gated branch.
+            if path.is_file() || include_gitignored || !is_gitignored(path, &mut visible) {
                 resolved.push(path.clone());
             }
         } else if has_glob_metachar(&path.to_string_lossy()) {
@@ -1074,7 +1083,7 @@ mod tests {
     }
 
     #[test]
-    fn expand_search_paths_drops_gitignored_concrete() {
+    fn expand_search_paths_keeps_named_gitignored_file() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path();
         git_init(root);
@@ -1085,14 +1094,39 @@ mod tests {
         let ignored = root.join("ignored.rs");
         let kept = root.join("kept.rs");
 
-        // A shell-expanded gitignored path is dropped just like an internally
-        // expanded one — convergence regardless of who expanded.
+        // A named existing gitignored FILE is searched unconditionally — naming
+        // it is a direct request for that exact file, so the gitignore gate does
+        // not apply even without `--include-gitignored` (misc 110, ripgrep
+        // parity).
         let resolved = expand_search_paths(&[ignored.clone(), kept.clone()], false, false);
-        assert_eq!(resolved, vec![kept], "{resolved:?}");
+        assert_eq!(resolved, vec![ignored.clone(), kept], "{resolved:?}");
 
-        // The escape hatch keeps it.
+        // The escape hatch is also a no-op for an already-kept named file.
         let with_ignored = expand_search_paths(std::slice::from_ref(&ignored), true, false);
         assert_eq!(with_ignored, vec![ignored], "{with_ignored:?}");
+    }
+
+    #[test]
+    fn expand_search_paths_still_gates_named_gitignored_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        git_init(root);
+        std::fs::write(root.join(".gitignore"), "target/\n").expect("write");
+        std::fs::create_dir_all(root.join("target")).expect("mkdir");
+        std::fs::write(root.join("target/ignored.rs"), "x").expect("write");
+
+        let dir = root.join("target");
+
+        // A named gitignored DIRECTORY is still dropped — the gate governs the
+        // recursive directory walk, not a named file. `--include-gitignored`
+        // remains the opt-in for directory contents (directory-walk behavior
+        // unchanged, misc 110).
+        let gated = expand_search_paths(std::slice::from_ref(&dir), false, false);
+        assert!(gated.is_empty(), "named gitignored dir is gated: {gated:?}");
+
+        // The escape hatch lifts the directory gate.
+        let with_ignored = expand_search_paths(std::slice::from_ref(&dir), true, false);
+        assert_eq!(with_ignored, vec![dir], "{with_ignored:?}");
     }
 
     #[test]
