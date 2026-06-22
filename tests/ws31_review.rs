@@ -544,17 +544,54 @@ fn request_method_count(log: &str, target: &str) -> usize {
 /// on `resolve_root(path).is_some()` and the per-root server is shut down on
 /// removal, so two independent backstops suppress `calls:` even if `evict_root`
 /// were a no-op. This test instead removes AND re-adds the root, then proves the
-/// re-grep was cold by reading a request counter on the re-spawned server: a
-/// no-op evict would leave the daemon-lived `SymbolIndex` warm, the re-grep would
-/// short-circuit on the cache, and the re-spawned server would see ZERO
-/// `textDocument/documentSymbol`. Because the re-add `File::create`-truncates the
-/// request-log, the window covers only the re-grep's server.
+/// re-grep was cold by counting `textDocument/documentSymbol` on the re-spawned
+/// server: a no-op evict would leave the daemon-lived `SymbolIndex` warm, the
+/// re-grep would short-circuit on the cache, and the re-spawned server would see
+/// ZERO `documentSymbol`.
+///
+/// Witness via PER-PID request logs (`--log-pid-suffix`), not one shared file.
+/// Under load the per-root server can transiently double-spawn across the rm→add
+/// cycle (a fast-`mockls` timing artifact: a real, slow-init LSP serializes on the
+/// spawn lock and never double-spawns — verified over 90 cycles with rust-analyzer
+/// in `ra_double_spawn_probe.rs`). With ONE shared `File::create`-truncated log
+/// that second instance wipes the first's logged cold request → spurious
+/// `count=0`. Each instance instead writes its own `requests.jsonl.<pid>`;
+/// warm-phase pid logs are deleted after `roots-rm`, so any request surviving in a
+/// post-re-add log is necessarily the COLD re-query, and the merge across all
+/// post-re-add logs is immune to cross-instance truncation.
 ///
 /// GREEN today: `evict_root` is correct ⇒ the re-grep is cold ⇒ documentSymbol
 /// is re-issued. The mutation check (Phase-A writer stubbed `evict_root` to a
 /// no-op) confirms this FAILS when eviction is broken.
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "linear: setup + rm/add cycle + asserts"
+)]
 fn ws31_review_r4_eviction_witnessed_via_request_count() -> Result<()> {
+    // Per-pid request logs written next to the base as `requests.jsonl.<pid>`.
+    fn list_pid_logs(base: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let Some(dir) = base.parent() else {
+            return Vec::new();
+        };
+        let Some(name) = base.file_name().and_then(|n| n.to_str()) else {
+            return Vec::new();
+        };
+        let prefix = format!("{name}.");
+        let mut out = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for e in entries.flatten() {
+                if e.file_name()
+                    .to_str()
+                    .is_some_and(|f| f.starts_with(&prefix))
+                {
+                    out.push(e.path());
+                }
+            }
+        }
+        out
+    }
+
     // The base root keeps the daemon alive across the rm/add cycle.
     let base = tempfile::tempdir()?;
     let base_str = base.path().to_str().context("base path")?;
@@ -567,13 +604,12 @@ fn ws31_review_r4_eviction_witnessed_via_request_count() -> Result<()> {
     let file = work.path().join(format!("warm.{MOCK_LANG}"));
     std::fs::write(&file, caller_callee("callee_x", "caller_x"))?;
 
-    // The re-spawned server truncates this on `File::create`, so after the re-add
-    // it records ONLY the re-grep's requests.
-    let req_log_path = work_path.join("requests.jsonl");
-    let req_log_arg = req_log_path.to_str().context("request log path")?;
+    // Per-pid request logs: `requests.jsonl.<pid>`, one writer each (no tearing).
+    let req_log_base = work_path.join("requests.jsonl");
+    let req_log_arg = req_log_base.to_str().context("request log path")?;
     let lsp = mockls_lsp_arg(
         MOCK_LANG,
-        &format!("--scan-roots --request-log {req_log_arg}"),
+        &format!("--scan-roots --log-pid-suffix --request-log {req_log_arg}"),
     );
 
     let mut bridge = BridgeProcess::spawn(&[&lsp], base_str)?;
@@ -618,8 +654,13 @@ fn ws31_review_r4_eviction_witnessed_via_request_count() -> Result<()> {
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    // Re-add the root. The per-root server re-spawns and `File::create`-truncates
-    // the request-log, opening a clean window over just the re-grep's server.
+    // Delete every warm-phase pid log: any request in a post-re-add log is COLD.
+    for p in list_pid_logs(&req_log_base) {
+        let _ = std::fs::remove_file(&p);
+    }
+
+    // Re-add the root. The per-root server re-spawns; its fresh
+    // `requests.jsonl.<pid>` captures the re-grep's requests.
     ipc_request(
         &socket,
         &json!({ "method": "tool/roots-add", "path": work_str }),
@@ -632,7 +673,7 @@ fn ws31_review_r4_eviction_witnessed_via_request_count() -> Result<()> {
     // sleeping to guess the re-spawned server is ready — that guess (300 ms) was
     // the flake source under CPU contention, racing a cold grep against the
     // re-spawn + `--scan-roots` index so the request counts came up empty. Each
-    // retry re-issues documentSymbol/outgoingCalls into the (truncated) request
+    // retry re-issues documentSymbol/outgoingCalls into the (per-pid) request
     // log, so the `>= 1` counts below only strengthen.
     let cold = grep_until_enriched(
         &bridge,
@@ -648,23 +689,33 @@ fn ws31_review_r4_eviction_witnessed_via_request_count() -> Result<()> {
         "cold first touch after eviction must re-resolve enrichment; got:\n{cold}"
     );
 
-    // Drop the bridge first to shut the server down — its on-exit flush is the
-    // durability guarantee the request-log read relies on. The poll below only
-    // removes the fixed-time GUESS for when that flush becomes visible to this
-    // reader: under heavy parallel load the re-spawned server's requests may not
-    // be flushed/visible to the file by a fixed delay, so we re-read + re-parse
-    // until both expected counts hold (or the GENEROUS backstop passes). 50 ms
-    // cadence between attempts; the backstop only trips on a genuine hang.
+    // Drop the bridge first to shut the server(s) down — the on-exit flush is the
+    // durability guarantee the request-log read relies on. The poll below removes
+    // the fixed-time GUESS for when that flush becomes visible: under heavy load
+    // the re-spawned server's requests may not be flushed by a fixed delay, so we
+    // re-merge all post-re-add per-pid logs until both expected counts hold (or
+    // the GENEROUS backstop passes). Merging is immune to the transient
+    // double-spawn that a single shared `File::create` log would let truncate.
     drop(bridge);
+    let merged = || -> (usize, usize, String) {
+        let mut buf = String::new();
+        for p in list_pid_logs(&req_log_base) {
+            if let Ok(t) = std::fs::read_to_string(&p) {
+                buf.push_str(&t);
+            }
+        }
+        let doc = request_method_count(&buf, "textDocument/documentSymbol");
+        let out = request_method_count(&buf, "callHierarchy/outgoingCalls");
+        (doc, out, buf)
+    };
     let req_deadline = std::time::Instant::now() + common::POLL_BACKSTOP;
-    let mut req_log = std::fs::read_to_string(&req_log_path).unwrap_or_default();
-    let mut doc_symbol_count = request_method_count(&req_log, "textDocument/documentSymbol");
-    let mut outgoing_count = request_method_count(&req_log, "callHierarchy/outgoingCalls");
+    let (mut doc_symbol_count, mut outgoing_count, mut req_log) = merged();
     while (doc_symbol_count < 1 || outgoing_count < 1) && std::time::Instant::now() < req_deadline {
         std::thread::sleep(common::POLL_SPACING);
-        req_log = std::fs::read_to_string(&req_log_path).unwrap_or_default();
-        doc_symbol_count = request_method_count(&req_log, "textDocument/documentSymbol");
-        outgoing_count = request_method_count(&req_log, "callHierarchy/outgoingCalls");
+        let m = merged();
+        doc_symbol_count = m.0;
+        outgoing_count = m.1;
+        req_log = m.2;
     }
 
     // The re-grep was cold ⇒ the daemon re-issued documentSymbol against the
@@ -674,14 +725,14 @@ fn ws31_review_r4_eviction_witnessed_via_request_count() -> Result<()> {
         doc_symbol_count >= 1,
         "re-add must be a genuine cold touch — the daemon must re-query the \
          outline (textDocument/documentSymbol) at least once. count={doc_symbol_count}, \
-         request log:\n{req_log}"
+         merged request log:\n{req_log}"
     );
     // The outgoingCalls re-query is the enrichment edge; its presence corroborates
     // a cold enrichment rather than a stale warm hit.
     assert!(
         outgoing_count >= 1,
         "cold re-enrichment must re-query callHierarchy/outgoingCalls at least \
-         once. count={outgoing_count}, request log:\n{req_log}"
+         once. count={outgoing_count}, merged request log:\n{req_log}"
     );
 
     Ok(())
