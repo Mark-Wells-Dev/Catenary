@@ -67,18 +67,23 @@ for its language. Two sub-cases based on server capabilities:
   instance per root, each using `Scope::Root(root)`. They cannot be
   told about multiple roots, so each process sees only its own.
 
-### Tier 3 — Single-file (designed, not yet implemented)
+### Tier 3 — Single-file
 
-P is outside all active workspace roots. The server would be spawned
-with a null workspace for just that file. Negative-cached on failure.
-Tracked in misc 28b.
+P is outside all active workspace roots. A server marked
+`single_file = true` in `[server.*]` is spawned with a null workspace
+(`rootUri: null`, `workspaceFolders: null`) to serve the file with a
+`Scope::SingleFile` instance. If the server rejects null-workspace
+initialization, the `(language, server)` pair is negative-cached so it
+is not retried. Servers without `single_file = true` are skipped — a
+file outside all roots resolves to nothing for them.
 
 ### Roots are explicit
 
 Only roots added via `--root` or `catenary roots add` are active. Catenary never
 auto-discovers roots from file paths. A file outside all active roots
-has no owning root and cannot route to any server (until tier 3 is
-implemented). This is deliberate: implicit root discovery would make
+has no owning root; it routes only to single-file-capable servers
+(tier 3), never to a root- or workspace-scoped instance. This is
+deliberate: implicit root discovery would make
 the routing model hard to predict, especially in multi-root sessions
 where adjacent directories might contain unrelated projects.
 
@@ -109,7 +114,7 @@ The `Scope` enum has three variants:
 |---|---|
 | `Workspace` | Shared across roots. One instance per (language, server) pair. |
 | `Root(PathBuf)` | Bound to a specific root. Used for legacy servers and project-scoped instances. |
-| `SingleFile` | Tier 3. Not yet implemented. |
+| `SingleFile` | Tier 3. A `single_file = true` server spawned with a null workspace for a file outside all roots. |
 
 ### Instance lookup
 
@@ -264,6 +269,7 @@ pub async fn get_servers(
     &self,
     path: &Path,
     capability: fn(&LspServer) -> bool,
+    method: Option<DispatchMethod>,
 ) -> Vec<Arc<Mutex<LspClient>>>
 ```
 
@@ -271,9 +277,11 @@ This is the routing entry point. Every tool server calls it to resolve
 a file path to an ordered list of server handles. The function:
 
 1. Classifies the file to a language ID.
-2. Resolves the owning workspace root.
+2. Resolves the owning workspace root — or, for a file outside all
+   roots, falls through to the single-file tier.
 3. Looks up the language config for server bindings.
-4. Iterates bindings in priority order, filtering by `file_patterns`,
+4. Iterates bindings in priority order, filtering by per-binding
+   `disabled_methods` (when a `method` is given), `file_patterns`,
    instance liveness, and the capability predicate.
 5. Returns clients in binding order (priority order).
 

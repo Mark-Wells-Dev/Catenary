@@ -51,17 +51,18 @@ all protocol logging:
   dispatches hook requests, returns responses.
 
 **`LoggingServer`** is the telemetry port. It is a `tracing` Layer
-that dispatches events to two sinks: a notification queue (for
-user-facing `systemMessage` delivery) and a message database (for
-monitor visibility, debugging, and TUI broadcast). Every protocol
-message flows through it.
+that dispatches every event to its sinks: the notification queue (for
+user-facing `systemMessage` delivery) and the append-only JSONL telemetry
+firehose (the full audit trail, read by `catenary query`). Warn/error
+events additionally feed the alert ring of the daemon-owned `state.json`
+snapshot. Every protocol message flows through it.
 
 Application servers (`GrepServer`, `GlobServer`, `DiagnosticsServer`)
 are the transformation layer. They receive application-level parameters
 from the IPC router, do work using `LspClient`, and return results.
 They do not log protocol messages — that is the boundary components'
 job. An application server is a black box: the protocol messages that
-went in and came out are linked by `parent_id` at the database level.
+went in and came out are linked by `parent_id` in the firehose records.
 
 ## Component diagram
 
@@ -89,8 +90,8 @@ Host CLI ◄──IPC──► HookServer ──► HookRouter (editing enforcem
   (hooks)                          command filtering, file tracking)
 
 LoggingServer (tracing Layer) ─── dispatches all events to sinks:
-  ├── NotificationQueueSink  (user-facing systemMessage)
-  └── MessageDbSink          (messages table + TUI broadcast)
+  ├── notification queue     (user-facing systemMessage)
+  └── JSONL firehose         (append-only audit trail, read by catenary query)
 ```
 
 ## Shared infrastructure
@@ -100,15 +101,22 @@ LoggingServer (tracing Layer) ─── dispatches all events to sinks:
   and logging. Protocol boundaries hold `Arc<Session>`.
 - **`FilesystemManager`** — file classification and root resolution.
   Single authority for language detection, shebang parsing, and
-  workspace root membership. Also implements the snapshot-and-diff
-  model for `workspace/didChangeWatchedFiles` notifications.
+  workspace root membership. Also owns the per-root mtime baselines
+  behind walk-on-demand change detection — there is no background
+  watcher; the walk a query already performs feeds a precise per-server
+  `workspace/didChangeWatchedFiles` changed-set (see [Document Lifecycle
+  & File Watching](documents.md)).
 - **`LspClientManager`** — LSP server lifecycle. Spawns, caches, and
   shuts down `LspClient` instances. Manages instance keying (language,
   server name, scope), multi-server routing, document lifecycle, and
   workspace folder synchronization.
-- **SQLite database** — all session state (sessions, protocol
-  messages, trace events, workspace roots, language servers) is stored
-  in `~/.local/state/catenary/catenary.db` with WAL mode.
+- **State & storage** — there is no primary database. Live state (the
+  session and server boards, recent alerts and activity) lives in a
+  daemon-owned `state.json` snapshot under `runtime_dir`, rewritten on
+  change; the full protocol and trace history streams to an append-only,
+  sharded JSONL firehose under `cache_dir`, read by `catenary query`. The
+  durable Unix sockets live under `state_dir`. A legacy `catenary.db` from
+  older versions is deleted on daemon startup. See `src/paths.rs`.
 
 ## Topic pages
 

@@ -28,8 +28,9 @@ others.
   Unix domain socket. LSP servers are shared across all sessions. See
   `src/router.rs` (`SessionManager`).
 - **Session:** A connected agent. Each session has a unique ID (opaque string)
-  and one or more workspace roots. Sessions are discoverable via `catenary list`
-  and monitorable via `catenary monitor <id>`.
+  and one or more workspace roots. Live sessions appear on the `state.json`
+  session board (rendered by the `catenary` TUI dashboard); their telemetry is
+  queryable via `catenary query --session <id>`.
 - **State & storage:** There is no primary SQLite database (a legacy
   `catenary.db` is drained on startup). State spans three XDG base dirs, chosen for
   their durability semantics (see `src/paths.rs`): the durable Unix **socket**

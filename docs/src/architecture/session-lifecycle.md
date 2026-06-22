@@ -5,46 +5,45 @@ shutdown.
 
 ## Startup sequence
 
-When the binary starts without a subcommand and stdin/stdout are not a
-terminal, it starts the daemon. The startup sequence is:
+A single daemon serves the whole host. The bridge proxy — `catenary`
+launched over stdio by an MCP client — starts the daemon on first
+connection and then just forwards bytes; later agents reuse the same
+daemon. Daemon startup, in order:
 
-1. **`LoggingServer` construction.** Created in buffering mode. All
-   `tracing` events during early startup are captured in a bounded
-   in-memory buffer (4096 events). Nothing is written to disk yet.
+1. **Socket bind.** The daemon binds two deterministic Unix sockets under
+   `state_dir`: `catenary/catenary-mcp.sock` (MCP traffic from the bridge
+   proxy) and `catenary/catenary.sock` (hook events and CLI commands).
+   Binding first proves this is the sole daemon and lets bridge proxies
+   queue connections during the rest of init. Any leftover legacy
+   `catenary.db` is deleted here.
 
-2. **Config loading.** `Config::load()` reads sources in order:
-   embedded default language definitions, user config
-   (`~/.config/catenary/config.toml`), and optional explicit file
-   (`CATENARY_CONFIG` env var). Later sources override earlier ones.
-   Environment variable overrides (`CATENARY_SERVERS`,
-   `CATENARY_ROOTS`) are applied last.
+2. **`LoggingServer` activation.** Constructed earlier in buffering mode
+   (early `tracing` events are captured in a bounded 4096-event buffer);
+   once the sinks exist, `activate()` drains the buffer and switches to
+   direct dispatch. The sinks are the notification queue and the JSONL
+   firehose.
 
-3. **Root resolution.** Workspace roots come from `CATENARY_ROOTS`
+3. **Config loading.** `Config::load()` reads sources in order: embedded
+   default language definitions, user config
+   (`~/.config/catenary/config.toml`), and an optional explicit file
+   (`CATENARY_CONFIG` env var). Later sources override earlier ones;
+   environment overrides (`CATENARY_SERVERS`, `CATENARY_ROOTS`) are
+   applied last.
+
+4. **Root resolution.** Workspace roots come from `CATENARY_ROOTS`
    (path-separated) or default to the current directory. Roots are
    canonicalized to absolute paths.
 
-4. **Session creation.** A `Session` is inserted into the SQLite
-   database (`~/.local/state/catenary/catenary.db`) with a generated
-   ID, the process PID, and the workspace display name. The sessions
-   directory (`~/.local/state/catenary/sessions/<id>/`) is created for
-   the IPC socket.
-
-5. **`Session` assembly.** The application container is constructed:
-   - Logging sinks are created (notification queue, message DB) and
-     `LoggingServer::activate()` is called. This drains the
-     bootstrap buffer through the sinks and switches to direct
-     dispatch. From this point, all `tracing` events flow to the
-     database.
-   - `FilesystemManager` is constructed with classification tables
-     derived from config, roots are set, and `seed()` is called
-     (snapshots the initial filesystem state for later diffing).
-   - `TsIndex` is built from workspace roots (tree-sitter symbol
-     index, used by grep for structural search).
-   - `LspClientManager` is constructed with the config, logging, and
-     filesystem manager.
-   - Tool servers (`GrepServer`, `GlobServer`, `DiagnosticsServer`)
-     and supporting infrastructure (`EditingManager`, `PathValidator`)
-     are created.
+5. **Primary session assembly.** The daemon builds one shared,
+   infrastructure-only `Session`. It owns the resources every agent
+   shares: the `LspClientManager` (the LSP server pool), the tool servers
+   (`GrepServer`, `GlobServer`, `DiagnosticsServer`), the `SymbolIndex`
+   (populated lazily from LSP `documentSymbol` responses), and the JSONL
+   firehose sink. `FilesystemManager` is constructed with classification
+   tables from config and the roots are set — there is no filesystem
+   snapshot at startup; change detection walks on demand, and each root's
+   first walk is its own baseline. This session has no connection
+   affinity.
 
 6. **`spawn_all`.** The client manager walks workspace roots, classifies
    files via `FilesystemManager`, detects which configured languages
@@ -62,17 +61,26 @@ terminal, it starts the daemon. The startup sequence is:
      `Scope::Root` instance and are excluded from the workspace
      instance via `didChangeWorkspaceFolders`.
 
-7. **Hook server start.** `HookServer` is created and bound to the
-   IPC socket (`sessions/<id>/notify.sock` on Unix, named pipe on
-   Windows). This enables host CLI hooks to communicate with the
-   session.
+7. **Accept loop.** `SessionManager` begins accepting connections on both
+   sockets. The daemon never reads stdin — the bridge proxy owns the
+   stdio pipe to the host CLI and forwards MCP traffic over the socket.
+   `McpServer` handles the MCP lifecycle (`initialize`, roots, `ping`)
+   per connection and exposes no application-level tools; an
+   `on_roots_changed` callback triggers root re-sync when an MCP client
+   updates its root list.
 
-8. **MCP server start.** `McpServer` is created and begins reading
-   JSON-RPC messages from stdin. It handles the MCP lifecycle
-   (initialize, roots, ping) but exposes no application-level tools.
-   The `on_client_info` callback records the MCP client's name and
-   version in the session. The `on_roots_changed` callback triggers
-   `Session::sync_roots` when the MCP client updates its root list.
+## Sessions
+
+In the daemon model a *session* is a connected agent, not a process. A
+session is identified by its bridge MCP connection and the `session_id`
+its hooks carry, and appears on the `state.json` session board with its
+client, roots, and status. All sessions share the daemon's LSP server
+pool and tool servers — there is no per-session language server. What is
+per-session is lightweight: the editing state (`EditingManager`,
+the accumulated set of edited files), created on the session's first
+hook dispatch. A session ends when its connection disconnects, dropping
+it from the board; the daemon keeps running for the other sessions, and
+exits only when the last one disconnects.
 
 ## Root discovery
 
@@ -89,16 +97,20 @@ language detection.
 
 ## Serving
 
-Once initialized, the daemon serves requests from two sources: CLI
-commands over the IPC socket (grep, glob, sed, diagnostics) and MCP
-messages over stdin (session management, roots). Each CLI command
-follows this sequence:
+Once initialized, the daemon serves requests from two sockets: CLI
+commands and hook events over the IPC socket (grep, glob, sed,
+diagnostics, roots, editing enforcement) and MCP traffic over the MCP
+socket (the bridge proxy forwards the handshake and root updates). Each
+CLI command follows this sequence:
 
-1. **File change notification.** Before any LSP interaction, Catenary
-   diffs the filesystem against the last snapshot
-   (`FilesystemManager::diff()`) and sends
-   `workspace/didChangeWatchedFiles` notifications to servers with
-   matching glob registrations.
+1. **File change notification.** The walk a command already performs
+   (grep's search walk, glob's directory scan, the diagnostics
+   stat-walk) doubles as change detection: observed `(path, mtime)`
+   pairs are diffed against each root's baseline (`diff_and_update`), and
+   only the files that actually changed are sent — as a precise,
+   per-server changed-set (`nudge_changed_set`) — via
+   `workspace/didChangeWatchedFiles` to servers whose registered watchers
+   match.
 
 2. **IPC dispatch.** The IPC router dispatches the request to the
    appropriate application server:
@@ -144,8 +156,8 @@ When a workspace root is added (`catenary roots add <path>` via the
 host's shell tool, or via MCP `roots/list` update), Catenary processes
 it through `Session::sync_roots`:
 
-1. `FilesystemManager` roots are updated and the filesystem is
-   re-seeded.
+1. `FilesystemManager` roots are updated; a newly added root has no
+   baseline yet, so its first walk becomes the baseline (no re-seed).
 2. Project configs are loaded for new roots; classification tables
    are updated.
 3. Workspace-capable servers receive `didChangeWorkspaceFolders`
@@ -159,34 +171,36 @@ it through `Session::sync_roots`:
 
 ## Shutdown
 
-Shutdown is triggered by stdin EOF (MCP client disconnects), Ctrl+C,
-or SIGTERM:
+The daemon exits when the last client disconnects, on `catenary stop`,
+or on SIGINT/SIGTERM:
 
-1. The MCP dispatch loop exits.
-2. The hook server's IPC listener is aborted.
-3. `Session::shutdown()` sends LSP `shutdown` requests to all active
+1. The accept loop stops and both socket listeners are torn down.
+2. `Session::shutdown()` sends LSP `shutdown` requests to all active
    servers, waits for responses, then sends `exit` notifications.
-4. The session is marked dead in the database (`alive = 0`,
-   `ended_at` is set).
-5. The session directory and IPC socket are cleaned up on `Drop`.
+3. The JSONL firehose is flushed — the queue drains and the writer
+   thread joins.
+4. Dropping the `SessionManager` removes both daemon sockets
+   (`catenary.sock` and `catenary-mcp.sock`), so a stale bridge cannot
+   reconnect to a dead daemon.
+
+(An individual session ending is not a daemon shutdown — it just
+disconnects and drops off the `state.json` board while the daemon keeps
+serving the rest.)
 
 ## TUI monitoring
 
 Running `catenary` with no subcommand in an interactive terminal launches
-the read-only TUI dashboard. It connects to the SQLite database (not to
-the running daemon), reads protocol messages from the `messages` table
-using WAL-based change notification, and applies the display pipeline:
+the read-only TUI dashboard. It is a pure file reader: it file-watches
+the daemon-owned `state.json` snapshot under `runtime_dir` and reloads on
+change — it never connects to the daemon, the firehose, or a database, so
+it cannot affect (or wedge) a running session.
 
-1. **Pair merge** — joins request/response messages that share a
-   `request_id`.
-2. **Scope collapse** — groups LSP messages behind the CLI command that
-   produced them, using `parent_id`.
-3. **Run collapse** — groups consecutive messages in the same category
-   into a single summary line.
+The snapshot holds live state only, so the dashboard renders boards
+rather than a message stream: a **Servers** board and a **Sessions**
+board on the left (with a collapsible **Keybinds** panel), and
+**Activity** and **Alerts** boards on the right. On narrow terminals the
+four boards stack full-width.
 
-The dashboard renders a left sidebar — a **Workspaces** panel (sessions
-with their servers nested) plus a collapsible **Keybinds** panel — and
-the unified **Traffic** stream on the right, degrading responsively on
-small terminals. It operates read-only against the database; monitoring
-cannot affect the running session. For a single session's events as plain
-text, use `catenary debug monitor <id>`.
+For full protocol and trace history — request/response pairing, the LSP
+traffic behind a single command — query the firehose with `catenary
+query` (e.g. `catenary query --session <id>`).

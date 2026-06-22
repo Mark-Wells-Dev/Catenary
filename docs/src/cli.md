@@ -6,11 +6,13 @@ Running `catenary` in an interactive terminal launches the TUI dashboard.
 When stdin and stdout are pipes (launched by an MCP client), it serves
 MCP instead — no flags needed.
 
-The dashboard is the primary way to observe Catenary. It shows all
-sessions (active and historical), their language servers, and a live
-stream of protocol messages (MCP, LSP, hooks). All messages are stored
-in a SQLite database, so historical sessions can be browsed after the
-fact.
+The dashboard is the primary way to observe Catenary at a glance. It
+reads a daemon-owned `state.json` snapshot and renders four live boards:
+the LSP servers and their health, the connected sessions, recent
+activity, and recent alerts. It is a pure file reader — it never connects
+to the daemon or opens the firehose. Full protocol and trace history
+streams to an append-only JSONL telemetry firehose, which `catenary
+query` reads after the fact.
 
 ```bash
 catenary  # launch dashboard
@@ -18,42 +20,32 @@ catenary  # launch dashboard
 
 ### Keybindings
 
-Keybinding hints appear in each pane's border.
-
-**Sessions pane:**
-
-| Key | Action |
-|-----|--------|
-| `j` / `Down` | Next session |
-| `k` / `Up` | Previous session |
-| `Space` | Toggle expand/collapse |
-| `h` / `l` | Scroll horizontally (events) |
-| `r` | Refresh |
-| `x` | Delete session data (dead sessions only) |
-| `q` / `Esc` | Quit |
-
-**Events pane:**
+The dashboard renders four boards — **Servers** and **Sessions** on the
+left (with a collapsible **Keybinds** panel) and **Activity** and
+**Alerts** on the right. Navigation is keyboard-first:
 
 | Key | Action |
 |-----|--------|
-| `j` / `Down` | Next event |
-| `k` / `Up` | Previous event |
-| `Space` | Toggle expand/collapse |
-| `h` / `l` | Scroll horizontally |
-| `Ctrl-u` | Page up |
-| `Ctrl-d` | Page down |
-| `G` | Jump to latest |
-| `y` | Yank selected event |
-| `f` | Open filter input |
-| `F` | Clear filter |
+| `j` / `Down` | Move down one entry |
+| `k` / `Up` | Move up one entry |
+| `Tab` | Focus the next board |
+| `Shift+Tab` | Focus the previous board |
+| `g` / `Home` | Jump to the first entry |
+| `G` / `End` | Jump to the last entry |
+| `PageDown` | Page down |
+| `PageUp` | Page up |
+| `y` | Yank the selected entry (scope id / text) via OSC 52 |
+| `?` | Toggle the keybinds help panel |
+| `q` | Quit |
 
 ## Protocol Transparency
 
 Catenary logs every protocol message — every MCP exchange, every LSP
-request and response, every hook invocation — to a local SQLite database.
-The TUI shows the full message flow in real time: what Catenary sends to
-your language servers, what they send back, and how long each exchange
-takes.
+request and response, every hook invocation — to an append-only JSONL
+telemetry firehose, sharded per session, server, and tool invocation:
+what Catenary sends to your language servers, what they send back, and
+how long each exchange takes. `catenary query` reads it after the fact;
+the TUI renders a live snapshot of the resulting state.
 
 You can see exactly what Catenary does. Nothing is hidden.
 
@@ -169,58 +161,39 @@ pending, the command filter blocks unrelated commands until you run
 the run is "dirty" (an error by default — see `diagnostics_severity` in
 [Configuration](configuration.md#diagnostics)).
 
-### `catenary debug`
+### `catenary query`
 
-Diagnostic and debugging tools for inspecting session data, grouped under
-the `debug` subcommand: `list`, `monitor`, `status`, `query`, and `gc`.
+Query the JSONL telemetry firehose — every LSP, MCP, and hook message,
+plus internal trace events. Reads the append-only logs directly, so it
+works even when the daemon is down. Useful for debugging and bug reports.
 
-#### `catenary debug list`
-
-List active and historical sessions.
-
-```bash
-catenary debug list
-```
-
-#### `catenary debug monitor <id>`
-
-Stream events from a session to the terminal. Accepts a prefix of
-either the Catenary session ID or the host CLI session ID.
+Filters fall into two groups. *File-selection* filters pick which shards
+to read: `--session` (one session's log), `--server` (an LSP server),
+`--tool` (a `grep`/`glob` invocation). *Record* filters apply after open:
+`--cwd`, `--since`, `--level`, `--kind`, and `--search`.
 
 ```bash
-catenary debug monitor 029b
-catenary debug monitor 029b --raw       # raw JSON output
-catenary debug monitor 029b --filter hover
+catenary query --session 029ba740 --since 1h
+catenary query --kind hook --since today
+catenary query --search "timeout" --format json
+catenary query --server rust-analyzer --level warn --follow
 ```
 
-#### `catenary debug status <id>`
-
-Show the status of a single session.
-
-```bash
-catenary debug status 029b
-```
-
-#### `catenary debug query`
-
-Query events from the database. Useful for debugging and bug reports.
-
-```bash
-catenary debug query --session 029ba740 --since 1h
-catenary debug query --kind diagnostics --since today
-catenary debug query --search "hover" --format json
-catenary debug query --sql "SELECT * FROM events WHERE payload LIKE '%timeout%'"
-```
-
-#### `catenary debug gc`
-
-Garbage-collect old session data.
-
-```bash
-catenary debug gc --older-than 7d
-catenary debug gc --dead
-catenary debug gc --session 029ba740
-```
+| Flag | Description |
+|------|-------------|
+| `--session <id>` | Read one session's log (id or prefix) |
+| `--server <name>` | Read an LSP server's log (all instances) |
+| `--tool <grep\|glob>` | Read a search tool's invocation log |
+| `--cwd <path>` | Keep records whose cwd is this path or under it |
+| `--since <dur>` | Time filter (`1h`, `today`, `7d`, `30m`) |
+| `--level <lvl>` | Minimum severity (`error`/`warn`/`info`/`debug`) |
+| `--kind <kind>` | Record kind (`lsp`/`mcp`/`hook`/`internal`) |
+| `--search <text>` | Free-text substring over method, message, payload |
+| `--instance <id>` | Read a specific daemon instance dir (default: freshest) |
+| `--all-instances` | Read every instance dir, not just the freshest |
+| `--follow` | Live-tail the selected files |
+| `--limit <n>` | Max rows (0 = unlimited; default 100) |
+| `--format <fmt>` | Output format: `table` (default) or `json` |
 
 ### `catenary doctor`
 

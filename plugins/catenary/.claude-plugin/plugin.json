@@ -1,6 +1,6 @@
 {
   "name": "catenary",
-  "description": "Bridge between MCP and LSP, providing IDE-quality code intelligence (hover, go-to-definition, references, diagnostics, completions, and more) for any language with an LSP server",
+  "description": "Enforced code intelligence for Claude Code — an opinionated, LSP-backed command surface (grep, glob, sed, diagnostics) plus a hook that keeps the agent on the code-intelligent path",
   "author": {
     "name": "Mark Wells Dev",
     "email": "contact@markwells.dev"

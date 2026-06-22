@@ -215,6 +215,13 @@ into two steps:
    `set_scope` is called on `LspServer`, and the full `InstanceKey` is
    constructed and inserted into the client map.
 
+   Files outside all workspace roots take a separate path:
+   `spawn_single_file` sets `Scope::SingleFile` *before* `initialize`
+   (the scope is known without the handshake) and initializes with a
+   null workspace. It is gated on `single_file = true` in `[server.*]`,
+   and a server that rejects null-workspace init is negative-cached. See
+   the single-file tier in [Routing & Dispatch](routing.md).
+
 The clients lock is held across the entire sequence (`spawn_inner`
 acquires it before the double-spawn check and holds it through
 insertion). This prevents races where two concurrent spawns for the

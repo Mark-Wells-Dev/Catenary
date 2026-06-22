@@ -41,14 +41,16 @@ dispatches to sinks.
 ### Two-phase construction
 
 `LoggingServer` starts in buffering mode. During early startup (config
-loading, database migration), tracing events are captured in a bounded
+loading, daemon assembly), tracing events are captured in a bounded
 in-memory buffer (4096 events). Nothing is written to disk yet — the
-database connection does not exist.
+sinks do not exist.
 
-When `Session` assembly creates the database connection and sinks,
-`LoggingServer::activate()` is called. This drains the bootstrap buffer
-through the sinks in FIFO order and switches to direct dispatch. From
-this point, every tracing event flows to the database immediately.
+When daemon assembly constructs the sinks,
+`LoggingServer::activate(sinks)` is called. This drains the bootstrap
+buffer through the sinks in FIFO order and switches to direct dispatch.
+From this point, every tracing event flows to the sinks immediately.
+Activation depends only on sink readiness — there is no database
+connection or migration.
 
 If bootstrap events were dropped due to buffer overflow, activate emits
 a `warn!()` describing the loss. That event flows through the now-active
@@ -56,23 +58,28 @@ sinks like any other.
 
 ### Sinks
 
-Post-activation, two sinks receive every tracing event:
+Post-activation, the sinks receive every tracing event:
 
 - **Notification queue** — severity-filtered (default `warn`),
   deduplicated. Accumulates user-facing notifications between drain
   points. See [notification lifecycle](#notification-lifecycle) below.
 
-- **Message DB** — writes all events to the `messages` table. Protocol
-  events (`kind` in `{lsp, mcp, hook}`) set `type` from the kind field;
-  internal events set `type = "internal"`. The `level` column always
-  reflects the event's tracing severity. Broadcasts inserted ROWIDs so
-  `SqliteMessageTail` can stay live without polling. This is the data
-  that powers the TUI.
+- **JSONL firehose** — appends every event as one JSON line to a
+  sharded, append-only log under `cache_dir` (see
+  [Data source](#data-source) below). Protocol events carry `kind` in
+  `{lsp, mcp, hook}`; internal events use `kind = "internal"`. The
+  `level` field always reflects the event's tracing severity. This is the
+  full audit trail, read after the fact by `catenary query`.
 
-The message DB sink replaces the former `MessageLog` (protocol logging)
-and `ErrorLayer` (error reporting) — both were deleted during the
-logging consolidation. The consolidation means every telemetry event
-follows the same pipeline regardless of origin.
+- **Snapshot alert ring** — `warn!()` / `error!()` events are also folded
+  into the alert ring of the daemon-owned `state.json` snapshot, so the
+  TUI surfaces them without reading the firehose.
+
+The firehose sink replaces the former `MessageLog` (protocol logging),
+`ErrorLayer` (error reporting), and the SQLite `messages` table — all
+removed during the logging consolidation and the observability rewrite.
+The consolidation means every telemetry event follows the same pipeline
+regardless of origin.
 
 ### Hot path
 
@@ -258,105 +265,86 @@ Watching](documents.md#editing-mode) for the full diagnostic pipeline.
 Running `catenary` with no subcommand in an interactive terminal launches
 the TUI dashboard. (When stdin and stdout are pipes — an MCP client
 launched it — the same binary serves MCP instead, no flag needed.) The
-dashboard connects to the SQLite database (not to the running daemon
-process) and renders the protocol message stream across all sessions. It
-is a read-only observer — it cannot affect a running session.
+dashboard is a pure file reader: it reads the daemon-owned `state.json`
+snapshot and never connects to the daemon process, the firehose, or a
+database. It is a read-only observer — it cannot affect a running session.
 
-For a single session's events as plain text instead of the full TUI, use
-`catenary debug monitor <id>` — see
-[CLI & Dashboard](../cli.md#catenary-debug).
+For full protocol and trace history (a single session, a server, a
+search), query the firehose with `catenary query` — see
+[CLI & Dashboard](../cli.md#catenary-query).
 
 ### Data source
 
-The TUI reads from the `messages` table using WAL-based change
-notification. A file watcher on the WAL file triggers re-reads when
-new rows are inserted. The TUI never polls — it wakes only when there
-is new data. Historical sessions can be browsed after the fact because
-all messages persist in the database.
+The TUI reads a single file: the daemon-owned `state.json` snapshot under
+`runtime_dir`. A file watcher on the snapshot's directory triggers a
+reload whenever the daemon rewrites it. The TUI never polls and never
+opens the firehose — it wakes only when the snapshot changes. The
+snapshot holds live state only (current sessions, servers, recent alerts
+and activity); historical protocol traffic lives in the firehose and is
+read with `catenary query`.
 
-### Message envelope
+### Firehose record
 
-Every protocol message is stored as an envelope with these fields:
+Every event is appended to the firehose as one JSON line. Empty or absent
+fields are omitted; the principal fields are:
 
 | Field | Purpose |
 |-------|---------|
-| `type` | Protocol boundary: `mcp`, `lsp`, `hook`, or `internal` |
-| `method` | Protocol method name (e.g., `textDocument/hover`, `tools/call`) |
-| `server` | LSP server name (e.g., `rust-analyzer`) |
-| `client` | Host CLI identifier (e.g., `claude-code`) |
-| `request_id` | Correlation ID for request/response pairing |
-| `parent_id` | Causation ID linking LSP messages to their originating CLI command |
+| `ts` | Timestamp (RFC 3339, millisecond, UTC) |
+| `kind` | Event kind: `lsp`, `mcp`, `hook`, or `internal` |
 | `level` | Tracing severity (`debug`, `info`, `warn`, `error`) |
-| `payload` | Raw JSON content |
+| `scope_id` | Self-describing shard id: session id, search UUID, `server@root`, or instance id |
+| `parent_id` | Causation ID pairing a response with its request |
+| `server` | LSP server name (e.g., `rust-analyzer`) |
+| `scope_root` | Workspace root the event was routed for |
+| `cwd` | Originating working directory (the `catenary query --cwd` filter dimension) |
+| `method` | Protocol method (e.g., `textDocument/hover`) or, for internal events, the module target |
+| `source` | Subsystem taxonomy (e.g., `lsp.lifecycle`) |
+| `payload` | Nested protocol JSON (protocol events) |
+| `message` / `language` / `fields` | Rendered message and remaining structured fields (internal events) |
 
 Three boundary components own logging: `McpServer` (MCP), `LspClient`
 (LSP), and `HookServer` (hooks). Application servers are black boxes —
 the protocol messages that went in and came out are linked by
-`parent_id` at the database level.
+`parent_id` in the firehose records.
 
-### Display pipeline
+### Boards
 
-The TUI transforms raw messages into display-ready entries through
-three passes:
+The dashboard is a snapshot renderer: it shows the daemon's current state
+directly, with no message-stream reconstruction (no request/response
+pairing or scope collapse — that view is `catenary query`'s job). It
+renders four boards built from `state.json`:
 
-```
-Raw messages → Pair merge → Scope collapse → Run collapse → Display
-```
-
-1. **Pair merge.** Request/response messages that share a `request_id`
-   merge into a single `Paired` display entry with timing information
-   (response time = response timestamp - request timestamp).
-
-2. **Scope collapse.** Entries sharing a `parent_id` group into a
-   `Scope` display entry. The parent is typically an MCP `tools/call`
-   pair; the children are the LSP messages that the tool call produced.
-   A single grep call that generates hundreds of LSP messages collapses
-   to one summary line showing result counts and timing. Scopes that
-   are interrupted by unrelated root-level events (e.g., progress
-   tokens) are split into segments with position tracking
-   (`First`/`Middle`/`Last`).
-
-3. **Run collapse.** Consecutive messages in the same category collapse
-   into a single `Collapsed` entry with a count. Categories are
-   determined by `lsp_category()` / `mcp_category()` /
-   `hook_category()` functions that group by protocol method.
-
-### Summary lines
-
-The TUI inverts the display hierarchy. Summary lines surface the
-innermost useful content — error messages, result counts, diagnostic
-severity — rather than protocol scaffolding (direction arrows, method
-names, JSON-RPC structure).
-
-Icons replace direction arrows. An icon carries at-a-glance semantic
-status (success, protocol error, cancellation, progress) while
-direction is implied by protocol role. Three icon presets are available:
-Unicode (default), Nerd Font, and emoji.
+- **Servers** — every LSP server the daemon manages, with lifecycle
+  state, time in state, `$/progress`, and the last `window/logMessage`.
+- **Sessions** — connected agents, each with its client, workspace
+  roots, and current status (editing / diagnostics / idle).
+- **Activity** — a curated ring of recent milestones (newest first).
+- **Alerts** — a ring of recent `warn!()` / `error!()` events (newest
+  first).
 
 ### Layout
 
-The dashboard places a sidebar on the left and the message stream on the
-right (the default *quadrant* layout):
+The dashboard places a sidebar on the left and detail boards on the
+right (the default wide layout):
 
-- **Workspaces** (left, top) — connected sessions grouped by workspace
-  root, each with its language servers nested beneath. Server rows show
-  lifecycle state, `$/progress` percentages, and `window/logMessage`
-  content. Selecting a session or server filters the stream; combining
-  selections intersects.
-- **Keybinds** (left, bottom) — a help panel, collapsed by default to a
+- **Left column** — the Servers board (top) and Sessions board (middle),
+  with a **Keybinds** help panel (bottom), collapsed by default to a
   single "Keybinds — `?` to expand" line.
-- **Traffic** (right) — the unified, chronological message stream, with
-  search (`/`, then `n`/`N`), filtering, visual selection, and yank via
-  OSC 52. Expanding a message or scope reveals the full JSON payload.
+- **Right column** — the Activity board (top) and Alerts board (bottom),
+  with the daemon status line on the divider.
 
-This unified stream + sidebar replaced the earlier per-session BSP panel
-layout: with a shared daemon and many concurrent sessions, per-session
-panels did not scale. The layout degrades responsively — on short
-terminals the left column collapses to a tab stack, and on narrow
-terminals every panel (Traffic included) stacks into one full-width tab
-strip. Mouse support covers scrolling, selection, and dragging the
-sidebar/stream divider. All colors use the terminal's ANSI palette, so
-the TUI inherits the user's theme.
+On narrow terminals the columns collapse and the four boards stack
+full-width. Navigation is keyboard-first: `j`/`k` to move, `Tab` to cycle
+boards, `g`/`G` and `PageUp`/`PageDown` to jump, `y` to yank the selected
+entry via OSC 52, `?` for the keybinds panel, `q` to quit. All colors use
+the terminal's ANSI palette, so the TUI inherits the user's theme.
+
+This snapshot dashboard replaced an earlier message-stream TUI: with a
+shared daemon and many concurrent sessions, reconstructing every
+session's protocol stream in the UI did not scale and coupled the TUI to
+a growing database. Reading a small live snapshot instead keeps the
+dashboard structurally unable to wedge the daemon.
 
 For keybindings and usage, see the
 [CLI & Dashboard](../cli.md#dashboard-tui) page.

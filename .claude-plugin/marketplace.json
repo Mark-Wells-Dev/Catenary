@@ -1,7 +1,7 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "catenary",
-  "description": "LSP-powered code intelligence for AI coding agents - search, diagnostics, and navigation for any language with an LSP server",
+  "description": "Enforced code intelligence for AI coding agents — a curated, LSP-backed command surface (grep, glob, sed, diagnostics) the agent can't route around",
   "owner": {
     "name": "Mark Wells Dev",
     "email": "contact@markwells.dev"
@@ -9,7 +9,7 @@
   "plugins": [
     {
       "name": "catenary",
-      "description": "LSP-powered code intelligence for AI coding agents - search, diagnostics, and navigation for any language with an LSP server",
+      "description": "Enforced code intelligence for AI coding agents — a curated, LSP-backed command surface (grep, glob, sed, diagnostics) the agent can't route around",
       "version": "1.6.1",
       "author": {
         "name": "Mark Wells Dev",

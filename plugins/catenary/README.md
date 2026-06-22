@@ -1,10 +1,16 @@
 # Catenary
 
-LSP-powered code intelligence for AI coding agents. Catenary manages a
-pool of language servers and exposes them through CLI commands (`grep`,
-`glob`, `sed`, `diagnostics`) and hooks (editing enforcement, command
-filtering). Multiple agents share the same LSP servers via a single
-daemon. Run `catenary primer` for the full agent-facing workflow.
+**Enforced code intelligence for Claude Code.**
+
+Catenary hands the agent a small, opinionated set of code-intelligent
+commands — `catenary grep`, `glob`, `sed`, `diagnostics` — and a
+`PreToolUse` hook that keeps it on them. Reach for `grep` and it's
+redirected to `catenary grep`; reach for `sed -i` and you get `catenary
+sed`. Every command is backed by a language server, so the agent navigates
+code by meaning instead of brute-forcing text. Multiple agents share one
+daemon and one pool of LSP servers.
+
+Run `catenary primer` for the full agent-facing workflow.
 
 ## Installation
 
@@ -25,13 +31,15 @@ hooks will silently do nothing.
 /plugin install catenary@catenary
 ```
 
-The plugin registers hooks for editing enforcement, command filtering,
-and agent lifecycle tracking, plus an MCP connection for session
-management and workspace root discovery.
+The plugin registers the `PreToolUse` hook (editing enforcement, command
+allowlist, file tracking) and agent-lifecycle hooks, plus an MCP
+connection used as a **heartbeat** — the protocol handshake and
+workspace-root discovery. It advertises no query tools; the command
+surface is the CLI.
 
 ## Configuration
 
-See `config.example.toml` in this directory or the [Official Configuration Guide](https://twowells.github.io/catenary/configuration.html).
+See `config.example.toml` in this directory or the [Official Configuration Guide](https://twowells.github.io/Catenary/stable/configuration.html).
 
 ## Documentation
 

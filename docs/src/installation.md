@@ -2,10 +2,16 @@
 
 ## Prerequisites
 
-- [Rust toolchain](https://rustup.rs/) (for building from source)
+- [Rust toolchain](https://rustup.rs/)
 - Language servers for the languages you want to use (see [Language Servers](lsp/README.md))
 
 ## Install Catenary
+
+```bash
+cargo install catenary-mcp
+```
+
+To build from source instead:
 
 ```bash
 cargo install --git https://github.com/TwoWells/Catenary catenary-mcp

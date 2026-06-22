@@ -129,9 +129,11 @@ runs `catenary diagnostics`. During editing mode:
 `catenary diagnostics` triggers a multi-phase pipeline on
 `DiagnosticsServer`:
 
-1. **File change notifications.** `notify_file_changes()` runs first,
-   so servers know about any filesystem changes (new files, deletes)
-   before the diagnostic cycle.
+1. **File change notifications.** The diagnostics stat-walk doubles as
+   change detection: changed files are diffed against each root's mtime
+   baseline (`diff_and_update`) and delivered to servers as a per-server
+   changed-set (`nudge_changed_set`) first, so servers know about any new
+   or deleted files before the diagnostic cycle.
 
 2. **Resolve and group.** Modified files are canonicalized, validated
    against workspace roots, and grouped by diagnostic-enabled server.
@@ -158,10 +160,11 @@ runs `catenary diagnostics`. During editing mode:
    get per-line error/warning output, clean files are grouped on one
    line, N/A files are grouped separately.
 
-5. **`mark_current`** — refreshes the filesystem cache for all
-   processed files, preventing the next `diff()` from reporting them
-   as changed (see [interaction with editing mode](#interaction-with-editing-mode)
-   below).
+5. **Baseline already current.** No separate cache-refresh pass is
+   needed: the change-detection walk in step 1 already recorded these
+   files' mtimes in each root's baseline, so the next walk will not
+   re-report them as changed (see [interaction with editing
+   mode](#interaction-with-editing-mode) below).
 
 Cross-file diagnostics are correct because each server sees the
 complete final state before producing diagnostics. A renamed type
@@ -196,89 +199,97 @@ or external tools.
 ### Why not a traditional file watcher
 
 Most LSP clients use a background file watcher (inotify on Linux,
-FSEvents on macOS) that fires events continuously. Catenary doesn't:
+FSEvents on macOS) that fires events continuously over the whole
+workspace. Catenary doesn't — it detects changes by walking at query
+time, the same walk `grep`/`glob`/`diagnostics` already perform:
 
-- **Zero idle overhead.** No background watcher thread, no inotify
-  watches, no file descriptor budget to manage. Between tool calls,
-  Catenary does nothing.
-- **No platform-specific dependencies.** No `notify` crate, no
-  `inotify`, no `FSEvents`, no `ReadDirectoryChangesW`. Directory
-  walking uses the `ignore` crate, which is already a dependency for
-  `FilesystemManager`.
-- **No inotify watch limits.** Large monorepos can exceed the default
-  8192 inotify watch limit. Catenary never hits this because it
-  doesn't register watches.
+- **Zero idle overhead.** No background watcher over workspace files, no
+  recursive inotify watches, no file-descriptor budget to manage.
+  Between tool calls, Catenary does nothing.
+- **No sub-`O(tree)` consumer to accelerate.** `grep` is `O(tree)` and
+  asks a fresh question each time, so an incremental change feed would
+  not speed it up. Walking on demand yields change detection for free,
+  off work the query already does.
+- **No watch limits.** Large monorepos can exceed the default inotify
+  watch limit; Catenary never hits it because it registers no recursive
+  workspace watches. Directory walking uses the `ignore` crate (already a
+  `FilesystemManager` dependency).
 
 The tradeoff: changes are not detected instantly. They are detected at
 the next tool boundary, which is when they matter — that is when the
 agent is about to interact with servers.
 
-### Snapshot-and-diff model
+(Catenary does use the `notify` crate for one narrow, unrelated purpose:
+a bounded, non-recursive directory-deletion watch on subagent worktree
+roots, for teardown — not workspace-file watching. See [Logging, Hooks &
+TUI](logging-hooks-tui.md#worktree-root-teardown).)
 
-`FilesystemManager` implements a snapshot-and-diff model:
+### Walk-on-demand change detection
 
-1. **`seed()`** at session start — walks all workspace roots and
-   records `(path, mtime)` for every file and directory. Stat-only,
-   no content read. Respects `.gitignore` via the `ignore` crate.
+`FilesystemManager` detects changes by walking on demand and diffing
+against a per-root mtime baseline:
 
-2. **`diff()`** at tool boundaries — walks all roots again, compares
-   current `(path, mtime)` to the cached snapshot, and produces a
-   change set: `Created`, `Changed`, or `Deleted` entries. Updates the
-   cache to reflect current disk state.
+1. **First walk is the baseline.** There is no separate seed step. The
+   first walk of a root records `(path, mtime)` for every file (stat-only,
+   no content read; `.gitignore` respected via the `ignore` crate) and
+   establishes that root's baseline.
 
-3. **Glob matching.** Changes are matched against per-server glob
-   registrations. Servers register interest in file patterns via
-   `client/registerCapability` for
-   `workspace/didChangeWatchedFiles`. Each registration carries glob
-   patterns and watch kinds (create, change, delete). Only changes
-   that match a registration's patterns and watch kinds are delivered.
+2. **`diff_and_update` on each walk.** A later walk compares the current
+   `(path, mtime)` against the baseline, produces a change set —
+   `Created`, `Changed`, or `Deleted` — then merges the new mtimes back
+   into the baseline. (The first walk's whole observation is reported as
+   `Changed` — the cold snapshot.)
 
-4. **Batched notification.** Matching changes are sent as a single
-   `workspace/didChangeWatchedFiles` notification per server. The
-   notification carries an array of `(uri, changeType)` pairs.
+3. **Per-server routing.** Each covering server's registered watchers
+   are snapshotted; observations are filtered to the union of their
+   globs, then fanned out so each server receives only the changes that
+   match its own globs *and* watch-kind mask (create / change / delete).
+   Servers register interest via `client/registerCapability` for
+   `workspace/didChangeWatchedFiles`.
+
+4. **Precise notification.** Each server gets a single
+   `workspace/didChangeWatchedFiles` carrying only its matching changes,
+   as `(uri, changeType)` pairs whose `changeType` is the true semantic
+   kind (Created → 1, Changed → 2, Deleted → 3). It is never a broad
+   unconditional poke.
 
 ### Registration management
 
 Glob registrations live on `LspServer`. They are populated via
-`client/registerCapability` (the server declares what file patterns
-it wants to watch) and cleared via `client/unregisterCapability`.
-Registration IDs are tracked so that specific registrations can be
-unregistered without affecting others.
+`client/registerCapability` (the server declares what file patterns it
+wants to watch) and cleared via `client/unregisterCapability`.
+Registration IDs are tracked so specific registrations can be removed
+without affecting others. Each watcher compiles its glob with LSP 3.17
+semantics and carries a watch-kind mask; the matcher gates on both.
 
-The `file_watcher_snapshot` method on `LspServer` returns a clone
-of the current registrations for matching. The snapshot approach
-avoids holding the registration lock during the (potentially slow)
-glob matching and notification loop.
+The registrations are snapshotted before matching, so the registration
+lock is not held during the (potentially slow) glob matching and
+notification loop.
 
 ### Interaction with editing mode
 
-`catenary diagnostics` calls `FilesystemManager::mark_current()` after
-processing diagnostics. This re-stats every processed file and
-updates its mtime in the cache. Without this step, the next
-`diff()` at the next tool boundary would report every edited file
-as `Changed`, and servers would receive redundant
-`didChangeWatchedFiles` events for files they have already seen
-the final content of (via `didOpen`/`didChange` during the
-diagnostic pipeline).
-
-For files deleted during editing, `mark_current` removes them from
-the cache — the next `diff()` will not report them as deleted again.
+The change-detection walk at the start of `catenary diagnostics` also
+updates each root's mtime baseline, recording the edited files at their
+final mtime. A later walk therefore does not re-report them as
+`Changed`, and servers do not receive redundant `didChangeWatchedFiles`
+events for content they have already seen (via `didOpen`/`didChange`
+during the diagnostic pipeline). Deletions are folded into the baseline
+the same way, so they are not reported twice.
 
 ### When notifications fire
 
-`notify_file_changes()` runs at two points:
+Change detection rides each query's walk, so a notification can fire on:
 
-- **Before every grep and glob CLI command.** The IPC router runs file
-  change notification before dispatching grep and glob requests. This
-  ensures servers have up-to-date awareness of the filesystem state
-  before the agent queries them.
-- **At the start of `catenary diagnostics`.** The diagnostic pipeline
-  calls `notify_file_changes()` first, so servers know about any file
-  creates or deletes before receiving `didOpen` for modified files.
+- **`grep`** — the search walk collects mtimes and feeds the changed-set
+  before results are returned.
+- **`glob`** — the scoped directory scan (`nudge_scoped`) does the same
+  for the listed paths.
+- **`catenary diagnostics`** — the stat-walk runs first, so servers know
+  about any creates or deletes before receiving `didOpen` for modified
+  files.
 
-The notification is a no-op when `diff()` returns an empty change
-set, which is the common case when the agent has not modified the
-filesystem since the last tool call.
+The notification is a no-op when the walk finds no changes — the common
+case when the agent has not touched the filesystem since the last query.
 
 ## Related pages
 
@@ -286,8 +297,8 @@ filesystem since the last tool call.
   handles, priority chain vs. diagnostic concatenation.
 - [LSP Client Layer](lsp-client.md) — connection management,
   capabilities, settle/idle detection used by the diagnostic pipeline.
-- [Session Lifecycle](session-lifecycle.md) — when `seed()` runs,
-  editing mode in the serving loop.
+- [Session Lifecycle](session-lifecycle.md) — daemon startup and the
+  serving loop, including change detection on each query walk.
 - [Configuration Model](configuration.md) — `diagnostics` flags on
   language bindings and servers.
 - [Logging, Hooks & TUI](logging-hooks-tui.md) — hook integration
