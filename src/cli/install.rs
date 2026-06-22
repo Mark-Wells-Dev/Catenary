@@ -43,6 +43,10 @@ fn parse_source(source: &str) -> InstallSource {
 /// Default repo identifier when no source is specified.
 const DEFAULT_REPO: &str = "TwoWells/Catenary";
 
+/// Claude Code marketplace name for the catenary plugin (the `@catenary` in
+/// `catenary@catenary`). Used to refresh the marketplace's cached content.
+const CLAUDE_MARKETPLACE: &str = "catenary";
+
 // ── Host detection ─────────────────────────────────────────────────
 
 /// Check whether a binary can be found on `$PATH`.
@@ -302,52 +306,91 @@ pub fn run_install_claude(out: &mut Output, source: Option<&str>, dry_run: bool)
     claude_ensure_plugin(out, dry_run)
 }
 
-/// Ensure the Claude Code marketplace is registered.
+/// Ensure the Claude Code marketplace is registered AND its content is fresh.
+///
+/// Registration (`marketplace add`) only runs for a new or changed source. The
+/// content refresh (`marketplace update`) runs ALWAYS, because a marketplace that
+/// is already registered with the right source can still serve a STALE snapshot:
+/// for a `directory` source whose plugin version is unchanged, Claude caches the
+/// marketplace content by version, so a plugin reinstall would re-copy the OLD
+/// hooks (the "stale hooks persist after `catenary install`" gap). `update`
+/// re-reads the source so the subsequent reinstall picks up current hooks. The
+/// refresh is non-fatal — a possibly-stale reinstall beats a blocked install.
 ///
 /// Returns `Ok(true)` if the caller should proceed to plugin install,
-/// `Ok(false)` if a non-recoverable error occurred.
+/// `Ok(false)` if registration failed.
 fn claude_ensure_marketplace(
     out: &mut Output,
     source: &str,
     needs_update: bool,
     dry_run: bool,
 ) -> Result<bool> {
-    if !needs_update {
-        let _ = out.writeln(format_args!(
-            "  {} marketplace registered ({source})",
-            out.colors.green("✓"),
-        ));
-        return Ok(true);
-    }
-
-    if dry_run {
-        let _ = out.writeln(format_args!(
-            "  {} marketplace add {source}",
-            out.colors.dim("(dry-run)"),
-        ));
-        return Ok(true);
-    }
-
-    let status = Command::new("claude")
-        .args(["plugin", "marketplace", "add", source])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .status()
-        .context("failed to run `claude plugin marketplace add`")?;
-
-    if status.success() {
-        let _ = out.writeln(format_args!(
-            "  {} marketplace registered ({source})",
-            out.colors.green("✓"),
-        ));
-        Ok(true)
+    // Register the marketplace (only when the source is new or changed).
+    if needs_update {
+        if dry_run {
+            let _ = out.writeln(format_args!(
+                "  {} marketplace add {source}",
+                out.colors.dim("(dry-run)"),
+            ));
+        } else {
+            let status = Command::new("claude")
+                .args(["plugin", "marketplace", "add", source])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .status()
+                .context("failed to run `claude plugin marketplace add`")?;
+            if status.success() {
+                let _ = out.writeln(format_args!(
+                    "  {} marketplace registered ({source})",
+                    out.colors.green("✓"),
+                ));
+            } else {
+                let _ = out.writeln(format_args!(
+                    "  {} marketplace add failed",
+                    out.colors.red("✗"),
+                ));
+                return Ok(false);
+            }
+        }
     } else {
         let _ = out.writeln(format_args!(
-            "  {} marketplace add failed",
-            out.colors.red("✗"),
+            "  {} marketplace registered ({source})",
+            out.colors.green("✓"),
         ));
-        Ok(false)
     }
+
+    // Refresh the marketplace content so the reinstall below picks up the current
+    // hooks even when the plugin version is unchanged (directory marketplaces /
+    // dev installs). Without this, a registered-but-cached marketplace re-serves
+    // stale hooks and the daemon keeps emitting "Stale … hooks detected".
+    if dry_run {
+        let _ = out.writeln(format_args!(
+            "  {} marketplace update {CLAUDE_MARKETPLACE}",
+            out.colors.dim("(dry-run)"),
+        ));
+    } else {
+        match Command::new("claude")
+            .args(["plugin", "marketplace", "update", CLAUDE_MARKETPLACE])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .status()
+        {
+            Ok(status) if status.success() => {
+                let _ = out.writeln(format_args!(
+                    "  {} marketplace refreshed",
+                    out.colors.green("✓"),
+                ));
+            }
+            _ => {
+                let _ = out.writeln(format_args!(
+                    "  {} marketplace update failed (reinstall may use cached content)",
+                    out.colors.yellow("⚠"),
+                ));
+            }
+        }
+    }
+
+    Ok(true)
 }
 
 /// Ensure the Claude Code plugin is installed (uninstall + reinstall cycle).
@@ -1667,6 +1710,44 @@ mod tests {
         run_install_list(&mut out).expect("list should succeed");
         let output = out.into_string();
         assert!(output.contains("Detected hosts:"), "output: {output}");
+    }
+
+    // ── Claude marketplace refresh ──────────────────────────────────
+
+    /// Registration-current ≠ content-current: an already-registered marketplace
+    /// (`needs_update = false`) must STILL refresh its cached content, else a
+    /// reinstall re-serves stale hooks and the daemon keeps flagging them.
+    #[test]
+    fn claude_marketplace_refreshes_even_when_already_registered() {
+        let mut out = Output::buffer(80);
+        let proceed = claude_ensure_marketplace(&mut out, "/some/dir", false, true)
+            .expect("dry run should succeed");
+        assert!(proceed, "should proceed to plugin install");
+        let output = out.into_string();
+        assert!(
+            output.contains(&format!("marketplace update {CLAUDE_MARKETPLACE}")),
+            "must refresh content even when already registered. output: {output}"
+        );
+        assert!(
+            !output.contains("marketplace add"),
+            "must not re-add an already-registered marketplace. output: {output}"
+        );
+    }
+
+    /// A new/changed source both registers (`add`) and refreshes (`update`).
+    #[test]
+    fn claude_marketplace_adds_then_refreshes_new_source() {
+        let mut out = Output::buffer(80);
+        claude_ensure_marketplace(&mut out, "/new/dir", true, true).expect("dry run");
+        let output = out.into_string();
+        assert!(
+            output.contains("marketplace add /new/dir"),
+            "new source must be registered. output: {output}"
+        );
+        assert!(
+            output.contains(&format!("marketplace update {CLAUDE_MARKETPLACE}")),
+            "new source must also be refreshed. output: {output}"
+        );
     }
 
     // ── Per-host primer pointer ─────────────────────────────────────
