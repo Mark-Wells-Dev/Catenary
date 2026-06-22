@@ -23,8 +23,8 @@ Every external interaction crosses one of four boundaries:
   language server processes, sending requests and receiving
   notifications over JSON-RPC stdio.
 - **Hooks** — host CLI ↔ Catenary. The host CLI (Claude Code, Gemini
-  CLI) fires hooks at lifecycle boundaries (pre-tool, pre-agent,
-  post-agent, session start/end). Hook processes connect to the daemon's
+  CLI) fires hooks at lifecycle boundaries (pre-tool, post-agent,
+  session start/end). Hook processes connect to the daemon's
   IPC socket and exchange JSON messages.
 
 ## Multiplexing

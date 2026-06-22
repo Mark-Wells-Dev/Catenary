@@ -18,7 +18,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::json;
 
-use common::{BridgeProcess, ipc_request, mockls_lsp_arg};
+use common::{BridgeProcess, mockls_lsp_arg};
 
 const MOCK_LANG_A: &str = "yX4Za";
 const MOCK_LANG_B: &str = "d5apI";
@@ -3078,47 +3078,6 @@ fn test_mcp_cancel_nonexistent_is_noop() -> Result<()> {
     assert!(
         ping_response.get("result").is_some(),
         "bridge should respond to ping after stale cancellation: {ping_response}"
-    );
-
-    Ok(())
-}
-
-// ── Turn-boundary roots refresh ─────────────────────────────────────
-
-/// `PreAgent` hook does NOT trigger `roots/list` when the client lacks roots
-/// capability.
-#[test]
-fn test_turn_boundary_no_roots_capability() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let root = dir.path().to_str().context("dir")?;
-    let lsp = mockls_lsp_arg(MOCK_LANG_A, "");
-    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
-
-    // Initialize WITHOUT roots capability.
-    bridge.initialize()?;
-
-    let socket_path = bridge.wait_for_ipc_socket()?;
-
-    // Send PreAgent hook.
-    ipc_request(&socket_path, &json!({"method": "pre-agent/turn-start"}))?;
-
-    // Send a tool call. Without roots capability, the bridge should NOT
-    // send roots/list — the response should be the tool call result directly.
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 600,
-        "method": "ping"
-    }))?;
-
-    let response = bridge.recv()?;
-    assert!(
-        response.get("result").is_some(),
-        "should get ping result directly (no roots/list): {response}"
-    );
-    // Confirm it's the ping response, not a roots/list request.
-    assert!(
-        response.get("method").is_none(),
-        "should be a response, not a request: {response}"
     );
 
     Ok(())

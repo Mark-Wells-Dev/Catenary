@@ -4,13 +4,11 @@
 //! Application dispatch for hook requests.
 //!
 //! `HookRouter` owns all hook method handlers and application logic
-//! (editing state enforcement, diagnostics dispatch, turn tracking).
-//! Protocol boundary delegates to router, router delegates to
-//! [`super::session::Session`].
+//! (editing state enforcement, diagnostics dispatch). Protocol boundary
+//! delegates to router, router delegates to [`super::session::Session`].
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::debug;
 
 use crate::source::Source;
@@ -111,14 +109,9 @@ pub struct DispatchResult {
 /// Routes parsed [`HookRequest`] values to the appropriate handler and
 /// returns an optional [`HookResult`]. Holds all shared application state
 /// needed by hook handlers: editing state (via [`super::editing_manager::EditingManager`]
-/// on [`Session`]) and a turn counter for per-turn debounce.
+/// on [`Session`]).
 pub struct HookRouter {
     pub(crate) session: Arc<Session>,
-    turn_counter: AtomicU64,
-    /// Last turn number where a full config dump was shown on denial.
-    last_config_dump_turn: AtomicU64,
-    /// Config version at the time of the last full dump.
-    last_config_dump_version: AtomicU64,
     #[allow(
         dead_code,
         reason = "per-session router identity; the client-session DB write that read it was removed (observability ticket 07)"
@@ -134,61 +127,16 @@ impl HookRouter {
     pub const fn new(session: Arc<Session>, instance_id: Arc<str>, client_name: String) -> Self {
         Self {
             session,
-            turn_counter: AtomicU64::new(0),
-            // Initialized to MAX so the first denial always triggers a full
-            // config dump (turn 0 != MAX).
-            last_config_dump_turn: AtomicU64::new(u64::MAX),
-            last_config_dump_version: AtomicU64::new(u64::MAX),
             instance_id,
             client_name,
-        }
-    }
-
-    /// Returns the current turn number.
-    ///
-    /// Incremented each time the pre-agent hook fires (once per user
-    /// prompt / agent turn). Used by command filtering for per-turn debounce.
-    #[cfg(test)]
-    pub(crate) fn turn(&self) -> u64 {
-        self.turn_counter.load(Ordering::Acquire)
-    }
-
-    /// Bump the config version counter.
-    ///
-    /// Delegates to `Session::config_version`. Forces the next denial
-    /// to show a full config dump regardless of turn.
-    #[cfg(test)]
-    pub(crate) fn bump_config_version(&self) {
-        self.session.config_version.fetch_add(1, Ordering::AcqRel);
-    }
-
-    /// Check whether the next command denial should show a full config dump.
-    ///
-    /// Returns `true` if the full dump is needed (first denial in a new turn
-    /// or config version changed), `false` for a short message.
-    fn should_show_full_dump(&self) -> bool {
-        let current_turn = self.turn_counter.load(Ordering::Acquire);
-        let current_version = self.session.config_version.load(Ordering::Acquire);
-        let last_dump_turn = self.last_config_dump_turn.load(Ordering::Acquire);
-        let last_dump_version = self.last_config_dump_version.load(Ordering::Acquire);
-
-        if current_turn != last_dump_turn || current_version != last_dump_version {
-            self.last_config_dump_turn
-                .store(current_turn, Ordering::Release);
-            self.last_config_dump_version
-                .store(current_version, Ordering::Release);
-            true
-        } else {
-            false
         }
     }
 
     /// Evaluate a shell command against the session's merged allowlist.
     ///
     /// Builds the merged `ResolvedCommands` from user config + all project
-    /// configs for current roots. If the command is denied, applies debounce:
-    /// full config dump on the first denial in a turn, short message on
-    /// subsequent denials.
+    /// configs for current roots. If the command is denied, renders the terse
+    /// deny message (specific reason + fix + `catenary commands` pointer).
     fn handle_check_command(
         &self,
         command: &str,
@@ -228,23 +176,13 @@ impl HookRouter {
         let resolved_cwd = effective_cwd_str.as_deref().or(cwd);
         let build_hint = self.resolve_build_hint(&denial.command, &resolved, resolved_cwd);
 
-        let message = if self.should_show_full_dump() {
-            crate::cli::command_filter::format_denial_full(
-                &denial.command,
-                &resolved,
-                &denial,
-                format,
-                build_hint.as_deref(),
-            )
-        } else {
-            crate::cli::command_filter::format_denial_short(
-                &denial.command,
-                &denial,
-                &resolved,
-                format,
-                build_hint.as_deref(),
-            )
-        };
+        let message = crate::cli::command_filter::format_denial(
+            &denial.command,
+            &resolved,
+            &denial,
+            format,
+            build_hint.as_deref(),
+        );
 
         DispatchResult {
             result: Some(HookResult::Deny(message)),
@@ -315,18 +253,6 @@ impl HookRouter {
     #[allow(clippy::too_many_lines, reason = "match arms are sequential and flat")]
     pub(crate) fn dispatch(&self, request: HookRequest) -> DispatchResult {
         match request {
-            HookRequest::PreAgent { session_id: _ } => {
-                let turn = self.turn_counter.fetch_add(1, Ordering::AcqRel) + 1;
-                debug!(
-                    source = Source::HookDispatch.as_str(),
-                    turn, "Hook: turn start"
-                );
-
-                DispatchResult {
-                    result: None,
-                    system_message: None,
-                }
-            }
             HookRequest::PreTool {
                 tool_name,
                 file_path,
@@ -1977,21 +1903,7 @@ mod tests {
         }
     }
 
-    // ── Turn counter tests ────────────────────────────────────────────
-
-    #[test]
-    fn turn_counter_increments_on_dispatch() {
-        let router = test_router();
-        assert_eq!(router.turn(), 0);
-
-        router.dispatch(crate::hook::HookRequest::PreAgent { session_id: None });
-        assert_eq!(router.turn(), 1);
-
-        router.dispatch(crate::hook::HookRequest::PreAgent { session_id: None });
-        assert_eq!(router.turn(), 2);
-    }
-
-    // ── Command check + debounce tests ────────────────────────────
+    // ── Command check tests ───────────────────────────────────────
 
     /// Create a test router with an active command allowlist.
     ///
@@ -2062,76 +1974,40 @@ mod tests {
     }
 
     #[test]
-    fn check_command_denied_first_returns_full() {
+    fn check_command_denied_names_command_and_points_at_commands() {
         let router = test_router_with_commands();
         let result = dispatch_check_denied(&router);
         let Some(HookResult::Deny(msg)) = result.result else {
             unreachable!("expected Deny, got {:?}", result.result);
         };
-        assert!(
-            msg.contains("cargo"),
-            "full denial should name denied command"
-        );
+        assert!(msg.contains("cargo"), "denial should name denied command");
         assert!(
             msg.contains("catenary commands"),
-            "full denial should point at the `catenary commands` surface"
+            "denial should point at the `catenary commands` surface"
         );
     }
 
     #[test]
-    fn check_command_denied_second_returns_short() {
+    fn check_command_denial_is_identical_across_denials() {
+        // The deny message no longer depends on turn count or denial history —
+        // every denial returns the same terse message (decision 023).
         let router = test_router_with_commands();
-        // First denial → full (stores current turn).
-        dispatch_check_denied(&router);
 
-        // Second denial in same turn → short.
-        let result = dispatch_check_denied(&router);
-        let Some(HookResult::Deny(msg)) = result.result else {
-            unreachable!("expected Deny, got {:?}", result.result);
+        let Some(HookResult::Deny(first)) = dispatch_check_denied(&router).result else {
+            unreachable!("expected Deny on first denial");
         };
-        assert!(
-            msg.contains("cargo"),
-            "short denial still names the command"
-        );
-        assert!(
-            !msg.contains("catenary commands"),
-            "subsequent denial is terse — the pointer rode the first denial this turn"
-        );
-    }
-
-    #[test]
-    fn check_command_new_turn_resets_to_full() {
-        let router = test_router_with_commands();
-        dispatch_check_denied(&router);
-        dispatch_check_denied(&router); // short
-
-        // Advance turn, next denial → full again.
-        router.dispatch(crate::hook::HookRequest::PreAgent { session_id: None });
-        let result = dispatch_check_denied(&router);
-        let Some(HookResult::Deny(msg)) = result.result else {
-            unreachable!("expected Deny, got {:?}", result.result);
+        let Some(HookResult::Deny(second)) = dispatch_check_denied(&router).result else {
+            unreachable!("expected Deny on second denial");
         };
-        assert!(
-            msg.contains("catenary commands"),
-            "new turn should reset to the full denial (pointer present)"
-        );
-    }
-
-    #[test]
-    fn check_command_config_version_forces_full() {
-        let router = test_router_with_commands();
-        dispatch_check_denied(&router);
-        dispatch_check_denied(&router); // short
-
-        // Bump config version → full again.
-        router.bump_config_version();
-        let result = dispatch_check_denied(&router);
-        let Some(HookResult::Deny(msg)) = result.result else {
-            unreachable!("expected Deny, got {:?}", result.result);
+        let Some(HookResult::Deny(third)) = dispatch_check_denied(&router).result else {
+            unreachable!("expected Deny on third denial");
         };
+
+        assert_eq!(first, second, "second denial must match the first");
+        assert_eq!(second, third, "third denial must match the first");
         assert!(
-            msg.contains("catenary commands"),
-            "config version change should force the full denial (pointer present)"
+            first.contains("catenary commands"),
+            "every denial carries the pointer: {first}"
         );
     }
 

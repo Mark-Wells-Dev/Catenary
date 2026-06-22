@@ -352,13 +352,6 @@ enum RootsCommand {
 /// Hook subcommands invoked by host CLI hooks.
 #[derive(Subcommand, Debug)]
 enum HookCommand {
-    /// Pre-agent: signal turn start (`UserPromptSubmit` / `BeforeAgent`).
-    #[command(name = "pre-agent")]
-    PreAgent {
-        /// Output format: "claude", "gemini", or "antigravity".
-        #[arg(long, value_enum)]
-        format: HostFormat,
-    },
     /// Pre-tool: editing state enforcement (`PreToolUse` / `BeforeTool`).
     #[command(name = "pre-tool")]
     PreTool {
@@ -744,7 +737,6 @@ fn main() -> Result<()> {
             hook_logging.activate(vec![desktop_sink]);
 
             match command {
-                HookCommand::PreAgent { format } => cli::hooks::run_pre_agent(format),
                 HookCommand::PreTool { format } => cli::hooks::run_pre_tool(format),
                 HookCommand::PostAgent { format } => cli::hooks::run_post_agent(format),
                 HookCommand::SessionStart { format } => cli::hooks::run_session_start(format),
@@ -2069,17 +2061,6 @@ mod tests {
     }
 
     // ── CLI hook subcommand tests ─────────────────────────────────
-
-    #[test]
-    fn test_cli_hook_pre_agent() {
-        use clap::Parser;
-        let args = Args::try_parse_from(["catenary", "hook", "pre-agent", "--format=claude"]);
-        let args = args.expect("hook pre-agent should parse");
-        let Some(Command::Hook { command }) = args.command else {
-            unreachable!("expected Hook command");
-        };
-        assert!(matches!(command, HookCommand::PreAgent { .. }));
-    }
 
     #[test]
     fn test_cli_hook_pre_tool() {

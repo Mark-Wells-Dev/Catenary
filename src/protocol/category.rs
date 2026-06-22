@@ -94,14 +94,14 @@ pub fn mcp_category(method: &str) -> &'static str {
 ///
 /// Matches on the namespace prefix (before the `/`). The IPC
 /// socket carries two kinds of traffic:
-/// - `pre-tool/*`, `pre-agent/*`, `post-agent/*`,
-///   `session-start/*`, `session-end/*` — hook lifecycle events
+/// - `pre-tool/*`, `post-agent/*`, `session-start/*`, `session-end/*` —
+///   hook lifecycle events
 /// - `tool/*` — CLI commands (agent-invoked via shell tool)
 #[must_use]
 pub fn hook_category(method: &str) -> &'static str {
     match method.split('/').next().unwrap_or(method) {
         "tool" => "tool",
-        "pre-tool" | "pre-agent" | "post-agent" | "session-start" | "session-end" => "lifecycle",
+        "pre-tool" | "post-agent" | "session-start" | "session-end" => "lifecycle",
         _ => "unknown",
     }
 }
@@ -213,7 +213,6 @@ mod tests {
         assert_eq!(hook_category("tool/roots-ls"), "tool");
         assert_eq!(hook_category("tool/shutdown"), "tool");
         // lifecycle (hook events)
-        assert_eq!(hook_category("pre-agent/turn-start"), "lifecycle");
         assert_eq!(hook_category("pre-tool/editing-state"), "lifecycle");
         assert_eq!(hook_category("pre-tool/editing-start"), "lifecycle");
         assert_eq!(hook_category("pre-tool/editing-stop"), "lifecycle");

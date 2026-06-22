@@ -322,10 +322,6 @@ fn visible_entries(dir: &Path) -> HashSet<PathBuf> {
 pub struct Session {
     /// Session-wide configuration (shared with `LspClientManager`).
     pub config: Arc<Config>,
-    /// Monotonic config version — bumped when merged command config changes
-    /// (e.g., root addition expands the allowlist). Read by `HookRouter`
-    /// for debounce invalidation.
-    pub config_version: std::sync::atomic::AtomicU64,
     /// Grep tool server.
     pub grep: GrepServer,
     /// Glob tool server.
@@ -508,7 +504,6 @@ impl Session {
         };
         Self {
             config,
-            config_version: std::sync::atomic::AtomicU64::new(0),
             grep,
             glob,
             diagnostics,
@@ -579,7 +574,6 @@ impl Session {
 
         Self {
             config: primary.config.clone(),
-            config_version: std::sync::atomic::AtomicU64::new(0),
             grep: GrepServer {
                 client_manager: primary.client_manager.clone(),
                 fs_manager: primary.fs_manager.clone(),
@@ -906,11 +900,6 @@ impl Session {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clear();
         }
-
-        // Root changes may expand the merged command allowlist —
-        // bump config version so the next denial shows a fresh full dump.
-        self.config_version
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
 
         // Fire-and-forget: spawn_all is pre-warming, not a gate.
         // Tool calls that need a server will trigger spawning on demand.

@@ -12,18 +12,6 @@
         ]
       }
     ],
-    "BeforeAgent": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "name": "catenary-pre-agent",
-            "type": "command",
-            "command": "catenary hook pre-agent --format=gemini"
-          }
-        ]
-      }
-    ],
     "BeforeTool": [
       {
         "matcher": "",

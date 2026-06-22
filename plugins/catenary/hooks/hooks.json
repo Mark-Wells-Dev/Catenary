@@ -1,5 +1,5 @@
 {
-  "description": "LSP diagnostics, editing state enforcement, and turn tracking via catenary hooks",
+  "description": "LSP diagnostics and editing state enforcement via catenary hooks",
   "hooks": {
     "SessionStart": [
       {
@@ -8,17 +8,6 @@
           {
             "type": "command",
             "command": "catenary hook session-start --format=claude"
-          }
-        ]
-      }
-    ],
-    "UserPromptSubmit": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "catenary hook pre-agent --format=claude"
           }
         ]
       }
@@ -36,7 +25,6 @@
     ],
     "Stop": [
       {
-        "matcher": "",
         "hooks": [
           {
             "type": "command",
@@ -80,7 +68,6 @@
     ],
     "WorktreeRemove": [
       {
-        "matcher": "",
         "hooks": [
           {
             "type": "command",

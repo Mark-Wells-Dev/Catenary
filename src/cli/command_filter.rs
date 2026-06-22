@@ -1470,8 +1470,8 @@ fn format_opening_line(denied_cmd: &str, reason: DenialReason) -> String {
 }
 
 /// One-line pointer to `catenary commands`, where the full allow / pipeline /
-/// deny surface now lives. Denials reference this instead of dumping the whole
-/// surface inline on the first denial of every turn (bug 25).
+/// deny surface lives. Every denial carries this pointer instead of dumping the
+/// whole surface inline (decision 023).
 const SURFACE_POINTER: &str = "Run `catenary commands` for the allowed command surface.";
 
 /// Render the allowed-command surface as sorted lines: `Allowed`, `Allowed in
@@ -1530,15 +1530,17 @@ pub fn format_command_surface(commands: &ResolvedCommands) -> Vec<String> {
     parts
 }
 
-/// Format the full denial response shown on the first denial in a turn.
+/// Format the denial response for a denied shell command.
 ///
-/// Names the denied command, adds the cwd-resolved build `Hint` (when the
-/// command has build guidance), and points the agent at `catenary commands`
-/// for the full allow / pipeline / deny surface — the surface itself is no
-/// longer dumped inline (see [`format_command_surface`]). `build_hint` is a
-/// pre-resolved build guidance string from the caller (when available).
+/// The sole deny renderer. Names the denied command, adds the cwd-resolved
+/// build `Hint` (when the command has build guidance), and points the agent at
+/// `catenary commands` for the full allow / pipeline / deny surface — the
+/// surface itself is never dumped inline (see [`format_command_surface`]). The
+/// message is identical regardless of how many denials have occurred.
+/// `build_hint` is a pre-resolved build guidance string from the caller (when
+/// available).
 #[must_use]
-pub fn format_denial_full(
+pub fn format_denial(
     denied_cmd: &str,
     commands: &ResolvedCommands,
     denial: &Denial,
@@ -1609,70 +1611,6 @@ pub fn format_denial_full(
     }
 
     parts.join("\n")
-}
-
-/// Format the short denial response for subsequent denials in the same turn.
-///
-/// After the first denial in a turn (which carries the `catenary commands`
-/// pointer via [`format_denial_full`]), subsequent denials use this terser
-/// form to reduce noise: the reason plus the command's guidance hint when
-/// available, and no repeated pointer. `build_hint` is a pre-resolved short
-/// build guidance string.
-#[must_use]
-pub fn format_denial_short(
-    denied_cmd: &str,
-    denial: &Denial,
-    commands: &ResolvedCommands,
-    format: Option<super::HostFormat>,
-    build_hint: Option<&str>,
-) -> String {
-    // Output-redirection denial carries the same fixed guidance in both forms.
-    if denial.reason == DenialReason::OutputRedirect {
-        return format_redirect_denial(format);
-    }
-
-    let lookup_cmd = denied_cmd.split_whitespace().next().unwrap_or(denied_cmd);
-
-    // Subsequent denials in a turn stay terse: just the reason, plus the
-    // command's own guidance hint when it has one. The first denial this turn
-    // already carried the `catenary commands` pointer (see `format_denial_full`),
-    // so the short form does not repeat it.
-    let suffix = commands
-        .guidance_for(lookup_cmd)
-        .map_or_else(String::new, |entry| match entry {
-            crate::config::GuidanceEntry::Static(msg) => {
-                let resolved = resolve_client_vars(msg, format);
-                format!(" — {resolved}")
-            }
-            crate::config::GuidanceEntry::Build(_) => {
-                build_hint.map_or_else(String::new, |hint| format!(" — {hint}"))
-            }
-            crate::config::GuidanceEntry::Redirect { command, .. } => {
-                format!(
-                    " — Use `catenary {command}` instead. \
-                     Works on any path (LSP enrichment only within tracked roots)."
-                )
-            }
-        });
-
-    let opening = match denial.reason {
-        DenialReason::NotAllowed => format!("`{denied_cmd}` isn't allowed"),
-        DenialReason::PipelinePosition => {
-            format!("`{denied_cmd}` isn't allowed at the start of a pipeline")
-        }
-        DenialReason::DeniedSubcommand => {
-            format!("`{denied_cmd}` isn't allowed (denied subcommand)")
-        }
-        DenialReason::DeniedFlag => {
-            format!("`{denied_cmd}` isn't allowed (denied flag)")
-        }
-        // Early-returned above; arm only satisfies exhaustiveness.
-        DenialReason::OutputRedirect => {
-            format!("`{denied_cmd}` isn't allowed (output redirection)")
-        }
-    };
-
-    format!("{opening}{suffix}")
 }
 
 #[cfg(test)]
@@ -1803,7 +1741,7 @@ mod tests {
         let rules = recommended_rules();
         let denial = check_command("git log | sed -n 'w /tmp/x'", &rules, None)
             .expect("sed denied mid-pipeline");
-        let msg = format_denial_full(&denial.command, &rules, &denial, None, None);
+        let msg = format_denial(&denial.command, &rules, &denial, None, None);
         assert!(msg.contains("Edit"), "names the edit tool: {msg}");
         assert!(
             msg.contains("catenary sed"),
@@ -1899,7 +1837,7 @@ mod tests {
 
         let grep =
             check_command("grep pattern src", &rules, None).expect("grep denied at position 0");
-        let grep_msg = format_denial_full(&grep.command, &rules, &grep, None, None);
+        let grep_msg = format_denial(&grep.command, &rules, &grep, None, None);
         assert!(
             grep_msg.contains("catenary grep"),
             "grep nudges to catenary grep: {grep_msg}",
@@ -1907,7 +1845,7 @@ mod tests {
 
         for cmd in ["ls", "find . -name x"] {
             let denial = check_command(cmd, &rules, None).expect("scan/list command denied");
-            let msg = format_denial_full(&denial.command, &rules, &denial, None, None);
+            let msg = format_denial(&denial.command, &rules, &denial, None, None);
             assert!(
                 msg.contains("catenary glob"),
                 "{cmd} nudges to catenary glob: {msg}",
@@ -2720,14 +2658,14 @@ mod tests {
     }
 
     #[test]
-    fn format_full_points_to_commands() {
+    fn format_denial_includes_commands_pointer() {
         let rules = python_equivalent_rules();
-        let msg = format_denial_full("ls", &rules, &no_cd_denial("ls"), None, None);
+        let msg = format_denial("ls", &rules, &no_cd_denial("ls"), None, None);
 
         assert!(msg.starts_with("`ls` isn't allowed"), "opening line: {msg}");
         assert!(
             msg.contains("Run `catenary commands` for the allowed command surface."),
-            "should point at `catenary commands`: {msg}",
+            "deny renderer should point at `catenary commands`: {msg}",
         );
         // The surface itself moved behind `catenary commands` — no inline dump.
         assert!(!msg.contains("Allowed:"), "no inline allow section: {msg}");
@@ -2752,7 +2690,7 @@ mod tests {
             )]),
             ..ResolvedCommands::default()
         };
-        let msg = format_denial_full("ls", &rules, &no_cd_denial("ls"), None, None);
+        let msg = format_denial("ls", &rules, &no_cd_denial("ls"), None, None);
         // Per-root / default build tools are no longer dumped — the cwd build
         // context rides the `Hint` line (build-command denials only).
         assert!(
@@ -2850,20 +2788,6 @@ mod tests {
         let mut sorted = items.clone();
         sorted.sort_unstable();
         assert_eq!(items, sorted, "deny pairs should be sorted");
-    }
-
-    #[test]
-    fn format_short_contains_command() {
-        let rules = basic_rules();
-        let denial = no_cd_denial("cargo");
-        let msg = format_denial_short("cargo", &denial, &rules, None, None);
-        assert!(msg.contains("`cargo`"));
-        // Terse: no guidance, and the pointer is not repeated (it rode the
-        // first denial of the turn via `format_denial_full`).
-        assert!(
-            !msg.contains("catenary commands"),
-            "short form should not repeat the pointer: {msg}",
-        );
     }
 
     #[test]
@@ -3027,7 +2951,7 @@ mod tests {
             unresolved_cd: true,
             effective_cwd: None,
         };
-        let msg = format_denial_full("npm", &rules, &denial, None, None);
+        let msg = format_denial("npm", &rules, &denial, None, None);
         assert!(
             msg.contains("could not be resolved"),
             "should include unresolved cd note: {msg}",
@@ -3043,7 +2967,7 @@ mod tests {
             unresolved_cd: false,
             effective_cwd: None,
         };
-        let msg = format_denial_full("npm", &rules, &denial, None, None);
+        let msg = format_denial("npm", &rules, &denial, None, None);
         assert!(
             !msg.contains("could not be resolved"),
             "should not include note when resolved: {msg}",
@@ -3080,7 +3004,7 @@ mod tests {
             unresolved_cd: false,
             effective_cwd: None,
         };
-        let msg = format_denial_full("grep", &rules, &denial, None, None);
+        let msg = format_denial("grep", &rules, &denial, None, None);
         assert!(
             msg.contains("Hint: Use Catenary's grep tool instead"),
             "should include guidance hint: {msg}",
@@ -3096,7 +3020,7 @@ mod tests {
             unresolved_cd: false,
             effective_cwd: None,
         };
-        let msg = format_denial_full("grep", &rules, &denial, None, None);
+        let msg = format_denial("grep", &rules, &denial, None, None);
         assert!(
             msg.starts_with("`grep` isn't allowed at the start of a pipeline."),
             "pipeline opening line: {msg}",
@@ -3112,7 +3036,7 @@ mod tests {
             unresolved_cd: false,
             effective_cwd: None,
         };
-        let msg = format_denial_full("git grep", &rules, &denial, None, None);
+        let msg = format_denial("git grep", &rules, &denial, None, None);
         assert!(
             msg.starts_with("`git grep` isn't allowed (denied subcommand)."),
             "subcommand opening line: {msg}",
@@ -3123,7 +3047,7 @@ mod tests {
     fn format_full_no_guidance_fallback() {
         let rules = basic_rules();
         let denial = no_cd_denial("ls");
-        let msg = format_denial_full("ls", &rules, &denial, None, None);
+        let msg = format_denial("ls", &rules, &denial, None, None);
         assert!(
             !msg.contains("Hint:"),
             "no guidance should mean no Hint line: {msg}",
@@ -3134,7 +3058,7 @@ mod tests {
     fn format_full_read_edit_template_vars_default() {
         let rules = rules_with_guidance();
         let denial = no_cd_denial("cat");
-        let msg = format_denial_full("cat", &rules, &denial, None, None);
+        let msg = format_denial("cat", &rules, &denial, None, None);
         assert!(
             msg.contains("Hint: Use Read instead"),
             "{{READ}} should resolve to Read by default: {msg}",
@@ -3145,7 +3069,7 @@ mod tests {
     fn format_full_read_edit_template_vars_claude() {
         let rules = rules_with_guidance();
         let denial = no_cd_denial("cat");
-        let msg = format_denial_full(
+        let msg = format_denial(
             "cat",
             &rules,
             &denial,
@@ -3162,7 +3086,7 @@ mod tests {
     fn format_full_read_edit_template_vars_gemini() {
         let rules = rules_with_guidance();
         let denial = no_cd_denial("cat");
-        let msg = format_denial_full(
+        let msg = format_denial(
             "cat",
             &rules,
             &denial,
@@ -3181,7 +3105,7 @@ mod tests {
         let denial = no_cd_denial("cargo");
         let hint = "User config has make as the default build tool.\n\
                      No local `.catenary.toml` was found.";
-        let msg = format_denial_full("cargo", &rules, &denial, None, Some(hint));
+        let msg = format_denial("cargo", &rules, &denial, None, Some(hint));
         assert!(
             msg.contains("Hint: User config has make"),
             "build guidance should show resolved hint: {msg}"
@@ -3196,48 +3120,10 @@ mod tests {
     fn format_full_build_guidance_without_hint() {
         let rules = rules_with_guidance();
         let denial = no_cd_denial("cargo");
-        let msg = format_denial_full("cargo", &rules, &denial, None, None);
+        let msg = format_denial("cargo", &rules, &denial, None, None);
         assert!(
             !msg.contains("Hint:"),
             "no build_hint should mean no Hint line: {msg}",
-        );
-    }
-
-    #[test]
-    fn format_short_with_guidance() {
-        let rules = rules_with_guidance();
-        let denial = Denial {
-            command: "grep".to_string(),
-            reason: DenialReason::PipelinePosition,
-            unresolved_cd: false,
-            effective_cwd: None,
-        };
-        let msg = format_denial_short("grep", &denial, &rules, None, None);
-        assert!(
-            msg.contains("Use Catenary's grep tool instead"),
-            "short form should include guidance: {msg}",
-        );
-        assert!(
-            msg.contains("at the start of a pipeline"),
-            "short form should use pipeline reason: {msg}",
-        );
-    }
-
-    #[test]
-    fn format_short_no_guidance() {
-        let rules = basic_rules();
-        let denial = no_cd_denial("ls");
-        let msg = format_denial_short("ls", &denial, &rules, None, None);
-        // No guidance → just the reason, no surface dump, no repeated pointer,
-        // no stale "see earlier message" reference to a dump that no longer runs.
-        assert!(msg.starts_with("`ls` isn't allowed"), "opening line: {msg}");
-        assert!(
-            !msg.contains("catenary commands"),
-            "short form should not repeat the pointer: {msg}",
-        );
-        assert!(
-            !msg.contains("see earlier"),
-            "no stale 'see earlier' reference: {msg}",
         );
     }
 
@@ -3345,7 +3231,7 @@ mod tests {
             unresolved_cd: false,
             effective_cwd: None,
         };
-        let msg = format_denial_full("make -C", &rules, &denial, None, None);
+        let msg = format_denial("make -C", &rules, &denial, None, None);
         assert!(
             msg.starts_with("`make -C` isn't allowed (denied flag)."),
             "flag denial opening: {msg}",
@@ -3486,19 +3372,11 @@ mod tests {
     fn redirect_denial_message_points_at_edit_tool() {
         let rules = basic_rules();
         let denial = check_command("git status > out.txt", &rules, None).expect("denied");
-        let full = format_denial_full("git", &rules, &denial, None, None);
+        let msg = format_denial("git", &rules, &denial, None, None);
+        assert!(msg.contains("Edit"), "message names edit tool: {msg}");
         assert!(
-            full.contains("Edit"),
-            "full message names edit tool: {full}"
-        );
-        assert!(
-            full.contains("allow_file_redirects"),
-            "full message names the escape hatch: {full}",
-        );
-        let short = format_denial_short("git", &denial, &rules, None, None);
-        assert!(
-            short.contains("Edit"),
-            "short message names edit tool: {short}"
+            msg.contains("allow_file_redirects"),
+            "message names the escape hatch: {msg}",
         );
     }
 

@@ -627,12 +627,12 @@ fn correlation_end_to_end() -> Result<()> {
     );
 
     // 3. Subsequent hooks for the same session should route correctly.
-    //    Verify by sending a pre-agent hook (which increments the turn
-    //    counter on the correlated session).
+    //    Verify by sending another hook on the correlated session.
     hook_roundtrip(
         &ipc_path,
         &json!({
-            "method": "pre-agent/turn-start",
+            "method": "pre-tool/check-command",
+            "command": "git status",
             "session_id": "corr-session"
         }),
     )?;
@@ -641,7 +641,7 @@ fn correlation_end_to_end() -> Result<()> {
     let text = bridge.call_tool_text("grep", &json!({"pattern": "correlated_fn"}))?;
     assert!(
         text.contains("correlated_fn"),
-        "grep should work after turn-start hook, got:\n{text}",
+        "grep should work after the follow-up hook, got:\n{text}",
     );
 
     Ok(())

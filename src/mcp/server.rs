@@ -141,9 +141,8 @@ pub struct McpServer {
     /// Shared with the stdin reader thread so `notifications/cancelled`
     /// can trigger cancellation while a tool call blocks the main loop.
     cancel_map: CancelMap,
-    /// External signal requesting a `roots/list` poll. Set by
-    /// `HookRouter` on `PreAgent` dispatch (turn boundary), cleared
-    /// by this run loop after triggering `fetch_roots`.
+    /// External signal requesting a `roots/list` poll. Set via the shared
+    /// flag, cleared by this run loop after triggering `fetch_roots`.
     roots_refresh: Option<Arc<AtomicBool>>,
 }
 
@@ -1452,7 +1451,7 @@ mod tests {
         let mut server = McpServer::new(LoggingServer::new());
         initialize_server(&mut server, true)?;
 
-        // Simulate PreAgent setting the external flag.
+        // Simulate an external signal setting the roots-refresh flag.
         let flag = Arc::new(AtomicBool::new(true));
         server.roots_refresh = Some(flag.clone());
 

@@ -186,14 +186,13 @@ Two components split protocol concerns from application logic:
 
 ### Hook methods
 
-Five hook methods, each corresponding to a host CLI lifecycle event:
+Hook methods, each corresponding to a host CLI lifecycle event:
 
 | Method | Host event | Purpose |
 |--------|-----------|---------|
 | `session-start/clear-editing` | `SessionStart` | Clear stale editing state from a previous agent context |
-| `pre-agent/turn-start` | `UserPromptSubmit` / `BeforeAgent` | Increment the turn counter (debounce boundary) |
 | `pre-tool/editing-state` | `PreToolUse` / `BeforeTool` | Editing state enforcement — deny or allow a tool call |
-| `pre-tool/command-denied` | `PreToolUse` / `BeforeTool` | Command filter debounce — full or short denial message |
+| `pre-tool/check-command` | `PreToolUse` / `BeforeTool` | Command filter — terse denial message (specific reason + fix + `catenary commands` pointer) |
 | `post-agent/require-release` | `Stop` / `AfterAgent` | Force `catenary diagnostics` if the agent stops with covered edits pending |
 
 ### Hook contracts by host
@@ -203,8 +202,8 @@ live in host-specific JSON files:
 
 | Host CLI | Hook file | Events |
 |----------|-----------|--------|
-| Claude Code | `plugins/catenary/hooks/hooks.json` | `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `Stop`, `SubagentStop`, `SessionEnd` |
-| Gemini CLI | `hooks/hooks.json` | `SessionStart`, `BeforeAgent`, `BeforeTool`, `AfterAgent`, `SessionEnd` |
+| Claude Code | `plugins/catenary/hooks/hooks.json` | `SessionStart`, `PreToolUse`, `Stop`, `SubagentStop`, `SessionEnd`, `SubagentStart`, `WorktreeRemove` |
+| Gemini CLI | `hooks/hooks.json` | `SessionStart`, `BeforeTool`, `AfterAgent`, `SessionEnd` |
 
 All hooks fire unconditionally (empty matcher). The `PreToolUse` /
 `BeforeTool` hook handles both editing state enforcement and command

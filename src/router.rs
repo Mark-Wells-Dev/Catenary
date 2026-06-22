@@ -4413,7 +4413,8 @@ mod tests {
 
         // Send a hook with session_id = "abc".
         let request = serde_json::json!({
-            "method": "pre-agent/turn-start",
+            "method": "pre-tool/check-command",
+            "command": "git status",
             "session_id": "abc"
         });
         let _ = hook_roundtrip(&ipc_path, &request).await;
@@ -4441,11 +4442,13 @@ mod tests {
 
         // Send hooks with two different session_ids.
         let req_a = serde_json::json!({
-            "method": "pre-agent/turn-start",
+            "method": "pre-tool/check-command",
+            "command": "git status",
             "session_id": "session-a"
         });
         let req_b = serde_json::json!({
-            "method": "pre-agent/turn-start",
+            "method": "pre-tool/check-command",
+            "command": "git status",
             "session_id": "session-b"
         });
         let _ = hook_roundtrip(&ipc_path, &req_a).await;
@@ -4630,49 +4633,6 @@ mod tests {
             "",
             "session B (not editing) should allow Bash — editing state is per-session"
         );
-
-        shutdown.cancel();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn session_state_turn_counter_per_session() {
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let ipc_path = ipc_socket_in(dir.path());
-
-        let manager = Arc::new(bind_with_session(dir.path()));
-        let shutdown = manager.shutdown_token();
-        let m = Arc::clone(&manager);
-        tokio::spawn(async move {
-            let _ = m.accept_loop().await;
-        });
-
-        // Send two turn-start hooks to session A.
-        let req_a = serde_json::json!({
-            "method": "pre-agent/turn-start",
-            "session_id": "session-a"
-        });
-        let _ = hook_roundtrip(&ipc_path, &req_a).await;
-        let _ = hook_roundtrip(&ipc_path, &req_a).await;
-
-        // Send one turn-start hook to session B.
-        let req_b = serde_json::json!({
-            "method": "pre-agent/turn-start",
-            "session_id": "session-b"
-        });
-        let _ = hook_roundtrip(&ipc_path, &req_b).await;
-
-        // Verify each session has its own turn counter by checking
-        // that session A and B exist independently.
-        assert_eq!(manager.session_count(), 2);
-
-        // Verify independence through the hook_ctx.
-        let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
-        let sessions = ctx.sessions.lock().expect("lock");
-        let router_a = Arc::clone(&sessions.get("session-a").expect("session-a").router);
-        let router_b = Arc::clone(&sessions.get("session-b").expect("session-b").router);
-        drop(sessions);
-        assert_eq!(router_a.turn(), 2, "session A should have turn 2");
-        assert_eq!(router_b.turn(), 1, "session B should have turn 1");
 
         shutdown.cancel();
     }

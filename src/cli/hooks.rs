@@ -12,7 +12,6 @@
 //! All hook logic runs server-side in `HookServer` (`src/hook.rs`).
 //!
 //! Function names mirror the hook lifecycle:
-//! - `run_pre_agent` — root sync (`UserPromptSubmit` / `BeforeAgent`)
 //! - `run_pre_tool` — editing state enforcement (`PreToolUse` / `BeforeTool`)
 //! - `run_post_agent` — force `done_editing` (`Stop` / `AfterAgent`)
 //! - `run_session_start` — clear stale editing state (`SessionStart`)
@@ -684,34 +683,6 @@ pub fn run_post_agent(format: HostFormat) {
     }
 }
 
-/// Signal turn start (`UserPromptSubmit` / `BeforeAgent` hook handler).
-///
-/// Sends a `pre-agent/turn-start` IPC request to the running Catenary session
-/// to increment the turn counter. Fires once per user prompt / agent turn.
-///
-/// Silently succeeds on any error to avoid breaking the host CLI's flow.
-pub fn run_pre_agent(format: HostFormat) {
-    let Ok(stdin_data) = std::io::read_to_string(std::io::stdin()) else {
-        return;
-    };
-
-    let Ok(hook_json) = serde_json::from_str::<serde_json::Value>(&stdin_data) else {
-        return;
-    };
-
-    if let Some(stream) = hook_connect(&hook_json) {
-        let mut request = serde_json::json!({
-            "method": "pre-agent/turn-start",
-            "format": format.as_str(),
-            "host_payload": prepare_host_payload(&hook_json),
-        });
-        if let Some(sid) = extract_session_id(&hook_json, format) {
-            request["session_id"] = serde_json::json!(sid);
-        }
-        let _ = ipc_exchange(stream, &request);
-    }
-}
-
 /// Editing state enforcement and command filtering (`PreToolUse` / `BeforeTool`
 /// hook handler).
 ///
@@ -854,7 +825,7 @@ fn foreign_command_denial(
     // IPC failed or session unreachable — try client-side.
     let (denial, resolved) = check_shell_command(hook_json, shell_cmd, format)?;
     let build_hint = resolve_client_build_hint(hook_json, &denial.command, &resolved, format);
-    Some(crate::cli::command_filter::format_denial_full(
+    Some(crate::cli::command_filter::format_denial(
         &denial.command,
         &resolved,
         &denial,

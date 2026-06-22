@@ -99,24 +99,11 @@ pub(crate) fn emit_hook_event(
 
 /// IPC request from the CLI hook process to the hook server.
 ///
-/// Dispatched by the `method` field. Each variant corresponds to one of the
-/// five host CLI hooks.
+/// Dispatched by the `method` field. Each variant corresponds to a host CLI
+/// hook event or an agent-invoked CLI lifecycle command.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "method")]
 pub(crate) enum HookRequest {
-    /// Turn boundary signal (fires at each user prompt / agent turn start).
-    #[serde(rename = "pre-agent/turn-start")]
-    PreAgent {
-        /// Host CLI session ID. Used by the daemon to route the hook
-        /// to the correct per-session `HookRouter`.
-        #[serde(default)]
-        #[allow(
-            dead_code,
-            reason = "deserialized from IPC protocol, consumed by serde"
-        )]
-        session_id: Option<String>,
-    },
-
     /// Editing state enforcement: deny or allow a tool call.
     #[serde(rename = "pre-tool/editing-state")]
     PreTool {
@@ -155,12 +142,12 @@ pub(crate) enum HookRequest {
         session_id: Option<String>,
     },
 
-    /// Session-side command check with debounce.
+    /// Session-side command check.
     ///
     /// Evaluates the shell command against the merged allowlist (user
-    /// config + all project configs for current roots). On denial,
-    /// applies turn-based debounce: first denial in a turn returns
-    /// the full config dump, subsequent denials return a short message.
+    /// config + all project configs for current roots). On denial, returns
+    /// the terse deny message (specific reason + fix + `catenary commands`
+    /// pointer).
     #[serde(rename = "pre-tool/check-command")]
     CheckCommand {
         /// The shell command string to evaluate.
@@ -551,21 +538,6 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines, reason = "one assertion per variant")]
     fn test_hook_request_tagged_deserialization() {
-        // pre-agent/turn-start (no session_id)
-        let json = r#"{"method": "pre-agent/turn-start"}"#;
-        let req: HookRequest = serde_json::from_str(json).expect("turn-start");
-        assert!(matches!(req, HookRequest::PreAgent { session_id: None }));
-
-        // pre-agent/turn-start with session_id
-        let json = r#"{"method": "pre-agent/turn-start", "session_id": "sess-123"}"#;
-        let req: HookRequest = serde_json::from_str(json).expect("turn-start with session_id");
-        assert!(matches!(
-            req,
-            HookRequest::PreAgent {
-                session_id: Some(ref s),
-            } if s == "sess-123"
-        ));
-
         // pre-tool/editing-state with all fields
         let json = r#"{"method": "pre-tool/editing-state", "tool_name": "Edit", "file_path": "/tmp/foo.rs", "agent_id": "", "session_id": "abc123"}"#;
         let req: HookRequest = serde_json::from_str(json).expect("editing-state");
@@ -796,23 +768,23 @@ mod tests {
     }
 
     #[test]
-    fn hook_turn_start_writes_protocol_row() {
+    fn hook_check_command_writes_protocol_row() {
         let (_logging, conn, _guard) = setup_logging();
 
-        let scope_id = "turn-scope";
+        let scope_id = "check-scope";
         emit_hook_event(
             tracing::Level::INFO,
             "host",
-            "pre-agent/turn-start",
+            "pre-tool/check-command",
             Some(scope_id),
-            &serde_json::json!({"method": "pre-agent/turn-start"}).to_string(),
+            &serde_json::json!({"method": "pre-tool/check-command"}).to_string(),
             "incoming hook",
         );
 
         emit_hook_event(
             tracing::Level::INFO,
             "host",
-            "pre-agent/turn-start",
+            "pre-tool/check-command",
             Some(scope_id),
             "",
             "outgoing hook response",
@@ -824,7 +796,7 @@ mod tests {
             "should have at least request + response, got {}",
             rows.len()
         );
-        assert_eq!(rows[0].method, "pre-agent/turn-start");
+        assert_eq!(rows[0].method, "pre-tool/check-command");
         assert_eq!(rows[0].client, "host");
     }
 
@@ -1019,13 +991,14 @@ mod tests {
     }
 
     #[test]
-    fn hook_turn_start_debug_without_result() {
-        // turn-start with no result → debug (lifecycle category, empty result)
+    fn hook_lifecycle_debug_without_result() {
+        // A lifecycle hook with no result → debug (lifecycle category, empty
+        // result).
         let env = HookResponseEnvelope {
             result: None,
             system_message: None,
         };
-        let level = HookServer::hook_outcome_level("pre-agent/turn-start", &env);
+        let level = HookServer::hook_outcome_level("session-start/clear-editing", &env);
         assert_eq!(level, tracing::Level::DEBUG);
     }
 
@@ -1037,15 +1010,15 @@ mod tests {
         // no deny_unknown_fields — so the field survives in the raw Value
         // for logging without breaking dispatch deserialization.
         let json = r#"{
-            "method": "pre-agent/turn-start",
+            "method": "post-agent/require-release",
             "host_payload": {
                 "transcript_path": "/tmp/transcript.jsonl",
                 "cwd": "/home/user/project",
-                "hook_event_name": "UserPromptSubmit"
+                "hook_event_name": "Stop"
             }
         }"#;
         let req: HookRequest = serde_json::from_str(json).expect("should deserialize");
-        assert!(matches!(req, HookRequest::PreAgent { session_id: None }));
+        assert!(matches!(req, HookRequest::PostAgent { .. }));
 
         // The raw Value retains host_payload for protocol logging.
         let raw: serde_json::Value = serde_json::from_str(json).expect("parse raw");
@@ -1060,18 +1033,18 @@ mod tests {
         let (_logging, conn, _guard) = setup_logging();
 
         let payload = serde_json::json!({
-            "method": "pre-agent/turn-start",
+            "method": "post-agent/require-release",
             "host_payload": {
                 "transcript_path": "/tmp/transcript.jsonl",
                 "cwd": "/home/user/project",
-                "hook_event_name": "UserPromptSubmit"
+                "hook_event_name": "Stop"
             }
         });
 
         emit_hook_event(
             tracing::Level::DEBUG,
             "claude-code",
-            "pre-agent/turn-start",
+            "post-agent/require-release",
             None,
             &payload.to_string(),
             "incoming hook",
@@ -1089,7 +1062,7 @@ mod tests {
         );
         assert_eq!(
             stored["host_payload"]["hook_event_name"].as_str(),
-            Some("UserPromptSubmit"),
+            Some("Stop"),
         );
     }
 
