@@ -1223,6 +1223,17 @@ fn run_daemon_main() -> Result<()> {
     // staleness heuristic.
     manager.spawn_worktree_root_gc(rt.handle());
 
+    // Worktree-deletion reaper (workstream 30, ticket 05): the PROMPT teardown
+    // trigger for `worktree:*` roots. `git worktree remove` fires no
+    // `WorktreeRemove` hook, so without this the hourly GC above is the only live
+    // reaper (≤1 h leak). This reaper drains the bounded directory-deletion watch
+    // (registered at `SubagentStart` mount) and reaps the root within the
+    // FS-event latency. Spawned AFTER `with_session` so the watcher + channel
+    // exist; a no-op for a session-less manager or if the OS watcher was
+    // unavailable. The GC stays the crash-safe backstop (the watch dies with the
+    // daemon).
+    manager.spawn_worktree_watch_reaper(rt.handle());
+
     info!(
         source = Source::DaemonLifecycle.as_str(),
         "daemon serving workspace: {workspace_display}",

@@ -636,6 +636,14 @@ struct HookDispatchContext {
     /// per-session `Session` instances to prevent concurrent editing
     /// in the same workspace root.
     editing_guardrail: Arc<EditingGuardrail>,
+    /// Bounded directory-deletion watch for mounted worktree roots (ticket 05).
+    /// Registered at `SubagentStart` mount, unregistered on every teardown path
+    /// (`WorktreeRemove`, `SessionEnd` sweep, the GC reap). Reaps the
+    /// `worktree:{session_id}:{path}` root the instant the worktree dir is deleted
+    /// — `git worktree remove` fires no `WorktreeRemove` hook. `None` when the OS
+    /// watcher couldn't be created (the hourly GC remains the backstop) or in
+    /// transport-only test managers.
+    worktree_watcher: Option<crate::worktree_watch::WorktreeWatcher>,
     /// Per-key hook→CLI handoff (ADR 014). Replaces the single global slot +
     /// 1-permit semaphore: each [`HandoffKey`] serializes independently, so a
     /// `diagnostics` handoff never stalls a `sed` handoff — or any other
@@ -1092,6 +1100,13 @@ pub struct SessionManager {
     root_tracker: Option<RootTracker>,
     shutdown: CancellationToken,
     disconnect: Arc<tokio::sync::Notify>,
+    /// Receiver for worktree-deletion events from the [`crate::worktree_watch`]
+    /// watcher, stashed by [`Self::with_session`] and taken once by
+    /// [`Self::spawn_worktree_watch_reaper`]. `None` until `with_session` wires
+    /// the watcher (or if the OS watcher couldn't be created).
+    worktree_watch_rx: std::sync::Mutex<
+        Option<tokio::sync::mpsc::UnboundedReceiver<crate::worktree_watch::WorktreeDeleted>>,
+    >,
 }
 
 #[cfg(unix)]
@@ -1128,6 +1143,7 @@ impl SessionManager {
             root_tracker: None,
             shutdown: CancellationToken::new(),
             disconnect: Arc::new(tokio::sync::Notify::new()),
+            worktree_watch_rx: std::sync::Mutex::new(None),
         }
     }
 
@@ -1174,6 +1190,7 @@ impl SessionManager {
             root_tracker: None,
             shutdown: CancellationToken::new(),
             disconnect: Arc::new(tokio::sync::Notify::new()),
+            worktree_watch_rx: std::sync::Mutex::new(None),
         })
     }
 
@@ -1473,6 +1490,27 @@ impl SessionManager {
             }));
         }
 
+        // Bounded worktree-deletion watch (ticket 05): the prompt teardown
+        // trigger for `worktree:*` roots, since `git worktree remove` never fires
+        // `WorktreeRemove`. A failure to create the OS watcher is non-fatal — the
+        // hourly GC remains the backstop — so we degrade to `None` and log.
+        let worktree_watcher = match crate::worktree_watch::WorktreeWatcher::new() {
+            Ok((watcher, rx)) => {
+                *self
+                    .worktree_watch_rx
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(rx);
+                Some(watcher)
+            }
+            Err(e) => {
+                warn!(
+                    source = Source::DaemonLifecycle.as_str(),
+                    "worktree deletion watcher unavailable (GC remains the backstop): {e}",
+                );
+                None
+            }
+        };
+
         self.hook_ctx = Some(HookDispatchContext {
             sessions,
             primary: session,
@@ -1480,6 +1518,7 @@ impl SessionManager {
             root_tracker: Some(root_tracker),
             editing_guardrail: Arc::new(EditingGuardrail::new()),
             handoff: KeyedHandoff::new(),
+            worktree_watcher,
         });
         self
     }
@@ -1511,6 +1550,7 @@ impl SessionManager {
         // both clones share the live state the request handlers mutate.
         let tracker = tracker.clone();
         let session = ctx.primary.clone();
+        let watcher = ctx.worktree_watcher.clone();
         rt.spawn(async move {
             let mut ticker = tokio::time::interval(WORKTREE_ROOT_GC_INTERVAL);
             ticker.tick().await; // consume the immediate first tick
@@ -1518,6 +1558,13 @@ impl SessionManager {
                 ticker.tick().await;
                 let removed = reap_missing_worktree_roots(&tracker);
                 if !removed.is_empty() {
+                    // Drop any in-memory watches for the reaped contributors so the
+                    // watch set never outlives the root (idempotent vs the reaper).
+                    if let Some(watcher) = &watcher {
+                        for key in &removed {
+                            watcher.unregister(key);
+                        }
+                    }
                     // Same sync call the request handlers use (`ctx.primary` is
                     // this `session`): re-sync the (now smaller) union once.
                     if let Err(e) = session.sync_roots(tracker.global_roots()).await {
@@ -1532,6 +1579,63 @@ impl SessionManager {
                         "reaped leaked worktree roots whose dir is gone",
                     );
                 }
+            }
+        });
+    }
+
+    /// Spawns the worktree-deletion reaper — the prompt teardown trigger for
+    /// `worktree:*` roots (ticket 05).
+    ///
+    /// Drains the channel the [`crate::worktree_watch::WorktreeWatcher`] feeds from
+    /// its [`notify`] callback. Each [`crate::worktree_watch::WorktreeDeleted`] is
+    /// the deletion of a watched worktree dir — for git subagents the host runs
+    /// `git worktree remove` itself and fires no `WorktreeRemove` hook, so this is
+    /// the only prompt signal. On each event it runs the SAME reap the
+    /// `WorktreeRemove` handler and the GC run — `remove_contributor` +
+    /// `sync_roots` — then drops the now-dead watch. Reaping is idempotent: a
+    /// double-reap from the watch, the GC, and the `SessionEnd` sweep is a
+    /// harmless no-op (`remove_contributor` of an absent key changes nothing, and
+    /// the re-sync is to the same union).
+    ///
+    /// A detached background task on the provided runtime handle, mirroring
+    /// [`Self::spawn_worktree_root_gc`]; it exits when the channel closes (daemon
+    /// shutdown drops the watcher). No-op unless [`Self::with_session`] wired the
+    /// watcher and the channel (daemon mode); test/transport-only managers skip it.
+    pub fn spawn_worktree_watch_reaper(&self, rt: &tokio::runtime::Handle) {
+        let Some(mut rx) = self
+            .worktree_watch_rx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        else {
+            return;
+        };
+        let (Some(tracker), Some(ctx)) = (&self.root_tracker, &self.hook_ctx) else {
+            return;
+        };
+        let tracker = tracker.clone();
+        let session = ctx.primary.clone();
+        let watcher = ctx.worktree_watcher.clone();
+        rt.spawn(async move {
+            while let Some(event) = rx.recv().await {
+                let contributor = event.contributor;
+                // Drop the watch first so a coalesced burst of delete events for
+                // the same worktree doesn't re-reap; idempotent either way.
+                if let Some(watcher) = &watcher {
+                    watcher.unregister(&contributor);
+                }
+                tracker.remove_contributor(&contributor);
+                if let Err(e) = session.sync_roots(tracker.global_roots()).await {
+                    debug!(
+                        source = Source::DaemonDispatch.as_str(),
+                        "root sync after worktree-deletion reap failed: {e}",
+                    );
+                }
+                debug!(
+                    source = Source::DaemonDispatch.as_str(),
+                    contributor = %contributor,
+                    "reaped worktree root on dir deletion",
+                );
             }
         });
     }
@@ -1996,8 +2100,13 @@ async fn handle_hook_dispatch(
             // graceful end. The `session_id` baked into the contributor key lets
             // the sweep find them without enumerating paths. Routine cleanup, so
             // debug/info — never warn (which reaches the user notification queue).
-            let removed =
-                tracker.remove_contributors_with_prefix(&format!("worktree:{session_id}:"));
+            let prefix = format!("worktree:{session_id}:");
+            let removed = tracker.remove_contributors_with_prefix(&prefix);
+            // Drop this session's in-memory deletion watches too (ticket 05) so
+            // they never outlive the roots; idempotent vs the reaper and the GC.
+            if let Some(ref watcher) = ctx.worktree_watcher {
+                watcher.unregister_with_prefix(&prefix);
+            }
             if removed > 0 {
                 info!(
                     source = Source::DaemonDispatch.as_str(),
@@ -2078,6 +2187,27 @@ async fn handle_hook_dispatch(
                 // canonicalizing `worktree_path` identically.
                 let contributor = format!("worktree:{session_id}:{}", worktree.display());
                 tracker.set_roots(&contributor, vec![worktree.clone()]);
+
+                // Register the bounded deletion watch (ticket 05): the prompt
+                // teardown trigger, since `git worktree remove` fires no
+                // `WorktreeRemove`. Then a race guard — the dir may have already
+                // been removed between mount and watch registration; if so, reap
+                // immediately (idempotent vs the watch/GC/SessionEnd).
+                if let Some(ref watcher) = ctx.worktree_watcher {
+                    watcher.register(&contributor, &worktree);
+                    if !worktree.exists() {
+                        watcher.unregister(&contributor);
+                        tracker.remove_contributor(&contributor);
+                        debug!(
+                            source = Source::DaemonDispatch.as_str(),
+                            session_id = %session_id,
+                            worktree = %worktree.display(),
+                            contributor = %contributor,
+                            "worktree dir already gone at mount — reaped immediately",
+                        );
+                    }
+                }
+
                 let global = tracker.global_roots();
                 if let Err(e) = ctx.primary.sync_roots(global).await {
                     debug!(
@@ -2150,6 +2280,11 @@ async fn handle_hook_dispatch(
             let canonical = raw_path.canonicalize().unwrap_or(raw_path);
             let contributor = format!("worktree:{session_id}:{}", canonical.display());
             tracker.remove_contributor(&contributor);
+            // Drop the in-memory deletion watch too (ticket 05) so it never
+            // outlives the root; idempotent vs the watch reaper and the GC.
+            if let Some(ref watcher) = ctx.worktree_watcher {
+                watcher.unregister(&contributor);
+            }
             let global = tracker.global_roots();
             if let Err(e) = ctx.primary.sync_roots(global).await {
                 debug!(
