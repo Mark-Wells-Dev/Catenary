@@ -42,6 +42,14 @@ mod patterns {
 }
 use patterns::{ECHO_SEP_RE, ENV_VAR_RE, HEREDOC_MARKER_RE, SEQ_SPLIT_RE, SUBSHELL_RE};
 
+/// Faithful, hand-rolled shell parser core (`&str → ParsedScript`).
+///
+/// The new parse substrate from decision 020 / tokenizer ticket 01. Tickets
+/// 02–04 re-point the allowlist evaluator and the redirect guard at it; ticket
+/// 07 deletes the legacy scanners above. Landed here but not yet wired into the
+/// gate, so its surface is exercised by its own unit tests for now.
+pub(crate) mod parse;
+
 use regex::Regex;
 
 use crate::config::ResolvedCommands;
