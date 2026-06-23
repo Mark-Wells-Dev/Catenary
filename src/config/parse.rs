@@ -212,7 +212,6 @@ pub const SERVER_DEF_KEYS: &[&str] = &[
     "env",
     "file_patterns",
     "single_file",
-    "suppress_symbol_kind",
 ];
 
 /// Deserialize a TOML source, handling the `[server.*]` / `[language.*]`

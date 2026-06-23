@@ -30,6 +30,7 @@ pub mod sed;
 /// Shared container for tool servers and cross-tool infrastructure.
 pub mod session;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -70,6 +71,65 @@ pub(crate) fn compress_home(path: &Path) -> String {
         }
     }
     path.display().to_string()
+}
+
+/// Reads source files once and serves any line by 0-based index.
+///
+/// The one-atom render model (decision 024) makes every `grep` and `glob`
+/// result a `path:line  <source line>` atom — the verbatim text at that
+/// location. Neither `Symbol`/`CallEdge`/`TypeEdge` carries the source text,
+/// so both surfaces resolve it here: glob reads one file and indexes many
+/// nodes; grep reads scattered edge-target lines across files. Each file is
+/// read at most once and its newline-stripped lines are cached, so repeated
+/// lookups (a hot file with many symbols, an edge cited several times) cost
+/// one read.
+///
+/// A file that cannot be read, or a line index past the file's end, yields
+/// `None`; callers fall back to the bare `path:line` form. Trailing `\r` is
+/// stripped alongside `\n` so a CRLF file renders the same bytes as `rg`.
+#[derive(Default)]
+pub(super) struct SourceLines {
+    /// Per-file cached lines (newline-stripped), or `None` when the file
+    /// could not be read — memoizing the failure so a missing file is
+    /// stat-ed once, not once per lookup.
+    cache: HashMap<PathBuf, Option<Vec<String>>>,
+}
+
+impl SourceLines {
+    /// Creates an empty reader cache.
+    pub(super) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns the source line at `line_0` (0-based) of `path`, verbatim and
+    /// newline-stripped, or `None` if the file is unreadable or the line is
+    /// out of range.
+    ///
+    /// Reads and caches the whole file on first touch.
+    pub(super) fn line(&mut self, path: &Path, line_0: u32) -> Option<&str> {
+        let entry = self
+            .cache
+            .entry(path.to_path_buf())
+            .or_insert_with(|| Self::read_lines(path));
+        entry
+            .as_ref()
+            .and_then(|lines| lines.get(line_0 as usize))
+            .map(String::as_str)
+    }
+
+    /// Reads a file and splits it into newline-stripped lines.
+    ///
+    /// Returns `None` if the file cannot be read. A trailing `\r` is removed
+    /// alongside `\n` so CRLF input renders identically to ripgrep.
+    fn read_lines(path: &Path) -> Option<Vec<String>> {
+        let content = std::fs::read_to_string(path).ok()?;
+        Some(
+            content
+                .split('\n')
+                .map(|l| l.strip_suffix('\r').unwrap_or(l).to_string())
+                .collect(),
+        )
+    }
 }
 
 /// Ensures the symbol index is populated — and fresh — for the given files.

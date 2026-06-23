@@ -22,12 +22,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use super::NO_LSP_LABEL;
+use super::SourceLines;
 use super::filesystem_manager::{
     FilesystemManager, STAT_RETRY_ATTEMPTS, format_file_size, mtime_nanos,
 };
 use super::session::{ResolvedGlob, expand_search_paths};
 use crate::lsp::{LspClientManager, WalkBreadth};
-use crate::symbol_index::{Symbol, SymbolIndex, format_symbol_kind};
+use crate::symbol_index::{Symbol, SymbolIndex};
 
 /// Input for the `glob` tool.
 #[derive(Debug, Deserialize)]
@@ -304,9 +305,10 @@ impl GlobServer {
             })
             .unwrap_or_default();
 
-        let suppress_kind = self.client_manager.suppress_symbol_kind(path);
+        let mut sources = SourceLines::new();
         for sym in syms {
-            render_symbol_line(&mut full, sym, Some(&children_set), "\t", suppress_kind);
+            let source = sources.line(path, sym.line);
+            render_symbol_line(&mut full, sym, Some(&children_set), "\t", source);
         }
 
         full
@@ -525,7 +527,6 @@ impl GlobServer {
             self.outline_threshold,
             &self.outline_suppress,
             &self.fs_manager,
-            &self.client_manager,
             "\t",
         );
         full.push_str(&content);
@@ -745,203 +746,61 @@ fn is_snapshot(name: &str) -> bool {
 
 // ─── Symbol rendering ─────────────────────────────────────────────────
 
-/// Renders a single symbol line: `:start-end <Kind[, deprecated]> Name[/]`.
+/// Renders a single outline node as the one atom: `:line  <source line>[/]`.
 ///
-/// When `suppress_kind` is `true`, the `<Kind[, deprecated]>` segment is
-/// omitted entirely — the server embeds structural context in the symbol
-/// name itself (e.g. Lattice's `H1:`), so the `SymbolKind` prefix would
-/// double-prefix. The trailing `/` (has-children) indicator is kept.
+/// The declaration line at the symbol's range start carries the kind
+/// implicitly (`fn foo(...)`, `struct Bar`, `# Heading`), so no `<Kind>`
+/// label is rendered (decision 024). When the source line is unavailable
+/// (file unreadable or line out of range) the bare name is used as a fall
+/// back so the node is never empty. The trailing `/` (has-children)
+/// indicator — a structural signal, not a kind label — is kept.
 fn render_symbol_line(
     out: &mut String,
     sym: &Symbol,
     children_set: Option<&HashSet<String>>,
     indent: &str,
-    suppress_kind: bool,
+    source: Option<&str>,
 ) {
     let trailing = if children_set.is_some_and(|cs| cs.contains(&sym.name)) {
         "/"
     } else {
         ""
     };
-    if suppress_kind {
-        let _ = writeln!(
-            out,
-            "{indent}:{}-{} {}{trailing}",
-            sym.line + 1,
-            sym.end_line + 1,
-            sym.name,
-        );
-        return;
-    }
-    let kind_label = format_symbol_kind(&sym.kind);
-    let deprecated = if sym.deprecated { ", deprecated" } else { "" };
-    let _ = writeln!(
-        out,
-        "{indent}:{}-{} <{kind_label}{deprecated}> {}{trailing}",
-        sym.line + 1,
-        sym.end_line + 1,
-        sym.name,
-    );
+    let text = source.map_or_else(|| sym.name.as_str(), str::trim_end);
+    let _ = writeln!(out, "{indent}:{}  {text}{trailing}", sym.line + 1);
 }
 
-// ─── Structure deduplication ──────────────────────────────────────────
-
-/// Minimum data needed for structure deduplication. Both `GlobEntry`
-/// (directory listings) and `FileNode` (glob pattern trees) provide
-/// these fields.
-struct MapItem<'a> {
-    name: &'a str,
-    abs_path: &'a Path,
-    line_count: Option<usize>,
-}
-
-/// Fingerprint: sorted `(kind, name)` pairs as a single string key.
-fn make_fingerprint(syms: &[Symbol]) -> String {
-    let mut pairs: Vec<(&str, &str)> = syms
-        .iter()
-        .map(|s| (s.kind.as_str(), s.name.as_str()))
-        .collect();
-    pairs.sort_unstable();
-    pairs
-        .iter()
-        .map(|(k, n)| format!("{k}\x00{n}"))
-        .collect::<Vec<_>>()
-        .join("\x01")
-}
-
-/// A bounding symbol for a dedup group.
-struct BoundingSymbol {
-    name: String,
-    kind: String,
-    min_line: u32,
-    max_end_line: u32,
-    has_children: bool,
-}
-
-/// A shared dedup group: (item indices into the `MapItem` slice, bounding symbols).
-type SharedGroup = (Vec<usize>, Vec<BoundingSymbol>);
-
-/// Computes structure dedup groups for a set of map-eligible items.
+/// Renders one file's outline as one atom per node.
 ///
-/// Returns `(shared_groups, individual_indices)` where shared groups
-/// are items with identical fingerprints (≥2 files) and individuals
-/// are unique. Indices are into the `items` slice.
-fn compute_dedup(
-    items: &[MapItem<'_>],
-    outline: &HashMap<PathBuf, Vec<Symbol>>,
-    symbol_index: &SymbolIndex,
-) -> (Vec<SharedGroup>, Vec<usize>) {
-    // Group by fingerprint.
-    let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
-    for (i, item) in items.iter().enumerate() {
-        if let Some(syms) = outline.get(item.abs_path) {
-            let fp = make_fingerprint(syms);
-            groups.entry(fp).or_default().push(i);
-        }
-    }
-
-    let mut shared = Vec::new();
-    let mut individual = Vec::new();
-
-    for (_fp, indices) in groups {
-        if indices.len() == 1 {
-            individual.push(indices[0]);
-        } else {
-            // Compute bounding ranges using the first file as representative.
-            let rep_path = items[indices[0]].abs_path;
-            let rep_syms = outline.get(rep_path);
-            let bounding = rep_syms.map_or_else(Vec::new, |syms| {
-                syms.iter()
-                    .map(|sym| {
-                        let mut min_l = sym.line;
-                        let mut max_e = sym.end_line;
-                        for &other_idx in &indices[1..] {
-                            if let Some(other_syms) = outline.get(items[other_idx].abs_path) {
-                                for s in other_syms {
-                                    if s.kind == sym.kind && s.name == sym.name {
-                                        min_l = min_l.min(s.line);
-                                        max_e = max_e.max(s.end_line);
-                                    }
-                                }
-                            }
-                        }
-                        BoundingSymbol {
-                            name: sym.name.clone(),
-                            kind: sym.kind.clone(),
-                            min_line: min_l,
-                            max_end_line: max_e,
-                            has_children: symbol_index.has_children(rep_path, &sym.name),
-                        }
-                    })
-                    .collect()
-            });
-            shared.push((indices, bounding));
-        }
-    }
-
-    (shared, individual)
-}
-
-/// Renders a shared dedup group: file list + "common structure" header
-/// + bounding symbols.
-fn render_shared_group(
-    out: &mut String,
-    items: &[MapItem<'_>],
-    group_indices: &[usize],
-    bounding: &[BoundingSymbol],
-    indent: &str,
-    sym_indent: &str,
-    suppress_kind: bool,
-) {
-    for &gi in group_indices {
-        let item = &items[gi];
-        if let Some(lc) = item.line_count {
-            let _ = writeln!(out, "{indent}{}  ({lc} lines)", item.name);
-        } else {
-            let _ = writeln!(out, "{indent}{}", item.name);
-        }
-    }
-    let _ = writeln!(out, "{indent}common structure (ranges are bounding):");
-    for sym in bounding {
-        let trailing = if sym.has_children { "/" } else { "" };
-        if suppress_kind {
-            let _ = writeln!(
-                out,
-                "{sym_indent}:{}-{} {}{trailing}",
-                sym.min_line + 1,
-                sym.max_end_line + 1,
-                sym.name,
-            );
-            continue;
-        }
-        let kind_label = format_symbol_kind(&sym.kind);
-        let _ = writeln!(
-            out,
-            "{sym_indent}:{}-{} <{kind_label}> {}{trailing}",
-            sym.min_line + 1,
-            sym.max_end_line + 1,
-            sym.name,
-        );
-    }
-}
-
-/// Renders an individual file's outline symbols.
+/// Each node is its declaration source line, indented under the file
+/// header (decision 024: the structure is the indentation, not a kind
+/// label). The one-atom model retired the cross-file "common structure"
+/// collapse — an outline shows each symbol once in its structural slot,
+/// nothing recurs (collapse is grep-only). The file is read once via
+/// [`SourceLines`] and indexed by line number for each node's source text.
 fn render_individual_map(
     out: &mut String,
+    file: &Path,
     syms: &[Symbol],
     children_set: Option<&HashSet<String>>,
     sym_indent: &str,
-    suppress_kind: bool,
+    sources: &mut SourceLines,
 ) {
     for sym in syms {
-        render_symbol_line(out, sym, children_set, sym_indent, suppress_kind);
+        let source = sources.line(file, sym.line);
+        render_symbol_line(out, sym, children_set, sym_indent, source);
     }
 }
 
 // ─── Directory rendering ─────────────────────────────────────────────
 
-/// Renders a directory listing: enriched (maps) for files with LSP
-/// symbols, plain (flags) for the rest.
+/// Renders a directory listing: outline maps for files with LSP symbols,
+/// plain (flags) for the rest.
+///
+/// Each map-eligible file renders its own outline — one atom per node, the
+/// declaration source line indented under the file header (decision 024).
+/// The cross-file "common structure" collapse is retired: an outline shows
+/// each symbol once in its structural slot, nothing recurs.
 #[allow(clippy::too_many_lines, reason = "sequential rendering pipeline")]
 fn render_dir(
     entries: &[GlobEntry],
@@ -949,7 +808,6 @@ fn render_dir(
     outline_threshold: usize,
     outline_suppress: &[globset::GlobMatcher],
     fs_manager: &FilesystemManager,
-    client_manager: &LspClientManager,
     indent: &str,
 ) -> String {
     let sym_indent = format!("{indent}\t");
@@ -1010,32 +868,10 @@ fn render_dir(
         );
     }
 
-    // Build children sets and render enriched for eligible, plain for the rest.
+    // Build children sets for the has-children (`/`) indicator.
     let children_sets = build_children_sets(idx, &eligible_refs);
-
-    let map_items: Vec<MapItem<'_>> = eligible_indices
-        .iter()
-        .map(|&i| MapItem {
-            name: &entries[i].name,
-            abs_path: &entries[i].abs_path,
-            line_count: entries[i].line_count,
-        })
-        .collect();
-
-    let (shared_groups, individual_map_indices) = compute_dedup(&map_items, &outline, idx);
-
-    let mut entry_to_group: HashMap<usize, usize> = HashMap::new();
-    for (gi, (mi_indices, _)) in shared_groups.iter().enumerate() {
-        for &mi in mi_indices {
-            entry_to_group.insert(eligible_indices[mi], gi);
-        }
-    }
-    let individual_entries: HashSet<usize> = individual_map_indices
-        .iter()
-        .map(|&mi| eligible_indices[mi])
-        .collect();
-
-    let mut rendered_groups: HashSet<usize> = HashSet::new();
+    let eligible_set: HashSet<usize> = eligible_indices.iter().copied().collect();
+    let mut sources = SourceLines::new();
     let mut result = String::new();
 
     let mut dirs: Vec<&GlobEntry> = entries.iter().filter(|e| e.is_dir).collect();
@@ -1052,34 +888,20 @@ fn render_dir(
     files.sort_by(|a, b| a.1.name.cmp(&b.1.name));
 
     for &(ei, f) in &files {
-        if let Some(&gi) = entry_to_group.get(&ei) {
-            if rendered_groups.contains(&gi) {
-                continue;
-            }
-            rendered_groups.insert(gi);
-            let (mi_indices, bounding) = &shared_groups[gi];
-            // Dedup groups share an identical fingerprint, so all members
-            // share a language — resolve suppression from the representative.
-            let suppress_kind = mi_indices
-                .first()
-                .is_some_and(|&mi| client_manager.suppress_symbol_kind(map_items[mi].abs_path));
-            render_shared_group(
-                &mut result,
-                &map_items,
-                mi_indices,
-                bounding,
-                indent,
-                &sym_indent,
-                suppress_kind,
-            );
-        } else if individual_entries.contains(&ei) {
+        if eligible_set.contains(&ei)
+            && let Some(syms) = outline.get(&f.abs_path)
+        {
             let flags = compute_entry_flags(f, Some(idx), 0, outline_suppress, fs_manager, true);
             render_entry_line(&mut result, f, &flags, indent);
-            if let Some(syms) = outline.get(&f.abs_path) {
-                let cs = children_sets.get(&f.abs_path);
-                let suppress_kind = client_manager.suppress_symbol_kind(&f.abs_path);
-                render_individual_map(&mut result, syms, cs, &sym_indent, suppress_kind);
-            }
+            let cs = children_sets.get(&f.abs_path);
+            render_individual_map(
+                &mut result,
+                &f.abs_path,
+                syms,
+                cs,
+                &sym_indent,
+                &mut sources,
+            );
         } else {
             // Non-eligible file: plain flags.
             let flags = compute_entry_flags(
@@ -1803,7 +1625,7 @@ mod tests {
         );
     }
 
-    // ─── render_symbol_line ─────────────────────────────────────────
+    // ─── render_symbol_line (one-atom: source line, no kind) ────────
 
     #[test]
     fn test_render_symbol_line_basic() {
@@ -1818,13 +1640,22 @@ mod tests {
         };
 
         let mut out = String::new();
-        render_symbol_line(&mut out, &sym, None, "\t", false);
+        // The atom is the declaration source line; the kind is implicit in it.
+        render_symbol_line(
+            &mut out,
+            &sym,
+            None,
+            "\t",
+            Some("fn my_func(x: u32) -> u32 {"),
+        );
 
-        assert_eq!(out, "\t:10-20 <Function> my_func\n");
+        assert_eq!(out, "\t:10  fn my_func(x: u32) -> u32 {\n");
     }
 
     #[test]
-    fn test_render_symbol_line_suppressed_omits_kind() {
+    fn test_render_symbol_line_name_embedding_no_double_prefix() {
+        // A name-embedding server (lattice `H1:`) — the heading source line is
+        // already clean, so there is no `<Class>` to double-prefix.
         let sym = Symbol {
             name: "H1: My Heading".to_string(),
             kind: "class".to_string(),
@@ -1836,14 +1667,14 @@ mod tests {
         };
 
         let mut out = String::new();
-        render_symbol_line(&mut out, &sym, None, "\t", true);
+        render_symbol_line(&mut out, &sym, None, "\t", Some("# My Heading"));
 
-        // No `<Class>` prefix — the server embeds structure in the name.
-        assert_eq!(out, "\t:1-2 H1: My Heading\n");
+        assert_eq!(out, "\t:1  # My Heading\n");
+        assert!(!out.contains('<'), "no kind label: {out:?}");
     }
 
     #[test]
-    fn test_render_symbol_line_suppressed_keeps_children_slash() {
+    fn test_render_symbol_line_keeps_children_slash() {
         let sym = Symbol {
             name: "H1: Parent".to_string(),
             kind: "class".to_string(),
@@ -1856,10 +1687,10 @@ mod tests {
 
         let children: HashSet<String> = ["H1: Parent".to_string()].into();
         let mut out = String::new();
-        render_symbol_line(&mut out, &sym, Some(&children), "\t", true);
+        render_symbol_line(&mut out, &sym, Some(&children), "\t", Some("# Parent"));
 
-        // Kind (and its `, deprecated` marker) dropped; trailing `/` kept.
-        assert_eq!(out, "\t:1-10 H1: Parent/\n");
+        // Source line carries the structure; trailing `/` (has-children) kept.
+        assert_eq!(out, "\t:1  # Parent/\n");
     }
 
     #[test]
@@ -1876,13 +1707,21 @@ mod tests {
 
         let children: HashSet<String> = ["MyStruct".to_string()].into();
         let mut out = String::new();
-        render_symbol_line(&mut out, &sym, Some(&children), "\t", false);
+        render_symbol_line(
+            &mut out,
+            &sym,
+            Some(&children),
+            "\t",
+            Some("struct MyStruct {"),
+        );
 
-        assert_eq!(out, "\t:1-11 <Struct> MyStruct/\n");
+        assert_eq!(out, "\t:1  struct MyStruct {/\n");
     }
 
     #[test]
-    fn test_render_symbol_line_deprecated() {
+    fn test_render_symbol_line_trailing_whitespace_trimmed() {
+        // Trailing whitespace on the source line is trimmed so the `/`
+        // indicator (and byte-stable output) stays adjacent to the text.
         let sym = Symbol {
             name: "old_fn".to_string(),
             kind: "function".to_string(),
@@ -1894,13 +1733,15 @@ mod tests {
         };
 
         let mut out = String::new();
-        render_symbol_line(&mut out, &sym, None, "", false);
+        render_symbol_line(&mut out, &sym, None, "", Some("fn old_fn() {   "));
 
-        assert_eq!(out, ":5-7 <Function, deprecated> old_fn\n");
+        assert_eq!(out, ":5  fn old_fn() {\n");
     }
 
     #[test]
-    fn test_render_symbol_line_not_in_children_set() {
+    fn test_render_symbol_line_falls_back_to_name() {
+        // When the source line is unavailable (file unreadable, line out of
+        // range) the node renders the bare name rather than an empty atom.
         let sym = Symbol {
             name: "standalone".to_string(),
             kind: "function".to_string(),
@@ -1911,403 +1752,52 @@ mod tests {
             deprecated: false,
         };
 
-        // Children set exists but doesn't contain this symbol.
-        let children: HashSet<String> = ["OtherThing".to_string()].into();
         let mut out = String::new();
-        render_symbol_line(&mut out, &sym, Some(&children), "", false);
+        render_symbol_line(&mut out, &sym, None, "", None);
 
-        // No trailing slash since not in children set.
-        assert_eq!(out, ":1-6 <Function> standalone\n");
+        assert_eq!(out, ":1  standalone\n");
     }
 
-    // ─── make_fingerprint ───────────────────────────────────────────
+    // ─── render_individual_map (per-file outline, one atom per node) ─
 
     #[test]
-    fn test_make_fingerprint_produces_sorted_pairs() {
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn test_render_individual_map_reads_declaration_lines() {
+        // The outline renders each node's declaration source line, nested by
+        // indentation — no `<Kind>` label, no "common structure" collapse.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let file = tmp.path().join("code.rs");
+        std::fs::write(&file, "fn alpha() {}\nstruct Bar {\n    x: u32,\n}\n").expect("write file");
+
         let syms = vec![
             Symbol {
-                name: "beta".to_string(),
-                kind: "struct".to_string(),
-                line: 5,
-                end_line: 10,
+                name: "alpha".to_string(),
+                kind: "function".to_string(),
+                line: 0,
+                end_line: 0,
                 scope: None,
                 scope_kind: None,
                 deprecated: false,
             },
             Symbol {
-                name: "alpha".to_string(),
-                kind: "function".to_string(),
-                line: 0,
+                name: "Bar".to_string(),
+                kind: "struct".to_string(),
+                line: 1,
                 end_line: 3,
                 scope: None,
                 scope_kind: None,
                 deprecated: false,
             },
         ];
-
-        let fp = make_fingerprint(&syms);
-
-        // Sorted by (kind, name): ("function", "alpha") before ("struct", "beta").
-        assert_eq!(fp, "function\x00alpha\x01struct\x00beta");
-    }
-
-    #[test]
-    fn test_make_fingerprint_identical_for_same_symbols() {
-        let syms_a = vec![
-            Symbol {
-                name: "foo".to_string(),
-                kind: "function".to_string(),
-                line: 0,
-                end_line: 5,
-                scope: None,
-                scope_kind: None,
-                deprecated: false,
-            },
-            Symbol {
-                name: "Bar".to_string(),
-                kind: "struct".to_string(),
-                line: 10,
-                end_line: 20,
-                scope: None,
-                scope_kind: None,
-                deprecated: false,
-            },
-        ];
-
-        // Same kinds/names but different line numbers.
-        let syms_b = vec![
-            Symbol {
-                name: "foo".to_string(),
-                kind: "function".to_string(),
-                line: 3,
-                end_line: 8,
-                scope: None,
-                scope_kind: None,
-                deprecated: false,
-            },
-            Symbol {
-                name: "Bar".to_string(),
-                kind: "struct".to_string(),
-                line: 15,
-                end_line: 25,
-                scope: None,
-                scope_kind: None,
-                deprecated: false,
-            },
-        ];
-
-        assert_eq!(
-            make_fingerprint(&syms_a),
-            make_fingerprint(&syms_b),
-            "same symbols at different lines should have identical fingerprints"
-        );
-    }
-
-    #[test]
-    fn test_make_fingerprint_differs_for_different_symbols() {
-        let syms_a = vec![Symbol {
-            name: "foo".to_string(),
-            kind: "function".to_string(),
-            line: 0,
-            end_line: 5,
-            scope: None,
-            scope_kind: None,
-            deprecated: false,
-        }];
-
-        let syms_b = vec![Symbol {
-            name: "bar".to_string(),
-            kind: "function".to_string(),
-            line: 0,
-            end_line: 5,
-            scope: None,
-            scope_kind: None,
-            deprecated: false,
-        }];
-
-        assert_ne!(
-            make_fingerprint(&syms_a),
-            make_fingerprint(&syms_b),
-            "different symbols should have different fingerprints"
-        );
-    }
-
-    // ─── compute_dedup ─────────────────────────────────────────────
-
-    fn make_symbol(name: &str, kind: &str, line: u32, end_line: u32) -> Symbol {
-        Symbol {
-            name: name.to_string(),
-            kind: kind.to_string(),
-            line,
-            end_line,
-            scope: None,
-            scope_kind: None,
-            deprecated: false,
-        }
-    }
-
-    #[test]
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    fn test_compute_dedup_shared_and_individual() {
-        let idx = SymbolIndex::new().expect("create index");
-
-        let path_a = PathBuf::from("/test/a.rs");
-        let path_b = PathBuf::from("/test/b.rs");
-        let path_c = PathBuf::from("/test/c.rs");
-
-        // a.rs and b.rs have identical symbols (same kind+name → same fingerprint).
-        let sym_foo_a = make_symbol("foo", "function", 0, 5);
-        let sym_foo_b = make_symbol("foo", "function", 3, 8);
-        // c.rs has a different symbol.
-        let sym_bar = make_symbol("bar", "struct", 0, 10);
-
-        let mut outline: HashMap<PathBuf, Vec<Symbol>> = HashMap::new();
-        outline.insert(path_a.clone(), vec![sym_foo_a]);
-        outline.insert(path_b.clone(), vec![sym_foo_b]);
-        outline.insert(path_c.clone(), vec![sym_bar]);
-
-        let items = vec![
-            MapItem {
-                name: "a.rs",
-                abs_path: &path_a,
-                line_count: Some(10),
-            },
-            MapItem {
-                name: "b.rs",
-                abs_path: &path_b,
-                line_count: Some(15),
-            },
-            MapItem {
-                name: "c.rs",
-                abs_path: &path_c,
-                line_count: Some(20),
-            },
-        ];
-
-        let (shared, individual) = compute_dedup(&items, &outline, &idx);
-
-        // a.rs and b.rs share the same fingerprint → one shared group.
-        assert_eq!(shared.len(), 1, "should have 1 shared group");
-        let (group_indices, bounding) = &shared[0];
-        assert_eq!(
-            group_indices.len(),
-            2,
-            "shared group should contain 2 items"
-        );
-        // Both indices should refer to items 0 and 1 (a.rs and b.rs).
-        assert!(
-            group_indices.contains(&0) && group_indices.contains(&1),
-            "shared group should contain a.rs (0) and b.rs (1): {group_indices:?}"
-        );
-
-        // Bounding should have one symbol with min/max across both files.
-        assert_eq!(bounding.len(), 1, "should have 1 bounding symbol");
-        assert_eq!(bounding[0].name, "foo");
-        assert_eq!(bounding[0].kind, "function");
-        assert_eq!(bounding[0].min_line, 0, "min_line should be min(0, 3)");
-        assert_eq!(
-            bounding[0].max_end_line, 8,
-            "max_end_line should be max(5, 8)"
-        );
-
-        // c.rs has a unique fingerprint → individual.
-        assert_eq!(individual.len(), 1, "should have 1 individual");
-        assert_eq!(individual[0], 2, "individual should be c.rs (index 2)");
-    }
-
-    #[test]
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    fn test_compute_dedup_all_unique() {
-        let idx = SymbolIndex::new().expect("create index");
-
-        let path_a = PathBuf::from("/test/a.rs");
-        let path_b = PathBuf::from("/test/b.rs");
-
-        let mut outline: HashMap<PathBuf, Vec<Symbol>> = HashMap::new();
-        outline.insert(path_a.clone(), vec![make_symbol("foo", "function", 0, 5)]);
-        outline.insert(path_b.clone(), vec![make_symbol("bar", "function", 0, 5)]);
-
-        let items = vec![
-            MapItem {
-                name: "a.rs",
-                abs_path: &path_a,
-                line_count: Some(10),
-            },
-            MapItem {
-                name: "b.rs",
-                abs_path: &path_b,
-                line_count: Some(10),
-            },
-        ];
-
-        let (shared, individual) = compute_dedup(&items, &outline, &idx);
-
-        assert!(shared.is_empty(), "no shared groups when all unique");
-        assert_eq!(individual.len(), 2, "both should be individual");
-    }
-
-    #[test]
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    fn test_compute_dedup_bounding_uses_kind_and_name() {
-        // When computing bounding ranges, only symbols matching BOTH kind and
-        // name should contribute. If the `&&` were replaced with `||`, unrelated
-        // symbols would contaminate the bounding range.
-        let idx = SymbolIndex::new().expect("create index");
-
-        let path_a = PathBuf::from("/test/a.rs");
-        let path_b = PathBuf::from("/test/b.rs");
-
-        // Both files have function "foo" and struct "baz" (same fingerprint).
-        // In file B, "baz" has a wider range.
-        let mut outline: HashMap<PathBuf, Vec<Symbol>> = HashMap::new();
-        outline.insert(
-            path_a.clone(),
-            vec![
-                make_symbol("foo", "function", 0, 5),
-                make_symbol("baz", "struct", 10, 20),
-            ],
-        );
-        outline.insert(
-            path_b.clone(),
-            vec![
-                make_symbol("foo", "function", 2, 4),
-                make_symbol("baz", "struct", 8, 25),
-            ],
-        );
-
-        let items = vec![
-            MapItem {
-                name: "a.rs",
-                abs_path: &path_a,
-                line_count: Some(30),
-            },
-            MapItem {
-                name: "b.rs",
-                abs_path: &path_b,
-                line_count: Some(30),
-            },
-        ];
-
-        let (shared, _) = compute_dedup(&items, &outline, &idx);
-
-        assert_eq!(shared.len(), 1);
-        let (_, bounding) = &shared[0];
-        assert_eq!(bounding.len(), 2, "should have 2 bounding symbols");
-
-        // Find "foo" bounding — should use min(0,2)=0, max(5,4)=5.
-        let foo = bounding.iter().find(|b| b.name == "foo").expect("foo");
-        assert_eq!(foo.min_line, 0, "foo min_line = min(0, 2)");
-        assert_eq!(foo.max_end_line, 5, "foo max_end_line = max(5, 4)");
-
-        // Find "baz" bounding — should use min(10,8)=8, max(20,25)=25.
-        let baz = bounding.iter().find(|b| b.name == "baz").expect("baz");
-        assert_eq!(baz.min_line, 8, "baz min_line = min(10, 8)");
-        assert_eq!(baz.max_end_line, 25, "baz max_end_line = max(20, 25)");
-    }
-
-    // ─── render_shared_group ───────────────────────────────────────
-
-    #[test]
-    fn test_render_shared_group_output_format() {
-        let items = vec![
-            MapItem {
-                name: "alpha.rs",
-                abs_path: Path::new("/test/alpha.rs"),
-                line_count: Some(100),
-            },
-            MapItem {
-                name: "beta.rs",
-                abs_path: Path::new("/test/beta.rs"),
-                line_count: None,
-            },
-        ];
-
-        let bounding = vec![BoundingSymbol {
-            name: "foo".to_string(),
-            kind: "function".to_string(),
-            min_line: 2,
-            max_end_line: 9,
-            has_children: false,
-        }];
+        // `Bar` has a field child → trailing `/`.
+        let children: HashSet<String> = ["Bar".to_string()].into();
 
         let mut out = String::new();
-        render_shared_group(&mut out, &items, &[0, 1], &bounding, "", "\t", false);
+        let mut sources = SourceLines::new();
+        render_individual_map(&mut out, &file, &syms, Some(&children), "\t", &mut sources);
 
-        // File with line count shows "(N lines)".
-        assert!(
-            out.contains("alpha.rs  (100 lines)"),
-            "should show line count for alpha: {out:?}"
-        );
-        // File without line count shows just the name.
-        assert!(
-            out.contains("beta.rs\n"),
-            "should show name only for beta: {out:?}"
-        );
-        // Header line.
-        assert!(
-            out.contains("common structure (ranges are bounding):"),
-            "should have common structure header: {out:?}"
-        );
-        // Symbol line: 0-based to 1-based conversion.
-        assert!(
-            out.contains("\t:3-10 <Function> foo\n"),
-            "should show bounding symbol with 1-based lines: {out:?}"
-        );
-    }
-
-    #[test]
-    fn test_render_shared_group_with_children() {
-        let items = vec![MapItem {
-            name: "a.rs",
-            abs_path: Path::new("/test/a.rs"),
-            line_count: Some(50),
-        }];
-
-        let bounding = vec![BoundingSymbol {
-            name: "MyStruct".to_string(),
-            kind: "struct".to_string(),
-            min_line: 0,
-            max_end_line: 20,
-            has_children: true,
-        }];
-
-        let mut out = String::new();
-        render_shared_group(&mut out, &items, &[0], &bounding, "", "\t", false);
-
-        assert!(
-            out.contains("<Struct> MyStruct/\n"),
-            "children should produce trailing slash: {out:?}"
-        );
-    }
-
-    #[test]
-    fn test_render_shared_group_suppressed_omits_kind() {
-        let items = vec![MapItem {
-            name: "doc.md",
-            abs_path: Path::new("/test/doc.md"),
-            line_count: Some(50),
-        }];
-
-        let bounding = vec![BoundingSymbol {
-            name: "H1: Title".to_string(),
-            kind: "class".to_string(),
-            min_line: 0,
-            max_end_line: 20,
-            has_children: true,
-        }];
-
-        let mut out = String::new();
-        render_shared_group(&mut out, &items, &[0], &bounding, "", "\t", true);
-
-        // No `<Class>` prefix; trailing `/` retained.
-        assert!(
-            out.contains("\t:1-21 H1: Title/\n"),
-            "suppressed group should omit kind but keep slash: {out:?}"
-        );
-        assert!(
-            !out.contains("<Class>"),
-            "suppressed group must not render kind: {out:?}"
-        );
+        assert_eq!(out, "\t:1  fn alpha() {}\n\t:2  struct Bar {/\n");
+        assert!(!out.contains('<'), "no kind label anywhere: {out:?}");
     }
 
     // ─── compute_entry_flags ───────────────────────────────────────

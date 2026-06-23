@@ -11,12 +11,13 @@ use grep_searcher::{Searcher, Sink, SinkMatch};
 use ignore::WalkBuilder;
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::debug;
 
 use super::NO_LSP_LABEL;
+use super::SourceLines;
 use super::filesystem_manager::{
     FilesystemManager, OBSERVED_STAT_MISS_MTIME, mtime_nanos, stat_with_retry,
 };
@@ -28,7 +29,6 @@ use crate::lsp::{LspClientManager, WalkBreadth};
 use crate::source::Source;
 use crate::symbol_index::{
     CallEdge, EnrichmentKey, Symbol, SymbolEnrichment, SymbolIndex, TypeEdge, Witness,
-    format_symbol_kind,
 };
 
 /// Input for grep tool.
@@ -78,19 +78,23 @@ struct GrepHit {
     file: PathBuf,
     line: u32,
     col: u32,
+    /// The full source line at the hit (the one-atom payload, decision 024),
+    /// verbatim and newline-stripped — not the matched token.
     matched_text: String,
     classification: HitClass,
 }
 
 /// Classification of a ripgrep hit against the symbol index.
 enum HitClass {
-    /// rg hit at a symbol index definition line.
+    /// rg hit at a symbol index definition line — enriched with edges.
     Symbol { symbol: Symbol },
-    /// rg hit at a non-definition line, with optional enclosing structure.
-    Reference { enclosing: Option<Symbol> },
-    /// Symbol identified via `prepareRename` (no symbol index data for file).
+    /// rg hit at a non-definition line — a plain occurrence atom (no edges).
+    /// In the one-atom model the line carries no enclosing tag.
+    Reference,
+    /// Symbol identified via `prepareRename` in a file with no symbol index
+    /// data — a definition-like hit that still gets enriched.
     PrepareRenameSymbol,
-    /// Keyword filtered out via `prepareRename` (will be dropped).
+    /// Keyword filtered out via `prepareRename` (dropped before rendering).
     Keyword,
 }
 
@@ -488,76 +492,56 @@ impl GrepServer {
                 let matched_text = texts.first().map(|(t, _)| t.clone()).unwrap_or_default();
                 let col = texts.first().map_or(0, |(_, c)| *c);
 
-                if has_symbols {
-                    // Check if this line is a definition
-                    if let Some(sym) = def_lookup.get(&(file_str.clone(), line_0)) {
-                        hits.push(GrepHit {
-                            file: file_path.clone(),
-                            line: line_0,
-                            col,
-                            matched_text: matched_text.clone(),
-                            classification: HitClass::Symbol {
-                                symbol: sym.clone(),
-                            },
-                        });
-                    } else {
-                        // Non-definition line — find enclosing structure via SQL.
-                        // find_enclosing opens a throwaway read connection internally.
-                        let enclosing = self.symbol_index.as_ref().and_then(|idx| {
-                            idx.lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .find_enclosing(&file_path, line_0)
-                                .ok()
-                                .flatten()
-                        });
-                        hits.push(GrepHit {
-                            file: file_path.clone(),
-                            line: line_0,
-                            col,
-                            matched_text,
-                            classification: HitClass::Reference { enclosing },
-                        });
-                    }
-                } else {
-                    // No symbol index data — check if the language server is alive
-                    let lang = self.fs_manager.language_id(&file_path);
-                    let server_dead = lang
-                        .as_ref()
-                        .is_some_and(|l| dead_languages.contains(l.as_str()));
-
-                    if server_dead {
-                        // Server unavailable — emit bare reference, skip LSP
-                        hits.push(GrepHit {
-                            file: file_path.clone(),
-                            line: line_0,
-                            col,
-                            matched_text,
-                            classification: HitClass::Reference { enclosing: None },
-                        });
-                    } else {
-                        // Server alive — use prepareRename for keyword discrimination
-                        let is_symbol = self
-                            .prepare_rename_check(&file_path, line_0, col, parent_id, cancel)
-                            .await;
-                        if is_symbol {
-                            hits.push(GrepHit {
-                                file: file_path.clone(),
-                                line: line_0,
-                                col,
-                                matched_text,
-                                classification: HitClass::PrepareRenameSymbol,
-                            });
-                        } else {
-                            hits.push(GrepHit {
-                                file: file_path.clone(),
-                                line: line_0,
-                                col,
-                                matched_text,
-                                classification: HitClass::Keyword,
-                            });
-                        }
-                    }
+                if has_symbols && let Some(sym) = def_lookup.get(&(file_str.clone(), line_0)) {
+                    // Definition line in an indexed file → enriched symbol atom.
+                    hits.push(GrepHit {
+                        file: file_path.clone(),
+                        line: line_0,
+                        col,
+                        matched_text,
+                        classification: HitClass::Symbol {
+                            symbol: sym.clone(),
+                        },
+                    });
+                    continue;
                 }
+
+                // Non-definition line. Discriminate keyword vs symbol via
+                // `prepareRename`, UNIFORMLY (decision 024, invariant 8): the
+                // keyword drop fires in indexed files too, not only non-indexed
+                // ones. The check is skipped only when the server is dead.
+                let lang = self.fs_manager.language_id(&file_path);
+                let server_dead = lang
+                    .as_ref()
+                    .is_some_and(|l| dead_languages.contains(l.as_str()));
+
+                let is_symbol = if server_dead {
+                    // No live server to ask — keep the line as a plain atom.
+                    true
+                } else {
+                    self.prepare_rename_check(&file_path, line_0, col, parent_id, cancel)
+                        .await
+                };
+
+                let classification = if !is_symbol {
+                    // `prepareRename` says keyword → dropped before rendering.
+                    HitClass::Keyword
+                } else if has_symbols {
+                    // A confirmed occurrence in an indexed file: a plain atom.
+                    // The enclosing definition is a separate, enriched `Symbol`.
+                    HitClass::Reference
+                } else {
+                    // A confirmed symbol in a file the index has no grammar for:
+                    // a definition-like atom that still gets enriched with edges.
+                    HitClass::PrepareRenameSymbol
+                };
+                hits.push(GrepHit {
+                    file: file_path.clone(),
+                    line: line_0,
+                    col,
+                    matched_text,
+                    classification,
+                });
             }
         }
 
@@ -589,13 +573,7 @@ impl GrepServer {
             enrichments.push((hit, enrichment));
         }
 
-        let rendered = render_results(
-            &enrichments,
-            self.symbol_index.as_ref(),
-            &self.fs_manager,
-            &self.client_manager,
-            cwd,
-        );
+        let rendered = render_results(&enrichments, &self.fs_manager, cwd);
         // Witnesses = matched files (content) + every directory the output's
         // membership depends on: the search roots and the subdirectories the
         // walk descended into. A file added directly to a root bumps the root's
@@ -1321,24 +1299,29 @@ impl GrepServer {
 
 /// Renders grep results with page-based paging.
 ///
-/// Each hit is rendered with whatever data is available: enriched
-/// navigation edges when LSP data exists, enclosing symbol context
-/// when available, bare line numbers otherwise. Grouped by workspace
-/// root (bare absolute path header) for absolute patterns, or under
+/// Every result is one atom — `path:line  <source line>` (decision 024).
+/// The top-level list is the matches (definitions and occurrences alike),
+/// each a full atom; a definition additionally carries nested, labeled edge
+/// groups (`calls:`/`called by:`/impls/super-/subtypes/refs). Grouped by
+/// workspace root (bare absolute path header) for absolute patterns, or under
 /// a `cwd: ~/…` context header for cwd-scoped searches.
 ///
 /// Returns the full unpaginated output. Pagination is applied by the
 /// caller (`execute`).
 fn render_results(
     enrichments: &[(&GrepHit, Option<SymbolEnrichment>)],
-    symbol_index: Option<&Arc<std::sync::Mutex<SymbolIndex>>>,
     fs_manager: &FilesystemManager,
-    client_manager: &LspClientManager,
     cwd: Option<&Path>,
 ) -> String {
     use std::fmt::Write;
 
     let mut full = String::new();
+    // The membership set: every top-level match atom's (file, line). An edge
+    // whose target is in this set collapses to a citation; one outside is read
+    // full. Collected across the WHOLE result so a citation in one root section
+    // can point at an atom rendered full in another (the paging invariant).
+    let top_level = collect_top_level_atoms(enrichments);
+    let mut sources = SourceLines::new();
 
     if let Some(cwd) = cwd {
         // cwd-scoped: one section, `cwd: ~/path` header, cwd-relative paths.
@@ -1352,9 +1335,9 @@ fn render_results(
         render_section(
             enrichments,
             &all_indices,
-            symbol_index,
             fs_manager,
-            client_manager,
+            &top_level,
+            &mut sources,
             &mut full,
             Some(cwd),
         );
@@ -1382,9 +1365,9 @@ fn render_results(
             render_section(
                 enrichments,
                 indices,
-                symbol_index,
                 fs_manager,
-                client_manager,
+                &top_level,
+                &mut sources,
                 &mut full,
                 None,
             );
@@ -1408,9 +1391,9 @@ fn render_results(
             render_section(
                 enrichments,
                 indices,
-                symbol_index,
                 fs_manager,
-                client_manager,
+                &top_level,
+                &mut sources,
                 &mut full,
                 None,
             );
@@ -1422,36 +1405,51 @@ fn render_results(
     full
 }
 
-/// Renders a single root section: definitions with enrichment edges,
-/// then remaining reference hits with enclosing context.
-#[allow(
-    clippy::too_many_lines,
-    reason = "Renders navigation sections per symbol + reference fallback"
-)]
+/// The `(file, line)` of a hit's atom — the definition line for a `Symbol`,
+/// the hit line otherwise.
+fn hit_atom(hit: &GrepHit) -> (String, u32) {
+    let line = match &hit.classification {
+        HitClass::Symbol { symbol } => symbol.line,
+        _ => hit.line,
+    };
+    (hit.file.to_string_lossy().to_string(), line)
+}
+
+/// Collects the set of top-level match atoms `(file, line)` across the whole
+/// result — the membership test that decides edge collapse.
+///
+/// Top level is always full and is the canonical home of every atom; an edge
+/// pointing here collapses to a `path:line  name` citation, an edge pointing
+/// elsewhere is read full. The set spans every root section so a citation is
+/// an absolute pointer to a guaranteed-present atom regardless of which page
+/// holds the full form (decision 024, the paging invariant).
+fn collect_top_level_atoms(
+    enrichments: &[(&GrepHit, Option<SymbolEnrichment>)],
+) -> HashSet<(String, u32)> {
+    enrichments.iter().map(|(hit, _)| hit_atom(hit)).collect()
+}
+
+/// Renders one root section as one-atom output (decision 024).
+///
+/// Every match is a top-level atom `path:line  <source line>`, ordered by
+/// `(file, line)` for byte-stable output (the misc-32 determinism pattern). A
+/// definition (a `Symbol`/`PrepareRenameSymbol` hit) additionally carries
+/// nested, labeled edge groups (`calls:`/`impls:`/`supertypes:`/`subtypes:`/
+/// `refs:`); each edge is itself an atom. An edge whose target is a top-level
+/// match collapses to a `path:line  name` citation (the full line is already
+/// present); an edge whose target is not a match is read full — the navigation
+/// Catenary does for the agent. A definition with no edges renders as its lean
+/// single atom (fish-eye).
 fn render_section(
     enrichments: &[(&GrepHit, Option<SymbolEnrichment>)],
     indices: &[usize],
-    symbol_index: Option<&Arc<std::sync::Mutex<SymbolIndex>>>,
     fs_manager: &FilesystemManager,
-    client_manager: &LspClientManager,
+    top_level: &HashSet<(String, u32)>,
+    sources: &mut SourceLines,
     output: &mut String,
     cwd: Option<&Path>,
 ) {
-    use std::cell::RefCell;
     use std::fmt::Write;
-
-    // Resolve `suppress_symbol_kind` per file path, memoized — a section can
-    // span many files of differing languages, and the daemon-side lookup
-    // (language → server binding → flag) is worth caching within the section.
-    let suppress_cache: RefCell<HashMap<PathBuf, bool>> = RefCell::new(HashMap::new());
-    let suppress_kind = |path: &Path| -> bool {
-        if let Some(&v) = suppress_cache.borrow().get(path) {
-            return v;
-        }
-        let v = client_manager.suppress_symbol_kind(path);
-        suppress_cache.borrow_mut().insert(path.to_path_buf(), v);
-        v
-    };
 
     // Path display: cwd-relative when cwd is set, root-relative otherwise.
     let rel = |file: &str| -> String {
@@ -1465,495 +1463,225 @@ fn render_section(
         )
     };
 
-    // Step 1: Group by bare name at depth 0.
-    let mut by_name: BTreeMap<String, Vec<(&GrepHit, &Option<SymbolEnrichment>)>> = BTreeMap::new();
+    // Citation names: a collapsed edge shows `path:line  name`. Only symbol
+    // atoms ever recur, so a citation's target is always a top-level
+    // `Symbol`/`PrepareRenameSymbol` hit, which carries a name (decision 024).
+    let atom_names = collect_atom_names(enrichments);
+
+    // Order the section's hits by `(file, line)` — reproducible bytes.
+    let mut ordered: BTreeMap<(String, u32), usize> = BTreeMap::new();
     for &i in indices {
-        let (hit, enrichment) = &enrichments[i];
-        let name = match &hit.classification {
-            HitClass::Symbol { symbol } => symbol.name.clone(),
-            _ => hit.matched_text.clone(),
-        };
-        by_name.entry(name).or_default().push((hit, enrichment));
+        ordered.insert(hit_atom(enrichments[i].0), i);
     }
 
-    // Step 2: Cross-definition dedup.
-    //
-    // Suppress definitions whose location appears in any labeled section
-    // (calls, impls, supertypes, subtypes) of another enriched definition.
-    // If the agent already sees a location in a labeled section, repeating
-    // it as a standalone definition is noise.
-    //
-    // Cycle guard: if A appears in B's labeled section AND B appears in
-    // A's, neither is suppressed — they're peers, not parent/child.
-    let suppressed: HashSet<(String, u32)> = {
-        // Map each labeled location → its dominator (the definition whose
-        // section lists it). First writer wins — if two definitions both
-        // list the same location, the first one encountered dominates.
-        let mut labeled_locs: HashMap<(String, u32), (String, u32)> = HashMap::new();
-        for &i in indices {
-            let (hit, enrichment) = &enrichments[i];
-            let Some(e) = enrichment else { continue };
-            let hit_file = hit.file.to_string_lossy().to_string();
-            let hit_line = match &hit.classification {
-                HitClass::Symbol { symbol } => symbol.line,
-                _ => hit.line,
-            };
-            let dominator = (hit_file, hit_line);
-            for c in &e.outgoing_calls {
-                labeled_locs
-                    .entry((c.file.clone(), c.line))
-                    .or_insert_with(|| dominator.clone());
-            }
-            for (f, l) in &e.implementations {
-                labeled_locs
-                    .entry((f.clone(), *l))
-                    .or_insert_with(|| dominator.clone());
-            }
-            for t in &e.supertypes {
-                labeled_locs
-                    .entry((t.file.clone(), t.line))
-                    .or_insert_with(|| dominator.clone());
-            }
-            for t in &e.subtypes {
-                labeled_locs
-                    .entry((t.file.clone(), t.line))
-                    .or_insert_with(|| dominator.clone());
-            }
-        }
+    for &i in ordered.values() {
+        let (hit, enrichment) = &enrichments[i];
 
-        // Only suppress if the dominator is not itself dominated (no cycles).
-        labeled_locs
-            .keys()
-            .filter(|loc| {
-                let Some(dom) = labeled_locs.get(loc) else {
-                    return true;
-                };
-                !labeled_locs.contains_key(dom)
-            })
-            .cloned()
-            .collect()
-    };
-
-    // Step 4: Render each name group.
-
-    for (name, group) in &by_name {
-        let visible: Vec<&(&GrepHit, &Option<SymbolEnrichment>)> = group
-            .iter()
-            .filter(|(hit, _)| {
-                let hit_file = hit.file.to_string_lossy().to_string();
-                let hit_line = match &hit.classification {
-                    HitClass::Symbol { symbol } => symbol.line,
-                    _ => hit.line,
-                };
-                !suppressed.contains(&(hit_file, hit_line))
-            })
-            .collect();
-
-        if visible.is_empty() {
-            continue;
-        }
-
-        // Blank line between name groups.
+        // Blank line between top-level atoms (and their edge blocks).
         if !output.is_empty() && !output.ends_with('\n') {
             output.push('\n');
         }
 
-        // Render definition-like hits (Symbol, PrepareRenameSymbol) with
-        // enrichment edges.
-        for (hit, enrichment) in &visible {
-            let has_edges = enrichment.as_ref().is_some_and(|e| {
-                !e.outgoing_calls.is_empty()
-                    || !e.implementations.is_empty()
-                    || !e.supertypes.is_empty()
-                    || !e.subtypes.is_empty()
-                    || !e.ref_lines.is_empty()
-                    || !e.incoming_calls.is_empty()
-            });
+        // Top-level atom: ALWAYS the full source line, verbatim.
+        let rel_path = rel(&hit.file.to_string_lossy());
+        let line_1 = hit_atom(hit).1 + 1;
+        let _ = writeln!(output, "{rel_path}:{line_1}  {}", hit.matched_text);
 
-            let rel_path = rel(&hit.file.to_string_lossy());
-
-            // Definition line — only Symbol and PrepareRenameSymbol hits
-            match &hit.classification {
-                HitClass::Symbol { symbol } => {
-                    let suppress = suppress_kind(&hit.file);
-                    let scope_prefix = symbol
-                        .scope
-                        .as_ref()
-                        .zip(symbol.scope_kind.as_ref())
-                        .map_or_else(String::new, |(sn, sk)| {
-                            if suppress {
-                                format!("{sn}/")
-                            } else {
-                                format!("<{}> {}/", format_symbol_kind(sk), sn)
-                            }
-                        });
-                    let line_1 = symbol.line + 1;
-                    if suppress {
-                        let _ = writeln!(output, "{scope_prefix}{name}  {rel_path}:{line_1}");
-                    } else {
-                        let kind = format_symbol_kind(&symbol.kind);
-                        let _ =
-                            writeln!(output, "{scope_prefix}<{kind}> {name}  {rel_path}:{line_1}");
-                    }
-                }
-                HitClass::PrepareRenameSymbol => {
-                    let line_1 = hit.line + 1;
-                    let _ = writeln!(output, "{name}  {rel_path}:{line_1}");
-                }
-                _ => continue,
-            }
-
-            // Fish-eye: symbols with no edges → lean single line (already rendered).
-            if !has_edges {
-                continue;
-            }
-
-            let Some(enrichment) = enrichment else {
-                continue;
-            };
-
-            // Build the set of labeled (file, line) pairs for ref dedup
-            let mut this_labeled: HashSet<(String, u32)> = HashSet::new();
-            for c in &enrichment.outgoing_calls {
-                this_labeled.insert((c.file.clone(), c.line));
-            }
-            for (f, l) in &enrichment.implementations {
-                this_labeled.insert((f.clone(), *l));
-            }
-            for t in &enrichment.supertypes {
-                this_labeled.insert((t.file.clone(), t.line));
-            }
-            for t in &enrichment.subtypes {
-                this_labeled.insert((t.file.clone(), t.line));
-            }
-
-            // calls: section — outgoing calls sorted alphabetically
-            if !enrichment.outgoing_calls.is_empty() {
-                let _ = writeln!(output, "\tcalls:");
-                let mut calls: Vec<&CallEdge> = enrichment.outgoing_calls.iter().collect();
-                calls.sort_by(|a, b| a.name.cmp(&b.name));
-                for c in &calls {
-                    let kind_label = crate::symbol_index::lsp_kind_label(c.kind);
-                    let depr = if c.deprecated { ", deprecated" } else { "" };
-                    let container_prefix = c.container.as_ref().map_or_else(String::new, |cn| {
-                        // Look up container kind from symbol_index if available
-                        let ck = symbol_index
-                            .and_then(|idx| {
-                                let index = idx
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                let path = PathBuf::from(&c.file);
-                                index.find_enclosing(&path, c.line).ok().flatten()
-                            })
-                            .map_or_else(String::new, |enc| {
-                                format!("<{}> ", format_symbol_kind(&enc.kind))
-                            });
-                        format!("{ck}{cn}/")
-                    });
-                    let c_rel = rel(&c.file);
-                    let line_1 = c.line + 1;
-                    let _ = writeln!(
-                        output,
-                        "\t\t{container_prefix}<{kind_label}{depr}> {}  {c_rel}:{line_1}",
-                        c.name
-                    );
-                }
-            }
-
-            // impls: section — grouped by file (alphabetical)
-            if !enrichment.implementations.is_empty() {
-                let _ = writeln!(output, "\timpls:");
-                let mut by_file: BTreeMap<String, Vec<u32>> = BTreeMap::new();
-                for (f, l) in &enrichment.implementations {
-                    by_file.entry(f.clone()).or_default().push(*l);
-                }
-                for (file, lines) in &by_file {
-                    let mut lines = lines.clone();
-                    lines.sort_unstable();
-                    let f_rel = rel(file);
-                    let _ = writeln!(output, "\t\t{f_rel}");
-                    for line_0 in &lines {
-                        let line_1 = line_0 + 1;
-                        // Look up enclosing structure from symbol_index
-                        let enc_str = symbol_index
-                            .and_then(|idx| {
-                                let index = idx
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                let path = PathBuf::from(file);
-                                index.find_enclosing(&path, *line_0).ok().flatten()
-                            })
-                            .map_or_else(String::new, |enc| {
-                                let ek = format_symbol_kind(&enc.kind);
-                                let span = format_span(enc.line, enc.end_line);
-                                format!(" <{ek}> {}{span}", enc.name)
-                            });
-                        let _ = writeln!(output, "\t\t\t:{line_1}{enc_str}");
-                    }
-                }
-            }
-
-            // supertypes: section
-            if !enrichment.supertypes.is_empty() {
-                let _ = writeln!(output, "\tsupertypes:");
-                for t in &enrichment.supertypes {
-                    let kind_label = crate::symbol_index::lsp_kind_label(t.kind);
-                    let depr = if t.deprecated { ", deprecated" } else { "" };
-                    let container_prefix = t
-                        .container
-                        .as_ref()
-                        .map_or_else(String::new, |cn| format!("{cn}/"));
-                    let t_rel = rel(&t.file);
-                    let line_1 = t.line + 1;
-                    let _ = writeln!(
-                        output,
-                        "\t\t{container_prefix}<{kind_label}{depr}> {}  {t_rel}:{line_1}",
-                        t.name
-                    );
-                }
-            }
-
-            // subtypes: section
-            if !enrichment.subtypes.is_empty() {
-                let _ = writeln!(output, "\tsubtypes:");
-                for t in &enrichment.subtypes {
-                    let kind_label = crate::symbol_index::lsp_kind_label(t.kind);
-                    let depr = if t.deprecated { ", deprecated" } else { "" };
-                    let container_prefix = t
-                        .container
-                        .as_ref()
-                        .map_or_else(String::new, |cn| format!("{cn}/"));
-                    let t_rel = rel(&t.file);
-                    let line_1 = t.line + 1;
-                    let _ = writeln!(
-                        output,
-                        "\t\t{container_prefix}<{kind_label}{depr}> {}  {t_rel}:{line_1}",
-                        t.name
-                    );
-                }
-            }
-
-            // refs: section — merge incoming calls, dedup against labeled sections
-            let mut ref_entries: BTreeMap<String, BTreeMap<u32, Option<Symbol>>> = BTreeMap::new();
-
-            // Add textDocument/references lines
-            for (file, lines) in &enrichment.ref_lines {
-                for &line_0 in lines {
-                    if this_labeled.contains(&(file.clone(), line_0)) {
-                        continue;
-                    }
-                    let enc = symbol_index.and_then(|idx| {
-                        let index = idx
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        let path = PathBuf::from(file);
-                        index.find_enclosing(&path, line_0).ok().flatten()
-                    });
-                    ref_entries
-                        .entry(file.clone())
-                        .or_default()
-                        .insert(line_0, enc);
-                }
-            }
-
-            // Merge incoming calls into refs (dedup: same file + same line)
-            for caller in &enrichment.incoming_calls {
-                if this_labeled.contains(&(caller.file.clone(), caller.line)) {
-                    continue;
-                }
-                // Use the caller's line as the ref entry. Dedup: if already present, skip.
-                let file_entries = ref_entries.entry(caller.file.clone()).or_default();
-                file_entries.entry(caller.line).or_insert_with(|| {
-                    symbol_index.and_then(|idx| {
-                        let index = idx
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        let path = PathBuf::from(&caller.file);
-                        index.find_enclosing(&path, caller.line).ok().flatten()
-                    })
-                });
-            }
-
-            if !ref_entries.is_empty() {
-                let _ = writeln!(output, "\trefs:");
-                for (file, lines) in &ref_entries {
-                    let f_rel = rel(file);
-                    let _ = writeln!(output, "\t\t{f_rel}");
-                    let suppress = suppress_kind(Path::new(file));
-                    for (&line_0, enc) in lines {
-                        let line_1 = line_0 + 1;
-                        let enc_str = enc.as_ref().map_or_else(String::new, |enc| {
-                            let scope_prefix = enc
-                                .scope
-                                .as_ref()
-                                .zip(enc.scope_kind.as_ref())
-                                .map_or_else(String::new, |(sn, sk)| {
-                                    if suppress {
-                                        format!("{sn}/")
-                                    } else {
-                                        format!("<{}> {}/", format_symbol_kind(sk), sn)
-                                    }
-                                });
-                            let span = format_span(enc.line, enc.end_line);
-                            if suppress {
-                                format!(" {scope_prefix}{}{span}", enc.name)
-                            } else {
-                                let ek = format_symbol_kind(&enc.kind);
-                                format!(" {scope_prefix}<{ek}> {}{span}", enc.name)
-                            }
-                        });
-                        let _ = writeln!(output, "\t\t\t:{line_1}{enc_str}");
-                    }
-                }
-            }
+        // Only definitions carry edge groups; occurrences are lean atoms.
+        if !matches!(
+            hit.classification,
+            HitClass::Symbol { .. } | HitClass::PrepareRenameSymbol
+        ) {
+            continue;
         }
+        let Some(enrichment) = enrichment else {
+            continue;
+        };
 
-        // Remaining Reference hits: not definition-like, rendered with
-        // enclosing context in dir/file grouping below definitions.
-        let ref_hits: Vec<&GrepHit> = visible
-            .iter()
-            .filter(|(hit, _)| matches!(hit.classification, HitClass::Reference { .. }))
-            .map(|(hit, _)| *hit)
-            .collect();
-        if !ref_hits.is_empty() {
-            let by_dir_file = group_hits_by_dir_file(&ref_hits, fs_manager, cwd);
-            for (dir, files) in &by_dir_file {
-                if !dir.is_empty() {
-                    let _ = writeln!(output, "{dir}");
-                }
-                for (file, file_hits) in files {
-                    let indent = if dir.is_empty() { "" } else { "\t" };
-                    let _ = writeln!(output, "{indent}{file}");
-                    for hit in file_hits {
-                        let line_1 = hit.line + 1;
-                        let hit_indent = if dir.is_empty() { "\t" } else { "\t\t" };
-                        let suppress = suppress_kind(&hit.file);
-                        let _ = writeln!(
-                            output,
-                            "{hit_indent}{}",
-                            format_hit_line(hit, line_1, suppress)
-                        );
-                    }
-                }
-            }
-        }
+        render_edge_groups(output, enrichment, top_level, &atom_names, sources, &rel);
     }
 }
 
-/// Groups hits by directory and file for tree rendering.
-fn group_hits_by_dir_file<'a>(
-    hits: &[&'a GrepHit],
-    fs_manager: &FilesystemManager,
-    cwd: Option<&Path>,
-) -> BTreeMap<String, BTreeMap<String, Vec<&'a GrepHit>>> {
-    let mut by_dir_file: BTreeMap<String, BTreeMap<String, Vec<&GrepHit>>> = BTreeMap::new();
-    for hit in hits {
-        let display = cwd.map_or_else(
-            || display_path(&hit.file.to_string_lossy(), fs_manager),
-            |base| {
-                hit.file.strip_prefix(base).map_or_else(
-                    |_| hit.file.to_string_lossy().to_string(),
-                    |r| r.to_string_lossy().to_string(),
-                )
-            },
-        );
-        let (dir, file) = split_dir_file(&display);
-        by_dir_file
-            .entry(dir)
-            .or_default()
-            .entry(file)
-            .or_default()
-            .push(hit);
+/// Builds the citation-name lookup: each top-level definition atom's
+/// `(file, line)` → its symbol name. A collapsed edge cites by this name.
+fn collect_atom_names(
+    enrichments: &[(&GrepHit, Option<SymbolEnrichment>)],
+) -> HashMap<(String, u32), String> {
+    let mut names = HashMap::new();
+    for (hit, _) in enrichments {
+        let name = match &hit.classification {
+            HitClass::Symbol { symbol } => symbol.name.clone(),
+            HitClass::PrepareRenameSymbol => hit.matched_text.clone(),
+            _ => continue,
+        };
+        names.insert(hit_atom(hit), name);
     }
-    by_dir_file
+    names
 }
 
-/// Formats a single hit line with enclosing structure.
+/// Renders the labeled edge groups under a definition atom (decision 024).
 ///
-/// For definition hits: `:line <Kind> name:start-end`
-/// For reference hits with enclosing: `:line <Kind> enclosing:start-end`
-/// For bare hits: `:line`
-///
-/// When `suppress_kind` is `true`, the `<Kind>` segment is omitted for both
-/// the hit symbol and its enclosing scope — the server embeds structural
-/// context in the symbol name itself (e.g. Lattice's `H1:`), so a
-/// `SymbolKind` prefix would double-prefix.
-fn format_hit_line(hit: &GrepHit, line_1: u32, suppress_kind: bool) -> String {
-    match &hit.classification {
-        HitClass::Symbol { symbol } => {
-            let scope_prefix = symbol
-                .scope
-                .as_ref()
-                .zip(symbol.scope_kind.as_ref())
-                .map_or_else(String::new, |(sn, sk)| {
-                    if suppress_kind {
-                        format!("{sn}/")
-                    } else {
-                        format!("<{}> {}/", format_symbol_kind(sk), sn)
-                    }
-                });
-            let span = format_span(symbol.line, symbol.end_line);
-            if suppress_kind {
-                format!(":{line_1} {scope_prefix}{}{span}", symbol.name)
-            } else {
-                let kind = format_symbol_kind(&symbol.kind);
-                format!(":{line_1} {scope_prefix}<{kind}> {}{span}", symbol.name)
+/// Each edge is an atom: collapsed to `path:line  name` when its target is a
+/// top-level match (the full line is present elsewhere in the result), read
+/// full (`path:line  <source line>`) otherwise. Edges are deduplicated by
+/// atom `(file, line)`, so a back-edge of a cycle collapses against its peer.
+fn render_edge_groups(
+    output: &mut String,
+    enrichment: &SymbolEnrichment,
+    top_level: &HashSet<(String, u32)>,
+    atom_names: &HashMap<(String, u32), String>,
+    sources: &mut SourceLines,
+    rel: &impl Fn(&str) -> String,
+) {
+    use std::fmt::Write;
+
+    // Dedup edges across all this definition's groups by atom (file, line).
+    let mut seen: HashSet<(String, u32)> = HashSet::new();
+
+    // calls: — outgoing call edges, ordered by (file, line).
+    let mut calls: BTreeMap<(String, u32), &CallEdge> = BTreeMap::new();
+    for c in &enrichment.outgoing_calls {
+        calls.entry((c.file.clone(), c.line)).or_insert(c);
+    }
+    if !calls.is_empty() {
+        let _ = writeln!(output, "\tcalls:");
+        for ((file, line_0), c) in &calls {
+            if seen.insert((file.clone(), *line_0)) {
+                render_edge_atom(output, &c.name, file, *line_0, top_level, sources, rel);
             }
         }
-        HitClass::Reference {
-            enclosing: Some(enc),
-        } => {
-            let scope_prefix = enc.scope.as_ref().zip(enc.scope_kind.as_ref()).map_or_else(
-                String::new,
-                |(sn, sk)| {
-                    if suppress_kind {
-                        format!("{sn}/")
-                    } else {
-                        format!("<{}> {}/", format_symbol_kind(sk), sn)
-                    }
-                },
-            );
-            let span = format_span(enc.line, enc.end_line);
-            if suppress_kind {
-                format!(
-                    ":{line_1} {}  {scope_prefix}{}{span}",
-                    hit.matched_text, enc.name
-                )
-            } else {
-                let enc_kind = format_symbol_kind(&enc.kind);
-                format!(
-                    ":{line_1} {}  {scope_prefix}<{enc_kind}> {}{span}",
-                    hit.matched_text, enc.name
-                )
-            }
+    }
+
+    // impls: — implementation locations, ordered by (file, line). LSP gives
+    // only `(file, line)`; a collapsed citation borrows the matched atom's name.
+    let mut impls: BTreeSet<(String, u32)> = BTreeSet::new();
+    for (f, l) in &enrichment.implementations {
+        impls.insert((f.clone(), *l));
+    }
+    let impls: Vec<(String, u32)> = impls
+        .into_iter()
+        .filter(|atom| seen.insert(atom.clone()))
+        .collect();
+    if !impls.is_empty() {
+        let _ = writeln!(output, "\timpls:");
+        for (file, line_0) in &impls {
+            let name = atom_names
+                .get(&(file.clone(), *line_0))
+                .map_or("", String::as_str);
+            render_edge_atom(output, name, file, *line_0, top_level, sources, rel);
         }
-        HitClass::Reference { enclosing: None } | HitClass::PrepareRenameSymbol => {
-            format!(":{line_1} {}", hit.matched_text)
+    }
+
+    // supertypes: / subtypes: — type hierarchy edges, ordered by (file, line).
+    render_type_group(
+        output,
+        "supertypes",
+        &enrichment.supertypes,
+        &mut seen,
+        top_level,
+        sources,
+        rel,
+    );
+    render_type_group(
+        output,
+        "subtypes",
+        &enrichment.subtypes,
+        &mut seen,
+        top_level,
+        sources,
+        rel,
+    );
+
+    // refs: — textDocument/references plus incoming call edges, ordered by
+    // (file, line), deduplicated against the edges above.
+    let mut refs: BTreeMap<(String, u32), String> = BTreeMap::new();
+    for (file, lines) in &enrichment.ref_lines {
+        for &line_0 in lines {
+            refs.entry((file.clone(), line_0)).or_default();
         }
-        HitClass::Keyword => String::new(),
+    }
+    for caller in &enrichment.incoming_calls {
+        refs.entry((caller.file.clone(), caller.line))
+            .or_insert_with(|| caller.name.clone());
+    }
+    let refs: Vec<((String, u32), String)> = refs
+        .into_iter()
+        .filter(|(atom, _)| seen.insert(atom.clone()))
+        .collect();
+    if !refs.is_empty() {
+        let _ = writeln!(output, "\trefs:");
+        for ((file, line_0), caller_name) in &refs {
+            // Prefer the cited atom's own name; fall back to an incoming
+            // caller's name when the reference is not itself a match.
+            let name = atom_names
+                .get(&(file.clone(), *line_0))
+                .map_or(caller_name.as_str(), String::as_str);
+            render_edge_atom(output, name, file, *line_0, top_level, sources, rel);
+        }
     }
 }
 
-/// Formats a span: `:start-end` for multi-line, `:line` for single-line.
-fn format_span(start_0: u32, end_0: u32) -> String {
-    let start_1 = start_0 + 1;
-    let end_1 = end_0 + 1;
-    if start_1 == end_1 {
-        format!(":{start_1}")
+/// Renders a type-hierarchy edge group (`supertypes:`/`subtypes:`).
+fn render_type_group(
+    output: &mut String,
+    label: &str,
+    edges: &[TypeEdge],
+    seen: &mut HashSet<(String, u32)>,
+    top_level: &HashSet<(String, u32)>,
+    sources: &mut SourceLines,
+    rel: &impl Fn(&str) -> String,
+) {
+    use std::fmt::Write;
+
+    let mut by_atom: BTreeMap<(String, u32), &TypeEdge> = BTreeMap::new();
+    for t in edges {
+        by_atom.entry((t.file.clone(), t.line)).or_insert(t);
+    }
+    let by_atom: Vec<((String, u32), &TypeEdge)> = by_atom
+        .into_iter()
+        .filter(|(atom, _)| seen.insert(atom.clone()))
+        .collect();
+    if by_atom.is_empty() {
+        return;
+    }
+    let _ = writeln!(output, "\t{label}:");
+    for ((file, line_0), t) in &by_atom {
+        render_edge_atom(output, &t.name, file, *line_0, top_level, sources, rel);
+    }
+}
+
+/// Renders a single edge as an atom (decision 024).
+///
+/// Collapsed to `path:line  name` when the target is a top-level match (the
+/// paging-invariant citation — an absolute pointer to an atom rendered full
+/// elsewhere in the same result), read full `path:line  <source line>`
+/// otherwise. When the source line is unavailable and the target is not a
+/// match, the edge's own `name` is the fallback so the atom is never empty.
+fn render_edge_atom(
+    output: &mut String,
+    name: &str,
+    file: &str,
+    line_0: u32,
+    top_level: &HashSet<(String, u32)>,
+    sources: &mut SourceLines,
+    rel: &impl Fn(&str) -> String,
+) {
+    use std::fmt::Write;
+
+    let line_1 = line_0 + 1;
+    let rel_path = rel(file);
+    if top_level.contains(&(file.to_string(), line_0)) {
+        // Citation: the full line is a top-level atom elsewhere in the result.
+        let _ = writeln!(output, "\t\t{rel_path}:{line_1}  {name}");
     } else {
-        format!(":{start_1}-{end_1}")
+        // Read the line in for the agent (bounded to new targets).
+        let text = sources
+            .line(Path::new(file), line_0)
+            .map(str::trim_end)
+            .filter(|l| !l.is_empty())
+            .unwrap_or(name);
+        let _ = writeln!(output, "\t\t{rel_path}:{line_1}  {text}");
     }
-}
-
-/// Splits a relative path into `(directory/, filename)`.
-///
-/// `"src/bridge/handler.rs"` → `("src/bridge/", "handler.rs")`
-/// `"handler.rs"` → `("", "handler.rs")`
-fn split_dir_file(rel: &str) -> (String, String) {
-    rel.rfind('/').map_or_else(
-        || (String::new(), rel.to_string()),
-        |pos| (format!("{}/", &rel[..pos]), rel[pos + 1..].to_string()),
-    )
 }
 
 /// Wrapper that pushes per-thread match data into a shared collector on drop.
@@ -2011,27 +1739,28 @@ impl Sink for MatchSink<'_> {
 
         let line_bytes = mat.bytes();
 
-        // Extract each individual match from the line (--only-matching equivalent).
-        let mut at = 0;
-        while let Ok(Some(m)) = self.matcher.find_at(line_bytes, at) {
-            if m.start() == m.end() {
-                // Zero-width match — advance to avoid infinite loop
-                at = m.end() + 1;
-                continue;
-            }
-            if let Ok(text) = std::str::from_utf8(&line_bytes[m]) {
-                let expanded = expand_match_to_token(line_bytes, m.start(), m.end());
-                let col = u32::try_from(m.start()).unwrap_or(0);
-                self.local
-                    .file_line_texts
-                    .entry(self.path.to_string())
-                    .or_default()
-                    .entry(line_num)
-                    .or_default()
-                    .push((expanded.unwrap_or_else(|| text.to_string()), col));
-            }
-            at = m.end();
-        }
+        // One-atom model (decision 024): the hit carries its FULL source line,
+        // byte-identical to `rg`, not the matched token (`--only-matching` is
+        // dropped). Capture the whole line, newline-stripped, plus the column
+        // of the FIRST match on it — the column still positions `prepareRename`
+        // (keyword discrimination) and the enrichment query at the symbol.
+        let Some(first) = self.matcher.find(line_bytes).ok().flatten() else {
+            return Ok(true);
+        };
+        let col = u32::try_from(first.start()).unwrap_or(0);
+        let raw = String::from_utf8_lossy(line_bytes);
+        // Strip the trailing newline (and a CRLF `\r`) so the atom is the line
+        // text, byte-identical to what `rg` prints.
+        let trimmed = raw.strip_suffix('\n').unwrap_or(&raw);
+        let line_str = trimmed.strip_suffix('\r').unwrap_or(trimmed).to_string();
+
+        self.local
+            .file_line_texts
+            .entry(self.path.to_string())
+            .or_default()
+            .entry(line_num)
+            .or_default()
+            .push((line_str, col));
 
         self.local
             .file_lines
@@ -2045,14 +1774,14 @@ impl Sink for MatchSink<'_> {
 
 // ─── Alternation splitting ────────────────────────────────────────────
 
-/// Result of a ripgrep `--only-matching` search.
+/// Result of a ripgrep line search.
 #[derive(Default)]
 struct RipgrepMatches {
     /// Per-file line numbers.
     file_lines: BTreeMap<String, Vec<u32>>,
-    /// Per-file, per-line matched texts with column offsets
-    /// `(matched_text, column_byte_offset)` for hit classification
-    /// and for no-grammar `prepareRename` positions.
+    /// Per-file, per-line `(full source line, first-match column)` — the atom
+    /// text (one-atom model, decision 024) plus the first match's column for
+    /// hit classification and `prepareRename` positioning.
     file_line_texts: HashMap<String, HashMap<u32, Vec<(String, u32)>>>,
     /// Directories the walk traversed. Their mtimes are the result cache's
     /// membership witnesses: a new matching file added anywhere under the scope
@@ -2131,7 +1860,7 @@ fn harvest(collected: Arc<std::sync::Mutex<Vec<ThreadMatches>>>) -> Result<Vec<T
 struct ThreadMatches {
     /// Per-file line numbers.
     file_lines: BTreeMap<String, Vec<u32>>,
-    /// Per-file, per-line matched texts with column offsets.
+    /// Per-file, per-line `(full source line, first-match column)`.
     file_line_texts: HashMap<String, HashMap<u32, Vec<(String, u32)>>>,
     /// Directories visited by this thread (result-cache membership witnesses).
     dirs: Vec<PathBuf>,
@@ -2185,69 +1914,6 @@ fn split_alternation(pattern: &str) -> Vec<String> {
     arms
 }
 
-// ─── Match expansion ────────────────────────────────────────────────────
-
-/// Returns `true` if a byte is a token delimiter.
-///
-/// Token delimiters are whitespace and common punctuation that separate
-/// identifiers in source code. The match text is expanded to the nearest
-/// delimiters on each side so reference hits show the full token, not a
-/// regex substring (e.g. `Configuration` instead of `Config`).
-const fn is_token_delimiter(b: u8) -> bool {
-    matches!(
-        b,
-        b' ' | b'\t'
-            | b'\n'
-            | b'\r'
-            | b'('
-            | b')'
-            | b'['
-            | b']'
-            | b'<'
-            | b'>'
-            | b'{'
-            | b'}'
-            | b','
-            | b';'
-            | b':'
-            | b'.'
-            | b'='
-            | b'+'
-            | b'-'
-            | b'*'
-            | b'/'
-            | b'!'
-            | b'?'
-            | b'&'
-            | b'|'
-            | b'^'
-            | b'~'
-            | b'#'
-            | b'@'
-            | b'%'
-            | b'"'
-            | b'\''
-            | b'`'
-    )
-}
-
-/// Expands a regex match span to token boundaries within a line.
-///
-/// Walks left from `start` and right from `end` until a delimiter or
-/// line boundary is reached. Returns the expanded substring, or `None`
-/// if the bytes aren't valid UTF-8.
-fn expand_match_to_token(line: &[u8], start: usize, end: usize) -> Option<String> {
-    let mut lo = start;
-    while lo > 0 && !is_token_delimiter(line[lo - 1]) {
-        lo -= 1;
-    }
-    let mut hi = end;
-    while hi < line.len() && !is_token_delimiter(line[hi]) {
-        hi += 1;
-    }
-    std::str::from_utf8(&line[lo..hi]).ok().map(str::to_string)
-}
-
 // ─── LSP JSON extraction helpers ────────────────────────────────────────
 
 /// Extracts a file path from an LSP Location's `uri` field.
@@ -2268,59 +1934,32 @@ fn extract_start_line(location: &Value) -> Option<u32> {
 }
 
 /// Extracts a [`CallEdge`] from a `CallHierarchyItem` JSON value.
+///
+/// The one-atom model carries only the edge's name and `(file, line)`; the LSP
+/// kind / container / deprecation tags are not rendered, so they are not read.
 fn extract_call_edge(item: &Value) -> Option<CallEdge> {
     let name = item.get("name")?.as_str()?.to_string();
-    let kind = u32::try_from(item.get("kind")?.as_u64()?).ok()?;
-    let container = item
-        .get("detail")
-        .and_then(Value::as_str)
-        .map(str::to_string);
     let file = item
         .get("uri")?
         .as_str()?
         .strip_prefix("file://")
         .map(str::to_string)?;
     let line = u32::try_from(item.get("range")?.get("start")?.get("line")?.as_u64()?).ok()?;
-    let deprecated = item
-        .get("tags")
-        .and_then(Value::as_array)
-        .is_some_and(|tags| tags.iter().any(|t| t.as_u64() == Some(1)));
-    Some(CallEdge {
-        name,
-        kind,
-        container,
-        file,
-        line,
-        deprecated,
-    })
+    Some(CallEdge { name, file, line })
 }
 
 /// Extracts a [`TypeEdge`] from a `TypeHierarchyItem` JSON value.
+///
+/// Carries only the atom's name and `(file, line)`; see [`extract_call_edge`].
 fn extract_type_edge(item: &Value) -> Option<TypeEdge> {
     let name = item.get("name")?.as_str()?.to_string();
-    let kind = u32::try_from(item.get("kind")?.as_u64()?).ok()?;
-    let container = item
-        .get("detail")
-        .and_then(Value::as_str)
-        .map(str::to_string);
     let file = item
         .get("uri")?
         .as_str()?
         .strip_prefix("file://")
         .map(str::to_string)?;
     let line = u32::try_from(item.get("range")?.get("start")?.get("line")?.as_u64()?).ok()?;
-    let deprecated = item
-        .get("tags")
-        .and_then(Value::as_array)
-        .is_some_and(|tags| tags.iter().any(|t| t.as_u64() == Some(1)));
-    Some(TypeEdge {
-        name,
-        kind,
-        container,
-        file,
-        line,
-        deprecated,
-    })
+    Some(TypeEdge { name, file, line })
 }
 
 #[cfg(test)]
@@ -2385,15 +2024,16 @@ mod tests {
         assert_eq!(split_alternation(r"foo\|bar"), vec![r"foo\|bar"]);
     }
 
-    // ─── Tier rendering helpers ─────────────────────────────────────────
+    // ─── One-atom rendering helpers ─────────────────────────────────────
 
-    /// Build a `GrepHit` with a `Symbol` classification for testing.
-    fn sym_hit(file: &str, line: u32, name: &str, kind: &str) -> GrepHit {
+    /// Build a `Symbol`-classified `GrepHit`. `src` is the verbatim source
+    /// line — the atom the renderer prints (`--only-matching` is dropped).
+    fn sym_hit(file: &str, line: u32, name: &str, kind: &str, src: &str) -> GrepHit {
         GrepHit {
             file: PathBuf::from(file),
             line,
             col: 0,
-            matched_text: name.to_string(),
+            matched_text: src.to_string(),
             classification: HitClass::Symbol {
                 symbol: Symbol {
                     name: name.to_string(),
@@ -2408,82 +2048,14 @@ mod tests {
         }
     }
 
-    /// Build a `GrepHit` with a `Symbol` that has scope (enclosing container).
-    fn scoped_sym_hit(
-        file: &str,
-        line: u32,
-        name: &str,
-        kind: &str,
-        scope: &str,
-        scope_kind: &str,
-    ) -> GrepHit {
+    /// Build a `Reference`-classified `GrepHit` carrying its full source line.
+    fn ref_hit(file: &str, line: u32, src: &str) -> GrepHit {
         GrepHit {
             file: PathBuf::from(file),
             line,
             col: 0,
-            matched_text: name.to_string(),
-            classification: HitClass::Symbol {
-                symbol: Symbol {
-                    name: name.to_string(),
-                    kind: kind.to_string(),
-                    line,
-                    end_line: line + 10,
-                    scope: Some(scope.to_string()),
-                    scope_kind: Some(scope_kind.to_string()),
-                    deprecated: false,
-                },
-            },
-        }
-    }
-
-    /// Build a `GrepHit` with a `Reference` classification with enclosing.
-    fn ref_hit(
-        file: &str,
-        line: u32,
-        text: &str,
-        enc_name: &str,
-        enc_kind: &str,
-        enc_start: u32,
-        enc_end: u32,
-    ) -> GrepHit {
-        GrepHit {
-            file: PathBuf::from(file),
-            line,
-            col: 0,
-            matched_text: text.to_string(),
-            classification: HitClass::Reference {
-                enclosing: Some(Symbol {
-                    name: enc_name.to_string(),
-                    kind: enc_kind.to_string(),
-                    line: enc_start,
-                    end_line: enc_end,
-                    scope: None,
-                    scope_kind: None,
-                    deprecated: false,
-                }),
-            },
-        }
-    }
-
-    /// Build a `GrepHit` with a bare `Reference` (no enclosing).
-    fn bare_ref_hit(file: &str, line: u32, text: &str) -> GrepHit {
-        GrepHit {
-            file: PathBuf::from(file),
-            line,
-            col: 0,
-            matched_text: text.to_string(),
-            classification: HitClass::Reference { enclosing: None },
-        }
-    }
-
-    /// Build a `GrepHit` with `PrepareRenameSymbol` (no-grammar path).
-    fn prepare_rename_hit(file: &str, line: u32, text: &str) -> GrepHit {
-        GrepHit {
-            file: PathBuf::from(file),
-            line,
-            col: 0,
-            matched_text: text.to_string(),
-            classification: HitClass::PrepareRenameSymbol,
+            matched_text: src.to_string(),
+            classification: HitClass::Reference,
         }
     }
 
@@ -2491,57 +2063,6 @@ mod tests {
         let fs = FilesystemManager::new();
         fs.set_roots(vec![PathBuf::from(root)]);
         fs
-    }
-
-    /// Builds a minimal [`LspClientManager`] for render unit tests. With a
-    /// default config no language has a server binding, so
-    /// [`LspClientManager::suppress_symbol_kind`] always returns `false` —
-    /// the `<Kind>` prefix is rendered, matching the non-suppressing baseline.
-    fn test_clients() -> Arc<LspClientManager> {
-        use crate::config::Config;
-        use crate::logging::LoggingServer;
-        Arc::new(LspClientManager::new(
-            Config::default(),
-            LoggingServer::new(),
-            Arc::new(FilesystemManager::new()),
-        ))
-    }
-
-    /// Builds an `(Arc<FilesystemManager>, Arc<LspClientManager>)` pair whose
-    /// markdown (`.md`) binding carries `suppress_symbol_kind = true`. A single
-    /// fs (built from the suppressing [`Config`]) backs both the render side
-    /// and the client manager's internal classifier, so `language_id(".md")`
-    /// → `"markdown"` agrees with the flag lookup:
-    /// [`LspClientManager::suppress_symbol_kind`] returns `true` for `.md`
-    /// files under `root`.
-    fn suppressing_fs_clients(root: &str) -> (Arc<FilesystemManager>, Arc<LspClientManager>) {
-        use crate::bridge::filesystem_manager::ClassificationTables;
-        use crate::config::{Config, LanguageConfig, ServerBinding, ServerDef};
-        use crate::logging::LoggingServer;
-
-        let mut config = Config::default();
-        let server = ServerDef {
-            suppress_symbol_kind: true,
-            ..ServerDef::default()
-        };
-        config.server.insert("lattice".to_string(), server);
-        let lang = LanguageConfig {
-            extensions: Some(vec!["md".to_string()]),
-            servers: Some(vec![ServerBinding::new("lattice")]),
-            ..LanguageConfig::default()
-        };
-        config.language.insert("markdown".to_string(), lang);
-
-        let fs = Arc::new(FilesystemManager::with_classification(
-            ClassificationTables::from_config(&config),
-        ));
-        fs.set_roots(vec![PathBuf::from(root)]);
-        let clients = Arc::new(LspClientManager::new(
-            config,
-            LoggingServer::new(),
-            fs.clone(),
-        ));
-        (fs, clients)
     }
 
     fn empty_enrichment() -> SymbolEnrichment {
@@ -2561,104 +2082,78 @@ mod tests {
     fn render(hits: &[GrepHit], budget: usize, page: usize, fs: &FilesystemManager) -> String {
         let enrichments: Vec<(&GrepHit, Option<SymbolEnrichment>)> =
             hits.iter().map(|h| (h, None)).collect();
-        let clients = test_clients();
-        let full = render_results(&enrichments, None, fs, &clients, None);
+        let full = render_results(&enrichments, fs, None);
         paginate(&full, budget, page)
     }
 
     #[test]
-    fn test_name_grouping() {
+    fn atom_is_the_full_source_line_no_kind() {
         let fs = test_fs("/project");
-        let hits = [
-            sym_hit(
-                "/project/tests/a.rs",
-                287,
-                "test_glob_directory",
-                "function",
-            ),
-            sym_hit(
-                "/project/tests/b.rs",
-                118,
-                "test_glob_directory",
-                "function",
-            ),
-            sym_hit("/project/src/handler.rs", 1085, "test_glob", "function"),
-        ];
+        // A mid-line comment match: the atom is the FULL line, not the token,
+        // and carries no `<Kind>` label.
+        let hits = [ref_hit(
+            "/project/src/a.rs",
+            9,
+            "let x = 1; // configure the widget",
+        )];
 
         let output = render(&hits, 10_000, 1, &fs);
 
         assert!(
-            output.contains("test_glob_directory"),
-            "missing name group: {output}"
+            output.contains("src/a.rs:10  let x = 1; // configure the widget"),
+            "full line atom, 1-based: {output}"
         );
-        assert!(output.contains("test_glob"), "missing name group: {output}");
-        assert!(
-            output.contains("<Function>"),
-            "missing kind label: {output}"
-        );
+        assert!(!output.contains('<'), "no kind label anywhere: {output}");
     }
 
     #[test]
-    fn test_mixed_definitions_and_references() {
+    fn definitions_and_references_are_both_top_level_atoms() {
         let fs = test_fs("/project");
-        // Same matched text: one PrepareRenameSymbol (definition-like)
-        // and one Reference. Both should appear.
+        // A definition-like hit and a plain occurrence — both top-level atoms.
         let hits = [
-            prepare_rename_hit("/project/data/config.yaml", 15, "handle"),
-            ref_hit(
-                "/project/src/util.rs",
-                30,
+            sym_hit(
+                "/project/data/config.yaml",
+                15,
                 "handle",
-                "process",
                 "function",
-                25,
-                50,
+                "handle: process",
             ),
+            ref_hit("/project/src/util.rs", 30, "    handle(input);"),
         ];
 
         let output = render(&hits, 10_000, 1, &fs);
 
-        // Definition rendered
         assert!(
-            output.contains("config.yaml:16"),
-            "definition should be present: {output}"
-        );
-        // Reference also rendered (not dropped)
-        assert!(
-            output.contains("util.rs"),
-            "reference should not be dropped: {output}"
+            output.contains("config.yaml:16  handle: process"),
+            "definition atom present: {output}"
         );
         assert!(
-            output.contains(":31"),
-            "reference line should be present: {output}"
+            output.contains("util.rs:31      handle(input);")
+                || output.contains("util.rs:31  ") && output.contains("handle(input);"),
+            "occurrence atom not dropped: {output}"
         );
+        assert!(!output.contains('<'), "no kind label: {output}");
     }
 
     #[test]
-    fn test_plain_references_only() {
+    fn plain_references_render_full_lines() {
         let fs = test_fs("/project");
         let hits = [
-            bare_ref_hit("/project/data/notes.txt", 5, "pattern"),
-            ref_hit(
-                "/project/src/main.rs",
-                100,
-                "pattern",
-                "call_tool",
-                "function",
-                95,
-                120,
-            ),
+            ref_hit("/project/data/notes.txt", 5, "see the pattern below"),
+            ref_hit("/project/src/main.rs", 100, "    let pattern = compile();"),
         ];
 
         let output = render(&hits, 10_000, 1, &fs);
 
-        // Both references rendered with 1-based lines
-        assert!(output.contains(":6"), "bare ref line: {output}");
-        assert!(output.contains(":101"), "enclosing ref line: {output}");
-        assert!(output.contains("call_tool"), "enclosing name: {output}");
-        // Directory headers present for non-empty dirs
-        assert!(output.contains("data/\n"), "data dir header: {output}");
-        assert!(output.contains("src/\n"), "src dir header: {output}");
+        // Both atoms rendered with 1-based lines and their full source text.
+        assert!(
+            output.contains("notes.txt:6  see the pattern below"),
+            "bare ref atom: {output}"
+        );
+        assert!(
+            output.contains("main.rs:101  ") && output.contains("let pattern = compile();"),
+            "second ref atom: {output}"
+        );
     }
 
     // ─── Paging ───────────────────────────────────────────────────────
@@ -2671,6 +2166,7 @@ mod tests {
             100,
             "handle_grep",
             "function",
+            "fn handle_grep() {",
         )];
 
         let output = render(&hits, 10_000, 1, &fs);
@@ -2680,7 +2176,7 @@ mod tests {
             "single-page result should have no page header: {output}"
         );
         assert!(
-            output.contains("handle_grep"),
+            output.contains("fn handle_grep() {"),
             "should contain content: {output}"
         );
     }
@@ -2696,6 +2192,7 @@ mod tests {
                 i * 10,
                 &format!("test_symbol_{i}"),
                 "function",
+                &format!("fn test_symbol_{i}() {{"),
             ));
         }
 
@@ -2721,6 +2218,7 @@ mod tests {
             100,
             "handle_grep",
             "function",
+            "fn handle_grep() {",
         )];
 
         let output = render(&hits, 10_000, 99, &fs);
@@ -2731,7 +2229,7 @@ mod tests {
             "single page should have no header: {output}"
         );
         assert!(
-            output.contains("handle_grep"),
+            output.contains("fn handle_grep() {"),
             "clamped page should contain content: {output}"
         );
     }
@@ -2744,6 +2242,7 @@ mod tests {
             100,
             "handle_grep",
             "function",
+            "fn handle_grep() {",
         )];
 
         let output = render(&hits, 10_000, 1, &fs);
@@ -2765,7 +2264,13 @@ mod tests {
     #[test]
     fn grep_out_of_root_hits() {
         let fs = test_fs("/project");
-        let hits = [sym_hit("/other/path/file.rs", 10, "orphan_fn", "function")];
+        let hits = [sym_hit(
+            "/other/path/file.rs",
+            10,
+            "orphan_fn",
+            "function",
+            "fn orphan_fn() {",
+        )];
 
         let output = render(&hits, 10_000, 1, &fs);
 
@@ -2783,8 +2288,8 @@ mod tests {
     fn grep_out_of_root_grouped_by_parent() {
         let fs = test_fs("/project");
         let hits = [
-            sym_hit("/other/path/a.rs", 10, "fn_a", "function"),
-            sym_hit("/other/path/b.rs", 20, "fn_b", "function"),
+            sym_hit("/other/path/a.rs", 10, "fn_a", "function", "fn fn_a() {"),
+            sym_hit("/other/path/b.rs", 20, "fn_b", "function", "fn fn_b() {"),
         ];
 
         let output = render(&hits, 10_000, 1, &fs);
@@ -2802,182 +2307,270 @@ mod tests {
     #[test]
     fn render_enriched_calls_only() {
         let fs = test_fs("/project");
-        let hit = sym_hit("/project/src/lib.rs", 10, "MyStruct", "struct");
+        let hit = sym_hit(
+            "/project/src/lib.rs",
+            10,
+            "MyStruct",
+            "struct",
+            "struct MyStruct {",
+        );
         let mut enrichment = empty_enrichment();
         enrichment.outgoing_calls.push(CallEdge {
             name: "helper".to_string(),
-            kind: 12,
-            container: None,
             file: "/project/src/util.rs".to_string(),
             line: 5,
-            deprecated: false,
         });
 
         let enrichments = vec![(&hit, Some(enrichment))];
-        let full = render_results(&enrichments, None, &fs, &test_clients(), None);
+        let full = render_results(&enrichments, &fs, None);
 
+        // Top-level atom = the full source line, no `<Kind>`.
         assert!(
-            full.starts_with("/project\n<"),
-            "no blank line between root header and definition: {full:?}"
-        );
-        assert!(
-            full.contains("<Struct> MyStruct  src/lib.rs:11"),
-            "definition with 1-based line: {full}"
+            full.starts_with("/project\nsrc/lib.rs:11  struct MyStruct {\n"),
+            "definition atom directly under root header: {full:?}"
         );
         assert!(full.contains("\tcalls:\n"), "calls header: {full}");
+        // The call target is not a top-level match and its source line is
+        // unavailable (no real file) → falls back to the edge name, 1-based.
         assert!(
-            full.contains("<Fn> helper  src/util.rs:6"),
-            "call edge with 1-based line: {full}"
+            full.contains("\t\tsrc/util.rs:6  helper"),
+            "call edge atom (citation/name fallback): {full}"
         );
+        assert!(!full.contains('<'), "no kind label anywhere: {full}");
     }
 
     #[test]
     fn render_enriched_impls_only() {
         let fs = test_fs("/project");
-        let hit = sym_hit("/project/src/lib.rs", 10, "MyTrait", "interface");
+        let hit = sym_hit(
+            "/project/src/lib.rs",
+            10,
+            "MyTrait",
+            "interface",
+            "trait MyTrait {",
+        );
         let mut enrichment = empty_enrichment();
         enrichment
             .implementations
             .push(("/project/src/impl.rs".to_string(), 30));
 
         let enrichments = vec![(&hit, Some(enrichment))];
-        let full = render_results(&enrichments, None, &fs, &test_clients(), None);
+        let full = render_results(&enrichments, &fs, None);
 
         assert!(full.contains("\timpls:\n"), "impls header: {full}");
-        assert!(full.contains("\t\tsrc/impl.rs\n"), "impl file: {full}");
-        assert!(full.contains("\t\t\t:31"), "impl 1-based line: {full}");
+        // Impl target is not a match and has no readable line → bare atom.
+        assert!(
+            full.contains("\t\tsrc/impl.rs:31"),
+            "impl edge atom 1-based: {full}"
+        );
     }
 
     #[test]
     fn render_enriched_supertypes_only() {
         let fs = test_fs("/project");
-        let hit = sym_hit("/project/src/lib.rs", 10, "MyStruct", "struct");
+        let hit = sym_hit(
+            "/project/src/lib.rs",
+            10,
+            "MyStruct",
+            "struct",
+            "struct MyStruct {",
+        );
         let mut enrichment = empty_enrichment();
         enrichment.supertypes.push(TypeEdge {
             name: "BaseTrait".to_string(),
-            kind: 11,
-            container: None,
             file: "/project/src/traits.rs".to_string(),
             line: 20,
-            deprecated: false,
         });
 
         let enrichments = vec![(&hit, Some(enrichment))];
-        let full = render_results(&enrichments, None, &fs, &test_clients(), None);
+        let full = render_results(&enrichments, &fs, None);
 
         assert!(
             full.contains("\tsupertypes:\n"),
             "supertypes header: {full}"
         );
         assert!(
-            full.contains("<Iface> BaseTrait  src/traits.rs:21"),
-            "supertype with 1-based line: {full}"
+            full.contains("\t\tsrc/traits.rs:21  BaseTrait"),
+            "supertype edge atom: {full}"
         );
+        assert!(!full.contains('<'), "no kind label: {full}");
     }
 
     #[test]
     fn render_enriched_subtypes_only() {
         let fs = test_fs("/project");
-        let hit = sym_hit("/project/src/lib.rs", 10, "MyTrait", "interface");
+        let hit = sym_hit(
+            "/project/src/lib.rs",
+            10,
+            "MyTrait",
+            "interface",
+            "trait MyTrait {",
+        );
         let mut enrichment = empty_enrichment();
         enrichment.subtypes.push(TypeEdge {
             name: "SubStruct".to_string(),
-            kind: 23,
-            container: None,
             file: "/project/src/sub.rs".to_string(),
             line: 15,
-            deprecated: false,
         });
 
         let enrichments = vec![(&hit, Some(enrichment))];
-        let full = render_results(&enrichments, None, &fs, &test_clients(), None);
+        let full = render_results(&enrichments, &fs, None);
 
         assert!(full.contains("\tsubtypes:\n"), "subtypes header: {full}");
         assert!(
-            full.contains("<Struct> SubStruct  src/sub.rs:16"),
-            "subtype with 1-based line: {full}"
+            full.contains("\t\tsrc/sub.rs:16  SubStruct"),
+            "subtype edge atom: {full}"
         );
     }
 
     #[test]
     fn render_enriched_refs_from_ref_lines_only() {
         let fs = test_fs("/project");
-        let hit = sym_hit("/project/src/lib.rs", 10, "MyStruct", "struct");
+        let hit = sym_hit(
+            "/project/src/lib.rs",
+            10,
+            "MyStruct",
+            "struct",
+            "struct MyStruct {",
+        );
         let mut enrichment = empty_enrichment();
         enrichment
             .ref_lines
             .insert("/project/src/main.rs".to_string(), HashSet::from([20]));
 
         let enrichments = vec![(&hit, Some(enrichment))];
-        let full = render_results(&enrichments, None, &fs, &test_clients(), None);
+        let full = render_results(&enrichments, &fs, None);
 
         assert!(full.contains("\trefs:\n"), "refs header: {full}");
-        assert!(full.contains("\t\tsrc/main.rs\n"), "ref file: {full}");
-        assert!(full.contains("\t\t\t:21"), "ref 1-based line: {full}");
+        assert!(
+            full.contains("\t\tsrc/main.rs:21"),
+            "ref edge atom 1-based: {full}"
+        );
     }
 
     #[test]
     fn render_enriched_refs_from_incoming_calls_only() {
         let fs = test_fs("/project");
-        let hit = sym_hit("/project/src/lib.rs", 10, "MyStruct", "struct");
+        let hit = sym_hit(
+            "/project/src/lib.rs",
+            10,
+            "MyStruct",
+            "struct",
+            "struct MyStruct {",
+        );
         let mut enrichment = empty_enrichment();
         enrichment.incoming_calls.push(CallEdge {
             name: "caller_fn".to_string(),
-            kind: 12,
-            container: None,
             file: "/project/src/caller.rs".to_string(),
             line: 50,
-            deprecated: false,
         });
 
         let enrichments = vec![(&hit, Some(enrichment))];
-        let full = render_results(&enrichments, None, &fs, &test_clients(), None);
+        let full = render_results(&enrichments, &fs, None);
 
         assert!(full.contains("\trefs:\n"), "refs header: {full}");
+        // Incoming caller is not a top-level match; no readable line → name.
         assert!(
-            full.contains("\t\tsrc/caller.rs\n"),
-            "incoming call file: {full}"
-        );
-        assert!(
-            full.contains("\t\t\t:51"),
-            "incoming call 1-based line: {full}"
+            full.contains("\t\tsrc/caller.rs:51  caller_fn"),
+            "incoming call edge atom: {full}"
         );
     }
 
     #[test]
-    fn render_cross_def_dedup_suppresses_dominated() {
+    fn render_edge_to_matched_symbol_collapses_to_citation() {
+        // A→B where B is also a top-level match: the edge to B collapses to a
+        // `path:line  name` citation (the full line is B's own atom), and B's
+        // standalone atom is rendered full. Cycles fall out the same way.
         let fs = test_fs("/project");
-        // A has outgoing call to B's location — B is dominated
-        let hit_a = sym_hit("/project/src/lib.rs", 10, "FnA", "function");
+        let hit_a = sym_hit("/project/src/lib.rs", 10, "FnA", "function", "fn FnA() {");
         let mut enrichment_a = empty_enrichment();
         enrichment_a.outgoing_calls.push(CallEdge {
             name: "FnB".to_string(),
-            kind: 12,
-            container: None,
             file: "/project/src/util.rs".to_string(),
             line: 20,
-            deprecated: false,
         });
-        // B at the dominated location, no enrichment
-        let hit_b = sym_hit("/project/src/util.rs", 20, "FnB", "function");
+        // B at the cited location, a top-level match in its own right.
+        let hit_b = sym_hit("/project/src/util.rs", 20, "FnB", "function", "fn FnB() {");
 
         let enrichments = vec![(&hit_a, Some(enrichment_a)), (&hit_b, None)];
-        let full = render_results(&enrichments, None, &fs, &test_clients(), None);
+        let full = render_results(&enrichments, &fs, None);
 
-        // A rendered as definition with calls section
+        // A's atom is full, with a calls: group.
         assert!(
-            full.contains("<Function> FnA  src/lib.rs:11"),
-            "FnA definition: {full}"
+            full.contains("src/lib.rs:11  fn FnA() {"),
+            "FnA atom full: {full}"
         );
         assert!(full.contains("\tcalls:\n"), "calls section: {full}");
-        // B suppressed as standalone definition (still in A's calls section)
-        let standalone_b = full
-            .lines()
-            .filter(|l| l.starts_with("<Function> FnB"))
-            .count();
-        assert_eq!(
-            standalone_b, 0,
-            "FnB should be suppressed as standalone: {full}"
+        // The edge to B collapses to a citation (its name), NOT its full line.
+        assert!(
+            full.contains("\t\tsrc/util.rs:21  FnB"),
+            "edge to matched B is a citation: {full}"
+        );
+        // B is ALSO a top-level atom, rendered full elsewhere.
+        assert!(
+            full.contains("src/util.rs:21  fn FnB() {"),
+            "FnB still rendered full at top level: {full}"
+        );
+    }
+
+    #[test]
+    fn cross_page_citation_is_a_resolvable_pointer() {
+        // The paging invariant (decision 024): when a definition and a citing
+        // edge land on DIFFERENT pages, the collapsed citation is still an
+        // absolute pointer to an atom rendered full elsewhere in the result —
+        // nothing is withheld. Here B's full atom and the A→B citation are
+        // forced onto separate pages by a tiny budget; both pages remain valid.
+        let fs = test_fs("/project");
+        let hit_a = sym_hit("/project/a.rs", 0, "FnA", "function", "fn FnA() {");
+        let mut enrichment_a = empty_enrichment();
+        enrichment_a.outgoing_calls.push(CallEdge {
+            name: "FnB".to_string(),
+            file: "/project/b.rs".to_string(),
+            line: 0,
+        });
+        let hit_b = sym_hit("/project/b.rs", 0, "FnB", "function", "fn FnB() {");
+
+        let enrichments = vec![(&hit_a, Some(enrichment_a)), (&hit_b, None)];
+        let full = render_results(&enrichments, &fs, None);
+
+        // The full result holds BOTH the citation and B's full atom.
+        let citation = "b.rs:1  FnB";
+        let full_atom = "b.rs:1  fn FnB() {";
+        assert!(full.contains(citation), "citation present: {full}");
+        assert!(full.contains(full_atom), "B full atom present: {full}");
+
+        // Page with a tiny budget so the citation and B's full atom are forced
+        // onto SEPARATE pages, then walk every page. Paging never withholds:
+        // the citation appears on exactly one page, the full atom on exactly
+        // one page, and across the page set BOTH survive — the citation is an
+        // absolute `path:line` pointer to a guaranteed-present atom, never a
+        // dangle, regardless of which page each lands on.
+        let mut all_pages = String::new();
+        let mut citation_pages = 0;
+        let mut full_atom_pages = 0;
+        for page in 1..=10 {
+            let rendered = paginate(&full, 24, page);
+            // Count membership on each page (the page header line is ignored).
+            if rendered.contains(citation) {
+                citation_pages += 1;
+            }
+            if rendered.contains(full_atom) {
+                full_atom_pages += 1;
+            }
+            all_pages.push_str(&rendered);
+            all_pages.push('\n');
+        }
+        // Distinct pages: the full atom (the long line) cannot fit on the same
+        // 24-char page as the citation, so they are genuinely separated.
+        assert!(
+            citation_pages >= 1 && full_atom_pages >= 1,
+            "both the citation and the full atom appear on some page: {all_pages}"
+        );
+        // Across the full page set, the citation and its target both survive —
+        // nothing withheld, the pointer resolves.
+        assert!(
+            all_pages.contains(citation) && all_pages.contains(full_atom),
+            "across all pages, citation and its target both survive: {all_pages}"
         );
     }
 
@@ -2986,13 +2579,13 @@ mod tests {
         let fs = FilesystemManager::new();
         fs.set_roots(vec![PathBuf::from("/project1"), PathBuf::from("/project2")]);
         let hits = [
-            sym_hit("/project1/src/a.rs", 5, "fn_a", "function"),
-            sym_hit("/project2/src/b.rs", 15, "fn_b", "function"),
+            sym_hit("/project1/src/a.rs", 5, "fn_a", "function", "fn fn_a() {"),
+            sym_hit("/project2/src/b.rs", 15, "fn_b", "function", "fn fn_b() {"),
         ];
 
         let enrichments: Vec<(&GrepHit, Option<SymbolEnrichment>)> =
             hits.iter().map(|h| (h, None)).collect();
-        let full = render_results(&enrichments, None, &fs, &test_clients(), None);
+        let full = render_results(&enrichments, &fs, None);
 
         assert!(!full.starts_with('\n'), "no leading newline: {full:?}");
         assert!(full.contains("/project1\n"), "first root header: {full}");
@@ -3007,13 +2600,13 @@ mod tests {
     fn render_oor_sections_separated_by_blank_line() {
         let fs = test_fs("/project");
         let hits = [
-            sym_hit("/other/dir1/a.rs", 5, "fn_a", "function"),
-            sym_hit("/other/dir2/b.rs", 15, "fn_b", "function"),
+            sym_hit("/other/dir1/a.rs", 5, "fn_a", "function", "fn fn_a() {"),
+            sym_hit("/other/dir2/b.rs", 15, "fn_b", "function", "fn fn_b() {"),
         ];
 
         let enrichments: Vec<(&GrepHit, Option<SymbolEnrichment>)> =
             hits.iter().map(|h| (h, None)).collect();
-        let full = render_results(&enrichments, None, &fs, &test_clients(), None);
+        let full = render_results(&enrichments, &fs, None);
 
         assert!(full.contains("/other/dir1\n"), "first oor parent: {full}");
         assert!(full.contains("/other/dir2\n"), "second oor parent: {full}");
@@ -3026,15 +2619,15 @@ mod tests {
     #[test]
     fn render_results_cwd_relative_paths_and_header() {
         let fs = test_fs("/project");
-        let hit = sym_hit("/project/src/lib.rs", 10, "MyStruct", "struct");
-        let enrichments: Vec<(&GrepHit, Option<SymbolEnrichment>)> = vec![(&hit, None)];
-        let full = render_results(
-            &enrichments,
-            None,
-            &fs,
-            &test_clients(),
-            Some(Path::new("/project")),
+        let hit = sym_hit(
+            "/project/src/lib.rs",
+            10,
+            "MyStruct",
+            "struct",
+            "struct MyStruct {",
         );
+        let enrichments: Vec<(&GrepHit, Option<SymbolEnrichment>)> = vec![(&hit, None)];
+        let full = render_results(&enrichments, &fs, Some(Path::new("/project")));
 
         // cwd header present with the path (inside a root: no LSP warning).
         assert!(
@@ -3043,11 +2636,10 @@ mod tests {
         );
         // Relative path used (no root grouping header)
         assert!(
-            full.contains("src/lib.rs:11"),
-            "path should be cwd-relative: {full}"
+            full.contains("src/lib.rs:11  struct MyStruct {"),
+            "path should be cwd-relative, atom is the full line: {full}"
         );
         // No root grouping header — cwd mode uses a single flat section.
-        // A standalone root header would be a line containing only the path.
         assert!(
             !full.lines().any(|l| l == "/project"),
             "should not have standalone root header in cwd mode: {full}"
@@ -3055,78 +2647,45 @@ mod tests {
     }
 
     #[test]
-    fn render_suppresses_kind_for_suppressing_language() {
-        // A `.md` definition hit: the server (`lattice`) sets
-        // `suppress_symbol_kind`, so the `<Class>` prefix must be omitted.
-        let (fs, clients) = suppressing_fs_clients("/project");
-        let hit = sym_hit("/project/doc.md", 0, "H1: Title", "class");
-        let enrichments: Vec<(&GrepHit, Option<SymbolEnrichment>)> = vec![(&hit, None)];
-        let full = render_results(&enrichments, None, &fs, &clients, None);
-
-        assert!(
-            full.contains("H1: Title  doc.md:1"),
-            "suppressing language should render the bare name: {full}"
-        );
-        assert!(
-            !full.contains("<Class>"),
-            "suppressing language must not emit <Class>: {full}"
-        );
-    }
-
-    #[test]
-    fn render_retains_kind_for_non_suppressing_language_in_mixed_section() {
-        // Same suppressing config, but a `.rs` hit is NOT markdown — its
-        // language has no binding, so the `<Function>` prefix is retained.
-        let (fs, clients) = suppressing_fs_clients("/project");
-        let md_hit = sym_hit("/project/doc.md", 0, "H1: Title", "class");
-        let rs_hit = sym_hit("/project/src/lib.rs", 9, "my_fn", "function");
-        let enrichments: Vec<(&GrepHit, Option<SymbolEnrichment>)> =
-            vec![(&md_hit, None), (&rs_hit, None)];
-        let full = render_results(&enrichments, None, &fs, &clients, None);
-
-        assert!(
-            full.contains("H1: Title  doc.md:1"),
-            "markdown hit suppressed: {full}"
-        );
-        assert!(
-            full.contains("<Function> my_fn  src/lib.rs:10"),
-            "rust hit retains kind: {full}"
-        );
-    }
-
-    #[test]
-    fn render_groups_by_symbol_name_not_matched_text() {
+    fn name_embedding_server_has_no_double_prefix() {
+        // A name-embedding server (lattice) emits headings whose source line is
+        // already clean (`# Title`). With no `<Kind>` rendered there is nothing
+        // to double-prefix (bug 29 symptom gone).
         let fs = test_fs("/project");
-        // matched_text differs from symbol.name (partial ripgrep match)
-        let hit = GrepHit {
-            file: PathBuf::from("/project/src/lib.rs"),
-            line: 10,
-            col: 0,
-            matched_text: "MyStr".to_string(),
-            classification: HitClass::Symbol {
-                symbol: Symbol {
-                    name: "MyStruct".to_string(),
-                    kind: "struct".to_string(),
-                    line: 10,
-                    end_line: 20,
-                    scope: None,
-                    scope_kind: None,
-                    deprecated: false,
-                },
-            },
-        };
-
+        let hit = sym_hit("/project/doc.md", 0, "H1: Title", "class", "# Title");
         let enrichments: Vec<(&GrepHit, Option<SymbolEnrichment>)> = vec![(&hit, None)];
-        let full = render_results(&enrichments, None, &fs, &test_clients(), None);
+        let full = render_results(&enrichments, &fs, None);
 
         assert!(
-            full.contains("<Struct> MyStruct"),
-            "should use symbol.name for display: {full}"
+            full.contains("doc.md:1  # Title"),
+            "heading atom is the clean source line: {full}"
         );
+        assert!(!full.contains('<'), "no kind label: {full}");
         assert!(
-            !full.contains("<Struct> MyStr "),
-            "should not use matched_text for display: {full}"
+            !full.contains("H1: H1:") && !full.contains("Class"),
+            "no double prefix / class label: {full}"
         );
+    }
+
+    #[test]
+    fn render_is_byte_stable_across_runs() {
+        // BTreeMap `(file, line)` ordering → reproducible bytes (decision 012).
+        let fs = test_fs("/project");
+        let hits = [
+            sym_hit("/project/src/b.rs", 4, "fn_b", "function", "fn fn_b() {"),
+            sym_hit("/project/src/a.rs", 9, "fn_a", "function", "fn fn_a() {"),
+            ref_hit("/project/src/a.rs", 2, "    // fn_a usage"),
+        ];
+        let enrichments: Vec<(&GrepHit, Option<SymbolEnrichment>)> =
+            hits.iter().map(|h| (h, None)).collect();
+        let a = render_results(&enrichments, &fs, None);
+        let b = render_results(&enrichments, &fs, None);
+        assert_eq!(a, b, "render must be byte-stable across runs");
+        // a.rs:3 (line 2) sorts before a.rs:10 (line 9), both before b.rs.
+        let a3 = a.find("a.rs:3").expect("a.rs:3 present");
+        let a10 = a.find("a.rs:10").expect("a.rs:10 present");
+        let b5 = a.find("b.rs:5").expect("b.rs:5 present");
+        assert!(a3 < a10 && a10 < b5, "atoms ordered by (file, line): {a}");
     }
 
     // ─── Paginate unit tests ──────────────────────────────────────────
@@ -3196,202 +2755,6 @@ mod tests {
         assert!(over2.contains("bbbb"), "page 2 content: {over2}");
     }
 
-    // ─── format_hit_line tests ──────────────────────────────────────────
-
-    #[test]
-    fn test_single_line_structure() {
-        // Single-line symbol (start == end) should show `:line` not `:start-end`
-        let hit = GrepHit {
-            file: PathBuf::from("/project/src/main.rs"),
-            line: 42,
-            col: 0,
-            matched_text: "CONST_VAL".to_string(),
-            classification: HitClass::Symbol {
-                symbol: Symbol {
-                    name: "CONST_VAL".to_string(),
-                    kind: "constant".to_string(),
-                    line: 42,
-                    end_line: 42, // single-line
-                    scope: None,
-                    scope_kind: None,
-                    deprecated: false,
-                },
-            },
-        };
-
-        let formatted = format_hit_line(&hit, 43, false);
-
-        // `:43 <Constant> CONST_VAL:43` — no range
-        assert!(
-            formatted.contains(":43 <Constant> CONST_VAL:43"),
-            "got: {formatted}"
-        );
-        assert!(
-            !formatted.contains('-'),
-            "single-line should not have range dash: {formatted}"
-        );
-    }
-
-    #[test]
-    fn test_multi_line_structure() {
-        let hit = GrepHit {
-            file: PathBuf::from("/project/src/main.rs"),
-            line: 10,
-            col: 0,
-            matched_text: "my_func".to_string(),
-            classification: HitClass::Symbol {
-                symbol: Symbol {
-                    name: "my_func".to_string(),
-                    kind: "function".to_string(),
-                    line: 10,
-                    end_line: 30,
-                    scope: None,
-                    scope_kind: None,
-                    deprecated: false,
-                },
-            },
-        };
-
-        let formatted = format_hit_line(&hit, 11, false);
-
-        assert!(
-            formatted.contains(":11 <Function> my_func:11-31"),
-            "got: {formatted}"
-        );
-    }
-
-    #[test]
-    fn test_scoped_symbol_path_syntax() {
-        let hit = scoped_sym_hit(
-            "/project/src/handler.rs",
-            297,
-            "handle_grep",
-            "method",
-            "LspBridgeHandler",
-            "implementation",
-        );
-
-        let formatted = format_hit_line(&hit, 298, false);
-
-        // Should use `/`-separated path syntax with scope
-        assert!(
-            formatted.contains("<Impl> LspBridgeHandler/<Method> handle_grep"),
-            "expected path syntax, got: {formatted}"
-        );
-    }
-
-    #[test]
-    fn format_hit_line_suppressed_omits_kind() {
-        // A scoped symbol hit whose name embeds structure (Lattice `H1:`).
-        let hit = scoped_sym_hit(
-            "/project/doc.md",
-            5,
-            "H2: Section",
-            "class",
-            "H1: Title",
-            "class",
-        );
-
-        let formatted = format_hit_line(&hit, 6, true);
-
-        // Both the leaf kind and the enclosing-scope kind are dropped; the
-        // scope's trailing `/` and the symbol names remain.
-        assert!(
-            formatted.contains("H1: Title/H2: Section"),
-            "suppressed hit should keep names + scope slash, drop kinds: {formatted}"
-        );
-        assert!(
-            !formatted.contains('<'),
-            "suppressed hit must not render any <Kind>: {formatted}"
-        );
-    }
-
-    // ─── split_dir_file ────────────────────────────────────────────────
-
-    #[test]
-    fn test_split_dir_file_nested() {
-        assert_eq!(
-            split_dir_file("src/bridge/handler.rs"),
-            ("src/bridge/".to_string(), "handler.rs".to_string())
-        );
-    }
-
-    #[test]
-    fn test_split_dir_file_root() {
-        assert_eq!(
-            split_dir_file("handler.rs"),
-            (String::new(), "handler.rs".to_string())
-        );
-    }
-
-    // ─── is_token_delimiter ─────────────────────────────────────────────
-
-    #[test]
-    fn token_delimiter_whitespace_and_punctuation() {
-        for &b in b" \t\n\r()[]<>{},;:.=+-*/!?&|^~#@%\"'`" {
-            assert!(
-                is_token_delimiter(b),
-                "expected delimiter for {:?}",
-                b as char
-            );
-        }
-    }
-
-    #[test]
-    fn token_delimiter_identifier_chars_are_not_delimiters() {
-        for &b in b"aZ09_" {
-            assert!(
-                !is_token_delimiter(b),
-                "expected non-delimiter for {:?}",
-                b as char
-            );
-        }
-    }
-
-    // ─── expand_match_to_token ──────────────────────────────────────────
-
-    #[test]
-    fn expand_match_mid_token() {
-        let line = b"  hello_world  ";
-        let result = expand_match_to_token(line, 3, 8);
-        assert_eq!(result.as_deref(), Some("hello_world"));
-    }
-
-    #[test]
-    fn expand_match_at_line_start() {
-        let line = b"Config = value";
-        let result = expand_match_to_token(line, 0, 3); // "Con"
-        assert_eq!(result.as_deref(), Some("Config"));
-    }
-
-    #[test]
-    fn expand_match_at_line_end() {
-        let line = b"let x = Config";
-        let result = expand_match_to_token(line, 10, 14);
-        assert_eq!(result.as_deref(), Some("Config"));
-    }
-
-    #[test]
-    fn expand_match_full_token_between_delimiters() {
-        let line = b"(Config)";
-        let result = expand_match_to_token(line, 1, 7);
-        assert_eq!(result.as_deref(), Some("Config"));
-    }
-
-    #[test]
-    fn expand_match_entire_line_is_token() {
-        let line = b"Configuration";
-        let result = expand_match_to_token(line, 0, 6); // "Config" → "Configuration"
-        assert_eq!(result.as_deref(), Some("Configuration"));
-    }
-
-    #[test]
-    fn expand_match_delimiters_on_both_sides() {
-        let line = b"foo.bar.baz";
-        let result = expand_match_to_token(line, 4, 7); // "bar"
-        assert_eq!(result.as_deref(), Some("bar"));
-    }
-
     // ─── extract_location_path ──────────────────────────────────────────
 
     #[test]
@@ -3442,7 +2805,7 @@ mod tests {
         assert_eq!(extract_start_line(&loc), None);
     }
 
-    // ─── extract_call_edge ──────────────────────────────────────────────
+    // ─── extract_call_edge (atom: name + file + line only) ──────────────
 
     #[test]
     fn extract_call_edge_full() {
@@ -3455,51 +2818,29 @@ mod tests {
         });
         let edge = extract_call_edge(&item).expect("should parse call edge");
         assert_eq!(edge.name, "my_function");
-        assert_eq!(edge.kind, 12);
-        assert_eq!(edge.container.as_deref(), Some("MyModule"));
         assert_eq!(edge.file, "/project/src/lib.rs");
         assert_eq!(edge.line, 10);
-        assert!(!edge.deprecated);
-    }
-
-    #[test]
-    fn extract_call_edge_deprecated_tag() {
-        let item = serde_json::json!({
-            "name": "old_fn",
-            "kind": 12,
-            "uri": "file:///project/src/lib.rs",
-            "range": {"start": {"line": 5, "character": 0}, "end": {"line": 5, "character": 10}},
-            "tags": [1]
-        });
-        let edge = extract_call_edge(&item).expect("should parse");
-        assert!(edge.deprecated, "tag [1] marks deprecated");
-        assert_eq!(edge.container, None);
-    }
-
-    #[test]
-    fn extract_call_edge_non_deprecated_tags() {
-        let item = serde_json::json!({
-            "name": "fn_with_tags",
-            "kind": 6,
-            "uri": "file:///project/src/lib.rs",
-            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 5}},
-            "tags": [2, 3]
-        });
-        let edge = extract_call_edge(&item).expect("should parse");
-        assert!(!edge.deprecated, "tags [2,3] are not deprecated");
     }
 
     #[test]
     fn extract_call_edge_missing_name() {
         let item = serde_json::json!({
-            "kind": 12,
             "uri": "file:///project/src/lib.rs",
             "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 5}}
         });
         assert!(extract_call_edge(&item).is_none());
     }
 
-    // ─── extract_type_edge ──────────────────────────────────────────────
+    #[test]
+    fn extract_call_edge_missing_uri() {
+        let item = serde_json::json!({
+            "name": "no_uri",
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 5}}
+        });
+        assert!(extract_call_edge(&item).is_none());
+    }
+
+    // ─── extract_type_edge (atom: name + file + line only) ──────────────
 
     #[test]
     fn extract_type_edge_full() {
@@ -3512,44 +2853,14 @@ mod tests {
         });
         let edge = extract_type_edge(&item).expect("should parse type edge");
         assert_eq!(edge.name, "MyTrait");
-        assert_eq!(edge.kind, 11);
-        assert_eq!(edge.container.as_deref(), Some("my_crate"));
         assert_eq!(edge.file, "/project/src/traits.rs");
         assert_eq!(edge.line, 20);
-        assert!(!edge.deprecated);
-    }
-
-    #[test]
-    fn extract_type_edge_deprecated_tag() {
-        let item = serde_json::json!({
-            "name": "OldType",
-            "kind": 5,
-            "uri": "file:///project/src/types.rs",
-            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 5, "character": 1}},
-            "tags": [1]
-        });
-        let edge = extract_type_edge(&item).expect("should parse");
-        assert!(edge.deprecated, "tag [1] marks deprecated");
-    }
-
-    #[test]
-    fn extract_type_edge_non_deprecated_tags() {
-        let item = serde_json::json!({
-            "name": "TypeWithTags",
-            "kind": 5,
-            "uri": "file:///project/src/types.rs",
-            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 5}},
-            "tags": [2]
-        });
-        let edge = extract_type_edge(&item).expect("should parse");
-        assert!(!edge.deprecated, "tag [2] is not deprecated");
     }
 
     #[test]
     fn extract_type_edge_missing_uri() {
         let item = serde_json::json!({
             "name": "Orphan",
-            "kind": 5,
             "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 5}}
         });
         assert!(extract_type_edge(&item).is_none());

@@ -260,37 +260,32 @@ pub(crate) struct SymbolEnrichment {
 }
 
 /// A call hierarchy edge (caller or callee).
+///
+/// In the one-atom model (decision 024) an edge is an atom: its name (for a
+/// collapsed citation) and its `(file, line)` (for the atom location). The LSP
+/// kind / container / deprecation are not rendered — the atom is the source
+/// line — so they are not carried.
 #[derive(Clone)]
 pub(crate) struct CallEdge {
-    /// Symbol name.
+    /// Symbol name — the collapsed-citation form.
     pub name: String,
-    /// LSP `SymbolKind` numeric value.
-    pub kind: u32,
-    /// Container name (enclosing scope).
-    pub container: Option<String>,
     /// File path.
     pub file: String,
     /// 0-based line number.
     pub line: u32,
-    /// Whether the symbol has a `Deprecated` tag.
-    pub deprecated: bool,
 }
 
 /// A type hierarchy edge (supertype or subtype).
+///
+/// Carries only the atom's name and `(file, line)`; see [`CallEdge`].
 #[derive(Clone)]
 pub(crate) struct TypeEdge {
-    /// Symbol name.
+    /// Symbol name — the collapsed-citation form.
     pub name: String,
-    /// LSP `SymbolKind` numeric value.
-    pub kind: u32,
-    /// Container name from LSP `detail` field.
-    pub container: Option<String>,
     /// File path.
     pub file: String,
     /// 0-based line number.
     pub line: u32,
-    /// Whether the symbol has a `Deprecated` tag.
-    pub deprecated: bool,
 }
 
 /// Workspace-wide symbol index held in memory.
@@ -1577,11 +1572,8 @@ mod tests {
             )]),
             incoming_calls: vec![super::CallEdge {
                 name: "caller".to_string(),
-                kind: 12,
-                container: None,
                 file: "/test/caller.rs".to_string(),
                 line: 5,
-                deprecated: false,
             }],
             outgoing_calls: Vec::new(),
             implementations: vec![("/test/impl.rs".to_string(), 42)],

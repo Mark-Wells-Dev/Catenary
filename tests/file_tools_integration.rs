@@ -878,20 +878,25 @@ fn test_glob_defensive_maps() -> Result<()> {
         &json!({ "paths": [dir.path().to_string_lossy().to_string()] }),
     )?;
 
-    // Big file should have a map with symbols.
+    // Big file should have a map: its declaration source lines are rendered
+    // as outline nodes, with no `<Kind>` label.
     assert!(
-        text.contains("<Function>") || text.contains("<Struct>"),
-        "Big file should have defensive map symbols: {text}"
+        text.contains("fn alpha") || text.contains("struct Gamma"),
+        "Big file should have defensive map declaration lines: {text}"
     );
-    // Small file should NOT have symbols (under threshold).
+    assert!(
+        !text.contains('<'),
+        "Outline should have no kind label: {text}"
+    );
+    // Small file should NOT have a map (under threshold): its declaration
+    // line `fn tiny` is not rendered as an outline node.
     assert!(
         text.contains(&format!("small.{MOCK_EXT}")),
         "Should list small file: {text}"
     );
-    let small_line = text.lines().find(|l| l.contains("small.")).unwrap_or("");
     assert!(
-        !small_line.contains('<'),
-        "Small file should not have symbols: {small_line}"
+        !text.contains("fn tiny"),
+        "Small file should not have an outline (under threshold): {text}"
     );
     Ok(())
 }
@@ -936,10 +941,15 @@ fn test_glob_dir_large_file_paged() -> Result<()> {
         &json!({ "paths": [dir.path().to_string_lossy().to_string()] }),
     )?;
 
-    // With stable shape, maps are always rendered and paged.
+    // With stable shape, maps are always rendered and paged: outline nodes
+    // render their declaration source lines, with no `<Kind>` label.
     assert!(
-        text.contains("<Function>") || text.contains("<Struct>"),
-        "Should show symbols in maps: {text}"
+        text.contains("fn func_") || text.contains("struct Struct_"),
+        "Should show declaration lines in maps: {text}"
+    );
+    assert!(
+        !text.contains('<'),
+        "Outline should have no kind label: {text}"
     );
     // Output should be paged since maps exceed budget.
     assert!(text.contains("[page 1/"), "Should have page header: {text}");
@@ -964,10 +974,10 @@ fn test_glob_outline_suppress() -> Result<()> {
         &json!({ "paths": [dir.path().to_string_lossy().to_string()] }),
     )?;
 
-    // Should NOT have symbol lines (denied by outline_suppress).
+    // Should NOT have outline declaration lines (denied by outline_suppress).
     assert!(
-        !text.contains("<Function>") && !text.contains("<Struct>"),
-        "Maps-denied file should not have symbols: {text}"
+        !text.contains("fn alpha") && !text.contains("fn beta"),
+        "Maps-denied file should not render its outline: {text}"
     );
     // Should have [symbols available] since grammar IS installed.
     assert!(
@@ -996,10 +1006,15 @@ fn test_glob_trailing_slash() -> Result<()> {
         &json!({ "paths": [dir.path().to_string_lossy().to_string()] }),
     )?;
 
-    // Container symbols should have trailing /.
+    // Container symbols render their declaration line with a trailing /
+    // (meaning "has children") and no `<Kind>` label.
     assert!(
-        text.contains("<Struct> Outer/"),
-        "Container should have trailing /: {text}"
+        text.contains("struct Outer {/"),
+        "Container declaration line should have trailing /: {text}"
+    );
+    assert!(
+        !text.contains('<'),
+        "Outline should have no kind label: {text}"
     );
     Ok(())
 }
@@ -1026,10 +1041,15 @@ fn test_glob_single_file_map() -> Result<()> {
         .and_then(|p| std::fs::read_to_string(p).ok())
         .unwrap_or_default();
 
-    // Single file should get a map regardless of size.
+    // Single file should get a map regardless of size: each outline node
+    // renders its declaration source line, with no `<Kind>` label.
     assert!(
-        text.contains("<Function>") || text.contains("<Struct>"),
-        "Single file should have map.\nglob output: {text}\nstderr:\n{stderr}"
+        text.contains("fn alpha") || text.contains("struct Beta"),
+        "Single file should have map declaration lines.\nglob output: {text}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !text.contains('<'),
+        "Outline should have no kind label: {text}"
     );
     assert!(text.contains("alpha"), "Should show symbol names: {text}");
     Ok(())
@@ -1050,9 +1070,10 @@ fn test_glob_single_file_denied() -> Result<()> {
         &json!({ "paths": [file.to_str().context("file path")?] }),
     )?;
 
-    // outline_suppress blocks the map even for single files.
+    // outline_suppress blocks the map even for single files: no outline
+    // declaration lines are rendered.
     assert!(
-        !text.contains("<Function>") && !text.contains("<Struct>"),
+        !text.contains("fn alpha") && !text.contains("struct Beta"),
         "Denied single file should not have map: {text}"
     );
     Ok(())
@@ -1142,16 +1163,21 @@ fn test_glob_maps_deny_partial() -> Result<()> {
         &json!({ "paths": [dir.path().to_string_lossy().to_string()] }),
     )?;
 
-    // File outside test_assets/ should have a map
+    // File outside test_assets/ should have a map: its declaration source
+    // lines are rendered as outline nodes, with no `<Kind>` label.
     assert!(
-        text.contains("allowed_fn") || text.contains("AllowedType"),
-        "File outside deny path should have map symbols: {text}"
+        text.contains("fn allowed_fn") || text.contains("struct AllowedType"),
+        "File outside deny path should have map declaration lines: {text}"
     );
-    // File inside test_assets/ should NOT have a map (denied)
-    let denied_line = text.lines().find(|l| l.contains("denied.")).unwrap_or("");
     assert!(
-        !denied_line.contains('<'),
-        "Denied file should not have map symbols: {denied_line}"
+        !text.contains('<'),
+        "Outline should have no kind label: {text}"
+    );
+    // File inside test_assets/ should NOT have a map (denied): its
+    // declaration lines are not rendered as outline nodes.
+    assert!(
+        !text.contains("fn denied_fn") && !text.contains("struct DeniedType"),
+        "Denied file should not render its outline: {text}"
     );
     Ok(())
 }
@@ -1186,15 +1212,35 @@ fn test_glob_bounding_ranges() -> Result<()> {
         &json!({ "paths": [dir.path().to_string_lossy().to_string()] }),
     )?;
 
-    // Should show "common structure" for deduplicated group
+    // Cross-file dedup (and its bounding-range collapse) is gone: each file
+    // now renders its OWN outline, so the same symbol shows up at its own
+    // 1-based declaration line per file — not folded into a shared map.
     assert!(
-        text.contains("common structure"),
-        "Should show shared map: {text}"
+        !text.contains("common structure") && !text.contains("ranges are bounding"),
+        "Cross-file dedup collapse should be gone: {text}"
     );
-    // Should note that ranges are bounding
     assert!(
-        text.contains("ranges are bounding"),
-        "Should note bounding ranges: {text}"
+        !text.contains('<'),
+        "Outline should have no kind label: {text}"
+    );
+    // Each of the three files is listed with its own outline declaration
+    // lines: `fn alpha` and `struct Beta` appear once per file.
+    for name in ["early", "late", "mid"] {
+        let file = format!("{name}.{MOCK_EXT}");
+        assert!(text.contains(&file), "Should list {file}: {text}");
+    }
+    assert_eq!(
+        text.matches("fn alpha").count(),
+        3,
+        "Each file should render its own `fn alpha` outline node: {text}"
+    );
+    // alpha sits at a different 1-based line in each file (early/mid/late),
+    // so its outline node renders at distinct line prefixes — not collapsed.
+    assert!(
+        text.contains(":1  fn alpha")
+            && text.contains(":3  fn alpha")
+            && text.contains(":5  fn alpha"),
+        "Each file's alpha should render at its own declaration line: {text}"
     );
     Ok(())
 }
@@ -1437,15 +1483,31 @@ fn test_glob_structure_dedup() -> Result<()> {
         &json!({ "paths": [dir.path().to_string_lossy().to_string()] }),
     )?;
 
-    // Should show "common structure" for deduplicated group.
+    // Cross-file dedup is gone: each identical file now renders its OWN
+    // outline of declaration source lines, independently.
     assert!(
-        text.contains("common structure"),
-        "Should show shared map: {text}"
+        !text.contains("common structure") && !text.contains("ranges are bounding"),
+        "Cross-file dedup collapse should be gone: {text}"
     );
-    // Should show "ranges are bounding" parenthetical.
     assert!(
-        text.contains("ranges are bounding"),
-        "Should note bounding ranges: {text}"
+        !text.contains('<'),
+        "Outline should have no kind label: {text}"
+    );
+    // Every file is listed with its own outline declaration lines.
+    for i in 0..5 {
+        let file = format!("proto_{i:03}.{MOCK_EXT}");
+        assert!(text.contains(&file), "Should list {file}: {text}");
+    }
+    // The shared declaration lines appear once per file (5 files).
+    assert_eq!(
+        text.matches("fn alpha").count(),
+        5,
+        "Each file should render its own `fn alpha` outline node: {text}"
+    );
+    assert_eq!(
+        text.matches("struct Beta").count(),
+        5,
+        "Each file should render its own `struct Beta` outline node: {text}"
     );
     Ok(())
 }
@@ -1473,14 +1535,27 @@ fn test_glob_dedup_mixed() -> Result<()> {
         &json!({ "paths": [dir.path().to_string_lossy().to_string()] }),
     )?;
 
-    // Should show both shared map and individual map.
+    // Cross-file dedup is gone: each formerly-deduplicated file now renders
+    // its OWN outline of declaration source lines, and the unique file
+    // renders its own — no `common structure` collapse, no `<Kind>` label.
     assert!(
-        text.contains("common structure"),
-        "Should have shared map: {text}"
+        !text.contains("common structure") && !text.contains("ranges are bounding"),
+        "Cross-file dedup collapse should be gone: {text}"
     );
     assert!(
-        text.contains("unique_func"),
-        "Should show individual map symbols: {text}"
+        !text.contains('<'),
+        "Outline should have no kind label: {text}"
+    );
+    // Each of the 3 shared files renders its own `fn alpha` outline node.
+    assert_eq!(
+        text.matches("fn alpha").count(),
+        3,
+        "Each shared file should render its own `fn alpha` outline node: {text}"
+    );
+    // The unique file renders its own distinct declaration line.
+    assert!(
+        text.contains("fn unique_func"),
+        "Should show the unique file's outline declaration line: {text}"
     );
     Ok(())
 }

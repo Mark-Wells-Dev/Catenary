@@ -38,7 +38,6 @@ args = ["lsp", "stdio"]
 [server.lattice]
 command = "lattice"
 args = ["serve"]
-suppress_symbol_kind = true
 
 [server.marksman]
 command = "marksman"
