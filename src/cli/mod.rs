@@ -29,6 +29,14 @@ pub enum HostFormat {
     Gemini,
     /// Antigravity CLI hooks (`PreToolUse` / `Stop`).
     Antigravity,
+    /// OpenCode plugin (`tool.execute.before`).
+    ///
+    /// The CLI value is `opencode` (one word) — the OpenCode plugin invokes
+    /// `catenary hook pre-tool --format=opencode`. Without this override clap's
+    /// `ValueEnum` would derive the kebab-case `open-code`, rejecting the
+    /// plugin's call.
+    #[value(name = "opencode")]
+    OpenCode,
 }
 
 impl HostFormat {
@@ -42,6 +50,7 @@ impl HostFormat {
             Self::Claude => "claude",
             Self::Gemini => "gemini",
             Self::Antigravity => "antigravity",
+            Self::OpenCode => "opencode",
         }
     }
 
@@ -51,6 +60,7 @@ impl HostFormat {
         match self {
             Self::Claude => "Read",
             Self::Gemini | Self::Antigravity => "read_file",
+            Self::OpenCode => "read",
         }
     }
 
@@ -61,6 +71,7 @@ impl HostFormat {
             Self::Claude => "Edit",
             Self::Gemini => "write_file",
             Self::Antigravity => "write_to_file",
+            Self::OpenCode => "edit",
         }
     }
 }
@@ -393,6 +404,7 @@ mod tests {
         assert_eq!(HostFormat::Claude.edit_tool(), "Edit");
         assert_eq!(HostFormat::Gemini.edit_tool(), "write_file");
         assert_eq!(HostFormat::Antigravity.edit_tool(), "write_to_file");
+        assert_eq!(HostFormat::OpenCode.edit_tool(), "edit");
     }
 
     #[test]
@@ -400,6 +412,7 @@ mod tests {
         assert_eq!(HostFormat::Claude.read_tool(), "Read");
         assert_eq!(HostFormat::Gemini.read_tool(), "read_file");
         assert_eq!(HostFormat::Antigravity.read_tool(), "read_file");
+        assert_eq!(HostFormat::OpenCode.read_tool(), "read");
     }
 
     #[test]

@@ -23,6 +23,7 @@ fn parse_host_format(s: &str) -> Option<crate::cli::HostFormat> {
         "claude" => Some(crate::cli::HostFormat::Claude),
         "gemini" => Some(crate::cli::HostFormat::Gemini),
         "antigravity" => Some(crate::cli::HostFormat::Antigravity),
+        "opencode" => Some(crate::cli::HostFormat::OpenCode),
         _ => None,
     }
 }
@@ -32,7 +33,8 @@ fn parse_host_format(s: &str) -> Option<crate::cli::HostFormat> {
 /// Returns `true` if the tool is an edit tool that requires `start_editing`.
 ///
 /// Checks all known edit tool names across host CLIs (Claude Code, Gemini CLI,
-/// and Antigravity CLI).
+/// Antigravity CLI, and OpenCode — whose built-ins are lowercase: `edit`/
+/// `write`/`patch`).
 #[must_use]
 pub fn is_edit_tool(tool_name: &str) -> bool {
     matches!(
@@ -45,19 +47,27 @@ pub fn is_edit_tool(tool_name: &str) -> bool {
             | "write_to_file"
             | "replace_file_content"
             | "multi_replace_file_content"
+            | "edit"
+            | "write"
+            | "patch"
     )
 }
 
 /// Returns `true` if the tool is a read tool (always allowed during editing).
 ///
-/// Checks all known read tool names across host CLIs.
+/// Checks all known read tool names across host CLIs (OpenCode's built-in is
+/// lowercase `read`).
 fn is_read_tool(tool_name: &str) -> bool {
-    matches!(tool_name, "Read" | "NotebookRead" | "read_file")
+    matches!(tool_name, "Read" | "NotebookRead" | "read_file" | "read")
 }
 
-/// Returns `true` if the tool is a shell tool (Bash, `run_shell_command`, or `run_command`).
+/// Returns `true` if the tool is a shell tool (`Bash`, `run_shell_command`,
+/// `run_command`, or OpenCode's lowercase `bash`).
 fn is_bash_tool(tool_name: &str) -> bool {
-    matches!(tool_name, "Bash" | "run_shell_command" | "run_command")
+    matches!(
+        tool_name,
+        "Bash" | "run_shell_command" | "run_command" | "bash"
+    )
 }
 
 /// Filesystem-manipulation commands allowed during editing mode.
@@ -670,10 +680,15 @@ mod tests {
         assert!(is_edit_tool("write_to_file"));
         assert!(is_edit_tool("replace_file_content"));
         assert!(is_edit_tool("multi_replace_file_content"));
+        // OpenCode edit tools (lowercase built-ins)
+        assert!(is_edit_tool("edit"));
+        assert!(is_edit_tool("write"));
+        assert!(is_edit_tool("patch"));
         // Non-edit tools
         assert!(!is_edit_tool("Read"));
         assert!(!is_edit_tool("Bash"));
         assert!(!is_edit_tool("grep"));
+        assert!(!is_edit_tool("read"));
     }
 
     #[test]
@@ -681,9 +696,12 @@ mod tests {
         assert!(is_read_tool("Read"));
         assert!(is_read_tool("NotebookRead"));
         assert!(is_read_tool("read_file"));
+        // OpenCode read tool (lowercase built-in)
+        assert!(is_read_tool("read"));
         assert!(!is_read_tool("Edit"));
         assert!(!is_read_tool("Bash"));
         assert!(!is_read_tool("run_command"));
+        assert!(!is_read_tool("edit"));
     }
 
     #[test]
@@ -1268,9 +1286,10 @@ mod tests {
         assert!(is_bash_tool("Bash"));
         assert!(is_bash_tool("run_shell_command"));
         assert!(is_bash_tool("run_command")); // Antigravity CLI
+        assert!(is_bash_tool("bash")); // OpenCode (lowercase built-in)
         assert!(!is_bash_tool("Edit"));
         assert!(!is_bash_tool("Read"));
-        assert!(!is_bash_tool("bash")); // case-sensitive
+        assert!(!is_bash_tool("BASH")); // case-sensitive
     }
 
     #[test]

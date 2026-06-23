@@ -175,7 +175,10 @@ fn format_deny(reason: &str, format: HostFormat) -> String {
             }
         })
         .to_string(),
-        HostFormat::Gemini | HostFormat::Antigravity => serde_json::json!({
+        // Gemini/Antigravity use `{decision: "deny", reason}`; the OpenCode
+        // plugin consumes the same shape directly (`catenary.js`), surfacing
+        // `reason` as the thrown block message.
+        HostFormat::Gemini | HostFormat::Antigravity | HostFormat::OpenCode => serde_json::json!({
             "decision": "deny",
             "reason": reason
         })
@@ -186,7 +189,10 @@ fn format_deny(reason: &str, format: HostFormat) -> String {
 /// Format a Stop/AfterAgent block response for the host CLI.
 fn format_stop_block(reason: &str, format: HostFormat) -> String {
     match format {
-        HostFormat::Claude => serde_json::json!({
+        // OpenCode registers only `tool.execute.before` (no Stop/AfterAgent
+        // surface), so this is never emitted for OpenCode; it shares Claude's
+        // `{decision: "block", reason}` shape as a safe never-reached default.
+        HostFormat::Claude | HostFormat::OpenCode => serde_json::json!({
             "decision": "block",
             "reason": reason
         })
@@ -211,6 +217,8 @@ fn extract_session_id(hook_json: &serde_json::Value, format: HostFormat) -> Opti
     match format {
         HostFormat::Claude | HostFormat::Gemini => hook_json.get("session_id"),
         HostFormat::Antigravity => hook_json.get("conversationId"),
+        // OpenCode plugin payload carries `sessionID` (`catenary.js`).
+        HostFormat::OpenCode => hook_json.get("sessionID"),
     }
     .and_then(|v| v.as_str())
 }
@@ -226,6 +234,8 @@ fn extract_cwd_str(hook_json: &serde_json::Value, format: HostFormat) -> Option<
             .and_then(|v| v.as_array())
             .and_then(|a| a.first())
             .and_then(|v| v.as_str()),
+        // OpenCode plugin payload carries `directory` (`catenary.js`).
+        HostFormat::OpenCode => hook_json.get("directory").and_then(|v| v.as_str()),
     }
 }
 
@@ -241,6 +251,10 @@ fn extract_tool_name(hook_json: &serde_json::Value, format: HostFormat) -> &str 
             .get("toolCall")
             .and_then(|tc| tc.get("name"))
             .and_then(|v| v.as_str()),
+        // OpenCode plugin forwards `input.tool` as the top-level `tool` field
+        // (`catenary.js`) — OpenCode's own lowercase tool name (`read`/`edit`/
+        // `write`/`bash`/…).
+        HostFormat::OpenCode => hook_json.get("tool").and_then(|v| v.as_str()),
     }
     .unwrap_or("")
 }
@@ -266,6 +280,12 @@ fn extract_file_path(hook_json: &serde_json::Value, format: HostFormat) -> Optio
             .get("toolCall")
             .and_then(|tc| tc.get("args"))
             .and_then(|a| a.get("TargetFile"))
+            .and_then(|fp| fp.as_str()),
+        // OpenCode forwards `output.args` under the `args` field (`catenary.js`);
+        // its `read`/`edit`/`write` tools name the target `filePath`.
+        HostFormat::OpenCode => hook_json
+            .get("args")
+            .and_then(|a| a.get("filePath"))
             .and_then(|fp| fp.as_str()),
     }?;
 
@@ -625,9 +645,12 @@ fn emit_session_start(
 /// Format a `systemMessage` for hook responses.
 fn format_system_message(msg: &str, format: HostFormat) -> String {
     match format {
-        HostFormat::Claude | HostFormat::Gemini | HostFormat::Antigravity => {
-            serde_json::json!({ "systemMessage": msg }).to_string()
-        }
+        // OpenCode reads `decision.systemMessage` (`catenary.js`) — same
+        // `{systemMessage}` shape as the other hosts.
+        HostFormat::Claude
+        | HostFormat::Gemini
+        | HostFormat::Antigravity
+        | HostFormat::OpenCode => serde_json::json!({ "systemMessage": msg }).to_string(),
     }
 }
 
@@ -1006,6 +1029,9 @@ fn extract_shell_command(
         HostFormat::Claude => tool_name == "Bash",
         HostFormat::Gemini => tool_name == "run_shell_command",
         HostFormat::Antigravity => tool_name == "run_command",
+        // OpenCode's shell tool is `bash`; its command lives in `args.command`,
+        // already covered by the `args`/`command` fallbacks below.
+        HostFormat::OpenCode => tool_name == "bash",
     };
     if !is_shell_tool {
         return None;
