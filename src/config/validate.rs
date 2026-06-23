@@ -105,6 +105,19 @@ pub fn validate(config: &Config) -> Vec<String> {
                 ));
             }
         }
+
+        // Validate diagnostic_precedence — the optional code-band regex must
+        // compile (misc 115). The advisory/authoritative source lists are
+        // free-form strings, so nothing to check there.
+        if let Some(precedence) = &server_def.diagnostic_precedence
+            && let Some(pat) = &precedence.code_pattern
+            && let Err(e) = regex::Regex::new(pat)
+        {
+            errors.push(format!(
+                "Server '{name}' has an invalid regex in \
+                 `diagnostic_precedence.code_pattern`: '{pat}' — {e}"
+            ));
+        }
     }
 
     errors

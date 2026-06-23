@@ -1929,6 +1929,11 @@ impl LspClientManager {
                 merged.settings = Some(project_settings.clone());
             }
         }
+        if project_def.diagnostic_precedence.is_some() {
+            merged
+                .diagnostic_precedence
+                .clone_from(&project_def.diagnostic_precedence);
+        }
 
         Some(merged)
     }

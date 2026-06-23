@@ -212,6 +212,7 @@ pub const SERVER_DEF_KEYS: &[&str] = &[
     "env",
     "file_patterns",
     "single_file",
+    "diagnostic_precedence",
 ];
 
 /// Deserialize a TOML source, handling the `[server.*]` / `[language.*]`

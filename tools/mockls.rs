@@ -245,6 +245,18 @@ struct Args {
     /// Used to verify that per-server `env` config reaches the process.
     #[arg(long)]
     report_env: Option<String>,
+
+    /// Publish an EXTRA diagnostic alongside the default one, with a custom
+    /// `source` and `code` (repeatable). Lets a single mockls instance emit
+    /// overlapping multi-source diagnostics — the shape rust-analyzer produces
+    /// when its native HIR analysis and flycheck both publish for one file
+    /// (misc 115, bug 42; mockls cannot reproduce RA's macro engine).
+    ///
+    /// Format: `source|code|message` (pipe-delimited). `code` may be empty.
+    /// Severity is always error (1). Example:
+    /// `--extra-diagnostic 'rust-analyzer|E0107|phantom arity error'`.
+    #[arg(long)]
+    extra_diagnostic: Vec<String>,
 }
 
 /// A JSON-RPC request.
@@ -1565,17 +1577,20 @@ impl MockServer {
             format!("mockls: mock diagnostic ({line_count} lines)")
         };
 
+        let mut items = vec![serde_json::json!({
+            "range": {
+                "start": { "line": 0, "character": 0 },
+                "end": { "line": 0, "character": 1 }
+            },
+            "severity": 2,
+            "source": "mockls",
+            "message": message
+        })];
+        items.extend(parse_extra_diagnostics(&self.args.extra_diagnostic));
+
         serde_json::json!({
             "kind": "full",
-            "items": [{
-                "range": {
-                    "start": { "line": 0, "character": 0 },
-                    "end": { "line": 0, "character": 1 }
-                },
-                "severity": 2,
-                "source": "mockls",
-                "message": message
-            }]
+            "items": items
         })
     }
 
@@ -1718,11 +1733,14 @@ impl MockServer {
         } else {
             None
         };
+        let extra = parse_extra_diagnostics(&self.args.extra_diagnostic);
 
         if delay > 0 {
             std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_millis(delay));
-                send_diagnostics_notification(&writer, &uri_owned, version, line_count, open_count);
+                send_diagnostics_notification(
+                    &writer, &uri_owned, version, line_count, open_count, &extra,
+                );
             });
         } else {
             send_diagnostics_notification(
@@ -1731,6 +1749,7 @@ impl MockServer {
                 version,
                 line_count,
                 open_count,
+                &extra,
             );
         }
     }
@@ -1802,6 +1821,7 @@ impl MockServer {
         } else {
             None
         };
+        let extra = parse_extra_diagnostics(&self.args.extra_diagnostic);
 
         std::thread::spawn(move || {
             let token = "mockls-checking";
@@ -1838,7 +1858,9 @@ impl MockServer {
             }
 
             if !no_diagnostics {
-                send_diagnostics_notification(&writer, &uri_owned, version, line_count, open_count);
+                send_diagnostics_notification(
+                    &writer, &uri_owned, version, line_count, open_count, &extra,
+                );
             }
 
             std::thread::sleep(Duration::from_millis(50));
@@ -1880,6 +1902,7 @@ impl MockServer {
         } else {
             None
         };
+        let extra = parse_extra_diagnostics(&self.args.extra_diagnostic);
 
         std::thread::spawn(move || {
             let token = "mockls-flycheck";
@@ -1929,7 +1952,9 @@ impl MockServer {
 
             // Publish diagnostics after subprocess completes
             if !no_diagnostics {
-                send_diagnostics_notification(&writer, &uri_owned, version, line_count, open_count);
+                send_diagnostics_notification(
+                    &writer, &uri_owned, version, line_count, open_count, &extra,
+                );
             }
 
             std::thread::sleep(Duration::from_millis(50));
@@ -2064,29 +2089,65 @@ fn send_message(writer: &Writer, value: &Value) {
     write_framed(writer, &json);
 }
 
+/// Parse `--extra-diagnostic 'source|code|message'` specs into diagnostic
+/// JSON objects (severity error). An empty `code` field is omitted from the
+/// object. Malformed specs (fewer than two `|`) are skipped.
+fn parse_extra_diagnostics(specs: &[String]) -> Vec<Value> {
+    specs
+        .iter()
+        .filter_map(|spec| {
+            let mut parts = spec.splitn(3, '|');
+            let source = parts.next()?;
+            let code = parts.next()?;
+            let message = parts.next()?;
+            let mut diag = serde_json::json!({
+                "range": {
+                    "start": { "line": 0, "character": 0 },
+                    "end": { "line": 0, "character": 1 }
+                },
+                "severity": 1,
+                "source": source,
+                "message": message
+            });
+            if !code.is_empty() {
+                diag["code"] = serde_json::json!(code);
+            }
+            Some(diag)
+        })
+        .collect()
+}
+
 /// Send a `publishDiagnostics` notification.
+///
+/// `extra` carries additional diagnostics (custom `source`/`code`) merged into
+/// the same per-file publish — the multi-source shape rust-analyzer produces
+/// (misc 115).
 fn send_diagnostics_notification(
     writer: &Writer,
     uri: &str,
     version: Option<i32>,
     line_count: usize,
     open_count: Option<usize>,
+    extra: &[Value],
 ) {
     let message = open_count.map_or_else(
         || format!("mockls: mock diagnostic ({line_count} lines)"),
         |n| format!("mockls: mock diagnostic ({line_count} lines, {n} open)"),
     );
+    let mut diagnostics = vec![serde_json::json!({
+        "range": {
+            "start": { "line": 0, "character": 0 },
+            "end": { "line": 0, "character": 1 }
+        },
+        "severity": 2,
+        "source": "mockls",
+        "message": message
+    })];
+    diagnostics.extend(extra.iter().cloned());
+
     let mut params = serde_json::json!({
         "uri": uri,
-        "diagnostics": [{
-            "range": {
-                "start": { "line": 0, "character": 0 },
-                "end": { "line": 0, "character": 1 }
-            },
-            "severity": 2,
-            "source": "mockls",
-            "message": message
-        }]
+        "diagnostics": diagnostics
     });
 
     if let Some(v) = version {
@@ -2484,6 +2545,7 @@ mod tests {
             stderr_message: None,
             stderr_length: None,
             report_env: None,
+            extra_diagnostic: vec![],
         }
     }
 

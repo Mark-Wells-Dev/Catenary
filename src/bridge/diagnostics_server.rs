@@ -631,6 +631,28 @@ impl DiagnosticsServer {
                 }
             };
 
+            // Source-precedence reconciliation (misc 115, bug 42). When a
+            // server publishes overlapping diagnostics from multiple `source`s
+            // (e.g. rust-analyzer's native HIR analysis alongside its flycheck
+            // = the real rustc/clippy), drop the advisory source's diagnostics
+            // in the band the authoritative source owns — but only once the
+            // authoritative source has actually reported for this file. The
+            // diagnostics here are the file's complete merged set for this
+            // server, exactly what the rule needs to test "has the
+            // authoritative source reported?". `catenary diagnostics` already
+            // waits for flycheck (bug 28), so when an authoritative report is
+            // expected it is present at this point.
+            let diagnostics = match self
+                .client_manager
+                .config()
+                .server
+                .get(&server_name)
+                .and_then(|sd| sd.diagnostic_precedence.as_ref())
+            {
+                Some(precedence) => reconcile_source_precedence(diagnostics, precedence),
+                None => diagnostics,
+            };
+
             // Apply per-server min_severity filter before quick-fix
             // collection so we don't waste code-action requests on
             // diagnostics that will be dropped.
@@ -980,6 +1002,71 @@ fn resolve_enclosing_symbols(
         .collect()
 }
 
+/// Reconciles overlapping diagnostics by their `source` (misc 115, bug 42).
+///
+/// **Generic, server-agnostic.** Given a file's complete merged diagnostic set
+/// from one server and that server's [`DiagnosticPrecedence`] policy, drops
+/// each *advisory* source's diagnostics that fall inside the band an
+/// *authoritative* source owns — but **only when the authoritative source has
+/// actually reported for this file**. Absence of an authoritative report is
+/// not contradiction: with no authoritative diagnostic present, advisory
+/// diagnostics are kept (the instant pre-flycheck preview, a single-source
+/// server). Diagnostics outside the band (an advisory source's own lints, an
+/// unresolved-import that is not a rustc-coded error) are always kept.
+///
+/// "Authoritative has reported" is gated on the *presence* of any authoritative
+/// diagnostic in this set — a clean authoritative result publishes zero
+/// diagnostics, so its silence here is indistinguishable from
+/// not-yet-reported, and we keep advisory (no over-suppression). This is the
+/// honest limit: the rule only fires when the authoritative source put at least
+/// one diagnostic on the file. For the rust-analyzer / flycheck case that holds
+/// — flycheck publishes its findings for a file it analyzed, and a native
+/// phantom E#### only matters when it claims an error flycheck did not.
+fn reconcile_source_precedence(
+    diagnostics: Vec<Value>,
+    precedence: &crate::config::DiagnosticPrecedence,
+) -> Vec<Value> {
+    // Has any authoritative source put a diagnostic on this file? Only then
+    // does an advisory source lose its band.
+    let authoritative_reported = diagnostics.iter().any(|d| {
+        d.get("source")
+            .and_then(Value::as_str)
+            .is_some_and(|s| precedence.is_authoritative(s))
+    });
+    if !authoritative_reported {
+        return diagnostics;
+    }
+
+    diagnostics
+        .into_iter()
+        .filter(|d| {
+            let source = d.get("source").and_then(Value::as_str).unwrap_or("");
+            // Only advisory diagnostics are eligible to be dropped.
+            if !precedence.is_advisory(source) {
+                return true;
+            }
+            // ...and only inside the authoritative band (by code).
+            let code = render_diagnostic_code(d.get("code"));
+            !precedence.code_in_band(&code)
+        })
+        .collect()
+}
+
+/// Renders a diagnostic's JSON `code` field to a string for band matching.
+///
+/// Mirrors the rendering [`format_diagnostics_entries`] uses: an integer code
+/// becomes its decimal form, a string code is taken as-is. A missing code is
+/// the empty string (which only matches an empty/absent band pattern).
+fn render_diagnostic_code(code: Option<&Value>) -> String {
+    code.map(|c| {
+        c.as_i64().map_or_else(
+            || c.as_str().map_or_else(|| c.to_string(), str::to_string),
+            |n| n.to_string(),
+        )
+    })
+    .unwrap_or_default()
+}
+
 /// Formats diagnostics as individual entry strings.
 ///
 /// Each entry contains the line/column, severity, message, and optional
@@ -1024,14 +1111,7 @@ pub(crate) fn format_diagnostics_entries(
             let source = d.get("source").and_then(Value::as_str);
             let source_str = source.unwrap_or("");
             let code_value = d.get("code");
-            let code = code_value
-                .map(|c| {
-                    c.as_i64().map_or_else(
-                        || c.as_str().map_or_else(|| c.to_string(), str::to_string),
-                        |n| n.to_string(),
-                    )
-                })
-                .unwrap_or_default();
+            let code = render_diagnostic_code(code_value);
 
             let diag_code = code_value.map(crate::filter::DiagnosticCode::from_value);
             let message = filter.filter_message(
@@ -1801,5 +1881,135 @@ mod tests {
         assert!(!budget_diagnostics(&diag_files, &[], 50, 1).dirty);
         // ...but dirty when the threshold is lowered to warning.
         assert!(budget_diagnostics(&diag_files, &[], 50, 2).dirty);
+    }
+
+    // ── source-precedence reconciliation tests (misc 115, bug 42) ───
+
+    /// Builds a diagnostic carrying a `source` and (optional) `code`.
+    fn src_diag(source: &str, code: Option<&str>, msg: &str) -> Value {
+        let mut d = serde_json::json!({
+            "range": {
+                "start": { "line": 0, "character": 0 },
+                "end": { "line": 0, "character": 1 }
+            },
+            "severity": 1,
+            "source": source,
+            "message": msg
+        });
+        if let Some(c) = code {
+            d["code"] = serde_json::json!(c);
+        }
+        d
+    }
+
+    /// The rust-analyzer default policy: native advisory, rustc/clippy
+    /// authoritative, scoped to the rustc `E####` band.
+    fn ra_precedence() -> crate::config::DiagnosticPrecedence {
+        let mut p = crate::config::DiagnosticPrecedence {
+            advisory_sources: vec!["rust-analyzer".to_string()],
+            authoritative_sources: vec!["rustc".to_string(), "clippy".to_string()],
+            code_pattern: Some("^E[0-9]+$".to_string()),
+            compiled_code_pattern: None,
+        };
+        p.compile().expect("compile code_pattern");
+        p
+    }
+
+    fn source_of(d: &Value) -> &str {
+        d.get("source").and_then(Value::as_str).unwrap_or("")
+    }
+
+    #[test]
+    fn precedence_drops_advisory_e_code_authoritative_did_not_corroborate() {
+        // Native E0107 phantom rides alongside a clean (different-error)
+        // flycheck result. Once flycheck has reported for the file, the
+        // native E#### is dropped — it claims a rustc error rustc didn't emit.
+        let diags = vec![
+            src_diag("rust-analyzer", Some("E0107"), "expected 0 args, found 1"),
+            src_diag("rustc", Some("E0599"), "no method named foo"),
+        ];
+        let kept = reconcile_source_precedence(diags, &ra_precedence());
+        // The native E0107 is gone; the authoritative rustc diagnostic stays.
+        assert_eq!(kept.len(), 1, "native E#### should be dropped: {kept:?}");
+        assert_eq!(source_of(&kept[0]), "rustc");
+    }
+
+    #[test]
+    fn precedence_keeps_authoritative_only_e_code() {
+        // A real rustc error with no native counterpart is kept untouched.
+        let diags = vec![src_diag("rustc", Some("E0599"), "no method named foo")];
+        let kept = reconcile_source_precedence(diags, &ra_precedence());
+        assert_eq!(kept.len(), 1);
+        assert_eq!(source_of(&kept[0]), "rustc");
+    }
+
+    #[test]
+    fn precedence_keeps_advisory_when_no_authoritative_source_present() {
+        // Single-source server case: only the advisory source reported (no
+        // flycheck stream at all). The advisory E#### is NOT over-suppressed —
+        // absence of an authoritative report is not contradiction.
+        let diags = vec![src_diag(
+            "rust-analyzer",
+            Some("E0107"),
+            "expected 0 args, found 1",
+        )];
+        let kept = reconcile_source_precedence(diags, &ra_precedence());
+        assert_eq!(
+            kept.len(),
+            1,
+            "advisory kept with no authoritative: {kept:?}"
+        );
+        assert_eq!(source_of(&kept[0]), "rust-analyzer");
+    }
+
+    #[test]
+    fn precedence_keeps_advisory_when_authoritative_not_yet_reported_for_file() {
+        // Another file's flycheck reported, but THIS file's set carries only
+        // the native preview (the authoritative source has not reported here).
+        // Since reconciliation runs per-file on the file's own merged set, the
+        // advisory E#### is kept — absence in this set is not contradiction.
+        let diags = vec![src_diag(
+            "rust-analyzer",
+            Some("E0107"),
+            "instant pre-flycheck preview",
+        )];
+        let kept = reconcile_source_precedence(diags, &ra_precedence());
+        assert_eq!(kept.len(), 1, "advisory kept pre-flycheck: {kept:?}");
+        assert_eq!(source_of(&kept[0]), "rust-analyzer");
+    }
+
+    #[test]
+    fn precedence_keeps_advisory_diagnostics_outside_the_band() {
+        // Native keeps its non-rustc value even when flycheck reported: an
+        // unresolved-import (string code) and an out-of-band native lint
+        // survive, because they fall outside the rustc-E#### band.
+        let diags = vec![
+            src_diag("rust-analyzer", Some("unresolved-import"), "no such crate"),
+            src_diag("rust-analyzer", None, "native lint without a code"),
+            src_diag("rustc", Some("E0599"), "no method named foo"),
+        ];
+        let kept = reconcile_source_precedence(diags, &ra_precedence());
+        // All three survive — only in-band advisory E#### codes are dropped.
+        assert_eq!(kept.len(), 3, "out-of-band advisory kept: {kept:?}");
+    }
+
+    #[test]
+    fn precedence_without_code_pattern_drops_all_advisory_once_authoritative_reports() {
+        // No code_pattern → the whole-diagnostic set is the band. Every
+        // advisory diagnostic is dropped once an authoritative one is present.
+        let mut p = crate::config::DiagnosticPrecedence {
+            advisory_sources: vec!["semantic".to_string()],
+            authoritative_sources: vec!["syntactic".to_string()],
+            code_pattern: None,
+            compiled_code_pattern: None,
+        };
+        p.compile().expect("compile");
+        let diags = vec![
+            src_diag("semantic", Some("anything"), "advisory"),
+            src_diag("syntactic", None, "authoritative"),
+        ];
+        let kept = reconcile_source_precedence(diags, &p);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(source_of(&kept[0]), "syntactic");
     }
 }

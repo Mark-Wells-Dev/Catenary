@@ -24,7 +24,7 @@ pub use language::{DispatchMethod, LanguageConfig, ServerBinding};
 pub use parse::{
     DEFAULT_SERVERS, ProjectConfig, SERVER_DEF_KEYS, config_sources, load_project_config,
 };
-pub use server::ServerDef;
+pub use server::{DiagnosticPrecedence, ServerDef};
 
 /// Notification delivery configuration.
 ///
@@ -1025,6 +1025,12 @@ args = ["start"]
             min_severity: Some("error".into()),
             single_file: true,
             file_patterns: vec!["*.rs".into()],
+            diagnostic_precedence: Some(crate::config::DiagnosticPrecedence {
+                advisory_sources: vec!["rust-analyzer".into()],
+                authoritative_sources: vec!["rustc".into()],
+                code_pattern: Some("^E[0-9]+$".into()),
+                compiled_code_pattern: None,
+            }),
             compiled_patterns: Vec::new(),
         };
 
