@@ -239,8 +239,19 @@ fn lex(input: &str) -> Vec<Token> {
                 tokens.push(Token::Control(Control::Newline));
                 i += 1;
             }
-            // ── Comments (only at a word boundary, outside quotes) ──────────
-            b'#' if !in_word => {
+            // ── Comments (only when `#` begins a word) ──────────────────────
+            // The shell starts a comment whenever `#` begins a word: at line
+            // start, after whitespace/newline (both reset `in_word`), or
+            // immediately after an unquoted word-terminating metacharacter. The
+            // substitution arms (`<(…)`, `$(…)`) leave `in_word` set but close on
+            // `)`, a metacharacter — so `didiff <(sort a)#<(sort)` begins a
+            // comment at the `#` (bug 40). A `#` inside quotes / after a backslash
+            // / in `$'…'` is consumed by those arms and never reaches here, so it
+            // stays literal. The metacharacter check excludes whitespace/newline:
+            // they already reset `in_word`, and a `\`-newline join leaves a stray
+            // `\n` as the previous byte while still mid-word (`cmd \<nl>#x` glues
+            // `#x` onto `cmd`).
+            b'#' if !in_word || (i > 0 && is_comment_boundary_metachar(bytes[i - 1])) => {
                 // Run to end of line; the line separator itself is emitted by
                 // the `\n` arm on the next iteration.
                 while i < n && bytes[i] != b'\n' {
@@ -363,6 +374,20 @@ fn flush_word(
         *had_quote = false;
         *in_word = false;
     }
+}
+
+/// Whether `byte` is an unquoted word-terminating metacharacter after which a
+/// `#` begins a comment (`)` `(` `;` `&` `|` `<` `>`).
+///
+/// Whitespace and newline are *excluded*: those already flush the word and
+/// reset `in_word`, so the `!in_word` gate covers them — and including the
+/// newline here would mis-fire on a `\`-newline join, whose stray `\n` precedes
+/// a `#` that is still mid-word (`cmd \<nl>#x` is one word, not a comment). In
+/// practice only a substitution-closing `)` reaches this check with `in_word`
+/// still set, but matching the full metacharacter set documents the shell rule
+/// (decision 020 §3, bug 40).
+const fn is_comment_boundary_metachar(byte: u8) -> bool {
+    matches!(byte, b')' | b'(' | b';' | b'&' | b'|' | b'<' | b'>')
 }
 
 /// Whether the `<`/`>` at index `i` is an fd-redirection context rather than a
@@ -1213,6 +1238,44 @@ mod tests {
     fn process_substitution_recurses() {
         let input = "diff <(sort a) <(sort b)";
         assert_eq!(positions(input), vec!["diff", "sort", "sort"]);
+    }
+
+    #[test]
+    fn hash_after_metacharacter_starts_comment() {
+        // Bug 40 (found by the differential fuzz oracle): a `#` glued to the `)`
+        // closing a process substitution begins a comment, exactly as the shell
+        // does — so the trailing `#<(sort)` is discarded, not parsed as a second,
+        // live process substitution. Without the fix our parser over-counts the
+        // inner `sort` a second time (`["didiff","sort","sort"]`), a false denial.
+        let input = "didiff <(sort a)#<(sort)";
+        assert_eq!(positions(input), vec!["didiff", "sort"]);
+    }
+
+    #[test]
+    fn hash_after_command_substitution_close_starts_comment() {
+        // The same rule for `$(…)`: its closing `)` is a word-terminating
+        // metacharacter, so `#bar` after it is a comment.
+        assert_eq!(positions("echo $(date)#bar"), vec!["echo", "date"]);
+    }
+
+    #[test]
+    fn hash_glued_mid_word_stays_literal() {
+        // A `#` not at a word start is ordinary text — `cmd#x` is one word, and a
+        // `#` directly after a `\`-newline join (no separating space) glues onto
+        // the word rather than starting a comment (`echo\<nl>#x` → `echo#x`).
+        assert_eq!(positions("cmd#x"), vec!["cmd#x"]);
+        let cmd = sole("echo\\\n#x");
+        assert_eq!(cmd.name.as_deref(), Some("echo#x"));
+        assert!(cmd.argv.is_empty());
+    }
+
+    #[test]
+    fn hash_inside_quotes_stays_literal() {
+        // A `#` inside single/double quotes after a metacharacter is still
+        // literal — the quote arms consume it before the comment check.
+        let cmd = sole("echo '(#)' \"a#b\"");
+        assert_eq!(cmd.name.as_deref(), Some("echo"));
+        assert_eq!(cmd.argv, vec!["(#)", "a#b"]);
     }
 
     #[test]

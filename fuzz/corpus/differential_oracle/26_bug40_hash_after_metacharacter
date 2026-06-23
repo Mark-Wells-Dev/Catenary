@@ -1,0 +1,1 @@
+didiff <(sort a)#<(sort)
