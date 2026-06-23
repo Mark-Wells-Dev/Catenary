@@ -556,6 +556,11 @@ impl Sub {
 enum Recog {
     /// An agent-facing subcommand.
     Agent(Sub),
+    /// A subcommand-less global read: `catenary --version`/`-V` or
+    /// `catenary --help`/`-h`. clap handles these globally, so they carry no
+    /// subcommand. A pure, side-effect-free introspection — no handoff, no
+    /// tracked-set interaction — so it is admitted (bug 22).
+    GlobalRead,
     /// A real catenary subcommand reserved for host hooks / interactive use.
     NotAgent,
     /// Not a recognized subcommand (typo, bare `catenary`, `$VAR`, …).
@@ -582,6 +587,13 @@ fn recognize_catenary_sub(rest: &[&str]) -> Recog {
             Some("hook" | "stop" | "debug" | "config" | "doctor" | "install" | "update" | "daemon"),
             _,
         ) => Recog::NotAgent,
+        // Subcommand-less global read: clap's `--version`/`-V` and `--help`/`-h`
+        // short-circuit before any subcommand, so they reach here only when the
+        // *first* token is the flag (the subcommand arms above already claimed
+        // `catenary grep --help` via `grep`). Placed after the subcommand arms
+        // and before the `_ => Unknown` fallthrough so everything else stays
+        // fail-closed (bug 22).
+        (Some("--version" | "-V" | "--help" | "-h"), _) => Recog::GlobalRead,
         _ => Recog::Unknown,
     }
 }
@@ -721,7 +733,7 @@ pub fn analyze_catenary_command(cmd: &str) -> CatenaryAction {
         .iter()
         .filter_map(|o| match o.recog {
             Recog::Agent(s) => Some(s),
-            Recog::NotAgent | Recog::Unknown => None,
+            Recog::GlobalRead | Recog::NotAgent | Recog::Unknown => None,
         })
         .collect();
 
@@ -782,9 +794,12 @@ const fn occ_needs_isolation(occ: &CatenaryOcc) -> bool {
             | Sub::Primer
             | Sub::Commands,
         ) => true,
-        // search (grep/glob) and the already-denied non-agent/unknown forms
-        // carry no handoff.
-        Recog::Agent(Sub::Grep | Sub::Glob) | Recog::NotAgent | Recog::Unknown => false,
+        // search (grep/glob), the subcommand-less global read, and the
+        // already-denied non-agent/unknown forms carry no handoff.
+        Recog::Agent(Sub::Grep | Sub::Glob)
+        | Recog::GlobalRead
+        | Recog::NotAgent
+        | Recog::Unknown => false,
     }
 }
 
@@ -908,6 +923,9 @@ fn catenary_occ_denial(occ: &CatenaryOcc) -> Option<String> {
     let sub = match occ.recog {
         Recog::Unknown => return Some(unknown_subcommand_denial()),
         Recog::NotAgent => return Some(not_agent_invocable_denial()),
+        // A subcommand-less global read (`--version`/`--help`) is a pure read —
+        // admit it with no output-ownership concern (bug 22).
+        Recog::GlobalRead => return None,
         Recog::Agent(s) => s,
     };
     if occ.wrapped {
@@ -3256,6 +3274,46 @@ mod tests {
     }
 
     #[test]
+    fn matcher_accepts_top_level_version_and_help() {
+        // bug 22: clap's global `--version`/`-V` and `--help`/`-h` carry no
+        // subcommand, so the canonical-form matcher must admit the subcommand-
+        // less forms as a pure read (no handoff, no isolation/redirect concern).
+        for cmd in [
+            "catenary --version",
+            "catenary -V",
+            "catenary --help",
+            "catenary -h",
+        ] {
+            assert_eq!(
+                analyze_catenary_command(cmd),
+                CatenaryAction::Allow { has_foreign: false },
+                "{cmd} should be a bare global-read allow",
+            );
+        }
+    }
+
+    #[test]
+    fn matcher_denies_unknown_top_level_flag() {
+        // bug 22 scope: only `--version`/`--help` are admitted. An unknown
+        // top-level flag with no subcommand stays fail-closed.
+        assert!(
+            deny_text("catenary --frobnicate").contains("isn't a recognized"),
+            "an unknown top-level flag must still deny",
+        );
+    }
+
+    #[test]
+    fn matcher_subcommand_help_unaffected() {
+        // bug 22 scope: subcommand-scoped help still resolves via the
+        // subcommand arm (the global-read arm sits after them), so
+        // `catenary grep --help` is a search allow, not the global read.
+        assert_eq!(
+            analyze_catenary_command("catenary grep --help"),
+            CatenaryAction::Allow { has_foreign: false },
+        );
+    }
+
+    #[test]
     fn matcher_denies_commands_pipe_and_chain() {
         // `catenary commands` is lifecycle/bare-only and owns its output.
         assert!(
@@ -3614,6 +3672,12 @@ mod tests {
             ("catenary editing stop", DenyCatenary), // retired → diagnostics
             ("catenary frobnicate", DenyCatenary),
             ("catenary daemon", DenyCatenary), // not agent-invocable
+            // ── catenary regime 1: top-level global reads (bug 22) ──
+            ("catenary --version", Allow),
+            ("catenary -V", Allow),
+            ("catenary --help", Allow),
+            ("catenary -h", Allow),
+            ("catenary --frobnicate", DenyCatenary), // unknown flag stays closed
         ];
         for (cmd, want) in cases {
             assert_eq!(&outcome(cmd, &rules), want, "outcome for {cmd:?}");
