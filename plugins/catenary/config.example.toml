@@ -103,10 +103,9 @@ servers = ["pyright"]
 #
 # Markdown defaults to Lattice (https://github.com/TwoWells/Lattice), a
 # Two Wells sibling project shipped as an LSP server. The built-in
-# [server.lattice] sets `suppress_symbol_kind = true` (Lattice embeds
-# structural context in symbol names, so the SymbolKind prefix would
-# double up in glob output). To re-enable marksman instead, bind it
-# (marksman stays defined in the built-in defaults):
+# [server.lattice] definition handles it automatically. To re-enable
+# marksman instead, bind it (marksman stays defined in the built-in
+# defaults):
 #
 # [language.markdown]
 # servers = ["marksman"]

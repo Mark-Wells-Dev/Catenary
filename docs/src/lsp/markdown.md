@@ -34,14 +34,7 @@ needed. If `lattice` is on PATH it works automatically:
 [server.lattice]
 command = "lattice"
 args = ["serve"]
-suppress_symbol_kind = true
 ```
-
-`suppress_symbol_kind = true` is set by the built-in default. Lattice embeds
-structural context in its symbol *names* (heading and link prefixes,
-`Field:` for predicates), so suppressing Catenary's own `SymbolKind` label
-avoids double-prefixing in `catenary glob` output. See
-[Suppress SymbolKind](../configuration.md#suppress-symbolkind).
 
 ### Root markers
 

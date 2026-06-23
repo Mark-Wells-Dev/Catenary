@@ -140,11 +140,6 @@
           "items": { "type": "string" },
           "description": "Glob patterns to filter which files this server handles within its language. Matched against the filename (not path). Servers without file_patterns handle all files for their language.",
           "default": []
-        },
-        "suppress_symbol_kind": {
-          "type": "boolean",
-          "description": "When true, glob output omits the SymbolKind prefix for symbols from this server. Useful for non-programming language servers where the symbol name already embeds structural context (e.g., H1:, CodeBlock:).",
-          "default": false
         }
       }
     }
