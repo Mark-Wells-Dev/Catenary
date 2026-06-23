@@ -5,7 +5,7 @@
 #   make release-major   # 0.5.5 -> 1.0.0
 #   make release V=0.6.0 # explicit version
 
-.PHONY: bench bench-test build-release check deny machete mdbook mutants mutants-stop rustdoc test test-ignored release release-patch release-minor release-major publish tag-current
+.PHONY: bench bench-test build-release check deny fuzz machete mdbook mutants mutants-stop rustdoc test test-ignored release release-patch release-minor release-major publish tag-current
 
 # Get current version from Cargo.toml
 CURRENT_VERSION := $(shell grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
@@ -79,6 +79,23 @@ deny:
 	     echo "cargo-deny segfaulted (EmbarkStudios/cargo-deny#855), retry $$tries/5..."; \
 	   fi; \
 	 done
+
+# Coverage-guided differential fuzz soak for the shell-tokenization oracle
+# (ADR 020 §6, tokenizer ticket 06). OUT-OF-BAND: needs the nightly toolchain and
+# cargo-fuzz, runs the detached `fuzz/` workspace, and is NOT part of `make check`
+# / CI-stable. Reuses the same `oracle::check()` the proptest layer drives.
+# Prereqs: `rustup toolchain install nightly` and `cargo install cargo-fuzz`.
+# Pass TARGET= to pick a fuzz target, RUNS= to bound iterations (RUNS=0 = forever).
+#   make fuzz                 # differential_oracle, 10k runs
+#   make fuzz RUNS=1000000    # longer soak
+# TRIPLE pins the build to the GNU host triple: cargo-fuzz otherwise defaults to a
+# musl target on some hosts, and the ASAN sanitizer is incompatible with musl's
+# statically linked libc. Override TRIPLE= for cross-fuzzing.
+TARGET ?= differential_oracle
+RUNS ?= 10000
+TRIPLE ?= $(shell rustc -vV | sed -n 's/host: //p')
+fuzz:
+	@cd fuzz && cargo +nightly fuzz run --target $(TRIPLE) $(TARGET) -- -runs=$(RUNS)
 
 # Run mutation testing. Expensive — use before releases, not on every commit.
 # Pass T= to scope to specific modules, e.g.: make mutants T=command_filter

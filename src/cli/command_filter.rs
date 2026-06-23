@@ -51,10 +51,14 @@ use patterns::{ECHO_SEP_RE, ENV_VAR_RE, HEREDOC_MARKER_RE, SEQ_SPLIT_RE, SUBSHEL
 pub(crate) mod parse;
 
 /// Differential fuzzing oracle (tokenizer ticket 05): `brush-parser` reference +
-/// `proptest`. Dev-only — gated `#[cfg(test)]`, so the reference parser never
-/// enters the runtime / `cargo deny` runtime graph and never ships.
-#[cfg(test)]
-mod oracle;
+/// `proptest`.
+///
+/// Dev/fuzz-only — gated `#[cfg(any(test, feature = "fuzzing"))]`, so the
+/// reference parser never enters the runtime / `cargo deny` runtime graph and
+/// never ships. The `fuzzing` feature lets the out-of-tree `fuzz/` crate
+/// (tokenizer ticket 06) reuse the same `check()` the `proptest` layer drives.
+#[cfg(any(test, feature = "fuzzing"))]
+pub mod oracle;
 
 use regex::Regex;
 

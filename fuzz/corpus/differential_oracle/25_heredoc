@@ -1,0 +1,3 @@
+cat <<EOF
+some body line with a fake ; rm -rf / inside
+EOF

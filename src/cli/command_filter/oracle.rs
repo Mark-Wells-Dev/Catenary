@@ -11,9 +11,15 @@
 //! inputs where we disagree with the shell; the known bug 11/13/17/20/30/33
 //! reproductions seed an explicit corpus as fixed regressions.
 //!
-//! The reference parser is a **dev-only** dependency — this whole module is
-//! `#[cfg(test)]`, so `brush-parser` never enters the runtime / `cargo deny`
-//! runtime graph and never ships.
+//! The reference parser is a **dev/fuzz-only** dependency — this whole module is
+//! gated `#[cfg(any(test, feature = "fuzzing"))]`, so `brush-parser` never enters
+//! the runtime / `cargo deny` runtime graph and never ships. The shared
+//! differential property [`check`] is exposed `pub` so the out-of-tree `fuzz/`
+//! crate (tokenizer ticket 06) drives the *same* oracle as the `proptest` layer —
+//! one copy of the projection + assertion logic, two harnesses (`proptest` on
+//! stable CI, `cargo-fuzz` for the nightly soak). The `proptest` strategies, the
+//! `proptest!` block, the seed corpus, and the unit tests stay `#[cfg(test)]`; the
+//! fuzz crate seeds its own on-disk corpus and supplies inputs from libFuzzer.
 //!
 //! ## Safety direction (ADR 020)
 //!
@@ -54,6 +60,7 @@
 //!   The proptest layer additionally draws only printable ASCII; the raw
 //!   control/byte tail is cargo-fuzz's job (ticket 06).
 
+#[cfg(test)]
 use proptest::prelude::{Just, Strategy, prop_oneof, proptest};
 
 use brush_parser::ast;
@@ -782,7 +789,7 @@ fn simple_has_pruned(simple: &ast::SimpleCommand) -> bool {
     prefix || suffix
 }
 
-fn prefix_or_suffix_is_pruned(item: &ast::CommandPrefixOrSuffixItem) -> bool {
+const fn prefix_or_suffix_is_pruned(item: &ast::CommandPrefixOrSuffixItem) -> bool {
     matches!(
         item,
         ast::CommandPrefixOrSuffixItem::IoRedirect(r) if io_redirect_is_pruned(r)
@@ -838,7 +845,18 @@ fn compound_has_pruned(compound: &ast::CompoundCommand) -> bool {
 ///
 /// Inputs in the pruned pathological tail ([`should_skip`]) — including those
 /// brush itself rejects — are skipped, never treated as agreement.
-fn check(input: &str) {
+///
+/// Exposed `pub` (behind the module's `any(test, feature = "fuzzing")` gate) so
+/// the out-of-tree `fuzz/` crate (tokenizer ticket 06) reuses this exact body as
+/// its libFuzzer target — no duplicated oracle logic.
+///
+/// # Panics
+///
+/// Panics (via `assert*!`) when the two parsers disagree on the gate view — a
+/// command-position or redirect-operator divergence. That panic *is* the
+/// property: under `proptest` it surfaces a shrunk counterexample, under
+/// `cargo-fuzz` a crash artifact to minimize.
+pub fn check(input: &str) {
     if should_skip(input) {
         return;
     }
@@ -936,6 +954,12 @@ fn is_redir_superset(ours: &[RedirectKind], oracle: &[RedirectKind]) -> bool {
 /// The explicit corpus: ticket 01's assert-on-value inputs plus the bug
 /// 11/13/17/20/30/33 reproductions, pinned as fixed `check()` cases so they stay
 /// permanent regressions alongside the proptest layer.
+///
+/// The same repros are mirrored as on-disk seed files under `fuzz/corpus/` (see
+/// `fuzz/README.md`) so the `cargo-fuzz` soak (tokenizer ticket 06) starts from
+/// the identical regression set. `#[cfg(test)]` because the fuzz crate reads its
+/// corpus from disk, not from this constant.
+#[cfg(test)]
 const SEED_CORPUS: &[&str] = &[
     // ── Ticket 01 assert-on-value inputs ─────────────────────────────────────
     "make test  # run it",
@@ -979,6 +1003,7 @@ const SEED_CORPUS: &[&str] = &[
 // ── proptest strategy ─────────────────────────────────────────────────────────
 
 /// A small alphabet of command-position-ish words the generator draws from.
+#[cfg(test)]
 fn word_strategy() -> impl Strategy<Value = String> {
     prop_oneof![
         Just("make".to_string()),
@@ -1008,6 +1033,7 @@ fn word_strategy() -> impl Strategy<Value = String> {
 }
 
 /// Operators / separators the generator splices between words.
+#[cfg(test)]
 fn operator_strategy() -> impl Strategy<Value = String> {
     prop_oneof![
         Just(" ".to_string()),
@@ -1024,6 +1050,7 @@ fn operator_strategy() -> impl Strategy<Value = String> {
 }
 
 /// Build a structured shell-ish input by interleaving words with operators.
+#[cfg(test)]
 fn input_strategy() -> impl Strategy<Value = String> {
     proptest::collection::vec((word_strategy(), operator_strategy()), 1..6).prop_map(|pairs| {
         let mut s = String::new();
@@ -1048,6 +1075,7 @@ fn input_strategy() -> impl Strategy<Value = String> {
 /// tokenizer — a pathological-tail artifact, not a gate-relevant difference (see
 /// the module-level divergence policy). cargo-fuzz (ticket 06) soaks the raw
 /// control/byte space separately.
+#[cfg(test)]
 fn arbitrary_shell_char() -> impl Strategy<Value = char> {
     prop_oneof![
         // Weighted toward the printable graphic range, with shell whitespace
@@ -1057,6 +1085,7 @@ fn arbitrary_shell_char() -> impl Strategy<Value = char> {
     ]
 }
 
+#[cfg(test)]
 proptest! {
     /// Structured shell-ish inputs (quotes, the `'\''` idiom, `$()`/backticks,
     /// operators, redirects, `#` comments) never make our parse disagree with

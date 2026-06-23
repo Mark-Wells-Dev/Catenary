@@ -1,0 +1,7 @@
+# cargo-fuzz build + run output. The seed `corpus/` IS committed (the permanent
+# regression set, ADR 020 §6); only the build dir, crash artifacts, the coverage
+# dir, and the per-fuzz lockfile are transient.
+target/
+artifacts/
+coverage/
+Cargo.lock

@@ -1,5 +1,11 @@
 [workspace]
 members = ["crates/catenary-proc"]
+# The cargo-fuzz crate (tokenizer ticket 06) is its own detached workspace
+# (`fuzz/Cargo.toml` declares `[workspace]`) and requires the nightly toolchain +
+# `libfuzzer-sys`. Excluded here so the stable `make check` run, `cargo deny`, and
+# `cargo machete` never descend into it — the fuzz soak is out-of-band (see
+# `fuzz/README.md` / `make fuzz`).
+exclude = ["fuzz"]
 
 [package]
 name = "catenary-mcp"
@@ -36,10 +42,25 @@ harness = false
 
 [features]
 mockls = []
+# Exposes the differential oracle (`cli::command_filter::oracle::check`) and pulls
+# in the `brush-parser` reference parse, so the out-of-tree `fuzz/` crate
+# (tokenizer ticket 06) can reuse the same `check()` the `proptest` layer drives.
+# Off by default and never enabled by the shipped build or `make check`, so
+# `brush-parser` stays out of the runtime / `cargo deny` graph. The `proptest`
+# layer reaches the oracle through `cfg(test)` instead, so stable CI needs no
+# feature flag.
+fuzzing = ["dep:brush-parser"]
 
 [dependencies]
 catenary-proc = { path = "crates/catenary-proc", version = "0.1.0" }
 anyhow = "1.0.100"
+# `brush-parser` is the bash-fidelity reference parse for the differential oracle
+# (tokenizer ticket 05). It is **optional** and only activated by the `fuzzing`
+# feature, which the shipped build and `make check` never enable — so it never
+# enters the runtime / `cargo deny` graph and never ships. The `proptest` layer
+# reaches it through the `[dev-dependencies]` copy below under `cfg(test)`; the
+# out-of-tree `fuzz/` crate reaches it through this optional dep + `fuzzing`.
+brush-parser = { version = "0.4.0", optional = true }
 bytes = "1.10"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5.54", features = ["derive"] }
@@ -75,7 +96,10 @@ uuid = { version = "1", features = ["v4"] }
 # Differential fuzzing oracle for the shell-command parser (tokenizer ticket 05).
 # `brush-parser` is the bash-fidelity reference parse; `proptest` drives the
 # stable-CI differential. Both are dev-only — they never enter the runtime /
-# `cargo deny` *runtime* graph and never ship.
+# `cargo deny` *runtime* graph and never ship. `brush-parser` is also declared as
+# an `optional` regular dependency above so the out-of-tree `fuzz/` crate can pull
+# it in via the `fuzzing` feature; this dev-dependency copy is what lets the
+# `cfg(test)` `proptest` layer reach the oracle with no feature flag.
 brush-parser = "0.4.0"
 proptest = "1.11"
 

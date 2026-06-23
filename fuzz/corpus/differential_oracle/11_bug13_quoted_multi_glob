@@ -1,0 +1,1 @@
+catenary glob 'src/**/*glob*.rs' 'src/**/grep*.rs' 'src/**/search*.rs'

@@ -1,0 +1,46 @@
+# cargo-fuzz workspace for the faithful shell-tokenization differential oracle
+# (ADR 020 §6, tokenizer ticket 06).
+#
+# This is a DETACHED workspace: the empty `[workspace]` table below makes `fuzz/`
+# its own workspace root, so the parent `catenary-mcp` workspace — and therefore
+# `make check`, `cargo deny`, and `cargo machete` on stable — never descends into
+# it (the parent also `exclude`s it explicitly). It needs the nightly toolchain
+# and is run out-of-band (`make fuzz` / see `README.md`), never in CI-stable.
+#
+# The fuzz target body IS `catenary_mcp::cli::command_filter::oracle::check` —
+# reused verbatim through the parent crate's `fuzzing` feature, so there is one
+# copy of the differential oracle, driven two ways (`proptest` on stable CI here,
+# `cargo-fuzz` for the nightly soak). `brush-parser` rides in transitively via the
+# `fuzzing` feature; it stays out of the shipped runtime / `cargo deny` graph.
+
+[package]
+name = "catenary-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "AGPL-3.0-or-later"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Detach from the parent workspace.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.catenary-mcp]
+path = ".."
+features = ["fuzzing"]
+
+# cargo-fuzz builds with debug assertions and overflow checks on even in release,
+# so the oracle's `assert*!` and any arithmetic overflow surface as crashes.
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "differential_oracle"
+path = "fuzz_targets/differential_oracle.rs"
+test = false
+doc = false
+bench = false
