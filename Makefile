@@ -106,8 +106,26 @@ fuzz:
 # concurrent tests and the unmutated baseline flakes red (e.g.
 # companions::mount_emits_debug_event_carrying_companion). nextest gives the same
 # green baseline as `make check`.
+#
+# Concurrency: cargo-mutants runs J mutant pipelines in parallel; each runs
+# nextest, which defaults to one test thread PER CORE. The real peak is the
+# PRODUCT J x TT — and each integration test spawns a daemon + mockls, so an
+# uncapped product (formerly --jobs 8 x one-thread-per-core) overflows RAM into
+# zram and thrashes. Keep J x TT at or below the core count. Override per run:
+#   make mutants T=command_filter J=4 TT=4
+# --iterate is ON by default (ITERATE ?= 1): skip mutants caught in a previous
+# run (read from the prior mutants.out) so an interrupted run resumes cheaply
+# instead of restarting. Safe on a fresh run — with nothing previously caught it
+# is a no-op and tests everything; it also accumulates caught mutants across runs.
+# Force a from-scratch run with an empty override:
+#   make mutants T=command_filter ITERATE=
+J  ?= 4
+TT ?= 4
+ITERATE ?= 1
 mutants:
-	@mkdir -p $(CURDIR)/../.catenary-mutants-tmp && ulimit -v 16777216 && TMPDIR=$$(realpath $(CURDIR)/../.catenary-mutants-tmp) cargo mutants --test-tool nextest $(if $(T),--package catenary-mcp -F $(T),) --timeout 1200 --jobs 8 --features mockls
+	@mkdir -p $(CURDIR)/../.catenary-mutants-tmp && ulimit -v 16777216 && \
+	 NEXTEST_TEST_THREADS=$(TT) TMPDIR=$$(realpath $(CURDIR)/../.catenary-mutants-tmp) \
+	 cargo mutants --test-tool nextest $(if $(T),--package catenary-mcp -F $(T),) --timeout 1200 --jobs $(J) --features mockls $(if $(ITERATE),--iterate,)
 
 # Kill a running cargo-mutants AND all its children (test binaries, mockls, etc.).
 # ALWAYS use this to stop mutation testing — NEVER `pkill cargo-mutants`, which
