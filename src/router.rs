@@ -676,10 +676,14 @@ struct HandoffContext {
 
 /// The direction-specific payload of a staged [`HandoffContext`].
 enum HandoffPayload {
-    /// `diagnostics` — *data-back*: the hook drains the accumulated set and the
-    /// `catenary diagnostics` CLI command retrieves it.
+    /// `diagnostics` — *data-back*: the hook snapshots the accumulated set and
+    /// the `catenary diagnostics` CLI command retrieves it. The accumulator is
+    /// cleared on successful *consume*, not at prepare (drain-on-consume, bug
+    /// 32): a failed attempt that never consumes leaves the set intact for a
+    /// retry, so the `editing_session`/`agent_id` key rides the handoff for the
+    /// consume step to clear the right `EditingManager` bucket.
     Diagnostics {
-        /// Accumulated files from the editing session.
+        /// Accumulated files snapshotted from the editing session.
         files: Vec<PathBuf>,
         /// Number of files skipped because they were outside tracked workspace
         /// roots (no LSP coverage).
@@ -688,6 +692,14 @@ enum HandoffPayload {
         /// diagnostics` process is identity-less, so the session id rides the
         /// handoff — the daemon names the per-session overflow file with it.
         session_id: String,
+        /// `EditingManager` session key (the raw `session_id` Option, absent →
+        /// `None`) used to clear the accumulator on consume. Distinct from the
+        /// `"default"`-fallback `session_id` above; mirrors how the prepare
+        /// snapshot was keyed.
+        editing_session: Option<String>,
+        /// Agent id used to clear the accumulator's per-agent bucket on consume
+        /// (bug 37 scoping — drain only the requesting agent's set).
+        agent_id: String,
     },
     /// `sed` — *identity-forward*: the hook (the only holder of identity for
     /// this tool-use) stages it; the `catenary sed --in-place` process connects,
@@ -2614,11 +2626,16 @@ async fn handle_hook_dispatch(
         // — and holds for milliseconds at most.
         let permit = ctx.handoff.acquire(HandoffKey::Diagnostics).await?;
 
-        // Drain this agent's accumulated files from EditingManager.
-        let (files, filtered) = router
-            .session
-            .editing
-            .drain_and_clear(editing_session, &agent_id);
+        // Snapshot this agent's accumulated files WITHOUT draining (bug 32:
+        // drain-on-consume). The `EditingManager` is cleared only when
+        // `tool/editing-stop` successfully consumes the slot — a failed or
+        // never-connecting `catenary diagnostics` (clap reject, host-killed
+        // subprocess) then leaves the set intact for a retry, instead of
+        // destroying it the instant the command is attempted. The
+        // `editing_session`/`agent_id` key rides the handoff so the consume
+        // step clears exactly this bucket.
+        let files = router.session.editing.files(editing_session, &agent_id);
+        let filtered = router.session.editing.filtered(editing_session, &agent_id);
 
         debug!(
             source = Source::DaemonDispatch.as_str(),
@@ -2626,7 +2643,7 @@ async fn handle_hook_dispatch(
             agent_id = %agent_id,
             file_count = files.len(),
             filtered,
-            "diagnostics: drained files from EditingManager",
+            "diagnostics: snapshotted files from EditingManager (clear deferred to consume)",
         );
 
         // Release the editing guardrail.
@@ -2648,6 +2665,8 @@ async fn handle_hook_dispatch(
                     files,
                     filtered,
                     session_id: session_id.clone(),
+                    editing_session: editing_session.map(str::to_string),
+                    agent_id: agent_id.clone(),
                 },
                 permit,
             },
@@ -2697,11 +2716,47 @@ async fn handle_hook_dispatch(
                     files,
                     filtered,
                     session_id,
-                } => Some((files, filtered, session_id, h.parent_id)),
+                    editing_session,
+                    agent_id,
+                } => Some((
+                    files,
+                    filtered,
+                    session_id,
+                    editing_session,
+                    agent_id,
+                    h.parent_id,
+                )),
                 // The diagnostics key only ever carries a diagnostics payload.
                 HandoffPayload::SedIdentity { .. } => None,
             }
         });
+
+        // Drain-on-consume (bug 32): the slot was just taken, so this attempt
+        // owns the round-trip. Clear the requesting agent's accumulator NOW —
+        // the prepare step only snapshotted it. A failed attempt that never
+        // reached here left the set intact; this consume is the success that
+        // earns the clear. Scoped to the requesting `(editing_session,
+        // agent_id)` bucket so a sibling agent's set survives (bug 37).
+        if let Some((_, _, session_id, editing_session, agent_id, _)) = &handoff {
+            let editing = ctx
+                .sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(session_id)
+                .map(|e| e.router.session.clone());
+            if let Some(session) = editing {
+                let (cleared, _) = session
+                    .editing
+                    .drain_and_clear(editing_session.as_deref(), agent_id);
+                debug!(
+                    source = Source::DaemonDispatch.as_str(),
+                    session_id = %session_id,
+                    agent_id = %agent_id,
+                    cleared = cleared.len(),
+                    "diagnostics: cleared accumulator on consume (drain-on-consume)",
+                );
+            }
+        }
 
         // Extract scope_id early so we can emit the incoming hook
         // event before running the diagnostics pipeline. This ensures
@@ -2709,7 +2764,7 @@ async fn handle_hook_dispatch(
         // parent_id group, making it the scope header in the TUI
         // (matching the grep/glob pattern).
         let scope_id = match &handoff {
-            Some((_, _, _, parent_id)) => parent_id.clone(),
+            Some((_, _, _, _, _, parent_id)) => parent_id.clone(),
             None => uuid::Uuid::new_v4().to_string(),
         };
 
@@ -2724,8 +2779,14 @@ async fn handle_hook_dispatch(
 
         // `dirty` drives the CLI's clean/dirty exit code (ticket 11). Faults
         // (no daemon, IPC/parse failure) are detected CLI-side and exit 2; the
-        // daemon only ever reports clean or dirty here.
-        let (dirty, output) = if let Some((files, filtered, session_id, _)) = handoff {
+        // daemon only ever reports clean or dirty here. `covered` is the count
+        // of LSP-covered files in the handoff: it lets the CLI distinguish "no
+        // edited files" (covered == 0, empty output) from a genuinely clean
+        // covered set (covered > 0, empty output) and synthesize the right
+        // sentinel (`[no edited files]` vs `[clean]`, bug 32 secondary).
+        let (dirty, output, covered) = if let Some((files, filtered, session_id, _, _, _)) = handoff
+        {
+            let covered = files.len();
             if files.is_empty() {
                 // Nothing covered to diagnose — the note (if any) stands alone.
                 // If edits were made but none had LSP coverage, the editing
@@ -2738,11 +2799,15 @@ async fn handle_hook_dispatch(
                         Some(session_id.clone()),
                     );
                 }
-                (false, with_out_of_roots_note(String::new(), filtered))
+                (
+                    false,
+                    with_out_of_roots_note(String::new(), filtered),
+                    covered,
+                )
             } else {
                 // Reflect the run on the session board: status → diagnostics
-                // for its duration (the editing accumulator already drained at
-                // the prepare step), then record the result as last_action
+                // for its duration (the editing accumulator was cleared on
+                // consume, just above), then record the result as last_action
                 // (observability ticket 05). Clone the session Arc and drop the
                 // registry lock before the await.
                 let board_session = ctx
@@ -2817,6 +2882,7 @@ async fn handle_hook_dispatch(
                 (
                     outcome.dirty,
                     with_out_of_roots_note(outcome.output, filtered),
+                    covered,
                 )
             }
         } else {
@@ -2824,6 +2890,7 @@ async fn handle_hook_dispatch(
             (
                 false,
                 "diagnostics handoff expired — no files available".to_string(),
+                0,
             )
         };
 
@@ -2838,9 +2905,14 @@ async fn handle_hook_dispatch(
 
         // Structured response so the CLI can map status → exit code while still
         // printing the diagnostics text. Mirrors the grep/glob JSON envelope.
+        // `covered` (the LSP-covered file count) lets the CLI pick the right
+        // empty-output sentinel: `[no edited files]` (covered == 0) vs `[clean]`
+        // (covered > 0) — bug 32 secondary, making "nothing to report"
+        // observable rather than a silent exit 0.
         let envelope = serde_json::json!({
             "status": if dirty { "dirty" } else { "clean" },
             "output": output,
+            "covered": covered,
         });
         let mut payload = serde_json::to_vec(&envelope)?;
         payload.push(b'\n');
@@ -5138,11 +5210,15 @@ mod tests {
 
     /// Regression guard for bug 37: two agents share one Catenary session
     /// (a subagent and the main agent, distinguished only by `agent_id`).
-    /// A `pre-tool/editing-stop` for one `agent_id` must drain ONLY that
+    /// A `catenary diagnostics` for one `agent_id` must drain ONLY that
     /// agent's accumulated set — the sibling agent's set must survive so its
     /// own later `catenary diagnostics` still reports its edits. Before the
     /// fix the drain flattened every agent's bucket, silently emptying the
     /// others.
+    ///
+    /// Post bug 32 the drain is deferred to the *consume* step
+    /// (`tool/editing-stop`), not the prepare (`pre-tool/editing-stop`): the
+    /// prepare only snapshots. So the assertion runs after the consume.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn done_editing_handoff_drains_only_requesting_agent() {
         let dir = tempfile::tempdir().expect("create tempdir");
@@ -5186,7 +5262,8 @@ mod tests {
             );
         }
 
-        // Prepare the handoff for the subagent only.
+        // Prepare the handoff for the subagent only. Post bug 32 this snapshots
+        // the subagent's set without draining it.
         let req = serde_json::json!({
             "method": "pre-tool/editing-stop",
             "agent_id": "sub-a",
@@ -5194,6 +5271,12 @@ mod tests {
         });
         let line = hook_roundtrip(&ipc_path, &req).await;
         assert!(line.contains("ok"), "prepare should succeed, got: {line}");
+
+        // Consume the handoff — this is where the drain-on-consume clear fires.
+        // The identity rides the staged payload, so the bare consume request
+        // carries none.
+        let req = serde_json::json!({"method": "tool/editing-stop"});
+        let _ = hook_roundtrip_full(&ipc_path, &req).await;
 
         // The subagent's bucket is drained; the main agent's set survives.
         {
@@ -5203,7 +5286,7 @@ mod tests {
             drop(sessions);
             assert!(
                 !router.session.editing.has_files(Some("sess-1"), "sub-a"),
-                "subagent's set should be drained after its editing-stop"
+                "subagent's set should be drained after its consume"
             );
             assert_eq!(
                 router.session.editing.files(Some("sess-1"), ""),
@@ -5211,6 +5294,140 @@ mod tests {
                 "main agent's set must survive the subagent's drain (bug 37)"
             );
         }
+
+        shutdown.cancel();
+    }
+
+    /// Core regression for bug 32: a failed `catenary diagnostics <path>`
+    /// attempt fires `pre-tool/editing-stop` (prepare) but never consumes the
+    /// slot (clap rejects it before the IPC, or the host kills the subprocess).
+    /// Post-fix the prepare only SNAPSHOTS — it no longer drains — so the
+    /// accumulated set survives the abandoned attempt, and a subsequent valid
+    /// `catenary diagnostics` still reports the edited files. Before the fix the
+    /// prepare drained on sight and the set was lost irrecoverably.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_diagnostics_attempt_preserves_edited_set() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let ipc_path = ipc_socket_in(dir.path());
+
+        let manager = Arc::new(bind_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        // Enter editing mode and accumulate a tracked file.
+        let req = serde_json::json!({
+            "method": "pre-tool/editing-start",
+            "agent_id": "",
+            "session_id": "sess-1"
+        });
+        let _ = hook_roundtrip(&ipc_path, &req).await;
+        {
+            let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
+            let sessions = ctx.sessions.lock().expect("lock");
+            let router = Arc::clone(&sessions.get("sess-1").expect("sess-1").router);
+            drop(sessions);
+            router.session.editing.add_file(
+                Some("sess-1"),
+                "",
+                std::path::PathBuf::from("/src/edited.rs"),
+            );
+        }
+
+        // The FAILED attempt: the PreToolUse hook fires prepare, but the
+        // malformed `catenary diagnostics <path>` exits before connecting, so
+        // the slot is never consumed. The set must survive.
+        let prepare = serde_json::json!({
+            "method": "pre-tool/editing-stop",
+            "agent_id": "",
+            "session_id": "sess-1"
+        });
+        let line = hook_roundtrip(&ipc_path, &prepare).await;
+        assert!(line.contains("ok"), "prepare should succeed, got: {line}");
+
+        {
+            let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
+            let sessions = ctx.sessions.lock().expect("lock");
+            let router = Arc::clone(&sessions.get("sess-1").expect("sess-1").router);
+            drop(sessions);
+            assert_eq!(
+                router.session.editing.files(Some("sess-1"), ""),
+                vec![std::path::PathBuf::from("/src/edited.rs")],
+                "snapshot prepare must NOT drain — the set survives the failed attempt (bug 32)"
+            );
+        }
+
+        // The corrective VALID attempt: prepare again (re-snapshots the still
+        // present set), then consume. The set is still reported, then cleared.
+        let line = hook_roundtrip(&ipc_path, &prepare).await;
+        assert!(
+            line.contains("ok"),
+            "second prepare should succeed, got: {line}"
+        );
+
+        let consume = serde_json::json!({"method": "tool/editing-stop"});
+        let response = hook_roundtrip_full(&ipc_path, &consume).await;
+        assert!(
+            !response.contains("handoff expired"),
+            "valid consume must find the staged files, got: {response}",
+        );
+
+        // After the successful consume the accumulator is cleared
+        // (drain-on-consume), so a third valid call reports no edited files.
+        {
+            let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
+            let sessions = ctx.sessions.lock().expect("lock");
+            let router = Arc::clone(&sessions.get("sess-1").expect("sess-1").router);
+            drop(sessions);
+            assert!(
+                !router.session.editing.has_files(Some("sess-1"), ""),
+                "consume must clear the accumulator (drain-on-consume)"
+            );
+        }
+
+        shutdown.cancel();
+    }
+
+    /// Bug 32 secondary: the consume envelope carries a `covered` file count so
+    /// the CLI can synthesize a `[no edited files]` sentinel for the 0-file
+    /// case. A consume over an empty handoff reports `covered: 0`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn done_editing_handoff_reports_covered_zero_when_empty() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let ipc_path = ipc_socket_in(dir.path());
+
+        let manager = Arc::new(bind_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        // Enter editing mode but accumulate NO files, then prepare + consume.
+        let req = serde_json::json!({
+            "method": "pre-tool/editing-start",
+            "agent_id": "",
+            "session_id": "sess-1"
+        });
+        let _ = hook_roundtrip(&ipc_path, &req).await;
+        let prepare = serde_json::json!({
+            "method": "pre-tool/editing-stop",
+            "agent_id": "",
+            "session_id": "sess-1"
+        });
+        let _ = hook_roundtrip(&ipc_path, &prepare).await;
+
+        let consume = serde_json::json!({"method": "tool/editing-stop"});
+        let response = hook_roundtrip_full(&ipc_path, &consume).await;
+        let parsed: serde_json::Value =
+            serde_json::from_str(response.trim()).expect("consume response is JSON");
+        assert_eq!(
+            parsed.get("covered").and_then(serde_json::Value::as_u64),
+            Some(0),
+            "an empty handoff reports covered: 0 for the CLI sentinel, got: {response}",
+        );
 
         shutdown.cancel();
     }
@@ -5491,6 +5708,8 @@ mod tests {
                     files: vec![PathBuf::from("/tmp/a.rs")],
                     filtered: 2,
                     session_id: "sess-1".to_string(),
+                    editing_session: Some("sess-1".to_string()),
+                    agent_id: String::new(),
                 },
                 permit,
             },
@@ -5504,11 +5723,15 @@ mod tests {
             files,
             filtered,
             session_id,
+            editing_session,
+            agent_id,
         } = &consumed.payload
         {
             assert_eq!(files, &vec![PathBuf::from("/tmp/a.rs")]);
             assert_eq!(*filtered, 2);
             assert_eq!(session_id, "sess-1");
+            assert_eq!(editing_session.as_deref(), Some("sess-1"));
+            assert_eq!(agent_id, "");
         } else {
             unreachable!("expected diagnostics payload");
         }
@@ -5551,6 +5774,8 @@ mod tests {
                     files: Vec::new(),
                     filtered: 0,
                     session_id: "x".to_string(),
+                    editing_session: Some("x".to_string()),
+                    agent_id: String::new(),
                 },
                 permit,
             },

@@ -169,11 +169,27 @@ enum Command {
     ///
     /// Runs the LSP diagnostics pipeline over every file edited since the
     /// last run: prints only the files that have errors or warnings, and
-    /// nothing when the batch is clean (the linter idiom — silent on
-    /// success, exit 0). Then resets so the next edit starts a fresh set.
-    /// Editing begins implicitly on the first edit — there is no separate
-    /// start step. Invoke via the host's shell tool.
-    Diagnostics,
+    /// nothing when a covered set is clean (the linter idiom — silent on
+    /// success, exit 0). When nothing was edited it prints `[no edited files]`
+    /// so an empty/drained set is distinguishable from a silent clean run.
+    /// Then resets so the next edit starts a fresh set. Editing begins
+    /// implicitly on the first edit — there is no separate start step. Invoke
+    /// via the host's shell tool.
+    Diagnostics {
+        /// Ignored trailing arguments.
+        ///
+        /// `catenary diagnostics` takes no arguments — it always reports the
+        /// FULL edited set, not a subset scoped to paths. Unlike every other
+        /// `catenary` file command, passing paths here is a natural mistake;
+        /// rather than a clap usage error (which would strand the staged hook
+        /// handoff and drain the edited set, bug 32), any stray args are
+        /// accepted, a note is printed to stderr, and the command proceeds as
+        /// the no-arg form. `trailing_var_arg` + `allow_hyphen_values` swallow
+        /// anything — even hyphen-led tokens — so no input reaches clap as an
+        /// unknown flag.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
+        ignored_args: Vec<String>,
+    },
 
     /// Editing mode (start). Optional — editing starts implicitly on the
     /// first edit; `catenary diagnostics` ends it and prints diagnostics.
@@ -579,7 +595,18 @@ fn main() -> Result<()> {
         #[cfg(not(unix))]
         Some(Command::Sed { .. }) => Err(anyhow::anyhow!("daemon mode requires Unix")),
         #[cfg(unix)]
-        Some(Command::Diagnostics) => {
+        Some(Command::Diagnostics { ignored_args }) => {
+            // Accept-and-warn (bug 32): `catenary diagnostics` takes no
+            // arguments, but every OTHER catenary file command does — so a stray
+            // path here is a natural fat-finger. Rather than a clap usage error
+            // (exit 2) that strands the staged hook handoff and drains the edited
+            // set, swallow the args, print an informational note to stderr making
+            // clear the paths were IGNORED and the FULL edited set was reported,
+            // then proceed exactly as the no-arg form. The exit contract is
+            // unchanged (0 clean / 1 dirty / 2 fault).
+            if !ignored_args.is_empty() {
+                eprintln!("{}", diagnostics_ignored_args_note());
+            }
             let mut out = cli::Output::stdout(false);
             // Exit-code contract (ticket 11): 0 clean / 1 dirty / 2 fault. A
             // fault (no daemon, IPC failure, malformed response) surfaces as
@@ -595,7 +622,7 @@ fn main() -> Result<()> {
             }
         }
         #[cfg(not(unix))]
-        Some(Command::Diagnostics) => Err(anyhow::anyhow!("daemon mode requires Unix")),
+        Some(Command::Diagnostics { .. }) => Err(anyhow::anyhow!("daemon mode requires Unix")),
         #[cfg(unix)]
         Some(Command::Editing { command }) => {
             let mut out = cli::Output::stdout(false);
@@ -1808,6 +1835,26 @@ async fn run_start_editing(out: &mut cli::Output) -> Result<()> {
     Ok(())
 }
 
+/// Sentinel printed when the edited set is empty (0 covered files in the
+/// handoff): "nothing to report" made observable rather than a silent exit 0.
+///
+/// This is the ONLY synthesized empty-output sentinel: a clean COVERED set stays
+/// silent (misc 111 / decision 022, the linter idiom). The sentinel exists so a
+/// drained/never-populated set is distinguishable from a clean covered run — the
+/// silent loss bug 32 surfaces.
+#[cfg(unix)]
+const NO_EDITED_FILES_SENTINEL: &str = "[no edited files]";
+
+/// The stderr note for accept-and-warn on stray `catenary diagnostics` args
+/// (bug 32). Makes explicit that the paths were IGNORED and the FULL edited set
+/// was reported, not a subset scoped to those paths — so the output can't be
+/// misread as scoped. Split out for unit testing.
+#[cfg(unix)]
+const fn diagnostics_ignored_args_note() -> &'static str {
+    "note: catenary diagnostics takes no arguments; the paths were ignored and \
+     diagnostics were reported for ALL edited files, not just those paths"
+}
+
 /// Clean/dirty outcome of `catenary diagnostics`, mapped to the process exit
 /// code by the dispatcher (`0` clean / `1` dirty). A genuine fault (no daemon,
 /// IPC failure, malformed response) propagates as `Err` and exits `2`.
@@ -1831,6 +1878,13 @@ struct DiagnosticsResponse {
     /// Rendered diagnostics preview (may include the overflow pointer line).
     #[serde(default)]
     output: String,
+    /// Count of LSP-covered files the daemon checked. Lets the CLI distinguish
+    /// the 0-file case (`[no edited files]`) from a clean covered set
+    /// (`[clean]`) when `output` is empty — bug 32 secondary. Absent on a
+    /// pre-fix daemon → defaults to 0, which collapses to the
+    /// `[no edited files]` sentinel only when output is also empty.
+    #[serde(default)]
+    covered: usize,
 }
 
 /// Implements `catenary diagnostics`: prints diagnostics for the edited
@@ -1890,7 +1944,18 @@ fn emit_diagnostics_response(out: &mut cli::Output, response: &str) -> Result<Di
         .context("invalid diagnostics response from daemon")?;
 
     let trimmed = parsed.output.trim();
-    if !trimmed.is_empty() {
+    if trimmed.is_empty() {
+        // Empty daemon output is ambiguous: it means EITHER a clean covered set
+        // OR nothing was edited (set drained / never populated). The
+        // covered-file count disambiguates them. Only the 0-file case gets a
+        // sentinel — that is the silent loss bug 32 needs to surface. A clean
+        // COVERED set stays SILENT (misc 111 / decision 022, the linter idiom):
+        // no diagnostics, no output, exit 0. Re-synthesizing `[clean]` here
+        // would reverse that deliberate decision.
+        if parsed.covered == 0 {
+            let _ = out.writeln(format_args!("{NO_EDITED_FILES_SENTINEL}"));
+        }
+    } else {
         let _ = out.writeln(format_args!("{trimmed}"));
     }
 
@@ -2216,7 +2281,28 @@ mod tests {
         use clap::Parser;
         let args = Args::try_parse_from(["catenary", "diagnostics"]);
         let args = args.expect("diagnostics should parse");
-        assert!(matches!(args.command, Some(Command::Diagnostics)));
+        let Some(Command::Diagnostics { ignored_args }) = args.command else {
+            unreachable!("expected Diagnostics");
+        };
+        assert!(
+            ignored_args.is_empty(),
+            "bare diagnostics has no trailing args"
+        );
+    }
+
+    #[test]
+    fn diagnostics_with_paths_parses_not_rejected() {
+        // Accept-and-warn (bug 32): stray paths must PARSE (no clap exit-2
+        // reject), so the command can connect + consume the staged handoff and
+        // complete the prepare→consume round-trip. The paths are captured into
+        // `ignored_args` for the stderr note.
+        use clap::Parser;
+        let args = Args::try_parse_from(["catenary", "diagnostics", "a.rs", "b.rs"])
+            .expect("stray paths must parse, not be rejected");
+        let Some(Command::Diagnostics { ignored_args }) = args.command else {
+            unreachable!("expected Diagnostics");
+        };
+        assert_eq!(ignored_args, vec!["a.rs".to_string(), "b.rs".to_string()]);
     }
 
     #[test]
@@ -2978,13 +3064,73 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn diagnostics_clean_exit_0() {
-        // Silent on clean (misc 111, linter idiom): a clean batch carries
-        // empty output and prints nothing, still exiting 0.
+        // Silent on clean (misc 111 / decision 022, the linter idiom): a clean
+        // COVERED set (covered > 0, empty output) prints NOTHING and exits 0.
+        // Bug 32's secondary fix deliberately does NOT synthesize `[clean]`
+        // here — that would reverse the silent-on-clean decision; only the
+        // 0-file case gets a sentinel.
+        let mut out = cli::Output::buffer(80);
+        let status =
+            emit_diagnostics_response(&mut out, r#"{"status":"clean","output":"","covered":3}"#)
+                .expect("clean response parses");
+        assert_eq!(status, DiagnosticsExit::Clean);
+        assert!(
+            out.into_string().is_empty(),
+            "a clean covered run must print nothing (silent on clean)",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn diagnostics_zero_files_prints_no_edited_files_sentinel() {
+        // Bug 32 secondary: the 0-file case (covered == 0, empty output) prints
+        // `[no edited files]`, distinct from a silent clean-covered run, so a
+        // drained/empty set is observable rather than a silent exit 0.
+        let mut out = cli::Output::buffer(80);
+        let status =
+            emit_diagnostics_response(&mut out, r#"{"status":"clean","output":"","covered":0}"#)
+                .expect("clean response parses");
+        assert_eq!(status, DiagnosticsExit::Clean);
+        assert_eq!(
+            out.into_string().trim(),
+            NO_EDITED_FILES_SENTINEL,
+            "the empty case must print [no edited files]",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn diagnostics_zero_files_sentinel_when_covered_absent() {
+        // A pre-fix daemon omits `covered`; it defaults to 0, so an empty-output
+        // clean response collapses to the [no edited files] sentinel rather than
+        // a silent exit 0.
         let mut out = cli::Output::buffer(80);
         let status = emit_diagnostics_response(&mut out, r#"{"status":"clean","output":""}"#)
             .expect("clean response parses");
         assert_eq!(status, DiagnosticsExit::Clean);
-        assert!(out.into_string().is_empty(), "clean run must print nothing");
+        assert_eq!(out.into_string().trim(), NO_EDITED_FILES_SENTINEL);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn diagnostics_ignored_args_note_names_full_set() {
+        // Accept-and-warn (bug 32): the note must make clear the paths were
+        // IGNORED and the FULL edited set was reported — not a subset scoped to
+        // those paths — so the output can't be misread as scoped.
+        let note = diagnostics_ignored_args_note();
+        assert!(note.starts_with("note:"), "an informational note: {note}");
+        assert!(
+            note.contains("takes no arguments"),
+            "states the command is argless: {note}",
+        );
+        assert!(
+            note.contains("ignored"),
+            "states the paths were ignored: {note}",
+        );
+        assert!(
+            note.contains("ALL edited files"),
+            "states the FULL set was reported, not a subset: {note}",
+        );
     }
 
     #[cfg(unix)]

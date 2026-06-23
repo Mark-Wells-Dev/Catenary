@@ -136,6 +136,25 @@ impl EditingManager {
             .unwrap_or_default()
     }
 
+    /// Returns the count of files skipped during accumulation for lack of LSP
+    /// coverage, without draining the editing state.
+    ///
+    /// Companion to [`files`](Self::files): together they let the
+    /// `pre-tool/editing-stop` prepare hook *snapshot* the accumulated set —
+    /// file list plus filtered count — into the handoff without clearing the
+    /// accumulator. The clear is deferred to the consume step (drain-on-consume,
+    /// bug 32), so a failed `catenary diagnostics` attempt that never consumes
+    /// leaves the set intact for a retry.
+    #[must_use]
+    pub fn filtered(&self, session_id: Option<&str>, agent_id: &str) -> usize {
+        let key = editing_key(session_id, agent_id);
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+            .map_or(0, |state| state.filtered)
+    }
+
     /// Accumulates a modified file path for an agent in editing mode.
     ///
     /// Idempotent — duplicate paths are not added.
@@ -328,6 +347,27 @@ mod tests {
     fn files_empty_when_not_editing() {
         let em = EditingManager::new();
         assert!(em.files(None, "ghost").is_empty());
+    }
+
+    #[test]
+    fn filtered_reads_count_without_draining() {
+        let em = EditingManager::new();
+        em.start_editing(None, "").expect("start");
+        em.add_file(None, "", PathBuf::from("/src/main.rs"));
+        em.increment_filtered(None, "");
+        em.increment_filtered(None, "");
+
+        assert_eq!(em.filtered(None, ""), 2);
+        // Reading the filtered count must not drain the file set.
+        assert!(em.has_files(None, ""), "filtered() must not drain");
+        // It remains readable on a repeat call (no consume).
+        assert_eq!(em.filtered(None, ""), 2);
+    }
+
+    #[test]
+    fn filtered_zero_when_not_editing() {
+        let em = EditingManager::new();
+        assert_eq!(em.filtered(None, "ghost"), 0);
     }
 
     #[test]
