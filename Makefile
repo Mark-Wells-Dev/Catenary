@@ -99,8 +99,15 @@ fuzz:
 
 # Run mutation testing. Expensive — use before releases, not on every commit.
 # Pass T= to scope to specific modules, e.g.: make mutants T=command_filter
+# Uses nextest (--test-tool nextest) to match the project's test runner. Several
+# tests capture tracing events via THREAD-LOCAL subscribers (set_default /
+# with_default) and rely on nextest's process-per-test isolation; under
+# cargo-test's shared-process threaded harness those dispatchers race across
+# concurrent tests and the unmutated baseline flakes red (e.g.
+# companions::mount_emits_debug_event_carrying_companion). nextest gives the same
+# green baseline as `make check`.
 mutants:
-	@mkdir -p $(CURDIR)/../.catenary-mutants-tmp && ulimit -v 16777216 && TMPDIR=$$(realpath $(CURDIR)/../.catenary-mutants-tmp) cargo mutants $(if $(T),--package catenary-mcp -F $(T),) --timeout 1200 --jobs 8 --features mockls
+	@mkdir -p $(CURDIR)/../.catenary-mutants-tmp && ulimit -v 16777216 && TMPDIR=$$(realpath $(CURDIR)/../.catenary-mutants-tmp) cargo mutants --test-tool nextest $(if $(T),--package catenary-mcp -F $(T),) --timeout 1200 --jobs 8 --features mockls
 
 # Kill a running cargo-mutants AND all its children (test binaries, mockls, etc.).
 # ALWAYS use this to stop mutation testing — NEVER `pkill cargo-mutants`, which
