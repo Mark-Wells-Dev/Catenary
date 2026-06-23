@@ -486,6 +486,71 @@ fn redirects_to_file(segment: &str) -> bool {
     false
 }
 
+/// Whether a [`SimpleCommand`](parse::SimpleCommand)'s redirects include a file
+/// write the gate must deny (target not a [`DEVICE_SINKS`] sink), recursing into
+/// substitutions.
+///
+/// This is the parse-driven successor of [`redirects_to_file`] (ticket 03): it
+/// reads the redirect family off the faithful parse rather than re-scanning the
+/// raw bytes, so a quoted `>` (`echo "a > b"`) is structurally not a redirect
+/// and a real redirect the byte scanner missed is now seen. It honors the wider
+/// zsh write-surface (decision 020 §8a): every MULTIOS / brace target is its own
+/// [`Redirect`] and each is gated; `>>` / `>|` / `&>` / fd-targeted `N>` all
+/// write files; `>&N` / `>&-` fd duplication / close and `>(cmd)` output process
+/// substitution are **not** file writes; and an unverifiable variable or
+/// command-substitution target (`> $f`) fails **closed** (it is not a device
+/// sink, so it denies). Redirects inside recursed `$()` / `` `…` `` / `<(…)` /
+/// `>(…)` substitutions are checked too — the old byte scanner only saw the top
+/// segment.
+fn parse_redirects_to_file(script: &parse::ParsedScript) -> bool {
+    script.pipelines.iter().any(|pipeline| {
+        pipeline.commands.iter().any(|cmd| {
+            cmd.redirects.iter().any(redirect_writes_file)
+                || cmd.substitutions.iter().any(parse_redirects_to_file)
+        })
+    })
+}
+
+/// Whether a single [`Redirect`](parse::Redirect) writes a non-device-sink file.
+///
+/// Maps the parsed operator + target to the file-write decision (decision 020
+/// §8a). Input-side operators (`<`, `<&`, `<<<`) never write. `>` / `>>` / `&>`
+/// always write a file. `>&` (`DupOut`) writes a file **only** when its target
+/// is a path: a bare fd number (`>&1`) or close (`>&-`) is a descriptor
+/// duplication, not a write. A [`DEVICE_SINKS`] target is allowed. Any other
+/// target — including an empty target (a dangling `>` or an output process
+/// substitution `> >(cmd)`, whose inner command is gated through the
+/// substitution recursion) and an unverifiable `$var` / `$(...)` target — is a
+/// deny, the fail-closed direction.
+fn redirect_writes_file(redirect: &parse::Redirect) -> bool {
+    use parse::RedirectOp;
+
+    match redirect.op {
+        // Input-side operators never write a file.
+        RedirectOp::Read | RedirectOp::DupIn | RedirectOp::HereString => false,
+        // Plain / append / combined-stream output writes a file.
+        RedirectOp::Write | RedirectOp::Append | RedirectOp::WriteBoth => {
+            !target_is_device_sink(&redirect.target)
+        }
+        // `>&word`: a bare fd number (`>&1`) or close (`>&-`) is a descriptor
+        // duplication, not a write; a path target (`>&file`) is a file write.
+        RedirectOp::DupOut => {
+            !is_fd_dup_target(&redirect.target) && !target_is_device_sink(&redirect.target)
+        }
+    }
+}
+
+/// Whether a redirect target is one of the allowed [`DEVICE_SINKS`].
+fn target_is_device_sink(target: &str) -> bool {
+    DEVICE_SINKS.contains(&target)
+}
+
+/// Whether a `>&` target is a file-descriptor duplication / close rather than a
+/// file path: an all-digit run (`2`, `10`) or a bare `-` (close).
+fn is_fd_dup_target(target: &str) -> bool {
+    target == "-" || (!target.is_empty() && target.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// Check whether a command is denied by the allowlist rules.
 ///
 /// A command is denied if:
@@ -702,10 +767,12 @@ pub fn check_command(
             // the allow/deny decision (and before the heredoc exception) so
             // neither an otherwise-allowed command nor the heredoc
             // short-circuit can carry a redirect through. Gated by
-            // `allow_file_redirects`. Ticket 03 reads this off
-            // `parsed_cmd.redirects`; until then the byte scanner runs on the
-            // raw segment (temporary overlap).
-            if !rules.allow_file_redirects && redirects_to_file(segment) {
+            // `allow_file_redirects`. Read off the faithful parse (ticket 03):
+            // the whole redirect family — every MULTIOS / brace target, `>>` /
+            // `>|` / `&>` / fd-targeted `N>`, recursed into substitutions —
+            // with fd-dup / close / `>(cmd)` excluded and an unverifiable
+            // `$var` target failing closed (decision 020 §8a).
+            if !rules.allow_file_redirects && parse_redirects_to_file(&parsed) {
                 return Some(Denial {
                     command: name.to_string(),
                     reason: DenialReason::OutputRedirect,
@@ -3384,6 +3451,81 @@ mod tests {
             msg.contains("allow_file_redirects"),
             "message names the escape hatch: {msg}",
         );
+    }
+
+    // ── Ticket-03 redirect-guard cases (parse-driven) ───────────────
+
+    #[test]
+    fn quoted_redirect_echo_allowed() {
+        // Bug 33c: the `>` lives inside a quoted argument, so the faithful
+        // parse records no redirect — `echo "a > b"` is allowed (the false
+        // positive the byte scanner produced is gone).
+        let rules = basic_rules();
+        assert!(check_command(r#"echo "a > b""#, &rules, None).is_none());
+    }
+
+    #[test]
+    fn echo_real_redirect_denied() {
+        let rules = basic_rules();
+        let denial =
+            check_command("echo hi > out.txt", &rules, None).expect("real redirect denied");
+        assert_eq!(denial.reason, DenialReason::OutputRedirect);
+    }
+
+    #[test]
+    fn echo_redirect_to_device_sink_allowed() {
+        let rules = basic_rules();
+        assert!(check_command("echo hi > /dev/null", &rules, None).is_none());
+    }
+
+    #[test]
+    fn fd_dup_and_close_allowed() {
+        // `2>&1` duplicates a descriptor and `>&-` closes one — neither writes
+        // a file, so both pass through the build tool unflagged.
+        let rules = basic_rules();
+        assert!(check_command("make test 2>&1", &rules, None).is_none());
+        assert!(check_command("make test >&-", &rules, None).is_none());
+    }
+
+    #[test]
+    fn redirect_inside_substitution_denied() {
+        // The redirect lives inside a command substitution; recursing the guard
+        // into the substitution catches it (the byte scanner only saw the top
+        // segment).
+        let rules = basic_rules();
+        let denial =
+            check_command("echo $(date > stamp)", &rules, None).expect("nested redirect denied");
+        assert_eq!(denial.reason, DenialReason::OutputRedirect);
+    }
+
+    #[test]
+    fn dup_out_to_file_target_denied() {
+        // `>&file` (a non-fd target) is the zsh/bash combined-stream file write,
+        // not a descriptor duplication — so it is a real file write (§8a).
+        let rules = basic_rules();
+        let denial =
+            check_command("make test >&out.log", &rules, None).expect("dup-to-file-target denied");
+        assert_eq!(denial.reason, DenialReason::OutputRedirect);
+    }
+
+    #[test]
+    fn multios_targets_all_gated() {
+        // MULTIOS: `> a > b` writes *both* targets — each is its own redirect
+        // and any one of them trips the guard (§8a).
+        let rules = basic_rules();
+        let denial =
+            check_command("echo hi > a > b", &rules, None).expect("multios redirect denied");
+        assert_eq!(denial.reason, DenialReason::OutputRedirect);
+    }
+
+    #[test]
+    fn variable_redirect_target_fails_closed() {
+        // `> $f` is an unverifiable target — the parser does not expand it, so it
+        // is not a device sink and the guard denies (fail closed, §8a).
+        let rules = basic_rules();
+        let denial =
+            check_command("echo hi > $f", &rules, None).expect("variable target fails closed");
+        assert_eq!(denial.reason, DenialReason::OutputRedirect);
     }
 
     // ── mask_quotes boundary tests ──────────────────────────────────
