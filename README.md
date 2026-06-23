@@ -6,6 +6,7 @@
 <img width="1280" height="640" alt="github_catenary_hero_image" src="https://github.com/user-attachments/assets/1f797daa-94bc-4ffd-bc85-f445da88d1e4" />
 
 
+
 Catenary hands an AI coding agent a small, opinionated set of
 code-intelligent commands — and a hook that keeps it on them. Reach for
 `grep` and you're redirected to `catenary grep`; reach for `sed -i` and
