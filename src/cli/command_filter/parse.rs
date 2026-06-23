@@ -43,8 +43,10 @@ use super::patterns::{ENV_VAR_RE, HEREDOC_MARKER_RE};
 /// list operators `;` `&&` `||` newline `&`.
 ///
 /// The ordering is document order; the joining operators themselves are not
-/// retained because the gate only needs the segmentation, not which operator
-/// produced it.
+/// retained — with one exception the gate needs: a pipeline terminated by a
+/// bare `&` is marked [`Pipeline::backgrounded`] (the catenary isolation /
+/// output-ownership gate denies a backgrounded catenary command, whose output
+/// would be dropped — ticket 04).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct ParsedScript {
     /// The pipelines, in document order.
@@ -58,6 +60,11 @@ pub(crate) struct ParsedScript {
 pub(crate) struct Pipeline {
     /// The simple commands, in pipeline order (position 0 is the head).
     pub(crate) commands: Vec<SimpleCommand>,
+    /// Whether this pipeline is terminated by a bare backgrounding `&`
+    /// (`cmd &`). The joining operator is otherwise not retained; this single
+    /// bit is what the catenary gate needs to deny a backgrounded invocation
+    /// (ticket 04).
+    pub(crate) backgrounded: bool,
 }
 
 /// A simple command: a command-position word, its arguments, redirections, and
@@ -549,9 +556,9 @@ fn classify_word(w: WordTok) -> Token {
 /// The reserved words that introduce or delimit compound commands. Returns the
 /// canonical static string when `text` is one of them.
 fn reserved_word(text: &str) -> Option<&'static str> {
-    const WORDS: [&str; 14] = [
-        "for", "while", "until", "if", "case", "do", "done", "then", "elif", "else", "fi", "esac",
-        "in", "{",
+    const WORDS: [&str; 15] = [
+        "for", "select", "while", "until", "if", "case", "do", "done", "then", "elif", "else",
+        "fi", "esac", "in", "{",
     ];
     WORDS.iter().copied().find(|&w| w == text)
 }
@@ -585,26 +592,43 @@ fn strip_heredoc_bodies(input: &str) -> String {
 
 /// Segment a token stream into a [`ParsedScript`]: split on list operators into
 /// pipelines, split each pipeline on `|` into simple commands, and build each
-/// command (name, argv, redirects, substitutions, compound flag).
+/// command (name, argv, redirects, substitutions, compound flag). The list
+/// operator that *terminates* each pipeline is otherwise discarded, except a
+/// bare `&` sets [`Pipeline::backgrounded`].
 fn segment(tokens: &[Token]) -> ParsedScript {
     let mut pipelines = Vec::new();
-    for pipe_tokens in split_on(tokens, |t| {
-        matches!(
-            t,
-            Token::Control(
-                Control::Semi | Control::Amp | Control::AndAnd | Control::OrOr | Control::Newline
-            )
-        )
-    }) {
+    for (pipe_tokens, sep) in split_on_list_ops(tokens) {
         if pipe_tokens.is_empty() {
             continue;
         }
-        let pipeline = build_pipeline(pipe_tokens);
-        if !pipeline.commands.is_empty() {
-            pipelines.push(pipeline);
+        let mut pipeline = build_pipeline(pipe_tokens);
+        if pipeline.commands.is_empty() {
+            continue;
         }
+        pipeline.backgrounded = sep == Some(Control::Amp);
+        pipelines.push(pipeline);
     }
     ParsedScript { pipelines }
+}
+
+/// Split a token slice on the list operators `;` `&` `&&` `||` newline,
+/// returning each segment paired with the [`Control`] operator that terminated
+/// it (`None` for the final, unterminated segment). The operator is needed so a
+/// bare `&` can mark the preceding pipeline backgrounded.
+fn split_on_list_ops(tokens: &[Token]) -> Vec<(&[Token], Option<Control>)> {
+    let mut parts = Vec::new();
+    let mut last = 0;
+    for (i, t) in tokens.iter().enumerate() {
+        if let Token::Control(
+            c @ (Control::Semi | Control::Amp | Control::AndAnd | Control::OrOr | Control::Newline),
+        ) = t
+        {
+            parts.push((&tokens[last..i], Some(*c)));
+            last = i + 1;
+        }
+    }
+    parts.push((&tokens[last..], None));
+    parts
 }
 
 /// Build a pipeline from a slice of tokens with no top-level list operators.
@@ -615,7 +639,10 @@ fn build_pipeline(tokens: &[Token]) -> Pipeline {
             commands.push(cmd);
         }
     }
-    Pipeline { commands }
+    Pipeline {
+        commands,
+        backgrounded: false,
+    }
 }
 
 /// Build a single simple command from a slice of word / redirect / reserved /
@@ -631,10 +658,23 @@ fn build_command(tokens: &[Token]) -> Option<SimpleCommand> {
     let mut idx = 0;
     while idx < tokens.len() {
         match &tokens[idx] {
+            // `for VAR in LIST` / `select VAR in LIST`: the loop variable and the
+            // iteration list are *not* command positions (only the body, after
+            // `do`, is — and `;`/newline already split it into its own segment).
+            // Sweep the words for their substitutions (`for f in $(ls)` still
+            // runs `ls` during expansion) but assign no command name, so the
+            // loop variable never reaches the allowlist (ticket 04: a `for` loop
+            // of allowlisted commands must be allowed).
+            Token::Reserved("for" | "select") => {
+                cmd.is_compound = true;
+                collect_subs_only(&tokens[idx..], &mut cmd);
+                idx = tokens.len();
+            }
             Token::Reserved(_) | Token::Paren('(') => {
-                // A reserved word or `(` in command position marks a compound;
-                // sweep the rest of the segment's words so inner command
-                // positions and substitutions are still discovered.
+                // Any other reserved word or `(` in command position marks a
+                // compound; sweep the rest of the segment's words so inner
+                // command positions (a `while`/`if` condition, a `do`/`{`/`(`
+                // body) and substitutions are still discovered.
                 cmd.is_compound = true;
                 collect_rest(&tokens[idx..], &mut words, &mut cmd);
                 idx = tokens.len();
@@ -696,6 +736,18 @@ fn collect_rest<'a>(tokens: &'a [Token], words: &mut Vec<&'a WordTok>, cmd: &mut
                 collect_subs(w, cmd);
             }
             Token::Redir(_) | Token::Reserved(_) | Token::Paren(_) | Token::Control(_) => {}
+        }
+    }
+}
+
+/// Sweep the remaining tokens of a `for`/`select` segment for *substitutions
+/// only* (`for f in $(ls)` still runs `ls` during list expansion), assigning no
+/// command name — the loop variable and the iteration words are not command
+/// positions.
+fn collect_subs_only(tokens: &[Token], cmd: &mut SimpleCommand) {
+    for tok in tokens {
+        if let Token::Word(w) = tok {
+            collect_subs(w, cmd);
         }
     }
 }
@@ -977,6 +1029,50 @@ mod tests {
         );
         // `for` never reaches command position (the bug-33 class false denial).
         assert!(!script.command_positions().contains(&"for".to_string()));
+        // The loop variable `f` is structure, not a command (ticket 04): only
+        // the body command is surfaced, so the loop of an allowlisted command
+        // is allowed rather than denied on `f`.
+        assert_eq!(script.command_positions(), vec!["git"]);
+    }
+
+    #[test]
+    fn for_loop_variable_and_list_are_not_commands() {
+        // Neither the loop variable nor the bare iteration words are command
+        // positions; only the `do` body is.
+        let input = "for cargo in build test; do echo hi; done";
+        assert_eq!(parse(input).command_positions(), vec!["echo"]);
+    }
+
+    #[test]
+    fn select_loop_variable_is_not_a_command() {
+        // `select` mirrors `for`: variable + list are structure.
+        let input = "select x in a b c; do make test; done";
+        assert_eq!(parse(input).command_positions(), vec!["make"]);
+    }
+
+    #[test]
+    fn for_iteration_list_substitution_still_runs() {
+        // A substitution in the iteration list runs during expansion, so its
+        // command position is still surfaced.
+        let input = "for f in $(rm x); do echo hi; done";
+        assert_eq!(parse(input).command_positions(), vec!["rm", "echo"]);
+    }
+
+    #[test]
+    fn trailing_amp_marks_pipeline_backgrounded() {
+        // A bare backgrounding `&` is retained as the pipeline's `backgrounded`
+        // bit (the only joining operator the parse keeps — ticket 04).
+        let script = parse("make test &");
+        assert_eq!(script.pipelines.len(), 1);
+        assert!(script.pipelines[0].backgrounded);
+        // A `;`-terminated or unterminated pipeline is not backgrounded.
+        let script = parse("make test ; cargo build");
+        assert!(script.pipelines.iter().all(|p| !p.backgrounded));
+        // In `a & b`, only the detached `a` is backgrounded.
+        let script = parse("make a & cargo b");
+        assert_eq!(script.pipelines.len(), 2);
+        assert!(script.pipelines[0].backgrounded);
+        assert!(!script.pipelines[1].backgrounded);
     }
 
     #[test]

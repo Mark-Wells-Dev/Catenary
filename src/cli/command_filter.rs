@@ -406,93 +406,13 @@ fn shell_split(s: &str) -> Vec<String> {
 /// rather than growing this set.
 const DEVICE_SINKS: [&str; 3] = ["/dev/null", "/dev/stdout", "/dev/stderr"];
 
-/// Whether a shell segment redirects output to a file target.
-///
-/// Scans the quote-masked segment for `>` redirect operators (`>`, `>>`,
-/// `1>`, `2>`, `&>`, `>|`, `>&`), so a `>` inside quotes is ignored. Two
-/// forms carry no file target and are not flagged: file-descriptor
-/// duplications (`2>&1`, `>&2`, `>&-`) and output process substitution
-/// (`>(cmd)`). The literal [`DEVICE_SINKS`] are allowed. Every other `>`
-/// pointing at a target is a file write.
-///
-/// Closes the redirection write-bypass (`bugs/11`): a redirected write skips
-/// the tracked Edit/Write path and would make the diagnostics batch lie. The
-/// target is read from the original bytes — a quoted target masks to spaces
-/// and reads as empty (or as the following operator), which denies, since a
-/// quoted redirect still writes a file and the device-sink exception is only
-/// spelled unquoted.
-fn redirects_to_file(segment: &str) -> bool {
-    let masked = mask_quotes(segment);
-    let mbytes = masked.as_bytes();
-    let bytes = segment.as_bytes();
-    let n = mbytes.len();
-    let mut i = 0;
-
-    while i < n {
-        if mbytes[i] != b'>' {
-            i += 1;
-            continue;
-        }
-
-        // Consume the operator: `>`, optional append `>`, optional clobber
-        // `|`, optional `&` (fd-dup or `>&word`).
-        let mut j = i + 1;
-        if j < n && mbytes[j] == b'>' {
-            j += 1;
-        }
-        if j < n && mbytes[j] == b'|' {
-            j += 1;
-        }
-        let amp = j < n && mbytes[j] == b'&';
-        if amp {
-            j += 1;
-        }
-
-        // `>&<digit>` / `>&-` duplicates a descriptor — no file target.
-        if amp && j < n && (mbytes[j].is_ascii_digit() || mbytes[j] == b'-') {
-            i = j;
-            continue;
-        }
-
-        // `>(cmd)` is output process substitution, not a file write.
-        if j < n && mbytes[j] == b'(' {
-            i = j;
-            continue;
-        }
-
-        // Skip whitespace between the operator and its target.
-        while j < n && (mbytes[j] == b' ' || mbytes[j] == b'\t') {
-            j += 1;
-        }
-
-        // Read the target token, stopping at whitespace or a shell operator.
-        let start = j;
-        while j < n
-            && !mbytes[j].is_ascii_whitespace()
-            && !matches!(mbytes[j], b'|' | b'<' | b'>' | b';' | b'&')
-        {
-            j += 1;
-        }
-        let target = &bytes[start..j];
-
-        if target.is_empty() || !DEVICE_SINKS.iter().any(|s| target == s.as_bytes()) {
-            return true;
-        }
-
-        // Device sink — allowed. Keep scanning for other redirects.
-        i = j;
-    }
-
-    false
-}
-
 /// Whether a [`SimpleCommand`](parse::SimpleCommand)'s redirects include a file
 /// write the gate must deny (target not a [`DEVICE_SINKS`] sink), recursing into
 /// substitutions.
 ///
-/// This is the parse-driven successor of [`redirects_to_file`] (ticket 03): it
-/// reads the redirect family off the faithful parse rather than re-scanning the
-/// raw bytes, so a quoted `>` (`echo "a > b"`) is structurally not a redirect
+/// The redirect guard reads the redirect family off the faithful parse (ticket
+/// 03) rather than re-scanning the raw bytes, so a quoted `>` (`echo "a > b"`)
+/// is structurally not a redirect
 /// and a real redirect the byte scanner missed is now seen. It honors the wider
 /// zsh write-surface (decision 020 §8a): every MULTIOS / brace target is its own
 /// [`Redirect`] and each is gated; `>>` / `>|` / `&>` / fd-targeted `N>` all
@@ -1013,36 +933,6 @@ fn recognize_catenary_sub(rest: &[&str]) -> Recog {
     }
 }
 
-/// The basename of a segment's command word (env prefix + path stripped), or
-/// `None` if the segment has no command word.
-fn segment_command_name(seg: &str) -> Option<String> {
-    let tokens = shell_split(seg);
-    let token_refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
-    let idx = find_command(&token_refs)?;
-    Some(
-        std::path::Path::new(token_refs[idx])
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(token_refs[idx])
-            .to_string(),
-    )
-}
-
-/// If `seg`'s command word is `catenary`, classify its subcommand; else `None`.
-fn recognize_segment_catenary(seg: &str) -> Option<Recog> {
-    let tokens = shell_split(seg);
-    let token_refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
-    let idx = find_command(&token_refs)?;
-    let name = std::path::Path::new(token_refs[idx])
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(token_refs[idx]);
-    if name != "catenary" {
-        return None;
-    }
-    Some(recognize_catenary_sub(&token_refs[idx + 1..]))
-}
-
 /// One recognized occurrence of a `catenary` command within a bash call, with
 /// the output-ownership context of its segment.
 #[allow(
@@ -1099,116 +989,57 @@ pub enum CatenaryAction {
     },
 }
 
-/// Recognize, classify, and validate any `catenary` command in a shell call
-/// (regime 1 of ADR 013). Pure — no IO. See [`CatenaryAction`].
+/// What the [`ParsedScript`](parse::ParsedScript) walk found: every `catenary`
+/// occurrence plus the structural facts the isolation gate needs.
+#[derive(Default)]
+struct CatenaryScan {
+    /// Every recognized `catenary` occurrence, in document order.
+    occs: Vec<CatenaryOcc>,
+    /// Top-level command positions with a command word (across all pipelines /
+    /// pipe stages, *not* counting substitution-internal ones). The isolation
+    /// gate's count of "how many commands the shell runs at this level".
+    total_top_level: usize,
+    /// A top-level foreign (non-`catenary`) command position is present.
+    has_foreign_segment: bool,
+    /// A foreign command position appears inside an arg-substitution
+    /// (`catenary grep "$(foo)"`) — permitted by hygiene but still
+    /// allowlist-checked (regime 2). Flagged so the caller runs that check even
+    /// with no top-level foreign segment.
+    inner_foreign_substitution: bool,
+    /// Any top-level segment is a compound (`for`/`while`/`if`/`{`/subshell).
+    /// A correlated catenary command inside a compound is *wrapped*, so it can
+    /// never be the canonical sole command — the under-counting hazard the
+    /// isolation gate must catch structurally (decision 020 §5/§7).
+    compound_present: bool,
+}
+
+/// Recognize, classify, and validate any `catenary` command in a shell call.
 ///
-/// The two regimes are split by correlation class: `grep`/`glob` may be `cd`-
-/// prefixed and `&&`/`;`/`||`-chained with allowlisted foreign commands;
-/// `diagnostics`/`sed`/`editing`/`roots`/`primer` must be the sole command in
-/// the call. Both classes reject pipes, file redirects, substitution-wrapping,
-/// and backgrounding. Unrecognized or non-agent subcommands are denied.
+/// Regime 1 of ADR 013, reading the faithful [`ParsedScript`](parse::parse)
+/// rather than the ad-hoc scanners (ticket 04). Pure — no IO. See
+/// [`CatenaryAction`].
+///
+/// The two regimes are split by correlation class: `grep`/`glob`/`sed`-preview
+/// carry no hook→IPC handoff, so they may be `cd`-prefixed and `&&`/`;`/`||`-
+/// chained with allowlisted foreign commands, any count. The correlated, load-
+/// bearing commands — `catenary diagnostics` and `catenary sed --in-place` —
+/// take the handoff and must therefore be the *sole* command of the whole
+/// script: a non-isolated invocation (`sleep 100; catenary diagnostics`, or a
+/// `for`-loop body) would wedge the daemon (decision 020 §5). That gate is
+/// **structural** — it counts the parse's command positions and inspects its
+/// compound flag, never a substring scan, so an under-counted separator can
+/// never mistake a chained command for isolated. Both classes also reject pipes,
+/// file redirects, substitution-wrapping, and backgrounding. Unrecognized or
+/// non-agent subcommands are denied.
 #[must_use]
-#[allow(
-    clippy::too_many_lines,
-    reason = "one linear recognize→classify→validate pass; splitting it would \
-              scatter the occurrence-collection state across helpers"
-)]
 pub fn analyze_catenary_command(cmd: &str) -> CatenaryAction {
-    let stripped = strip_heredoc_bodies(cmd);
-    let stripped = strip_echo_separators(&stripped);
+    // The parse strips heredoc bodies, `#` comments, and `\`-newline joins, and
+    // segments on the real list/pipe operators quote-faithfully — so a `catenary`
+    // word inside a quoted argument or comment never reaches command position.
+    let script = parse::parse(cmd);
+    let scan = scan_catenary(&script);
 
-    let mut occs: Vec<CatenaryOcc> = Vec::new();
-    let mut foreign_segments = 0usize;
-    let mut total_segments = 0usize;
-    // A foreign command inside an arg-substitution (`catenary grep "$(foo)"`)
-    // is permitted by hygiene but still allowlist-checked (regime 2, via the
-    // subshell recursion in `check_command`). Flag it so the caller runs that
-    // check even when there is no top-level foreign segment.
-    let mut inner_foreign_substitution = false;
-
-    // Bare `&` is the loosest separator and detaches the piece before it. Split
-    // on it first (outermost) so a catenary command after `&` is still seen
-    // (`foo & catenary diagnostics`), and a catenary command *before* a `&` is
-    // marked backgrounded. A piece is backgrounded iff it is not the last one.
-    let bg_pieces = background_split(&stripped);
-    let piece_count = bg_pieces.len();
-    let sequential: Vec<(&str, bool)> = bg_pieces
-        .into_iter()
-        .enumerate()
-        .flat_map(|(idx, bg)| {
-            let backgrounded = idx + 1 < piece_count;
-            // A newline within the piece separates further commands but never
-            // backgrounds them — they inherit the piece's `&` backgrounding.
-            newline_split(bg)
-                .into_iter()
-                .flat_map(|nl| quote_aware_split(nl, &SEQ_SPLIT_RE))
-                .map(move |seq| (seq, backgrounded))
-        })
-        .collect();
-    for (seq, backgrounded) in sequential {
-        let stages = pipe_split(seq);
-        let stage_count = stages.len();
-        for (pipe_pos, stage_raw) in stages.iter().enumerate() {
-            let stage = stage_raw.trim();
-            if stage.is_empty() {
-                continue;
-            }
-
-            // Catenary *wrapped* in a substitution inside this stage.
-            for m in SUBSHELL_RE.captures_iter(stage) {
-                let inner = m
-                    .get(1)
-                    .or_else(|| m.get(2))
-                    .or_else(|| m.get(3))
-                    .map_or("", |g| g.as_str().trim());
-                if let Some(recog) = recognize_segment_catenary(inner) {
-                    occs.push(CatenaryOcc {
-                        recog,
-                        piped_in: false,
-                        piped_out: None,
-                        redirected: false,
-                        backgrounded: false,
-                        wrapped: true,
-                        in_place: false,
-                    });
-                } else if segment_command_name(inner).is_some() {
-                    inner_foreign_substitution = true;
-                }
-            }
-
-            // The stage's own command word.
-            let Some(name) = segment_command_name(stage) else {
-                continue;
-            };
-            if name == "catenary" {
-                total_segments += 1;
-                let recog = recognize_segment_catenary(stage).unwrap_or(Recog::Unknown);
-                let piped_out = if pipe_pos + 1 < stage_count {
-                    segment_command_name(stages[pipe_pos + 1])
-                } else {
-                    None
-                };
-                let in_place = matches!(recog, Recog::Agent(Sub::Sed))
-                    && shell_split(stage).iter().any(|t| t == "--in-place");
-                occs.push(CatenaryOcc {
-                    recog,
-                    piped_in: pipe_pos > 0,
-                    piped_out,
-                    // `background_split` already consumed every bare `&`, so the
-                    // stage holds none; backgrounding is a property of the piece.
-                    redirected: redirects_to_file(stage),
-                    backgrounded,
-                    wrapped: false,
-                    in_place,
-                });
-            } else {
-                foreign_segments += 1;
-                total_segments += 1;
-            }
-        }
-    }
-
-    if occs.is_empty() {
+    if scan.occs.is_empty() {
         return CatenaryAction::NotCatenary;
     }
 
@@ -1216,7 +1047,8 @@ pub fn analyze_catenary_command(cmd: &str) -> CatenaryAction {
     // (ticket 05). Catch it in any form, before the output-ownership and
     // bare-only denials, so the agent always learns the new name rather than a
     // generic output-ownership complaint.
-    if occs
+    if scan
+        .occs
         .iter()
         .any(|o| matches!(o.recog, Recog::Agent(Sub::EditingStop)))
     {
@@ -1224,14 +1056,15 @@ pub fn analyze_catenary_command(cmd: &str) -> CatenaryAction {
     }
 
     // First occurrence with a per-command problem wins (document order).
-    for occ in &occs {
+    for occ in &scan.occs {
         if let Some(msg) = catenary_occ_denial(occ) {
             return CatenaryAction::Deny(msg);
         }
     }
 
     // Every occurrence is a clean, agent-invocable command.
-    let subs: Vec<Sub> = occs
+    let subs: Vec<Sub> = scan
+        .occs
         .iter()
         .filter_map(|o| match o.recog {
             Recog::Agent(s) => Some(s),
@@ -1239,28 +1072,167 @@ pub fn analyze_catenary_command(cmd: &str) -> CatenaryAction {
         })
         .collect();
 
-    let has_foreign = foreign_segments > 0 || inner_foreign_substitution;
+    let has_foreign = scan.has_foreign_segment || scan.inner_foreign_substitution;
 
-    if subs.iter().any(|s| s.class() != CatenaryClass::Search) {
-        // A correlated/lifecycle command must be bare: the only command anywhere
-        // (an arg-substitution is not a separate segment, so it stays bare).
-        if total_segments != 1 || occs.len() != 1 {
+    // Isolation gate (decision 020 §7.1). An occurrence that takes the hook→IPC
+    // handoff — `diagnostics`, `editing start`, `sed --in-place`, and the bare
+    // lifecycle commands (`roots`/`primer`/`commands`) — must be the *sole*
+    // command of the whole script: a non-isolated invocation wedges the daemon.
+    // `grep`/`glob` and a `sed` *preview* carry no handoff, so they chain freely.
+    if scan.occs.iter().any(occ_needs_isolation) {
+        // Canonical only when the script is exactly *one* top-level command — no
+        // chaining (one command position), no compound wrapper, and the lone
+        // catenary occurrence (a wrapped one is caught above). The check is count-
+        // and structure-based on the parse, never a substring scan, so an
+        // under-counted separator can't slip a chained command past as isolated
+        // (decision 020 §5).
+        if scan.total_top_level != 1 || scan.occs.len() != 1 || scan.compound_present {
             return CatenaryAction::Deny(bare_only_denial(&subs));
         }
         return match subs.first() {
             Some(Sub::EditingStart) => CatenaryAction::EditingStart,
             Some(Sub::Diagnostics) => CatenaryAction::Diagnostics,
-            // Bare-only already enforced above, so `occs` holds exactly the sed
-            // occurrence — read `--in-place` off it to pick the handoff path.
-            Some(Sub::Sed) => CatenaryAction::Sed {
-                in_place: occs.first().is_some_and(|o| o.in_place),
-            },
+            // A sed reaching the isolation gate is the `--in-place` write form
+            // (a preview never triggers it); route it to the identity handoff.
+            Some(Sub::Sed) => CatenaryAction::Sed { in_place: true },
+            // A bare lifecycle command (`roots`/`primer`/`commands`).
             _ => CatenaryAction::Allow { has_foreign },
         };
     }
 
-    // All occurrences are search commands — chaining/`cd`/count all allowed.
+    // No handoff anywhere — `grep`/`glob` and `sed` previews chain freely. A lone
+    // bare `sed` preview still routes to the `Sed` action (no handoff); every
+    // other clean form is a plain allow that carries the foreign-check flag.
+    if scan.total_top_level == 1 && matches!(subs.first(), Some(Sub::Sed)) {
+        return CatenaryAction::Sed { in_place: false };
+    }
     CatenaryAction::Allow { has_foreign }
+}
+
+/// Whether a clean catenary occurrence takes the hook→IPC handoff and so must be
+/// the sole command of the script (the isolation gate, decision 020 §7.1):
+/// `diagnostics`, `editing start`, `sed --in-place`, and the bare lifecycle
+/// commands (`roots`/`primer`/`commands`). A `grep`/`glob` search or a `sed`
+/// *preview* carries no handoff and chains freely. `NotAgent`/`Unknown`
+/// occurrences were already denied before this runs.
+const fn occ_needs_isolation(occ: &CatenaryOcc) -> bool {
+    match occ.recog {
+        // `sed` is correlated only in its `--in-place` write form.
+        Recog::Agent(Sub::Sed) => occ.in_place,
+        // diagnostics / editing start / roots / primer / commands take the
+        // handoff (or are bare-only lifecycle).
+        Recog::Agent(
+            Sub::Diagnostics
+            | Sub::EditingStart
+            | Sub::EditingStop
+            | Sub::Roots
+            | Sub::Primer
+            | Sub::Commands,
+        ) => true,
+        // search (grep/glob) and the already-denied non-agent/unknown forms
+        // carry no handoff.
+        Recog::Agent(Sub::Grep | Sub::Glob) | Recog::NotAgent | Recog::Unknown => false,
+    }
+}
+
+/// Walk a [`ParsedScript`](parse::ParsedScript), collecting every `catenary`
+/// occurrence (with its output-ownership context) and the structural facts the
+/// isolation gate reads. Recurses into command substitutions, where a `catenary`
+/// command is *wrapped* (`$(catenary …)` captures its output) and a foreign
+/// command is flagged for the regime-2 allowlist.
+fn scan_catenary(script: &parse::ParsedScript) -> CatenaryScan {
+    let mut scan = CatenaryScan::default();
+    scan_catenary_into(script, &mut scan);
+    scan
+}
+
+/// Walk the top-level pipelines of the script the gate dispatches on, recording
+/// each `catenary` / foreign command position, the compound flag, and the
+/// isolation gate's command count. Command substitutions are walked by
+/// [`scan_substitution`] (their commands are not separate top-level segments,
+/// but their `catenary` occurrences are *wrapped* and their foreign commands are
+/// allowlist-flagged).
+fn scan_catenary_into(script: &parse::ParsedScript, scan: &mut CatenaryScan) {
+    for pipeline in &script.pipelines {
+        let stage_count = pipeline.commands.len();
+        for (pipe_pos, command) in pipeline.commands.iter().enumerate() {
+            // Recurse into this command's substitutions first: a wrapped
+            // `catenary` occurrence or an inner foreign command is recorded
+            // regardless of the host command's own name.
+            for sub in &command.substitutions {
+                scan_substitution(sub, scan);
+            }
+
+            if command.is_compound {
+                scan.compound_present = true;
+            }
+
+            let Some(name) = command.name.as_deref() else {
+                continue;
+            };
+
+            // A named command position is one command the shell runs at this
+            // level — the isolation gate's count, catenary or foreign.
+            scan.total_top_level += 1;
+
+            if name == "catenary" {
+                let recog = recognize_catenary_argv(&command.argv);
+                let piped_out = if pipe_pos + 1 < stage_count {
+                    pipeline.commands[pipe_pos + 1].name.clone()
+                } else {
+                    None
+                };
+                let in_place = matches!(recog, Recog::Agent(Sub::Sed))
+                    && command.argv.iter().any(|a| a == "--in-place");
+                scan.occs.push(CatenaryOcc {
+                    recog,
+                    piped_in: pipe_pos > 0,
+                    piped_out,
+                    redirected: command.redirects.iter().any(redirect_writes_file),
+                    backgrounded: pipeline.backgrounded,
+                    wrapped: false,
+                    in_place,
+                });
+            } else {
+                scan.has_foreign_segment = true;
+            }
+        }
+    }
+}
+
+/// Record a substitution's contents: a `catenary` command in it is *wrapped*
+/// (its output captured — denied), a foreign command in it is flagged for the
+/// regime-2 allowlist. Recurses through nested substitutions and compounds.
+fn scan_substitution(sub: &parse::ParsedScript, scan: &mut CatenaryScan) {
+    for pipeline in &sub.pipelines {
+        for command in &pipeline.commands {
+            for inner in &command.substitutions {
+                scan_substitution(inner, scan);
+            }
+            let Some(name) = command.name.as_deref() else {
+                continue;
+            };
+            if name == "catenary" {
+                scan.occs.push(CatenaryOcc {
+                    recog: recognize_catenary_argv(&command.argv),
+                    piped_in: false,
+                    piped_out: None,
+                    redirected: false,
+                    backgrounded: false,
+                    wrapped: true,
+                    in_place: false,
+                });
+            } else {
+                scan.inner_foreign_substitution = true;
+            }
+        }
+    }
+}
+
+/// Classify the words after a `catenary` command word (its parsed `argv`).
+fn recognize_catenary_argv(argv: &[String]) -> Recog {
+    let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+    recognize_catenary_sub(&refs)
 }
 
 /// Convenience for the editing-boundary defense (`hook_router`): the deny reason
@@ -3923,7 +3895,9 @@ mod tests {
     fn matcher_denies_correlated_prefix_and_chain() {
         assert!(deny_text("cd src && catenary diagnostics").contains("its own"));
         assert!(deny_text("catenary diagnostics && make test").contains("its own"));
-        assert!(deny_text("make x && catenary sed a b f").contains("its own"));
+        // The correlated `sed` is the `--in-place` write form (it takes the
+        // handoff); a chained preview is allowed (see `matcher_sed_preview_*`).
+        assert!(deny_text("make x && catenary sed --in-place a b f").contains("its own"));
     }
 
     #[test]
@@ -4305,5 +4279,183 @@ mod tests {
             check_command("echo $(cargo build)", &rules, None).expect("cargo inside $() denied");
         assert_eq!(denial.command, "cargo");
         assert_eq!(denial.reason, DenialReason::NotAllowed);
+    }
+
+    // ── Compound + isolation routing on the faithful parse (ticket 04) ─
+    //
+    // The catenary-regime classification and the isolation gate run on the
+    // `ParsedScript`. The isolation gate is *structural* — it counts the parse's
+    // command positions and reads its compound flag — so an under-counted
+    // separator can never mistake a chained correlated command for an isolated
+    // one (the daemon-wedge hazard, decision 020 §5). Compounds of allowlisted
+    // commands fall through to the per-command allowlist walk (the `for`-loop
+    // flip). The ticket's named cases:
+
+    #[test]
+    fn ticket04_bare_diagnostics_is_isolated() {
+        // `catenary diagnostics` → isolated, handed off (allowed).
+        assert_eq!(
+            analyze_catenary_command("catenary diagnostics"),
+            CatenaryAction::Diagnostics,
+        );
+        // Trailing args keep it one `SimpleCommand`, so the count-based gate
+        // still passes it as isolated (the CLI accept-and-warns separately).
+        assert_eq!(
+            analyze_catenary_command("catenary diagnostics src/main.rs"),
+            CatenaryAction::Diagnostics,
+        );
+    }
+
+    #[test]
+    fn ticket04_sleep_then_diagnostics_denied_daemon_wedge() {
+        // `sleep 100; catenary diagnostics` → denied (isolation). A non-isolated
+        // correlated command would wedge the daemon — caught by the command
+        // *count* (two `SimpleCommand`s), never a substring scan.
+        assert!(
+            matches!(
+                analyze_catenary_command("sleep 100; catenary diagnostics"),
+                CatenaryAction::Deny(_),
+            ),
+            "a chained `catenary diagnostics` must deny on isolation",
+        );
+        assert!(deny_text("sleep 100; catenary diagnostics").contains("its own"));
+    }
+
+    #[test]
+    fn ticket04_for_loop_diagnostics_denied_isolation() {
+        // `for f in *.rs; do catenary diagnostics; done` → denied (isolation):
+        // the catenary command is in a compound, so it is not the sole command.
+        assert!(
+            matches!(
+                analyze_catenary_command("for f in *.rs; do catenary diagnostics; done"),
+                CatenaryAction::Deny(_),
+            ),
+            "a `for`-loop body `catenary diagnostics` must deny on isolation",
+        );
+        assert!(deny_text("for f in *.rs; do catenary diagnostics; done").contains("its own"),);
+    }
+
+    #[test]
+    fn ticket04_cd_then_grep_allowed() {
+        // `cd src && catenary grep foo` → allowed (grep chains freely).
+        assert_eq!(
+            analyze_catenary_command("cd src && catenary grep foo"),
+            CatenaryAction::Allow { has_foreign: true },
+        );
+    }
+
+    #[test]
+    fn ticket04_sed_preview_chains_freely() {
+        // `catenary sed -e 's/a/b/' f.rs` (preview) in a chain → allowed (no
+        // handoff): only `--in-place` is correlated.
+        assert_eq!(
+            analyze_catenary_command("cd src && catenary sed -e 's/a/b/' f.rs"),
+            CatenaryAction::Allow { has_foreign: true },
+        );
+        // A bare preview still routes to the (handoff-free) `Sed` action.
+        assert_eq!(
+            analyze_catenary_command("catenary sed -e 's/a/b/' f.rs"),
+            CatenaryAction::Sed { in_place: false },
+        );
+    }
+
+    #[test]
+    fn ticket04_sed_in_place_chained_denied() {
+        // `catenary sed --in-place ...; echo done` → denied (correlated, must be
+        // the sole command).
+        assert!(
+            matches!(
+                analyze_catenary_command("catenary sed --in-place a b f.rs; echo done"),
+                CatenaryAction::Deny(_),
+            ),
+            "a chained `catenary sed --in-place` must deny on isolation",
+        );
+        assert!(deny_text("catenary sed --in-place a b f.rs; echo done").contains("its own"));
+    }
+
+    #[test]
+    fn ticket04_for_loop_of_allowlisted_git_allowed() {
+        // `for f in *.rs; do git add "$f"; done` → allowed (compound of
+        // allowlisted `git`). The loop variable `f` is structure, not a command.
+        let rules = recommended_rules();
+        assert!(
+            check_command(r#"for f in *.rs; do git add "$f"; done"#, &rules, None).is_none(),
+            "a `for`-loop of an allowlisted command must be allowed",
+        );
+        assert_eq!(
+            outcome(r#"for f in *.rs; do git add "$f"; done"#, &rules),
+            Outcome::Allow,
+        );
+    }
+
+    #[test]
+    fn ticket04_for_loop_of_denied_cargo_denied() {
+        // `for f in *; do cargo build; done` → denied on `cargo` (allowlist,
+        // inside the compound).
+        let rules = recommended_rules();
+        let denial = check_command("for f in *; do cargo build; done", &rules, None)
+            .expect("cargo inside a for loop must be denied");
+        assert_eq!(denial.command, "cargo");
+        assert_eq!(denial.reason, DenialReason::NotAllowed);
+    }
+
+    #[test]
+    fn ticket04_for_loop_redirect_style_sed_denied() {
+        // `for f in *; do sed -i s/a/b/ "$f"; done` → denied: `sed` is not an
+        // allowed first-position command (the redirect-style in-place edit is
+        // not the tracked path).
+        let rules = recommended_rules();
+        let denial = check_command(r#"for f in *; do sed -i s/a/b/ "$f"; done"#, &rules, None)
+            .expect("sed inside a for loop must be denied");
+        assert_eq!(denial.command, "sed");
+    }
+
+    #[test]
+    fn ticket04_isolation_gate_is_structural_not_substring() {
+        // The hazard guard: a correlated command quoted inside an argument is
+        // *not* a command position, so it never trips the isolation gate (it is
+        // not even recognized); and a real chained one is caught by the command
+        // count, not by scanning for the word "diagnostics". Both directions
+        // confirm the gate reads the parse's structure, never raw text.
+        assert_eq!(
+            analyze_catenary_command(r#"git commit -m "ran catenary diagnostics on the tree""#),
+            CatenaryAction::NotCatenary,
+            "a quoted `catenary diagnostics` is prose, not a command",
+        );
+        // A genuine second command is seen structurally (count == 2 → deny).
+        assert!(matches!(
+            analyze_catenary_command("true && catenary diagnostics"),
+            CatenaryAction::Deny(_),
+        ));
+    }
+
+    #[test]
+    fn ticket04_compound_table() {
+        use Outcome::{Allow, DenyCatenary, DenyForeign};
+        let rules = recommended_rules();
+        let cases: &[(&str, Outcome)] = &[
+            // Isolation: correlated commands must be the sole command.
+            ("catenary diagnostics", Allow),
+            ("sleep 100; catenary diagnostics", DenyCatenary),
+            ("for f in *.rs; do catenary diagnostics; done", DenyCatenary),
+            ("catenary sed --in-place a b f.rs; echo done", DenyCatenary),
+            // Chain-free: search + sed-preview carry no handoff.
+            ("cd src && catenary grep foo", Allow),
+            ("cd src && catenary sed -e 's/a/b/' f.rs", Allow),
+            // Compound allow: a `for` loop of allowlisted commands runs.
+            (r#"for f in *.rs; do git add "$f"; done"#, Allow),
+            // Compound deny: the allowlist still gates every body command.
+            (
+                "for f in *; do cargo build; done",
+                DenyForeign(DenialReason::NotAllowed),
+            ),
+            (
+                r#"for f in *; do sed -i s/a/b/ "$f"; done"#,
+                DenyForeign(DenialReason::NotAllowed),
+            ),
+        ];
+        for (cmd, want) in cases {
+            assert_eq!(&outcome(cmd, &rules), want, "outcome for {cmd:?}");
+        }
     }
 }

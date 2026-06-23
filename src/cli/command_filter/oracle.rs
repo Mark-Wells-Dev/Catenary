@@ -968,6 +968,12 @@ const SEED_CORPUS: &[&str] = &[
     "cat f | grep x | wc -l",
     "FOO=bar RUST_LOG=debug cargo build",
     "/usr/bin/git status",
+    // ── Ticket 04 — `for`/`select` loop variable + list are not commands ──────
+    // Only the body command is a command position; the loop variable `f` and the
+    // bare iteration words are structure (brush agrees), so ours == brush.
+    r#"for f in *.rs; do git add "$f"; done"#,
+    "for f in a b c; do echo x; done",
+    "for f in $(rm x); do echo hi; done",
 ];
 
 // ── proptest strategy ─────────────────────────────────────────────────────────
