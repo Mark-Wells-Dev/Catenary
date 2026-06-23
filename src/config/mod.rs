@@ -2829,4 +2829,49 @@ servers = ["nonexistent"]
         }
         Ok(())
     }
+
+    // ── Shipped config.example.toml round-trip ──────────────────────
+
+    /// The onboarding artifact `plugins/catenary/config.example.toml` — the
+    /// file users are told to "Copy to ~/.config/catenary/config.toml" — must
+    /// load cleanly through the real config loader (the same `deserialize_source`
+    /// → merge → validate path `Config::load` uses). This guards against the
+    /// example drifting back to the pre-split format (`[language.*]` with inline
+    /// `command`/`args`, or the removed `inherit` field), which the migration
+    /// guards in `deserialize_source` hard-reject (bug 27).
+    #[test]
+    fn shipped_config_example_loads() -> anyhow::Result<()> {
+        let example = std::path::PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/plugins/catenary/config.example.toml"
+        ));
+        assert!(
+            example.exists(),
+            "shipped example missing at {}",
+            example.display(),
+        );
+
+        // Full loader pipeline: parse + migration guards + merge + validate.
+        // A pre-split example (inline `command` on [language.*], or `inherit`)
+        // makes this `?` propagate the migration-guard `bail!` and fail the test.
+        let config = Config::load_from_sources(&[example])?;
+
+        // Spot-check the split format took effect: the rust-analyzer override
+        // is a [server.*] definition with a command, and the markdown default
+        // resolves to lattice (decision 015), not marksman.
+        let ra = config
+            .server
+            .get("rust-analyzer")
+            .expect("rust-analyzer server def");
+        assert_eq!(ra.command, "rustup");
+
+        let markdown = config.language.get("markdown").expect("markdown language");
+        assert_eq!(
+            markdown.servers,
+            Some(vec![ServerBinding::new("lattice")]),
+            "markdown should default to lattice (decision 015)",
+        );
+
+        Ok(())
+    }
 }
