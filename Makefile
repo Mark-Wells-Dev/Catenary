@@ -122,9 +122,13 @@ fuzz:
 J  ?= 4
 TT ?= 4
 ITERATE ?= 1
+# Reuse compiled dependencies across the per-job scratch target dirs (cargo-mutants
+# makes one per --jobs, each otherwise rebuilding the full dep graph cold) and
+# across runs, via sccache when present. Auto-detected — a no-op without sccache.
+SCCACHE := $(shell command -v sccache 2>/dev/null)
 mutants:
 	@mkdir -p $(CURDIR)/../.catenary-mutants-tmp && ulimit -v 16777216 && \
-	 NEXTEST_TEST_THREADS=$(TT) TMPDIR=$$(realpath $(CURDIR)/../.catenary-mutants-tmp) \
+	 $(if $(SCCACHE),RUSTC_WRAPPER=$(SCCACHE) CARGO_INCREMENTAL=0 ,)NEXTEST_TEST_THREADS=$(TT) TMPDIR=$$(realpath $(CURDIR)/../.catenary-mutants-tmp) \
 	 cargo mutants --test-tool nextest $(if $(T),--package catenary-mcp -F $(T),) --timeout 1200 --jobs $(J) --features mockls $(if $(ITERATE),--iterate,)
 
 # Kill a running cargo-mutants AND all its children (test binaries, mockls, etc.).
