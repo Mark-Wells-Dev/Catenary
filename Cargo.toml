@@ -72,6 +72,12 @@ ureq = { version = "2", features = ["json"] }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
+# Differential fuzzing oracle for the shell-command parser (tokenizer ticket 05).
+# `brush-parser` is the bash-fidelity reference parse; `proptest` drives the
+# stable-CI differential. Both are dev-only — they never enter the runtime /
+# `cargo deny` *runtime* graph and never ship.
+brush-parser = "0.4.0"
+proptest = "1.11"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

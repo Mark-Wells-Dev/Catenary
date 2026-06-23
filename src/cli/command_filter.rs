@@ -50,6 +50,12 @@ use patterns::{ECHO_SEP_RE, ENV_VAR_RE, HEREDOC_MARKER_RE, SEQ_SPLIT_RE, SUBSHEL
 /// gate, so its surface is exercised by its own unit tests for now.
 pub(crate) mod parse;
 
+/// Differential fuzzing oracle (tokenizer ticket 05): `brush-parser` reference +
+/// `proptest`. Dev-only — gated `#[cfg(test)]`, so the reference parser never
+/// enters the runtime / `cargo deny` runtime graph and never ships.
+#[cfg(test)]
+mod oracle;
+
 use regex::Regex;
 
 use crate::config::ResolvedCommands;
