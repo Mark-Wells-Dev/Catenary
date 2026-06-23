@@ -590,15 +590,54 @@ fn reserved_word(text: &str) -> Option<&'static str> {
 
 // ── Heredoc stripping ─────────────────────────────────────────────────────────
 
+/// The closing delimiter the body-strip is scanning for, plus whether the
+/// heredoc allows the terminator to be indented (`<<-`).
+struct HeredocClose {
+    /// The delimiter word (`EOF`), with surrounding quotes already removed by
+    /// the marker capture.
+    marker: String,
+    /// `<<-EOF` — the terminator (and body lines) may carry leading tabs, which
+    /// the shell strips. A plain `<<EOF` terminator must sit at column 0.
+    dash: bool,
+}
+
+impl HeredocClose {
+    /// Whether `line` is this heredoc's closing-delimiter line.
+    ///
+    /// For a plain `<<EOF`, only the bare delimiter at column 0 closes it — an
+    /// *indented* line that happens to read `EOF` is body text, not the
+    /// terminator (the historical leak: `trim()`-comparing closed early and let
+    /// the rest of the body reach the gate). For `<<-EOF`, the shell strips
+    /// leading tabs from the terminator, so a tab-indented delimiter still
+    /// closes.
+    fn closes(&self, line: &str) -> bool {
+        let candidate = if self.dash {
+            line.trim_start_matches('\t')
+        } else {
+            line
+        };
+        candidate == self.marker
+    }
+}
+
 /// Remove heredoc bodies *and* their closing-delimiter lines, keeping the
 /// marker line (e.g. `cat <<EOF`) intact so the `<<` redirection is still
-/// lexed. Mirrors the legacy `strip_heredoc_bodies` semantics.
+/// lexed.
+///
+/// A heredoc body is literal stdin, never commands — stripping it before the
+/// lexer is what keeps body prose (a `catenary diagnostics` named in a commit
+/// message, a `;`/`&&` in a sentence) out of every gate. The terminator match
+/// is shell-faithful so a delimiter-like word *inside* the body does not close
+/// the heredoc early: a plain `<<EOF` closes only on a bare `EOF` at column 0,
+/// while `<<-EOF` permits a tab-indented one. The quoted (`<<'EOF'`) and
+/// indented (`<<-EOF`) marker forms are recognized by
+/// [`HEREDOC_MARKER_RE`](super::patterns::HEREDOC_MARKER_RE).
 fn strip_heredoc_bodies(input: &str) -> String {
     let mut out: Vec<&str> = Vec::new();
-    let mut skip_until: Option<String> = None;
+    let mut skip_until: Option<HeredocClose> = None;
     for line in input.split('\n') {
-        if let Some(marker) = &skip_until {
-            if line.trim() == marker {
+        if let Some(close) = &skip_until {
+            if close.closes(line) {
                 skip_until = None;
             }
             continue;
@@ -607,7 +646,15 @@ fn strip_heredoc_bodies(input: &str) -> String {
         if let Some(caps) = HEREDOC_MARKER_RE.captures(line)
             && let Some(m) = caps.get(1)
         {
-            skip_until = Some(m.as_str().to_string());
+            // `m.start()` follows the `<<` (and any `-`); a `<<-` marker has the
+            // dash immediately before the captured delimiter run / its quote.
+            let dash = caps
+                .get(0)
+                .is_some_and(|whole| whole.as_str().starts_with("<<-"));
+            skip_until = Some(HeredocClose {
+                marker: m.as_str().to_string(),
+                dash,
+            });
         }
     }
     out.join("\n")
@@ -1289,6 +1336,44 @@ mod tests {
         let input = "cat <<EOF\nrm -rf /\nEOF\ncargo build";
         // The heredoc body `rm -rf /` is literal; only `cat` and `cargo` run.
         assert_eq!(positions(input), vec!["cat", "cargo"]);
+    }
+
+    #[test]
+    fn heredoc_quoted_delimiter_body_is_stripped() {
+        // `<<'EOF'` (quoted delimiter): the body is still literal stdin, so a
+        // command-looking line inside it never reaches the gate — only `cat`
+        // and the trailing `make` run.
+        let input = "cat <<'EOF'\nrm -rf /\nEOF\nmake test";
+        assert_eq!(positions(input), vec!["cat", "make"]);
+    }
+
+    #[test]
+    fn heredoc_dash_indented_terminator_closes() {
+        // `<<-EOF` lets the closing delimiter (and body) be tab-indented; the
+        // tab-indented `EOF` still terminates, so the body is stripped and the
+        // command after it (`make`) splits out.
+        let input = "cat <<-EOF\n\trm -rf /\n\tEOF\nmake test";
+        assert_eq!(positions(input), vec!["cat", "make"]);
+    }
+
+    #[test]
+    fn heredoc_delimiter_word_inside_body_does_not_close_early() {
+        // A plain `<<EOF` closes only on a bare `EOF` at column 0. An *indented*
+        // `EOF` is body text (the shell keeps reading), so it must not terminate
+        // the heredoc early and leak the rest of the body as commands. Here the
+        // indented `  EOF` is body; the real terminator is the column-0 `EOF`,
+        // so the smuggled `rm -rf /` never surfaces.
+        let input = "cat <<EOF\n  EOF\nrm -rf /\nEOF\nmake test";
+        assert_eq!(positions(input), vec!["cat", "make"]);
+    }
+
+    #[test]
+    fn heredoc_body_prose_with_metacharacters_is_stripped() {
+        // The required bug-class case: prose in a commit-message heredoc body —
+        // mentioning `catenary diagnostics` and carrying `;`/`&&` — is opaque
+        // stdin, stripped before any gate sees it. Only `git` runs.
+        let input = "git commit -F - <<EOF\nran catenary diagnostics; tidied && shipped\nEOF";
+        assert_eq!(positions(input), vec!["git"]);
     }
 
     #[test]

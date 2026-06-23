@@ -3,11 +3,14 @@
 
 //! Shell command parser for allowlist-based command filtering.
 //!
-//! Checks Bash commands against a [`ResolvedCommands`] allowlist. Reimplements
-//! all parsing logic from `scripts/constrained_bash.py` in Rust: pipeline
-//! position tracking, subshell recursion, heredoc exception, quote-aware
-//! splitting, env var prefix skipping, full path stripping, and subcommand
-//! deny matching.
+//! Checks Bash commands against a [`ResolvedCommands`] allowlist. Both the
+//! allowlist evaluator and the redirect guard read one faithful
+//! [`parse::ParsedScript`] (decision 020 §3): pipeline position is the index
+//! into a pipeline's commands, substitutions are recursed, and env-var prefix
+//! skipping / path stripping / subcommand deny matching run on the parse's
+//! command-position words. A heredoc is stdin input, not an allow/deny knob —
+//! its body is stripped by the parse and the command faces the allowlist on its
+//! name alone.
 
 #[allow(
     clippy::expect_used,
@@ -17,37 +20,22 @@ mod patterns {
     use regex::Regex;
     use std::sync::LazyLock;
 
-    /// Matches `$(...)`, `<(...)`, and `` `...` `` substitutions for recursive checking.
-    pub static SUBSHELL_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"\$\(([^)]*)\)|<\(([^)]*)\)|`([^`]*)`").expect("constant pattern")
-    });
-
     /// Matches heredoc start markers: `<<EOF`, `<<'EOF'`, `<<"EOF"`, `<<-EOF`.
     pub static HEREDOC_MARKER_RE: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r#"<<-?\s*\\?['""]?(\w+)['""]?"#).expect("constant pattern"));
 
-    /// Splits on sequential operators: `&&`, `||`, `;`.
-    pub static SEQ_SPLIT_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"\s*(?:&&|\|\||;)\s*").expect("constant pattern"));
-
     /// Matches env var assignment prefix: `VAR=value`.
     pub static ENV_VAR_RE: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"^[A-Za-z_][A-Za-z_0-9]*=").expect("constant pattern"));
-
-    /// Echo separator between sequential operators.
-    pub static ECHO_SEP_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r#"(&&|\|\||;)\s*echo\s+(?:"[^"]*"|'[^']*')\s*(&&|\|\||;)"#)
-            .expect("constant pattern")
-    });
 }
-use patterns::{ECHO_SEP_RE, ENV_VAR_RE, HEREDOC_MARKER_RE, SEQ_SPLIT_RE, SUBSHELL_RE};
 
 /// Faithful, hand-rolled shell parser core (`&str → ParsedScript`).
 ///
-/// The new parse substrate from decision 020 / tokenizer ticket 01. Tickets
-/// 02–04 re-point the allowlist evaluator and the redirect guard at it; ticket
-/// 07 deletes the legacy scanners above. Landed here but not yet wired into the
-/// gate, so its surface is exercised by its own unit tests for now.
+/// The parse substrate from decision 020 / tokenizer ticket 01. The allowlist
+/// evaluator ([`check_command`]), the redirect guard, and the catenary
+/// canonical-form matcher all read it — segmentation, substitution recursion,
+/// heredoc stripping, and command-position extraction come from this one parse,
+/// not the ad-hoc scanners it replaced (tickets 02 / 03 / 04 / 08).
 pub(crate) mod parse;
 
 /// Differential fuzzing oracle (tokenizer ticket 05): `brush-parser` reference +
@@ -60,348 +48,7 @@ pub(crate) mod parse;
 #[cfg(any(test, feature = "fuzzing"))]
 pub mod oracle;
 
-use regex::Regex;
-
 use crate::config::ResolvedCommands;
-
-/// Replace quoted content (including delimiters) with spaces.
-///
-/// Preserves string length and character positions so that regex
-/// matches on the masked string can be mapped back to the original.
-/// Prevents operators inside quoted strings from being treated as
-/// shell operators.
-fn mask_quotes(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = vec![b' '; bytes.len()];
-    let n = bytes.len();
-    let mut i = 0;
-
-    while i < n {
-        if bytes[i] == b'\'' {
-            // Skip to after the closing quote, or to end if unterminated.
-            i = memchr::memchr(b'\'', &bytes[i + 1..]).map_or(n, |offset| i + 2 + offset);
-        } else if bytes[i] == b'"' {
-            let mut j = i + 1;
-            while j < n && bytes[j] != b'"' {
-                if bytes[j] == b'\\' && j + 1 < n {
-                    j += 1;
-                }
-                j += 1;
-            }
-            i = j + 1;
-        } else {
-            out[i] = bytes[i];
-            i += 1;
-        }
-    }
-
-    String::from_utf8(out).unwrap_or_else(|_| " ".repeat(n))
-}
-
-/// Split `cmd` on `sep_re`, ignoring matches inside quoted strings.
-fn quote_aware_split<'a>(cmd: &'a str, sep_re: &Regex) -> Vec<&'a str> {
-    let masked = mask_quotes(cmd);
-    let mut parts = Vec::new();
-    let mut last = 0;
-    for m in sep_re.find_iter(&masked) {
-        parts.push(&cmd[last..m.start()]);
-        last = m.end();
-    }
-    parts.push(&cmd[last..]);
-    parts
-}
-
-/// Split `cmd` on bare `|` (not `||`), ignoring operators inside quotes.
-///
-/// Rust's `regex` crate does not support lookahead/lookbehind, so this
-/// uses character-level scanning on the quote-masked string instead.
-fn pipe_split(cmd: &str) -> Vec<&str> {
-    let masked = mask_quotes(cmd);
-    let bytes = masked.as_bytes();
-    let n = bytes.len();
-    let mut parts = Vec::new();
-    let mut last = 0;
-    let mut i = 0;
-
-    while i < n {
-        if bytes[i] == b'|' {
-            // Skip || (logical OR) — not a pipe
-            if i + 1 < n && bytes[i + 1] == b'|' {
-                i += 2;
-                continue;
-            }
-            // Check this isn't the second | of a || we already skipped past
-            if i > 0 && bytes[i - 1] == b'|' {
-                i += 1;
-                continue;
-            }
-            // Bare pipe: split here
-            let end = cmd[last..i].trim_end().len() + last;
-            parts.push(&cmd[last..end]);
-            i += 1;
-            while i < n && (bytes[i] == b' ' || bytes[i] == b'\t') {
-                i += 1;
-            }
-            last = i;
-            continue;
-        }
-        i += 1;
-    }
-    parts.push(&cmd[last..]);
-    parts
-}
-
-/// Split `cmd` on bare backgrounding `&` (not `&&`, `&>`, `>&`, or `N>&`),
-/// ignoring `&` inside quotes.
-///
-/// A bare `&` terminates a list element and runs it in the background, so it
-/// is a command separator just like `;` — `make test & cargo build` runs both.
-/// In bash grammar `&` binds *looser* than `|`, `&&`, and `||`, so this is the
-/// **outermost** split: applied before sequential (`&&`/`||`/`;`) and pipe
-/// splitting, so every command around a `&` is seen by the filter rather than
-/// swallowed into the previous command's arguments. A piece is *backgrounded*
-/// iff it is not the last piece (the trailing `&` detaches it).
-///
-/// Operator disambiguation mirrors the (now-removed) background detector: `&&`
-/// is sequential, `&>` is a redirect, and `>&`/`N>&` are fd duplications —
-/// none split. Quotes are masked first, so a `&` inside an argument (a commit
-/// message, a sed program) is never a separator. Scans the masked string and
-/// slices the original, like [`pipe_split`].
-///
-/// Only **top-level** `&` split: a `&` inside a `(…)` grouping (`$(…)`, `<(…)`,
-/// `>(…)`, a plain subshell) or backticks is left in place, so a wrapped
-/// catenary command (`$(catenary grep p & foo)`) stays intact for the
-/// `SUBSHELL_RE` recursion to recognize and deny precisely, and the inner list
-/// is checked by that recursion rather than by a mid-substitution slice.
-///
-/// Heredoc bodies are stripped before this runs, and `&` does not occur in
-/// heredoc markers, so heredoc handling (e.g. the `git commit` heredoc form)
-/// is untouched.
-///
-/// The other bare separator — a newline — is split by [`newline_split`], a
-/// sibling pass applied right after this one. It lives in its own function
-/// because a newline never backgrounds the piece before it, so it can't share
-/// this function's piece-is-backgrounded bookkeeping.
-fn background_split(cmd: &str) -> Vec<&str> {
-    let masked = mask_quotes(cmd);
-    let b = masked.as_bytes();
-    let n = b.len();
-    let mut parts = Vec::new();
-    let mut last = 0;
-    let mut i = 0;
-    // Don't split inside a `(…)` grouping or backticks — that `&` separates an
-    // inner list, handled by the substitution recursion, not a top-level one.
-    let mut paren_depth: u32 = 0;
-    let mut in_backtick = false;
-    while i < n {
-        match b[i] {
-            b'`' => {
-                in_backtick = !in_backtick;
-                i += 1;
-                continue;
-            }
-            b'(' if !in_backtick => {
-                paren_depth += 1;
-                i += 1;
-                continue;
-            }
-            b')' if !in_backtick => {
-                paren_depth = paren_depth.saturating_sub(1);
-                i += 1;
-                continue;
-            }
-            b'&' => {}
-            _ => {
-                i += 1;
-                continue;
-            }
-        }
-        // From here `b[i] == b'&'`. Skip it entirely while nested.
-        if in_backtick || paren_depth > 0 {
-            i += 1;
-            continue;
-        }
-        // `&&` — sequential operator, not a split point.
-        if i + 1 < n && b[i + 1] == b'&' {
-            i += 2;
-            continue;
-        }
-        // Second `&` of a `&&` we already stepped past.
-        if i > 0 && b[i - 1] == b'&' {
-            i += 1;
-            continue;
-        }
-        // `&>` redirect.
-        if i + 1 < n && b[i + 1] == b'>' {
-            i += 2;
-            continue;
-        }
-        // `>&` / `N>&` fd duplication.
-        if i > 0 && b[i - 1] == b'>' {
-            i += 1;
-            continue;
-        }
-        // Bare top-level `&` — split here (the preceding piece is backgrounded).
-        parts.push(&cmd[last..i]);
-        last = i + 1;
-        i += 1;
-    }
-    parts.push(&cmd[last..]);
-    parts
-}
-
-/// Split `cmd` on a bare newline — the loosest list separator — ignoring
-/// newlines inside quotes or within a `(…)`/backtick grouping.
-///
-/// In bash a newline terminates a list element exactly like `;`
-/// (`make test\ncargo build` runs both), so a command on the next line must
-/// reach the filter too. Mirrors [`background_split`]'s top-level discipline:
-/// quotes are masked first, so a newline inside a quoted argument — or the
-/// multi-line `git commit -m "$(cat <<'EOF'…)"` form, whose body newlines live
-/// inside the `"…"` — is never a separator; and a newline inside a `(…)`
-/// grouping or backticks is left in place so the [`SUBSHELL_RE`] recursion owns
-/// that inner list (a wrapped catenary command stays intact for precise
-/// denial). Unlike `&`, a newline never backgrounds the preceding element, so
-/// this is a plain separator with none of `background_split`'s operator
-/// disambiguation.
-///
-/// Safe only because [`strip_heredoc_bodies`] runs first and removes heredoc
-/// bodies *and their closing-delimiter lines*: the only newlines reaching here
-/// are genuine separators (or quoted/grouped ones, masked or skipped). Were a
-/// stray closing `EOF` left on its own line, this would slice it into a bogus
-/// command — which is exactly why the body-strip drops the delimiter line.
-fn newline_split(cmd: &str) -> Vec<&str> {
-    let masked = mask_quotes(cmd);
-    let b = masked.as_bytes();
-    let n = b.len();
-    let mut parts = Vec::new();
-    let mut last = 0;
-    let mut i = 0;
-    // Don't split inside a `(…)` grouping or backticks — those newlines separate
-    // an inner list owned by the substitution recursion, not a top-level one.
-    let mut paren_depth: u32 = 0;
-    let mut in_backtick = false;
-    while i < n {
-        match b[i] {
-            b'`' => in_backtick = !in_backtick,
-            b'(' if !in_backtick => paren_depth += 1,
-            b')' if !in_backtick => paren_depth = paren_depth.saturating_sub(1),
-            b'\n' if !in_backtick && paren_depth == 0 => {
-                parts.push(&cmd[last..i]);
-                last = i + 1;
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    parts.push(&cmd[last..]);
-    parts
-}
-
-/// Strip echo separators between sequential operators.
-///
-/// Agents insert `&& echo "---" &&` as visual separators. This replaces
-/// those patterns with just the operators so they don't interfere with
-/// command checking.
-fn strip_echo_separators(s: &str) -> String {
-    let mut result = s.to_string();
-    loop {
-        let next = ECHO_SEP_RE.replace(&result, "$1 $2").to_string();
-        if next == result {
-            break;
-        }
-        result = next;
-    }
-    result
-}
-
-/// Remove heredoc bodies *and their closing-delimiter lines*, keeping the
-/// marker line (e.g. `cat <<EOF`) intact.
-///
-/// Heredoc bodies are literal text, not shell commands. Without stripping them,
-/// the recursive subshell checker would parse their content as commands —
-/// triggering false denials on natural language. The closing-delimiter line (a
-/// bare `EOF`) is dropped too, not kept: once [`newline_split`] treats a
-/// newline as a command separator, a surviving `EOF` line would slice out as a
-/// bogus command and false-deny. Dropping it also lets a real command *after*
-/// the heredoc (`cat <<EOF…EOF\ncargo build`) split out and reach the filter
-/// rather than being glued onto the marker token. The marker line is preserved
-/// so the `has_heredoc` stdin exception in [`check_command`] still fires.
-fn strip_heredoc_bodies(cmd_string: &str) -> String {
-    let mut result = Vec::new();
-    let mut skip_until: Option<String> = None;
-
-    for line in cmd_string.split('\n') {
-        if let Some(ref marker) = skip_until {
-            if line.trim() == marker {
-                skip_until = None;
-            }
-            // Drop the body lines and the closing-delimiter line alike.
-            continue;
-        }
-        result.push(line);
-        if let Some(m) = HEREDOC_MARKER_RE.captures(line)
-            && let Some(marker) = m.get(1)
-        {
-            skip_until = Some(marker.as_str().to_string());
-        }
-    }
-    result.join("\n")
-}
-
-/// Skip leading environment variable assignments to find the command token index.
-///
-/// Returns the index of the first token that is not a `VAR=value` assignment,
-/// or `None` if all tokens are assignments.
-fn find_command(tokens: &[&str]) -> Option<usize> {
-    tokens.iter().position(|t| !ENV_VAR_RE.is_match(t))
-}
-
-/// Whether `<<` is the first argument after a segment's command word.
-///
-/// The heredoc exception keys off this: a command whose first operand is a
-/// heredoc marker reads stdin, not files, so the allowlist denial is
-/// suppressed (`cat <<'EOF'…` commit pattern). Quoted arguments are masked to
-/// whitespace by [`shell_split`], so `sed 's/foo/bar/' <<EOF` reads as
-/// `["sed", "<<EOF"]` and still qualifies, while an unquoted operand before the
-/// heredoc (`grep pattern <<EOF`) does not. The per-argument quote information
-/// needed to recover this from the faithful parse is not carried on
-/// [`SimpleCommand`](parse::SimpleCommand), so the heuristic stays on the raw
-/// segment until ticket 03 folds the redirect surface onto the parse.
-fn segment_has_leading_heredoc(segment: &str) -> bool {
-    let tokens = shell_split(segment);
-    let token_refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
-    let Some(cmd_idx) = find_command(&token_refs) else {
-        return false;
-    };
-    token_refs
-        .get(cmd_idx + 1)
-        .is_some_and(|t| t.starts_with("<<"))
-}
-
-/// Split a string on whitespace, respecting single and double quotes.
-fn shell_split(s: &str) -> Vec<String> {
-    let masked = mask_quotes(s);
-    let masked_bytes = masked.as_bytes();
-    let mut tokens = Vec::new();
-    let mut start = None;
-
-    for (i, &b) in masked_bytes.iter().enumerate() {
-        if b == b' ' || b == b'\t' {
-            if let Some(s_idx) = start {
-                tokens.push(&s[s_idx..i]);
-                start = None;
-            }
-        } else if start.is_none() {
-            start = Some(i);
-        }
-    }
-    if let Some(s_idx) = start {
-        tokens.push(&s[s_idx..]);
-    }
-
-    tokens.into_iter().map(String::from).collect()
-}
 
 /// Device sinks allowed as redirect targets even in the deny state.
 ///
@@ -483,19 +130,20 @@ fn is_fd_dup_target(target: &str) -> bool {
 /// 3. It is in `allow` but the specific subcommand is in `deny.<cmd>`.
 /// 4. It is otherwise allowed but uses a flag in `deny_flags.<cmd>`.
 ///
-/// The heredoc exception suppresses denial for commands reading from stdin.
 /// Returns the denied command name and reason if denied, `None` if allowed.
 ///
 /// `cmd` is a [`SimpleCommand`](parse::SimpleCommand) from the faithful parse
 /// (ticket 02): its command-position `name` and `argv` come from the
 /// quote-faithful tokenizer, so a substring of a quoted argument can never be
-/// mistaken for a command word. The decision ladder — heredoc exception → build
-/// tool → unconditional allow + denied subcommand/flags → pipeline with the
-/// position-0 guard → default deny — is unchanged. A command with no
-/// command-position word (`name == None`) is not validated.
+/// mistaken for a command word. The decision ladder — build tool →
+/// unconditional allow + denied subcommand/flags → pipeline with the position-0
+/// guard → default deny — faces the command on its name alone: a heredoc is
+/// stdin input, never an allow/deny knob (decision 020 §2), so `cat <<EOF` is
+/// allowed because `cat` is allowed and `python <<EOF` denied because `python`
+/// is denied — the form is irrelevant. A command with no command-position word
+/// (`name == None`) is not validated.
 fn check_against_allowlist(
     cmd: &parse::SimpleCommand,
-    has_heredoc: bool,
     pipe_pos: usize,
     rules: &ResolvedCommands,
     cwd: Option<&std::path::Path>,
@@ -504,11 +152,6 @@ fn check_against_allowlist(
     // validate.
     let name = cmd.name.as_deref()?;
     let argv = &cmd.argv;
-
-    // Heredoc exception: command is reading from stdin, not files.
-    if has_heredoc {
-        return None;
-    }
 
     // Build tool is always allowed (per-root lookup with default fallback).
     if rules.build_for_cwd(cwd).iter().any(|t| t == name) {
@@ -623,126 +266,132 @@ pub fn check_command(
     rules: &ResolvedCommands,
     cwd: Option<&std::path::Path>,
 ) -> Option<Denial> {
-    let cmd_string = strip_heredoc_bodies(cmd);
-    let cmd_string = strip_echo_separators(&cmd_string);
+    // One faithful parse drives segmentation end-to-end (decision 020 §3): the
+    // list operators (`;` / `&&` / `||` / newline / `&`) separate
+    // `ParsedScript.pipelines`, `|` separates `Pipeline.commands` — so the pipe
+    // position is the index into `commands`, with no second ad-hoc scan. Heredoc
+    // bodies, `#` comments, and `\`-newline joins are already resolved by the
+    // parse, so body prose never reaches the gate.
+    let script = parse::parse(cmd);
 
-    // Track effective cwd across sequential segments for per-root
-    // build tool resolution. Updated when `cd <path>` is encountered.
-    let mut effective_cwd: Option<std::path::PathBuf> = cwd.map(std::path::PathBuf::from);
-    let mut saw_unresolved_cd = false;
+    // Track effective cwd across the script's commands (document order) for
+    // per-root build tool resolution. Updated when `cd <path>` is encountered.
+    let mut cwd_state = CwdState {
+        effective_cwd: cwd.map(std::path::PathBuf::from),
+        saw_unresolved_cd: false,
+    };
+    check_script(&script, rules, &mut cwd_state)
+}
 
-    // Split on the loose list separators first — bare `&` (backgrounding) and a
-    // bare newline — so a command after either runs as its own list element and
-    // is checked too (`make test & cargo build` and `make test\ncargo build`
-    // both run both). Backgrounding a *foreign* command is fine; we only need
-    // each command name to reach the allowlist.
-    let sequential: Vec<&str> = background_split(&cmd_string)
-        .into_iter()
-        .flat_map(|bg| newline_split(bg))
-        .flat_map(|nl| quote_aware_split(nl, &SEQ_SPLIT_RE))
-        .collect();
-    for seq in sequential {
-        let stages = pipe_split(seq);
-        for (pipe_pos, segment) in stages.iter().enumerate() {
-            let segment = segment.trim();
-            if segment.is_empty() {
-                continue;
-            }
+/// Effective working directory threaded across a script's commands.
+///
+/// `cd <path>` segments update [`Self::effective_cwd`] (used for per-root build
+/// tool resolution); an unresolvable target (`$VAR`, `$(...)`) flips
+/// [`Self::saw_unresolved_cd`] so a later denial can note the stale cwd.
+struct CwdState {
+    effective_cwd: Option<std::path::PathBuf>,
+    saw_unresolved_cd: bool,
+}
 
-            // Recursively check $(), <(), and `` substitutions.
-            for m in SUBSHELL_RE.captures_iter(segment) {
-                let inner = m
-                    .get(1)
-                    .or_else(|| m.get(2))
-                    .or_else(|| m.get(3))
-                    .map_or("", |g| g.as_str().trim());
-                if let Some(denial) = check_command(inner, rules, effective_cwd.as_deref()) {
-                    return Some(denial);
-                }
-            }
-
-            // Command-position word comes from the faithful parse (ticket 02):
-            // the segment has no top-level list/pipe operators (those were
-            // split above), so it parses to at most one pipeline holding one
-            // simple command. Its `name`/`argv` are quote-faithful — a
-            // substring of a quoted argument can never reach command position
-            // (the bug-33 false-deny fix). Substitutions are still recursed
-            // above via `SUBSHELL_RE`, and the redirect/heredoc guards still
-            // read the raw `segment` (ticket 03 folds them onto the parse).
-            let parsed = parse::parse(segment);
-            let Some(parsed_cmd) = parsed.pipelines.first().and_then(|p| p.commands.first()) else {
-                continue;
-            };
-            let Some(name) = parsed_cmd.name.as_deref() else {
-                continue;
-            };
-
-            // Catenary's own commands run under the canonical-form matcher
-            // (regime 1, `analyze_catenary_command`), not the foreign
-            // allowlist. Skip them here so a search chain's foreign segments
-            // (e.g. `cd src && catenary grep p`) are still validated without
-            // `catenary` itself tripping the denylist.
-            if name == "catenary" {
-                continue;
-            }
-
-            // Output redirection to a file bypasses the tracked Edit/Write
-            // path, making the diagnostics batch incomplete. Deny it before
-            // the allow/deny decision (and before the heredoc exception) so
-            // neither an otherwise-allowed command nor the heredoc
-            // short-circuit can carry a redirect through. Gated by
-            // `allow_file_redirects`. Read off the faithful parse (ticket 03):
-            // the whole redirect family — every MULTIOS / brace target, `>>` /
-            // `>|` / `&>` / fd-targeted `N>`, recursed into substitutions —
-            // with fd-dup / close / `>(cmd)` excluded and an unverifiable
-            // `$var` target failing closed (decision 020 §8a).
-            if !rules.allow_file_redirects && parse_redirects_to_file(&parsed) {
-                return Some(Denial {
-                    command: name.to_string(),
-                    reason: DenialReason::OutputRedirect,
-                    unresolved_cd: saw_unresolved_cd,
-                    effective_cwd,
-                });
-            }
-
-            // Heredoc exception: only when `<<` is the first argument after
-            // the command name. Quoted arguments (like sed patterns) are
-            // invisible to this masked tokenization, so `sed 's/foo/bar/'
-            // <<EOF` reads as `["sed", "<<EOF"]`. This prevents
-            // `rm -rf target/ <<EOF` from bypassing the allowlist while
-            // preserving the `cat <<'EOF'` commit pattern. The per-argument
-            // quote information needed to reproduce this from the parse is not
-            // carried on `SimpleCommand`, so the heuristic stays on the raw
-            // segment for now.
-            let has_heredoc = segment_has_leading_heredoc(segment);
-
-            if let Some((denied, reason)) = check_against_allowlist(
-                parsed_cmd,
-                has_heredoc,
-                pipe_pos,
-                rules,
-                effective_cwd.as_deref(),
-            ) {
-                return Some(Denial {
-                    command: denied,
-                    reason,
-                    unresolved_cd: saw_unresolved_cd,
-                    effective_cwd,
-                });
-            }
-
-            // Track `cd` to update effective cwd for subsequent segments. The
-            // target is the first parsed argument after the command word.
-            if name == "cd"
-                && let Some(target) = parsed_cmd.argv.first()
-            {
-                let resolved = resolve_cd_target(target, effective_cwd.as_deref());
-                if is_unresolvable_cd_target(target) {
-                    saw_unresolved_cd = true;
-                }
-                effective_cwd = resolved;
+/// Walk a [`ParsedScript`](parse::ParsedScript)'s pipelines and commands in
+/// document order, validating each command position against the allowlist and
+/// returning the first [`Denial`].
+///
+/// Segmentation is the parse's: a `Pipeline` is one list element (separated by
+/// `;` / `&&` / `||` / newline / `&`); its `commands` are the pipe stages, so
+/// the stage index is the pipe position the `pipeline`-class position-0 guard
+/// reads. Command substitutions are recursed here (not via a separate scan), so
+/// a redirect or denied command inside `$()` / `` `…` `` / `<(…)` / `>(…)` is
+/// still caught. `cwd` threads across commands so a `cd` updates the build-tool
+/// resolution for the rest of the walk.
+fn check_script(
+    script: &parse::ParsedScript,
+    rules: &ResolvedCommands,
+    cwd: &mut CwdState,
+) -> Option<Denial> {
+    for pipeline in &script.pipelines {
+        for (pipe_pos, command) in pipeline.commands.iter().enumerate() {
+            if let Some(denial) = check_parsed_command(command, pipe_pos, rules, cwd) {
+                return Some(denial);
             }
         }
+    }
+    None
+}
+
+/// Validate one [`SimpleCommand`](parse::SimpleCommand) at pipe position
+/// `pipe_pos`, recursing its substitutions first, then applying the redirect
+/// guard and the allowlist. Updates `cwd` on a `cd`. Returns the first
+/// [`Denial`].
+fn check_parsed_command(
+    command: &parse::SimpleCommand,
+    pipe_pos: usize,
+    rules: &ResolvedCommands,
+    cwd: &mut CwdState,
+) -> Option<Denial> {
+    // Recurse substitutions first — a denied command (or a redirect) inside
+    // `$()` / `` `…` `` / `<(…)` / `>(…)` is caught regardless of the host
+    // command's own name (including a `catenary` host, skipped below).
+    for sub in &command.substitutions {
+        if let Some(denial) = check_script(sub, rules, cwd) {
+            return Some(denial);
+        }
+    }
+
+    // A command with no command-position word (only assignments / redirects /
+    // a `for` header) has nothing to validate at the allowlist.
+    let name = command.name.as_deref()?;
+
+    // Catenary's own commands run under the canonical-form matcher (regime 1,
+    // `analyze_catenary_command`), not the foreign allowlist. Skip them here so
+    // a search chain's foreign segments (e.g. `cd src && catenary grep p`) are
+    // still validated without `catenary` itself tripping the denylist.
+    if name == "catenary" {
+        return None;
+    }
+
+    // Output redirection to a file bypasses the tracked Edit/Write path, making
+    // the diagnostics batch incomplete. Deny it before the allow/deny decision
+    // so an otherwise-allowed command can't carry a redirect through. Gated by
+    // `allow_file_redirects`. Read off the faithful parse (ticket 03): the whole
+    // redirect family — every MULTIOS / brace target, `>>` / `>|` / `&>` /
+    // fd-targeted `N>`, recursed into substitutions — with fd-dup / close /
+    // `>(cmd)` excluded and an unverifiable `$var` target failing closed
+    // (decision 020 §8a). A heredoc (`<<`) lexes to `RedirectOp::Read` (input),
+    // so it never shields an output redirect: `cat <<EOF > out.txt` still denies
+    // on the `> out.txt` write (bug 11).
+    if !rules.allow_file_redirects
+        && (command.redirects.iter().any(redirect_writes_file)
+            || command.substitutions.iter().any(parse_redirects_to_file))
+    {
+        return Some(Denial {
+            command: name.to_string(),
+            reason: DenialReason::OutputRedirect,
+            unresolved_cd: cwd.saw_unresolved_cd,
+            effective_cwd: cwd.effective_cwd.clone(),
+        });
+    }
+
+    if let Some((denied, reason)) =
+        check_against_allowlist(command, pipe_pos, rules, cwd.effective_cwd.as_deref())
+    {
+        return Some(Denial {
+            command: denied,
+            reason,
+            unresolved_cd: cwd.saw_unresolved_cd,
+            effective_cwd: cwd.effective_cwd.clone(),
+        });
+    }
+
+    // Track `cd` to update effective cwd for subsequent commands. The target is
+    // the first parsed argument after the command word.
+    if name == "cd"
+        && let Some(target) = command.argv.first()
+    {
+        if is_unresolvable_cd_target(target) {
+            cwd.saw_unresolved_cd = true;
+        }
+        cwd.effective_cwd = resolve_cd_target(target, cwd.effective_cwd.as_deref());
     }
 
     None
@@ -1953,12 +1602,46 @@ mod tests {
         assert!(check_command("ls | grep foo", &rules, None).is_some());
     }
 
-    // ── Heredoc exception ────────────────────────────────────────────
+    // ── Heredoc is stdin input, not an allow/deny knob (ticket 08) ────
+    //
+    // The heredoc allowlist exception is deleted (decision 020 §2): a command
+    // faces the allowlist on its *name* alone, never on the form in which it
+    // receives stdin. `<<` lexes to `RedirectOp::Read` (input), so it never
+    // shields an output redirect, and the body is stripped before any gate sees
+    // it. So denial moves to the command, where it belongs: `cat <<EOF` is
+    // allowed iff `cat` is allowed; `python <<EOF` denies because `python` is.
 
     #[test]
-    fn cat_heredoc_allowed() {
-        let rules = basic_rules();
+    fn cat_heredoc_allowed_when_cat_allowed() {
+        // `cat` is on the recommended allowlist (reads moved to `allow`), so
+        // `cat <<EOF` is allowed — because `cat` is allowed, not via a heredoc
+        // exception.
+        let rules = recommended_rules();
         assert!(check_command("cat <<EOF\nhello\nEOF", &rules, None).is_none());
+    }
+
+    #[test]
+    fn cat_heredoc_denied_when_cat_not_allowed() {
+        // Flip from the old heredoc exception: with `cat` *not* allowlisted, the
+        // heredoc form no longer waves it through — the command faces the
+        // allowlist normally and is denied.
+        let rules = basic_rules();
+        let denial =
+            check_command("cat <<EOF\nhello\nEOF", &rules, None).expect("cat denied on its name");
+        assert_eq!(denial.command, "cat");
+        assert_eq!(denial.reason, DenialReason::NotAllowed);
+    }
+
+    #[test]
+    fn python_heredoc_denied() {
+        // Required ticket-08 outcome: `python <<EOF` now DENIES — `python` is
+        // denied regardless of the stdin form. (Was allowed under the old
+        // heredoc exception.)
+        let rules = recommended_rules();
+        let denial = check_command("python <<EOF\nprint(1)\nEOF", &rules, None)
+            .expect("python denied on its name");
+        assert_eq!(denial.command, "python");
+        assert_eq!(denial.reason, DenialReason::NotAllowed);
     }
 
     #[test]
@@ -1968,30 +1651,41 @@ mod tests {
     }
 
     #[test]
-    fn head_heredoc_quoted_marker_allowed() {
-        // head is not in allow, but heredoc exception applies.
+    fn head_heredoc_denied_when_not_allowed() {
+        // Flip: `head` was waved through by the old quoted-marker heredoc
+        // exception. It now faces the allowlist on its name and is denied.
         let mut rules = ResolvedCommands::default();
         rules.allow.insert("git".to_string());
-        assert!(check_command("head <<'MARKER'\nhello\nMARKER", &rules, None).is_none());
+        let denial = check_command("head <<'MARKER'\nhello\nMARKER", &rules, None)
+            .expect("head denied on its name");
+        assert_eq!(denial.command, "head");
     }
 
     #[test]
-    fn sed_heredoc_allowed() {
+    fn sed_heredoc_denied_mid_position_zero() {
+        // Flip: `sed 's/foo/bar/' <<EOF` was allowed by the heredoc exception.
+        // `sed` is a pipeline command, so at position 0 it now denies on the
+        // pipeline-position guard — the heredoc form is irrelevant.
         let rules = basic_rules();
-        assert!(check_command("sed 's/foo/bar/' <<EOF\nhello\nEOF", &rules, None).is_none());
+        let denial = check_command("sed 's/foo/bar/' <<EOF\nhello\nEOF", &rules, None)
+            .expect("sed denied at pipeline position 0");
+        assert_eq!(denial.command, "sed");
+        assert_eq!(denial.reason, DenialReason::PipelinePosition);
     }
 
     #[test]
-    fn heredoc_narrowing_unquoted_arg_before_heredoc() {
-        // grep has an unquoted positional arg before <<, so the heredoc
-        // exception does NOT fire. grep is in pipeline → denied at pos 0.
+    fn heredoc_unquoted_arg_before_heredoc_still_denied() {
+        // `grep pattern <<EOF` — grep is a pipeline command at position 0, so it
+        // denies. (Outcome preserved; the old "leading-heredoc narrowing"
+        // reasoning is gone — the form never mattered.)
         let rules = basic_rules();
         assert!(check_command("grep pattern <<EOF\nhello\nEOF", &rules, None).is_some());
     }
 
     #[test]
-    fn heredoc_narrowing_file_arg_before_heredoc() {
-        // Adversarial: file operand before << prevents the exception.
+    fn heredoc_file_arg_before_heredoc_still_denied() {
+        // `cat file.txt <<EOF` — cat is not allowlisted, so it denies regardless
+        // of the heredoc. (Outcome preserved.)
         let rules = basic_rules();
         assert!(check_command("cat file.txt <<EOF\nhello\nEOF", &rules, None).is_some());
     }
@@ -2291,9 +1985,17 @@ mod tests {
         }
 
         // TestHeredoc
+        //
+        // The multi-line `git commit`/`gh pr create` heredoc form runs a *real*
+        // `cat` inside `$(…)` (the shell captures its output), so it is allowed
+        // because `cat` is allowlisted — `recommended_rules` (matching the
+        // shipped config) puts reads in `allow`. The old heredoc *exception*
+        // that waved the inner `cat` through regardless is deleted (ticket 08);
+        // the body prose is still stripped before any gate sees it, so the
+        // semicolons / parentheses in the message never segment.
         #[test]
         fn git_commit_heredoc() {
-            let rules = python_equivalent_rules();
+            let rules = recommended_rules();
             assert!(
                 check_command(
                     "git commit -m \"$(cat <<'EOF'\nmessage\nEOF\n)\"",
@@ -2306,7 +2008,7 @@ mod tests {
 
         #[test]
         fn gh_pr_create_heredoc() {
-            let rules = python_equivalent_rules();
+            let rules = recommended_rules();
             assert!(
                 check_command(
                     "gh pr create --body \"$(cat <<'EOF'\nbody text\nEOF\n)\"",
@@ -2319,7 +2021,7 @@ mod tests {
 
         #[test]
         fn heredoc_body_with_semicolons() {
-            let rules = python_equivalent_rules();
+            let rules = recommended_rules();
             let cmd = "git commit -m \"$(cat <<'EOF'\n\
                         feat: fix hook deny response\n\
                         \n\
@@ -2332,7 +2034,7 @@ mod tests {
 
         #[test]
         fn heredoc_body_with_parentheses() {
-            let rules = python_equivalent_rules();
+            let rules = recommended_rules();
             let cmd = "git commit -m \"$(cat <<'EOF'\n\
                         fix(hook): missing execute bit was silently allowing blocked commands through)\n\
                         EOF\n\
@@ -2560,93 +2262,10 @@ mod tests {
         }
     }
 
-    // ── mask_quotes unit tests ───────────────────────────────────────
-
-    #[test]
-    fn mask_quotes_single() {
-        let result = mask_quotes("echo 'foo && bar'");
-        assert!(!result.contains("foo"));
-        assert_eq!(result.len(), "echo 'foo && bar'".len());
-    }
-
-    #[test]
-    fn mask_quotes_double() {
-        let result = mask_quotes("echo \"foo | bar\"");
-        assert!(!result.contains("foo"));
-        assert_eq!(result.len(), "echo \"foo | bar\"".len());
-    }
-
-    #[test]
-    fn mask_quotes_preserves_unquoted() {
-        let result = mask_quotes("echo hello && world");
-        assert!(result.contains("echo"));
-        assert!(result.contains("hello"));
-        assert!(result.contains("&&"));
-        assert!(result.contains("world"));
-    }
-
-    // ── strip_heredoc_bodies tests ───────────────────────────────────
-
-    #[test]
-    fn strip_heredoc_removes_body() {
-        let input = "cat <<EOF\nhello world\nfoo bar\nEOF";
-        let result = strip_heredoc_bodies(input);
-        assert!(!result.contains("hello world"));
-        assert!(!result.contains("foo bar"));
-        assert!(result.contains("cat <<EOF"));
-        assert!(result.contains("EOF"));
-    }
-
-    #[test]
-    fn strip_heredoc_preserves_non_heredoc() {
-        let input = "make build && git status";
-        let result = strip_heredoc_bodies(input);
-        assert_eq!(result, input);
-    }
-
-    // ── find_command tests ───────────────────────────────────────────
-
-    #[test]
-    fn find_command_no_env_vars() {
-        assert_eq!(find_command(&["make", "test"]), Some(0));
-    }
-
-    #[test]
-    fn find_command_skips_env_vars() {
-        assert_eq!(find_command(&["DEBUG=1", "make", "test"]), Some(1));
-        assert_eq!(find_command(&["A=1", "B=2", "cat", "file"]), Some(2));
-    }
-
-    #[test]
-    fn find_command_all_env_vars() {
-        assert_eq!(find_command(&["A=1", "B=2"]), None);
-    }
-
-    // ── pipe_split tests ─────────────────────────────────────────────
-
-    #[test]
-    fn pipe_split_basic() {
-        let parts = pipe_split("echo foo | grep bar");
-        assert_eq!(parts, vec!["echo foo", "grep bar"]);
-    }
-
-    #[test]
-    fn pipe_split_preserves_or() {
-        let parts = pipe_split("make check || cargo test");
-        assert_eq!(parts, vec!["make check || cargo test"]);
-    }
-
-    #[test]
-    fn pipe_split_multi_stage() {
-        let parts = pipe_split("a | b | c");
-        assert_eq!(parts, vec!["a", "b", "c"]);
-    }
-
-    #[test]
-    fn pipe_split_quoted_pipe() {
-        let parts = pipe_split("git commit -m \"a | b\"");
-        assert_eq!(parts, vec!["git commit -m \"a | b\""]);
-    }
+    // The mask_quotes / strip_heredoc_bodies / find_command / pipe_split unit
+    // tests retired with their scanners (tokenizer ticket 08): segmentation,
+    // env-var skipping, heredoc stripping, and quote-faithful pipe splitting are
+    // now properties of the one faithful parse, covered by `parse.rs` tests.
 
     // ── extract_command_names tests ─────────────────────────────────
 
@@ -3368,8 +2987,10 @@ mod tests {
 
     #[test]
     fn heredoc_plus_redirect_denied() {
-        // The redirect check runs before the heredoc exception, so the
-        // stdin-reading short-circuit can't smuggle a file write through.
+        // Required ticket-08 outcome: a heredoc never shields an output
+        // redirect. `<<` lexes to `RedirectOp::Read` (input, ignored by the
+        // guard); the `> file.rs` write is a separate `RedirectOp::Write` the
+        // guard catches (bug 11).
         let rules = basic_rules();
         let denial = check_command("cat <<'EOF' > file.rs\nfn main() {}\nEOF", &rules, None)
             .expect("heredoc + redirect denied");
@@ -3502,91 +3123,6 @@ mod tests {
         let denial =
             check_command("echo hi > $f", &rules, None).expect("variable target fails closed");
         assert_eq!(denial.reason, DenialReason::OutputRedirect);
-    }
-
-    // ── mask_quotes boundary tests ──────────────────────────────────
-
-    #[test]
-    fn mask_quotes_escaped_double_quote() {
-        // Backslash-escaped double quote inside a double-quoted string.
-        // The \" should NOT close the quoted region.
-        let input = r#"echo "he said \"hello\" today""#;
-        let result = mask_quotes(input);
-        // "echo " is unquoted — should be preserved.
-        assert!(result.starts_with("echo "), "unquoted prefix preserved");
-        // Everything inside the quotes should be masked (spaces).
-        // The word "hello" is inside quotes — must NOT appear.
-        assert!(
-            !result.contains("hello"),
-            "escaped quote content should be masked, got: {result}",
-        );
-        // "today" is inside the outer quotes (between \" and closing ").
-        assert!(
-            !result.contains("today"),
-            "content after escaped quote should still be masked, got: {result}",
-        );
-        assert_eq!(result.len(), input.len(), "length must be preserved");
-    }
-
-    #[test]
-    fn mask_quotes_unterminated_double_quote() {
-        // Unterminated double quote — should mask to end without panic.
-        let input = r#"echo "unterminated"#;
-        let result = mask_quotes(input);
-        assert!(result.starts_with("echo "), "unquoted prefix preserved");
-        assert!(!result.contains("unterminated"), "quoted content masked");
-        assert_eq!(result.len(), input.len());
-    }
-
-    #[test]
-    fn mask_quotes_unterminated_single_quote() {
-        let input = "echo 'unterminated";
-        let result = mask_quotes(input);
-        assert!(result.starts_with("echo "), "unquoted prefix preserved");
-        assert!(!result.contains("unterminated"), "quoted content masked");
-        assert_eq!(result.len(), input.len());
-    }
-
-    #[test]
-    fn mask_quotes_backslash_at_end_of_double_quote() {
-        // Backslash as the last char inside double quotes.
-        let input = r#"echo "test\""#;
-        let result = mask_quotes(input);
-        assert!(result.starts_with("echo "), "unquoted prefix preserved");
-        assert!(!result.contains("test"), "quoted content masked");
-        assert_eq!(result.len(), input.len());
-    }
-
-    // ── pipe_split boundary tests ───────────────────────────────────
-
-    #[test]
-    fn pipe_split_trailing_pipe() {
-        // Pipe as the last character — tests bounds check on bytes[i+1].
-        let parts = pipe_split("echo foo |");
-        assert_eq!(parts, vec!["echo foo", ""]);
-    }
-
-    #[test]
-    fn pipe_split_leading_pipe() {
-        // Pipe at position 0 — tests i > 0 guard in backward || check.
-        let parts = pipe_split("| grep foo");
-        assert_eq!(parts, vec!["", "grep foo"]);
-    }
-
-    #[test]
-    fn pipe_split_triple_pipe() {
-        // ||| = || followed by |. The third | is the second of || in
-        // backward check, so it should be skipped (not a bare pipe).
-        let parts = pipe_split("a ||| b");
-        assert_eq!(parts, vec!["a ||| b"]);
-    }
-
-    #[test]
-    fn pipe_split_pipe_then_trailing_whitespace() {
-        // Pipe followed by trailing whitespace — tests the whitespace
-        // skip loop's bounds check (i < n vs i <= n).
-        let parts = pipe_split("echo foo |   ");
-        assert_eq!(parts, vec!["echo foo", ""]);
     }
 
     // ── is_unresolvable_cd_target tests ─────────────────────────────
@@ -4147,12 +3683,13 @@ mod tests {
     //
     // A bare newline separates commands in bash (`a\nb` runs both). The `&`
     // sibling of this hole was closed in ticket 14; this closes the newline
-    // half. The fix is heredoc-aware: `strip_heredoc_bodies` drops the body
-    // *and* the closing-delimiter line, and `newline_split` masks quotes and
-    // skips `(…)`/backtick groupings — so a newline inside a quoted arg or the
-    // multi-line `git commit` heredoc form is never split. These assertions
-    // were the `known_gap_newline_not_a_separator` pins (CatenaryInternal
-    // bugs/20); they are now flipped to the closed behavior.
+    // half. The faithful parse (ticket 08) makes this fall out structurally: a
+    // newline is one of the list operators that separate pipelines, and the
+    // parse strips heredoc bodies and their closing-delimiter lines and never
+    // splits a newline inside a quoted arg or a `(…)`/backtick grouping — so the
+    // multi-line `git commit` heredoc form is never split. These assertions were
+    // the `known_gap_newline_not_a_separator` pins (CatenaryInternal bugs/20);
+    // they are now flipped to the closed behavior.
 
     #[test]
     fn newline_separates_foreign_commands() {
@@ -4431,6 +3968,32 @@ mod tests {
             analyze_catenary_command("true && catenary diagnostics"),
             CatenaryAction::Deny(_),
         ));
+    }
+
+    #[test]
+    fn ticket08_catenary_words_in_heredoc_body_do_not_trip_gates() {
+        // Required ticket-08 outcome: a `catenary diagnostics` named in a commit
+        // heredoc *body* is opaque stdin — the parse strips the body before
+        // either gate runs, so neither the isolation/catenary gate nor the
+        // foreign allowlist ever sees it.
+        let cmd = "git commit -F - <<EOF\n\
+                   refactor: ran catenary diagnostics; everything is green\n\
+                   also tidied catenary sed --in-place call sites\n\
+                   EOF";
+        // The catenary gate finds no `catenary` command — the body is gone, so
+        // the only command is the foreign `git`.
+        assert_eq!(
+            analyze_catenary_command(cmd),
+            CatenaryAction::NotCatenary,
+            "a `catenary diagnostics` in a heredoc body must not be recognized",
+        );
+        // The foreign allowlist sees only `git` (allowed) — the body prose,
+        // including its `;`, never segments or reaches the gate.
+        let rules = recommended_rules();
+        assert!(
+            check_command(cmd, &rules, None).is_none(),
+            "heredoc body prose must not deny the allowlisted `git`",
+        );
     }
 
     #[test]
