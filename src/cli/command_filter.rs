@@ -347,6 +347,28 @@ fn find_command(tokens: &[&str]) -> Option<usize> {
     tokens.iter().position(|t| !ENV_VAR_RE.is_match(t))
 }
 
+/// Whether `<<` is the first argument after a segment's command word.
+///
+/// The heredoc exception keys off this: a command whose first operand is a
+/// heredoc marker reads stdin, not files, so the allowlist denial is
+/// suppressed (`cat <<'EOF'…` commit pattern). Quoted arguments are masked to
+/// whitespace by [`shell_split`], so `sed 's/foo/bar/' <<EOF` reads as
+/// `["sed", "<<EOF"]` and still qualifies, while an unquoted operand before the
+/// heredoc (`grep pattern <<EOF`) does not. The per-argument quote information
+/// needed to recover this from the faithful parse is not carried on
+/// [`SimpleCommand`](parse::SimpleCommand), so the heuristic stays on the raw
+/// segment until ticket 03 folds the redirect surface onto the parse.
+fn segment_has_leading_heredoc(segment: &str) -> bool {
+    let tokens = shell_split(segment);
+    let token_refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
+    let Some(cmd_idx) = find_command(&token_refs) else {
+        return false;
+    };
+    token_refs
+        .get(cmd_idx + 1)
+        .is_some_and(|t| t.starts_with("<<"))
+}
+
 /// Split a string on whitespace, respecting single and double quotes.
 fn shell_split(s: &str) -> Vec<String> {
     let masked = mask_quotes(s);
@@ -468,15 +490,26 @@ fn redirects_to_file(segment: &str) -> bool {
 ///
 /// The heredoc exception suppresses denial for commands reading from stdin.
 /// Returns the denied command name and reason if denied, `None` if allowed.
+///
+/// `cmd` is a [`SimpleCommand`](parse::SimpleCommand) from the faithful parse
+/// (ticket 02): its command-position `name` and `argv` come from the
+/// quote-faithful tokenizer, so a substring of a quoted argument can never be
+/// mistaken for a command word. The decision ladder — heredoc exception → build
+/// tool → unconditional allow + denied subcommand/flags → pipeline with the
+/// position-0 guard → default deny — is unchanged. A command with no
+/// command-position word (`name == None`) is not validated.
 fn check_against_allowlist(
-    name: &str,
-    rest: &[&str],
-    subcommand: Option<&str>,
+    cmd: &parse::SimpleCommand,
     has_heredoc: bool,
     pipe_pos: usize,
     rules: &ResolvedCommands,
     cwd: Option<&std::path::Path>,
 ) -> Option<(String, DenialReason)> {
+    // No command-position word (only assignments / redirects) — nothing to
+    // validate.
+    let name = cmd.name.as_deref()?;
+    let argv = &cmd.argv;
+
     // Heredoc exception: command is reading from stdin, not files.
     if has_heredoc {
         return None;
@@ -484,7 +517,7 @@ fn check_against_allowlist(
 
     // Build tool is always allowed (per-root lookup with default fallback).
     if rules.build_for_cwd(cwd).iter().any(|t| t == name) {
-        if let Some(flag) = check_denied_flags(name, rest, rules) {
+        if let Some(flag) = check_denied_flags(name, argv, rules) {
             return Some((format!("{name} {flag}"), DenialReason::DeniedFlag));
         }
         return None;
@@ -493,14 +526,15 @@ fn check_against_allowlist(
     // Check if command is in the unconditional allow list.
     if rules.allow.contains(name) {
         // Check subcommand deny: e.g., git is allowed but `git grep` is denied.
+        // The subcommand is the first argument after the command word.
         // Returns the full denied form (e.g., "git grep") for clear denial messages.
-        if let Some(sub) = subcommand
+        if let Some(sub) = argv.first()
             && let Some(denied_subs) = rules.deny.get(name)
             && denied_subs.contains(sub)
         {
             return Some((format!("{name} {sub}"), DenialReason::DeniedSubcommand));
         }
-        if let Some(flag) = check_denied_flags(name, rest, rules) {
+        if let Some(flag) = check_denied_flags(name, argv, rules) {
             return Some((format!("{name} {flag}"), DenialReason::DeniedFlag));
         }
         return None;
@@ -512,7 +546,7 @@ fn check_against_allowlist(
         if pipe_pos == 0 {
             return Some((name.to_string(), DenialReason::PipelinePosition));
         }
-        if let Some(flag) = check_denied_flags(name, rest, rules) {
+        if let Some(flag) = check_denied_flags(name, argv, rules) {
             return Some((format!("{name} {flag}"), DenialReason::DeniedFlag));
         }
         return None;
@@ -524,20 +558,22 @@ fn check_against_allowlist(
 
 /// Scan arguments for denied flags.
 ///
-/// Checks `rest[1..]` (everything after the command name) against
+/// Checks `argv` (the words after the command name, from the parse) against
 /// `deny_flags.<name>`. Long flags with `=` are split (e.g.,
 /// `--manifest-path=Cargo.toml` matches `--manifest-path`). Short flags
 /// are matched as-is — no combined flag decomposition (`-rf` does not
 /// match `-r`).
 ///
 /// Returns the matched flag if found.
-fn check_denied_flags(name: &str, rest: &[&str], rules: &ResolvedCommands) -> Option<String> {
+fn check_denied_flags(name: &str, argv: &[String], rules: &ResolvedCommands) -> Option<String> {
     let denied = rules.deny_flags.get(name)?;
-    for token in rest.iter().skip(1) {
+    for token in argv {
         let flag = if token.starts_with("--") {
-            token.split_once('=').map_or(*token, |(flag, _)| flag)
-        } else {
             token
+                .split_once('=')
+                .map_or(token.as_str(), |(flag, _)| flag)
+        } else {
+            token.as_str()
         };
         if denied.contains(flag) {
             return Some(flag.to_string());
@@ -630,20 +666,21 @@ pub fn check_command(
                 }
             }
 
-            let tokens = shell_split(segment);
-            let token_refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
-            if token_refs.is_empty() {
-                continue;
-            }
-
-            let Some(cmd_idx) = find_command(&token_refs) else {
+            // Command-position word comes from the faithful parse (ticket 02):
+            // the segment has no top-level list/pipe operators (those were
+            // split above), so it parses to at most one pipeline holding one
+            // simple command. Its `name`/`argv` are quote-faithful — a
+            // substring of a quoted argument can never reach command position
+            // (the bug-33 false-deny fix). Substitutions are still recursed
+            // above via `SUBSHELL_RE`, and the redirect/heredoc guards still
+            // read the raw `segment` (ticket 03 folds them onto the parse).
+            let parsed = parse::parse(segment);
+            let Some(parsed_cmd) = parsed.pipelines.first().and_then(|p| p.commands.first()) else {
                 continue;
             };
-
-            let name = std::path::Path::new(token_refs[cmd_idx])
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(token_refs[cmd_idx]);
+            let Some(name) = parsed_cmd.name.as_deref() else {
+                continue;
+            };
 
             // Catenary's own commands run under the canonical-form matcher
             // (regime 1, `analyze_catenary_command`), not the foreign
@@ -659,7 +696,9 @@ pub fn check_command(
             // the allow/deny decision (and before the heredoc exception) so
             // neither an otherwise-allowed command nor the heredoc
             // short-circuit can carry a redirect through. Gated by
-            // `allow_file_redirects`.
+            // `allow_file_redirects`. Ticket 03 reads this off
+            // `parsed_cmd.redirects`; until then the byte scanner runs on the
+            // raw segment (temporary overlap).
             if !rules.allow_file_redirects && redirects_to_file(segment) {
                 return Some(Denial {
                     command: name.to_string(),
@@ -669,20 +708,19 @@ pub fn check_command(
                 });
             }
 
-            let rest = &token_refs[cmd_idx..];
             // Heredoc exception: only when `<<` is the first argument after
             // the command name. Quoted arguments (like sed patterns) are
-            // invisible here because mask_quotes already collapsed them,
-            // so `sed 's/foo/bar/' <<EOF` tokenizes as `["sed", "<<EOF"]`.
-            // This prevents `rm -rf target/ <<EOF` from bypassing the
-            // allowlist while preserving the `cat <<'EOF'` commit pattern.
-            let has_heredoc = rest.get(1).is_some_and(|t| t.starts_with("<<"));
-            let subcommand = if rest.len() > 1 { Some(rest[1]) } else { None };
+            // invisible to this masked tokenization, so `sed 's/foo/bar/'
+            // <<EOF` reads as `["sed", "<<EOF"]`. This prevents
+            // `rm -rf target/ <<EOF` from bypassing the allowlist while
+            // preserving the `cat <<'EOF'` commit pattern. The per-argument
+            // quote information needed to reproduce this from the parse is not
+            // carried on `SimpleCommand`, so the heuristic stays on the raw
+            // segment for now.
+            let has_heredoc = segment_has_leading_heredoc(segment);
 
             if let Some((denied, reason)) = check_against_allowlist(
-                name,
-                rest,
-                subcommand,
+                parsed_cmd,
                 has_heredoc,
                 pipe_pos,
                 rules,
@@ -696,9 +734,10 @@ pub fn check_command(
                 });
             }
 
-            // Track `cd` to update effective cwd for subsequent segments.
+            // Track `cd` to update effective cwd for subsequent segments. The
+            // target is the first parsed argument after the command word.
             if name == "cd"
-                && let Some(target) = subcommand
+                && let Some(target) = parsed_cmd.argv.first()
             {
                 let resolved = resolve_cd_target(target, effective_cwd.as_deref());
                 if is_unresolvable_cd_target(target) {
@@ -774,70 +813,20 @@ fn normalize_path(path: &std::path::Path) -> std::path::PathBuf {
 
 /// Extract all command names from a shell command string.
 ///
-/// Reuses the same parsing infrastructure as [`check_command`]: heredoc
-/// stripping, echo separator removal, sequential/pipe splitting, subshell
-/// recursion, env-var prefix skipping, and full-path stripping. Returns the
-/// bare command names (e.g., `rm`, `cp`) found at each pipeline position.
+/// Re-points at the faithful parse's command-position projection (ticket 02):
+/// [`ParsedScript::command_positions`](parse::ParsedScript::command_positions)
+/// returns every command-position word across all pipelines and recursed
+/// substitutions, path-stripped and `VAR=`-skipped, with quoted-argument
+/// substrings never mistaken for commands. Returns the bare command names
+/// (e.g., `rm`, `cp`).
 ///
 /// Used by editing enforcement to decide whether a Bash tool call contains
-/// only filesystem-manipulation commands.
+/// only filesystem-manipulation commands; the consumer treats the result as a
+/// set, so the projection order (command word before its substitutions) is not
+/// significant.
 #[must_use]
 pub fn extract_command_names(cmd: &str) -> Vec<String> {
-    let mut names = Vec::new();
-    collect_command_names(cmd, &mut names);
-    names
-}
-
-/// Recursive helper for [`extract_command_names`].
-fn collect_command_names(cmd: &str, names: &mut Vec<String>) {
-    let cmd_string = strip_heredoc_bodies(cmd);
-    let cmd_string = strip_echo_separators(&cmd_string);
-
-    // Bare `&` (backgrounding) and a bare newline are the loosest separators —
-    // split on both first so a command after either is still enumerated
-    // (editing enforcement must see every command, not just the one before the
-    // separator).
-    let sequential: Vec<&str> = background_split(&cmd_string)
-        .into_iter()
-        .flat_map(|bg| newline_split(bg))
-        .flat_map(|nl| quote_aware_split(nl, &SEQ_SPLIT_RE))
-        .collect();
-    for seq in sequential {
-        let stages = pipe_split(seq);
-        for segment in &stages {
-            let segment = segment.trim();
-            if segment.is_empty() {
-                continue;
-            }
-
-            // Recursively process $(), <(), and `` substitutions.
-            for m in SUBSHELL_RE.captures_iter(segment) {
-                let inner = m
-                    .get(1)
-                    .or_else(|| m.get(2))
-                    .or_else(|| m.get(3))
-                    .map_or("", |g| g.as_str().trim());
-                collect_command_names(inner, names);
-            }
-
-            let tokens = shell_split(segment);
-            let token_refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
-            if token_refs.is_empty() {
-                continue;
-            }
-
-            let Some(cmd_idx) = find_command(&token_refs) else {
-                continue;
-            };
-
-            let name = std::path::Path::new(token_refs[cmd_idx])
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(token_refs[cmd_idx]);
-
-            names.push(name.to_string());
-        }
-    }
+    parse::parse(cmd).command_positions()
 }
 
 // ── Catenary command canonical-form matcher (ADR 013/014) ───────────────
@@ -2644,8 +2633,11 @@ mod tests {
 
     #[test]
     fn extract_names_subshell() {
+        // The faithful parse projects the command word before its recursed
+        // substitutions (`rm` then `cat`); the consumer treats this as a set,
+        // so the order is not significant.
         let names = extract_command_names("rm $(cat files.txt)");
-        assert_eq!(names, vec!["cat", "rm"]);
+        assert_eq!(names, vec!["rm", "cat"]);
     }
 
     #[test]
@@ -4107,5 +4099,63 @@ mod tests {
             check_command("git commit -m \"run editing start first\"", &rules, None).is_none(),
             "plain prose mentioning a subcommand is allowed",
         );
+    }
+
+    // ── bug-33 false-deny class now allowed (ticket 02) ──────────────
+    //
+    // The allowlist evaluator validates only the *command-position* words from
+    // the faithful parse, never a substring of a quoted argument. These cases
+    // false-denied under the ad-hoc tokenizer (innocent words read as
+    // commands); the parse keeps them as a single argument, so they are
+    // allowed. A command position inside a substitution is still checked.
+
+    #[test]
+    fn bug33_single_quote_escape_idiom_allowed() {
+        // `git commit -m 'it'\''s done'` → one command `git`; the `'\''`
+        // close·escape·reopen idiom keeps the message one argument, so neither
+        // `s` nor `done` reaches command position.
+        let rules = recommended_rules();
+        assert!(
+            check_command(r"git commit -m 'it'\''s done'", &rules, None).is_none(),
+            "the single-quote escape idiom must not surface `s`/`done` as commands",
+        );
+    }
+
+    #[test]
+    fn bug33_quoted_prose_arg_allowed() {
+        // `git commit -m "… catenary diagnostics …"` → one command `git`; the
+        // quoted prose is an argument, not an inner command.
+        let rules = recommended_rules();
+        assert!(
+            check_command(
+                "git commit -m \"refactor: catenary diagnostics now bare\"",
+                &rules,
+                None,
+            )
+            .is_none(),
+            "quoted prose must stay an argument, not an inner command",
+        );
+    }
+
+    #[test]
+    fn bug33_comment_is_not_a_command() {
+        // `make test  # comment` → one command `make`; the `#` comment is
+        // dropped by the parse and never read as an argument-command.
+        let rules = recommended_rules();
+        assert!(
+            check_command("make test  # run the suite", &rules, None).is_none(),
+            "an inline comment must not be parsed as a command",
+        );
+    }
+
+    #[test]
+    fn bug33_command_position_in_substitution_still_checked() {
+        // `echo $(cargo build)` → denied on `cargo` (the substitution's command
+        // position), not on the allowed `echo`.
+        let rules = recommended_rules();
+        let denial =
+            check_command("echo $(cargo build)", &rules, None).expect("cargo inside $() denied");
+        assert_eq!(denial.command, "cargo");
+        assert_eq!(denial.reason, DenialReason::NotAllowed);
     }
 }
