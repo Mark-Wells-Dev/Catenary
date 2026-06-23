@@ -1047,6 +1047,19 @@ impl RootTracker {
     }
 }
 
+/// Parses the contributing `session_id` out of a `worktree:{session_id}:{path}`
+/// contributor key.
+///
+/// The reaper task has no session span (it runs in the background watcher), so it
+/// recovers the session id from the contributor to scope its reap log under the
+/// same firehose shard as the mount (which logs inside the session-scoped hook
+/// handler). Returns `None` if the key is not a well-formed `worktree:` key.
+fn worktree_contributor_session_id(contributor: &str) -> Option<&str> {
+    let rest = contributor.strip_prefix("worktree:")?;
+    let (session_id, _path) = rest.split_once(':')?;
+    (!session_id.is_empty()).then_some(session_id)
+}
+
 /// Reaps every `worktree:*` contributor whose worktree directory is gone on
 /// disk (a missed `WorktreeRemove`). Returns the removed contributor keys so the
 /// caller can re-sync + log. Path-existence is a direct, correlation-free,
@@ -1636,8 +1649,15 @@ impl SessionManager {
                         "root sync after worktree-deletion reap failed: {e}",
                     );
                 }
+                // Scope the reap log under the contributing session — the same
+                // firehose shard as the mount (which logs inside the
+                // session-scoped hook handler) — so a worktree's full lifecycle
+                // co-locates. The reaper has no session span, so recover the id
+                // from the contributor; `session_id = ""` falls through to the
+                // daemon scope for a malformed key (no behavior change).
                 debug!(
                     source = Source::DaemonDispatch.as_str(),
+                    session_id = worktree_contributor_session_id(&contributor).unwrap_or(""),
                     contributor = %contributor,
                     "reaped worktree root on dir deletion",
                 );
@@ -5973,6 +5993,53 @@ mod tests {
             "no worktree dir gone → nothing reaped",
         );
         assert_eq!(tracker.global_roots().len(), 2, "both roots survive");
+    }
+
+    // ── Reap-log scoping: worktree_contributor_session_id ─────────────────
+    //
+    // The reaper task has no session span, so it recovers the contributing
+    // session id from the `worktree:{session_id}:{path}` key to scope its reap
+    // log under the same firehose shard as the mount. This is the parse the
+    // `session_id` field on that log feeds from.
+
+    #[test]
+    fn worktree_contributor_session_id_extracts_the_session() {
+        assert_eq!(
+            worktree_contributor_session_id(
+                "worktree:dc1bdd1b-7b18-4ab8-a42a-0dbea87a271d:/home/mark/wt"
+            ),
+            Some("dc1bdd1b-7b18-4ab8-a42a-0dbea87a271d"),
+            "the session id between the first two colons is recovered",
+        );
+    }
+
+    #[test]
+    fn worktree_contributor_session_id_stops_at_first_path_colon() {
+        // A path may itself contain a colon; only the first segment is the id.
+        assert_eq!(
+            worktree_contributor_session_id("worktree:sess-a:/odd:path/wt"),
+            Some("sess-a"),
+            "only the segment before the first path colon is the session id",
+        );
+    }
+
+    #[test]
+    fn worktree_contributor_session_id_rejects_malformed_keys() {
+        assert_eq!(
+            worktree_contributor_session_id("mcp:1"),
+            None,
+            "a non-worktree contributor has no worktree session id",
+        );
+        assert_eq!(
+            worktree_contributor_session_id("worktree:/no-session-segment"),
+            None,
+            "a key without a session:path split yields no id",
+        );
+        assert_eq!(
+            worktree_contributor_session_id("worktree::/empty-session"),
+            None,
+            "an empty session segment is not a usable scope",
+        );
     }
 
     // ── Companion roots (workstream 29) ──────────────────────────────────
