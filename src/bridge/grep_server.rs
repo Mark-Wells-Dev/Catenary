@@ -593,6 +593,7 @@ impl GrepServer {
             &enrichments,
             self.symbol_index.as_ref(),
             &self.fs_manager,
+            &self.client_manager,
             cwd,
         );
         // Witnesses = matched files (content) + every directory the output's
@@ -1332,6 +1333,7 @@ fn render_results(
     enrichments: &[(&GrepHit, Option<SymbolEnrichment>)],
     symbol_index: Option<&Arc<std::sync::Mutex<SymbolIndex>>>,
     fs_manager: &FilesystemManager,
+    client_manager: &LspClientManager,
     cwd: Option<&Path>,
 ) -> String {
     use std::fmt::Write;
@@ -1352,6 +1354,7 @@ fn render_results(
             &all_indices,
             symbol_index,
             fs_manager,
+            client_manager,
             &mut full,
             Some(cwd),
         );
@@ -1381,6 +1384,7 @@ fn render_results(
                 indices,
                 symbol_index,
                 fs_manager,
+                client_manager,
                 &mut full,
                 None,
             );
@@ -1406,6 +1410,7 @@ fn render_results(
                 indices,
                 symbol_index,
                 fs_manager,
+                client_manager,
                 &mut full,
                 None,
             );
@@ -1428,10 +1433,25 @@ fn render_section(
     indices: &[usize],
     symbol_index: Option<&Arc<std::sync::Mutex<SymbolIndex>>>,
     fs_manager: &FilesystemManager,
+    client_manager: &LspClientManager,
     output: &mut String,
     cwd: Option<&Path>,
 ) {
+    use std::cell::RefCell;
     use std::fmt::Write;
+
+    // Resolve `suppress_symbol_kind` per file path, memoized — a section can
+    // span many files of differing languages, and the daemon-side lookup
+    // (language → server binding → flag) is worth caching within the section.
+    let suppress_cache: RefCell<HashMap<PathBuf, bool>> = RefCell::new(HashMap::new());
+    let suppress_kind = |path: &Path| -> bool {
+        if let Some(&v) = suppress_cache.borrow().get(path) {
+            return v;
+        }
+        let v = client_manager.suppress_symbol_kind(path);
+        suppress_cache.borrow_mut().insert(path.to_path_buf(), v);
+        v
+    };
 
     // Path display: cwd-relative when cwd is set, root-relative otherwise.
     let rel = |file: &str| -> String {
@@ -1555,16 +1575,26 @@ fn render_section(
             // Definition line — only Symbol and PrepareRenameSymbol hits
             match &hit.classification {
                 HitClass::Symbol { symbol } => {
-                    let kind = format_symbol_kind(&symbol.kind);
+                    let suppress = suppress_kind(&hit.file);
                     let scope_prefix = symbol
                         .scope
                         .as_ref()
                         .zip(symbol.scope_kind.as_ref())
                         .map_or_else(String::new, |(sn, sk)| {
-                            format!("<{}> {}/", format_symbol_kind(sk), sn)
+                            if suppress {
+                                format!("{sn}/")
+                            } else {
+                                format!("<{}> {}/", format_symbol_kind(sk), sn)
+                            }
                         });
                     let line_1 = symbol.line + 1;
-                    let _ = writeln!(output, "{scope_prefix}<{kind}> {name}  {rel_path}:{line_1}");
+                    if suppress {
+                        let _ = writeln!(output, "{scope_prefix}{name}  {rel_path}:{line_1}");
+                    } else {
+                        let kind = format_symbol_kind(&symbol.kind);
+                        let _ =
+                            writeln!(output, "{scope_prefix}<{kind}> {name}  {rel_path}:{line_1}");
+                    }
                 }
                 HitClass::PrepareRenameSymbol => {
                     let line_1 = hit.line + 1;
@@ -1749,19 +1779,28 @@ fn render_section(
                 for (file, lines) in &ref_entries {
                     let f_rel = rel(file);
                     let _ = writeln!(output, "\t\t{f_rel}");
+                    let suppress = suppress_kind(Path::new(file));
                     for (&line_0, enc) in lines {
                         let line_1 = line_0 + 1;
                         let enc_str = enc.as_ref().map_or_else(String::new, |enc| {
-                            let ek = format_symbol_kind(&enc.kind);
                             let scope_prefix = enc
                                 .scope
                                 .as_ref()
                                 .zip(enc.scope_kind.as_ref())
                                 .map_or_else(String::new, |(sn, sk)| {
-                                    format!("<{}> {}/", format_symbol_kind(sk), sn)
+                                    if suppress {
+                                        format!("{sn}/")
+                                    } else {
+                                        format!("<{}> {}/", format_symbol_kind(sk), sn)
+                                    }
                                 });
                             let span = format_span(enc.line, enc.end_line);
-                            format!(" {scope_prefix}<{ek}> {}{span}", enc.name)
+                            if suppress {
+                                format!(" {scope_prefix}{}{span}", enc.name)
+                            } else {
+                                let ek = format_symbol_kind(&enc.kind);
+                                format!(" {scope_prefix}<{ek}> {}{span}", enc.name)
+                            }
                         });
                         let _ = writeln!(output, "\t\t\t:{line_1}{enc_str}");
                     }
@@ -1788,7 +1827,12 @@ fn render_section(
                     for hit in file_hits {
                         let line_1 = hit.line + 1;
                         let hit_indent = if dir.is_empty() { "\t" } else { "\t\t" };
-                        let _ = writeln!(output, "{hit_indent}{}", format_hit_line(hit, line_1));
+                        let suppress = suppress_kind(&hit.file);
+                        let _ = writeln!(
+                            output,
+                            "{hit_indent}{}",
+                            format_hit_line(hit, line_1, suppress)
+                        );
                     }
                 }
             }
@@ -1829,36 +1873,59 @@ fn group_hits_by_dir_file<'a>(
 /// For definition hits: `:line <Kind> name:start-end`
 /// For reference hits with enclosing: `:line <Kind> enclosing:start-end`
 /// For bare hits: `:line`
-fn format_hit_line(hit: &GrepHit, line_1: u32) -> String {
+///
+/// When `suppress_kind` is `true`, the `<Kind>` segment is omitted for both
+/// the hit symbol and its enclosing scope — the server embeds structural
+/// context in the symbol name itself (e.g. Lattice's `H1:`), so a
+/// `SymbolKind` prefix would double-prefix.
+fn format_hit_line(hit: &GrepHit, line_1: u32, suppress_kind: bool) -> String {
     match &hit.classification {
         HitClass::Symbol { symbol } => {
-            let kind = format_symbol_kind(&symbol.kind);
             let scope_prefix = symbol
                 .scope
                 .as_ref()
                 .zip(symbol.scope_kind.as_ref())
                 .map_or_else(String::new, |(sn, sk)| {
-                    format!("<{}> {}/", format_symbol_kind(sk), sn)
+                    if suppress_kind {
+                        format!("{sn}/")
+                    } else {
+                        format!("<{}> {}/", format_symbol_kind(sk), sn)
+                    }
                 });
             let span = format_span(symbol.line, symbol.end_line);
-            format!(":{line_1} {scope_prefix}<{kind}> {}{span}", symbol.name)
+            if suppress_kind {
+                format!(":{line_1} {scope_prefix}{}{span}", symbol.name)
+            } else {
+                let kind = format_symbol_kind(&symbol.kind);
+                format!(":{line_1} {scope_prefix}<{kind}> {}{span}", symbol.name)
+            }
         }
         HitClass::Reference {
             enclosing: Some(enc),
         } => {
-            let enc_kind = format_symbol_kind(&enc.kind);
-            let scope_prefix = enc
-                .scope
-                .as_ref()
-                .zip(enc.scope_kind.as_ref())
-                .map_or_else(String::new, |(sn, sk)| {
-                    format!("<{}> {}/", format_symbol_kind(sk), sn)
-                });
+            let scope_prefix = enc.scope.as_ref().zip(enc.scope_kind.as_ref()).map_or_else(
+                String::new,
+                |(sn, sk)| {
+                    if suppress_kind {
+                        format!("{sn}/")
+                    } else {
+                        format!("<{}> {}/", format_symbol_kind(sk), sn)
+                    }
+                },
+            );
             let span = format_span(enc.line, enc.end_line);
-            format!(
-                ":{line_1} {}  {scope_prefix}<{enc_kind}> {}{span}",
-                hit.matched_text, enc.name
-            )
+            if suppress_kind {
+                format!(
+                    ":{line_1} {}  {scope_prefix}{}{span}",
+                    hit.matched_text, enc.name
+                )
+            } else {
+                let enc_kind = format_symbol_kind(&enc.kind);
+                format!(
+                    ":{line_1} {}  {scope_prefix}<{enc_kind}> {}{span}",
+                    hit.matched_text, enc.name
+                )
+            }
         }
         HitClass::Reference { enclosing: None } | HitClass::PrepareRenameSymbol => {
             format!(":{line_1} {}", hit.matched_text)
@@ -2426,6 +2493,57 @@ mod tests {
         fs
     }
 
+    /// Builds a minimal [`LspClientManager`] for render unit tests. With a
+    /// default config no language has a server binding, so
+    /// [`LspClientManager::suppress_symbol_kind`] always returns `false` —
+    /// the `<Kind>` prefix is rendered, matching the non-suppressing baseline.
+    fn test_clients() -> Arc<LspClientManager> {
+        use crate::config::Config;
+        use crate::logging::LoggingServer;
+        Arc::new(LspClientManager::new(
+            Config::default(),
+            LoggingServer::new(),
+            Arc::new(FilesystemManager::new()),
+        ))
+    }
+
+    /// Builds an `(Arc<FilesystemManager>, Arc<LspClientManager>)` pair whose
+    /// markdown (`.md`) binding carries `suppress_symbol_kind = true`. A single
+    /// fs (built from the suppressing [`Config`]) backs both the render side
+    /// and the client manager's internal classifier, so `language_id(".md")`
+    /// → `"markdown"` agrees with the flag lookup:
+    /// [`LspClientManager::suppress_symbol_kind`] returns `true` for `.md`
+    /// files under `root`.
+    fn suppressing_fs_clients(root: &str) -> (Arc<FilesystemManager>, Arc<LspClientManager>) {
+        use crate::bridge::filesystem_manager::ClassificationTables;
+        use crate::config::{Config, LanguageConfig, ServerBinding, ServerDef};
+        use crate::logging::LoggingServer;
+
+        let mut config = Config::default();
+        let server = ServerDef {
+            suppress_symbol_kind: true,
+            ..ServerDef::default()
+        };
+        config.server.insert("lattice".to_string(), server);
+        let lang = LanguageConfig {
+            extensions: Some(vec!["md".to_string()]),
+            servers: Some(vec![ServerBinding::new("lattice")]),
+            ..LanguageConfig::default()
+        };
+        config.language.insert("markdown".to_string(), lang);
+
+        let fs = Arc::new(FilesystemManager::with_classification(
+            ClassificationTables::from_config(&config),
+        ));
+        fs.set_roots(vec![PathBuf::from(root)]);
+        let clients = Arc::new(LspClientManager::new(
+            config,
+            LoggingServer::new(),
+            fs.clone(),
+        ));
+        (fs, clients)
+    }
+
     fn empty_enrichment() -> SymbolEnrichment {
         SymbolEnrichment {
             ref_lines: HashMap::new(),
@@ -2443,7 +2561,8 @@ mod tests {
     fn render(hits: &[GrepHit], budget: usize, page: usize, fs: &FilesystemManager) -> String {
         let enrichments: Vec<(&GrepHit, Option<SymbolEnrichment>)> =
             hits.iter().map(|h| (h, None)).collect();
-        let full = render_results(&enrichments, None, fs, None);
+        let clients = test_clients();
+        let full = render_results(&enrichments, None, fs, &clients, None);
         paginate(&full, budget, page)
     }
 
@@ -2695,7 +2814,7 @@ mod tests {
         });
 
         let enrichments = vec![(&hit, Some(enrichment))];
-        let full = render_results(&enrichments, None, &fs, None);
+        let full = render_results(&enrichments, None, &fs, &test_clients(), None);
 
         assert!(
             full.starts_with("/project\n<"),
@@ -2722,7 +2841,7 @@ mod tests {
             .push(("/project/src/impl.rs".to_string(), 30));
 
         let enrichments = vec![(&hit, Some(enrichment))];
-        let full = render_results(&enrichments, None, &fs, None);
+        let full = render_results(&enrichments, None, &fs, &test_clients(), None);
 
         assert!(full.contains("\timpls:\n"), "impls header: {full}");
         assert!(full.contains("\t\tsrc/impl.rs\n"), "impl file: {full}");
@@ -2744,7 +2863,7 @@ mod tests {
         });
 
         let enrichments = vec![(&hit, Some(enrichment))];
-        let full = render_results(&enrichments, None, &fs, None);
+        let full = render_results(&enrichments, None, &fs, &test_clients(), None);
 
         assert!(
             full.contains("\tsupertypes:\n"),
@@ -2771,7 +2890,7 @@ mod tests {
         });
 
         let enrichments = vec![(&hit, Some(enrichment))];
-        let full = render_results(&enrichments, None, &fs, None);
+        let full = render_results(&enrichments, None, &fs, &test_clients(), None);
 
         assert!(full.contains("\tsubtypes:\n"), "subtypes header: {full}");
         assert!(
@@ -2790,7 +2909,7 @@ mod tests {
             .insert("/project/src/main.rs".to_string(), HashSet::from([20]));
 
         let enrichments = vec![(&hit, Some(enrichment))];
-        let full = render_results(&enrichments, None, &fs, None);
+        let full = render_results(&enrichments, None, &fs, &test_clients(), None);
 
         assert!(full.contains("\trefs:\n"), "refs header: {full}");
         assert!(full.contains("\t\tsrc/main.rs\n"), "ref file: {full}");
@@ -2812,7 +2931,7 @@ mod tests {
         });
 
         let enrichments = vec![(&hit, Some(enrichment))];
-        let full = render_results(&enrichments, None, &fs, None);
+        let full = render_results(&enrichments, None, &fs, &test_clients(), None);
 
         assert!(full.contains("\trefs:\n"), "refs header: {full}");
         assert!(
@@ -2843,7 +2962,7 @@ mod tests {
         let hit_b = sym_hit("/project/src/util.rs", 20, "FnB", "function");
 
         let enrichments = vec![(&hit_a, Some(enrichment_a)), (&hit_b, None)];
-        let full = render_results(&enrichments, None, &fs, None);
+        let full = render_results(&enrichments, None, &fs, &test_clients(), None);
 
         // A rendered as definition with calls section
         assert!(
@@ -2873,7 +2992,7 @@ mod tests {
 
         let enrichments: Vec<(&GrepHit, Option<SymbolEnrichment>)> =
             hits.iter().map(|h| (h, None)).collect();
-        let full = render_results(&enrichments, None, &fs, None);
+        let full = render_results(&enrichments, None, &fs, &test_clients(), None);
 
         assert!(!full.starts_with('\n'), "no leading newline: {full:?}");
         assert!(full.contains("/project1\n"), "first root header: {full}");
@@ -2894,7 +3013,7 @@ mod tests {
 
         let enrichments: Vec<(&GrepHit, Option<SymbolEnrichment>)> =
             hits.iter().map(|h| (h, None)).collect();
-        let full = render_results(&enrichments, None, &fs, None);
+        let full = render_results(&enrichments, None, &fs, &test_clients(), None);
 
         assert!(full.contains("/other/dir1\n"), "first oor parent: {full}");
         assert!(full.contains("/other/dir2\n"), "second oor parent: {full}");
@@ -2909,7 +3028,13 @@ mod tests {
         let fs = test_fs("/project");
         let hit = sym_hit("/project/src/lib.rs", 10, "MyStruct", "struct");
         let enrichments: Vec<(&GrepHit, Option<SymbolEnrichment>)> = vec![(&hit, None)];
-        let full = render_results(&enrichments, None, &fs, Some(Path::new("/project")));
+        let full = render_results(
+            &enrichments,
+            None,
+            &fs,
+            &test_clients(),
+            Some(Path::new("/project")),
+        );
 
         // cwd header present with the path (inside a root: no LSP warning).
         assert!(
@@ -2926,6 +3051,46 @@ mod tests {
         assert!(
             !full.lines().any(|l| l == "/project"),
             "should not have standalone root header in cwd mode: {full}"
+        );
+    }
+
+    #[test]
+    fn render_suppresses_kind_for_suppressing_language() {
+        // A `.md` definition hit: the server (`lattice`) sets
+        // `suppress_symbol_kind`, so the `<Class>` prefix must be omitted.
+        let (fs, clients) = suppressing_fs_clients("/project");
+        let hit = sym_hit("/project/doc.md", 0, "H1: Title", "class");
+        let enrichments: Vec<(&GrepHit, Option<SymbolEnrichment>)> = vec![(&hit, None)];
+        let full = render_results(&enrichments, None, &fs, &clients, None);
+
+        assert!(
+            full.contains("H1: Title  doc.md:1"),
+            "suppressing language should render the bare name: {full}"
+        );
+        assert!(
+            !full.contains("<Class>"),
+            "suppressing language must not emit <Class>: {full}"
+        );
+    }
+
+    #[test]
+    fn render_retains_kind_for_non_suppressing_language_in_mixed_section() {
+        // Same suppressing config, but a `.rs` hit is NOT markdown — its
+        // language has no binding, so the `<Function>` prefix is retained.
+        let (fs, clients) = suppressing_fs_clients("/project");
+        let md_hit = sym_hit("/project/doc.md", 0, "H1: Title", "class");
+        let rs_hit = sym_hit("/project/src/lib.rs", 9, "my_fn", "function");
+        let enrichments: Vec<(&GrepHit, Option<SymbolEnrichment>)> =
+            vec![(&md_hit, None), (&rs_hit, None)];
+        let full = render_results(&enrichments, None, &fs, &clients, None);
+
+        assert!(
+            full.contains("H1: Title  doc.md:1"),
+            "markdown hit suppressed: {full}"
+        );
+        assert!(
+            full.contains("<Function> my_fn  src/lib.rs:10"),
+            "rust hit retains kind: {full}"
         );
     }
 
@@ -2952,7 +3117,7 @@ mod tests {
         };
 
         let enrichments: Vec<(&GrepHit, Option<SymbolEnrichment>)> = vec![(&hit, None)];
-        let full = render_results(&enrichments, None, &fs, None);
+        let full = render_results(&enrichments, None, &fs, &test_clients(), None);
 
         assert!(
             full.contains("<Struct> MyStruct"),
@@ -3054,7 +3219,7 @@ mod tests {
             },
         };
 
-        let formatted = format_hit_line(&hit, 43);
+        let formatted = format_hit_line(&hit, 43, false);
 
         // `:43 <Constant> CONST_VAL:43` — no range
         assert!(
@@ -3087,7 +3252,7 @@ mod tests {
             },
         };
 
-        let formatted = format_hit_line(&hit, 11);
+        let formatted = format_hit_line(&hit, 11, false);
 
         assert!(
             formatted.contains(":11 <Function> my_func:11-31"),
@@ -3106,12 +3271,38 @@ mod tests {
             "implementation",
         );
 
-        let formatted = format_hit_line(&hit, 298);
+        let formatted = format_hit_line(&hit, 298, false);
 
         // Should use `/`-separated path syntax with scope
         assert!(
             formatted.contains("<Impl> LspBridgeHandler/<Method> handle_grep"),
             "expected path syntax, got: {formatted}"
+        );
+    }
+
+    #[test]
+    fn format_hit_line_suppressed_omits_kind() {
+        // A scoped symbol hit whose name embeds structure (Lattice `H1:`).
+        let hit = scoped_sym_hit(
+            "/project/doc.md",
+            5,
+            "H2: Section",
+            "class",
+            "H1: Title",
+            "class",
+        );
+
+        let formatted = format_hit_line(&hit, 6, true);
+
+        // Both the leaf kind and the enclosing-scope kind are dropped; the
+        // scope's trailing `/` and the symbol names remain.
+        assert!(
+            formatted.contains("H1: Title/H2: Section"),
+            "suppressed hit should keep names + scope slash, drop kinds: {formatted}"
+        );
+        assert!(
+            !formatted.contains('<'),
+            "suppressed hit must not render any <Kind>: {formatted}"
         );
     }
 

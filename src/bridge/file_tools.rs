@@ -304,8 +304,9 @@ impl GlobServer {
             })
             .unwrap_or_default();
 
+        let suppress_kind = self.client_manager.suppress_symbol_kind(path);
         for sym in syms {
-            render_symbol_line(&mut full, sym, Some(&children_set), "\t");
+            render_symbol_line(&mut full, sym, Some(&children_set), "\t", suppress_kind);
         }
 
         full
@@ -524,6 +525,7 @@ impl GlobServer {
             self.outline_threshold,
             &self.outline_suppress,
             &self.fs_manager,
+            &self.client_manager,
             "\t",
         );
         full.push_str(&content);
@@ -744,18 +746,34 @@ fn is_snapshot(name: &str) -> bool {
 // ─── Symbol rendering ─────────────────────────────────────────────────
 
 /// Renders a single symbol line: `:start-end <Kind[, deprecated]> Name[/]`.
+///
+/// When `suppress_kind` is `true`, the `<Kind[, deprecated]>` segment is
+/// omitted entirely — the server embeds structural context in the symbol
+/// name itself (e.g. Lattice's `H1:`), so the `SymbolKind` prefix would
+/// double-prefix. The trailing `/` (has-children) indicator is kept.
 fn render_symbol_line(
     out: &mut String,
     sym: &Symbol,
     children_set: Option<&HashSet<String>>,
     indent: &str,
+    suppress_kind: bool,
 ) {
-    let kind_label = format_symbol_kind(&sym.kind);
     let trailing = if children_set.is_some_and(|cs| cs.contains(&sym.name)) {
         "/"
     } else {
         ""
     };
+    if suppress_kind {
+        let _ = writeln!(
+            out,
+            "{indent}:{}-{} {}{trailing}",
+            sym.line + 1,
+            sym.end_line + 1,
+            sym.name,
+        );
+        return;
+    }
+    let kind_label = format_symbol_kind(&sym.kind);
     let deprecated = if sym.deprecated { ", deprecated" } else { "" };
     let _ = writeln!(
         out,
@@ -873,6 +891,7 @@ fn render_shared_group(
     bounding: &[BoundingSymbol],
     indent: &str,
     sym_indent: &str,
+    suppress_kind: bool,
 ) {
     for &gi in group_indices {
         let item = &items[gi];
@@ -885,6 +904,16 @@ fn render_shared_group(
     let _ = writeln!(out, "{indent}common structure (ranges are bounding):");
     for sym in bounding {
         let trailing = if sym.has_children { "/" } else { "" };
+        if suppress_kind {
+            let _ = writeln!(
+                out,
+                "{sym_indent}:{}-{} {}{trailing}",
+                sym.min_line + 1,
+                sym.max_end_line + 1,
+                sym.name,
+            );
+            continue;
+        }
         let kind_label = format_symbol_kind(&sym.kind);
         let _ = writeln!(
             out,
@@ -902,9 +931,10 @@ fn render_individual_map(
     syms: &[Symbol],
     children_set: Option<&HashSet<String>>,
     sym_indent: &str,
+    suppress_kind: bool,
 ) {
     for sym in syms {
-        render_symbol_line(out, sym, children_set, sym_indent);
+        render_symbol_line(out, sym, children_set, sym_indent, suppress_kind);
     }
 }
 
@@ -919,6 +949,7 @@ fn render_dir(
     outline_threshold: usize,
     outline_suppress: &[globset::GlobMatcher],
     fs_manager: &FilesystemManager,
+    client_manager: &LspClientManager,
     indent: &str,
 ) -> String {
     let sym_indent = format!("{indent}\t");
@@ -1027,6 +1058,11 @@ fn render_dir(
             }
             rendered_groups.insert(gi);
             let (mi_indices, bounding) = &shared_groups[gi];
+            // Dedup groups share an identical fingerprint, so all members
+            // share a language — resolve suppression from the representative.
+            let suppress_kind = mi_indices
+                .first()
+                .is_some_and(|&mi| client_manager.suppress_symbol_kind(map_items[mi].abs_path));
             render_shared_group(
                 &mut result,
                 &map_items,
@@ -1034,13 +1070,15 @@ fn render_dir(
                 bounding,
                 indent,
                 &sym_indent,
+                suppress_kind,
             );
         } else if individual_entries.contains(&ei) {
             let flags = compute_entry_flags(f, Some(idx), 0, outline_suppress, fs_manager, true);
             render_entry_line(&mut result, f, &flags, indent);
             if let Some(syms) = outline.get(&f.abs_path) {
                 let cs = children_sets.get(&f.abs_path);
-                render_individual_map(&mut result, syms, cs, &sym_indent);
+                let suppress_kind = client_manager.suppress_symbol_kind(&f.abs_path);
+                render_individual_map(&mut result, syms, cs, &sym_indent, suppress_kind);
             }
         } else {
             // Non-eligible file: plain flags.
@@ -1780,9 +1818,48 @@ mod tests {
         };
 
         let mut out = String::new();
-        render_symbol_line(&mut out, &sym, None, "\t");
+        render_symbol_line(&mut out, &sym, None, "\t", false);
 
         assert_eq!(out, "\t:10-20 <Function> my_func\n");
+    }
+
+    #[test]
+    fn test_render_symbol_line_suppressed_omits_kind() {
+        let sym = Symbol {
+            name: "H1: My Heading".to_string(),
+            kind: "class".to_string(),
+            line: 0,
+            end_line: 1,
+            scope: None,
+            scope_kind: None,
+            deprecated: false,
+        };
+
+        let mut out = String::new();
+        render_symbol_line(&mut out, &sym, None, "\t", true);
+
+        // No `<Class>` prefix — the server embeds structure in the name.
+        assert_eq!(out, "\t:1-2 H1: My Heading\n");
+    }
+
+    #[test]
+    fn test_render_symbol_line_suppressed_keeps_children_slash() {
+        let sym = Symbol {
+            name: "H1: Parent".to_string(),
+            kind: "class".to_string(),
+            line: 0,
+            end_line: 9,
+            scope: None,
+            scope_kind: None,
+            deprecated: true,
+        };
+
+        let children: HashSet<String> = ["H1: Parent".to_string()].into();
+        let mut out = String::new();
+        render_symbol_line(&mut out, &sym, Some(&children), "\t", true);
+
+        // Kind (and its `, deprecated` marker) dropped; trailing `/` kept.
+        assert_eq!(out, "\t:1-10 H1: Parent/\n");
     }
 
     #[test]
@@ -1799,7 +1876,7 @@ mod tests {
 
         let children: HashSet<String> = ["MyStruct".to_string()].into();
         let mut out = String::new();
-        render_symbol_line(&mut out, &sym, Some(&children), "\t");
+        render_symbol_line(&mut out, &sym, Some(&children), "\t", false);
 
         assert_eq!(out, "\t:1-11 <Struct> MyStruct/\n");
     }
@@ -1817,7 +1894,7 @@ mod tests {
         };
 
         let mut out = String::new();
-        render_symbol_line(&mut out, &sym, None, "");
+        render_symbol_line(&mut out, &sym, None, "", false);
 
         assert_eq!(out, ":5-7 <Function, deprecated> old_fn\n");
     }
@@ -1837,7 +1914,7 @@ mod tests {
         // Children set exists but doesn't contain this symbol.
         let children: HashSet<String> = ["OtherThing".to_string()].into();
         let mut out = String::new();
-        render_symbol_line(&mut out, &sym, Some(&children), "");
+        render_symbol_line(&mut out, &sym, Some(&children), "", false);
 
         // No trailing slash since not in children set.
         assert_eq!(out, ":1-6 <Function> standalone\n");
@@ -2154,7 +2231,7 @@ mod tests {
         }];
 
         let mut out = String::new();
-        render_shared_group(&mut out, &items, &[0, 1], &bounding, "", "\t");
+        render_shared_group(&mut out, &items, &[0, 1], &bounding, "", "\t", false);
 
         // File with line count shows "(N lines)".
         assert!(
@@ -2195,11 +2272,41 @@ mod tests {
         }];
 
         let mut out = String::new();
-        render_shared_group(&mut out, &items, &[0], &bounding, "", "\t");
+        render_shared_group(&mut out, &items, &[0], &bounding, "", "\t", false);
 
         assert!(
             out.contains("<Struct> MyStruct/\n"),
             "children should produce trailing slash: {out:?}"
+        );
+    }
+
+    #[test]
+    fn test_render_shared_group_suppressed_omits_kind() {
+        let items = vec![MapItem {
+            name: "doc.md",
+            abs_path: Path::new("/test/doc.md"),
+            line_count: Some(50),
+        }];
+
+        let bounding = vec![BoundingSymbol {
+            name: "H1: Title".to_string(),
+            kind: "class".to_string(),
+            min_line: 0,
+            max_end_line: 20,
+            has_children: true,
+        }];
+
+        let mut out = String::new();
+        render_shared_group(&mut out, &items, &[0], &bounding, "", "\t", true);
+
+        // No `<Class>` prefix; trailing `/` retained.
+        assert!(
+            out.contains("\t:1-21 H1: Title/\n"),
+            "suppressed group should omit kind but keep slash: {out:?}"
+        );
+        assert!(
+            !out.contains("<Class>"),
+            "suppressed group must not render kind: {out:?}"
         );
     }
 
