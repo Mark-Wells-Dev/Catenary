@@ -631,8 +631,9 @@ fn correlation_end_to_end() -> Result<()> {
     hook_roundtrip(
         &ipc_path,
         &json!({
-            "method": "pre-tool/check-command",
-            "command": "git status",
+            "method": "pre-tool/editing-state",
+            "tool_name": "mcp_catenary_grep",
+            "agent_id": "",
             "session_id": "corr-session"
         }),
     )?;

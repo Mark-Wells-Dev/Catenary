@@ -142,32 +142,6 @@ pub(crate) enum HookRequest {
         session_id: Option<String>,
     },
 
-    /// Session-side command check.
-    ///
-    /// Evaluates the shell command against the merged allowlist (user
-    /// config + all project configs for current roots). On denial, returns
-    /// the terse deny message (specific reason + fix + `catenary commands`
-    /// pointer).
-    #[serde(rename = "pre-tool/check-command")]
-    CheckCommand {
-        /// The shell command string to evaluate.
-        command: String,
-        /// Working directory from the hook payload (for per-root build lookup).
-        #[serde(default)]
-        cwd: Option<String>,
-        /// Host CLI session ID (Claude Code / Gemini CLI UUID).
-        #[serde(default)]
-        #[allow(
-            dead_code,
-            reason = "deserialized from IPC protocol, consumed by serde"
-        )]
-        session_id: Option<String>,
-        /// Host CLI format (`"claude"` or `"gemini"`), for per-client
-        /// template variable resolution in guidance messages.
-        #[serde(default)]
-        format: Option<String>,
-    },
-
     /// Force `editing stop` before the agent stops.
     #[serde(rename = "post-agent/require-release")]
     PostAgent {
@@ -649,31 +623,6 @@ mod tests {
         let req: HookRequest = serde_json::from_str(json).expect("tool/editing-stop");
         assert!(matches!(req, HookRequest::DoneEditingRun));
 
-        // pre-tool/check-command
-        let json = r#"{"method": "pre-tool/check-command", "command": "cargo test", "cwd": "/project", "session_id": "abc123", "format": "claude"}"#;
-        let req: HookRequest = serde_json::from_str(json).expect("check-command");
-        let HookRequest::CheckCommand {
-            command,
-            cwd,
-            session_id,
-            format,
-        } = req
-        else {
-            unreachable!("expected CheckCommand");
-        };
-        assert_eq!(command, "cargo test");
-        assert_eq!(cwd.as_deref(), Some("/project"));
-        assert_eq!(session_id.as_deref(), Some("abc123"));
-        assert_eq!(format.as_deref(), Some("claude"));
-
-        // pre-tool/check-command minimal (only command required)
-        let json = r#"{"method": "pre-tool/check-command", "command": "ls"}"#;
-        let req: HookRequest = serde_json::from_str(json).expect("check-command minimal");
-        assert!(matches!(
-            req,
-            HookRequest::CheckCommand { command, cwd: None, session_id: None, format: None } if command == "ls"
-        ));
-
         // session-end/cleanup
         let json = r#"{"method": "session-end/cleanup", "session_id": "uuid-456"}"#;
         let req: HookRequest = serde_json::from_str(json).expect("session-end");
@@ -765,39 +714,6 @@ mod tests {
         // Both share the same parent_id
         assert_eq!(rows[0].parent_id.as_deref(), Some(scope_id));
         assert_eq!(rows[1].parent_id.as_deref(), Some(scope_id));
-    }
-
-    #[test]
-    fn hook_check_command_writes_protocol_row() {
-        let (_logging, conn, _guard) = setup_logging();
-
-        let scope_id = "check-scope";
-        emit_hook_event(
-            tracing::Level::INFO,
-            "host",
-            "pre-tool/check-command",
-            Some(scope_id),
-            &serde_json::json!({"method": "pre-tool/check-command"}).to_string(),
-            "incoming hook",
-        );
-
-        emit_hook_event(
-            tracing::Level::INFO,
-            "host",
-            "pre-tool/check-command",
-            Some(scope_id),
-            "",
-            "outgoing hook response",
-        );
-
-        let rows = hook_messages(&conn);
-        assert!(
-            rows.len() >= 2,
-            "should have at least request + response, got {}",
-            rows.len()
-        );
-        assert_eq!(rows[0].method, "pre-tool/check-command");
-        assert_eq!(rows[0].client, "host");
     }
 
     // ── Level-aware emit tests ──────────────────────────────────────

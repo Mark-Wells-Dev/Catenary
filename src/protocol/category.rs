@@ -216,7 +216,6 @@ mod tests {
         assert_eq!(hook_category("pre-tool/editing-state"), "lifecycle");
         assert_eq!(hook_category("pre-tool/editing-start"), "lifecycle");
         assert_eq!(hook_category("pre-tool/editing-stop"), "lifecycle");
-        assert_eq!(hook_category("pre-tool/check-command"), "lifecycle");
         assert_eq!(hook_category("post-agent/require-release"), "lifecycle");
         assert_eq!(hook_category("session-start/clear-editing"), "lifecycle");
         assert_eq!(hook_category("session-end/cleanup"), "lifecycle");

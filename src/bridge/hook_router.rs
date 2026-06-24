@@ -17,17 +17,6 @@ use super::session::Session;
 use crate::hook::response::SystemMessageBuilder;
 use crate::hook::{HookRequest, HookResult};
 
-/// Parse a `HostFormat` from a string value sent over IPC.
-fn parse_host_format(s: &str) -> Option<crate::cli::HostFormat> {
-    match s {
-        "claude" => Some(crate::cli::HostFormat::Claude),
-        "gemini" => Some(crate::cli::HostFormat::Gemini),
-        "antigravity" => Some(crate::cli::HostFormat::Antigravity),
-        "opencode" => Some(crate::cli::HostFormat::OpenCode),
-        _ => None,
-    }
-}
-
 // ── Tool classification helpers ─────────────────────────────────────────
 
 /// Returns `true` if the tool is an edit tool that requires `start_editing`.
@@ -142,119 +131,6 @@ impl HookRouter {
         }
     }
 
-    /// Evaluate a shell command against the session's merged allowlist.
-    ///
-    /// Builds the merged `ResolvedCommands` from user config + all project
-    /// configs for current roots. If the command is denied, renders the terse
-    /// deny message (specific reason + fix + `catenary commands` pointer).
-    fn handle_check_command(
-        &self,
-        command: &str,
-        cwd: Option<&str>,
-        format: Option<crate::cli::HostFormat>,
-    ) -> DispatchResult {
-        let Some(resolved) = self.session.merged_commands() else {
-            return DispatchResult {
-                result: None,
-                system_message: None,
-            };
-        };
-
-        if !resolved.is_active() {
-            return DispatchResult {
-                result: None,
-                system_message: None,
-            };
-        }
-
-        let cwd_path = cwd.map(std::path::Path::new);
-        let Some(denial) = crate::cli::command_filter::check_command(command, &resolved, cwd_path)
-        else {
-            return DispatchResult {
-                result: None,
-                system_message: None,
-            };
-        };
-
-        // Resolve build guidance with full cwd context. Prefer the effective
-        // cwd from command parsing (accounts for `cd` within the command) over
-        // the raw hook cwd.
-        let effective_cwd_str = denial
-            .effective_cwd
-            .as_ref()
-            .map(|p| p.display().to_string());
-        let resolved_cwd = effective_cwd_str.as_deref().or(cwd);
-        let build_hint = self.resolve_build_hint(&denial.command, &resolved, resolved_cwd);
-
-        let message = crate::cli::command_filter::format_denial(
-            &denial.command,
-            &resolved,
-            &denial,
-            format,
-            build_hint.as_deref(),
-        );
-
-        DispatchResult {
-            result: Some(HookResult::Deny(message)),
-            system_message: None,
-        }
-    }
-
-    /// Resolve build guidance for a denied command using session context.
-    ///
-    /// Constructs a [`BuildContext`] from the session's config state and the
-    /// hook's `cwd`, then resolves the `BuildGuidance` templates. Returns
-    /// `None` when the denied command has no build guidance entry.
-    fn resolve_build_hint(
-        &self,
-        denied_cmd: &str,
-        resolved: &crate::config::ResolvedCommands,
-        cwd: Option<&str>,
-    ) -> Option<String> {
-        let lookup = denied_cmd.split_whitespace().next().unwrap_or(denied_cmd);
-        let crate::config::GuidanceEntry::Build(bg) = resolved.guidance_for(lookup)? else {
-            return None;
-        };
-
-        // User config path — first source in the standard config chain.
-        let user_config_path = crate::config::config_sources()
-            .first()
-            .map(|p| p.display().to_string());
-        let user_path_str = user_config_path.as_deref().unwrap_or("user config");
-
-        // Project config state for the cwd's root.
-        let cwd_path = cwd.map(std::path::Path::new);
-        let project_commands = self.session.client_manager.project_commands();
-        let roots = self.session.client_manager.roots();
-
-        // Find the root matching cwd (longest prefix).
-        let matching_root = cwd_path.and_then(|cwd| {
-            roots
-                .iter()
-                .filter(|r| cwd.starts_with(r))
-                .max_by_key(|r| r.as_os_str().len())
-        });
-
-        let has_project = matching_root.is_some();
-        let project_build_owned = matching_root
-            .and_then(|r| project_commands.get(r))
-            .and_then(|cmds| cmds.build.as_ref())
-            .map_or(&[] as &[String], |sv| &sv.0);
-        let project_path = matching_root.map(|r| r.join(".catenary.toml").display().to_string());
-
-        let ctx = crate::config::BuildContext {
-            user_config_path: user_path_str,
-            default_build: &resolved.default_build,
-            has_project_config: has_project,
-            project_config_path: project_path.as_deref(),
-            project_build: project_build_owned,
-            cwd_resolved: cwd.is_some(),
-            resolved_cwd_path: cwd,
-        };
-
-        Some(bg.resolve(&ctx))
-    }
-
     /// Dispatches a parsed hook request to the appropriate handler.
     ///
     /// Returns a [`DispatchResult`] with the handler's result and an optional
@@ -324,15 +200,6 @@ impl HookRouter {
                     result: None,
                     system_message: None,
                 }
-            }
-            HookRequest::CheckCommand {
-                command,
-                cwd,
-                session_id: _,
-                format,
-            } => {
-                let host_format = format.as_deref().and_then(parse_host_format);
-                self.handle_check_command(&command, cwd.as_deref(), host_format)
             }
             HookRequest::PostAgent {
                 agent_id,
@@ -1920,125 +1787,6 @@ mod tests {
             session_id: Some("test-session".to_string()),
             fields: serde_json::Map::new(),
         }
-    }
-
-    // ── Command check tests ───────────────────────────────────────
-
-    /// Create a test router with an active command allowlist.
-    ///
-    /// Allows only `git` — any other command (e.g., `cargo`) is denied.
-    fn test_router_with_commands() -> TestHookRouter {
-        let dir = tempfile::tempdir().expect("tempdir");
-
-        let config = Config {
-            resolved_commands: Some(crate::config::ResolvedCommands {
-                allow: std::collections::HashSet::from(["git".into()]),
-                ..crate::config::ResolvedCommands::default()
-            }),
-            ..Config::default()
-        };
-        let logging = crate::logging::LoggingServer::new();
-        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
-        let handle = runtime.handle().clone();
-        let instance_id: Arc<str> = "test-session".into();
-        let notification_router = Arc::new(
-            crate::logging::notification_router::NotificationRouter::new(
-                crate::logging::Severity::Warn,
-            ),
-        );
-        notification_router.register_session(&instance_id);
-        let session = Arc::new(Session::new(
-            config,
-            vec![],
-            logging,
-            instance_id.clone(),
-            handle,
-            notification_router,
-            None,
-        ));
-        let router = HookRouter::new(session, instance_id, "test".to_string());
-        TestHookRouter {
-            _dir: dir,
-            _runtime: runtime,
-            router,
-        }
-    }
-
-    fn dispatch_check_denied(router: &HookRouter) -> DispatchResult {
-        router.dispatch(crate::hook::HookRequest::CheckCommand {
-            command: "cargo test".to_string(),
-            cwd: None,
-            session_id: None,
-            format: None,
-        })
-    }
-
-    fn dispatch_check_allowed(router: &HookRouter) -> DispatchResult {
-        router.dispatch(crate::hook::HookRequest::CheckCommand {
-            command: "git status".to_string(),
-            cwd: None,
-            session_id: None,
-            format: None,
-        })
-    }
-
-    #[test]
-    fn check_command_allowed_returns_none() {
-        let router = test_router_with_commands();
-        let result = dispatch_check_allowed(&router);
-        assert!(
-            result.result.is_none(),
-            "allowed command should return no result"
-        );
-    }
-
-    #[test]
-    fn check_command_denied_names_command_and_points_at_commands() {
-        let router = test_router_with_commands();
-        let result = dispatch_check_denied(&router);
-        let Some(HookResult::Deny(msg)) = result.result else {
-            unreachable!("expected Deny, got {:?}", result.result);
-        };
-        assert!(msg.contains("cargo"), "denial should name denied command");
-        assert!(
-            msg.contains("catenary commands"),
-            "denial should point at the `catenary commands` surface"
-        );
-    }
-
-    #[test]
-    fn check_command_denial_is_identical_across_denials() {
-        // The deny message no longer depends on turn count or denial history —
-        // every denial returns the same terse message (decision 023).
-        let router = test_router_with_commands();
-
-        let Some(HookResult::Deny(first)) = dispatch_check_denied(&router).result else {
-            unreachable!("expected Deny on first denial");
-        };
-        let Some(HookResult::Deny(second)) = dispatch_check_denied(&router).result else {
-            unreachable!("expected Deny on second denial");
-        };
-        let Some(HookResult::Deny(third)) = dispatch_check_denied(&router).result else {
-            unreachable!("expected Deny on third denial");
-        };
-
-        assert_eq!(first, second, "second denial must match the first");
-        assert_eq!(second, third, "third denial must match the first");
-        assert!(
-            first.contains("catenary commands"),
-            "every denial carries the pointer: {first}"
-        );
-    }
-
-    #[test]
-    fn check_command_no_config_returns_none() {
-        // Default router has no [commands] → check-command returns allow.
-        let router = test_router();
-        let result = dispatch_check_denied(&router);
-        assert!(
-            result.result.is_none(),
-            "no commands config should return no result"
-        );
     }
 
     // ── PreToolUse file tracking tests ──────────────────────────────

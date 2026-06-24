@@ -199,7 +199,6 @@ Hook methods, each corresponding to a host CLI lifecycle event:
 |--------|-----------|---------|
 | `session-start/clear-editing` | `SessionStart` | Clear stale editing state from a previous agent context |
 | `pre-tool/editing-state` | `PreToolUse` / `BeforeTool` | Editing state enforcement — deny or allow a tool call |
-| `pre-tool/check-command` | `PreToolUse` / `BeforeTool` | Command filter — terse denial message (specific reason + fix + `catenary commands` pointer) |
 | `post-agent/require-release` | `Stop` / `AfterAgent` | Force `catenary diagnostics` if the agent stops with covered edits pending |
 | `subagent-start/mount-worktree` | `SubagentStart` | Mount an `isolation:"worktree"` subagent's git worktree as its own `worktree:{session_id}:{path}` LSP root |
 | `worktree-remove/unmount-worktree` | `WorktreeRemove` | Tear down a `worktree:*` root — fires only for non-git VCS / `--worktree` session exit (see worktree-root teardown below) |

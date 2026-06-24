@@ -783,9 +783,10 @@ pub fn run_pre_tool(format: HostFormat) {
     }
 
     // ── Command filter (regime 2: foreign allowlist) ─────────────
-    // Try session-side check first (full multi-root merged config).
-    // Fall back to client-side check (user config + cwd's project
-    // config) when the session is unreachable.
+    // Local-only enforcement: the client-side check (user config + cwd's
+    // project config) is the sole authority — enforcement keys are
+    // user-level, so it reaches the same verdict as any daemon round-trip
+    // would, and the local cwd is more accurate than the daemon's view.
     if let Some(shell_cmd) = extract_shell_command(&hook_json, tool_name, format)
         && let Some(reason) = foreign_command_denial(&hook_json, &shell_cmd, format)
     {
@@ -833,19 +834,18 @@ pub fn run_pre_tool(format: HostFormat) {
 /// Run the foreign-command allowlist filter (regime 2) and return the formatted
 /// denial reason, or `None` when the command is allowed.
 ///
-/// Tries the session-side check (full merged config) first, then the
-/// client-side fallback (user config + cwd project config). Catenary's own
-/// commands are skipped by [`check_command`](crate::cli::command_filter::check_command)
+/// The local [`check_shell_command`] is the sole authority: enforcement keys
+/// (`allow`/`pipeline`/`deny`/`deny_flags`/`allow_file_redirects`) are
+/// user-level, so the local path reaches the same verdict as any daemon
+/// round-trip would, and the local cwd is more accurate than the daemon's
+/// view. Catenary's own commands
+/// are skipped by [`check_command`](crate::cli::command_filter::check_command)
 /// — they run under the canonical-form matcher (regime 1), not the allowlist.
 fn foreign_command_denial(
     hook_json: &serde_json::Value,
     shell_cmd: &str,
     format: HostFormat,
 ) -> Option<String> {
-    if let Some(reason) = ipc_check_command(hook_json, shell_cmd, format) {
-        return Some(reason);
-    }
-    // IPC failed or session unreachable — try client-side.
     let (denial, resolved) = check_shell_command(hook_json, shell_cmd, format)?;
     let build_hint = resolve_client_build_hint(hook_json, &denial.command, &resolved, format);
     Some(crate::cli::command_filter::format_denial(
@@ -860,9 +860,10 @@ fn foreign_command_denial(
 /// Check a shell command against the configured allowlist.
 ///
 /// Loads user config, then merges with the `cwd`'s project config (if any)
-/// for per-root `build` tool support. This is a client-side fallback — the
-/// full session-side check (all roots, dynamically-added roots) is handled
-/// by `pre-tool/check-command` IPC in ticket 03a.
+/// for per-root `build` tool support. This is the sole, authoritative
+/// enforcement path: enforcement keys are user-level, so the local verdict
+/// matches what any daemon round-trip would reach, and the local cwd is more
+/// accurate than the daemon's view.
 ///
 /// Returns a [`Denial`](crate::cli::command_filter::Denial) and the resolved
 /// config on denial, or `None` if the command is allowed.
@@ -1008,44 +1009,6 @@ pub(crate) fn find_project_config(
         dir = d.parent();
     }
     None
-}
-
-/// Session-side command check via IPC.
-///
-/// Sends `pre-tool/check-command` with the shell command and cwd. The
-/// session evaluates against the merged allowlist (all roots, all project
-/// configs) and handles debounce. Returns the denial reason string on
-/// denial, `None` on allow or IPC failure.
-fn ipc_check_command(
-    hook_json: &serde_json::Value,
-    shell_cmd: &str,
-    format: HostFormat,
-) -> Option<String> {
-    let stream = hook_connect(hook_json)?;
-
-    let cwd = extract_cwd_str(hook_json, format);
-    let session_id = extract_session_id(hook_json, format);
-
-    let mut request = serde_json::json!({
-        "method": "pre-tool/check-command",
-        "command": shell_cmd,
-        "format": format.as_str(),
-    });
-    if let Some(c) = cwd {
-        request["cwd"] = serde_json::json!(c);
-    }
-    if let Some(sid) = session_id {
-        request["session_id"] = serde_json::json!(sid);
-    }
-    request["host_payload"] = prepare_host_payload(hook_json);
-
-    let lines = ipc_exchange(stream, &request);
-    let line = lines.first()?;
-    let envelope = serde_json::from_str::<crate::hook::HookResponseEnvelope>(line).ok()?;
-    match envelope.result {
-        Some(crate::hook::HookResult::Deny(reason)) => Some(reason),
-        _ => None,
-    }
 }
 
 /// Extract the shell command string from hook JSON for Bash-like tools.

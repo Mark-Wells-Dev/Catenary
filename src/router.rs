@@ -4717,8 +4717,8 @@ mod tests {
 
         // Send a hook with session_id = "abc".
         let request = serde_json::json!({
-            "method": "pre-tool/check-command",
-            "command": "git status",
+            "method": "pre-tool/editing-state",
+            "tool_name": "Read",
             "session_id": "abc"
         });
         let _ = hook_roundtrip(&ipc_path, &request).await;
@@ -4746,13 +4746,13 @@ mod tests {
 
         // Send hooks with two different session_ids.
         let req_a = serde_json::json!({
-            "method": "pre-tool/check-command",
-            "command": "git status",
+            "method": "pre-tool/editing-state",
+            "tool_name": "Read",
             "session_id": "session-a"
         });
         let req_b = serde_json::json!({
-            "method": "pre-tool/check-command",
-            "command": "git status",
+            "method": "pre-tool/editing-state",
+            "tool_name": "Read",
             "session_id": "session-b"
         });
         let _ = hook_roundtrip(&ipc_path, &req_a).await;
