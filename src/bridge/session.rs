@@ -779,21 +779,29 @@ impl Session {
 
     /// Returns `true` if the path has known LSP coverage for diagnostics.
     ///
-    /// A file has coverage if it is within a workspace root (tiers 1–2)
-    /// OR its language has a server with a positive single-file cache
-    /// entry (tier 3). Files with uncached or negative-cached languages
-    /// return `false` — the editing gate should not impose friction
-    /// until we know the server works in single-file mode.
+    /// Both tiers require the file's language to be actually served: an
+    /// in-root file (tiers 1–2) is covered when a server is *configured* for
+    /// its language ([`has_configured_server`], independent of instance
+    /// state — a cold per-root instance of a warm language still counts,
+    /// granularity Decision 3); an out-of-root file (tier 3) is covered when
+    /// its language has a server with a positive single-file cache entry
+    /// ([`has_single_file_coverage`]). Files whose language is unknown, has no
+    /// configured server (e.g. `.txt`, logs, data/scratch files), or has only
+    /// an uncached / negative-cached single-file server return `false` — the
+    /// editing gate should not impose friction on edits it cannot diagnose.
+    ///
+    /// [`has_configured_server`]: crate::lsp::LspClientManager::has_configured_server
+    /// [`has_single_file_coverage`]: crate::lsp::LspClientManager::has_single_file_coverage
     #[must_use]
     pub fn has_lsp_coverage(&self, path: &Path) -> bool {
-        if self.fs_manager.resolve_root(path).is_some() {
-            return true;
-        }
         let lang = self.fs_manager.language_id(path).or_else(|| {
             path.extension()
                 .and_then(|e| e.to_str())
                 .map(str::to_string)
         });
+        if self.fs_manager.resolve_root(path).is_some() {
+            return lang.is_some_and(|id| self.client_manager.has_configured_server(&id));
+        }
         lang.is_some_and(|id| self.client_manager.has_single_file_coverage(&id))
     }
 
@@ -1260,6 +1268,53 @@ mod tests {
         assert!(
             resolved.is_empty(),
             "metachar-free absent path is not glob-expanded: {resolved:?}"
+        );
+    }
+
+    // ── has_lsp_coverage ───────────────────────────────────────────
+
+    /// Builds a `Session` rooted at `root` with the embedded default
+    /// classification + server bindings loaded, so coverage gating sees the
+    /// real served/unserved split.
+    fn session_with_root(handle: &Handle, root: PathBuf) -> Session {
+        let instance_id: Arc<str> = "test-session".into();
+        let notification_router = Arc::new(NotificationRouter::new(crate::logging::Severity::Warn));
+        notification_router.register_session(&instance_id);
+        Session::new(
+            Config::default_with_classification(),
+            vec![root],
+            LoggingServer::new(),
+            instance_id,
+            handle.clone(),
+            notification_router,
+            None,
+        )
+    }
+
+    #[test]
+    fn has_lsp_coverage_gates_in_root_on_served_language() {
+        // Bug 44: the in-root tier must require the file's language to be
+        // actually served, not blanket-cover every in-root path.
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("workspace");
+        std::fs::create_dir_all(&root).expect("create workspace dir");
+        let session = session_with_root(rt.handle(), root.clone());
+
+        // Served in-root types stay covered (rust → rust-analyzer).
+        assert!(
+            session.has_lsp_coverage(&root.join("src/main.rs")),
+            "in-root .rs (served) must have coverage"
+        );
+
+        // Non-served in-root types flow free (no configured server).
+        assert!(
+            !session.has_lsp_coverage(&root.join("notes.txt")),
+            "in-root .txt (non-served) must not claim coverage"
+        );
+        assert!(
+            !session.has_lsp_coverage(&root.join("run.log")),
+            "in-root .log (non-served) must not claim coverage"
         );
     }
 }

@@ -129,8 +129,9 @@ fn test_batch_multi_file_different_servers() -> Result<()> {
 
 // ─── No diagnostic servers ─────────────────────────────────────────
 
-/// A file with no language server coverage shows `[no LSP coverage]`.
-/// Covered files still produce diagnostics.
+/// A file whose language has no configured server flows free (bug 44): it is
+/// not accumulated for diagnostics, so it surfaces only via the unchecked-edit
+/// count, never silently dropped. Covered files still produce diagnostics.
 #[test]
 fn test_batch_uncovered_file() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -152,13 +153,17 @@ fn test_batch_uncovered_file() -> Result<()> {
         text.contains("mock diagnostic"),
         "Covered file should produce diagnostics. Got:\n{text}"
     );
+    // The no-server file is gated out of accumulation (bug 44): it has no
+    // configured server, so it never reaches the diagnostics batch and is not
+    // rendered per-file. It is still accounted for in the unchecked-edit count
+    // so the batch is not a silent, lying one.
     assert!(
-        text.contains("zzz_no_server"),
-        "Uncovered file should appear in output. Got:\n{text}"
+        !text.contains("zzz_no_server"),
+        "No-server file must not be accumulated into per-file diagnostics. Got:\n{text}"
     );
     assert!(
-        text.contains("[no LSP coverage]"),
-        "Uncovered file should show no LSP coverage. Got:\n{text}"
+        text.contains("1 edit") && text.contains("not checked"),
+        "No-server file should be reported as an unchecked edit. Got:\n{text}"
     );
 
     Ok(())

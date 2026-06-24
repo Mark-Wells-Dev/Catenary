@@ -4591,7 +4591,7 @@ mod tests {
             ),
         );
         let session = Arc::new(crate::bridge::session::Session::new(
-            crate::config::Config::default(),
+            crate::config::Config::default_with_classification(),
             roots,
             logging.clone(),
             instance_id,

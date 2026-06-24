@@ -440,6 +440,29 @@ impl LspClientManager {
         })
     }
 
+    /// Returns whether any server is configured for this language.
+    ///
+    /// Used by the editing-boundary gate to decide whether an in-root edit
+    /// has LSP coverage. Unlike [`Self::has_single_file_coverage`], this does
+    /// not require `single_file` mode or a running instance — it reports
+    /// purely config-level coverage. A configured but cold per-root instance
+    /// still counts as covered (granularity Decision 3): a warm language's
+    /// in-root file must not be silently dropped just because no instance has
+    /// spawned yet. Files whose language has no `servers` binding —
+    /// classification-only entries, or types absent from every `[language.*]`
+    /// table (`.txt`, logs, data/scratch files) — return `false`, so
+    /// non-served in-root edits flow free.
+    #[must_use]
+    pub fn has_configured_server(&self, lang: &str) -> bool {
+        let Some(lang_config) = self.config.resolve_language(lang) else {
+            return false;
+        };
+        lang_config
+            .servers()
+            .iter()
+            .any(|binding| self.config.server.contains_key(&binding.name))
+    }
+
     /// Returns the current workspace roots.
     pub fn roots(&self) -> Vec<PathBuf> {
         self.fs.roots()

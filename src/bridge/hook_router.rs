@@ -1441,10 +1441,16 @@ mod tests {
     }
 
     /// Create a `HookRouter` with a workspace root for scope boundary tests.
+    ///
+    /// Loads the embedded default classification + server bindings
+    /// (`default_with_classification`) so in-root coverage gating sees the
+    /// real served/unserved split: `.rs` resolves to a configured
+    /// rust-analyzer binding (served), while types with no `servers` entry
+    /// (e.g. `.txt`, logs) are unserved.
     fn test_router_with_root() -> (TestHookRouter, PathBuf) {
         let dir = tempfile::tempdir().expect("tempdir");
 
-        let config = Config::default();
+        let config = Config::default_with_classification();
         let logging = crate::logging::LoggingServer::new();
 
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -1494,7 +1500,10 @@ mod tests {
     ) {
         let dir = tempfile::tempdir().expect("tempdir");
 
-        let config = Config::default();
+        // Load the embedded classification + server bindings so in-root `.rs`
+        // edits are served (covered) — the cross-session deny path is gated on
+        // coverage.
+        let config = Config::default_with_classification();
         let logging = crate::logging::LoggingServer::new();
 
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -1859,5 +1868,49 @@ mod tests {
 
         let files = router.session.editing.drain_files(None, "");
         assert!(files.is_empty(), "non-edit tool should not accumulate file");
+    }
+
+    #[test]
+    fn doc_only_in_root_edit_flows_free() {
+        // Bug 44: an in-root file whose language has no configured server
+        // (`.txt`, logs, data/scratch files) must NOT be treated as covered.
+        // It flows free — not accumulated, filtered counter bumped — so the
+        // editing boundary never sends the agent to run empty diagnostics.
+        let (router, root) = test_router_with_root();
+        let _ = router.session.editing.start_editing(None, "");
+
+        let unserved = format!("{}/notes.txt", root.display());
+        assert!(
+            !router.session.has_lsp_coverage(Path::new(&unserved)),
+            "in-root non-served type must not claim LSP coverage"
+        );
+
+        router.handle_file_accumulation(&unserved, None, "", Some("Edit"));
+        let files = router.session.editing.drain_files(None, "");
+        assert!(
+            files.is_empty(),
+            "non-served in-root edit must not be accumulated"
+        );
+        let (_, filtered) = router.session.editing.drain_and_clear(None, "");
+        assert_eq!(
+            filtered, 1,
+            "non-served in-root edit should increment the filtered counter"
+        );
+
+        // Contrast: a served in-root type (`.rs` → rust-analyzer) stays
+        // covered and is accumulated, so diagnostics still flow for it.
+        let _ = router.session.editing.start_editing(None, "");
+        let served = format!("{}/src/main.rs", root.display());
+        assert!(
+            router.session.has_lsp_coverage(Path::new(&served)),
+            "in-root served type must keep LSP coverage"
+        );
+        router.handle_file_accumulation(&served, None, "", Some("Edit"));
+        let served_files = router.session.editing.drain_files(None, "");
+        assert_eq!(
+            served_files.len(),
+            1,
+            "served in-root edit must still be accumulated"
+        );
     }
 }
