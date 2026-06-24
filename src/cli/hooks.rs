@@ -875,7 +875,40 @@ fn check_shell_command(
     crate::config::ResolvedCommands,
 )> {
     let config = crate::config::Config::load().ok()?;
-    let mut resolved = config.resolved_commands?;
+    let resolved = config.resolved_commands?;
+    let cwd = extract_cwd_str(hook_json, format).map(PathBuf::from);
+    check_resolved_command(resolved, cmd, cwd)
+}
+
+/// The config-independent core of [`check_shell_command`]: given an already
+/// loaded user-level [`ResolvedCommands`] and the hook's resolved `cwd`, apply
+/// the client-side gating and run the allowlist filter.
+///
+/// Split out from [`check_shell_command`] so the gating decision is unit
+/// testable without touching `Config::load()` (which reads process env and the
+/// user's home directory). Behavior is identical to the inlined form:
+///
+/// - `client_enforcement_only` short-circuits to `None` (allow) **before** any
+///   project merge — that flag means "don't enforce client-side".
+/// - the `cwd`'s nearest project `.catenary.toml` contributes its per-root
+///   `build` tool (enforcement keys stay user-level; see
+///   [`merge_project_commands`](crate::config::ResolvedCommands::merge_project_commands)).
+/// - an inactive allowlist (`!is_active()`) short-circuits to `None`.
+/// - otherwise the command faces [`check_command`]; a denial is returned with
+///   the resolved config it was judged against.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "owns `resolved`: it is reassigned by the project merge and returned \
+              in the denial tuple"
+)]
+fn check_resolved_command(
+    mut resolved: crate::config::ResolvedCommands,
+    cmd: &str,
+    cwd: Option<PathBuf>,
+) -> Option<(
+    crate::cli::command_filter::Denial,
+    crate::config::ResolvedCommands,
+)> {
     if resolved.client_enforcement_only {
         return None;
     }
@@ -885,7 +918,6 @@ fn check_shell_command(
     // typically a subdirectory of the workspace root.
     // This covers the common single-root case and "agent is in the right
     // directory" case. Multi-root coverage requires the session-side check.
-    let cwd = extract_cwd_str(hook_json, format).map(PathBuf::from);
     if let Some(ref cwd_path) = cwd
         && let Some((root, pc)) = find_project_config(cwd_path)
     {
@@ -1384,6 +1416,87 @@ mod tests {
         // Gemini format should NOT have hookSpecificOutput.hookEventName
         assert!(parsed["hookSpecificOutput"].is_null());
         Ok(())
+    }
+
+    // ── check_resolved_command (client-side allowlist gate) tests ─────
+    //
+    // These pin the *decision* the client-side fallback makes — the gap the
+    // `check_shell_command -> None` mutant flagged. `check_shell_command` itself
+    // is a thin `Config::load()` + delegate wrapper that can't be exercised
+    // in-process (env/home coupling; Rust 2024 `set_var` is `unsafe`, which is
+    // `forbid`den here), so the testable gating lives in `check_resolved_command`
+    // and is verified directly. `cwd: None` keeps the run hermetic — no project
+    // `.catenary.toml` walk.
+
+    /// Build a user-level `ResolvedCommands` from inline TOML (no env, no
+    /// filesystem walk), mirroring how the hook's `Config::load()` would resolve
+    /// the `[commands]` table.
+    fn resolved_from_toml(toml: &str) -> crate::config::ResolvedCommands {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, toml).expect("write config");
+        crate::config::Config::load_from_sources(&[path])
+            .expect("config should parse")
+            .resolved_commands
+            .expect("`[commands]` table should resolve")
+    }
+
+    #[test]
+    fn check_resolved_command_denies_command_off_allowlist() {
+        // A command not on the allowlist is denied client-side: the gate returns
+        // the actual `Denial` (with the offending command + `NotAllowed`
+        // reason), not `None`. This is the assertion the `-> None` mutant
+        // (allow-everything) must fail.
+        let resolved = resolved_from_toml("[commands]\nallow = [\"git\", \"ls\"]\n");
+        let (denial, _) = check_resolved_command(resolved, "cargo build", None)
+            .expect("a command off the allowlist must be denied client-side");
+        assert_eq!(denial.command, "cargo");
+        assert_eq!(
+            denial.reason,
+            crate::cli::command_filter::DenialReason::NotAllowed,
+        );
+    }
+
+    #[test]
+    fn check_resolved_command_allows_allowlisted_command() {
+        // An allowlisted command passes the gate → `None` (no denial).
+        let resolved = resolved_from_toml("[commands]\nallow = [\"git\", \"ls\"]\n");
+        assert!(
+            check_resolved_command(resolved, "git status", None).is_none(),
+            "an allowlisted command must pass the client-side gate",
+        );
+    }
+
+    #[test]
+    fn check_resolved_command_client_enforcement_only_allows_all() {
+        // `client_enforcement_only = true` means the daemon enforces, not the
+        // client fallback — so even an off-allowlist command short-circuits to
+        // allow (`None`) here. (Built directly: TOML rejects
+        // `client_enforcement_only` alongside `allow`, see config validation.)
+        let resolved = crate::config::ResolvedCommands {
+            client_enforcement_only: true,
+            allow: std::collections::HashSet::from(["git".to_string()]),
+            ..Default::default()
+        };
+        assert!(
+            check_resolved_command(resolved, "cargo build", None).is_none(),
+            "client_enforcement_only must bypass the client-side gate",
+        );
+    }
+
+    #[test]
+    fn check_resolved_command_inactive_allowlist_allows_all() {
+        // An inactive allowlist (no allow/pipeline/build entries) is not
+        // enforced client-side, so every command is allowed (`None`).
+        let resolved = crate::config::ResolvedCommands::default();
+        assert!(
+            !resolved.is_active(),
+            "an empty allowlist should be inactive",
+        );
+        assert!(
+            check_resolved_command(resolved, "cargo build", None).is_none(),
+            "an inactive allowlist must not deny client-side",
+        );
     }
 
     // ── format_stop_block tests ──────────────────────────────────────

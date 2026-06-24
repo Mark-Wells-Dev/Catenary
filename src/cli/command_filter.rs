@@ -3477,37 +3477,108 @@ mod tests {
 
     #[test]
     fn matcher_denies_background() {
-        assert!(deny_text("catenary grep p &").contains("background"));
-        assert!(deny_text("catenary editing start &").contains("background"));
+        // The message names the offending subcommand via `Sub::label`; pin both
+        // the "background" reason and the embedded canonical label so a
+        // `Sub::label` substitution (`"grep" → "xyzzy"/""`) can't slip past.
+        let grep = deny_text("catenary grep p &");
+        assert!(grep.contains("background"), "got: {grep}");
+        assert!(
+            grep.contains("catenary grep"),
+            "background denial must name `catenary grep`, got: {grep}",
+        );
+        let start = deny_text("catenary editing start &");
+        assert!(start.contains("background"), "got: {start}");
+        assert!(
+            start.contains("catenary editing start"),
+            "background denial must name `catenary editing start`, got: {start}",
+        );
     }
 
     #[test]
     fn matcher_denies_substitution_wrap() {
-        assert!(deny_text("$(catenary grep p)").contains("capture"));
-        assert!(deny_text("echo `catenary glob src`").contains("capture"));
+        // The substitution-capture message names the wrapped subcommand via
+        // `Sub::label` — assert it so a `Sub::label` substitution is caught.
+        let grep = deny_text("$(catenary grep p)");
+        assert!(grep.contains("capture"), "got: {grep}");
+        assert!(
+            grep.contains("catenary grep"),
+            "capture denial must name `catenary grep`, got: {grep}",
+        );
+        let glob = deny_text("echo `catenary glob src`");
+        assert!(glob.contains("capture"), "got: {glob}");
+        assert!(
+            glob.contains("catenary glob"),
+            "capture denial must name `catenary glob`, got: {glob}",
+        );
     }
 
     // ---- Deny table: bare-only (correlated/lifecycle) ----
 
     #[test]
     fn matcher_denies_correlated_prefix_and_chain() {
-        assert!(deny_text("cd src && catenary diagnostics").contains("its own"));
-        assert!(deny_text("catenary diagnostics && make test").contains("its own"));
-        // The correlated `sed` is the `--in-place` write form (it takes the
-        // handoff); a chained preview is allowed (see `matcher_sed_preview_*`).
-        assert!(deny_text("make x && catenary sed --in-place a b f").contains("its own"));
+        // A *single* correlated command sharing the call (a foreign prefix /
+        // chain, one catenary occurrence) gets the single-command message —
+        // "as its own command" with the offending subcommand named — not the
+        // multi-command "on its own line" form. Pinning the message branch and
+        // the embedded `Sub::label` here is what catches a `bare_only_denial`
+        // boundary flip (`correlated >= 2 → correlated < 2`) that would route a
+        // single-command denial to the wrong message, and a `Sub::label`
+        // substitution that would drop the named subcommand.
+        for (cmd, label) in [
+            ("cd src && catenary diagnostics", "diagnostics"),
+            ("catenary diagnostics && make test", "diagnostics"),
+            // The correlated `sed` is the `--in-place` write form (it takes the
+            // handoff); a chained preview is allowed (see `matcher_sed_preview_*`).
+            ("make x && catenary sed --in-place a b f", "sed"),
+        ] {
+            let msg = deny_text(cmd);
+            assert!(
+                msg.contains("as its own command"),
+                "{cmd} should get the single-command bare-only message, got: {msg}",
+            );
+            assert!(
+                !msg.contains("on its own line"),
+                "{cmd} is a single command — not the multi-command message, got: {msg}",
+            );
+            assert!(
+                msg.contains(&format!("catenary {label}")),
+                "{cmd} should name `catenary {label}`, got: {msg}",
+            );
+        }
     }
 
     #[test]
     fn matcher_denies_two_correlated_in_one_call() {
+        // Two catenary commands (`sed` preview + `diagnostics`) → multi-command
+        // "on its own line" message, never the single-command form.
         let msg = deny_text("catenary sed a b f && catenary diagnostics");
         assert!(msg.contains("on its own line"), "got: {msg}");
+        assert!(
+            !msg.contains("as its own command"),
+            "two commands must not use the single-command message, got: {msg}",
+        );
     }
 
     #[test]
     fn matcher_denies_search_mixed_with_correlated() {
-        // grep is unrestricted, but diagnostics is not bare → deny.
-        assert!(deny_text("catenary grep p && catenary diagnostics").contains("its own"));
+        // grep is unrestricted, but diagnostics chained alongside a second
+        // catenary occurrence is not bare → deny. Two catenary commands share
+        // the call (`subs.len() == 2`, only one of them correlated), so this is
+        // the multi-command "on its own line" message — NOT the single-command
+        // form. Pinning the multi branch here is what catches the
+        // `bare_only_denial` `|| → &&` mutant: with `&&`, the
+        // `correlated >= 2 (= false) && subs.len() >= 2` short-circuits to the
+        // single-command message and names only the first subcommand (`grep`),
+        // mis-describing a two-command denial.
+        let msg = deny_text("catenary grep p && catenary diagnostics");
+        assert!(
+            msg.contains("on its own line"),
+            "two catenary commands sharing a call get the multi-command message, got: {msg}",
+        );
+        assert!(
+            !msg.contains("as its own command"),
+            "a two-command denial must not use the single-command message, got: {msg}",
+        );
     }
 
     // ---- Deny table: recognition ----
@@ -3534,6 +3605,53 @@ mod tests {
                 "{cmd} should be not-agent-invocable",
             );
         }
+    }
+
+    // ---- catenary_command_denial (hook_router editing-boundary defense) ----
+
+    #[test]
+    fn catenary_command_denial_returns_reason_for_denied_only() {
+        // `catenary_command_denial` is the convenience wrapper `hook_router`
+        // uses: it maps a `Deny` action to its reason and every clean/routed
+        // action to `None`. Pin both directions and the *content* of the
+        // returned reason so a `-> Some(String::new())` body (which would
+        // wrongly report every command — even clean ones — as denied with an
+        // empty reason) is caught.
+
+        // Clean / routed catenary commands carry no denial.
+        for clean in [
+            "catenary grep p src",
+            "catenary glob src",
+            "catenary diagnostics",
+            "catenary sed a b src",
+            "catenary sed --in-place a b src",
+            "catenary editing start",
+            "catenary roots add /tmp/p",
+            "catenary primer",
+            "catenary --version",
+            "make test", // not a catenary command at all
+        ] {
+            assert_eq!(
+                catenary_command_denial(clean),
+                None,
+                "{clean} is clean/not-catenary — no denial reason",
+            );
+        }
+
+        // Denied forms return the actual pedagogical reason (non-empty, with
+        // the same text `analyze_catenary_command` produced).
+        let unknown = catenary_command_denial("catenary frobnicate")
+            .expect("an unknown subcommand must yield a denial reason");
+        assert!(unknown.contains("isn't a recognized"), "got: {unknown}");
+        let piped = catenary_command_denial("catenary grep p | head")
+            .expect("a piped search must yield a denial reason");
+        assert!(piped.contains("--page"), "got: {piped}");
+        let bare_only = catenary_command_denial("cd src && catenary diagnostics")
+            .expect("a chained correlated command must yield a denial reason");
+        assert!(
+            bare_only.contains("as its own command") && bare_only.contains("catenary diagnostics"),
+            "got: {bare_only}",
+        );
     }
 
     // ---- Foreign regime unaffected ----
