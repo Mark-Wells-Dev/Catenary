@@ -1132,7 +1132,8 @@ proptest! {
 mod tests {
     use super::{
         Projection, RedirectKind, SEED_CORPUS, brush_projection, check, cook_command_name,
-        ours_projection, unquote,
+        extract_substitutions, is_balanced, is_clean_name, ours_projection, scan_balanced,
+        should_skip, strip_substitutions, unquote,
     };
 
     /// A word that is purely a substitution carries no literal command name —
@@ -1232,5 +1233,335 @@ mod tests {
         assert_eq!(unquote(r#""hello""#), "hello");
         assert_eq!(unquote(r"\g\i\t"), "git");
         assert_eq!(unquote("plain"), "plain");
+    }
+
+    // ── `scan_balanced` — exact (inner, next) span ────────────────────────────
+
+    /// `scan_balanced` starts at the opening `(` and returns the text between the
+    /// outermost parens plus the index just past the matching `)`. Pin both
+    /// fields so the offset arithmetic (inner-start, `i + 1` past-close, depth
+    /// bumps) is fixed, not merely "non-empty".
+    #[test]
+    fn scan_balanced_simple_span() {
+        // `(rm x)` — inner is exactly "rm x", next is past the `)` at index 6.
+        assert_eq!(scan_balanced(b"(rm x)", 0), ("rm x".to_string(), 6));
+        // Empty body: `()` — inner is "" and next is 2.
+        assert_eq!(scan_balanced(b"()", 0), (String::new(), 2));
+    }
+
+    /// A `(` opening partway through the buffer: the returned `next` is an
+    /// absolute index, and the inner text excludes the delimiters. Pins the
+    /// `i + 1` past-close offset against an off-by-one at a non-zero start.
+    #[test]
+    fn scan_balanced_nonzero_start() {
+        // `a$(b)` — caller passes the index of `(` (= 2). Inner "b", next = 5.
+        let bytes = b"a$(b)";
+        assert_eq!(scan_balanced(bytes, 2), ("b".to_string(), 5));
+    }
+
+    /// Nested parens: the span closes only when depth returns to zero, so the
+    /// inner text keeps the interior parens verbatim.
+    #[test]
+    fn scan_balanced_nested() {
+        assert_eq!(scan_balanced(b"(a (b) c)", 0), ("a (b) c".to_string(), 9));
+        // Two nested levels: `((x))` — inner is "(x)", next past the final `)`.
+        assert_eq!(scan_balanced(b"((x))", 0), ("(x)".to_string(), 5));
+    }
+
+    /// A `)` inside a single- or double-quoted run does not close the span —
+    /// the scanner is quote-aware. Pins the quote-skip arms (delete-match-arm
+    /// mutants at the `'` / `"` cases).
+    #[test]
+    fn scan_balanced_quote_aware() {
+        // `)` inside single quotes is literal.
+        assert_eq!(scan_balanced(b"(a ')' x)", 0), ("a ')' x".to_string(), 9));
+        // `)` inside double quotes is literal.
+        assert_eq!(
+            scan_balanced(br#"(echo "x)y")"#, 0),
+            (r#"echo "x)y""#.to_string(), 12)
+        );
+    }
+
+    /// A backslash-escaped paren inside the span does not change depth, and a
+    /// `\` escapes the next byte (the `b'\\'` arm).
+    #[test]
+    fn scan_balanced_backslash_escape() {
+        // `(a\)b)` — the escaped `)` is consumed as a pair, the real close is
+        // the final `)` at index 5, so inner is `a\)b`.
+        assert_eq!(scan_balanced(br"(a\)b)", 0), (r"a\)b".to_string(), 6));
+    }
+
+    /// An unbalanced (never-closing) span runs to end-of-input: `next == n` and
+    /// the inner text is everything after the opening `(`. Pins the fall-through
+    /// return (`inner_start.min(n)..n`, `n`).
+    #[test]
+    fn scan_balanced_unbalanced_runs_to_end() {
+        assert_eq!(scan_balanced(b"(rm x", 0), ("rm x".to_string(), 5));
+    }
+
+    // ── `extract_substitutions` — exact captured inner texts ──────────────────
+
+    /// Each top-level substitution form yields exactly its inner text, in order.
+    #[test]
+    fn extract_substitutions_each_form() {
+        assert_eq!(extract_substitutions("$(rm x)"), vec!["rm x".to_string()]);
+        assert_eq!(
+            extract_substitutions("`echo hi`"),
+            vec!["echo hi".to_string()]
+        );
+        assert_eq!(
+            extract_substitutions("<(sort a)"),
+            vec!["sort a".to_string()]
+        );
+        assert_eq!(extract_substitutions(">(tee f)"), vec!["tee f".to_string()]);
+    }
+
+    /// Arithmetic `$((…))` is recognized and skipped — it is not a command
+    /// substitution, so nothing is captured. Pins the `i + 2 < n &&
+    /// bytes[i + 2] == b'('` arithmetic guard.
+    #[test]
+    fn extract_substitutions_arithmetic_is_skipped() {
+        assert!(extract_substitutions("$((1+2))").is_empty());
+        // But a `$(` immediately followed by a non-`(` *is* a command sub.
+        assert_eq!(extract_substitutions("$( (x) )"), vec![" (x) ".to_string()]);
+    }
+
+    /// Multiple top-level substitutions are captured in document order; only the
+    /// outermost is extracted (the recursion re-projects the inner one).
+    #[test]
+    fn extract_substitutions_multiple_and_nested() {
+        assert_eq!(
+            extract_substitutions("a$(b)c`d`e"),
+            vec!["b".to_string(), "d".to_string()]
+        );
+        // Nested: only the outer `$(…)` is captured, inner text kept verbatim.
+        assert_eq!(
+            extract_substitutions("$(echo $(rm x))"),
+            vec!["echo $(rm x)".to_string()]
+        );
+        // Deeply nested process substitution: outer `<(…)` captured verbatim.
+        assert_eq!(
+            extract_substitutions("<(diff <(a) <(b))"),
+            vec!["diff <(a) <(b)".to_string()]
+        );
+    }
+
+    /// A substitution inside single quotes is not a substitution.
+    #[test]
+    fn extract_substitutions_single_quoted_is_inert() {
+        assert!(extract_substitutions("'$(x)'").is_empty());
+        assert!(extract_substitutions("'`y`'").is_empty());
+    }
+
+    /// A `$`/`<`/`>` not followed by `(` is ordinary text and captures nothing.
+    /// Pins the false side of the `i + 1 < n && bytes[i + 1] == b'('` guards.
+    #[test]
+    fn extract_substitutions_lone_sigils_are_inert() {
+        assert!(extract_substitutions("a < b > c").is_empty());
+        assert!(extract_substitutions("price=$5").is_empty());
+        // A `$` at the very end of input (the `i + 1 < n` boundary) is inert.
+        assert!(extract_substitutions("end$").is_empty());
+    }
+
+    /// A backtick run honors `\` escapes (an escaped backtick does not close the
+    /// run) and the captured inner text excludes the delimiters.
+    #[test]
+    fn extract_substitutions_backtick_escape() {
+        assert_eq!(extract_substitutions(r"`a\`b`"), vec![r"a\`b".to_string()]);
+        // Unterminated backtick runs to end-of-input.
+        assert_eq!(extract_substitutions("`abc"), vec!["abc".to_string()]);
+    }
+
+    // ── `strip_substitutions` — exact literal residue ─────────────────────────
+
+    /// Stripping leaves exactly the literal text around each removed span.
+    #[test]
+    fn strip_substitutions_drops_each_form() {
+        assert_eq!(strip_substitutions("pre$(sub)post"), "prepost");
+        assert_eq!(strip_substitutions("a`b`c"), "ac");
+        assert_eq!(strip_substitutions("x<(a)y"), "xy");
+        assert_eq!(strip_substitutions("x>(a)y"), "xy");
+        // Arithmetic `$((…))` is a balanced span and is dropped entirely.
+        assert_eq!(strip_substitutions("v$((1+2))w"), "vw");
+        assert_eq!(strip_substitutions("plain"), "plain");
+    }
+
+    /// A single-quoted run is copied verbatim (including its delimiters) and any
+    /// substitution syntax inside it is inert. Pins the verbatim
+    /// `out.extend_from_slice(&bytes[start..i])` slice bounds.
+    #[test]
+    fn strip_substitutions_single_quote_verbatim() {
+        assert_eq!(strip_substitutions("'$(x)'"), "'$(x)'");
+        assert_eq!(strip_substitutions("a'$(x)'b"), "a'$(x)'b");
+        // Unterminated single quote: copied to end-of-input.
+        assert_eq!(strip_substitutions("'abc"), "'abc");
+    }
+
+    // ── `unquote` — exact cooked output, edge by edge ─────────────────────────
+
+    /// Double quotes drop the delimiters and honor the `\"`/`\\`/`` \` ``/`\$`
+    /// escapes; any other backslash is kept literally inside the run.
+    #[test]
+    fn unquote_double_quote_escapes() {
+        assert_eq!(unquote(r#""a\"b""#), "a\"b");
+        assert_eq!(unquote(r#""a\\b""#), r"a\b");
+        assert_eq!(unquote(r#""a\`b""#), "a`b");
+        assert_eq!(unquote(r#""a\$b""#), "a$b");
+        // A backslash before a non-special byte is preserved verbatim.
+        assert_eq!(unquote(r#""a\nb""#), r"a\nb");
+        // An escape immediately before the closing quote (the `i + 1 < n`
+        // boundary inside the double-quoted run): `"\""` cooks to a single `"`.
+        assert_eq!(unquote(r#""\"""#), "\"");
+    }
+
+    /// The `$'…'` form drops the delimiters and removes a backslash before any
+    /// byte (it does not interpret escapes — `\n` becomes `n`, not a newline).
+    /// Pins the `i + 1 < n && bytes[i + 1] == b'\''` match guard.
+    #[test]
+    fn unquote_dollar_single_quote() {
+        assert_eq!(unquote(r"$'a\nb'"), "anb");
+        assert_eq!(unquote(r"$'plain'"), "plain");
+        // A lone `$` not followed by `'` is a literal `$`.
+        assert_eq!(unquote("$x"), "$x");
+    }
+
+    /// Unterminated quotes consume to end-of-input rather than overrun.
+    #[test]
+    fn unquote_unterminated_quotes() {
+        assert_eq!(unquote("a'b"), "ab");
+        assert_eq!(unquote(r#"a"b"#), "ab");
+        // A trailing unescaped backslash (no next byte) is kept verbatim.
+        assert_eq!(unquote(r"a\"), r"a\");
+        assert_eq!(unquote(""), "");
+    }
+
+    // ── `is_balanced` — exact true/false at the edges ─────────────────────────
+
+    /// Balanced quotes, backticks, and parens return true; each unterminated or
+    /// stray-close form returns false. Pins the return-value arms and the
+    /// `paren_depth == 0` final check.
+    #[test]
+    fn is_balanced_well_formed_inputs() {
+        assert!(is_balanced("echo hi"));
+        assert!(is_balanced("echo $(rm x)"));
+        assert!(is_balanced(r#"echo "a > b""#));
+        assert!(is_balanced("echo 'a)b'"));
+        assert!(is_balanced("echo `cmd`"));
+        assert!(is_balanced("a (b (c) d) e"));
+        assert!(is_balanced(""));
+    }
+
+    /// Each unbalanced form is rejected for the right reason.
+    #[test]
+    fn is_balanced_unbalanced_inputs() {
+        assert!(!is_balanced("'unterminated"));
+        assert!(!is_balanced(r#""unterminated"#));
+        assert!(!is_balanced("`unterminated"));
+        assert!(!is_balanced("echo (x")); // dangling open paren
+        assert!(!is_balanced("echo )x")); // stray close paren
+        assert!(!is_balanced("(()"));
+    }
+
+    /// A paren or quote inside a quoted run does not affect balance; a `\`
+    /// outside a string escapes the next byte so an escaped quote/paren opens
+    /// nothing. Pins the quote-skip arms and the `\\` arm.
+    #[test]
+    fn is_balanced_quote_and_escape_aware() {
+        // `(` inside single quotes is inert.
+        assert!(is_balanced("'('"));
+        // `)` inside double quotes is inert.
+        assert!(is_balanced(r#""a)b""#));
+        // An escaped paren outside a string opens/closes nothing.
+        assert!(is_balanced(r"\("));
+        assert!(is_balanced(r"\)"));
+        // An escaped quote does not open a quoted run.
+        assert!(is_balanced(r"\'"));
+        // A `\"` inside a double-quoted run is an escaped quote, not the close —
+        // the run still terminates at the final `"` (exercises the dq-escape
+        // `j + 1 < n` arm and its `j += 2` skip).
+        assert!(is_balanced(r#""a\"b""#));
+        // An unterminated double-quoted run whose only `"` is escaped is *not*
+        // balanced — the closing quote is consumed by the escape.
+        assert!(!is_balanced(r#""a\""#));
+        // A `\`` inside a backtick run is escaped, so the run closes at the
+        // final backtick (the backtick-escape arm).
+        assert!(is_balanced(r"`a\`b`"));
+    }
+
+    // ── `is_clean_name` — character-class boundary ────────────────────────────
+
+    /// A clean name is non-empty and built only from alphanumerics plus the
+    /// allowed word/path punctuation; anything else (empty, whitespace, quotes,
+    /// operators, comment) is not clean.
+    #[test]
+    fn is_clean_name_boundary() {
+        assert!(is_clean_name("git"));
+        assert!(is_clean_name("/usr/bin/git"));
+        assert!(is_clean_name("a_b-c.d+e@f"));
+        assert!(!is_clean_name("")); // empty is never clean
+        assert!(!is_clean_name("a b")); // whitespace
+        assert!(!is_clean_name("a;b")); // operator
+        assert!(!is_clean_name("a'b")); // quote
+        assert!(!is_clean_name("#comment")); // comment marker
+    }
+
+    // ── `should_skip` — the prune predicate ───────────────────────────────────
+
+    /// `should_skip` is true for the pruned tail (unbalanced input, brush
+    /// rejects, adversarial-spelling names) and false for clean, well-formed
+    /// shell that both parsers handle. Pins the `!is_balanced` short-circuit and
+    /// the final `!all(is_clean_name)` disjunction.
+    #[test]
+    fn should_skip_clean_vs_pruned() {
+        // Clean, balanced, both-parsable, clean names → not skipped.
+        assert!(!should_skip("git status"));
+        assert!(!should_skip("echo x; rm y"));
+        // Unbalanced → skipped (short-circuits before consulting brush).
+        assert!(should_skip("echo (x"));
+        assert!(should_skip("'unterminated"));
+        // Balanced and brush-parsable, but the command name cooks to a token
+        // carrying an operator (`;`) — the adversarial-spelling tail. Reaches
+        // the final `!all(is_clean_name)` disjunction and prunes. Pins the
+        // trailing `!`/`||` from being deleted/weakened.
+        assert!(should_skip(r#""a;b" arg"#));
+    }
+
+    /// Inputs that are balanced, brush-parsable, and clean-named but contain a
+    /// construct in the pruned tail (function definition, arithmetic, heredoc)
+    /// are skipped *because of the construct*. These pin the
+    /// `program_has_pruned_construct` projection (and the `*_has_pruned`
+    /// recursion) — were that projection forced to `false`, `should_skip` would
+    /// wrongly return `false` here (clean names, balanced, brush-parses).
+    #[test]
+    fn should_skip_pruned_constructs() {
+        // Function definition — `Command::Function`.
+        assert!(should_skip("f() { git status; }"));
+        // Arithmetic compound — `CompoundCommand::Arithmetic`.
+        assert!(should_skip("(( 1 + 2 ))"));
+        // Heredoc body — `IoRedirect::HereDocument`.
+        assert!(should_skip("cat <<EOF\nhi\nEOF\n"));
+        // A plain command nested in an `if` (no pruned construct) is *not*
+        // skipped on this account — guards against the projection over-pruning.
+        assert!(!should_skip("if true; then git status; fi"));
+    }
+
+    /// The `*_has_pruned` recursion must find a pruned construct no matter which
+    /// disjunct of an and-or / pipeline / compound it hides in. Each input below
+    /// carries the pruned construct in a position reachable only through one
+    /// branch of a `||` in the recursion — pinning those `||`s against an
+    /// `&&` mutation (which would lose the construct and stop skipping).
+    #[test]
+    fn should_skip_finds_pruned_in_any_branch() {
+        // Arithmetic in the *second* and-or pipeline (`and_or_has_pruned`'s
+        // `first || additional.any(...)`).
+        assert!(should_skip("git status && (( 1 ))"));
+        // Arithmetic inside the `then` branch of an `if` (the `condition ||
+        // then || elses` disjunction in `compound_has_pruned`).
+        assert!(should_skip("if true; then (( 1 )); fi"));
+        // Arithmetic inside the `else` branch (the `elses` disjunct).
+        assert!(should_skip("if true; then x; else (( 1 )); fi"));
+        // Arithmetic in a `while` body (the `cond || body` disjunct of the
+        // while/until arm).
+        assert!(should_skip("while true; do (( 1 )); done"));
     }
 }
