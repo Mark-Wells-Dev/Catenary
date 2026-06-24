@@ -903,20 +903,6 @@ fn recognize_catenary_argv(argv: &[String]) -> Recog {
     recognize_catenary_sub(&refs)
 }
 
-/// Convenience for the editing-boundary defense (`hook_router`): the deny reason
-/// when `cmd` is a non-canonical catenary command, else `None`.
-#[must_use]
-pub fn catenary_command_denial(cmd: &str) -> Option<String> {
-    match analyze_catenary_command(cmd) {
-        CatenaryAction::Deny(msg) => Some(msg),
-        CatenaryAction::NotCatenary
-        | CatenaryAction::EditingStart
-        | CatenaryAction::Diagnostics
-        | CatenaryAction::Sed { .. }
-        | CatenaryAction::Allow { .. } => None,
-    }
-}
-
 /// Per-occurrence deny reason in priority order, or `None` if the occurrence is
 /// a clean, agent-invocable command.
 fn catenary_occ_denial(occ: &CatenaryOcc) -> Option<String> {
@@ -3595,53 +3581,6 @@ mod tests {
                 "{cmd} should be not-agent-invocable",
             );
         }
-    }
-
-    // ---- catenary_command_denial (hook_router editing-boundary defense) ----
-
-    #[test]
-    fn catenary_command_denial_returns_reason_for_denied_only() {
-        // `catenary_command_denial` is the convenience wrapper `hook_router`
-        // uses: it maps a `Deny` action to its reason and every clean/routed
-        // action to `None`. Pin both directions and the *content* of the
-        // returned reason so a `-> Some(String::new())` body (which would
-        // wrongly report every command — even clean ones — as denied with an
-        // empty reason) is caught.
-
-        // Clean / routed catenary commands carry no denial.
-        for clean in [
-            "catenary grep p src",
-            "catenary glob src",
-            "catenary diagnostics",
-            "catenary sed a b src",
-            "catenary sed --in-place a b src",
-            "catenary editing start",
-            "catenary roots add /tmp/p",
-            "catenary primer",
-            "catenary --version",
-            "make test", // not a catenary command at all
-        ] {
-            assert_eq!(
-                catenary_command_denial(clean),
-                None,
-                "{clean} is clean/not-catenary — no denial reason",
-            );
-        }
-
-        // Denied forms return the actual pedagogical reason (non-empty, with
-        // the same text `analyze_catenary_command` produced).
-        let unknown = catenary_command_denial("catenary frobnicate")
-            .expect("an unknown subcommand must yield a denial reason");
-        assert!(unknown.contains("isn't a recognized"), "got: {unknown}");
-        let piped = catenary_command_denial("catenary grep p | head")
-            .expect("a piped search must yield a denial reason");
-        assert!(piped.contains("--page"), "got: {piped}");
-        let bare_only = catenary_command_denial("cd src && catenary diagnostics")
-            .expect("a chained correlated command must yield a denial reason");
-        assert!(
-            bare_only.contains("as its own command") && bare_only.contains("catenary diagnostics"),
-            "got: {bare_only}",
-        );
     }
 
     // ---- Foreign regime unaffected ----
