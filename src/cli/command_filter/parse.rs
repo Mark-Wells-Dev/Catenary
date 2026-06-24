@@ -1424,4 +1424,360 @@ mod tests {
                 .any(|c| c.is_compound)
         );
     }
+
+    // ── Scanning-loop boundary cases (lexer offset arithmetic) ───────────────
+    //
+    // The scanners below (`scan_balanced`, `scan_backtick`, `skip_double_quote`,
+    // `lex_double_quote`, `lex_ansi_c_quote`, `lex_operator`) carry byte-offset
+    // arithmetic whose edges decide where a quote / substitution / operator span
+    // ends. An off-by-one there can mis-terminate a span and leak or swallow a
+    // command, so these cases pin the exact span boundaries — not just that the
+    // parse "ran".
+
+    #[test]
+    fn glued_fd_prefix_is_redirect_not_process_sub() {
+        // `is_redir_fd_context`: a digit-run glued to `>(`/`<(` (`x2>(…)`) is an
+        // fd redirect, NOT a process substitution — so it produces a redirect and
+        // does NOT recurse. A bare `>(…)` (no digit prefix) is a process sub.
+        let cmd = sole("echo x2>(cat f)");
+        assert_eq!(cmd.name.as_deref(), Some("echo"));
+        assert_eq!(cmd.redirects.len(), 1);
+        assert_eq!(cmd.redirects[0].op, RedirectOp::Write);
+        assert!(
+            cmd.substitutions.is_empty(),
+            "a digit-prefixed `>(` must not recurse, got {:?}",
+            cmd.substitutions
+        );
+        // Contrast: bare `>(…)` IS a process substitution (recurses, no redirect).
+        let bare = sole("echo >(cat f)");
+        assert!(bare.redirects.is_empty());
+        assert_eq!(bare.substitutions.len(), 1);
+        assert_eq!(
+            bare.substitutions[0].pipelines[0].commands[0]
+                .name
+                .as_deref(),
+            Some("cat")
+        );
+    }
+
+    #[test]
+    fn substitution_word_is_just_the_substitution() {
+        // `echo $(rm x)` — echo's only word is the substitution; the close index
+        // lands exactly past the `)`, so no stray `)` or trailing byte leaks into
+        // echo's argv, and `; true` is a separate top-level pipeline.
+        let script = parse("echo $(rm x) ; true");
+        assert_eq!(script.pipelines.len(), 2);
+        let echo = &script.pipelines[0].commands[0];
+        assert_eq!(echo.name.as_deref(), Some("echo"));
+        assert_eq!(echo.argv, vec![""]);
+        assert_eq!(echo.substitutions.len(), 1);
+        assert_eq!(
+            echo.substitutions[0].pipelines[0].commands[0]
+                .name
+                .as_deref(),
+            Some("rm")
+        );
+        assert_eq!(
+            script.pipelines[1].commands[0].name.as_deref(),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn nested_substitution_outer_spans_to_own_close() {
+        // depth tracking: the inner `$(rm x)` increments depth, so the FIRST `)`
+        // closes only the inner sub; the outer `$( … )` spans its full body. `b`
+        // is therefore captured INSIDE the substitution (an arg of the inner
+        // command), and echo's only word is the substitution itself.
+        let cmd = sole("echo $(a $(rm x) b)");
+        assert_eq!(cmd.name.as_deref(), Some("echo"));
+        assert_eq!(cmd.argv, vec![""]);
+        assert_eq!(cmd.substitutions.len(), 1);
+        let inner = &cmd.substitutions[0];
+        assert_eq!(inner.pipelines.len(), 1);
+        let a = &inner.pipelines[0].commands[0];
+        assert_eq!(a.name.as_deref(), Some("a"));
+        // The isolated inner `$(rm x)` is its own empty-text word, so `a`'s argv
+        // is the substitution word (`""`) followed by `b`.
+        assert_eq!(a.argv, vec!["", "b"]);
+        assert_eq!(a.substitutions.len(), 1);
+        assert_eq!(
+            a.substitutions[0].pipelines[0].commands[0].name.as_deref(),
+            Some("rm")
+        );
+    }
+
+    #[test]
+    fn nested_substitution_does_not_swallow_trailing_pipeline() {
+        // The close mutants (`depth -= 1` → `+= / *=`) would never reach zero and
+        // over-consume to EOF, swallowing `; true` into the substitution. The
+        // outer must close at its own `)`, keeping `true` a top-level pipeline.
+        let script = parse("echo $(a $(rm x) b) ; true");
+        assert_eq!(script.pipelines.len(), 2);
+        assert_eq!(
+            script.pipelines[1].commands[0].name.as_deref(),
+            Some("true")
+        );
+        assert_eq!(script.command_positions(), vec!["echo", "a", "rm", "true"]);
+    }
+
+    #[test]
+    fn substitution_single_quote_span_exact() {
+        // The single-quoted `')x'` protects `)` from closing the `$(…)`; the sub
+        // closes at its own `)`, so `; true` is a separate top-level pipeline and
+        // grep's quoted arg is intact (the `;` inside the quote does not split).
+        let script = parse("echo $(grep ')x' f) ; true");
+        assert_eq!(script.pipelines.len(), 2);
+        assert_eq!(
+            script.pipelines[1].commands[0].name.as_deref(),
+            Some("true")
+        );
+        let echo = &script.pipelines[0].commands[0];
+        assert_eq!(echo.substitutions.len(), 1);
+        let grep = &echo.substitutions[0].pipelines[0].commands[0];
+        assert_eq!(grep.name.as_deref(), Some("grep"));
+        assert_eq!(grep.argv, vec![")x", "f"]);
+        assert_eq!(echo.substitutions[0].pipelines.len(), 1);
+        assert_eq!(script.command_positions(), vec!["echo", "grep", "true"]);
+    }
+
+    #[test]
+    fn substitution_double_quote_span_exact() {
+        // A `)` inside `"…"` in a `$(…)` must not close it (`skip_double_quote`);
+        // the sub closes at its own `)`, leaving `; true` a separate pipeline.
+        let script = parse(r#"echo $(grep ")x" f) ; true"#);
+        assert_eq!(script.pipelines.len(), 2);
+        assert_eq!(
+            script.pipelines[1].commands[0].name.as_deref(),
+            Some("true")
+        );
+        let echo = &script.pipelines[0].commands[0];
+        assert_eq!(echo.substitutions.len(), 1);
+        let grep = &echo.substitutions[0].pipelines[0].commands[0];
+        assert_eq!(grep.name.as_deref(), Some("grep"));
+        assert_eq!(grep.argv, vec![")x", "f"]);
+        assert_eq!(script.command_positions(), vec!["echo", "grep", "true"]);
+    }
+
+    #[test]
+    fn substitution_double_quote_escaped_quote_does_not_close_early() {
+        // `skip_double_quote` (inside `$(…)`): a `\"` inside the `"…"` is an
+        // escaped quote, so the run spans to the real closing `"` and the `$(…)`
+        // closes at its own `)`. The `\)` between would otherwise leak.
+        let script = parse(r#"echo $(grep "a\")b" f) ; true"#);
+        assert_eq!(script.pipelines.len(), 2);
+        assert_eq!(
+            script.pipelines[1].commands[0].name.as_deref(),
+            Some("true")
+        );
+        let echo = &script.pipelines[0].commands[0];
+        assert_eq!(echo.substitutions.len(), 1);
+        let grep = &echo.substitutions[0].pipelines[0].commands[0];
+        assert_eq!(grep.name.as_deref(), Some("grep"));
+        // The double-quoted arg reassembles to `a")b` (escaped quote, then `)b`).
+        assert_eq!(grep.argv, vec![r#"a")b"#, "f"]);
+    }
+
+    #[test]
+    fn substitution_double_quote_unterminated_no_panic() {
+        // `skip_double_quote` must not index past the end on an unterminated `"`
+        // inside a `$(…)` (the `i < n` → `i <= n` boundary). Defined, panic-free.
+        let cmd = sole(r#"echo $(grep "unterminated)"#);
+        assert_eq!(cmd.name.as_deref(), Some("echo"));
+        assert_eq!(cmd.substitutions.len(), 1);
+    }
+
+    #[test]
+    fn substitution_backslash_escapes_close_paren() {
+        // Inside `$(…)` a `\)` is an escaped paren, not a closing one — so the sub
+        // spans to its real `)` and the `\)` stays literal in the inner word.
+        let script = parse(r"echo $(printf a\)z) ; true");
+        assert_eq!(script.pipelines.len(), 2);
+        let echo = &script.pipelines[0].commands[0];
+        assert_eq!(echo.argv, vec![""]);
+        assert_eq!(echo.substitutions.len(), 1);
+        let printf = &echo.substitutions[0].pipelines[0].commands[0];
+        assert_eq!(printf.name.as_deref(), Some("printf"));
+        assert_eq!(printf.argv, vec!["a)z"]);
+        assert_eq!(script.command_positions(), vec!["echo", "printf", "true"]);
+    }
+
+    #[test]
+    fn backtick_escaped_backtick_does_not_close_early() {
+        // Inside `` `…` `` a `\`` is an escaped backtick, not a close; the sub
+        // spans to the real closing backtick, and the trailing word stays an arg.
+        let cmd = sole(r"echo `printf a\`b` tail");
+        assert_eq!(cmd.name.as_deref(), Some("echo"));
+        assert_eq!(cmd.argv, vec!["", "tail"]);
+        assert_eq!(cmd.substitutions.len(), 1);
+        let printf = &cmd.substitutions[0].pipelines[0].commands[0];
+        assert_eq!(printf.name.as_deref(), Some("printf"));
+        assert_eq!(printf.argv, vec!["a`b"]);
+    }
+
+    #[test]
+    fn double_quote_escaped_quote_is_one_arg() {
+        // `lex_double_quote`: `\"` inside a double-quoted run is an escaped quote
+        // that stays inside the word (the run does not close early).
+        let cmd = sole(r#"echo "a\"b""#);
+        assert_eq!(cmd.name.as_deref(), Some("echo"));
+        assert_eq!(cmd.argv, vec![r#"a"b"#]);
+    }
+
+    #[test]
+    fn double_quote_backslash_newline_is_continuation() {
+        // `lex_double_quote`: a `\`-newline inside a double-quoted run is a line
+        // continuation — both bytes drop, joining the run (`"a\<nl>b"` → `ab`).
+        let cmd = sole("echo \"a\\\nb\"");
+        assert_eq!(cmd.name.as_deref(), Some("echo"));
+        assert_eq!(cmd.argv, vec!["ab"]);
+    }
+
+    #[test]
+    fn ansi_c_quote_keeps_escaped_byte() {
+        // `lex_ansi_c_quote`: best-effort keeps the byte AFTER the backslash, so
+        // `$'a\nb'` reassembles to `anb` (the escaped `n`, not the `a` before it).
+        let cmd = sole(r"echo $'a\nb'");
+        assert_eq!(cmd.name.as_deref(), Some("echo"));
+        assert_eq!(cmd.argv, vec!["anb"]);
+    }
+
+    #[test]
+    fn ansi_c_quote_trailing_backslash_no_panic() {
+        // A trailing backslash at the end of an unterminated `$'…` must not index
+        // past the end (`lex_ansi_c_quote` guard `i + 1 < n`); kept literally.
+        let cmd = sole(r"echo $'ab\");
+        assert_eq!(cmd.name.as_deref(), Some("echo"));
+        assert_eq!(cmd.argv, vec![r"ab\"]);
+    }
+
+    #[test]
+    fn crlf_line_continuation_joins() {
+        // `lex`: a `\`-CRLF line continuation (`\<CR><LF>`) drops all three bytes,
+        // joining the lines — distinct from the `\`-LF case already covered.
+        let cmd = sole("cmd \\\r\nmore");
+        assert_eq!(cmd.name.as_deref(), Some("cmd"));
+        assert_eq!(cmd.argv, vec!["more"]);
+        assert_eq!(positions("cmd \\\r\nmore"), vec!["cmd"]);
+    }
+
+    #[test]
+    fn multi_digit_fd_redirect() {
+        // `digit_run_len`: a multi-digit source fd (`10>file`) is consumed whole
+        // as the redirect's fd — the digits never leak into argv.
+        let cmd = sole("cmd 10>file");
+        assert_eq!(cmd.name.as_deref(), Some("cmd"));
+        assert!(
+            cmd.argv.is_empty(),
+            "fd digits must not be argv: {:?}",
+            cmd.argv
+        );
+        assert_eq!(cmd.redirects.len(), 1);
+        assert_eq!(cmd.redirects[0].op, RedirectOp::Write);
+        assert_eq!(cmd.redirects[0].target, "file");
+    }
+
+    #[test]
+    fn bare_assignment_is_no_command() {
+        // `build_command`: a stage of only `VAR=value` assignments has no command
+        // word and produces NO command (the `!cmd.is_compound` empty-stage guard).
+        let script = parse("FOO=bar");
+        assert_eq!(script, ParsedScript::default());
+        assert!(script.command_positions().is_empty());
+    }
+
+    // ── Operator lexing (`lex_operator` offsets / guards) ────────────────────
+
+    #[test]
+    fn redirect_write_both_truncate() {
+        // `&>` redirects both stdout and stderr (truncate).
+        let cmd = sole("make test &>log");
+        assert_eq!(cmd.name.as_deref(), Some("make"));
+        assert_eq!(cmd.argv, vec!["test"]);
+        assert_eq!(cmd.redirects.len(), 1);
+        assert_eq!(cmd.redirects[0].op, RedirectOp::WriteBoth);
+        assert_eq!(cmd.redirects[0].target, "log");
+    }
+
+    #[test]
+    fn redirect_write_both_append() {
+        // `&>>` redirects both stdout and stderr (append); the 3-byte operator is
+        // consumed whole, so the target is the following word, not a stray `>`.
+        let cmd = sole("make test &>>log");
+        assert_eq!(cmd.name.as_deref(), Some("make"));
+        assert_eq!(cmd.argv, vec!["test"]);
+        assert_eq!(cmd.redirects.len(), 1);
+        assert_eq!(cmd.redirects[0].op, RedirectOp::WriteBoth);
+        assert_eq!(cmd.redirects[0].target, "log");
+    }
+
+    #[test]
+    fn redirect_clobber_is_write() {
+        // `>|` clobber is treated as a plain write; the `|` is part of the
+        // operator, not a pipe, and the target is the following word.
+        let cmd = sole("echo hi >|log");
+        assert_eq!(cmd.name.as_deref(), Some("echo"));
+        assert_eq!(cmd.argv, vec!["hi"]);
+        assert_eq!(cmd.redirects.len(), 1);
+        assert_eq!(cmd.redirects[0].op, RedirectOp::Write);
+        assert_eq!(cmd.redirects[0].target, "log");
+    }
+
+    #[test]
+    fn here_string_triple_lt() {
+        // `<<<word` is a single here-string operator; the target is `word`.
+        let cmd = sole("cat <<<word");
+        assert_eq!(cmd.name.as_deref(), Some("cat"));
+        assert_eq!(cmd.redirects.len(), 1);
+        assert_eq!(cmd.redirects[0].op, RedirectOp::HereString);
+        assert_eq!(cmd.redirects[0].target, "word");
+    }
+
+    #[test]
+    fn heredoc_operator_is_single_read_redirect() {
+        // `<<EOF` is a single Read redirect; its target word is the delimiter
+        // (the body is stripped before lexing). The two `<` are one operator.
+        let cmd = sole("cat <<EOF\nbody\nEOF");
+        assert_eq!(cmd.name.as_deref(), Some("cat"));
+        assert_eq!(cmd.redirects.len(), 1);
+        assert_eq!(cmd.redirects[0].op, RedirectOp::Read);
+        assert_eq!(cmd.redirects[0].target, "EOF");
+    }
+
+    #[test]
+    fn double_lt_at_eof_no_panic() {
+        // A `<<` with no following delimiter at end of input must not index past
+        // the end (`i + 2 < n` boundary); it is a single Read with empty target.
+        let cmd = sole("cat <<");
+        assert_eq!(cmd.name.as_deref(), Some("cat"));
+        assert_eq!(cmd.redirects.len(), 1);
+        assert_eq!(cmd.redirects[0].op, RedirectOp::Read);
+        assert_eq!(cmd.redirects[0].target, "");
+    }
+
+    #[test]
+    fn dup_in_redirect() {
+        // `<&3` is an input fd duplication (DupIn), target `3` — not a Read
+        // followed by a backgrounding `&`.
+        let cmd = sole("cat <&3");
+        assert_eq!(cmd.name.as_deref(), Some("cat"));
+        assert_eq!(cmd.redirects.len(), 1);
+        assert_eq!(cmd.redirects[0].op, RedirectOp::DupIn);
+        assert_eq!(cmd.redirects[0].target, "3");
+    }
+
+    #[test]
+    fn lt_between_words_is_not_here_string() {
+        // `<a<b`: each `<` has a non-`<` next byte, so each is a plain Read — the
+        // here-string check must read `bytes[i + 1]` / `bytes[i + 2]`, not
+        // `bytes[i]`. Two Read redirects, targets `a` and `b`.
+        let cmd = sole("cat <a<b");
+        assert_eq!(cmd.name.as_deref(), Some("cat"));
+        assert_eq!(cmd.argv, Vec::<String>::new());
+        assert_eq!(cmd.redirects.len(), 2);
+        assert_eq!(cmd.redirects[0].op, RedirectOp::Read);
+        assert_eq!(cmd.redirects[0].target, "a");
+        assert_eq!(cmd.redirects[1].op, RedirectOp::Read);
+        assert_eq!(cmd.redirects[1].target, "b");
+    }
 }
