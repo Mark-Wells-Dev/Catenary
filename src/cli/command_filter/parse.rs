@@ -204,8 +204,11 @@ fn lex(input: &str) -> Vec<Token> {
     let mut tokens: Vec<Token> = Vec::new();
     let mut i = 0;
 
-    // The in-progress word, accumulated across quoted and unquoted runs.
-    let mut word = String::new();
+    // The in-progress word, accumulated as raw bytes across quoted and unquoted
+    // runs. UTF-8 conversion is deferred to `flush_word` (a single
+    // `from_utf8_lossy` per word), so a multibyte scalar fed one byte at a time
+    // is never split across a conversion (bug 43).
+    let mut word: Vec<u8> = Vec::new();
     let mut subs: Vec<String> = Vec::new();
     let mut had_quote = false;
     let mut in_word = false;
@@ -275,7 +278,7 @@ fn lex(input: &str) -> Vec<Token> {
                 } else {
                     // Trailing backslash at end of input — keep literally.
                     in_word = true;
-                    word.push('\\');
+                    word.push(b'\\');
                     i += 1;
                 }
             }
@@ -306,7 +309,7 @@ fn lex(input: &str) -> Vec<Token> {
                     subs.push(inner);
                     i = next;
                 } else {
-                    word.push('$');
+                    word.push(b'$');
                     i += 1;
                 }
             }
@@ -360,14 +363,18 @@ fn lex(input: &str) -> Vec<Token> {
 /// read as a dead store.
 fn flush_word(
     tokens: &mut Vec<Token>,
-    word: &mut String,
+    word: &mut Vec<u8>,
     subs: &mut Vec<String>,
     had_quote: &mut bool,
     in_word: &mut bool,
 ) {
     if *in_word {
+        // Convert the accumulated raw bytes to text exactly once, at the word
+        // boundary — a complete buffer, so a multibyte scalar is never split
+        // across the `from_utf8_lossy` (bug 43).
+        let text = String::from_utf8_lossy(&std::mem::take(word)).into_owned();
         tokens.push(classify_word(WordTok {
-            text: std::mem::take(word),
+            text,
             subs: std::mem::take(subs),
             had_quote: *had_quote,
         }));
@@ -424,7 +431,7 @@ fn fd_redirect_after(bytes: &[u8], i: usize) -> bool {
 fn lex_double_quote(
     bytes: &[u8],
     start: usize,
-    word: &mut String,
+    word: &mut Vec<u8>,
     subs: &mut Vec<String>,
 ) -> usize {
     let n = bytes.len();
@@ -443,11 +450,11 @@ fn lex_double_quote(
                         push_byte(word, next);
                         i += 2;
                     } else {
-                        word.push('\\');
+                        word.push(b'\\');
                         i += 1;
                     }
                 } else {
-                    word.push('\\');
+                    word.push(b'\\');
                     i += 1;
                 }
             }
@@ -473,7 +480,7 @@ fn lex_double_quote(
 /// Lex a `$'…'` ANSI-C quoted run starting just after the opening `'`,
 /// appending interpreted content to `word`. Returns the index past the closing
 /// `'`. A backslash escapes the next character (so `\'` stays inside the run).
-fn lex_ansi_c_quote(bytes: &[u8], start: usize, word: &mut String) -> usize {
+fn lex_ansi_c_quote(bytes: &[u8], start: usize, word: &mut Vec<u8>) -> usize {
     let n = bytes.len();
     let mut i = start;
     while i < n {
@@ -898,24 +905,20 @@ fn memchr_byte(bytes: &[u8], needle: u8, from: usize) -> Option<usize> {
     (from..bytes.len()).find(|&j| bytes[j] == needle)
 }
 
-/// Append a single byte (from a valid `&str`, scanned in order) to a string,
-/// preserving multibyte UTF-8 sequences without `unsafe`.
-fn push_byte(s: &mut String, b: u8) {
-    if b < 0x80 {
-        s.push(b as char);
-    } else {
-        // A continuation / lead byte: re-validate through the byte buffer. Since
-        // the source bytes come from a valid `&str` consumed in order, the tail
-        // forms valid UTF-8 once the full sequence is present.
-        let mut bytes = std::mem::take(s).into_bytes();
-        bytes.push(b);
-        *s = String::from_utf8_lossy(&bytes).into_owned();
-    }
+/// Append a single byte (from a valid `&str`, scanned in order) to the word
+/// accumulator.
+///
+/// The accumulator holds raw bytes; UTF-8 validation is deferred to
+/// [`flush_word`], which converts the complete buffer exactly once. Appending
+/// byte-by-byte here is therefore always correct, even for a multibyte scalar
+/// fed one byte at a time — the bytes are never split across a conversion.
+fn push_byte(s: &mut Vec<u8>, b: u8) {
+    s.push(b);
 }
 
-/// Append a byte slice (a sub-run of a valid `&str`) to a string.
-fn push_bytes(s: &mut String, bytes: &[u8]) {
-    s.push_str(&String::from_utf8_lossy(bytes));
+/// Append a byte slice (a sub-run of a valid `&str`) to the word accumulator.
+fn push_bytes(s: &mut Vec<u8>, bytes: &[u8]) {
+    s.extend_from_slice(bytes);
 }
 
 /// Scan a balanced `open`/`close` run starting at `start` (just past the first
@@ -1779,5 +1782,68 @@ mod tests {
         assert_eq!(cmd.redirects[0].target, "a");
         assert_eq!(cmd.redirects[1].op, RedirectOp::Read);
         assert_eq!(cmd.redirects[1].target, "b");
+    }
+
+    // ── Multibyte UTF-8 in words (bug 43) ────────────────────────────────────
+    //
+    // The word accumulator buffers raw bytes and converts to text exactly once
+    // at the word boundary, so a multibyte scalar fed one byte at a time is
+    // never split across a `from_utf8_lossy` (which would replace each
+    // lead/continuation byte with U+FFFD). These cases assert the *exact* word
+    // text round-trips, so a regression to per-byte conversion is caught.
+
+    #[test]
+    fn unquoted_multibyte_word_roundtrips() {
+        // `echo —x` (em-dash `—` = E2 80 94) must parse to argv `["—x"]`, not
+        // the corrupted `["\u{FFFD}\u{FFFD}\u{FFFD}x"]` (bug 43).
+        let cmd = sole("echo —x");
+        assert_eq!(cmd.name.as_deref(), Some("echo"));
+        assert_eq!(cmd.argv, vec!["—x"]);
+        assert!(
+            !cmd.argv[0].contains('\u{FFFD}'),
+            "multibyte word must not be corrupted to U+FFFD, got {:?}",
+            cmd.argv
+        );
+    }
+
+    #[test]
+    fn double_quoted_multibyte_word_roundtrips() {
+        // A multibyte scalar inside a double-quoted word takes the
+        // `lex_double_quote` byte path; it must round-trip intact.
+        let cmd = sole(r#"echo "café—™""#);
+        assert_eq!(cmd.name.as_deref(), Some("echo"));
+        assert_eq!(cmd.argv, vec!["café—™"]);
+        assert!(!cmd.argv[0].contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn backslash_escaped_multibyte_char_roundtrips() {
+        // A `\`-escaped multibyte char keeps the following *scalar* literally:
+        // the backslash arm feeds only the first continuation byte to
+        // `push_byte`, and the remaining continuation bytes flow through the
+        // ordinary-word arm — all into the same byte buffer, converted once.
+        let cmd = sole(r"echo \—x");
+        assert_eq!(cmd.name.as_deref(), Some("echo"));
+        assert_eq!(cmd.argv, vec!["—x"]);
+        assert!(!cmd.argv[0].contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn ansi_c_quoted_multibyte_word_roundtrips() {
+        // The `$'…'` path (`lex_ansi_c_quote`) is also byte-fed; a multibyte
+        // scalar inside it must survive.
+        let cmd = sole("echo $'—x'");
+        assert_eq!(cmd.name.as_deref(), Some("echo"));
+        assert_eq!(cmd.argv, vec!["—x"]);
+        assert!(!cmd.argv[0].contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn multibyte_command_name_roundtrips() {
+        // A non-ASCII command *name* must not be mangled before allowlist
+        // matching (gate-impact path noted in bug 43).
+        let cmd = sole("café build");
+        assert_eq!(cmd.name.as_deref(), Some("café"));
+        assert_eq!(cmd.argv, vec!["build"]);
     }
 }
