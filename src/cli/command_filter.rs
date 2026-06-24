@@ -1067,23 +1067,26 @@ fn background_denial(sub: Sub) -> String {
 }
 
 /// Bare-only violation for a correlated/lifecycle command sharing the call.
+///
+/// Names the isolation-needing command — the first `Correlated`/`Lifecycle`
+/// sub, the one `occ_needs_isolation` gates on — not `subs.first()`, which in a
+/// mixed chain like `catenary grep x && catenary diagnostics` would be the
+/// freely-chaining `grep`. Falls back to `diagnostics` if none resolves.
 fn bare_only_denial(subs: &[Sub]) -> String {
-    let correlated = subs
+    let label = subs
         .iter()
-        .filter(|s| s.class() == CatenaryClass::Correlated)
-        .count();
-    if correlated >= 2 || subs.len() >= 2 {
-        return "Run each catenary command on its own line — `diagnostics`/`sed` (and \
-             the editing lifecycle) can't share a command with anything else; they must \
-             reach the daemon immediately to attribute correctly."
-            .to_string();
-    }
-    let label = subs.first().map_or("diagnostics", |s| s.label());
+        .find(|s| {
+            matches!(
+                s.class(),
+                CatenaryClass::Correlated | CatenaryClass::Lifecycle
+            )
+        })
+        .map_or("diagnostics", |s| s.label());
     format!(
-        "Run `catenary {label}` as its own command — it can't be combined with other \
-         commands (no `cd` prefix, no `&&`/`;`/`||` chain). It must reach the daemon \
-         promptly to attribute correctly; it takes no paths, so the working directory \
-         doesn't matter."
+        "Run `catenary {label}` as its own command — `diagnostics` / `sed --in-place` \
+         and the editing-lifecycle commands take a daemon handoff and must be the SOLE \
+         command (no `cd` prefix, no `&&`/`;`/`||` chain, not combined with another \
+         command). It must reach the daemon promptly to attribute correctly."
     )
 }
 
@@ -3516,68 +3519,55 @@ mod tests {
 
     #[test]
     fn matcher_denies_correlated_prefix_and_chain() {
-        // A *single* correlated command sharing the call (a foreign prefix /
-        // chain, one catenary occurrence) gets the single-command message —
-        // "as its own command" with the offending subcommand named — not the
-        // multi-command "on its own line" form. Pinning the message branch and
-        // the embedded `Sub::label` here is what catches a `bare_only_denial`
-        // boundary flip (`correlated >= 2 → correlated < 2`) that would route a
-        // single-command denial to the wrong message, and a `Sub::label`
-        // substitution that would drop the named subcommand.
-        for (cmd, label) in [
-            ("cd src && catenary diagnostics", "diagnostics"),
-            ("catenary diagnostics && make test", "diagnostics"),
-            // The correlated `sed` is the `--in-place` write form (it takes the
-            // handoff); a chained preview is allowed (see `matcher_sed_preview_*`).
-            ("make x && catenary sed --in-place a b f", "sed"),
-        ] {
-            let msg = deny_text(cmd);
-            assert!(
-                msg.contains("as its own command"),
-                "{cmd} should get the single-command bare-only message, got: {msg}",
-            );
-            assert!(
-                !msg.contains("on its own line"),
-                "{cmd} is a single command — not the multi-command message, got: {msg}",
-            );
-            assert!(
-                msg.contains(&format!("catenary {label}")),
-                "{cmd} should name `catenary {label}`, got: {msg}",
-            );
-        }
+        // The unified bare-only denial names the isolation-needing command
+        // (`as its own command`) and embeds its `Sub::label`.
+        let diag_prefix = deny_text("cd src && catenary diagnostics");
+        assert!(
+            diag_prefix.contains("as its own command"),
+            "got: {diag_prefix}"
+        );
+        assert!(
+            diag_prefix.contains("catenary diagnostics"),
+            "got: {diag_prefix}"
+        );
+
+        let diag_chain = deny_text("catenary diagnostics && make test");
+        assert!(
+            diag_chain.contains("as its own command"),
+            "got: {diag_chain}"
+        );
+        assert!(
+            diag_chain.contains("catenary diagnostics"),
+            "got: {diag_chain}"
+        );
+
+        // The correlated `sed` is the `--in-place` write form (it takes the
+        // handoff); a chained preview is allowed (see `matcher_sed_preview_*`).
+        let sed_chain = deny_text("make x && catenary sed --in-place a b f");
+        assert!(sed_chain.contains("as its own command"), "got: {sed_chain}");
+        assert!(sed_chain.contains("catenary sed"), "got: {sed_chain}");
     }
 
     #[test]
     fn matcher_denies_two_correlated_in_one_call() {
-        // Two catenary commands (`sed` preview + `diagnostics`) → multi-command
-        // "on its own line" message, never the single-command form.
+        // Two correlated subs chained: the unified denial names the first
+        // isolation-needing command in document order (`sed`).
         let msg = deny_text("catenary sed a b f && catenary diagnostics");
-        assert!(msg.contains("on its own line"), "got: {msg}");
-        assert!(
-            !msg.contains("as its own command"),
-            "two commands must not use the single-command message, got: {msg}",
-        );
+        assert!(msg.contains("as its own command"), "got: {msg}");
+        assert!(msg.contains("catenary sed"), "got: {msg}");
     }
 
     #[test]
     fn matcher_denies_search_mixed_with_correlated() {
-        // grep is unrestricted, but diagnostics chained alongside a second
-        // catenary occurrence is not bare → deny. Two catenary commands share
-        // the call (`subs.len() == 2`, only one of them correlated), so this is
-        // the multi-command "on its own line" message — NOT the single-command
-        // form. Pinning the multi branch here is what catches the
-        // `bare_only_denial` `|| → &&` mutant: with `&&`, the
-        // `correlated >= 2 (= false) && subs.len() >= 2` short-circuits to the
-        // single-command message and names only the first subcommand (`grep`),
-        // mis-describing a two-command denial.
+        // grep is unrestricted, but diagnostics is not bare → deny. The denial
+        // must name the isolation-needing command (`diagnostics`), not the
+        // freely-chaining `grep` that happens to be `subs.first()`.
         let msg = deny_text("catenary grep p && catenary diagnostics");
+        assert!(msg.contains("as its own command"), "got: {msg}");
+        assert!(msg.contains("catenary diagnostics"), "got: {msg}");
         assert!(
-            msg.contains("on its own line"),
-            "two catenary commands sharing a call get the multi-command message, got: {msg}",
-        );
-        assert!(
-            !msg.contains("as its own command"),
-            "a two-command denial must not use the single-command message, got: {msg}",
+            !msg.contains("catenary grep"),
+            "must name diagnostics, not grep: {msg}"
         );
     }
 
