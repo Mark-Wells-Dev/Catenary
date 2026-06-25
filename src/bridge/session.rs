@@ -1317,4 +1317,30 @@ mod tests {
             "in-root .log (non-served) must not claim coverage"
         );
     }
+
+    #[test]
+    fn has_lsp_coverage_gates_out_of_root_on_single_file_coverage() {
+        // Bug 44 / Decision 3: the out-of-root tier (tier 3) gates on single-file
+        // coverage, NOT the in-root configured-server check. The project-based
+        // rust-analyzer is not a single-file server, so an out-of-root .rs is not
+        // covered — even though the same .rs in-root IS. Pins the `resolve_root`
+        // in-root/out-of-root branch so it cannot collapse to a single tier.
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("workspace");
+        std::fs::create_dir_all(&root).expect("create workspace dir");
+        let session = session_with_root(rt.handle(), root.clone());
+
+        // In-root .rs is covered (configured server) ...
+        assert!(
+            session.has_lsp_coverage(&root.join("src/main.rs")),
+            "in-root .rs must have coverage"
+        );
+        // ... but the same language out of root is not (no single-file server).
+        let outside = tmp.path().join("outside").join("lib.rs");
+        assert!(
+            !session.has_lsp_coverage(&outside),
+            "out-of-root .rs must gate on single-file coverage (none for rust)"
+        );
+    }
 }
