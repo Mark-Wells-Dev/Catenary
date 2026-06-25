@@ -998,6 +998,14 @@ const SEED_CORPUS: &[&str] = &[
     r#"for f in *.rs; do git add "$f"; done"#,
     "for f in a b c; do echo x; done",
     "for f in $(rm x); do echo hi; done",
+    // ── Bug 45 — redirect trailing a subshell binds to the subshell ───────────
+    // The compound-sweep used to drop these; the brace-group reference form is
+    // pinned alongside so the two stay agreeing.
+    "( echo hi ) > out",
+    "( cmd ) >> out",
+    "( cmd ) > out 2>&1",
+    "( ( a ) > x ) > y",
+    "{ echo hi; } > out",
 ];
 
 // ── proptest strategy ─────────────────────────────────────────────────────────
@@ -1225,6 +1233,28 @@ mod tests {
         // And both agree with brush.
         check("git status > out.txt");
         check(r#"echo "a > b""#);
+    }
+
+    /// Bug 45: a redirect *following* the close of a subshell binds to the
+    /// subshell. Our parser used to drop it (the compound-sweep ignored redirect
+    /// tokens), under-counting the redirect signature versus brush's
+    /// `[OutputFile]`. With the fix the two parsers agree, so `check` — which
+    /// asserts redirect-signature equality + containment — no longer panics. This
+    /// is the case the brace-group-scoped oracle test deliberately sidestepped
+    /// while the bug was live.
+    #[test]
+    fn subshell_trailing_redirect_agrees_with_brush() {
+        // The headline repro: previously brush saw `[OutputFile]`, ours saw `[]`.
+        let ours = ours_projection("( echo hi ) > out");
+        assert_eq!(ours.redirect_ops, vec![RedirectKind::OutputFile]);
+        // The differential no longer diverges (does not panic).
+        check("( echo hi ) > out");
+        // Append, fd-duplication, and nested forms also agree.
+        check("( cmd ) >> out");
+        check("( cmd ) > out 2>&1");
+        check("( ( a ) > x ) > y");
+        // The brace-group reference form still agrees (no regression).
+        check("{ echo hi; } > out");
     }
 
     /// `unquote` reproduces the name-cooking our lexer applies, so a raw brush

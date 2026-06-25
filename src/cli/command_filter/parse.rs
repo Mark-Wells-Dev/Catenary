@@ -804,17 +804,55 @@ fn build_command(tokens: &[Token]) -> Option<SimpleCommand> {
 }
 
 /// After hitting a reserved word / `(`, sweep the remaining tokens for words
-/// (to find inner command positions) and substitutions, ignoring further
-/// structure — gate 04 owns compound-body policy; the parser only surfaces the
-/// inner words and recursed substitutions.
+/// (to find inner command positions), substitutions, and redirects — ignoring
+/// only further reserved/paren/control *structure*. Gate 04 owns compound-body
+/// policy; the parser surfaces the inner words, recursed substitutions, and the
+/// redirects.
+///
+/// Redirects are collected because a redirect *following* the compound's close
+/// binds to the whole compound and must reach the gate's `allow_file_redirects`
+/// enforcement (bug 45). When a compound has no top-level list operator its
+/// closing delimiter and any trailing redirect stay in the same segment that
+/// began with the `(` / reserved word, so they route through here rather than
+/// the `Token::Redir` arm of [`build_command`]. The brace-group form escaped the
+/// bug only by accident — its `}` is not a reserved word, so the `;` before it
+/// splits the trailing-redirect tail into its own simple command. The subshell
+/// `( … )` arm had no such split and so dropped the redirect. Sweeping every
+/// `Token::Redir` here (its following word consumed as the target, mirroring
+/// [`build_command`]) attaches the redirect at every nesting level — matching the
+/// flat redirect multiset the brush reference parser projects (`( ( a ) > x ) > y`
+/// → two output redirects).
 fn collect_rest<'a>(tokens: &'a [Token], words: &mut Vec<&'a WordTok>, cmd: &mut SimpleCommand) {
-    for tok in tokens {
-        match tok {
+    let mut idx = 0;
+    while idx < tokens.len() {
+        match &tokens[idx] {
             Token::Word(w) => {
                 words.push(w);
                 collect_subs(w, cmd);
+                idx += 1;
             }
-            Token::Redir(_) | Token::Reserved(_) | Token::Paren(_) | Token::Control(_) => {}
+            Token::Redir(op) => {
+                // The next word (if any) is the redirect target — consume it so a
+                // bound redirect on the compound (`( cmd ) > out`) reaches the
+                // gate and its target word does not leak into the swept words.
+                if let Some(t) = tokens.get(idx + 1).and_then(token_word) {
+                    cmd.redirects.push(Redirect {
+                        op: *op,
+                        target: t.text.clone(),
+                    });
+                    collect_subs(t, cmd);
+                    idx += 2;
+                } else {
+                    cmd.redirects.push(Redirect {
+                        op: *op,
+                        target: String::new(),
+                    });
+                    idx += 1;
+                }
+            }
+            Token::Reserved(_) | Token::Paren(_) | Token::Control(_) => {
+                idx += 1;
+            }
         }
     }
 }
@@ -1426,6 +1464,93 @@ mod tests {
                 .flat_map(|p| &p.commands)
                 .any(|c| c.is_compound)
         );
+    }
+
+    // ── Subshell trailing redirect (bug 45) ──────────────────────────────────
+    //
+    // A redirect *following* the closing `)` of a subshell binds to the whole
+    // subshell. When the subshell carries no top-level list operator, its close
+    // and the trailing redirect stay in the segment that began with `(`, which
+    // routes through `collect_rest`. That sweep used to drop every `Token::Redir`
+    // (it collected only words), so the bound redirect vanished — a SECURITY
+    // under-count for the gate's `allow_file_redirects` enforcement. The fix
+    // sweeps the redirects too; these cases pin it (the differential oracle, which
+    // had been scoped to the brace-group form to dodge this bug, now also covers
+    // the subshell form in `oracle.rs`).
+
+    #[test]
+    fn subshell_trailing_redirect_is_captured() {
+        // Bug 45: `( echo hi ) > out` must surface the `OutputFile` redirect that
+        // binds to the subshell — previously dropped (redirects `[]`).
+        let cmd = sole("( echo hi ) > out");
+        assert!(cmd.is_compound);
+        assert_eq!(cmd.redirects.len(), 1, "got {:?}", cmd.redirects);
+        assert_eq!(cmd.redirects[0].op, RedirectOp::Write);
+        assert_eq!(cmd.redirects[0].target, "out");
+        // The inner `echo` is still a command position.
+        assert!(
+            parse("( echo hi ) > out")
+                .command_positions()
+                .contains(&"echo".to_string())
+        );
+    }
+
+    #[test]
+    fn subshell_trailing_append_redirect_is_captured() {
+        // `( cmd ) >> out` — appending output redirect on the subshell.
+        let cmd = sole("( cmd ) >> out");
+        assert!(cmd.is_compound);
+        assert_eq!(cmd.redirects.len(), 1, "got {:?}", cmd.redirects);
+        assert_eq!(cmd.redirects[0].op, RedirectOp::Append);
+        assert_eq!(cmd.redirects[0].target, "out");
+    }
+
+    #[test]
+    fn subshell_multiple_trailing_redirects_are_captured() {
+        // `( cmd ) > out 2>&1` — a file write plus an fd duplication, both bound
+        // to the subshell. The `2` is the source fd of the dup, not an argument.
+        let cmd = sole("( cmd ) > out 2>&1");
+        assert!(cmd.is_compound);
+        assert_eq!(cmd.redirects.len(), 2, "got {:?}", cmd.redirects);
+        assert_eq!(cmd.redirects[0].op, RedirectOp::Write);
+        assert_eq!(cmd.redirects[0].target, "out");
+        assert_eq!(cmd.redirects[1].op, RedirectOp::DupOut);
+        assert_eq!(cmd.redirects[1].target, "1");
+    }
+
+    #[test]
+    fn nested_subshell_trailing_redirects_are_captured() {
+        // `( ( a ) > x ) > y` — a redirect after each closing `)`. With no
+        // top-level list operator the whole thing is one swept compound, so both
+        // bound redirects must surface (matching brush's flat two-redirect
+        // projection). The inner command `a` is still seen.
+        let cmd = sole("( ( a ) > x ) > y");
+        assert!(cmd.is_compound);
+        assert_eq!(cmd.redirects.len(), 2, "got {:?}", cmd.redirects);
+        assert_eq!(cmd.redirects[0].op, RedirectOp::Write);
+        assert_eq!(cmd.redirects[0].target, "x");
+        assert_eq!(cmd.redirects[1].op, RedirectOp::Write);
+        assert_eq!(cmd.redirects[1].target, "y");
+        assert_eq!(parse("( ( a ) > x ) > y").command_positions(), vec!["a"]);
+    }
+
+    #[test]
+    fn brace_group_trailing_redirect_still_captured() {
+        // Regression guard for the reference form: `{ echo hi; } > out` still
+        // surfaces its `OutputFile` redirect (the `;` splits the `} > out` tail
+        // into its own simple command, where the redirect is captured). The fix
+        // to the subshell arm must not perturb this.
+        let script = parse("{ echo hi; } > out");
+        let redirs: Vec<_> = script
+            .pipelines
+            .iter()
+            .flat_map(|p| &p.commands)
+            .flat_map(|c| &c.redirects)
+            .collect();
+        assert_eq!(redirs.len(), 1, "got {redirs:?}");
+        assert_eq!(redirs[0].op, RedirectOp::Write);
+        assert_eq!(redirs[0].target, "out");
+        assert!(script.command_positions().contains(&"echo".to_string()));
     }
 
     // ── Scanning-loop boundary cases (lexer offset arithmetic) ───────────────
