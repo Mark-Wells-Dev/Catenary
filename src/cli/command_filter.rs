@@ -57,31 +57,6 @@ use crate::config::ResolvedCommands;
 /// rather than growing this set.
 const DEVICE_SINKS: [&str; 3] = ["/dev/null", "/dev/stdout", "/dev/stderr"];
 
-/// Whether a [`SimpleCommand`](parse::SimpleCommand)'s redirects include a file
-/// write the gate must deny (target not a [`DEVICE_SINKS`] sink), recursing into
-/// substitutions.
-///
-/// The redirect guard reads the redirect family off the faithful parse (ticket
-/// 03) rather than re-scanning the raw bytes, so a quoted `>` (`echo "a > b"`)
-/// is structurally not a redirect
-/// and a real redirect the byte scanner missed is now seen. It honors the wider
-/// zsh write-surface (decision 020 §8a): every MULTIOS / brace target is its own
-/// [`Redirect`] and each is gated; `>>` / `>|` / `&>` / fd-targeted `N>` all
-/// write files; `>&N` / `>&-` fd duplication / close and `>(cmd)` output process
-/// substitution are **not** file writes; and an unverifiable variable or
-/// command-substitution target (`> $f`) fails **closed** (it is not a device
-/// sink, so it denies). Redirects inside recursed `$()` / `` `…` `` / `<(…)` /
-/// `>(…)` substitutions are checked too — the old byte scanner only saw the top
-/// segment.
-fn parse_redirects_to_file(script: &parse::ParsedScript) -> bool {
-    script.pipelines.iter().any(|pipeline| {
-        pipeline.commands.iter().any(|cmd| {
-            cmd.redirects.iter().any(redirect_writes_file)
-                || cmd.substitutions.iter().any(parse_redirects_to_file)
-        })
-    })
-}
-
 /// Whether a single [`Redirect`](parse::Redirect) writes a non-device-sink file.
 ///
 /// Maps the parsed operator + target to the file-write decision (decision 020
@@ -355,15 +330,15 @@ fn check_parsed_command(
     // so an otherwise-allowed command can't carry a redirect through. Gated by
     // `allow_file_redirects`. Read off the faithful parse (ticket 03): the whole
     // redirect family — every MULTIOS / brace target, `>>` / `>|` / `&>` /
-    // fd-targeted `N>`, recursed into substitutions — with fd-dup / close /
-    // `>(cmd)` excluded and an unverifiable `$var` target failing closed
-    // (decision 020 §8a). A heredoc (`<<`) lexes to `RedirectOp::Read` (input),
-    // so it never shields an output redirect: `cat <<EOF > out.txt` still denies
-    // on the `> out.txt` write (bug 11).
-    if !rules.allow_file_redirects
-        && (command.redirects.iter().any(redirect_writes_file)
-            || command.substitutions.iter().any(parse_redirects_to_file))
-    {
+    // fd-targeted `N>` — with fd-dup / close / `>(cmd)` excluded and an
+    // unverifiable `$var` target failing closed (decision 020 §8a). A redirect
+    // *inside* a `$()` / `` `…` `` / `<(…)` / `>(…)` substitution is already
+    // caught by the substitution recursion at the top of this function (each sub
+    // is re-checked through this same guard), so it needs no separate sweep here.
+    // A heredoc (`<<`) lexes to `RedirectOp::Read` (input), so it never shields
+    // an output redirect: `cat <<EOF > out.txt` still denies on the `> out.txt`
+    // write (bug 11).
+    if !rules.allow_file_redirects && command.redirects.iter().any(redirect_writes_file) {
         return Some(Denial {
             command: name.to_string(),
             reason: DenialReason::OutputRedirect,
@@ -3103,6 +3078,21 @@ mod tests {
     }
 
     #[test]
+    fn redirect_nested_two_levels_in_substitution_denied() {
+        // A redirect two substitution levels deep is still caught: the guard's
+        // own recursion (`check_parsed_command` → `check_script` →
+        // `check_parsed_command`) descends every `$()` level and re-applies the
+        // redirect guard at each. This is why the redundant top-level
+        // `command.substitutions … parse_redirects_to_file` sweep was removed
+        // without loss of coverage — the leading recursion subsumes it at any
+        // depth, not just one level.
+        let rules = basic_rules();
+        let denial = check_command("echo $(echo $(date > deep.txt))", &rules, None)
+            .expect("redirect nested two levels deep must still deny");
+        assert_eq!(denial.reason, DenialReason::OutputRedirect);
+    }
+
+    #[test]
     fn dup_out_to_file_target_denied() {
         // `>&file` (a non-fd target) is the zsh/bash combined-stream file write,
         // not a descriptor duplication — so it is a real file write (§8a).
@@ -4165,48 +4155,6 @@ mod tests {
         assert!(
             msg.contains("--count") && !msg.contains("output is paged"),
             "`| wc` must give the --count nudge, not the paging one, got: {msg:?}",
-        );
-    }
-
-    // ── parse_redirects_to_file direct unit coverage ────────────────
-    //
-    // The call site (`check_parsed_command`) recurses substitutions through the
-    // full gate first, so `parse_redirects_to_file` never decides an integration
-    // outcome on its own. These direct tests pin its contract instead, so the
-    // `-> false` and `|| -> &&` mutations are caught.
-
-    #[test]
-    fn parse_redirects_top_level_write_detected() {
-        // A command with a file-writing redirect and no substitution: the left
-        // side of the `||` is true. Kills `-> false` and `|| -> &&` (the latter
-        // would need the empty right side to also be true).
-        let script = parse::parse("date > stamp");
-        assert!(
-            parse_redirects_to_file(&script),
-            "a top-level `> stamp` write must be detected",
-        );
-    }
-
-    #[test]
-    fn parse_redirects_nested_substitution_write_detected() {
-        // The redirect lives only inside a command substitution, so the outer
-        // command has no direct redirect: detection rides the recursion on the
-        // right side of the `||`. Kills `-> false`.
-        let script = parse::parse("echo $(date > stamp)");
-        assert!(
-            parse_redirects_to_file(&script),
-            "a redirect inside `$(…)` must be detected via recursion",
-        );
-    }
-
-    #[test]
-    fn parse_redirects_device_sink_not_detected() {
-        // A device-sink write is not a file write, so the function returns false —
-        // pinning that it does not blanket-true (guards the `-> true`-style drift).
-        let script = parse::parse("date > /dev/null");
-        assert!(
-            !parse_redirects_to_file(&script),
-            "a `/dev/null` sink must not count as a file write",
         );
     }
 

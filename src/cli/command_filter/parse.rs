@@ -172,6 +172,25 @@ enum Control {
     Newline,
 }
 
+/// The five single-byte operators [`lex_operator`] dispatches on. The lexer's
+/// main loop already discriminates these bytes before calling, so passing the
+/// classified operator in — rather than re-matching `bytes[i]` inside
+/// `lex_operator` — makes that dispatch match exhaustive over a finite set, with
+/// no impossible-byte `_` arm to harbor an equivalent mutant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpByte {
+    /// `;` — sequence.
+    Semi,
+    /// `&` — background / `&&` and-list / `&>` combined redirect.
+    Amp,
+    /// `|` — pipe / `||` or-list.
+    Pipe,
+    /// `>` — the output redirect family.
+    Gt,
+    /// `<` — the input redirect family.
+    Lt,
+}
+
 /// A lexed word and the substitutions discovered inside it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WordTok {
@@ -338,12 +357,27 @@ fn lex(input: &str) -> Vec<Token> {
             // not an argument word, so it must not leak into argv.
             b'0'..=b'9' if !in_word && fd_redirect_after(bytes, i) => {
                 let op_at = i + digit_run_len(bytes, i);
-                i = lex_operator(bytes, op_at, &mut tokens);
+                // `fd_redirect_after` guarantees `bytes[op_at]` is `<` or `>`, so
+                // the catch-all is reached exactly for `<` (an fd read redirect).
+                let op = match bytes[op_at] {
+                    b'>' => OpByte::Gt,
+                    _ => OpByte::Lt,
+                };
+                i = lex_operator(bytes, op_at, op, &mut tokens);
             }
             // ── Operators (only at a word boundary) ─────────────────────────
             b';' | b'&' | b'|' | b'<' | b'>' => {
                 flush_word!();
-                i = lex_operator(bytes, i, &mut tokens);
+                // This arm admits only the five operator bytes; matching four
+                // explicitly leaves the catch-all reachable exactly for `<`.
+                let op = match c {
+                    b';' => OpByte::Semi,
+                    b'&' => OpByte::Amp,
+                    b'|' => OpByte::Pipe,
+                    b'>' => OpByte::Gt,
+                    _ => OpByte::Lt,
+                };
+                i = lex_operator(bytes, i, op, &mut tokens);
             }
             // ── Ordinary word byte ──────────────────────────────────────────
             _ => {
@@ -502,16 +536,19 @@ fn lex_ansi_c_quote(bytes: &[u8], start: usize, word: &mut Vec<u8>) -> usize {
     n
 }
 
-/// Lex a control / redirection operator at index `i`, pushing the corresponding
-/// token. Returns the index just past the operator.
-fn lex_operator(bytes: &[u8], i: usize, tokens: &mut Vec<Token>) -> usize {
+/// Lex the operator `op` beginning at index `i`, pushing the corresponding token
+/// (looking ahead for the multi-byte forms `&&`, `&>`, `>>`, `<<<`, `<&`, …).
+/// Returns the index just past the operator. `op` is the classified leading byte
+/// `bytes[i]`, threaded in by the caller so this dispatch stays exhaustive over a
+/// finite set — there is no impossible-byte `_` arm to leave dead.
+fn lex_operator(bytes: &[u8], i: usize, op: OpByte, tokens: &mut Vec<Token>) -> usize {
     let n = bytes.len();
-    match bytes[i] {
-        b';' => {
+    match op {
+        OpByte::Semi => {
             tokens.push(Token::Control(Control::Semi));
             i + 1
         }
-        b'&' => {
+        OpByte::Amp => {
             if i + 1 < n && bytes[i + 1] == b'&' {
                 tokens.push(Token::Control(Control::AndAnd));
                 i + 2
@@ -528,7 +565,7 @@ fn lex_operator(bytes: &[u8], i: usize, tokens: &mut Vec<Token>) -> usize {
                 i + 1
             }
         }
-        b'|' => {
+        OpByte::Pipe => {
             if i + 1 < n && bytes[i + 1] == b'|' {
                 tokens.push(Token::Control(Control::OrOr));
                 i + 2
@@ -537,7 +574,7 @@ fn lex_operator(bytes: &[u8], i: usize, tokens: &mut Vec<Token>) -> usize {
                 i + 1
             }
         }
-        b'>' => {
+        OpByte::Gt => {
             if i + 1 < n && bytes[i + 1] == b'>' {
                 tokens.push(Token::Redir(RedirectOp::Append));
                 i + 2
@@ -553,7 +590,7 @@ fn lex_operator(bytes: &[u8], i: usize, tokens: &mut Vec<Token>) -> usize {
                 i + 1
             }
         }
-        b'<' => {
+        OpByte::Lt => {
             if i + 2 < n && bytes[i + 1] == b'<' && bytes[i + 2] == b'<' {
                 tokens.push(Token::Redir(RedirectOp::HereString));
                 i + 3
@@ -570,7 +607,6 @@ fn lex_operator(bytes: &[u8], i: usize, tokens: &mut Vec<Token>) -> usize {
                 i + 1
             }
         }
-        _ => i + 1,
     }
 }
 
@@ -758,7 +794,13 @@ fn build_command(tokens: &[Token]) -> Option<SimpleCommand> {
                 collect_rest(&tokens[idx..], &mut words, &mut cmd);
                 idx = tokens.len();
             }
-            Token::Paren(_) => {
+            // A close `)` (the opening `(` is handled above) carries no command
+            // position. A `Token::Control` cannot actually reach a built stage —
+            // `split_on_list_ops` / `build_pipeline` strip every list/pipe operator
+            // before `build_command` runs — so it is folded in here rather than
+            // given its own arm, keeping the match exhaustive without a separate
+            // dead branch to skip.
+            Token::Paren(_) | Token::Control(_) => {
                 idx += 1;
             }
             Token::Redir(op) => {
@@ -781,10 +823,6 @@ fn build_command(tokens: &[Token]) -> Option<SimpleCommand> {
             Token::Word(w) => {
                 words.push(w);
                 collect_subs(w, &mut cmd);
-                idx += 1;
-            }
-            Token::Control(_) => {
-                // Control operators never appear inside a built stage.
                 idx += 1;
             }
         }
@@ -1272,6 +1310,23 @@ mod tests {
         assert_eq!(cmd.redirects.len(), 1);
         assert_eq!(cmd.redirects[0].op, RedirectOp::Write);
         assert_eq!(cmd.redirects[0].target, "err.log");
+    }
+
+    #[test]
+    fn fd_numbered_read_redirect() {
+        // `0<input` is a read redirect on fd 0 — the source fd attaches to the
+        // redirect (not argv) and the `<` classifies as a read, not a write.
+        // Exercises the fd-redirect dispatch's `<` arm (the `>` sibling is pinned
+        // by `fd_numbered_file_redirect`).
+        let cmd = sole("cat 0<input");
+        assert_eq!(cmd.name.as_deref(), Some("cat"));
+        assert!(
+            cmd.argv.is_empty(),
+            "the source fd `0` must not leak into argv"
+        );
+        assert_eq!(cmd.redirects.len(), 1);
+        assert_eq!(cmd.redirects[0].op, RedirectOp::Read);
+        assert_eq!(cmd.redirects[0].target, "input");
     }
 
     #[test]
@@ -1812,6 +1867,18 @@ mod tests {
         let script = parse("FOO=bar");
         assert_eq!(script, ParsedScript::default());
         assert!(script.command_positions().is_empty());
+    }
+
+    #[test]
+    fn stray_close_paren_is_skipped_in_command() {
+        // A `)` with no matching `(` in command position is structure, not an
+        // argument: `build_command`'s `Token::Paren(_)` arm skips it and the
+        // command name is still recovered. Pins that arm's `idx += 1` skip — the
+        // arm that also folds in the (unreachable) `Token::Control` case — so a
+        // mutation of the advance is caught rather than surviving on a dead branch.
+        let cmd = sole("echo )");
+        assert_eq!(cmd.name.as_deref(), Some("echo"));
+        assert!(cmd.argv.is_empty(), "the stray `)` must not leak into argv");
     }
 
     // ── Operator lexing (`lex_operator` offsets / guards) ────────────────────
