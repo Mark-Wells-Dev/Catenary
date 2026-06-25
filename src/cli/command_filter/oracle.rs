@@ -865,7 +865,22 @@ pub fn check(input: &str) {
         return;
     };
     let ours = ours_projection(input);
+    assert_projections_agree(input, &ours, &oracle);
+}
 
+/// Assert the two gate projections agree — the differential's core, factored out
+/// of [`check`] so the disagreement (panic) path is exercisable directly with
+/// hand-built divergent projections, not only the agreeing inputs the generators
+/// happen to produce. Without this seam a `check` body silently replaced by `()`
+/// passes every test (no generated input diverges), so the assertions would have
+/// no anchor; the meta-tests on this function are that anchor.
+///
+/// # Panics
+///
+/// Panics (via `assert*!`) on any command-position or redirect-operator
+/// divergence — equality (a false-deny when ours ⊋ oracle) or containment (a
+/// false-allow when ours misses one the shell runs).
+fn assert_projections_agree(input: &str, ours: &Projection, oracle: &Projection) {
     let ours_cmds = sorted(&ours.command_positions);
     let oracle_cmds = sorted(&oracle.command_positions);
 
@@ -1057,9 +1072,9 @@ fn operator_strategy() -> impl Strategy<Value = String> {
     ]
 }
 
-/// Build a structured shell-ish input by interleaving words with operators.
+/// Build a flat command list by interleaving words with operators (no grouping).
 #[cfg(test)]
-fn input_strategy() -> impl Strategy<Value = String> {
+fn flat_strategy() -> impl Strategy<Value = String> {
     proptest::collection::vec((word_strategy(), operator_strategy()), 1..6).prop_map(|pairs| {
         let mut s = String::new();
         for (i, (word, op)) in pairs.iter().enumerate() {
@@ -1070,6 +1085,41 @@ fn input_strategy() -> impl Strategy<Value = String> {
         }
         s
     })
+}
+
+/// A trailing redirect that binds to a compound command's close — the bug-45
+/// shape (`( … ) > out`). The empty arm leaves the group bare.
+#[cfg(test)]
+fn trailing_redirect_strategy() -> impl Strategy<Value = String> {
+    prop_oneof![
+        Just(String::new()),
+        Just(" > out".to_string()),
+        Just(" >> out".to_string()),
+        Just(" 2>&1".to_string()),
+        Just(" > out 2>&1".to_string()),
+    ]
+}
+
+/// Build a structured shell-ish input: a flat command list, optionally wrapped in
+/// a subshell `( … )` — once or nested twice — each level optionally carrying a
+/// trailing redirect that binds to its close. The grouping arms exercise the
+/// compound-redirect projection (a redirect attached to a subshell's close, at
+/// every nesting level) the flat grammar never reached — the class bug 45 hid in.
+/// Brace groups are intentionally omitted: their `}` is not a clean command name,
+/// so `should_skip` prunes them and they would add no differential.
+#[cfg(test)]
+fn input_strategy() -> impl Strategy<Value = String> {
+    (
+        flat_strategy(),
+        trailing_redirect_strategy(),
+        trailing_redirect_strategy(),
+        0u8..4,
+    )
+        .prop_map(|(body, inner, outer, shape)| match shape {
+            1 => format!("( {body} ){inner}"),
+            2 => format!("( ( {body} ){inner} ){outer}"),
+            _ => body,
+        })
 }
 
 /// A single character for the arbitrary-robustness strategy: printable ASCII
@@ -1139,10 +1189,10 @@ proptest! {
 )]
 mod tests {
     use super::{
-        Projection, RedirectKind, SEED_CORPUS, brush_projection, check, cook_command_name,
-        extract_substitutions, is_balanced, is_clean_name, is_redir_superset, our_redirect_kind,
-        ours_projection, redir_rank, scan_balanced, should_skip, sorted, sorted_redirs,
-        strip_substitutions, unquote,
+        Projection, RedirectKind, SEED_CORPUS, assert_projections_agree, brush_projection, check,
+        cook_command_name, extract_substitutions, is_balanced, is_clean_name, is_redir_superset,
+        our_redirect_kind, ours_projection, redir_rank, scan_balanced, should_skip, sorted,
+        sorted_redirs, strip_substitutions, unquote,
     };
     use crate::cli::command_filter::parse::RedirectOp;
 
@@ -1182,6 +1232,37 @@ mod tests {
             exercised >= SEED_CORPUS.len() / 2,
             "expected most seed inputs to parse under brush, only {exercised} did"
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "command-position disagreement")]
+    fn assert_projections_agree_panics_on_command_divergence() {
+        // The differential's whole purpose: a command-position mismatch must
+        // panic. This is the anchor that makes the comparison observable — a
+        // `check` body silently replaced by `()` would pass every (always
+        // agreeing) generated input, leaving the assertions untested otherwise.
+        let ours = Projection {
+            command_positions: vec!["a".to_string(), "b".to_string()],
+            ..Projection::default()
+        };
+        let oracle = Projection {
+            command_positions: vec!["a".to_string()],
+            ..Projection::default()
+        };
+        assert_projections_agree("( a ) > out", &ours, &oracle);
+    }
+
+    #[test]
+    #[should_panic(expected = "redirect-operator disagreement")]
+    fn assert_projections_agree_panics_on_redirect_divergence() {
+        // A redirect-signature mismatch — the exact shape bug 45 produced, ours
+        // dropping a write the shell performs — must also panic.
+        let ours = Projection::default();
+        let oracle = Projection {
+            redirect_ops: vec![RedirectKind::OutputFile],
+            ..Projection::default()
+        };
+        assert_projections_agree("( echo hi ) > out", &ours, &oracle);
     }
 
     /// Meta-test: a deliberately broken our-side projection that drops `;`
