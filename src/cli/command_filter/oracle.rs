@@ -1132,9 +1132,11 @@ proptest! {
 mod tests {
     use super::{
         Projection, RedirectKind, SEED_CORPUS, brush_projection, check, cook_command_name,
-        extract_substitutions, is_balanced, is_clean_name, ours_projection, scan_balanced,
-        should_skip, strip_substitutions, unquote,
+        extract_substitutions, is_balanced, is_clean_name, is_redir_superset, our_redirect_kind,
+        ours_projection, redir_rank, scan_balanced, should_skip, sorted, sorted_redirs,
+        strip_substitutions, unquote,
     };
+    use crate::cli::command_filter::parse::RedirectOp;
 
     /// A word that is purely a substitution carries no literal command name —
     /// only its recursed inner command counts. Mirrors our parser yielding
@@ -1563,5 +1565,311 @@ mod tests {
         // Arithmetic in a `while` body (the `cond || body` disjunct of the
         // while/until arm).
         assert!(should_skip("while true; do (( 1 )); done"));
+    }
+
+    // ── seq7: whole-function / return-replacement kills ───────────────────────
+
+    /// `sorted` returns the input multiset in ascending order — not the empty
+    /// vec, a singleton `[""]`, or `["xyzzy"]`. Pins the whole-function-body
+    /// replacements (`->vec![]` / `->vec![String::new()]` / `->vec!["xyzzy"]`)
+    /// and the in-place sort.
+    #[test]
+    fn seq7_sorted_orders_and_preserves_multiset() {
+        assert_eq!(
+            sorted(&["git".to_string(), "cargo".to_string(), "echo".to_string()]),
+            vec!["cargo".to_string(), "echo".to_string(), "git".to_string()]
+        );
+        // Duplicates are kept (multiset, not set) — rules out a dedup mutation.
+        assert_eq!(
+            sorted(&["b".to_string(), "a".to_string(), "b".to_string()]),
+            vec!["a".to_string(), "b".to_string(), "b".to_string()]
+        );
+        // Empty in, empty out — distinguishes `->vec![""]` / `->vec!["xyzzy"]`,
+        // which would inject a bogus element here.
+        assert!(sorted(&[]).is_empty());
+    }
+
+    /// `sorted_redirs` returns the redirect multiset ordered by `redir_rank`,
+    /// never the empty vec. Pins the `->vec![]` whole-body replacement and the
+    /// sort-by-key.
+    #[test]
+    fn seq7_sorted_redirs_orders_and_preserves() {
+        let unsorted = vec![
+            RedirectKind::HereString,
+            RedirectKind::OutputFile,
+            RedirectKind::InputFile,
+        ];
+        assert_eq!(
+            sorted_redirs(&unsorted),
+            vec![
+                RedirectKind::OutputFile,
+                RedirectKind::InputFile,
+                RedirectKind::HereString,
+            ]
+        );
+        // A non-empty input must not collapse to empty (`->vec![]`).
+        assert_eq!(sorted_redirs(&[RedirectKind::Dup]), vec![RedirectKind::Dup]);
+    }
+
+    /// `redir_rank` assigns a *distinct* rank per kind, so `sorted_redirs` groups
+    /// by kind. A `->0` or `->1` constant replacement makes every rank equal,
+    /// leaving a deliberately mis-ordered pair unsorted; assert the ordering is
+    /// actually applied (kills both constant replacements) and pin every arm.
+    #[test]
+    fn seq7_redir_rank_is_a_distinct_total_order() {
+        assert_eq!(redir_rank(RedirectKind::OutputFile), 0);
+        assert_eq!(redir_rank(RedirectKind::InputFile), 1);
+        assert_eq!(redir_rank(RedirectKind::Dup), 2);
+        assert_eq!(redir_rank(RedirectKind::OutputBoth), 3);
+        assert_eq!(redir_rank(RedirectKind::HereString), 4);
+        // Behavioral check: a higher-ranked kind sorts after a lower-ranked one.
+        // With `redir_rank->0`/`->1` (constant), the stable sort would keep the
+        // input order `[HereString, OutputFile]` instead of swapping them.
+        assert_eq!(
+            sorted_redirs(&[RedirectKind::HereString, RedirectKind::OutputFile]),
+            vec![RedirectKind::OutputFile, RedirectKind::HereString]
+        );
+    }
+
+    /// `is_redir_superset` is a real multiset-containment check, not a constant
+    /// `true`. When ours is missing an operator the oracle has, it must return
+    /// `false`; when ours covers the oracle (with extras allowed) it returns
+    /// `true`. Pins the `->true` whole-body replacement.
+    #[test]
+    fn seq7_is_redir_superset_rejects_undercount() {
+        // ours misses the InputFile the oracle saw → not a superset.
+        assert!(!is_redir_superset(
+            &[RedirectKind::OutputFile],
+            &[RedirectKind::OutputFile, RedirectKind::InputFile],
+        ));
+        // ours is a strict superset (extra Dup) → still a superset.
+        assert!(is_redir_superset(
+            &[RedirectKind::OutputFile, RedirectKind::Dup],
+            &[RedirectKind::OutputFile],
+        ));
+        // Multiset semantics: two of a kind needed, only one present → not a
+        // superset (rules out a set-based weakening as well as `->true`).
+        assert!(!is_redir_superset(
+            &[RedirectKind::OutputFile],
+            &[RedirectKind::OutputFile, RedirectKind::OutputFile],
+        ));
+    }
+
+    /// `our_redirect_kind` maps each of our `RedirectOp` spellings onto the
+    /// shared `RedirectKind`. Pins every match arm against an arm deletion / kind
+    /// swap.
+    #[test]
+    fn seq7_our_redirect_kind_maps_each_op() {
+        assert_eq!(
+            our_redirect_kind(RedirectOp::Write),
+            RedirectKind::OutputFile
+        );
+        assert_eq!(
+            our_redirect_kind(RedirectOp::Append),
+            RedirectKind::OutputFile
+        );
+        assert_eq!(our_redirect_kind(RedirectOp::Read), RedirectKind::InputFile);
+        assert_eq!(our_redirect_kind(RedirectOp::DupOut), RedirectKind::Dup);
+        assert_eq!(our_redirect_kind(RedirectOp::DupIn), RedirectKind::Dup);
+        assert_eq!(
+            our_redirect_kind(RedirectOp::WriteBoth),
+            RedirectKind::OutputBoth
+        );
+        assert_eq!(
+            our_redirect_kind(RedirectOp::HereString),
+            RedirectKind::HereString
+        );
+    }
+
+    /// `walk_redirect_list` actually surfaces the redirects hung off a compound
+    /// command (a brace group with a trailing redirect list). With the body
+    /// replaced by `()` the redirect would vanish from the brush projection. A
+    /// brace group `{ …; } > out` routes its redirect through
+    /// `walk_redirect_list`.
+    #[test]
+    fn seq7_walk_redirect_list_surfaces_compound_redirects() {
+        let brace = brush_projection("{ echo hi; } > out")
+            .expect("brush parses a brace group with a redirect");
+        assert_eq!(brace.redirect_ops, vec![RedirectKind::OutputFile]);
+        // Two redirects on the brace group: both flow through the list walk.
+        let two = brush_projection("{ echo hi; } > out 2> err")
+            .expect("brush parses a brace group with two redirects");
+        assert_eq!(
+            two.redirect_ops,
+            vec![RedirectKind::OutputFile, RedirectKind::OutputFile]
+        );
+        // And the full differential agrees (the operator is real, not quoted, on
+        // both sides).
+        check("{ echo hi; } > out");
+    }
+
+    /// `io_redirect_is_pruned` is true *only* for a heredoc, not for an ordinary
+    /// file redirect. A `->true` replacement would prune (`should_skip`) every
+    /// simple command carrying any redirect, so assert a plain `> out` is *not*
+    /// skipped while a heredoc *is*.
+    #[test]
+    fn seq7_io_redirect_is_pruned_only_heredoc() {
+        // A plain output redirect on a simple command is not a pruned construct.
+        assert!(!should_skip("echo hi > out"));
+        assert!(!should_skip("cat < in"));
+        // A heredoc body is pruned.
+        assert!(should_skip("cat <<EOF\nbody\nEOF\n"));
+    }
+
+    // ── seq7: strip_substitutions boundary / arithmetic kills ──────────────────
+
+    /// A single-quoted run is skipped *verbatim*: the scan-to-closing-quote loop
+    /// (`while i < n && bytes[i] != b'\''`) and the post-loop `i = (i+1).min(n)`
+    /// must advance past the *entire* quoted span, so substitution syntax inside
+    /// single quotes stays literal. With the loop guard flipped (`<`→`>`, the
+    /// inner `!=`→`==`) or the close arithmetic mutated (`+`→`*`), the `$(x)`
+    /// inside the quotes would be processed as a real substitution and dropped.
+    #[test]
+    fn seq7_strip_substitutions_single_quote_scan_advances() {
+        // The substitution lives *inside* a single-quoted run, so nothing is
+        // stripped — the whole literal survives. (Flipping the scan-loop guard
+        // `< → >` / `!= → ==` would step out of the run and strip the inner
+        // `$(x)`, yielding `'ab'`.)
+        assert_eq!(strip_substitutions("'a$(x)b'"), "'a$(x)b'");
+        // Single-quoted backtick is inert too.
+        assert_eq!(strip_substitutions("'a`y`b'"), "'a`y`b'");
+        // The post-loop close `i = (i + 1).min(n)` must step *past* the closing
+        // quote: a real `$(x)` immediately after a single-quoted run is dropped,
+        // and the quoted run before it is preserved verbatim. With `+ → *` the
+        // close index does not advance past the `'`, so the trailing `$(x)`
+        // would be mis-scanned and survive as `'ab'$(x)` instead of `'ab'`.
+        assert_eq!(strip_substitutions("'ab'$(x)"), "'ab'");
+    }
+
+    /// A `<`/`>` followed by `(` opens a process substitution that is stripped
+    /// only when the `i + 1 < n` look-ahead holds. A trailing lone `<`/`>` (the
+    /// `i + 1 < n` boundary) is kept literally — pins that guard, and a literal
+    /// `>`/`<` not followed by `(` is preserved.
+    #[test]
+    fn seq7_strip_substitutions_process_sub_and_lone_sigil() {
+        assert_eq!(strip_substitutions("a<(x)b"), "ab");
+        assert_eq!(strip_substitutions("a>(x)b"), "ab");
+        // A lone `<` / `>` (not before `(`) is literal text.
+        assert_eq!(strip_substitutions("a < b"), "a < b");
+        // A `<` at end-of-input (the `i + 1 < n` false side) is kept.
+        assert_eq!(strip_substitutions("end<"), "end<");
+    }
+
+    // ── seq7: extract_substitutions backtick / boundary kills ──────────────────
+
+    /// A backtick run advances byte-by-byte to the closing backtick, honoring a
+    /// `\`-escape (`if bytes[j] == b'\\' && j + 1 < n { j += 1 }` then `j += 1`).
+    /// The captured inner text excludes the delimiters and the *next* scan
+    /// resumes past the close (`i = j + 1`). A `+=`→`*=` on either `j` advance
+    /// would mis-walk the run; assert the exact captures including that text
+    /// *after* the closing backtick is reached.
+    #[test]
+    fn seq7_extract_substitutions_backtick_walk() {
+        // Two backtick runs back-to-back: each captured exactly, the second only
+        // reachable if the first's close advance (`i = j + 1`) landed correctly.
+        assert_eq!(
+            extract_substitutions("`a``b`"),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        // An escaped backtick mid-run does not close it; the run closes at the
+        // final real backtick and text resumes after it.
+        assert_eq!(extract_substitutions(r"`a\`b`c"), vec![r"a\`b".to_string()]);
+    }
+
+    /// `extract_substitutions` walks past ordinary characters one byte at a time
+    /// (`_ => i += 1`) and finds a substitution that only appears *after* a run
+    /// of plain text — pinning the default-arm advance and the outer `while i < n`
+    /// bound against an off-by-one that would skip or loop on the tail.
+    #[test]
+    fn seq7_extract_substitutions_after_plain_run() {
+        assert_eq!(
+            extract_substitutions("plain text then $(rm x)"),
+            vec!["rm x".to_string()]
+        );
+        // A substitution at the very tail (last bytes) is still captured.
+        assert_eq!(extract_substitutions("tail$(z)"), vec!["z".to_string()]);
+    }
+
+    // ── seq7: unquote termination + boundary kills ─────────────────────────────
+
+    /// `unquote` terminates and yields the right output even when a quoted run
+    /// abuts more text — the per-byte advances inside each arm (`i += 1` /
+    /// `i += 2`) must make progress. A `+=`→`*=` on an advance would wedge `i`
+    /// at 0 and loop forever; this test would hang rather than pass, so its mere
+    /// completion (plus the exact output) kills those infinite-loop mutants.
+    #[test]
+    fn seq7_unquote_terminates_on_mixed_runs() {
+        // Single-quote run followed by plain text, then a double-quote run.
+        assert_eq!(unquote(r#"'a'b"c""#), "abc");
+        // `$'…'` run abutting a double-quoted run.
+        assert_eq!(unquote(r#"$'a'"b""#), "ab");
+        // A double-quoted run with *more text after the close*: the post-loop
+        // advance (`i += 1`) must step past the closing `"`, or the trailing run
+        // is re-entered as a fresh (mismatched) quote. With `i += 1 → i *= 1` the
+        // close index does not advance, so `"a"'b'` would cook to `a'b'`.
+        assert_eq!(unquote(r#""a"'b'"#), "ab");
+        assert_eq!(unquote(r#""a"b"#), "ab");
+        // A `$'…'` run with more text after the close: the same post-loop advance
+        // must step past the closing `'` (`i += 1 → i *= 1` would mis-cook).
+        assert_eq!(unquote(r"$'a'b"), "ab");
+        // A long-ish plain run to make a stalled-advance loop obvious if it ever
+        // regressed (still completes near-instantly when advances are correct).
+        assert_eq!(unquote("abcdefghij"), "abcdefghij");
+    }
+
+    /// Inside a double-quoted run, `\X` for a *non-special* `X` keeps both bytes
+    /// (the `else` advance `i += 1`), while the four recognized escapes consume
+    /// the backslash (`i += 2`). Pins the `i + 1 < n` look-ahead boundary: a `\`
+    /// as the run's last byte before the close is kept literal.
+    #[test]
+    fn seq7_unquote_double_quote_escape_boundary() {
+        // `\n` is not a recognized escape → both bytes kept.
+        assert_eq!(unquote(r#""x\ny""#), r"x\ny");
+        // Recognized `\\` consumes the pair → single backslash.
+        assert_eq!(unquote(r#""x\\y""#), r"x\y");
+        // A recognized escape *not* at index 2, with content after it: the
+        // escape advance (`i += 2`) must skip exactly the `\X` pair and leave the
+        // tail intact. With `i += 2 → i *= 2` the index would jump past the `c`,
+        // dropping it (`"ab\$c"` would cook to `ab$` instead of `ab$c`).
+        assert_eq!(unquote(r#""ab\$c""#), "ab$c");
+    }
+
+    // ── seq7: scan_balanced inner-text + depth kills ───────────────────────────
+
+    /// `scan_balanced`'s inner text is taken between the depth-1 open and the
+    /// depth-0 close. A nested span keeps its interior parens; a sibling pair
+    /// after the close is *not* swallowed (the depth bookkeeping returns at the
+    /// first balanced close). Pins the depth `+= 1` / `-= 1` and the
+    /// `depth == 0` / `depth == 1` guards.
+    #[test]
+    fn seq7_scan_balanced_depth_returns_at_first_close() {
+        // `(a)(b)` from index 0 closes after `(a)` — next = 3, inner = "a".
+        assert_eq!(scan_balanced(b"(a)(b)", 0), ("a".to_string(), 3));
+        // Inner-start tracks the depth-1 open even with leading nested opens:
+        // `((a))` → inner "(a)", next 5.
+        assert_eq!(scan_balanced(b"((a))", 0), ("(a)".to_string(), 5));
+    }
+
+    // ── seq7: is_balanced structural kills ─────────────────────────────────────
+
+    /// `is_balanced` tracks paren depth with `+= 1` / `-= 1` and rejects a
+    /// negative depth (a stray close) immediately. A pair that opens and closes
+    /// is balanced; a close before any open is not; nesting beyond one level is
+    /// tracked. Pins the depth arithmetic and the `paren_depth < 0` early reject.
+    #[test]
+    fn seq7_is_balanced_depth_tracking() {
+        // Deep nesting that pairs up exactly.
+        assert!(is_balanced("(((a)))"));
+        // A close immediately at the start (depth would go negative) is rejected
+        // before any open — pins the `< 0` guard, not just the final `== 0`.
+        assert!(!is_balanced(")"));
+        // A stray close *that a later open rebalances to zero*: `)(` ends with
+        // depth 0, so only the early `paren_depth < 0` reject (not the final
+        // `== 0`) catches it. Pins the `< 0` guard specifically — with it
+        // weakened (e.g. `< 0 → > 0`), `)(` would wrongly read as balanced.
+        assert!(!is_balanced(")("));
+        // One extra open at the end leaves depth positive → not balanced (pins
+        // the final `paren_depth == 0` against `!= 0` / a constant `true`).
+        assert!(!is_balanced("(a)("));
     }
 }
