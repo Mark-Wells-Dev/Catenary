@@ -4136,4 +4136,111 @@ mod tests {
             assert_eq!(&outcome(cmd, &rules), want, "outcome for {cmd:?}");
         }
     }
+
+    // ── out_pipe_denial message coverage ────────────────────────────
+
+    #[test]
+    fn out_pipe_head_tail_names_paging() {
+        // The `"head" | "tail"` arm renders the paging nudge — distinct from the
+        // generic fall-through ("owns its output"). Deleting the arm would route
+        // `catenary grep | head` to the `_` arm and drop the paging wording.
+        for down in ["head", "tail"] {
+            let msg = deny_text(&format!("catenary grep p | {down}"));
+            assert!(
+                msg.contains("output is paged") && msg.contains("--page N"),
+                "`catenary grep | {down}` must give the paging nudge, got: {msg:?}",
+            );
+            assert!(
+                msg.contains(down),
+                "the message should name the downstream `{down}`, got: {msg:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn out_pipe_wc_distinct_from_head() {
+        // A neighbouring arm renders a different message, so deleting head|tail
+        // cannot accidentally pass by matching wc's text.
+        let msg = deny_text("catenary grep p | wc -l");
+        assert!(
+            msg.contains("--count") && !msg.contains("output is paged"),
+            "`| wc` must give the --count nudge, not the paging one, got: {msg:?}",
+        );
+    }
+
+    // ── parse_redirects_to_file direct unit coverage ────────────────
+    //
+    // The call site (`check_parsed_command`) recurses substitutions through the
+    // full gate first, so `parse_redirects_to_file` never decides an integration
+    // outcome on its own. These direct tests pin its contract instead, so the
+    // `-> false` and `|| -> &&` mutations are caught.
+
+    #[test]
+    fn parse_redirects_top_level_write_detected() {
+        // A command with a file-writing redirect and no substitution: the left
+        // side of the `||` is true. Kills `-> false` and `|| -> &&` (the latter
+        // would need the empty right side to also be true).
+        let script = parse::parse("date > stamp");
+        assert!(
+            parse_redirects_to_file(&script),
+            "a top-level `> stamp` write must be detected",
+        );
+    }
+
+    #[test]
+    fn parse_redirects_nested_substitution_write_detected() {
+        // The redirect lives only inside a command substitution, so the outer
+        // command has no direct redirect: detection rides the recursion on the
+        // right side of the `||`. Kills `-> false`.
+        let script = parse::parse("echo $(date > stamp)");
+        assert!(
+            parse_redirects_to_file(&script),
+            "a redirect inside `$(…)` must be detected via recursion",
+        );
+    }
+
+    #[test]
+    fn parse_redirects_device_sink_not_detected() {
+        // A device-sink write is not a file write, so the function returns false —
+        // pinning that it does not blanket-true (guards the `-> true`-style drift).
+        let script = parse::parse("date > /dev/null");
+        assert!(
+            !parse_redirects_to_file(&script),
+            "a `/dev/null` sink must not count as a file write",
+        );
+    }
+
+    // ── set_cli_command / render_subcommand_help coverage ───────────
+    //
+    // `CLI_COMMAND` is a process-global `OnceLock`, so a single test owns both
+    // the write (set_cli_command) and the reads (render_subcommand_help). No
+    // other lib test touches the static, so this is the sole writer.
+
+    #[test]
+    fn cli_command_set_and_subcommand_help_rendered() {
+        let cli = clap::Command::new("catenary")
+            .subcommand(clap::Command::new("grep").about("Search code with structured results"));
+        set_cli_command(cli);
+
+        // set_cli_command must actually install the command (kills `-> ()`):
+        // an unset OnceLock leaves render_subcommand_help returning empty.
+        let help = render_subcommand_help("grep");
+        assert!(
+            help.contains("Search code with structured results"),
+            "rendered help must carry the subcommand's about text, got: {help:?}",
+        );
+        assert!(
+            help.contains("catenary grep"),
+            "rendered help must use the `catenary grep` bin name, got: {help:?}",
+        );
+        // Kills `-> "xyzzy".into()`: real help never equals the constant.
+        assert_ne!(help.trim(), "xyzzy");
+
+        // An unknown subcommand returns empty — pins the not-found path and kills
+        // `-> "xyzzy".into()` (which would return non-empty here).
+        assert!(
+            render_subcommand_help("no-such-subcommand").is_empty(),
+            "an unknown subcommand must render empty",
+        );
+    }
 }

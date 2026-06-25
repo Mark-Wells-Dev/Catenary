@@ -2664,4 +2664,142 @@ mod tests {
             "embedded antigravity rules should not be empty",
         );
     }
+
+    // ── check_command_filter_config tests ───────────────────────────
+    //
+    // These pin the exact diagnostic line each branch renders, so the match
+    // guards (`client_enforcement_only`, `is_active()`), the `total` arithmetic
+    // (`allow.len() + pipeline.len()`), and the two `!…is_empty()` build-suffix
+    // selectors cannot mutate without a test failing.
+
+    /// Render `check_command_filter_config` for a given `resolved_commands` into
+    /// a captured buffer and return the emitted text (colors disabled).
+    fn render_command_filter_config(resolved: Option<crate::config::ResolvedCommands>) -> String {
+        let config = crate::config::Config {
+            resolved_commands: resolved,
+            ..Default::default()
+        };
+        let mut out = Output::buffer(80);
+        check_command_filter_config(&mut out, &config);
+        out.into_string()
+    }
+
+    #[test]
+    fn command_filter_config_client_enforcement_only_line() {
+        // Guard `resolved.client_enforcement_only` must select this branch even
+        // when the set would otherwise be active (allow is non-empty here).
+        let resolved = crate::config::ResolvedCommands {
+            client_enforcement_only: true,
+            allow: std::iter::once("git".to_string()).collect(),
+            ..Default::default()
+        };
+        let text = render_command_filter_config(Some(resolved));
+        assert!(
+            text.contains("client_enforcement_only — Catenary enforcement disabled"),
+            "client_enforcement_only must render the disabled line, got: {text:?}",
+        );
+    }
+
+    #[test]
+    fn command_filter_config_active_count_and_arithmetic() {
+        // allow.len() == 3, pipeline.len() == 2 → total 5 (kills + → -, + → *,
+        // and the `is_active() → false` guard). Not client_enforcement_only, so
+        // the `client_enforcement_only → true` guard mutant is killed too.
+        let resolved = crate::config::ResolvedCommands {
+            allow: ["git", "cat", "ls"].into_iter().map(String::from).collect(),
+            pipeline: ["grep", "head"].into_iter().map(String::from).collect(),
+            ..Default::default()
+        };
+        let text = render_command_filter_config(Some(resolved));
+        assert!(
+            text.contains("✓ 5 commands allowed"),
+            "active set of allow=3 + pipeline=2 must report 5 commands, got: {text:?}",
+        );
+        assert!(
+            !text.contains("client_enforcement_only"),
+            "active set must not render the client_enforcement_only line, got: {text:?}",
+        );
+        assert!(
+            !text.contains("no [commands] section"),
+            "active set must not render the no-section line, got: {text:?}",
+        );
+    }
+
+    #[test]
+    fn command_filter_config_singular_command() {
+        // A single allowed command must read "1 command allowed" (no plural).
+        let resolved = crate::config::ResolvedCommands {
+            allow: std::iter::once("git".to_string()).collect(),
+            ..Default::default()
+        };
+        let text = render_command_filter_config(Some(resolved));
+        assert!(
+            text.contains("✓ 1 command allowed"),
+            "a single command must read singular, got: {text:?}",
+        );
+    }
+
+    #[test]
+    fn command_filter_config_inactive_some_renders_no_section() {
+        // A `Some` but inactive set (no allow/pipeline/build, not
+        // client_enforcement_only) must fall to the no-section line. Kills the
+        // `is_active() → true` guard, which would instead report "0 commands".
+        let text = render_command_filter_config(Some(crate::config::ResolvedCommands::default()));
+        assert!(
+            text.contains("no [commands] section — all shell commands allowed"),
+            "an inactive Some(_) must render the no-section line, got: {text:?}",
+        );
+        assert!(
+            !text.contains('✓'),
+            "an inactive set must not render the active count line, got: {text:?}",
+        );
+    }
+
+    #[test]
+    fn command_filter_config_none_renders_no_section() {
+        // `None` resolved_commands must also render the no-section line. Also
+        // pins that the function writes output at all (kills the `-> ()` body
+        // mutant for this input).
+        let text = render_command_filter_config(None);
+        assert!(
+            text.contains("no [commands] section — all shell commands allowed"),
+            "None must render the no-section line, got: {text:?}",
+        );
+    }
+
+    #[test]
+    fn command_filter_config_default_build_suffix() {
+        // A non-empty `default_build` selects the user-level build suffix
+        // (`!resolved.default_build.is_empty()`). Deleting that `!` would skip
+        // this branch and drop the build tool from the line.
+        let resolved = crate::config::ResolvedCommands {
+            allow: std::iter::once("git".to_string()).collect(),
+            default_build: vec!["make".to_string()],
+            ..Default::default()
+        };
+        let text = render_command_filter_config(Some(resolved));
+        assert!(
+            text.contains("build tool: make"),
+            "default_build must contribute `build tool: make`, got: {text:?}",
+        );
+    }
+
+    #[test]
+    fn command_filter_config_per_root_build_suffix() {
+        // Empty `default_build` but a non-empty per-root `build` selects the
+        // second build-suffix branch (`!resolved.build.is_empty()`). Deleting
+        // that `!` would skip it and drop the build tool.
+        let build = std::iter::once((std::path::PathBuf::from("/repo"), vec!["cargo".to_string()]))
+            .collect();
+        let resolved = crate::config::ResolvedCommands {
+            allow: std::iter::once("git".to_string()).collect(),
+            build,
+            ..Default::default()
+        };
+        let text = render_command_filter_config(Some(resolved));
+        assert!(
+            text.contains("build tool: cargo"),
+            "per-root build must contribute `build tool: cargo`, got: {text:?}",
+        );
+    }
 }
