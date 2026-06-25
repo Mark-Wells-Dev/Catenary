@@ -336,8 +336,19 @@ fn walk_io_redirect(redirect: &ast::IoRedirect, proj: &mut Projection) {
         }
         ast::IoRedirect::HereString(_, _) => proj.redirect_ops.push(RedirectKind::HereString),
         ast::IoRedirect::OutputAndError(_, _) => proj.redirect_ops.push(RedirectKind::OutputBoth),
-        // Heredoc inputs are pruned at the input level (`should_skip`).
-        ast::IoRedirect::HereDocument(_, _) => {}
+        // A heredoc is an stdin redirect. Our lexer reads `<<EOF` as a plain
+        // `RedirectOp::Read` (it cannot distinguish `<<` from `<`), so the
+        // differential aligns the heredoc on the same `InputFile` kind. When the
+        // delimiter is unquoted (`requires_expansion`), the shell expands and
+        // runs the body's `$(…)` / `` `…` `` — mirror our parser projecting those
+        // body substitutions as command positions (bug 46). A quoted delimiter
+        // (`<<'EOF'`) leaves the body inert on both sides.
+        ast::IoRedirect::HereDocument(_, here_doc) => {
+            proj.redirect_ops.push(RedirectKind::InputFile);
+            if here_doc.requires_expansion {
+                recurse_word_substitutions(&here_doc.doc.value, proj);
+            }
+        }
     }
 }
 
@@ -636,9 +647,10 @@ fn should_skip(input: &str) -> bool {
     else {
         return true;
     };
-    // Heredoc bodies, function definitions, arithmetic, extended-test, and
-    // coprocess forms are modeled by brush but folded/stripped by our parser —
-    // prune them.
+    // Function definitions, arithmetic, extended-test, and coprocess forms are
+    // modeled by brush but folded by our parser — prune them. (Heredocs are no
+    // longer pruned: an unquoted body's substitutions are now projected on both
+    // sides — bug 46.)
     if program_has_pruned_construct(&program) {
         return true;
     }
@@ -767,39 +779,14 @@ fn command_has_pruned(cmd: &ast::Command) -> bool {
         // Function definitions and extended tests have no faithful analogue in
         // our compound sweep.
         ast::Command::Function(_) | ast::Command::ExtendedTest(_, _) => true,
-        ast::Command::Simple(simple) => simple_has_pruned(simple),
-        ast::Command::Compound(compound, redirects) => {
-            compound_has_pruned(compound)
-                || redirects
-                    .as_ref()
-                    .is_some_and(|r| r.0.iter().any(io_redirect_is_pruned))
-        }
+        // A simple command carries no pruned construct: its prefix/suffix items
+        // are words, assignments, redirects (heredocs now projected, bug 46),
+        // and process substitutions — all of which our parser models.
+        ast::Command::Simple(_) => false,
+        // A compound's redirects (heredoc included) are no longer pruned; only
+        // its body can hold a pruned construct (arithmetic/coprocess).
+        ast::Command::Compound(compound, _) => compound_has_pruned(compound),
     }
-}
-
-fn simple_has_pruned(simple: &ast::SimpleCommand) -> bool {
-    let prefix = simple
-        .prefix
-        .as_ref()
-        .is_some_and(|p| p.0.iter().any(prefix_or_suffix_is_pruned));
-    let suffix = simple
-        .suffix
-        .as_ref()
-        .is_some_and(|s| s.0.iter().any(prefix_or_suffix_is_pruned));
-    prefix || suffix
-}
-
-const fn prefix_or_suffix_is_pruned(item: &ast::CommandPrefixOrSuffixItem) -> bool {
-    matches!(
-        item,
-        ast::CommandPrefixOrSuffixItem::IoRedirect(r) if io_redirect_is_pruned(r)
-    )
-}
-
-/// A heredoc redirect is pruned: our parser strips its body before lexing, so
-/// the differential can't compare body command positions.
-const fn io_redirect_is_pruned(redirect: &ast::IoRedirect) -> bool {
-    matches!(redirect, ast::IoRedirect::HereDocument(_, _))
 }
 
 fn compound_has_pruned(compound: &ast::CompoundCommand) -> bool {
@@ -1021,6 +1008,16 @@ const SEED_CORPUS: &[&str] = &[
     "( cmd ) > out 2>&1",
     "( ( a ) > x ) > y",
     "{ echo hi; } > out",
+    // ── Bug 46 — unquoted-heredoc body substitutions are real commands ────────
+    // An unquoted `<<EOF` body's `$(…)` / `` `…` `` is expanded and run, so both
+    // parsers must surface the inner command; the quoted form stays inert (the
+    // body carries no command on either side). The differential pruned all
+    // heredocs before bug 46 — these pin the unpruned class.
+    "cat <<EOF\n$(rg foo)\nEOF",
+    "cat <<EOF\n`sed -i s/a/b/ f`\nEOF",
+    "cat <<EOF\nprose then $(rm x) then more\nEOF",
+    "cat <<'EOF'\n$(rm x)\nEOF",
+    "git commit -F - <<EOF\nran tests; shipped\nEOF",
 ];
 
 // ── proptest strategy ─────────────────────────────────────────────────────────
@@ -1640,19 +1637,21 @@ mod tests {
     }
 
     /// Inputs that are balanced, brush-parsable, and clean-named but contain a
-    /// construct in the pruned tail (function definition, arithmetic, heredoc)
-    /// are skipped *because of the construct*. These pin the
-    /// `program_has_pruned_construct` projection (and the `*_has_pruned`
-    /// recursion) — were that projection forced to `false`, `should_skip` would
-    /// wrongly return `false` here (clean names, balanced, brush-parses).
+    /// construct in the pruned tail (function definition, arithmetic) are skipped
+    /// *because of the construct*. These pin the `program_has_pruned_construct`
+    /// projection (and the `*_has_pruned` recursion) — were that projection
+    /// forced to `false`, `should_skip` would wrongly return `false` here (clean
+    /// names, balanced, brush-parses).
     #[test]
     fn should_skip_pruned_constructs() {
         // Function definition — `Command::Function`.
         assert!(should_skip("f() { git status; }"));
         // Arithmetic compound — `CompoundCommand::Arithmetic`.
         assert!(should_skip("(( 1 + 2 ))"));
-        // Heredoc body — `IoRedirect::HereDocument`.
-        assert!(should_skip("cat <<EOF\nhi\nEOF\n"));
+        // A heredoc is *no longer* pruned (bug 46): an unquoted body's
+        // substitutions are projected on both sides, so the differential covers
+        // it instead of skipping it.
+        assert!(!should_skip("cat <<EOF\nhi\nEOF\n"));
         // A plain command nested in an `if` (no pruned construct) is *not*
         // skipped on this account — guards against the projection over-pruning.
         assert!(!should_skip("if true; then git status; fi"));
@@ -1814,17 +1813,20 @@ mod tests {
         check("{ echo hi; } > out");
     }
 
-    /// `io_redirect_is_pruned` is true *only* for a heredoc, not for an ordinary
-    /// file redirect. A `->true` replacement would prune (`should_skip`) every
-    /// simple command carrying any redirect, so assert a plain `> out` is *not*
-    /// skipped while a heredoc *is*.
+    /// Redirects — heredocs included (bug 46) — are not a pruning trigger: no
+    /// redirect-carrying simple command is skipped on its redirect's account.
+    /// Pins `command_has_pruned`'s `Simple => false` arm against a `->true`
+    /// mutation that would prune every simple command, and the dropped
+    /// heredoc-prune against being reinstated.
     #[test]
-    fn seq7_io_redirect_is_pruned_only_heredoc() {
-        // A plain output redirect on a simple command is not a pruned construct.
+    fn seq7_redirects_do_not_trigger_pruning() {
+        // Plain file redirects on a simple command are not pruned.
         assert!(!should_skip("echo hi > out"));
         assert!(!should_skip("cat < in"));
-        // A heredoc body is pruned.
-        assert!(should_skip("cat <<EOF\nbody\nEOF\n"));
+        // A heredoc is now exercised by the differential, not skipped — its
+        // unquoted body's substitutions are projected on both sides.
+        assert!(!should_skip("cat <<EOF\nbody\nEOF\n"));
+        assert!(!should_skip("cat <<EOF\n$(rm x)\nEOF\n"));
     }
 
     // ── seq7: strip_substitutions boundary / arithmetic kills ──────────────────

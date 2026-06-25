@@ -12,8 +12,9 @@
 //!
 //! The parse is quote-faithful (single, double, `$'…'`, and the `'\''`
 //! close·escape·reopen idiom), strips inline `#` comments, joins `\`-newline
-//! line continuations (bug 30), removes heredoc bodies, and recurses into
-//! `$(…)` / `` `…` `` / `<(…)` / `>(…)` substitutions.
+//! line continuations (bug 30), removes heredoc bodies (projecting an *unquoted*
+//! body's command substitutions, which the shell expands and runs — bug 46), and
+//! recurses into `$(…)` / `` `…` `` / `<(…)` / `>(…)` substitutions.
 //!
 //! No I/O, no global state — a clean fuzz target. The public surface is one
 //! free function, [`parse`], plus the value types it returns.
@@ -129,7 +130,9 @@ pub(crate) enum RedirectOp {
 pub(crate) fn parse(input: &str) -> ParsedScript {
     // Strip heredoc bodies first: their content is literal text, not commands,
     // and their newlines would otherwise segment as list separators. The marker
-    // line is kept so the redirection (`<<EOF`) is still seen.
+    // line is kept so the redirection (`<<EOF`) is still seen — and an *unquoted*
+    // delimiter's body has its `$(…)` / `` `…` `` command substitutions appended
+    // to that marker line, since the shell expands and runs them (bug 46).
     let without_heredocs = strip_heredoc_bodies(input);
     let tokens = lex(&without_heredocs);
     segment(&tokens)
@@ -663,44 +666,153 @@ impl HeredocClose {
     }
 }
 
+/// The heredoc currently being skipped: how its terminator is matched, whether
+/// its body undergoes expansion (an unquoted delimiter), where its marker line
+/// sits in the stripped output (so an expanded body's substitutions can be
+/// appended to it), and the accumulated body text.
+struct ActiveHeredoc {
+    /// The terminator matcher (delimiter + `<<-` indentation rule).
+    close: HeredocClose,
+    /// Whether the shell expands this body. `true` only for a wholly
+    /// unquoted/unescaped delimiter (`<<EOF`); any quote (`<<'EOF'` / `<<"EOF"`)
+    /// or backslash (`<<\EOF`) makes the body literal stdin (bug 46).
+    expand: bool,
+    /// Index of the marker line (`cat <<EOF`) in the stripped output, so an
+    /// expanded body's command substitutions can be appended to it.
+    marker_idx: usize,
+    /// The accumulated body text (only collected when `expand`).
+    body: String,
+}
+
 /// Remove heredoc bodies *and* their closing-delimiter lines, keeping the
 /// marker line (e.g. `cat <<EOF`) intact so the `<<` redirection is still
 /// lexed.
 ///
-/// A heredoc body is literal stdin, never commands — stripping it before the
-/// lexer is what keeps body prose (a `catenary diagnostics` named in a commit
-/// message, a `;`/`&&` in a sentence) out of every gate. The terminator match
-/// is shell-faithful so a delimiter-like word *inside* the body does not close
-/// the heredoc early: a plain `<<EOF` closes only on a bare `EOF` at column 0,
-/// while `<<-EOF` permits a tab-indented one. The quoted (`<<'EOF'`) and
-/// indented (`<<-EOF`) marker forms are recognized by
+/// A *quoted*-delimiter heredoc body (`<<'EOF'` / `<<"EOF"` / `<<\EOF`) is
+/// literal stdin, never commands — stripping it before the lexer is what keeps
+/// body prose (a `catenary diagnostics` named in a commit message, a `;`/`&&`
+/// in a sentence) out of every gate. An *unquoted* `<<EOF` body is **not**
+/// opaque: the shell expands `$(…)` / `` `…` `` in it and runs them, so those
+/// substitution spans are appended to the marker line — projected as command
+/// positions on the heredoc-owning command — while the inert literal text is
+/// still dropped (bug 46). The terminator match is shell-faithful so a
+/// delimiter-like word *inside* the body does not close the heredoc early: a
+/// plain `<<EOF` closes only on a bare `EOF` at column 0, while `<<-EOF` permits
+/// a tab-indented one. The quoted (`<<'EOF'`) and indented (`<<-EOF`) marker
+/// forms are recognized by
 /// [`HEREDOC_MARKER_RE`](super::patterns::HEREDOC_MARKER_RE).
 fn strip_heredoc_bodies(input: &str) -> String {
-    let mut out: Vec<&str> = Vec::new();
-    let mut skip_until: Option<HeredocClose> = None;
+    let mut out: Vec<String> = Vec::new();
+    let mut active: Option<ActiveHeredoc> = None;
     for line in input.split('\n') {
-        if let Some(close) = &skip_until {
-            if close.closes(line) {
-                skip_until = None;
+        // `closed` flags the terminator line, deferring the `active.take()`
+        // until after the `as_mut()` borrow ends (so no `expect` is needed).
+        let closed = match active.as_mut() {
+            // Body line of the active heredoc (terminator not yet reached):
+            // dropped from the lexed stream, but accumulated when the body
+            // expands so its substitutions can be projected.
+            Some(h) if !h.close.closes(line) => {
+                if h.expand {
+                    h.body.push_str(line);
+                    h.body.push('\n');
+                }
+                false
             }
-            continue;
-        }
-        out.push(line);
-        if let Some(caps) = HEREDOC_MARKER_RE.captures(line)
-            && let Some(m) = caps.get(1)
-        {
-            // `m.start()` follows the `<<` (and any `-`); a `<<-` marker has the
-            // dash immediately before the captured delimiter run / its quote.
-            let dash = caps
-                .get(0)
-                .is_some_and(|whole| whole.as_str().starts_with("<<-"));
-            skip_until = Some(HeredocClose {
-                marker: m.as_str().to_string(),
-                dash,
-            });
+            // The closing-delimiter line.
+            Some(_) => true,
+            None => {
+                out.push(line.to_string());
+                if let Some(caps) = HEREDOC_MARKER_RE.captures(line)
+                    && let Some(m) = caps.get(1)
+                {
+                    let whole = caps.get(0).map_or("", |w| w.as_str());
+                    active = Some(ActiveHeredoc {
+                        close: HeredocClose {
+                            marker: m.as_str().to_string(),
+                            // A `<<-` marker has the dash immediately after `<<`.
+                            dash: whole.starts_with("<<-"),
+                        },
+                        // Any quote or backslash in the delimiter run defuses
+                        // expansion; a bare `<<EOF` expands and runs its body
+                        // substitutions (bug 46).
+                        expand: !whole.bytes().any(|b| matches!(b, b'\'' | b'"' | b'\\')),
+                        marker_idx: out.len() - 1,
+                        body: String::new(),
+                    });
+                }
+                false
+            }
+        };
+        if closed && let Some(h) = active.take() {
+            flush_heredoc_subs(&mut out, &h);
         }
     }
+    // An unterminated heredoc still flushes whatever it accumulated — the safe
+    // (over-count) direction; the malformed input is a fail-closed deny anyway.
+    if let Some(h) = active.take() {
+        flush_heredoc_subs(&mut out, &h);
+    }
     out.join("\n")
+}
+
+/// Finalize a closed (or end-of-input) heredoc: when its delimiter was unquoted,
+/// append the body's command substitutions to its marker line so they lex as
+/// substitutions on the heredoc-owning command (bug 46). A quoted/inert body, or
+/// one with no substitution, leaves the marker line untouched.
+fn flush_heredoc_subs(out: &mut [String], heredoc: &ActiveHeredoc) {
+    if !heredoc.expand {
+        return;
+    }
+    let subs = heredoc_command_subs(&heredoc.body);
+    if subs.is_empty() {
+        return;
+    }
+    let marker = &mut out[heredoc.marker_idx];
+    marker.push(' ');
+    marker.push_str(&subs);
+}
+
+/// Extract an unquoted heredoc body's command-substitution spans (`$(…)` and
+/// `` `…` ``), in document order, space-joined — the spans the shell expands and
+/// executes when the delimiter is unquoted (bug 46).
+///
+/// The literal body text is inert stdin and dropped; only the substitution spans
+/// survive, to be re-lexed (the caller appends them to the marker line) as
+/// substitutions on the heredoc-owning command. The scan honours the heredoc
+/// body's escape rule — a backslash defuses a following `$` / `` ` `` / `\` — and
+/// is *not* quote-aware at the body level (single/double quotes are literal in a
+/// heredoc body and never guard a substitution). `$((…))` arithmetic runs no
+/// command and is skipped. The captured span's *inner* parens/quotes are still
+/// balanced quote-aware by [`scan_balanced`] / [`scan_backtick`], so a `)` or
+/// backtick inside a nested string does not end the span early.
+fn heredoc_command_subs(body: &str) -> String {
+    let bytes = body.as_bytes();
+    let n = bytes.len();
+    let mut spans: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < n {
+        match bytes[i] {
+            // A backslash defuses the next byte (the body's only escape).
+            b'\\' if i + 1 < n => i += 2,
+            // `$(…)` command substitution — capture; `$((…))` arithmetic — skip.
+            b'$' if i + 1 < n && bytes[i + 1] == b'(' => {
+                let arithmetic = i + 2 < n && bytes[i + 2] == b'(';
+                let (_, next) = scan_balanced(bytes, i + 2, b'(', b')');
+                if !arithmetic {
+                    spans.push(&body[i..next]);
+                }
+                i = next;
+            }
+            // `` `…` `` backtick command substitution — capture.
+            b'`' => {
+                let (_, next) = scan_backtick(bytes, i + 1);
+                spans.push(&body[i..next]);
+                i = next;
+            }
+            _ => i += 1,
+        }
+    }
+    spans.join(" ")
 }
 
 // ── Segmentation ──────────────────────────────────────────────────────────────
@@ -1470,6 +1582,81 @@ mod tests {
         // stdin, stripped before any gate sees it. Only `git` runs.
         let input = "git commit -F - <<EOF\nran catenary diagnostics; tidied && shipped\nEOF";
         assert_eq!(positions(input), vec!["git"]);
+    }
+
+    #[test]
+    fn unquoted_heredoc_backtick_substitution_is_a_command() {
+        // Bug 46: an *unquoted* `<<EOF` body is not opaque stdin — the shell
+        // expands `` `…` `` in it and runs it. The smuggled `sed --in-place` is
+        // a real command position on the `cat` that owns the heredoc, so both
+        // `cat` and `sed` must surface (the `cat`/`sed` ordering follows the
+        // marker-line append).
+        let input = "cat <<EOF\n`sed --in-place 's/a/b/' f`\nEOF";
+        assert_eq!(positions(input), vec!["cat", "sed"]);
+        // The owning `cat` still carries its heredoc read redirect.
+        let cmd = &parse(input).pipelines[0].commands[0];
+        assert_eq!(cmd.name.as_deref(), Some("cat"));
+        assert_eq!(cmd.redirects.len(), 1);
+        assert_eq!(cmd.redirects[0].op, RedirectOp::Read);
+    }
+
+    #[test]
+    fn unquoted_heredoc_dollar_paren_substitution_is_a_command() {
+        // The `$(…)` form of bug 46, and the prose around it stays inert — only
+        // the substitution span projects, not the surrounding body words.
+        let input = "cat <<EOF\nresult: $(rg foo) done\nEOF";
+        assert_eq!(positions(input), vec!["cat", "rg"]);
+    }
+
+    #[test]
+    fn unquoted_heredoc_projects_every_substitution() {
+        // Multiple substitutions across multiple body lines all project, in
+        // document order, after the owning command.
+        let input = "cat <<EOF\n$(rg a)\nmid `sed -i s/x/y/ f`\nEOF\nmake test";
+        assert_eq!(positions(input), vec!["cat", "rg", "sed", "make"]);
+    }
+
+    #[test]
+    fn quoted_heredoc_delimiter_keeps_substitution_inert() {
+        // A *quoted* delimiter (`<<'EOF'` / `<<"EOF"`) performs no expansion, so
+        // a `$(…)` / `` `…` `` in the body is literal stdin — the smuggled `sed`
+        // never reaches the gate. Counterpart to the unquoted cases above.
+        let single = "cat <<'EOF'\n$(sed -i s/a/b/ f)\nEOF";
+        assert_eq!(positions(single), vec!["cat"]);
+        let double = "cat <<\"EOF\"\n`sed -i s/a/b/ f`\nEOF";
+        assert_eq!(positions(double), vec!["cat"]);
+    }
+
+    #[test]
+    fn escaped_heredoc_delimiter_keeps_substitution_inert() {
+        // A backslash-escaped delimiter (`<<\EOF`) is also non-expanding, so the
+        // body stays literal — same inert behavior as the quoted forms.
+        let input = "cat <<\\EOF\n$(sed -i s/a/b/ f)\nEOF";
+        assert_eq!(positions(input), vec!["cat"]);
+    }
+
+    #[test]
+    fn unquoted_heredoc_escaped_dollar_is_inert() {
+        // Inside the body the backslash defuses the substitution (`\$(…)` is a
+        // literal `$(…)`), so no command is projected — only `cat` runs.
+        let input = "cat <<EOF\n\\$(sed -i s/a/b/ f)\nEOF";
+        assert_eq!(positions(input), vec!["cat"]);
+    }
+
+    #[test]
+    fn unquoted_heredoc_arithmetic_is_not_a_command() {
+        // `$((…))` is arithmetic expansion, not a command substitution — it runs
+        // nothing, so it is skipped and only `cat` surfaces.
+        let input = "cat <<EOF\ntotal=$((1 + 2))\nEOF";
+        assert_eq!(positions(input), vec!["cat"]);
+    }
+
+    #[test]
+    fn unquoted_heredoc_dash_marker_projects_substitution() {
+        // `<<-EOF` strips leading tabs but is still an unquoted (expanding)
+        // delimiter, so its body substitution projects.
+        let input = "cat <<-EOF\n\t$(rg foo)\n\tEOF\nmake test";
+        assert_eq!(positions(input), vec!["cat", "rg", "make"]);
     }
 
     #[test]

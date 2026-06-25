@@ -9,8 +9,10 @@
 //! into a pipeline's commands, substitutions are recursed, and env-var prefix
 //! skipping / path stripping / subcommand deny matching run on the parse's
 //! command-position words. A heredoc is stdin input, not an allow/deny knob —
-//! its body is stripped by the parse and the command faces the allowlist on its
-//! name alone.
+//! the command faces the allowlist on its name alone — but an *unquoted* body's
+//! `$(…)` / `` `…` `` command substitutions are expanded and run by the shell, so
+//! the parse projects them as command positions on the heredoc-owning command
+//! (bug 46); a quoted delimiter's body stays inert stdin.
 
 #[allow(
     clippy::expect_used,
@@ -1451,6 +1453,45 @@ mod tests {
         let rules = recommended_rules();
         let denial = check_command("cat foo > bar.rs", &rules, None).expect("redirect denied");
         assert_eq!(denial.reason, DenialReason::OutputRedirect);
+    }
+
+    #[test]
+    fn unquoted_heredoc_substitution_is_gated() {
+        // Bug 46: an *unquoted* `<<EOF` body is not opaque stdin — the shell
+        // expands `$(…)` / `` `…` `` in it and runs them. `cat` (which owns the
+        // heredoc) is allowed, but a `sed --in-place` smuggled into the body via
+        // a substitution must still be denied, just as the bare command is.
+        let rules = recommended_rules();
+        assert!(
+            check_command("cat <<EOF\n`sed --in-place 's/a/b/' f`\nEOF", &rules, None).is_some(),
+            "backtick substitution in an unquoted heredoc body must be gated",
+        );
+        assert!(
+            check_command("cat <<EOF\n$(sed -i 's/a/b/' f)\nEOF", &rules, None).is_some(),
+            "$(…) substitution in an unquoted heredoc body must be gated",
+        );
+    }
+
+    #[test]
+    fn quoted_heredoc_substitution_stays_inert() {
+        // A *quoted* delimiter (`<<'EOF'`) performs no expansion, so the same
+        // `$(…)` text is literal stdin and `cat` alone runs — nothing is denied.
+        let rules = recommended_rules();
+        assert!(
+            check_command("cat <<'EOF'\n$(sed -i 's/a/b/' f)\nEOF", &rules, None).is_none(),
+            "quoted-delimiter heredoc body is inert",
+        );
+        // And bare prose in an *unquoted* body (no real substitution) is still
+        // not a command — only `$(…)` / `` `…` `` spans project, not words (bug 17).
+        assert!(
+            check_command(
+                "cat <<EOF\njust prose mentioning sed and rm\nEOF",
+                &rules,
+                None
+            )
+            .is_none(),
+            "prose in an unquoted heredoc body is not a command",
+        );
     }
 
     #[test]
