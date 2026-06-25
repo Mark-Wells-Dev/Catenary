@@ -5,7 +5,7 @@
 #   make release-major   # 0.5.5 -> 1.0.0
 #   make release V=0.6.0 # explicit version
 
-.PHONY: bench bench-test build-release check deny fuzz machete mdbook mutants mutants-stop rustdoc test test-ignored release release-patch release-minor release-major publish tag-current
+.PHONY: bench bench-test build-release check deny fuzz machete mdbook mutants mutants-stop mutants-flag-runaways rustdoc test test-ignored release release-patch release-minor release-major publish tag-current
 
 # Get current version from Cargo.toml
 CURRENT_VERSION := $(shell grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
@@ -108,41 +108,114 @@ fuzz:
 # green baseline as `make check`.
 #
 # Concurrency: cargo-mutants runs J mutant pipelines in parallel; each runs
-# nextest, which defaults to one test thread PER CORE. The real peak is the
-# PRODUCT J x TT — and each integration test spawns a daemon + mockls, so an
-# uncapped product (formerly --jobs 8 x one-thread-per-core) overflows RAM into
-# zram and thrashes. Keep J x TT at or below the core count. Override per run:
-#   make mutants T=command_filter J=4 TT=4
+# nextest with TT test threads, and each integration test spawns a daemon +
+# mockls. Two peaks: the BUILD phase scales with J alone (J cold-ish rustc/link
+# jobs — the RAM hog); the TEST phase with J x TT (that many daemon+mockls trees).
+# Keep J x TT at or below the core count for CPU; lower J to cut peak RAM.
+#   make mutants T=command_filter J=3 TT=4
+#
+# RAM safety. `ulimit -v 16G` caps any SINGLE process — it does NOT cap the
+# aggregate (J trees can still sum past RAM and thrash zram/swap), and a
+# memory-runaway mutant (a mutation that drops a loop bound / alloc guard) can
+# thrash for the whole --timeout window. Set MEMCAP for a hard, aggregate,
+# swap-proof cap: the run executes in a transient systemd cgroup scope with swap
+# FORBIDDEN, so the kernel OOM-kills *inside* the run instead of thrashing the
+# box. Requires systemd (cgroup v2); unset = per-process ulimit only.
+#   make mutants T=command_filter MEMCAP=48G
+#
+# Each run then auto-runs the runaway scan (the same logic as the standalone
+# `make mutants-flag-runaways` target — inlined here rather than a recursive
+# $(MAKE) so that `make -n mutants` stays a true dry-run), scanning the per-mutant
+# logs for OOM-kills / SIGKILLs / allocation failures / timeouts and writing
+# mutants.out/runaway.txt. A flagged mutant's "caught" outcome (if any) came from
+# a resource kill, not an assertion — audit each (a bounding test, or a
+# documented #[mutants::skip]). Under an aggregate MEMCAP the kernel may kill a
+# bystander, so attribution is best-effort; a per-mutant cap would be exact.
+#
 # --iterate is ON by default (ITERATE ?= 1): skip mutants caught in a previous
 # run (read from the prior mutants.out) so an interrupted run resumes cheaply
 # instead of restarting. Safe on a fresh run — with nothing previously caught it
 # is a no-op and tests everything; it also accumulates caught mutants across runs.
 # Force a from-scratch run with an empty override:
 #   make mutants T=command_filter ITERATE=
-J  ?= 4
+J  ?= 3
 TT ?= 4
 ITERATE ?= 1
+MEMCAP ?=
+# Wrap the run in a swap-forbidden cgroup scope when MEMCAP is set (e.g. 48G).
+MUTANTS_MEMCAP_WRAP = $(if $(MEMCAP),systemd-run --user --scope -p MemoryMax=$(MEMCAP) -p MemorySwapMax=0 --,)
+# Per-mutant log signatures of a resource runaway (OOM / SIGKILL / alloc fail / timeout).
+MUTANTS_RUNAWAY_RE := SIGKILL|signal:? 9|[Oo]ut of [Mm]emory|memory allocation of [0-9]+ bytes failed|cannot allocate memory|oom.?kill|TIMEOUT
 # Reuse compiled dependencies across the per-job scratch target dirs (cargo-mutants
 # makes one per --jobs, each otherwise rebuilding the full dep graph cold) and
 # across runs, via sccache when present. Auto-detected — a no-op without sccache.
 SCCACHE := $(shell command -v sccache 2>/dev/null)
 mutants:
-	@mkdir -p $(CURDIR)/../.catenary-mutants-tmp && ulimit -v 16777216 && \
-	 $(if $(SCCACHE),RUSTC_WRAPPER=$(SCCACHE) CARGO_INCREMENTAL=0 ,)NEXTEST_TEST_THREADS=$(TT) TMPDIR=$$(realpath $(CURDIR)/../.catenary-mutants-tmp) \
-	 cargo mutants --test-tool nextest $(if $(T),--package catenary-mcp -F $(T),) --timeout 1200 --jobs $(J) --features mockls $(if $(ITERATE),--iterate,)
+	@mkdir -p $(CURDIR)/../.catenary-mutants-tmp && ulimit -v 16777216 && { \
+	   $(MUTANTS_MEMCAP_WRAP) env $(if $(SCCACHE),RUSTC_WRAPPER=$(SCCACHE) CARGO_INCREMENTAL=0 ,)NEXTEST_TEST_THREADS=$(TT) TMPDIR=$$(realpath $(CURDIR)/../.catenary-mutants-tmp) \
+	     cargo mutants --test-tool nextest $(if $(T),--package catenary-mcp -F $(T),) --timeout 1200 --jobs $(J) --features mockls $(if $(ITERATE),--iterate,) ; \
+	   rc=$$? ; \
+	   out=$(CURDIR)/mutants.out ; \
+	   if [ -d $$out/log ]; then \
+	     : > $$out/runaway.txt ; \
+	     for f in $$out/log/*.log ; do \
+	       [ -e "$$f" ] || continue ; \
+	       if grep -Eqi '$(MUTANTS_RUNAWAY_RE)' "$$f" ; then basename "$$f" .log >> $$out/runaway.txt ; fi ; \
+	     done ; \
+	     sort -u -o $$out/runaway.txt $$out/runaway.txt ; \
+	     echo "runaway/killed/timed-out mutants flagged: $$(wc -l < $$out/runaway.txt) (see mutants.out/runaway.txt; timeouts also in timeout.txt)" ; \
+	   else echo "no mutants.out/log — nothing to scan" ; fi ; \
+	   exit $$rc ; \
+	 }
 
-# Kill a running cargo-mutants AND all its children (test binaries, mockls, etc.).
-# ALWAYS use this to stop mutation testing — NEVER `pkill cargo-mutants`, which
-# kills only the parent and orphans the test binaries. Orphans keep running with
-# no timeout or memory limit; an orphaned mutant binary once caused a 41.8GB OOM
-# that crashed the GPU driver. (The `mutants` target caps each run at ulimit -v
-# 16G, but a killed-parent orphan can escape the intended lifecycle.)
+# Flag resource-runaway mutants: scan the per-mutant logs for OOM-kills /
+# SIGKILLs / allocation failures / timeouts and write mutants.out/runaway.txt
+# (one mutant per line). A flagged mutant's "caught" outcome, if any, is a
+# resource kill — not a meaningful assertion — so audit each: it is either a
+# latent unbounded loop / allocation (give it a bounding test) or a documented
+# #[mutants::skip].
+mutants-flag-runaways:
+	@out=$(CURDIR)/mutants.out ; \
+	 if [ ! -d $$out/log ]; then echo "no mutants.out/log — nothing to scan" ; exit 0 ; fi ; \
+	 : > $$out/runaway.txt ; \
+	 for f in $$out/log/*.log ; do \
+	   [ -e "$$f" ] || continue ; \
+	   if grep -Eqi '$(MUTANTS_RUNAWAY_RE)' "$$f" ; then basename "$$f" .log >> $$out/runaway.txt ; fi ; \
+	 done ; \
+	 sort -u -o $$out/runaway.txt $$out/runaway.txt ; \
+	 echo "runaway/killed/timed-out mutants flagged: $$(wc -l < $$out/runaway.txt) (see mutants.out/runaway.txt; timeouts also in timeout.txt)"
+
+# Kill a running cargo-mutants AND its orphans. Two kinds of children escape a
+# naive `pkill cargo-mutants`: (1) test binaries in cargo-mutants' process group
+# — handled by the process-group kill (step 1); and (2) the `catenary daemon` /
+# `mockls` an integration test spawns, which DAEMONIZE into their own session and
+# so survive a group kill (step 2). Orphans keep running with no timeout or memory
+# limit; an orphaned mutant binary once caused a 41.8GB OOM that crashed the GPU
+# driver. Step 2 sweeps the daemonized orphans by their scratch-dir executable
+# path ($(CURDIR)/../.catenary-mutants-tmp/cargo-mutants-*), which is unique to a
+# mutation run — so it can NEVER hit your interactive session daemon (that does
+# not run from there). ALWAYS use this to stop mutation testing; NEVER a bare
+# `pkill cargo-mutants`.
 mutants-stop:
-	@if pgid=$$(ps -o pgid= -p $$(pgrep -x cargo-mutants 2>/dev/null | head -1) 2>/dev/null | tr -d ' '); then \
-	  kill -- -$$pgid 2>/dev/null && echo "Killed process group $$pgid"; \
+	@if pgid=$$(ps -o pgid= -p $$(pgrep -x cargo-mutants 2>/dev/null | head -1) 2>/dev/null | tr -d ' ') && [ -n "$$pgid" ]; then \
+	  kill -- -$$pgid 2>/dev/null && echo "Killed cargo-mutants process group $$pgid"; \
 	else \
 	  echo "No cargo-mutants process found"; \
 	fi
+	@scratch=$$(realpath $(CURDIR)/../.catenary-mutants-tmp 2>/dev/null) ; \
+	 if [ -n "$$scratch" ] && [ -d "$$scratch" ]; then \
+	   orphans=$$(pgrep -f "$$scratch/cargo-mutants" 2>/dev/null | grep -vx "$$$$" 2>/dev/null) ; \
+	   if [ -n "$$orphans" ]; then \
+	     echo "Killing orphaned mutation processes (daemonized out of the group):" ; \
+	     pgrep -af "$$scratch/cargo-mutants" 2>/dev/null ; \
+	     kill $$orphans 2>/dev/null ; sleep 2 ; \
+	     leftover=$$(pgrep -f "$$scratch/cargo-mutants" 2>/dev/null | grep -vx "$$$$" 2>/dev/null) ; \
+	     [ -n "$$leftover" ] && kill -9 $$leftover 2>/dev/null && echo "SIGKILLed stragglers" ; \
+	     echo "Orphans cleared." ; \
+	   else \
+	     echo "No scratch-dir orphans found." ; \
+	   fi ; \
+	 fi
 
 # Run tests. Pass T= to filter, N= to repeat, e.g.: make test T=json_diagnostics N=5
 # Prefix with ! to exclude: make test T=\!flaky_test
