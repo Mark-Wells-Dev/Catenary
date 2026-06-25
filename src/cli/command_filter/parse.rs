@@ -1846,4 +1846,109 @@ mod tests {
         assert_eq!(cmd.name.as_deref(), Some("café"));
         assert_eq!(cmd.argv, vec!["build"]);
     }
+
+    // ── End-of-input / mid-word edge guards (Sequence-7 mutant hardening) ─────
+    //
+    // The arms below pin guards whose only divergent input is an operator /
+    // quote / escape sitting at — or one byte from — end of input, or a literal
+    // metacharacter glued mid-word. Each case is constructed so the targeted
+    // guard mutation changes the observed argv / redirect (or trips an
+    // out-of-bounds index), so a passing assertion here fails under the mutant.
+
+    #[test]
+    fn literal_close_paren_mid_word_stays_in_word() {
+        // `lex` paren arm guard `!in_word` (mutant 331:28 → `true`): a `)` that
+        // is *not* at a word boundary (mid-word, `in_word` set) is an ordinary
+        // byte, not a `Paren` token. With the guard forced true the `)` would
+        // flush `a` and split the word, yielding argv `["a", "b"]` instead of the
+        // single argument `a)b`.
+        let cmd = sole("echo a)b");
+        assert_eq!(cmd.name.as_deref(), Some("echo"));
+        assert_eq!(cmd.argv, vec!["a)b"]);
+    }
+
+    #[test]
+    fn trailing_backslash_at_eof_kept_literally() {
+        // `lex` backslash arm guard `i + 1 < n` (mutant 266:26 → `i + 1 <= n`):
+        // a lone trailing `\` has no following byte, so the continuation /
+        // CRLF / escape checks must all fall through to the literal branch. The
+        // `<=` mutant would read `bytes[i + 1]` past the end (out-of-bounds).
+        let cmd = sole(r"echo \");
+        assert_eq!(cmd.name.as_deref(), Some("echo"));
+        assert_eq!(cmd.argv, vec![r"\"]);
+    }
+
+    #[test]
+    fn backslash_then_lone_cr_at_eof_is_escaped_cr() {
+        // `lex` CRLF-continuation guard `i + 2 < n` (mutant 270:33 →
+        // `i + 2 <= n`): a `\` followed by a lone `\r` at EOF is *not* a CRLF
+        // continuation (no `\n` follows), so it is an escaped `\r`. The `<=`
+        // mutant would read `bytes[i + 2]` past the end (out-of-bounds).
+        let cmd = sole("echo \\\r");
+        assert_eq!(cmd.name.as_deref(), Some("echo"));
+        assert_eq!(cmd.argv, vec!["\r"]);
+    }
+
+    #[test]
+    fn unterminated_double_quote_trailing_backslash_no_oob() {
+        // `lex_double_quote` backslash guard `i + 1 < n` (mutant 445:22 →
+        // `i * 1 < n`, i.e. always-true in-loop): a trailing `\` inside an
+        // unterminated `"…` has no byte to escape and is kept literally. The
+        // `i * 1` mutant would read `bytes[i + 1]` past the end (out-of-bounds).
+        let cmd = sole(r#"echo "a\"#);
+        assert_eq!(cmd.name.as_deref(), Some("echo"));
+        assert_eq!(cmd.argv, vec![r"a\"]);
+    }
+
+    #[test]
+    fn unterminated_double_quote_trailing_dollar_no_oob() {
+        // `lex_double_quote` `$(` lookahead guard `i + 1 < n` (mutant 466:23 →
+        // `i * 1 < n`, always-true in-loop): a trailing `$` inside an
+        // unterminated `"…` is a literal `$` (no `(` follows). The `i * 1`
+        // mutant would read `bytes[i + 1]` past the end (out-of-bounds).
+        let cmd = sole(r#"echo "a$"#);
+        assert_eq!(cmd.name.as_deref(), Some("echo"));
+        assert_eq!(cmd.argv, vec!["a$"]);
+    }
+
+    #[test]
+    fn write_both_op_at_eof_is_truncate_not_oob() {
+        // `lex_operator` `&>>` lookahead guard `i + 2 < n` (mutant 521:26 →
+        // `i + 2 <= n`): a bare `&>` at EOF is `WriteBoth` (truncate) with an
+        // empty target — there is no third byte to read. The `<=` mutant would
+        // read `bytes[i + 2]` past the end (out-of-bounds).
+        let cmd = sole("cat &>");
+        assert_eq!(cmd.name.as_deref(), Some("cat"));
+        assert_eq!(cmd.redirects.len(), 1);
+        assert_eq!(cmd.redirects[0].op, RedirectOp::WriteBoth);
+        assert_eq!(cmd.redirects[0].target, "");
+    }
+
+    #[test]
+    fn pipe_op_at_eof_is_single_pipe_not_oob() {
+        // `lex_operator` `||` lookahead guard `i + 1 < n` (mutant 532:18 →
+        // `i * 1 < n`, always-true since `i < n` in `lex_operator`): a trailing
+        // bare `|` at EOF is a single `Pipe`; the empty second stage is dropped,
+        // leaving one command. The `i * 1` mutant would read `bytes[i + 1]` past
+        // the end (out-of-bounds).
+        let script = parse("cat |");
+        assert_eq!(script.command_positions(), vec!["cat"]);
+        assert_eq!(script.pipelines.len(), 1);
+        assert_eq!(script.pipelines[0].commands.len(), 1);
+    }
+
+    #[test]
+    fn here_string_short_target_is_single_here_string() {
+        // `lex_operator` `<<<` length guard `i + 2 < n` (mutant 557:18 →
+        // `i * 2 < n`): with a short target the operator sits where `i * 2 >= n`
+        // while `i + 2 < n`, so the `*` mutant misreads `<<<` as a `<<` heredoc
+        // plus a stray `<`, producing two `Read` redirects. The correct parse is
+        // a single `HereString` whose target is the glued word. (`cat <<<x`: `<`
+        // at index 4, n == 8, so `4 * 2 == 8` is *not* `< 8`.)
+        let cmd = sole("cat <<<x");
+        assert_eq!(cmd.name.as_deref(), Some("cat"));
+        assert_eq!(cmd.redirects.len(), 1);
+        assert_eq!(cmd.redirects[0].op, RedirectOp::HereString);
+        assert_eq!(cmd.redirects[0].target, "x");
+    }
 }
