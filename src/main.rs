@@ -1519,8 +1519,8 @@ struct SearchResponse {
 
 /// Renders the `catenary grep --count` summary: `N matches in M files`.
 ///
-/// `matches` is the matching-line total (one per rendered leaf row, keywords
-/// dropped); `files` is the number of distinct files holding them.
+/// `matches` is the matching-line total (one per rendered leaf row); `files`
+/// is the number of distinct files holding them.
 fn render_grep_count(out: &mut cli::Output, matches: usize, files: usize) {
     let _ = out.writeln(format_args!("{matches} matches in {files} files"));
 }

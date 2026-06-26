@@ -94,8 +94,6 @@ enum HitClass {
     /// Symbol identified via `prepareRename` in a file with no symbol index
     /// data — a definition-like hit that still gets enriched.
     PrepareRenameSymbol,
-    /// Keyword filtered out via `prepareRename` (dropped before rendering).
-    Keyword,
 }
 
 /// Outcome of a grep query.
@@ -506,34 +504,43 @@ impl GrepServer {
                     continue;
                 }
 
-                // Non-definition line. Discriminate keyword vs symbol via
-                // `prepareRename`, UNIFORMLY (decision 024, invariant 8): the
-                // keyword drop fires in indexed files too, not only non-indexed
-                // ones. The check is skipped only when the server is dead.
-                let lang = self.fs_manager.language_id(&file_path);
-                let server_dead = lang
-                    .as_ref()
-                    .is_some_and(|l| dead_languages.contains(l.as_str()));
-
-                let is_symbol = if server_dead {
-                    // No live server to ask — keep the line as a plain atom.
-                    true
-                } else {
-                    self.prepare_rename_check(&file_path, line_0, col, parent_id, cancel)
-                        .await
-                };
-
-                let classification = if !is_symbol {
-                    // `prepareRename` says keyword → dropped before rendering.
-                    HitClass::Keyword
-                } else if has_symbols {
-                    // A confirmed occurrence in an indexed file: a plain atom.
-                    // The enclosing definition is a separate, enriched `Symbol`.
+                // Non-definition line. No ripgrep match is ever dropped
+                // (decision 024: `catenary grep` is a strict superset of `grep`
+                // — every byte-match is rendered verbatim). `prepareRename`
+                // gates *enrichment* only, never membership (bug 47).
+                //
+                // In an indexed file every non-definition hit is a plain
+                // reference atom regardless of `prepareRename` (the enclosing
+                // definition is a separate, enriched `Symbol`), so the round
+                // trip is skipped entirely — one LSP call saved per hit. In a
+                // non-indexed file `prepareRename` chooses enrich-vs-plain: a
+                // confirmed symbol becomes an enriched `PrepareRenameSymbol`; a
+                // non-symbol (a keyword, or prose body text on a Lattice /
+                // markdown root, where only headings are renameable) renders as
+                // a plain reference atom — present, just not enriched. The check
+                // is also skipped when the server is dead.
+                let classification = if has_symbols {
                     HitClass::Reference
                 } else {
-                    // A confirmed symbol in a file the index has no grammar for:
-                    // a definition-like atom that still gets enriched with edges.
-                    HitClass::PrepareRenameSymbol
+                    let lang = self.fs_manager.language_id(&file_path);
+                    let server_dead = lang
+                        .as_ref()
+                        .is_some_and(|l| dead_languages.contains(l.as_str()));
+                    let is_symbol = if server_dead {
+                        // No live server to enrich with — a plain atom.
+                        false
+                    } else {
+                        self.prepare_rename_check(&file_path, line_0, col, parent_id, cancel)
+                            .await
+                    };
+                    if is_symbol {
+                        // A confirmed symbol in a file the index has no grammar
+                        // for: a definition-like atom enriched with edges.
+                        HitClass::PrepareRenameSymbol
+                    } else {
+                        // Not a symbol — a verbatim reference atom, never dropped.
+                        HitClass::Reference
+                    }
                 };
                 hits.push(GrepHit {
                     file: file_path.clone(),
@@ -544,9 +551,6 @@ impl GrepServer {
                 });
             }
         }
-
-        // Drop keywords
-        hits.retain(|h| !matches!(h.classification, HitClass::Keyword));
 
         if hits.is_empty() {
             return Ok((String::new(), Vec::new()));
@@ -559,7 +563,7 @@ impl GrepServer {
             let (line_0, col) = match &hit.classification {
                 HitClass::Symbol { symbol } => (symbol.line, hit.col),
                 HitClass::PrepareRenameSymbol => (hit.line, hit.col),
-                _ => {
+                HitClass::Reference => {
                     enrichments.push((hit, None));
                     continue;
                 }
@@ -586,14 +590,17 @@ impl GrepServer {
         Ok((rendered, witnesses))
     }
 
-    /// Checks `prepareRename` at a position to distinguish symbols from keywords.
+    /// Checks `prepareRename` at a position to decide whether a hit is a
+    /// renameable symbol worth enriching — an *enrichment* signal only, never a
+    /// filter (bug 47). A `false` answer demotes the hit to a plain reference
+    /// atom; it never drops it.
     ///
     /// Uses priority chain dispatch: iterates servers that support rename
     /// in binding order, returns on the first definitive answer. Dispatch
     /// errors are logged via `debug!()` and never surface in the tool result.
     ///
     /// Returns `true` if the position is a symbol (or no capable server
-    /// exists), `false` if keyword.
+    /// exists), `false` if not (e.g. a keyword).
     async fn prepare_rename_check(
         &self,
         path: &Path,
@@ -632,7 +639,7 @@ impl GrepServer {
             drop(client);
 
             match response {
-                Ok(v) if v.is_null() => return false, // null → keyword
+                Ok(v) if v.is_null() => return false, // null → not a symbol
                 Ok(_) => return true,                 // range → symbol
                 Err(e) => {
                     debug!(
@@ -652,9 +659,10 @@ impl GrepServer {
     /// Sends all enrichment queries (references, call hierarchy, implementations,
     /// type hierarchy) for every symbol. The server decides what returns results.
     ///
-    /// Callers are responsible for keyword filtering before calling this method
-    /// — `GrepServer::run` uses `prepare_rename_check` during hit classification
-    /// and only passes confirmed symbols here.
+    /// Callers gate enrichment before calling this method — `GrepServer::run`
+    /// only enriches `Symbol`/`PrepareRenameSymbol` hits, so a hit
+    /// `prepare_rename_check` did not confirm as a symbol is rendered as a
+    /// plain reference atom and never reaches this method (it is not dropped).
     ///
     /// Opens the document once on the union of all capability-filtered servers,
     /// runs all four enrichment methods (skipping their per-method open/close),
@@ -1512,7 +1520,7 @@ fn collect_atom_names(
         let name = match &hit.classification {
             HitClass::Symbol { symbol } => symbol.name.clone(),
             HitClass::PrepareRenameSymbol => hit.matched_text.clone(),
-            _ => continue,
+            HitClass::Reference => continue,
         };
         names.insert(hit_atom(hit), name);
     }
@@ -1743,7 +1751,7 @@ impl Sink for MatchSink<'_> {
         // byte-identical to `rg`, not the matched token (`--only-matching` is
         // dropped). Capture the whole line, newline-stripped, plus the column
         // of the FIRST match on it — the column still positions `prepareRename`
-        // (keyword discrimination) and the enrichment query at the symbol.
+        // (enrichment gating) and the enrichment query at the symbol.
         let Some(first) = self.matcher.find(line_bytes).ok().flatten() else {
             return Ok(true);
         };

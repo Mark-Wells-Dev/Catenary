@@ -684,9 +684,10 @@ fn test_mockls_did_save_sent_with_capability() -> Result<()> {
     Ok(())
 }
 
-/// Symbol source present: `documentSymbol` still drives classification, but the
-/// one-atom format renders results as plain full-source-line atoms — keyword-only
-/// matches are dropped and there are no `<Kind>` labels.
+/// Symbol source present: `documentSymbol` still drives classification, and the
+/// one-atom format renders results as plain full-source-line atoms with no
+/// `<Kind>` labels. A keyword-position hit is returned verbatim as a reference
+/// atom (bug 47: `prepareRename` gates enrichment, never membership).
 #[test]
 fn test_search_graceful_degradation() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -698,12 +699,13 @@ fn test_search_graceful_degradation() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    // Search for "fn" — a declaration keyword, now dropped uniformly (even in
-    // indexed files), so the result is empty.
+    // Search for "fn" — a declaration keyword. The line is returned verbatim as
+    // a plain reference atom (not dropped); the keyword is not the symbol name,
+    // so the symbol index does not classify it as a definition.
     let text_fn = bridge.call_tool_text("grep", &json!({ "pattern": "fn" }))?;
     assert!(
-        text_fn.is_empty(),
-        "keyword-only match should be dropped, got: {text_fn}"
+        text_fn.contains(&format!("test.{MOCK_LANG_A}:1  fn greet()")),
+        "keyword hit should be returned as a reference atom, got: {text_fn}"
     );
 
     // Search for "greet" — a symbol, not a keyword.
@@ -1522,15 +1524,16 @@ fn test_grep_alternation_nested() -> Result<()> {
     Ok(())
 }
 
-/// No-grammar file, pattern matches only keywords. Keywords filtered out
-/// via `prepareRename` returning null should not appear in output.
-/// Searches for the keyword `struct` which mockls recognizes and returns
-/// null for via prepareRename.
+/// Bug 47: a hit on the keyword position of a definition line is returned
+/// verbatim as a plain reference atom. mockls returns null from `prepareRename`
+/// for the `struct` keyword, which gates enrichment only — it never drops a
+/// ripgrep match (decision 024: `catenary grep` is a strict superset of
+/// `grep`). The symbol name is `MyType`, so the symbol index does not classify
+/// the keyword hit as a definition.
 #[test]
-fn test_grep_prepare_rename_keyword() -> Result<()> {
+fn test_grep_keyword_hit_returned_as_reference() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let file = dir.path().join(format!("kw.{MOCK_LANG_A}"));
-    // Only the keyword `struct` matches — mockls returns null for keywords
     std::fs::write(&file, "struct MyType\n")?;
 
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
@@ -1538,14 +1541,13 @@ fn test_grep_prepare_rename_keyword() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    // Search for the keyword `struct` (not the symbol name)
-    let text = bridge.call_tool_text("grep", &json!({ "pattern": "^struct$" }))?;
+    // Grep the `struct` keyword (not the `MyType` symbol name).
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "struct" }))?;
 
-    // The keyword `struct` is filtered out by prepareRename returning null.
-    // Only the keyword itself matched (not the symbol name), so output is empty.
+    // The keyword line is returned verbatim, not dropped.
     assert!(
-        text.is_empty(),
-        "Expected empty output when only keywords match, got:\n{text}"
+        text.contains(&format!("kw.{MOCK_LANG_A}:1  struct MyType")),
+        "Expected keyword hit returned as a reference atom, got:\n{text}"
     );
 
     Ok(())
@@ -2052,17 +2054,16 @@ fn test_enrich_prepare_rename_symbol() -> Result<()> {
     Ok(())
 }
 
-/// Keyword matching on a line that IS a symbol definition: under decision 024's
-/// uniform keyword drop, a `prepareRename`-confirmed keyword is dropped in ALL
-/// files (including indexed ones). A grep for the bare `fn` keyword therefore
-/// produces empty output even though the line is a definition.
+/// Bug 47: grepping the bare `fn` keyword on a definition line in an indexed
+/// file returns the line verbatim as a plain reference atom. The keyword is not
+/// the symbol name, so the symbol index does not classify the hit as a
+/// definition, and `prepareRename` returning null no longer drops it.
 #[test]
 fn test_enrich_prepare_rename_keyword() -> Result<()> {
     let dir = tempfile::tempdir()?;
 
-    // File with a function definition — `documentSymbol` will report
-    // `my_symbol` at line 0. A grep for `^fn ` hits only the `fn` keyword
-    // position, not the symbol name.
+    // File with a function definition — `documentSymbol` reports `my_symbol`
+    // at line 0. A grep for `^fn ` hits the `fn` keyword position, not the name.
     let file = dir.path().join(format!("kw.{MOCK_LANG_A}"));
     std::fs::write(&file, "fn my_symbol\n")?;
 
@@ -2073,29 +2074,27 @@ fn test_enrich_prepare_rename_keyword() -> Result<()> {
 
     let text = bridge.call_tool_text("grep", &json!({ "pattern": "^fn " }))?;
 
-    // The keyword `fn` is dropped uniformly — only the keyword matched (not the
-    // symbol name), so the output is empty.
+    // The keyword hit is returned verbatim as a reference atom (not dropped).
     assert!(
-        text.is_empty(),
-        "Expected empty output when only the keyword matches, got:\n{text}"
+        text.contains(&format!("kw.{MOCK_LANG_A}:1  fn my_symbol")),
+        "Expected keyword hit returned as a reference atom, got:\n{text}"
     );
 
     Ok(())
 }
 
-/// Keyword-only matches filtered on prepareRename path (no symbol index data).
-/// When the symbol index has no data for a file (no `documentSymbol`
-/// definitions), hits go through `prepare_rename_check`. mockls returns
-/// null for declaration keywords (`fn`, `struct`, etc.), which
-/// `prepare_rename_check` interprets as keyword → filtered from output.
+/// Bug 47: in a non-indexed file (no `documentSymbol` definitions) a hit whose
+/// position `prepareRename` reports as a non-symbol (here the `fn` keyword, for
+/// which mockls returns null) is returned as a plain reference atom, not
+/// filtered out. `prepare_rename_check` gates enrichment only.
 #[test]
-fn test_keyword_filtered_no_grammar() -> Result<()> {
+fn test_keyword_no_grammar_returned_as_reference() -> Result<()> {
     let dir = tempfile::tempdir()?;
 
-    // File with no declaration-keyword-at-line-start patterns, so
-    // mockls's `documentSymbol` returns empty → symbol index has no
-    // data for this file → prepareRename path (no symbol index data) → `prepare_rename_check`.
-    // The `fn` keyword appears mid-line, not as a definition.
+    // File with no declaration-keyword-at-line-start patterns, so mockls's
+    // `documentSymbol` returns empty → the symbol index has no data for this
+    // file → the `prepare_rename_check` path. The `fn` keyword appears mid-line,
+    // not as a definition, so prepareRename returns null at that position.
     let file = dir.path().join(format!("kw_filter.{MOCK_LANG_A}"));
     std::fs::write(&file, "just some fn keyword\nanother fn here\n")?;
 
@@ -2106,11 +2105,60 @@ fn test_keyword_filtered_no_grammar() -> Result<()> {
 
     let text = bridge.call_tool_text("grep", &json!({ "pattern": "fn" }))?;
 
-    // `fn` is a declaration keyword — mockls's prepareRename returns
-    // null at the keyword position. All hits should be filtered.
+    // Both keyword hits are returned verbatim, not filtered.
     assert!(
-        text.is_empty(),
-        "Expected keyword hits to be filtered, got:\n{text}"
+        text.contains(&format!("kw_filter.{MOCK_LANG_A}:1  just some fn keyword")),
+        "Expected line 1 returned as a reference atom, got:\n{text}"
+    );
+    assert!(
+        text.contains(&format!("kw_filter.{MOCK_LANG_A}:2  another fn here")),
+        "Expected line 2 returned as a reference atom, got:\n{text}"
+    );
+
+    Ok(())
+}
+
+/// Regression for bug 47: on a prose root (markdown served by Lattice) only
+/// headings are renameable symbols, so every body-text line returns null from
+/// `prepareRename`. Body-text matches MUST be returned as plain reference atoms
+/// — decision 024 makes `catenary grep` a strict superset of `grep`, so no
+/// ripgrep byte-match is ever dropped. Before the fix only heading-line hits
+/// survived and every body line was silently dropped.
+///
+/// mockls stands in for Lattice: `fn heading` is the lone "heading"
+/// (`documentSymbol`), and the body lines mention the keyword `struct`, for
+/// which mockls's `prepareRename` returns null exactly as Lattice does for
+/// prose. The body lines do not start with a declaration keyword, so they are
+/// not themselves symbols.
+#[test]
+fn test_grep_prose_body_text_not_dropped() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().to_str().context("root path")?;
+
+    let file = dir.path().join(format!("notes.{MOCK_LANG_A}"));
+    std::fs::write(
+        &file,
+        "fn heading\nfirst mention of struct in a paragraph\nanother struct in a list item\n",
+    )?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "struct" }))?;
+
+    // Both body-text matches are returned verbatim (the bug dropped them).
+    assert!(
+        text.contains(&format!(
+            "notes.{MOCK_LANG_A}:2  first mention of struct in a paragraph"
+        )),
+        "Expected body-text line 2 returned as a reference atom, got:\n{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "notes.{MOCK_LANG_A}:3  another struct in a list item"
+        )),
+        "Expected body-text line 3 returned as a reference atom, got:\n{text}"
     );
 
     Ok(())
