@@ -105,24 +105,31 @@ pub fn validate(config: &Config) -> Vec<String> {
                 ));
             }
         }
-
-        // Validate diagnostic_precedence — the optional code-band regex must
-        // compile (misc 115). The advisory/authoritative source lists are
-        // free-form strings, so nothing to check there.
-        if let Some(precedence) = &server_def.diagnostic_precedence
-            && let Some(pat) = &precedence.code_pattern
-            && let Err(e) = regex::Regex::new(pat)
-        {
-            errors.push(format!(
-                "Server '{name}' has an invalid regex in \
-                 `diagnostic_precedence.code_pattern`: '{pat}' — {e}"
-            ));
-        }
     }
 
     validate_linters(config, &mut errors);
+    validate_precedence(&config.diagnostic_precedence, &mut errors);
 
     errors
+}
+
+/// Validates `[[diagnostic_precedence]]` policies (misc 115; per-root in
+/// workstream 34 ticket 02).
+///
+/// Each policy's optional code-band regex must compile. The
+/// advisory/authoritative source lists are free-form strings, so nothing to
+/// check there.
+fn validate_precedence(precedence: &[super::DiagnosticPrecedence], errors: &mut Vec<String>) {
+    for (i, policy) in precedence.iter().enumerate() {
+        if let Some(pat) = &policy.code_pattern
+            && let Err(e) = regex::Regex::new(pat)
+        {
+            errors.push(format!(
+                "diagnostic_precedence[{i}] has an invalid regex in \
+                 `code_pattern`: '{pat}' — {e}"
+            ));
+        }
+    }
 }
 
 /// Validates `[linter.*]` definitions, appending any errors (workstream 34

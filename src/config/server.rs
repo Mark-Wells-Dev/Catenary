@@ -70,49 +70,37 @@ pub struct ServerDef {
     #[serde(default)]
     pub file_patterns: Vec<String>,
 
-    /// Source-precedence reconciliation policy for servers that publish
-    /// overlapping diagnostics from multiple `source`s (misc 115, bug 42).
-    ///
-    /// When set, the diagnostics filter drops an *advisory* source's
-    /// diagnostics in the band an *authoritative* source owns — but only
-    /// once the authoritative source has reported for that file (absence of
-    /// an authoritative report is **not** contradiction). See
-    /// [`DiagnosticPrecedence`].
-    ///
-    /// **Boundary:** this only helps servers that *expose* an authoritative
-    /// source to defer to. rust-analyzer is the lucky case — its flycheck
-    /// (`rustc`/`clippy`) stream is ground truth against its own unreliable
-    /// in-macro native analysis. A single-analysis server (pyright, gopls,
-    /// the markdown servers) has no authoritative source to fall back on, so
-    /// this policy gives it nothing; there the only levers are
-    /// config-disabling specific codes or accepting the false positive. This
-    /// is not rust-analyzer special treatment — it is a generic mechanism
-    /// that any multi-source server can opt into via its own default row.
-    #[serde(default)]
-    pub diagnostic_precedence: Option<DiagnosticPrecedence>,
-
     /// Compiled glob patterns from `file_patterns`. Populated by
     /// [`Self::compile_patterns`] after deserialization.
     #[serde(skip)]
     pub compiled_patterns: Vec<LspGlob>,
 }
 
-/// Per-server diagnostic source-precedence policy (misc 115, bug 42).
+/// Per-root, cross-feeder diagnostic source-precedence policy (misc 115, bug
+/// 42; hoisted to per-root in workstream 34 ticket 02).
 ///
-/// A **generic, server-agnostic** reconciliation keyed on the standard LSP
-/// `Diagnostic.source` field. Splits a server's sources into two roles:
+/// A **generic, feeder-agnostic** reconciliation keyed on the standard LSP
+/// `Diagnostic.source` field. Splits the sources that report for a file into
+/// two roles:
 ///
 /// - **advisory** — fast but unreliable in some band (e.g. rust-analyzer's
 ///   in-memory native HIR/macro analysis).
 /// - **authoritative** — ground truth in that band (e.g. rust-analyzer's
 ///   flycheck = the real `rustc`/`clippy`).
 ///
-/// The rule the filter applies: on a given file, an advisory source's
-/// diagnostics are dropped in the band an authoritative source owns, **once
-/// the authoritative source has reported for that file**. Scoping the rule to
-/// a [`code_pattern`](Self::code_pattern) keeps advisory diagnostics that fall
+/// The rule applied over a file's merged diagnostic set (all feeders — every
+/// language server **and** every linter): an advisory source's diagnostics are
+/// dropped in the band an authoritative source owns, **once the authoritative
+/// source has reported for that file**. Scoping the rule to a
+/// [`code_pattern`](Self::code_pattern) keeps advisory diagnostics that fall
 /// *outside* the authoritative band (an advisory source's own lints, an
 /// unresolved-import preview) — they only lose trust inside the band.
+///
+/// Precedence is configured **per root** (top-level `[[diagnostic_precedence]]`
+/// in user config or `.catenary.toml`), not per-`[server.*]`. It is deliberately
+/// narrow — the rust-analyzer / flycheck ground-truth tool — **not** a lever for
+/// ranking linters against language servers; that overlap is handled by
+/// opinion-free dedup, not precedence.
 #[derive(Debug, Default, Deserialize, Serialize, Clone)]
 pub struct DiagnosticPrecedence {
     /// Source names whose diagnostics are advisory in the band (dropped when
@@ -185,28 +173,52 @@ impl DiagnosticPrecedence {
         };
         Ok(())
     }
+
+    /// The shipped default precedence policy: rust-analyzer's native analysis is
+    /// advisory against its flycheck (`rustc`/`clippy`) ground truth, scoped to
+    /// the rustc `E####` error-code band (misc 115, bug 42).
+    ///
+    /// Returned pre-compiled so it works on the [`Config::default`] path that
+    /// skips the post-load compile step. Keyed purely on `source` names, so it is
+    /// a no-op for any root whose diagnostics carry none of those sources — which
+    /// is why it can ship as a single global default rather than a per-server
+    /// row.
+    ///
+    /// [`Config::default`]: crate::config::Config::default
+    #[must_use]
+    pub fn rust_analyzer_default() -> Self {
+        let pattern = "^E[0-9]+$";
+        // The pattern is a compile-time constant known to be valid; on the
+        // impossible regex error, fall back to an inert (empty-source) policy
+        // rather than an unrestricted band — an unrestricted band would drop
+        // *all* advisory diagnostics, far worse than doing nothing.
+        Regex::new(pattern).map_or_else(
+            |_| Self::default(),
+            |re| Self {
+                advisory_sources: vec!["rust-analyzer".to_string()],
+                authoritative_sources: vec!["rustc".to_string(), "clippy".to_string()],
+                code_pattern: Some(pattern.to_string()),
+                compiled_code_pattern: Some(re),
+            },
+        )
+    }
 }
 
 impl ServerDef {
-    /// Compiles `file_patterns` into [`LspGlob`] matchers and the
-    /// `diagnostic_precedence` code band into a [`Regex`].
+    /// Compiles `file_patterns` into [`LspGlob`] matchers.
     ///
     /// Called once after deserialization. Fails fast on invalid patterns
     /// so `catenary doctor` can surface the issue at config load time.
     ///
     /// # Errors
     ///
-    /// Returns an error if any pattern in `file_patterns`, or the
-    /// `diagnostic_precedence` code pattern, fails to compile.
+    /// Returns an error if any pattern in `file_patterns` fails to compile.
     pub fn compile_patterns(&mut self) -> Result<()> {
         self.compiled_patterns = self
             .file_patterns
             .iter()
             .map(|p| LspGlob::new(p).with_context(|| format!("file_patterns glob '{p}'")))
             .collect::<Result<Vec<_>>>()?;
-        if let Some(precedence) = self.diagnostic_precedence.as_mut() {
-            precedence.compile()?;
-        }
         Ok(())
     }
 }

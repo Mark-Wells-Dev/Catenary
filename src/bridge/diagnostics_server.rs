@@ -58,10 +58,55 @@ pub struct DiagnosticsOutcome {
     pub warnings: usize,
 }
 
-/// Per-server diagnostics result from [`DiagnosticsServer::run_server_batch`].
-struct ServerDiagnostics {
-    /// Formatted diagnostic entries (one per diagnostic, position order).
-    entries: Vec<DiagEntry>,
+/// Rendering context shared by every [`FeederEntry`] from one feeder.
+///
+/// A feeder is a single diagnostic source for a batch: one language server, or
+/// one standalone linter. The fields drive the message filter and the rendered
+/// `source(code)` line; they are constant across a feeder's diagnostics, so the
+/// context is shared behind an `Arc` rather than copied per entry.
+#[derive(Debug)]
+struct FeederContext {
+    /// The feeder's command — the LSP server command or the linter command.
+    /// Selects the message filter and feeds version-keyed filtering.
+    command: String,
+    /// Server version, when known (LSP feeders only; `None` for linters).
+    version: Option<String>,
+    /// Language id for the message filter (LSP feeders only; empty for linters).
+    language_id: String,
+}
+
+/// One LSP-shaped diagnostic from a single feeder, before the cross-feeder
+/// merge (workstream 34 ticket 02).
+///
+/// Feeders publish these; the per-file aggregation pass dedups and reconciles on
+/// the raw `value` (`source` / `code` / start-line), then renders each survivor
+/// through its own [`FeederContext`]. Rendering is deferred to *after* the merge
+/// so dedup and precedence see canonical LSP-diagnostic JSON, feeder-blind.
+#[derive(Debug)]
+struct FeederEntry {
+    /// The raw LSP-shaped diagnostic JSON. The dedup key and precedence policy
+    /// both read from here.
+    value: Value,
+    /// Quick-fix titles for this diagnostic (LSP code actions). Empty for
+    /// linters, which carry no code actions.
+    fixes: Vec<String>,
+    /// Innermost enclosing symbol name, if resolved (LSP feeders only).
+    enclosing: Option<String>,
+    /// Shared rendering context for the producing feeder.
+    ctx: Arc<FeederContext>,
+}
+
+/// A file's accumulated feeder diagnostics, keyed by canonical path in the
+/// batch result map.
+///
+/// Presence of a key means at least one feeder produced a result for the file
+/// (so the clean-vs-no-results distinction survives the merge); the `entries`
+/// may still be empty when every feeder reported clean.
+struct FileFeed {
+    /// Display path (root-relative or bare filename) for output.
+    display: String,
+    /// Raw per-feeder diagnostics, merged across all feeders for the file.
+    entries: Vec<FeederEntry>,
 }
 
 /// File with diagnostics for root-grouped output.
@@ -297,21 +342,22 @@ impl DiagnosticsServer {
         }
 
         // ── Phase 2: per-server batch lifecycle ────────────────────
-        // Collect per-file diagnostics across all servers.
-        // Key: canonical path string → (display path, Vec<ServerDiagnostics>).
-        let mut file_results: BTreeMap<String, (String, Vec<ServerDiagnostics>)> = BTreeMap::new();
+        // Collect each file's raw LSP-shaped diagnostics across all servers.
+        // Key: canonical path string → the file's accumulated feeder entries.
+        // Rendering is deferred to Phase 2c so dedup/precedence run on canonical
+        // JSON, feeder-blind (ticket 02).
+        let mut feeds: BTreeMap<String, FileFeed> = BTreeMap::new();
 
         for (client_mutex, paths) in server_groups.values() {
-            self.run_server_batch(client_mutex, paths, parent_id, &mut file_results)
+            self.run_server_batch(client_mutex, paths, parent_id, &mut feeds)
                 .await;
         }
 
         // ── Phase 2b: linter feeders (workstream 34 ticket 01) ─────
-        // Fan the lint-covered subset out to matching standalone linters,
-        // translate each adapter's LSP-shaped diagnostics into rendered entries,
-        // and merge them into the same per-file result map the LSP pass
-        // populated. Cross-feeder dedup/precedence is ticket 02 — here we only
-        // merge. Fail-soft: a not-installed linter or a parse failure drops its
+        // Fan the lint-covered subset out to matching standalone linters and
+        // merge each adapter's LSP-shaped diagnostics into the same per-file map
+        // the LSP pass populated — still raw, for the cross-feeder pass below.
+        // Fail-soft: a not-installed linter or a parse failure drops its
         // diagnostics without poisoning the batch.
         if !lint_candidates.is_empty() {
             let feeder = super::linter::LinterFeeder::new(&self.client_manager, &self.fs);
@@ -319,28 +365,34 @@ impl DiagnosticsServer {
                 if feed.diagnostics.is_empty() {
                     continue;
                 }
-                let filter = crate::filter::get_filter(&feed.command);
-                let entries = format_diagnostics_entries(
-                    &feed.diagnostics,
-                    &[],
-                    filter,
-                    &feed.command,
-                    None,
-                    "",
-                    &[],
-                );
-                if entries.is_empty() {
-                    continue;
-                }
+                let ctx = Arc::new(FeederContext {
+                    command: feed.command,
+                    version: None,
+                    language_id: String::new(),
+                });
                 let key = feed.file.to_string_lossy().to_string();
                 let display = self.display_rel(&key);
-                file_results
-                    .entry(key)
-                    .or_insert_with(|| (display, Vec::new()))
-                    .1
-                    .push(ServerDiagnostics { entries });
+                let file_feed = feeds.entry(key).or_insert_with(|| FileFeed {
+                    display,
+                    entries: Vec::new(),
+                });
+                for value in feed.diagnostics {
+                    file_feed.entries.push(FeederEntry {
+                        value,
+                        fixes: Vec::new(),
+                        enclosing: None,
+                        ctx: Arc::clone(&ctx),
+                    });
+                }
             }
         }
+
+        // ── Phase 2c: cross-feeder aggregation (ticket 02) ─────────
+        // Per file, over the merged set from every feeder: dedup identical
+        // findings, reconcile source precedence (per-root policy), then render.
+        // This is the order the ticket fixes — merge → dedup → precedence →
+        // render → budget/format.
+        let file_results = self.aggregate_feeds(feeds);
 
         // ── Phase 3: classify, budget, and format ────────────────
         let outcome = self.format_output(&canonical_paths, &file_results, &uncovered, session_id);
@@ -349,6 +401,54 @@ impl DiagnosticsServer {
         self.fs.bump_generations(&canonical_paths);
 
         outcome
+    }
+
+    /// Cross-feeder aggregation: per file, dedup → reconcile precedence →
+    /// render (workstream 34 ticket 02).
+    ///
+    /// Runs over the merged raw diagnostics each file accumulated from every
+    /// feeder (language servers and linters). Dedup is opinion-free (the same
+    /// finding from two feeders shown once); precedence is the narrow,
+    /// per-root, opinion-laden rule (advisory source dropped in the
+    /// authoritative band). Both operate on canonical LSP-diagnostic JSON, so
+    /// the pass is feeder-blind. Each surviving entry is then rendered through
+    /// its own feeder's context; the per-key presence (even with zero rendered
+    /// entries) is preserved so the downstream clean-vs-no-results distinction
+    /// survives.
+    fn aggregate_feeds(
+        &self,
+        feeds: BTreeMap<String, FileFeed>,
+    ) -> BTreeMap<String, (String, Vec<DiagEntry>)> {
+        let mut rendered: BTreeMap<String, (String, Vec<DiagEntry>)> = BTreeMap::new();
+        for (key, feed) in feeds {
+            let path = PathBuf::from(&key);
+            let policies = self.fs.resolve_root(&path).map_or_else(
+                || self.client_manager.config().diagnostic_precedence.clone(),
+                |root| self.client_manager.effective_precedence(&root),
+            );
+
+            let deduped = dedupe_entries(feed.entries);
+            let reconciled = reconcile_entries(deduped, &policies);
+
+            let entries: Vec<DiagEntry> = reconciled
+                .iter()
+                .filter_map(|e| {
+                    let filter = crate::filter::get_filter(&e.ctx.command);
+                    render_entry(
+                        &e.value,
+                        &e.fixes,
+                        e.enclosing.as_deref(),
+                        filter,
+                        &e.ctx.command,
+                        e.ctx.version.as_deref(),
+                        &e.ctx.language_id,
+                    )
+                })
+                .collect();
+
+            rendered.insert(key, (feed.display, entries));
+        }
+        rendered
     }
 
     /// Classifies files from server results, applies the single-shot preview
@@ -365,7 +465,7 @@ impl DiagnosticsServer {
     fn format_output(
         &self,
         canonical_paths: &[PathBuf],
-        file_results: &BTreeMap<String, (String, Vec<ServerDiagnostics>)>,
+        file_results: &BTreeMap<String, (String, Vec<DiagEntry>)>,
         uncovered: &[UncoveredEntry],
         session_id: &str,
     ) -> DiagnosticsOutcome {
@@ -373,13 +473,13 @@ impl DiagnosticsServer {
 
         for cp in canonical_paths {
             let key = cp.to_string_lossy().to_string();
-            let segments = file_results.get(&key).map(|(_, segs)| segs.as_slice());
+            let entries = file_results.get(&key).map(|(_, e)| e.as_slice());
             let display = file_results
                 .get(&key)
                 .map_or_else(|| self.display_rel(&key), |(d, _)| d.clone());
             let root = self.resolve_root_or_parent(cp);
 
-            match classify_file(segments) {
+            match classify_file(entries) {
                 FileOutcome::HasDiagnostics(entries) => {
                     diag_files.push(DiagnosticFile {
                         display,
@@ -468,7 +568,7 @@ impl DiagnosticsServer {
         client_mutex: &Arc<Mutex<LspClient>>,
         paths: &[PathBuf],
         parent_id: Option<&str>,
-        file_results: &mut BTreeMap<String, (String, Vec<ServerDiagnostics>)>,
+        feeds: &mut BTreeMap<String, FileFeed>,
     ) {
         let Some(baseline) = self.pre_open_settle(client_mutex).await else {
             return;
@@ -507,7 +607,7 @@ impl DiagnosticsServer {
             let server = client_mutex.lock().await.server().clone();
             drain_pipe(&server).await;
 
-            self.retrieve_diagnostics(client_mutex, &opened, file_results)
+            self.retrieve_diagnostics(client_mutex, &opened, feeds)
                 .await;
         }
 
@@ -661,16 +761,22 @@ impl DiagnosticsServer {
         Ok(())
     }
 
-    /// Retrieves diagnostics for each opened file on the server.
+    /// Retrieves raw diagnostics for each opened file on the server and merges
+    /// them, unrendered, into `feeds`.
     ///
-    /// Collects push-cached or pull diagnostics, applies severity
-    /// filters, fetches quick-fix code actions, populates the symbol
-    /// index, and formats entries into `file_results`.
+    /// Collects push-cached or pull diagnostics, applies the per-server severity
+    /// filter, fetches quick-fix code actions, populates the symbol index, and
+    /// pushes each diagnostic as a [`FeederEntry`] — the raw LSP-shaped JSON plus
+    /// its render context. Source-precedence reconciliation no longer runs here:
+    /// it is hoisted to the per-file cross-feeder pass (ticket 02) so one policy
+    /// reconciles every feeder's findings together. Every opened file is recorded
+    /// (even with zero diagnostics) so the clean-vs-no-results distinction
+    /// survives the merge.
     async fn retrieve_diagnostics(
         &self,
         client_mutex: &Arc<Mutex<LspClient>>,
         opened_uris: &[(PathBuf, String)],
-        file_results: &mut BTreeMap<String, (String, Vec<ServerDiagnostics>)>,
+        feeds: &mut BTreeMap<String, FileFeed>,
     ) {
         let client = client_mutex.lock().await;
 
@@ -679,6 +785,12 @@ impl DiagnosticsServer {
         let server_version = client.server_version().map(str::to_string);
         let lang_id = client.language().to_string();
         let has_code_actions = client.supports_code_action();
+
+        let ctx = Arc::new(FeederContext {
+            command: server_command,
+            version: server_version,
+            language_id: lang_id,
+        });
 
         for (path, uri) in opened_uris {
             let diagnostics = {
@@ -697,28 +809,6 @@ impl DiagnosticsServer {
                 } else {
                     Vec::new()
                 }
-            };
-
-            // Source-precedence reconciliation (misc 115, bug 42). When a
-            // server publishes overlapping diagnostics from multiple `source`s
-            // (e.g. rust-analyzer's native HIR analysis alongside its flycheck
-            // = the real rustc/clippy), drop the advisory source's diagnostics
-            // in the band the authoritative source owns — but only once the
-            // authoritative source has actually reported for this file. The
-            // diagnostics here are the file's complete merged set for this
-            // server, exactly what the rule needs to test "has the
-            // authoritative source reported?". `catenary diagnostics` already
-            // waits for flycheck (bug 28), so when an authoritative report is
-            // expected it is present at this point.
-            let diagnostics = match self
-                .client_manager
-                .config()
-                .server
-                .get(&server_name)
-                .and_then(|sd| sd.diagnostic_precedence.as_ref())
-            {
-                Some(precedence) => reconcile_source_precedence(diagnostics, precedence),
-                None => diagnostics,
             };
 
             // Apply per-server min_severity filter before quick-fix
@@ -751,8 +841,6 @@ impl DiagnosticsServer {
                 Vec::new()
             };
 
-            let filter = crate::filter::get_filter(&server_command);
-
             // Populate symbol index if needed — the file is already open
             // on this server, so documentSymbol is a single request.
             if let Some(ref idx_arc) = self.symbol_index {
@@ -769,23 +857,22 @@ impl DiagnosticsServer {
             let enclosing_symbols =
                 resolve_enclosing_symbols(self.symbol_index.as_ref(), path, &diagnostics);
 
-            let entries = format_diagnostics_entries(
-                &diagnostics,
-                &fixes,
-                filter,
-                &server_command,
-                server_version.as_deref(),
-                &lang_id,
-                &enclosing_symbols,
-            );
-
             let key = path.to_string_lossy().to_string();
             let display = self.display_rel(&key);
-            file_results
-                .entry(key)
-                .or_insert_with(|| (display, Vec::new()))
-                .1
-                .push(ServerDiagnostics { entries });
+            // Record the file even with zero diagnostics so it classifies as
+            // Clean, not NoResults (a server reached retrieval for it).
+            let file_feed = feeds.entry(key).or_insert_with(|| FileFeed {
+                display,
+                entries: Vec::new(),
+            });
+            for (i, value) in diagnostics.into_iter().enumerate() {
+                file_feed.entries.push(FeederEntry {
+                    value,
+                    fixes: fixes.get(i).cloned().unwrap_or_default(),
+                    enclosing: enclosing_symbols.get(i).cloned().flatten(),
+                    ctx: Arc::clone(&ctx),
+                });
+            }
         }
     }
 
@@ -956,25 +1043,17 @@ pub(crate) fn resolve_path(file: &str) -> Result<PathBuf> {
     }
 }
 
-/// Classifies a file based on its server diagnostics results.
+/// Classifies a file based on its rendered cross-feeder diagnostics.
 ///
-/// - `Some(segments)` with any non-empty entries → [`FileOutcome::HasDiagnostics`]
-/// - `Some(segments)` with all entries empty → [`FileOutcome::Clean`]
-/// - `None` (no server produced results) → [`FileOutcome::NoResults`]
-fn classify_file(segments: Option<&[ServerDiagnostics]>) -> FileOutcome {
-    let Some(segments) = segments else {
-        return FileOutcome::NoResults;
-    };
-
-    let entries: Vec<DiagEntry> = segments
-        .iter()
-        .flat_map(|s| s.entries.iter().cloned())
-        .collect();
-
-    if entries.is_empty() {
-        FileOutcome::Clean
-    } else {
-        FileOutcome::HasDiagnostics(entries)
+/// - `Some(entries)` non-empty → [`FileOutcome::HasDiagnostics`]
+/// - `Some(entries)` empty (a feeder reached retrieval but reported clean, or
+///   every diagnostic was filtered out) → [`FileOutcome::Clean`]
+/// - `None` (no feeder produced a result for the file) → [`FileOutcome::NoResults`]
+fn classify_file(entries: Option<&[DiagEntry]>) -> FileOutcome {
+    match entries {
+        None => FileOutcome::NoResults,
+        Some([]) => FileOutcome::Clean,
+        Some(entries) => FileOutcome::HasDiagnostics(entries.to_vec()),
     }
 }
 
@@ -1090,41 +1169,137 @@ fn resolve_enclosing_symbols(
 /// one diagnostic on the file. For the rust-analyzer / flycheck case that holds
 /// — flycheck publishes its findings for a file it analyzed, and a native
 /// phantom E#### only matters when it claims an error flycheck did not.
+///
+/// Production reconciliation runs over the cross-feeder [`FeederEntry`] set via
+/// [`reconcile_entries`]; this value-level form exercises the shared
+/// [`authoritative_reported`] / [`advisory_in_band`] predicates directly.
+#[cfg(test)]
 fn reconcile_source_precedence(
     diagnostics: Vec<Value>,
     precedence: &crate::config::DiagnosticPrecedence,
 ) -> Vec<Value> {
     // Has any authoritative source put a diagnostic on this file? Only then
     // does an advisory source lose its band.
-    let authoritative_reported = diagnostics.iter().any(|d| {
-        d.get("source")
-            .and_then(Value::as_str)
-            .is_some_and(|s| precedence.is_authoritative(s))
-    });
-    if !authoritative_reported {
+    if !authoritative_reported(diagnostics.iter(), precedence) {
         return diagnostics;
     }
-
     diagnostics
         .into_iter()
-        .filter(|d| {
-            let source = d.get("source").and_then(Value::as_str).unwrap_or("");
-            // Only advisory diagnostics are eligible to be dropped.
-            if !precedence.is_advisory(source) {
-                return true;
-            }
-            // ...and only inside the authoritative band (by code).
-            let code = render_diagnostic_code(d.get("code"));
-            !precedence.code_in_band(&code)
-        })
+        .filter(|d| !advisory_in_band(d, precedence))
         .collect()
 }
 
-/// Renders a diagnostic's JSON `code` field to a string for band matching.
+/// Whether any authoritative source has reported in this diagnostic set.
 ///
-/// Mirrors the rendering [`format_diagnostics_entries`] uses: an integer code
-/// becomes its decimal form, a string code is taken as-is. A missing code is
-/// the empty string (which only matches an empty/absent band pattern).
+/// The precedence rule only fires once an authoritative source has put at least
+/// one diagnostic on the file — absence of an authoritative report is not
+/// contradiction (see [`DiagnosticPrecedence`](crate::config::DiagnosticPrecedence)).
+fn authoritative_reported<'a>(
+    diagnostics: impl IntoIterator<Item = &'a Value>,
+    precedence: &crate::config::DiagnosticPrecedence,
+) -> bool {
+    diagnostics.into_iter().any(|d| {
+        d.get("source")
+            .and_then(Value::as_str)
+            .is_some_and(|s| precedence.is_authoritative(s))
+    })
+}
+
+/// Whether a diagnostic is an *advisory* source's finding *inside* the
+/// authoritative band — the only case eligible to be dropped once the
+/// authoritative source has reported.
+fn advisory_in_band(diagnostic: &Value, precedence: &crate::config::DiagnosticPrecedence) -> bool {
+    let source = diagnostic
+        .get("source")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    precedence.is_advisory(source)
+        && precedence.code_in_band(&render_diagnostic_code(diagnostic.get("code")))
+}
+
+/// Reconciles source precedence over a file's merged cross-feeder set (ticket
+/// 02).
+///
+/// Applies each per-root [`DiagnosticPrecedence`](crate::config::DiagnosticPrecedence)
+/// policy in turn to the [`FeederEntry`] list — the same advisory-in-band rule
+/// the per-server path used, now run over diagnostics from *every* feeder
+/// together. Policies are narrow and source-disjoint in practice, so the order
+/// among them does not matter.
+fn reconcile_entries(
+    mut entries: Vec<FeederEntry>,
+    policies: &[crate::config::DiagnosticPrecedence],
+) -> Vec<FeederEntry> {
+    for policy in policies {
+        if !authoritative_reported(entries.iter().map(|e| &e.value), policy) {
+            continue;
+        }
+        entries.retain(|e| !advisory_in_band(&e.value, policy));
+    }
+    entries
+}
+
+/// Collapses identical findings delivered by more than one feeder (ticket 02).
+///
+/// Opinion-free dedup keyed coarse on `(source, code, start-line)` — anchored on
+/// line, not column/span, since LSP (0-based char) and CLI (1-based) ranges
+/// drift and a wrapper may normalize spans differently. A codeless diagnostic
+/// falls back to `(source, normalized-message, line)`, best-effort. First
+/// occurrence wins (LSP feeders populate before linters), and the bias is
+/// **coarse**: over-dedup on a tie beats leaking duplicates, since the
+/// aggregator owns the clean output.
+///
+/// Reliable because a wrapped tool preserves its identity: bash-language-server
+/// runs shellcheck and emits `source: "shellcheck", code: "SC2086"`, exactly
+/// what standalone shellcheck emits — so the same finding collapses regardless
+/// of which feeder delivered it.
+fn dedupe_entries(entries: Vec<FeederEntry>) -> Vec<FeederEntry> {
+    let mut seen: HashSet<(String, String, u32)> = HashSet::new();
+    entries
+        .into_iter()
+        .filter(|e| seen.insert(dedup_key(&e.value)))
+        .collect()
+}
+
+/// Builds the coarse dedup key for a diagnostic: `(source, discriminant, line)`.
+///
+/// `line` is the 0-based start line. The discriminant is the rendered code when
+/// present (`c\0<code>`), else the normalized message (`m\0<message>`) — the NUL
+/// tag keeps a code that happens to equal a message text from colliding across
+/// the two key shapes.
+fn dedup_key(diagnostic: &Value) -> (String, String, u32) {
+    let source = diagnostic
+        .get("source")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let line = crate::lsp::extract::diagnostic_range(diagnostic).map_or(0, |r| r.start.line);
+    let code = render_diagnostic_code(diagnostic.get("code"));
+    let discriminant = if code.is_empty() {
+        let message = crate::lsp::extract::diagnostic_message(diagnostic).unwrap_or("");
+        format!("m\u{0}{}", normalize_message(message))
+    } else {
+        format!("c\u{0}{code}")
+    };
+    (source, discriminant, line)
+}
+
+/// Normalizes a diagnostic message for codeless dedup: trims, collapses internal
+/// whitespace runs to a single space, and lowercases. Best-effort — a wrapper
+/// that rephrases the message defeats it, which is why codes are preferred.
+fn normalize_message(message: &str) -> String {
+    message
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// Renders a diagnostic's JSON `code` field to a string for band and dedup
+/// matching.
+///
+/// Mirrors the rendering [`render_entry`] uses: an integer code becomes its
+/// decimal form, a string code is taken as-is. A missing code is the empty
+/// string (which only matches an empty/absent band pattern).
 fn render_diagnostic_code(code: Option<&Value>) -> String {
     code.map(|c| {
         c.as_i64().map_or_else(
@@ -1135,22 +1310,92 @@ fn render_diagnostic_code(code: Option<&Value>) -> String {
     .unwrap_or_default()
 }
 
-/// Formats diagnostics as individual entry strings.
+/// Renders one LSP-shaped diagnostic into a [`DiagEntry`], or `None` when the
+/// message filter drops it.
 ///
-/// Each entry contains the line/column, severity, message, and optional
-/// quick-fix titles. Returns one string per diagnostic (may span multiple
-/// lines when fixes are present). Diagnostics whose noise-filtered message
-/// is empty are dropped.
+/// The entry text carries the line/column, severity label, `source(code)`,
+/// message, optional enclosing-symbol suffix, and any indented quick-fix lines.
+/// This is the single rendering path for every feeder — the cross-feeder
+/// aggregation pass (ticket 02) calls it once per surviving entry, each through
+/// its own feeder's `filter`/`server_command`/`server_version`/`language_id`.
 ///
-/// `fixes` is parallel to `diagnostics` — each entry contains the titles of
-/// quick-fix code actions for that diagnostic. Pass an empty slice when no
-/// fixes were collected.
+/// `fixes` are the quick-fix titles for this diagnostic (empty for linters);
+/// `enclosing` is the innermost enclosing symbol name, if resolved.
+fn render_entry(
+    diagnostic: &Value,
+    fixes: &[String],
+    enclosing: Option<&str>,
+    filter: &dyn crate::filter::DiagnosticFilter,
+    server_command: &str,
+    server_version: Option<&str>,
+    language_id: &str,
+) -> Option<DiagEntry> {
+    let severity_num = crate::lsp::extract::diagnostic_severity(diagnostic);
+    let severity = match severity_num {
+        Some(1) => "error",
+        Some(2) => "warning",
+        Some(3) => "info",
+        Some(4) => "hint",
+        _ => "unknown",
+    };
+    // Numeric severity for budgeting/dirty: 1..=4 as-is, anything else
+    // (including a missing severity) ranks last and never gates.
+    let severity_rank = severity_num.filter(|s| (1..=4).contains(s)).unwrap_or(5);
+    let (line, col) = crate::lsp::extract::diagnostic_range(diagnostic)
+        .map_or((0, 0), |r| (r.start.line + 1, r.start.character + 1));
+    let source = diagnostic.get("source").and_then(Value::as_str);
+    let source_str = source.unwrap_or("");
+    let code_value = diagnostic.get("code");
+    let code = render_diagnostic_code(code_value);
+
+    let diag_code = code_value.map(crate::filter::DiagnosticCode::from_value);
+    let message = filter.filter_message(
+        server_command,
+        server_version,
+        source,
+        diag_code.as_ref(),
+        crate::lsp::extract::diagnostic_severity(diagnostic)
+            .unwrap_or(crate::filter::SEVERITY_WARNING),
+        language_id,
+        crate::lsp::extract::diagnostic_message(diagnostic).unwrap_or(""),
+    );
+
+    // Empty message means the filter wants to drop this diagnostic.
+    if message.is_empty() {
+        return None;
+    }
+
+    let mut result = if code.is_empty() {
+        format!(":{line}:{col} [{severity}] {source_str}: {message}")
+    } else {
+        format!(":{line}:{col} [{severity}] {source_str}({code}): {message}")
+    };
+
+    // Append enclosing symbol context.
+    if let Some(name) = enclosing {
+        use std::fmt::Write;
+        let _ = write!(result, " (in {name})");
+    }
+
+    // Append indented fix lines.
+    for title in fixes {
+        use std::fmt::Write;
+        let _ = write!(result, "\n\tfix: {title}");
+    }
+
+    Some(DiagEntry {
+        severity: severity_rank,
+        text: result,
+    })
+}
+
+/// Renders a slice of diagnostics through [`render_entry`] (test ergonomics).
 ///
-/// `enclosing_symbols` is parallel to `diagnostics` — each entry is the
-/// name of the innermost enclosing symbol (from `SymbolIndex`), or `None`
-/// when no symbol encloses the diagnostic. Pass an empty slice when the
-/// symbol index is unavailable.
-pub(crate) fn format_diagnostics_entries(
+/// `fixes` and `enclosing_symbols` are parallel to `diagnostics`; pass empty
+/// slices when none were collected. Production code renders one entry at a time
+/// in the cross-feeder pass, so this batch helper is test-only.
+#[cfg(test)]
+fn format_diagnostics_entries(
     diagnostics: &[Value],
     fixes: &[Vec<String>],
     filter: &dyn crate::filter::DiagnosticFilter,
@@ -1163,65 +1408,15 @@ pub(crate) fn format_diagnostics_entries(
         .iter()
         .enumerate()
         .filter_map(|(i, d)| {
-            let severity_num = crate::lsp::extract::diagnostic_severity(d);
-            let severity = match severity_num {
-                Some(1) => "error",
-                Some(2) => "warning",
-                Some(3) => "info",
-                Some(4) => "hint",
-                _ => "unknown",
-            };
-            // Numeric severity for budgeting/dirty: 1..=4 as-is, anything
-            // else (including a missing severity) ranks last and never gates.
-            let severity_rank = severity_num.filter(|s| (1..=4).contains(s)).unwrap_or(5);
-            let (line, col) = crate::lsp::extract::diagnostic_range(d)
-                .map_or((0, 0), |r| (r.start.line + 1, r.start.character + 1));
-            let source = d.get("source").and_then(Value::as_str);
-            let source_str = source.unwrap_or("");
-            let code_value = d.get("code");
-            let code = render_diagnostic_code(code_value);
-
-            let diag_code = code_value.map(crate::filter::DiagnosticCode::from_value);
-            let message = filter.filter_message(
+            render_entry(
+                d,
+                fixes.get(i).map_or(&[], Vec::as_slice),
+                enclosing_symbols.get(i).and_then(Option::as_deref),
+                filter,
                 server_command,
                 server_version,
-                source,
-                diag_code.as_ref(),
-                crate::lsp::extract::diagnostic_severity(d)
-                    .unwrap_or(crate::filter::SEVERITY_WARNING),
                 language_id,
-                crate::lsp::extract::diagnostic_message(d).unwrap_or(""),
-            );
-
-            // Empty message means the filter wants to drop this diagnostic
-            if message.is_empty() {
-                return None;
-            }
-
-            let mut result = if code.is_empty() {
-                format!(":{line}:{col} [{severity}] {source_str}: {message}")
-            } else {
-                format!(":{line}:{col} [{severity}] {source_str}({code}): {message}")
-            };
-
-            // Append enclosing symbol context
-            if let Some(Some(name)) = enclosing_symbols.get(i) {
-                use std::fmt::Write;
-                let _ = write!(result, " (in {name})");
-            }
-
-            // Append indented fix lines
-            if let Some(fix_titles) = fixes.get(i) {
-                for title in fix_titles {
-                    use std::fmt::Write;
-                    let _ = write!(result, "\n\tfix: {title}");
-                }
-            }
-
-            Some(DiagEntry {
-                severity: severity_rank,
-                text: result,
-            })
+            )
         })
         .collect()
 }
@@ -1463,19 +1658,18 @@ mod tests {
 
     #[test]
     fn classify_file_with_diagnostics() {
-        let segments = vec![ServerDiagnostics {
-            entries: vec![de(1, ":1:1 [error] test: msg")],
-        }];
+        let entries = vec![de(1, ":1:1 [error] test: msg")];
         assert_eq!(
-            classify_file(Some(&segments)),
+            classify_file(Some(&entries)),
             FileOutcome::HasDiagnostics(vec![de(1, ":1:1 [error] test: msg")]),
         );
     }
 
     #[test]
     fn classify_file_empty_entries_is_clean() {
-        let segments = vec![ServerDiagnostics { entries: vec![] }];
-        assert_eq!(classify_file(Some(&segments)), FileOutcome::Clean);
+        // A feeder reached retrieval but reported clean (or every diagnostic was
+        // filtered out) → present-but-empty → Clean.
+        assert_eq!(classify_file(Some(&[])), FileOutcome::Clean);
     }
 
     #[test]
@@ -1484,47 +1678,20 @@ mod tests {
     }
 
     #[test]
-    fn classify_file_multi_server_merges_entries() {
-        let segments = vec![
-            ServerDiagnostics {
-                entries: vec![de(1, ":1:1 [error] server-a: msg")],
-            },
-            ServerDiagnostics {
-                entries: vec![de(2, ":2:1 [warning] server-b: msg")],
-            },
+    fn classify_file_merged_entries_across_feeders() {
+        // After the cross-feeder pass, a file's entries are one flat list
+        // (servers + linters already merged).
+        let entries = vec![
+            de(1, ":1:1 [error] server-a: msg"),
+            de(2, ":2:1 [warning] shellcheck(SC2086): msg"),
         ];
         assert_eq!(
-            classify_file(Some(&segments)),
+            classify_file(Some(&entries)),
             FileOutcome::HasDiagnostics(vec![
                 de(1, ":1:1 [error] server-a: msg"),
-                de(2, ":2:1 [warning] server-b: msg"),
+                de(2, ":2:1 [warning] shellcheck(SC2086): msg"),
             ]),
         );
-    }
-
-    #[test]
-    fn classify_file_some_servers_empty() {
-        // One server has entries, one doesn't → HasDiagnostics.
-        let segments = vec![
-            ServerDiagnostics { entries: vec![] },
-            ServerDiagnostics {
-                entries: vec![de(1, ":1:1 [error] test: msg")],
-            },
-        ];
-        assert_eq!(
-            classify_file(Some(&segments)),
-            FileOutcome::HasDiagnostics(vec![de(1, ":1:1 [error] test: msg")]),
-        );
-    }
-
-    #[test]
-    fn classify_file_all_servers_empty_is_clean() {
-        // Multiple servers, all empty → Clean.
-        let segments = vec![
-            ServerDiagnostics { entries: vec![] },
-            ServerDiagnostics { entries: vec![] },
-        ];
-        assert_eq!(classify_file(Some(&segments)), FileOutcome::Clean);
     }
 
     // ── format_diagnostics tests ────────────────────────────────────
@@ -2118,5 +2285,179 @@ mod tests {
         let kept = reconcile_source_precedence(diags, &p);
         assert_eq!(kept.len(), 1);
         assert_eq!(source_of(&kept[0]), "syntactic");
+    }
+
+    // ── cross-feeder dedup + precedence tests (ticket 02) ───────────
+
+    /// Builds a diagnostic at an explicit position carrying a `source` and
+    /// (optional) `code`.
+    fn diag_at(source: &str, code: Option<&str>, line: u32, col: u32, msg: &str) -> Value {
+        let mut d = serde_json::json!({
+            "range": {
+                "start": { "line": line, "character": col },
+                "end": { "line": line, "character": col + 1 }
+            },
+            "severity": 2,
+            "source": source,
+            "message": msg
+        });
+        if let Some(c) = code {
+            d["code"] = serde_json::json!(c);
+        }
+        d
+    }
+
+    /// Wraps a diagnostic value into a [`FeederEntry`] with a feeder context
+    /// keyed by `command` (so two feeders can be distinguished, though dedup is
+    /// feeder-blind).
+    fn fe(command: &str, value: Value) -> FeederEntry {
+        FeederEntry {
+            value,
+            fixes: Vec::new(),
+            enclosing: None,
+            ctx: Arc::new(FeederContext {
+                command: command.to_string(),
+                version: None,
+                language_id: String::new(),
+            }),
+        }
+    }
+
+    fn entry_source(e: &FeederEntry) -> &str {
+        e.value.get("source").and_then(Value::as_str).unwrap_or("")
+    }
+
+    #[test]
+    fn dedup_collapses_same_finding_across_feeders() {
+        // bash-language-server (an LSP feeder) and standalone shellcheck both
+        // report SC2086 at the same line: same (source, code, line) → one entry.
+        let entries = vec![
+            fe(
+                "bash-language-server",
+                diag_at(
+                    "shellcheck",
+                    Some("SC2086"),
+                    4,
+                    2,
+                    "Double quote to prevent globbing",
+                ),
+            ),
+            fe(
+                "shellcheck",
+                diag_at(
+                    "shellcheck",
+                    Some("SC2086"),
+                    4,
+                    9,
+                    "Double quote to prevent globbing.",
+                ),
+            ),
+        ];
+        let deduped = dedupe_entries(entries);
+        assert_eq!(deduped.len(), 1, "the wrapped + standalone copy collapse");
+        // First occurrence (the LSP feeder) wins.
+        assert_eq!(deduped[0].ctx.command, "bash-language-server");
+    }
+
+    #[test]
+    fn dedup_anchors_on_line_not_column() {
+        // Same source/code/line, drifting columns (LSP 0-based vs CLI 1-based)
+        // collapse — the key is line-anchored, bias coarse.
+        let entries = vec![
+            fe("a", diag_at("sc", Some("SC1000"), 7, 0, "msg")),
+            fe("b", diag_at("sc", Some("SC1000"), 7, 40, "msg")),
+        ];
+        assert_eq!(dedupe_entries(entries).len(), 1);
+    }
+
+    #[test]
+    fn dedup_keeps_distinct_line_source_and_code() {
+        // Different line, different source, and different code each stay.
+        let entries = vec![
+            fe("a", diag_at("sc", Some("SC1000"), 7, 0, "msg")),
+            fe("a", diag_at("sc", Some("SC1000"), 8, 0, "msg")), // different line
+            fe("a", diag_at("other", Some("SC1000"), 7, 0, "msg")), // different source
+            fe("a", diag_at("sc", Some("SC1001"), 7, 0, "msg")), // different code
+        ];
+        assert_eq!(dedupe_entries(entries).len(), 4, "nothing collapses");
+    }
+
+    #[test]
+    fn dedup_codeless_fallback_keys_on_normalized_message() {
+        // No code → fall back to (source, normalized-message, line). Whitespace
+        // and case differences in the message still collapse; a genuinely
+        // different message does not.
+        let entries = vec![
+            fe("a", diag_at("yaml", None, 3, 0, "trailing   spaces")),
+            fe("b", diag_at("yaml", None, 3, 4, "Trailing spaces")), // normalizes equal
+            fe("c", diag_at("yaml", None, 3, 0, "wrong indentation")), // distinct
+        ];
+        let deduped = dedupe_entries(entries);
+        assert_eq!(
+            deduped.len(),
+            2,
+            "normalized duplicate collapses, distinct stays"
+        );
+    }
+
+    #[test]
+    fn dedup_codeless_does_not_collide_with_coded() {
+        // A codeless entry whose message text equals another entry's code must
+        // not collapse into it — the NUL-tagged discriminant separates them.
+        let entries = vec![
+            fe("a", diag_at("x", Some("SC2086"), 1, 0, "real message")),
+            fe("b", diag_at("x", None, 1, 0, "SC2086")),
+        ];
+        assert_eq!(dedupe_entries(entries).len(), 2);
+    }
+
+    #[test]
+    fn reconcile_entries_drops_advisory_across_merged_feeders() {
+        // The advisory native E#### and the authoritative rustc E#### arrive as
+        // a single merged cross-feeder set; reconciliation drops the in-band
+        // advisory once authoritative has reported.
+        let entries = vec![
+            fe(
+                "rust-analyzer",
+                diag_at("rust-analyzer", Some("E0107"), 0, 0, "phantom"),
+            ),
+            fe(
+                "rust-analyzer",
+                diag_at("rustc", Some("E0599"), 1, 0, "no method foo"),
+            ),
+        ];
+        let kept = reconcile_entries(entries, &[ra_precedence()]);
+        assert_eq!(kept.len(), 1, "advisory in-band E#### dropped: {kept:?}");
+        assert_eq!(entry_source(&kept[0]), "rustc");
+    }
+
+    #[test]
+    fn reconcile_entries_keeps_all_when_no_policy() {
+        // Empty policy list (the `diagnostic_precedence = []` opt-out) → union.
+        let entries = vec![
+            fe(
+                "rust-analyzer",
+                diag_at("rust-analyzer", Some("E0107"), 0, 0, "phantom"),
+            ),
+            fe(
+                "rust-analyzer",
+                diag_at("rustc", Some("E0599"), 1, 0, "no method foo"),
+            ),
+        ];
+        let kept = reconcile_entries(entries, &[]);
+        assert_eq!(kept.len(), 2, "no policy keeps the union");
+    }
+
+    #[test]
+    fn reconcile_entries_keeps_advisory_when_no_authoritative() {
+        // Advisory-only merged set → kept (absence of authoritative is not
+        // contradiction), even with the policy active.
+        let entries = vec![fe(
+            "rust-analyzer",
+            diag_at("rust-analyzer", Some("E0107"), 0, 0, "preview"),
+        )];
+        let kept = reconcile_entries(entries, &[ra_precedence()]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(entry_source(&kept[0]), "rust-analyzer");
     }
 }

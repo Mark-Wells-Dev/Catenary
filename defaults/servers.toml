@@ -11,33 +11,20 @@
 #
 # Mostly only `command` and `args` are defined here;
 # `initialization_options`, `settings`, `env`, and other fields are user
-# preferences. The exception is `diagnostic_precedence` (misc 115): a
-# server-agnostic source-reconciliation *policy* whose correct default is a
-# property of the server, not a user preference, so it ships as a default row.
-# A user `[server.*]` override replaces the whole row, so a user who overrides
-# `command`/`args` must re-state `diagnostic_precedence` to keep it.
+# preferences.
+#
+# Source-precedence reconciliation (misc 115) no longer lives here: as of
+# workstream 34 ticket 02 it is a per-root, cross-feeder policy configured via a
+# top-level `[[diagnostic_precedence]]` section. The rust-analyzer / flycheck
+# default ships in code (`DiagnosticPrecedence::rust_analyzer_default`) and is
+# keyed on the LSP `source` field, so it is a no-op for any root whose
+# diagnostics carry none of those sources.
 
 # ── Own name ─────────────────────────────────────────────────────
 
 [server.rust-analyzer]
 command = "rustup"
 args = ["run", "stable", "rust-analyzer"]
-
-# Source-precedence reconciliation (misc 115, bug 42). rust-analyzer publishes
-# two diagnostic streams via publishDiagnostics, each tagged with `source`:
-# its in-memory `rust-analyzer` native analysis (fast, but unreliable inside
-# macro expansions) and its flycheck stream (`rustc`/`clippy` — the real
-# compiler, ground truth). A native phantom (e.g. E0107 at a macro call site
-# against a stale trait view) can ride alongside a clean flycheck result. A
-# rustc error code (E####) is by definition something rustc produces, so a
-# native E#### that flycheck does not corroborate is a false positive. The
-# filter drops native diagnostics in the rustc-E#### band once flycheck has
-# reported for that file (`catenary diagnostics` already waits for flycheck,
-# bug 28). Native keeps everything outside the band.
-[server.rust-analyzer.diagnostic_precedence]
-advisory_sources = ["rust-analyzer"]
-authoritative_sources = ["rustc", "clippy"]
-code_pattern = "^E[0-9]+$"
 
 [server.gopls]
 command = "gopls"

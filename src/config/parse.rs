@@ -15,8 +15,8 @@ use crate::logging::reaper::ReapPolicy;
 
 use super::commands::{self, CommandsConfig};
 use super::{
-    Config, IconConfig, LanguageConfig, LinterConfig, NotificationConfig, RootsConfig,
-    ServerBinding, ServerDef, ToolsConfig, TuiConfig, default_log_retention_days,
+    Config, DiagnosticPrecedence, IconConfig, LanguageConfig, LinterConfig, NotificationConfig,
+    RootsConfig, ServerBinding, ServerDef, ToolsConfig, TuiConfig, default_log_retention_days,
 };
 
 /// Embedded default classification config (lowest-priority layer).
@@ -67,6 +67,15 @@ struct RawConfig {
 
     #[serde(default)]
     linter: HashMap<String, LinterConfig>,
+
+    /// Cross-feeder precedence policies (`[[diagnostic_precedence]]`).
+    ///
+    /// `None` = the layer did not mention the section (inherit the earlier
+    /// layer, ultimately the seeded [`DiagnosticPrecedence::rust_analyzer_default`]).
+    /// `Some` (even empty) = the layer sets the policy list, replacing it —
+    /// `diagnostic_precedence = []` is the explicit "no precedence" opt-out.
+    #[serde(default)]
+    diagnostic_precedence: Option<Vec<DiagnosticPrecedence>>,
 
     #[serde(default)]
     commands: Option<CommandsConfig>,
@@ -207,6 +216,15 @@ pub fn load_from_sources(sources: &[PathBuf]) -> Result<Config> {
             .context("linter patterns compilation failed after validation (bug)")?;
     }
 
+    // Compile cross-feeder precedence code bands after validation (ticket 02).
+    // The seeded default is already compiled; this populates any user-provided
+    // `[[diagnostic_precedence]]` policies, whose patterns validation checked.
+    for precedence in &mut config.diagnostic_precedence {
+        precedence.compile().context(
+            "diagnostic_precedence code_pattern compilation failed after validation (bug)",
+        )?;
+    }
+
     Ok(config)
 }
 
@@ -223,7 +241,6 @@ pub const SERVER_DEF_KEYS: &[&str] = &[
     "env",
     "file_patterns",
     "single_file",
-    "diagnostic_precedence",
 ];
 
 /// Deserialize a TOML source, handling the `[server.*]` / `[language.*]`
@@ -417,6 +434,12 @@ fn merge(config: &mut Config, other: RawConfig) {
     for (key, value) in other.linter {
         config.linter.insert(key, value);
     }
+    // Whole-list replace when the layer sets the section (`Some`, even empty),
+    // mirroring `servers = []`: an explicit empty array clears the seeded
+    // default; absence (`None`) inherits the earlier layer.
+    if let Some(precedence) = other.diagnostic_precedence {
+        config.diagnostic_precedence = precedence;
+    }
     if let Some(ref cmds) = other.commands {
         config
             .resolved_commands
@@ -490,6 +513,7 @@ const PROJECT_CONFIG_ALLOWED_KEYS: &[&str] = &[
     "language",
     "server",
     "linter",
+    "diagnostic_precedence",
     "commands",
 ];
 
@@ -531,6 +555,16 @@ pub struct ProjectConfig {
     /// with the user `[linter.*]` (project wins on a name collision) to form the
     /// root's effective linter set.
     pub linter: HashMap<String, LinterConfig>,
+    /// Cross-feeder precedence policies from the project config
+    /// (`[[diagnostic_precedence]]`, workstream 34 ticket 02).
+    ///
+    /// Per-root override: when non-empty, this list replaces the user-level
+    /// `diagnostic_precedence` for files under this root (see
+    /// [`LspClientManager::effective_precedence`]). Empty = unspecified, so the
+    /// user policy is inherited.
+    ///
+    /// [`LspClientManager::effective_precedence`]: crate::lsp::LspClientManager::effective_precedence
+    pub diagnostic_precedence: Vec<DiagnosticPrecedence>,
     /// Command filter configuration from the project config.
     ///
     /// `build` is per-root (each root can have its own build tool).
@@ -767,6 +801,30 @@ pub fn load_project_config(root: &std::path::Path) -> Result<Option<ProjectConfi
         })?;
     }
 
+    // Parse [[diagnostic_precedence]] policies (workstream 34 ticket 02). A
+    // non-empty list overrides the user-level precedence for this root; absence
+    // (empty) inherits it.
+    let mut diagnostic_precedence: Vec<DiagnosticPrecedence> = raw
+        .get("diagnostic_precedence")
+        .map(|v| {
+            toml::Value::try_into(v.clone()).with_context(|| {
+                format!(
+                    "Failed to parse [[diagnostic_precedence]] in project config: {}",
+                    config_path.display()
+                )
+            })
+        })
+        .transpose()?
+        .unwrap_or_default();
+    for precedence in &mut diagnostic_precedence {
+        precedence.compile().with_context(|| {
+            format!(
+                "Project config {}: [[diagnostic_precedence]] code_pattern compilation failed",
+                config_path.display()
+            )
+        })?;
+    }
+
     // Parse and validate [commands] section.
     let commands_config: Option<CommandsConfig> = raw
         .get("commands")
@@ -827,6 +885,7 @@ pub fn load_project_config(root: &std::path::Path) -> Result<Option<ProjectConfi
         language,
         server,
         linter,
+        diagnostic_precedence,
         commands: commands_config,
     }))
 }
@@ -1501,6 +1560,47 @@ servers = ["pyright"]
         assert!(
             result.is_err(),
             "invalid glob must fail project-config load"
+        );
+    }
+
+    // ── Project config [[diagnostic_precedence]] (ticket 02) ─────────
+
+    #[test]
+    fn test_load_project_config_precedence() -> Result<()> {
+        let dir = tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join(".catenary.toml"),
+            "[[diagnostic_precedence]]\n\
+             advisory_sources = [\"adv\"]\n\
+             authoritative_sources = [\"auth\"]\n\
+             code_pattern = \"^E[0-9]+$\"\n",
+        )
+        .expect("write");
+
+        let config = load_project_config(dir.path())?.expect("project config");
+        assert_eq!(config.diagnostic_precedence.len(), 1);
+        let policy = &config.diagnostic_precedence[0];
+        assert!(policy.is_advisory("adv"));
+        assert!(policy.is_authoritative("auth"));
+        // Compiled at load — the band matches an E#### code.
+        assert!(policy.code_in_band("E0107"));
+        assert!(!policy.code_in_band("other"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_project_config_precedence_invalid_regex_errors() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join(".catenary.toml"),
+            "[[diagnostic_precedence]]\ncode_pattern = \"^E[0-9+$\"\n",
+        )
+        .expect("write");
+
+        let result = load_project_config(dir.path());
+        assert!(
+            result.is_err(),
+            "invalid precedence regex must fail project-config load"
         );
     }
 }

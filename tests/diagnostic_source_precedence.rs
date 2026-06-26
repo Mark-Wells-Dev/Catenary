@@ -11,9 +11,10 @@
 //!
 //! mockls cannot reproduce rust-analyzer's macro engine, so these tests drive a
 //! mockls instance configured with `--extra-diagnostic` (multiple `source`s in
-//! one per-file publish) plus a `[server.*].diagnostic_precedence` policy, and
-//! assert the filter drops the advisory source's diagnostics in the
-//! authoritative band — but only once the authoritative source has reported.
+//! one per-file publish) plus a top-level `[[diagnostic_precedence]]` policy
+//! (per-root, cross-feeder — workstream 34 ticket 02), and assert the filter
+//! drops the advisory source's diagnostics in the authoritative band — but only
+//! once the authoritative source has reported.
 
 mod common;
 
@@ -28,8 +29,10 @@ const MOCK_LANG: &str = "pR3cD";
 /// Writes a config that defines a mockls server for `MOCK_LANG` with the given
 /// extra-diagnostic args and the rust-analyzer-style precedence policy
 /// (native advisory, rustc/clippy authoritative, scoped to the rustc `E####`
-/// band). When `with_policy` is false, the precedence section is omitted (a
-/// server with no policy — the baseline).
+/// band) as a top-level `[[diagnostic_precedence]]` section. When `with_policy`
+/// is false, an explicit empty `diagnostic_precedence = []` clears the shipped
+/// default so the baseline (union) is observed — the global default would
+/// otherwise reconcile these very sources.
 fn write_config(dir: &Path, extra_diagnostics: &[&str], with_policy: bool) -> Result<PathBuf> {
     let mockls_bin = env!("CARGO_BIN_EXE_mockls");
     let config_path = dir.join("config.toml");
@@ -44,24 +47,26 @@ fn write_config(dir: &Path, extra_diagnostics: &[&str], with_policy: bool) -> Re
     }
     let args_line = args.join(", ");
 
-    let policy = if with_policy {
-        format!(
-            "\n[server.mockls-{MOCK_LANG}.diagnostic_precedence]\n\
-             advisory_sources = [\"rust-analyzer\"]\n\
-             authoritative_sources = [\"rustc\", \"clippy\"]\n\
-             code_pattern = \"^E[0-9]+$\"\n"
-        )
+    // Top-level precedence: array-of-tables for the policy, or an explicit empty
+    // array to clear the shipped default. Placed first so the `[[...]]` /
+    // top-level key is not captured by a following `[table]` header.
+    let precedence = if with_policy {
+        "[[diagnostic_precedence]]\n\
+         advisory_sources = [\"rust-analyzer\"]\n\
+         authoritative_sources = [\"rustc\", \"clippy\"]\n\
+         code_pattern = \"^E[0-9]+$\"\n\n"
+            .to_string()
     } else {
-        String::new()
+        "diagnostic_precedence = []\n\n".to_string()
     };
 
     std::fs::write(
         &config_path,
         format!(
-            "[server.mockls-{MOCK_LANG}]\n\
+            "{precedence}\
+             [server.mockls-{MOCK_LANG}]\n\
              command = \"{mockls_bin}\"\n\
-             args = [{args_line}]\n\
-             {policy}\n\
+             args = [{args_line}]\n\n\
              [language.{MOCK_LANG}]\n\
              servers = [\"mockls-{MOCK_LANG}\"]\n"
         ),
