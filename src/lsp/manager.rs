@@ -343,16 +343,16 @@ impl LspClientManager {
         linters
     }
 
-    /// The effective cross-feeder precedence policies for a root (workstream 34
-    /// ticket 02).
+    /// The effective cross-feeder precedence chains for a root (linters ticket
+    /// 02).
     ///
-    /// The root's project `[[diagnostic_precedence]]` when it sets any (a
+    /// The root's project `[[diagnostics.precedence]]` when it sets any (a
     /// per-root override), else the user-level list (seeded with
     /// [`DiagnosticPrecedence::rust_analyzer_default`]). Applied per file over
     /// the merged diagnostic set from every feeder — language servers and
-    /// linters alike — so one policy reconciles them together.
+    /// linters alike — so one chain reconciles them together.
     ///
-    /// Each returned policy carries its compiled code band, ready for
+    /// Each returned chain carries its compiled code band, ready for
     /// reconciliation.
     ///
     /// [`DiagnosticPrecedence::rust_analyzer_default`]: crate::config::DiagnosticPrecedence::rust_analyzer_default
@@ -5815,13 +5815,12 @@ mod tests {
         );
     }
 
-    /// `effective_precedence` returns the per-root project policy when set, else
+    /// `effective_precedence` returns the per-root project chain when set, else
     /// the user-level list (ticket 02).
     #[test]
     fn test_effective_precedence_project_overrides_user() {
         let user_policy = crate::config::DiagnosticPrecedence {
-            advisory_sources: vec!["user-adv".to_string()],
-            authoritative_sources: vec!["user-auth".to_string()],
+            priority: vec!["user-high".to_string(), "user-low".to_string()],
             code_pattern: None,
             compiled_code_pattern: None,
         };
@@ -5832,7 +5831,7 @@ mod tests {
         // Unknown root → user-level list.
         let user = manager.effective_precedence(&PathBuf::from("/unknown"));
         assert_eq!(user.len(), 1);
-        assert!(user[0].is_advisory("user-adv"));
+        assert_eq!(user[0].rank("user-high"), Some(0));
 
         // Project override replaces the user list for that root.
         let overridden = PathBuf::from("/override");
@@ -5840,8 +5839,7 @@ mod tests {
             overridden.clone(),
             crate::config::ProjectConfig {
                 diagnostic_precedence: vec![crate::config::DiagnosticPrecedence {
-                    advisory_sources: vec!["proj-adv".to_string()],
-                    authoritative_sources: vec!["proj-auth".to_string()],
+                    priority: vec!["proj-high".to_string(), "proj-low".to_string()],
                     code_pattern: None,
                     compiled_code_pattern: None,
                 }],
@@ -5850,14 +5848,14 @@ mod tests {
         );
         let proj = manager.effective_precedence(&overridden);
         assert_eq!(proj.len(), 1);
-        assert!(proj[0].is_advisory("proj-adv"), "project policy wins");
+        assert_eq!(proj[0].rank("proj-high"), Some(0), "project chain wins");
 
         // A root with an empty project precedence inherits the user list.
         let inherited = PathBuf::from("/inherit");
         manager.install_root_config(inherited.clone(), crate::config::ProjectConfig::default());
         let policy = manager.effective_precedence(&inherited);
         assert_eq!(policy.len(), 1);
-        assert!(policy[0].is_advisory("user-adv"), "inherits user list");
+        assert_eq!(policy[0].rank("user-high"), Some(0), "inherits user list");
     }
 
     /// `lint_covers` matches the root-relative path against the effective linter

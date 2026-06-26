@@ -1443,9 +1443,10 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path().join("workspace");
         std::fs::create_dir_all(&root).expect("create workspace dir");
-        std::fs::write(root.join(".catenary.toml"), "disable_lsp = true\n").expect("write config");
+        std::fs::write(root.join(".catenary.toml"), "[lsp]\ndisable = true\n")
+            .expect("write config");
         // No spawn_all: `Session::new` primes the project config at construction,
-        // so the gate sees `disable_lsp` immediately (ticket 00).
+        // so the gate sees `[lsp] disable` immediately (ticket 00).
         let session = session_with_root(rt.handle(), root.clone());
 
         let served = root.join("src/main.rs");
@@ -1467,7 +1468,11 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path().join("workspace");
         std::fs::create_dir_all(&root).expect("create workspace dir");
-        std::fs::write(root.join(".catenary.toml"), "disable_diag = true\n").expect("write config");
+        std::fs::write(
+            root.join(".catenary.toml"),
+            "[diagnostics]\ndisable = true\n",
+        )
+        .expect("write config");
         // No spawn_all: the config is primed at construction (ticket 00).
         let session = session_with_root(rt.handle(), root.clone());
 

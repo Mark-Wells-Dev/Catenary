@@ -1149,91 +1149,102 @@ fn resolve_enclosing_symbols(
         .collect()
 }
 
-/// Reconciles overlapping diagnostics by their `source` (misc 115, bug 42).
+/// Reconciles overlapping diagnostics by their `source` priority chain (misc
+/// 115, bug 42; chain form in linters ticket 02).
 ///
-/// **Generic, server-agnostic.** Given a file's complete merged diagnostic set
-/// from one server and that server's [`DiagnosticPrecedence`] policy, drops
-/// each *advisory* source's diagnostics that fall inside the band an
-/// *authoritative* source owns — but **only when the authoritative source has
-/// actually reported for this file**. Absence of an authoritative report is
-/// not contradiction: with no authoritative diagnostic present, advisory
-/// diagnostics are kept (the instant pre-flycheck preview, a single-source
-/// server). Diagnostics outside the band (an advisory source's own lints, an
-/// unresolved-import that is not a rustc-coded error) are always kept.
+/// **Generic, feeder-agnostic.** Given a file's complete merged diagnostic set
+/// and a [`DiagnosticPrecedence`] chain (source names, highest trust first),
+/// drops each diagnostic whose source is outranked by a source that *actually
+/// reported* for this file — inside the band when a `code_pattern` is set.
+/// Absence of a higher-priority report is **not** contradiction: with no
+/// higher-ranked source present, the diagnostic is kept (the instant
+/// pre-flycheck preview, a single-source server). Out-of-band diagnostics (a
+/// lower source's own lints, an unresolved-import that is not a rustc-coded
+/// error) are always kept.
 ///
-/// "Authoritative has reported" is gated on the *presence* of any authoritative
-/// diagnostic in this set — a clean authoritative result publishes zero
-/// diagnostics, so its silence here is indistinguishable from
-/// not-yet-reported, and we keep advisory (no over-suppression). This is the
-/// honest limit: the rule only fires when the authoritative source put at least
-/// one diagnostic on the file. For the rust-analyzer / flycheck case that holds
-/// — flycheck publishes its findings for a file it analyzed, and a native
-/// phantom E#### only matters when it claims an error flycheck did not.
+/// The gate is the *presence* of a strictly-higher-priority diagnostic in this
+/// set — a clean higher source publishes zero diagnostics, so its silence here
+/// is indistinguishable from not-yet-reported, and the lower source is kept (no
+/// over-suppression). For the rust-analyzer / flycheck case that holds: flycheck
+/// publishes its findings for a file it analyzed, and a native phantom E#### only
+/// matters when it claims an error flycheck did not.
 ///
 /// Production reconciliation runs over the cross-feeder [`FeederEntry`] set via
 /// [`reconcile_entries`]; this value-level form exercises the shared
-/// [`authoritative_reported`] / [`advisory_in_band`] predicates directly.
+/// [`precedence_min_rank`] / [`precedence_drops`] predicates directly.
 #[cfg(test)]
 fn reconcile_source_precedence(
     diagnostics: Vec<Value>,
     precedence: &crate::config::DiagnosticPrecedence,
 ) -> Vec<Value> {
-    // Has any authoritative source put a diagnostic on this file? Only then
-    // does an advisory source lose its band.
-    if !authoritative_reported(diagnostics.iter(), precedence) {
+    let Some(min_rank) = precedence_min_rank(diagnostics.iter(), precedence) else {
         return diagnostics;
-    }
+    };
     diagnostics
         .into_iter()
-        .filter(|d| !advisory_in_band(d, precedence))
+        .filter(|d| !precedence_drops(d, precedence, min_rank))
         .collect()
 }
 
-/// Whether any authoritative source has reported in this diagnostic set.
-///
-/// The precedence rule only fires once an authoritative source has put at least
-/// one diagnostic on the file — absence of an authoritative report is not
-/// contradiction (see [`DiagnosticPrecedence`](crate::config::DiagnosticPrecedence)).
-fn authoritative_reported<'a>(
-    diagnostics: impl IntoIterator<Item = &'a Value>,
+/// The trust rank of a diagnostic's `source` within the chain, or `None` when
+/// the source is not part of it.
+fn source_rank(
+    diagnostic: &Value,
     precedence: &crate::config::DiagnosticPrecedence,
-) -> bool {
-    diagnostics.into_iter().any(|d| {
-        d.get("source")
-            .and_then(Value::as_str)
-            .is_some_and(|s| precedence.is_authoritative(s))
-    })
-}
-
-/// Whether a diagnostic is an *advisory* source's finding *inside* the
-/// authoritative band — the only case eligible to be dropped once the
-/// authoritative source has reported.
-fn advisory_in_band(diagnostic: &Value, precedence: &crate::config::DiagnosticPrecedence) -> bool {
-    let source = diagnostic
+) -> Option<usize> {
+    diagnostic
         .get("source")
         .and_then(Value::as_str)
-        .unwrap_or("");
-    precedence.is_advisory(source)
-        && precedence.code_in_band(&render_diagnostic_code(diagnostic.get("code")))
+        .and_then(|s| precedence.rank(s))
+}
+
+/// The best (lowest) rank present across the set — the highest-trust source that
+/// reported for the file. `None` when no charted source reported, in which case
+/// nothing is dropped (the gate never fires).
+fn precedence_min_rank<'a>(
+    diagnostics: impl IntoIterator<Item = &'a Value>,
+    precedence: &crate::config::DiagnosticPrecedence,
+) -> Option<usize> {
+    diagnostics
+        .into_iter()
+        .filter_map(|d| source_rank(d, precedence))
+        .min()
+}
+
+/// Whether a diagnostic is outranked (some strictly-higher source reported) and
+/// in-band — the condition for dropping it. `min_rank` is the best rank present
+/// in the file's set; a diagnostic at rank `r > min_rank` has a higher-priority
+/// source present, so it loses inside the band.
+fn precedence_drops(
+    diagnostic: &Value,
+    precedence: &crate::config::DiagnosticPrecedence,
+    min_rank: usize,
+) -> bool {
+    match source_rank(diagnostic, precedence) {
+        Some(r) if r > min_rank => {
+            precedence.code_in_band(&render_diagnostic_code(diagnostic.get("code")))
+        }
+        _ => false,
+    }
 }
 
 /// Reconciles source precedence over a file's merged cross-feeder set (ticket
 /// 02).
 ///
 /// Applies each per-root [`DiagnosticPrecedence`](crate::config::DiagnosticPrecedence)
-/// policy in turn to the [`FeederEntry`] list — the same advisory-in-band rule
+/// chain in turn to the [`FeederEntry`] list — the same outranked-in-band rule
 /// the per-server path used, now run over diagnostics from *every* feeder
-/// together. Policies are narrow and source-disjoint in practice, so the order
+/// together. Chains are narrow and source-disjoint in practice, so the order
 /// among them does not matter.
 fn reconcile_entries(
     mut entries: Vec<FeederEntry>,
     policies: &[crate::config::DiagnosticPrecedence],
 ) -> Vec<FeederEntry> {
     for policy in policies {
-        if !authoritative_reported(entries.iter().map(|e| &e.value), policy) {
+        let Some(min_rank) = precedence_min_rank(entries.iter().map(|e| &e.value), policy) else {
             continue;
-        }
-        entries.retain(|e| !advisory_in_band(&e.value, policy));
+        };
+        entries.retain(|e| !precedence_drops(&e.value, policy, min_rank));
     }
     entries
 }
@@ -2176,12 +2187,15 @@ mod tests {
         d
     }
 
-    /// The rust-analyzer default policy: native advisory, rustc/clippy
-    /// authoritative, scoped to the rustc `E####` band.
+    /// The rust-analyzer default chain: rustc/clippy outrank rust-analyzer,
+    /// scoped to the rustc `E####` band.
     fn ra_precedence() -> crate::config::DiagnosticPrecedence {
         let mut p = crate::config::DiagnosticPrecedence {
-            advisory_sources: vec!["rust-analyzer".to_string()],
-            authoritative_sources: vec!["rustc".to_string(), "clippy".to_string()],
+            priority: vec![
+                "rustc".to_string(),
+                "clippy".to_string(),
+                "rust-analyzer".to_string(),
+            ],
             code_pattern: Some("^E[0-9]+$".to_string()),
             compiled_code_pattern: None,
         };
@@ -2270,10 +2284,9 @@ mod tests {
     #[test]
     fn precedence_without_code_pattern_drops_all_advisory_once_authoritative_reports() {
         // No code_pattern → the whole-diagnostic set is the band. Every
-        // advisory diagnostic is dropped once an authoritative one is present.
+        // lower-priority diagnostic is dropped once a higher-ranked one is present.
         let mut p = crate::config::DiagnosticPrecedence {
-            advisory_sources: vec!["semantic".to_string()],
-            authoritative_sources: vec!["syntactic".to_string()],
+            priority: vec!["syntactic".to_string(), "semantic".to_string()],
             code_pattern: None,
             compiled_code_pattern: None,
         };
@@ -2433,7 +2446,7 @@ mod tests {
 
     #[test]
     fn reconcile_entries_keeps_all_when_no_policy() {
-        // Empty policy list (the `diagnostic_precedence = []` opt-out) → union.
+        // Empty policy list (the `[diagnostics] precedence = []` opt-out) → union.
         let entries = vec![
             fe(
                 "rust-analyzer",

@@ -14,11 +14,11 @@
 # preferences.
 #
 # Source-precedence reconciliation (misc 115) no longer lives here: as of
-# workstream 34 ticket 02 it is a per-root, cross-feeder policy configured via a
-# top-level `[[diagnostic_precedence]]` section. The rust-analyzer / flycheck
-# default ships in code (`DiagnosticPrecedence::rust_analyzer_default`) and is
-# keyed on the LSP `source` field, so it is a no-op for any root whose
-# diagnostics carry none of those sources.
+# linters ticket 02 it is a per-root, cross-feeder priority chain configured via
+# a `[[diagnostics.precedence]]` section. The rust-analyzer / flycheck default
+# ships in code (`DiagnosticPrecedence::rust_analyzer_default`) and is keyed on
+# the LSP `source` field, so it is a no-op for any root whose diagnostics carry
+# none of those sources.
 
 # ── Own name ─────────────────────────────────────────────────────
 

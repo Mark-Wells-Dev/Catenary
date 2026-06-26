@@ -80,43 +80,48 @@ pub struct ServerDef {
 /// 42; hoisted to per-root in workstream 34 ticket 02).
 ///
 /// A **generic, feeder-agnostic** reconciliation keyed on the standard LSP
-/// `Diagnostic.source` field. Splits the sources that report for a file into
-/// two roles:
+/// `Diagnostic.source` field. [`priority`](Self::priority) is an ordered trust
+/// chain over source names, **highest trust first**. Over a file's merged
+/// diagnostic set (all feeders — every language server **and** every linter), a
+/// diagnostic from source `S` is dropped **once a strictly-higher-priority
+/// source has reported for that file** — and, when a
+/// [`code_pattern`](Self::code_pattern) is set, only inside that band.
 ///
-/// - **advisory** — fast but unreliable in some band (e.g. rust-analyzer's
-///   in-memory native HIR/macro analysis).
-/// - **authoritative** — ground truth in that band (e.g. rust-analyzer's
-///   flycheck = the real `rustc`/`clippy`).
+/// The old advisory/authoritative split is just a two-level chain: authoritative
+/// sources rank above advisory ones. The chain generalizes it to N levels and
+/// drops a concept (one ordered list instead of two role lists). The band keeps
+/// a lower-priority source's *out-of-band* findings (its own lints, an
+/// unresolved-import preview) — they only lose trust inside the band. The
+/// "strictly higher reported" gate is what prevents over-suppression: absence of
+/// a higher-priority report (e.g. flycheck has not run yet) is not contradiction.
 ///
-/// The rule applied over a file's merged diagnostic set (all feeders — every
-/// language server **and** every linter): an advisory source's diagnostics are
-/// dropped in the band an authoritative source owns, **once the authoritative
-/// source has reported for that file**. Scoping the rule to a
-/// [`code_pattern`](Self::code_pattern) keeps advisory diagnostics that fall
-/// *outside* the authoritative band (an advisory source's own lints, an
-/// unresolved-import preview) — they only lose trust inside the band.
+/// Precedence is configured **per root** (`[diagnostics].precedence` in user
+/// config or `.catenary.toml`), not per-`[server.*]`. It is deliberately narrow
+/// — the rust-analyzer / flycheck ground-truth tool — **not** a lever for ranking
+/// linters against language servers; that overlap is handled by opinion-free
+/// dedup, not precedence.
 ///
-/// Precedence is configured **per root** (top-level `[[diagnostic_precedence]]`
-/// in user config or `.catenary.toml`), not per-`[server.*]`. It is deliberately
-/// narrow — the rust-analyzer / flycheck ground-truth tool — **not** a lever for
-/// ranking linters against language servers; that overlap is handled by
-/// opinion-free dedup, not precedence.
+/// Note: a flat chain is a total order, so co-equal peers (e.g. `rustc` and
+/// `clippy`) are technically ranked. In practice it is moot — they never collide
+/// inside the same band — and a tiered form is the future escape hatch if a real
+/// peer case appears.
 #[derive(Debug, Default, Deserialize, Serialize, Clone)]
 pub struct DiagnosticPrecedence {
-    /// Source names whose diagnostics are advisory in the band (dropped when
-    /// the authoritative source has reported, see [`Self::code_pattern`]).
+    /// Diagnostic `source` names in descending trust order (highest first).
+    ///
+    /// Within the band, a diagnostic from a source listed here is dropped once a
+    /// source ranked *strictly higher* has reported for the file. Sources not in
+    /// the list are never dropped and never suppress others.
+    ///
+    /// Example: `["rustc", "clippy", "rust-analyzer"]` — rust-analyzer's native
+    /// analysis defers to flycheck's `rustc`/`clippy` ground truth.
     #[serde(default)]
-    pub advisory_sources: Vec<String>,
-
-    /// Source names whose diagnostics are authoritative — ground truth in the
-    /// band. Their presence (for a file) clobbers advisory diagnostics there.
-    #[serde(default)]
-    pub authoritative_sources: Vec<String>,
+    pub priority: Vec<String>,
 
     /// Regex scoping the reconciliation to a code band, matched against the
-    /// diagnostic's `code` (rendered as a string). When set, only advisory
-    /// diagnostics whose code matches are eligible to be dropped; advisory
-    /// diagnostics outside the band are always kept.
+    /// diagnostic's `code` (rendered as a string). When set, only diagnostics
+    /// whose code matches are eligible to be dropped; out-of-band diagnostics
+    /// are always kept.
     ///
     /// For rust-analyzer the band is the rustc error-code namespace
     /// (`^E[0-9]+$`): a rustc error code is by definition something `rustc`
@@ -132,19 +137,14 @@ pub struct DiagnosticPrecedence {
 }
 
 impl DiagnosticPrecedence {
-    /// Returns `true` if `source` is listed as authoritative.
+    /// Returns the trust rank of `source` (0 = highest), or `None` when the
+    /// source is not part of this chain.
     #[must_use]
-    pub fn is_authoritative(&self, source: &str) -> bool {
-        self.authoritative_sources.iter().any(|s| s == source)
+    pub fn rank(&self, source: &str) -> Option<usize> {
+        self.priority.iter().position(|s| s == source)
     }
 
-    /// Returns `true` if `source` is listed as advisory.
-    #[must_use]
-    pub fn is_advisory(&self, source: &str) -> bool {
-        self.advisory_sources.iter().any(|s| s == source)
-    }
-
-    /// Returns `true` if `code` falls inside the authoritative band.
+    /// Returns `true` if `code` falls inside the reconciliation band.
     ///
     /// An absent or empty [`code_pattern`](Self::code_pattern) means the band
     /// is unrestricted — every code is in-band.
@@ -167,16 +167,16 @@ impl DiagnosticPrecedence {
         self.compiled_code_pattern = match &self.code_pattern {
             Some(pat) => Some(
                 Regex::new(pat)
-                    .with_context(|| format!("diagnostic_precedence code_pattern '{pat}'"))?,
+                    .with_context(|| format!("diagnostics.precedence code_pattern '{pat}'"))?,
             ),
             None => None,
         };
         Ok(())
     }
 
-    /// The shipped default precedence policy: rust-analyzer's native analysis is
-    /// advisory against its flycheck (`rustc`/`clippy`) ground truth, scoped to
-    /// the rustc `E####` error-code band (misc 115, bug 42).
+    /// The shipped default precedence chain: rust-analyzer's native analysis
+    /// defers to its flycheck (`rustc`/`clippy`) ground truth, scoped to the
+    /// rustc `E####` error-code band (misc 115, bug 42).
     ///
     /// Returned pre-compiled so it works on the [`Config::default`] path that
     /// skips the post-load compile step. Keyed purely on `source` names, so it is
@@ -189,14 +189,17 @@ impl DiagnosticPrecedence {
     pub fn rust_analyzer_default() -> Self {
         let pattern = "^E[0-9]+$";
         // The pattern is a compile-time constant known to be valid; on the
-        // impossible regex error, fall back to an inert (empty-source) policy
+        // impossible regex error, fall back to an inert (empty-chain) policy
         // rather than an unrestricted band — an unrestricted band would drop
-        // *all* advisory diagnostics, far worse than doing nothing.
+        // *all* lower-priority diagnostics, far worse than doing nothing.
         Regex::new(pattern).map_or_else(
             |_| Self::default(),
             |re| Self {
-                advisory_sources: vec!["rust-analyzer".to_string()],
-                authoritative_sources: vec!["rustc".to_string(), "clippy".to_string()],
+                priority: vec![
+                    "rustc".to_string(),
+                    "clippy".to_string(),
+                    "rust-analyzer".to_string(),
+                ],
                 code_pattern: Some(pattern.to_string()),
                 compiled_code_pattern: Some(re),
             },

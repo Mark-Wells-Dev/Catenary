@@ -10,10 +10,10 @@
 //! (workstream 34 ticket 00).
 //!
 //! The old coarse `lsp = false` kill switch — which disabled the whole
-//! session — is gone. A root with `disable_lsp = true` is still tracked and
+//! session — is gone. A root with `[lsp] disable = true` is still tracked and
 //! the daemon serves normally; the toggle only drops the LSP feeder for that
 //! root. These tests assert the daemon is **not** wedged or whole-disabled by
-//! either the new toggle or a leftover (now-removed) `lsp` key.
+//! either the new toggle or a leftover (now-removed) bare `lsp` key.
 
 mod common;
 
@@ -52,10 +52,10 @@ fn disable_lsp_root_still_serves() -> Result<()> {
     let root = dir.path().to_str().ok_or_else(|| anyhow!("dir path"))?;
     fs::write(
         PathBuf::from(root).join(".catenary.toml"),
-        "disable_lsp = true\n",
+        "[lsp]\ndisable = true\n",
     )?;
 
-    // disable_lsp drops the LSP feeder for the root but does not disable the
+    // [lsp] disable drops the LSP feeder for the root but does not disable the
     // session — the daemon completes the handshake and answers normally.
     let mut bridge = BridgeProcess::spawn(&[], root)?;
     assert_serves_but_no_tools(&mut bridge)

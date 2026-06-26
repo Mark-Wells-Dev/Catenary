@@ -68,17 +68,26 @@ struct RawConfig {
     #[serde(default)]
     linter: HashMap<String, LinterConfig>,
 
-    /// Cross-feeder precedence policies (`[[diagnostic_precedence]]`).
-    ///
-    /// `None` = the layer did not mention the section (inherit the earlier
-    /// layer, ultimately the seeded [`DiagnosticPrecedence::rust_analyzer_default`]).
-    /// `Some` (even empty) = the layer sets the policy list, replacing it —
-    /// `diagnostic_precedence = []` is the explicit "no precedence" opt-out.
+    /// The `[diagnostics]` section (the diagnostics surface config). At user
+    /// level only `precedence` is meaningful; `disable` is a per-root toggle.
     #[serde(default)]
-    diagnostic_precedence: Option<Vec<DiagnosticPrecedence>>,
+    diagnostics: Option<RawDiagnostics>,
 
     #[serde(default)]
     commands: Option<CommandsConfig>,
+}
+
+/// Deserialize target for the `[diagnostics]` section.
+///
+/// `precedence` distinguishes absent (`None` — inherit the earlier layer,
+/// ultimately the seeded [`DiagnosticPrecedence::rust_analyzer_default`]) from
+/// set (`Some`, even empty — replace it; `precedence = []` is the explicit "no
+/// precedence" opt-out).
+#[derive(Debug, Deserialize, Clone, Default)]
+struct RawDiagnostics {
+    /// `[[diagnostics.precedence]]` — cross-feeder precedence chains.
+    #[serde(default)]
+    precedence: Option<Vec<DiagnosticPrecedence>>,
 }
 
 /// Load configuration from standard paths or a specific file.
@@ -218,7 +227,7 @@ pub fn load_from_sources(sources: &[PathBuf]) -> Result<Config> {
 
     // Compile cross-feeder precedence code bands after validation (ticket 02).
     // The seeded default is already compiled; this populates any user-provided
-    // `[[diagnostic_precedence]]` policies, whose patterns validation checked.
+    // `[[diagnostics.precedence]]` chains, whose patterns validation checked.
     for precedence in &mut config.diagnostic_precedence {
         precedence.compile().context(
             "diagnostic_precedence code_pattern compilation failed after validation (bug)",
@@ -434,10 +443,12 @@ fn merge(config: &mut Config, other: RawConfig) {
     for (key, value) in other.linter {
         config.linter.insert(key, value);
     }
-    // Whole-list replace when the layer sets the section (`Some`, even empty),
-    // mirroring `servers = []`: an explicit empty array clears the seeded
-    // default; absence (`None`) inherits the earlier layer.
-    if let Some(precedence) = other.diagnostic_precedence {
+    // Whole-list replace when the layer sets `[[diagnostics.precedence]]`
+    // (`Some`, even empty), mirroring `servers = []`: an explicit empty array
+    // clears the seeded default; absence (`None`) inherits the earlier layer.
+    if let Some(diagnostics) = other.diagnostics
+        && let Some(precedence) = diagnostics.precedence
+    {
         config.diagnostic_precedence = precedence;
     }
     if let Some(ref cmds) = other.commands {
@@ -503,17 +514,16 @@ pub(super) fn parse_server_specs(val: &str) -> Vec<(String, ServerDef, LanguageC
 
 /// Top-level keys allowed in `.catenary.toml` project config files.
 ///
-/// The three per-root feeder toggles (`disable_lsp` / `disable_lint` /
-/// `disable_diag`) replace the removed `lsp`/`enabled` key (workstream 34
-/// ticket 00). The unsupported-key warning skips all of these.
+/// The per-root feeder/surface toggles live nested under their subsystem
+/// tables: `[lsp] disable`, `[linter] disable`, `[diagnostics] disable`
+/// (linters 02). `[diagnostics]` also carries `[[diagnostics.precedence]]`.
+/// The unsupported-key warning skips all of these.
 const PROJECT_CONFIG_ALLOWED_KEYS: &[&str] = &[
-    "disable_lsp",
-    "disable_lint",
-    "disable_diag",
+    "lsp",
+    "linter",
+    "diagnostics",
     "language",
     "server",
-    "linter",
-    "diagnostic_precedence",
     "commands",
 ];
 
@@ -555,11 +565,11 @@ pub struct ProjectConfig {
     /// with the user `[linter.*]` (project wins on a name collision) to form the
     /// root's effective linter set.
     pub linter: HashMap<String, LinterConfig>,
-    /// Cross-feeder precedence policies from the project config
-    /// (`[[diagnostic_precedence]]`, workstream 34 ticket 02).
+    /// Cross-feeder precedence chains from the project config
+    /// (`[[diagnostics.precedence]]`, linters ticket 02).
     ///
     /// Per-root override: when non-empty, this list replaces the user-level
-    /// `diagnostic_precedence` for files under this root (see
+    /// precedence for files under this root (see
     /// [`LspClientManager::effective_precedence`]). Empty = unspecified, so the
     /// user policy is inherited.
     ///
@@ -691,18 +701,23 @@ pub fn load_project_config(root: &std::path::Path) -> Result<Option<ProjectConfi
     // deprecated `enabled` alias) is gone, replaced by the three orthogonal
     // toggles below. Error rather than silently ignore — a stale `lsp = false`
     // means "disable LSP here", and dropping it would silently re-enable LSP.
-    if raw.get("lsp").is_some() || raw.get("enabled").is_some() {
+    // Reject the pre-2.0 bare `lsp = false` / `enabled = false` toggles. The
+    // `[lsp]` *table* (carrying `disable`) is the current form, so only a scalar
+    // `lsp` value is the removed key.
+    if matches!(raw.get("lsp"), Some(v) if !v.is_table()) || raw.get("enabled").is_some() {
         bail!(
-            "Project config {}: the `lsp`/`enabled` key was removed in 2.0 — \
-             use `disable_lsp` instead (polarity flips: `lsp = false` becomes \
-             `disable_lsp = true`).",
+            "Project config {}: the bare `lsp`/`enabled` toggle was removed — \
+             use a `[lsp]` table with `disable` instead (polarity flips: \
+             `lsp = false` becomes `[lsp]` / `disable = true`).",
             config_path.display(),
         );
     }
 
-    let disable_lsp = parse_bool_flag(&raw, "disable_lsp", &config_path)?;
-    let disable_lint = parse_bool_flag(&raw, "disable_lint", &config_path)?;
-    let disable_diag = parse_bool_flag(&raw, "disable_diag", &config_path)?;
+    // Per-root feeder/surface toggles, nested under their subsystem tables
+    // (linters 02): `[lsp] disable`, `[linter] disable`, `[diagnostics] disable`.
+    let disable_lsp = parse_section_disable(&raw, "lsp", &config_path)?;
+    let disable_lint = parse_section_disable(&raw, "linter", &config_path)?;
+    let disable_diag = parse_section_disable(&raw, "diagnostics", &config_path)?;
 
     // Deserialize only the supported sections.
     let mut language: HashMap<String, LanguageConfig> = raw
@@ -766,19 +781,27 @@ pub fn load_project_config(root: &std::path::Path) -> Result<Option<ProjectConfi
         }
     }
 
-    // Parse [linter.*] entries (workstream 34 ticket 01).
-    let mut linter: HashMap<String, LinterConfig> = raw
-        .get("linter")
-        .map(|v| {
-            toml::Value::try_into(v.clone()).with_context(|| {
+    // Parse [linter.*] definitions (ticket 01). The `[linter]` table also holds
+    // the `disable` feeder toggle (parsed above), so strip that key before the
+    // remaining sub-tables deserialize as the linter definition map. `disable`
+    // is therefore a reserved linter name at project scope.
+    let mut linter: HashMap<String, LinterConfig> = match raw.get("linter") {
+        Some(toml::Value::Table(table)) => {
+            let mut table = table.clone();
+            table.remove("disable");
+            toml::Value::Table(table).try_into().with_context(|| {
                 format!(
                     "Failed to parse [linter.*] in project config: {}",
                     config_path.display()
                 )
-            })
-        })
-        .transpose()?
-        .unwrap_or_default();
+            })?
+        }
+        Some(_) => bail!(
+            "Project config {}: `[linter]` must be a table",
+            config_path.display(),
+        ),
+        None => HashMap::new(),
+    };
 
     // Compile routing globs and validate. An entry with an empty `command` is
     // only valid as a `disable = true` override of a user-configured linter;
@@ -801,25 +824,23 @@ pub fn load_project_config(root: &std::path::Path) -> Result<Option<ProjectConfi
         })?;
     }
 
-    // Parse [[diagnostic_precedence]] policies (workstream 34 ticket 02). A
-    // non-empty list overrides the user-level precedence for this root; absence
-    // (empty) inherits it.
-    let mut diagnostic_precedence: Vec<DiagnosticPrecedence> = raw
-        .get("diagnostic_precedence")
-        .map(|v| {
-            toml::Value::try_into(v.clone()).with_context(|| {
+    // Parse [[diagnostics.precedence]] chains (ticket 02). A non-empty list
+    // overrides the user-level precedence for this root; absence (empty)
+    // inherits it.
+    let mut diagnostic_precedence: Vec<DiagnosticPrecedence> =
+        match raw.get("diagnostics").and_then(|d| d.get("precedence")) {
+            Some(v) => toml::Value::try_into(v.clone()).with_context(|| {
                 format!(
-                    "Failed to parse [[diagnostic_precedence]] in project config: {}",
+                    "Failed to parse [[diagnostics.precedence]] in project config: {}",
                     config_path.display()
                 )
-            })
-        })
-        .transpose()?
-        .unwrap_or_default();
+            })?,
+            None => Vec::new(),
+        };
     for precedence in &mut diagnostic_precedence {
         precedence.compile().with_context(|| {
             format!(
-                "Project config {}: [[diagnostic_precedence]] code_pattern compilation failed",
+                "Project config {}: [[diagnostics.precedence]] code_pattern compilation failed",
                 config_path.display()
             )
         })?;
@@ -890,17 +911,29 @@ pub fn load_project_config(root: &std::path::Path) -> Result<Option<ProjectConfi
     }))
 }
 
-/// Parses a top-level boolean toggle, defaulting to `false` when absent.
+/// Parses a `[section].disable` boolean toggle, defaulting to `false`.
 ///
-/// Errors when the key is present but not a boolean — a malformed value
-/// (e.g. `disable_lsp = "true"`) would otherwise silently default to `false`,
-/// quietly defeating the user's intent to disable a feeder.
-fn parse_bool_flag(raw: &toml::Value, key: &str, config_path: &std::path::Path) -> Result<bool> {
-    match raw.get(key) {
+/// Errors when `[section]` is present but not a table, or `disable` is present
+/// but not a boolean — a malformed value (e.g. `disable = "true"`) would
+/// otherwise silently default to `false`, quietly defeating the user's intent to
+/// disable a feeder or surface.
+fn parse_section_disable(
+    raw: &toml::Value,
+    section: &str,
+    config_path: &std::path::Path,
+) -> Result<bool> {
+    match raw.get(section) {
         None => Ok(false),
-        Some(toml::Value::Boolean(b)) => Ok(*b),
+        Some(toml::Value::Table(table)) => match table.get("disable") {
+            None => Ok(false),
+            Some(toml::Value::Boolean(b)) => Ok(*b),
+            Some(_) => bail!(
+                "Project config {}: `[{section}] disable` must be a boolean (true or false).",
+                config_path.display(),
+            ),
+        },
         Some(_) => bail!(
-            "Project config {}: `{key}` must be a boolean (true or false).",
+            "Project config {}: `[{section}]` must be a table.",
             config_path.display(),
         ),
     }
@@ -1130,11 +1163,11 @@ servers = ["pyright"]
     #[test]
     fn test_load_project_config_disable_lsp() -> Result<()> {
         let dir = tempdir()?;
-        fs::write(dir.path().join(".catenary.toml"), "disable_lsp = true\n")?;
+        fs::write(dir.path().join(".catenary.toml"), "[lsp]\ndisable = true\n")?;
 
         let result = load_project_config(dir.path())?;
         let config = result.expect("should find project config");
-        assert!(config.disable_lsp, "disable_lsp should be true");
+        assert!(config.disable_lsp, "[lsp] disable should be true");
         assert!(!config.disable_lint);
         assert!(!config.disable_diag);
 
@@ -1146,28 +1179,57 @@ servers = ["pyright"]
         let dir = tempdir()?;
         fs::write(
             dir.path().join(".catenary.toml"),
-            "disable_lint = true\ndisable_diag = true\n",
+            "[linter]\ndisable = true\n\n[diagnostics]\ndisable = true\n",
         )?;
 
         let result = load_project_config(dir.path())?;
         let config = result.expect("should find project config");
         assert!(!config.disable_lsp);
-        assert!(config.disable_lint, "disable_lint should be true");
-        assert!(config.disable_diag, "disable_diag should be true");
+        assert!(config.disable_lint, "[linter] disable should be true");
+        assert!(config.disable_diag, "[diagnostics] disable should be true");
 
         Ok(())
     }
 
     #[test]
-    fn test_load_project_config_lsp_key_removed_errors() {
+    fn test_load_project_config_disable_lint_coexists_with_definitions() -> Result<()> {
+        // The `[linter]` table carries both the `disable` toggle and the linter
+        // definition sub-tables; `disable` is stripped before the rest parse.
+        let dir = tempdir()?;
+        fs::write(
+            dir.path().join(".catenary.toml"),
+            "[linter]\ndisable = true\n\n\
+             [linter.shellcheck]\ncommand = \"shellcheck\"\npatterns = [\"**/*.sh\"]\n",
+        )?;
+
+        let result = load_project_config(dir.path())?;
+        let config = result.expect("should find project config");
+        assert!(config.disable_lint, "[linter] disable should be true");
+        assert!(
+            config.linter.contains_key("shellcheck"),
+            "definition still parses alongside the toggle"
+        );
+        assert!(
+            !config.linter.contains_key("disable"),
+            "the disable toggle is not a linter definition"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_project_config_bare_lsp_key_removed_errors() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join(".catenary.toml"), "lsp = false\n").expect("write");
 
         let result = load_project_config(dir.path());
-        let err = format!("{:#}", result.expect_err("removed `lsp` key should error"));
+        let err = format!(
+            "{:#}",
+            result.expect_err("removed bare `lsp` key should error")
+        );
         assert!(
-            err.contains("disable_lsp"),
-            "error should point to disable_lsp: {err}",
+            err.contains("[lsp]") && err.contains("disable"),
+            "error should point to the [lsp] disable table: {err}",
         );
     }
 
@@ -1182,15 +1244,19 @@ servers = ["pyright"]
             result.expect_err("removed `enabled` key should error")
         );
         assert!(
-            err.contains("disable_lsp"),
-            "error should point to disable_lsp: {err}",
+            err.contains("[lsp]") && err.contains("disable"),
+            "error should point to the [lsp] disable table: {err}",
         );
     }
 
     #[test]
     fn test_load_project_config_non_bool_toggle_errors() {
         let dir = tempdir().expect("tempdir");
-        fs::write(dir.path().join(".catenary.toml"), "disable_lsp = \"yes\"\n").expect("write");
+        fs::write(
+            dir.path().join(".catenary.toml"),
+            "[lsp]\ndisable = \"yes\"\n",
+        )
+        .expect("write");
 
         let result = load_project_config(dir.path());
         let err = format!("{:#}", result.expect_err("non-bool toggle should error"));
@@ -1286,7 +1352,8 @@ build = "make"
         fs::write(
             dir.path().join(".catenary.toml"),
             r#"
-disable_lsp = true
+[lsp]
+disable = true
 
 [commands]
 build = "make"
@@ -1563,16 +1630,15 @@ servers = ["pyright"]
         );
     }
 
-    // ── Project config [[diagnostic_precedence]] (ticket 02) ─────────
+    // ── Project config [[diagnostics.precedence]] (ticket 02) ────────
 
     #[test]
     fn test_load_project_config_precedence() -> Result<()> {
         let dir = tempdir().expect("tempdir");
         fs::write(
             dir.path().join(".catenary.toml"),
-            "[[diagnostic_precedence]]\n\
-             advisory_sources = [\"adv\"]\n\
-             authoritative_sources = [\"auth\"]\n\
+            "[[diagnostics.precedence]]\n\
+             priority = [\"high\", \"low\"]\n\
              code_pattern = \"^E[0-9]+$\"\n",
         )
         .expect("write");
@@ -1580,8 +1646,9 @@ servers = ["pyright"]
         let config = load_project_config(dir.path())?.expect("project config");
         assert_eq!(config.diagnostic_precedence.len(), 1);
         let policy = &config.diagnostic_precedence[0];
-        assert!(policy.is_advisory("adv"));
-        assert!(policy.is_authoritative("auth"));
+        assert_eq!(policy.rank("high"), Some(0));
+        assert_eq!(policy.rank("low"), Some(1));
+        assert_eq!(policy.rank("unlisted"), None);
         // Compiled at load — the band matches an E#### code.
         assert!(policy.code_in_band("E0107"));
         assert!(!policy.code_in_band("other"));
@@ -1593,7 +1660,7 @@ servers = ["pyright"]
         let dir = tempdir().expect("tempdir");
         fs::write(
             dir.path().join(".catenary.toml"),
-            "[[diagnostic_precedence]]\ncode_pattern = \"^E[0-9+$\"\n",
+            "[[diagnostics.precedence]]\ncode_pattern = \"^E[0-9+$\"\n",
         )
         .expect("write");
 

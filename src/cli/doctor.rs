@@ -956,17 +956,23 @@ fn doctor_check_project_config(
         .ok()
         .and_then(|c| c.parse::<toml::Value>().ok())
         .and_then(|raw| {
-            ["lsp", "enabled"]
-                .into_iter()
-                .find(|k| raw.get(*k).is_some())
+            // A `[lsp]` *table* is valid (it carries `disable`); only a bare
+            // scalar `lsp`, or any `enabled`, is the removed key.
+            if matches!(raw.get("lsp"), Some(v) if !v.is_table()) {
+                Some("lsp")
+            } else if raw.get("enabled").is_some() {
+                Some("enabled")
+            } else {
+                None
+            }
         });
 
     if let Some(key) = removed_key {
         let _ = out.writeln(format_args!(
             "  {}",
             out.colors.red(&format!(
-                "✗  `{key}` was removed in 2.0 — use `disable_lsp` \
-                 (`lsp = false` becomes `disable_lsp = true`)"
+                "✗  bare `{key}` was removed — use a `[lsp]` table with `disable` \
+                 (`lsp = false` becomes `[lsp]` / `disable = true`)"
             )),
         ));
     }
@@ -985,16 +991,17 @@ fn doctor_check_project_config(
                 )),
             ));
 
-            // Report the three per-root feeder toggles when set (ticket 00).
-            for (name, set, note) in [
+            // Report the per-root feeder/surface toggles when set (linters 02:
+            // nested under their subsystem tables).
+            for (section, set, note) in [
                 (
-                    "disable_lsp",
+                    "lsp",
                     pc.disable_lsp,
                     "no LSP servers, grep/glob enrichment, or LSP diagnostics",
                 ),
-                ("disable_lint", pc.disable_lint, "no linter diagnostics"),
+                ("linter", pc.disable_lint, "no linter diagnostics"),
                 (
-                    "disable_diag",
+                    "diagnostics",
                     pc.disable_diag,
                     "diagnostics surface off; LSP navigation kept",
                 ),
@@ -1002,7 +1009,7 @@ fn doctor_check_project_config(
                 if set {
                     let _ = out.writeln(format_args!(
                         "  {}",
-                        out.colors.dim(&format!("{name} = true — {note}")),
+                        out.colors.dim(&format!("[{section}] disable — {note}")),
                     ));
                 }
             }

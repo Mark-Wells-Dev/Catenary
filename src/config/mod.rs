@@ -173,17 +173,20 @@ pub struct Config {
     /// [`LspClientManager::effective_linters`](crate::lsp::LspClientManager::effective_linters).
     pub linter: HashMap<String, LinterConfig>,
 
-    /// Cross-feeder diagnostic source-precedence policies (`[[diagnostic_precedence]]`).
+    /// Cross-feeder diagnostic source-precedence chains (`[[diagnostics.precedence]]`).
     ///
     /// The user-level default, applied per file over the merged diagnostic set
-    /// from all feeders (workstream 34 ticket 02). Hoisted here from
-    /// per-`[server.*]` so one policy reconciles a file's language-server **and**
-    /// linter findings together. Seeded with
-    /// [`DiagnosticPrecedence::rust_analyzer_default`] so the rust-analyzer /
-    /// flycheck case works out of the box; a user `[[diagnostic_precedence]]`
-    /// section replaces it, and `diagnostic_precedence = []` clears it. A root's
-    /// `.catenary.toml` may override per-root — see
+    /// from all feeders (linters ticket 02). Hoisted off per-`[server.*]` so one
+    /// chain reconciles a file's language-server **and** linter findings
+    /// together. Seeded with [`DiagnosticPrecedence::rust_analyzer_default`] so
+    /// the rust-analyzer / flycheck case works out of the box; a user
+    /// `[[diagnostics.precedence]]` section replaces it, and `precedence = []`
+    /// under `[diagnostics]` clears it. A root's `.catenary.toml` may override
+    /// per-root — see
     /// [`LspClientManager::effective_precedence`](crate::lsp::LspClientManager::effective_precedence).
+    ///
+    /// (The internal field keeps its `diagnostic_precedence` name; the TOML
+    /// surface is `[diagnostics].precedence`.)
     pub diagnostic_precedence: Vec<DiagnosticPrecedence>,
 }
 
@@ -1185,18 +1188,19 @@ servers = []
         Ok(())
     }
 
-    // ── cross-feeder precedence config (workstream 34 ticket 02) ────
+    // ── cross-feeder precedence config (linters ticket 02) ──────────
 
     #[test]
     fn default_precedence_is_seeded_and_compiled() {
         // No source mentions precedence → the shipped rust-analyzer default
-        // survives, pre-compiled (its band matches an E#### code).
+        // chain survives, pre-compiled (its band matches an E#### code).
         let config = Config::default_with_classification();
         assert_eq!(config.diagnostic_precedence.len(), 1);
         let policy = &config.diagnostic_precedence[0];
-        assert!(policy.is_advisory("rust-analyzer"));
-        assert!(policy.is_authoritative("rustc"));
-        assert!(policy.is_authoritative("clippy"));
+        // rustc/clippy outrank rust-analyzer (highest trust first).
+        assert_eq!(policy.rank("rustc"), Some(0));
+        assert_eq!(policy.rank("clippy"), Some(1));
+        assert_eq!(policy.rank("rust-analyzer"), Some(2));
         assert!(policy.code_in_band("E0107"), "band compiled");
         assert!(!policy.code_in_band("SC2086"), "non-rustc code out of band");
     }
@@ -1208,35 +1212,47 @@ servers = []
         fs::write(
             &config_path,
             r#"
-[[diagnostic_precedence]]
-advisory_sources = ["semantic"]
-authoritative_sources = ["syntactic"]
+[[diagnostics.precedence]]
+priority = ["high", "low"]
 code_pattern = "^X[0-9]+$"
 "#,
         )?;
         let config = Config::load_from_sources(&[config_path])?;
         assert_eq!(config.diagnostic_precedence.len(), 1);
         let policy = &config.diagnostic_precedence[0];
-        assert!(
-            policy.is_advisory("semantic"),
-            "user policy replaced default"
-        );
-        assert!(!policy.is_advisory("rust-analyzer"), "default gone");
+        assert_eq!(policy.rank("high"), Some(0), "user chain replaced default");
+        assert_eq!(policy.rank("rust-analyzer"), None, "default gone");
         assert!(policy.code_in_band("X9"), "user band compiled");
         Ok(())
     }
 
     #[test]
     fn empty_precedence_array_clears_default() -> anyhow::Result<()> {
-        // `diagnostic_precedence = []` is the explicit opt-out, mirroring
-        // `servers = []`: it replaces the seeded default with nothing.
+        // `precedence = []` under `[diagnostics]` is the explicit opt-out,
+        // mirroring `servers = []`: it replaces the seeded default with nothing.
         let dir = tempdir()?;
         let config_path = dir.path().join("config.toml");
-        fs::write(&config_path, "diagnostic_precedence = []\n")?;
+        fs::write(&config_path, "[diagnostics]\nprecedence = []\n")?;
         let config = Config::load_from_sources(&[config_path])?;
         assert!(
             config.diagnostic_precedence.is_empty(),
             "explicit empty array clears the default"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn diagnostics_section_without_precedence_keeps_default() -> anyhow::Result<()> {
+        // A `[diagnostics]` table that omits `precedence` (e.g. only sets other
+        // future keys) must NOT clear the seeded default — absent ≠ empty.
+        let dir = tempdir()?;
+        let config_path = dir.path().join("config.toml");
+        fs::write(&config_path, "[diagnostics]\n")?;
+        let config = Config::load_from_sources(&[config_path])?;
+        assert_eq!(
+            config.diagnostic_precedence.len(),
+            1,
+            "omitting precedence inherits the seeded default"
         );
         Ok(())
     }
@@ -1248,16 +1264,15 @@ code_pattern = "^X[0-9]+$"
         fs::write(
             &config_path,
             r#"
-[[diagnostic_precedence]]
-advisory_sources = ["a"]
-authoritative_sources = ["b"]
+[[diagnostics.precedence]]
+priority = ["a", "b"]
 code_pattern = "^E[0-9+$"
 "#,
         )?;
         let result = Config::load_from_sources(&[config_path]);
         let err = format!("{:#}", result.expect_err("invalid regex should error"));
         assert!(
-            err.contains("diagnostic_precedence") && err.contains("code_pattern"),
+            err.contains("precedence") && err.contains("code_pattern"),
             "error should name the offending field: {err}"
         );
         Ok(())

@@ -113,19 +113,18 @@ pub fn validate(config: &Config) -> Vec<String> {
     errors
 }
 
-/// Validates `[[diagnostic_precedence]]` policies (misc 115; per-root in
-/// workstream 34 ticket 02).
+/// Validates `[[diagnostics.precedence]]` chains (misc 115; per-root chain form
+/// in linters ticket 02).
 ///
-/// Each policy's optional code-band regex must compile. The
-/// advisory/authoritative source lists are free-form strings, so nothing to
-/// check there.
+/// Each chain's optional code-band regex must compile. The `priority` source
+/// list is free-form strings, so nothing to check there.
 fn validate_precedence(precedence: &[super::DiagnosticPrecedence], errors: &mut Vec<String>) {
     for (i, policy) in precedence.iter().enumerate() {
         if let Some(pat) = &policy.code_pattern
             && let Err(e) = regex::Regex::new(pat)
         {
             errors.push(format!(
-                "diagnostic_precedence[{i}] has an invalid regex in \
+                "diagnostics.precedence[{i}] has an invalid regex in \
                  `code_pattern`: '{pat}' — {e}"
             ));
         }
