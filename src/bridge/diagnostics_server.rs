@@ -9,6 +9,7 @@
 //! collection, and compact formatting.
 
 use super::filesystem_manager::{FilesystemManager, observe_mtime};
+use super::linter::DiagnosticFeeder;
 use super::path_security::PathValidator;
 use crate::lsp::server::LspServer;
 use crate::lsp::settle::{IdleDetector, SettleResult, await_idle};
@@ -137,7 +138,8 @@ impl DiagnosticsServer {
     /// final state before producing diagnostics.
     #[allow(
         clippy::type_complexity,
-        reason = "Server grouping map is local and self-documenting"
+        clippy::too_many_lines,
+        reason = "batch pipeline: the server-grouping map is local; the phased lifecycle (resolve / nudge / LSP / linter / format) reads top-to-bottom"
     )]
     pub async fn process_files_batched(
         &self,
@@ -162,6 +164,9 @@ impl DiagnosticsServer {
         // ── Phase 1: resolve + canonicalize ────────────────────────
         let mut canonical_paths: Vec<PathBuf> = Vec::new();
         let mut uncovered: Vec<UncoveredEntry> = Vec::new();
+        // The lint-covered subset, fanned out to standalone linters in Phase 2b
+        // (workstream 34 ticket 01). A file can be both LSP- and lint-covered.
+        let mut lint_candidates: Vec<PathBuf> = Vec::new();
 
         // Server → list of canonical paths.
         // Keyed by server name for stable (alphabetical) iteration order.
@@ -195,14 +200,29 @@ impl DiagnosticsServer {
             }
 
             let clients = self.client_manager.diagnostic_servers(&canonical).await;
+            // A standalone linter may cover this file too (or instead of LSP).
+            let lint_covered = self.client_manager.lint_covers(&canonical);
+
             if clients.is_empty() {
-                let display = self.display_rel(&canonical.to_string_lossy());
-                let root = self.resolve_root_or_parent(&canonical);
-                uncovered.push(UncoveredEntry { display, root });
+                if lint_covered {
+                    // Lint-only coverage: no language server, but a matching
+                    // linter will report. Treat it as covered so it is neither
+                    // flagged `[no LSP coverage]` nor dropped, and so any linter
+                    // diagnostics render in the format pass.
+                    canonical_paths.push(canonical.clone());
+                    lint_candidates.push(canonical);
+                } else {
+                    let display = self.display_rel(&canonical.to_string_lossy());
+                    let root = self.resolve_root_or_parent(&canonical);
+                    uncovered.push(UncoveredEntry { display, root });
+                }
                 continue;
             }
 
             canonical_paths.push(canonical.clone());
+            if lint_covered {
+                lint_candidates.push(canonical.clone());
+            }
 
             for client_mutex in &clients {
                 let name = client_mutex.lock().await.server_name().to_string();
@@ -284,6 +304,42 @@ impl DiagnosticsServer {
         for (client_mutex, paths) in server_groups.values() {
             self.run_server_batch(client_mutex, paths, parent_id, &mut file_results)
                 .await;
+        }
+
+        // ── Phase 2b: linter feeders (workstream 34 ticket 01) ─────
+        // Fan the lint-covered subset out to matching standalone linters,
+        // translate each adapter's LSP-shaped diagnostics into rendered entries,
+        // and merge them into the same per-file result map the LSP pass
+        // populated. Cross-feeder dedup/precedence is ticket 02 — here we only
+        // merge. Fail-soft: a not-installed linter or a parse failure drops its
+        // diagnostics without poisoning the batch.
+        if !lint_candidates.is_empty() {
+            let feeder = super::linter::LinterFeeder::new(&self.client_manager, &self.fs);
+            for feed in feeder.feed(&lint_candidates).await {
+                if feed.diagnostics.is_empty() {
+                    continue;
+                }
+                let filter = crate::filter::get_filter(&feed.command);
+                let entries = format_diagnostics_entries(
+                    &feed.diagnostics,
+                    &[],
+                    filter,
+                    &feed.command,
+                    None,
+                    "",
+                    &[],
+                );
+                if entries.is_empty() {
+                    continue;
+                }
+                let key = feed.file.to_string_lossy().to_string();
+                let display = self.display_rel(&key);
+                file_results
+                    .entry(key)
+                    .or_insert_with(|| (display, Vec::new()))
+                    .1
+                    .push(ServerDiagnostics { entries });
+            }
         }
 
         // ── Phase 3: classify, budget, and format ────────────────
@@ -1362,6 +1418,45 @@ mod tests {
             severity,
             text: text.to_string(),
         }
+    }
+
+    // ── linter feeder translation (ticket 01) ───────────────────
+
+    #[test]
+    fn linter_diagnostic_translates_to_rendered_entry() {
+        // An LSP-shaped linter diagnostic (the canonical feeder shape) renders
+        // through the same formatter as LSP diagnostics, so the merged output is
+        // feeder-blind: `:line:col [severity] source(code): message`.
+        let diag = serde_json::json!({
+            "range": {
+                "start": { "line": 2, "character": 5 },
+                "end": { "line": 2, "character": 8 }
+            },
+            "severity": 2,
+            "source": "shellcheck",
+            "code": "SC2086",
+            "message": "Double quote to prevent globbing and word splitting."
+        });
+        let filter = crate::filter::get_filter("shellcheck");
+        let entries = format_diagnostics_entries(
+            std::slice::from_ref(&diag),
+            &[],
+            filter,
+            "shellcheck",
+            None,
+            "",
+            &[],
+        );
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].severity, 2);
+        // 0-based (2,5) renders 1-based as :3:6.
+        assert!(
+            entries[0]
+                .text
+                .contains(":3:6 [warning] shellcheck(SC2086): "),
+            "unexpected render: {}",
+            entries[0].text,
+        );
     }
 
     // ── classify_file tests ─────────────────────────────────────

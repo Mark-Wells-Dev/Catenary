@@ -4,6 +4,7 @@
 //! Configuration handling for language servers and session settings.
 
 mod language;
+mod linter;
 pub(crate) mod merge;
 mod parse;
 mod server;
@@ -21,6 +22,7 @@ use crate::logging::reaper::ReapPolicy;
 
 pub use commands::{BuildContext, BuildGuidance, CommandsConfig, GuidanceEntry, ResolvedCommands};
 pub use language::{DispatchMethod, LanguageConfig, ServerBinding};
+pub use linter::LinterConfig;
 pub use parse::{
     DEFAULT_SERVERS, ProjectConfig, SERVER_DEF_KEYS, config_sources, load_project_config,
 };
@@ -162,6 +164,14 @@ pub struct Config {
     /// `None` when no source specified `[roots]`. User-config only. Read via
     /// [`Config::companion_rules`].
     pub roots: Option<RootsConfig>,
+
+    /// Standalone-linter definitions keyed by linter name (`[linter.*]`).
+    ///
+    /// The user-level half of the linter feeder (workstream 34 ticket 01). The
+    /// effective set for a root is this map unioned with the root's project
+    /// `[linter.*]` — see
+    /// [`LspClientManager::effective_linters`](crate::lsp::LspClientManager::effective_linters).
+    pub linter: HashMap<String, LinterConfig>,
 }
 
 /// Icon preset selecting a base set of icons.
@@ -531,6 +541,7 @@ impl Default for Config {
             resolved_commands: None,
             observability: None,
             roots: None,
+            linter: HashMap::new(),
         }
     }
 }
@@ -584,6 +595,65 @@ servers = ["rust-analyzer"]
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn test_config_load_linter() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let config_path = dir.path().join("config.toml");
+
+        fs::write(
+            &config_path,
+            r#"
+[linter.yamllint]
+command = "yamllint"
+args = ["-f", "parsable"]
+patterns = ["**/*.{yml,yaml}"]
+"#,
+        )?;
+
+        let config = Config::load_from_sources(&[config_path])?;
+        let yl = config.linter.get("yamllint").expect("yamllint linter");
+        assert_eq!(yl.command, "yamllint");
+        // Routing globs are compiled after validation.
+        assert!(yl.matches(std::path::Path::new("a/b.yaml")));
+        assert!(!yl.matches(std::path::Path::new("a/b.txt")));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_linter_invalid_glob_rejected() {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+
+        fs::write(
+            &config_path,
+            "[linter.x]\ncommand = \"x\"\npatterns = [\"[bad\"]\n",
+        )
+        .expect("write config");
+
+        let result = Config::load_from_sources(&[config_path]);
+        let err = format!("{:#}", result.expect_err("invalid glob should error"));
+        assert!(
+            err.contains("invalid glob") && err.contains("patterns"),
+            "error should mention the invalid linter glob: {err}",
+        );
+    }
+
+    #[test]
+    fn test_config_linter_empty_command_rejected() {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+
+        fs::write(&config_path, "[linter.x]\npatterns = [\"**/*.sh\"]\n").expect("write config");
+
+        let result = Config::load_from_sources(&[config_path]);
+        let err = format!("{:#}", result.expect_err("empty command should error"));
+        assert!(
+            err.contains("empty `command`"),
+            "error should mention the empty linter command: {err}",
+        );
     }
 
     #[test]

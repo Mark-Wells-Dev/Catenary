@@ -17,6 +17,8 @@ mod grep_server;
 mod handler;
 /// Application dispatch for hook requests.
 mod hook_router;
+/// Standalone-linter diagnostic feeder (blessed + SARIF adapters).
+mod linter;
 /// Shared runtime-dir overflow reports (diagnostics + sed preview).
 pub mod overflow;
 /// Shared page-based output pagination.

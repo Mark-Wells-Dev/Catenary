@@ -120,7 +120,35 @@ pub fn validate(config: &Config) -> Vec<String> {
         }
     }
 
+    validate_linters(config, &mut errors);
+
     errors
+}
+
+/// Validates `[linter.*]` definitions, appending any errors (workstream 34
+/// ticket 01).
+///
+/// Each linter must have a non-empty `command`, and every routing pattern must
+/// be a non-empty, valid glob.
+fn validate_linters(config: &Config, errors: &mut Vec<String>) {
+    for (name, linter) in &config.linter {
+        if linter.command.is_empty() {
+            errors.push(format!(
+                "Linter '{name}' has an empty `command` — \
+                 linter definitions must specify a command"
+            ));
+        }
+
+        for pattern in &linter.patterns {
+            if pattern.is_empty() {
+                errors.push(format!("Linter '{name}' has an empty string in `patterns`"));
+            } else if let Err(e) = LspGlob::new(pattern) {
+                errors.push(format!(
+                    "Linter '{name}' has an invalid glob in `patterns`: '{pattern}' — {e}"
+                ));
+            }
+        }
+    }
 }
 
 /// Warns about orphan `[server.*]` entries in a project config.

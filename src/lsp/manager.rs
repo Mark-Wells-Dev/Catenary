@@ -313,6 +313,60 @@ impl LspClientManager {
         self.fs.root(root).is_some_and(|r| r.config().disable_diag)
     }
 
+    /// Whether the root's project config sets `disable_lint` (workstream 34
+    /// ticket 00 / 01).
+    ///
+    /// A disabled root runs no standalone linters: it stays tracked everywhere
+    /// else (LSP, build/command resolution, gate via LSP coverage), but the
+    /// linter feeder is dropped for it.
+    #[must_use]
+    pub fn is_lint_disabled(&self, root: &Path) -> bool {
+        self.fs.root(root).is_some_and(|r| r.config().disable_lint)
+    }
+
+    /// The effective linter set for a root (workstream 34 ticket 01).
+    ///
+    /// The user config's `[linter.*]` unioned with the root's project
+    /// `[linter.*]`, the project winning on a name collision (so a project entry
+    /// can override or `disable` a user-configured linter). Each entry carries
+    /// its compiled routing globs, ready for [`LinterConfig::matches`].
+    ///
+    /// [`LinterConfig::matches`]: crate::config::LinterConfig::matches
+    #[must_use]
+    pub fn effective_linters(&self, root: &Path) -> HashMap<String, crate::config::LinterConfig> {
+        let mut linters = self.config.linter.clone();
+        if let Some(r) = self.fs.root(root) {
+            for (name, linter) in &r.config().linter {
+                linters.insert(name.clone(), linter.clone());
+            }
+        }
+        linters
+    }
+
+    /// Whether a standalone linter covers `file` (workstream 34 ticket 01).
+    ///
+    /// Resolves `file` to its owning root and matches the **root-relative** path
+    /// against that root's effective `[linter.*]` patterns (user ∪ project),
+    /// reusing [`LspGlob`]. Out-of-root files and `disable_lint` roots are never
+    /// covered; an entry with `disable = true` or no patterns contributes
+    /// nothing. This is the routing predicate behind both the editing-boundary
+    /// coverage gate and the diagnostics-batch fan-out.
+    #[must_use]
+    pub fn lint_covers(&self, file: &Path) -> bool {
+        let Some(root) = self.fs.resolve_root(file) else {
+            return false;
+        };
+        if self.is_lint_disabled(&root) {
+            return false;
+        }
+        let Ok(rel) = file.strip_prefix(&root) else {
+            return false;
+        };
+        self.effective_linters(&root)
+            .values()
+            .any(|linter| !linter.disable && linter.matches(rel))
+    }
+
     /// Resolves the effective root for a server instance given a file path.
     ///
     /// If the language has active `root_markers`, walks up from `file`
@@ -2124,6 +2178,7 @@ mod tests {
             resolved_commands: None,
             observability: None,
             roots: None,
+            linter: HashMap::new(),
         }
     }
 
@@ -2199,6 +2254,7 @@ mod tests {
             resolved_commands: None,
             observability: None,
             roots: None,
+            linter: HashMap::new(),
         })
     }
 
@@ -2233,6 +2289,7 @@ mod tests {
             resolved_commands: None,
             observability: None,
             roots: None,
+            linter: HashMap::new(),
         })
     }
 
@@ -2277,6 +2334,7 @@ mod tests {
             resolved_commands: None,
             observability: None,
             roots: None,
+            linter: HashMap::new(),
         })
     }
 
@@ -2321,6 +2379,7 @@ mod tests {
             resolved_commands: None,
             observability: None,
             roots: None,
+            linter: HashMap::new(),
         })
     }
 
@@ -2368,6 +2427,7 @@ mod tests {
             resolved_commands: None,
             observability: None,
             roots: None,
+            linter: HashMap::new(),
         })
     }
 
@@ -2546,6 +2606,7 @@ mod tests {
             resolved_commands: None,
             observability: None,
             roots: None,
+            linter: HashMap::new(),
         });
 
         let manager = LspClientManager::new(config, test_logging(), test_fs_with_roots(&["/tmp"]));
@@ -2996,6 +3057,7 @@ mod tests {
             resolved_commands: None,
             observability: None,
             roots: None,
+            linter: HashMap::new(),
         });
 
         let fs = test_fs_with_roots(&[
@@ -3449,6 +3511,7 @@ mod tests {
             resolved_commands: None,
             observability: None,
             roots: None,
+            linter: HashMap::new(),
         });
 
         let manager = LspClientManager::new(config, test_logging(), test_fs_with_roots(&["/tmp"]));
@@ -3507,6 +3570,7 @@ mod tests {
             resolved_commands: None,
             observability: None,
             roots: None,
+            linter: HashMap::new(),
         });
 
         let manager = LspClientManager::new(config, test_logging(), test_fs_with_roots(&["/tmp"]));
@@ -3564,6 +3628,7 @@ mod tests {
             resolved_commands: None,
             observability: None,
             roots: None,
+            linter: HashMap::new(),
         });
 
         let manager = LspClientManager::new(config, test_logging(), test_fs_with_roots(&["/tmp"]));
@@ -3657,6 +3722,7 @@ mod tests {
             resolved_commands: None,
             observability: None,
             roots: None,
+            linter: HashMap::new(),
         });
 
         let manager = LspClientManager::new(config, test_logging(), test_fs_with_roots(&["/tmp"]));
@@ -4902,6 +4968,7 @@ mod tests {
             resolved_commands: None,
             observability: None,
             roots: None,
+            linter: HashMap::new(),
         })
     }
 
@@ -4941,6 +5008,7 @@ mod tests {
             resolved_commands: None,
             observability: None,
             roots: None,
+            linter: HashMap::new(),
         })
     }
 
@@ -5714,6 +5782,99 @@ mod tests {
         );
     }
 
+    /// `lint_covers` matches the root-relative path against the effective linter
+    /// set (user ∪ project), and never covers out-of-root files (ticket 01).
+    #[test]
+    fn test_lint_covers_user_and_project_union() {
+        use crate::config::LinterConfig;
+
+        let mut config = test_config_raw();
+        config.linter.insert(
+            "shellcheck".to_string(),
+            LinterConfig::new("shellcheck", vec![], vec!["**/*.sh".to_string()])
+                .expect("compile user linter"),
+        );
+        let manager = LspClientManager::new(Arc::new(config), test_logging(), test_fs());
+
+        let root = PathBuf::from("/proj");
+        let mut project = crate::config::ProjectConfig::default();
+        project.linter.insert(
+            "actionlint".to_string(),
+            LinterConfig::new(
+                "actionlint",
+                vec![],
+                vec![".github/workflows/*.yml".to_string()],
+            )
+            .expect("compile project linter"),
+        );
+        manager.install_root_config(root.clone(), project);
+
+        // User linter (shellcheck) matches a .sh anywhere in the root.
+        assert!(manager.lint_covers(&root.join("scripts/build.sh")));
+        // Project linter (actionlint) matches a workflow, root-relative.
+        assert!(manager.lint_covers(&root.join(".github/workflows/ci.yml")));
+        // A YAML outside the workflows dir is NOT matched (path glob, not name).
+        assert!(!manager.lint_covers(&root.join("docs/config.yml")));
+        // A non-matching file in the root.
+        assert!(!manager.lint_covers(&root.join("README.md")));
+        // An out-of-root file is never covered (routing is root-relative).
+        assert!(!manager.lint_covers(Path::new("/elsewhere/x.sh")));
+    }
+
+    /// `disable_lint` zeroes linter coverage for the root (ticket 00 / 01).
+    #[test]
+    fn test_lint_covers_respects_disable_lint() {
+        use crate::config::LinterConfig;
+
+        let mut config = test_config_raw();
+        config.linter.insert(
+            "shellcheck".to_string(),
+            LinterConfig::new("shellcheck", vec![], vec!["**/*.sh".to_string()]).expect("compile"),
+        );
+        let manager = LspClientManager::new(Arc::new(config), test_logging(), test_fs());
+
+        let root = PathBuf::from("/proj");
+        manager.install_root_config(
+            root.clone(),
+            crate::config::ProjectConfig {
+                disable_lint: true,
+                ..crate::config::ProjectConfig::default()
+            },
+        );
+
+        assert!(
+            !manager.lint_covers(&root.join("x.sh")),
+            "disable_lint must zero linter coverage despite a matching user linter"
+        );
+    }
+
+    /// A project `[linter.<name>] disable = true` overrides a user linter of the
+    /// same name (ticket 01 — project wins on a name collision).
+    #[test]
+    fn test_lint_covers_project_disable_overrides_user() {
+        use crate::config::LinterConfig;
+
+        let mut config = test_config_raw();
+        config.linter.insert(
+            "shellcheck".to_string(),
+            LinterConfig::new("shellcheck", vec![], vec!["**/*.sh".to_string()]).expect("compile"),
+        );
+        let manager = LspClientManager::new(Arc::new(config), test_logging(), test_fs());
+
+        let root = PathBuf::from("/proj");
+        let mut overridden =
+            LinterConfig::new("shellcheck", vec![], vec!["**/*.sh".to_string()]).expect("compile");
+        overridden.disable = true;
+        let mut project = crate::config::ProjectConfig::default();
+        project.linter.insert("shellcheck".to_string(), overridden);
+        manager.install_root_config(root.clone(), project);
+
+        assert!(
+            !manager.lint_covers(&root.join("x.sh")),
+            "a project disable override must beat the user linter"
+        );
+    }
+
     /// `rooted_clients` includes rooted servers (not just single-file).
     #[tokio::test]
     async fn test_rooted_clients_includes_rooted() -> Result<()> {
@@ -6023,6 +6184,7 @@ mod tests {
             resolved_commands: None,
             observability: None,
             roots: None,
+            linter: HashMap::new(),
         })
     }
 
@@ -6059,6 +6221,7 @@ mod tests {
             resolved_commands: None,
             observability: None,
             roots: None,
+            linter: HashMap::new(),
         })
     }
 

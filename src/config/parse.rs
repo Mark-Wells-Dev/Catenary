@@ -15,8 +15,8 @@ use crate::logging::reaper::ReapPolicy;
 
 use super::commands::{self, CommandsConfig};
 use super::{
-    Config, IconConfig, LanguageConfig, NotificationConfig, RootsConfig, ServerBinding, ServerDef,
-    ToolsConfig, TuiConfig, default_log_retention_days,
+    Config, IconConfig, LanguageConfig, LinterConfig, NotificationConfig, RootsConfig,
+    ServerBinding, ServerDef, ToolsConfig, TuiConfig, default_log_retention_days,
 };
 
 /// Embedded default classification config (lowest-priority layer).
@@ -64,6 +64,9 @@ struct RawConfig {
 
     #[serde(default)]
     roots: Option<RootsConfig>,
+
+    #[serde(default)]
+    linter: HashMap<String, LinterConfig>,
 
     #[serde(default)]
     commands: Option<CommandsConfig>,
@@ -194,6 +197,14 @@ pub fn load_from_sources(sources: &[PathBuf]) -> Result<Config> {
         lang_config
             .compile_markers()
             .context("root_markers compilation failed after validation (bug)")?;
+    }
+
+    // Compile linter routing globs after validation. Validation already checks
+    // each pattern with LspGlob::new(), so this just populates compiled_patterns.
+    for linter in config.linter.values_mut() {
+        linter
+            .compile_patterns()
+            .context("linter patterns compilation failed after validation (bug)")?;
     }
 
     Ok(config)
@@ -403,6 +414,9 @@ fn merge(config: &mut Config, other: RawConfig) {
     if other.roots.is_some() {
         config.roots = other.roots;
     }
+    for (key, value) in other.linter {
+        config.linter.insert(key, value);
+    }
     if let Some(ref cmds) = other.commands {
         config
             .resolved_commands
@@ -475,6 +489,7 @@ const PROJECT_CONFIG_ALLOWED_KEYS: &[&str] = &[
     "disable_diag",
     "language",
     "server",
+    "linter",
     "commands",
 ];
 
@@ -510,6 +525,12 @@ pub struct ProjectConfig {
     pub language: HashMap<String, LanguageConfig>,
     /// Server definitions from the project config.
     pub server: HashMap<String, ServerDef>,
+    /// Standalone-linter definitions from the project config (`[linter.*]`).
+    ///
+    /// The per-root half of the linter feeder (workstream 34 ticket 01). Merged
+    /// with the user `[linter.*]` (project wins on a name collision) to form the
+    /// root's effective linter set.
+    pub linter: HashMap<String, LinterConfig>,
     /// Command filter configuration from the project config.
     ///
     /// `build` is per-root (each root can have its own build tool).
@@ -711,6 +732,41 @@ pub fn load_project_config(root: &std::path::Path) -> Result<Option<ProjectConfi
         }
     }
 
+    // Parse [linter.*] entries (workstream 34 ticket 01).
+    let mut linter: HashMap<String, LinterConfig> = raw
+        .get("linter")
+        .map(|v| {
+            toml::Value::try_into(v.clone()).with_context(|| {
+                format!(
+                    "Failed to parse [linter.*] in project config: {}",
+                    config_path.display()
+                )
+            })
+        })
+        .transpose()?
+        .unwrap_or_default();
+
+    // Compile routing globs and validate. An entry with an empty `command` is
+    // only valid as a `disable = true` override of a user-configured linter;
+    // otherwise it is a malformed definition.
+    for (name, linter_config) in &mut linter {
+        if linter_config.command.is_empty()
+            && !linter_config.disable
+            && (!linter_config.args.is_empty() || !linter_config.patterns.is_empty())
+        {
+            bail!(
+                "Project config {}: [linter.{name}] has an empty `command`",
+                config_path.display()
+            );
+        }
+        linter_config.compile_patterns().with_context(|| {
+            format!(
+                "Project config {}: [linter.{name}] patterns compilation failed",
+                config_path.display()
+            )
+        })?;
+    }
+
     // Parse and validate [commands] section.
     let commands_config: Option<CommandsConfig> = raw
         .get("commands")
@@ -770,6 +826,7 @@ pub fn load_project_config(root: &std::path::Path) -> Result<Option<ProjectConfi
         disable_diag,
         language,
         server,
+        linter,
         commands: commands_config,
     }))
 }
@@ -1375,5 +1432,75 @@ servers = ["pyright"]
         assert!(pyright.env.is_none(), "env should default to None");
 
         Ok(())
+    }
+
+    // ── Project config [linter.*] (ticket 01) ───────────────────────
+
+    #[test]
+    fn test_load_project_config_linter() -> Result<()> {
+        let dir = tempdir()?;
+        fs::write(
+            dir.path().join(".catenary.toml"),
+            "[linter.shellcheck]\ncommand = \"shellcheck\"\n\
+             args = [\"-f\", \"json1\"]\npatterns = [\"**/*.sh\"]\n",
+        )?;
+
+        let config = load_project_config(dir.path())?.expect("project config");
+        let sc = config.linter.get("shellcheck").expect("shellcheck linter");
+        assert_eq!(sc.command, "shellcheck");
+        assert_eq!(sc.args, vec!["-f".to_string(), "json1".to_string()]);
+        assert_eq!(sc.patterns, vec!["**/*.sh".to_string()]);
+        // Routing globs are compiled at load.
+        assert!(sc.matches(std::path::Path::new("scripts/x.sh")));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_project_config_linter_disable_override_no_command() -> Result<()> {
+        // A project entry can disable a user-configured linter by name with no
+        // command of its own — that is a valid override, not a malformed entry.
+        let dir = tempdir()?;
+        fs::write(
+            dir.path().join(".catenary.toml"),
+            "[linter.shellcheck]\ndisable = true\n",
+        )?;
+
+        let config = load_project_config(dir.path())?.expect("project config");
+        let sc = config.linter.get("shellcheck").expect("shellcheck linter");
+        assert!(sc.disable);
+        assert!(sc.command.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_project_config_linter_empty_command_errors() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join(".catenary.toml"),
+            "[linter.shellcheck]\npatterns = [\"**/*.sh\"]\n",
+        )
+        .expect("write");
+
+        let result = load_project_config(dir.path());
+        let err = format!("{:#}", result.expect_err("empty command should error"));
+        assert!(err.contains("empty `command`"), "got: {err}");
+    }
+
+    #[test]
+    fn test_load_project_config_linter_invalid_glob_errors() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join(".catenary.toml"),
+            "[linter.x]\ncommand = \"x\"\npatterns = [\"[bad\"]\n",
+        )
+        .expect("write");
+
+        let result = load_project_config(dir.path());
+        assert!(
+            result.is_err(),
+            "invalid glob must fail project-config load"
+        );
     }
 }

@@ -833,18 +833,16 @@ impl Session {
         self.has_lsp_coverage(path) || self.has_lint_coverage(path)
     }
 
-    /// Whether a standalone linter covers this file.
+    /// Whether a standalone linter covers this file (workstream 34 ticket 01).
     ///
-    /// Stub returning `false` — implemented by workstream 34 ticket 01 (the
-    /// linter feeder framework).
+    /// Resolves the file to its owning root and matches the root-relative path
+    /// against that root's effective `[linter.*]` patterns (user ∪ project),
+    /// reusing `LspGlob`. Out-of-root files and `disable_lint` roots are never
+    /// covered. With no `[linter.*]` configured (defaults ship in ticket 03)
+    /// this is `false`, so the coverage gate is unchanged until a linter is set.
     #[must_use]
-    #[allow(
-        clippy::unused_self,
-        clippy::missing_const_for_fn,
-        reason = "stub; ticket 01 reads per-root linter config off self"
-    )]
-    fn has_lint_coverage(&self, _path: &Path) -> bool {
-        false
+    pub fn has_lint_coverage(&self, path: &Path) -> bool {
+        self.client_manager.lint_covers(path)
     }
 
     /// Whether the diagnostics surface is suppressed for the file's root
@@ -1485,5 +1483,58 @@ mod tests {
             !session.covered_for_diagnostics(&served),
             "disable_diag turns the editing gate off despite LSP coverage"
         );
+    }
+
+    // ── has_lint_coverage (ticket 01) ──────────────────────────────
+
+    #[test]
+    fn has_lint_coverage_matches_configured_linter() {
+        // A root-level `[linter.*]` with a matching path glob covers a file even
+        // when no language server backs it — the gate tracks lint-only files.
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("workspace");
+        std::fs::create_dir_all(&root).expect("create workspace dir");
+        std::fs::write(
+            root.join(".catenary.toml"),
+            "[linter.shellcheck]\ncommand = \"shellcheck\"\n\
+             args = [\"-f\", \"json1\"]\npatterns = [\"**/*.sh\"]\n",
+        )
+        .expect("write config");
+        let session = session_with_root(rt.handle(), root.clone());
+
+        let script = root.join("scripts/deploy.sh");
+        // A .sh file in the root is lint-covered ...
+        assert!(
+            session.has_lint_coverage(&script),
+            "configured shellcheck linter covers a matching .sh"
+        );
+        assert!(
+            session.has_coverage(&script),
+            "lint coverage feeds has_coverage"
+        );
+        // ... and gated for diagnostics (no LSP server required).
+        assert!(
+            session.covered_for_diagnostics(&script),
+            "a lint-covered file is gated for diagnostics"
+        );
+        // A non-matching file is not lint-covered.
+        assert!(
+            !session.has_lint_coverage(&root.join("notes.txt")),
+            "a non-matching file is not lint-covered"
+        );
+    }
+
+    #[test]
+    fn has_lint_coverage_false_without_linters() {
+        // With no `[linter.*]` configured (defaults ship in ticket 03), every
+        // file is lint-uncovered — the gate is unchanged.
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("workspace");
+        std::fs::create_dir_all(&root).expect("create workspace dir");
+        let session = session_with_root(rt.handle(), root.clone());
+
+        assert!(!session.has_lint_coverage(&root.join("scripts/deploy.sh")));
     }
 }
