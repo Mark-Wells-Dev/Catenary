@@ -21,6 +21,7 @@ use tracing::{Instrument, debug, error, info, warn};
 
 use crate::bridge::EditingGuardrail;
 use crate::bridge::HookRouter;
+use crate::bridge::filesystem_manager::Root;
 use crate::bridge::session::Session;
 use crate::bridge::{GlobOutcome, GrepOutcome};
 use crate::companions::expand_companions;
@@ -902,43 +903,93 @@ pub const WORKTREE_ROOT_GC_INTERVAL: Duration = Duration::from_hours(1);
 #[cfg(unix)]
 #[derive(Clone)]
 struct RootTracker {
-    /// Per-contributor root sets. The global root set is the union of
+    inner: Arc<std::sync::Mutex<RootTrackerInner>>,
+}
+
+/// The two indices the tracker maintains together under one lock.
+///
+/// `contributors` is the **provenance** forward index (which connection
+/// declared which paths); `roots` is the **identity + config** store, shared
+/// across contributors. A `Root` is born when a path's refcount goes 0→1
+/// (loading `.catenary.toml` then) and reaped when it goes 1→0 — both happen in
+/// [`reconcile_roots`](RootTrackerInner::reconcile_roots), kept in lock-step
+/// with every contributor mutation, so a tracked root is always config-complete
+/// (ticket 00a).
+#[cfg(unix)]
+struct RootTrackerInner {
+    /// Per-contributor declared root sets. The global root set is the union of
     /// all values.
-    contributors: Arc<std::sync::Mutex<HashMap<String, HashSet<PathBuf>>>>,
+    contributors: HashMap<String, HashSet<PathBuf>>,
+    /// Canonical config-complete roots, keyed by path, shared across
+    /// contributors. Reconciled to the contributor union on every mutation.
+    roots: HashMap<PathBuf, Arc<Root>>,
+}
+
+#[cfg(unix)]
+impl RootTrackerInner {
+    /// Reconciles the `roots` store to the current contributor union: births a
+    /// config-loaded [`Root`] for each newly-present path (refcount 0→1) and
+    /// reaps any path no contributor declares any more (refcount 1→0).
+    ///
+    /// Loading `.catenary.toml` happens here, exactly once per path's lifetime
+    /// (the `entry`/`or_insert_with` skips paths already born) — so a steady
+    /// re-sync that adds no new path does no I/O.
+    fn reconcile_roots(&mut self) {
+        let union: HashSet<PathBuf> = self.contributors.values().flatten().cloned().collect();
+        self.roots.retain(|path, _| union.contains(path));
+        for path in union {
+            self.roots
+                .entry(path.clone())
+                .or_insert_with(|| Arc::new(Root::load(path)));
+        }
+    }
 }
 
 #[cfg(unix)]
 impl RootTracker {
     fn new() -> Self {
         Self {
-            contributors: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            inner: Arc::new(std::sync::Mutex::new(RootTrackerInner {
+                contributors: HashMap::new(),
+                roots: HashMap::new(),
+            })),
         }
     }
 
     /// Replaces a contributor's root set.
     fn set_roots(&self, contributor: &str, roots: Vec<PathBuf>) {
-        self.contributors
+        let mut inner = self
+            .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner
+            .contributors
             .insert(contributor.to_string(), roots.into_iter().collect());
+        inner.reconcile_roots();
     }
 
     /// Adds roots to a contributor's set (does not remove existing ones).
     fn add_roots(&self, contributor: &str, roots: &[PathBuf]) {
-        self.contributors
+        let mut inner = self
+            .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner
+            .contributors
             .entry(contributor.to_string())
             .or_default()
             .extend(roots.iter().cloned());
+        inner.reconcile_roots();
     }
 
     /// Removes a contributor entirely.
     fn remove_contributor(&self, contributor: &str) {
-        self.contributors
+        let mut inner = self
+            .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(contributor);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.contributors.remove(contributor);
+        inner.reconcile_roots();
     }
 
     /// Removes every contributor whose key `starts_with(prefix)`, in one shot.
@@ -952,13 +1003,19 @@ impl RootTracker {
     /// lets a sweep caller skip `sync_roots` when nothing matched (`0`) and
     /// re-sync only when the union actually changed (`> 0`).
     fn remove_contributors_with_prefix(&self, prefix: &str) -> usize {
-        let mut map = self
-            .contributors
+        let mut inner = self
+            .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let before = map.len();
-        map.retain(|contributor, _| !contributor.starts_with(prefix));
-        before - map.len()
+        let before = inner.contributors.len();
+        inner
+            .contributors
+            .retain(|contributor, _| !contributor.starts_with(prefix));
+        let removed = before - inner.contributors.len();
+        if removed > 0 {
+            inner.reconcile_roots();
+        }
+        removed
     }
 
     /// Returns each contributor whose key `starts_with(prefix)`, paired with its
@@ -970,9 +1027,10 @@ impl RootTracker {
     /// test it against the filesystem). Semantics-free: the tracker stays a pure
     /// data structure with no knowledge of `worktree:` or the filesystem.
     fn contributors_with_prefix(&self, prefix: &str) -> Vec<(String, Vec<PathBuf>)> {
-        self.contributors
+        self.inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contributors
             .iter()
             .filter(|(contributor, _)| contributor.starts_with(prefix))
             .map(|(contributor, roots)| (contributor.clone(), roots.iter().cloned().collect()))
@@ -985,36 +1043,49 @@ impl RootTracker {
     /// the contributor or root was not found.
     #[allow(
         clippy::option_if_let_else,
-        reason = "map_or causes double-borrow on the Mutex guard"
+        reason = "map_or's closure would re-borrow inner.contributors while the get_mut borrow is live"
     )]
     fn remove_root(&self, contributor: &str, root: &Path) -> bool {
-        let mut map = self
-            .contributors
+        let mut inner = self
+            .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(roots) = map.get_mut(contributor) {
+        let removed = if let Some(roots) = inner.contributors.get_mut(contributor) {
             let removed = roots.remove(root);
             if roots.is_empty() {
-                map.remove(contributor);
+                inner.contributors.remove(contributor);
             }
             removed
         } else {
             false
+        };
+        if removed {
+            inner.reconcile_roots();
         }
+        removed
     }
 
-    /// Returns the union of all contributors' root sets.
+    /// Returns the union of all contributors' root sets (path-only view).
     fn global_roots(&self) -> Vec<PathBuf> {
-        let map = self
-            .contributors
+        self.inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut all = HashSet::new();
-        for roots in map.values() {
-            all.extend(roots.iter().cloned());
-        }
-        drop(map);
-        all.into_iter().collect()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .roots
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    /// Returns the canonical config-complete [`Root`]s — the rich view the
+    /// daemon pushes down to `Session::sync_roots`/`LspClientManager`.
+    fn global_roots_rich(&self) -> Vec<Arc<Root>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .roots
+            .values()
+            .cloned()
+            .collect()
     }
 
     /// Returns all roots with their contributor sources.
@@ -1022,14 +1093,14 @@ impl RootTracker {
     /// Each entry is `(path, sources)` where `sources` is a sorted list
     /// of contributor keys (e.g., `["hook", "mcp:3"]`).
     fn list_roots(&self) -> Vec<(PathBuf, Vec<String>)> {
-        let map = self
-            .contributors
+        let inner = self
+            .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         // Invert: root → list of contributors.
         let mut root_sources: HashMap<PathBuf, Vec<String>> = HashMap::new();
-        for (contributor, roots) in &*map {
+        for (contributor, roots) in &inner.contributors {
             for root in roots {
                 root_sources
                     .entry(root.clone())
@@ -1037,7 +1108,7 @@ impl RootTracker {
                     .push(contributor.clone());
             }
         }
-        drop(map);
+        drop(inner);
 
         let mut result: Vec<(PathBuf, Vec<String>)> = root_sources.into_iter().collect();
         result.sort_by(|(a, _), (b, _)| a.cmp(b));
@@ -1050,9 +1121,10 @@ impl RootTracker {
     /// Returns the number of contributors that include the given root.
     #[cfg(test)]
     fn refcount(&self, root: &Path) -> usize {
-        self.contributors
+        self.inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contributors
             .values()
             .filter(|roots| roots.contains(root))
             .count()
@@ -1412,7 +1484,7 @@ impl SessionManager {
                                 // add/remove for free (no provenance bookkeeping).
                                 let paths = companion_expanded_roots(&roots, &session.config);
                                 tracker.set_roots(&mcp_key, paths);
-                                let global = tracker.global_roots();
+                                let global = tracker.global_roots_rich();
                                 tokio::runtime::Handle::current()
                                     .block_on(session.sync_roots(global))?;
                                 Ok(())
@@ -1420,8 +1492,14 @@ impl SessionManager {
                         }
                         (None, Some(cm), _) => {
                             mcp = mcp.on_roots_changed(Box::new(move |roots| {
-                                let paths = parse_root_uris(&roots);
-                                tokio::runtime::Handle::current().block_on(cm.sync_roots(paths))?;
+                                // No tracker (transport-only mode): build
+                                // config-complete roots inline so the manager
+                                // still gets `Root`s, not bare paths.
+                                let roots: Vec<Arc<Root>> = parse_root_uris(&roots)
+                                    .into_iter()
+                                    .map(|p| Arc::new(Root::load(p)))
+                                    .collect();
+                                tokio::runtime::Handle::current().block_on(cm.sync_roots(roots))?;
                                 Ok(())
                             }));
                         }
@@ -1458,7 +1536,7 @@ impl SessionManager {
                     // Sync the reduced root set through the primary
                     // session so both FilesystemManager and PathValidator
                     // are updated.
-                    let global = tracker.global_roots();
+                    let global = tracker.global_roots_rich();
                     let sync_result = if let Some(ref session) = session_cleanup {
                         session.sync_roots(global).await
                     } else if let Some(ref cm) = lsp_cleanup {
@@ -1597,7 +1675,7 @@ impl SessionManager {
                     }
                     // Same sync call the request handlers use (`ctx.primary` is
                     // this `session`): re-sync the (now smaller) union once.
-                    if let Err(e) = session.sync_roots(tracker.global_roots()).await {
+                    if let Err(e) = session.sync_roots(tracker.global_roots_rich()).await {
                         debug!(
                             source = Source::DaemonDispatch.as_str(),
                             "root sync after worktree-root GC failed: {e}",
@@ -1655,7 +1733,7 @@ impl SessionManager {
                     watcher.unregister(&contributor);
                 }
                 tracker.remove_contributor(&contributor);
-                if let Err(e) = session.sync_roots(tracker.global_roots()).await {
+                if let Err(e) = session.sync_roots(tracker.global_roots_rich()).await {
                     debug!(
                         source = Source::DaemonDispatch.as_str(),
                         "root sync after worktree-deletion reap failed: {e}",
@@ -2176,7 +2254,7 @@ async fn handle_hook_dispatch(
             }
 
             // Sync the reduced root set.
-            let global = tracker.global_roots();
+            let global = tracker.global_roots_rich();
             if let Err(e) = ctx.primary.sync_roots(global).await {
                 debug!(
                     source = Source::DaemonDispatch.as_str(),
@@ -2261,7 +2339,7 @@ async fn handle_hook_dispatch(
                     }
                 }
 
-                let global = tracker.global_roots();
+                let global = tracker.global_roots_rich();
                 if let Err(e) = ctx.primary.sync_roots(global).await {
                     debug!(
                         source = Source::DaemonDispatch.as_str(),
@@ -2338,7 +2416,7 @@ async fn handle_hook_dispatch(
             if let Some(ref watcher) = ctx.worktree_watcher {
                 watcher.unregister(&contributor);
             }
-            let global = tracker.global_roots();
+            let global = tracker.global_roots_rich();
             if let Err(e) = ctx.primary.sync_roots(global).await {
                 debug!(
                     source = Source::DaemonDispatch.as_str(),
@@ -3176,7 +3254,7 @@ async fn handle_hook_dispatch(
             let canonical = path.canonicalize().unwrap_or(path);
             if let Some(ref tracker) = ctx.root_tracker {
                 tracker.add_roots("hook", std::slice::from_ref(&canonical));
-                let global = tracker.global_roots();
+                let global = tracker.global_roots_rich();
                 if let Err(e) = ctx.primary.sync_roots(global).await {
                     debug!(
                         source = Source::DaemonDispatch.as_str(),
@@ -3226,7 +3304,7 @@ async fn handle_hook_dispatch(
             if let Some(ref tracker) = ctx.root_tracker {
                 let removed = tracker.remove_root("hook", &canonical);
                 if removed {
-                    let global = tracker.global_roots();
+                    let global = tracker.global_roots_rich();
                     if let Err(e) = ctx.primary.sync_roots(global).await {
                         debug!(
                             source = Source::DaemonDispatch.as_str(),

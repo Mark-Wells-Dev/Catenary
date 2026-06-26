@@ -11,9 +11,7 @@ use tracing::{debug, info, warn};
 
 use tokio_util::sync::CancellationToken;
 
-use crate::bridge::filesystem_manager::{
-    Change, ChangeKind, ClassificationTables, FilesystemManager,
-};
+use crate::bridge::filesystem_manager::{Change, ChangeKind, FilesystemManager, Root};
 use crate::config::{Config, DispatchMethod, LanguageConfig, ServerDef};
 use crate::logging::LoggingServer;
 use crate::lsp::LspClient;
@@ -218,10 +216,6 @@ fn dir_has_marker(dir: &Path, markers: &[String], compiled_markers: &[LspGlob]) 
 /// [`LspClient`] — each server sees an independent monotonic version sequence.
 pub struct LspClientManager {
     config: Arc<Config>,
-    /// Per-root project configs from `.catenary.toml`. Keyed by root path.
-    /// Uses `std::sync::Mutex` — reads are fast, non-contended, and must
-    /// not be held across `.await` points.
-    project_configs: std::sync::Mutex<HashMap<PathBuf, crate::config::ProjectConfig>>,
     clients: Mutex<HashMap<InstanceKey, Arc<Mutex<LspClient>>>>,
     /// Negative cache for single-file server initialization failures.
     /// Contains `(language_id, server_name)` pairs where the server is
@@ -255,7 +249,6 @@ impl LspClientManager {
         let config = config.into();
         Self {
             config,
-            project_configs: std::sync::Mutex::new(HashMap::new()),
             clients: Mutex::new(HashMap::new()),
             single_file_failures: std::sync::Mutex::new(HashSet::new()),
             marker_cache: std::sync::Mutex::new(HashMap::new()),
@@ -278,18 +271,20 @@ impl LspClientManager {
         &self.config
     }
 
-    /// Extracts `CommandsConfig` from each loaded project config.
+    /// Extracts `CommandsConfig` from each tracked root's project config.
     ///
     /// Returns a map from root path to the project's `[commands]` section.
     /// Roots without a `[commands]` section are omitted.
     pub fn project_commands(&self) -> HashMap<PathBuf, crate::config::CommandsConfig> {
-        let configs = self
-            .project_configs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        configs
-            .iter()
-            .filter_map(|(root, pc)| pc.commands.clone().map(|cmds| (root.clone(), cmds)))
+        self.fs
+            .root_views()
+            .into_iter()
+            .filter_map(|root| {
+                root.config()
+                    .commands
+                    .clone()
+                    .map(|cmds| (root.path().to_path_buf(), cmds))
+            })
             .collect()
     }
 
@@ -300,14 +295,12 @@ impl LspClientManager {
     /// resolution, classification, linters, gate) but is dropped from what
     /// reaches language servers: every spawn path skips it, so navigation
     /// (grep/glob) yields no enrichment and the editing gate stays inert.
-    /// Cheap lookup against the already-loaded `project_configs` — no I/O.
+    /// Reads the toggle straight off the tracked [`Root`]'s config — the same
+    /// map `resolve_root` consults, so a resolvable root is always
+    /// config-complete (no spawn race; ticket 00a).
     #[must_use]
     pub fn is_lsp_disabled(&self, root: &Path) -> bool {
-        self.project_configs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(root)
-            .is_some_and(|pc| pc.disable_lsp)
+        self.fs.root(root).is_some_and(|r| r.config().disable_lsp)
     }
 
     /// Whether the root's project config sets `disable_diag` (workstream 34
@@ -317,11 +310,7 @@ impl LspClientManager {
     /// output are off for the root, but LSP servers still run for grep/glob.
     #[must_use]
     pub fn is_diag_disabled(&self, root: &Path) -> bool {
-        self.project_configs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(root)
-            .is_some_and(|pc| pc.disable_diag)
+        self.fs.root(root).is_some_and(|r| r.config().disable_diag)
     }
 
     /// Resolves the effective root for a server instance given a file path.
@@ -383,10 +372,17 @@ impl LspClientManager {
     pub async fn spawn_all(&self) {
         let roots = self.fs.roots();
 
-        // Load project configs for all roots and set per-root
-        // classification tables before detection runs.
-        self.load_project_configs_for_roots(&roots);
-        self.set_per_root_classification(&roots);
+        // Each tracked root already carries its `.catenary.toml` config +
+        // classification (loaded at birth, ticket 00a) — no config loading
+        // here. Surface any orphan `[server.*]` entries while we hold every
+        // root's config.
+        for root in self.fs.root_views() {
+            crate::config::validate::warn_orphan_project_servers(
+                root.config(),
+                &self.config,
+                root.path(),
+            );
+        }
 
         let configured_keys: HashSet<&str> =
             self.config.language.keys().map(String::as_str).collect();
@@ -398,8 +394,8 @@ impl LspClientManager {
         // a language detected in one served root would spawn a server
         // in every served root.
         for root in &roots {
-            // `disable_lsp` roots stay tracked (configs + classification loaded
-            // above) but never reach a language server (ticket 00).
+            // `disable_lsp` roots stay tracked but never reach a language
+            // server (ticket 00).
             if self.is_lsp_disabled(root) {
                 continue;
             }
@@ -512,18 +508,21 @@ impl LspClientManager {
     ///
     /// Returns an error if the root path cannot be converted to a valid URI.
     pub async fn remove_root(&self, root: &Path) -> Result<()> {
-        let mut roots = self.fs.roots();
-        roots.retain(|r| r != root);
-        self.fs.set_roots(roots);
+        // Re-install the surviving roots (config-complete `Root`s), dropping the
+        // removed one. Its per-root config + classification leave with it (they
+        // live on the `Root`); a bare `set_roots` would have erased the kept
+        // roots' configs too.
+        let kept: Vec<Arc<Root>> = self
+            .fs
+            .root_views()
+            .into_iter()
+            .filter(|r| r.path() != root)
+            .collect();
+        self.fs.set_roots_rich(kept);
 
-        // Remove project config and classification tables for the removed root.
-        self.project_configs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(root);
-        self.fs.remove_root_classification(root);
         // Drop the changed-set baseline and generation counter for the removed
-        // root (same leak/staleness reasons as the sync_roots cleanup).
+        // root (path-keyed caches NOT folded onto `Root`; same leak/staleness
+        // reasons as the sync_roots cleanup).
         self.fs.remove_root_baseline(root);
 
         // Shut down per-root instances bound to the removed root.
@@ -544,35 +543,39 @@ impl LspClientManager {
     /// uses it as the single source of truth for evicting per-root
     /// `SymbolIndex` entries (bug #36).
     ///
+    /// `new_roots` are config-complete [`Root`]s (loaded at birth by the
+    /// tracker, ticket 00a): installing them via `fs.set_roots_rich` makes each
+    /// path resolvable and its config readable in one atomic swap, so there is
+    /// no "load config before `set_roots`" reorder — a resolvable root is never
+    /// observed without its config (the `disable_lsp` spawn race is gone by
+    /// construction).
+    ///
     /// # Errors
     ///
     /// Returns an error if any root path cannot be converted to a valid URI.
-    pub async fn sync_roots(&self, new_roots: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
-        // Snapshot the old set, then compute the diff against it. The diff uses
-        // the snapshot (not `fs.roots()`), so `fs.set_roots` can run later.
+    pub async fn sync_roots(&self, new_roots: Vec<Arc<Root>>) -> Result<Vec<PathBuf>> {
+        // Snapshot the old paths, then compute the diff against it. The diff
+        // uses the snapshot (not `fs.roots()`), so `fs.set_roots_rich` can run
+        // later.
         let current_roots = self.fs.roots();
+        let new_paths: Vec<PathBuf> = new_roots.iter().map(|r| r.path().to_path_buf()).collect();
 
-        let to_add: Vec<PathBuf> = new_roots
+        let to_add: Vec<PathBuf> = new_paths
             .iter()
             .filter(|r| !current_roots.contains(r))
             .cloned()
             .collect();
         let to_remove: Vec<PathBuf> = current_roots
             .iter()
-            .filter(|r| !new_roots.contains(r))
+            .filter(|r| !new_paths.contains(r))
             .cloned()
             .collect();
 
-        // Load project configs + classification for added roots BEFORE they
-        // become resolvable via `fs.set_roots`. Otherwise a concurrent
-        // `ensure_clients_for_paths` could see a root in `fs.roots()` whose
-        // `disable_lsp` config is not yet loaded — the gate would read it as
-        // enabled and spawn a server for a disabled root (ticket 00). Both
-        // calls are no-ops when `to_add` is empty (the steady-state sync).
-        self.load_project_configs_for_roots(&to_add);
-        self.set_per_root_classification(&to_add);
-
-        self.fs.set_roots(new_roots.clone());
+        // Install the config-complete roots atomically. Each `Root` carries its
+        // config + classification, so this single swap makes a root resolvable
+        // and config-readable together — no separate prime step, no reorder
+        // (ticket 00a).
+        self.fs.set_roots_rich(new_roots);
 
         if to_add.is_empty() && to_remove.is_empty() {
             return Ok(to_remove);
@@ -590,24 +593,13 @@ impl LspClientManager {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
 
-        // Added-root configs + classification are loaded above (before the
-        // roots became resolvable); here we only tear down removed roots.
-        if !to_remove.is_empty() {
-            let mut configs = self
-                .project_configs
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for removed in &to_remove {
-                configs.remove(removed);
-            }
-            drop(configs);
-            for removed in &to_remove {
-                self.fs.remove_root_classification(removed);
-                // Drop the changed-set baseline and generation counter so
-                // removed-root entries don't accumulate (a leak) and a later
-                // re-mount diffs against a fresh baseline (cold-start full set).
-                self.fs.remove_root_baseline(removed);
-            }
+        // Removed roots dropped their config + classification with the
+        // `set_roots_rich` swap above; here drop the path-keyed caches that are
+        // NOT folded onto `Root` so removed-root entries don't accumulate (a
+        // leak) and a later re-mount diffs against a fresh baseline (cold-start
+        // full set).
+        for removed in &to_remove {
+            self.fs.remove_root_baseline(removed);
         }
 
         // Shut down per-root instances for removed roots.
@@ -1939,13 +1931,9 @@ impl LspClientManager {
     /// isolated per-root instance.
     #[must_use]
     pub fn is_project_scoped(&self, lang: &str, root: &Path) -> bool {
-        let configs = self
-            .project_configs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        configs
-            .get(root)
-            .is_some_and(|pc| pc.language.contains_key(lang))
+        self.fs
+            .root(root)
+            .is_some_and(|r| r.config().language.contains_key(lang))
     }
 
     /// Returns the effective `ServerDef` for a server in a root.
@@ -1958,12 +1946,9 @@ impl LspClientManager {
         let user_def = self.config.server.get(server_name)?;
 
         let project_def = self
-            .project_configs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(root)
-            .and_then(|pc| pc.server.get(server_name))
-            .cloned();
+            .fs
+            .root(root)
+            .and_then(|r| r.config().server.get(server_name).cloned());
 
         let Some(project_def) = project_def else {
             return Some(user_def.clone());
@@ -2030,88 +2015,18 @@ impl LspClientManager {
             .get(server_name)
             .and_then(|d| d.settings.clone());
 
-        let project_settings = self
-            .project_configs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(root)
-            .and_then(|pc| pc.server.get(server_name))
-            .and_then(|d| d.settings.clone());
+        let project_settings = self.fs.root(root).and_then(|r| {
+            r.config()
+                .server
+                .get(server_name)
+                .and_then(|d| d.settings.clone())
+        });
 
         match (user_settings, project_settings) {
             (Some(user), Some(project)) => Some(crate::config::merge::deep_merge(&user, &project)),
             (None, Some(project)) => Some(project),
             (Some(user), None) => Some(user),
             (None, None) => None,
-        }
-    }
-
-    /// Feeds per-root classification tables to `FilesystemManager`.
-    ///
-    /// For each root with a loaded project config that has classification
-    /// fields, builds a [`ClassificationTables`] and stores it on the
-    /// filesystem manager. Must be called after
-    /// [`load_project_configs_for_roots`](Self::load_project_configs_for_roots)
-    /// and before [`FilesystemManager::detect_workspace_languages`].
-    fn set_per_root_classification(&self, roots: &[PathBuf]) {
-        let configs = self
-            .project_configs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for root in roots {
-            if let Some(pc) = configs.get(root) {
-                let tables = ClassificationTables::from_project_config(&pc.language);
-                if !tables.is_empty() {
-                    self.fs.set_root_classification(root.clone(), tables);
-                }
-            }
-        }
-    }
-
-    /// Loads project configs for the given roots without spawning.
-    ///
-    /// Primes the per-root toggle gate (`is_lsp_disabled` / `is_diag_disabled`)
-    /// so a `disable_lsp` root is never observed as enabled. Called by
-    /// [`Session::new`](crate::bridge::session::Session::new) before the session
-    /// serves, closing the startup window between `fs.set_roots` and the
-    /// backgrounded [`spawn_all`](Self::spawn_all) that would otherwise load
-    /// these configs (ticket 00). Idempotent: re-reads `.catenary.toml` and
-    /// overwrites, so a later `spawn_all` reload is harmless.
-    pub fn prime_project_configs(&self, roots: &[PathBuf]) {
-        self.load_project_configs_for_roots(roots);
-    }
-
-    /// Loads project configs for the given roots.
-    ///
-    /// For each root, discovers `.catenary.toml` via [`crate::config::load_project_config`]
-    /// and stores the result. Errors are logged and skipped — a broken
-    /// project config should not prevent other roots from loading.
-    fn load_project_configs_for_roots(&self, roots: &[PathBuf]) {
-        for root in roots {
-            match crate::config::load_project_config(root) {
-                Ok(Some(pc)) => {
-                    info!(
-                        source = Source::ConfigParse.as_str(),
-                        root = %root.display(),
-                        "Loaded project config from {}",
-                        root.join(".catenary.toml").display(),
-                    );
-                    crate::config::validate::warn_orphan_project_servers(&pc, &self.config, root);
-                    self.project_configs
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .insert(root.clone(), pc);
-                }
-                Ok(None) => {} // No project config — fine.
-                Err(e) => {
-                    warn!(
-                        source = Source::ConfigParse.as_str(),
-                        root = %root.display(),
-                        "Failed to load project config from {}: {e}",
-                        root.join(".catenary.toml").display(),
-                    );
-                }
-            }
         }
     }
 
@@ -2142,6 +2057,20 @@ impl LspClientManager {
             }
         }
     }
+
+    /// Installs (or replaces) a single root's project config, preserving the
+    /// other tracked roots (test-only).
+    ///
+    /// Folds what tests previously did by inserting into the removed
+    /// `project_configs` side-table: builds a config-complete [`Root`] and swaps
+    /// it into the filesystem manager's root map.
+    #[cfg(test)]
+    fn install_root_config(&self, root: PathBuf, config: crate::config::ProjectConfig) {
+        let mut roots = self.fs.root_views();
+        roots.retain(|r| r.path() != root);
+        roots.push(Arc::new(Root::new(root, config)));
+        self.fs.set_roots_rich(roots);
+    }
 }
 
 #[cfg(test)]
@@ -2168,6 +2097,19 @@ mod tests {
         let fs = Arc::new(FilesystemManager::new());
         fs.set_roots(roots.iter().map(PathBuf::from).collect());
         fs
+    }
+
+    /// Builds bare (default-config) `Root`s for `sync_roots` in tests.
+    fn rich(paths: &[&str]) -> Vec<Arc<Root>> {
+        paths
+            .iter()
+            .map(|p| Arc::new(Root::bare(PathBuf::from(p))))
+            .collect()
+    }
+
+    /// Like [`rich`] but for owned `PathBuf`s (e.g. tempdir paths).
+    fn rich_bufs(paths: Vec<PathBuf>) -> Vec<Arc<Root>> {
+        paths.into_iter().map(|p| Arc::new(Root::bare(p))).collect()
     }
 
     fn test_config_raw() -> Config {
@@ -2480,10 +2422,7 @@ mod tests {
 
         // Sync: remove /tmp/root_a, keep /tmp/root_b, add /tmp/root_c
         manager
-            .sync_roots(vec![
-                PathBuf::from("/tmp/root_b"),
-                PathBuf::from("/tmp/root_c"),
-            ])
+            .sync_roots(rich(&["/tmp/root_b", "/tmp/root_c"]))
             .await?;
 
         let roots = manager.roots();
@@ -2501,9 +2440,7 @@ mod tests {
             test_fs_with_roots(&["/tmp/root_a"]),
         );
 
-        manager
-            .sync_roots(vec![PathBuf::from("/tmp/root_a")])
-            .await?;
+        manager.sync_roots(rich(&["/tmp/root_a"])).await?;
 
         let roots = manager.roots();
         assert_eq!(roots.len(), 1);
@@ -2536,7 +2473,7 @@ mod tests {
         assert!(has_language(&manager.clients().await, MOCK_LANG_A));
 
         // sync_roots removes /tmp — the per-root instance should be shut down.
-        manager.sync_roots(vec![PathBuf::from("/var")]).await?;
+        manager.sync_roots(rich(&["/var"])).await?;
 
         assert!(
             !has_language(&manager.clients().await, MOCK_LANG_A),
@@ -2560,9 +2497,7 @@ mod tests {
         assert!(client.lock().await.is_alive());
 
         // sync_roots adds /var but keeps /tmp — the /tmp instance stays.
-        manager
-            .sync_roots(vec![PathBuf::from("/tmp"), PathBuf::from("/var")])
-            .await?;
+        manager.sync_roots(rich(&["/tmp", "/var"])).await?;
 
         assert!(
             has_language(&manager.clients().await, MOCK_LANG_A),
@@ -2643,9 +2578,7 @@ mod tests {
         assert!(has_language(&manager.clients().await, MOCK_LANG_A));
 
         // sync_roots should send notification, NOT shut down the client
-        manager
-            .sync_roots(vec![PathBuf::from("/tmp"), PathBuf::from("/var")])
-            .await?;
+        manager.sync_roots(rich(&["/tmp", "/var"])).await?;
 
         // Client should still be active (not removed)
         assert!(
@@ -2771,11 +2704,7 @@ mod tests {
                 ..LanguageConfig::default()
             },
         );
-        manager
-            .project_configs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(PathBuf::from("/tmp"), pc);
+        manager.install_root_config(PathBuf::from("/tmp"), pc);
 
         let paths = vec![PathBuf::from(format!("/tmp/test.{MOCK_LANG_A}"))];
         manager.ensure_clients_for_paths(&paths).await;
@@ -3146,9 +3075,7 @@ mod tests {
         let client = ensure_first_server(&manager, MOCK_LANG_A).await?;
         assert!(client.lock().await.is_alive());
 
-        manager
-            .sync_roots(vec![PathBuf::from("/tmp"), PathBuf::from("/var")])
-            .await?;
+        manager.sync_roots(rich(&["/tmp", "/var"])).await?;
 
         let clients = manager.clients().await;
         assert!(
@@ -3220,7 +3147,7 @@ mod tests {
         let _ = ensure_first_server(&manager, MOCK_LANG_A).await?;
         let before = manager.clients().await.len();
 
-        manager.sync_roots(vec![PathBuf::from("/tmp")]).await?;
+        manager.sync_roots(rich(&["/tmp"])).await?;
 
         assert_eq!(
             manager.clients().await.len(),
@@ -4022,10 +3949,10 @@ mod tests {
 
         // sync_roots adds root_b — both legacy servers should get root_b instances.
         manager
-            .sync_roots(vec![
+            .sync_roots(rich_bufs(vec![
                 root_a.path().to_path_buf(),
                 root_b.path().to_path_buf(),
-            ])
+            ]))
             .await?;
 
         let clients = manager.clients().await;
@@ -4070,7 +3997,7 @@ mod tests {
         assert_eq!(manager.clients().await.len(), 4);
 
         // Remove /var — should shut down both servers' /var instances.
-        manager.sync_roots(vec![PathBuf::from("/tmp")]).await?;
+        manager.sync_roots(rich(&["/tmp"])).await?;
 
         let clients = manager.clients().await;
         assert_eq!(
@@ -4314,11 +4241,7 @@ mod tests {
                 ..LanguageConfig::default()
             },
         );
-        manager
-            .project_configs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(root.clone(), pc);
+        manager.install_root_config(root.clone(), pc);
 
         assert!(manager.is_project_scoped("rust", &root));
     }
@@ -4338,11 +4261,7 @@ mod tests {
                 ..ServerDef::default()
             },
         );
-        manager
-            .project_configs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(root.clone(), pc);
+        manager.install_root_config(root.clone(), pc);
 
         assert!(!manager.is_project_scoped("rust", &root));
     }
@@ -4382,11 +4301,7 @@ mod tests {
                 ..ServerDef::default()
             },
         );
-        manager
-            .project_configs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(root.clone(), pc);
+        manager.install_root_config(root.clone(), pc);
 
         let merged = manager
             .effective_server_def("rust-analyzer", &root)
@@ -4430,11 +4345,7 @@ mod tests {
                 ..ServerDef::default()
             },
         );
-        manager
-            .project_configs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(root.clone(), pc);
+        manager.install_root_config(root.clone(), pc);
 
         let merged = manager
             .effective_server_def("rust-analyzer", &root)
@@ -4496,11 +4407,7 @@ mod tests {
                 ..ServerDef::default()
             },
         );
-        manager
-            .project_configs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(root.clone(), pc);
+        manager.install_root_config(root.clone(), pc);
 
         let settings = manager
             .effective_settings("ra", &root)
@@ -4568,11 +4475,7 @@ mod tests {
                 ..LanguageConfig::default()
             },
         );
-        manager
-            .project_configs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(PathBuf::from("/tmp"), pc);
+        manager.install_root_config(PathBuf::from("/tmp"), pc);
 
         let (key, client) = manager
             .spawn_project_scoped(&server_name, MOCK_LANG_A, Path::new("/tmp"))
@@ -4628,11 +4531,7 @@ mod tests {
                 ..ServerDef::default()
             },
         );
-        manager
-            .project_configs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(PathBuf::from("/tmp"), pc);
+        manager.install_root_config(PathBuf::from("/tmp"), pc);
 
         let (key, client) = manager
             .spawn_project_scoped(&server_name, MOCK_LANG_A, Path::new("/tmp"))
@@ -4669,17 +4568,17 @@ mod tests {
             .name
             .clone();
 
-        let fs = test_fs();
-        fs.set_roots(vec![
-            root_a.path().to_path_buf(),
-            root_b.path().to_path_buf(),
-        ]);
-        let manager = LspClientManager::new(config, test_logging(), fs);
-
-        // Write .catenary.toml for root_b so load_project_configs_for_roots
-        // discovers it during spawn_all.
+        // Write .catenary.toml for root_b so the root is config-complete when
+        // it is born (ticket 00a) — root_a has none and loads bare.
         let project_toml = format!("[language.{MOCK_LANG_A}]\nservers = [\"{server_name}\"]\n");
         std::fs::write(root_b.path().join(".catenary.toml"), project_toml).expect("write");
+
+        let fs = test_fs();
+        fs.set_roots_rich(vec![
+            Arc::new(Root::load(root_a.path().to_path_buf())),
+            Arc::new(Root::load(root_b.path().to_path_buf())),
+        ]);
+        let manager = LspClientManager::new(config, test_logging(), fs);
 
         manager.spawn_all().await;
 
@@ -4713,12 +4612,12 @@ mod tests {
             .name
             .clone();
 
-        let fs = test_fs();
-        fs.set_roots(vec![root.path().to_path_buf()]);
-        let manager = LspClientManager::new(config, test_logging(), fs);
-
         let project_toml = format!("[language.{MOCK_LANG_A}]\nservers = [\"{server_name}\"]\n");
         std::fs::write(root.path().join(".catenary.toml"), project_toml).expect("write");
+
+        let fs = test_fs();
+        fs.set_roots_rich(vec![Arc::new(Root::load(root.path().to_path_buf()))]);
+        let manager = LspClientManager::new(config, test_logging(), fs);
 
         manager.spawn_all().await;
 
@@ -4756,17 +4655,17 @@ mod tests {
             .name
             .clone();
 
-        let fs = test_fs();
-        fs.set_roots(vec![
-            root_a.path().to_path_buf(),
-            root_b.path().to_path_buf(),
-            root_c.path().to_path_buf(),
-        ]);
-        let manager = LspClientManager::new(config, test_logging(), fs);
-
         // Only root_b is project-scoped.
         let project_toml = format!("[language.{MOCK_LANG_A}]\nservers = [\"{server_name}\"]\n");
         std::fs::write(root_b.path().join(".catenary.toml"), project_toml).expect("write");
+
+        let fs = test_fs();
+        fs.set_roots_rich(vec![
+            Arc::new(Root::load(root_a.path().to_path_buf())),
+            Arc::new(Root::load(root_b.path().to_path_buf())),
+            Arc::new(Root::load(root_c.path().to_path_buf())),
+        ]);
+        let manager = LspClientManager::new(config, test_logging(), fs);
 
         manager.spawn_all().await;
 
@@ -4816,11 +4715,7 @@ mod tests {
                 ..LanguageConfig::default()
             },
         );
-        manager
-            .project_configs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(PathBuf::from("/var"), pc);
+        manager.install_root_config(PathBuf::from("/var"), pc);
 
         // Spawn workspace instance for /tmp.
         let ws_client = manager
@@ -4885,7 +4780,7 @@ mod tests {
             .await?;
         assert!(ws.lock().await.supports_workspace_folders());
 
-        // root_b is project-scoped.
+        // root_b is project-scoped (carries a `[language.*]` config).
         let mut pc = crate::config::ProjectConfig::default();
         pc.language.insert(
             MOCK_LANG_A.to_string(),
@@ -4894,17 +4789,12 @@ mod tests {
                 ..LanguageConfig::default()
             },
         );
-        manager
-            .project_configs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(root_b.path().to_path_buf(), pc);
 
-        // sync_roots adds root_b.
+        // sync_roots adds root_b (config-complete) alongside the bare root_a.
         manager
             .sync_roots(vec![
-                root_a.path().to_path_buf(),
-                root_b.path().to_path_buf(),
+                Arc::new(Root::bare(root_a.path().to_path_buf())),
+                Arc::new(Root::new(root_b.path().to_path_buf(), pc)),
             ])
             .await?;
 
@@ -4970,7 +4860,7 @@ mod tests {
         assert_eq!(manager.clients().await.len(), 2);
 
         // Remove /var.
-        manager.sync_roots(vec![PathBuf::from("/tmp")]).await?;
+        manager.sync_roots(rich(&["/tmp"])).await?;
 
         let clients = manager.clients().await;
         assert_eq!(clients.len(), 1, "/var instance should be removed");
@@ -5273,7 +5163,9 @@ mod tests {
 
         // Add the root via sync_roots — this shuts down single-file
         // instances and clears failure cache.
-        manager.sync_roots(vec![root.path().to_path_buf()]).await?;
+        manager
+            .sync_roots(rich_bufs(vec![root.path().to_path_buf()]))
+            .await?;
 
         // Single-file instance should be cleaned up.
         assert_eq!(
@@ -5745,11 +5637,7 @@ mod tests {
             ..crate::config::ProjectConfig::default()
         };
         let root = PathBuf::from("/project");
-        manager
-            .project_configs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(root.clone(), pc);
+        manager.install_root_config(root.clone(), pc);
 
         let cmds = manager.project_commands();
         assert_eq!(cmds.len(), 1, "should have one entry");
@@ -5763,11 +5651,7 @@ mod tests {
 
         let pc = crate::config::ProjectConfig::default(); // commands = None
         let root = PathBuf::from("/project");
-        manager
-            .project_configs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(root, pc);
+        manager.install_root_config(root, pc);
 
         assert!(
             manager.project_commands().is_empty(),
@@ -5786,20 +5670,14 @@ mod tests {
         // Unknown root → not disabled (default false).
         assert!(!manager.is_lsp_disabled(&disabled));
 
-        {
-            let mut configs = manager
-                .project_configs
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            configs.insert(
-                disabled.clone(),
-                crate::config::ProjectConfig {
-                    disable_lsp: true,
-                    ..crate::config::ProjectConfig::default()
-                },
-            );
-            configs.insert(enabled.clone(), crate::config::ProjectConfig::default());
-        }
+        manager.install_root_config(
+            disabled.clone(),
+            crate::config::ProjectConfig {
+                disable_lsp: true,
+                ..crate::config::ProjectConfig::default()
+            },
+        );
+        manager.install_root_config(enabled.clone(), crate::config::ProjectConfig::default());
 
         assert!(manager.is_lsp_disabled(&disabled), "disable_lsp root");
         assert!(
@@ -5821,17 +5699,13 @@ mod tests {
 
         assert!(!manager.is_diag_disabled(&root));
 
-        manager
-            .project_configs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(
-                root.clone(),
-                crate::config::ProjectConfig {
-                    disable_diag: true,
-                    ..crate::config::ProjectConfig::default()
-                },
-            );
+        manager.install_root_config(
+            root.clone(),
+            crate::config::ProjectConfig {
+                disable_diag: true,
+                ..crate::config::ProjectConfig::default()
+            },
+        );
 
         assert!(manager.is_diag_disabled(&root));
         assert!(
@@ -5937,11 +5811,7 @@ mod tests {
                 ..ServerDef::default()
             },
         );
-        manager
-            .project_configs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(root.clone(), pc);
+        manager.install_root_config(root.clone(), pc);
 
         let merged = manager
             .effective_server_def("rust-analyzer", &root)
@@ -5978,11 +5848,7 @@ mod tests {
                 ..ServerDef::default()
             },
         );
-        manager
-            .project_configs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(root.clone(), pc);
+        manager.install_root_config(root.clone(), pc);
 
         let merged = manager
             .effective_server_def("rust-analyzer", &root)
@@ -5994,9 +5860,10 @@ mod tests {
         );
     }
 
-    /// `set_per_root_classification` feeds non-empty tables to `FilesystemManager`.
+    /// A config-bearing root's `[language.*]` classification reaches
+    /// `FilesystemManager` (the tables are derived on the `Root`, ticket 00a).
     #[test]
-    fn test_set_per_root_classification_non_empty() {
+    fn test_root_config_feeds_classification() {
         let root = PathBuf::from("/project");
         let fs = test_fs_with_roots(&["/project"]);
         let manager = LspClientManager::new(test_config(), test_logging(), Arc::clone(&fs));
@@ -6009,13 +5876,7 @@ mod tests {
                 ..LanguageConfig::default()
             },
         );
-        manager
-            .project_configs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(root.clone(), pc);
-
-        manager.set_per_root_classification(&[root]);
+        manager.install_root_config(root, pc);
 
         // Verify: a file with .xyz extension under this root should resolve
         // to the "custom" language via per-root classification.
@@ -6027,29 +5888,23 @@ mod tests {
         );
     }
 
-    /// `set_per_root_classification` skips empty tables.
+    /// A root with no `[language.*]` classification falls through to the global
+    /// tables (no per-root entry).
     #[test]
-    fn test_set_per_root_classification_empty_skipped() {
+    fn test_root_config_empty_classification_falls_through() {
         let fs = test_fs_with_roots(&["/project"]);
         let manager = LspClientManager::new(test_config(), test_logging(), Arc::clone(&fs));
 
         let root = PathBuf::from("/project");
-        // No classification fields → empty tables
-        let pc = crate::config::ProjectConfig::default();
-        manager
-            .project_configs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(root.clone(), pc);
+        // No classification fields → empty tables.
+        manager.install_root_config(root, crate::config::ProjectConfig::default());
 
-        manager.set_per_root_classification(&[root]);
-
-        // No per-root classification should have been set,
-        // so language_id should return None for unknown extensions.
+        // No per-root classification, so language_id returns None for an
+        // unknown extension.
         let lang = fs.language_id(Path::new("/project/test.xyz"));
         assert!(
             lang.is_none(),
-            "empty classification tables should not be set"
+            "empty classification tables should not match"
         );
     }
 
@@ -6342,7 +6197,7 @@ mod tests {
 
         // Add second root mid-session.
         manager
-            .sync_roots(vec![root_a.clone(), root_b.clone()])
+            .sync_roots(rich_bufs(vec![root_a.clone(), root_b.clone()]))
             .await?;
 
         // Two instances — one per root.
@@ -6575,7 +6430,7 @@ mod tests {
         );
 
         // Re-add the root and walk again ⇒ fresh cold-start full set.
-        manager.sync_roots(vec![root.clone()]).await?;
+        manager.sync_roots(rich_bufs(vec![root.clone()])).await?;
         let set = fs.diff_and_update(&root, &[(PathBuf::from("a.rs"), 100)]);
         assert_eq!(set.changes.len(), 1, "re-added root ⇒ fresh first walk");
 

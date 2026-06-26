@@ -19,7 +19,7 @@ use super::diagnostics_server::DiagnosticsServer;
 use super::editing_guardrail::EditingGuardrail;
 use super::editing_manager::EditingManager;
 use super::file_tools::GlobServer;
-use super::filesystem_manager::FilesystemManager;
+use super::filesystem_manager::{FilesystemManager, Root};
 use super::grep_server::GrepServer;
 use super::handler::expand_tilde;
 use super::path_security::PathValidator;
@@ -446,7 +446,16 @@ impl Session {
 
         let classification = super::filesystem_manager::ClassificationTables::from_config(&config);
         let fs_manager = Arc::new(FilesystemManager::with_classification(classification));
-        fs_manager.set_roots(roots.clone());
+        // Install config-complete roots: each `Root` loads its `.catenary.toml`
+        // at birth, so the per-root toggle gate (`is_lsp_disabled` /
+        // `is_diag_disabled`) sees the config the moment the root is resolvable —
+        // no separate prime step, no spawn race (ticket 00a).
+        fs_manager.set_roots_rich(
+            roots
+                .iter()
+                .map(|p| Arc::new(Root::load(p.clone())))
+                .collect(),
+        );
 
         // Build symbol index (in-memory, populated lazily from documentSymbol).
         let symbol_index = SymbolIndex::new()
@@ -474,15 +483,6 @@ impl Session {
             client_manager.set_snapshot(writer.clone());
         }
         let client_manager = Arc::new(client_manager);
-
-        // Prime the per-root toggle gate before this session serves. `fs_manager`
-        // already made the roots resolvable above, but `project_configs` stays
-        // empty until the backgrounded `spawn_all` — so without this a startup
-        // query against a `disable_lsp` root would read it as enabled and spawn a
-        // server (ticket 00). Construction runs before any connection is served,
-        // so loading here closes that window; `spawn_all`'s later reload is a
-        // harmless idempotent overwrite.
-        client_manager.prime_project_configs(&fs_manager.roots());
 
         let diagnostics = Arc::new(DiagnosticsServer::new(
             client_manager.clone(),
@@ -928,14 +928,21 @@ impl Session {
     /// Updates path validation, notifies LSP servers of folder changes,
     /// and spawns servers for any newly detected languages.
     ///
+    /// `roots` are config-complete [`Root`]s (loaded at birth by the daemon's
+    /// root tracker, ticket 00a). The manager consumes the rich roots (config +
+    /// classification); the path validator gets the path-only view.
+    ///
     /// # Errors
     ///
     /// Returns an error if root synchronization fails.
-    pub async fn sync_roots(&self, roots: Vec<PathBuf>) -> Result<()> {
+    pub async fn sync_roots(&self, roots: Vec<Arc<Root>>) -> Result<()> {
+        // Path-only view for the validator (a path-only consumer).
+        let paths: Vec<PathBuf> = roots.iter().map(|r| r.path().to_path_buf()).collect();
+
         // sync_roots updates FilesystemManager roots first (before any
         // async work), then reacts to the diff.
-        let removed = self.client_manager.sync_roots(roots.clone()).await?;
-        self.path_validator.write().await.update_roots(roots);
+        let removed = self.client_manager.sync_roots(roots).await?;
+        self.path_validator.write().await.update_roots(paths);
 
         // Evict the per-root `SymbolIndex` entries for every removed root —
         // the manager owns no handle to the index, so this is the only layer

@@ -14,6 +14,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use ignore::WalkBuilder;
 
+use crate::config::ProjectConfig;
+use crate::source::Source;
+
 /// Files above this size are assumed binary without reading.
 const BINARY_SIZE_THRESHOLD: u64 = 10 * 1024 * 1024; // 10 MB
 
@@ -312,6 +315,105 @@ impl ClassificationTables {
     }
 }
 
+/// A workspace root folded into one value: its path, its loaded
+/// `.catenary.toml` project config, and the [`ClassificationTables`] derived
+/// from that config's `[language.*]` section.
+///
+/// This replaces the formerly-parallel `(path → ProjectConfig)` side-table
+/// (`LspClientManager.project_configs`) and the per-root classification map.
+/// A `Root` is **config-complete the moment it exists**: it is born when a
+/// path's tracker refcount goes 0→1 (loading `.catenary.toml` then) and reaped
+/// at 1→0. Because the config travels with the path on a single map under a
+/// single lock, a consumer that resolves a root can never observe it without
+/// its config — the `disable_lsp` spawn race is structurally impossible, so no
+/// "prime configs before `set_roots`" reorder is needed (workstream 34 ticket
+/// 00a).
+///
+/// The hot, mutable runtime caches (`root_generations`, the changed-set
+/// `last_seen` baseline, the LSP instance map) are deliberately **not** folded
+/// here: they have independent locking and a lifetime tied to
+/// spawn/invalidation, not config. Co-locating them behind one `Root` lock
+/// would regress concurrency.
+#[derive(Debug)]
+pub struct Root {
+    path: PathBuf,
+    config: ProjectConfig,
+    classification: ClassificationTables,
+}
+
+impl Root {
+    /// Builds a root from an explicit path + config, deriving its
+    /// classification tables from the config's `[language.*]` section.
+    #[must_use]
+    pub fn new(path: PathBuf, config: ProjectConfig) -> Self {
+        let classification = ClassificationTables::from_project_config(&config.language);
+        Self {
+            path,
+            config,
+            classification,
+        }
+    }
+
+    /// Builds a config-complete root by loading `.catenary.toml` at `path`.
+    ///
+    /// A missing config yields the default [`ProjectConfig`]; a malformed one
+    /// logs a `warn!` and also falls back to default — a broken project config
+    /// must never block a root from being tracked.
+    #[must_use]
+    pub fn load(path: PathBuf) -> Self {
+        let config = match crate::config::load_project_config(&path) {
+            Ok(Some(pc)) => {
+                tracing::info!(
+                    source = Source::ConfigParse.as_str(),
+                    root = %path.display(),
+                    "Loaded project config from {}",
+                    path.join(".catenary.toml").display(),
+                );
+                pc
+            }
+            Ok(None) => ProjectConfig::default(),
+            Err(e) => {
+                tracing::warn!(
+                    source = Source::ConfigParse.as_str(),
+                    root = %path.display(),
+                    "Failed to load project config from {}: {e}",
+                    path.join(".catenary.toml").display(),
+                );
+                ProjectConfig::default()
+            }
+        };
+        Self::new(path, config)
+    }
+
+    /// Builds a root carrying the default (empty) project config.
+    ///
+    /// Used for path-only consumers (tests and query scoping) that never read
+    /// per-root config — the classification tables are empty, so file
+    /// classification falls through to the global tables.
+    #[must_use]
+    pub fn bare(path: PathBuf) -> Self {
+        Self::new(path, ProjectConfig::default())
+    }
+
+    /// The root's path (its identity).
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The root's loaded project config.
+    #[must_use]
+    pub const fn config(&self) -> &ProjectConfig {
+        &self.config
+    }
+
+    /// The classification tables derived from the root's `[language.*]`.
+    #[must_use]
+    pub const fn classification(&self) -> &ClassificationTables {
+        &self.classification
+    }
+}
+
 /// Cross-tool filesystem classification cache.
 ///
 /// Single authority for file metadata: binary detection, line count,
@@ -325,9 +427,14 @@ pub struct FilesystemManager {
     /// ensures that root changes (add/remove) cause cache misses,
     /// preventing stale `language_id` from per-root classification.
     cache: std::sync::Mutex<HashMap<(PathBuf, Option<PathBuf>), CachedEntry>>,
-    roots: std::sync::Mutex<Vec<PathBuf>>,
+    /// Workspace roots keyed by path. Each [`Root`] carries its loaded
+    /// `.catenary.toml` config and the classification tables derived from it,
+    /// so resolving a root and reading its config/classification hit one map
+    /// under one lock — a resolvable root is always config-complete (workstream
+    /// 34 ticket 00a). Folds the former `roots: Vec<PathBuf>` and
+    /// `per_root_classification` maps.
+    roots: std::sync::Mutex<HashMap<PathBuf, Arc<Root>>>,
     classification: ClassificationTables,
-    per_root_classification: std::sync::Mutex<HashMap<PathBuf, ClassificationTables>>,
     /// Per-root generation counter, bumped by
     /// [`bump_generations()`](Self::bump_generations) when files are
     /// modified. Used by [`SymbolIndex`] enrichment cache and
@@ -361,9 +468,8 @@ impl Default for FilesystemManager {
     fn default() -> Self {
         Self {
             cache: std::sync::Mutex::new(HashMap::new()),
-            roots: std::sync::Mutex::new(Vec::new()),
+            roots: std::sync::Mutex::new(HashMap::new()),
             classification: ClassificationTables::default(),
-            per_root_classification: std::sync::Mutex::new(HashMap::new()),
             root_generations: std::sync::Mutex::new(HashMap::new()),
             last_seen: Mutex::new(HashMap::new()),
         }
@@ -385,9 +491,8 @@ impl FilesystemManager {
     pub fn with_classification(classification: ClassificationTables) -> Self {
         Self {
             cache: std::sync::Mutex::new(HashMap::new()),
-            roots: std::sync::Mutex::new(Vec::new()),
+            roots: std::sync::Mutex::new(HashMap::new()),
             classification,
-            per_root_classification: std::sync::Mutex::new(HashMap::new()),
             root_generations: std::sync::Mutex::new(HashMap::new()),
             last_seen: Mutex::new(HashMap::new()),
         }
@@ -431,11 +536,12 @@ impl FilesystemManager {
             let language_id = root
                 .as_ref()
                 .and_then(|r| {
-                    let per_root = self
-                        .per_root_classification
+                    let roots = self
+                        .roots
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    per_root.get(r).and_then(|tables| {
+                    roots.get(r).and_then(|root| {
+                        let tables = root.classification();
                         scan.shebang_interpreter
                             .as_deref()
                             .and_then(|interp| tables.lookup_shebang(interp))
@@ -496,12 +602,12 @@ impl FilesystemManager {
     pub fn language_id(&self, path: &Path) -> Option<String> {
         // Per-root fast path: filename/extension (no I/O).
         if let Some(root) = self.resolve_root(path) {
-            let per_root = self
-                .per_root_classification
+            let roots = self
+                .roots
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(tables) = per_root.get(&root)
-                && let Some(lang) = tables.classify_path(path)
+            if let Some(r) = roots.get(&root)
+                && let Some(lang) = r.classification().classify_path(path)
             {
                 return Some(lang);
             }
@@ -527,38 +633,81 @@ impl FilesystemManager {
         let Ok(roots) = self.roots.lock() else {
             return None;
         };
-        resolve_root_in(&roots, path)
+        resolve_root_in_map(&roots, path)
     }
 
-    /// Returns a snapshot of the current workspace roots.
+    /// Returns a sorted snapshot of the current workspace root paths.
+    ///
+    /// Sorted for deterministic order (the underlying map is unordered, and the
+    /// daemon already feeds roots from an unordered set union, so callers must
+    /// not rely on insertion order).
     #[must_use]
     pub fn roots(&self) -> Vec<PathBuf> {
-        self.roots.lock().map_or_else(|_| Vec::new(), |r| r.clone())
+        let mut roots: Vec<PathBuf> = self
+            .roots
+            .lock()
+            .map_or_else(|_| Vec::new(), |r| r.keys().cloned().collect());
+        roots.sort();
+        roots
     }
 
-    /// Updates the known workspace root set.
+    /// Returns the [`Root`] for an exact path, if tracked.
+    ///
+    /// Returns a cheap `Arc` clone — the lock is released before the caller
+    /// inspects the config/classification.
+    #[must_use]
+    pub fn root(&self, path: &Path) -> Option<Arc<Root>> {
+        self.roots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(path)
+            .cloned()
+    }
+
+    /// Returns a snapshot of all tracked [`Root`]s (cheap `Arc` clones).
+    ///
+    /// Used by config-bearing consumers (the manager's `project_commands`,
+    /// orphan-server warnings) that need every root's config, not just its path.
+    #[must_use]
+    pub fn root_views(&self) -> Vec<Arc<Root>> {
+        self.roots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    /// Updates the known workspace root set from bare paths.
+    ///
+    /// Builds [`Root::bare`] entries (default config, empty per-root
+    /// classification) — for path-only callers and tests that never read
+    /// per-root config. Production callers that carry config use
+    /// [`set_roots_rich`](Self::set_roots_rich).
     pub fn set_roots(&self, roots: Vec<PathBuf>) {
+        let map = roots
+            .into_iter()
+            .map(|p| (p.clone(), Arc::new(Root::bare(p))))
+            .collect();
         if let Ok(mut current) = self.roots.lock() {
-            *current = roots;
+            *current = map;
         }
     }
 
-    /// Sets per-root classification tables from a project config.
+    /// Replaces the workspace root set with config-complete [`Root`]s.
     ///
-    /// Called by the manager during `spawn_all` and `sync_roots`.
-    /// Replaces any existing per-root tables for the given root.
-    pub fn set_root_classification(&self, root: PathBuf, tables: ClassificationTables) {
-        if let Ok(mut per_root) = self.per_root_classification.lock() {
-            per_root.insert(root, tables);
-        }
-    }
-
-    /// Removes per-root classification tables for a root.
-    ///
-    /// Called when a root is removed.
-    pub fn remove_root_classification(&self, root: &Path) {
-        if let Ok(mut per_root) = self.per_root_classification.lock() {
-            per_root.remove(root);
+    /// The single chokepoint through which the daemon installs the root set:
+    /// each `Root` already carries its loaded config + classification, so the
+    /// path becomes resolvable and config-readable in one atomic map swap.
+    /// Removed roots (absent from `roots`) drop out of the map, taking their
+    /// per-root classification with them.
+    pub fn set_roots_rich(&self, roots: Vec<Arc<Root>>) {
+        let map = roots
+            .into_iter()
+            .map(|r| (r.path().to_path_buf(), r))
+            .collect();
+        if let Ok(mut current) = self.roots.lock() {
+            *current = map;
         }
     }
 
@@ -989,14 +1138,14 @@ pub fn format_file_size(bytes: u64) -> String {
     }
 }
 
-/// Resolves the owning workspace root for a path from a roots slice.
+/// Resolves the owning workspace root for a path from the roots map.
 ///
-/// Returns the longest-prefix match, or `None` if the path is outside
-/// all roots. Used by methods that already hold the roots lock to avoid
-/// re-locking.
-fn resolve_root_in(roots: &[PathBuf], path: &Path) -> Option<PathBuf> {
+/// Returns the longest-prefix match against the map keys, or `None` if the path
+/// is outside all roots. Used by methods that already hold the roots lock to
+/// avoid re-locking.
+fn resolve_root_in_map(roots: &HashMap<PathBuf, Arc<Root>>, path: &Path) -> Option<PathBuf> {
     roots
-        .iter()
+        .keys()
         .filter(|root| path.starts_with(root))
         .max_by_key(|root| root.as_os_str().len())
         .cloned()
@@ -1642,6 +1791,22 @@ mod tests {
         }
     }
 
+    /// Builds an `Arc<Root>` carrying a project config whose `[language.*]`
+    /// section is `languages` — the modern way to attach per-root
+    /// classification (the classification tables are derived on the `Root`).
+    fn root_with_langs(
+        path: PathBuf,
+        languages: HashMap<String, crate::config::LanguageConfig>,
+    ) -> Arc<Root> {
+        Arc::new(Root::new(
+            path,
+            ProjectConfig {
+                language: languages,
+                ..ProjectConfig::default()
+            },
+        ))
+    }
+
     #[test]
     fn test_from_project_config_basic() {
         let mut languages = HashMap::new();
@@ -1669,13 +1834,14 @@ mod tests {
         let root_b = PathBuf::from("/projects/b");
 
         let mgr = default_mgr();
-        mgr.set_roots(vec![root_a.clone(), root_b]);
 
-        // Root A maps .pkg → pkgbuild.
+        // Root A maps .pkg → pkgbuild; root B is bare.
         let mut languages = HashMap::new();
         languages.insert("pkgbuild".to_string(), lang_config_with_exts(&["pkg"]));
-        let tables = ClassificationTables::from_project_config(&languages);
-        mgr.set_root_classification(root_a, tables);
+        mgr.set_roots_rich(vec![
+            root_with_langs(root_a, languages),
+            Arc::new(Root::bare(root_b)),
+        ]);
 
         // File in root A: .pkg → pkgbuild.
         assert_eq!(
@@ -1706,15 +1872,13 @@ mod tests {
         let root_a = PathBuf::from("/projects/a");
 
         let mgr = default_mgr();
-        mgr.set_roots(vec![root_a.clone()]);
 
         let mut languages = HashMap::new();
         languages.insert(
             "custom".to_string(),
             lang_config_with_filenames(&["Taskfile"]),
         );
-        let tables = ClassificationTables::from_project_config(&languages);
-        mgr.set_root_classification(root_a, tables);
+        mgr.set_roots_rich(vec![root_with_langs(root_a, languages)]);
 
         assert_eq!(
             mgr.language_id(Path::new("/projects/a/Taskfile")),
@@ -1726,12 +1890,13 @@ mod tests {
     fn test_per_root_shebang_classification() {
         let root_a = tempfile::tempdir().expect("tempdir");
         let mgr = default_mgr();
-        mgr.set_roots(vec![root_a.path().to_path_buf()]);
 
         let mut languages = HashMap::new();
         languages.insert("custom".to_string(), lang_config_with_shebangs(&["deno"]));
-        let tables = ClassificationTables::from_project_config(&languages);
-        mgr.set_root_classification(root_a.path().to_path_buf(), tables);
+        mgr.set_roots_rich(vec![root_with_langs(
+            root_a.path().to_path_buf(),
+            languages,
+        )]);
 
         // Extensionless file with deno shebang in root A → custom.
         let path = root_a.path().join("script");
@@ -1745,13 +1910,11 @@ mod tests {
         let root_a = PathBuf::from("/projects/a");
 
         let mgr = default_mgr();
-        mgr.set_roots(vec![root_a.clone()]);
 
         // Root A maps .sh → custom-shell (global maps .sh → shellscript).
         let mut languages = HashMap::new();
         languages.insert("custom-shell".to_string(), lang_config_with_exts(&["sh"]));
-        let tables = ClassificationTables::from_project_config(&languages);
-        mgr.set_root_classification(root_a, tables);
+        mgr.set_roots_rich(vec![root_with_langs(root_a, languages)]);
 
         assert_eq!(
             mgr.language_id(Path::new("/projects/a/test.sh")),
@@ -1764,13 +1927,11 @@ mod tests {
         let root_a = PathBuf::from("/projects/a");
 
         let mgr = default_mgr();
-        mgr.set_roots(vec![root_a.clone()]);
 
         // Set per-root tables for root A.
         let mut languages = HashMap::new();
         languages.insert("custom".to_string(), lang_config_with_exts(&["xyz"]));
-        let tables = ClassificationTables::from_project_config(&languages);
-        mgr.set_root_classification(root_a, tables);
+        mgr.set_roots_rich(vec![root_with_langs(root_a, languages)]);
 
         // File outside all roots uses global classification only.
         assert_eq!(
@@ -1782,19 +1943,18 @@ mod tests {
     }
 
     #[test]
-    fn test_set_root_classification() {
+    fn test_set_roots_rich_attaches_classification() {
         let root = PathBuf::from("/projects/a");
         let mgr = FilesystemManager::new();
-        mgr.set_roots(vec![root.clone()]);
 
-        // No per-root tables initially.
+        // A bare root has no per-root tables.
+        mgr.set_roots(vec![root.clone()]);
         assert_eq!(mgr.language_id(Path::new("/projects/a/foo.pkg")), None);
 
-        // Set per-root tables.
+        // A config-bearing root carries its derived classification.
         let mut languages = HashMap::new();
         languages.insert("pkgbuild".to_string(), lang_config_with_exts(&["pkg"]));
-        let tables = ClassificationTables::from_project_config(&languages);
-        mgr.set_root_classification(root, tables);
+        mgr.set_roots_rich(vec![root_with_langs(root, languages)]);
 
         assert_eq!(
             mgr.language_id(Path::new("/projects/a/foo.pkg")),
@@ -1803,23 +1963,22 @@ mod tests {
     }
 
     #[test]
-    fn test_remove_root_classification() {
+    fn test_dropped_root_drops_classification() {
         let root = PathBuf::from("/projects/a");
         let mgr = FilesystemManager::new();
-        mgr.set_roots(vec![root.clone()]);
 
         let mut languages = HashMap::new();
         languages.insert("pkgbuild".to_string(), lang_config_with_exts(&["pkg"]));
-        let tables = ClassificationTables::from_project_config(&languages);
-        mgr.set_root_classification(root.clone(), tables);
+        mgr.set_roots_rich(vec![root_with_langs(root, languages)]);
 
         assert_eq!(
             mgr.language_id(Path::new("/projects/a/foo.pkg")),
             Some("pkgbuild".to_string()),
         );
 
-        // Remove per-root tables — falls back to global (None).
-        mgr.remove_root_classification(&root);
+        // Replacing the set without the root drops its per-root classification —
+        // falls back to global (None).
+        mgr.set_roots_rich(vec![]);
         assert_eq!(mgr.language_id(Path::new("/projects/a/foo.pkg")), None);
     }
 
@@ -1827,16 +1986,14 @@ mod tests {
     fn test_detect_workspace_languages_per_root() {
         let root = tempfile::tempdir().expect("tempdir");
         let mgr = FilesystemManager::new();
-        mgr.set_roots(vec![root.path().to_path_buf()]);
 
         // Create a file with a custom extension.
         std::fs::write(root.path().join("build.pkg"), "content\n").expect("write");
 
-        // Set per-root classification: .pkg → pkgbuild.
+        // Per-root classification: .pkg → pkgbuild.
         let mut languages = HashMap::new();
         languages.insert("pkgbuild".to_string(), lang_config_with_exts(&["pkg"]));
-        let tables = ClassificationTables::from_project_config(&languages);
-        mgr.set_root_classification(root.path().to_path_buf(), tables);
+        mgr.set_roots_rich(vec![root_with_langs(root.path().to_path_buf(), languages)]);
 
         let configured: HashSet<&str> = std::iter::once("pkgbuild").collect();
         let detected = mgr.detect_workspace_languages(&[root.path().to_path_buf()], &configured);
@@ -1851,13 +2008,11 @@ mod tests {
     fn test_classify_uses_per_root_shebang() {
         let root = tempfile::tempdir().expect("tempdir");
         let mgr = default_mgr();
-        mgr.set_roots(vec![root.path().to_path_buf()]);
 
         // Per-root: deno → custom.
         let mut languages = HashMap::new();
         languages.insert("custom".to_string(), lang_config_with_shebangs(&["deno"]));
-        let tables = ClassificationTables::from_project_config(&languages);
-        mgr.set_root_classification(root.path().to_path_buf(), tables);
+        mgr.set_roots_rich(vec![root_with_langs(root.path().to_path_buf(), languages)]);
 
         let path = root.path().join("script");
         std::fs::write(&path, "#!/usr/bin/env deno\nconsole.log('hi')\n").expect("write");
