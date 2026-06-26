@@ -926,8 +926,9 @@ fn doctor_check_config(out: &mut Output) {
 
 /// Check a project root for `.catenary.toml` and validate its contents.
 ///
-/// Reports unsupported sections, parse errors, and orphan server definitions.
-/// Called with `--root` (defaults to cwd).
+/// Reports unsupported sections, parse errors, the per-root feeder toggles,
+/// and orphan server definitions. Called with `--root` (defaults to cwd).
+#[allow(clippy::too_many_lines, reason = "sequential per-section reporting")]
 fn doctor_check_project_config(
     out: &mut Output,
     project_root: &Path,
@@ -948,18 +949,25 @@ fn doctor_check_project_config(
         config_path.display(),
     ));
 
-    // Flag deprecated `enabled` key before parsing.
-    let has_deprecated_enabled = std::fs::read_to_string(&config_path)
+    // Flag the removed `lsp`/`enabled` kill switch before parsing (workstream
+    // 34 ticket 00). `load_project_config` now hard-errors on these keys; this
+    // gives a targeted migration hint pointing at the replacement toggle.
+    let removed_key = std::fs::read_to_string(&config_path)
         .ok()
         .and_then(|c| c.parse::<toml::Value>().ok())
-        .and_then(|raw| raw.get("enabled").map(|_| ()))
-        .is_some();
+        .and_then(|raw| {
+            ["lsp", "enabled"]
+                .into_iter()
+                .find(|k| raw.get(*k).is_some())
+        });
 
-    if has_deprecated_enabled {
+    if let Some(key) = removed_key {
         let _ = out.writeln(format_args!(
             "  {}",
-            out.colors
-                .yellow("⚠  `enabled` is deprecated — rename it to `lsp`"),
+            out.colors.red(&format!(
+                "✗  `{key}` was removed in 2.0 — use `disable_lsp` \
+                 (`lsp = false` becomes `disable_lsp = true`)"
+            )),
         ));
     }
 
@@ -976,6 +984,28 @@ fn doctor_check_project_config(
                     if server_count == 1 { "" } else { "s" },
                 )),
             ));
+
+            // Report the three per-root feeder toggles when set (ticket 00).
+            for (name, set, note) in [
+                (
+                    "disable_lsp",
+                    pc.disable_lsp,
+                    "no LSP servers, grep/glob enrichment, or LSP diagnostics",
+                ),
+                ("disable_lint", pc.disable_lint, "no linter diagnostics"),
+                (
+                    "disable_diag",
+                    pc.disable_diag,
+                    "diagnostics surface off; LSP navigation kept",
+                ),
+            ] {
+                if set {
+                    let _ = out.writeln(format_args!(
+                        "  {}",
+                        out.colors.dim(&format!("{name} = true — {note}")),
+                    ));
+                }
+            }
 
             // Orphan server warnings
             for (server_name, server_def) in &pc.server {

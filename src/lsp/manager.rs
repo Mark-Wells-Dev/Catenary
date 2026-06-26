@@ -293,6 +293,37 @@ impl LspClientManager {
             .collect()
     }
 
+    /// Whether the root's project config sets `disable_lsp` (workstream 34
+    /// ticket 00).
+    ///
+    /// A disabled root stays tracked everywhere else (`roots ls`, build/command
+    /// resolution, classification, linters, gate) but is dropped from what
+    /// reaches language servers: every spawn path skips it, so navigation
+    /// (grep/glob) yields no enrichment and the editing gate stays inert.
+    /// Cheap lookup against the already-loaded `project_configs` — no I/O.
+    #[must_use]
+    pub fn is_lsp_disabled(&self, root: &Path) -> bool {
+        self.project_configs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(root)
+            .is_some_and(|pc| pc.disable_lsp)
+    }
+
+    /// Whether the root's project config sets `disable_diag` (workstream 34
+    /// ticket 00).
+    ///
+    /// A surface suppressor: the editing→`catenary diagnostics` gate and its
+    /// output are off for the root, but LSP servers still run for grep/glob.
+    #[must_use]
+    pub fn is_diag_disabled(&self, root: &Path) -> bool {
+        self.project_configs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(root)
+            .is_some_and(|pc| pc.disable_diag)
+    }
+
     /// Resolves the effective root for a server instance given a file path.
     ///
     /// If the language has active `root_markers`, walks up from `file`
@@ -367,6 +398,12 @@ impl LspClientManager {
         // a language detected in one served root would spawn a server
         // in every served root.
         for root in &roots {
+            // `disable_lsp` roots stay tracked (configs + classification loaded
+            // above) but never reach a language server (ticket 00).
+            if self.is_lsp_disabled(root) {
+                continue;
+            }
+
             let detected = self
                 .fs
                 .detect_workspace_languages(std::slice::from_ref(root), &configured_keys);
@@ -511,9 +548,9 @@ impl LspClientManager {
     ///
     /// Returns an error if any root path cannot be converted to a valid URI.
     pub async fn sync_roots(&self, new_roots: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
-        // Snapshot before updating so the diff is computed against old state.
+        // Snapshot the old set, then compute the diff against it. The diff uses
+        // the snapshot (not `fs.roots()`), so `fs.set_roots` can run later.
         let current_roots = self.fs.roots();
-        self.fs.set_roots(new_roots.clone());
 
         let to_add: Vec<PathBuf> = new_roots
             .iter()
@@ -525,6 +562,17 @@ impl LspClientManager {
             .filter(|r| !new_roots.contains(r))
             .cloned()
             .collect();
+
+        // Load project configs + classification for added roots BEFORE they
+        // become resolvable via `fs.set_roots`. Otherwise a concurrent
+        // `ensure_clients_for_paths` could see a root in `fs.roots()` whose
+        // `disable_lsp` config is not yet loaded — the gate would read it as
+        // enabled and spawn a server for a disabled root (ticket 00). Both
+        // calls are no-ops when `to_add` is empty (the steady-state sync).
+        self.load_project_configs_for_roots(&to_add);
+        self.set_per_root_classification(&to_add);
+
+        self.fs.set_roots(new_roots.clone());
 
         if to_add.is_empty() && to_remove.is_empty() {
             return Ok(to_remove);
@@ -542,9 +590,8 @@ impl LspClientManager {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
 
-        // Update project configs: load for added roots, remove for removed.
-        self.load_project_configs_for_roots(&to_add);
-        self.set_per_root_classification(&to_add);
+        // Added-root configs + classification are loaded above (before the
+        // roots became resolvable); here we only tear down removed roots.
         if !to_remove.is_empty() {
             let mut configs = self
                 .project_configs
@@ -1371,6 +1418,11 @@ impl LspClientManager {
                     continue;
                 };
 
+                // Skip `disable_lsp` roots — no on-demand spawn (ticket 00).
+                if self.is_lsp_disabled(&root) {
+                    continue;
+                }
+
                 let Some(lang_config) = self.config.resolve_language(&lang) else {
                     continue;
                 };
@@ -1844,6 +1896,11 @@ impl LspClientManager {
         let configured_keys: HashSet<&str> = active_langs.keys().map(String::as_str).collect();
 
         for root in added_roots {
+            // Skip `disable_lsp` roots — tracked, but no language server (ticket 00).
+            if self.is_lsp_disabled(root) {
+                continue;
+            }
+
             let detected = self
                 .fs
                 .detect_workspace_languages(std::slice::from_ref(root), &configured_keys);
@@ -2009,6 +2066,19 @@ impl LspClientManager {
                 }
             }
         }
+    }
+
+    /// Loads project configs for the given roots without spawning.
+    ///
+    /// Primes the per-root toggle gate (`is_lsp_disabled` / `is_diag_disabled`)
+    /// so a `disable_lsp` root is never observed as enabled. Called by
+    /// [`Session::new`](crate::bridge::session::Session::new) before the session
+    /// serves, closing the startup window between `fs.set_roots` and the
+    /// backgrounded [`spawn_all`](Self::spawn_all) that would otherwise load
+    /// these configs (ticket 00). Idempotent: re-reads `.catenary.toml` and
+    /// overwrites, so a later `spawn_all` reload is harmless.
+    pub fn prime_project_configs(&self, roots: &[PathBuf]) {
+        self.load_project_configs_for_roots(roots);
     }
 
     /// Loads project configs for the given roots.
@@ -5702,6 +5772,71 @@ mod tests {
         assert!(
             manager.project_commands().is_empty(),
             "roots without commands should be omitted"
+        );
+    }
+
+    /// `is_lsp_disabled` reads `disable_lsp` off the loaded project config and
+    /// is orthogonal to `disable_diag` (ticket 00).
+    #[test]
+    fn test_is_lsp_disabled_reads_project_config() {
+        let manager = LspClientManager::new(test_config(), test_logging(), test_fs());
+        let disabled = PathBuf::from("/disabled");
+        let enabled = PathBuf::from("/enabled");
+
+        // Unknown root → not disabled (default false).
+        assert!(!manager.is_lsp_disabled(&disabled));
+
+        {
+            let mut configs = manager
+                .project_configs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            configs.insert(
+                disabled.clone(),
+                crate::config::ProjectConfig {
+                    disable_lsp: true,
+                    ..crate::config::ProjectConfig::default()
+                },
+            );
+            configs.insert(enabled.clone(), crate::config::ProjectConfig::default());
+        }
+
+        assert!(manager.is_lsp_disabled(&disabled), "disable_lsp root");
+        assert!(
+            !manager.is_lsp_disabled(&enabled),
+            "default root is enabled"
+        );
+        assert!(
+            !manager.is_diag_disabled(&disabled),
+            "disable_lsp must not imply disable_diag"
+        );
+    }
+
+    /// `is_diag_disabled` reads `disable_diag` and is orthogonal to
+    /// `disable_lsp` (ticket 00).
+    #[test]
+    fn test_is_diag_disabled_reads_project_config() {
+        let manager = LspClientManager::new(test_config(), test_logging(), test_fs());
+        let root = PathBuf::from("/diag-off");
+
+        assert!(!manager.is_diag_disabled(&root));
+
+        manager
+            .project_configs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                root.clone(),
+                crate::config::ProjectConfig {
+                    disable_diag: true,
+                    ..crate::config::ProjectConfig::default()
+                },
+            );
+
+        assert!(manager.is_diag_disabled(&root));
+        assert!(
+            !manager.is_lsp_disabled(&root),
+            "disable_diag must not imply disable_lsp"
         );
     }
 

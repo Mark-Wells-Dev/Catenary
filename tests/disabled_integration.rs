@@ -6,10 +6,14 @@
     clippy::expect_used,
     reason = "tests use expect for readable assertions"
 )]
-//! Integration tests for `lsp = false` in `.catenary.toml`.
+//! Integration tests for the per-root feeder toggles in `.catenary.toml`
+//! (workstream 34 ticket 00).
 //!
-//! When the primary workspace root has `lsp = false`, the session
-//! is disabled: no tools, no servers, no hooks, no database writes.
+//! The old coarse `lsp = false` kill switch — which disabled the whole
+//! session — is gone. A root with `disable_lsp = true` is still tracked and
+//! the daemon serves normally; the toggle only drops the LSP feeder for that
+//! root. These tests assert the daemon is **not** wedged or whole-disabled by
+//! either the new toggle or a leftover (now-removed) `lsp` key.
 
 mod common;
 
@@ -20,18 +24,12 @@ use std::path::PathBuf;
 
 use common::BridgeProcess;
 
-/// Spawn a bridge whose primary workspace root has `lsp = false`.
-fn spawn_disabled_bridge(root: &str) -> Result<BridgeProcess> {
-    fs::write(PathBuf::from(root).join(".catenary.toml"), "lsp = false\n")?;
-    BridgeProcess::spawn(&[], root)
-}
-
-#[test]
-fn tools_list_returns_method_not_found_when_disabled() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let root = dir.path().to_str().ok_or_else(|| anyhow!("dir path"))?;
-    let mut bridge = spawn_disabled_bridge(root)?;
-
+/// Drive the MCP handshake, then assert `tools/list` returns method-not-found.
+///
+/// MCP is a pure heartbeat — it advertises no application tools — so a healthy
+/// daemon returns an error here regardless of feeder toggles. A wedged or
+/// whole-session-disabled daemon would instead fail the handshake or hang.
+fn assert_serves_but_no_tools(bridge: &mut BridgeProcess) -> Result<()> {
     bridge.initialize()?;
 
     bridge.send(&json!({
@@ -43,34 +41,44 @@ fn tools_list_returns_method_not_found_when_disabled() -> Result<()> {
     let response = bridge.recv()?;
     assert!(
         response.get("error").is_some(),
-        "tools/list should return error (method not found): {response:?}"
+        "tools/list should return method-not-found: {response:?}"
     );
-
     Ok(())
 }
 
 #[test]
-fn tools_list_returns_method_not_found_when_enabled() -> Result<()> {
+fn disable_lsp_root_still_serves() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().to_str().ok_or_else(|| anyhow!("dir path"))?;
+    fs::write(
+        PathBuf::from(root).join(".catenary.toml"),
+        "disable_lsp = true\n",
+    )?;
 
-    // No .catenary.toml at all — should behave normally.
-    // MCP no longer serves application tools, so tools/list returns
-    // method-not-found regardless of enabled/disabled state.
+    // disable_lsp drops the LSP feeder for the root but does not disable the
+    // session — the daemon completes the handshake and answers normally.
     let mut bridge = BridgeProcess::spawn(&[], root)?;
-    bridge.initialize()?;
+    assert_serves_but_no_tools(&mut bridge)
+}
 
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 10,
-        "method": "tools/list"
-    }))?;
+#[test]
+fn removed_lsp_key_does_not_wedge_daemon() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().to_str().ok_or_else(|| anyhow!("dir path"))?;
+    // The `lsp` key was removed in 2.0: loading this config errors, the root is
+    // logged-and-skipped, and the daemon keeps serving rather than wedging.
+    fs::write(PathBuf::from(root).join(".catenary.toml"), "lsp = false\n")?;
 
-    let response = bridge.recv()?;
-    assert!(
-        response.get("error").is_some(),
-        "tools/list should return error (method not found): {response:?}"
-    );
+    let mut bridge = BridgeProcess::spawn(&[], root)?;
+    assert_serves_but_no_tools(&mut bridge)
+}
 
-    Ok(())
+#[test]
+fn no_project_config_serves_normally() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().to_str().ok_or_else(|| anyhow!("dir path"))?;
+
+    // No .catenary.toml at all — baseline healthy daemon.
+    let mut bridge = BridgeProcess::spawn(&[], root)?;
+    assert_serves_but_no_tools(&mut bridge)
 }

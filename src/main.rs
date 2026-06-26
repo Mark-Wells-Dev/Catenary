@@ -1112,25 +1112,13 @@ fn run_daemon_main() -> Result<()> {
         .collect::<Vec<_>>()
         .join(", ");
 
-    let disabled = roots
-        .first()
-        .and_then(|r| catenary_mcp::config::load_project_config(r).ok().flatten())
-        .is_some_and(|pc| !pc.lsp);
-
-    let shared_session = if disabled {
-        info!("Catenary disabled by .catenary.toml (lsp = false) in {workspace_display}");
-        // Activate with just the desktop notification sink so stale hook
-        // detection can still fire OS notifications.
-        let desktop_enabled = config
-            .notifications
-            .as_ref()
-            .and_then(|n| n.desktop)
-            .unwrap_or(true);
-        let desktop_sink =
-            catenary_mcp::notify::DesktopNotificationSink::with_enabled(desktop_enabled);
-        logging.activate(vec![desktop_sink]);
-        None
-    } else {
+    // The daemon always activates a full session. Per-root `disable_lsp`
+    // (workstream 34 ticket 00) replaces the old coarse daemon-wide
+    // `lsp = false` kill switch: `Session::sync_roots` filters disabled roots
+    // out of the LSP layer per contributor, which composes across a
+    // multi-connection daemon (one process serving several projects) — the
+    // startup check, keyed on the primary root only, could not.
+    let shared_session = {
         let instance_id: Arc<str> = format!("daemon:{}", uuid::Uuid::new_v4()).into();
 
         // Firehose reaping knobs, captured before `config` moves into the

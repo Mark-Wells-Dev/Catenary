@@ -339,10 +339,12 @@ Classification precedence (highest first): shebang > filename > extension.
 ## Project Configuration
 
 Place a `.catenary.toml` in a workspace root to override language and
-server configuration and set the per-project build tool for that root.
-Supported sections are `lsp`, `[language.*]`, `[server.*]`, and
-`[commands]` (the build tool only — command **enforcement** is user-level;
-see [Project-scoped commands](#project-scoped-commands)). Other sections
+server configuration, set the per-project build tool, and toggle the
+diagnostic feeders for that root. Supported keys are the three feeder
+toggles (`disable_lsp`, `disable_lint`, `disable_diag`), `[language.*]`,
+`[server.*]`, and `[commands]` (the build tool only — command
+**enforcement** is user-level; see
+[Project-scoped commands](#project-scoped-commands)). Other sections
 (`[notifications]`, `[icons]`, etc.) are user-level and belong in
 `~/.config/catenary/config.toml`.
 
@@ -350,26 +352,41 @@ Project config is discovered when roots are added (at startup or via
 `catenary roots add`). Changes to `.catenary.toml` require restarting
 the session.
 
-### Disabling Catenary
+### Disabling feeders per root
 
-Set `lsp = false` to turn Catenary off for a workspace:
+Three orthogonal, per-root toggles control each diagnostic feeder
+independently. All default to `false` and are scoped to the root whose
+`.catenary.toml` declares them — a multi-project daemon honours each
+root's choice separately.
 
 ```toml
 # .catenary.toml
-lsp = false
+disable_lsp = true   # no language servers for this root
+disable_diag = true  # diagnostics surface off, navigation kept
 ```
 
-When the primary workspace root has `lsp = false`, the entire session is
-disabled: no tools appear in `tools/list`, no LSP servers spawn, all
-hooks pass through, and no database rows are written. The MCP process
-still runs (the host starts it) but is invisible to the agent.
+- **`disable_lsp`** — drops the LSP feeder: no language servers spawn for
+  this root, so there is no grep/glob enrichment and no LSP diagnostics.
+  The root stays tracked everywhere else (`catenary roots ls`, the build
+  tool, command resolution, the editing gate). Useful for media
+  collections, data directories, or any root where a language server is
+  pure overhead. (Polarity flip of the old `lsp = false`.)
+- **`disable_lint`** — drops the standalone-linter feeder: no linter
+  diagnostics for this root. (No effect yet — the linter framework is not
+  shipped; the toggle is parsed and reported by `catenary doctor`.)
+- **`disable_diag`** — suppresses the diagnostics **surface** (the
+  editing→`catenary diagnostics` gate and its output) while keeping LSP
+  servers running for grep/glob navigation. Use it when you want code
+  intelligence but no edit-time diagnostics friction.
 
-This is useful for media collections, documentation repos, data
-directories, or any workspace where LSP is pure overhead.
+`disable_lsp` together with `disable_lint` also zeroes diagnostics, but
+kills navigation too; `disable_diag` keeps navigation — that is the
+distinction.
 
-> **Migration:** The old `enabled` key is still accepted with a
-> deprecation warning. Rename it to `lsp`. Using both in the same file
-> is an error.
+> **Migration:** The `lsp` key (and its old `enabled` alias) was removed
+> in 2.0. Replace `lsp = false` with `disable_lsp = true` — the polarity
+> flips. A leftover `lsp`/`enabled` key is now a hard error, flagged by
+> `catenary doctor`.
 
 ### Merge Semantics
 

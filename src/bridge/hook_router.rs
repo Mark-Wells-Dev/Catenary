@@ -298,7 +298,7 @@ impl HookRouter {
         // mode and the root lock — parallel first-edits all succeed and none can
         // reject the others (race-free by construction).
         if is_edit_tool(tool_name) {
-            if file_path.is_some_and(|p| !self.session.has_lsp_coverage(Path::new(p))) {
+            if file_path.is_some_and(|p| !self.session.covered_for_diagnostics(Path::new(p))) {
                 return None;
             }
             // Cross-session guardrail before claiming the root: if another
@@ -433,11 +433,12 @@ impl HookRouter {
             return None;
         }
 
-        // Only accumulate files with known LSP coverage — files
-        // without coverage have no server to produce diagnostics,
-        // so processing them in done_editing is wasted work.
+        // Only accumulate files a diagnostic feeder covers whose root has not
+        // suppressed the diagnostics surface — files without coverage (or in a
+        // `disable_diag` root) have nothing to report in done_editing, so
+        // processing them is wasted work.
         let path = Path::new(file_path);
-        if self.session.has_lsp_coverage(path) {
+        if self.session.covered_for_diagnostics(path) {
             self.session
                 .editing
                 .add_file(session_id, agent_id, PathBuf::from(file_path));

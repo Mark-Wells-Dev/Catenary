@@ -182,6 +182,18 @@ impl DiagnosticsServer {
                 continue;
             };
 
+            // Suppress the diagnostics surface for `disable_diag` roots (ticket
+            // 00). The editing gate already declines to accumulate such files,
+            // but filter here too so no other accumulation path (or a
+            // mid-session toggle) leaks diagnostics for a surface turned off.
+            if self
+                .fs
+                .resolve_root(&canonical)
+                .is_some_and(|root| self.client_manager.is_diag_disabled(&root))
+            {
+                continue;
+            }
+
             let clients = self.client_manager.diagnostic_servers(&canonical).await;
             if clients.is_empty() {
                 let display = self.display_rel(&canonical.to_string_lossy());

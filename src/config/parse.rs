@@ -466,23 +466,46 @@ pub(super) fn parse_server_specs(val: &str) -> Vec<(String, ServerDef, LanguageC
 
 /// Top-level keys allowed in `.catenary.toml` project config files.
 ///
-/// Both `lsp` (current) and `enabled` (deprecated) are accepted during
-/// transition. The unsupported-key warning skips both.
-const PROJECT_CONFIG_ALLOWED_KEYS: &[&str] = &["lsp", "enabled", "language", "server", "commands"];
+/// The three per-root feeder toggles (`disable_lsp` / `disable_lint` /
+/// `disable_diag`) replace the removed `lsp`/`enabled` key (workstream 34
+/// ticket 00). The unsupported-key warning skips all of these.
+const PROJECT_CONFIG_ALLOWED_KEYS: &[&str] = &[
+    "disable_lsp",
+    "disable_lint",
+    "disable_diag",
+    "language",
+    "server",
+    "commands",
+];
 
 /// Per-root project configuration from `.catenary.toml`.
 ///
-/// Contains `lsp` (LSP kill switch), `[language.*]` and `[server.*]`
-/// sections, and an optional `[commands]` section. Roots with
-/// `lsp = false` still contribute `[commands]` config (both `build`
-/// and `allow`) but not LSP config.
-#[derive(Debug, Clone)]
+/// Contains the three orthogonal feeder toggles, `[language.*]` and
+/// `[server.*]` sections, and an optional `[commands]` section. A root with
+/// any toggle set still contributes `[commands]` config (both `build` and
+/// `allow`) — the toggles only suppress the matching diagnostic feeder or
+/// surface, never command/build resolution.
+#[derive(Debug, Clone, Default)]
 pub struct ProjectConfig {
-    /// Whether LSP is active for this workspace (default `true`).
+    /// Drops the LSP feeder for this root (default `false`).
     ///
-    /// When `false` on the primary root, the entire session is disabled:
-    /// no tools, no servers, no hooks, no database writes.
-    pub lsp: bool,
+    /// No language servers spawn, no grep/glob enrichment, no LSP
+    /// diagnostics. The root stays tracked (`roots ls`, build/command
+    /// resolution, linters, gate). Polarity flip of the removed
+    /// `lsp = false`.
+    pub disable_lsp: bool,
+    /// Drops the linter feeder for this root (default `false`).
+    ///
+    /// No standalone-linter diagnostics. No-op until workstream 34 ticket
+    /// 01 lands the linter framework — parsed and stored here so the toggle
+    /// is stable and reflected by `catenary doctor`.
+    pub disable_lint: bool,
+    /// Suppresses the diagnostics surface for this root (default `false`).
+    ///
+    /// The editing→`catenary diagnostics` gate and its output are turned
+    /// off, but LSP servers still run for grep/glob navigation. A surface
+    /// suppressor, not a feeder toggle.
+    pub disable_diag: bool,
     /// Language definitions from the project config.
     pub language: HashMap<String, LanguageConfig>,
     /// Server definitions from the project config.
@@ -493,17 +516,6 @@ pub struct ProjectConfig {
     /// `allow` replaces the user's list for this root's contribution.
     /// `pipeline` and `deny` follow the same replacement semantics.
     pub commands: Option<CommandsConfig>,
-}
-
-impl Default for ProjectConfig {
-    fn default() -> Self {
-        Self {
-            lsp: true,
-            language: HashMap::new(),
-            server: HashMap::new(),
-            commands: None,
-        }
-    }
 }
 
 /// Project `[commands]` keys that Catenary ignores — everything but `build`.
@@ -620,29 +632,22 @@ pub fn load_project_config(root: &std::path::Path) -> Result<Option<ProjectConfi
         }
     }
 
-    // Parse `lsp` (preferred) or `enabled` (deprecated). Error if both.
-    let lsp_val = raw.get("lsp").and_then(toml::Value::as_bool);
-    let enabled_val = raw.get("enabled").and_then(toml::Value::as_bool);
-
-    if lsp_val.is_some() && enabled_val.is_some() {
+    // Hard rename at the 2.0 boundary: the `lsp` kill switch (and its
+    // deprecated `enabled` alias) is gone, replaced by the three orthogonal
+    // toggles below. Error rather than silently ignore — a stale `lsp = false`
+    // means "disable LSP here", and dropping it would silently re-enable LSP.
+    if raw.get("lsp").is_some() || raw.get("enabled").is_some() {
         bail!(
-            "Project config {}: both `lsp` and `enabled` are set — \
-             remove `enabled` and use `lsp` only.",
+            "Project config {}: the `lsp`/`enabled` key was removed in 2.0 — \
+             use `disable_lsp` instead (polarity flips: `lsp = false` becomes \
+             `disable_lsp = true`).",
             config_path.display(),
         );
     }
 
-    if enabled_val.is_some() {
-        tracing::warn!(
-            source = Source::ConfigParse.as_str(),
-            path = %config_path.display(),
-            "Project config {}: `enabled` is deprecated — \
-             rename it to `lsp`.",
-            config_path.display(),
-        );
-    }
-
-    let lsp = lsp_val.or(enabled_val).unwrap_or(true);
+    let disable_lsp = parse_bool_flag(&raw, "disable_lsp", &config_path)?;
+    let disable_lint = parse_bool_flag(&raw, "disable_lint", &config_path)?;
+    let disable_diag = parse_bool_flag(&raw, "disable_diag", &config_path)?;
 
     // Deserialize only the supported sections.
     let mut language: HashMap<String, LanguageConfig> = raw
@@ -760,11 +765,29 @@ pub fn load_project_config(root: &std::path::Path) -> Result<Option<ProjectConfi
     }
 
     Ok(Some(ProjectConfig {
-        lsp,
+        disable_lsp,
+        disable_lint,
+        disable_diag,
         language,
         server,
         commands: commands_config,
     }))
+}
+
+/// Parses a top-level boolean toggle, defaulting to `false` when absent.
+///
+/// Errors when the key is present but not a boolean — a malformed value
+/// (e.g. `disable_lsp = "true"`) would otherwise silently default to `false`,
+/// quietly defeating the user's intent to disable a feeder.
+fn parse_bool_flag(raw: &toml::Value, key: &str, config_path: &std::path::Path) -> Result<bool> {
+    match raw.get(key) {
+        None => Ok(false),
+        Some(toml::Value::Boolean(b)) => Ok(*b),
+        Some(_) => bail!(
+            "Project config {}: `{key}` must be a boolean (true or false).",
+            config_path.display(),
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -972,7 +995,7 @@ servers = ["pyright"]
     }
 
     #[test]
-    fn test_load_project_config_lsp_true_default() -> Result<()> {
+    fn test_load_project_config_toggles_default_false() -> Result<()> {
         let dir = tempdir()?;
         fs::write(
             dir.path().join(".catenary.toml"),
@@ -981,68 +1004,83 @@ servers = ["pyright"]
 
         let result = load_project_config(dir.path())?;
         let config = result.expect("should find project config");
-        assert!(config.lsp, "lsp should default to true");
+        assert!(!config.disable_lsp, "disable_lsp should default to false");
+        assert!(!config.disable_lint, "disable_lint should default to false");
+        assert!(!config.disable_diag, "disable_diag should default to false");
 
         Ok(())
     }
 
     #[test]
-    fn test_load_project_config_lsp_false() -> Result<()> {
+    fn test_load_project_config_disable_lsp() -> Result<()> {
         let dir = tempdir()?;
-        fs::write(dir.path().join(".catenary.toml"), "lsp = false\n")?;
+        fs::write(dir.path().join(".catenary.toml"), "disable_lsp = true\n")?;
 
         let result = load_project_config(dir.path())?;
         let config = result.expect("should find project config");
-        assert!(!config.lsp, "lsp should be false");
+        assert!(config.disable_lsp, "disable_lsp should be true");
+        assert!(!config.disable_lint);
+        assert!(!config.disable_diag);
 
         Ok(())
     }
 
     #[test]
-    fn test_load_project_config_lsp_true_explicit() -> Result<()> {
+    fn test_load_project_config_disable_lint_and_diag() -> Result<()> {
         let dir = tempdir()?;
         fs::write(
             dir.path().join(".catenary.toml"),
-            "lsp = true\n\n[language.rust]\nservers = []\n",
+            "disable_lint = true\ndisable_diag = true\n",
         )?;
 
         let result = load_project_config(dir.path())?;
         let config = result.expect("should find project config");
-        assert!(config.lsp);
+        assert!(!config.disable_lsp);
+        assert!(config.disable_lint, "disable_lint should be true");
+        assert!(config.disable_diag, "disable_diag should be true");
 
         Ok(())
     }
 
     #[test]
-    fn test_load_project_config_enabled_deprecated_still_works() -> Result<()> {
-        let dir = tempdir()?;
-        fs::write(dir.path().join(".catenary.toml"), "enabled = false\n")?;
-
-        let result = load_project_config(dir.path())?;
-        let config = result.expect("should find project config");
-        assert!(
-            !config.lsp,
-            "deprecated enabled = false should set lsp = false"
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_load_project_config_both_lsp_and_enabled_errors() {
+    fn test_load_project_config_lsp_key_removed_errors() {
         let dir = tempdir().expect("tempdir");
-        fs::write(
-            dir.path().join(".catenary.toml"),
-            "lsp = true\nenabled = false\n",
-        )
-        .expect("write");
+        fs::write(dir.path().join(".catenary.toml"), "lsp = false\n").expect("write");
 
         let result = load_project_config(dir.path());
-        assert!(result.is_err());
-        let err = format!("{:#}", result.expect_err("should error"));
+        let err = format!("{:#}", result.expect_err("removed `lsp` key should error"));
         assert!(
-            err.contains("both `lsp` and `enabled`"),
-            "error should mention both keys: {err}",
+            err.contains("disable_lsp"),
+            "error should point to disable_lsp: {err}",
+        );
+    }
+
+    #[test]
+    fn test_load_project_config_enabled_key_removed_errors() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join(".catenary.toml"), "enabled = false\n").expect("write");
+
+        let result = load_project_config(dir.path());
+        let err = format!(
+            "{:#}",
+            result.expect_err("removed `enabled` key should error")
+        );
+        assert!(
+            err.contains("disable_lsp"),
+            "error should point to disable_lsp: {err}",
+        );
+    }
+
+    #[test]
+    fn test_load_project_config_non_bool_toggle_errors() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join(".catenary.toml"), "disable_lsp = \"yes\"\n").expect("write");
+
+        let result = load_project_config(dir.path());
+        let err = format!("{:#}", result.expect_err("non-bool toggle should error"));
+        assert!(
+            err.contains("must be a boolean"),
+            "error should mention boolean: {err}",
         );
     }
 
@@ -1107,7 +1145,9 @@ build = "make"
 
         let result = load_project_config(dir.path())?;
         let config = result.expect("should find project config");
-        assert!(config.lsp, "lsp defaults to true");
+        assert!(!config.disable_lsp, "toggles default to false");
+        assert!(!config.disable_lint);
+        assert!(!config.disable_diag);
         assert!(config.language.is_empty());
         assert!(config.server.is_empty());
         assert!(config.commands.is_some());
@@ -1130,7 +1170,7 @@ build = "make"
         fs::write(
             dir.path().join(".catenary.toml"),
             r#"
-lsp = false
+disable_lsp = true
 
 [commands]
 build = "make"
@@ -1140,7 +1180,7 @@ allow = ["git"]
 
         let result = load_project_config(dir.path())?;
         let config = result.expect("should find project config");
-        assert!(!config.lsp);
+        assert!(config.disable_lsp);
         let cmds = config.commands.expect("commands present despite disabled");
         assert_eq!(
             cmds.build.as_ref().map(|b| &b.0[..]),

@@ -2992,7 +2992,7 @@ async fn handle_hook_dispatch(
     // staged identity is consumed *up front* — the per-session `Session` both
     // guards writes (the cross-session per-root editing guardrail, exactly as
     // Edit/Write do) and, after the run, accumulates the changed set through the
-    // same `has_lsp_coverage` gate. The substitute engine itself runs on a
+    // same `covered_for_diagnostics` gate. The substitute engine itself runs on a
     // blocking thread so a broad sweep can't stall the daemon.
     if method == METHOD_SED {
         let sed_req: SedRequest =
@@ -3091,7 +3091,7 @@ async fn handle_hook_dispatch(
             let mut accumulated = 0usize;
             let mut filtered = 0usize;
             for file in &outcome.changed {
-                if router.session.has_lsp_coverage(file) {
+                if router.session.covered_for_diagnostics(file) {
                     if !started {
                         let _ = router
                             .session

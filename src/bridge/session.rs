@@ -474,6 +474,16 @@ impl Session {
             client_manager.set_snapshot(writer.clone());
         }
         let client_manager = Arc::new(client_manager);
+
+        // Prime the per-root toggle gate before this session serves. `fs_manager`
+        // already made the roots resolvable above, but `project_configs` stays
+        // empty until the backgrounded `spawn_all` — so without this a startup
+        // query against a `disable_lsp` root would read it as enabled and spawn a
+        // server (ticket 00). Construction runs before any connection is served,
+        // so loading here closes that window; `spawn_all`'s later reload is a
+        // harmless idempotent overwrite.
+        client_manager.prime_project_configs(&fs_manager.roots());
+
         let diagnostics = Arc::new(DiagnosticsServer::new(
             client_manager.clone(),
             path_validator.clone(),
@@ -790,6 +800,9 @@ impl Session {
     /// an uncached / negative-cached single-file server return `false` — the
     /// editing gate should not impose friction on edits it cannot diagnose.
     ///
+    /// A root with `disable_lsp` set (ticket 00) runs no language server, so its
+    /// files have no LSP coverage regardless of configured servers.
+    ///
     /// [`has_configured_server`]: crate::lsp::LspClientManager::has_configured_server
     /// [`has_single_file_coverage`]: crate::lsp::LspClientManager::has_single_file_coverage
     #[must_use]
@@ -799,10 +812,62 @@ impl Session {
                 .and_then(|e| e.to_str())
                 .map(str::to_string)
         });
-        if self.fs_manager.resolve_root(path).is_some() {
+        if let Some(root) = self.fs_manager.resolve_root(path) {
+            if self.client_manager.is_lsp_disabled(&root) {
+                return false;
+            }
             return lang.is_some_and(|id| self.client_manager.has_configured_server(&id));
         }
         lang.is_some_and(|id| self.client_manager.has_single_file_coverage(&id))
+    }
+
+    /// Whether *any* diagnostic feeder covers this file.
+    ///
+    /// `has_coverage = has_lsp_coverage || has_lint_coverage` (workstream 34
+    /// ticket 00). The editing-boundary gate tracks/gates a file iff some
+    /// feeder covers it. [`has_lint_coverage`](Self::has_lint_coverage) is
+    /// stubbed `false` until the linter framework lands (ticket 01), so today
+    /// this equals [`has_lsp_coverage`](Self::has_lsp_coverage).
+    #[must_use]
+    pub fn has_coverage(&self, path: &Path) -> bool {
+        self.has_lsp_coverage(path) || self.has_lint_coverage(path)
+    }
+
+    /// Whether a standalone linter covers this file.
+    ///
+    /// Stub returning `false` — implemented by workstream 34 ticket 01 (the
+    /// linter feeder framework).
+    #[must_use]
+    #[allow(
+        clippy::unused_self,
+        clippy::missing_const_for_fn,
+        reason = "stub; ticket 01 reads per-root linter config off self"
+    )]
+    fn has_lint_coverage(&self, _path: &Path) -> bool {
+        false
+    }
+
+    /// Whether the diagnostics surface is suppressed for the file's root
+    /// (`disable_diag`, ticket 00).
+    ///
+    /// Out-of-root files have no owning root to consult and are never disabled.
+    #[must_use]
+    pub fn diag_disabled(&self, path: &Path) -> bool {
+        self.fs_manager
+            .resolve_root(path)
+            .is_some_and(|root| self.client_manager.is_diag_disabled(&root))
+    }
+
+    /// The editing-boundary gate predicate (ticket 00).
+    ///
+    /// Track/gate a file for batched diagnostics iff some feeder covers it
+    /// ([`has_coverage`](Self::has_coverage)) AND its root has not suppressed
+    /// the diagnostics surface (`disable_diag`). `disable_diag` keeps LSP
+    /// navigation (grep/glob) but turns the gate + output off, so a covered
+    /// file in such a root flows free.
+    #[must_use]
+    pub fn covered_for_diagnostics(&self, path: &Path) -> bool {
+        self.has_coverage(path) && !self.diag_disabled(path)
     }
 
     /// Drops cached symbols and bumps the enrichment generation for files
@@ -1341,6 +1406,77 @@ mod tests {
         assert!(
             !session.has_lsp_coverage(&outside),
             "out-of-root .rs must gate on single-file coverage (none for rust)"
+        );
+    }
+
+    // ── disable_lsp / disable_diag (ticket 00) ─────────────────────
+
+    #[test]
+    fn has_coverage_equals_lsp_coverage_without_linters() {
+        // has_lint_coverage is a false stub (ticket 01), so has_coverage tracks
+        // has_lsp_coverage exactly today.
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("workspace");
+        std::fs::create_dir_all(&root).expect("create workspace dir");
+        let session = session_with_root(rt.handle(), root.clone());
+
+        let served = root.join("src/main.rs");
+        let unserved = root.join("notes.txt");
+        assert_eq!(
+            session.has_coverage(&served),
+            session.has_lsp_coverage(&served),
+            "has_coverage == has_lsp_coverage while linters are stubbed"
+        );
+        assert!(session.has_coverage(&served));
+        assert!(!session.has_coverage(&unserved));
+    }
+
+    #[test]
+    fn disable_lsp_root_has_no_lsp_coverage() {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("workspace");
+        std::fs::create_dir_all(&root).expect("create workspace dir");
+        std::fs::write(root.join(".catenary.toml"), "disable_lsp = true\n").expect("write config");
+        // No spawn_all: `Session::new` primes the project config at construction,
+        // so the gate sees `disable_lsp` immediately (ticket 00).
+        let session = session_with_root(rt.handle(), root.clone());
+
+        let served = root.join("src/main.rs");
+        // A served language in a disable_lsp root has NO LSP coverage ...
+        assert!(
+            !session.has_lsp_coverage(&served),
+            "disable_lsp root must not claim LSP coverage"
+        );
+        // ... so with the linter stub still false, the editing gate is inert.
+        assert!(
+            !session.covered_for_diagnostics(&served),
+            "disable_lsp root with no linter leaves the gate inert"
+        );
+    }
+
+    #[test]
+    fn disable_diag_root_keeps_lsp_coverage_but_gate_off() {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("workspace");
+        std::fs::create_dir_all(&root).expect("create workspace dir");
+        std::fs::write(root.join(".catenary.toml"), "disable_diag = true\n").expect("write config");
+        // No spawn_all: the config is primed at construction (ticket 00).
+        let session = session_with_root(rt.handle(), root.clone());
+
+        let served = root.join("src/main.rs");
+        // disable_diag keeps LSP navigation/coverage ...
+        assert!(
+            session.has_lsp_coverage(&served),
+            "disable_diag keeps LSP coverage (navigation intact)"
+        );
+        assert!(session.diag_disabled(&served), "root is disable_diag");
+        // ... but turns the diagnostics gate off.
+        assert!(
+            !session.covered_for_diagnostics(&served),
+            "disable_diag turns the editing gate off despite LSP coverage"
         );
     }
 }
