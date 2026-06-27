@@ -18,6 +18,33 @@ use anyhow::{Context, Result};
 
 use crate::bridge::filesystem_manager::mtime_nanos;
 
+/// Identity of a rendered atom: a file path and its 0-based line (decision 024).
+///
+/// The single key used for atom membership, citation lookups, edge targets, and
+/// byte-stable ordering across the enrichment model ([`Edge`],
+/// [`SymbolEnrichment`]) and the grep renderer. Ordering is `(file, line)`
+/// lexicographic (field declaration order), matching the determinism the output
+/// relies on (misc 32). Replaces the bare `(String, u32)` tuple — named fields
+/// remove the `.0`/`.1` and field-order footguns (cf. [`EnrichmentKey`], which
+/// did the same for the cache key).
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct AtomId {
+    /// Absolute file path as a lossy string.
+    pub file: String,
+    /// 0-based line.
+    pub line: u32,
+}
+
+impl AtomId {
+    /// Builds an atom id from a borrowed path string and 0-based line.
+    pub(crate) fn new(file: &str, line: u32) -> Self {
+        Self {
+            file: file.to_string(),
+            line,
+        }
+    }
+}
+
 /// A symbol extracted from the symbol index.
 #[derive(Clone)]
 pub struct Symbol {
@@ -25,9 +52,11 @@ pub struct Symbol {
     pub name: String,
     /// Kind string (e.g., `"function"`, `"struct"`).
     pub kind: String,
-    /// 0-based start line of the definition.
+    /// 0-based line of the symbol's name (`selectionRange.start`) — the
+    /// declaration line `grep` matches, not `range.start` (which includes
+    /// leading doc comments and attributes).
     pub line: u32,
-    /// 0-based end line of the definition (for structure spans).
+    /// 0-based end line of the definition (`range.end`, for structure spans).
     pub end_line: u32,
     /// Container name (enclosing definition's name).
     pub scope: Option<String>,
@@ -245,47 +274,39 @@ struct CachedEnrichment {
 /// Shared between [`GrepServer`] (producer) and the enrichment cache.
 #[derive(Clone)]
 pub(crate) struct SymbolEnrichment {
-    /// Reference lines grouped by file path (0-based line numbers).
-    pub ref_lines: HashMap<String, HashSet<u32>>,
+    /// Reference atoms (`textDocument/references` targets).
+    pub ref_lines: HashSet<AtomId>,
     /// Incoming call edges (callers of this symbol).
-    pub incoming_calls: Vec<CallEdge>,
+    pub incoming_calls: Vec<Edge>,
     /// Outgoing call edges (callees of this symbol).
-    pub outgoing_calls: Vec<CallEdge>,
-    /// Implementation locations: `(file_path, line_0)`.
-    pub implementations: Vec<(String, u32)>,
+    pub outgoing_calls: Vec<Edge>,
+    /// Implementation location atoms.
+    pub implementations: Vec<AtomId>,
     /// Supertype edges.
-    pub supertypes: Vec<TypeEdge>,
+    pub supertypes: Vec<Edge>,
     /// Subtype edges.
-    pub subtypes: Vec<TypeEdge>,
+    pub subtypes: Vec<Edge>,
 }
 
-/// A call hierarchy edge (caller or callee).
+/// A navigation edge to a *named* atom — a call-hierarchy caller/callee or a
+/// type-hierarchy super/subtype.
 ///
 /// In the one-atom model (decision 024) an edge is an atom: its name (for a
-/// collapsed citation) and its `(file, line)` (for the atom location). The LSP
+/// collapsed citation) and its target [`AtomId`] (the atom location). The LSP
 /// kind / container / deprecation are not rendered — the atom is the source
 /// line — so they are not carried.
-#[derive(Clone)]
-pub(crate) struct CallEdge {
-    /// Symbol name — the collapsed-citation form.
-    pub name: String,
-    /// File path.
-    pub file: String,
-    /// 0-based line number.
-    pub line: u32,
-}
-
-/// A type hierarchy edge (supertype or subtype).
 ///
-/// Carries only the atom's name and `(file, line)`; see [`CallEdge`].
+/// Call and type hierarchy items share this shape, so there is one `Edge` type,
+/// not a `CallEdge`/`TypeEdge` pair. Implementations
+/// (`textDocument/implementation`) and references (`textDocument/references`)
+/// return bare `Location`s with no name, so they are plain [`AtomId`]
+/// collections — there is deliberately no `ImplEdge`/`RefEdge`.
 #[derive(Clone)]
-pub(crate) struct TypeEdge {
+pub(crate) struct Edge {
     /// Symbol name — the collapsed-citation form.
     pub name: String,
-    /// File path.
-    pub file: String,
-    /// 0-based line number.
-    pub line: u32,
+    /// Target atom (the related symbol's location).
+    pub target: AtomId,
 }
 
 /// Workspace-wide symbol index held in memory.
@@ -735,7 +756,7 @@ fn flatten_document_symbol(
     let kind = symbol_kind_to_string(u32::try_from(kind_num).unwrap_or(0));
 
     let range = node.get("range");
-    let start_line = range
+    let range_start_line = range
         .and_then(|r| r.get("start"))
         .and_then(|s| s.get("line"))
         .and_then(serde_json::Value::as_u64)
@@ -744,14 +765,30 @@ fn flatten_document_symbol(
         .and_then(|r| r.get("end"))
         .and_then(|e| e.get("line"))
         .and_then(serde_json::Value::as_u64)
-        .unwrap_or(start_line);
+        .unwrap_or(range_start_line);
+
+    // The symbol's line is the NAME line (`selectionRange.start`), not
+    // `range.start`. rust-analyzer's `range` spans the whole item INCLUDING
+    // leading doc comments and attributes, but `grep` matches the declaration
+    // line where the name appears — and the classifier keys its definition
+    // lookup on that match line. Keying by `range.start` would miss every
+    // doc-commented or attributed symbol (i.e. every public API in a codebase
+    // that mandates doc comments), silently dropping enrichment (bug 48). Fall
+    // back to `range.start` when `selectionRange` is absent. `end_line` stays
+    // `range.end` so structure spans still cover the whole item.
+    let name_line = node
+        .get("selectionRange")
+        .and_then(|r| r.get("start"))
+        .and_then(|s| s.get("line"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(range_start_line);
 
     let deprecated = node
         .get("tags")
         .and_then(serde_json::Value::as_array)
         .is_some_and(|tags| tags.iter().any(|t| t.as_u64() == Some(1)));
 
-    let line = u32::try_from(start_line).unwrap_or(u32::MAX);
+    let line = u32::try_from(name_line).unwrap_or(u32::MAX);
     let end = u32::try_from(end_line).unwrap_or(line);
 
     out.push(Symbol {
@@ -912,6 +949,56 @@ mod tests {
 
     #[allow(clippy::expect_used, reason = "test assertions")]
     #[test]
+    fn symbol_line_is_name_line_not_range_start() {
+        // Repro for bug 48 (silent enrichment degradation on code symbols).
+        //
+        // rust-analyzer's `DocumentSymbol.range` spans the ENTIRE item,
+        // including leading doc comments and attributes; `selectionRange` is the
+        // name. This codebase mandates doc comments on public APIs, so virtually
+        // every public symbol has `range.start.line` ABOVE the declaration line.
+        //
+        // `catenary grep` matches the declaration line (where the name appears)
+        // and classifies a hit as an enrichable definition only when the symbol
+        // index holds a symbol at that exact line (grep_server `def_lookup`). If
+        // the index keys by `range.start.line` (the doc-comment line) the lookup
+        // misses, the definition is demoted to a plain reference, and NO
+        // enrichment is produced — silently. So the index must key by the name
+        // line.
+        //
+        //   line 0:  /// doc comment          <- range.start.line
+        //   line 1:  #[derive(Clone)]
+        //   line 2:  pub fn format_deny() {   <- selectionRange.start.line (name)
+        //
+        // NOTE: every existing fixture sets range.start.line ==
+        // selectionRange.start.line, which is exactly why this bug went
+        // unnoticed.
+        let index = SymbolIndex::new().expect("create index");
+        let symbols = serde_json::json!([
+            {
+                "name": "format_deny",
+                "kind": 12,
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 4, "character": 1 } },
+                "selectionRange": { "start": { "line": 2, "character": 7 }, "end": { "line": 2, "character": 18 } }
+            }
+        ]);
+        let path = std::path::Path::new("/test/hooks.rs");
+        index
+            .populate_from_document_symbols(path, &symbols)
+            .expect("populate");
+
+        let results = index.query("format_deny", None).expect("query");
+        let (_, sym) = results.first().expect("format_deny must be indexed");
+        assert_eq!(
+            sym.line, 2,
+            "symbol must be keyed by selectionRange (name on line 2), not \
+             range.start (doc-comment line 0); a range.start key makes grep's \
+             def_lookup miss the declaration line and silently drop enrichment \
+             (bug 48)"
+        );
+    }
+
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    #[test]
     fn test_deprecated_tag() {
         let index = SymbolIndex::new().expect("create index");
 
@@ -1006,7 +1093,7 @@ mod tests {
 
         // Seed the enrichment cache for one position under each path.
         let empty = || super::SymbolEnrichment {
-            ref_lines: std::collections::HashMap::new(),
+            ref_lines: std::collections::HashSet::new(),
             incoming_calls: Vec::new(),
             outgoing_calls: Vec::new(),
             implementations: Vec::new(),
@@ -1566,17 +1653,16 @@ mod tests {
     /// Helper: builds a minimal `SymbolEnrichment` for cache tests.
     fn dummy_enrichment() -> super::SymbolEnrichment {
         super::SymbolEnrichment {
-            ref_lines: std::collections::HashMap::from([(
-                "/test/other.rs".to_string(),
-                std::collections::HashSet::from([10, 20]),
-            )]),
-            incoming_calls: vec![super::CallEdge {
+            ref_lines: std::collections::HashSet::from([
+                super::AtomId::new("/test/other.rs", 10),
+                super::AtomId::new("/test/other.rs", 20),
+            ]),
+            incoming_calls: vec![super::Edge {
                 name: "caller".to_string(),
-                file: "/test/caller.rs".to_string(),
-                line: 5,
+                target: super::AtomId::new("/test/caller.rs", 5),
             }],
             outgoing_calls: Vec::new(),
-            implementations: vec![("/test/impl.rs".to_string(), 42)],
+            implementations: vec![super::AtomId::new("/test/impl.rs", 42)],
             supertypes: Vec::new(),
             subtypes: Vec::new(),
         }

@@ -28,7 +28,7 @@ use crate::lsp::server::LspServer;
 use crate::lsp::{LspClientManager, WalkBreadth};
 use crate::source::Source;
 use crate::symbol_index::{
-    CallEdge, EnrichmentKey, Symbol, SymbolEnrichment, SymbolIndex, TypeEdge, Witness,
+    AtomId, Edge, EnrichmentKey, Symbol, SymbolEnrichment, SymbolIndex, Witness,
 };
 
 /// Input for grep tool.
@@ -471,11 +471,13 @@ impl GrepServer {
             (Vec::new(), HashSet::new())
         };
 
-        // Build lookup: (file_path, line) → Symbol for definitions
-        let mut def_lookup: HashMap<(String, u32), Symbol> = HashMap::new();
+        // Build lookup: definition atom id → Symbol.
+        let mut def_lookup: HashMap<AtomId, Symbol> = HashMap::new();
         for (path, sym) in &indexed_symbols {
-            let path_str = path.to_string_lossy().to_string();
-            def_lookup.insert((path_str, sym.line), sym.clone());
+            def_lookup.insert(
+                AtomId::new(path.to_string_lossy().as_ref(), sym.line),
+                sym.clone(),
+            );
         }
 
         // Step 4: Classify each rg hit.
@@ -490,7 +492,7 @@ impl GrepServer {
                 let matched_text = texts.first().map(|(t, _)| t.clone()).unwrap_or_default();
                 let col = texts.first().map_or(0, |(_, c)| *c);
 
-                if has_symbols && let Some(sym) = def_lookup.get(&(file_str.clone(), line_0)) {
+                if has_symbols && let Some(sym) = def_lookup.get(&AtomId::new(file_str, line_0)) {
                     // Definition line in an indexed file → enriched symbol atom.
                     hits.push(GrepHit {
                         file: file_path.clone(),
@@ -849,7 +851,7 @@ impl GrepServer {
         parent_id: Option<&str>,
         pre_opened_uri: Option<&str>,
         cancel: &tokio_util::sync::CancellationToken,
-    ) -> HashMap<String, HashSet<u32>> {
+    ) -> HashSet<AtomId> {
         let servers = self
             .client_manager
             .get_servers(
@@ -890,12 +892,12 @@ impl GrepServer {
 
             match result {
                 Ok(Value::Array(refs)) => {
-                    let mut ref_lines: HashMap<String, HashSet<u32>> = HashMap::new();
+                    let mut ref_lines: HashSet<AtomId> = HashSet::new();
                     for r in &refs {
                         if let Some(file) = extract_location_path(r)
                             && let Some(line) = extract_start_line(r)
                         {
-                            ref_lines.entry(file).or_default().insert(line);
+                            ref_lines.insert(AtomId::new(&file, line));
                         }
                     }
                     return ref_lines;
@@ -910,7 +912,7 @@ impl GrepServer {
             }
         }
 
-        HashMap::new()
+        HashSet::new()
     }
 
     /// Fetches incoming and outgoing calls via priority chain dispatch.
@@ -926,7 +928,7 @@ impl GrepServer {
         parent_id: Option<&str>,
         pre_opened_uri: Option<&str>,
         cancel: &tokio_util::sync::CancellationToken,
-    ) -> (Vec<CallEdge>, Vec<CallEdge>) {
+    ) -> (Vec<Edge>, Vec<Edge>) {
         let servers = self
             .client_manager
             .get_servers(
@@ -966,14 +968,14 @@ impl GrepServer {
                     let incoming = match client.incoming_calls(item).await {
                         Ok(Value::Array(calls)) => calls
                             .iter()
-                            .filter_map(|c| extract_call_edge(c.get("from")?))
+                            .filter_map(|c| extract_edge(c.get("from")?))
                             .collect(),
                         _ => Vec::new(),
                     };
                     let outgoing = match client.outgoing_calls(item).await {
                         Ok(Value::Array(calls)) => calls
                             .iter()
-                            .filter_map(|c| extract_call_edge(c.get("to")?))
+                            .filter_map(|c| extract_edge(c.get("to")?))
                             .collect(),
                         _ => Vec::new(),
                     };
@@ -1013,7 +1015,7 @@ impl GrepServer {
         parent_id: Option<&str>,
         pre_opened_uri: Option<&str>,
         cancel: &tokio_util::sync::CancellationToken,
-    ) -> Vec<(String, u32)> {
+    ) -> Vec<AtomId> {
         let servers = self
             .client_manager
             .get_servers(
@@ -1059,7 +1061,7 @@ impl GrepServer {
                         .filter_map(|loc| {
                             let file = extract_location_path(loc)?;
                             let line = extract_start_line(loc)?;
-                            Some((file, line))
+                            Some(AtomId::new(&file, line))
                         })
                         .collect();
                 }
@@ -1089,7 +1091,7 @@ impl GrepServer {
         parent_id: Option<&str>,
         pre_opened_uri: Option<&str>,
         cancel: &tokio_util::sync::CancellationToken,
-    ) -> (Vec<TypeEdge>, Vec<TypeEdge>) {
+    ) -> (Vec<Edge>, Vec<Edge>) {
         let servers = self
             .client_manager
             .get_servers(
@@ -1127,15 +1129,11 @@ impl GrepServer {
                 Ok(Value::Array(ref items)) if !items.is_empty() => {
                     let item = &items[0];
                     let supertypes = match client.supertypes(item).await {
-                        Ok(Value::Array(types)) => {
-                            types.iter().filter_map(extract_type_edge).collect()
-                        }
+                        Ok(Value::Array(types)) => types.iter().filter_map(extract_edge).collect(),
                         _ => Vec::new(),
                     };
                     let subtypes = match client.subtypes(item).await {
-                        Ok(Value::Array(types)) => {
-                            types.iter().filter_map(extract_type_edge).collect()
-                        }
+                        Ok(Value::Array(types)) => types.iter().filter_map(extract_edge).collect(),
                         _ => Vec::new(),
                     };
                     Some((supertypes, subtypes))
@@ -1413,18 +1411,18 @@ fn render_results(
     full
 }
 
-/// The `(file, line)` of a hit's atom — the definition line for a `Symbol`,
-/// the hit line otherwise.
-fn hit_atom(hit: &GrepHit) -> (String, u32) {
+/// The [`AtomId`] of a hit — the definition line for a `Symbol`, the hit line
+/// otherwise.
+fn hit_atom(hit: &GrepHit) -> AtomId {
     let line = match &hit.classification {
         HitClass::Symbol { symbol } => symbol.line,
         _ => hit.line,
     };
-    (hit.file.to_string_lossy().to_string(), line)
+    AtomId::new(hit.file.to_string_lossy().as_ref(), line)
 }
 
-/// Collects the set of top-level match atoms `(file, line)` across the whole
-/// result — the membership test that decides edge collapse.
+/// Collects the set of top-level match atoms across the whole result — the
+/// membership test that decides edge collapse.
 ///
 /// Top level is always full and is the canonical home of every atom; an edge
 /// pointing here collapses to a `path:line  name` citation, an edge pointing
@@ -1433,7 +1431,7 @@ fn hit_atom(hit: &GrepHit) -> (String, u32) {
 /// holds the full form (decision 024, the paging invariant).
 fn collect_top_level_atoms(
     enrichments: &[(&GrepHit, Option<SymbolEnrichment>)],
-) -> HashSet<(String, u32)> {
+) -> HashSet<AtomId> {
     enrichments.iter().map(|(hit, _)| hit_atom(hit)).collect()
 }
 
@@ -1452,7 +1450,7 @@ fn render_section(
     enrichments: &[(&GrepHit, Option<SymbolEnrichment>)],
     indices: &[usize],
     fs_manager: &FilesystemManager,
-    top_level: &HashSet<(String, u32)>,
+    top_level: &HashSet<AtomId>,
     sources: &mut SourceLines,
     output: &mut String,
     cwd: Option<&Path>,
@@ -1471,13 +1469,22 @@ fn render_section(
         )
     };
 
-    // Citation names: a collapsed edge shows `path:line  name`. Only symbol
-    // atoms ever recur, so a citation's target is always a top-level
-    // `Symbol`/`PrepareRenameSymbol` hit, which carries a name (decision 024).
+    // Citation names: a collapsed edge shows `path:line  name`. A symbol atom
+    // cites by its lean name (decision 024); but a citation target can also be a
+    // plain `Reference` occurrence (a grep hit that is itself referenced by a
+    // definition), which has no name. `atom_texts` carries every top-level atom's
+    // full source line so such a citation falls back to it instead of rendering
+    // blank (bug 48).
     let atom_names = collect_atom_names(enrichments);
+    let atom_texts = collect_atom_texts(enrichments);
+    let citations = AtomCitations {
+        top_level,
+        names: &atom_names,
+        texts: &atom_texts,
+    };
 
-    // Order the section's hits by `(file, line)` — reproducible bytes.
-    let mut ordered: BTreeMap<(String, u32), usize> = BTreeMap::new();
+    // Order the section's hits by atom id (`(file, line)`) — reproducible bytes.
+    let mut ordered: BTreeMap<AtomId, usize> = BTreeMap::new();
     for &i in indices {
         ordered.insert(hit_atom(enrichments[i].0), i);
     }
@@ -1492,7 +1499,7 @@ fn render_section(
 
         // Top-level atom: ALWAYS the full source line, verbatim.
         let rel_path = rel(&hit.file.to_string_lossy());
-        let line_1 = hit_atom(hit).1 + 1;
+        let line_1 = hit_atom(hit).line + 1;
         let _ = writeln!(output, "{rel_path}:{line_1}  {}", hit.matched_text);
 
         // Only definitions carry edge groups; occurrences are lean atoms.
@@ -1506,15 +1513,15 @@ fn render_section(
             continue;
         };
 
-        render_edge_groups(output, enrichment, top_level, &atom_names, sources, &rel);
+        render_edge_groups(output, enrichment, &citations, sources, &rel);
     }
 }
 
-/// Builds the citation-name lookup: each top-level definition atom's
-/// `(file, line)` → its symbol name. A collapsed edge cites by this name.
+/// Builds the citation-name lookup: each top-level definition atom's [`AtomId`]
+/// → its symbol name. A collapsed edge cites by this name.
 fn collect_atom_names(
     enrichments: &[(&GrepHit, Option<SymbolEnrichment>)],
-) -> HashMap<(String, u32), String> {
+) -> HashMap<AtomId, String> {
     let mut names = HashMap::new();
     for (hit, _) in enrichments {
         let name = match &hit.classification {
@@ -1527,6 +1534,35 @@ fn collect_atom_names(
     names
 }
 
+/// Builds the citation-text lookup: each top-level atom's [`AtomId`] → its full
+/// source line. Unlike [`collect_atom_names`] this includes `Reference`
+/// occurrences, so a citation whose target has no symbol name (a plain
+/// occurrence referenced by a definition) can fall back to the verbatim line
+/// instead of rendering blank (bug 48).
+fn collect_atom_texts(
+    enrichments: &[(&GrepHit, Option<SymbolEnrichment>)],
+) -> HashMap<AtomId, String> {
+    enrichments
+        .iter()
+        .map(|(hit, _)| (hit_atom(hit), hit.matched_text.clone()))
+        .collect()
+}
+
+/// The citation lookups shared across edge rendering: the membership set that
+/// decides edge collapse, plus the name and full-text maps a collapsed citation
+/// draws on. Bundled so the edge renderers stay within argument limits.
+struct AtomCitations<'a> {
+    /// Every top-level match atom — an edge whose target is here collapses to a
+    /// citation.
+    top_level: &'a HashSet<AtomId>,
+    /// Top-level definition atoms' names, for lean citations (decision 024).
+    names: &'a HashMap<AtomId, String>,
+    /// Every top-level atom's full source line — the fallback when a cited atom
+    /// has no name (a plain `Reference` occurrence), so a citation is never
+    /// blank (bug 48).
+    texts: &'a HashMap<AtomId, String>,
+}
+
 /// Renders the labeled edge groups under a definition atom (decision 024).
 ///
 /// Each edge is an atom: collapsed to `path:line  name` when its target is a
@@ -1536,47 +1572,44 @@ fn collect_atom_names(
 fn render_edge_groups(
     output: &mut String,
     enrichment: &SymbolEnrichment,
-    top_level: &HashSet<(String, u32)>,
-    atom_names: &HashMap<(String, u32), String>,
+    citations: &AtomCitations,
     sources: &mut SourceLines,
     rel: &impl Fn(&str) -> String,
 ) {
     use std::fmt::Write;
 
-    // Dedup edges across all this definition's groups by atom (file, line).
-    let mut seen: HashSet<(String, u32)> = HashSet::new();
+    // Dedup edges across all this definition's groups by atom id.
+    let mut seen: HashSet<AtomId> = HashSet::new();
 
-    // calls: — outgoing call edges, ordered by (file, line).
-    let mut calls: BTreeMap<(String, u32), &CallEdge> = BTreeMap::new();
+    // calls: — outgoing call edges, ordered by atom id.
+    let mut calls: BTreeMap<AtomId, &Edge> = BTreeMap::new();
     for c in &enrichment.outgoing_calls {
-        calls.entry((c.file.clone(), c.line)).or_insert(c);
+        calls.entry(c.target.clone()).or_insert(c);
     }
     if !calls.is_empty() {
         let _ = writeln!(output, "\tcalls:");
-        for ((file, line_0), c) in &calls {
-            if seen.insert((file.clone(), *line_0)) {
-                render_edge_atom(output, &c.name, file, *line_0, top_level, sources, rel);
+        for (id, c) in &calls {
+            if seen.insert(id.clone()) {
+                render_edge_atom(output, &c.name, id, citations, sources, rel);
             }
         }
     }
 
-    // impls: — implementation locations, ordered by (file, line). LSP gives
-    // only `(file, line)`; a collapsed citation borrows the matched atom's name.
-    let mut impls: BTreeSet<(String, u32)> = BTreeSet::new();
-    for (f, l) in &enrichment.implementations {
-        impls.insert((f.clone(), *l));
+    // impls: — implementation locations, ordered by atom id. LSP gives only
+    // `(file, line)`; a collapsed citation borrows the matched atom's name.
+    let mut impls: BTreeSet<AtomId> = BTreeSet::new();
+    for id in &enrichment.implementations {
+        impls.insert(id.clone());
     }
-    let impls: Vec<(String, u32)> = impls
+    let impls: Vec<AtomId> = impls
         .into_iter()
         .filter(|atom| seen.insert(atom.clone()))
         .collect();
     if !impls.is_empty() {
         let _ = writeln!(output, "\timpls:");
-        for (file, line_0) in &impls {
-            let name = atom_names
-                .get(&(file.clone(), *line_0))
-                .map_or("", String::as_str);
-            render_edge_atom(output, name, file, *line_0, top_level, sources, rel);
+        for id in &impls {
+            let name = citations.names.get(id).map_or("", String::as_str);
+            render_edge_atom(output, name, id, citations, sources, rel);
         }
     }
 
@@ -1586,7 +1619,7 @@ fn render_edge_groups(
         "supertypes",
         &enrichment.supertypes,
         &mut seen,
-        top_level,
+        citations,
         sources,
         rel,
     );
@@ -1595,36 +1628,35 @@ fn render_edge_groups(
         "subtypes",
         &enrichment.subtypes,
         &mut seen,
-        top_level,
+        citations,
         sources,
         rel,
     );
 
-    // refs: — textDocument/references plus incoming call edges, ordered by
-    // (file, line), deduplicated against the edges above.
-    let mut refs: BTreeMap<(String, u32), String> = BTreeMap::new();
-    for (file, lines) in &enrichment.ref_lines {
-        for &line_0 in lines {
-            refs.entry((file.clone(), line_0)).or_default();
-        }
+    // refs: — textDocument/references plus incoming call edges, ordered by atom
+    // id, deduplicated against the edges above.
+    let mut refs: BTreeMap<AtomId, String> = BTreeMap::new();
+    for id in &enrichment.ref_lines {
+        refs.entry(id.clone()).or_default();
     }
     for caller in &enrichment.incoming_calls {
-        refs.entry((caller.file.clone(), caller.line))
+        refs.entry(caller.target.clone())
             .or_insert_with(|| caller.name.clone());
     }
-    let refs: Vec<((String, u32), String)> = refs
+    let refs: Vec<(AtomId, String)> = refs
         .into_iter()
         .filter(|(atom, _)| seen.insert(atom.clone()))
         .collect();
     if !refs.is_empty() {
         let _ = writeln!(output, "\trefs:");
-        for ((file, line_0), caller_name) in &refs {
+        for (id, caller_name) in &refs {
             // Prefer the cited atom's own name; fall back to an incoming
             // caller's name when the reference is not itself a match.
-            let name = atom_names
-                .get(&(file.clone(), *line_0))
+            let name = citations
+                .names
+                .get(id)
                 .map_or(caller_name.as_str(), String::as_str);
-            render_edge_atom(output, name, file, *line_0, top_level, sources, rel);
+            render_edge_atom(output, name, id, citations, sources, rel);
         }
     }
 }
@@ -1633,19 +1665,19 @@ fn render_edge_groups(
 fn render_type_group(
     output: &mut String,
     label: &str,
-    edges: &[TypeEdge],
-    seen: &mut HashSet<(String, u32)>,
-    top_level: &HashSet<(String, u32)>,
+    edges: &[Edge],
+    seen: &mut HashSet<AtomId>,
+    citations: &AtomCitations,
     sources: &mut SourceLines,
     rel: &impl Fn(&str) -> String,
 ) {
     use std::fmt::Write;
 
-    let mut by_atom: BTreeMap<(String, u32), &TypeEdge> = BTreeMap::new();
+    let mut by_atom: BTreeMap<AtomId, &Edge> = BTreeMap::new();
     for t in edges {
-        by_atom.entry((t.file.clone(), t.line)).or_insert(t);
+        by_atom.entry(t.target.clone()).or_insert(t);
     }
-    let by_atom: Vec<((String, u32), &TypeEdge)> = by_atom
+    let by_atom: Vec<(AtomId, &Edge)> = by_atom
         .into_iter()
         .filter(|(atom, _)| seen.insert(atom.clone()))
         .collect();
@@ -1653,8 +1685,8 @@ fn render_type_group(
         return;
     }
     let _ = writeln!(output, "\t{label}:");
-    for ((file, line_0), t) in &by_atom {
-        render_edge_atom(output, &t.name, file, *line_0, top_level, sources, rel);
+    for (id, t) in &by_atom {
+        render_edge_atom(output, &t.name, id, citations, sources, rel);
     }
 }
 
@@ -1665,26 +1697,36 @@ fn render_type_group(
 /// elsewhere in the same result), read full `path:line  <source line>`
 /// otherwise. When the source line is unavailable and the target is not a
 /// match, the edge's own `name` is the fallback so the atom is never empty.
+///
+/// A citation whose target has no name — a plain `Reference` occurrence
+/// referenced by a definition — falls back to that target's full source line
+/// from `citations.texts`, never rendering a blank raw field (bug 48).
 fn render_edge_atom(
     output: &mut String,
     name: &str,
-    file: &str,
-    line_0: u32,
-    top_level: &HashSet<(String, u32)>,
+    atom: &AtomId,
+    citations: &AtomCitations,
     sources: &mut SourceLines,
     rel: &impl Fn(&str) -> String,
 ) {
     use std::fmt::Write;
 
-    let line_1 = line_0 + 1;
-    let rel_path = rel(file);
-    if top_level.contains(&(file.to_string(), line_0)) {
+    let line_1 = atom.line + 1;
+    let rel_path = rel(&atom.file);
+    if citations.top_level.contains(atom) {
         // Citation: the full line is a top-level atom elsewhere in the result.
-        let _ = writeln!(output, "\t\t{rel_path}:{line_1}  {name}");
+        // Prefer the lean name; when the cited atom has none (a plain occurrence)
+        // fall back to its verbatim source line so the citation is never blank.
+        let label = if name.is_empty() {
+            citations.texts.get(atom).map_or(name, String::as_str)
+        } else {
+            name
+        };
+        let _ = writeln!(output, "\t\t{rel_path}:{line_1}  {label}");
     } else {
         // Read the line in for the agent (bounded to new targets).
         let text = sources
-            .line(Path::new(file), line_0)
+            .line(Path::new(&atom.file), atom.line)
             .map(str::trim_end)
             .filter(|l| !l.is_empty())
             .unwrap_or(name);
@@ -1941,11 +1983,14 @@ fn extract_start_line(location: &Value) -> Option<u32> {
     u32::try_from(location.get("range")?.get("start")?.get("line")?.as_u64()?).ok()
 }
 
-/// Extracts a [`CallEdge`] from a `CallHierarchyItem` JSON value.
+/// Extracts an [`Edge`] from a `CallHierarchyItem` or `TypeHierarchyItem` JSON
+/// value — both share the `name`/`uri`/`range` shape, so one extractor serves
+/// both.
 ///
-/// The one-atom model carries only the edge's name and `(file, line)`; the LSP
-/// kind / container / deprecation tags are not rendered, so they are not read.
-fn extract_call_edge(item: &Value) -> Option<CallEdge> {
+/// The one-atom model carries only the edge's name and target `(file, line)`;
+/// the LSP kind / container / deprecation tags are not rendered, so they are
+/// not read.
+fn extract_edge(item: &Value) -> Option<Edge> {
     let name = item.get("name")?.as_str()?.to_string();
     let file = item
         .get("uri")?
@@ -1953,21 +1998,10 @@ fn extract_call_edge(item: &Value) -> Option<CallEdge> {
         .strip_prefix("file://")
         .map(str::to_string)?;
     let line = u32::try_from(item.get("range")?.get("start")?.get("line")?.as_u64()?).ok()?;
-    Some(CallEdge { name, file, line })
-}
-
-/// Extracts a [`TypeEdge`] from a `TypeHierarchyItem` JSON value.
-///
-/// Carries only the atom's name and `(file, line)`; see [`extract_call_edge`].
-fn extract_type_edge(item: &Value) -> Option<TypeEdge> {
-    let name = item.get("name")?.as_str()?.to_string();
-    let file = item
-        .get("uri")?
-        .as_str()?
-        .strip_prefix("file://")
-        .map(str::to_string)?;
-    let line = u32::try_from(item.get("range")?.get("start")?.get("line")?.as_u64()?).ok()?;
-    Some(TypeEdge { name, file, line })
+    Some(Edge {
+        name,
+        target: AtomId::new(&file, line),
+    })
 }
 
 #[cfg(test)]
@@ -2075,7 +2109,7 @@ mod tests {
 
     fn empty_enrichment() -> SymbolEnrichment {
         SymbolEnrichment {
-            ref_lines: HashMap::new(),
+            ref_lines: HashSet::new(),
             incoming_calls: Vec::new(),
             outgoing_calls: Vec::new(),
             implementations: Vec::new(),
@@ -2161,6 +2195,69 @@ mod tests {
         assert!(
             output.contains("main.rs:101  ") && output.contains("let pattern = compile();"),
             "second ref atom: {output}"
+        );
+    }
+
+    #[test]
+    fn citation_to_reference_atom_is_not_blank() {
+        // Repro for bug 48 empty-raw `refs` lines.
+        //
+        // When an edge (here a `refs:` entry) points at a (file, line) that is
+        // ALSO a top-level match atom, the renderer collapses it to a citation
+        // `path:line  name` instead of re-reading the source. But citation names
+        // come from `collect_atom_names`, which only records
+        // Symbol/PrepareRenameSymbol atoms — a plain Reference occurrence has no
+        // name. The result is a citation with an EMPTY raw field:
+        // `\t\tpath:line  ` with nothing after it. Decision 024 / bug 31: an
+        // atom must never render blank — the renderer already HAS the cited
+        // atom's full source line (it is a top-level match), so a citation can
+        // and must surface it.
+        let fs = test_fs("/project");
+
+        // The enriched definition.
+        let def = sym_hit(
+            "/project/src/feeder.rs",
+            78,
+            "DiagnosticFeeder",
+            "trait",
+            "pub trait DiagnosticFeeder {",
+        );
+        // A plain textual occurrence that is ALSO a reference target of `def`.
+        let user = ref_hit(
+            "/project/src/user.rs",
+            11,
+            "use crate::bridge::linter::DiagnosticFeeder;",
+        );
+
+        // Enrichment: references include the occurrence's atom (0-based line).
+        let enrichment = SymbolEnrichment {
+            ref_lines: HashSet::from([AtomId::new("/project/src/user.rs", 11)]),
+            ..empty_enrichment()
+        };
+
+        let enrichments: Vec<(&GrepHit, Option<SymbolEnrichment>)> =
+            vec![(&def, Some(enrichment)), (&user, None)];
+        let output = render_results(&enrichments, &fs, None);
+
+        // The `refs:` citation is the DOUBLE-TAB-indented line under the def
+        // (`\t\tsrc/user.rs:12  …`) — distinct from the top-level atom for the
+        // same occurrence (rendered with no indent). Currently it renders blank
+        // (`\t\tsrc/user.rs:12  ` with nothing after) because a Reference atom
+        // has no citation name. The renderer already knows the cited atom's full
+        // source line, so the citation must surface it.
+        let citation = output
+            .lines()
+            .find(|l| l.starts_with("\t\tsrc/user.rs:12"))
+            .expect("refs block must cite src/user.rs:12");
+        let raw = citation
+            .trim_start_matches('\t')
+            .trim_start_matches("src/user.rs:12")
+            .trim();
+        assert!(
+            !raw.is_empty(),
+            "citation to a top-level reference atom must surface its known source \
+             line, never an empty raw field (bug 48); got blank citation: \
+             {citation:?}"
         );
     }
 
@@ -2323,10 +2420,9 @@ mod tests {
             "struct MyStruct {",
         );
         let mut enrichment = empty_enrichment();
-        enrichment.outgoing_calls.push(CallEdge {
+        enrichment.outgoing_calls.push(Edge {
             name: "helper".to_string(),
-            file: "/project/src/util.rs".to_string(),
-            line: 5,
+            target: AtomId::new("/project/src/util.rs", 5),
         });
 
         let enrichments = vec![(&hit, Some(enrichment))];
@@ -2360,7 +2456,7 @@ mod tests {
         let mut enrichment = empty_enrichment();
         enrichment
             .implementations
-            .push(("/project/src/impl.rs".to_string(), 30));
+            .push(AtomId::new("/project/src/impl.rs", 30));
 
         let enrichments = vec![(&hit, Some(enrichment))];
         let full = render_results(&enrichments, &fs, None);
@@ -2384,10 +2480,9 @@ mod tests {
             "struct MyStruct {",
         );
         let mut enrichment = empty_enrichment();
-        enrichment.supertypes.push(TypeEdge {
+        enrichment.supertypes.push(Edge {
             name: "BaseTrait".to_string(),
-            file: "/project/src/traits.rs".to_string(),
-            line: 20,
+            target: AtomId::new("/project/src/traits.rs", 20),
         });
 
         let enrichments = vec![(&hit, Some(enrichment))];
@@ -2415,10 +2510,9 @@ mod tests {
             "trait MyTrait {",
         );
         let mut enrichment = empty_enrichment();
-        enrichment.subtypes.push(TypeEdge {
+        enrichment.subtypes.push(Edge {
             name: "SubStruct".to_string(),
-            file: "/project/src/sub.rs".to_string(),
-            line: 15,
+            target: AtomId::new("/project/src/sub.rs", 15),
         });
 
         let enrichments = vec![(&hit, Some(enrichment))];
@@ -2444,7 +2538,7 @@ mod tests {
         let mut enrichment = empty_enrichment();
         enrichment
             .ref_lines
-            .insert("/project/src/main.rs".to_string(), HashSet::from([20]));
+            .insert(AtomId::new("/project/src/main.rs", 20));
 
         let enrichments = vec![(&hit, Some(enrichment))];
         let full = render_results(&enrichments, &fs, None);
@@ -2467,10 +2561,9 @@ mod tests {
             "struct MyStruct {",
         );
         let mut enrichment = empty_enrichment();
-        enrichment.incoming_calls.push(CallEdge {
+        enrichment.incoming_calls.push(Edge {
             name: "caller_fn".to_string(),
-            file: "/project/src/caller.rs".to_string(),
-            line: 50,
+            target: AtomId::new("/project/src/caller.rs", 50),
         });
 
         let enrichments = vec![(&hit, Some(enrichment))];
@@ -2492,10 +2585,9 @@ mod tests {
         let fs = test_fs("/project");
         let hit_a = sym_hit("/project/src/lib.rs", 10, "FnA", "function", "fn FnA() {");
         let mut enrichment_a = empty_enrichment();
-        enrichment_a.outgoing_calls.push(CallEdge {
+        enrichment_a.outgoing_calls.push(Edge {
             name: "FnB".to_string(),
-            file: "/project/src/util.rs".to_string(),
-            line: 20,
+            target: AtomId::new("/project/src/util.rs", 20),
         });
         // B at the cited location, a top-level match in its own right.
         let hit_b = sym_hit("/project/src/util.rs", 20, "FnB", "function", "fn FnB() {");
@@ -2531,10 +2623,9 @@ mod tests {
         let fs = test_fs("/project");
         let hit_a = sym_hit("/project/a.rs", 0, "FnA", "function", "fn FnA() {");
         let mut enrichment_a = empty_enrichment();
-        enrichment_a.outgoing_calls.push(CallEdge {
+        enrichment_a.outgoing_calls.push(Edge {
             name: "FnB".to_string(),
-            file: "/project/b.rs".to_string(),
-            line: 0,
+            target: AtomId::new("/project/b.rs", 0),
         });
         let hit_b = sym_hit("/project/b.rs", 0, "FnB", "function", "fn FnB() {");
 
@@ -2813,10 +2904,10 @@ mod tests {
         assert_eq!(extract_start_line(&loc), None);
     }
 
-    // ─── extract_call_edge (atom: name + file + line only) ──────────────
+    // ─── extract_edge (one extractor for call- and type-hierarchy items) ──
 
     #[test]
-    fn extract_call_edge_full() {
+    fn extract_edge_from_call_hierarchy_item() {
         let item = serde_json::json!({
             "name": "my_function",
             "kind": 12,
@@ -2824,34 +2915,14 @@ mod tests {
             "uri": "file:///project/src/lib.rs",
             "range": {"start": {"line": 10, "character": 4}, "end": {"line": 20, "character": 1}}
         });
-        let edge = extract_call_edge(&item).expect("should parse call edge");
+        let edge = extract_edge(&item).expect("should parse call edge");
         assert_eq!(edge.name, "my_function");
-        assert_eq!(edge.file, "/project/src/lib.rs");
-        assert_eq!(edge.line, 10);
+        assert_eq!(edge.target.file, "/project/src/lib.rs");
+        assert_eq!(edge.target.line, 10);
     }
 
     #[test]
-    fn extract_call_edge_missing_name() {
-        let item = serde_json::json!({
-            "uri": "file:///project/src/lib.rs",
-            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 5}}
-        });
-        assert!(extract_call_edge(&item).is_none());
-    }
-
-    #[test]
-    fn extract_call_edge_missing_uri() {
-        let item = serde_json::json!({
-            "name": "no_uri",
-            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 5}}
-        });
-        assert!(extract_call_edge(&item).is_none());
-    }
-
-    // ─── extract_type_edge (atom: name + file + line only) ──────────────
-
-    #[test]
-    fn extract_type_edge_full() {
+    fn extract_edge_from_type_hierarchy_item() {
         let item = serde_json::json!({
             "name": "MyTrait",
             "kind": 11,
@@ -2859,19 +2930,28 @@ mod tests {
             "uri": "file:///project/src/traits.rs",
             "range": {"start": {"line": 20, "character": 0}, "end": {"line": 30, "character": 1}}
         });
-        let edge = extract_type_edge(&item).expect("should parse type edge");
+        let edge = extract_edge(&item).expect("should parse type edge");
         assert_eq!(edge.name, "MyTrait");
-        assert_eq!(edge.file, "/project/src/traits.rs");
-        assert_eq!(edge.line, 20);
+        assert_eq!(edge.target.file, "/project/src/traits.rs");
+        assert_eq!(edge.target.line, 20);
     }
 
     #[test]
-    fn extract_type_edge_missing_uri() {
+    fn extract_edge_missing_name() {
         let item = serde_json::json!({
-            "name": "Orphan",
+            "uri": "file:///project/src/lib.rs",
             "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 5}}
         });
-        assert!(extract_type_edge(&item).is_none());
+        assert!(extract_edge(&item).is_none());
+    }
+
+    #[test]
+    fn extract_edge_missing_uri() {
+        let item = serde_json::json!({
+            "name": "no_uri",
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 5}}
+        });
+        assert!(extract_edge(&item).is_none());
     }
 
     // ─── CollectOnDrop ──────────────────────────────────────────────────

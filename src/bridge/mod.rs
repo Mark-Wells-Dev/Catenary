@@ -79,7 +79,7 @@ pub(crate) fn compress_home(path: &Path) -> String {
 ///
 /// The one-atom render model (decision 024) makes every `grep` and `glob`
 /// result a `path:line  <source line>` atom — the verbatim text at that
-/// location. Neither `Symbol`/`CallEdge`/`TypeEdge` carries the source text,
+/// location. Neither `Symbol` nor `Edge` carries the source text,
 /// so both surfaces resolve it here: glob reads one file and indexes many
 /// nodes; grep reads scattered edge-target lines across files. Each file is
 /// read at most once and its newline-stripped lines are cached, so repeated
