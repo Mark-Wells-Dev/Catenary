@@ -43,6 +43,13 @@ pub struct LinterConfig {
     /// A project entry can disable a user-configured linter by setting this on
     /// an entry with the same name.
     pub disable: bool,
+    /// Diagnostic trust weight for this linter's source (linters ticket 05).
+    ///
+    /// A linter is a 1:1 emitter — the diagnostic `source` equals the linter
+    /// name — so this single weight covers it. Higher = more trusted. Absent ⇒
+    /// the [`BASELINE_WEIGHT`](super::BASELINE_WEIGHT). Drives the cross-feeder
+    /// dedup keeper and the provisional challenge.
+    pub weight: Option<u32>,
     /// Compiled form of [`Self::patterns`]. Populated by
     /// [`Self::compile_patterns`] after deserialization.
     #[serde(skip)]
@@ -68,6 +75,7 @@ impl LinterConfig {
             args,
             patterns,
             disable: false,
+            weight: None,
             compiled_patterns: Vec::new(),
         };
         linter.compile_patterns()?;

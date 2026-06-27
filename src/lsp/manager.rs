@@ -343,28 +343,45 @@ impl LspClientManager {
         linters
     }
 
-    /// The effective cross-feeder precedence chains for a root (linters ticket
-    /// 02).
+    /// The effective cross-feeder diagnostic weights for a root (linters ticket
+    /// 05).
     ///
-    /// The root's project `[[diagnostics.precedence]]` when it sets any (a
-    /// per-root override), else the user-level list (seeded with
-    /// [`DiagnosticPrecedence::rust_analyzer_default`]). Applied per file over
-    /// the merged diagnostic set from every feeder — language servers and
-    /// linters alike — so one chain reconciles them together.
+    /// Built from the seeded code default
+    /// ([`DiagnosticWeights::rust_analyzer_default`]) overlaid with the user-level
+    /// `[server.*]` / `[linter.*]` weight fields, then the root's project
+    /// `.catenary.toml` overrides (project winning). Consumed per file by the
+    /// `catenary diagnostics` cross-feeder reconciliation — the dedup keeper and
+    /// the provisional challenge — over the merged set from every feeder.
     ///
-    /// Each returned chain carries its compiled code band, ready for
-    /// reconciliation.
+    /// `root` is `None` for files outside every workspace root: only the seed +
+    /// user layer applies, with no project overrides.
     ///
-    /// [`DiagnosticPrecedence::rust_analyzer_default`]: crate::config::DiagnosticPrecedence::rust_analyzer_default
+    /// [`DiagnosticWeights::rust_analyzer_default`]: crate::config::DiagnosticWeights::rust_analyzer_default
     #[must_use]
-    pub fn effective_precedence(&self, root: &Path) -> Vec<crate::config::DiagnosticPrecedence> {
-        if let Some(r) = self.fs.root(root) {
-            let project = &r.config().diagnostic_precedence;
-            if !project.is_empty() {
-                return project.clone();
+    pub fn effective_weights(&self, root: Option<&Path>) -> crate::config::DiagnosticWeights {
+        let mut weights = crate::config::DiagnosticWeights::rust_analyzer_default();
+
+        // User layer.
+        for (name, def) in &self.config.server {
+            weights.apply_server_def(name, def);
+        }
+        for (name, def) in &self.config.linter {
+            weights.apply_linter(name, def);
+        }
+
+        // Project layer (overrides the user layer per source).
+        if let Some(root) = root
+            && let Some(r) = self.fs.root(root)
+        {
+            for (name, def) in &r.config().server {
+                weights.apply_server_def(name, def);
+            }
+            for (name, def) in &r.config().linter {
+                weights.apply_linter(name, def);
             }
         }
-        self.config.diagnostic_precedence.clone()
+
+        weights
     }
 
     /// Whether a standalone linter covers `file` (workstream 34 ticket 01).
@@ -2198,7 +2215,6 @@ mod tests {
             observability: None,
             roots: None,
             linter: HashMap::new(),
-            diagnostic_precedence: Vec::new(),
         }
     }
 
@@ -2275,7 +2291,6 @@ mod tests {
             observability: None,
             roots: None,
             linter: HashMap::new(),
-            diagnostic_precedence: Vec::new(),
         })
     }
 
@@ -2311,7 +2326,6 @@ mod tests {
             observability: None,
             roots: None,
             linter: HashMap::new(),
-            diagnostic_precedence: Vec::new(),
         })
     }
 
@@ -2357,7 +2371,6 @@ mod tests {
             observability: None,
             roots: None,
             linter: HashMap::new(),
-            diagnostic_precedence: Vec::new(),
         })
     }
 
@@ -2403,7 +2416,6 @@ mod tests {
             observability: None,
             roots: None,
             linter: HashMap::new(),
-            diagnostic_precedence: Vec::new(),
         })
     }
 
@@ -2452,7 +2464,6 @@ mod tests {
             observability: None,
             roots: None,
             linter: HashMap::new(),
-            diagnostic_precedence: Vec::new(),
         })
     }
 
@@ -2632,7 +2643,6 @@ mod tests {
             observability: None,
             roots: None,
             linter: HashMap::new(),
-            diagnostic_precedence: Vec::new(),
         });
 
         let manager = LspClientManager::new(config, test_logging(), test_fs_with_roots(&["/tmp"]));
@@ -3084,7 +3094,6 @@ mod tests {
             observability: None,
             roots: None,
             linter: HashMap::new(),
-            diagnostic_precedence: Vec::new(),
         });
 
         let fs = test_fs_with_roots(&[
@@ -3539,7 +3548,6 @@ mod tests {
             observability: None,
             roots: None,
             linter: HashMap::new(),
-            diagnostic_precedence: Vec::new(),
         });
 
         let manager = LspClientManager::new(config, test_logging(), test_fs_with_roots(&["/tmp"]));
@@ -3599,7 +3607,6 @@ mod tests {
             observability: None,
             roots: None,
             linter: HashMap::new(),
-            diagnostic_precedence: Vec::new(),
         });
 
         let manager = LspClientManager::new(config, test_logging(), test_fs_with_roots(&["/tmp"]));
@@ -3658,7 +3665,6 @@ mod tests {
             observability: None,
             roots: None,
             linter: HashMap::new(),
-            diagnostic_precedence: Vec::new(),
         });
 
         let manager = LspClientManager::new(config, test_logging(), test_fs_with_roots(&["/tmp"]));
@@ -3753,7 +3759,6 @@ mod tests {
             observability: None,
             roots: None,
             linter: HashMap::new(),
-            diagnostic_precedence: Vec::new(),
         });
 
         let manager = LspClientManager::new(config, test_logging(), test_fs_with_roots(&["/tmp"]));
@@ -5000,7 +5005,6 @@ mod tests {
             observability: None,
             roots: None,
             linter: HashMap::new(),
-            diagnostic_precedence: Vec::new(),
         })
     }
 
@@ -5041,7 +5045,6 @@ mod tests {
             observability: None,
             roots: None,
             linter: HashMap::new(),
-            diagnostic_precedence: Vec::new(),
         })
     }
 
@@ -5815,47 +5818,57 @@ mod tests {
         );
     }
 
-    /// `effective_precedence` returns the per-root project chain when set, else
-    /// the user-level list (ticket 02).
+    /// `effective_weights` seeds the rust-analyzer default, overlays the
+    /// user-level `[server.*]` / `[linter.*]` weights, and lets a per-root
+    /// project override win (linters ticket 05).
     #[test]
-    fn test_effective_precedence_project_overrides_user() {
-        let user_policy = crate::config::DiagnosticPrecedence {
-            priority: vec!["user-high".to_string(), "user-low".to_string()],
-            code_pattern: None,
-            compiled_code_pattern: None,
-        };
+    fn test_effective_weights_layers_seed_user_and_project() {
+        use crate::config::{BASELINE_WEIGHT, LinterConfig, ServerDef};
+        use std::collections::HashMap;
+
         let mut config = test_config_raw();
-        config.diagnostic_precedence = vec![user_policy];
-        let manager = LspClientManager::new(Arc::new(config), test_logging(), test_fs());
-
-        // Unknown root → user-level list.
-        let user = manager.effective_precedence(&PathBuf::from("/unknown"));
-        assert_eq!(user.len(), 1);
-        assert_eq!(user[0].rank("user-high"), Some(0));
-
-        // Project override replaces the user list for that root.
-        let overridden = PathBuf::from("/override");
-        manager.install_root_config(
-            overridden.clone(),
-            crate::config::ProjectConfig {
-                diagnostic_precedence: vec![crate::config::DiagnosticPrecedence {
-                    priority: vec!["proj-high".to_string(), "proj-low".to_string()],
-                    code_pattern: None,
-                    compiled_code_pattern: None,
-                }],
-                ..crate::config::ProjectConfig::default()
+        // User overrides rust-analyzer's native weight and adds a linter weight.
+        config.server.insert(
+            "rust-analyzer".to_string(),
+            ServerDef {
+                command: "rust-analyzer".to_string(),
+                weight: Some(20),
+                ..ServerDef::default()
             },
         );
-        let proj = manager.effective_precedence(&overridden);
-        assert_eq!(proj.len(), 1);
-        assert_eq!(proj[0].rank("proj-high"), Some(0), "project chain wins");
+        let mut sc = LinterConfig::new("shellcheck", vec![], vec![]).expect("compile");
+        sc.weight = Some(70);
+        config.linter.insert("shellcheck".to_string(), sc);
+        let manager = LspClientManager::new(Arc::new(config), test_logging(), test_fs());
 
-        // A root with an empty project precedence inherits the user list.
-        let inherited = PathBuf::from("/inherit");
-        manager.install_root_config(inherited.clone(), crate::config::ProjectConfig::default());
-        let policy = manager.effective_precedence(&inherited);
-        assert_eq!(policy.len(), 1);
-        assert_eq!(policy[0].rank("user-high"), Some(0), "inherits user list");
+        // Unknown root → seed + user layer.
+        let w = manager.effective_weights(Some(&PathBuf::from("/unknown")));
+        assert_eq!(w.weight("rust-analyzer"), 20, "user override of native");
+        assert_eq!(w.weight("rustc"), 100, "seeded flycheck weight survives");
+        assert_eq!(w.weight("shellcheck"), 70, "user linter weight");
+        assert_eq!(w.weight("unlisted"), BASELINE_WEIGHT);
+        assert!(w.is_provisional("rust-analyzer", "E0107"), "seeded band");
+
+        // None root → same seed + user layer, no project override.
+        let none = manager.effective_weights(None);
+        assert_eq!(none.weight("rust-analyzer"), 20);
+
+        // Project override wins for that root.
+        let overridden = PathBuf::from("/override");
+        let mut project = crate::config::ProjectConfig::default();
+        project.server.insert(
+            "rust-analyzer".to_string(),
+            ServerDef {
+                command: "rust-analyzer".to_string(),
+                weight: Some(3),
+                sources: HashMap::from([("rustc".to_string(), 90)]),
+                ..ServerDef::default()
+            },
+        );
+        manager.install_root_config(overridden.clone(), project);
+        let proj = manager.effective_weights(Some(&overridden));
+        assert_eq!(proj.weight("rust-analyzer"), 3, "project native wins");
+        assert_eq!(proj.weight("rustc"), 90, "project sub-source override");
     }
 
     /// `lint_covers` matches the root-relative path against the effective linter
@@ -6261,7 +6274,6 @@ mod tests {
             observability: None,
             roots: None,
             linter: HashMap::new(),
-            diagnostic_precedence: Vec::new(),
         })
     }
 
@@ -6299,7 +6311,6 @@ mod tests {
             observability: None,
             roots: None,
             linter: HashMap::new(),
-            diagnostic_precedence: Vec::new(),
         })
     }
 

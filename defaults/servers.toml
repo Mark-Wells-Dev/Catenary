@@ -13,12 +13,15 @@
 # `initialization_options`, `settings`, `env`, and other fields are user
 # preferences.
 #
-# Source-precedence reconciliation (misc 115) no longer lives here: as of
-# linters ticket 02 it is a per-root, cross-feeder priority chain configured via
-# a `[[diagnostics.precedence]]` section. The rust-analyzer / flycheck default
-# ships in code (`DiagnosticPrecedence::rust_analyzer_default`) and is keyed on
-# the LSP `source` field, so it is a no-op for any root whose diagnostics carry
-# none of those sources.
+# Diagnostic source weights (misc 115) are co-located on the source definition:
+# as of linters ticket 05 a `[server.*]` may set `weight` (native-source trust),
+# a `[server.*.sources]` sub-table (per-sub-source overrides, e.g. flycheck
+# `rustc`/`clippy`), and `provisional` (the native source's provisional code
+# band). The rust-analyzer / flycheck default (`rust-analyzer = 10`,
+# `rustc`/`clippy = 100`, provisional `^E[0-9]+$`) ships in code
+# (`DiagnosticWeights::rust_analyzer_default`), not here, so it survives a user
+# redefining `[server.rust-analyzer]`, and is keyed on the LSP `source` field, so
+# it is inert for any root whose diagnostics carry none of those sources.
 
 # ── Own name ─────────────────────────────────────────────────────
 

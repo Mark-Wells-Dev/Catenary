@@ -403,32 +403,40 @@ impl DiagnosticsServer {
         outcome
     }
 
-    /// Cross-feeder aggregation: per file, dedup → reconcile precedence →
-    /// render (workstream 34 ticket 02).
+    /// Cross-feeder aggregation: per file, dedup → provisional drop → render
+    /// (workstream 34 ticket 05).
     ///
     /// Runs over the merged raw diagnostics each file accumulated from every
-    /// feeder (language servers and linters). Dedup is opinion-free (the same
-    /// finding from two feeders shown once); precedence is the narrow,
-    /// per-root, opinion-laden rule (advisory source dropped in the
-    /// authoritative band). Both operate on canonical LSP-diagnostic JSON, so
-    /// the pass is feeder-blind. Each surviving entry is then rendered through
-    /// its own feeder's context; the per-key presence (even with zero rendered
-    /// entries) is preserved so the downstream clean-vs-no-results distinction
-    /// survives.
+    /// feeder (language servers and linters). Reconciliation is **union →
+    /// cross-source dedup (heaviest-weight keeper) → provisional drop**, keyed on
+    /// the per-root effective [`DiagnosticWeights`](crate::config::DiagnosticWeights).
+    /// Dedup collapses the same finding across sources; the provisional pass drops
+    /// only a flycheck-contradicted phantom. Both operate on canonical
+    /// LSP-diagnostic JSON, so the pass is feeder-blind. Each surviving entry is
+    /// then rendered through its own feeder's context; the per-key presence (even
+    /// with zero rendered entries) is preserved so the downstream
+    /// clean-vs-no-results distinction survives.
+    ///
+    /// Weights are resolved once per distinct root in the batch (memoized), since
+    /// resolving compiles the provisional bands.
     fn aggregate_feeds(
         &self,
         feeds: BTreeMap<String, FileFeed>,
     ) -> BTreeMap<String, (String, Vec<DiagEntry>)> {
         let mut rendered: BTreeMap<String, (String, Vec<DiagEntry>)> = BTreeMap::new();
+        let mut weight_cache: std::collections::HashMap<
+            Option<PathBuf>,
+            crate::config::DiagnosticWeights,
+        > = std::collections::HashMap::new();
         for (key, feed) in feeds {
             let path = PathBuf::from(&key);
-            let policies = self.fs.resolve_root(&path).map_or_else(
-                || self.client_manager.config().diagnostic_precedence.clone(),
-                |root| self.client_manager.effective_precedence(&root),
-            );
+            let root = self.fs.resolve_root(&path);
+            let weights = weight_cache
+                .entry(root.clone())
+                .or_insert_with(|| self.client_manager.effective_weights(root.as_deref()));
 
-            let deduped = dedupe_entries(feed.entries);
-            let reconciled = reconcile_entries(deduped, &policies);
+            let deduped = dedupe_entries(feed.entries, weights);
+            let reconciled = drop_challenged_provisional(deduped, weights);
 
             let entries: Vec<DiagEntry> = reconciled
                 .iter()
@@ -1149,140 +1157,113 @@ fn resolve_enclosing_symbols(
         .collect()
 }
 
-/// Reconciles overlapping diagnostics by their `source` priority chain (misc
-/// 115, bug 42; chain form in linters ticket 02).
-///
-/// **Generic, feeder-agnostic.** Given a file's complete merged diagnostic set
-/// and a [`DiagnosticPrecedence`] chain (source names, highest trust first),
-/// drops each diagnostic whose source is outranked by a source that *actually
-/// reported* for this file — inside the band when a `code_pattern` is set.
-/// Absence of a higher-priority report is **not** contradiction: with no
-/// higher-ranked source present, the diagnostic is kept (the instant
-/// pre-flycheck preview, a single-source server). Out-of-band diagnostics (a
-/// lower source's own lints, an unresolved-import that is not a rustc-coded
-/// error) are always kept.
-///
-/// The gate is the *presence* of a strictly-higher-priority diagnostic in this
-/// set — a clean higher source publishes zero diagnostics, so its silence here
-/// is indistinguishable from not-yet-reported, and the lower source is kept (no
-/// over-suppression). For the rust-analyzer / flycheck case that holds: flycheck
-/// publishes its findings for a file it analyzed, and a native phantom E#### only
-/// matters when it claims an error flycheck did not.
-///
-/// Production reconciliation runs over the cross-feeder [`FeederEntry`] set via
-/// [`reconcile_entries`]; this value-level form exercises the shared
-/// [`precedence_min_rank`] / [`precedence_drops`] predicates directly.
-#[cfg(test)]
-fn reconcile_source_precedence(
-    diagnostics: Vec<Value>,
-    precedence: &crate::config::DiagnosticPrecedence,
-) -> Vec<Value> {
-    let Some(min_rank) = precedence_min_rank(diagnostics.iter(), precedence) else {
-        return diagnostics;
-    };
-    diagnostics
-        .into_iter()
-        .filter(|d| !precedence_drops(d, precedence, min_rank))
-        .collect()
-}
-
-/// The trust rank of a diagnostic's `source` within the chain, or `None` when
-/// the source is not part of it.
-fn source_rank(
-    diagnostic: &Value,
-    precedence: &crate::config::DiagnosticPrecedence,
-) -> Option<usize> {
+/// The `source` field of a diagnostic, or `""` when absent.
+fn source_of(diagnostic: &Value) -> &str {
     diagnostic
         .get("source")
         .and_then(Value::as_str)
-        .and_then(|s| precedence.rank(s))
+        .unwrap_or("")
 }
 
-/// The best (lowest) rank present across the set — the highest-trust source that
-/// reported for the file. `None` when no charted source reported, in which case
-/// nothing is dropped (the gate never fires).
-fn precedence_min_rank<'a>(
-    diagnostics: impl IntoIterator<Item = &'a Value>,
-    precedence: &crate::config::DiagnosticPrecedence,
-) -> Option<usize> {
-    diagnostics
-        .into_iter()
-        .filter_map(|d| source_rank(d, precedence))
-        .min()
-}
-
-/// Whether a diagnostic is outranked (some strictly-higher source reported) and
-/// in-band — the condition for dropping it. `min_rank` is the best rank present
-/// in the file's set; a diagnostic at rank `r > min_rank` has a higher-priority
-/// source present, so it loses inside the band.
-fn precedence_drops(
-    diagnostic: &Value,
-    precedence: &crate::config::DiagnosticPrecedence,
-    min_rank: usize,
-) -> bool {
-    match source_rank(diagnostic, precedence) {
-        Some(r) if r > min_rank => {
-            precedence.code_in_band(&render_diagnostic_code(diagnostic.get("code")))
-        }
-        _ => false,
-    }
-}
-
-/// Reconciles source precedence over a file's merged cross-feeder set (ticket
-/// 02).
+/// Cross-source dedup keeping the highest-weight source's copy (linters ticket
+/// 05).
 ///
-/// Applies each per-root [`DiagnosticPrecedence`](crate::config::DiagnosticPrecedence)
-/// chain in turn to the [`FeederEntry`] list — the same outranked-in-band rule
-/// the per-server path used, now run over diagnostics from *every* feeder
-/// together. Chains are narrow and source-disjoint in practice, so the order
-/// among them does not matter.
-fn reconcile_entries(
-    mut entries: Vec<FeederEntry>,
-    policies: &[crate::config::DiagnosticPrecedence],
+/// Collapses findings that are the *same* — keyed coarse on `(code, start-line)`,
+/// codeless fallback `(normalized-message, line)`. The key **drops `source`**, so
+/// the same finding reported by two different sources collapses: bash-ls's
+/// wrapped shellcheck `SC2086` and standalone shellcheck's `SC2086`, or a real
+/// error reported by both rust-analyzer-native and rustc-flycheck. Anchored on
+/// line, not column/span — LSP (0-based char) and CLI (1-based) ranges drift and
+/// a wrapper may normalize spans differently; bias **coarse** (over-dedup on a
+/// tie beats leaking duplicates, since the aggregator owns the clean output).
+///
+/// When a group spans multiple sources, the **highest-weight** source's copy is
+/// kept; ties fall to first-seen (the entry order is feeder order — LSP feeders
+/// before linters). Surviving entries keep their original relative order.
+fn dedupe_entries(
+    entries: Vec<FeederEntry>,
+    weights: &crate::config::DiagnosticWeights,
 ) -> Vec<FeederEntry> {
-    for policy in policies {
-        let Some(min_rank) = precedence_min_rank(entries.iter().map(|e| &e.value), policy) else {
-            continue;
-        };
-        entries.retain(|e| !precedence_drops(&e.value, policy, min_rank));
+    // Map each dedup key to the index of its current keeper (heaviest source so
+    // far, first-seen on a tie).
+    let mut keeper: std::collections::HashMap<(String, u32), usize> =
+        std::collections::HashMap::new();
+    for (i, e) in entries.iter().enumerate() {
+        let key = dedup_key(&e.value);
+        match keeper.get(&key) {
+            None => {
+                keeper.insert(key, i);
+            }
+            Some(&j) => {
+                // Strictly-greater so a tie keeps the earlier (first-seen) entry.
+                if weights.weight(source_of(&e.value))
+                    > weights.weight(source_of(&entries[j].value))
+                {
+                    keeper.insert(key, i);
+                }
+            }
+        }
     }
-    entries
-}
-
-/// Collapses identical findings delivered by more than one feeder (ticket 02).
-///
-/// Opinion-free dedup keyed coarse on `(source, code, start-line)` — anchored on
-/// line, not column/span, since LSP (0-based char) and CLI (1-based) ranges
-/// drift and a wrapper may normalize spans differently. A codeless diagnostic
-/// falls back to `(source, normalized-message, line)`, best-effort. First
-/// occurrence wins (LSP feeders populate before linters), and the bias is
-/// **coarse**: over-dedup on a tie beats leaking duplicates, since the
-/// aggregator owns the clean output.
-///
-/// Reliable because a wrapped tool preserves its identity: bash-language-server
-/// runs shellcheck and emits `source: "shellcheck", code: "SC2086"`, exactly
-/// what standalone shellcheck emits — so the same finding collapses regardless
-/// of which feeder delivered it.
-fn dedupe_entries(entries: Vec<FeederEntry>) -> Vec<FeederEntry> {
-    let mut seen: HashSet<(String, String, u32)> = HashSet::new();
+    let keep: HashSet<usize> = keeper.into_values().collect();
     entries
         .into_iter()
-        .filter(|e| seen.insert(dedup_key(&e.value)))
+        .enumerate()
+        .filter_map(|(i, e)| keep.contains(&i).then_some(e))
         .collect()
 }
 
-/// Builds the coarse dedup key for a diagnostic: `(source, discriminant, line)`.
+/// Drops *provisional* findings that are challenged but uncorroborated (linters
+/// ticket 05) — the misc-115 phantom and nothing else.
+///
+/// Runs over the **post-dedup** set. A finding is provisional when its
+/// `(source, code)` falls in a source's provisional band
+/// ([`DiagnosticWeights::is_provisional`](crate::config::DiagnosticWeights::is_provisional)).
+/// A provisional finding is dropped only when **challenged** — a strictly-heavier
+/// source reported *anything* for the file. It survives when:
+///
+/// - **corroborated** — a heavier source emitted the same finding, in which case
+///   dedup already kept the heavier copy and dropped this one, so any provisional
+///   entry still present here is uncorroborated by construction; or
+/// - **unchallenged** — no strictly-heavier source reported for the file (the
+///   instant pre-flycheck preview, a single-source server).
+///
+/// The "challenged" test reuses the weights: the file's max present weight is
+/// strictly greater than the provisional source's weight. Non-provisional
+/// findings (out-of-band native lints, every linter finding) are untouched.
+fn drop_challenged_provisional(
+    entries: Vec<FeederEntry>,
+    weights: &crate::config::DiagnosticWeights,
+) -> Vec<FeederEntry> {
+    let Some(max_weight) = entries
+        .iter()
+        .map(|e| weights.weight(source_of(&e.value)))
+        .max()
+    else {
+        return entries;
+    };
+    entries
+        .into_iter()
+        .filter(|e| {
+            let source = source_of(&e.value);
+            let code = render_diagnostic_code(e.value.get("code"));
+            if !weights.is_provisional(source, &code) {
+                return true;
+            }
+            // Provisional + uncorroborated (survived dedup): keep iff unchallenged
+            // — no strictly-heavier source reported for the file.
+            max_weight <= weights.weight(source)
+        })
+        .collect()
+}
+
+/// Builds the cross-source dedup key for a diagnostic: `(discriminant, line)`.
 ///
 /// `line` is the 0-based start line. The discriminant is the rendered code when
 /// present (`c\0<code>`), else the normalized message (`m\0<message>`) — the NUL
 /// tag keeps a code that happens to equal a message text from colliding across
-/// the two key shapes.
-fn dedup_key(diagnostic: &Value) -> (String, String, u32) {
-    let source = diagnostic
-        .get("source")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
+/// the two key shapes. The `source` is deliberately **not** part of the key, so a
+/// finding reported by multiple sources collapses (ticket 05).
+fn dedup_key(diagnostic: &Value) -> (String, u32) {
     let line = crate::lsp::extract::diagnostic_range(diagnostic).map_or(0, |r| r.start.line);
     let code = render_diagnostic_code(diagnostic.get("code"));
     let discriminant = if code.is_empty() {
@@ -1291,7 +1272,7 @@ fn dedup_key(diagnostic: &Value) -> (String, String, u32) {
     } else {
         format!("c\u{0}{code}")
     };
-    (source, discriminant, line)
+    (discriminant, line)
 }
 
 /// Normalizes a diagnostic message for codeless dedup: trims, collapses internal
@@ -2168,139 +2149,7 @@ mod tests {
         assert!(budget_diagnostics(&diag_files, &[], 50, 2).dirty);
     }
 
-    // ── source-precedence reconciliation tests (misc 115, bug 42) ───
-
-    /// Builds a diagnostic carrying a `source` and (optional) `code`.
-    fn src_diag(source: &str, code: Option<&str>, msg: &str) -> Value {
-        let mut d = serde_json::json!({
-            "range": {
-                "start": { "line": 0, "character": 0 },
-                "end": { "line": 0, "character": 1 }
-            },
-            "severity": 1,
-            "source": source,
-            "message": msg
-        });
-        if let Some(c) = code {
-            d["code"] = serde_json::json!(c);
-        }
-        d
-    }
-
-    /// The rust-analyzer default chain: rustc/clippy outrank rust-analyzer,
-    /// scoped to the rustc `E####` band.
-    fn ra_precedence() -> crate::config::DiagnosticPrecedence {
-        let mut p = crate::config::DiagnosticPrecedence {
-            priority: vec![
-                "rustc".to_string(),
-                "clippy".to_string(),
-                "rust-analyzer".to_string(),
-            ],
-            code_pattern: Some("^E[0-9]+$".to_string()),
-            compiled_code_pattern: None,
-        };
-        p.compile().expect("compile code_pattern");
-        p
-    }
-
-    fn source_of(d: &Value) -> &str {
-        d.get("source").and_then(Value::as_str).unwrap_or("")
-    }
-
-    #[test]
-    fn precedence_drops_advisory_e_code_authoritative_did_not_corroborate() {
-        // Native E0107 phantom rides alongside a clean (different-error)
-        // flycheck result. Once flycheck has reported for the file, the
-        // native E#### is dropped — it claims a rustc error rustc didn't emit.
-        let diags = vec![
-            src_diag("rust-analyzer", Some("E0107"), "expected 0 args, found 1"),
-            src_diag("rustc", Some("E0599"), "no method named foo"),
-        ];
-        let kept = reconcile_source_precedence(diags, &ra_precedence());
-        // The native E0107 is gone; the authoritative rustc diagnostic stays.
-        assert_eq!(kept.len(), 1, "native E#### should be dropped: {kept:?}");
-        assert_eq!(source_of(&kept[0]), "rustc");
-    }
-
-    #[test]
-    fn precedence_keeps_authoritative_only_e_code() {
-        // A real rustc error with no native counterpart is kept untouched.
-        let diags = vec![src_diag("rustc", Some("E0599"), "no method named foo")];
-        let kept = reconcile_source_precedence(diags, &ra_precedence());
-        assert_eq!(kept.len(), 1);
-        assert_eq!(source_of(&kept[0]), "rustc");
-    }
-
-    #[test]
-    fn precedence_keeps_advisory_when_no_authoritative_source_present() {
-        // Single-source server case: only the advisory source reported (no
-        // flycheck stream at all). The advisory E#### is NOT over-suppressed —
-        // absence of an authoritative report is not contradiction.
-        let diags = vec![src_diag(
-            "rust-analyzer",
-            Some("E0107"),
-            "expected 0 args, found 1",
-        )];
-        let kept = reconcile_source_precedence(diags, &ra_precedence());
-        assert_eq!(
-            kept.len(),
-            1,
-            "advisory kept with no authoritative: {kept:?}"
-        );
-        assert_eq!(source_of(&kept[0]), "rust-analyzer");
-    }
-
-    #[test]
-    fn precedence_keeps_advisory_when_authoritative_not_yet_reported_for_file() {
-        // Another file's flycheck reported, but THIS file's set carries only
-        // the native preview (the authoritative source has not reported here).
-        // Since reconciliation runs per-file on the file's own merged set, the
-        // advisory E#### is kept — absence in this set is not contradiction.
-        let diags = vec![src_diag(
-            "rust-analyzer",
-            Some("E0107"),
-            "instant pre-flycheck preview",
-        )];
-        let kept = reconcile_source_precedence(diags, &ra_precedence());
-        assert_eq!(kept.len(), 1, "advisory kept pre-flycheck: {kept:?}");
-        assert_eq!(source_of(&kept[0]), "rust-analyzer");
-    }
-
-    #[test]
-    fn precedence_keeps_advisory_diagnostics_outside_the_band() {
-        // Native keeps its non-rustc value even when flycheck reported: an
-        // unresolved-import (string code) and an out-of-band native lint
-        // survive, because they fall outside the rustc-E#### band.
-        let diags = vec![
-            src_diag("rust-analyzer", Some("unresolved-import"), "no such crate"),
-            src_diag("rust-analyzer", None, "native lint without a code"),
-            src_diag("rustc", Some("E0599"), "no method named foo"),
-        ];
-        let kept = reconcile_source_precedence(diags, &ra_precedence());
-        // All three survive — only in-band advisory E#### codes are dropped.
-        assert_eq!(kept.len(), 3, "out-of-band advisory kept: {kept:?}");
-    }
-
-    #[test]
-    fn precedence_without_code_pattern_drops_all_advisory_once_authoritative_reports() {
-        // No code_pattern → the whole-diagnostic set is the band. Every
-        // lower-priority diagnostic is dropped once a higher-ranked one is present.
-        let mut p = crate::config::DiagnosticPrecedence {
-            priority: vec!["syntactic".to_string(), "semantic".to_string()],
-            code_pattern: None,
-            compiled_code_pattern: None,
-        };
-        p.compile().expect("compile");
-        let diags = vec![
-            src_diag("semantic", Some("anything"), "advisory"),
-            src_diag("syntactic", None, "authoritative"),
-        ];
-        let kept = reconcile_source_precedence(diags, &p);
-        assert_eq!(kept.len(), 1);
-        assert_eq!(source_of(&kept[0]), "syntactic");
-    }
-
-    // ── cross-feeder dedup + precedence tests (ticket 02) ───────────
+    // ── cross-feeder dedup + provisional tests (linters ticket 05) ──
 
     /// Builds a diagnostic at an explicit position carrying a `source` and
     /// (optional) `code`.
@@ -2340,10 +2189,16 @@ mod tests {
         e.value.get("source").and_then(Value::as_str).unwrap_or("")
     }
 
+    /// The shipped weight set: rust-analyzer native `10`, flycheck `100`,
+    /// baseline `50`, provisional `^E[0-9]+$` on the native source.
+    fn ra_weights() -> crate::config::DiagnosticWeights {
+        crate::config::DiagnosticWeights::rust_analyzer_default()
+    }
+
     #[test]
     fn dedup_collapses_same_finding_across_feeders() {
         // bash-language-server (an LSP feeder) and standalone shellcheck both
-        // report SC2086 at the same line: same (source, code, line) → one entry.
+        // report SC2086 at the same line: same (code, line) → one entry.
         let entries = vec![
             fe(
                 "bash-language-server",
@@ -2366,46 +2221,70 @@ mod tests {
                 ),
             ),
         ];
-        let deduped = dedupe_entries(entries);
+        let deduped = dedupe_entries(entries, &ra_weights());
         assert_eq!(deduped.len(), 1, "the wrapped + standalone copy collapse");
-        // First occurrence (the LSP feeder) wins.
+        // Equal weight (both baseline) → first-seen (the LSP feeder) wins.
         assert_eq!(deduped[0].ctx.command, "bash-language-server");
     }
 
     #[test]
     fn dedup_anchors_on_line_not_column() {
-        // Same source/code/line, drifting columns (LSP 0-based vs CLI 1-based)
-        // collapse — the key is line-anchored, bias coarse.
+        // Same code/line, drifting columns (LSP 0-based vs CLI 1-based) collapse
+        // — the key is line-anchored, bias coarse.
         let entries = vec![
             fe("a", diag_at("sc", Some("SC1000"), 7, 0, "msg")),
             fe("b", diag_at("sc", Some("SC1000"), 7, 40, "msg")),
         ];
-        assert_eq!(dedupe_entries(entries).len(), 1);
+        assert_eq!(dedupe_entries(entries, &ra_weights()).len(), 1);
     }
 
     #[test]
-    fn dedup_keeps_distinct_line_source_and_code() {
-        // Different line, different source, and different code each stay.
+    fn dedup_keeps_distinct_line_and_code() {
+        // Different line and different code each stay (the key is `(code, line)`).
         let entries = vec![
             fe("a", diag_at("sc", Some("SC1000"), 7, 0, "msg")),
             fe("a", diag_at("sc", Some("SC1000"), 8, 0, "msg")), // different line
-            fe("a", diag_at("other", Some("SC1000"), 7, 0, "msg")), // different source
             fe("a", diag_at("sc", Some("SC1001"), 7, 0, "msg")), // different code
         ];
-        assert_eq!(dedupe_entries(entries).len(), 4, "nothing collapses");
+        assert_eq!(
+            dedupe_entries(entries, &ra_weights()).len(),
+            3,
+            "nothing collapses"
+        );
+    }
+
+    #[test]
+    fn dedup_collapses_across_sources_keeping_heaviest() {
+        // The same code at the same line from two *different* sources collapses
+        // (source dropped from the key, ticket 05); the heavier-weight source's
+        // copy is kept. A real error reported by both rust-analyzer (10) and
+        // rustc (100) → one entry, the rustc copy.
+        let entries = vec![
+            fe(
+                "rust-analyzer",
+                diag_at("rust-analyzer", Some("E0599"), 3, 0, "no method foo"),
+            ),
+            fe(
+                "rust-analyzer",
+                diag_at("rustc", Some("E0599"), 3, 8, "no method named `foo`"),
+            ),
+        ];
+        let kept = dedupe_entries(entries, &ra_weights());
+        assert_eq!(kept.len(), 1, "cross-source duplicate collapses: {kept:?}");
+        assert_eq!(entry_source(&kept[0]), "rustc", "heaviest source kept");
     }
 
     #[test]
     fn dedup_codeless_fallback_keys_on_normalized_message() {
-        // No code → fall back to (source, normalized-message, line). Whitespace
-        // and case differences in the message still collapse; a genuinely
-        // different message does not.
+        // No code → fall back to (normalized-message, line). Whitespace and case
+        // differences in the message still collapse; a genuinely different
+        // message does not.
         let entries = vec![
             fe("a", diag_at("yaml", None, 3, 0, "trailing   spaces")),
             fe("b", diag_at("yaml", None, 3, 4, "Trailing spaces")), // normalizes equal
             fe("c", diag_at("yaml", None, 3, 0, "wrong indentation")), // distinct
         ];
-        let deduped = dedupe_entries(entries);
+        let deduped = dedupe_entries(entries, &ra_weights());
         assert_eq!(
             deduped.len(),
             2,
@@ -2421,14 +2300,14 @@ mod tests {
             fe("a", diag_at("x", Some("SC2086"), 1, 0, "real message")),
             fe("b", diag_at("x", None, 1, 0, "SC2086")),
         ];
-        assert_eq!(dedupe_entries(entries).len(), 2);
+        assert_eq!(dedupe_entries(entries, &ra_weights()).len(), 2);
     }
 
     #[test]
-    fn reconcile_entries_drops_advisory_across_merged_feeders() {
-        // The advisory native E#### and the authoritative rustc E#### arrive as
-        // a single merged cross-feeder set; reconciliation drops the in-band
-        // advisory once authoritative has reported.
+    fn provisional_phantom_dropped_when_challenged() {
+        // Native E0107 phantom rides alongside a different rustc error. After
+        // dedup (different codes, no collapse), the provisional native E0107 is
+        // challenged (rustc, weight 100 > 10, reported) and uncorroborated → dropped.
         let entries = vec![
             fe(
                 "rust-analyzer",
@@ -2439,38 +2318,79 @@ mod tests {
                 diag_at("rustc", Some("E0599"), 1, 0, "no method foo"),
             ),
         ];
-        let kept = reconcile_entries(entries, &[ra_precedence()]);
-        assert_eq!(kept.len(), 1, "advisory in-band E#### dropped: {kept:?}");
+        let kept = drop_challenged_provisional(entries, &ra_weights());
+        assert_eq!(kept.len(), 1, "challenged phantom dropped: {kept:?}");
         assert_eq!(entry_source(&kept[0]), "rustc");
     }
 
     #[test]
-    fn reconcile_entries_keeps_all_when_no_policy() {
-        // Empty policy list (the `[diagnostics] precedence = []` opt-out) → union.
+    fn provisional_kept_when_unchallenged() {
+        // Only the native preview reported (no heavier source). The provisional
+        // E0107 is unchallenged → kept (the instant pre-flycheck preview).
+        let entries = vec![fe(
+            "rust-analyzer",
+            diag_at("rust-analyzer", Some("E0107"), 0, 0, "preview"),
+        )];
+        let kept = drop_challenged_provisional(entries, &ra_weights());
+        assert_eq!(kept.len(), 1, "unchallenged preview kept");
+        assert_eq!(entry_source(&kept[0]), "rust-analyzer");
+    }
+
+    #[test]
+    fn provisional_out_of_band_native_kept() {
+        // A native lint outside the E#### band is not provisional, so it survives
+        // even though heavier flycheck reported.
         let entries = vec![
             fe(
                 "rust-analyzer",
-                diag_at("rust-analyzer", Some("E0107"), 0, 0, "phantom"),
+                diag_at("rust-analyzer", Some("unused-variable"), 0, 0, "unused"),
             ),
             fe(
                 "rust-analyzer",
                 diag_at("rustc", Some("E0599"), 1, 0, "no method foo"),
             ),
         ];
-        let kept = reconcile_entries(entries, &[]);
-        assert_eq!(kept.len(), 2, "no policy keeps the union");
+        let kept = drop_challenged_provisional(entries, &ra_weights());
+        assert_eq!(kept.len(), 2, "out-of-band native kept: {kept:?}");
     }
 
     #[test]
-    fn reconcile_entries_keeps_advisory_when_no_authoritative() {
-        // Advisory-only merged set → kept (absence of authoritative is not
-        // contradiction), even with the policy active.
-        let entries = vec![fe(
-            "rust-analyzer",
-            diag_at("rust-analyzer", Some("E0107"), 0, 0, "preview"),
-        )];
-        let kept = reconcile_entries(entries, &[ra_precedence()]);
-        assert_eq!(kept.len(), 1);
-        assert_eq!(entry_source(&kept[0]), "rust-analyzer");
+    fn provisional_corroborated_real_error_survives_as_heavier() {
+        // A real E0599 reported by both native and rustc: dedup keeps the rustc
+        // copy (heavier), and the provisional pass leaves rustc (non-provisional)
+        // alone. The finding survives, labeled rustc.
+        let entries = vec![
+            fe(
+                "rust-analyzer",
+                diag_at("rust-analyzer", Some("E0599"), 3, 0, "no method foo"),
+            ),
+            fe(
+                "rust-analyzer",
+                diag_at("rustc", Some("E0599"), 3, 0, "no method named `foo`"),
+            ),
+        ];
+        let weights = ra_weights();
+        let kept = drop_challenged_provisional(dedupe_entries(entries, &weights), &weights);
+        assert_eq!(kept.len(), 1, "corroborated real error survives: {kept:?}");
+        assert_eq!(entry_source(&kept[0]), "rustc");
+    }
+
+    #[test]
+    fn provisional_not_triggered_by_equal_weight_peer() {
+        // A linter at baseline weight (50) does not challenge a baseline-weight
+        // provisional-band-less source. With no provisional source present, the
+        // pass is a no-op. Guards against the challenge firing on equal weights.
+        let entries = vec![
+            fe(
+                "shellcheck",
+                diag_at("shellcheck", Some("SC2086"), 0, 0, "quote"),
+            ),
+            fe(
+                "yamllint",
+                diag_at("yamllint", None, 1, 0, "trailing spaces"),
+            ),
+        ];
+        let kept = drop_challenged_provisional(entries, &ra_weights());
+        assert_eq!(kept.len(), 2, "non-provisional findings untouched");
     }
 }

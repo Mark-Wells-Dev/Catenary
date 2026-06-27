@@ -6,7 +6,6 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::lsp::glob::LspGlob;
@@ -74,137 +73,40 @@ pub struct ServerDef {
     /// [`Self::compile_patterns`] after deserialization.
     #[serde(skip)]
     pub compiled_patterns: Vec<LspGlob>,
-}
 
-/// Per-root, cross-feeder diagnostic source-precedence policy (misc 115, bug
-/// 42; hoisted to per-root in workstream 34 ticket 02).
-///
-/// A **generic, feeder-agnostic** reconciliation keyed on the standard LSP
-/// `Diagnostic.source` field. [`priority`](Self::priority) is an ordered trust
-/// chain over source names, **highest trust first**. Over a file's merged
-/// diagnostic set (all feeders — every language server **and** every linter), a
-/// diagnostic from source `S` is dropped **once a strictly-higher-priority
-/// source has reported for that file** — and, when a
-/// [`code_pattern`](Self::code_pattern) is set, only inside that band.
-///
-/// The old advisory/authoritative split is just a two-level chain: authoritative
-/// sources rank above advisory ones. The chain generalizes it to N levels and
-/// drops a concept (one ordered list instead of two role lists). The band keeps
-/// a lower-priority source's *out-of-band* findings (its own lints, an
-/// unresolved-import preview) — they only lose trust inside the band. The
-/// "strictly higher reported" gate is what prevents over-suppression: absence of
-/// a higher-priority report (e.g. flycheck has not run yet) is not contradiction.
-///
-/// Precedence is configured **per root** (`[diagnostics].precedence` in user
-/// config or `.catenary.toml`), not per-`[server.*]`. It is deliberately narrow
-/// — the rust-analyzer / flycheck ground-truth tool — **not** a lever for ranking
-/// linters against language servers; that overlap is handled by opinion-free
-/// dedup, not precedence.
-///
-/// Note: a flat chain is a total order, so co-equal peers (e.g. `rustc` and
-/// `clippy`) are technically ranked. In practice it is moot — they never collide
-/// inside the same band — and a tiered form is the future escape hatch if a real
-/// peer case appears.
-#[derive(Debug, Default, Deserialize, Serialize, Clone)]
-pub struct DiagnosticPrecedence {
-    /// Diagnostic `source` names in descending trust order (highest first).
+    /// Diagnostic trust weight for the source this server emits natively
+    /// (the source named after the definition), and the fallback for any
+    /// sub-source not listed in [`sources`](Self::sources) (linters ticket 05).
     ///
-    /// Within the band, a diagnostic from a source listed here is dropped once a
-    /// source ranked *strictly higher* has reported for the file. Sources not in
-    /// the list are never dropped and never suppress others.
-    ///
-    /// Example: `["rustc", "clippy", "rust-analyzer"]` — rust-analyzer's native
-    /// analysis defers to flycheck's `rustc`/`clippy` ground truth.
+    /// Higher = more trusted. Drives the cross-feeder dedup keeper and the
+    /// provisional challenge. Absent ⇒ inherit the seeded default
+    /// ([`DiagnosticWeights::rust_analyzer_default`](crate::config::DiagnosticWeights::rust_analyzer_default))
+    /// or the [`BASELINE_WEIGHT`](crate::config::BASELINE_WEIGHT) for an
+    /// otherwise-unlisted source.
     #[serde(default)]
-    pub priority: Vec<String>,
+    pub weight: Option<u32>,
 
-    /// Regex scoping the reconciliation to a code band, matched against the
-    /// diagnostic's `code` (rendered as a string). When set, only diagnostics
-    /// whose code matches are eligible to be dropped; out-of-band diagnostics
-    /// are always kept.
+    /// Per-sub-source weight overrides for a multi-source server
+    /// (`[server.<name>.sources]`, linters ticket 05).
     ///
-    /// For rust-analyzer the band is the rustc error-code namespace
-    /// (`^E[0-9]+$`): a rustc error code is by definition something `rustc`
-    /// produces, so a native `E####` that flycheck does not corroborate is a
-    /// false positive. When absent, the whole-diagnostic set is the band.
+    /// rust-analyzer emits three sources — `rust-analyzer` (native), `rustc`,
+    /// and `clippy` (flycheck) — that need different weights. The native source
+    /// inherits [`weight`](Self::weight); each entry here overrides one
+    /// sub-source by its emitted `source` name.
     #[serde(default)]
-    pub code_pattern: Option<String>,
+    pub sources: HashMap<String, u32>,
 
-    /// Compiled form of [`Self::code_pattern`]. Populated by
-    /// [`Self::compile`] after deserialization.
-    #[serde(skip)]
-    pub compiled_code_pattern: Option<Regex>,
-}
-
-impl DiagnosticPrecedence {
-    /// Returns the trust rank of `source` (0 = highest), or `None` when the
-    /// source is not part of this chain.
-    #[must_use]
-    pub fn rank(&self, source: &str) -> Option<usize> {
-        self.priority.iter().position(|s| s == source)
-    }
-
-    /// Returns `true` if `code` falls inside the reconciliation band.
+    /// Regex marking the native source's *provisional* diagnostic code band
+    /// (linters ticket 05).
     ///
-    /// An absent or empty [`code_pattern`](Self::code_pattern) means the band
-    /// is unrestricted — every code is in-band.
-    #[must_use]
-    pub fn code_in_band(&self, code: &str) -> bool {
-        self.compiled_code_pattern
-            .as_ref()
-            .is_none_or(|re| re.is_match(code))
-    }
-
-    /// Compiles [`Self::code_pattern`] into [`Self::compiled_code_pattern`].
-    ///
-    /// Called once after deserialization. Validation already checks the
-    /// pattern compiles, so this is normally infallible at load time.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if `code_pattern` is not a valid regex.
-    pub fn compile(&mut self) -> Result<()> {
-        self.compiled_code_pattern = match &self.code_pattern {
-            Some(pat) => Some(
-                Regex::new(pat)
-                    .with_context(|| format!("diagnostics.precedence code_pattern '{pat}'"))?,
-            ),
-            None => None,
-        };
-        Ok(())
-    }
-
-    /// The shipped default precedence chain: rust-analyzer's native analysis
-    /// defers to its flycheck (`rustc`/`clippy`) ground truth, scoped to the
-    /// rustc `E####` error-code band (misc 115, bug 42).
-    ///
-    /// Returned pre-compiled so it works on the [`Config::default`] path that
-    /// skips the post-load compile step. Keyed purely on `source` names, so it is
-    /// a no-op for any root whose diagnostics carry none of those sources — which
-    /// is why it can ship as a single global default rather than a per-server
-    /// row.
-    ///
-    /// [`Config::default`]: crate::config::Config::default
-    #[must_use]
-    pub fn rust_analyzer_default() -> Self {
-        let pattern = "^E[0-9]+$";
-        // The pattern is a compile-time constant known to be valid; on the
-        // impossible regex error, fall back to an inert (empty-chain) policy
-        // rather than an unrestricted band — an unrestricted band would drop
-        // *all* lower-priority diagnostics, far worse than doing nothing.
-        Regex::new(pattern).map_or_else(
-            |_| Self::default(),
-            |re| Self {
-                priority: vec![
-                    "rustc".to_string(),
-                    "clippy".to_string(),
-                    "rust-analyzer".to_string(),
-                ],
-                code_pattern: Some(pattern.to_string()),
-                compiled_code_pattern: Some(re),
-            },
-        )
-    }
+    /// A native finding whose `code` matches survives only if corroborated by a
+    /// heavier source or unchallenged (no strictly-heavier source reported for
+    /// the file). For rust-analyzer the band is the rustc error-code namespace
+    /// (`^E[0-9]+$`): a native `E####` flycheck does not corroborate is a phantom
+    /// (misc 115). Validated at config load; compiled lazily when weights are
+    /// resolved.
+    #[serde(default)]
+    pub provisional: Option<String>,
 }
 
 impl ServerDef {

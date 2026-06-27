@@ -105,30 +105,21 @@ pub fn validate(config: &Config) -> Vec<String> {
                 ));
             }
         }
-    }
 
-    validate_linters(config, &mut errors);
-    validate_precedence(&config.diagnostic_precedence, &mut errors);
-
-    errors
-}
-
-/// Validates `[[diagnostics.precedence]]` chains (misc 115; per-root chain form
-/// in linters ticket 02).
-///
-/// Each chain's optional code-band regex must compile. The `priority` source
-/// list is free-form strings, so nothing to check there.
-fn validate_precedence(precedence: &[super::DiagnosticPrecedence], errors: &mut Vec<String>) {
-    for (i, policy) in precedence.iter().enumerate() {
-        if let Some(pat) = &policy.code_pattern
+        // Validate the optional provisional code-band regex (linters ticket 05).
+        // Compiled lazily at weight resolution, so check it here.
+        if let Some(pat) = &server_def.provisional
             && let Err(e) = regex::Regex::new(pat)
         {
             errors.push(format!(
-                "diagnostics.precedence[{i}] has an invalid regex in \
-                 `code_pattern`: '{pat}' — {e}"
+                "Server '{name}' has an invalid regex in `provisional`: '{pat}' — {e}"
             ));
         }
     }
+
+    validate_linters(config, &mut errors);
+
+    errors
 }
 
 /// Validates `[linter.*]` definitions, appending any errors (workstream 34
