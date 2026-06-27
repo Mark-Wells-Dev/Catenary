@@ -1276,27 +1276,31 @@ fn test_grep_enrichment_incoming_calls() -> Result<()> {
     Ok(())
 }
 
-/// Verifies that enrichment for structs runs without error.
+/// Verifies that enrichment for a type with implementors runs without error.
 #[test]
 fn test_grep_enrichment_implementations() -> Result<()> {
     let dir = tempfile::tempdir()?;
 
-    // mockls routes textDocument/implementation to handle_references,
-    // so any reference location will appear as an implementation entry.
+    // mockls `handle_implementation` returns `implements`-based implementors;
+    // `Hello implements Greeter`, so enrichment for `Greeter` exercises the
+    // implementation path and renders.
     let test_file = dir.path().join(format!("impls.{MOCK_LANG_A}"));
-    std::fs::write(&test_file, "struct MyStruct\nMyStruct\n")?;
+    std::fs::write(
+        &test_file,
+        "interface Greeter\nstruct Hello implements Greeter\n",
+    )?;
 
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
     let root = dir.path().to_str().context("root path")?;
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    let text = bridge.call_tool_text("grep", &json!({ "pattern": "MyStruct" }))?;
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "Greeter" }))?;
 
     // Enrichment runs and renders the result
     assert!(
-        text.contains("MyStruct"),
-        "Expected MyStruct in output, got:\n{text}"
+        text.contains("Greeter"),
+        "Expected Greeter in output, got:\n{text}"
     );
 
     Ok(())
@@ -3053,35 +3057,38 @@ fn test_grep_incoming_calls_merge() -> Result<()> {
     Ok(())
 }
 
-/// Impls structure: `impls:` has file-grouped entries with tree-sitter spans.
-/// Uses prepareRename path (no symbol index data) for reliable enrichment.
+/// Impls structure: `impls:` lists implementors of the queried type. mockls
+/// `handle_implementation` returns `implements`-based implementors (distinct
+/// from references and from `extends` subtypes), so querying the interface
+/// `Drawable` surfaces its implementor `Sprite`.
 #[test]
 fn test_grep_impls_structure() -> Result<()> {
     let dir = tempfile::tempdir()?;
 
     let file = dir.path().join(format!("impls.{MOCK_LANG_A}"));
-    std::fs::write(&file, "struct ImplStr\nImplStr\n")?;
+    std::fs::write(
+        &file,
+        "interface Drawable\nstruct Sprite implements Drawable\n",
+    )?;
 
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
     let root = dir.path().to_str().context("root path")?;
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    let text = bridge.call_tool_text("grep", &json!({ "pattern": "ImplStr" }))?;
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "Drawable" }))?;
 
-    // mockls routes textDocument/implementation to handle_references
-    // (same word-search logic), so fetch_implementations returns
-    // locations for ImplStr. The impls section must be present.
+    // fetch_implementations(Drawable) → Sprite (implements Drawable). The
+    // impls section must be present and name the implementor.
     assert!(
         text.contains("impls:"),
         "Expected impls: section from fetch_implementations, got:\n{text}"
     );
     let impls_start = text.find("impls:").context("impls")?;
     let impls_section = &text[impls_start..];
-    // Should contain a file path and at least one `:line` entry
     assert!(
-        impls_section.contains(&format!("impls.{MOCK_LANG_A}")) || impls_section.contains(':'),
-        "impls section should have file-grouped entries, got:\n{text}"
+        impls_section.contains("Sprite"),
+        "impls section should list the implementor Sprite, got:\n{text}"
     );
 
     Ok(())

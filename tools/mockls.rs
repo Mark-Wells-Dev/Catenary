@@ -572,9 +572,8 @@ impl MockServer {
                 self.handle_definition(&request.params)
             }
             "textDocument/typeDefinition" => self.handle_type_definition(&request.params),
-            "textDocument/references" | "textDocument/implementation" => {
-                self.handle_references(&request.params)
-            }
+            "textDocument/references" => self.handle_references(&request.params),
+            "textDocument/implementation" => self.handle_implementation(&request.params),
             "textDocument/documentSymbol" => self.handle_document_symbols(&request.params),
             "workspace/symbol" => Some(self.handle_workspace_symbols(&request.params)),
             "workspaceSymbol/resolve" => self.handle_workspace_symbol_resolve(&request.params),
@@ -1106,6 +1105,63 @@ impl MockServer {
                         col_idx + word.len(),
                     ));
                     start = col_idx + word.len();
+                }
+            }
+        }
+
+        Some(Value::Array(locations))
+    }
+
+    /// Goto-implementation: `Location[]` for every type whose declaration
+    /// `implements` the queried type (the `implements` keyword only).
+    ///
+    /// Deliberately distinct from `handle_references` (text-scan occurrences)
+    /// and from `handle_type_hierarchy_subtypes` (which spans both `extends`
+    /// and `implements`): an `extends`-only subtype is a subtype but not an
+    /// implementor, so it is excluded here. Each location points at the
+    /// implementing type's name in its declaration.
+    fn handle_implementation(&self, params: &Value) -> Option<Value> {
+        let (uri, line, col) = extract_position(params)?;
+        let content = self.documents.get(uri)?;
+        let queried = extract_symbol_name(content, line, col)?;
+
+        let type_keywords: &[&str] = &["struct ", "class ", "interface ", "trait ", "enum "];
+        let mut locations = Vec::new();
+
+        for (doc_uri, doc_content) in &self.documents {
+            for (line_idx, line_text) in doc_content.lines().enumerate() {
+                let trimmed = line_text.trim_start();
+                let indent = line_text.len() - trimmed.len();
+
+                for &kw in type_keywords {
+                    let Some(after_kw) = trimmed.strip_prefix(kw) else {
+                        continue;
+                    };
+                    let name: String = after_kw
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                        .collect();
+                    if name.is_empty() {
+                        break;
+                    }
+                    // Match `implements <queried>` only (NOT `extends`).
+                    if let Some(pos) = trimmed.find("implements ") {
+                        let after = &trimmed[pos + "implements ".len()..];
+                        let target: String = after
+                            .chars()
+                            .take_while(|c| c.is_alphanumeric() || *c == '_')
+                            .collect();
+                        if target == queried {
+                            let name_col = indent + kw.len();
+                            locations.push(location_json(
+                                doc_uri,
+                                line_idx,
+                                name_col,
+                                name_col + name.len(),
+                            ));
+                        }
+                    }
+                    break; // Only one keyword prefix can match per line.
                 }
             }
         }
@@ -3604,6 +3660,19 @@ const PI: f64
         .to_string()
     }
 
+    fn implementation_request(id: u64, uri: &str, line: u64, character: u64) -> String {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "textDocument/implementation",
+            "params": {
+                "textDocument": { "uri": uri },
+                "position": { "line": line, "character": character }
+            }
+        })
+        .to_string()
+    }
+
     fn prepare_rename_request(id: u64, uri: &str, line: u64, character: u64) -> String {
         serde_json::json!({
             "jsonrpc": "2.0",
@@ -3814,6 +3883,68 @@ const PI: f64
         let from_ranges = calls[0]["fromRanges"].as_array().expect("fromRanges");
         assert!(!from_ranges.is_empty());
         assert_eq!(from_ranges[0]["start"]["line"], 2, "Call site is on line 2");
+    }
+
+    #[test]
+    fn test_implementation_response() {
+        let uri = "file:///tmp/shapes.yX4Za";
+        // Shape declared on line 0; Circle/Square implement it; Triangle only
+        // extends it — a subtype, but not an implementor.
+        let text = "interface Shape\n\
+                    struct Circle implements Shape\n\
+                    struct Square implements Shape\n\
+                    struct Triangle extends Shape\n";
+
+        let mut input = frame(&initialize_request(1));
+        input.extend(frame(&did_open_notification(uri, text)));
+        // implementation on 'Shape' (line 0, character 10 — the name after
+        // `interface `).
+        input.extend(frame(&implementation_request(2, uri, 0, 10)));
+        input.extend(frame(&shutdown_request(3)));
+
+        let messages = run_server_with(default_args(), &input);
+
+        let impls = messages
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(2))
+            .expect("implementation response with id=2");
+        assert!(impls["error"].is_null(), "Expected no error");
+        let locations = impls["result"].as_array().expect("result array");
+
+        // Only the two `implements Shape` types are returned; the `extends`-only
+        // Triangle is excluded, proving this is not the subtypes path.
+        assert_eq!(
+            locations.len(),
+            2,
+            "Expected exactly 2 implementors (Circle, Square), got {}",
+            locations.len()
+        );
+
+        let impl_lines: Vec<u64> = locations
+            .iter()
+            .filter_map(|l| l["range"]["start"]["line"].as_u64())
+            .collect();
+        assert!(
+            impl_lines.contains(&1),
+            "Circle (line 1) implements Shape and should be reported"
+        );
+        assert!(
+            impl_lines.contains(&2),
+            "Square (line 2) implements Shape and should be reported"
+        );
+        assert!(
+            !impl_lines.contains(&3),
+            "Triangle (line 3) only extends Shape and must not be reported"
+        );
+
+        // Each location points at the implementing type's name (after `struct `).
+        for loc in locations {
+            assert_eq!(loc["uri"], uri);
+            assert_eq!(
+                loc["range"]["start"]["character"], 7,
+                "name starts after `struct `"
+            );
+        }
     }
 
     // ── New tests: match arm dispatch coverage ──────────────────────
