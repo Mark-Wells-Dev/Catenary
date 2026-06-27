@@ -36,6 +36,11 @@ name = "mockc"
 path = "tools/mockc.rs"
 required-features = ["mockls"]
 
+[[bin]]
+name = "mocklint"
+path = "tools/mocklint.rs"
+required-features = ["mockls"]
+
 [[bench]]
 name = "logging_overhead"
 harness = false
