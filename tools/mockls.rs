@@ -755,7 +755,23 @@ impl MockServer {
             "textDocument/didClose" => {
                 if let Some(td) = params.get("textDocument") {
                     let uri = td.get("uri").and_then(Value::as_str).unwrap_or_default();
-                    self.documents.remove(uri);
+                    // LSP-faithful close: drop the in-memory overlay but retain
+                    // disk-backed documents. `scan_directory` builds URIs as
+                    // `format!("file://{abs}")`, so reverse it by stripping the
+                    // `file://` prefix and re-reading the file if it still exists
+                    // on disk. A purely synthetic `didOpen` doc (no real file) is
+                    // removed as before.
+                    let disk_content = uri
+                        .strip_prefix("file://")
+                        .filter(|path| std::path::Path::new(path).is_file())
+                        .and_then(|path| std::fs::read_to_string(path).ok());
+                    if let Some(content) = disk_content {
+                        self.documents.insert(uri.to_string(), content);
+                        self.rebuild_types();
+                        self.rebuild_imports();
+                    } else {
+                        self.documents.remove(uri);
+                    }
                 }
             }
             "exit" => {
@@ -4532,6 +4548,71 @@ const PI: f64
         assert!(
             hover2["result"].is_null(),
             "Hover after close should be null"
+        );
+    }
+
+    /// Regression test for bug 49: a document loaded from disk via
+    /// `--scan-roots` must survive a `didClose`. A real language server keeps
+    /// its workspace index after close — it drops the in-memory overlay and
+    /// reverts to on-disk content rather than forgetting the file. Catenary's
+    /// enrichment opens then closes each file it touches, so an
+    /// eviction-on-close silently dropped cross-file edges. A purely synthetic
+    /// `didOpen` doc with no backing file is still removed, as before.
+    #[test]
+    fn test_did_close_retains_scanned_document() {
+        let dir = std::env::temp_dir().join(format!("mockls_close_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create scan dir");
+
+        let file = dir.join(format!("core.{MOCK_LANG_A}"));
+        std::fs::write(&file, "fn shared()\n").expect("write core file");
+        let dir_str = dir.to_str().expect("valid path");
+        let file_uri = format!("file://{}", file.to_str().expect("valid path"));
+        // A synthetic doc with no backing file under the scanned dir.
+        let ghost_uri = format!("file://{dir_str}/ghost.{MOCK_LANG_A}");
+
+        let init_req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "processId": null,
+                "capabilities": {},
+                "rootUri": format!("file://{dir_str}")
+            }
+        })
+        .to_string();
+
+        let mut input = frame(&init_req);
+        // Mirror enrichment: open then close the disk-backed file.
+        input.extend(frame(&did_open_notification(&file_uri, "fn shared()\n")));
+        input.extend(frame(&did_close_notification(&file_uri)));
+        // Open then close a synthetic doc with no disk backing.
+        input.extend(frame(&did_open_notification(&ghost_uri, "fn phantom()\n")));
+        input.extend(frame(&did_close_notification(&ghost_uri)));
+        input.extend(frame(&workspace_symbol_request(2, "")));
+        input.extend(frame(&shutdown_request(99)));
+
+        let mut args = default_args();
+        args.scan_roots = true;
+        let messages = run_server_with(args, &input);
+
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let ws_resp = messages
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(2))
+            .expect("workspace/symbol response with id=2");
+        let syms = ws_resp["result"].as_array().expect("result array");
+        let names: Vec<&str> = syms.iter().filter_map(|s| s["name"].as_str()).collect();
+
+        assert!(
+            names.contains(&"shared"),
+            "disk-backed `shared` must survive didClose, got: {names:?}"
+        );
+        assert!(
+            !names.contains(&"phantom"),
+            "synthetic `phantom` (no disk file) must be removed on didClose, got: {names:?}"
         );
     }
 
