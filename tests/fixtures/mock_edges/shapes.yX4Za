@@ -1,0 +1,5 @@
+interface BaseEntity
+interface Shape extends BaseEntity
+struct Circle extends Shape
+struct Square extends Shape
+struct Glyph implements Shape

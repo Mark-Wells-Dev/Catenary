@@ -1,0 +1,3 @@
+fn log_event
+  emit
+fn emit

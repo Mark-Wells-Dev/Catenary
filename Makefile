@@ -5,7 +5,7 @@
 #   make release-major   # 0.5.5 -> 1.0.0
 #   make release V=0.6.0 # explicit version
 
-.PHONY: bench bench-test build-release check deny fuzz machete mdbook mutants mutants-stop mutants-flag-runaways rustdoc test test-ignored release release-patch release-minor release-major publish tag-current
+.PHONY: bench bench-test build-release check deny fuzz machete mdbook mockgrep mockglob mutants mutants-stop mutants-flag-runaways rustdoc test test-ignored release release-patch release-minor release-major publish tag-current
 
 # Get current version from Cargo.toml
 CURRENT_VERSION := $(shell grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
@@ -229,6 +229,76 @@ test-ignored:
 test:
 	@if [ "$(MEMLIMIT_KB)" != unlimited ]; then ulimit -v $(MEMLIMIT_KB); fi; \
 	 cargo nextest run --workspace --features mockls --status-level fail --final-status-level slow --cargo-quiet $(if $(N),--stress-count $(N),) $(if $(T),$(if $(findstring !,$(T)),-E 'not test($(CLEAN_T))',-E 'test($(T))'),)
+
+# ── mock_edges harness (ticket 00b) ───────────────────────────────────
+# A hermetic "build and see" harness for eyeballing enriched `catenary
+# grep`/`glob` output over the full set of typed edges (calls, super/sub/impl,
+# refs, nested documentSymbol). The fixture under tests/fixtures/mock_edges is
+# written in the `mockls` mini-language; mockls stands in for a real LSP so the
+# run is deterministic and offline. NOT part of `make check`/`make test` — a
+# manual inspection target only.
+#
+#   make mockgrep                 # default Q=Shape: impls / super / sub + refs
+#   make mockgrep Q=process       # outgoing + incoming calls, incl. cross-file
+#   make mockgrep Q=log_event     # cross-file incoming call
+#   make mockgrep Q=buried_fn     # a 2-levels-deep nested symbol
+#   make mockgrep Q=loose_marker  # bare match with no enclosing symbol
+#   make mockgrep Q='Shape|process'  # alternation: one section PER arm
+#   make mockglob                 # structural map (top-level outlines)
+#
+# Isolation (the `isolate_env` discipline applied to the real CLI): distinct
+# XDG bases under target/ give the run its OWN daemon + socket, so it never
+# touches the user's live daemon; the only configured server is the freshly
+# built mockls (absolute path) pointed at the fixture, so it never routes to a
+# real LSP.
+MOCK_EDGES_EXT    := yX4Za
+MOCK_EDGES_DIR    := $(CURDIR)/tests/fixtures/mock_edges
+MOCK_EDGES_HOME   := $(CURDIR)/target/mock_edges
+MOCK_EDGES_SOCK   := $(MOCK_EDGES_HOME)/state/catenary/catenary.sock
+MOCK_EDGES_CAT    := $(CURDIR)/target/debug/catenary
+MOCK_EDGES_MOCKLS := $(CURDIR)/target/debug/mockls
+MOCK_EDGES_ENV     = env XDG_CONFIG_HOME=$(MOCK_EDGES_HOME)/config \
+	XDG_STATE_HOME=$(MOCK_EDGES_HOME)/state \
+	XDG_DATA_HOME=$(MOCK_EDGES_HOME)/data \
+	XDG_CACHE_HOME=$(MOCK_EDGES_HOME)/cache \
+	XDG_RUNTIME_DIR=$(MOCK_EDGES_HOME)/runtime \
+	CATENARY_ROOTS=$(MOCK_EDGES_DIR) \
+	CATENARY_SERVERS='$(MOCK_EDGES_EXT):$(MOCK_EDGES_MOCKLS) $(MOCK_EDGES_EXT) --scan-roots'
+
+# Grep query override; the default surfaces the type-hierarchy cluster (the
+# interface Shape: its impls, supertypes, subtypes, and cross-file refs).
+Q ?= Shape
+
+# $(call mock_edges_run,<catenary subcommand + args>)
+# Builds the catenary + mockls binaries, starts an isolated daemon, waits for
+# its socket, runs the given catenary subcommand against the daemon (the daemon
+# blocks the query on server readiness, so the first query is already enriched),
+# then tears the daemon down on exit via the trap.
+define mock_edges_run
+@cargo build --quiet --features mockls --bin catenary --bin mockls
+@mkdir -p $(MOCK_EDGES_HOME)/config $(MOCK_EDGES_HOME)/state $(MOCK_EDGES_HOME)/data $(MOCK_EDGES_HOME)/cache $(MOCK_EDGES_HOME)/runtime
+@rm -f $(MOCK_EDGES_SOCK); \
+	$(MOCK_EDGES_ENV) $(MOCK_EDGES_CAT) daemon >$(MOCK_EDGES_HOME)/daemon.log 2>&1 & \
+	dpid=$$!; \
+	trap 'kill $$dpid 2>/dev/null; wait $$dpid 2>/dev/null' EXIT INT TERM; \
+	for i in $$(seq 1 150); do [ -S $(MOCK_EDGES_SOCK) ] && break; sleep 0.1; done; \
+	if [ ! -S $(MOCK_EDGES_SOCK) ]; then \
+		echo "mock_edges: daemon failed to start (see $(MOCK_EDGES_HOME)/daemon.log):"; \
+		cat $(MOCK_EDGES_HOME)/daemon.log; exit 1; \
+	fi; \
+	$(MOCK_EDGES_ENV) $(MOCK_EDGES_CAT) $(1)
+endef
+
+# Run `catenary grep` over the fixture under the isolated daemon. Q= overrides.
+mockgrep:
+	$(call mock_edges_run,grep '$(Q)' $(MOCK_EDGES_DIR))
+
+# Run `catenary glob` over the fixture under the isolated daemon. The quoted
+# recursive pattern resolves to the fixture's files, so each renders its
+# documentSymbol outline (the structural map, incl. the ≥2-level nesting in
+# nested.yX4Za) rather than a bare directory listing.
+mockglob:
+	$(call mock_edges_run,glob '$(MOCK_EDGES_DIR)/**/*.$(MOCK_EDGES_EXT)')
 
 # Verify we're in a good state for release
 pre-release-check:

@@ -1,0 +1,9 @@
+fn guard_input
+fn validate
+  guard_input
+fn process
+  validate
+  log_event
+  Shape
+fn bootstrap
+  process

@@ -1,0 +1,6 @@
+struct Outer {
+  struct Inner {
+    fn buried_fn
+  }
+}
+loose_marker at top scope
