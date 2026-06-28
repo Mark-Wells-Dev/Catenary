@@ -1966,21 +1966,35 @@ fn split_alternation(pattern: &str) -> Vec<String> {
 
 // ─── LSP JSON extraction helpers ────────────────────────────────────────
 
-/// Extracts a file path from an LSP Location's `uri` field.
+/// Extracts a file path from an LSP `Location` or `LocationLink`.
 ///
-/// Strips the `file://` prefix from a `file://` URI. Returns `None`
-/// for non-file URIs or missing fields.
+/// Reads the plain-`Location` `uri` field, falling back to the
+/// `LocationLink` `targetUri` field when `uri` is absent (a server may
+/// answer `linkSupport`-enabled requests — implementation, definition,
+/// declaration, typeDefinition — with `LocationLink[]`). Strips the
+/// `file://` prefix from a `file://` URI. Returns `None` for non-file
+/// URIs or missing fields.
 fn extract_location_path(location: &Value) -> Option<String> {
     location
-        .get("uri")?
+        .get("uri")
+        .or_else(|| location.get("targetUri"))?
         .as_str()?
         .strip_prefix("file://")
         .map(str::to_string)
 }
 
-/// Extracts the start line (0-based) from an LSP Location's range.
+/// Extracts the start line (0-based) from an LSP `Location` or `LocationLink`.
+///
+/// Reads the plain-`Location` `range.start.line`. For a `LocationLink`
+/// (no `range`), falls back to `targetSelectionRange.start.line` — the
+/// name position, matching the declaration line grep prints — then to
+/// `targetRange.start.line`.
 fn extract_start_line(location: &Value) -> Option<u32> {
-    u32::try_from(location.get("range")?.get("start")?.get("line")?.as_u64()?).ok()
+    let range = location
+        .get("range")
+        .or_else(|| location.get("targetSelectionRange"))
+        .or_else(|| location.get("targetRange"))?;
+    u32::try_from(range.get("start")?.get("line")?.as_u64()?).ok()
 }
 
 /// Extracts an [`Edge`] from a `CallHierarchyItem` or `TypeHierarchyItem` JSON
@@ -2880,6 +2894,28 @@ mod tests {
         assert_eq!(extract_location_path(&loc), None);
     }
 
+    #[test]
+    fn extract_location_path_location_link_target_uri() {
+        // rust-analyzer answers `linkSupport:true` requests with
+        // `LocationLink[]`: `targetUri`/`targetRange`/`targetSelectionRange`,
+        // and no `uri`/`range`. The extractor must fall back to `targetUri`.
+        let link = serde_json::json!({
+            "targetUri": "file:///home/user/project/src/animals.rs",
+            "targetRange": {
+                "start": {"line": 37, "character": 0},
+                "end": {"line": 41, "character": 1}
+            },
+            "targetSelectionRange": {
+                "start": {"line": 37, "character": 5},
+                "end": {"line": 37, "character": 8}
+            }
+        });
+        assert_eq!(
+            extract_location_path(&link),
+            Some("/home/user/project/src/animals.rs".to_string())
+        );
+    }
+
     // ─── extract_start_line ─────────────────────────────────────────────
 
     #[test]
@@ -2902,6 +2938,40 @@ mod tests {
     fn extract_start_line_missing_range() {
         let loc = serde_json::json!({"uri": "file:///foo.rs"});
         assert_eq!(extract_start_line(&loc), None);
+    }
+
+    #[test]
+    fn extract_start_line_location_link_uses_selection_range() {
+        // For a `LocationLink` the line must come from
+        // `targetSelectionRange.start` (the name/declaration position),
+        // not `targetRange.start` (the whole-item span). Here they differ
+        // so the assertion pins the selection range.
+        let link = serde_json::json!({
+            "targetUri": "file:///foo.rs",
+            "targetRange": {
+                "start": {"line": 37, "character": 0},
+                "end": {"line": 41, "character": 1}
+            },
+            "targetSelectionRange": {
+                "start": {"line": 49, "character": 5},
+                "end": {"line": 49, "character": 8}
+            }
+        });
+        assert_eq!(extract_start_line(&link), Some(49));
+    }
+
+    #[test]
+    fn extract_start_line_location_link_falls_back_to_target_range() {
+        // A `LocationLink` without `targetSelectionRange` falls back to
+        // `targetRange.start`.
+        let link = serde_json::json!({
+            "targetUri": "file:///foo.rs",
+            "targetRange": {
+                "start": {"line": 37, "character": 0},
+                "end": {"line": 41, "character": 1}
+            }
+        });
+        assert_eq!(extract_start_line(&link), Some(37));
     }
 
     // ─── extract_edge (one extractor for call- and type-hierarchy items) ──
