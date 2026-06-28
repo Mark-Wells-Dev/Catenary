@@ -5,7 +5,12 @@ members = ["crates/catenary-proc"]
 # `libfuzzer-sys`. Excluded here so the stable `make check` run, `cargo deny`, and
 # `cargo machete` never descend into it — the fuzz soak is out-of-band (see
 # `fuzz/README.md` / `make fuzz`).
-exclude = ["fuzz"]
+# `tests/fixtures/rust_repo` is the opt-in real-rust-analyzer eyeball fixture
+# (ticket 00c, `make rustgrep`/`make rustglob`). It is a standalone crate that
+# only rust-analyzer ever compiles; excluding it keeps every workspace `cargo`
+# invocation (`make check`, `cargo deny`, `cargo machete`) from descending into a
+# nested non-member package.
+exclude = ["fuzz", "tests/fixtures/rust_repo"]
 
 [package]
 name = "catenary-mcp"

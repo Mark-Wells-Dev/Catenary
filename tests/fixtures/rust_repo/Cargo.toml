@@ -1,0 +1,14 @@
+[package]
+name = "rust_repo_fixture"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Opt-in eyeball fixture for `make rustgrep` / `make rustglob` (ticket 00c).
+# Excluded from the Catenary workspace (`workspace.exclude` in the root
+# Cargo.toml) so only rust-analyzer ever compiles it. No dependencies — the
+# crate exists purely so rust-analyzer has a real trait / impl / call-graph to
+# enrich.
+
+[lib]
+path = "src/lib.rs"

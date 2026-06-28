@@ -1,0 +1,4 @@
+# rust-analyzer runs `cargo check` on first load and writes build artifacts
+# here. They are regenerable and must never be committed.
+/target
+/Cargo.lock

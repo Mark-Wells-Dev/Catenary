@@ -5,7 +5,7 @@
 #   make release-major   # 0.5.5 -> 1.0.0
 #   make release V=0.6.0 # explicit version
 
-.PHONY: bench bench-test build-release check deny fuzz machete mdbook mockgrep mockglob mutants mutants-stop mutants-flag-runaways rustdoc test test-ignored release release-patch release-minor release-major publish tag-current
+.PHONY: bench bench-test build-release check deny fuzz machete mdbook mockgrep mockglob mdgrep mdglob rustgrep rustglob mutants mutants-stop mutants-flag-runaways rustdoc test test-ignored release release-patch release-minor release-major publish tag-current
 
 # Get current version from Cargo.toml
 CURRENT_VERSION := $(shell grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
@@ -230,13 +230,51 @@ test:
 	@if [ "$(MEMLIMIT_KB)" != unlimited ]; then ulimit -v $(MEMLIMIT_KB); fi; \
 	 cargo nextest run --workspace --features mockls --status-level fail --final-status-level slow --cargo-quiet $(if $(N),--stress-count $(N),) $(if $(T),$(if $(findstring !,$(T)),-E 'not test($(CLEAN_T))',-E 'test($(T))'),)
 
-# ── mock_edges harness (ticket 00b) ───────────────────────────────────
+# ── isolated server harness (tickets 00b / 00c) ───────────────────────
 # A hermetic "build and see" harness for eyeballing enriched `catenary
-# grep`/`glob` output over the full set of typed edges (calls, super/sub/impl,
-# refs, nested documentSymbol). The fixture under tests/fixtures/mock_edges is
-# written in the `mockls` mini-language; mockls stands in for a real LSP so the
-# run is deterministic and offline. NOT part of `make check`/`make test` — a
-# manual inspection target only.
+# grep`/`glob` output against a language server under a PRIVATE daemon. Each
+# fixture binds the run to its OWN XDG bases under target/ (its own daemon +
+# socket, so it never touches the user's live daemon), points CATENARY_SERVERS
+# at the one server it exercises, and CATENARY_ROOTS at its fixture dir. NONE of
+# these targets are part of `make check`/`make test` — manual inspection only,
+# so the default build never depends on Lattice or rust-analyzer.
+#
+# Three fixtures share one parameterized recipe ($(call iso_run,...)):
+#   mockgrep/mockglob   mockls       over tests/fixtures/mock_edges  (offline, 00b)
+#   mdgrep/mdglob       Lattice      over tests/fixtures/md_repo     (real,    00c)
+#   rustgrep/rustglob   rust-analyzer over tests/fixtures/rust_repo  (real,    00c)
+# The mock fixture is fully self-contained; the two real-server fixtures need
+# `lattice` / `rustup` on PATH.
+#
+# $(call iso_run,<home-dir>,<env-prefix>,<catenary subcommand + args>)
+# Builds the catenary + mockls binaries, starts an isolated daemon under
+# <home-dir>'s XDG bases, waits for its socket, runs the given catenary
+# subcommand against the daemon (the daemon blocks the query on server
+# readiness, so the first query is already enriched — real servers cold-start +
+# index, so the first run can take a while), then tears the daemon down on exit
+# via the trap. Unlike the test harness's `isolate_env`, PATH/HOME are inherited,
+# so `lattice` / `rustup` resolve and rust-analyzer finds its toolchain.
+ISO_CAT := $(CURDIR)/target/debug/catenary
+define iso_run
+@cargo build --quiet --features mockls --bin catenary --bin mockls
+@mkdir -p $(1)/config $(1)/state $(1)/data $(1)/cache $(1)/runtime
+@sock=$(1)/state/catenary/catenary.sock; \
+	rm -f $$sock; \
+	$(2) $(ISO_CAT) daemon >$(1)/daemon.log 2>&1 & \
+	dpid=$$!; \
+	trap 'kill $$dpid 2>/dev/null; wait $$dpid 2>/dev/null' EXIT INT TERM; \
+	for i in $$(seq 1 150); do [ -S $$sock ] && break; sleep 0.1; done; \
+	if [ ! -S $$sock ]; then \
+		echo "iso_run: daemon failed to start (see $(1)/daemon.log):"; \
+		cat $(1)/daemon.log; exit 1; \
+	fi; \
+	$(2) $(ISO_CAT) $(3)
+endef
+
+# ── mock_edges (ticket 00b): mockls, offline, deterministic ───────────
+# The fixture under tests/fixtures/mock_edges is written in the `mockls`
+# mini-language; mockls (absolute path) stands in for a real LSP so the run is
+# deterministic and offline, never routing to a real server.
 #
 #   make mockgrep                 # default Q=Shape: impls / super / sub + refs
 #   make mockgrep Q=process       # outgoing + incoming calls, incl. cross-file
@@ -245,17 +283,9 @@ test:
 #   make mockgrep Q=loose_marker  # bare match with no enclosing symbol
 #   make mockgrep Q='Shape|process'  # alternation: one section PER arm
 #   make mockglob                 # structural map (top-level outlines)
-#
-# Isolation (the `isolate_env` discipline applied to the real CLI): distinct
-# XDG bases under target/ give the run its OWN daemon + socket, so it never
-# touches the user's live daemon; the only configured server is the freshly
-# built mockls (absolute path) pointed at the fixture, so it never routes to a
-# real LSP.
 MOCK_EDGES_EXT    := yX4Za
 MOCK_EDGES_DIR    := $(CURDIR)/tests/fixtures/mock_edges
 MOCK_EDGES_HOME   := $(CURDIR)/target/mock_edges
-MOCK_EDGES_SOCK   := $(MOCK_EDGES_HOME)/state/catenary/catenary.sock
-MOCK_EDGES_CAT    := $(CURDIR)/target/debug/catenary
 MOCK_EDGES_MOCKLS := $(CURDIR)/target/debug/mockls
 MOCK_EDGES_ENV     = env XDG_CONFIG_HOME=$(MOCK_EDGES_HOME)/config \
 	XDG_STATE_HOME=$(MOCK_EDGES_HOME)/state \
@@ -269,36 +299,77 @@ MOCK_EDGES_ENV     = env XDG_CONFIG_HOME=$(MOCK_EDGES_HOME)/config \
 # interface Shape: its impls, supertypes, subtypes, and cross-file refs).
 Q ?= Shape
 
-# $(call mock_edges_run,<catenary subcommand + args>)
-# Builds the catenary + mockls binaries, starts an isolated daemon, waits for
-# its socket, runs the given catenary subcommand against the daemon (the daemon
-# blocks the query on server readiness, so the first query is already enriched),
-# then tears the daemon down on exit via the trap.
-define mock_edges_run
-@cargo build --quiet --features mockls --bin catenary --bin mockls
-@mkdir -p $(MOCK_EDGES_HOME)/config $(MOCK_EDGES_HOME)/state $(MOCK_EDGES_HOME)/data $(MOCK_EDGES_HOME)/cache $(MOCK_EDGES_HOME)/runtime
-@rm -f $(MOCK_EDGES_SOCK); \
-	$(MOCK_EDGES_ENV) $(MOCK_EDGES_CAT) daemon >$(MOCK_EDGES_HOME)/daemon.log 2>&1 & \
-	dpid=$$!; \
-	trap 'kill $$dpid 2>/dev/null; wait $$dpid 2>/dev/null' EXIT INT TERM; \
-	for i in $$(seq 1 150); do [ -S $(MOCK_EDGES_SOCK) ] && break; sleep 0.1; done; \
-	if [ ! -S $(MOCK_EDGES_SOCK) ]; then \
-		echo "mock_edges: daemon failed to start (see $(MOCK_EDGES_HOME)/daemon.log):"; \
-		cat $(MOCK_EDGES_HOME)/daemon.log; exit 1; \
-	fi; \
-	$(MOCK_EDGES_ENV) $(MOCK_EDGES_CAT) $(1)
-endef
-
 # Run `catenary grep` over the fixture under the isolated daemon. Q= overrides.
 mockgrep:
-	$(call mock_edges_run,grep '$(Q)' $(MOCK_EDGES_DIR))
+	$(call iso_run,$(MOCK_EDGES_HOME),$(MOCK_EDGES_ENV),grep '$(Q)' $(MOCK_EDGES_DIR))
 
 # Run `catenary glob` over the fixture under the isolated daemon. The quoted
 # recursive pattern resolves to the fixture's files, so each renders its
 # documentSymbol outline (the structural map, incl. the ≥2-level nesting in
 # nested.yX4Za) rather than a bare directory listing.
 mockglob:
-	$(call mock_edges_run,glob '$(MOCK_EDGES_DIR)/**/*.$(MOCK_EDGES_EXT)')
+	$(call iso_run,$(MOCK_EDGES_HOME),$(MOCK_EDGES_ENV),glob '$(MOCK_EDGES_DIR)/**/*.$(MOCK_EDGES_EXT)')
+
+# ── md_repo (ticket 00c): real Lattice over markdown ──────────────────
+# Lattice codifies markdown into the LSP edge model (headings -> documentSymbols;
+# inline links + frontmatter `referenced_by` -> references). The repo is a small
+# backlink graph in which core.md links to the README five times, so the README
+# has many incoming links. `catenary grep` fires the full nav suite on every
+# match that resolves to a Lattice symbol and prints the matched document's
+# incoming references beneath it — so a query that lands on the README's title
+# region reprints that whole incoming-ref block under each such match. That
+# per-match repetition of document-level refs is the faithful demonstrator for
+# the "24-page" doc-scoped-refs bloat that mockls (symbol-scoped) cannot
+# reproduce. Requires `lattice` on PATH (the markdown default server).
+#
+#   make mdgrep                 # default Q=Core: README's incoming-ref block, repeated
+#   make mdgrep Q=pipeline      # heading matches: full nav suite fired, refs come back empty
+#   make mdglob                 # documentSymbol outlines (frontmatter + headings)
+MD_REPO_EXT  := md
+MD_REPO_DIR  := $(CURDIR)/tests/fixtures/md_repo
+MD_REPO_HOME := $(CURDIR)/target/md_repo
+MD_REPO_ENV   = env XDG_CONFIG_HOME=$(MD_REPO_HOME)/config \
+	XDG_STATE_HOME=$(MD_REPO_HOME)/state \
+	XDG_DATA_HOME=$(MD_REPO_HOME)/data \
+	XDG_CACHE_HOME=$(MD_REPO_HOME)/cache \
+	XDG_RUNTIME_DIR=$(MD_REPO_HOME)/runtime \
+	CATENARY_ROOTS=$(MD_REPO_DIR) \
+	CATENARY_SERVERS='md:lattice serve'
+
+mdgrep: Q = Core
+mdgrep:
+	$(call iso_run,$(MD_REPO_HOME),$(MD_REPO_ENV),grep '$(Q)' $(MD_REPO_DIR))
+
+mdglob:
+	$(call iso_run,$(MD_REPO_HOME),$(MD_REPO_ENV),glob '$(MD_REPO_DIR)/**/*.$(MD_REPO_EXT)')
+
+# ── rust_repo (ticket 00c): real rust-analyzer over a tiny crate ──────
+# A minimal crate (trait Animal, subtrait Pet, structs Dog/Cat, a small call
+# graph) so impl / super / sub / caller / callee edges all have something to
+# show — a sanity check that the format holds against a production LSP. The
+# crate is `workspace.exclude`d so cargo never compiles it as part of the build.
+# Requires `rustup` on PATH; cold-start + indexing makes the first run slow.
+#
+#   make rustgrep               # default Q=Animal: impls + subtype (Pet)
+#   make rustgrep Q=describe    # callers / callees in the call graph
+#   make rustglob               # documentSymbol outline of src/lib.rs
+RUST_REPO_EXT  := rs
+RUST_REPO_DIR  := $(CURDIR)/tests/fixtures/rust_repo
+RUST_REPO_HOME := $(CURDIR)/target/rust_repo
+RUST_REPO_ENV   = env XDG_CONFIG_HOME=$(RUST_REPO_HOME)/config \
+	XDG_STATE_HOME=$(RUST_REPO_HOME)/state \
+	XDG_DATA_HOME=$(RUST_REPO_HOME)/data \
+	XDG_CACHE_HOME=$(RUST_REPO_HOME)/cache \
+	XDG_RUNTIME_DIR=$(RUST_REPO_HOME)/runtime \
+	CATENARY_ROOTS=$(RUST_REPO_DIR) \
+	CATENARY_SERVERS='rs:rustup run stable rust-analyzer'
+
+rustgrep: Q = Animal
+rustgrep:
+	$(call iso_run,$(RUST_REPO_HOME),$(RUST_REPO_ENV),grep '$(Q)' $(RUST_REPO_DIR))
+
+rustglob:
+	$(call iso_run,$(RUST_REPO_HOME),$(RUST_REPO_ENV),glob '$(RUST_REPO_DIR)/**/*.$(RUST_REPO_EXT)')
 
 # Verify we're in a good state for release
 pre-release-check:
