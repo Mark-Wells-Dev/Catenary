@@ -437,8 +437,35 @@ pub(super) fn apply_env_overrides(config: &mut Config) {
 
     // CATENARY_SERVERS: semicolon-separated "lang:command args" specs
     if let Ok(val) = std::env::var("CATENARY_SERVERS") {
-        for (lang, server_def, lang_config) in parse_server_specs(&val) {
-            config.server.insert(lang.clone(), server_def);
+        apply_server_specs(config, &val);
+    }
+}
+
+/// Apply parsed `CATENARY_SERVERS` specs onto a resolved config.
+///
+/// For each `lang:command args` spec the server definition is inserted under
+/// `lang` (replacing any built-in of the same name). The language binding is
+/// then **merged, not replaced**: when `lang` already names an existing entry
+/// (e.g. a built-in like `rust`), only its `servers` binding is overridden —
+/// the classification fields (`extensions` / `filenames` / `shebangs` /
+/// `root_markers`) are preserved, so files still classify and route to the
+/// overridden server. When `lang` is new (no existing entry), the env-derived
+/// [`LanguageConfig`] is inserted as-is, so a language defined entirely via
+/// `CATENARY_SERVERS` (e.g. the mockls `--scan-roots` harness) keeps working.
+///
+/// Split out from [`apply_env_overrides`] so the merge logic is unit-testable
+/// without mutating the process environment (`std::env::set_var` is `unsafe`
+/// under Rust 2024, which this crate forbids).
+pub(super) fn apply_server_specs(config: &mut Config, val: &str) {
+    for (lang, server_def, lang_config) in parse_server_specs(val) {
+        config.server.insert(lang.clone(), server_def);
+        if let Some(existing) = config.language.get_mut(&lang) {
+            // Existing/built-in language: keep classification, override only
+            // the server binding.
+            existing.servers = lang_config.servers;
+        } else {
+            // New language with no built-in entry: insert the env-derived
+            // entry whole.
             config.language.insert(lang, lang_config);
         }
     }

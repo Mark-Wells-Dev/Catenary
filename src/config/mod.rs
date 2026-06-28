@@ -1324,6 +1324,65 @@ servers = ["tsserver"]
         assert_eq!(results[0].1.command, "ra");
     }
 
+    /// Regression for bug 50: a `CATENARY_SERVERS` override keyed by a built-in
+    /// language name must *merge* — preserving the built-in classification
+    /// fields — not replace the whole `LanguageConfig` (which wiped
+    /// `extensions`, so `.rs` files stopped classifying and routed nowhere).
+    #[test]
+    fn test_apply_server_specs_preserves_builtin_classification() -> anyhow::Result<()> {
+        // Built-in config: [language.rust] extensions=["rs"], servers=["rust-analyzer"],
+        // root_markers=["Cargo.toml"].
+        let mut config = Config::load_from_sources(&[])?;
+
+        parse::apply_server_specs(&mut config, "rust:somebin");
+
+        let rust = config.resolve_language("rust").expect("rust language");
+        // Classification fields preserved — `.rs` still classifies as rust.
+        assert_eq!(
+            rust.extensions,
+            Some(vec!["rs".to_string()]),
+            "built-in extensions must survive a CATENARY_SERVERS override",
+        );
+        assert_eq!(
+            rust.root_markers,
+            Some(vec!["Cargo.toml".to_string()]),
+            "built-in root_markers must survive too",
+        );
+        // Only the server binding is overridden, to the env-derived server.
+        assert_eq!(rust.servers, Some(vec![ServerBinding::new("rust")]));
+        let server = config.server.get("rust").expect("env server def");
+        assert_eq!(server.command, "somebin");
+
+        Ok(())
+    }
+
+    /// The new-language case (no built-in entry) must keep today's behavior:
+    /// insert the env-derived entry whole. The mockls `--scan-roots` harness
+    /// relies on this for its custom `yX4Za` language.
+    #[test]
+    fn test_apply_server_specs_inserts_new_language() -> anyhow::Result<()> {
+        let mut config = Config::load_from_sources(&[])?;
+        assert!(
+            config.resolve_language("yX4Za").is_none(),
+            "precondition: yX4Za is not a built-in language",
+        );
+
+        parse::apply_server_specs(&mut config, "yX4Za:mockls yX4Za --scan-roots");
+
+        let lang = config
+            .resolve_language("yX4Za")
+            .expect("new language inserted");
+        assert_eq!(lang.servers, Some(vec![ServerBinding::new("yX4Za")]));
+        let server = config.server.get("yX4Za").expect("env server def");
+        assert_eq!(server.command, "mockls");
+        assert_eq!(
+            server.args,
+            vec!["yX4Za".to_string(), "--scan-roots".to_string()]
+        );
+
+        Ok(())
+    }
+
     #[test]
     fn test_resolve_language_servers() -> anyhow::Result<()> {
         let dir = tempdir()?;
