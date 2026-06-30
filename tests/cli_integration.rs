@@ -833,22 +833,24 @@ fn test_glob_count_reports_paths() -> Result<()> {
     Ok(())
 }
 
-// ── sed preview overflow file ──────────────────────────────────────
+// ── sed preview overflow valve ─────────────────────────────────────
 
-/// End-to-end: a bare `catenary sed` preview that truncates spills the complete
-/// diff to a per-invocation `sed-<uuid>.txt` under the isolated runtime dir, and
-/// the preview points the agent at it (cli-prerelease ticket 11a). Exercises the
-/// daemon-side UUID minting + `runtime_dir()` wiring the unit tests can't reach.
+/// End-to-end: a bare `catenary sed` preview that overflows the display line
+/// budget truncates stdout, spills the complete diff to a per-invocation
+/// `sed-<uuid>.txt` under the isolated runtime dir, and points the agent at it
+/// via a STDERR receipt — the shared overflow valve, the grep/glob model
+/// (pipeable-output ticket 03a). Exercises the daemon-side `line_budget` +
+/// `runtime_dir()` wiring the unit tests can't reach.
 #[test]
-fn test_sed_preview_writes_overflow_file() -> Result<()> {
+fn test_sed_preview_valve_spills_and_receipts() -> Result<()> {
     let state_dir = tempfile::tempdir()?;
     let state_home = state_dir.path().to_str().context("state dir")?;
 
-    // More matched files than the in-memory render cap (MAX_PREVIEW_FILES = 200),
-    // so the preview truncates and spills the full set to disk.
+    // Each file renders ~4 diff lines, so enough files push the body well past the
+    // default 1000-line budget and the valve truncates + spills.
     let root = tempfile::tempdir()?;
     let root_str = root.path().to_str().context("root path")?;
-    let total = 205;
+    let total = 400;
     for i in 0..total {
         std::fs::write(root.path().join(format!("f{i:04}.txt")), "foo\n")?;
     }
@@ -883,6 +885,7 @@ fn test_sed_preview_writes_overflow_file() -> Result<()> {
         String::from_utf8_lossy(&output.stderr),
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
 
     // The daemon wrote exactly one sed-<uuid>.txt under the isolated runtime dir.
     let overflow_dir = common::xdg_runtime_dir(state_dir.path()).join("catenary");
@@ -901,26 +904,31 @@ fn test_sed_preview_writes_overflow_file() -> Result<()> {
     assert_eq!(
         sed_files.len(),
         1,
-        "exactly one overflow file written; stdout:\n{stdout}"
+        "exactly one spill file written; stdout:\n{stdout}\nstderr:\n{stderr}"
     );
     let on_disk = sed_files.remove(0);
     let name = on_disk
         .file_name()
         .and_then(|n| n.to_str())
-        .context("overflow file name")?;
+        .context("spill file name")?;
 
-    // The preview points the agent at that file by name…
+    // The receipt rides out on STDERR and names the spill; stdout stays clean (the
+    // truncated preview, no in-band pointer).
     assert!(
-        stdout.contains("full diff at") && stdout.contains(name),
-        "preview points at the on-disk overflow file ({name}); stdout:\n{stdout}"
+        stderr.contains("output truncated") && stderr.contains(name),
+        "stderr receipt points at the spill ({name}); stderr:\n{stderr}"
     );
-    // …and the file holds the complete set (one diff section per matched file,
-    // beyond what the bounded in-memory preview rendered).
+    assert!(
+        !stdout.contains("output truncated"),
+        "the receipt must not leak into stdout; stdout:\n{stdout}"
+    );
+    // The spill holds the complete set (one diff section per matched file, beyond
+    // what the truncated display showed).
     let contents = std::fs::read_to_string(&on_disk)?;
     assert_eq!(
         contents.matches(" (1 match)").count(),
         total,
-        "overflow file holds every matched file's diff"
+        "spill holds every matched file's diff"
     );
 
     drop(bridge);

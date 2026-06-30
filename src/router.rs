@@ -367,9 +367,6 @@ pub struct SedRequest {
     /// Include hidden files and directories.
     #[serde(default)]
     pub include_hidden: bool,
-    /// Page number for the paged preview (1-based, default: 1).
-    #[serde(default = "ipc_default_page")]
-    pub page: usize,
 }
 
 impl SedRequest {
@@ -421,7 +418,6 @@ impl SedRequest {
             exclude,
             include_gitignored: self.include_gitignored,
             include_hidden,
-            page: self.page,
         }
     }
 }
@@ -434,11 +430,10 @@ pub struct SedResponse {
     /// Rendered preview / write summary.
     #[serde(default)]
     pub output: String,
-}
-
-/// Default page number for IPC tool requests (1-based).
-const fn ipc_default_page() -> usize {
-    1
+    /// Overflow-valve receipt for stderr, present only when the preview / write
+    /// summary was truncated and the full output spilled to a runtime-dir file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<String>,
 }
 
 /// Resolves a pattern path against a base directory if it is relative.
@@ -3097,7 +3092,15 @@ async fn handle_hook_dispatch(
             "incoming hook",
         );
 
-        let budget = crate::bridge::sed::PREVIEW_BUDGET;
+        // One shared display line budget feeds every truncating surface's
+        // overflow valve (pipeable-output ticket 03); sed joins grep/glob on it
+        // (ticket 03a). Resolved the same way the search servers resolve theirs.
+        let line_budget = ctx
+            .primary
+            .config
+            .tools
+            .as_ref()
+            .map_or(1000, crate::config::ToolsConfig::line_budget);
 
         // Consume the staged identity before the write so the session can both
         // guard and accumulate. `None` ⇒ preview, or an expired/absent handoff
@@ -3121,15 +3124,12 @@ async fn handle_hook_dispatch(
             .map(|(sid, _)| get_or_create_router(&ctx, sid.as_deref().unwrap_or("default"), &raw));
         let guard_session = router.as_ref().map(|r| r.session.clone());
 
-        // The bare preview streams its full diff to a per-invocation overflow
-        // file (ticket 11a) when its in-memory render caps truncate. Stateless
-        // (grep-class): a daemon-minted UUID names `sed-<uuid>.txt`, swept at
-        // startup + bounded by an in-lifetime cap. `--in-place` has no preview,
-        // so it carries no overflow context.
-        let overflow = (!in_place).then(|| crate::bridge::sed::PreviewOverflow {
-            base: crate::paths::runtime_dir(),
-            id: uuid::Uuid::new_v4().to_string(),
-        });
+        // Volume is bounded by the shared overflow valve: the preview / write
+        // summary is truncated at `line_budget` and the full output spills to a
+        // per-invocation `sed-<uuid>.txt` under the runtime dir (swept at startup,
+        // bounded by an in-lifetime cap), with the pointer carried out as a stderr
+        // receipt — the same model as grep/glob (ticket 03a).
+        let base = crate::paths::runtime_dir();
 
         let outcome = match tokio::task::spawn_blocking(move || {
             // Per-file write guard: deny files whose root another session holds.
@@ -3144,7 +3144,7 @@ async fn handle_hook_dispatch(
                     })
                 })
             };
-            crate::bridge::sed::execute_with_overflow(&input, budget, guard, overflow)
+            crate::bridge::sed::execute(&input, line_budget, &base, guard)
         })
         .await
         {
@@ -3152,6 +3152,7 @@ async fn handle_hook_dispatch(
             Err(e) => crate::bridge::sed::SedOutcome {
                 output: format!("sed error: {e}"),
                 changed: Vec::new(),
+                receipt: None,
             },
         };
 
@@ -3223,6 +3224,7 @@ async fn handle_hook_dispatch(
 
         let response = SedResponse {
             output: outcome.output,
+            receipt: outcome.receipt,
         };
         let mut payload = serde_json::to_vec(&response)?;
 

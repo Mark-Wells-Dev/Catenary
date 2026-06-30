@@ -36,7 +36,7 @@ use fancy_regex::{Captures, Regex, RegexBuilder};
 use ignore::WalkBuilder;
 use similar::{ChangeTag, TextDiff};
 
-use super::pagination::paginate;
+use super::overflow::{self, Valved};
 use super::session::{ResolvedGlob, path_is_gitignored};
 
 /// VCS metadata directories `catenary sed` never edits.
@@ -55,34 +55,12 @@ const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 /// Lines of unchanged context shown around each hunk in a preview diff.
 const DIFF_CONTEXT: usize = 3;
 
-/// Per-page character budget for the `catenary sed` preview pagination.
-///
-/// `sed`'s preview keeps the page-based [`paginate`] surface (orthogonal to the
-/// grep/glob overflow valve, which `sed` does not use). This is the page size in
-/// characters. It was previously sourced incidentally from the (now-removed)
-/// `[tools.grep] budget`; a fixed default decouples it from the retired
-/// char-budget config knobs (pipeable-output ticket 03).
-pub const PREVIEW_BUDGET: usize = 4000;
-
-/// Maximum changed (`+`/`-`) lines rendered for a single file in a preview diff
-/// before truncating with a "… N more changed lines" marker. Bounds any one file
-/// so a repo-wide rename can't bury the preview; `paginate` then pages the
-/// (bounded-per-file) body across files.
-const MAX_DIFF_LINES_PER_FILE: usize = 40;
-
-/// Maximum number of files whose diffs are rendered into a preview. Matches are
-/// still *counted* across every file (the totals stay honest), but the diff body
-/// is built for at most this many — the remainder is summarized. Together with
-/// [`MAX_DIFF_LINES_PER_FILE`] and [`MAX_PREVIEW_DIFF_LINE`] this hard-bounds the
-/// preview's peak memory regardless of how many files a pattern sweeps, so a
-/// broad pattern can never OOM the daemon.
-const MAX_PREVIEW_FILES: usize = 200;
-
 /// Maximum characters of a single diff line rendered in a preview; longer lines
 /// are clipped with `…`. A text file may be up to [`MAX_FILE_BYTES`] on one line,
-/// so without this the per-file/per-count caps alone would not bound memory.
-/// Display-only — the `--in-place` write is computed from the substitution, not
-/// this rendering, so a clipped preview line never affects what gets written.
+/// so without this guard a single pathological line could blow the output even
+/// though the overflow valve bounds *line count*, not bytes. Display-only — the
+/// `--in-place` write is computed from the substitution, not this rendering, so a
+/// clipped preview line never affects what gets written.
 const MAX_PREVIEW_DIFF_LINE: usize = 500;
 
 /// Loud error when `catenary sed` is invoked without an explicit path.
@@ -127,8 +105,6 @@ pub struct SedInput {
     pub include_gitignored: bool,
     /// Include hidden files and directories (never re-exposes VCS dirs).
     pub include_hidden: bool,
-    /// Page number for the paged preview (1-based).
-    pub page: usize,
 }
 
 /// Result of a `catenary sed` invocation.
@@ -138,6 +114,10 @@ pub struct SedOutcome {
     /// Files actually written (empty for a preview). The router accumulates the
     /// LSP-covered subset under the handed-off `(session_id, agent_id)`.
     pub changed: Vec<PathBuf>,
+    /// Overflow-valve receipt for stderr, present only when the preview / write
+    /// summary was truncated and the complete output spilled to a runtime-dir
+    /// file. Rides out the same way grep/glob's does, keeping stdout clean.
+    pub receipt: Option<String>,
 }
 
 impl SedOutcome {
@@ -147,6 +127,7 @@ impl SedOutcome {
         Self {
             output: output.into(),
             changed: Vec::new(),
+            receipt: None,
         }
     }
 }
@@ -199,51 +180,26 @@ struct FileHit {
     count: usize,
 }
 
-/// Per-invocation overflow context for the bare preview: the runtime-dir base and
-/// the daemon-minted UUID that names `sed-<uuid>.txt`.
-///
-/// Supplied by the router for a preview run so a truncated diff spills the
-/// complete set to disk (ticket 11a). `--in-place` has no preview and carries no
-/// context; [`execute`] omits it entirely (a truncated preview then degrades to
-/// its in-memory summary).
-pub struct PreviewOverflow {
-    /// Runtime-dir base (`paths::runtime_dir()`); the file lands under
-    /// `<base>/catenary/`.
-    pub base: PathBuf,
-    /// Daemon-minted per-invocation UUID naming the `sed-<uuid>.txt` report.
-    pub id: String,
-}
-
-/// Executes a `catenary sed` invocation without a preview overflow file.
-///
-/// Convenience wrapper over [`execute_with_overflow`] for callers (and tests)
-/// that supply no runtime-dir overflow context; a truncated preview falls back to
-/// its in-memory "diff not shown" summary.
-#[must_use]
-pub fn execute(input: &SedInput, budget: usize, guard: impl Fn(&Path) -> bool) -> SedOutcome {
-    execute_with_overflow(input, budget, guard, None)
-}
-
 /// Executes a `catenary sed` invocation: validate, resolve, substitute, and
 /// (for `--in-place`) write.
 ///
 /// Synchronous and self-contained (only filesystem IO) so the caller can run it
-/// on a blocking thread. `budget` is the per-page character budget for the
-/// preview. `guard` decides whether a given file may be written (the
-/// cross-session editing guardrail) — it is consulted *only* on the
-/// `--in-place` write path, so a preview never acquires a lock.
+/// on a blocking thread. `guard` decides whether a given file may be written (the
+/// cross-session editing guardrail) — it is consulted *only* on the `--in-place`
+/// write path, so a preview never acquires a lock.
 ///
-/// When `overflow` is `Some`, a bare preview whose render caps truncate streams
-/// its complete diff to `sed-<uuid>.txt` and ends with a `… full diff at <path>`
-/// pointer instead of dead-ending at the in-memory summary (ticket 11a). The diff
-/// is streamed one file at a time, so it never reintroduces the OOM risk the
-/// in-memory caps guard against. `--in-place` ignores `overflow` (no preview).
+/// Volume is bounded by the shared overflow [`valve`](overflow::valve), the same
+/// model as `catenary grep`/`glob`: the complete preview diff / write summary is
+/// built in memory, the display is truncated at `line_budget`, and the full
+/// output spills to `<base>/catenary/sed-<uuid>.txt` with the pointer carried out
+/// as the [`receipt`](SedOutcome::receipt) (stderr) rather than an in-band line.
+/// `base` is the runtime-dir root for that spill.
 #[must_use]
-pub fn execute_with_overflow(
+pub fn execute(
     input: &SedInput,
-    budget: usize,
+    line_budget: usize,
+    base: &Path,
     guard: impl Fn(&Path) -> bool,
-    overflow: Option<PreviewOverflow>,
 ) -> SedOutcome {
     if input.paths.is_empty() {
         return SedOutcome::message(REQUIRES_PATH_MSG);
@@ -275,9 +231,7 @@ pub fn execute_with_overflow(
     let mut drops = drops;
     let mut hits: Vec<FileHit> = Vec::new();
     let mut changed: Vec<PathBuf> = Vec::new();
-    let mut preview = Preview::new(
-        overflow.map(|o| crate::bridge::overflow::SedOverflowWriter::new(o.base, o.id)),
-    );
+    let mut preview = Preview::default();
 
     let mut runtime_err: Option<String> = None;
     for path in files {
@@ -325,10 +279,9 @@ pub fn execute_with_overflow(
             }
         } else {
             // Preview: run the real substitution (preserve-case/first included)
-            // so the diff reflects the exact transformation. Matches are counted
-            // for every file (totals stay honest), but the diff body is rendered
-            // for at most MAX_PREVIEW_FILES — peak memory is bounded no matter how
-            // many files the pattern sweeps. Nothing is written.
+            // so the diff reflects the exact transformation. Every matched file's
+            // complete diff is rendered into the body; the overflow valve bounds
+            // the *display* at render time. Nothing is written.
             let new = match substitute(
                 &regex,
                 &content,
@@ -353,20 +306,20 @@ pub fn execute_with_overflow(
         return SedOutcome {
             output: err,
             changed,
+            receipt: None,
         };
     }
 
-    let output = if input.in_place {
-        render_in_place(input, &hits, &drops, budget)
+    let valved = if input.in_place {
+        render_in_place(input, &hits, &drops, base, line_budget)
     } else {
-        // Persist the streamed full diff iff the preview truncated (file-count
-        // overflow, or any per-file/line cap), then point the header at it.
-        let not_rendered = preview.matched_files - preview.rendered_files;
-        let truncated = not_rendered > 0 || preview.body_truncated;
-        let overflow_path = preview.overflow.take().and_then(|w| w.finish(truncated));
-        preview.render(input, &drops, budget, overflow_path.as_deref())
+        preview.render(input, &drops, base, line_budget)
     };
-    SedOutcome { output, changed }
+    SedOutcome {
+        output: valved.display,
+        changed,
+        receipt: valved.receipt,
+    }
 }
 
 /// Validates and interprets a replacement string.
@@ -789,18 +742,17 @@ fn read_text_file(path: &Path) -> Result<String, ReadSkip> {
     String::from_utf8(bytes).map_err(|_| ReadSkip::Binary)
 }
 
-/// Accumulates the bare-preview result while staying memory-bounded.
+/// Accumulates the bare-preview result: the complete diff body plus exact
+/// totals.
 ///
-/// Every matched file is *counted* (`total_matches` / `matched_files` /
-/// `unchanged_files` are exact), but the rendered `body` is built for at most
-/// [`MAX_PREVIEW_FILES`] files. Combined with the per-file
-/// ([`MAX_DIFF_LINES_PER_FILE`]) and per-line ([`MAX_PREVIEW_DIFF_LINE`]) caps,
-/// the body has a hard size ceiling independent of how many files the pattern
-/// sweeps — a broad preview cannot OOM the daemon. The remainder is summarized
-/// in the header so the agent learns it was truncated.
+/// Every matched file's complete diff is rendered into `body` (the overflow
+/// [`valve`](overflow::valve) bounds the *display* at render time and spills the
+/// whole body, so nothing is lost — the grep/glob model). The only per-line guard
+/// is [`MAX_PREVIEW_DIFF_LINE`], which clips a single pathological line the
+/// valve's line-count budget would not catch.
 #[derive(Default)]
 struct Preview {
-    /// Rendered diff sections + `unchanged` markers (bounded; see above).
+    /// Rendered diff sections + `unchanged` markers, complete across every file.
     body: String,
     /// Total matches across *all* matched files.
     total_matches: usize,
@@ -808,52 +760,16 @@ struct Preview {
     matched_files: usize,
     /// Files that matched but whose substitution reproduced the original text.
     unchanged_files: usize,
-    /// Files actually rendered into `body` (`≤ MAX_PREVIEW_FILES`).
-    rendered_files: usize,
-    /// `true` when the in-memory `body` was truncated by the per-file
-    /// ([`MAX_DIFF_LINES_PER_FILE`]) or per-line ([`MAX_PREVIEW_DIFF_LINE`]) cap.
-    /// Together with the file-count overflow it decides whether the overflow file
-    /// is persisted.
-    body_truncated: bool,
-    /// Streams the complete, uncapped diff to a runtime-dir file when present;
-    /// persisted as `sed-<uuid>.txt` only if the preview truncated (ticket 11a).
-    overflow: Option<crate::bridge::overflow::SedOverflowWriter>,
 }
 
 impl Preview {
-    /// Creates a preview, optionally streaming the full diff to `overflow`.
-    fn new(overflow: Option<crate::bridge::overflow::SedOverflowWriter>) -> Self {
-        Self {
-            overflow,
-            ..Self::default()
-        }
-    }
-
-    /// Records one matched file: always counts it, streams its complete diff to
-    /// the overflow file (if any), and renders its diff (or a no-op marker) into
-    /// `body` while under the render cap.
+    /// Records one matched file: counts it and renders its diff (or a no-op
+    /// marker) into `body`.
     fn observe(&mut self, path: &Path, count: usize, old: &str, new: &str) {
         self.total_matches += count;
         self.matched_files += 1;
-        let is_noop = old == new;
-        if is_noop {
+        if old == new {
             self.unchanged_files += 1;
-        }
-
-        // Stream every genuinely-changed file's *complete* (uncapped) diff to the
-        // overflow file — regardless of the body render cap — so the on-disk
-        // report is the full set while `body` stays bounded. Rendered one file at
-        // a time, so the whole diff is never assembled in memory.
-        if !is_noop && let Some(writer) = self.overflow.as_mut() {
-            let mut section = String::new();
-            append_file_diff(&mut section, path, count, old, new, usize::MAX, false);
-            writer.append(&section);
-        }
-
-        if self.rendered_files >= MAX_PREVIEW_FILES {
-            return;
-        }
-        if is_noop {
             // Flagged, not hidden: the agent learns the pattern matched but the
             // replacement reproduces the existing text, so nothing would change.
             let _ = writeln!(
@@ -863,90 +779,78 @@ impl Preview {
                 matches_label(count)
             );
         } else {
-            self.body_truncated |= append_file_diff(
-                &mut self.body,
-                path,
-                count,
-                old,
-                new,
-                MAX_DIFF_LINES_PER_FILE,
-                true,
-            );
+            append_file_diff(&mut self.body, path, count, old, new);
         }
-        self.rendered_files += 1;
     }
 
-    /// Renders the preview: totals + flags in the header (repeated on every
-    /// page), the bounded diff body paged by `--page`. The no-match case is a
-    /// loud zero.
-    ///
-    /// `overflow_path` is `Some` when the preview truncated *and* the complete
-    /// diff was persisted (ticket 11a): the header then points the agent at it
-    /// instead of dead-ending at "diff not shown".
-    fn render(
-        &self,
-        input: &SedInput,
-        drops: &Drops,
-        budget: usize,
-        overflow_path: Option<&Path>,
-    ) -> String {
+    /// Renders the preview: totals + flags header, then the complete diff body
+    /// run through the overflow [`valve`](overflow::valve) (display truncated at
+    /// `line_budget`, the full body spilled with a stderr receipt). The no-match
+    /// case is a loud zero.
+    fn render(&self, input: &SedInput, drops: &Drops, base: &Path, line_budget: usize) -> Valved {
         if self.matched_files == 0 {
-            return render_zero(input, drops);
+            return Valved {
+                display: render_zero(input, drops),
+                receipt: None,
+            };
         }
-        let mut header = summary_header(self.total_matches, "matches", self.matched_files, drops);
+        let mut full = summary_header(self.total_matches, "matches", self.matched_files, drops);
         if self.unchanged_files > 0 {
             let _ = writeln!(
-                header,
+                full,
                 "{} matched but unchanged (replacement reproduces the match)",
                 self.unchanged_files
             );
         }
-        let not_rendered = self.matched_files - self.rendered_files;
-        match overflow_path {
-            // File-count overflow: the dropped files' diffs are on disk.
-            Some(path) if not_rendered > 0 => {
-                let _ = writeln!(
-                    header,
-                    "… {not_rendered} more files matched — full diff at {}",
-                    path.display()
-                );
-            }
-            // Every file rendered, but a per-file/per-line cap clipped the body —
-            // the complete, untruncated diff is still on disk.
-            Some(path) => {
-                let _ = writeln!(header, "… full diff at {}", path.display());
-            }
-            // No overflow file (disabled, or the write failed): degrade to the
-            // in-memory summary so the count is still honest.
-            None if not_rendered > 0 => {
-                let _ = writeln!(
-                    header,
-                    "{not_rendered} more files matched (diff not shown) — narrow the pattern or run --in-place"
-                );
-            }
-            None => {}
-        }
-        format!(
-            "{header}{}",
-            paginate(&self.body, budget, input.page.max(1))
+        full.push_str(&self.body);
+        // Per-file diff blocks must not be cut mid-hunk, so back the cut up to a
+        // file-header boundary (the glob model, sed's shape).
+        overflow::valve(
+            &full,
+            line_budget,
+            base,
+            overflow::SED_PREFIX,
+            Some(&is_diff_boundary),
         )
     }
 }
 
 /// Renders the `--in-place` write summary: totals header + per-file replacement
-/// counts (the write already happened). The no-match case is a loud zero.
-fn render_in_place(input: &SedInput, hits: &[FileHit], drops: &Drops, budget: usize) -> String {
+/// counts (the write already happened), bounded by the overflow
+/// [`valve`](overflow::valve). The no-match case is a loud zero.
+fn render_in_place(
+    input: &SedInput,
+    hits: &[FileHit],
+    drops: &Drops,
+    base: &Path,
+    line_budget: usize,
+) -> Valved {
     if hits.is_empty() {
-        return render_zero(input, drops);
+        return Valved {
+            display: render_zero(input, drops),
+            receipt: None,
+        };
     }
     let total: usize = hits.iter().map(|h| h.count).sum();
-    let header = summary_header(total, "replacements", hits.len(), drops);
-    let mut list = String::new();
+    let mut full = summary_header(total, "replacements", hits.len(), drops);
     for hit in hits {
-        let _ = writeln!(list, "  {}: {}", hit.path.display(), hit.count);
+        let _ = writeln!(full, "  {}: {}", hit.path.display(), hit.count);
     }
-    // Header (totals + drops) is always shown; the per-file list is paged.
-    format!("{header}{}", paginate(&list, budget, input.page.max(1)))
+    // The per-file list is flat — every `  path: count` line is self-contained,
+    // so a hard line cut is safe (the grep model, no boundary needed).
+    overflow::valve(&full, line_budget, base, overflow::SED_PREFIX, None)
+}
+
+/// Whether a sed preview line *begins* a complete per-file diff block — a safe
+/// place for the overflow [`valve`](overflow::valve) to truncate.
+///
+/// Each file's section opens with a `path (N matches)` header; the diff content
+/// below it is `similar`'s unified-diff lines, every one prefixed by `@` (hunk
+/// header) or `+` / `-` / ` ` (change / context). A line starting with none of
+/// those is therefore a file header — the start of a fresh block, where cutting
+/// never severs a file's diff mid-hunk.
+fn is_diff_boundary(line: &str) -> bool {
+    !line.starts_with(['+', '-', ' ', '@'])
 }
 
 /// Builds the leading `{total} {noun} in {files} files` line plus the drop
@@ -970,94 +874,42 @@ fn matches_label(count: usize) -> String {
     }
 }
 
-/// Appends one file's unified diff to `out`: a `path (N matches)` header followed
-/// by `similar` hunks (`-old` / `+new` / context lines). Returns `true` when the
-/// rendering was truncated — the per-file `line_cap` was hit, or a line was
-/// clipped.
+/// Appends one file's complete unified diff to `out`: a `path (N matches)` header
+/// followed by every `similar` hunk (`-old` / `+new` / context lines).
 ///
 /// The caller renders only genuinely-changed files here (no-ops are flagged
-/// separately), so there is always at least one hunk. Two knobs bound the output
-/// for the in-memory preview body: a file's changed (`+`/`-`) lines stop at
-/// `line_cap` ([`MAX_DIFF_LINES_PER_FILE`]; overflow → a "… N more changed lines"
-/// marker), and with `clip` set each rendered line is clipped at
-/// [`MAX_PREVIEW_DIFF_LINE`] characters — together these bound a single file's
-/// contribution regardless of its size. The streamed overflow file (ticket 11a)
-/// instead passes `usize::MAX` / `clip = false` to write the complete, untruncated
-/// diff one file at a time.
-fn append_file_diff(
-    out: &mut String,
-    path: &Path,
-    count: usize,
-    old: &str,
-    new: &str,
-    line_cap: usize,
-    clip: bool,
-) -> bool {
+/// separately), so there is always at least one hunk. The diff is rendered in
+/// full — the overflow [`valve`](overflow::valve) bounds the display by line
+/// count downstream — except that each rendered line is clipped at
+/// [`MAX_PREVIEW_DIFF_LINE`] characters, the one guard the line-count valve can't
+/// supply against a single pathological line.
+fn append_file_diff(out: &mut String, path: &Path, count: usize, old: &str, new: &str) {
     let diff = TextDiff::from_lines(old, new);
-    let total_changed = diff
-        .iter_all_changes()
-        .filter(|c| c.tag() != ChangeTag::Equal)
-        .count();
-    if total_changed == 0 {
-        return false;
+    let has_change = diff.iter_all_changes().any(|c| c.tag() != ChangeTag::Equal);
+    if !has_change {
+        return;
     }
 
-    let mut truncated = false;
     let _ = writeln!(out, "{} ({})", path.display(), matches_label(count));
 
-    let mut shown = 0usize;
     let mut udiff = diff.unified_diff();
     udiff.context_radius(DIFF_CONTEXT);
     for hunk in udiff.iter_hunks() {
-        // Already at the cap — don't open another hunk; its leading context would
-        // add bulk with no new change to show.
-        if shown >= line_cap {
-            break;
-        }
-        let mut header_written = false;
+        let _ = writeln!(out, "{}", hunk.header());
         for change in hunk.iter_changes() {
-            let changed = change.tag() != ChangeTag::Equal;
-            if changed && shown >= line_cap {
-                break;
-            }
-            // Defer the `@@ … @@` header until a line is actually emitted, so a
-            // hunk we stop before never leaves a dangling header behind.
-            if !header_written {
-                let _ = writeln!(out, "{}", hunk.header());
-                header_written = true;
-            }
             let sign = match change.tag() {
                 ChangeTag::Delete => '-',
                 ChangeTag::Insert => '+',
                 ChangeTag::Equal => ' ',
             };
             // `from_lines` change values carry their trailing newline; normalize
-            // to one output line per change so `paginate` splits cleanly, then
-            // clip an over-long line (preview body only) so one giant line can't
-            // blow the budget.
+            // to one output line per change, then clip an over-long line so one
+            // giant line can't blow the output the valve bounds by line count.
             let line = change.value();
             let line = line.strip_suffix('\n').unwrap_or(line);
-            let rendered = if clip {
-                clip_line(line)
-            } else {
-                Cow::Borrowed(line)
-            };
-            if matches!(rendered, Cow::Owned(_)) {
-                truncated = true;
-            }
-            let _ = writeln!(out, "{sign}{rendered}");
-            if changed {
-                shown += 1;
-            }
+            let _ = writeln!(out, "{sign}{}", clip_line(line));
         }
     }
-
-    if total_changed > line_cap {
-        let _ = writeln!(out, "… {} more changed lines", total_changed - line_cap);
-        truncated = true;
-    }
-
-    truncated
 }
 
 /// Clips a rendered diff line to [`MAX_PREVIEW_DIFF_LINE`] characters, appending
@@ -1102,13 +954,20 @@ mod tests {
             exclude: None,
             include_gitignored: false,
             include_hidden: false,
-            page: 1,
         }
+    }
+
+    /// Runs [`execute`] with a generous line budget and a throwaway runtime base
+    /// — for tests that don't exercise the overflow valve (no truncation, so the
+    /// base is never written).
+    fn run(input: &SedInput, guard: impl Fn(&Path) -> bool) -> SedOutcome {
+        let rt = tempfile::tempdir().expect("runtime tempdir");
+        execute(input, 100_000, rt.path(), guard)
     }
 
     #[test]
     fn requires_explicit_path() {
-        let outcome = execute(&input("a", "b", Vec::new()), 4000, |_| true);
+        let outcome = run(&input("a", "b", Vec::new()), |_| true);
         assert!(
             outcome.output.contains("explicit path"),
             "got: {}",
@@ -1223,7 +1082,7 @@ mod tests {
         let file = dir.path().join("a.txt");
         std::fs::write(&file, "foo foo bar\nfoo\n").expect("write");
 
-        let outcome = execute(&input("foo", "baz", vec![file.clone()]), 4000, |_| true);
+        let outcome = run(&input("foo", "baz", vec![file.clone()]), |_| true);
         assert!(outcome.changed.is_empty(), "preview writes nothing");
         // Totals header + per-file header carry the counts.
         assert!(
@@ -1255,44 +1114,55 @@ mod tests {
     }
 
     #[test]
-    fn sed_preview_diff_budgeted() {
+    fn sed_preview_diff_valve_truncates_and_spills() {
         let dir = tempfile::tempdir().expect("tempdir");
+        let rt = tempfile::tempdir().expect("runtime tempdir");
         let file = dir.path().join("big.txt");
-        // 20 changed lines (== the per-file cap, so no truncation marker); the
-        // rendered diff easily exceeds a tiny budget and pages.
+        // 20 changed lines; the rendered diff comfortably exceeds a small line
+        // budget, so the overflow valve truncates the display and spills the rest.
         let mut content = String::new();
         for i in 0..20 {
             let _ = writeln!(content, "line{i:02} foo");
         }
         std::fs::write(&file, &content).expect("write");
 
-        let mut sed = input("foo", "bar", vec![file.clone()]);
-        sed.page = 1;
-        let page1 = execute(&sed, 200, |_| true);
-        assert!(page1.changed.is_empty(), "preview writes nothing");
-        assert!(
-            page1.output.contains("matches in 1 files"),
-            "page 1 carries the totals header: {}",
-            page1.output
+        let budget = 6;
+        let outcome = execute(
+            &input("foo", "bar", vec![file.clone()]),
+            budget,
+            rt.path(),
+            |_| true,
         );
+        assert!(outcome.changed.is_empty(), "preview writes nothing");
+        // The totals header still leads the (truncated) display.
         assert!(
-            page1.output.contains("[page 1/"),
-            "preview pages under a small budget: {}",
-            page1.output
+            outcome.output.contains("matches in 1 files"),
+            "display carries the totals header: {}",
+            outcome.output
         );
-
-        sed.page = 2;
-        let page2 = execute(&sed, 200, |_| true);
+        // Display is bounded by the line budget (stdout stays small).
         assert!(
-            page2.output.contains("[page 2/"),
-            "page 2 reachable: {}",
-            page2.output
+            outcome.output.lines().count() <= budget,
+            "display truncated at the line budget: {}",
+            outcome.output
         );
-        // Totals survive paging.
+        // The receipt rides out on stderr and names the spill file holding the
+        // complete output.
+        let receipt = outcome.receipt.expect("truncation → stderr receipt");
         assert!(
-            page2.output.contains("matches in 1 files"),
-            "page 2 also carries the totals header: {}",
-            page2.output
+            receipt.contains("output truncated") && receipt.contains(" at "),
+            "receipt points at the spill: {receipt}"
+        );
+        let spill = receipt
+            .rsplit(" at ")
+            .next()
+            .map(std::path::PathBuf::from)
+            .expect("path in receipt");
+        let full = std::fs::read_to_string(&spill).expect("read spill");
+        // The spill is the COMPLETE diff — every changed line, none paged away.
+        assert!(
+            full.contains("-line00 foo") && full.contains("+line19 bar"),
+            "spill holds the complete diff: {full}"
         );
         assert_eq!(std::fs::read_to_string(&file).expect("read"), content);
     }
@@ -1306,7 +1176,7 @@ mod tests {
         let mut sed = input("omni", "lattice", vec![file.clone()]);
         sed.ignore_case = true;
         sed.preserve_case = true;
-        let outcome = execute(&sed, 4000, |_| true);
+        let outcome = run(&sed, |_| true);
 
         assert!(outcome.changed.is_empty(), "preview writes nothing");
         // The `+` line reflects the real per-hit cased substitution.
@@ -1329,7 +1199,7 @@ mod tests {
 
         let mut sed = input("x", "y", vec![file.clone()]);
         sed.first = true;
-        let outcome = execute(&sed, 4000, |_| true);
+        let outcome = run(&sed, |_| true);
 
         assert!(
             outcome.output.contains("(1 match)"),
@@ -1352,7 +1222,7 @@ mod tests {
         std::fs::write(&file, "foo bar\n").expect("write");
 
         // Replacement reproduces the match exactly → unchanged file → no hunk.
-        let outcome = execute(&input("foo", "foo", vec![file.clone()]), 4000, |_| true);
+        let outcome = run(&input("foo", "foo", vec![file.clone()]), |_| true);
         assert!(outcome.changed.is_empty(), "preview writes nothing");
         // Still counted as a match, but nothing to diff.
         assert!(
@@ -1380,24 +1250,13 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&file).expect("read"), "foo bar\n");
     }
 
-    /// Builds a [`PreviewOverflow`] rooted at a tempdir runtime base (ticket 11a
-    /// tests).
-    fn overflow(rt: &tempfile::TempDir, id: &str) -> PreviewOverflow {
-        PreviewOverflow {
-            base: rt.path().to_path_buf(),
-            id: id.to_string(),
-        }
-    }
-
     #[test]
-    fn sed_preview_caps_rendered_file_count() {
+    fn sed_preview_valve_spills_complete_set() {
         let dir = tempfile::tempdir().expect("tempdir");
         let rt = tempfile::tempdir().expect("runtime tempdir");
-        // More matched files than the render cap: every match is counted, but the
-        // diff body is bounded and the remainder spills to the overflow file (no
-        // OOM on a broad pattern).
-        let extra = 5;
-        let total = MAX_PREVIEW_FILES + extra;
+        // A broad multi-file preview: the display is bounded by the line budget,
+        // but the spill holds every matched file's complete diff (nothing lost).
+        let total = 50;
         let mut paths = Vec::new();
         for i in 0..total {
             let file = dir.path().join(format!("f{i:04}.txt"));
@@ -1405,12 +1264,8 @@ mod tests {
             paths.push(file);
         }
 
-        let outcome = execute_with_overflow(
-            &input("foo", "bar", paths),
-            1_000_000,
-            |_| true,
-            Some(overflow(&rt, "cap")),
-        );
+        let budget = 6;
+        let outcome = execute(&input("foo", "bar", paths), budget, rt.path(), |_| true);
         assert!(outcome.changed.is_empty(), "preview writes nothing");
         // Totals count every file…
         assert!(
@@ -1420,162 +1275,62 @@ mod tests {
             "totals count all matched files: {}",
             outcome.output
         );
-        // …but only the cap is rendered, and the overflow now points at the full
-        // diff on disk (ticket 11a) instead of dead-ending at "diff not shown".
-        let path = crate::bridge::overflow::sed_path(rt.path(), "cap");
+        // …the displayed body is bounded by the line budget…
         assert!(
-            outcome.output.contains(&format!(
-                "{extra} more files matched — full diff at {}",
-                path.display()
-            )),
-            "overflow beyond the render cap points at the file: {}",
+            outcome.output.lines().count() <= budget,
+            "display truncated at the line budget: {}",
             outcome.output
         );
-        assert!(path.exists(), "overflow file written to the runtime dir");
-        // The body holds at most the cap's worth of per-file diff headers.
-        let rendered = outcome.output.matches(" (1 match)").count();
-        assert!(
-            rendered <= MAX_PREVIEW_FILES,
-            "rendered file diffs are bounded by the cap: {rendered}"
-        );
-    }
-
-    #[test]
-    fn sed_preview_overflow_file_written() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let rt = tempfile::tempdir().expect("runtime tempdir");
-        let total = MAX_PREVIEW_FILES + 3;
-        let mut paths = Vec::new();
-        for i in 0..total {
-            let file = dir.path().join(format!("f{i:04}.txt"));
-            std::fs::write(&file, "foo\n").expect("write");
-            paths.push(file);
-        }
-
-        let outcome = execute_with_overflow(
-            &input("foo", "bar", paths),
-            1_000_000,
-            |_| true,
-            Some(overflow(&rt, "run-1")),
-        );
-
-        let path = crate::bridge::overflow::sed_path(rt.path(), "run-1");
-        // The on-disk path matches the pointer line printed in the preview.
-        assert!(
-            outcome.output.contains(&path.display().to_string()),
-            "preview points at the on-disk file: {}",
-            outcome.output
-        );
-        assert!(path.exists(), "complete diff written to the runtime dir");
-        // The on-disk file is the *complete* set — one section per matched file,
-        // more than the bounded in-memory preview rendered.
-        let contents = std::fs::read_to_string(&path).expect("read overflow");
+        // …and the stderr receipt points at the spill holding the COMPLETE set.
+        let receipt = outcome.receipt.expect("truncation → stderr receipt");
+        let spill = receipt
+            .rsplit(" at ")
+            .next()
+            .map(std::path::PathBuf::from)
+            .expect("path in receipt");
+        assert!(spill.exists(), "spill written to the runtime dir");
+        let contents = std::fs::read_to_string(&spill).expect("read spill");
         assert_eq!(
             contents.matches(" (1 match)").count(),
             total,
-            "overflow holds every file's diff"
+            "spill holds every file's diff"
         );
-    }
-
-    #[test]
-    fn sed_preview_overflow_has_dropped_files() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let rt = tempfile::tempdir().expect("runtime tempdir");
-        let total = MAX_PREVIEW_FILES + 5;
-        let mut paths = Vec::new();
-        for i in 0..total {
-            let file = dir.path().join(format!("f{i:04}.txt"));
-            std::fs::write(&file, "foo\n").expect("write");
-            paths.push(file);
-        }
-
-        let outcome = execute_with_overflow(
-            &input("foo", "bar", paths),
-            1_000_000,
-            |_| true,
-            Some(overflow(&rt, "drop")),
-        );
-
-        // Files are processed in sorted order, so the last names fall past the
-        // in-memory render cap: absent from stdout, present in the full set.
+        // A file past the display cut is absent from stdout but present in the
+        // spill — sorted order puts the last name last.
         let dropped = format!("f{:04}.txt", total - 1);
         assert!(
             !outcome.output.contains(&dropped),
-            "the dropped file is not in the bounded preview: {}",
+            "the cut file is not in the bounded display: {}",
             outcome.output
         );
-        let contents =
-            std::fs::read_to_string(crate::bridge::overflow::sed_path(rt.path(), "drop"))
-                .expect("read overflow");
         assert!(
             contents.contains(&dropped),
-            "the dropped file's diff is in the on-disk full set"
+            "the cut file's diff is in the complete spill"
         );
     }
 
     #[test]
-    fn sed_preview_overflow_on_per_file_cap() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let rt = tempfile::tempdir().expect("runtime tempdir");
-        let file = dir.path().join("huge.txt");
-        // 25 changed lines → 50 diff lines, over the 40-line per-file cap, so the
-        // body truncates even though the single file is rendered.
-        let mut content = String::new();
-        for i in 0..25 {
-            let _ = writeln!(content, "line{i:02} foo");
-        }
-        std::fs::write(&file, &content).expect("write");
-
-        let outcome = execute_with_overflow(
-            &input("foo", "bar", vec![file]),
-            100_000,
-            |_| true,
-            Some(overflow(&rt, "perfile")),
-        );
-
-        let path = crate::bridge::overflow::sed_path(rt.path(), "perfile");
-        assert!(
-            outcome
-                .output
-                .contains(&format!("full diff at {}", path.display())),
-            "per-file cap points at the full diff: {}",
-            outcome.output
-        );
-        assert!(path.exists(), "overflow file written for a per-file cap");
-        // The on-disk diff is complete — uncapped, no "more changed lines" marker.
-        let contents = std::fs::read_to_string(&path).expect("read overflow");
-        assert!(
-            !contents.contains("more changed lines"),
-            "the on-disk diff is uncapped: {contents}"
-        );
-    }
-
-    #[test]
-    fn sed_preview_no_overflow_no_file() {
+    fn sed_preview_within_budget_no_receipt() {
         let dir = tempfile::tempdir().expect("tempdir");
         let rt = tempfile::tempdir().expect("runtime tempdir");
         let file = dir.path().join("a.txt");
         std::fs::write(&file, "foo foo\n").expect("write");
 
-        let outcome = execute_with_overflow(
-            &input("foo", "bar", vec![file]),
-            4000,
-            |_| true,
-            Some(overflow(&rt, "small")),
-        );
+        let outcome = execute(&input("foo", "bar", vec![file]), 100_000, rt.path(), |_| {
+            true
+        });
 
-        // A preview that fits in memory leaves no file and shows no pointer —
-        // parity with diagnostics' no-overflow path.
+        // A preview that fits the budget leaves no spill and emits no receipt.
         assert!(
-            !outcome.output.contains("full diff at"),
-            "no overflow pointer for a small preview: {}",
-            outcome.output
+            outcome.receipt.is_none(),
+            "no receipt for a within-budget preview"
         );
-        assert!(
-            !crate::bridge::overflow::sed_path(rt.path(), "small").exists(),
-            "no overflow file for a non-truncating preview"
+        assert_eq!(
+            crate::bridge::overflow::sweep_query(rt.path()),
+            0,
+            "no spill file written for a within-budget preview"
         );
-        // The diff is still shown inline.
+        // The diff is shown inline.
         assert!(
             outcome.output.contains("+bar bar"),
             "diff shown inline: {}",
@@ -1588,14 +1343,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let file = dir.path().join("long.txt");
         // One line far longer than the per-line clip (a text file may be up to
-        // MAX_FILE_BYTES on a single line — without clipping the per-file/count
-        // caps alone would not bound memory).
+        // MAX_FILE_BYTES on a single line — the valve bounds line *count*, so a
+        // pathological single line still needs the per-line clip).
         let long = "foo ".repeat(2000);
         std::fs::write(&file, format!("{long}\n")).expect("write");
 
-        let outcome = execute(&input("foo", "bar", vec![file.clone()]), 10_000_000, |_| {
-            true
-        });
+        let outcome = run(&input("foo", "bar", vec![file.clone()]), |_| true);
         assert!(
             outcome.output.contains('…'),
             "an over-long diff line is clipped with an ellipsis"
@@ -1619,21 +1372,33 @@ mod tests {
     }
 
     #[test]
-    fn sed_preview_diff_truncates_large_file() {
+    fn sed_preview_renders_complete_per_file_diff() {
         let dir = tempfile::tempdir().expect("tempdir");
         let file = dir.path().join("huge.txt");
-        // 25 distinct changed lines → 50 changed (`-`/`+`) diff lines, over the
-        // 40-line per-file cap, so the overflow is summarized.
+        // 25 distinct changed lines → 50 changed (`-`/`+`) diff lines. There is no
+        // per-file cap anymore: under a generous budget the diff is rendered in
+        // full (the valve bounds volume by line count, never summarizing a file).
         let mut content = String::new();
         for i in 0..25 {
             let _ = writeln!(content, "line{i:02} foo");
         }
         std::fs::write(&file, &content).expect("write");
 
-        let outcome = execute(&input("foo", "bar", vec![file.clone()]), 100_000, |_| true);
+        let outcome = run(&input("foo", "bar", vec![file.clone()]), |_| true);
         assert!(
-            outcome.output.contains("10 more changed lines"),
-            "per-file cap summarizes the overflow (50 changed - 40 cap = 10): {}",
+            outcome.receipt.is_none(),
+            "well within budget → no truncation: {:?}",
+            outcome.receipt
+        );
+        assert!(
+            !outcome.output.contains("more changed lines"),
+            "no per-file summary marker; the diff is complete: {}",
+            outcome.output
+        );
+        // Both ends of the file are present — nothing summarized away.
+        assert!(
+            outcome.output.contains("-line00 foo") && outcome.output.contains("+line24 bar"),
+            "the complete diff is rendered: {}",
             outcome.output
         );
         assert_eq!(std::fs::read_to_string(&file).expect("read"), content);
@@ -1647,7 +1412,7 @@ mod tests {
 
         let mut sed = input("foo", "baz", vec![file.clone()]);
         sed.in_place = true;
-        let outcome = execute(&sed, 4000, |_| true);
+        let outcome = run(&sed, |_| true);
 
         assert_eq!(outcome.changed, vec![file.clone()]);
         assert_eq!(std::fs::read_to_string(&file).expect("read"), "baz baz\n");
@@ -1664,7 +1429,7 @@ mod tests {
         let mut sed = input("x", "y", vec![config.clone()]);
         sed.in_place = true;
         sed.include_hidden = true;
-        let outcome = execute(&sed, 4000, |_| true);
+        let outcome = run(&sed, |_| true);
 
         assert!(
             outcome.output.contains("refused"),
@@ -1687,7 +1452,7 @@ mod tests {
         let mut sed = input("url", "URL", vec![dir.path().to_path_buf()]);
         sed.in_place = true;
         sed.include_hidden = true;
-        let outcome = execute(&sed, 4000, |_| true);
+        let outcome = run(&sed, |_| true);
 
         assert_eq!(outcome.changed, vec![dir.path().join("real.txt")]);
         // .git/config untouched.
@@ -1705,7 +1470,7 @@ mod tests {
 
         let mut sed = input("foo", "baz", vec![bin.clone()]);
         sed.in_place = true;
-        let outcome = execute(&sed, 4000, |_| true);
+        let outcome = run(&sed, |_| true);
 
         assert!(outcome.changed.is_empty(), "binary file not edited");
         assert!(
@@ -1725,7 +1490,7 @@ mod tests {
         let mut sed = input("foo", "bar", vec![file.clone()]);
         sed.in_place = true;
         // The guard denies every write (simulating another session's lock).
-        let outcome = execute(&sed, 4000, |_| false);
+        let outcome = run(&sed, |_| false);
 
         assert!(outcome.changed.is_empty(), "locked file not edited");
         assert!(
@@ -1746,7 +1511,7 @@ mod tests {
 
         let mut sed = input("foo", "bar", vec![file.clone()]);
         sed.in_place = true;
-        let outcome = execute(&sed, 4000, |_| true);
+        let outcome = run(&sed, |_| true);
 
         assert_eq!(outcome.changed, vec![file.clone()]);
         assert_eq!(std::fs::read_to_string(&file).expect("read"), "echo bar\n");
@@ -1767,7 +1532,7 @@ mod tests {
         std::fs::write(&ignored, "foo\n").expect("write");
 
         // Explicitly named gitignored file → dropped and reported.
-        let outcome = execute(&input("foo", "baz", vec![ignored]), 4000, |_| true);
+        let outcome = run(&input("foo", "baz", vec![ignored]), |_| true);
         assert!(
             outcome.output.contains("skipped gitignored"),
             "gitignored drop reported: {}",
@@ -1781,7 +1546,7 @@ mod tests {
         let file = dir.path().join("a.txt");
         std::fs::write(&file, "nothing here\n").expect("write");
 
-        let outcome = execute(&input("absent", "x", vec![file]), 4000, |_| true);
+        let outcome = run(&input("absent", "x", vec![file]), |_| true);
         assert!(
             outcome.output.contains("no matches for: absent"),
             "loud zero: {}",
@@ -1795,7 +1560,7 @@ mod tests {
         let file = dir.path().join("a.txt");
         std::fs::write(&file, "x\n").expect("write");
 
-        let outcome = execute(&input("(unclosed", "y", vec![file]), 4000, |_| true);
+        let outcome = run(&input("(unclosed", "y", vec![file]), |_| true);
         assert!(
             outcome.output.contains("invalid pattern"),
             "bad regex is loud: {}",

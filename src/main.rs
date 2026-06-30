@@ -151,10 +151,6 @@ enum Command {
         /// Include hidden files and directories.
         #[arg(long)]
         include_hidden: bool,
-
-        /// Page number for the paged preview.
-        #[arg(long, default_value = "1")]
-        page: usize,
     },
 
     /// Print diagnostics for the files you've edited, then clear the set.
@@ -561,7 +557,6 @@ fn main() -> Result<()> {
             exclude,
             include_gitignored,
             include_hidden,
-            page,
         }) => {
             let paths = to_literal_paths(paths);
             let mut out = cli::Output::stdout(false);
@@ -577,7 +572,6 @@ fn main() -> Result<()> {
                 exclude,
                 include_gitignored,
                 include_hidden,
-                page,
             ))
         }
         #[cfg(not(unix))]
@@ -1117,11 +1111,11 @@ fn run_daemon_main() -> Result<()> {
         let retention_days = config.log_retention_days;
 
         // Sweep runtime-dir overflow files left by crashed/ended sessions
-        // (tickets 11 + 11a). At startup no session is connected yet, so every
-        // diagnostics/sed overflow file belongs to a dead prior daemon and is
-        // reaped. Authoritative GC — no teardown signal is reliable across hosts.
+        // (tickets 11 + 03 / 03a). At startup no session is connected yet, so
+        // every diagnostics file and grep/glob/sed valve spill belongs to a dead
+        // prior daemon and is reaped. Authoritative GC — no teardown signal is
+        // reliable across hosts.
         sweep_diagnostics_overflow();
-        sweep_sed_overflow();
         sweep_query_overflow();
 
         let threshold: catenary_mcp::logging::Severity = config
@@ -1316,30 +1310,19 @@ fn sweep_diagnostics_overflow() {
     }
 }
 
-/// Remove `sed-*` preview overflow files left by a previous daemon.
+/// Remove `grep-*`/`glob-*`/`sed-*` valve overflow spill files left by a previous
+/// daemon.
 ///
-/// Each preview mints a fresh per-invocation UUID (no session to key on), so a
-/// prior daemon's previews are unreferenced and reaped wholesale at startup
-/// (ticket 11a). An in-lifetime last-N cap bounds the dir while the daemon runs.
-#[cfg(unix)]
-fn sweep_sed_overflow() {
-    let removed = catenary_mcp::bridge::overflow::sweep_sed(&catenary_mcp::paths::runtime_dir());
-    if removed > 0 {
-        info!("swept {removed} stale sed preview overflow file(s)");
-    }
-}
-
-/// Remove `grep-*`/`glob-*` query overflow spill files left by a previous daemon.
-///
-/// Each grep/glob overflow valve mints a fresh per-invocation UUID (a stateless
-/// grep-class query, no session to key on), so a prior daemon's spills are
-/// unreferenced and reaped wholesale at startup (pipeable-output ticket 03). An
-/// in-lifetime last-N cap per prefix bounds the dir while the daemon runs.
+/// Each grep/glob/sed overflow valve mints a fresh per-invocation UUID (a
+/// stateless grep-class query, no session to key on), so a prior daemon's spills
+/// are unreferenced and reaped wholesale at startup (pipeable-output tickets 03 /
+/// 03a). An in-lifetime last-N cap per prefix bounds the dir while the daemon
+/// runs.
 #[cfg(unix)]
 fn sweep_query_overflow() {
     let removed = catenary_mcp::bridge::overflow::sweep_query(&catenary_mcp::paths::runtime_dir());
     if removed > 0 {
-        info!("swept {removed} stale grep/glob overflow file(s)");
+        info!("swept {removed} stale grep/glob/sed overflow file(s)");
     }
 }
 
@@ -1683,7 +1666,6 @@ async fn run_sed(
     exclude: Option<String>,
     include_gitignored: bool,
     include_hidden: bool,
-    page: usize,
 ) -> Result<()> {
     use catenary_mcp::router::{METHOD_SED, SedRequest, SedResponse};
 
@@ -1715,7 +1697,6 @@ async fn run_sed(
             exclude,
             include_gitignored,
             include_hidden,
-            page,
         };
         sed_ipc(METHOD_SED, &request).await?
     } else {
@@ -1725,6 +1706,11 @@ async fn run_sed(
     render_sed_outcome(out, &cwd, &response.output);
     for path in &resolved.missing {
         let _ = out.writeln(format_args!("path does not exist: {path}"));
+    }
+    // The overflow valve's receipt goes to STDERR so stdout stays the clean
+    // preview / write summary (pipeable-output ticket 03a, the grep/glob model).
+    if let Some(receipt) = &response.receipt {
+        eprintln!("{receipt}");
     }
     Ok(())
 }
@@ -2513,6 +2499,15 @@ mod tests {
     }
 
     #[test]
+    fn test_cli_sed_page_flag_is_rejected() {
+        use clap::Parser;
+        // sed moved off pagination onto the shared overflow valve, so `--page`
+        // is retired here too (pipeable-output ticket 03a).
+        let result = Args::try_parse_from(["catenary", "sed", "old", "new", "src/", "--page", "2"]);
+        assert!(result.is_err(), "sed --page should no longer parse");
+    }
+
+    #[test]
     fn test_cli_glob_missing_path() {
         use clap::Parser;
         let result = Args::try_parse_from(["catenary", "glob"]);
@@ -2600,7 +2595,6 @@ mod tests {
             "catenary roots",
             "catenary commands",
             "--count",
-            "--page",
         ] {
             assert!(
                 text.contains(needle),
