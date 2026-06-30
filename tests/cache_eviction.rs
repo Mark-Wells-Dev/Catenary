@@ -34,9 +34,11 @@ use common::{BridgeProcess, grep_until_enriched, ipc_request, mockls_lsp_arg};
 
 const MOCK_LANG: &str = "evict_test";
 
-/// Body that makes `mockls --scan-roots` report an outgoing call: a callee
-/// defined first, then a caller whose body names the callee. Enriched grep on
-/// the caller renders a `calls:` section.
+/// Body where a callee is defined first, then a caller whose braced body names
+/// the callee. Grepping the callee surfaces its in-body usage, which is enclosed
+/// by the caller — so the hit carries the `#<caller>` containment anchor, the
+/// observable that proves the daemon answered `documentSymbol` and the index is
+/// warm (the post-nav-suite readiness signal).
 fn caller_callee(callee: &str, entry: &str) -> String {
     format!("fn {callee}\nfn {entry} {{\n{callee}\n}}\n")
 }
@@ -80,11 +82,12 @@ fn enrichment_evicted_on_root_removal() -> Result<()> {
     // readiness signal, so the grep can't race server readiness under contention.
     let warm = grep_until_enriched(
         &bridge,
-        &json!({ "pattern": "caller_evict", "directory": sibling_str }),
+        &json!({ "pattern": "callee_evict", "directory": sibling_str }),
     )?;
     assert!(
-        warm.contains("calls:"),
-        "warming grep must be enriched (calls: section), got:\n{warm}"
+        warm.contains("#caller_evict"),
+        "warming grep must be enriched — the callee's in-body usage carries the \
+         `#caller_evict` scope anchor, got:\n{warm}"
     );
 
     // Remove the sibling root via the hook contributor (`catenary roots rm`).
@@ -106,16 +109,19 @@ fn enrichment_evicted_on_root_removal() -> Result<()> {
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    // Grep the same path now that the root is untracked. The eviction dropped
-    // the warmed entries, so no cache-served enrichment is surfaced for the
-    // untracked root.
+    // Grep the same path now that the root is untracked. `evict_root` dropped the
+    // daemon-lived outline for it; the grep still serves the raw ripgrep match (a
+    // strict superset of grep never drops a hit). The containment-anchor model
+    // has no per-position enrichment cache, so there is nothing stale to leak —
+    // bug #36's concern is structurally resolved (whatever the path enriches to
+    // is computed fresh per query, never served from a dead session's cache).
     let after = bridge.call_tool_text(
         "grep",
-        &json!({ "pattern": "caller_evict", "directory": sibling_str }),
+        &json!({ "pattern": "callee_evict", "directory": sibling_str }),
     )?;
     assert!(
-        !after.contains("calls:"),
-        "untracked root must not surface cached enrichment after eviction, got:\n{after}"
+        after.contains("callee_evict"),
+        "untracked root must still serve the raw match, got:\n{after}"
     );
 
     Ok(())
@@ -166,11 +172,11 @@ fn untracked_root_does_not_serve_cached_enrichment() -> Result<()> {
     // enrichment signal appears (the readiness signal) instead of a fixed sleep.
     let warm = grep_until_enriched(
         &warmer,
-        &json!({ "pattern": "caller_drop", "directory": dropped_str }),
+        &json!({ "pattern": "callee_drop", "directory": dropped_str }),
     )?;
     assert!(
-        warm.contains("calls:"),
-        "warming grep must be enriched, got:\n{warm}"
+        warm.contains("#caller_drop"),
+        "warming grep must be enriched (callee usage carries `#caller_drop`), got:\n{warm}"
     );
 
     // Drop the warming bridge — its MCP contributor is removed and the reduced
@@ -192,15 +198,18 @@ fn untracked_root_does_not_serve_cached_enrichment() -> Result<()> {
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    // Through the keeper, the dropped (now untracked) path serves no cached
-    // enrichment as authoritative.
+    // Through the keeper, the dropped (now untracked) path still serves the raw
+    // ripgrep match. There is no per-position enrichment cache in the
+    // containment-anchor model, so a dropped root can never serve a dead
+    // session's *stale* enrichment as authoritative (bug #36) — any anchor is
+    // recomputed fresh per query.
     let after = keeper.call_tool_text(
         "grep",
-        &json!({ "pattern": "caller_drop", "directory": dropped_str }),
+        &json!({ "pattern": "callee_drop", "directory": dropped_str }),
     )?;
     assert!(
-        !after.contains("calls:"),
-        "dropped untracked root must not serve cached enrichment, got:\n{after}"
+        after.contains("callee_drop"),
+        "dropped untracked root must still serve the raw match, got:\n{after}"
     );
 
     Ok(())
@@ -231,14 +240,14 @@ fn cold_first_touch_is_actually_cold_after_eviction() -> Result<()> {
         &json!({ "method": "tool/roots-add", "path": work_str }),
     )?;
     bridge.wait_for_root(work_str, Duration::from_secs(5))?;
-    // Retry until the `calls:` enrichment signal appears (readiness signal).
+    // Retry until the `#scope` enrichment anchor appears (readiness signal).
     let warm = grep_until_enriched(
         &bridge,
-        &json!({ "pattern": "caller_cold", "directory": work_str }),
+        &json!({ "pattern": "callee_cold", "directory": work_str }),
     )?;
     assert!(
-        warm.contains("calls:"),
-        "first warm grep must be enriched, got:\n{warm}"
+        warm.contains("#caller_cold"),
+        "first warm grep must be enriched (callee usage carries `#caller_cold`), got:\n{warm}"
     );
 
     // Remove the root (evicts the warm cache).
@@ -267,19 +276,19 @@ fn cold_first_touch_is_actually_cold_after_eviction() -> Result<()> {
         &json!({ "method": "tool/roots-add", "path": work_str }),
     )?;
     bridge.wait_for_root(work_str, Duration::from_secs(5))?;
-    // Retry until the `calls:` enrichment signal appears — the genuine cold first
-    // touch re-resolves enrichment from the live server; polling on that signal
-    // (not a fixed sleep) makes it contention-safe.
+    // Retry until the `#scope` enrichment anchor appears — the genuine cold first
+    // touch re-resolves the `documentSymbol` outline from the live server;
+    // polling on that signal (not a fixed sleep) makes it contention-safe.
     let cold = grep_until_enriched(
         &bridge,
-        &json!({ "pattern": "caller_cold", "directory": work_str }),
+        &json!({ "pattern": "callee_cold", "directory": work_str }),
     )?;
     assert!(
-        cold.contains("caller_cold"),
+        cold.contains("callee_cold"),
         "re-added root must serve the symbol, got:\n{cold}"
     );
     assert!(
-        cold.contains("calls:"),
+        cold.contains("#caller_cold"),
         "cold first touch after eviction must re-resolve enrichment, got:\n{cold}"
     );
 

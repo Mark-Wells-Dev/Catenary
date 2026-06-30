@@ -10,14 +10,11 @@ use grep_regex::RegexMatcherBuilder;
 use grep_searcher::{Searcher, Sink, SinkMatch};
 use ignore::WalkBuilder;
 use serde::Deserialize;
-use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::debug;
 
-use super::NO_LSP_LABEL;
-use super::SourceLines;
 use super::filesystem_manager::{
     FilesystemManager, OBSERVED_STAT_MISS_MTIME, mtime_nanos, stat_with_retry,
 };
@@ -26,10 +23,7 @@ use super::overflow;
 use crate::config::DispatchMethod;
 use crate::lsp::server::LspServer;
 use crate::lsp::{LspClientManager, WalkBreadth};
-use crate::source::Source;
-use crate::symbol_index::{
-    AtomId, Edge, EnrichmentKey, Symbol, SymbolEnrichment, SymbolIndex, Witness,
-};
+use crate::symbol_index::{ScopeFilter, Symbol, SymbolIndex};
 
 /// Input for grep tool.
 #[derive(Debug, Deserialize)]
@@ -65,27 +59,33 @@ pub struct GrepInput {
     pub count: bool,
 }
 
-/// A classified hit from the grep pipeline.
+/// A single grep hit, rendered as one self-contained URL-style deep-link line
+/// `path:line#scope:<verbatim>`.
 struct GrepHit {
+    /// Absolute path of the matched file.
     file: PathBuf,
+    /// 0-based line of the match.
     line: u32,
-    col: u32,
-    /// The full source line at the hit (the one-atom payload, decision 024),
-    /// verbatim and newline-stripped — not the matched token.
+    /// The full source line at the hit, verbatim and newline-stripped — the
+    /// `<verbatim>` payload, byte-identical to ripgrep (not the matched token).
     matched_text: String,
-    classification: HitClass,
+    /// The `#scope` graph coordinate for this hit (see [`Anchor`]).
+    anchor: Anchor,
 }
 
-/// Classification of a ripgrep hit against the symbol index.
-enum HitClass {
-    /// rg hit at a symbol index definition line — enriched with edges.
-    Symbol { symbol: Symbol },
-    /// rg hit at a non-definition line — a plain occurrence atom (no edges).
-    /// In the one-atom model the line carries no enclosing tag.
-    Reference,
-    /// Symbol identified via `prepareRename` in a file with no symbol index
-    /// data — a definition-like hit that still gets enriched.
-    PrepareRenameSymbol,
+/// The `#scope` graph coordinate appended to a grep line — a containment trail,
+/// not a resolvable path. The `#` scheme carries degradation natively (bug 48).
+enum Anchor {
+    /// Enriched, inside a scope → `#<trail>`: the `/`-joined chain of enclosing
+    /// *named* symbols (slugified), outermost→hit. Already joined.
+    Scope(String),
+    /// Enriched, genuinely top-level (no enclosing symbol) → no `#` at all: a
+    /// pure ripgrep line. Honest — there is no graph coordinate to report.
+    TopLevel,
+    /// Could not enrich (no server, language unserved, request failed) → `#?`,
+    /// a distinct marker so degradation is never misread as top-level and it
+    /// survives a pipe.
+    Unknown,
 }
 
 /// Outcome of a grep query.
@@ -178,32 +178,26 @@ impl GrepServer {
             return self.count_matches(&input, &search_paths, cwd.as_deref());
         }
 
-        // Split top-level alternation into independent arms
-        let arms = split_alternation(&input.pattern);
+        // Run the whole pattern in a single pass. Top-level `|` alternation is
+        // handled natively by the ripgrep regex engine, so there is no arm
+        // split: each match line is emitted exactly once (dedup), and the
+        // per-arm root-header glitch from the findings is retired by
+        // construction — the flat, header-free line format leaves nothing to
+        // repeat per arm.
+        let run_input = GrepInput {
+            pattern: input.pattern.clone(),
+            paths: search_paths,
+            exclude: input.exclude.clone(),
+            include_gitignored: input.include_gitignored,
+            include_hidden: input.include_hidden,
+            cwd: cwd.clone(),
+            count: false,
+        };
+        let output = self
+            .run(run_input, parent_id, cancel, cwd.as_deref())
+            .await?;
 
-        let mut all_output = String::new();
-        for arm in &arms {
-            let arm_input = GrepInput {
-                pattern: arm.clone(),
-                paths: search_paths.clone(),
-                exclude: input.exclude.clone(),
-                include_gitignored: input.include_gitignored,
-                include_hidden: input.include_hidden,
-                cwd: cwd.clone(),
-                count: false,
-            };
-            let output = self
-                .run(arm_input, parent_id, cancel, cwd.as_deref())
-                .await?;
-            if !output.is_empty() {
-                if !all_output.is_empty() {
-                    all_output.push('\n');
-                }
-                all_output.push_str(&output);
-            }
-        }
-
-        if all_output.is_empty() {
+        if output.is_empty() {
             return Ok(GrepOutcome::Rendered {
                 output: String::new(),
                 receipt: None,
@@ -216,7 +210,7 @@ impl GrepServer {
         // ripgrep superset). Grep lines are self-contained, so a hard line cut is
         // safe — no block boundary needed.
         let v = overflow::valve(
-            &all_output,
+            &output,
             self.budget,
             &crate::paths::runtime_dir(),
             overflow::GREP_PREFIX,
@@ -339,22 +333,6 @@ impl GrepServer {
             .ensure_and_wait_for_paths(&rg_paths)
             .await;
 
-        // Collect dead languages so the pipeline can skip prepareRename for them.
-        // Exclude single-file servers — they have no project context for
-        // workspace-wide search. Checked after ensure_and_wait_for_paths so
-        // servers are in a terminal state (Ready or Dead), not still initializing.
-        let mut dead_languages: HashSet<String> = HashSet::new();
-        let clients = self.client_manager.rooted_clients().await;
-        for (key, client_mutex) in &clients {
-            if !client_mutex.lock().await.is_alive() {
-                debug!(
-                    "[{}] server died \u{2014} tool will run in degraded mode",
-                    key.language_id
-                );
-                dead_languages.insert(key.language_id.clone());
-            }
-        }
-
         // Step 2a: Route the changed-set nudge (WS31 Consumer A) under the
         // walk-breadth gate (ticket 04). Enriched `grep`'s reverse-direction
         // enrichment is whole-tree, so a covered root is a `Full` walk: the
@@ -427,105 +405,83 @@ impl GrepServer {
         )
         .await;
 
-        // Step 3: Symbol index query.
-        let (indexed_symbols, indexed_files) = if let Some(ref index_mutex) = self.symbol_index {
-            let index = index_mutex
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let re_pattern = format!("(?i){}", &input.pattern);
-            let idx_syms = index
-                .query(&re_pattern, Some(&rg_paths))
-                .unwrap_or_default();
-            let if_set: HashSet<String> = rg_paths
-                .iter()
-                .filter(|p| index.has_symbols_for(p))
-                .map(|p| p.to_string_lossy().to_string())
-                .collect();
-            drop(index);
-            (idx_syms, if_set)
-        } else {
-            (Vec::new(), HashSet::new())
-        };
+        // Step 3: documentSymbol outlines for the matched files — the sole
+        // source of the `#scope` anchor. `ensure_symbols` (Step 2b) already
+        // fetched them; here we read every symbol per matched file in one
+        // index query, then walk each hit's ancestry locally. The per-hit nav
+        // suite (references / call hierarchy / implementation / type hierarchy)
+        // no longer fires: references *are* the hits, resolution is dropped, and
+        // impl/super/sub targets are themselves hits — so this is goto-tier and
+        // essentially free (`O(files)`, no per-hit round-trip).
+        let path_refs: Vec<&Path> = rg_paths.iter().map(PathBuf::as_path).collect();
+        let file_symbols: HashMap<PathBuf, Vec<Symbol>> =
+            self.symbol_index
+                .as_ref()
+                .map_or_else(HashMap::new, |index_mutex| {
+                    let index = index_mutex
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    index
+                        .query_scoped(&path_refs, &ScopeFilter::AnyDepth, "*", None, false)
+                        .unwrap_or_default()
+                });
 
-        // Build lookup: definition atom id → Symbol.
-        let mut def_lookup: HashMap<AtomId, Symbol> = HashMap::new();
-        for (path, sym) in &indexed_symbols {
-            def_lookup.insert(
-                AtomId::new(path.to_string_lossy().as_ref(), sym.line),
-                sym.clone(),
-            );
+        // Per-file documentSymbol coverage, for the `#?` degradation marker. A
+        // file with indexed symbols is covered. For a symbol-less file the two
+        // causes are indistinguishable from the index alone — "enriched, but
+        // genuinely empty" (no `#`) versus "could not enrich" (`#?`) — so we
+        // consult the live server registry: a documentSymbol-capable, alive
+        // server for the file means coverage (`get_servers` already filters dead
+        // servers, disabled methods, and file-pattern mismatches). No round-trip.
+        let mut uncovered: HashSet<PathBuf> = HashSet::new();
+        for path in &rg_paths {
+            if file_symbols.contains_key(path) {
+                continue;
+            }
+            let servers = self
+                .client_manager
+                .get_servers(
+                    path,
+                    LspServer::supports_document_symbols,
+                    Some(DispatchMethod::DocumentSymbol),
+                )
+                .await;
+            if servers.is_empty() {
+                uncovered.insert(path.clone());
+            }
         }
 
-        // Step 4: Classify each rg hit.
-        let mut hits: Vec<GrepHit> = Vec::new();
+        if cancel.is_cancelled() {
+            return Err(crate::mcp::RequestCancelled.into());
+        }
 
+        // Step 4: build one self-contained line per hit — `path:line#scope:raw`.
+        // Every ripgrep match is a top-level line (hits-as-spine); the `#scope`
+        // anchor is the containment trail from documentSymbol ancestry. No match
+        // is ever dropped (strict ripgrep superset).
+        let mut hits: Vec<GrepHit> = Vec::new();
         for (file_str, line_map) in &rg.file_line_texts {
             let file_path = PathBuf::from(file_str);
-            let has_symbols = indexed_files.contains(file_str);
-
+            let could_not_enrich = uncovered.contains(&file_path);
+            let symbols = file_symbols.get(&file_path);
             for (&line_1, texts) in line_map {
                 let line_0 = line_1 - 1;
                 let matched_text = texts.first().map(|(t, _)| t.clone()).unwrap_or_default();
-                let col = texts.first().map_or(0, |(_, c)| *c);
-
-                if has_symbols && let Some(sym) = def_lookup.get(&AtomId::new(file_str, line_0)) {
-                    // Definition line in an indexed file → enriched symbol atom.
-                    hits.push(GrepHit {
-                        file: file_path.clone(),
-                        line: line_0,
-                        col,
-                        matched_text,
-                        classification: HitClass::Symbol {
-                            symbol: sym.clone(),
-                        },
-                    });
-                    continue;
-                }
-
-                // Non-definition line. No ripgrep match is ever dropped
-                // (decision 024: `catenary grep` is a strict superset of `grep`
-                // — every byte-match is rendered verbatim). `prepareRename`
-                // gates *enrichment* only, never membership (bug 47).
-                //
-                // In an indexed file every non-definition hit is a plain
-                // reference atom regardless of `prepareRename` (the enclosing
-                // definition is a separate, enriched `Symbol`), so the round
-                // trip is skipped entirely — one LSP call saved per hit. In a
-                // non-indexed file `prepareRename` chooses enrich-vs-plain: a
-                // confirmed symbol becomes an enriched `PrepareRenameSymbol`; a
-                // non-symbol (a keyword, or prose body text on a Lattice /
-                // markdown root, where only headings are renameable) renders as
-                // a plain reference atom — present, just not enriched. The check
-                // is also skipped when the server is dead.
-                let classification = if has_symbols {
-                    HitClass::Reference
+                let anchor = if could_not_enrich {
+                    Anchor::Unknown
                 } else {
-                    let lang = self.fs_manager.language_id(&file_path);
-                    let server_dead = lang
-                        .as_ref()
-                        .is_some_and(|l| dead_languages.contains(l.as_str()));
-                    let is_symbol = if server_dead {
-                        // No live server to enrich with — a plain atom.
-                        false
+                    let trail = symbols.map_or_else(Vec::new, |s| scope_trail(s, line_0));
+                    if trail.is_empty() {
+                        Anchor::TopLevel
                     } else {
-                        self.prepare_rename_check(&file_path, line_0, col, parent_id, cancel)
-                            .await
-                    };
-                    if is_symbol {
-                        // A confirmed symbol in a file the index has no grammar
-                        // for: a definition-like atom enriched with edges.
-                        HitClass::PrepareRenameSymbol
-                    } else {
-                        // Not a symbol — a verbatim reference atom, never dropped.
-                        HitClass::Reference
+                        Anchor::Scope(trail.join("/"))
                     }
                 };
                 hits.push(GrepHit {
                     file: file_path.clone(),
                     line: line_0,
-                    col,
                     matched_text,
-                    classification,
+                    anchor,
                 });
             }
         }
@@ -534,597 +490,7 @@ impl GrepServer {
             return Ok(String::new());
         }
 
-        // Enrich definition-like hits (Symbol, PrepareRenameSymbol).
-        // Reference hits pass through with no enrichment.
-        let mut enrichments: Vec<(&GrepHit, Option<SymbolEnrichment>)> = Vec::new();
-        for hit in &hits {
-            let (line_0, col) = match &hit.classification {
-                HitClass::Symbol { symbol } => (symbol.line, hit.col),
-                HitClass::PrepareRenameSymbol => (hit.line, hit.col),
-                HitClass::Reference => {
-                    enrichments.push((hit, None));
-                    continue;
-                }
-            };
-            if cancel.is_cancelled() {
-                return Err(crate::mcp::RequestCancelled.into());
-            }
-            let enrichment = self
-                .enrich_at_position(&hit.file, line_0, col, parent_id, cancel)
-                .await;
-            enrichments.push((hit, enrichment));
-        }
-
-        let rendered = render_results(&enrichments, &self.fs_manager, cwd);
-        Ok(rendered)
-    }
-
-    /// Checks `prepareRename` at a position to decide whether a hit is a
-    /// renameable symbol worth enriching — an *enrichment* signal only, never a
-    /// filter (bug 47). A `false` answer demotes the hit to a plain reference
-    /// atom; it never drops it.
-    ///
-    /// Uses priority chain dispatch: iterates servers that support rename
-    /// in binding order, returns on the first definitive answer. Dispatch
-    /// errors are logged via `debug!()` and never surface in the tool result.
-    ///
-    /// Returns `true` if the position is a symbol (or no capable server
-    /// exists), `false` if not (e.g. a keyword).
-    async fn prepare_rename_check(
-        &self,
-        path: &Path,
-        line_0: u32,
-        col: u32,
-        parent_id: Option<&str>,
-        cancel: &tokio_util::sync::CancellationToken,
-    ) -> bool {
-        let servers = self
-            .client_manager
-            .get_servers(
-                path,
-                LspServer::supports_rename,
-                Some(DispatchMethod::Rename),
-            )
-            .await;
-
-        for client_mutex in &servers {
-            if cancel.is_cancelled() {
-                break;
-            }
-
-            let Ok(uri) = self
-                .client_manager
-                .open_document_on(path, client_mutex, parent_id.map(str::to_string))
-                .await
-            else {
-                continue;
-            };
-
-            let mut client = client_mutex.lock().await;
-            client.set_parent_id(parent_id.map(str::to_string));
-            client.set_cancel_token(cancel.clone());
-            let response = client.prepare_rename(&uri, line_0, col).await;
-            client.close_tracked_document(&uri).await;
-            drop(client);
-
-            match response {
-                Ok(v) if v.is_null() => return false, // null → not a symbol
-                Ok(_) => return true,                 // range → symbol
-                Err(e) => {
-                    debug!(
-                        source = Source::LspDispatch.as_str(),
-                        "prepare_rename failed: {e}"
-                    );
-                }
-            }
-        }
-
-        // No capable server, all errored, or cancelled — assume symbol
-        true
-    }
-
-    /// Enriches a symbol at a position with LSP data.
-    ///
-    /// Sends all enrichment queries (references, call hierarchy, implementations,
-    /// type hierarchy) for every symbol. The server decides what returns results.
-    ///
-    /// Callers gate enrichment before calling this method — `GrepServer::run`
-    /// only enriches `Symbol`/`PrepareRenameSymbol` hits, so a hit
-    /// `prepare_rename_check` did not confirm as a symbol is rendered as a
-    /// plain reference atom and never reaches this method (it is not dropped).
-    ///
-    /// Opens the document once on the union of all capability-filtered servers,
-    /// runs all four enrichment methods (skipping their per-method open/close),
-    /// then closes the document on each server. This avoids `didClose` between
-    /// methods causing the server to evict document state.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "orchestration across four LSP methods"
-    )]
-    async fn enrich_at_position(
-        &self,
-        path: &Path,
-        line_0: u32,
-        col: u32,
-        parent_id: Option<&str>,
-        cancel: &tokio_util::sync::CancellationToken,
-    ) -> Option<SymbolEnrichment> {
-        // Check the enrichment cache for workspace-rooted files.
-        let resolved_root = self.fs_manager.resolve_root(path);
-        let key = EnrichmentKey {
-            file: path.to_path_buf(),
-            line: line_0,
-            col,
-        };
-        if resolved_root.is_some()
-            && let Some(ref idx_arc) = self.symbol_index
-            && let Ok(mut idx) = idx_arc.lock()
-            && let Some(cached) = idx.get_enrichment(&key, &self.fs_manager)
-        {
-            return Some(cached);
-        }
-
-        // Collect the union of servers across all enrichment capabilities.
-        let ref_servers = self
-            .client_manager
-            .get_servers(
-                path,
-                LspServer::supports_references,
-                Some(DispatchMethod::References),
-            )
-            .await;
-        let call_servers = self
-            .client_manager
-            .get_servers(
-                path,
-                LspServer::supports_call_hierarchy,
-                Some(DispatchMethod::CallHierarchy),
-            )
-            .await;
-        let impl_servers = self
-            .client_manager
-            .get_servers(
-                path,
-                LspServer::supports_implementation,
-                Some(DispatchMethod::Implementation),
-            )
-            .await;
-        let type_servers = self
-            .client_manager
-            .get_servers(
-                path,
-                LspServer::supports_type_hierarchy,
-                Some(DispatchMethod::TypeHierarchy),
-            )
-            .await;
-
-        let all_servers = {
-            let mut seen = HashSet::new();
-            ref_servers
-                .iter()
-                .chain(call_servers.iter())
-                .chain(impl_servers.iter())
-                .chain(type_servers.iter())
-                .filter(|s| seen.insert(Arc::as_ptr(s)))
-                .cloned()
-                .collect::<Vec<_>>()
-        };
-
-        // Open the document once on each server.
-        let mut uri_opt: Option<String> = None;
-        let mut opened_servers = Vec::new();
-        for server in &all_servers {
-            match self
-                .client_manager
-                .open_document_on(path, server, parent_id.map(str::to_string))
-                .await
-            {
-                Ok(u) => {
-                    uri_opt = Some(u);
-                    opened_servers.push(Arc::clone(server));
-                }
-                Err(e) => {
-                    debug!(
-                        source = Source::LspDispatch.as_str(),
-                        "enrichment open failed: {e}"
-                    );
-                }
-            }
-        }
-
-        let pre_uri = uri_opt.as_deref();
-
-        // Run all enrichment methods with the document already open.
-        // Check cancellation between each method so we don't burn
-        // through fetch attempts after the token has already fired.
-        let ref_lines = self
-            .fetch_references(path, line_0, col, parent_id, pre_uri, cancel)
-            .await;
-
-        let (incoming_calls, outgoing_calls) = if cancel.is_cancelled() {
-            (Vec::new(), Vec::new())
-        } else {
-            self.fetch_call_hierarchy(path, line_0, col, parent_id, pre_uri, cancel)
-                .await
-        };
-
-        let implementations = if cancel.is_cancelled() {
-            Vec::new()
-        } else {
-            self.fetch_implementations(path, line_0, col, parent_id, pre_uri, cancel)
-                .await
-        };
-
-        let (supertypes, subtypes) = if cancel.is_cancelled() {
-            (Vec::new(), Vec::new())
-        } else {
-            self.fetch_type_hierarchy(path, line_0, col, parent_id, pre_uri, cancel)
-                .await
-        };
-
-        // Close the document once on each server.
-        if let Some(ref uri) = uri_opt {
-            for server in &opened_servers {
-                server.lock().await.close_tracked_document(uri).await;
-            }
-        }
-
-        // If cancelled, return None so the caller's is_cancelled()
-        // check triggers immediately.
-        if cancel.is_cancelled() {
-            return None;
-        }
-
-        let enrichment = SymbolEnrichment {
-            ref_lines,
-            incoming_calls,
-            outgoing_calls,
-            implementations,
-            supertypes,
-            subtypes,
-        };
-
-        // Store in the enrichment cache for workspace-rooted files.
-        if let Some(root) = resolved_root
-            && let Some(ref idx_arc) = self.symbol_index
-            && let Ok(mut idx) = idx_arc.lock()
-        {
-            let generation = self.fs_manager.root_generation(&root);
-            let source_mtime = std::fs::metadata(path).ok().map(|m| mtime_nanos(&m));
-            idx.cache_enrichment(
-                key,
-                Witness {
-                    root,
-                    generation,
-                    source_mtime,
-                },
-                enrichment.clone(),
-            );
-        }
-
-        Some(enrichment)
-    }
-
-    /// Fetches references via priority chain dispatch.
-    ///
-    /// When `pre_opened_uri` is `Some`, the document is already open on
-    /// all servers — skips `open_document_on` / `close_document`. When
-    /// `None`, each server attempt opens and closes independently.
-    async fn fetch_references(
-        &self,
-        path: &Path,
-        line_0: u32,
-        col: u32,
-        parent_id: Option<&str>,
-        pre_opened_uri: Option<&str>,
-        cancel: &tokio_util::sync::CancellationToken,
-    ) -> HashSet<AtomId> {
-        let servers = self
-            .client_manager
-            .get_servers(
-                path,
-                LspServer::supports_references,
-                Some(DispatchMethod::References),
-            )
-            .await;
-
-        for client_mutex in &servers {
-            if cancel.is_cancelled() {
-                break;
-            }
-
-            let owned_uri;
-            let uri: &str = if let Some(u) = pre_opened_uri {
-                u
-            } else {
-                let Ok(u) = self
-                    .client_manager
-                    .open_document_on(path, client_mutex, parent_id.map(str::to_string))
-                    .await
-                else {
-                    continue;
-                };
-                owned_uri = u;
-                &owned_uri
-            };
-
-            let mut client = client_mutex.lock().await;
-            client.set_parent_id(parent_id.map(str::to_string));
-            client.set_cancel_token(cancel.clone());
-            let result = client.references(uri, line_0, col, true).await;
-            if pre_opened_uri.is_none() {
-                client.close_tracked_document(uri).await;
-            }
-            drop(client);
-
-            match result {
-                Ok(Value::Array(refs)) => {
-                    let mut ref_lines: HashSet<AtomId> = HashSet::new();
-                    for r in &refs {
-                        if let Some(file) = extract_location_path(r)
-                            && let Some(line) = extract_start_line(r)
-                        {
-                            ref_lines.insert(AtomId::new(&file, line));
-                        }
-                    }
-                    return ref_lines;
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    debug!(
-                        source = Source::LspDispatch.as_str(),
-                        "references failed: {e}"
-                    );
-                }
-            }
-        }
-
-        HashSet::new()
-    }
-
-    /// Fetches incoming and outgoing calls via priority chain dispatch.
-    ///
-    /// When `pre_opened_uri` is `Some`, the document is already open —
-    /// skips open/close. Otherwise opens, runs the full prepare →
-    /// incoming → outgoing sequence on a single server, then closes.
-    async fn fetch_call_hierarchy(
-        &self,
-        path: &Path,
-        line_0: u32,
-        col: u32,
-        parent_id: Option<&str>,
-        pre_opened_uri: Option<&str>,
-        cancel: &tokio_util::sync::CancellationToken,
-    ) -> (Vec<Edge>, Vec<Edge>) {
-        let servers = self
-            .client_manager
-            .get_servers(
-                path,
-                LspServer::supports_call_hierarchy,
-                Some(DispatchMethod::CallHierarchy),
-            )
-            .await;
-
-        for client_mutex in &servers {
-            if cancel.is_cancelled() {
-                break;
-            }
-
-            let owned_uri;
-            let uri: &str = if let Some(u) = pre_opened_uri {
-                u
-            } else {
-                let Ok(u) = self
-                    .client_manager
-                    .open_document_on(path, client_mutex, parent_id.map(str::to_string))
-                    .await
-                else {
-                    continue;
-                };
-                owned_uri = u;
-                &owned_uri
-            };
-
-            let mut client = client_mutex.lock().await;
-            client.set_parent_id(parent_id.map(str::to_string));
-            client.set_cancel_token(cancel.clone());
-            let prepare = client.prepare_call_hierarchy(uri, line_0, col).await;
-            let result = match prepare {
-                Ok(Value::Array(ref items)) if !items.is_empty() => {
-                    let item = &items[0];
-                    let incoming = match client.incoming_calls(item).await {
-                        Ok(Value::Array(calls)) => calls
-                            .iter()
-                            .filter_map(|c| extract_edge(c.get("from")?))
-                            .collect(),
-                        _ => Vec::new(),
-                    };
-                    let outgoing = match client.outgoing_calls(item).await {
-                        Ok(Value::Array(calls)) => calls
-                            .iter()
-                            .filter_map(|c| extract_edge(c.get("to")?))
-                            .collect(),
-                        _ => Vec::new(),
-                    };
-                    Some((incoming, outgoing))
-                }
-                Ok(_) => None,
-                Err(e) => {
-                    debug!(
-                        source = Source::LspDispatch.as_str(),
-                        "prepare_call_hierarchy failed: {e}"
-                    );
-                    None
-                }
-            };
-            if pre_opened_uri.is_none() {
-                client.close_tracked_document(uri).await;
-            }
-            drop(client);
-
-            if let Some(calls) = result {
-                return calls;
-            }
-        }
-
-        (Vec::new(), Vec::new())
-    }
-
-    /// Fetches implementation locations via priority chain dispatch.
-    ///
-    /// When `pre_opened_uri` is `Some`, the document is already open —
-    /// skips open/close.
-    async fn fetch_implementations(
-        &self,
-        path: &Path,
-        line_0: u32,
-        col: u32,
-        parent_id: Option<&str>,
-        pre_opened_uri: Option<&str>,
-        cancel: &tokio_util::sync::CancellationToken,
-    ) -> Vec<AtomId> {
-        let servers = self
-            .client_manager
-            .get_servers(
-                path,
-                LspServer::supports_implementation,
-                Some(DispatchMethod::Implementation),
-            )
-            .await;
-
-        for client_mutex in &servers {
-            if cancel.is_cancelled() {
-                break;
-            }
-
-            let owned_uri;
-            let uri: &str = if let Some(u) = pre_opened_uri {
-                u
-            } else {
-                let Ok(u) = self
-                    .client_manager
-                    .open_document_on(path, client_mutex, parent_id.map(str::to_string))
-                    .await
-                else {
-                    continue;
-                };
-                owned_uri = u;
-                &owned_uri
-            };
-
-            let mut client = client_mutex.lock().await;
-            client.set_parent_id(parent_id.map(str::to_string));
-            client.set_cancel_token(cancel.clone());
-            let result = client.implementation(uri, line_0, col).await;
-            if pre_opened_uri.is_none() {
-                client.close_tracked_document(uri).await;
-            }
-            drop(client);
-
-            match result {
-                Ok(Value::Array(locs)) => {
-                    return locs
-                        .iter()
-                        .filter_map(|loc| {
-                            let file = extract_location_path(loc)?;
-                            let line = extract_start_line(loc)?;
-                            Some(AtomId::new(&file, line))
-                        })
-                        .collect();
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    debug!(
-                        source = Source::LspDispatch.as_str(),
-                        "implementation failed: {e}"
-                    );
-                }
-            }
-        }
-
-        Vec::new()
-    }
-
-    /// Fetches supertypes and subtypes via priority chain dispatch.
-    ///
-    /// When `pre_opened_uri` is `Some`, the document is already open —
-    /// skips open/close. Otherwise opens, runs the full prepare →
-    /// supertypes → subtypes sequence on a single server, then closes.
-    async fn fetch_type_hierarchy(
-        &self,
-        path: &Path,
-        line_0: u32,
-        col: u32,
-        parent_id: Option<&str>,
-        pre_opened_uri: Option<&str>,
-        cancel: &tokio_util::sync::CancellationToken,
-    ) -> (Vec<Edge>, Vec<Edge>) {
-        let servers = self
-            .client_manager
-            .get_servers(
-                path,
-                LspServer::supports_type_hierarchy,
-                Some(DispatchMethod::TypeHierarchy),
-            )
-            .await;
-
-        for client_mutex in &servers {
-            if cancel.is_cancelled() {
-                break;
-            }
-
-            let owned_uri;
-            let uri: &str = if let Some(u) = pre_opened_uri {
-                u
-            } else {
-                let Ok(u) = self
-                    .client_manager
-                    .open_document_on(path, client_mutex, parent_id.map(str::to_string))
-                    .await
-                else {
-                    continue;
-                };
-                owned_uri = u;
-                &owned_uri
-            };
-
-            let mut client = client_mutex.lock().await;
-            client.set_parent_id(parent_id.map(str::to_string));
-            client.set_cancel_token(cancel.clone());
-            let prepare = client.prepare_type_hierarchy(uri, line_0, col).await;
-            let result = match prepare {
-                Ok(Value::Array(ref items)) if !items.is_empty() => {
-                    let item = &items[0];
-                    let supertypes = match client.supertypes(item).await {
-                        Ok(Value::Array(types)) => types.iter().filter_map(extract_edge).collect(),
-                        _ => Vec::new(),
-                    };
-                    let subtypes = match client.subtypes(item).await {
-                        Ok(Value::Array(types)) => types.iter().filter_map(extract_edge).collect(),
-                        _ => Vec::new(),
-                    };
-                    Some((supertypes, subtypes))
-                }
-                Ok(_) => None,
-                Err(e) => {
-                    debug!(
-                        source = Source::LspDispatch.as_str(),
-                        "prepare_type_hierarchy failed: {e}"
-                    );
-                    None
-                }
-            };
-            if pre_opened_uri.is_none() {
-                client.close_tracked_document(uri).await;
-            }
-            drop(client);
-
-            if let Some(types) = result {
-                return types;
-            }
-        }
-
-        (Vec::new(), Vec::new())
+        Ok(render_results(&hits, &self.fs_manager, cwd))
     }
 
     /// Searches workspace roots for pattern matches using the `grep-*` crates
@@ -1268,435 +634,116 @@ impl GrepServer {
 
 // ─── Rendering ─────────────────────────────────────────────────────────
 
-/// Renders grep results as the full one-atom tree.
+/// Renders grep hits as one self-contained URL-style deep-link line each —
+/// `path:line#scope:<verbatim>` — ordered by `(file, line)` for byte-stable
+/// output (the misc-32 determinism pattern).
 ///
-/// Every result is one atom — `path:line  <source line>` (decision 024).
-/// The top-level list is the matches (definitions and occurrences alike),
-/// each a full atom; a definition additionally carries nested, labeled edge
-/// groups (`calls:`/`called by:`/impls/super-/subtypes/refs). Grouped by
-/// workspace root (bare absolute path header) for absolute patterns, or under
-/// a `cwd: ~/…` context header for cwd-scoped searches.
+/// There is **no header** of any kind (no root header, no `cwd:` context line):
+/// every line carries its own cwd-relative path, exactly like ripgrep, so the
+/// output is pipe-safe and the alternation-header glitch is retired. Stripping
+/// the `#…` fragment (up to the next `:`) yields byte-exact ripgrep
+/// (`path:line:text`) — the superset contract, mechanized. The verbatim payload
+/// floats (variable start column, indentation preserved) with no padding.
 ///
 /// Returns the complete output. Volume is bounded downstream by the shared
 /// overflow valve (`overflow::valve`) in [`GrepServer::execute`].
-fn render_results(
-    enrichments: &[(&GrepHit, Option<SymbolEnrichment>)],
-    fs_manager: &FilesystemManager,
-    cwd: Option<&Path>,
-) -> String {
+fn render_results(hits: &[GrepHit], fs_manager: &FilesystemManager, cwd: Option<&Path>) -> String {
     use std::fmt::Write;
 
-    let mut full = String::new();
-    // The membership set: every top-level match atom's (file, line). An edge
-    // whose target is in this set collapses to a citation; one outside is read
-    // full. Collected across the WHOLE result so a citation in one root section
-    // can point at an atom rendered full in another (the paging invariant).
-    let top_level = collect_top_level_atoms(enrichments);
-    let mut sources = SourceLines::new();
+    let mut ordered: Vec<&GrepHit> = hits.iter().collect();
+    ordered.sort_by(|a, b| a.file.cmp(&b.file).then_with(|| a.line.cmp(&b.line)));
 
-    if let Some(cwd) = cwd {
-        // cwd-scoped: one section, `cwd: ~/path` header, cwd-relative paths.
-        let compressed = super::compress_home(cwd);
-        if fs_manager.resolve_root(cwd).is_some() {
-            let _ = writeln!(full, "cwd: {compressed}");
-        } else {
-            let _ = writeln!(full, "cwd: {compressed} {NO_LSP_LABEL}");
-        }
-        let all_indices: Vec<usize> = (0..enrichments.len()).collect();
-        render_section(
-            enrichments,
-            &all_indices,
-            fs_manager,
-            &top_level,
-            &mut sources,
-            &mut full,
-            Some(cwd),
-        );
-    } else {
-        // Absolute glob: group by workspace root.
-        let mut root_items: BTreeMap<PathBuf, Vec<usize>> = BTreeMap::new();
-        let mut oor_items: Vec<usize> = Vec::new();
-        for (i, (hit, _)) in enrichments.iter().enumerate() {
-            match fs_manager.resolve_root(&hit.file) {
-                Some(root) => root_items.entry(root).or_default().push(i),
-                None => oor_items.push(i),
+    let mut out = String::new();
+    for hit in ordered {
+        let rel = rel_path(&hit.file, fs_manager, cwd);
+        let line_1 = hit.line + 1;
+        // `path:line` + the `#scope` fragment (omitted when top-level, `#?` when
+        // un-enrichable) + the ripgrep `:` delimiter + the byte-verbatim line.
+        match &hit.anchor {
+            Anchor::Scope(trail) => {
+                let _ = writeln!(out, "{rel}:{line_1}#{trail}:{}", hit.matched_text);
             }
-        }
-
-        // LSP warning when all results are outside workspace roots.
-        if root_items.is_empty() && !oor_items.is_empty() {
-            let _ = writeln!(full, "{NO_LSP_LABEL}");
-        }
-
-        for (root, indices) in &root_items {
-            if !full.is_empty() {
-                full.push('\n');
+            Anchor::TopLevel => {
+                let _ = writeln!(out, "{rel}:{line_1}:{}", hit.matched_text);
             }
-            let _ = writeln!(full, "{}", root.display());
-            render_section(
-                enrichments,
-                indices,
-                fs_manager,
-                &top_level,
-                &mut sources,
-                &mut full,
-                None,
-            );
-        }
-        // Out-of-root hits grouped under their parent directory path.
-        let mut oor_by_parent: BTreeMap<PathBuf, Vec<usize>> = BTreeMap::new();
-        for &i in &oor_items {
-            let (hit, _) = &enrichments[i];
-            let parent = hit
-                .file
-                .parent()
-                .unwrap_or_else(|| Path::new("/"))
-                .to_path_buf();
-            oor_by_parent.entry(parent).or_default().push(i);
-        }
-        for (parent, indices) in &oor_by_parent {
-            if !full.is_empty() {
-                full.push('\n');
+            Anchor::Unknown => {
+                let _ = writeln!(out, "{rel}:{line_1}#?:{}", hit.matched_text);
             }
-            let _ = writeln!(full, "{}", parent.display());
-            render_section(
-                enrichments,
-                indices,
-                fs_manager,
-                &top_level,
-                &mut sources,
-                &mut full,
-                None,
-            );
         }
     }
 
-    let trimmed_len = full.trim_end().len();
-    full.truncate(trimmed_len);
-    full
+    let trimmed_len = out.trim_end().len();
+    out.truncate(trimmed_len);
+    out
 }
 
-/// The [`AtomId`] of a hit — the definition line for a `Symbol`, the hit line
-/// otherwise.
-fn hit_atom(hit: &GrepHit) -> AtomId {
-    let line = match &hit.classification {
-        HitClass::Symbol { symbol } => symbol.line,
-        _ => hit.line,
-    };
-    AtomId::new(hit.file.to_string_lossy().as_ref(), line)
+/// The displayed path for a hit: cwd-relative when a `cwd` is set (the normal
+/// CLI case, like ripgrep), falling back to the verbatim absolute path when the
+/// file is not under `cwd`; root-relative (via [`display_path`]) when no `cwd`
+/// is supplied (the explicit all-roots mode).
+fn rel_path(file: &Path, fs_manager: &FilesystemManager, cwd: Option<&Path>) -> String {
+    cwd.map_or_else(
+        || display_path(&file.to_string_lossy(), fs_manager),
+        |base| {
+            file.strip_prefix(base).map_or_else(
+                |_| file.to_string_lossy().into_owned(),
+                |rel| rel.to_string_lossy().into_owned(),
+            )
+        },
+    )
 }
 
-/// Collects the set of top-level match atoms across the whole result — the
-/// membership test that decides edge collapse.
+/// Builds the `#scope` containment trail for a hit at `line_0` from the file's
+/// `documentSymbol` ancestry: the chain of enclosing *named* symbols, outermost
+/// → hit, each slugified and joined with a neutral `/`.
 ///
-/// Top level is always full and is the canonical home of every atom; an edge
-/// pointing here collapses to a `path:line  name` citation, an edge pointing
-/// elsewhere is read full. The set spans every root section so a citation is
-/// an absolute pointer to a guaranteed-present atom regardless of which page
-/// holds the full form (decision 024, the paging invariant).
-fn collect_top_level_atoms(
-    enrichments: &[(&GrepHit, Option<SymbolEnrichment>)],
-) -> HashSet<AtomId> {
-    enrichments.iter().map(|(hit, _)| hit_atom(hit)).collect()
-}
-
-/// Renders one root section as one-atom output (decision 024).
-///
-/// Every match is a top-level atom `path:line  <source line>`, ordered by
-/// `(file, line)` for byte-stable output (the misc-32 determinism pattern). A
-/// definition (a `Symbol`/`PrepareRenameSymbol` hit) additionally carries
-/// nested, labeled edge groups (`calls:`/`impls:`/`supertypes:`/`subtypes:`/
-/// `refs:`); each edge is itself an atom. An edge whose target is a top-level
-/// match collapses to a `path:line  name` citation (the full line is already
-/// present); an edge whose target is not a match is read full — the navigation
-/// Catenary does for the agent. A definition with no edges renders as its lean
-/// single atom (fish-eye).
-fn render_section(
-    enrichments: &[(&GrepHit, Option<SymbolEnrichment>)],
-    indices: &[usize],
-    fs_manager: &FilesystemManager,
-    top_level: &HashSet<AtomId>,
-    sources: &mut SourceLines,
-    output: &mut String,
-    cwd: Option<&Path>,
-) {
-    use std::fmt::Write;
-
-    // Path display: cwd-relative when cwd is set, root-relative otherwise.
-    let rel = |file: &str| -> String {
-        cwd.map_or_else(
-            || display_path(file, fs_manager),
-            |base| {
-                Path::new(file)
-                    .strip_prefix(base)
-                    .map_or_else(|_| file.to_string(), |r| r.to_string_lossy().to_string())
-            },
-        )
-    };
-
-    // Citation names: a collapsed edge shows `path:line  name`. A symbol atom
-    // cites by its lean name (decision 024); but a citation target can also be a
-    // plain `Reference` occurrence (a grep hit that is itself referenced by a
-    // definition), which has no name. `atom_texts` carries every top-level atom's
-    // full source line so such a citation falls back to it instead of rendering
-    // blank (bug 48).
-    let atom_names = collect_atom_names(enrichments);
-    let atom_texts = collect_atom_texts(enrichments);
-    let citations = AtomCitations {
-        top_level,
-        names: &atom_names,
-        texts: &atom_texts,
-    };
-
-    // Order the section's hits by atom id (`(file, line)`) — reproducible bytes.
-    let mut ordered: BTreeMap<AtomId, usize> = BTreeMap::new();
-    for &i in indices {
-        ordered.insert(hit_atom(enrichments[i].0), i);
-    }
-
-    for &i in ordered.values() {
-        let (hit, enrichment) = &enrichments[i];
-
-        // Blank line between top-level atoms (and their edge blocks).
-        if !output.is_empty() && !output.ends_with('\n') {
-            output.push('\n');
-        }
-
-        // Top-level atom: ALWAYS the full source line, verbatim.
-        let rel_path = rel(&hit.file.to_string_lossy());
-        let line_1 = hit_atom(hit).line + 1;
-        let _ = writeln!(output, "{rel_path}:{line_1}  {}", hit.matched_text);
-
-        // Only definitions carry edge groups; occurrences are lean atoms.
-        if !matches!(
-            hit.classification,
-            HitClass::Symbol { .. } | HitClass::PrepareRenameSymbol
-        ) {
-            continue;
-        }
-        let Some(enrichment) = enrichment else {
-            continue;
-        };
-
-        render_edge_groups(output, enrichment, &citations, sources, &rel);
-    }
-}
-
-/// Builds the citation-name lookup: each top-level definition atom's [`AtomId`]
-/// → its symbol name. A collapsed edge cites by this name.
-fn collect_atom_names(
-    enrichments: &[(&GrepHit, Option<SymbolEnrichment>)],
-) -> HashMap<AtomId, String> {
-    let mut names = HashMap::new();
-    for (hit, _) in enrichments {
-        let name = match &hit.classification {
-            HitClass::Symbol { symbol } => symbol.name.clone(),
-            HitClass::PrepareRenameSymbol => hit.matched_text.clone(),
-            HitClass::Reference => continue,
-        };
-        names.insert(hit_atom(hit), name);
-    }
-    names
-}
-
-/// Builds the citation-text lookup: each top-level atom's [`AtomId`] → its full
-/// source line. Unlike [`collect_atom_names`] this includes `Reference`
-/// occurrences, so a citation whose target has no symbol name (a plain
-/// occurrence referenced by a definition) can fall back to the verbatim line
-/// instead of rendering blank (bug 48).
-fn collect_atom_texts(
-    enrichments: &[(&GrepHit, Option<SymbolEnrichment>)],
-) -> HashMap<AtomId, String> {
-    enrichments
+/// A **definition** drops its own leaf — a symbol whose own name line *is* the
+/// hit line is the hit itself, so it is excluded (it fails `s.line < line_0`);
+/// its ancestors remain. A **usage** keeps its innermost enclosing symbol (no symbol
+/// starts on the hit line, so nothing is excluded). Anonymous scopes (closures,
+/// blocks, `let`s) are absent from `documentSymbol`, so the trail is only ever
+/// named scopes. Returns an empty `Vec` when the hit is genuinely top-level.
+fn scope_trail(symbols: &[Symbol], line_0: u32) -> Vec<String> {
+    // `s.line < line_0` both requires the symbol to start strictly above the hit
+    // (so it encloses it) and drops the definition's own leaf — a symbol whose
+    // name line *is* the hit line (`s.line == line_0`) is the hit itself.
+    let mut chain: Vec<&Symbol> = symbols
         .iter()
-        .map(|(hit, _)| (hit_atom(hit), hit.matched_text.clone()))
-        .collect()
+        .filter(|s| s.line < line_0 && s.end_line >= line_0)
+        .collect();
+    // Outermost → innermost. Spans nest, so start line ascending is the
+    // containment order; one symbol per line (the index dedups by start line),
+    // with the wider span first on the (impossible) tie for total ordering.
+    chain.sort_by(|a, b| {
+        a.line
+            .cmp(&b.line)
+            .then_with(|| b.end_line.cmp(&a.end_line))
+    });
+    chain.iter().map(|s| slugify(&s.name)).collect()
 }
 
-/// The citation lookups shared across edge rendering: the membership set that
-/// decides edge collapse, plus the name and full-text maps a collapsed citation
-/// draws on. Bundled so the edge renderers stay within argument limits.
-struct AtomCitations<'a> {
-    /// Every top-level match atom — an edge whose target is here collapses to a
-    /// citation.
-    top_level: &'a HashSet<AtomId>,
-    /// Top-level definition atoms' names, for lean citations (decision 024).
-    names: &'a HashMap<AtomId, String>,
-    /// Every top-level atom's full source line — the fallback when a cited atom
-    /// has no name (a plain `Reference` occurrence), so a citation is never
-    /// blank (bug 48).
-    texts: &'a HashMap<AtomId, String>,
-}
-
-/// Renders the labeled edge groups under a definition atom (decision 024).
-///
-/// Each edge is an atom: collapsed to `path:line  name` when its target is a
-/// top-level match (the full line is present elsewhere in the result), read
-/// full (`path:line  <source line>`) otherwise. Edges are deduplicated by
-/// atom `(file, line)`, so a back-edge of a cycle collapses against its peer.
-fn render_edge_groups(
-    output: &mut String,
-    enrichment: &SymbolEnrichment,
-    citations: &AtomCitations,
-    sources: &mut SourceLines,
-    rel: &impl Fn(&str) -> String,
-) {
-    use std::fmt::Write;
-
-    // Dedup edges across all this definition's groups by atom id.
-    let mut seen: HashSet<AtomId> = HashSet::new();
-
-    // calls: — outgoing call edges, ordered by atom id.
-    let mut calls: BTreeMap<AtomId, &Edge> = BTreeMap::new();
-    for c in &enrichment.outgoing_calls {
-        calls.entry(c.target.clone()).or_insert(c);
-    }
-    if !calls.is_empty() {
-        let _ = writeln!(output, "\tcalls:");
-        for (id, c) in &calls {
-            if seen.insert(id.clone()) {
-                render_edge_atom(output, &c.name, id, citations, sources, rel);
+/// Slugifies one scope-anchor segment: the grammar-significant characters
+/// (whitespace and the scheme's own `/`, `:`, `#`) collapse to a single `-`,
+/// runs collapsed, **case preserved**. A code identifier contains none of these,
+/// so the transform is the identity on it; only free-text names (markdown
+/// headings — `Pipeline Stages` → `Pipeline-Stages`) visibly change. Code and
+/// markdown therefore share one path — "preserve when clean" is the fixed point
+/// of this transform on identifier-shaped names, not a branch.
+fn slugify(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut prev_dash = false;
+    for ch in name.chars() {
+        if ch.is_whitespace() || matches!(ch, '/' | ':' | '#') {
+            if !prev_dash {
+                out.push('-');
+                prev_dash = true;
             }
-        }
-    }
-
-    // impls: — implementation locations, ordered by atom id. LSP gives only
-    // `(file, line)`; a collapsed citation borrows the matched atom's name.
-    let mut impls: BTreeSet<AtomId> = BTreeSet::new();
-    for id in &enrichment.implementations {
-        impls.insert(id.clone());
-    }
-    let impls: Vec<AtomId> = impls
-        .into_iter()
-        .filter(|atom| seen.insert(atom.clone()))
-        .collect();
-    if !impls.is_empty() {
-        let _ = writeln!(output, "\timpls:");
-        for id in &impls {
-            let name = citations.names.get(id).map_or("", String::as_str);
-            render_edge_atom(output, name, id, citations, sources, rel);
-        }
-    }
-
-    // supertypes: / subtypes: — type hierarchy edges, ordered by (file, line).
-    render_type_group(
-        output,
-        "supertypes",
-        &enrichment.supertypes,
-        &mut seen,
-        citations,
-        sources,
-        rel,
-    );
-    render_type_group(
-        output,
-        "subtypes",
-        &enrichment.subtypes,
-        &mut seen,
-        citations,
-        sources,
-        rel,
-    );
-
-    // refs: — textDocument/references plus incoming call edges, ordered by atom
-    // id, deduplicated against the edges above.
-    let mut refs: BTreeMap<AtomId, String> = BTreeMap::new();
-    for id in &enrichment.ref_lines {
-        refs.entry(id.clone()).or_default();
-    }
-    for caller in &enrichment.incoming_calls {
-        refs.entry(caller.target.clone())
-            .or_insert_with(|| caller.name.clone());
-    }
-    let refs: Vec<(AtomId, String)> = refs
-        .into_iter()
-        .filter(|(atom, _)| seen.insert(atom.clone()))
-        .collect();
-    if !refs.is_empty() {
-        let _ = writeln!(output, "\trefs:");
-        for (id, caller_name) in &refs {
-            // Prefer the cited atom's own name; fall back to an incoming
-            // caller's name when the reference is not itself a match.
-            let name = citations
-                .names
-                .get(id)
-                .map_or(caller_name.as_str(), String::as_str);
-            render_edge_atom(output, name, id, citations, sources, rel);
-        }
-    }
-}
-
-/// Renders a type-hierarchy edge group (`supertypes:`/`subtypes:`).
-fn render_type_group(
-    output: &mut String,
-    label: &str,
-    edges: &[Edge],
-    seen: &mut HashSet<AtomId>,
-    citations: &AtomCitations,
-    sources: &mut SourceLines,
-    rel: &impl Fn(&str) -> String,
-) {
-    use std::fmt::Write;
-
-    let mut by_atom: BTreeMap<AtomId, &Edge> = BTreeMap::new();
-    for t in edges {
-        by_atom.entry(t.target.clone()).or_insert(t);
-    }
-    let by_atom: Vec<(AtomId, &Edge)> = by_atom
-        .into_iter()
-        .filter(|(atom, _)| seen.insert(atom.clone()))
-        .collect();
-    if by_atom.is_empty() {
-        return;
-    }
-    let _ = writeln!(output, "\t{label}:");
-    for (id, t) in &by_atom {
-        render_edge_atom(output, &t.name, id, citations, sources, rel);
-    }
-}
-
-/// Renders a single edge as an atom (decision 024).
-///
-/// Collapsed to `path:line  name` when the target is a top-level match (the
-/// paging-invariant citation — an absolute pointer to an atom rendered full
-/// elsewhere in the same result), read full `path:line  <source line>`
-/// otherwise. When the source line is unavailable and the target is not a
-/// match, the edge's own `name` is the fallback so the atom is never empty.
-///
-/// A citation whose target has no name — a plain `Reference` occurrence
-/// referenced by a definition — falls back to that target's full source line
-/// from `citations.texts`, never rendering a blank raw field (bug 48).
-fn render_edge_atom(
-    output: &mut String,
-    name: &str,
-    atom: &AtomId,
-    citations: &AtomCitations,
-    sources: &mut SourceLines,
-    rel: &impl Fn(&str) -> String,
-) {
-    use std::fmt::Write;
-
-    let line_1 = atom.line + 1;
-    let rel_path = rel(&atom.file);
-    if citations.top_level.contains(atom) {
-        // Citation: the full line is a top-level atom elsewhere in the result.
-        // Prefer the lean name; when the cited atom has none (a plain occurrence)
-        // fall back to its verbatim source line so the citation is never blank.
-        let label = if name.is_empty() {
-            citations.texts.get(atom).map_or(name, String::as_str)
         } else {
-            name
-        };
-        let _ = writeln!(output, "\t\t{rel_path}:{line_1}  {label}");
-    } else {
-        // Read the line in for the agent (bounded to new targets).
-        let text = sources
-            .line(Path::new(&atom.file), atom.line)
-            .map(str::trim_end)
-            .filter(|l| !l.is_empty())
-            .unwrap_or(name);
-        let _ = writeln!(output, "\t\t{rel_path}:{line_1}  {text}");
+            out.push(ch);
+            prev_dash = false;
+        }
     }
+    out
 }
 
 /// Wrapper that pushes per-thread match data into a shared collector on drop.
@@ -1873,105 +920,6 @@ struct ThreadMatches {
     files: Vec<(PathBuf, i64)>,
 }
 
-/// Splits a regex pattern on top-level `|` alternation.
-///
-/// Only splits on `|` when depth == 0 and not inside a character class.
-/// `foo|bar` → `["foo", "bar"]`. `(foo|bar)_baz` → `["(foo|bar)_baz"]`.
-fn split_alternation(pattern: &str) -> Vec<String> {
-    let mut arms = Vec::new();
-    let mut depth: usize = 0;
-    let mut in_class = false;
-    let mut start = 0;
-    let mut escaped = false;
-
-    for (i, ch) in pattern.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if ch == '\\' {
-            escaped = true;
-            continue;
-        }
-        if in_class {
-            if ch == ']' {
-                in_class = false;
-            }
-            continue;
-        }
-        match ch {
-            '[' => in_class = true,
-            '(' => depth += 1,
-            ')' => depth = depth.saturating_sub(1),
-            '|' if depth == 0 => {
-                arms.push(pattern[start..i].to_string());
-                start = i + 1;
-            }
-            _ => {}
-        }
-    }
-    arms.push(pattern[start..].to_string());
-    arms.retain(|a| !a.is_empty());
-    if arms.is_empty() {
-        arms.push(pattern.to_string());
-    }
-    arms
-}
-
-// ─── LSP JSON extraction helpers ────────────────────────────────────────
-
-/// Extracts a file path from an LSP `Location` or `LocationLink`.
-///
-/// Reads the plain-`Location` `uri` field, falling back to the
-/// `LocationLink` `targetUri` field when `uri` is absent (a server may
-/// answer `linkSupport`-enabled requests — implementation, definition,
-/// declaration, typeDefinition — with `LocationLink[]`). Strips the
-/// `file://` prefix from a `file://` URI. Returns `None` for non-file
-/// URIs or missing fields.
-fn extract_location_path(location: &Value) -> Option<String> {
-    location
-        .get("uri")
-        .or_else(|| location.get("targetUri"))?
-        .as_str()?
-        .strip_prefix("file://")
-        .map(str::to_string)
-}
-
-/// Extracts the start line (0-based) from an LSP `Location` or `LocationLink`.
-///
-/// Reads the plain-`Location` `range.start.line`. For a `LocationLink`
-/// (no `range`), falls back to `targetSelectionRange.start.line` — the
-/// name position, matching the declaration line grep prints — then to
-/// `targetRange.start.line`.
-fn extract_start_line(location: &Value) -> Option<u32> {
-    let range = location
-        .get("range")
-        .or_else(|| location.get("targetSelectionRange"))
-        .or_else(|| location.get("targetRange"))?;
-    u32::try_from(range.get("start")?.get("line")?.as_u64()?).ok()
-}
-
-/// Extracts an [`Edge`] from a `CallHierarchyItem` or `TypeHierarchyItem` JSON
-/// value — both share the `name`/`uri`/`range` shape, so one extractor serves
-/// both.
-///
-/// The one-atom model carries only the edge's name and target `(file, line)`;
-/// the LSP kind / container / deprecation tags are not rendered, so they are
-/// not read.
-fn extract_edge(item: &Value) -> Option<Edge> {
-    let name = item.get("name")?.as_str()?.to_string();
-    let file = item
-        .get("uri")?
-        .as_str()?
-        .strip_prefix("file://")
-        .map(str::to_string)?;
-    let line = u32::try_from(item.get("range")?.get("start")?.get("line")?.as_u64()?).ok()?;
-    Some(Edge {
-        name,
-        target: AtomId::new(&file, line),
-    })
-}
-
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
@@ -2002,72 +950,26 @@ mod tests {
         );
     }
 
-    // ─── split_alternation tests ─────────────────────────────────────────
+    // ─── slugify ─────────────────────────────────────────────────────────
 
     #[test]
-    fn test_split_top_level() {
-        assert_eq!(split_alternation("foo|bar"), vec!["foo", "bar"]);
-    }
-
-    #[test]
-    fn test_split_nested_no_split() {
-        assert_eq!(split_alternation("(foo|bar)_baz"), vec!["(foo|bar)_baz"]);
+    fn slugify_is_identity_on_code_identifiers() {
+        // No whitespace/`/`/`:`/`#` → the transform passes the name through.
+        assert_eq!(slugify("run"), "run");
+        assert_eq!(slugify("DiagnosticFeeder"), "DiagnosticFeeder");
+        assert_eq!(slugify("handle_grep"), "handle_grep");
     }
 
     #[test]
-    fn test_split_character_class() {
-        assert_eq!(split_alternation("[a|b]_c"), vec!["[a|b]_c"]);
+    fn slugify_collapses_significant_chars_preserving_case() {
+        // whitespace / `/` / `:` / `#` → `-`, runs collapsed, case preserved.
+        assert_eq!(slugify("Pipeline Stages"), "Pipeline-Stages");
+        assert_eq!(slugify("a  b"), "a-b");
+        assert_eq!(slugify("a:/#b"), "a-b");
+        assert_eq!(slugify("Core/Sub"), "Core-Sub");
     }
 
-    #[test]
-    fn test_split_three_arms() {
-        assert_eq!(split_alternation("a|b|c"), vec!["a", "b", "c"]);
-    }
-
-    #[test]
-    fn test_split_no_alternation() {
-        assert_eq!(split_alternation("foobar"), vec!["foobar"]);
-    }
-
-    #[test]
-    fn test_split_escaped_pipe() {
-        assert_eq!(split_alternation(r"foo\|bar"), vec![r"foo\|bar"]);
-    }
-
-    // ─── One-atom rendering helpers ─────────────────────────────────────
-
-    /// Build a `Symbol`-classified `GrepHit`. `src` is the verbatim source
-    /// line — the atom the renderer prints (`--only-matching` is dropped).
-    fn sym_hit(file: &str, line: u32, name: &str, kind: &str, src: &str) -> GrepHit {
-        GrepHit {
-            file: PathBuf::from(file),
-            line,
-            col: 0,
-            matched_text: src.to_string(),
-            classification: HitClass::Symbol {
-                symbol: Symbol {
-                    name: name.to_string(),
-                    kind: kind.to_string(),
-                    line,
-                    end_line: line + 10,
-                    scope: None,
-                    scope_kind: None,
-                    deprecated: false,
-                },
-            },
-        }
-    }
-
-    /// Build a `Reference`-classified `GrepHit` carrying its full source line.
-    fn ref_hit(file: &str, line: u32, src: &str) -> GrepHit {
-        GrepHit {
-            file: PathBuf::from(file),
-            line,
-            col: 0,
-            matched_text: src.to_string(),
-            classification: HitClass::Reference,
-        }
-    }
+    // ─── scope_trail + line-format helpers ─────────────────────────────────
 
     fn test_fs(root: &str) -> FilesystemManager {
         let fs = FilesystemManager::new();
@@ -2075,731 +977,193 @@ mod tests {
         fs
     }
 
-    fn empty_enrichment() -> SymbolEnrichment {
-        SymbolEnrichment {
-            ref_lines: HashSet::new(),
-            incoming_calls: Vec::new(),
-            outgoing_calls: Vec::new(),
-            implementations: Vec::new(),
-            supertypes: Vec::new(),
-            subtypes: Vec::new(),
+    /// Build a `Symbol` spanning `[line, end_line]` with the given name.
+    fn sym(name: &str, line: u32, end_line: u32) -> Symbol {
+        Symbol {
+            name: name.to_string(),
+            kind: "function".to_string(),
+            line,
+            end_line,
+            scope: None,
+            scope_kind: None,
+            deprecated: false,
         }
     }
 
-    // ─── Rendering ──────────────────────────────────────────────────────
-
-    /// Helper: render with no enrichment.
-    fn render(hits: &[GrepHit], fs: &FilesystemManager) -> String {
-        let enrichments: Vec<(&GrepHit, Option<SymbolEnrichment>)> =
-            hits.iter().map(|h| (h, None)).collect();
-        render_results(&enrichments, fs, None)
+    /// Build a `GrepHit` with an explicit anchor and verbatim line.
+    fn hit(file: &str, line: u32, text: &str, anchor: Anchor) -> GrepHit {
+        GrepHit {
+            file: PathBuf::from(file),
+            line,
+            matched_text: text.to_string(),
+            anchor,
+        }
     }
 
     #[test]
-    fn atom_is_the_full_source_line_no_kind() {
-        let fs = test_fs("/project");
-        // A mid-line comment match: the atom is the FULL line, not the token,
-        // and carries no `<Kind>` label.
-        let hits = [ref_hit(
-            "/project/src/a.rs",
-            9,
-            "let x = 1; // configure the widget",
-        )];
-
-        let output = render(&hits, &fs);
-
-        assert!(
-            output.contains("src/a.rs:10  let x = 1; // configure the widget"),
-            "full line atom, 1-based: {output}"
-        );
-        assert!(!output.contains('<'), "no kind label anywhere: {output}");
+    fn scope_trail_definition_drops_own_leaf() {
+        // `foo` is defined at line 20 inside `impl Bar` (lines 18..=30). The hit
+        // is foo's own name line, so its leaf is dropped — the trail is just the
+        // container.
+        let symbols = vec![sym("Bar", 18, 30), sym("foo", 20, 25)];
+        assert_eq!(scope_trail(&symbols, 20), vec!["Bar".to_string()]);
     }
 
     #[test]
-    fn definitions_and_references_are_both_top_level_atoms() {
-        let fs = test_fs("/project");
-        // A definition-like hit and a plain occurrence — both top-level atoms.
-        let hits = [
-            sym_hit(
-                "/project/data/config.yaml",
-                15,
-                "handle",
-                "function",
-                "handle: process",
-            ),
-            ref_hit("/project/src/util.rs", 30, "    handle(input);"),
-        ];
-
-        let output = render(&hits, &fs);
-
-        assert!(
-            output.contains("config.yaml:16  handle: process"),
-            "definition atom present: {output}"
-        );
-        assert!(
-            output.contains("util.rs:31      handle(input);")
-                || output.contains("util.rs:31  ") && output.contains("handle(input);"),
-            "occurrence atom not dropped: {output}"
-        );
-        assert!(!output.contains('<'), "no kind label: {output}");
-    }
-
-    #[test]
-    fn plain_references_render_full_lines() {
-        let fs = test_fs("/project");
-        let hits = [
-            ref_hit("/project/data/notes.txt", 5, "see the pattern below"),
-            ref_hit("/project/src/main.rs", 100, "    let pattern = compile();"),
-        ];
-
-        let output = render(&hits, &fs);
-
-        // Both atoms rendered with 1-based lines and their full source text.
-        assert!(
-            output.contains("notes.txt:6  see the pattern below"),
-            "bare ref atom: {output}"
-        );
-        assert!(
-            output.contains("main.rs:101  ") && output.contains("let pattern = compile();"),
-            "second ref atom: {output}"
-        );
-    }
-
-    #[test]
-    fn citation_to_reference_atom_is_not_blank() {
-        // Repro for bug 48 empty-raw `refs` lines.
-        //
-        // When an edge (here a `refs:` entry) points at a (file, line) that is
-        // ALSO a top-level match atom, the renderer collapses it to a citation
-        // `path:line  name` instead of re-reading the source. But citation names
-        // come from `collect_atom_names`, which only records
-        // Symbol/PrepareRenameSymbol atoms — a plain Reference occurrence has no
-        // name. The result is a citation with an EMPTY raw field:
-        // `\t\tpath:line  ` with nothing after it. Decision 024 / bug 31: an
-        // atom must never render blank — the renderer already HAS the cited
-        // atom's full source line (it is a top-level match), so a citation can
-        // and must surface it.
-        let fs = test_fs("/project");
-
-        // The enriched definition.
-        let def = sym_hit(
-            "/project/src/feeder.rs",
-            78,
-            "DiagnosticFeeder",
-            "trait",
-            "pub trait DiagnosticFeeder {",
-        );
-        // A plain textual occurrence that is ALSO a reference target of `def`.
-        let user = ref_hit(
-            "/project/src/user.rs",
-            11,
-            "use crate::bridge::linter::DiagnosticFeeder;",
-        );
-
-        // Enrichment: references include the occurrence's atom (0-based line).
-        let enrichment = SymbolEnrichment {
-            ref_lines: HashSet::from([AtomId::new("/project/src/user.rs", 11)]),
-            ..empty_enrichment()
-        };
-
-        let enrichments: Vec<(&GrepHit, Option<SymbolEnrichment>)> =
-            vec![(&def, Some(enrichment)), (&user, None)];
-        let output = render_results(&enrichments, &fs, None);
-
-        // The `refs:` citation is the DOUBLE-TAB-indented line under the def
-        // (`\t\tsrc/user.rs:12  …`) — distinct from the top-level atom for the
-        // same occurrence (rendered with no indent). Currently it renders blank
-        // (`\t\tsrc/user.rs:12  ` with nothing after) because a Reference atom
-        // has no citation name. The renderer already knows the cited atom's full
-        // source line, so the citation must surface it.
-        let citation = output
-            .lines()
-            .find(|l| l.starts_with("\t\tsrc/user.rs:12"))
-            .expect("refs block must cite src/user.rs:12");
-        let raw = citation
-            .trim_start_matches('\t')
-            .trim_start_matches("src/user.rs:12")
-            .trim();
-        assert!(
-            !raw.is_empty(),
-            "citation to a top-level reference atom must surface its known source \
-             line, never an empty raw field (bug 48); got blank citation: \
-             {citation:?}"
-        );
-    }
-
-    // ─── Path headers ─────────────────────────────────────────────────
-
-    #[test]
-    fn grep_bare_path_headers() {
-        let fs = test_fs("/project");
-        let hits = [sym_hit(
-            "/project/src/handler.rs",
-            100,
-            "handle_grep",
-            "function",
-            "fn handle_grep() {",
-        )];
-
-        let output = render(&hits, &fs);
-
-        assert!(
-            !output.contains("Root:"),
-            "should not contain Root: prefix: {output}"
-        );
-        assert!(
-            !output.contains("OutOfRoots:"),
-            "should not contain OutOfRoots: prefix: {output}"
-        );
-        assert!(
-            output.contains("/project"),
-            "should contain bare absolute path: {output}"
-        );
-    }
-
-    #[test]
-    fn grep_out_of_root_hits() {
-        let fs = test_fs("/project");
-        let hits = [sym_hit(
-            "/other/path/file.rs",
-            10,
-            "orphan_fn",
-            "function",
-            "fn orphan_fn() {",
-        )];
-
-        let output = render(&hits, &fs);
-
-        assert!(
-            !output.contains("OutOfRoots:"),
-            "should not contain OutOfRoots: prefix: {output}"
-        );
-        assert!(
-            output.contains("/other/path"),
-            "should contain parent directory path: {output}"
-        );
-    }
-
-    #[test]
-    fn grep_out_of_root_grouped_by_parent() {
-        let fs = test_fs("/project");
-        let hits = [
-            sym_hit("/other/path/a.rs", 10, "fn_a", "function", "fn fn_a() {"),
-            sym_hit("/other/path/b.rs", 20, "fn_b", "function", "fn fn_b() {"),
-        ];
-
-        let output = render(&hits, &fs);
-
-        // Both grouped under one /other/path header, not two
-        let header_count = output.matches("/other/path\n").count();
+    fn scope_trail_usage_keeps_innermost() {
+        // A usage at line 22 inside foo inside Bar — both kept, outermost first.
+        let symbols = vec![sym("Bar", 18, 30), sym("foo", 20, 25)];
         assert_eq!(
-            header_count, 1,
-            "expected one /other/path header, got {header_count} in:\n{output}"
+            scope_trail(&symbols, 22),
+            vec!["Bar".to_string(), "foo".to_string()]
         );
     }
 
-    // ─── Enrichment rendering ─────────────────────────────────────────
+    #[test]
+    fn scope_trail_top_level_is_empty() {
+        // A top-level definition (its own line) with no enclosing symbol → empty.
+        let symbols = vec![sym("foo", 5, 9)];
+        assert!(scope_trail(&symbols, 5).is_empty());
+        // A line outside every symbol → empty.
+        assert!(scope_trail(&symbols, 99).is_empty());
+    }
 
     #[test]
-    fn render_enriched_calls_only() {
+    fn scope_trail_slugifies_and_orders_outermost_first() {
+        // A markdown-style heading name slugifies; nesting joins outermost→inner.
+        let symbols = vec![sym("Core", 0, 40), sym("Pipeline Stages", 10, 30)];
+        assert_eq!(
+            scope_trail(&symbols, 14),
+            vec!["Core".to_string(), "Pipeline-Stages".to_string()]
+        );
+    }
+
+    // ─── line format ───────────────────────────────────────────────────────
+
+    #[test]
+    fn render_top_level_hit_has_no_anchor() {
+        // Enriched but genuinely top-level → a pure ripgrep line, no `#`.
         let fs = test_fs("/project");
-        let hit = sym_hit(
+        let hits = [hit("/project/src/a.rs", 9, "fn run() {", Anchor::TopLevel)];
+        assert_eq!(render_results(&hits, &fs, None), "src/a.rs:10:fn run() {");
+    }
+
+    #[test]
+    fn render_scope_anchor_shoved_between_line_and_delimiter() {
+        // `#scope` carries no whitespace, sits against `path:line`, then the
+        // ripgrep `:` delimiter, then the byte-verbatim line.
+        let fs = test_fs("/project");
+        let hits = [hit(
             "/project/src/lib.rs",
-            10,
-            "MyStruct",
-            "struct",
-            "struct MyStruct {",
+            58,
+            "    foo()",
+            Anchor::Scope("A/B/run".to_string()),
+        )];
+        assert_eq!(
+            render_results(&hits, &fs, None),
+            "src/lib.rs:59#A/B/run:    foo()"
         );
-        let mut enrichment = empty_enrichment();
-        enrichment.outgoing_calls.push(Edge {
-            name: "helper".to_string(),
-            target: AtomId::new("/project/src/util.rs", 5),
-        });
-
-        let enrichments = vec![(&hit, Some(enrichment))];
-        let full = render_results(&enrichments, &fs, None);
-
-        // Top-level atom = the full source line, no `<Kind>`.
-        assert!(
-            full.starts_with("/project\nsrc/lib.rs:11  struct MyStruct {\n"),
-            "definition atom directly under root header: {full:?}"
-        );
-        assert!(full.contains("\tcalls:\n"), "calls header: {full}");
-        // The call target is not a top-level match and its source line is
-        // unavailable (no real file) → falls back to the edge name, 1-based.
-        assert!(
-            full.contains("\t\tsrc/util.rs:6  helper"),
-            "call edge atom (citation/name fallback): {full}"
-        );
-        assert!(!full.contains('<'), "no kind label anywhere: {full}");
     }
 
     #[test]
-    fn render_enriched_impls_only() {
+    fn render_unknown_anchor_is_question_mark() {
+        // Could-not-enrich → `#?`, a distinct marker (never misread as top-level).
         let fs = test_fs("/project");
-        let hit = sym_hit(
-            "/project/src/lib.rs",
-            10,
-            "MyTrait",
-            "interface",
-            "trait MyTrait {",
-        );
-        let mut enrichment = empty_enrichment();
-        enrichment
-            .implementations
-            .push(AtomId::new("/project/src/impl.rs", 30));
-
-        let enrichments = vec![(&hit, Some(enrichment))];
-        let full = render_results(&enrichments, &fs, None);
-
-        assert!(full.contains("\timpls:\n"), "impls header: {full}");
-        // Impl target is not a match and has no readable line → bare atom.
-        assert!(
-            full.contains("\t\tsrc/impl.rs:31"),
-            "impl edge atom 1-based: {full}"
-        );
+        let hits = [hit("/project/x.rs", 4, "some text", Anchor::Unknown)];
+        assert_eq!(render_results(&hits, &fs, None), "x.rs:5#?:some text");
     }
 
     #[test]
-    fn render_enriched_supertypes_only() {
+    fn render_strips_to_byte_exact_ripgrep() {
+        // Removing the `#…` fragment (from `#` to the next `:`) yields
+        // `path:line:text` — the superset contract, for every anchor variant.
         let fs = test_fs("/project");
-        let hit = sym_hit(
-            "/project/src/lib.rs",
-            10,
-            "MyStruct",
-            "struct",
-            "struct MyStruct {",
-        );
-        let mut enrichment = empty_enrichment();
-        enrichment.supertypes.push(Edge {
-            name: "BaseTrait".to_string(),
-            target: AtomId::new("/project/src/traits.rs", 20),
-        });
-
-        let enrichments = vec![(&hit, Some(enrichment))];
-        let full = render_results(&enrichments, &fs, None);
-
-        assert!(
-            full.contains("\tsupertypes:\n"),
-            "supertypes header: {full}"
-        );
-        assert!(
-            full.contains("\t\tsrc/traits.rs:21  BaseTrait"),
-            "supertype edge atom: {full}"
-        );
-        assert!(!full.contains('<'), "no kind label: {full}");
+        for anchor in [
+            Anchor::Scope("Outer".to_string()),
+            Anchor::Unknown,
+            Anchor::TopLevel,
+        ] {
+            let line = render_results(&[hit("/project/a.rs", 0, "code", anchor)], &fs, None);
+            let stripped = line.find('#').map_or_else(
+                || line.clone(),
+                |hash| {
+                    let colon = line[hash..].find(':').expect("delimiter after fragment") + hash;
+                    format!("{}{}", &line[..hash], &line[colon..])
+                },
+            );
+            assert_eq!(stripped, "a.rs:1:code", "strip of {line:?}");
+        }
     }
 
     #[test]
-    fn render_enriched_subtypes_only() {
-        let fs = test_fs("/project");
-        let hit = sym_hit(
-            "/project/src/lib.rs",
-            10,
-            "MyTrait",
-            "interface",
-            "trait MyTrait {",
-        );
-        let mut enrichment = empty_enrichment();
-        enrichment.subtypes.push(Edge {
-            name: "SubStruct".to_string(),
-            target: AtomId::new("/project/src/sub.rs", 15),
-        });
-
-        let enrichments = vec![(&hit, Some(enrichment))];
-        let full = render_results(&enrichments, &fs, None);
-
-        assert!(full.contains("\tsubtypes:\n"), "subtypes header: {full}");
-        assert!(
-            full.contains("\t\tsrc/sub.rs:16  SubStruct"),
-            "subtype edge atom: {full}"
-        );
-    }
-
-    #[test]
-    fn render_enriched_refs_from_ref_lines_only() {
-        let fs = test_fs("/project");
-        let hit = sym_hit(
-            "/project/src/lib.rs",
-            10,
-            "MyStruct",
-            "struct",
-            "struct MyStruct {",
-        );
-        let mut enrichment = empty_enrichment();
-        enrichment
-            .ref_lines
-            .insert(AtomId::new("/project/src/main.rs", 20));
-
-        let enrichments = vec![(&hit, Some(enrichment))];
-        let full = render_results(&enrichments, &fs, None);
-
-        assert!(full.contains("\trefs:\n"), "refs header: {full}");
-        assert!(
-            full.contains("\t\tsrc/main.rs:21"),
-            "ref edge atom 1-based: {full}"
-        );
-    }
-
-    #[test]
-    fn render_enriched_refs_from_incoming_calls_only() {
-        let fs = test_fs("/project");
-        let hit = sym_hit(
-            "/project/src/lib.rs",
-            10,
-            "MyStruct",
-            "struct",
-            "struct MyStruct {",
-        );
-        let mut enrichment = empty_enrichment();
-        enrichment.incoming_calls.push(Edge {
-            name: "caller_fn".to_string(),
-            target: AtomId::new("/project/src/caller.rs", 50),
-        });
-
-        let enrichments = vec![(&hit, Some(enrichment))];
-        let full = render_results(&enrichments, &fs, None);
-
-        assert!(full.contains("\trefs:\n"), "refs header: {full}");
-        // Incoming caller is not a top-level match; no readable line → name.
-        assert!(
-            full.contains("\t\tsrc/caller.rs:51  caller_fn"),
-            "incoming call edge atom: {full}"
-        );
-    }
-
-    #[test]
-    fn render_edge_to_matched_symbol_collapses_to_citation() {
-        // A→B where B is also a top-level match: the edge to B collapses to a
-        // `path:line  name` citation (the full line is B's own atom), and B's
-        // standalone atom is rendered full. Cycles fall out the same way.
-        let fs = test_fs("/project");
-        let hit_a = sym_hit("/project/src/lib.rs", 10, "FnA", "function", "fn FnA() {");
-        let mut enrichment_a = empty_enrichment();
-        enrichment_a.outgoing_calls.push(Edge {
-            name: "FnB".to_string(),
-            target: AtomId::new("/project/src/util.rs", 20),
-        });
-        // B at the cited location, a top-level match in its own right.
-        let hit_b = sym_hit("/project/src/util.rs", 20, "FnB", "function", "fn FnB() {");
-
-        let enrichments = vec![(&hit_a, Some(enrichment_a)), (&hit_b, None)];
-        let full = render_results(&enrichments, &fs, None);
-
-        // A's atom is full, with a calls: group.
-        assert!(
-            full.contains("src/lib.rs:11  fn FnA() {"),
-            "FnA atom full: {full}"
-        );
-        assert!(full.contains("\tcalls:\n"), "calls section: {full}");
-        // The edge to B collapses to a citation (its name), NOT its full line.
-        assert!(
-            full.contains("\t\tsrc/util.rs:21  FnB"),
-            "edge to matched B is a citation: {full}"
-        );
-        // B is ALSO a top-level atom, rendered full elsewhere.
-        assert!(
-            full.contains("src/util.rs:21  fn FnB() {"),
-            "FnB still rendered full at top level: {full}"
-        );
-    }
-
-    #[test]
-    fn citation_and_full_atom_both_present_in_result() {
-        // Decision 024 invariant: when a definition's edge cites another
-        // top-level match, the edge collapses to a `path:line  name` citation
-        // AND that target is still rendered full elsewhere in the result —
-        // nothing is withheld. (Previously this also exercised cross-page
-        // resolution; with paging retired the whole result is one stream, so the
-        // invariant is simply that both forms are present.)
-        let fs = test_fs("/project");
-        let hit_a = sym_hit("/project/a.rs", 0, "FnA", "function", "fn FnA() {");
-        let mut enrichment_a = empty_enrichment();
-        enrichment_a.outgoing_calls.push(Edge {
-            name: "FnB".to_string(),
-            target: AtomId::new("/project/b.rs", 0),
-        });
-        let hit_b = sym_hit("/project/b.rs", 0, "FnB", "function", "fn FnB() {");
-
-        let enrichments = vec![(&hit_a, Some(enrichment_a)), (&hit_b, None)];
-        let full = render_results(&enrichments, &fs, None);
-
-        // The full result holds BOTH the citation and B's full atom.
-        assert!(full.contains("b.rs:1  FnB"), "citation present: {full}");
-        assert!(
-            full.contains("b.rs:1  fn FnB() {"),
-            "B full atom present: {full}"
-        );
-    }
-
-    #[test]
-    fn render_multiple_roots_separated_by_blank_line() {
-        let fs = FilesystemManager::new();
-        fs.set_roots(vec![PathBuf::from("/project1"), PathBuf::from("/project2")]);
-        let hits = [
-            sym_hit("/project1/src/a.rs", 5, "fn_a", "function", "fn fn_a() {"),
-            sym_hit("/project2/src/b.rs", 15, "fn_b", "function", "fn fn_b() {"),
-        ];
-
-        let enrichments: Vec<(&GrepHit, Option<SymbolEnrichment>)> =
-            hits.iter().map(|h| (h, None)).collect();
-        let full = render_results(&enrichments, &fs, None);
-
-        assert!(!full.starts_with('\n'), "no leading newline: {full:?}");
-        assert!(full.contains("/project1\n"), "first root header: {full}");
-        assert!(full.contains("/project2\n"), "second root header: {full}");
-        assert!(
-            full.contains("\n\n/project2"),
-            "blank line between root sections: {full:?}"
-        );
-    }
-
-    #[test]
-    fn render_oor_sections_separated_by_blank_line() {
+    fn render_orders_by_file_then_line() {
         let fs = test_fs("/project");
         let hits = [
-            sym_hit("/other/dir1/a.rs", 5, "fn_a", "function", "fn fn_a() {"),
-            sym_hit("/other/dir2/b.rs", 15, "fn_b", "function", "fn fn_b() {"),
+            hit("/project/src/b.rs", 4, "b4", Anchor::TopLevel),
+            hit("/project/src/a.rs", 9, "a9", Anchor::TopLevel),
+            hit("/project/src/a.rs", 2, "a2", Anchor::Unknown),
         ];
-
-        let enrichments: Vec<(&GrepHit, Option<SymbolEnrichment>)> =
-            hits.iter().map(|h| (h, None)).collect();
-        let full = render_results(&enrichments, &fs, None);
-
-        assert!(full.contains("/other/dir1\n"), "first oor parent: {full}");
-        assert!(full.contains("/other/dir2\n"), "second oor parent: {full}");
-        assert!(
-            full.contains("\n\n/other/dir2"),
-            "blank line between oor sections: {full:?}"
-        );
-    }
-
-    #[test]
-    fn render_results_cwd_relative_paths_and_header() {
-        let fs = test_fs("/project");
-        let hit = sym_hit(
-            "/project/src/lib.rs",
-            10,
-            "MyStruct",
-            "struct",
-            "struct MyStruct {",
-        );
-        let enrichments: Vec<(&GrepHit, Option<SymbolEnrichment>)> = vec![(&hit, None)];
-        let full = render_results(&enrichments, &fs, Some(Path::new("/project")));
-
-        // cwd header present with the path (inside a root: no LSP warning).
-        assert!(
-            full.starts_with("cwd: /project\n"),
-            "cwd header should be first line: {full:?}"
-        );
-        // Relative path used (no root grouping header)
-        assert!(
-            full.contains("src/lib.rs:11  struct MyStruct {"),
-            "path should be cwd-relative, atom is the full line: {full}"
-        );
-        // No root grouping header — cwd mode uses a single flat section.
-        assert!(
-            !full.lines().any(|l| l == "/project"),
-            "should not have standalone root header in cwd mode: {full}"
-        );
-    }
-
-    #[test]
-    fn name_embedding_server_has_no_double_prefix() {
-        // A name-embedding server (lattice) emits headings whose source line is
-        // already clean (`# Title`). With no `<Kind>` rendered there is nothing
-        // to double-prefix (bug 29 symptom gone).
-        let fs = test_fs("/project");
-        let hit = sym_hit("/project/doc.md", 0, "H1: Title", "class", "# Title");
-        let enrichments: Vec<(&GrepHit, Option<SymbolEnrichment>)> = vec![(&hit, None)];
-        let full = render_results(&enrichments, &fs, None);
-
-        assert!(
-            full.contains("doc.md:1  # Title"),
-            "heading atom is the clean source line: {full}"
-        );
-        assert!(!full.contains('<'), "no kind label: {full}");
-        assert!(
-            !full.contains("H1: H1:") && !full.contains("Class"),
-            "no double prefix / class label: {full}"
+        assert_eq!(
+            render_results(&hits, &fs, None),
+            "src/a.rs:3#?:a2\nsrc/a.rs:10:a9\nsrc/b.rs:5:b4"
         );
     }
 
     #[test]
     fn render_is_byte_stable_across_runs() {
-        // BTreeMap `(file, line)` ordering → reproducible bytes (decision 012).
+        // `(file, line)` ordering → reproducible bytes (the misc-32 pattern).
         let fs = test_fs("/project");
         let hits = [
-            sym_hit("/project/src/b.rs", 4, "fn_b", "function", "fn fn_b() {"),
-            sym_hit("/project/src/a.rs", 9, "fn_a", "function", "fn fn_a() {"),
-            ref_hit("/project/src/a.rs", 2, "    // fn_a usage"),
+            hit("/project/src/b.rs", 4, "fn fn_b() {", Anchor::TopLevel),
+            hit("/project/src/a.rs", 9, "fn fn_a() {", Anchor::TopLevel),
+            hit("/project/src/a.rs", 2, "// fn_a usage", Anchor::TopLevel),
         ];
-        let enrichments: Vec<(&GrepHit, Option<SymbolEnrichment>)> =
-            hits.iter().map(|h| (h, None)).collect();
-        let a = render_results(&enrichments, &fs, None);
-        let b = render_results(&enrichments, &fs, None);
-        assert_eq!(a, b, "render must be byte-stable across runs");
-        // a.rs:3 (line 2) sorts before a.rs:10 (line 9), both before b.rs.
-        let a3 = a.find("a.rs:3").expect("a.rs:3 present");
-        let a10 = a.find("a.rs:10").expect("a.rs:10 present");
-        let b5 = a.find("b.rs:5").expect("b.rs:5 present");
-        assert!(a3 < a10 && a10 < b5, "atoms ordered by (file, line): {a}");
-    }
-
-    // ─── extract_location_path ──────────────────────────────────────────
-
-    #[test]
-    fn extract_location_path_valid() {
-        let loc = serde_json::json!({
-            "uri": "file:///home/user/project/src/main.rs",
-            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 5}}
-        });
         assert_eq!(
-            extract_location_path(&loc),
-            Some("/home/user/project/src/main.rs".to_string())
+            render_results(&hits, &fs, None),
+            render_results(&hits, &fs, None)
         );
     }
 
     #[test]
-    fn extract_location_path_non_file_uri() {
-        let loc = serde_json::json!({"uri": "untitled:Untitled-1"});
-        assert_eq!(extract_location_path(&loc), None);
+    fn render_cwd_relative_no_header() {
+        // cwd-scoped: cwd-relative path, NO `cwd:` header, NO root header.
+        let fs = test_fs("/project");
+        let hits = [hit(
+            "/project/src/lib.rs",
+            10,
+            "struct MyStruct {",
+            Anchor::Scope("mod_x".to_string()),
+        )];
+        let out = render_results(&hits, &fs, Some(Path::new("/project")));
+        assert_eq!(out, "src/lib.rs:11#mod_x:struct MyStruct {");
+        assert!(!out.contains("cwd:"), "no cwd header: {out}");
     }
 
     #[test]
-    fn extract_location_path_missing_uri() {
-        let loc = serde_json::json!({"range": {"start": {"line": 0}}});
-        assert_eq!(extract_location_path(&loc), None);
-    }
-
-    #[test]
-    fn extract_location_path_location_link_target_uri() {
-        // rust-analyzer answers `linkSupport:true` requests with
-        // `LocationLink[]`: `targetUri`/`targetRange`/`targetSelectionRange`,
-        // and no `uri`/`range`. The extractor must fall back to `targetUri`.
-        let link = serde_json::json!({
-            "targetUri": "file:///home/user/project/src/animals.rs",
-            "targetRange": {
-                "start": {"line": 37, "character": 0},
-                "end": {"line": 41, "character": 1}
-            },
-            "targetSelectionRange": {
-                "start": {"line": 37, "character": 5},
-                "end": {"line": 37, "character": 8}
-            }
-        });
+    fn render_verbatim_preserves_indentation_with_no_padding() {
+        // The raw floats — indentation intact, no padding added.
+        let fs = test_fs("/project");
+        let hits = [hit(
+            "/project/a.rs",
+            0,
+            "        deeply_indented();",
+            Anchor::TopLevel,
+        )];
         assert_eq!(
-            extract_location_path(&link),
-            Some("/home/user/project/src/animals.rs".to_string())
+            render_results(&hits, &fs, None),
+            "a.rs:1:        deeply_indented();"
         );
     }
 
-    // ─── extract_start_line ─────────────────────────────────────────────
-
     #[test]
-    fn extract_start_line_valid() {
-        let loc = serde_json::json!({
-            "range": {"start": {"line": 42, "character": 0}, "end": {"line": 50, "character": 0}}
-        });
-        assert_eq!(extract_start_line(&loc), Some(42));
-    }
-
-    #[test]
-    fn extract_start_line_zero() {
-        let loc = serde_json::json!({
-            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 5}}
-        });
-        assert_eq!(extract_start_line(&loc), Some(0));
-    }
-
-    #[test]
-    fn extract_start_line_missing_range() {
-        let loc = serde_json::json!({"uri": "file:///foo.rs"});
-        assert_eq!(extract_start_line(&loc), None);
-    }
-
-    #[test]
-    fn extract_start_line_location_link_uses_selection_range() {
-        // For a `LocationLink` the line must come from
-        // `targetSelectionRange.start` (the name/declaration position),
-        // not `targetRange.start` (the whole-item span). Here they differ
-        // so the assertion pins the selection range.
-        let link = serde_json::json!({
-            "targetUri": "file:///foo.rs",
-            "targetRange": {
-                "start": {"line": 37, "character": 0},
-                "end": {"line": 41, "character": 1}
-            },
-            "targetSelectionRange": {
-                "start": {"line": 49, "character": 5},
-                "end": {"line": 49, "character": 8}
-            }
-        });
-        assert_eq!(extract_start_line(&link), Some(49));
-    }
-
-    #[test]
-    fn extract_start_line_location_link_falls_back_to_target_range() {
-        // A `LocationLink` without `targetSelectionRange` falls back to
-        // `targetRange.start`.
-        let link = serde_json::json!({
-            "targetUri": "file:///foo.rs",
-            "targetRange": {
-                "start": {"line": 37, "character": 0},
-                "end": {"line": 41, "character": 1}
-            }
-        });
-        assert_eq!(extract_start_line(&link), Some(37));
-    }
-
-    // ─── extract_edge (one extractor for call- and type-hierarchy items) ──
-
-    #[test]
-    fn extract_edge_from_call_hierarchy_item() {
-        let item = serde_json::json!({
-            "name": "my_function",
-            "kind": 12,
-            "detail": "MyModule",
-            "uri": "file:///project/src/lib.rs",
-            "range": {"start": {"line": 10, "character": 4}, "end": {"line": 20, "character": 1}}
-        });
-        let edge = extract_edge(&item).expect("should parse call edge");
-        assert_eq!(edge.name, "my_function");
-        assert_eq!(edge.target.file, "/project/src/lib.rs");
-        assert_eq!(edge.target.line, 10);
-    }
-
-    #[test]
-    fn extract_edge_from_type_hierarchy_item() {
-        let item = serde_json::json!({
-            "name": "MyTrait",
-            "kind": 11,
-            "detail": "my_crate",
-            "uri": "file:///project/src/traits.rs",
-            "range": {"start": {"line": 20, "character": 0}, "end": {"line": 30, "character": 1}}
-        });
-        let edge = extract_edge(&item).expect("should parse type edge");
-        assert_eq!(edge.name, "MyTrait");
-        assert_eq!(edge.target.file, "/project/src/traits.rs");
-        assert_eq!(edge.target.line, 20);
-    }
-
-    #[test]
-    fn extract_edge_missing_name() {
-        let item = serde_json::json!({
-            "uri": "file:///project/src/lib.rs",
-            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 5}}
-        });
-        assert!(extract_edge(&item).is_none());
-    }
-
-    #[test]
-    fn extract_edge_missing_uri() {
-        let item = serde_json::json!({
-            "name": "no_uri",
-            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 5}}
-        });
-        assert!(extract_edge(&item).is_none());
+    fn name_embedding_server_heading_is_clean_source_line() {
+        // A markdown heading hit: the verbatim raw is the clean source line,
+        // with no kind label.
+        let fs = test_fs("/project");
+        let hits = [hit("/project/doc.md", 0, "# Title", Anchor::TopLevel)];
+        let out = render_results(&hits, &fs, None);
+        assert_eq!(out, "doc.md:1:# Title");
+        assert!(!out.contains('<'), "no kind label: {out}");
     }
 
     // ─── CollectOnDrop ──────────────────────────────────────────────────

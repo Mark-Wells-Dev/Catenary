@@ -1099,19 +1099,24 @@ pub fn rewrite_advancing_mtime(path: &Path, content: &str) -> Result<()> {
     }
 }
 
-/// Retries an enriched grep until its output contains the `calls:` enrichment
-/// signal, then returns that output. The enrichment-present output *is* the
-/// readiness signal for the (re-)spawned server + its `--scan-roots` index — a
+/// Retries an enriched grep until its output carries a `#scope` containment
+/// anchor — a `#` that is not the `#?` degradation marker — on some hit line,
+/// then returns that output. A real scope anchor *is* the readiness signal for
+/// the (re-)spawned server + its `--scan-roots` `documentSymbol` index: a
 /// contention-resistant replacement for `sleep(N) + grep-once` (which guesses
 /// the server is ready and races a cold grep against server readiness under
 /// load). Polls on the generous [`POLL_BACKSTOP`]; if the deadline passes the
-/// last (un-enriched) output is returned so the caller's `calls:` precondition
-/// fails loudly rather than hanging.
+/// last (un-enriched) output is returned so the caller's precondition fails
+/// loudly rather than hanging.
 pub fn grep_until_enriched(bridge: &BridgeProcess, args: &Value) -> Result<String> {
     let deadline = std::time::Instant::now() + POLL_BACKSTOP;
     loop {
         let out = bridge.call_tool_text("grep", args)?;
-        if out.contains("calls:") || std::time::Instant::now() >= deadline {
+        // A hit inside a named scope renders `path:line#scope:raw`; `#?` is the
+        // un-enrichable marker. A line carrying a `#` that is not `#?` proves the
+        // server answered `documentSymbol` and the index is warm.
+        let scoped = out.lines().any(|l| l.contains('#') && !l.contains("#?"));
+        if scoped || std::time::Instant::now() >= deadline {
             return Ok(out);
         }
         std::thread::sleep(POLL_SPACING);

@@ -1642,12 +1642,16 @@ fn test_grep_no_glob_cwd_scoped() -> Result<()> {
 
     let text = bridge.call_tool_text("grep", &json!({ "pattern": "needle" }))?;
 
-    // No glob → cwd-scoped search with cwd header.
+    // No glob → cwd-scoped search: paths are per-line and cwd-relative (no
+    // `cwd:` header), and a no-LSP scope is flagged per line with `#?`.
     assert!(
-        text.contains("cwd:"),
-        "Grep without glob should have cwd header: {text}"
+        text.contains("hello.txt:1#?:needle in haystack"),
+        "cwd-scoped grep should emit a cwd-relative `#?` line: {text}"
     );
-    assert!(text.contains("needle"), "Should find the match: {text}");
+    assert!(
+        !text.contains("cwd:"),
+        "the `cwd:` header is retired (paths are per-line, cwd-relative): {text}"
+    );
     Ok(())
 }
 
@@ -1761,20 +1765,15 @@ fn test_grep_outside_roots_lsp_warning() -> Result<()> {
         &json!({ "pattern": "shared_needle", "directory": outside.path().to_string_lossy().as_ref() }),
     )?;
 
-    // Should contain the LSP warning.
+    // Degradation is now per-line: an out-of-LSP scope carries the `#?` marker
+    // rather than a `(no LSP)` / `cwd:` header.
     assert!(
-        text.contains("no LSP"),
-        "grep outside roots should show LSP warning: {text}"
+        text.contains("outside.txt:1#?:shared_needle"),
+        "grep outside roots should carry the per-line `#?` marker, cwd-relative: {text}"
     );
-    // Should contain the cwd header.
     assert!(
-        text.contains("cwd:"),
-        "grep outside roots should show cwd header: {text}"
-    );
-    // Should find the match in the outside directory.
-    assert!(
-        text.contains("shared_needle"),
-        "Should find the match outside roots: {text}"
+        !text.contains("cwd:") && !text.contains("no LSP"),
+        "the `cwd:` header and `(no LSP)` label are retired (replaced by `#?`): {text}"
     );
     // Should NOT find the match in the workspace root.
     assert!(
@@ -1906,12 +1905,9 @@ fn dot_grep_cwd_outside_roots_is_labeled() -> Result<()> {
     )?;
 
     assert!(
-        text.contains("no LSP"),
-        "grep outside all roots must carry the loud `(no LSP)` label: {text}"
-    );
-    assert!(
-        text.contains("loose.txt"),
-        "grep must search the literal cwd and find its match: {text}"
+        text.contains("loose.txt:1#?:outside_scope_needle here"),
+        "grep outside all roots must carry the per-line `#?` degradation marker \
+         on its literal-cwd match: {text}"
     );
     assert!(
         !text.contains("in_repo.txt") && !text.contains("in_probe.txt"),

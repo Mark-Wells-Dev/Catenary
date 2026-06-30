@@ -704,7 +704,7 @@ fn test_search_graceful_degradation() -> Result<()> {
     // so the symbol index does not classify it as a definition.
     let text_fn = bridge.call_tool_text("grep", &json!({ "pattern": "fn" }))?;
     assert!(
-        text_fn.contains(&format!("test.{MOCK_LANG_A}:1  fn greet()")),
+        text_fn.contains(&format!("test.{MOCK_LANG_A}:1:fn greet()")),
         "keyword hit should be returned as a reference atom, got: {text_fn}"
     );
 
@@ -1369,8 +1369,10 @@ fn test_symbol_index_finds_methods() -> Result<()> {
     let text = bridge.call_tool_text("grep", &json!({ "pattern": "widget_method" }))?;
 
     // Tree-sitter index should find the method, rendered as its full-line atom.
+    // The method is a nested definition inside `Widget`, so it drops its own leaf
+    // and carries only its container as the `#scope` anchor.
     assert!(
-        text.contains(&format!("widget.{MOCK_LANG_A}:2  fn widget_method")),
+        text.contains(&format!("widget.{MOCK_LANG_A}:2#Widget:fn widget_method")),
         "Expected widget_method full-line atom, got:\n{text}"
     );
     // One-atom format: no `<Kind>` (or any other) angle-bracket labels.
@@ -1567,7 +1569,7 @@ fn test_grep_keyword_hit_returned_as_reference() -> Result<()> {
 
     // The keyword line is returned verbatim, not dropped.
     assert!(
-        text.contains(&format!("kw.{MOCK_LANG_A}:1  struct MyType")),
+        text.contains(&format!("kw.{MOCK_LANG_A}:1:struct MyType")),
         "Expected keyword hit returned as a reference atom, got:\n{text}"
     );
 
@@ -1592,11 +1594,11 @@ fn test_grep_kind_brackets() -> Result<()> {
 
     // Each definition is a full-source-line atom: `relpath:LINE  <source line>`.
     assert!(
-        text.contains(&format!("kinds.{MOCK_LANG_A}:1  fn my_func")),
+        text.contains(&format!("kinds.{MOCK_LANG_A}:1:fn my_func")),
         "Expected full-line atom for my_func, got:\n{text}"
     );
     assert!(
-        text.contains(&format!("kinds.{MOCK_LANG_A}:2  struct MyStruct")),
+        text.contains(&format!("kinds.{MOCK_LANG_A}:2:struct MyStruct")),
         "Expected full-line atom for MyStruct, got:\n{text}"
     );
     // No `<Kind>` (or any other) angle-bracket labels in the one-atom format.
@@ -1608,8 +1610,9 @@ fn test_grep_kind_brackets() -> Result<()> {
     Ok(())
 }
 
-/// Reference hit at a non-definition line renders as its full-line atom —
-/// no enclosing-symbol tag and no enclosing span.
+/// Reference hit at a non-definition line renders as its full-line atom with a
+/// `#scope` containment anchor naming its innermost enclosing symbol (no kind
+/// tag, no enclosing span).
 /// Uses the mock grammar's brace-delimited block syntax: `fn outer { target }`.
 #[test]
 fn test_grep_reference_enclosing() -> Result<()> {
@@ -1626,10 +1629,11 @@ fn test_grep_reference_enclosing() -> Result<()> {
 
     let text = bridge.call_tool_text("grep", &json!({ "pattern": "target" }))?;
 
-    // The occurrence renders as a single full-line atom `relpath:LINE  <line>`.
+    // The occurrence renders as a single full-line atom carrying its enclosing
+    // symbol as the `#scope` anchor: `relpath:LINE#scope:<line>`.
     assert!(
-        text.contains(&format!("enclosing.{MOCK_LANG_A}:2  target")),
-        "Expected full-line atom for the target occurrence, got:\n{text}"
+        text.contains(&format!("enclosing.{MOCK_LANG_A}:2#outer:target")),
+        "Expected full-line atom with #outer scope for the target occurrence, got:\n{text}"
     );
     // No enclosing-symbol kind tag.
     assert!(
@@ -1701,10 +1705,22 @@ fn test_grep_name_grouping() -> Result<()> {
         "Top-level atom should be at column 0, got:\n{text}"
     );
 
-    // The definition renders as a full-line atom.
+    // The definition renders as a full-line atom (top-level def → no `#`).
     assert!(
-        text.contains(&format!("tests/alpha.{MOCK_LANG_A}:1  fn test_alpha {{")),
+        text.contains(&format!("tests/alpha.{MOCK_LANG_A}:1:fn test_alpha {{")),
         "Expected test_alpha definition atom, got:\n{text}"
+    );
+
+    // Usages carry their innermost enclosing symbol as the `#scope` anchor.
+    assert!(
+        text.contains(&format!(
+            "tests/alpha.{MOCK_LANG_A}:2#test_alpha:test_alpha"
+        )),
+        "Expected test_alpha usage with #test_alpha scope, got:\n{text}"
+    );
+    assert!(
+        text.contains(&format!("tests/beta.{MOCK_LANG_A}:2#test_beta:test_alpha")),
+        "Expected test_alpha usage with #test_beta scope, got:\n{text}"
     );
 
     // Directory grouping retained in the relative path.
@@ -1832,7 +1848,7 @@ fn test_grep_narrow_pattern() -> Result<()> {
 
     // Definition is a full-source-line atom: `relpath:LINE  <source line>`.
     assert!(
-        text.contains(&format!("narrow.{MOCK_LANG_A}:1  fn unique_symbol_xyz")),
+        text.contains(&format!("narrow.{MOCK_LANG_A}:1:fn unique_symbol_xyz")),
         "Expected full-line atom for the definition, got:\n{text}"
     );
     // One-atom format: no `<Kind>` angle-bracket labels.
@@ -1863,7 +1879,7 @@ fn test_grep_single_line_structure() -> Result<()> {
 
     // The definition atom carries a single `:LINE` and the full source line.
     assert!(
-        text.contains(&format!("single.{MOCK_LANG_A}:1  fn one_liner")),
+        text.contains(&format!("single.{MOCK_LANG_A}:1:fn one_liner")),
         "Expected single-line atom, got:\n{text}"
     );
     // Single-line: `:1` not `:1-1` (spans are gone).
@@ -2033,7 +2049,7 @@ fn test_enrich_symbol_index_path() -> Result<()> {
     // Symbol index identified the symbol — enrichment runs without prepareRename.
     // The definition renders as a full-line atom with no `<Kind>` label.
     assert!(
-        text.contains(&format!("ts_true.{MOCK_LANG_A}:1  fn my_symbol")),
+        text.contains(&format!("ts_true.{MOCK_LANG_A}:1:fn my_symbol")),
         "Expected my_symbol definition atom, got:\n{text}"
     );
     assert!(
@@ -2060,16 +2076,15 @@ fn test_enrich_prepare_rename_symbol() -> Result<()> {
 
     let text = bridge.call_tool_text("grep", &json!({ "pattern": "enrichable_sym" }))?;
 
-    // prepareRename confirmed symbol, enrichment ran
+    // prepareRename confirmed symbol; the definition and its usage both render
+    // as self-contained `path:line:text` atoms (both top-level → no `#scope`).
     assert!(
-        text.contains("enrichable_sym"),
-        "Expected enrichable_sym in output, got:\n{text}"
+        text.contains(&format!("sym.{MOCK_LANG_A}:1:fn enrichable_sym")),
+        "Expected enrichable_sym definition atom, got:\n{text}"
     );
-    // Enrichment should produce edges (mockls routes implementation to
-    // references, so impls section may absorb refs via dedup).
     assert!(
-        text.contains("impls:") || text.contains("refs:"),
-        "Expected enrichment section, got:\n{text}"
+        text.contains(&format!("sym.{MOCK_LANG_A}:2:enrichable_sym")),
+        "Expected enrichable_sym usage atom, got:\n{text}"
     );
 
     Ok(())
@@ -2097,7 +2112,7 @@ fn test_enrich_prepare_rename_keyword() -> Result<()> {
 
     // The keyword hit is returned verbatim as a reference atom (not dropped).
     assert!(
-        text.contains(&format!("kw.{MOCK_LANG_A}:1  fn my_symbol")),
+        text.contains(&format!("kw.{MOCK_LANG_A}:1:fn my_symbol")),
         "Expected keyword hit returned as a reference atom, got:\n{text}"
     );
 
@@ -2128,11 +2143,11 @@ fn test_keyword_no_grammar_returned_as_reference() -> Result<()> {
 
     // Both keyword hits are returned verbatim, not filtered.
     assert!(
-        text.contains(&format!("kw_filter.{MOCK_LANG_A}:1  just some fn keyword")),
+        text.contains(&format!("kw_filter.{MOCK_LANG_A}:1:just some fn keyword")),
         "Expected line 1 returned as a reference atom, got:\n{text}"
     );
     assert!(
-        text.contains(&format!("kw_filter.{MOCK_LANG_A}:2  another fn here")),
+        text.contains(&format!("kw_filter.{MOCK_LANG_A}:2:another fn here")),
         "Expected line 2 returned as a reference atom, got:\n{text}"
     );
 
@@ -2171,13 +2186,13 @@ fn test_grep_prose_body_text_not_dropped() -> Result<()> {
     // Both body-text matches are returned verbatim (the bug dropped them).
     assert!(
         text.contains(&format!(
-            "notes.{MOCK_LANG_A}:2  first mention of struct in a paragraph"
+            "notes.{MOCK_LANG_A}:2:first mention of struct in a paragraph"
         )),
         "Expected body-text line 2 returned as a reference atom, got:\n{text}"
     );
     assert!(
         text.contains(&format!(
-            "notes.{MOCK_LANG_A}:3  another struct in a list item"
+            "notes.{MOCK_LANG_A}:3:another struct in a list item"
         )),
         "Expected body-text line 3 returned as a reference atom, got:\n{text}"
     );
@@ -2207,16 +2222,15 @@ fn test_enrich_prepare_rename_path() -> Result<()> {
 
     let text = bridge.call_tool_text("grep", &json!({ "pattern": "myTarget" }))?;
 
+    // Both occurrences render as self-contained `path:line:text` atoms
+    // (top-level body text → no `#scope`).
     assert!(
-        text.contains("myTarget"),
-        "Expected myTarget in output, got:\n{text}"
+        text.contains(&format!("pr_enrich.{MOCK_LANG_A}:1:call myTarget here")),
+        "Expected myTarget line 1 atom, got:\n{text}"
     );
-    // Enrichment should run: mockls returns references for myTarget
-    // (all occurrences across documents). At minimum, impls or refs
-    // section should be present.
     assert!(
-        text.contains("impls:") || text.contains("refs:"),
-        "Expected enrichment section on prepareRename path, got:\n{text}"
+        text.contains(&format!("pr_enrich.{MOCK_LANG_A}:2:use myTarget again")),
+        "Expected myTarget line 2 atom, got:\n{text}"
     );
 
     Ok(())
@@ -2242,24 +2256,18 @@ fn test_enrich_deprecated_type_edge() -> Result<()> {
 
     let text = bridge.call_tool_text("grep", &json!({ "pattern": "Shape" }))?;
 
-    // Definition renders as a full-line atom.
+    // Definition renders as a full-line atom (top-level def → no `#`).
     assert!(
-        text.contains(&format!("depr.{MOCK_LANG_A}:1  interface Shape")),
+        text.contains(&format!("depr.{MOCK_LANG_A}:1:interface Shape")),
         "Expected Shape definition atom, got:\n{text}"
     );
-    // A type-hierarchy edge group carries the subtype (mockls may route the
-    // edge through impls/subtypes).
-    assert!(
-        text.contains("subtypes:") || text.contains("impls:"),
-        "Expected a type-hierarchy edge group, got:\n{text}"
-    );
-    // The subtype edge reads its full source line verbatim (no Catenary-added
+    // The subtype line reads its full source verbatim (no Catenary-added
     // deprecation tag — the `@deprecated` text is part of the source).
     assert!(
         text.contains(&format!(
-            "depr.{MOCK_LANG_A}:2  struct OldSquare extends Shape @deprecated"
+            "depr.{MOCK_LANG_A}:2:struct OldSquare extends Shape @deprecated"
         )),
-        "Expected OldSquare subtype edge atom, got:\n{text}"
+        "Expected OldSquare subtype atom, got:\n{text}"
     );
 
     Ok(())
@@ -2286,22 +2294,12 @@ fn test_enrich_outgoing_calls() -> Result<()> {
 
     let text = bridge.call_tool_text("grep", &json!({ "pattern": "main_fn" }))?;
 
-    // Enrichment — outgoing calls visible
+    // The matched definition renders as a self-contained `path:line:text` atom
+    // (top-level def → no `#scope`). The per-hit nav suite no longer fires, so
+    // the callee names are not emitted under the hit.
     assert!(
-        text.contains("main_fn"),
-        "Expected main_fn in output, got:\n{text}"
-    );
-    assert!(
-        text.contains("calls:"),
-        "Expected calls: section for outgoing calls, got:\n{text}"
-    );
-    assert!(
-        text.contains("helper_a"),
-        "Expected helper_a in calls section, got:\n{text}"
-    );
-    assert!(
-        text.contains("helper_b"),
-        "Expected helper_b in calls section, got:\n{text}"
+        text.contains(&format!("out.{MOCK_LANG_A}:3:fn main_fn()")),
+        "Expected main_fn definition atom, got:\n{text}"
     );
 
     Ok(())
@@ -2326,20 +2324,12 @@ fn test_grep_grammar_path_calls() -> Result<()> {
 
     let text = bridge.call_tool_text("grep", &json!({ "pattern": "main_gp" }))?;
 
-    // Definition renders as a full-line atom.
+    // Definition renders as a full-line atom (top-level def → no `#`). The
+    // per-hit nav suite no longer fires, so the callee `helper_gp` is not
+    // emitted under the hit.
     assert!(
-        text.contains(&format!("gpcalls.{MOCK_LANG_A}:2  fn main_gp {{")),
+        text.contains(&format!("gpcalls.{MOCK_LANG_A}:2:fn main_gp {{")),
         "Expected main_gp definition atom, got:\n{text}"
-    );
-    // Enrichment: outgoing calls populated
-    assert!(
-        text.contains("calls:"),
-        "Expected calls: section on grammar path, got:\n{text}"
-    );
-    // helper_gp is not a top-level match, so its call edge reads the full line.
-    assert!(
-        text.contains(&format!("gpcalls.{MOCK_LANG_A}:1  fn helper_gp")),
-        "Expected full-line edge atom for helper_gp, got:\n{text}"
     );
 
     Ok(())
@@ -2371,25 +2361,17 @@ fn test_grep_enriched() -> Result<()> {
         !text.contains("Root: "),
         "Should not contain Root: prefix, got:\n{text}"
     );
-    // Definition renders as a full-line atom.
+    // Definition renders as a full-line atom (top-level def → no `#`). The
+    // per-hit nav suite no longer fires, so the callee `callee_t1` is not
+    // emitted under the hit.
     assert!(
-        text.contains(&format!("enrich.{MOCK_LANG_A}:2  fn caller_t1 {{")),
+        text.contains(&format!("enrich.{MOCK_LANG_A}:2:fn caller_t1 {{")),
         "Expected caller_t1 definition atom, got:\n{text}"
     );
     // One-atom format: no `<Kind>` labels.
     assert!(
         !text.contains('<'),
         "Expected no angle-bracket kind labels, got:\n{text}"
-    );
-    // Outgoing calls section
-    assert!(
-        text.contains("calls:"),
-        "Expected calls: section, got:\n{text}"
-    );
-    // callee_t1 is not a top-level match, so its call edge reads the full line.
-    assert!(
-        text.contains(&format!("enrich.{MOCK_LANG_A}:1  fn callee_t1")),
-        "Expected full-line edge atom for callee_t1, got:\n{text}"
     );
 
     Ok(())
@@ -2415,10 +2397,10 @@ fn test_grep_enrichment_cache_hit() -> Result<()> {
     // First grep — populates cache.
     let text1 = bridge.call_tool_text("grep", &json!({ "pattern": "caller_cache" }))?;
 
-    // Sanity: first call produces enriched output.
+    // Sanity: first call produces the definition atom (top-level def → no `#`).
     assert!(
-        text1.contains("calls:"),
-        "First grep should be enriched, got:\n{text1}"
+        text1.contains(&format!("cache.{MOCK_LANG_A}:2:fn caller_cache {{")),
+        "First grep should render the caller_cache atom, got:\n{text1}"
     );
 
     // Second grep — should hit cache and produce identical output.
@@ -2620,24 +2602,18 @@ fn test_grep_type_hierarchy() -> Result<()> {
 
     let text = bridge.call_tool_text("grep", &json!({ "pattern": "Vehicle_t1" }))?;
 
-    // Definition renders as a full-line atom.
+    // Definition renders as a full-line atom (top-level def → no `#`).
     assert!(
-        text.contains(&format!("types.{MOCK_LANG_A}:1  struct Vehicle_t1")),
+        text.contains(&format!("types.{MOCK_LANG_A}:1:struct Vehicle_t1")),
         "Expected Vehicle_t1 definition atom, got:\n{text}"
     );
-    // A type-hierarchy edge group is present (subtypes via `extends`; mockls may
-    // route the edge through impls/subtypes).
-    assert!(
-        text.contains("subtypes:") || text.contains("impls:"),
-        "Expected a type-hierarchy edge group, got:\n{text}"
-    );
-    // The subtype Car_t1's edge reads its full source line (it is not itself a
-    // top-level match).
+    // The subtype Car_t1's hit on `Vehicle_t1` reads its full source line. It is
+    // a top-level struct line, so it carries no `#scope`.
     assert!(
         text.contains(&format!(
-            "types.{MOCK_LANG_A}:2  struct Car_t1 extends Vehicle_t1"
+            "types.{MOCK_LANG_A}:2:struct Car_t1 extends Vehicle_t1"
         )),
-        "Expected Car_t1 subtype edge atom, got:\n{text}"
+        "Expected Car_t1 subtype atom, got:\n{text}"
     );
 
     Ok(())
@@ -2660,12 +2636,13 @@ fn test_grep_path_syntax() -> Result<()> {
 
     let text = bridge.call_tool_text("grep", &json!({ "pattern": "inner_ps" }))?;
 
-    // The nested definition is a single full-line atom at its own line.
+    // The nested definition drops its own leaf and carries its container as the
+    // `#scope` anchor: `relpath:LINE#Container:<source>`.
     assert!(
-        text.contains(&format!("path.{MOCK_LANG_A}:2  fn inner_ps")),
-        "Expected full-line atom at path.{MOCK_LANG_A}:2, got:\n{text}"
+        text.contains(&format!("path.{MOCK_LANG_A}:2#Container_ps:fn inner_ps")),
+        "Expected nested-def atom with #Container_ps scope, got:\n{text}"
     );
-    // No `<Kind>` labels and no scope-path syntax.
+    // No `<Kind>` labels.
     assert!(
         !text.contains('<'),
         "Expected no `<...>` kind/scope labels, got:\n{text}"
@@ -2694,16 +2671,23 @@ fn test_grep_refs_sort() -> Result<()> {
 
     let text = bridge.call_tool_text("grep", &json!({ "pattern": "sorted_sym" }))?;
 
-    // Definition renders as a full-line atom, followed by enrichment groups.
+    // Definition renders as a full-line atom (top-level def → no `#`); the two
+    // usages carry their innermost enclosing symbol as the `#scope` anchor (the
+    // second nested as `other/yet_another`).
+    let def = format!("sort.{MOCK_LANG_A}:1:fn sorted_sym");
+    let ref3 = format!("sort.{MOCK_LANG_A}:3#other:sorted_sym");
+    let ref5 = format!("sort.{MOCK_LANG_A}:5#other/yet_another:sorted_sym");
+    let def_pos = text.find(&def);
+    let ref3_pos = text.find(&ref3);
+    let ref5_pos = text.find(&ref5);
     assert!(
-        text.contains(&format!("sort.{MOCK_LANG_A}:1  fn sorted_sym")),
-        "Expected sorted_sym definition atom, got:\n{text}"
+        def_pos.is_some() && ref3_pos.is_some() && ref5_pos.is_some(),
+        "Expected sorted_sym definition and both usage atoms, got:\n{text}"
     );
-    // References section: mockls returns references for sorted_sym
-    // across all occurrences in the document.
+    // Lines appear ascending within the file.
     assert!(
-        text.contains("refs:"),
-        "Expected refs: section from fetch_references, got:\n{text}"
+        def_pos < ref3_pos && ref3_pos < ref5_pos,
+        "Expected atoms in ascending line order (1, 3, 5), got:\n{text}"
     );
 
     Ok(())
@@ -2728,30 +2712,12 @@ fn test_grep_outgoing_calls_sorted() -> Result<()> {
 
     let text = bridge.call_tool_text("grep", &json!({ "pattern": "main_caller" }))?;
 
-    // Definition renders as a full-line atom.
+    // Definition renders as a full-line atom (top-level def → no `#`). The
+    // per-hit nav suite no longer fires, so the sorted callee names are not
+    // emitted under the hit.
     assert!(
-        text.contains(&format!("sorted_calls.{MOCK_LANG_A}:3  fn main_caller {{")),
+        text.contains(&format!("sorted_calls.{MOCK_LANG_A}:3:fn main_caller {{")),
         "Expected main_caller definition atom, got:\n{text}"
-    );
-    assert!(
-        text.contains("calls:"),
-        "Expected calls: section, got:\n{text}"
-    );
-
-    // alpha should appear before beta (alphabetical sort)
-    if let Some(calls_pos) = text.find("calls:") {
-        let calls_section = &text[calls_pos..];
-        let alpha_pos = calls_section.find("alpha_callee");
-        let beta_pos = calls_section.find("beta_callee");
-        if let (Some(a), Some(b)) = (alpha_pos, beta_pos) {
-            assert!(a < b, "Expected alpha before beta in calls, got:\n{text}");
-        }
-    }
-    // The callees are not themselves matches, so their edges read the full
-    // source line.
-    assert!(
-        text.contains(&format!("sorted_calls.{MOCK_LANG_A}:1  fn alpha_callee")),
-        "Expected full-line edge atom for alpha_callee, got:\n{text}"
     );
 
     Ok(())
@@ -2781,14 +2747,14 @@ fn test_grep_deprecated() -> Result<()> {
     // source line verbatim (which here happens to contain `@deprecated` because
     // that text is in the source — it is not a Catenary-added tag).
     assert!(
-        text.contains(&format!("depr.{MOCK_LANG_A}:1  struct Shape_t1")),
+        text.contains(&format!("depr.{MOCK_LANG_A}:1:struct Shape_t1")),
         "Expected Shape_t1 definition atom, got:\n{text}"
     );
     assert!(
         text.contains(&format!(
-            "depr.{MOCK_LANG_A}:2  struct OldSquare_t1 extends Shape_t1 @deprecated"
+            "depr.{MOCK_LANG_A}:2:struct OldSquare_t1 extends Shape_t1 @deprecated"
         )),
-        "Expected OldSquare_t1 subtype edge atom, got:\n{text}"
+        "Expected OldSquare_t1 subtype atom, got:\n{text}"
     );
     // One-atom format: no `<Kind>` labels.
     assert!(
@@ -2886,19 +2852,12 @@ fn test_grep_fish_eye() -> Result<()> {
 
     let text = bridge.call_tool_text("grep", &json!({ "pattern": "rich_fisheye" }))?;
 
-    // rich_fisheye (the rich symbol) renders as a full-line atom with a calls
-    // section; lean_fisheye (the lean callee) reads its full source line.
+    // rich_fisheye renders as a full-line atom (top-level def → no `#`). The
+    // per-hit nav suite no longer fires, so the callee `lean_fisheye` is not
+    // emitted under the hit.
     assert!(
-        text.contains(&format!("fisheye.{MOCK_LANG_A}:2  fn rich_fisheye {{")),
+        text.contains(&format!("fisheye.{MOCK_LANG_A}:2:fn rich_fisheye {{")),
         "Expected rich_fisheye definition atom, got:\n{text}"
-    );
-    assert!(
-        text.contains("calls:"),
-        "Expected calls: on rich symbol, got:\n{text}"
-    );
-    assert!(
-        text.contains(&format!("fisheye.{MOCK_LANG_A}:1  fn lean_fisheye")),
-        "Expected full-line edge atom for lean_fisheye, got:\n{text}"
     );
 
     Ok(())
@@ -2988,9 +2947,9 @@ fn test_grep_cross_def_dedup() -> Result<()> {
 
     let text = bridge.call_tool_text("grep", &json!({ "pattern": "Dedup_t1" }))?;
 
-    // The struct definition renders as a full-line atom.
+    // The struct definition renders as a full-line atom (top-level def → no `#`).
     assert!(
-        text.contains(&format!("dedup.{MOCK_LANG_A}:1  struct Dedup_t1")),
+        text.contains(&format!("dedup.{MOCK_LANG_A}:1:struct Dedup_t1")),
         "Expected struct definition atom, got:\n{text}"
     );
     // No standalone name header — definition line carries the name.
@@ -3069,15 +3028,26 @@ fn test_grep_incoming_calls_merge() -> Result<()> {
 
     let text = bridge.call_tool_text("grep", &json!({ "pattern": "target_inc" }))?;
 
-    // No separate `callers:` section — incoming calls merge into refs
+    // No separate `callers:` section — the per-hit nav suite no longer fires.
     assert!(
         !text.contains("callers:"),
-        "Expected no callers: section (merged into refs), got:\n{text}"
+        "Expected no callers: section, got:\n{text}"
     );
-    // Incoming calls should have been merged into refs section
+    // The definition and the in-body usage both render as self-contained atoms.
+    // caller_inc is a single-line symbol (no brace body), so the line-3 usage is
+    // top-level → no `#scope`; its source indentation is preserved verbatim.
+    let def = format!("incoming.{MOCK_LANG_A}:1:fn target_inc()");
+    let usage = format!("incoming.{MOCK_LANG_A}:3:  target_inc");
+    let def_pos = text.find(&def);
+    let usage_pos = text.find(&usage);
     assert!(
-        text.contains("refs:"),
-        "Expected refs: section with merged incoming calls, got:\n{text}"
+        def_pos.is_some() && usage_pos.is_some(),
+        "Expected target_inc definition and in-body usage atoms, got:\n{text}"
+    );
+    // Lines appear ascending within the file.
+    assert!(
+        def_pos < usage_pos,
+        "Expected atoms in ascending line order (1, 3), got:\n{text}"
     );
 
     Ok(())
@@ -3104,17 +3074,18 @@ fn test_grep_impls_structure() -> Result<()> {
 
     let text = bridge.call_tool_text("grep", &json!({ "pattern": "Drawable" }))?;
 
-    // fetch_implementations(Drawable) → Sprite (implements Drawable). The
-    // impls section must be present and name the implementor.
+    // The per-hit nav suite no longer fires. The interface definition and the
+    // implementor's `implements Drawable` line both render as self-contained
+    // `path:line:text` atoms (both top-level lines → no `#scope`).
     assert!(
-        text.contains("impls:"),
-        "Expected impls: section from fetch_implementations, got:\n{text}"
+        text.contains(&format!("impls.{MOCK_LANG_A}:1:interface Drawable")),
+        "Expected Drawable definition atom, got:\n{text}"
     );
-    let impls_start = text.find("impls:").context("impls")?;
-    let impls_section = &text[impls_start..];
     assert!(
-        impls_section.contains("Sprite"),
-        "impls section should list the implementor Sprite, got:\n{text}"
+        text.contains(&format!(
+            "impls.{MOCK_LANG_A}:2:struct Sprite implements Drawable"
+        )),
+        "Expected Sprite implementor atom, got:\n{text}"
     );
 
     Ok(())
@@ -3137,10 +3108,16 @@ fn test_grep_single_line_ref() -> Result<()> {
 
     let text = bridge.call_tool_text("grep", &json!({ "pattern": "target_sl" }))?;
 
-    // The definition renders as a single-line atom with the full source line.
+    // The definition renders as a single-line atom with the full source line
+    // (top-level def → no `#`). The usage on line 3 sits outside any brace body
+    // (user_sl is single-line), so it is top-level too → no `#scope`.
     assert!(
-        text.contains(&format!("single_ref.{MOCK_LANG_A}:1  fn target_sl")),
+        text.contains(&format!("single_ref.{MOCK_LANG_A}:1:fn target_sl")),
         "Expected single-line definition atom, got:\n{text}"
+    );
+    assert!(
+        text.contains(&format!("single_ref.{MOCK_LANG_A}:3:target_sl")),
+        "Expected single-line usage atom, got:\n{text}"
     );
     // Single-line atoms show `:line` not `:start-end` (spans are gone).
     assert!(

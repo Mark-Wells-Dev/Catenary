@@ -488,12 +488,13 @@ fn ws31_review_r4_eviction_witnessed_via_request_count() -> Result<()> {
 
     let warm = grep_until_enriched(
         &bridge,
-        &json!({ "pattern": "caller_x", "directory": work_str }),
+        &json!({ "pattern": "callee_x", "directory": work_str }),
     )?;
-    // Precondition — the setup is genuinely enriched.
+    // Precondition — the setup is genuinely enriched (the callee's in-body usage
+    // carries the `#caller_x` containment anchor).
     assert!(
-        warm.contains("calls:"),
-        "warming grep must be enriched (calls: section), got:\n{warm}"
+        warm.contains("#caller_x"),
+        "warming grep must be enriched (callee usage carries `#caller_x`), got:\n{warm}"
     );
 
     // Remove the root, then poll until untracked.
@@ -537,15 +538,15 @@ fn ws31_review_r4_eviction_witnessed_via_request_count() -> Result<()> {
     // log, so the `>= 1` counts below only strengthen.
     let cold = grep_until_enriched(
         &bridge,
-        &json!({ "pattern": "caller_x", "directory": work_str }),
+        &json!({ "pattern": "callee_x", "directory": work_str }),
     )?;
     // Anti-vacuous: the re-grep still surfaces the symbol AND re-resolves enrichment.
     assert!(
-        cold.contains("caller_x"),
+        cold.contains("callee_x"),
         "re-added root must serve the raw match; got:\n{cold}"
     );
     assert!(
-        cold.contains("calls:"),
+        cold.contains("#caller_x"),
         "cold first touch after eviction must re-resolve enrichment; got:\n{cold}"
     );
 
@@ -557,7 +558,7 @@ fn ws31_review_r4_eviction_witnessed_via_request_count() -> Result<()> {
     // the GENEROUS backstop passes). Merging is immune to the transient
     // double-spawn that a single shared `File::create` log would let truncate.
     drop(bridge);
-    let merged = || -> (usize, usize, String) {
+    let merged = || -> (usize, String) {
         let mut buf = String::new();
         for p in list_pid_logs(&req_log_base) {
             if let Ok(t) = std::fs::read_to_string(&p) {
@@ -565,34 +566,28 @@ fn ws31_review_r4_eviction_witnessed_via_request_count() -> Result<()> {
             }
         }
         let doc = request_method_count(&buf, "textDocument/documentSymbol");
-        let out = request_method_count(&buf, "callHierarchy/outgoingCalls");
-        (doc, out, buf)
+        (doc, buf)
     };
     let req_deadline = std::time::Instant::now() + common::POLL_BACKSTOP;
-    let (mut doc_symbol_count, mut outgoing_count, mut req_log) = merged();
-    while (doc_symbol_count < 1 || outgoing_count < 1) && std::time::Instant::now() < req_deadline {
+    let (mut doc_symbol_count, mut req_log) = merged();
+    while doc_symbol_count < 1 && std::time::Instant::now() < req_deadline {
         std::thread::sleep(common::POLL_SPACING);
         let m = merged();
         doc_symbol_count = m.0;
-        outgoing_count = m.1;
-        req_log = m.2;
+        req_log = m.1;
     }
 
     // The re-grep was cold ⇒ the daemon re-issued documentSymbol against the
     // re-spawned server. A no-op evict would leave the cache warm ⇒ count 0.
     // A deadline reached with the condition still unmet falls through to FAIL.
+    // The `#scope` anchor comes from `documentSymbol` alone — the per-hit nav
+    // suite (callHierarchy/outgoingCalls) no longer fires — so documentSymbol is
+    // the sole cold-touch witness.
     assert!(
         doc_symbol_count >= 1,
         "re-add must be a genuine cold touch — the daemon must re-query the \
          outline (textDocument/documentSymbol) at least once. count={doc_symbol_count}, \
          merged request log:\n{req_log}"
-    );
-    // The outgoingCalls re-query is the enrichment edge; its presence corroborates
-    // a cold enrichment rather than a stale warm hit.
-    assert!(
-        outgoing_count >= 1,
-        "cold re-enrichment must re-query callHierarchy/outgoingCalls at least \
-         once. count={outgoing_count}, merged request log:\n{req_log}"
     );
 
     Ok(())

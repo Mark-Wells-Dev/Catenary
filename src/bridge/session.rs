@@ -939,7 +939,7 @@ impl Session {
         // (bug #36). The per-root baseline / `root_generations` teardown for the
         // same removed roots already happens inside `LspClientManager`.
         if let Some(index) = &self.symbol_index {
-            let mut idx = index
+            let idx = index
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             for root in &removed {
