@@ -41,8 +41,13 @@ enum Command {
 
     /// Search for a pattern with LSP-enriched results.
     ///
-    /// Searches from the current working directory. Results within tracked
-    /// workspace roots include symbol context from LSP servers.
+    /// A strict ripgrep superset: the ripgrep flag surface drives it (so a
+    /// `grep`-fluent agent needs no relearning), and stdin is read when piped
+    /// (`… | catenary grep PAT`) — a plain ripgrep pass over the stream, same
+    /// flags, no enrichment. Searches from the current working directory
+    /// otherwise; results within tracked workspace roots gain a `#scope` symbol
+    /// anchor. Case defaults to smart-case (insensitive unless the pattern has an
+    /// uppercase letter); `-i` forces insensitive, `-s` forces sensitive.
     Grep {
         /// Regex pattern (Rust `regex` syntax, | for alternation; no look-around —
         /// unlike `catenary sed`, grep runs the linear ripgrep engine).
@@ -54,6 +59,53 @@ enum Command {
         /// to individual files and all are searched.
         #[arg(name = "PATH")]
         scope: Vec<String>,
+
+        /// Case-insensitive matching (overrides the smart-case default).
+        #[arg(short = 'i', long = "ignore-case")]
+        ignore_case: bool,
+
+        /// Case-sensitive matching (overrides the smart-case default).
+        #[arg(short = 's', long = "case-sensitive")]
+        case_sensitive: bool,
+
+        /// Only match whole words (word-boundary anchored).
+        #[arg(short = 'w', long = "word-regexp")]
+        word: bool,
+
+        /// Treat the pattern as a literal string, not a regex.
+        #[arg(short = 'F', long = "fixed-strings")]
+        fixed_strings: bool,
+
+        /// Select non-matching lines (invert the match).
+        #[arg(short = 'v', long = "invert-match")]
+        invert_match: bool,
+
+        /// Print only the paths of files containing a match (takes precedence
+        /// over results; `--count` still wins over this).
+        #[arg(short = 'l', long = "files-with-matches")]
+        files_with_matches: bool,
+
+        /// Show NUM lines of context after each match.
+        #[arg(short = 'A', long = "after-context", value_name = "NUM")]
+        after_context: Option<usize>,
+
+        /// Show NUM lines of context before each match.
+        #[arg(short = 'B', long = "before-context", value_name = "NUM")]
+        before_context: Option<usize>,
+
+        /// Show NUM lines of context before AND after each match.
+        #[arg(short = 'C', long = "context", value_name = "NUM")]
+        context: Option<usize>,
+
+        /// Include only files matching this glob (repeatable; a leading `!`
+        /// excludes, ripgrep semantics).
+        #[arg(short = 'g', long = "glob", value_name = "GLOB")]
+        glob: Vec<String>,
+
+        /// Include only files of this ripgrep type, e.g. `rust`, `md`
+        /// (repeatable).
+        #[arg(short = 't', long = "type", value_name = "TYPE")]
+        type_filter: Vec<String>,
 
         /// Exclude matches by glob pattern (e.g., tests/**).
         #[arg(long = "exclude-pattern")]
@@ -505,12 +557,37 @@ fn main() -> Result<()> {
         Some(Command::Grep {
             pattern,
             scope,
+            ignore_case,
+            case_sensitive,
+            word,
+            fixed_strings,
+            invert_match,
+            files_with_matches,
+            after_context,
+            before_context,
+            context,
+            glob,
+            type_filter,
             exclude,
             count,
             include_gitignored,
             include_hidden,
         }) => {
             let paths = to_literal_paths(scope);
+            // `-C N` sets both sides; `-A`/`-B` override their side (ripgrep
+            // precedence — the more specific flag wins).
+            let flags = catenary_mcp::bridge::GrepFlags {
+                ignore_case,
+                case_sensitive,
+                word,
+                fixed_strings,
+                invert: invert_match,
+                files_with_matches,
+                before_context: before_context.or(context).unwrap_or(0),
+                after_context: after_context.or(context).unwrap_or(0),
+                globs: glob,
+                types: type_filter,
+            };
             let mut out = cli::Output::stdout(false);
             build_runtime()?.block_on(run_grep(
                 &mut out,
@@ -520,6 +597,7 @@ fn main() -> Result<()> {
                 count,
                 include_gitignored,
                 include_hidden,
+                flags,
             ))
         }
         #[cfg(not(unix))]
@@ -1417,11 +1495,17 @@ async fn run_stop(out: &mut cli::Output) -> Result<()> {
     Ok(())
 }
 
-/// Runs a grep query against the running daemon.
+/// Runs a grep query against the running daemon, or a plain ripgrep pass over
+/// stdin when the stream is piped.
 ///
-/// Connects to the daemon's IPC socket, sends a [`GrepRequest`], and
-/// prints the rendered output to stdout. The daemon resolves relative
-/// patterns against `cwd` and dispatches to the grep pipeline.
+/// When no path arguments are given and stdin is a readable stream (a pipe,
+/// socket, or redirected file — ripgrep's `is_readable_stdin` rule), this is
+/// stdin mode: a plain ripgrep pass over the stream, carrying the same flags but
+/// with no enrichment (a stream has no file/LSP context) and no daemon
+/// round-trip. Otherwise it connects to the daemon's IPC socket, sends a
+/// [`GrepRequest`], and prints the rendered output to stdout. A tty or
+/// `/dev/null` stdin is NOT readable, so a bare `catenary grep PAT` still
+/// searches the cwd.
 ///
 /// # Errors
 ///
@@ -1439,8 +1523,15 @@ async fn run_grep(
     count: bool,
     include_gitignored: bool,
     include_hidden: bool,
+    flags: catenary_mcp::bridge::GrepFlags,
 ) -> Result<()> {
     use catenary_mcp::router::{GrepRequest, METHOD_GREP};
+
+    // stdin mode: no paths + a readable piped/redirected stream. A plain
+    // ripgrep pass over the stream, same flags, no enrichment, no daemon.
+    if paths.is_empty() && is_readable_stdin() {
+        return run_grep_stdin(out, &pattern, &flags, count);
+    }
 
     let cwd = std::env::current_dir().context("cannot determine working directory")?;
 
@@ -1462,6 +1553,7 @@ async fn run_grep(
             count,
             include_gitignored,
             include_hidden,
+            flags,
         };
         search_ipc(METHOD_GREP, &request).await?
     } else {
@@ -1480,6 +1572,64 @@ async fn run_grep(
         // byte-clean ripgrep superset (pipeable-output ticket 03).
         if let Some(receipt) = &response.receipt {
             eprintln!("{receipt}");
+        }
+    }
+    Ok(())
+}
+
+/// Returns `true` when stdin is a readable stream — a pipe (FIFO), a socket, or
+/// a redirected regular file — and `false` for a terminal or a character device
+/// like `/dev/null`. Mirrors ripgrep's `is_readable_stdin`: only then does a
+/// pathless `catenary grep PAT` read the stream instead of searching the cwd.
+///
+/// Resolved via `/dev/stdin` metadata (which follows the fd-0 symlink), so it
+/// needs no `unsafe` fd introspection. A missing/unstattable `/dev/stdin` is
+/// treated as not-readable (cwd search), the safe default.
+#[cfg(unix)]
+fn is_readable_stdin() -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    let Ok(meta) = std::fs::metadata("/dev/stdin") else {
+        return false;
+    };
+    let ft = meta.file_type();
+    ft.is_fifo() || ft.is_socket() || ft.is_file()
+}
+
+/// stdin mode: a plain ripgrep pass over the piped stream.
+///
+/// No daemon, no enrichment, no `#scope` — a stream has no file or LSP context.
+/// Carries the same flags as file mode (`-i`/`-s`/`-w`/`-F`/`-v`, context,
+/// `--count`, `-l`), differing only in enrichment. `-l` prints `(standard
+/// input)` when the stream matched (the GNU `grep -l` convention for a nameless
+/// stream); `--count` prints the matching-line tally.
+///
+/// # Errors
+///
+/// Returns an error if the pattern is invalid or the stream cannot be read.
+#[cfg(unix)]
+fn run_grep_stdin(
+    out: &mut cli::Output,
+    pattern: &str,
+    flags: &catenary_mcp::bridge::GrepFlags,
+    count: bool,
+) -> Result<()> {
+    use catenary_mcp::bridge::{StreamOutcome, grep_stream};
+
+    let stdin = std::io::stdin();
+    let outcome = grep_stream(stdin.lock(), pattern, flags, count)?;
+    match outcome {
+        StreamOutcome::Count(n) => {
+            let _ = out.writeln(format_args!("{n} matches"));
+        }
+        StreamOutcome::FilesWithMatches(matched) => {
+            if matched {
+                let _ = out.writeln(format_args!("(standard input)"));
+            }
+        }
+        StreamOutcome::Lines(lines) => {
+            if !lines.is_empty() {
+                let _ = out.writeln(format_args!("{lines}"));
+            }
         }
     }
     Ok(())
@@ -2320,6 +2470,17 @@ mod tests {
         let Some(Command::Grep {
             pattern,
             scope,
+            ignore_case,
+            case_sensitive,
+            word,
+            fixed_strings,
+            invert_match,
+            files_with_matches,
+            after_context,
+            before_context,
+            context,
+            glob,
+            type_filter,
             exclude,
             count,
             include_gitignored,
@@ -2334,6 +2495,103 @@ mod tests {
         assert!(!count);
         assert!(!include_gitignored);
         assert!(!include_hidden);
+        // Ripgrep-parity flags default off / unset.
+        assert!(!ignore_case);
+        assert!(!case_sensitive);
+        assert!(!word);
+        assert!(!fixed_strings);
+        assert!(!invert_match);
+        assert!(!files_with_matches);
+        assert!(after_context.is_none());
+        assert!(before_context.is_none());
+        assert!(context.is_none());
+        assert!(glob.is_empty());
+        assert!(type_filter.is_empty());
+    }
+
+    #[test]
+    fn test_cli_grep_ripgrep_flags_parse() {
+        use clap::Parser;
+        let args = Args::try_parse_from([
+            "catenary",
+            "grep",
+            "foo",
+            "-i",
+            "-w",
+            "-F",
+            "-v",
+            "-l",
+            "-A",
+            "2",
+            "-B",
+            "1",
+            "-C",
+            "3",
+            "-g",
+            "*.rs",
+            "-g",
+            "!target/**",
+            "-t",
+            "rust",
+        ]);
+        let args = args.expect("grep with ripgrep flags should parse");
+        let Some(Command::Grep {
+            ignore_case,
+            word,
+            fixed_strings,
+            invert_match,
+            files_with_matches,
+            after_context,
+            before_context,
+            context,
+            glob,
+            type_filter,
+            ..
+        }) = args.command
+        else {
+            unreachable!("expected Grep command");
+        };
+        assert!(ignore_case);
+        assert!(word);
+        assert!(fixed_strings);
+        assert!(invert_match);
+        assert!(files_with_matches);
+        assert_eq!(after_context, Some(2));
+        assert_eq!(before_context, Some(1));
+        assert_eq!(context, Some(3));
+        assert_eq!(glob, vec!["*.rs", "!target/**"]);
+        assert_eq!(type_filter, vec!["rust"]);
+    }
+
+    #[test]
+    fn test_cli_grep_long_flag_spellings() {
+        use clap::Parser;
+        let args = Args::try_parse_from([
+            "catenary",
+            "grep",
+            "foo",
+            "--case-sensitive",
+            "--files-with-matches",
+            "--glob",
+            "*.md",
+            "--type",
+            "md",
+        ]);
+        let args = args.expect("grep with long flags should parse");
+        let Some(Command::Grep {
+            case_sensitive,
+            files_with_matches,
+            glob,
+            type_filter,
+            ..
+        }) = args.command
+        else {
+            unreachable!("expected Grep command");
+        };
+        assert!(case_sensitive);
+        assert!(files_with_matches);
+        assert_eq!(glob, vec!["*.md"]);
+        assert_eq!(type_filter, vec!["md"]);
     }
 
     #[test]
@@ -2388,6 +2646,7 @@ mod tests {
             count,
             include_gitignored,
             include_hidden,
+            ..
         }) = args.command
         else {
             unreachable!("expected Grep command");

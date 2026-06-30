@@ -23,7 +23,7 @@ use crate::bridge::EditingGuardrail;
 use crate::bridge::HookRouter;
 use crate::bridge::filesystem_manager::Root;
 use crate::bridge::session::Session;
-use crate::bridge::{GlobOutcome, GrepOutcome};
+use crate::bridge::{GlobOutcome, GrepFlags, GrepOutcome};
 use crate::companions::expand_companions;
 use crate::hook::{HookRequest, HookResponseEnvelope, emit_hook_event, hook_outcome_level};
 use crate::logging::LoggingServer;
@@ -127,6 +127,12 @@ pub struct GrepRequest {
     /// Return a match/file count instead of rendered results (`--count`).
     #[serde(default)]
     pub count: bool,
+    /// Ripgrep-parity flags (`-i`/`-s`/`-w`/`-F`/`-v`/`-l`, context, `-g`/
+    /// `--type`). Flattened onto the wire so the request stays a flat object and
+    /// a flagless query serializes exactly as before (each inner field carries
+    /// its own `#[serde(default)]`, so a minimal payload still deserializes).
+    #[serde(flatten)]
+    pub flags: GrepFlags,
 }
 
 impl GrepRequest {
@@ -186,6 +192,17 @@ impl GrepRequest {
             params["exclude"] = serde_json::Value::String(resolved);
         }
         params["include_hidden"] = serde_json::Value::Bool(include_hidden);
+
+        // Merge the ripgrep-parity flags as flat keys so the daemon-side
+        // `GrepInput` (which flattens the same `GrepFlags`) deserializes them.
+        if let (Some(params_obj), Ok(serde_json::Value::Object(flag_obj))) =
+            (params.as_object_mut(), serde_json::to_value(&self.flags))
+        {
+            for (k, v) in flag_obj {
+                params_obj.insert(k, v);
+            }
+        }
+
         params
     }
 }
@@ -7380,6 +7397,7 @@ mod tests {
             include_gitignored: true,
             include_hidden: false,
             count: false,
+            flags: GrepFlags::default(),
         };
         let json = serde_json::to_string(&req).expect("serialize");
         let parsed: GrepRequest = serde_json::from_str(&json).expect("deserialize");
@@ -7417,10 +7435,18 @@ mod tests {
             include_gitignored: false,
             include_hidden: false,
             count: false,
+            flags: GrepFlags::default(),
         };
         let json = serde_json::to_string(&req).expect("serialize");
         assert!(!json.contains("paths"), "empty paths should be skipped");
         assert!(!json.contains("exclude"), "None exclude should be skipped");
+        // Default ripgrep-parity flags are skipped too — a flagless query
+        // serializes exactly as before this surface existed.
+        assert!(
+            !json.contains("ignore_case"),
+            "default flags should be skipped"
+        );
+        assert!(!json.contains("globs"), "empty globs should be skipped");
     }
 
     /// `GrepResponse` roundtrips through JSON.

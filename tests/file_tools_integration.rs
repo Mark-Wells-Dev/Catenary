@@ -432,6 +432,166 @@ fn test_grep_path_glob_zero_files_does_not_search_cwd() -> Result<()> {
     Ok(())
 }
 
+// ─── ripgrep flag parity (pipeable-output ticket 04) ───────────────────
+
+/// `-l`/`--files-with-matches` yields a bare cwd-relative file list — one path
+/// per line, no `#scope` anchor and no verbatim text — that composes with the
+/// strip-to-ripgrep contract.
+#[test]
+fn test_grep_files_with_matches_lists_paths() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(dir.path().join("a.rs"), "let needle = 1;")?;
+    std::fs::write(dir.path().join("b.rs"), "needle again")?;
+    std::fs::write(dir.path().join("c.rs"), "nothing here")?;
+
+    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text(
+        "grep",
+        &json!({ "pattern": "needle", "files_with_matches": true }),
+    )?;
+    assert!(text.contains("a.rs"), "a.rs matched: {text}");
+    assert!(text.contains("b.rs"), "b.rs matched: {text}");
+    assert!(!text.contains("c.rs"), "c.rs has no match: {text}");
+    // Just paths — no anchor, no verbatim line.
+    assert!(!text.contains('#'), "no #scope anchor in -l output: {text}");
+    assert!(
+        !text.contains("needle"),
+        "no verbatim text in -l output: {text}"
+    );
+    Ok(())
+}
+
+/// Context lines (`-A`/`-B`/`-C`) render in the same `path:line#…:<verbatim>`
+/// shape as match lines — each becomes its own self-contained line.
+#[test]
+fn test_grep_context_renders_in_line_format() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(dir.path().join("f.rs"), "before\nthe needle line\nafter\n")?;
+
+    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text(
+        "grep",
+        &json!({ "pattern": "needle", "paths": ["f.rs"], "after_context": 1 }),
+    )?;
+    // The match line plus one after-context line, both in the line format.
+    assert!(
+        text.contains("the needle line"),
+        "match line present: {text}"
+    );
+    assert!(text.contains("after"), "after-context line present: {text}");
+    // No-LSP → `#?`; stripping it yields byte-exact ripgrep `f.rs:LINE:text`.
+    assert!(
+        text.contains("f.rs:2"),
+        "match keeps its textual coord: {text}"
+    );
+    assert!(
+        text.contains("f.rs:3"),
+        "context keeps its textual coord: {text}"
+    );
+    Ok(())
+}
+
+/// `-g`/`--glob` is a positive file filter on a directory (cwd) walk.
+#[test]
+fn test_grep_glob_filter_restricts_files() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(dir.path().join("a.rs"), "let needle = 1;")?;
+    std::fs::write(dir.path().join("b.txt"), "needle in text")?;
+
+    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "needle", "globs": ["*.rs"] }))?;
+    assert!(
+        text.contains("a.rs"),
+        "-g '*.rs' keeps the .rs file: {text}"
+    );
+    assert!(
+        !text.contains("b.txt"),
+        "-g '*.rs' filters the .txt file: {text}"
+    );
+    Ok(())
+}
+
+/// Case defaults to smart-case: a lowercase pattern is insensitive, a pattern
+/// with an uppercase letter is sensitive; `-i` forces insensitive.
+#[test]
+fn test_grep_smart_case_default_and_overrides() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(
+        dir.path().join("f.rs"),
+        "let Needle = 1;\nlet needle = 2;\n",
+    )?;
+
+    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    // Uppercase-bearing pattern → case-sensitive: matches only `Needle`.
+    let sensitive =
+        bridge.call_tool_text("grep", &json!({ "pattern": "Needle", "paths": ["f.rs"] }))?;
+    assert!(
+        sensitive.contains("f.rs:1"),
+        "Needle matched line 1: {sensitive}"
+    );
+    assert!(
+        !sensitive.contains("f.rs:2"),
+        "smart-case keeps `Needle` off the lowercase line: {sensitive}"
+    );
+
+    // Lowercase pattern → case-insensitive: matches both lines.
+    let insensitive =
+        bridge.call_tool_text("grep", &json!({ "pattern": "needle", "paths": ["f.rs"] }))?;
+    assert!(
+        insensitive.contains("f.rs:1"),
+        "needle matched line 1: {insensitive}"
+    );
+    assert!(
+        insensitive.contains("f.rs:2"),
+        "needle matched line 2: {insensitive}"
+    );
+
+    // `-i` forces insensitive even for an uppercase-bearing pattern.
+    let forced = bridge.call_tool_text(
+        "grep",
+        &json!({ "pattern": "Needle", "paths": ["f.rs"], "ignore_case": true }),
+    )?;
+    assert!(forced.contains("f.rs:1"), "-i matched line 1: {forced}");
+    assert!(forced.contains("f.rs:2"), "-i matched line 2: {forced}");
+    Ok(())
+}
+
+/// `-v`/`--invert-match` selects non-matching lines, rendered in the line format.
+#[test]
+fn test_grep_invert_selects_non_matching() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(dir.path().join("f.rs"), "keep one\ndrop needle\nkeep two\n")?;
+
+    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text(
+        "grep",
+        &json!({ "pattern": "needle", "paths": ["f.rs"], "invert": true }),
+    )?;
+    assert!(
+        text.contains("keep one"),
+        "non-matching line 1 selected: {text}"
+    );
+    assert!(
+        text.contains("keep two"),
+        "non-matching line 3 selected: {text}"
+    );
+    assert!(
+        !text.contains("drop needle"),
+        "the matching line is inverted out: {text}"
+    );
+    Ok(())
+}
+
 #[test]
 fn test_glob_tier3_bucketed() -> Result<()> {
     let dir = tempfile::tempdir()?;

@@ -6,10 +6,12 @@
 use super::session::ResolvedGlob;
 use anyhow::{Result, anyhow};
 use grep_matcher::Matcher;
-use grep_regex::RegexMatcherBuilder;
-use grep_searcher::{Searcher, Sink, SinkMatch};
+use grep_regex::{RegexMatcher, RegexMatcherBuilder};
+use grep_searcher::{Searcher, SearcherBuilder, Sink, SinkContext, SinkMatch};
 use ignore::WalkBuilder;
-use serde::Deserialize;
+use ignore::overrides::OverrideBuilder;
+use ignore::types::TypesBuilder;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -24,6 +26,67 @@ use crate::config::DispatchMethod;
 use crate::lsp::server::LspServer;
 use crate::lsp::{LspClientManager, WalkBreadth};
 use crate::symbol_index::{ScopeFilter, Symbol, SymbolIndex};
+
+/// Ripgrep-parity flags shared across the grep surfaces (`catenary grep`'s CLI,
+/// the IPC [`crate::router::GrepRequest`], and this daemon-side [`GrepInput`]).
+///
+/// These make `catenary grep` a strict ripgrep superset on the *input* surface
+/// (it is already one on results): the matcher modifiers (`-i`/`-s`/`-w`/`-F`),
+/// the line-selection modifiers (`-v`, context `-A`/`-B`/`-C`), the positive file
+/// filters (`-g`/`--type`), and the files-with-matches view (`-l`). They are
+/// carried identically into stdin mode (which only drops enrichment, never
+/// capability) and into file mode. Every field is `#[serde(default)]` so an older
+/// or minimal wire payload round-trips, and skipped when empty so a flagless query
+/// serializes exactly as before.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "orthogonal ripgrep flags, 1:1 with the clap-parsed grep surface"
+)]
+pub struct GrepFlags {
+    /// `-i`/`--ignore-case`: force case-insensitive matching (overrides smart-case).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ignore_case: bool,
+    /// `-s`/`--case-sensitive`: force case-sensitive matching (overrides smart-case).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub case_sensitive: bool,
+    /// `-w`/`--word-regexp`: only match on word boundaries.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub word: bool,
+    /// `-F`/`--fixed-strings`: treat the pattern as a literal string, not a regex.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fixed_strings: bool,
+    /// `-v`/`--invert-match`: select the lines that do *not* match.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub invert: bool,
+    /// `-l`/`--files-with-matches`: print only the paths of files with a match.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub files_with_matches: bool,
+    /// `-B`/`--before-context` (also set by `-C`): lines of context before a match.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub before_context: usize,
+    /// `-A`/`--after-context` (also set by `-C`): lines of context after a match.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub after_context: usize,
+    /// `-g`/`--glob`: positive include globs (ripgrep semantics — a leading `!`
+    /// negates). When any non-negated glob is present, only matching files are
+    /// searched.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub globs: Vec<String>,
+    /// `-t`/`--type`: ripgrep file-type filters (e.g. `rust`, `md`), resolved
+    /// against ripgrep's built-in type definitions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub types: Vec<String>,
+}
+
+/// `serde` `skip_serializing_if` predicate for `usize` fields that default to 0.
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if requires a &T predicate"
+)]
+const fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
 
 /// Input for grep tool.
 #[derive(Debug, Deserialize)]
@@ -57,6 +120,10 @@ pub struct GrepInput {
     /// lines and distinct files, never a page.
     #[serde(default)]
     pub count: bool,
+    /// Ripgrep-parity flags (case/word/fixed/invert/context/glob/type/`-l`),
+    /// flattened so the wire stays a flat object.
+    #[serde(flatten)]
+    pub flags: GrepFlags,
 }
 
 /// A single grep hit, rendered as one self-contained URL-style deep-link line
@@ -173,9 +240,19 @@ impl GrepServer {
         // Count mode is a dumb, `grep -c`-style tally: a single ripgrep pass
         // over the whole pattern, no alternation split, no symbol
         // classification, no LSP. Matching lines (a line counts once) and the
-        // distinct files holding them, straight from the ripgrep result.
+        // distinct files holding them, straight from the ripgrep result. Count
+        // takes precedence over `-l` when both are given (the more specific
+        // tally wins).
         if input.count {
             return self.count_matches(&input, &search_paths, cwd.as_deref());
+        }
+
+        // `-l`/`--files-with-matches`: a plain ripgrep pass, then just the
+        // distinct matching files as cwd-relative paths (one per line) — no
+        // enrichment, no `#scope`, no context (ripgrep drops context with `-l`).
+        // The list still rides the shared overflow valve.
+        if input.flags.files_with_matches {
+            return self.files_with_matches(&input, &search_paths, cwd.as_deref());
         }
 
         // Run the whole pattern in a single pass. Top-level `|` alternation is
@@ -192,6 +269,7 @@ impl GrepServer {
             include_hidden: input.include_hidden,
             cwd: cwd.clone(),
             count: false,
+            flags: input.flags.clone(),
         };
         let output = self
             .run(run_input, parent_id, cancel, cwd.as_deref())
@@ -276,6 +354,14 @@ impl GrepServer {
             .transpose()?
             .map(Arc::new);
 
+        // A count must never inflate from context lines, and `-l` is irrelevant
+        // here — keep only the matcher/file-filter flags, drop context.
+        let flags = GrepFlags {
+            before_context: 0,
+            after_context: 0,
+            files_with_matches: false,
+            ..input.flags.clone()
+        };
         let rg = Self::ripgrep_matches(
             &input.pattern,
             &effective_roots,
@@ -283,11 +369,76 @@ impl GrepServer {
             input.include_gitignored,
             input.include_hidden,
             &self.fs_manager,
+            &flags,
         )?;
 
         let matches: usize = rg.file_line_texts.values().map(HashMap::len).sum();
         let files = rg.file_line_texts.len();
         Ok(GrepOutcome::Count { matches, files })
+    }
+
+    /// `-l`/`--files-with-matches`: a plain ripgrep pass, then the distinct
+    /// matching files rendered as cwd-relative paths, one per line, sorted for
+    /// byte-stable output. No enrichment, no `#scope`, no context (ripgrep drops
+    /// context with `-l`) — the list still rides the shared overflow valve, and a
+    /// path per line keeps it pipe-safe (`-l` composes with `| head`/`| grep`).
+    fn files_with_matches(
+        &self,
+        input: &GrepInput,
+        search_paths: &[PathBuf],
+        cwd: Option<&Path>,
+    ) -> Result<GrepOutcome> {
+        let effective_roots = self.effective_search_roots(search_paths, cwd);
+        let resolved_exclude = input
+            .exclude
+            .as_deref()
+            .map(ResolvedGlob::new)
+            .transpose()?
+            .map(Arc::new);
+
+        // Matcher/file-filter flags only; context never changes the file set.
+        let flags = GrepFlags {
+            before_context: 0,
+            after_context: 0,
+            files_with_matches: false,
+            ..input.flags.clone()
+        };
+        let rg = Self::ripgrep_matches(
+            &input.pattern,
+            &effective_roots,
+            resolved_exclude.as_ref(),
+            input.include_gitignored,
+            input.include_hidden,
+            &self.fs_manager,
+            &flags,
+        )?;
+
+        if rg.file_lines.is_empty() {
+            return Ok(GrepOutcome::Rendered {
+                output: String::new(),
+                receipt: None,
+            });
+        }
+
+        let mut paths: Vec<String> = rg
+            .file_lines
+            .keys()
+            .map(|f| rel_path(Path::new(f), &self.fs_manager, cwd))
+            .collect();
+        paths.sort();
+        let output = paths.join("\n");
+
+        let v = overflow::valve(
+            &output,
+            self.budget,
+            &crate::paths::runtime_dir(),
+            overflow::GREP_PREFIX,
+            None,
+        );
+        Ok(GrepOutcome::Rendered {
+            output: v.display,
+            receipt: v.receipt,
+        })
     }
 
     /// Grep pipeline: ripgrep + `documentSymbol` index + hit classification.
@@ -314,6 +465,9 @@ impl GrepServer {
             .map(Arc::new);
 
         // Step 1: Ripgrep scoped to file set → raw hits with matched text.
+        // Context lines (`-A`/`-B`/`-C`) and inverted selection (`-v`) are
+        // captured here too — each becomes a hit and is anchored by containment
+        // exactly like a match line.
         let rg = Self::ripgrep_matches(
             &input.pattern,
             &effective_roots,
@@ -321,6 +475,7 @@ impl GrepServer {
             input.include_gitignored,
             input.include_hidden,
             &self.fs_manager,
+            &input.flags,
         )?;
 
         if rg.file_lines.is_empty() {
@@ -507,14 +662,28 @@ impl GrepServer {
         include_gitignored: bool,
         include_hidden: bool,
         fs_manager: &Arc<FilesystemManager>,
+        flags: &GrepFlags,
     ) -> Result<RipgrepMatches> {
         use ignore::WalkState;
         use std::sync::Mutex as StdMutex;
 
-        let matcher = RegexMatcherBuilder::new()
-            .case_insensitive(true)
-            .build(pattern)
-            .map_err(|e| anyhow!("Invalid regex pattern: {e}"))?;
+        let matcher = build_matcher(pattern, flags)?;
+
+        // `-t`/`--type` resolves against ripgrep's built-in type definitions and
+        // is root-independent, so build it once and clone per directory walk.
+        let types = if flags.types.is_empty() {
+            None
+        } else {
+            let mut tb = TypesBuilder::new();
+            tb.add_defaults();
+            for t in &flags.types {
+                tb.select(t);
+            }
+            Some(
+                tb.build()
+                    .map_err(|e| anyhow!("Invalid --type filter: {e}"))?,
+            )
+        };
 
         let collected = Arc::new(StdMutex::new(Vec::<ThreadMatches>::new()));
 
@@ -529,13 +698,36 @@ impl GrepServer {
             // recursive *directory* traversal, not paths the user named. Bypass
             // the gate for a file root; keep it for directory walks.
             let root_is_file = root.is_file();
-            let walker = WalkBuilder::new(root)
+            let mut builder = WalkBuilder::new(root);
+            builder
                 .git_ignore(skip_gitignored && !root_is_file)
-                .hidden(skip_hidden && !root_is_file)
-                .build_parallel();
+                .hidden(skip_hidden && !root_is_file);
+            // Positive file filters (`-g`/`--type`) govern recursive directory
+            // traversal, not an explicitly-named file (same misc-110 reasoning as
+            // the gitignore/hidden bypass): naming a file is a direct request for
+            // it, so a `-g`/`--type` whitelist never silently drops it.
+            if !root_is_file {
+                if !flags.globs.is_empty() {
+                    let mut ob = OverrideBuilder::new(root);
+                    for g in &flags.globs {
+                        ob.add(g)
+                            .map_err(|e| anyhow!("Invalid --glob pattern '{g}': {e}"))?;
+                    }
+                    builder.overrides(
+                        ob.build()
+                            .map_err(|e| anyhow!("Invalid --glob filter: {e}"))?,
+                    );
+                }
+                if let Some(types) = &types {
+                    builder.types(types.clone());
+                }
+            }
+            let walker = builder.build_parallel();
 
             walker.run(|| {
                 let matcher = matcher.clone();
+                let mut searcher = build_searcher(flags);
+                let invert = flags.invert;
                 let exclude = exclude.cloned();
                 let root = root.clone();
                 let fs_manager = Arc::clone(fs_manager);
@@ -615,9 +807,10 @@ impl GrepServer {
                         matcher: &matcher,
                         path: &path_str,
                         local: &mut state.local,
+                        invert,
                     };
 
-                    if let Err(e) = Searcher::new().search_path(&matcher, path, &mut sink) {
+                    if let Err(e) = searcher.search_path(&matcher, path, &mut sink) {
                         debug!("grep: skipping {path_str}: {e}");
                     }
 
@@ -629,6 +822,148 @@ impl GrepServer {
         let parts = harvest(collected)?;
 
         Ok(RipgrepMatches::merge(parts))
+    }
+}
+
+// ─── Matcher / searcher construction ───────────────────────────────────
+
+/// Builds the regex matcher for a grep query from the ripgrep-parity flags.
+///
+/// Case handling reconciles to **smart-case** (the residual design decision):
+/// with neither `-i` nor `-s`, the matcher is case-insensitive *unless* the
+/// pattern carries an uppercase letter; `-i` (`ignore_case`) forces insensitive
+/// and `-s` (`case_sensitive`) forces sensitive. `-F` (`fixed_strings`) escapes
+/// the pattern to a literal first (uppercase letters survive escaping, so
+/// smart-case still sees them), and `-w` (`word`) wraps it in word boundaries.
+///
+/// # Errors
+///
+/// Returns an error if the (possibly escaped) pattern is not a valid regex.
+fn build_matcher(pattern: &str, flags: &GrepFlags) -> Result<RegexMatcher> {
+    let effective = if flags.fixed_strings {
+        regex::escape(pattern)
+    } else {
+        pattern.to_string()
+    };
+    let mut builder = RegexMatcherBuilder::new();
+    if flags.ignore_case {
+        builder.case_insensitive(true);
+    } else if flags.case_sensitive {
+        builder.case_insensitive(false).case_smart(false);
+    } else {
+        builder.case_smart(true);
+    }
+    builder.word(flags.word);
+    builder
+        .build(&effective)
+        .map_err(|e| anyhow!("Invalid regex pattern: {e}"))
+}
+
+/// Builds a line searcher honoring the context (`-A`/`-B`/`-C`) and invert
+/// (`-v`) flags. Line numbers are always on (the grep line format needs them).
+fn build_searcher(flags: &GrepFlags) -> Searcher {
+    SearcherBuilder::new()
+        .line_number(true)
+        .before_context(flags.before_context)
+        .after_context(flags.after_context)
+        .invert_match(flags.invert)
+        .build()
+}
+
+// ─── stdin (stream) mode ───────────────────────────────────────────────
+
+/// Outcome of a plain-ripgrep pass over a stdin stream ([`grep_stream`]).
+///
+/// stdin mode carries the **same flags** as file mode but never enriches — a
+/// stream has no file path or LSP context — so it produces plain ripgrep output:
+/// matching (and context) lines verbatim, a count, or a single
+/// `(standard input)` marker for `-l`.
+pub enum StreamOutcome {
+    /// Default / `-A`/`-B`/`-C` / `-v`: the selected lines verbatim, `\n`-joined
+    /// (no trailing newline), in stream order. Empty string when nothing matched.
+    Lines(String),
+    /// `--count`: the number of matching (or, with `-v`, non-matching) lines.
+    Count(usize),
+    /// `-l`/`--files-with-matches`: whether the stream had at least one match.
+    /// The CLI prints `(standard input)` when `true`, nothing when `false`
+    /// (GNU `grep -l` convention for a stream with no filename).
+    FilesWithMatches(bool),
+}
+
+/// Runs a plain ripgrep pass over an arbitrary stream — the `… | catenary grep
+/// PAT` path.
+///
+/// No enrichment, no daemon, no `#scope`: a stream has no file or LSP context.
+/// It carries the same flags as file mode (`-i`/`-s`/`-w`/`-F`/`-v`, context,
+/// `--count`, `-l`), differing only in enrichment, never in capability.
+///
+/// # Errors
+///
+/// Returns an error if the pattern is invalid or the stream read fails.
+pub fn grep_stream<R: std::io::Read>(
+    reader: R,
+    pattern: &str,
+    flags: &GrepFlags,
+    count: bool,
+) -> Result<StreamOutcome> {
+    let matcher = build_matcher(pattern, flags)?;
+    let mut searcher = build_searcher(flags);
+    let mut sink = StreamSink {
+        lines: Vec::new(),
+        match_count: 0,
+    };
+    searcher
+        .search_reader(&matcher, reader, &mut sink)
+        .map_err(|e| anyhow!("stdin search failed: {e}"))?;
+
+    if count {
+        Ok(StreamOutcome::Count(sink.match_count))
+    } else if flags.files_with_matches {
+        Ok(StreamOutcome::FilesWithMatches(sink.match_count > 0))
+    } else {
+        Ok(StreamOutcome::Lines(sink.lines.join("\n")))
+    }
+}
+
+/// Collects selected lines (and context) from a stdin stream search.
+///
+/// `matched` fires for the selected lines (matching, or non-matching under `-v`)
+/// and is what `match_count` tallies; `context` fires for `-A`/`-B`/`-C` lines,
+/// which join the output but are never counted (matching ripgrep `--count`).
+struct StreamSink {
+    /// Selected and context lines, verbatim and newline-stripped, in stream order.
+    lines: Vec<String>,
+    /// Count of selected (matching, or inverted) lines — context excluded.
+    match_count: usize,
+}
+
+impl StreamSink {
+    /// Strips the trailing `\n` (and a CRLF `\r`) so a recorded line is
+    /// byte-identical to what ripgrep prints.
+    fn push_line(&mut self, bytes: &[u8]) {
+        let raw = String::from_utf8_lossy(bytes);
+        let trimmed = raw.strip_suffix('\n').unwrap_or(&raw);
+        let line = trimmed.strip_suffix('\r').unwrap_or(trimmed);
+        self.lines.push(line.to_string());
+    }
+}
+
+impl Sink for StreamSink {
+    type Error = std::io::Error;
+
+    fn matched(&mut self, _searcher: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, Self::Error> {
+        self.match_count += 1;
+        self.push_line(mat.bytes());
+        Ok(true)
+    }
+
+    fn context(
+        &mut self,
+        _searcher: &Searcher,
+        ctx: &SinkContext<'_>,
+    ) -> Result<bool, Self::Error> {
+        self.push_line(ctx.bytes());
+        Ok(true)
     }
 }
 
@@ -789,27 +1124,16 @@ struct MatchSink<'a> {
     matcher: &'a grep_regex::RegexMatcher,
     path: &'a str,
     local: &'a mut ThreadMatches,
+    /// `-v`/`--invert-match`: the selected lines are the *non*-matching ones, so
+    /// they carry no match column and `matcher.find` would (correctly) miss.
+    invert: bool,
 }
 
-impl Sink for MatchSink<'_> {
-    type Error = std::io::Error;
-
-    fn matched(&mut self, _searcher: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, Self::Error> {
-        let Some(line_num) = mat.line_number().and_then(|n| u32::try_from(n).ok()) else {
-            return Ok(true);
-        };
-
-        let line_bytes = mat.bytes();
-
-        // One-atom model (decision 024): the hit carries its FULL source line,
-        // byte-identical to `rg`, not the matched token (`--only-matching` is
-        // dropped). Capture the whole line, newline-stripped, plus the column
-        // of the FIRST match on it — the column still positions `prepareRename`
-        // (enrichment gating) and the enrichment query at the symbol.
-        let Some(first) = self.matcher.find(line_bytes).ok().flatten() else {
-            return Ok(true);
-        };
-        let col = u32::try_from(first.start()).unwrap_or(0);
+impl MatchSink<'_> {
+    /// Records one line (a match, an inverted selection, or a context line) into
+    /// the per-file accumulators: its newline-stripped verbatim text plus the
+    /// first-match column (0 for inverted/context lines, which have no match).
+    fn record(&mut self, line_num: u32, line_bytes: &[u8], col: u32) {
         let raw = String::from_utf8_lossy(line_bytes);
         // Strip the trailing newline (and a CRLF `\r`) so the atom is the line
         // text, byte-identical to what `rg` prints.
@@ -829,7 +1153,51 @@ impl Sink for MatchSink<'_> {
             .entry(self.path.to_string())
             .or_default()
             .push(line_num);
+    }
+}
 
+impl Sink for MatchSink<'_> {
+    type Error = std::io::Error;
+
+    fn matched(&mut self, _searcher: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, Self::Error> {
+        let Some(line_num) = mat.line_number().and_then(|n| u32::try_from(n).ok()) else {
+            return Ok(true);
+        };
+
+        let line_bytes = mat.bytes();
+
+        // One-atom model (decision 024): the hit carries its FULL source line,
+        // byte-identical to `rg`, not the matched token (`--only-matching` is
+        // dropped). Capture the whole line, newline-stripped, plus the column
+        // of the FIRST match on it — the column still positions `prepareRename`
+        // (enrichment gating) and the enrichment query at the symbol. Under `-v`
+        // the selected line does NOT match the pattern, so there is no column to
+        // find — anchor at column 0.
+        let col = if self.invert {
+            0
+        } else {
+            let Some(first) = self.matcher.find(line_bytes).ok().flatten() else {
+                return Ok(true);
+            };
+            u32::try_from(first.start()).unwrap_or(0)
+        };
+
+        self.record(line_num, line_bytes, col);
+        Ok(true)
+    }
+
+    fn context(
+        &mut self,
+        _searcher: &Searcher,
+        ctx: &SinkContext<'_>,
+    ) -> Result<bool, Self::Error> {
+        // Context lines (`-A`/`-B`/`-C`) render in the same
+        // `path:line#scope:<verbatim>` shape as match lines — each becomes a hit
+        // and is anchored by containment at its own line. No match column.
+        let Some(line_num) = ctx.line_number().and_then(|n| u32::try_from(n).ok()) else {
+            return Ok(true);
+        };
+        self.record(line_num, ctx.bytes(), 0);
         Ok(true)
     }
 }
@@ -1368,6 +1736,7 @@ mod tests {
                 matcher: &matcher,
                 path: "test.rs",
                 local: &mut local,
+                invert: false,
             };
             Searcher::new()
                 .search_slice(&matcher, content, &mut sink)
@@ -1399,6 +1768,7 @@ mod tests {
                 matcher: &matcher,
                 path: "test.rs",
                 local: &mut local,
+                invert: false,
             };
             Searcher::new()
                 .search_slice(&matcher, content, &mut sink)
@@ -1423,6 +1793,7 @@ mod tests {
                 matcher: &matcher,
                 path: "test.rs",
                 local: &mut local,
+                invert: false,
             };
             Searcher::new()
                 .search_slice(&matcher, content, &mut sink)
@@ -1466,6 +1837,7 @@ mod tests {
             false, // include_gitignored = false: the bypass must not depend on it
             false,
             &fs,
+            &GrepFlags::default(),
         )
         .expect("ripgrep_matches");
 
@@ -1474,6 +1846,273 @@ mod tests {
             "named gitignored file must be searched without --include-gitignored: {:?}",
             rg.file_lines
         );
+    }
+
+    // ─── flag parity: matcher (smart-case / -i / -s / -w / -F) ──────────
+
+    /// Build a matcher from `flags` and test it against `hay`.
+    fn matcher_hits(pattern: &str, flags: &GrepFlags, hay: &str) -> bool {
+        let m = build_matcher(pattern, flags).expect("valid matcher");
+        m.is_match(hay.as_bytes()).expect("is_match")
+    }
+
+    #[test]
+    fn smart_case_is_the_default() {
+        let f = GrepFlags::default();
+        // Lowercase pattern → case-insensitive (matches mixed case).
+        assert!(matcher_hits("config", &f, "let Config = 1;"));
+        assert!(matcher_hits("config", &f, "config value"));
+        // Pattern with an uppercase letter → case-sensitive.
+        assert!(matcher_hits("Config", &f, "let Config = 1;"));
+        assert!(!matcher_hits("Config", &f, "config value"));
+    }
+
+    #[test]
+    fn ignore_case_forces_insensitive() {
+        let f = GrepFlags {
+            ignore_case: true,
+            ..GrepFlags::default()
+        };
+        // Even an uppercase pattern matches lowercase text under `-i`.
+        assert!(matcher_hits("Config", &f, "config value"));
+    }
+
+    #[test]
+    fn case_sensitive_forces_sensitive() {
+        let f = GrepFlags {
+            case_sensitive: true,
+            ..GrepFlags::default()
+        };
+        // A lowercase pattern no longer matches uppercase text under `-s`.
+        assert!(!matcher_hits("config", &f, "Config value"));
+        assert!(matcher_hits("config", &f, "config value"));
+    }
+
+    #[test]
+    fn word_regexp_anchors_on_word_boundaries() {
+        let f = GrepFlags {
+            word: true,
+            ..GrepFlags::default()
+        };
+        assert!(matcher_hits("cat", &f, "a cat sat"));
+        assert!(!matcher_hits("cat", &f, "category"));
+    }
+
+    #[test]
+    fn fixed_strings_treats_pattern_as_literal() {
+        let fixed = GrepFlags {
+            fixed_strings: true,
+            ..GrepFlags::default()
+        };
+        // `.` is a literal dot, not "any char".
+        assert!(matcher_hits("a.b", &fixed, "a.b"));
+        assert!(!matcher_hits("a.b", &fixed, "axb"));
+        // Without -F the same pattern is a regex (dot matches any char).
+        assert!(matcher_hits("a.b", &GrepFlags::default(), "axb"));
+    }
+
+    // ─── flag parity: searcher (-v invert / -A/-B/-C context) ───────────
+
+    /// Run `ripgrep_matches` over a one-file tempdir and return the matched
+    /// line numbers (sorted), the line→texts present.
+    fn rg_over(dir: &Path, pattern: &str, flags: &GrepFlags) -> RipgrepMatches {
+        let fs = Arc::new(FilesystemManager::new());
+        GrepServer::ripgrep_matches(
+            pattern,
+            std::slice::from_ref(&dir.to_path_buf()),
+            None,
+            false,
+            false,
+            &fs,
+            flags,
+        )
+        .expect("ripgrep_matches")
+    }
+
+    #[test]
+    fn invert_match_selects_non_matching_lines() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("f.txt"), "alpha\nbeta\ngamma\n").expect("write");
+        let flags = GrepFlags {
+            invert: true,
+            ..GrepFlags::default()
+        };
+        let rg = rg_over(tmp.path(), "beta", &flags);
+        let lines = rg.file_line_texts.values().next().expect("one file");
+        // The non-matching lines (1, 3) are selected; the matching line (2) is not.
+        assert!(lines.contains_key(&1), "alpha selected: {lines:?}");
+        assert!(lines.contains_key(&3), "gamma selected: {lines:?}");
+        assert!(!lines.contains_key(&2), "beta excluded: {lines:?}");
+    }
+
+    #[test]
+    fn context_captures_surrounding_lines() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("f.txt"), "l1\nl2 HIT\nl3\nl4\n").expect("write");
+        let flags = GrepFlags {
+            before_context: 1,
+            after_context: 1,
+            ..GrepFlags::default()
+        };
+        let rg = rg_over(tmp.path(), "HIT", &flags);
+        let lines = rg.file_line_texts.values().next().expect("one file");
+        // The match (line 2) plus one line of context on each side (1, 3).
+        assert!(lines.contains_key(&1), "before-context: {lines:?}");
+        assert!(lines.contains_key(&2), "match: {lines:?}");
+        assert!(lines.contains_key(&3), "after-context: {lines:?}");
+        assert!(!lines.contains_key(&4), "no extra: {lines:?}");
+    }
+
+    // ─── flag parity: file filters (-g glob / --type) ───────────────────
+
+    #[test]
+    fn glob_filter_restricts_to_matching_files() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("a.rs"), "TODO here\n").expect("write");
+        std::fs::write(tmp.path().join("b.txt"), "TODO here\n").expect("write");
+        let flags = GrepFlags {
+            globs: vec!["*.rs".to_string()],
+            ..GrepFlags::default()
+        };
+        let rg = rg_over(tmp.path(), "TODO", &flags);
+        assert!(
+            rg.file_lines.keys().any(|k| k.ends_with("a.rs")),
+            "the .rs file is searched: {:?}",
+            rg.file_lines
+        );
+        assert!(
+            !rg.file_lines.keys().any(|k| k.ends_with("b.txt")),
+            "the .txt file is filtered out by -g '*.rs': {:?}",
+            rg.file_lines
+        );
+    }
+
+    #[test]
+    fn type_filter_restricts_to_matching_files() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("a.rs"), "TODO here\n").expect("write");
+        std::fs::write(tmp.path().join("b.md"), "TODO here\n").expect("write");
+        let flags = GrepFlags {
+            types: vec!["rust".to_string()],
+            ..GrepFlags::default()
+        };
+        let rg = rg_over(tmp.path(), "TODO", &flags);
+        assert!(
+            rg.file_lines.keys().any(|k| k.ends_with("a.rs")),
+            "the rust file is searched: {:?}",
+            rg.file_lines
+        );
+        assert!(
+            !rg.file_lines.keys().any(|k| k.ends_with("b.md")),
+            "the md file is filtered out by --type rust: {:?}",
+            rg.file_lines
+        );
+    }
+
+    // ─── stdin (stream) mode ────────────────────────────────────────────
+
+    impl StreamOutcome {
+        fn lines(self) -> Option<String> {
+            if let Self::Lines(s) = self {
+                Some(s)
+            } else {
+                None
+            }
+        }
+        const fn count(&self) -> Option<usize> {
+            if let Self::Count(n) = self {
+                Some(*n)
+            } else {
+                None
+            }
+        }
+        const fn files_with_matches(&self) -> Option<bool> {
+            if let Self::FilesWithMatches(b) = self {
+                Some(*b)
+            } else {
+                None
+            }
+        }
+    }
+
+    fn stream_lines(pattern: &str, flags: &GrepFlags, input: &str) -> String {
+        grep_stream(input.as_bytes(), pattern, flags, false)
+            .expect("grep_stream")
+            .lines()
+            .expect("Lines outcome")
+    }
+
+    #[test]
+    fn stream_plain_matches_lines_verbatim() {
+        let f = GrepFlags::default();
+        assert_eq!(stream_lines("beta", &f, "alpha\nbeta\ngamma\n"), "beta");
+        // No match → empty, no error.
+        assert_eq!(stream_lines("zzz", &f, "alpha\nbeta\n"), "");
+    }
+
+    #[test]
+    fn stream_carries_smart_case() {
+        let f = GrepFlags::default();
+        // Lowercase pattern → insensitive over the stream.
+        assert_eq!(stream_lines("alpha", &f, "ALPHA\nbeta\n"), "ALPHA");
+        // Uppercase pattern → sensitive.
+        assert_eq!(stream_lines("Alpha", &f, "alpha\nbeta\n"), "");
+    }
+
+    #[test]
+    fn stream_carries_invert_and_fixed_and_context() {
+        let inverted = GrepFlags {
+            invert: true,
+            ..GrepFlags::default()
+        };
+        assert_eq!(
+            stream_lines("beta", &inverted, "alpha\nbeta\ngamma\n"),
+            "alpha\ngamma"
+        );
+
+        let fixed = GrepFlags {
+            fixed_strings: true,
+            ..GrepFlags::default()
+        };
+        assert_eq!(stream_lines("a.c", &fixed, "a.c\nabc\n"), "a.c");
+
+        let after = GrepFlags {
+            after_context: 1,
+            ..GrepFlags::default()
+        };
+        assert_eq!(
+            stream_lines("beta", &after, "alpha\nbeta\ngamma\n"),
+            "beta\ngamma"
+        );
+    }
+
+    #[test]
+    fn stream_count_tallies_matching_lines() {
+        let f = GrepFlags::default();
+        let n = grep_stream(&b"a\nba\nc\n"[..], "a", &f, true)
+            .expect("grep_stream")
+            .count()
+            .expect("Count outcome");
+        assert_eq!(n, 2, "two lines contain 'a'");
+    }
+
+    #[test]
+    fn stream_files_with_matches_reports_presence() {
+        let f = GrepFlags {
+            files_with_matches: true,
+            ..GrepFlags::default()
+        };
+        let matched = grep_stream(&b"alpha\nbeta\n"[..], "beta", &f, false)
+            .expect("grep_stream")
+            .files_with_matches()
+            .expect("FilesWithMatches outcome");
+        assert!(matched, "stream matched");
+
+        let missed = grep_stream(&b"alpha\nbeta\n"[..], "zzz", &f, false)
+            .expect("grep_stream")
+            .files_with_matches()
+            .expect("FilesWithMatches outcome");
+        assert!(!missed, "stream did not match");
     }
 
     #[test]
@@ -1504,6 +2143,7 @@ mod tests {
             false,
             false,
             &fs,
+            &GrepFlags::default(),
         )
         .expect("ripgrep_matches");
         assert!(
@@ -1526,6 +2166,7 @@ mod tests {
             true,
             false,
             &fs,
+            &GrepFlags::default(),
         )
         .expect("ripgrep_matches");
         assert!(
