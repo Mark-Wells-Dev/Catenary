@@ -155,8 +155,14 @@ fn test_glob_file_header() -> Result<()> {
         &json!({ "paths": [script.to_str().context("file path")?] }),
     )?;
 
-    // File header with line count
-    assert!(text.contains("(4 lines)"), "Should show line count: {text}");
+    // File header with line count. No grammar here (spawn_no_lsp), so the file
+    // carries the `no outline` marker: `(4 lines, no outline)`.
+    assert!(text.contains("(4 lines"), "Should show line count: {text}");
+    assert!(
+        text.contains("no outline"),
+        "A file with no server should be marked `no outline`, not silently \
+         outline-less: {text}"
+    );
 
     // No symbols: bridge has no LSP servers and no grammar installed
     assert!(
@@ -180,13 +186,20 @@ fn test_glob_line_counts() -> Result<()> {
         &json!({ "paths": [dir.path().to_string_lossy().to_string()] }),
     )?;
 
+    // No grammar here (spawn_no_lsp), so each file carries the `no outline`
+    // marker inside the parens: `(N lines, no outline)`. Match the count prefix.
     assert!(
-        text.contains("(3 lines)"),
+        text.contains("(3 lines"),
         "Should show 3 lines for three.txt: {text}"
     );
+    // Pluralization fix: a single line is singular, not `(1 lines)`.
     assert!(
-        text.contains("(1 lines)"),
-        "Should show 1 lines for one.txt: {text}"
+        text.contains("(1 line"),
+        "Should show 1 line (singular) for one.txt: {text}"
+    );
+    assert!(
+        !text.contains("(1 lines"),
+        "Single-line file must not read `(1 lines)`: {text}"
     );
     // Should NOT show bytes
     assert!(!text.contains("bytes"), "Should not show bytes: {text}");
@@ -830,16 +843,17 @@ fn gen_mock_content(n: usize) -> String {
 }
 
 #[test]
-fn test_glob_defensive_maps() -> Result<()> {
+fn test_glob_enrich_always_includes_small_files() -> Result<()> {
     let dir = tempfile::tempdir()?;
-    // File with few symbols but enough lines to cross threshold (set to 5).
+    // A larger file and a one-line file. The old `outline_threshold` gate is
+    // gone (enrich always), so BOTH are outlined regardless of size.
     std::fs::write(
         dir.path().join(format!("big.{MOCK_EXT}")),
         "fn alpha\nfn beta\nstruct Gamma\n\n\n\n\n\n\n\n",
     )?;
-    // Small file < threshold.
     std::fs::write(dir.path().join(format!("small.{MOCK_EXT}")), "fn tiny\n")?;
 
+    // Threshold is now inert; pass it to confirm it no longer gates outlines.
     let config = "[tools.glob]\noutline_threshold = 5\n";
     let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), Some(config))?;
     bridge.initialize()?;
@@ -849,33 +863,33 @@ fn test_glob_defensive_maps() -> Result<()> {
         &json!({ "paths": [dir.path().to_string_lossy().to_string()] }),
     )?;
 
-    // Big file should have a map: its declaration source lines are rendered
-    // as outline nodes, with no `<Kind>` label.
+    // The larger file is outlined (declaration lines, no `<Kind>` label).
     assert!(
         text.contains("fn alpha") || text.contains("struct Gamma"),
-        "Big file should have defensive map declaration lines: {text}"
+        "Larger file should have outline declaration lines: {text}"
     );
     assert!(
         !text.contains('<'),
         "Outline should have no kind label: {text}"
     );
-    // Small file should NOT have a map (under threshold): its declaration
-    // line `fn tiny` is not rendered as an outline node.
+    // Enrich always: the one-line file is listed AND outlined — its `fn tiny`
+    // declaration appears (the size gate that used to suppress it is gone).
     assert!(
         text.contains(&format!("small.{MOCK_EXT}")),
         "Should list small file: {text}"
     );
     assert!(
-        !text.contains("fn tiny"),
-        "Small file should not have an outline (under threshold): {text}"
+        text.contains("fn tiny"),
+        "Small file should be outlined too (enrich always, no size gate): {text}"
     );
     Ok(())
 }
 
 #[test]
-fn test_glob_no_maps_needed() -> Result<()> {
+fn test_glob_small_files_outlined_no_kind_label() -> Result<()> {
     let dir = tempfile::tempdir()?;
-    // All files under 200 lines.
+    // Small files (well under the old default threshold of 200). Enrich always:
+    // they are outlined now, and the outline never carries a `<Kind>` label.
     std::fs::write(
         dir.path().join(format!("a.{MOCK_EXT}")),
         "fn alpha\nfn beta\n",
@@ -890,7 +904,12 @@ fn test_glob_no_maps_needed() -> Result<()> {
         &json!({ "paths": [dir.path().to_string_lossy().to_string()] }),
     )?;
 
-    assert!(!text.contains('<'), "No symbols should appear: {text}");
+    // Outlines appear even for these small files (no size gate).
+    assert!(
+        text.contains("fn alpha") && text.contains("struct Gamma"),
+        "Small files should be outlined (enrich always): {text}"
+    );
+    assert!(!text.contains('<'), "No kind label should appear: {text}");
     Ok(())
 }
 
@@ -905,8 +924,8 @@ fn test_glob_dir_large_file_paged() -> Result<()> {
             gen_mock_content(10),
         )?;
     }
-    // Threshold of 5 so files qualify for maps; a small line budget forces the
-    // valve to fire and truncate at a file boundary.
+    // A small line budget forces the valve to fire and truncate at a file
+    // boundary (threshold is inert under enrich-always; left to confirm so).
     let config = "[tools]\nline_budget = 25\n\n[tools.glob]\noutline_threshold = 5\n";
     let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), Some(config))?;
     bridge.initialize()?;
@@ -948,10 +967,13 @@ fn test_glob_dir_large_file_paged() -> Result<()> {
     );
 
     // File-boundary truncation: the first DROPPED line begins a fresh block (a
-    // file/dir header), never a `:` symbol-detail row mid-outline.
+    // file/dir header), never an outline node mid-tree. Outline nodes render
+    // `{line}  {decl}` — a digit run then two spaces — so a header never starts
+    // with a digit (the filenames here are `file_N.mock`).
     if let Some(first_dropped) = spilled.lines().nth(shown) {
+        let trimmed = first_dropped.trim_start();
         assert!(
-            !first_dropped.trim_start().starts_with(':'),
+            !trimmed.chars().next().is_some_and(|c| c.is_ascii_digit()),
             "truncation lands on a file boundary, not mid-tree; dropped: {first_dropped:?}"
         );
     }
@@ -990,17 +1012,17 @@ fn test_glob_outline_suppress() -> Result<()> {
 }
 
 #[test]
-fn test_glob_trailing_slash() -> Result<()> {
+fn test_glob_full_expansion_nested_children() -> Result<()> {
     let dir = tempfile::tempdir()?;
-    // A file with nested definitions: Outer has children → trailing /.
-    // Pad with empty lines to cross threshold.
+    // A file with nested definitions: Outer { contains inner }; leaf is
+    // top-level. Full expansion shows each node on its own indented line — the
+    // old `/`-collapse marker (a container shown as `Outer {/`) is gone.
     std::fs::write(
         dir.path().join(format!("nested.{MOCK_EXT}")),
         "struct Outer {\nfn inner\n}\nfn leaf\n\n\n\n\n\n\n",
     )?;
 
-    let config = "[tools.glob]\noutline_threshold = 5\n";
-    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), Some(config))?;
+    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), None)?;
     bridge.initialize()?;
 
     let text = bridge.call_tool_text(
@@ -1008,15 +1030,37 @@ fn test_glob_trailing_slash() -> Result<()> {
         &json!({ "paths": [dir.path().to_string_lossy().to_string()] }),
     )?;
 
-    // Container symbols render their declaration line with a trailing /
-    // (meaning "has children") and no `<Kind>` label.
+    // The container renders without the collapse marker; its child is expanded
+    // on its own, more-indented line.
     assert!(
-        text.contains("struct Outer {/"),
-        "Container declaration line should have trailing /: {text}"
+        text.contains("struct Outer {") && !text.contains("Outer {/"),
+        "Container should render fully expanded, not collapsed with `/`: {text}"
+    );
+    assert!(
+        text.contains("fn inner"),
+        "Nested child should be expanded on its own line: {text}"
     );
     assert!(
         !text.contains('<'),
         "Outline should have no kind label: {text}"
+    );
+
+    // `fn inner` is nested under `struct Outer {`, so its line is indented more
+    // deeply than the container's.
+    let outer_indent = text
+        .lines()
+        .find(|l| l.contains("struct Outer {"))
+        .map(|l| l.len() - l.trim_start().len())
+        .context("Outer line present")?;
+    let inner_indent = text
+        .lines()
+        .find(|l| l.contains("fn inner"))
+        .map(|l| l.len() - l.trim_start().len())
+        .context("inner line present")?;
+    assert!(
+        inner_indent > outer_indent,
+        "nested child must be indented deeper than its container: \
+         outer={outer_indent}, inner={inner_indent}, text:\n{text}"
     );
     Ok(())
 }
@@ -1238,10 +1282,11 @@ fn test_glob_bounding_ranges() -> Result<()> {
     );
     // alpha sits at a different 1-based line in each file (early/mid/late),
     // so its outline node renders at distinct line prefixes — not collapsed.
+    // Nodes render `{line}  {decl}` (no colon), indented under the file header.
     assert!(
-        text.contains(":1  fn alpha")
-            && text.contains(":3  fn alpha")
-            && text.contains(":5  fn alpha"),
+        text.contains("1  fn alpha")
+            && text.contains("3  fn alpha")
+            && text.contains("5  fn alpha"),
         "Each file's alpha should render at its own declaration line: {text}"
     );
     Ok(())
@@ -1455,11 +1500,17 @@ fn test_glob_budget_minimum() -> Result<()> {
         &json!({ "paths": [bridge.root_path().to_string_lossy().to_string()] }),
     )?;
 
-    // Output should fit within clamped budget (1000) + tolerance.
+    // Volume is bounded in LINES by the overflow valve (clamped budget 1000),
+    // not in characters. 40 files + a header sit well under the budget, so the
+    // listing is untruncated and every item is present.
     assert!(
-        text.len() <= 1200,
-        "Output should be clamped budget-constrained: len={}, text:\n{text}",
-        text.len()
+        text.lines().count() <= 1000,
+        "Output must stay within the line budget: {} lines:\n{text}",
+        text.lines().count()
+    );
+    assert!(
+        text.contains("item_000.txt") && text.contains("item_039.txt"),
+        "All items should be listed (no truncation at this size): {text}"
     );
     Ok(())
 }

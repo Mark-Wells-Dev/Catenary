@@ -514,7 +514,6 @@ impl Session {
             fs_manager: fs_manager.clone(),
             symbol_index: symbol_index.clone(),
             budget: line_budget,
-            outline_threshold: glob_config.outline_threshold,
             outline_suppress,
         };
         Self {
@@ -595,7 +594,6 @@ impl Session {
                 fs_manager: primary.fs_manager.clone(),
                 symbol_index: primary.symbol_index.clone(),
                 budget: line_budget,
-                outline_threshold: glob_config.outline_threshold,
                 outline_suppress,
             },
             diagnostics: primary.diagnostics.clone(),

@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
-//! Glob tool handler: file/directory browsing.
+//! Glob tool handler: the structural read.
 //!
-//! Each path is dispatched by type:
-//! - File path → single file with defensive map (if LSP available)
-//! - Directory path → listing with line counts, maps, and flags
+//! glob is grep's counterpart: where grep enriches a *hit* by where it lives,
+//! glob enriches a *file* by what's in it. Each path is dispatched by type:
+//! - File path → header `path  (N lines)` + the file's **fully-expanded**
+//!   `documentSymbol` outline, one node per line, re-indented by tree depth.
+//! - Directory path → its immediate entries (one level, not recursive): files
+//!   get their outline; subdirectories get `name/  (N files, M dirs)` — the
+//!   immediate child counts that track the active flags, a preview of the next
+//!   glob.
 //!
-//! Output shape is determined by LSP coverage, not result volume:
-//! - Enriched: file listing with defensive maps from symbol index (LSP available)
-//! - Plain: file listing with entry flags (no LSP)
+//! **Enrich always.** Every file with symbols is outlined and every directory
+//! shows its child counts — there is no per-file size gate and no file-count
+//! gate (both were intent-guesses that shave the wrong end). A file whose
+//! language has no server, or whose `documentSymbol` fails, is listed with a
+//! `no outline` marker rather than silently outline-less. The kind is implicit
+//! in each declaration source line — no `SymbolKind` ever surfaces.
 //!
 //! Volume is bounded by the shared overflow valve (`overflow::valve`): the
 //! display is truncated at a line budget — at a complete file boundary, so an
@@ -122,7 +130,10 @@ pub struct GlobServer {
     pub(super) symbol_index: Option<Arc<Mutex<SymbolIndex>>>,
     /// Line budget for the shared overflow valve (truncate-and-spill).
     pub(super) budget: usize,
-    pub(super) outline_threshold: usize,
+    /// Glob patterns whose outlines are suppressed from automatic display (an
+    /// explicit user opt-out, e.g. generated/vendored files — not an
+    /// intent-guess gate). Symbols remain available; the entry is flagged
+    /// `[symbols available]` instead of outlined.
     pub(super) outline_suppress: Vec<globset::GlobMatcher>,
 }
 
@@ -190,19 +201,14 @@ impl GlobServer {
         })
     }
 
-    /// Single file: header with defensive map (if symbols available).
+    /// Single file: header `path  (N lines)` + its fully-expanded outline.
     ///
-    /// Single files bypass `outline_threshold` — they get a map unless the
-    /// grammar is not installed or the path matches `outline_suppress`.
-    /// Returns the complete output.
-    #[allow(
-        clippy::significant_drop_tightening,
-        reason = "guard must live for all index queries"
-    )]
-    #[allow(
-        clippy::option_if_let_else,
-        reason = "side-effecting writeln in the Some branch"
-    )]
+    /// Enrich always — the file is outlined whenever it has symbols (the
+    /// `outline_threshold` size gate is gone). A file whose language has no
+    /// server, or whose `documentSymbol` returned nothing, carries the
+    /// `no outline` degradation marker; a file matched by `outline_suppress`
+    /// keeps its `[symbols available]` flag in place of the body. Returns the
+    /// complete output.
     fn handle_glob_file(&self, path: &Path, cwd: Option<&Path>) -> String {
         let mut full = String::new();
 
@@ -238,56 +244,49 @@ impl GlobServer {
             return full;
         }
 
-        // File header with line count or size.
         let line_count = metadata
             .as_ref()
             .and_then(|m| self.fs_manager.line_count(path, m));
+
+        // Resolve the outline once: whether the file has symbols, whether it is
+        // suppressed, and (when it will be rendered) the symbols themselves.
+        let suppressed = is_outline_suppressed(path, &self.outline_suppress, &self.fs_manager);
+        let (has_symbols, syms) = self
+            .symbol_index
+            .as_ref()
+            .and_then(|arc| arc.lock().ok())
+            .map_or((false, None), |idx| {
+                let hs = idx.has_symbols_for(path);
+                let syms = if hs && !suppressed {
+                    idx.query(".*", Some(std::slice::from_ref(&path.to_path_buf())))
+                        .ok()
+                        .map(|all| all.into_iter().map(|(_, s)| s).collect::<Vec<_>>())
+                } else {
+                    None
+                };
+                (hs, syms)
+            });
+
+        // Header: `(N lines)`, plus `no outline` when a text file has no
+        // symbols, or `[symbols available]` when symbols exist but are
+        // suppressed. Binary files report a size and are never marked.
         if let Some(lc) = line_count {
-            let _ = writeln!(full, "{display}  ({lc} lines)");
+            let lines = pluralize_lines(lc);
+            if has_symbols && suppressed {
+                let _ = writeln!(full, "{display}  ({lines}) [symbols available]");
+            } else if has_symbols {
+                let _ = writeln!(full, "{display}  ({lines})");
+            } else {
+                let _ = writeln!(full, "{display}  ({lines}, no outline)");
+            }
         } else {
             let size = metadata.map_or(0, |m| m.len());
             let _ = writeln!(full, "{display}  ({})", format_file_size(size));
         }
 
-        // Single-file map: bypass threshold, check symbols + deny only.
-        let Some(ref ts_arc) = self.symbol_index else {
-            return full;
-        };
-        let Ok(idx) = ts_arc.lock() else {
-            return full;
-        };
-        if !idx.has_symbols_for(path)
-            || is_outline_suppressed(path, &self.outline_suppress, &self.fs_manager)
-        {
-            return full;
-        }
-
-        let Ok(outline) = idx.query_outline_batch(&[path]) else {
-            return full;
-        };
-        let Some(syms) = outline.get(path) else {
-            return full;
-        };
-
-        // Build children set: names that appear as scope for other symbols.
-        let children_set = idx
-            .query(".*", Some(&[path.to_path_buf()]))
-            .ok()
-            .map(|all| {
-                let mut cs = HashSet::new();
-                for (_, s) in &all {
-                    if let Some(ref scope) = s.scope {
-                        cs.insert(scope.clone());
-                    }
-                }
-                cs
-            })
-            .unwrap_or_default();
-
-        let mut sources = SourceLines::new();
-        for sym in syms {
-            let source = sources.line(path, sym.line);
-            render_symbol_line(&mut full, sym, Some(&children_set), "\t", source);
+        if let Some(syms) = syms {
+            let mut sources = SourceLines::new();
+            render_full_outline(&mut full, path, &syms, "\t", &mut sources);
         }
 
         full
@@ -415,11 +414,15 @@ impl GlobServer {
         }
     }
 
-    /// Directory listing: enriched (maps) where LSP available, plain (flags) otherwise.
+    /// Directory listing: the one-level structural read.
     ///
-    /// Collects immediate children, applies visibility and exclude filters,
-    /// detects flags (gitignored, snapshot, broken). Output shape is
-    /// capability-driven, not volume-driven. Returns the complete output.
+    /// Collects immediate children, applies visibility and exclude filters, and
+    /// renders them: files get their fully-expanded outline (or the `no outline`
+    /// marker), subdirectories get `name/  (N files, M dirs)` immediate child
+    /// counts (no recursion). The directory's own header carries the same
+    /// `(N files, M dirs)` count — a directory renders identically as a child
+    /// entry and as the glob target's header — so an empty directory is
+    /// `path/  (empty)`. Returns the complete output.
     #[allow(
         clippy::significant_drop_tightening,
         reason = "guard must live for all index queries"
@@ -438,11 +441,40 @@ impl GlobServer {
 
         let entries = self.collect_dir_entries(&canonical, input, exclude)?;
 
-        if entries.is_empty() {
-            return Ok("Directory is empty".to_string());
+        // The target's own count = its immediate entries (what this glob
+        // enumerated), split into files and directories — the same split a
+        // subdir child entry shows, so the two forms agree.
+        let target_files = entries.iter().filter(|e| !e.is_dir).count();
+        let target_dirs = entries.iter().filter(|e| e.is_dir).count();
+        let target_suffix = dir_count_suffix(target_files, target_dirs);
+
+        // Context header: `cwd: ~/…` for cwd-scoped, absolute path for absolute.
+        let mut full = String::new();
+        if let Some(cwd) = cwd {
+            let compressed = super::compress_home(cwd);
+            if self.fs_manager.resolve_root(cwd).is_some() {
+                let _ = writeln!(full, "cwd: {compressed}");
+            } else {
+                let _ = writeln!(full, "cwd: {compressed} {NO_LSP_LABEL}");
+            }
+            let display = canonical.strip_prefix(cwd).map_or_else(
+                |_| canonical.to_string_lossy().to_string(),
+                |rel| rel.to_string_lossy().to_string(),
+            );
+            let _ = writeln!(full, "{display}/  {target_suffix}");
+        } else {
+            // Absolute pattern outside workspace roots: LSP warning.
+            if self.fs_manager.resolve_root(&canonical).is_none() {
+                let _ = writeln!(full, "{NO_LSP_LABEL}");
+            }
+            let _ = writeln!(full, "{}/  {target_suffix}", canonical.display());
         }
 
-        // Populate symbol index for eligible files.
+        if entries.is_empty() {
+            return Ok(full);
+        }
+
+        // Populate the symbol index for every listed file (enrich always).
         let file_paths: Vec<PathBuf> = entries
             .iter()
             .filter(|e| !e.is_dir && !e.is_broken_symlink && !e.is_snapshot)
@@ -462,36 +494,14 @@ impl GlobServer {
 
         let ts_guard = self.symbol_index.as_ref().and_then(|m| m.lock().ok());
 
-        // Context header: `cwd: ~/…` for cwd-scoped, absolute path for absolute.
-        let mut full = String::new();
-        if let Some(cwd) = cwd {
-            let compressed = super::compress_home(cwd);
-            if self.fs_manager.resolve_root(cwd).is_some() {
-                let _ = writeln!(full, "cwd: {compressed}");
-            } else {
-                let _ = writeln!(full, "cwd: {compressed} {NO_LSP_LABEL}");
-            }
-            let display = canonical.strip_prefix(cwd).map_or_else(
-                |_| canonical.to_string_lossy().to_string(),
-                |rel| rel.to_string_lossy().to_string(),
-            );
-            let _ = writeln!(full, "{display}/");
-        } else {
-            // Absolute pattern outside workspace roots: LSP warning.
-            if self.fs_manager.resolve_root(&canonical).is_none() {
-                let _ = writeln!(full, "{NO_LSP_LABEL}");
-            }
-            let _ = writeln!(full, "{}/", canonical.display());
-        }
-
-        // Render: enriched (maps) for eligible files, plain (flags) for the rest.
         let content = render_dir(
             &entries,
             ts_guard.as_deref(),
-            self.outline_threshold,
             &self.outline_suppress,
             &self.fs_manager,
             "\t",
+            input,
+            exclude,
         );
         full.push_str(&content);
         Ok(full)
@@ -662,23 +672,7 @@ impl GlobServer {
     }
 }
 
-// ─── Map eligibility ──────────────────────────────────────────────────
-
-/// Returns `true` if a file is eligible for defensive maps in a directory listing.
-fn is_enrichment_eligible_entry(
-    entry: &GlobEntry,
-    outline_threshold: usize,
-    outline_suppress: &[globset::GlobMatcher],
-    symbol_index: &SymbolIndex,
-    fs_manager: &FilesystemManager,
-) -> bool {
-    !entry.is_dir
-        && !entry.is_broken_symlink
-        && !entry.is_snapshot
-        && entry.line_count.is_some_and(|lc| lc >= outline_threshold)
-        && symbol_index.has_symbols_for(&entry.abs_path)
-        && !is_outline_suppressed(&entry.abs_path, outline_suppress, fs_manager)
-}
+// ─── Outline eligibility ──────────────────────────────────────────────
 
 /// Returns `true` if symbols are cached for the file in the index.
 fn has_symbols_available(path: &Path, symbol_index: Option<&SymbolIndex>) -> bool {
@@ -711,266 +705,253 @@ fn is_snapshot(name: &str) -> bool {
 /// Whether a glob output line *begins* a complete top-level block, i.e. is a
 /// safe place for the overflow valve to truncate.
 ///
-/// A symbol-detail row renders `{indent}:{line}  {decl}` (see
-/// [`render_symbol_line`]), so any line that does **not** start with `:` (after
-/// its indentation) is a file or directory header — the start of a fresh
-/// outline. Cutting there never severs a file's outline mid-tree. This module
-/// owns the glob line format, so it owns the boundary predicate the shared
-/// valve calls back into.
+/// An outline node renders `{indent}{line}  {decl}` (see [`render_symbol_line`])
+/// — a run of digits (the 1-based line number) followed by exactly two spaces.
+/// Every other line (a file or directory header, the `cwd:`/`(no LSP …)`
+/// banner) begins a fresh block. Cutting there never severs a file's outline
+/// mid-tree. A header whose name is *all* digits with no extension is the one
+/// ambiguous case (treated as a node); it is vanishingly rare and only costs a
+/// slightly earlier cut. This module owns the glob line format, so it owns the
+/// boundary predicate the shared valve calls back into.
 fn is_outline_boundary(line: &str) -> bool {
-    !line.trim_start().starts_with(':')
+    let trimmed = line.trim_start().as_bytes();
+    let digits = trimmed.iter().take_while(|b| b.is_ascii_digit()).count();
+    // A node row is `<digits>  <decl>`: at least one digit, then two spaces.
+    !(digits > 0 && trimmed.get(digits) == Some(&b' ') && trimmed.get(digits + 1) == Some(&b' '))
 }
 
-/// Renders a single outline node as the one atom: `:line  <source line>[/]`.
+/// Renders a single outline node: `{indent}{line}  <declaration source line>`.
 ///
-/// The declaration line at the symbol's range start carries the kind
-/// implicitly (`fn foo(...)`, `struct Bar`, `# Heading`), so no `<Kind>`
-/// label is rendered (decision 024). When the source line is unavailable
-/// (file unreadable or line out of range) the bare name is used as a fall
-/// back so the node is never empty. The trailing `/` (has-children)
-/// indicator — a structural signal, not a kind label — is kept.
-fn render_symbol_line(
-    out: &mut String,
-    sym: &Symbol,
-    children_set: Option<&HashSet<String>>,
-    indent: &str,
-    source: Option<&str>,
-) {
-    let trailing = if children_set.is_some_and(|cs| cs.contains(&sym.name)) {
-        "/"
-    } else {
-        ""
-    };
+/// The declaration source line (keyed by the symbol's `selectionRange` start,
+/// not `range.start` which would land on a leading `///`/attribute line)
+/// carries the kind implicitly (`fn foo(...)`, `struct Bar`, `# Heading`), so
+/// no `<Kind>` label is rendered, and no `SymbolKind` ever surfaces. Nesting is
+/// shown by `indent` (tree depth), so the old `/` has-children collapse marker
+/// is gone — the children are expanded on their own indented lines. When the
+/// source line is unavailable (file unreadable or line out of range) the bare
+/// name is used so the node is never empty.
+fn render_symbol_line(out: &mut String, sym: &Symbol, indent: &str, source: Option<&str>) {
     let text = source.map_or_else(|| sym.name.as_str(), str::trim_end);
-    let _ = writeln!(out, "{indent}:{}  {text}{trailing}", sym.line + 1);
+    let _ = writeln!(out, "{indent}{}  {text}", sym.line + 1);
 }
 
-/// Renders one file's outline as one atom per node.
+/// Renders one file's **fully-expanded** outline, re-indented by tree depth.
 ///
-/// Each node is its declaration source line, indented under the file
-/// header (decision 024: the structure is the indentation, not a kind
-/// label). The one-atom model retired the cross-file "common structure"
-/// collapse — an outline shows each symbol once in its structural slot,
-/// nothing recurs (collapse is grep-only). The file is read once via
-/// [`SourceLines`] and indexed by line number for each node's source text.
-fn render_individual_map(
+/// `syms` are the file's symbols at every depth, in ascending declaration-line
+/// order (as the index stores them). `documentSymbol` ranges nest — a child's
+/// `[line, end_line]` span lies within its parent's — so an interval stack
+/// recovers each node's depth: pop every ancestor whose span ends before this
+/// node begins, and the remaining stack height is the depth. The node is then
+/// indented `base_indent` + one tab per depth level (glob normalizes structure
+/// to tree depth, not source columns). The file is read once via
+/// [`SourceLines`] for each node's declaration text.
+fn render_full_outline(
     out: &mut String,
     file: &Path,
     syms: &[Symbol],
-    children_set: Option<&HashSet<String>>,
-    sym_indent: &str,
+    base_indent: &str,
     sources: &mut SourceLines,
 ) {
+    // Stack of open ancestors' `end_line`s.
+    let mut open_ends: Vec<u32> = Vec::new();
     for sym in syms {
+        while open_ends.last().is_some_and(|&end| end < sym.line) {
+            open_ends.pop();
+        }
+        let indent = format!("{base_indent}{}", "\t".repeat(open_ends.len()));
         let source = sources.line(file, sym.line);
-        render_symbol_line(out, sym, children_set, sym_indent, source);
+        render_symbol_line(out, sym, &indent, source);
+        open_ends.push(sym.end_line);
     }
+}
+
+/// Returns the file's parenthetical descriptor: `(N line[s])`, with `, no
+/// outline` appended when `mark_no_outline` (a text file whose language has no
+/// server, or whose `documentSymbol` produced nothing), or `(size)` for a
+/// binary file (never marked — a binary has no outline by nature). Empty when
+/// the file has neither a line count nor a size.
+fn file_descriptor(entry: &GlobEntry, mark_no_outline: bool) -> String {
+    entry.binary_size.as_ref().map_or_else(
+        || match entry.line_count {
+            Some(lc) if mark_no_outline => format!("({}, no outline)", pluralize_lines(lc)),
+            Some(lc) => format!("({})", pluralize_lines(lc)),
+            None => String::new(),
+        },
+        |size| format!("({size})"),
+    )
+}
+
+/// Pluralizes a file's line count: `1 line`, `0 lines`, `N lines`.
+fn pluralize_lines(count: usize) -> String {
+    if count == 1 {
+        "1 line".to_string()
+    } else {
+        format!("{count} lines")
+    }
+}
+
+/// Builds a directory's `(N files, M dirs)` child-count suffix, or `(empty)`
+/// when it has no entries. Pluralizes each part (`1 file`, `1 dir`).
+fn dir_count_suffix(files: usize, dirs: usize) -> String {
+    if files == 0 && dirs == 0 {
+        return "(empty)".to_string();
+    }
+    let files_word = if files == 1 {
+        "1 file".to_string()
+    } else {
+        format!("{files} files")
+    };
+    let dirs_word = if dirs == 1 {
+        "1 dir".to_string()
+    } else {
+        format!("{dirs} dirs")
+    };
+    format!("({files_word}, {dirs_word})")
+}
+
+/// Counts a directory's immediate children split into `(files, dirs)`, applying
+/// the same visibility (gitignore/hidden) and `exclude` filters the listing
+/// uses — *what globbing into this directory would enumerate*, the preview of
+/// the next glob. Cheap: one stat per entry, no content reads (unlike
+/// [`GlobServer::collect_dir_entries`]), so previewing a huge `target/` does not
+/// read 40 000 files. Symlinks are followed for the file/dir decision, matching
+/// the listing's classification.
+fn count_dir_children(
+    dir: &Path,
+    input: &GlobInput,
+    exclude: Option<&ResolvedGlob>,
+) -> (usize, usize) {
+    let walker = WalkBuilder::new(dir)
+        .max_depth(Some(1))
+        .git_ignore(!input.include_gitignored)
+        .hidden(!input.include_hidden)
+        .build();
+    let mut files = 0usize;
+    let mut dirs = 0usize;
+    for entry in walker.flatten() {
+        let entry_path = entry.into_path();
+        if entry_path.as_path() == dir {
+            continue;
+        }
+        if let Some(rg) = exclude
+            && rg.is_match(&entry_path, dir)
+        {
+            continue;
+        }
+        if std::fs::metadata(&entry_path).is_ok_and(|m| m.is_dir()) {
+            dirs += 1;
+        } else {
+            files += 1;
+        }
+    }
+    (files, dirs)
 }
 
 // ─── Directory rendering ─────────────────────────────────────────────
 
-/// Renders a directory listing: outline maps for files with LSP symbols,
-/// plain (flags) for the rest.
+/// Renders a directory listing: subdirectories with their child counts, then
+/// files with their fully-expanded outlines.
 ///
-/// Each map-eligible file renders its own outline — one atom per node, the
-/// declaration source line indented under the file header (decision 024).
-/// The cross-file "common structure" collapse is retired: an outline shows
-/// each symbol once in its structural slot, nothing recurs.
+/// Enrich always — every file with symbols is outlined (no size/count gate),
+/// unless matched by `outline_suppress` (which keeps a `[symbols available]`
+/// flag in its place). A file whose language has no server, or whose
+/// `documentSymbol` produced nothing, carries the `no outline` marker. Each
+/// subdirectory shows `name/  (N files, M dirs)` — its immediate child counts
+/// under the active flags, no recursion. Directories sort before files; both
+/// sort by name. `symbol_index` is `None` only outside the daemon; otherwise it
+/// is an index that may simply hold no symbols for an unserved file.
 #[allow(clippy::too_many_lines, reason = "sequential rendering pipeline")]
 fn render_dir(
     entries: &[GlobEntry],
     symbol_index: Option<&SymbolIndex>,
-    outline_threshold: usize,
     outline_suppress: &[globset::GlobMatcher],
     fs_manager: &FilesystemManager,
     indent: &str,
+    input: &GlobInput,
+    exclude: Option<&ResolvedGlob>,
 ) -> String {
-    let sym_indent = format!("{indent}\t");
-    let Some(idx) = symbol_index else {
-        // No symbol index — render everything as plain (flags).
-        return render_dir_plain(
-            entries,
-            None,
-            outline_threshold,
-            outline_suppress,
-            fs_manager,
-            indent,
-        );
-    };
-
-    let eligible_indices: Vec<usize> = entries
-        .iter()
-        .enumerate()
-        .filter(|(_, e)| {
-            is_enrichment_eligible_entry(e, outline_threshold, outline_suppress, idx, fs_manager)
-        })
-        .map(|(i, _)| i)
-        .collect();
-
-    if eligible_indices.is_empty() {
-        return render_dir_plain(
-            entries,
-            Some(idx),
-            outline_threshold,
-            outline_suppress,
-            fs_manager,
-            indent,
-        );
-    }
-
-    let eligible_refs: Vec<&Path> = eligible_indices
-        .iter()
-        .map(|&i| entries[i].abs_path.as_path())
-        .collect();
-    let Ok(outline) = idx.query_outline_batch(&eligible_refs) else {
-        return render_dir_plain(
-            entries,
-            Some(idx),
-            outline_threshold,
-            outline_suppress,
-            fs_manager,
-            indent,
-        );
-    };
-    if outline.is_empty() {
-        return render_dir_plain(
-            entries,
-            Some(idx),
-            outline_threshold,
-            outline_suppress,
-            fs_manager,
-            indent,
-        );
-    }
-
-    // Build children sets for the has-children (`/`) indicator.
-    let children_sets = build_children_sets(idx, &eligible_refs);
-    let eligible_set: HashSet<usize> = eligible_indices.iter().copied().collect();
+    // Outline nodes sit one level deeper than their file header.
+    let sym_base_indent = format!("{indent}\t");
     let mut sources = SourceLines::new();
     let mut result = String::new();
 
+    // Subdirectories first (sorted), each with its immediate child counts.
     let mut dirs: Vec<&GlobEntry> = entries.iter().filter(|e| e.is_dir).collect();
     dirs.sort_by(|a, b| a.name.cmp(&b.name));
     for d in &dirs {
-        let _ = writeln!(result, "{indent}{}", d.name);
+        let (files, subdirs) = count_dir_children(&d.abs_path, input, exclude);
+        let descriptor = dir_count_suffix(files, subdirs);
+        let flags = compute_entry_flags(false, false, d.is_gitignored);
+        render_entry_line(&mut result, d, &descriptor, &flags, indent);
     }
 
-    let mut files: Vec<(usize, &GlobEntry)> = entries
-        .iter()
-        .enumerate()
-        .filter(|(_, e)| !e.is_dir)
-        .collect();
-    files.sort_by(|a, b| a.1.name.cmp(&b.1.name));
+    // Files (sorted), each with its fully-expanded outline (enrich always).
+    let mut files: Vec<&GlobEntry> = entries.iter().filter(|e| !e.is_dir).collect();
+    files.sort_by(|a, b| a.name.cmp(&b.name));
+    for f in &files {
+        if f.is_broken_symlink || f.is_snapshot {
+            let flags = compute_entry_flags(false, false, f.is_gitignored);
+            render_entry_line(&mut result, f, "", &flags, indent);
+            continue;
+        }
 
-    for &(ei, f) in &files {
-        if eligible_set.contains(&ei)
-            && let Some(syms) = outline.get(&f.abs_path)
+        let has_symbols = has_symbols_available(&f.abs_path, symbol_index);
+        let suppressed =
+            has_symbols && is_outline_suppressed(&f.abs_path, outline_suppress, fs_manager);
+        // A text file (it has a line count) with no symbols degraded — mark it.
+        let mark_no_outline = f.line_count.is_some() && !has_symbols;
+        let descriptor = file_descriptor(f, mark_no_outline);
+        let flags = compute_entry_flags(has_symbols, suppressed, f.is_gitignored);
+        render_entry_line(&mut result, f, &descriptor, &flags, indent);
+
+        if has_symbols
+            && !suppressed
+            && let Some(idx) = symbol_index
+            && let Ok(all) = idx.query(".*", Some(std::slice::from_ref(&f.abs_path)))
         {
-            let flags = compute_entry_flags(f, Some(idx), 0, outline_suppress, fs_manager, true);
-            render_entry_line(&mut result, f, &flags, indent);
-            let cs = children_sets.get(&f.abs_path);
-            render_individual_map(
+            let syms: Vec<Symbol> = all.into_iter().map(|(_, s)| s).collect();
+            render_full_outline(
                 &mut result,
                 &f.abs_path,
-                syms,
-                cs,
-                &sym_indent,
+                &syms,
+                &sym_base_indent,
                 &mut sources,
             );
-        } else {
-            // Non-eligible file: plain flags.
-            let flags = compute_entry_flags(
-                f,
-                Some(idx),
-                outline_threshold,
-                outline_suppress,
-                fs_manager,
-                false,
-            );
-            render_entry_line(&mut result, f, &flags, indent);
         }
     }
 
     result
 }
 
-/// Renders a flat directory listing with entry flags (plain).
-fn render_dir_plain(
-    entries: &[GlobEntry],
-    symbol_index: Option<&SymbolIndex>,
-    outline_threshold: usize,
-    outline_suppress: &[globset::GlobMatcher],
-    fs_manager: &FilesystemManager,
-    indent: &str,
-) -> String {
-    let mut dirs: Vec<&GlobEntry> = entries.iter().filter(|e| e.is_dir).collect();
-    let mut files: Vec<&GlobEntry> = entries.iter().filter(|e| !e.is_dir).collect();
-
-    dirs.sort_by(|a, b| a.name.cmp(&b.name));
-    files.sort_by(|a, b| a.name.cmp(&b.name));
-
-    let mut result = String::new();
-    for d in &dirs {
-        let _ = writeln!(result, "{indent}{}", d.name);
-    }
-    for f in &files {
-        let flags = compute_entry_flags(
-            f,
-            symbol_index,
-            outline_threshold,
-            outline_suppress,
-            fs_manager,
-            false,
-        );
-        render_entry_line(&mut result, f, &flags, indent);
-    }
-    result
-}
-
-/// Computes entry flags for a `GlobEntry`.
-fn compute_entry_flags<'a>(
-    entry: &GlobEntry,
-    symbol_index: Option<&SymbolIndex>,
-    outline_threshold: usize,
-    outline_suppress: &[globset::GlobMatcher],
-    fs_manager: &FilesystemManager,
-    map_rendered: bool,
-) -> Vec<&'a str> {
+/// Computes the appended `[…]` flags for an entry: `symbols available` when the
+/// file has symbols that are suppressed from display, and `gitignored`.
+/// Broken/snapshot entries render their own dedicated form in
+/// [`render_entry_line`] and ignore these flags.
+fn compute_entry_flags<'a>(has_symbols: bool, suppressed: bool, gitignored: bool) -> Vec<&'a str> {
     let mut flags = Vec::new();
-
-    if entry.is_broken_symlink {
-        flags.push("broken");
-        return flags;
-    }
-
-    if entry.is_snapshot {
-        flags.push("snapshot");
-        return flags;
-    }
-
-    if !map_rendered
-        && has_symbols_available(&entry.abs_path, symbol_index)
-        && entry.line_count.is_some_and(|lc| lc >= outline_threshold)
-    {
+    if has_symbols && suppressed {
         flags.push("symbols available");
     }
-
-    if map_rendered
-        && has_symbols_available(&entry.abs_path, symbol_index)
-        && is_outline_suppressed(&entry.abs_path, outline_suppress, fs_manager)
-    {
-        flags.push("symbols available");
-    }
-
-    if entry.is_gitignored {
+    if gitignored {
         flags.push("gitignored");
     }
-
     flags
 }
 
-/// Renders a `GlobEntry` line with flags.
-fn render_entry_line(out: &mut String, entry: &GlobEntry, flags: &[&str], indent: &str) {
+/// Renders a `GlobEntry`'s header line: `{indent}{name}  {descriptor}{flags}`.
+///
+/// `descriptor` is the precomputed parenthetical — `(N lines)`, `(N lines, no
+/// outline)`, `(size)`, or a directory's `(N files, M dirs)`/`(empty)` — or
+/// empty. Broken symlinks and snapshot sidecars render their own dedicated form
+/// (and carry no descriptor); a symlink renders `name -> target` before the
+/// descriptor.
+fn render_entry_line(
+    out: &mut String,
+    entry: &GlobEntry,
+    descriptor: &str,
+    flags: &[&str],
+    indent: &str,
+) {
     let flag_str = if flags.is_empty() {
         String::new()
     } else {
@@ -984,56 +965,23 @@ fn render_entry_line(out: &mut String, entry: &GlobEntry, flags: &[&str], indent
         let _ = writeln!(out, "{indent}{} [snapshot]", entry.name);
     } else if entry.is_symlink {
         let target = entry.symlink_target.as_deref().unwrap_or("?");
-        if let Some(lc) = entry.line_count {
-            let _ = writeln!(
-                out,
-                "{indent}{} -> {target}  ({lc} lines){flag_str}",
-                entry.name
-            );
-        } else if let Some(ref size) = entry.binary_size {
-            let _ = writeln!(
-                out,
-                "{indent}{} -> {target}  ({size}){flag_str}",
-                entry.name
-            );
-        } else {
+        if descriptor.is_empty() {
             let _ = writeln!(out, "{indent}{} -> {target}{flag_str}", entry.name);
+        } else {
+            let _ = writeln!(
+                out,
+                "{indent}{} -> {target}  {descriptor}{flag_str}",
+                entry.name
+            );
         }
-    } else if let Some(ref size) = entry.binary_size {
-        let _ = writeln!(out, "{indent}{}  ({size}){flag_str}", entry.name);
-    } else if let Some(lc) = entry.line_count {
-        let _ = writeln!(out, "{indent}{}  ({lc} lines){flag_str}", entry.name);
-    } else {
+    } else if descriptor.is_empty() {
         let _ = writeln!(out, "{indent}{}{flag_str}", entry.name);
+    } else {
+        let _ = writeln!(out, "{indent}{}  {descriptor}{flag_str}", entry.name);
     }
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────
-
-/// Builds per-file children sets from the tree-sitter index.
-///
-/// For each file, collects the set of symbol names that are used as
-/// `scope` by other symbols — these are containers that get trailing `/`.
-fn build_children_sets(
-    symbol_index: &SymbolIndex,
-    files: &[&Path],
-) -> HashMap<PathBuf, HashSet<String>> {
-    let mut result = HashMap::new();
-    for &path in files {
-        let mut cs = HashSet::new();
-        if let Ok(all) = symbol_index.query(".*", Some(&[path.to_path_buf()])) {
-            for (_, s) in &all {
-                if let Some(ref scope) = s.scope {
-                    cs.insert(scope.clone());
-                }
-            }
-        }
-        if !cs.is_empty() {
-            result.insert(path.to_path_buf(), cs);
-        }
-    }
-    result
-}
 
 /// Whether `path` is a regular file or a symlink, retrying a transient miss.
 ///
@@ -1234,7 +1182,7 @@ mod tests {
         );
     }
 
-    // ─── is_enrichment_eligible_entry ────────────────────────────────
+    // ─── entry construction helper ───────────────────────────────────
 
     fn make_glob_entry(
         name: &str,
@@ -1256,246 +1204,60 @@ mod tests {
         }
     }
 
+    // ─── pluralization + descriptors ─────────────────────────────────
+
     #[test]
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    fn test_enrichment_eligible_entry_all_conditions() {
-        let idx = SymbolIndex::new().expect("create index");
-        let path = PathBuf::from("/test/eligible.rs");
-
-        idx.populate_from_document_symbols(
-            &path,
-            &serde_json::json!([{
-                "name": "foo",
-                "kind": 12,
-                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 5, "character": 1 } },
-                "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 6 } }
-            }]),
-        )
-        .expect("populate");
-
-        let entry = make_glob_entry("eligible.rs", &path, false, Some(200));
-        let fs = FilesystemManager::new();
-
-        // All conditions met → eligible.
-        assert!(
-            is_enrichment_eligible_entry(&entry, 100, &[], &idx, &fs),
-            "should be eligible when all conditions met"
-        );
+    fn test_pluralize_lines() {
+        // The `(1 lines)` bug fixed: a single line is singular.
+        assert_eq!(pluralize_lines(0), "0 lines");
+        assert_eq!(pluralize_lines(1), "1 line");
+        assert_eq!(pluralize_lines(2), "2 lines");
+        assert_eq!(pluralize_lines(92), "92 lines");
     }
 
     #[test]
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    fn test_enrichment_eligible_entry_dir_excluded() {
-        let idx = SymbolIndex::new().expect("create index");
-        let path = PathBuf::from("/test/dir");
-
-        idx.populate_from_document_symbols(
-            &path,
-            &serde_json::json!([{
-                "name": "sym",
-                "kind": 12,
-                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 1, "character": 1 } },
-                "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 6 } }
-            }]),
-        )
-        .expect("populate");
-
-        let entry = make_glob_entry("dir", &path, true, Some(200));
-        let fs = FilesystemManager::new();
-
-        assert!(
-            !is_enrichment_eligible_entry(&entry, 100, &[], &idx, &fs),
-            "directories should not be enrichment eligible"
-        );
+    fn test_dir_count_suffix() {
+        // `(empty)` for zero; each part pluralized independently.
+        assert_eq!(dir_count_suffix(0, 0), "(empty)");
+        assert_eq!(dir_count_suffix(1, 0), "(1 file, 0 dirs)");
+        assert_eq!(dir_count_suffix(0, 1), "(0 files, 1 dir)");
+        assert_eq!(dir_count_suffix(3, 2), "(3 files, 2 dirs)");
+        assert_eq!(dir_count_suffix(40000, 200), "(40000 files, 200 dirs)");
     }
 
     #[test]
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    fn test_enrichment_eligible_entry_broken_symlink_excluded() {
-        let idx = SymbolIndex::new().expect("create index");
-        let path = PathBuf::from("/test/broken.rs");
-
-        idx.populate_from_document_symbols(
-            &path,
-            &serde_json::json!([{
-                "name": "sym",
-                "kind": 12,
-                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 1, "character": 1 } },
-                "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 6 } }
-            }]),
-        )
-        .expect("populate");
-
-        let mut entry = make_glob_entry("broken.rs", &path, false, Some(200));
-        entry.is_broken_symlink = true;
-        let fs = FilesystemManager::new();
-
-        assert!(
-            !is_enrichment_eligible_entry(&entry, 100, &[], &idx, &fs),
-            "broken symlinks should not be enrichment eligible"
-        );
+    fn test_file_descriptor_text_and_no_outline() {
+        let entry = make_glob_entry("f.rs", Path::new("/t/f.rs"), false, Some(1));
+        // A text file with symbols: bare line count, singular.
+        assert_eq!(file_descriptor(&entry, false), "(1 line)");
+        // No symbols (no server / failed / empty): the `no outline` marker.
+        assert_eq!(file_descriptor(&entry, true), "(1 line, no outline)");
     }
 
     #[test]
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    fn test_enrichment_eligible_entry_snapshot_excluded() {
-        let idx = SymbolIndex::new().expect("create index");
-        let path = PathBuf::from("/test/snap.rs");
-
-        idx.populate_from_document_symbols(
-            &path,
-            &serde_json::json!([{
-                "name": "sym",
-                "kind": 12,
-                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 1, "character": 1 } },
-                "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 6 } }
-            }]),
-        )
-        .expect("populate");
-
-        let mut entry = make_glob_entry("snap.rs", &path, false, Some(200));
-        entry.is_snapshot = true;
-        let fs = FilesystemManager::new();
-
-        assert!(
-            !is_enrichment_eligible_entry(&entry, 100, &[], &idx, &fs),
-            "snapshot files should not be enrichment eligible"
-        );
+    fn test_file_descriptor_binary_never_marked() {
+        let mut entry = make_glob_entry("d.bin", Path::new("/t/d.bin"), false, None);
+        entry.binary_size = Some("1.5 MB".to_string());
+        // A binary has no outline by nature — never the `no outline` marker.
+        assert_eq!(file_descriptor(&entry, true), "(1.5 MB)");
     }
 
-    #[test]
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    fn test_enrichment_eligible_entry_below_threshold() {
-        let idx = SymbolIndex::new().expect("create index");
-        let path = PathBuf::from("/test/small.rs");
-
-        idx.populate_from_document_symbols(
-            &path,
-            &serde_json::json!([{
-                "name": "sym",
-                "kind": 12,
-                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 1, "character": 1 } },
-                "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 6 } }
-            }]),
-        )
-        .expect("populate");
-
-        // line_count (50) < threshold (100) → not eligible
-        let entry = make_glob_entry("small.rs", &path, false, Some(50));
-        let fs = FilesystemManager::new();
-
-        assert!(
-            !is_enrichment_eligible_entry(&entry, 100, &[], &idx, &fs),
-            "file below threshold should not be enrichment eligible"
-        );
-    }
+    // ─── is_outline_boundary (overflow-valve cut predicate) ──────────
 
     #[test]
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    fn test_enrichment_eligible_entry_at_threshold_boundary() {
-        let idx = SymbolIndex::new().expect("create index");
-        let path = PathBuf::from("/test/boundary.rs");
-
-        idx.populate_from_document_symbols(
-            &path,
-            &serde_json::json!([{
-                "name": "sym",
-                "kind": 12,
-                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 1, "character": 1 } },
-                "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 6 } }
-            }]),
-        )
-        .expect("populate");
-
-        // line_count == threshold → eligible (>= check)
-        let entry = make_glob_entry("boundary.rs", &path, false, Some(100));
-        let fs = FilesystemManager::new();
-
-        assert!(
-            is_enrichment_eligible_entry(&entry, 100, &[], &idx, &fs),
-            "file at exact threshold should be eligible"
-        );
-
-        // line_count one below threshold → not eligible
-        let entry_below = make_glob_entry("boundary.rs", &path, false, Some(99));
-        assert!(
-            !is_enrichment_eligible_entry(&entry_below, 100, &[], &idx, &fs),
-            "file one below threshold should not be eligible"
-        );
-    }
-
-    #[test]
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    fn test_enrichment_eligible_entry_no_symbols() {
-        let idx = SymbolIndex::new().expect("create index");
-        let path = PathBuf::from("/test/no_syms.rs");
-        // Don't populate any symbols for this path.
-
-        let entry = make_glob_entry("no_syms.rs", &path, false, Some(200));
-        let fs = FilesystemManager::new();
-
-        assert!(
-            !is_enrichment_eligible_entry(&entry, 100, &[], &idx, &fs),
-            "file without symbols should not be enrichment eligible"
-        );
-    }
-
-    #[test]
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    fn test_enrichment_eligible_entry_suppressed() {
-        let idx = SymbolIndex::new().expect("create index");
-        let path = PathBuf::from("/test/suppressed.rs");
-
-        idx.populate_from_document_symbols(
-            &path,
-            &serde_json::json!([{
-                "name": "sym",
-                "kind": 12,
-                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 1, "character": 1 } },
-                "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 6 } }
-            }]),
-        )
-        .expect("populate");
-
-        let entry = make_glob_entry("suppressed.rs", &path, false, Some(200));
-        let suppress = vec![
-            Glob::new("**/*.rs")
-                .expect("compile glob")
-                .compile_matcher(),
-        ];
-        let fs = FilesystemManager::new();
-
-        assert!(
-            !is_enrichment_eligible_entry(&entry, 100, &suppress, &idx, &fs),
-            "suppressed file should not be enrichment eligible"
-        );
-    }
-
-    #[test]
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    fn test_enrichment_eligible_entry_no_line_count() {
-        let idx = SymbolIndex::new().expect("create index");
-        let path = PathBuf::from("/test/no_lc.rs");
-
-        idx.populate_from_document_symbols(
-            &path,
-            &serde_json::json!([{
-                "name": "sym",
-                "kind": 12,
-                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 1, "character": 1 } },
-                "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 6 } }
-            }]),
-        )
-        .expect("populate");
-
-        // line_count = None → is_some_and fails → not eligible
-        let entry = make_glob_entry("no_lc.rs", &path, false, None);
-        let fs = FilesystemManager::new();
-
-        assert!(
-            !is_enrichment_eligible_entry(&entry, 100, &[], &idx, &fs),
-            "file with no line count should not be enrichment eligible"
-        );
+    fn test_is_outline_boundary() {
+        // Headers / banners begin a fresh block — safe cut points.
+        assert!(is_outline_boundary("src/lib.rs  (92 lines)"));
+        assert!(is_outline_boundary("\tfoo.rs  (3 lines, no outline)"));
+        assert!(is_outline_boundary("\tsub/  (2 files, 0 dirs)"));
+        assert!(is_outline_boundary("/abs/path/  (empty)"));
+        assert!(is_outline_boundary("cwd: ~/proj"));
+        // A filename that merely starts with a digit is still a header.
+        assert!(is_outline_boundary("3d_model.rs  (10 lines)"));
+        // Outline node rows (`<line>  <decl>`) are NOT boundaries.
+        assert!(!is_outline_boundary("\t10  pub trait Animal"));
+        assert!(!is_outline_boundary("\t\t12  fn name(&self) -> String"));
+        assert!(!is_outline_boundary("1  fn main()"));
     }
 
     // ─── has_symbols_available ───────────────────────────────────────
@@ -1592,7 +1354,7 @@ mod tests {
         );
     }
 
-    // ─── render_symbol_line (one-atom: source line, no kind) ────────
+    // ─── render_symbol_line (declaration line, no kind, no slash) ───
 
     #[test]
     fn test_render_symbol_line_basic() {
@@ -1607,41 +1369,18 @@ mod tests {
         };
 
         let mut out = String::new();
-        // The atom is the declaration source line; the kind is implicit in it.
-        render_symbol_line(
-            &mut out,
-            &sym,
-            None,
-            "\t",
-            Some("fn my_func(x: u32) -> u32 {"),
-        );
+        // The node is `{indent}{1-based line}  {declaration line}` — no colon,
+        // no `<Kind>`, no trailing `/` (nesting is shown by indentation).
+        render_symbol_line(&mut out, &sym, "\t", Some("fn my_func(x: u32) -> u32 {"));
 
-        assert_eq!(out, "\t:10  fn my_func(x: u32) -> u32 {\n");
+        assert_eq!(out, "\t10  fn my_func(x: u32) -> u32 {\n");
     }
 
     #[test]
-    fn test_render_symbol_line_name_embedding_no_double_prefix() {
+    fn test_render_symbol_line_no_kind_label_or_slash() {
         // A name-embedding server (lattice `H1:`) — the heading source line is
-        // already clean, so there is no `<Class>` to double-prefix.
-        let sym = Symbol {
-            name: "H1: My Heading".to_string(),
-            kind: "class".to_string(),
-            line: 0,
-            end_line: 1,
-            scope: None,
-            scope_kind: None,
-            deprecated: false,
-        };
-
-        let mut out = String::new();
-        render_symbol_line(&mut out, &sym, None, "\t", Some("# My Heading"));
-
-        assert_eq!(out, "\t:1  # My Heading\n");
-        assert!(!out.contains('<'), "no kind label: {out:?}");
-    }
-
-    #[test]
-    fn test_render_symbol_line_keeps_children_slash() {
+        // clean, so there is no `<Class>` label, and a container is no longer
+        // marked with a trailing `/` (its children are expanded instead).
         let sym = Symbol {
             name: "H1: Parent".to_string(),
             kind: "class".to_string(),
@@ -1652,43 +1391,18 @@ mod tests {
             deprecated: true,
         };
 
-        let children: HashSet<String> = ["H1: Parent".to_string()].into();
         let mut out = String::new();
-        render_symbol_line(&mut out, &sym, Some(&children), "\t", Some("# Parent"));
+        render_symbol_line(&mut out, &sym, "\t", Some("# Parent"));
 
-        // Source line carries the structure; trailing `/` (has-children) kept.
-        assert_eq!(out, "\t:1  # Parent/\n");
-    }
-
-    #[test]
-    fn test_render_symbol_line_with_children() {
-        let sym = Symbol {
-            name: "MyStruct".to_string(),
-            kind: "struct".to_string(),
-            line: 0,
-            end_line: 10,
-            scope: None,
-            scope_kind: None,
-            deprecated: false,
-        };
-
-        let children: HashSet<String> = ["MyStruct".to_string()].into();
-        let mut out = String::new();
-        render_symbol_line(
-            &mut out,
-            &sym,
-            Some(&children),
-            "\t",
-            Some("struct MyStruct {"),
-        );
-
-        assert_eq!(out, "\t:1  struct MyStruct {/\n");
+        assert_eq!(out, "\t1  # Parent\n");
+        assert!(!out.contains('<'), "no kind label: {out:?}");
+        assert!(!out.contains('/'), "no has-children slash marker: {out:?}");
     }
 
     #[test]
     fn test_render_symbol_line_trailing_whitespace_trimmed() {
-        // Trailing whitespace on the source line is trimmed so the `/`
-        // indicator (and byte-stable output) stays adjacent to the text.
+        // Trailing whitespace on the source line is trimmed so the output is
+        // byte-stable.
         let sym = Symbol {
             name: "old_fn".to_string(),
             kind: "function".to_string(),
@@ -1700,9 +1414,9 @@ mod tests {
         };
 
         let mut out = String::new();
-        render_symbol_line(&mut out, &sym, None, "", Some("fn old_fn() {   "));
+        render_symbol_line(&mut out, &sym, "", Some("fn old_fn() {   "));
 
-        assert_eq!(out, ":5  fn old_fn() {\n");
+        assert_eq!(out, "5  fn old_fn() {\n");
     }
 
     #[test]
@@ -1720,259 +1434,117 @@ mod tests {
         };
 
         let mut out = String::new();
-        render_symbol_line(&mut out, &sym, None, "", None);
+        render_symbol_line(&mut out, &sym, "", None);
 
-        assert_eq!(out, ":1  standalone\n");
+        assert_eq!(out, "1  standalone\n");
     }
 
-    // ─── render_individual_map (per-file outline, one atom per node) ─
+    // ─── render_full_outline (fully expanded, depth-indented) ───────
 
     #[test]
     #[allow(clippy::expect_used, reason = "test assertions")]
-    fn test_render_individual_map_reads_declaration_lines() {
-        // The outline renders each node's declaration source line, nested by
-        // indentation — no `<Kind>` label, no "common structure" collapse.
+    fn test_render_full_outline_indents_by_tree_depth() {
+        // Outer (lines 0–2) contains inner (line 1); leaf (line 3) is top-level.
+        // Full expansion: every node on its own line, re-indented by tree depth
+        // (one tab per level), no `<Kind>` label, no `/` collapse marker.
         let tmp = tempfile::tempdir().expect("tempdir");
         let file = tmp.path().join("code.rs");
-        std::fs::write(&file, "fn alpha() {}\nstruct Bar {\n    x: u32,\n}\n").expect("write file");
+        std::fs::write(&file, "struct Outer {\nfn inner() {}\n}\nfn leaf() {}\n").expect("write");
 
         let syms = vec![
             Symbol {
-                name: "alpha".to_string(),
-                kind: "function".to_string(),
+                name: "Outer".to_string(),
+                kind: "struct".to_string(),
                 line: 0,
-                end_line: 0,
+                end_line: 2,
                 scope: None,
                 scope_kind: None,
                 deprecated: false,
             },
             Symbol {
-                name: "Bar".to_string(),
-                kind: "struct".to_string(),
+                name: "inner".to_string(),
+                kind: "function".to_string(),
                 line: 1,
+                end_line: 1,
+                scope: Some("Outer".to_string()),
+                scope_kind: Some("struct".to_string()),
+                deprecated: false,
+            },
+            Symbol {
+                name: "leaf".to_string(),
+                kind: "function".to_string(),
+                line: 3,
                 end_line: 3,
                 scope: None,
                 scope_kind: None,
                 deprecated: false,
             },
         ];
-        // `Bar` has a field child → trailing `/`.
-        let children: HashSet<String> = ["Bar".to_string()].into();
 
         let mut out = String::new();
         let mut sources = SourceLines::new();
-        render_individual_map(&mut out, &file, &syms, Some(&children), "\t", &mut sources);
+        render_full_outline(&mut out, &file, &syms, "", &mut sources);
 
-        assert_eq!(out, "\t:1  fn alpha() {}\n\t:2  struct Bar {/\n");
+        // Depth 0 → no indent; depth 1 (inner, under Outer) → one tab.
+        assert_eq!(
+            out,
+            "1  struct Outer {\n\t2  fn inner() {}\n4  fn leaf() {}\n"
+        );
         assert!(!out.contains('<'), "no kind label anywhere: {out:?}");
     }
 
     // ─── compute_entry_flags ───────────────────────────────────────
 
     #[test]
-    fn test_compute_entry_flags_broken_symlink() {
-        let mut entry = make_glob_entry("link.rs", Path::new("/test/link.rs"), false, Some(100));
-        entry.is_broken_symlink = true;
-        let fs = FilesystemManager::new();
-
-        let flags = compute_entry_flags(&entry, None, 100, &[], &fs, false);
-        assert_eq!(
-            flags,
-            vec!["broken"],
-            "broken symlink should return [broken]"
-        );
-    }
-
-    #[test]
-    fn test_compute_entry_flags_snapshot() {
-        let mut entry = make_glob_entry("snap.rs", Path::new("/test/snap.rs"), false, Some(200));
-        entry.is_snapshot = true;
-        let fs = FilesystemManager::new();
-
-        let flags = compute_entry_flags(&entry, None, 100, &[], &fs, false);
-        assert_eq!(flags, vec!["snapshot"], "snapshot should return [snapshot]");
-    }
-
-    #[test]
     fn test_compute_entry_flags_empty_when_no_conditions() {
-        let entry = make_glob_entry("plain.rs", Path::new("/test/plain.rs"), false, Some(50));
-        let fs = FilesystemManager::new();
-
-        let flags = compute_entry_flags(&entry, None, 100, &[], &fs, false);
-        assert!(flags.is_empty(), "no conditions met → empty: {flags:?}");
+        assert!(compute_entry_flags(false, false, false).is_empty());
+        // Symbols present but rendered (not suppressed) → no flag.
+        assert!(compute_entry_flags(true, false, false).is_empty());
     }
 
     #[test]
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    fn test_compute_entry_flags_symbols_available_not_rendered() {
-        let idx = SymbolIndex::new().expect("create index");
-        let path = PathBuf::from("/test/big.rs");
-
-        idx.populate_from_document_symbols(
-            &path,
-            &serde_json::json!([{
-                "name": "sym",
-                "kind": 12,
-                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 5, "character": 1 } },
-                "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 6 } }
-            }]),
-        )
-        .expect("populate");
-
-        let entry = make_glob_entry("big.rs", &path, false, Some(200));
-        let fs = FilesystemManager::new();
-
-        // !map_rendered + has symbols + above threshold → symbols available.
-        let flags = compute_entry_flags(&entry, Some(&idx), 100, &[], &fs, false);
+    fn test_compute_entry_flags_symbols_available_when_suppressed() {
+        // Symbols exist but display is suppressed → `[symbols available]`.
         assert_eq!(
-            flags,
-            vec!["symbols available"],
-            "above threshold with symbols should flag: {flags:?}"
-        );
-    }
-
-    #[test]
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    fn test_compute_entry_flags_symbols_available_rendered_suppressed() {
-        let idx = SymbolIndex::new().expect("create index");
-        let path = PathBuf::from("/test/suppressed.rs");
-
-        idx.populate_from_document_symbols(
-            &path,
-            &serde_json::json!([{
-                "name": "sym",
-                "kind": 12,
-                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 5, "character": 1 } },
-                "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 6 } }
-            }]),
-        )
-        .expect("populate");
-
-        let entry = make_glob_entry("suppressed.rs", &path, false, Some(200));
-        let suppress = vec![
-            Glob::new("**/*.rs")
-                .expect("compile glob")
-                .compile_matcher(),
-        ];
-        let fs = FilesystemManager::new();
-
-        // map_rendered + has symbols + suppressed → symbols available.
-        let flags = compute_entry_flags(&entry, Some(&idx), 100, &suppress, &fs, true);
-        assert_eq!(
-            flags,
-            vec!["symbols available"],
-            "map_rendered + suppressed should flag: {flags:?}"
-        );
-    }
-
-    #[test]
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    fn test_compute_entry_flags_not_rendered_below_threshold() {
-        let idx = SymbolIndex::new().expect("create index");
-        let path = PathBuf::from("/test/small.rs");
-
-        idx.populate_from_document_symbols(
-            &path,
-            &serde_json::json!([{
-                "name": "sym",
-                "kind": 12,
-                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 1, "character": 1 } },
-                "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 6 } }
-            }]),
-        )
-        .expect("populate");
-
-        // Below threshold, not rendered → no symbols available flag.
-        let entry = make_glob_entry("small.rs", &path, false, Some(50));
-        let fs = FilesystemManager::new();
-
-        let flags = compute_entry_flags(&entry, Some(&idx), 100, &[], &fs, false);
-        assert!(
-            flags.is_empty(),
-            "below threshold should not flag: {flags:?}"
-        );
-    }
-
-    #[test]
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    fn test_compute_entry_flags_rendered_not_suppressed() {
-        let idx = SymbolIndex::new().expect("create index");
-        let path = PathBuf::from("/test/rendered.rs");
-
-        idx.populate_from_document_symbols(
-            &path,
-            &serde_json::json!([{
-                "name": "sym",
-                "kind": 12,
-                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 5, "character": 1 } },
-                "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 6 } }
-            }]),
-        )
-        .expect("populate");
-
-        // map_rendered but NOT suppressed → no flag.
-        let entry = make_glob_entry("rendered.rs", &path, false, Some(200));
-        let fs = FilesystemManager::new();
-
-        let flags = compute_entry_flags(&entry, Some(&idx), 100, &[], &fs, true);
-        assert!(
-            flags.is_empty(),
-            "map_rendered without suppress should not flag: {flags:?}"
+            compute_entry_flags(true, true, false),
+            vec!["symbols available"]
         );
     }
 
     #[test]
     fn test_compute_entry_flags_gitignored() {
-        let mut entry = make_glob_entry("debug.log", Path::new("/test/debug.log"), false, Some(10));
-        entry.is_gitignored = true;
-        let fs = FilesystemManager::new();
-
-        let flags = compute_entry_flags(&entry, None, 200, &[], &fs, false);
-        assert_eq!(flags, vec!["gitignored"]);
+        assert_eq!(compute_entry_flags(false, false, true), vec!["gitignored"]);
     }
 
     #[test]
-    fn test_compute_entry_flags_broken_early_return() {
-        // Broken symlink returns ["broken"] even if gitignored or snapshot.
-        let mut entry = make_glob_entry("link.rs", Path::new("/test/link.rs"), false, Some(100));
-        entry.is_broken_symlink = true;
-        entry.is_gitignored = true;
-        let fs = FilesystemManager::new();
-
-        let flags = compute_entry_flags(&entry, None, 100, &[], &fs, false);
+    fn test_compute_entry_flags_compose_suppressed_and_gitignored() {
         assert_eq!(
-            flags,
-            vec!["broken"],
-            "broken early return should not include gitignored: {flags:?}"
-        );
-    }
-
-    #[test]
-    fn test_compute_entry_flags_snapshot_early_return() {
-        // Snapshot returns ["snapshot"] even if gitignored.
-        let mut entry = make_glob_entry("snap.rs", Path::new("/test/snap.rs"), false, Some(200));
-        entry.is_snapshot = true;
-        entry.is_gitignored = true;
-        let fs = FilesystemManager::new();
-
-        let flags = compute_entry_flags(&entry, None, 100, &[], &fs, false);
-        assert_eq!(
-            flags,
-            vec!["snapshot"],
-            "snapshot early return should not include gitignored: {flags:?}"
+            compute_entry_flags(true, true, true),
+            vec!["symbols available", "gitignored"]
         );
     }
 
     // ─── render_entry_line ─────────────────────────────────────────
 
     #[test]
-    fn test_render_entry_line_regular_file_with_lines() {
+    fn test_render_entry_line_regular_file_with_descriptor() {
         let entry = make_glob_entry("main.rs", Path::new("/test/main.rs"), false, Some(42));
 
         let mut out = String::new();
-        render_entry_line(&mut out, &entry, &[], "");
+        render_entry_line(&mut out, &entry, "(42 lines)", &[], "");
 
         assert_eq!(out, "main.rs  (42 lines)\n");
+    }
+
+    #[test]
+    fn test_render_entry_line_no_outline_descriptor() {
+        // A degraded file carries the `no outline` marker inside the descriptor.
+        let entry = make_glob_entry("data.txt", Path::new("/test/data.txt"), false, Some(5));
+
+        let mut out = String::new();
+        render_entry_line(&mut out, &entry, "(5 lines, no outline)", &[], "");
+
+        assert_eq!(out, "data.txt  (5 lines, no outline)\n");
     }
 
     #[test]
@@ -1980,9 +1552,19 @@ mod tests {
         let entry = make_glob_entry("main.rs", Path::new("/test/main.rs"), false, Some(42));
 
         let mut out = String::new();
-        render_entry_line(&mut out, &entry, &["symbols available"], "");
+        render_entry_line(&mut out, &entry, "(42 lines)", &["symbols available"], "");
 
         assert_eq!(out, "main.rs  (42 lines) [symbols available]\n");
+    }
+
+    #[test]
+    fn test_render_entry_line_dir_count() {
+        let entry = make_glob_entry("sub/", Path::new("/test/sub"), true, None);
+
+        let mut out = String::new();
+        render_entry_line(&mut out, &entry, "(2 files, 1 dir)", &[], "\t");
+
+        assert_eq!(out, "\tsub/  (2 files, 1 dir)\n");
     }
 
     #[test]
@@ -1992,7 +1574,7 @@ mod tests {
         entry.symlink_target = Some("/nonexistent".to_string());
 
         let mut out = String::new();
-        render_entry_line(&mut out, &entry, &["broken"], "");
+        render_entry_line(&mut out, &entry, "", &[], "");
 
         assert_eq!(out, "broken.rs -> /nonexistent [broken]\n");
     }
@@ -2003,19 +1585,19 @@ mod tests {
         entry.is_snapshot = true;
 
         let mut out = String::new();
-        render_entry_line(&mut out, &entry, &["snapshot"], "");
+        render_entry_line(&mut out, &entry, "", &[], "");
 
         assert_eq!(out, "snap.rs [snapshot]\n");
     }
 
     #[test]
-    fn test_render_entry_line_symlink_with_lines() {
+    fn test_render_entry_line_symlink_with_descriptor() {
         let mut entry = make_glob_entry("link.rs", Path::new("/test/link.rs"), false, Some(50));
         entry.is_symlink = true;
         entry.symlink_target = Some("/real/file.rs".to_string());
 
         let mut out = String::new();
-        render_entry_line(&mut out, &entry, &[], "");
+        render_entry_line(&mut out, &entry, "(50 lines)", &[], "");
 
         assert_eq!(out, "link.rs -> /real/file.rs  (50 lines)\n");
     }
@@ -2026,17 +1608,17 @@ mod tests {
         entry.binary_size = Some("1.5 MB".to_string());
 
         let mut out = String::new();
-        render_entry_line(&mut out, &entry, &[], "");
+        render_entry_line(&mut out, &entry, "(1.5 MB)", &[], "");
 
         assert_eq!(out, "data.bin  (1.5 MB)\n");
     }
 
     #[test]
-    fn test_render_entry_line_no_size_no_lines() {
+    fn test_render_entry_line_no_descriptor() {
         let entry = make_glob_entry("empty", Path::new("/test/empty"), false, None);
 
         let mut out = String::new();
-        render_entry_line(&mut out, &entry, &[], "");
+        render_entry_line(&mut out, &entry, "", &[], "");
 
         assert_eq!(out, "empty\n");
     }
@@ -2046,131 +1628,9 @@ mod tests {
         let entry = make_glob_entry("nested.rs", Path::new("/test/nested.rs"), false, Some(10));
 
         let mut out = String::new();
-        render_entry_line(&mut out, &entry, &[], "\t");
+        render_entry_line(&mut out, &entry, "(10 lines)", &[], "\t");
 
         assert_eq!(out, "\tnested.rs  (10 lines)\n");
-    }
-
-    // ─── build_children_sets ───────────────────────────────────────
-
-    #[test]
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    fn test_build_children_sets_with_scoped_symbols() {
-        let idx = SymbolIndex::new().expect("create index");
-        let path = PathBuf::from("/test/has_scope.rs");
-
-        // Symbol "method" with scope "MyStruct".
-        idx.populate_from_document_symbols(
-            &path,
-            &serde_json::json!([
-                {
-                    "name": "MyStruct",
-                    "kind": 23,
-                    "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 20, "character": 1 } },
-                    "selectionRange": { "start": { "line": 0, "character": 7 }, "end": { "line": 0, "character": 15 } },
-                    "children": [{
-                        "name": "method",
-                        "kind": 12,
-                        "range": { "start": { "line": 2, "character": 4 }, "end": { "line": 5, "character": 5 } },
-                        "selectionRange": { "start": { "line": 2, "character": 7 }, "end": { "line": 2, "character": 13 } }
-                    }]
-                }
-            ]),
-        )
-        .expect("populate");
-
-        let files: Vec<&Path> = vec![path.as_path()];
-        let result = build_children_sets(&idx, &files);
-
-        assert!(
-            result.contains_key(&path),
-            "should have entry for file with scoped symbols"
-        );
-        let cs = &result[&path];
-        assert!(
-            cs.contains("MyStruct"),
-            "children set should contain the scope name: {cs:?}"
-        );
-    }
-
-    #[test]
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    fn test_build_children_sets_no_scoped_symbols() {
-        let idx = SymbolIndex::new().expect("create index");
-        let path = PathBuf::from("/test/no_scope.rs");
-
-        // Top-level symbol with no children/scope.
-        idx.populate_from_document_symbols(
-            &path,
-            &serde_json::json!([{
-                "name": "standalone",
-                "kind": 12,
-                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 5, "character": 1 } },
-                "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 13 } }
-            }]),
-        )
-        .expect("populate");
-
-        let files: Vec<&Path> = vec![path.as_path()];
-        let result = build_children_sets(&idx, &files);
-
-        assert!(
-            !result.contains_key(&path),
-            "file without scoped symbols should not appear in result"
-        );
-    }
-
-    #[test]
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    fn test_build_children_sets_multiple_files() {
-        let idx = SymbolIndex::new().expect("create index");
-
-        let path_a = PathBuf::from("/test/a.rs");
-        let path_b = PathBuf::from("/test/b.rs");
-
-        // File A has scoped symbol.
-        idx.populate_from_document_symbols(
-            &path_a,
-            &serde_json::json!([
-                {
-                    "name": "Container",
-                    "kind": 23,
-                    "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 10, "character": 1 } },
-                    "selectionRange": { "start": { "line": 0, "character": 7 }, "end": { "line": 0, "character": 16 } },
-                    "children": [{
-                        "name": "inner",
-                        "kind": 12,
-                        "range": { "start": { "line": 1, "character": 4 }, "end": { "line": 3, "character": 5 } },
-                        "selectionRange": { "start": { "line": 1, "character": 7 }, "end": { "line": 1, "character": 12 } }
-                    }]
-                }
-            ]),
-        )
-        .expect("populate a");
-
-        // File B has no scoped symbols.
-        idx.populate_from_document_symbols(
-            &path_b,
-            &serde_json::json!([{
-                "name": "top",
-                "kind": 12,
-                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 2, "character": 1 } },
-                "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 6 } }
-            }]),
-        )
-        .expect("populate b");
-
-        let files: Vec<&Path> = vec![path_a.as_path(), path_b.as_path()];
-        let result = build_children_sets(&idx, &files);
-
-        assert!(
-            result.contains_key(&path_a),
-            "file A with scoped symbols should be in result"
-        );
-        assert!(
-            !result.contains_key(&path_b),
-            "file B without scoped symbols should not be in result"
-        );
     }
 
     // ─── collect_scoped_observations — canonicalization divergence (R5 L7) ──
@@ -2265,7 +1725,6 @@ mod tests {
             fs_manager,
             symbol_index: None,
             budget: 2000,
-            outline_threshold: 200,
             outline_suppress: vec![],
         }
     }

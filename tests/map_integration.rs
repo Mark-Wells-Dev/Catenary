@@ -215,8 +215,10 @@ fn test_glob_multipage_cache_invalidates_on_host_edit() -> Result<()> {
         after.contains("file_0000.txt"),
         "edited file should be on page 1, got:\n{after}"
     );
+    // The `.txt` file has no server, so its descriptor is `(8 lines, no
+    // outline)` — match the count prefix rather than the closing paren.
     assert!(
-        after.contains("(8 lines)"),
+        after.contains("(8 lines"),
         "edited file's fresh line count must appear (cache must miss on host edit), got:\n{after}"
     );
     Ok(())
