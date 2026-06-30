@@ -303,6 +303,11 @@ const fn default_diagnostics_per_page() -> usize {
     50
 }
 
+/// Default shared display line budget for the grep/glob overflow valve.
+const fn default_line_budget() -> usize {
+    1000
+}
+
 /// Default dirty-severity threshold for `catenary diagnostics`.
 fn default_diagnostics_severity() -> String {
     "error".to_string()
@@ -310,24 +315,28 @@ fn default_diagnostics_severity() -> String {
 
 /// Per-tool configuration.
 ///
-/// Configures output budgets and tool-specific options. Each tool has its
-/// own section under `[tools]`:
+/// Configures output volume and tool-specific options under `[tools]`:
 ///
 /// ```toml
-/// [tools.grep]
-/// budget = 4000
+/// [tools]
+/// line_budget = 1000
 ///
 /// [tools.glob]
-/// budget = 2000
 /// outline_threshold = 200
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct ToolsConfig {
-    /// Grep tool configuration.
-    pub grep: GrepConfig,
     /// Glob tool configuration.
     pub glob: GlobConfig,
+    /// Shared display line budget for the `catenary grep`/`glob` overflow valve.
+    /// When a query's rendered output exceeds this many lines the display is
+    /// truncated (at a file boundary for glob) and the **complete** output is
+    /// spilled to a runtime-dir file, announced by a stderr receipt. The single
+    /// volume knob for both search surfaces — "more output" is recovered from the
+    /// spill file, not a flag (pipeable-output ticket 03). Default 1000, min 1.
+    #[serde(default = "default_line_budget")]
+    pub line_budget: usize,
     /// Single-shot preview budget for `catenary diagnostics`. When the run
     /// produces more than this many diagnostics, the preview shows the first
     /// N (errors before warnings, so a truncation never hides an error behind
@@ -349,8 +358,8 @@ pub struct ToolsConfig {
 impl Default for ToolsConfig {
     fn default() -> Self {
         Self {
-            grep: GrepConfig::default(),
             glob: GlobConfig::default(),
+            line_budget: default_line_budget(),
             diagnostics_per_page: default_diagnostics_per_page(),
             diagnostics_severity: default_diagnostics_severity(),
         }
@@ -380,23 +389,22 @@ impl ToolsConfig {
         }
     }
 
+    /// The shared grep/glob overflow-valve line budget, clamped to a minimum
+    /// of 1.
+    #[must_use]
+    pub const fn line_budget(&self) -> usize {
+        if self.line_budget == 0 {
+            1
+        } else {
+            self.line_budget
+        }
+    }
+
     /// Clamp budgets to their minimum values, warning on adjustment.
     pub(crate) fn clamp_budgets(&mut self) {
-        if self.grep.budget < 2000 {
-            tracing::warn!(
-                budget = self.grep.budget,
-                min = 2000,
-                "grep budget below minimum, clamping to 2000",
-            );
-            self.grep.budget = 2000;
-        }
-        if self.glob.budget < 1000 {
-            tracing::warn!(
-                budget = self.glob.budget,
-                min = 1000,
-                "glob budget below minimum, clamping to 1000",
-            );
-            self.glob.budget = 1000;
+        if self.line_budget == 0 {
+            tracing::warn!(min = 1, "line_budget cannot be 0, clamping to 1",);
+            self.line_budget = 1;
         }
         if self.diagnostics_per_page == 0 {
             tracing::warn!(min = 1, "diagnostics_per_page cannot be 0, clamping to 1",);
@@ -405,26 +413,10 @@ impl ToolsConfig {
     }
 }
 
-/// Grep tool configuration.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
-pub struct GrepConfig {
-    /// Output budget in characters. Default: 4000, min: 2000.
-    pub budget: u32,
-}
-
-impl Default for GrepConfig {
-    fn default() -> Self {
-        Self { budget: 4000 }
-    }
-}
-
 /// Glob tool configuration.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct GlobConfig {
-    /// Output budget in characters. Default: 2000, min: 1000.
-    pub budget: u32,
     /// Minimum line count for defensive outlines. Default: 200.
     pub outline_threshold: usize,
     /// Glob patterns whose outlines are suppressed from automatic display.
@@ -435,7 +427,6 @@ pub struct GlobConfig {
 impl Default for GlobConfig {
     fn default() -> Self {
         Self {
-            budget: 2000,
             outline_threshold: 200,
             outline_suppress: Vec::new(),
         }
@@ -2265,47 +2256,33 @@ extensions = ["xyz"]
 
         let config = Config::load_from_sources(&[path])?;
         let tools = config.tools.unwrap_or_default();
-        assert_eq!(tools.grep.budget, 4000);
-        assert_eq!(tools.glob.budget, 2000);
+        assert_eq!(tools.line_budget, 1000);
 
         Ok(())
     }
 
     #[test]
-    fn test_custom_grep_budget() -> anyhow::Result<()> {
+    fn test_custom_line_budget() -> anyhow::Result<()> {
         let dir = tempdir()?;
         let path = dir.path().join("config.toml");
-        fs::write(&path, "[tools.grep]\nbudget = 8000\n")?;
+        fs::write(&path, "[tools]\nline_budget = 8000\n")?;
 
         let config = Config::load_from_sources(&[path])?;
         let tools = config.tools.expect("tools should be Some");
-        assert_eq!(tools.grep.budget, 8000);
+        assert_eq!(tools.line_budget, 8000);
 
         Ok(())
     }
 
     #[test]
-    fn test_minimum_grep_budget() -> anyhow::Result<()> {
+    fn test_minimum_line_budget() -> anyhow::Result<()> {
         let dir = tempdir()?;
         let path = dir.path().join("config.toml");
-        fs::write(&path, "[tools.grep]\nbudget = 500\n")?;
+        fs::write(&path, "[tools]\nline_budget = 0\n")?;
 
         let config = Config::load_from_sources(&[path])?;
         let tools = config.tools.expect("tools should be Some");
-        assert_eq!(tools.grep.budget, 2000);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_minimum_glob_budget() -> anyhow::Result<()> {
-        let dir = tempdir()?;
-        let path = dir.path().join("config.toml");
-        fs::write(&path, "[tools.glob]\nbudget = 500\n")?;
-
-        let config = Config::load_from_sources(&[path])?;
-        let tools = config.tools.expect("tools should be Some");
-        assert_eq!(tools.glob.budget, 1000);
+        assert_eq!(tools.line_budget, 1, "line_budget clamps 0 to 1");
 
         Ok(())
     }
@@ -2348,8 +2325,7 @@ extensions = ["xyz"]
         let config = Config::load_from_sources(&[path])?;
         assert!(config.tools.is_none());
         let tools = config.tools.unwrap_or_default();
-        assert_eq!(tools.grep.budget, 4000);
-        assert_eq!(tools.glob.budget, 2000);
+        assert_eq!(tools.line_budget, 1000);
 
         Ok(())
     }
@@ -2358,13 +2334,13 @@ extensions = ["xyz"]
     fn test_partial_tools() -> anyhow::Result<()> {
         let dir = tempdir()?;
         let path = dir.path().join("config.toml");
-        fs::write(&path, "[tools.grep]\nbudget = 6000\n")?;
+        fs::write(&path, "[tools]\nline_budget = 6000\n")?;
 
         let config = Config::load_from_sources(&[path])?;
         let tools = config.tools.expect("tools should be Some");
-        assert_eq!(tools.grep.budget, 6000);
+        assert_eq!(tools.line_budget, 6000);
         // glob uses defaults
-        assert_eq!(tools.glob.budget, 2000);
+        assert_eq!(tools.glob.outline_threshold, 200);
 
         Ok(())
     }
@@ -2887,6 +2863,25 @@ servers = ["nonexistent"]
     }
 
     #[test]
+    fn line_budget_default_is_1000() {
+        assert_eq!(default_line_budget(), 1000);
+    }
+
+    #[test]
+    fn line_budget_accessor_clamps_zero_to_one() {
+        let tc = ToolsConfig {
+            line_budget: 0,
+            ..ToolsConfig::default()
+        };
+        assert_eq!(tc.line_budget(), 1);
+        let tc = ToolsConfig {
+            line_budget: 1500,
+            ..ToolsConfig::default()
+        };
+        assert_eq!(tc.line_budget(), 1500);
+    }
+
+    #[test]
     fn diagnostics_severity_default_is_error() {
         let tc = ToolsConfig::default();
         assert_eq!(tc.diagnostics_severity, "error");
@@ -2924,51 +2919,36 @@ servers = ["nonexistent"]
     #[test]
     fn clamp_budgets_leaves_valid_values() {
         let mut tc = ToolsConfig {
-            grep: GrepConfig { budget: 4000 },
-            glob: GlobConfig {
-                budget: 2000,
-                ..GlobConfig::default()
-            },
+            line_budget: 1000,
             diagnostics_per_page: 50,
             ..ToolsConfig::default()
         };
         tc.clamp_budgets();
-        assert_eq!(tc.grep.budget, 4000);
-        assert_eq!(tc.glob.budget, 2000);
+        assert_eq!(tc.line_budget, 1000);
         assert_eq!(tc.diagnostics_per_page, 50);
     }
 
     #[test]
     fn clamp_budgets_raises_below_minimum() {
         let mut tc = ToolsConfig {
-            grep: GrepConfig { budget: 500 },
-            glob: GlobConfig {
-                budget: 100,
-                ..GlobConfig::default()
-            },
+            line_budget: 0,
             diagnostics_per_page: 0,
             ..ToolsConfig::default()
         };
         tc.clamp_budgets();
-        assert_eq!(tc.grep.budget, 2000, "grep budget should clamp to 2000");
-        assert_eq!(tc.glob.budget, 1000, "glob budget should clamp to 1000");
+        assert_eq!(tc.line_budget, 1, "line_budget should clamp to 1");
         assert_eq!(tc.diagnostics_per_page, 1, "diagnostics should clamp to 1");
     }
 
     #[test]
     fn clamp_budgets_at_exact_minimum_is_noop() {
         let mut tc = ToolsConfig {
-            grep: GrepConfig { budget: 2000 },
-            glob: GlobConfig {
-                budget: 1000,
-                ..GlobConfig::default()
-            },
+            line_budget: 1,
             diagnostics_per_page: 1,
             ..ToolsConfig::default()
         };
         tc.clamp_budgets();
-        assert_eq!(tc.grep.budget, 2000, "at minimum should stay");
-        assert_eq!(tc.glob.budget, 1000, "at minimum should stay");
+        assert_eq!(tc.line_budget, 1, "at minimum should stay");
         assert_eq!(tc.diagnostics_per_page, 1, "at minimum should stay");
     }
 

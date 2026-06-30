@@ -976,8 +976,8 @@ fn test_grep_alternation() -> Result<()> {
     Ok(())
 }
 
-/// Budget-driven paging: broad pattern exceeding `budget` produces
-/// multiple pages with `[page N/M]` header instead of tier demotion.
+/// Volume valve: a broad pattern exceeding `line_budget` truncates the display
+/// and spills the complete output to a runtime-dir file announced by a receipt.
 #[test]
 fn test_grep_enrichment_threshold_broad() -> Result<()> {
     let mockls_bin = env!("CARGO_BIN_EXE_mockls");
@@ -996,7 +996,7 @@ fn test_grep_enrichment_threshold_broad() -> Result<()> {
         std::fs::write(
             &config_path,
             format!(
-                "[tools.grep]\nbudget = 200\n\n\
+                "[tools]\nline_budget = 10\n\n\
                  [server.mockls]\n\
                  command = \"{mockls_bin}\"\n\
                  args = [\"{MOCK_LANG_A}\", \"--scan-roots\"]\n\n\
@@ -1008,32 +1008,49 @@ fn test_grep_enrichment_threshold_broad() -> Result<()> {
 
     bridge.initialize()?;
 
-    let text = bridge.call_tool_text("grep", &json!({ "pattern": "zz_broad" }))?;
+    let resp = bridge.call_search_raw("tool/grep", &json!({ "pattern": "zz_broad" }))?;
+    let output = resp
+        .get("output")
+        .and_then(serde_json::Value::as_str)
+        .context("output")?;
+    let receipt = resp
+        .get("receipt")
+        .and_then(serde_json::Value::as_str)
+        .context("expected an overflow receipt when output exceeds the line budget")?;
 
-    // Should have page header indicating multiple pages
+    // Display truncated to the line budget; results still present on stdout.
+    let shown = output.lines().count();
     assert!(
-        text.starts_with("[page 1/"),
-        "Expected [page 1/N] header, got: {text}"
+        shown <= 10,
+        "display truncated to the 10-line budget, got {shown} lines:\n{output}"
     );
-    // Should still contain results
     assert!(
-        text.contains("zz_broad"),
-        "Expected results present, got: {text}"
+        output.contains("zz_broad"),
+        "results present, got:\n{output}"
     );
-    // The `[page 1/N]` header must report more than one page — the canonical
-    // proof that the broad pattern exceeded the budget and was paged. (The
-    // one-atom format is lean enough that a per-symbol-count heuristic no longer
-    // distinguishes truncation; the page count does.)
-    let header = text.lines().next().unwrap_or("");
-    let total_pages: usize = header
-        .trim_start_matches("[page 1/")
-        .split(']')
+
+    // The receipt (stderr-bound) names the truncation and the spill path.
+    assert!(
+        receipt.contains("output truncated to protect context")
+            && receipt.contains("full output ("),
+        "receipt names the truncation + spill path: {receipt}"
+    );
+
+    // The spill file holds the COMPLETE output — more than the truncated display,
+    // including the last symbol that did not fit.
+    let path = receipt
+        .rsplit(" at ")
         .next()
-        .and_then(|n| n.parse().ok())
-        .context("page count in header")?;
+        .context("spill path in receipt")?;
+    let spilled = std::fs::read_to_string(path).context("read spill file")?;
     assert!(
-        total_pages >= 2,
-        "Expected multiple pages (budget exceeded), got header: {header}"
+        spilled.lines().count() > shown,
+        "spill file holds the full output ({} lines) vs {shown} shown",
+        spilled.lines().count()
+    );
+    assert!(
+        spilled.contains("zz_broad_29"),
+        "spill file holds the complete result set, got:\n{spilled}"
     );
 
     Ok(())
@@ -2782,7 +2799,8 @@ fn test_grep_deprecated() -> Result<()> {
     Ok(())
 }
 
-/// Paging: many symbols exceed budget → paged output, not demotion.
+/// Volume valve: many symbols exceed the line budget → the display is truncated
+/// and the complete result lives in the spill file (replaces the old page-2 fetch).
 #[test]
 fn test_grep_paged_integration() -> Result<()> {
     let mockls_bin = env!("CARGO_BIN_EXE_mockls");
@@ -2797,7 +2815,7 @@ fn test_grep_paged_integration() -> Result<()> {
         std::fs::write(
             &config_path,
             format!(
-                "[tools.grep]\nbudget = 200\n\n\
+                "[tools]\nline_budget = 10\n\n\
                  [server.mockls]\n\
                  command = \"{mockls_bin}\"\n\
                  args = [\"{MOCK_LANG_A}\", \"--scan-roots\"]\n\n\
@@ -2809,33 +2827,41 @@ fn test_grep_paged_integration() -> Result<()> {
 
     bridge.initialize()?;
 
-    let text = bridge.call_tool_text("grep", &json!({ "pattern": "demote_sym" }))?;
+    let resp = bridge.call_search_raw("tool/grep", &json!({ "pattern": "demote_sym" }))?;
+    let output = resp
+        .get("output")
+        .and_then(serde_json::Value::as_str)
+        .context("output")?;
+    let receipt = resp
+        .get("receipt")
+        .and_then(serde_json::Value::as_str)
+        .context("expected a receipt when 50 symbols exceed the budget")?;
+    assert!(
+        output.contains("demote_sym"),
+        "Expected results present, got:\n{output}"
+    );
 
-    // Page header present, multiple pages expected
-    assert!(
-        text.starts_with("[page 1/"),
-        "Expected [page 1/N] header, got:\n{text}"
-    );
-    // Should still contain results
-    assert!(
-        text.contains("demote_sym"),
-        "Expected results present, got:\n{text}"
-    );
-    // Not all 50 symbols on one page
-    let sym_count = (0..50)
-        .filter(|i| text.contains(&format!("demote_sym_{i}")))
+    // Not all 50 symbols fit the truncated display.
+    let shown = (0..50)
+        .filter(|i| output.contains(&format!("demote_sym_{i}")))
         .count();
     assert!(
-        sym_count < 50,
-        "Expected paged output (not all 50 symbols), got {sym_count}"
+        shown < 50,
+        "Expected truncated output (not all 50 symbols), got {shown}"
     );
 
-    // Request page 2
-    let text2 = bridge.call_tool_text("grep", &json!({ "pattern": "demote_sym", "page": 2 }))?;
-
-    assert!(
-        text2.starts_with("[page 2/"),
-        "Expected [page 2/N] header, got:\n{text2}"
+    // The complete result lives in the spill file (the old "page 2").
+    let path = receipt
+        .rsplit(" at ")
+        .next()
+        .context("spill path in receipt")?;
+    let spilled = std::fs::read_to_string(path).context("read spill file")?;
+    let spilled_count = (0..50)
+        .filter(|i| spilled.contains(&format!("demote_sym_{i}")))
+        .count();
+    assert_eq!(
+        spilled_count, 50,
+        "spill file holds all 50 symbols, got {spilled_count}"
     );
 
     Ok(())

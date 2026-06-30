@@ -19,14 +19,12 @@ mod handler;
 mod hook_router;
 /// Standalone-linter diagnostic feeder (blessed + SARIF adapters).
 mod linter;
-/// Shared runtime-dir overflow reports (diagnostics + sed preview).
+/// Shared runtime-dir overflow reports (diagnostics, sed preview, grep/glob valve).
 pub mod overflow;
-/// Shared page-based output pagination.
+/// Shared page-based output pagination (`catenary sed` preview).
 mod pagination;
 /// Path validation for LSP-aware operations and config file protection.
 pub mod path_security;
-/// Single-slot paginated result cache for grep and glob servers.
-mod result_cache;
 /// `catenary sed` — the tracked mass-edit surface.
 pub mod sed;
 /// Shared container for tool servers and cross-tool infrastructure.

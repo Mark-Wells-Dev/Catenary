@@ -463,14 +463,12 @@ impl Session {
             .map_err(|e| tracing::info!("symbol index unavailable: {e}"))
             .ok();
 
-        let grep_budget = config
+        // One shared display line budget feeds both search surfaces' overflow
+        // valve (pipeable-output ticket 03); the per-tool char budgets are gone.
+        let line_budget = config
             .tools
             .as_ref()
-            .map_or(4000, |t| t.grep.budget as usize);
-        let glob_budget = config
-            .tools
-            .as_ref()
-            .map_or(2000, |t| t.glob.budget as usize);
+            .map_or(1000, crate::config::ToolsConfig::line_budget);
         let glob_config = config
             .tools
             .as_ref()
@@ -495,8 +493,7 @@ impl Session {
             client_manager: client_manager.clone(),
             fs_manager: fs_manager.clone(),
             symbol_index: symbol_index.clone(),
-            budget: grep_budget,
-            cache: std::sync::Mutex::new(super::result_cache::ResultCache::new(grep_budget)),
+            budget: line_budget,
         };
         let outline_suppress: Vec<globset::GlobMatcher> = glob_config
             .outline_suppress
@@ -516,10 +513,9 @@ impl Session {
             client_manager: client_manager.clone(),
             fs_manager: fs_manager.clone(),
             symbol_index: symbol_index.clone(),
-            budget: glob_budget,
+            budget: line_budget,
             outline_threshold: glob_config.outline_threshold,
             outline_suppress,
-            cache: std::sync::Mutex::new(super::result_cache::ResultCache::new(glob_budget)),
         };
         Self {
             config,
@@ -560,16 +556,11 @@ impl Session {
         session_id: Arc<str>,
         editing_guardrail: Option<Arc<EditingGuardrail>>,
     ) -> Self {
-        let grep_budget = primary
+        let line_budget = primary
             .config
             .tools
             .as_ref()
-            .map_or(4000, |t| t.grep.budget as usize);
-        let glob_budget = primary
-            .config
-            .tools
-            .as_ref()
-            .map_or(2000, |t| t.glob.budget as usize);
+            .map_or(1000, crate::config::ToolsConfig::line_budget);
         let glob_config = primary
             .config
             .tools
@@ -597,17 +588,15 @@ impl Session {
                 client_manager: primary.client_manager.clone(),
                 fs_manager: primary.fs_manager.clone(),
                 symbol_index: primary.symbol_index.clone(),
-                budget: grep_budget,
-                cache: std::sync::Mutex::new(super::result_cache::ResultCache::new(grep_budget)),
+                budget: line_budget,
             },
             glob: GlobServer {
                 client_manager: primary.client_manager.clone(),
                 fs_manager: primary.fs_manager.clone(),
                 symbol_index: primary.symbol_index.clone(),
-                budget: glob_budget,
+                budget: line_budget,
                 outline_threshold: glob_config.outline_threshold,
                 outline_suppress,
-                cache: std::sync::Mutex::new(super::result_cache::ResultCache::new(glob_budget)),
             },
             diagnostics: primary.diagnostics.clone(),
             editing: EditingManager::new(),
@@ -956,36 +945,6 @@ impl Session {
             for root in &removed {
                 idx.evict_root(root);
             }
-        }
-
-        // Clear the daemon-lived `ResultCache` slots on any removal. The
-        // `SymbolIndex` eviction above is keyed per root, but the single-slot
-        // result cache short-circuits in `GrepServer`/`GlobServer::execute`
-        // *before* root resolution, and on removal a read-only root's generation
-        // reverts to 0 so the cached page's generation/witness gates can both
-        // still validate — serving cached enrichment for an untracked path
-        // (bug M1). A single-slot cache makes an unconditional clear cheap, so
-        // drop both slots whenever a root left the tracked set.
-        //
-        // Logical TOCTOU (conc-4): an in-flight grep/glob that started against the
-        // old root set can `cache.put` *after* this clear, re-populating the slot
-        // for one query window. Each op takes the cache `Mutex` correctly
-        // (poison-consistent), so this is not a data race, and the single-slot
-        // last-writer-wins cache already tolerates this class of staleness — the
-        // next generation/witness mismatch (or removal) clears it. No mitigation
-        // unless concurrent root mutation during an in-flight search becomes a
-        // supported scenario.
-        if !removed.is_empty() {
-            self.grep
-                .cache
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clear();
-            self.glob
-                .cache
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clear();
         }
 
         // Fire-and-forget: spawn_all is pre-warming, not a gate.

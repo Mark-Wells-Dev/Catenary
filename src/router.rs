@@ -118,9 +118,6 @@ pub struct GrepRequest {
     /// Glob pattern to exclude from matches.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exclude: Option<String>,
-    /// Page number for paged results (1-based, default: 1).
-    #[serde(default = "ipc_default_page")]
-    pub page: usize,
     /// Include files ignored by `.gitignore`.
     #[serde(default)]
     pub include_gitignored: bool,
@@ -145,7 +142,6 @@ impl GrepRequest {
 
         let mut params = serde_json::json!({
             "pattern": self.pattern,
-            "page": self.page,
             "include_gitignored": self.include_gitignored,
             "count": self.count,
         });
@@ -207,6 +203,10 @@ pub struct GrepResponse {
     /// Distinct-file count, present only for a `--count` response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub files: Option<usize>,
+    /// Overflow-valve receipt for stderr, present only when the display was
+    /// truncated and the full output spilled to a runtime-dir file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<String>,
 }
 
 /// IPC request payload for `catenary glob`.
@@ -237,9 +237,6 @@ pub struct GlobRequest {
     /// Glob pattern to exclude from results.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exclude: Option<String>,
-    /// Page number for paged results (1-based, default: 1).
-    #[serde(default = "ipc_default_page")]
-    pub page: usize,
     /// Include files ignored by `.gitignore`.
     #[serde(default)]
     pub include_gitignored: bool,
@@ -265,7 +262,6 @@ impl GlobRequest {
         let mut include_hidden = self.include_hidden;
 
         let mut params = serde_json::json!({
-            "page": self.page,
             "include_gitignored": self.include_gitignored,
             "count": self.count,
         });
@@ -321,6 +317,10 @@ pub struct GlobResponse {
     /// Resolved-path count, present only for a `--count` response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paths: Option<usize>,
+    /// Overflow-valve receipt for stderr, present only when the display was
+    /// truncated and the full output spilled to a runtime-dir file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<String>,
 }
 
 /// IPC request payload for `catenary sed`.
@@ -2510,20 +2510,23 @@ async fn handle_hook_dispatch(
         let response = tokio::select! {
             result = ctx.primary.grep.execute(&params, Some(&parent_id), &cancel).instrument(span.clone()) => {
                 match result {
-                    Ok(GrepOutcome::Rendered(output)) => GrepResponse {
+                    Ok(GrepOutcome::Rendered { output, receipt }) => GrepResponse {
                         output,
                         matches: None,
                         files: None,
+                        receipt,
                     },
                     Ok(GrepOutcome::Count { matches, files }) => GrepResponse {
                         output: String::new(),
                         matches: Some(matches),
                         files: Some(files),
+                        receipt: None,
                     },
                     Err(e) => GrepResponse {
                         output: format!("grep error: {e}"),
                         matches: None,
                         files: None,
+                        receipt: None,
                     },
                 }
             }
@@ -2615,14 +2618,20 @@ async fn handle_hook_dispatch(
         let response = tokio::select! {
             result = ctx.primary.glob.execute(&params, Some(&parent_id), &cancel).instrument(span.clone()) => {
                 match result {
-                    Ok(GlobOutcome::Rendered(output)) => GlobResponse { output, paths: None },
+                    Ok(GlobOutcome::Rendered { output, receipt }) => GlobResponse {
+                        output,
+                        paths: None,
+                        receipt,
+                    },
                     Ok(GlobOutcome::Count { paths }) => GlobResponse {
                         output: String::new(),
                         paths: Some(paths),
+                        receipt: None,
                     },
                     Err(e) => GlobResponse {
                         output: format!("glob error: {e}"),
                         paths: None,
+                        receipt: None,
                     },
                 }
             }
@@ -3088,12 +3097,7 @@ async fn handle_hook_dispatch(
             "incoming hook",
         );
 
-        let budget = ctx
-            .primary
-            .config
-            .tools
-            .as_ref()
-            .map_or(4000, |t| t.grep.budget as usize);
+        let budget = crate::bridge::sed::PREVIEW_BUDGET;
 
         // Consume the staged identity before the write so the session can both
         // guard and accumulate. `None` ⇒ preview, or an expired/absent handoff
@@ -7371,7 +7375,6 @@ mod tests {
             pattern: "TODO|FIXME".to_string(),
             paths: vec![PathBuf::from("src/main.rs"), PathBuf::from("src/lib.rs")],
             exclude: Some("tests/**".to_string()),
-            page: 2,
             include_gitignored: true,
             include_hidden: false,
             count: false,
@@ -7385,7 +7388,6 @@ mod tests {
             vec![PathBuf::from("src/main.rs"), PathBuf::from("src/lib.rs")]
         );
         assert_eq!(parsed.exclude.as_deref(), Some("tests/**"));
-        assert_eq!(parsed.page, 2);
         assert!(parsed.include_gitignored);
         assert!(!parsed.include_hidden);
     }
@@ -7398,7 +7400,6 @@ mod tests {
         assert_eq!(req.cwd, Some(PathBuf::from("/tmp")));
         assert_eq!(req.pattern, "foo");
         assert!(req.exclude.is_none());
-        assert_eq!(req.page, 1);
         assert!(!req.include_gitignored);
         assert!(!req.include_hidden);
     }
@@ -7411,7 +7412,6 @@ mod tests {
             pattern: "foo".to_string(),
             paths: vec![],
             exclude: None,
-            page: 1,
             include_gitignored: false,
             include_hidden: false,
             count: false,
@@ -7428,12 +7428,14 @@ mod tests {
             output: "file.rs:10 matched line".to_string(),
             matches: None,
             files: None,
+            receipt: None,
         };
         let json = serde_json::to_string(&resp).expect("serialize");
         let parsed: GrepResponse = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed.output, "file.rs:10 matched line");
         assert!(parsed.matches.is_none());
         assert!(parsed.files.is_none());
+        assert!(parsed.receipt.is_none());
     }
 
     /// `GlobRequest` roundtrips through JSON with all fields.
@@ -7443,7 +7445,6 @@ mod tests {
             cwd: Some(PathBuf::from("/workspace")),
             paths: vec![PathBuf::from("src/"), PathBuf::from("tests/")],
             exclude: Some("target/**".to_string()),
-            page: 3,
             include_gitignored: false,
             include_hidden: true,
             count: false,
@@ -7456,7 +7457,6 @@ mod tests {
             vec![PathBuf::from("src/"), PathBuf::from("tests/")]
         );
         assert_eq!(parsed.exclude.as_deref(), Some("target/**"));
-        assert_eq!(parsed.page, 3);
         assert!(!parsed.include_gitignored);
         assert!(parsed.include_hidden);
     }
@@ -7469,7 +7469,6 @@ mod tests {
         assert_eq!(req.cwd, Some(PathBuf::from("/home")));
         assert_eq!(req.paths, vec![PathBuf::from("src/")]);
         assert!(req.exclude.is_none());
-        assert_eq!(req.page, 1);
         assert!(!req.include_gitignored);
         assert!(!req.include_hidden);
     }
@@ -7480,11 +7479,13 @@ mod tests {
         let resp = GlobResponse {
             output: "src/\n  main.rs (42 lines)".to_string(),
             paths: None,
+            receipt: None,
         };
         let json = serde_json::to_string(&resp).expect("serialize");
         let parsed: GlobResponse = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed.output, "src/\n  main.rs (42 lines)");
         assert!(parsed.paths.is_none());
+        assert!(parsed.receipt.is_none());
     }
 
     /// IPC method constants match expected wire values.

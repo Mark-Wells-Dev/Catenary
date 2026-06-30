@@ -22,7 +22,7 @@ use super::filesystem_manager::{
     FilesystemManager, OBSERVED_STAT_MISS_MTIME, mtime_nanos, stat_with_retry,
 };
 use super::handler::display_path;
-use super::pagination::paginate;
+use super::overflow;
 use crate::config::DispatchMethod;
 use crate::lsp::server::LspServer;
 use crate::lsp::{LspClientManager, WalkBreadth};
@@ -53,9 +53,6 @@ pub struct GrepInput {
     /// Include hidden/dot files (default: false).
     #[serde(default)]
     pub include_hidden: bool,
-    /// Page number for paged results (default: 1).
-    #[serde(default = "default_page")]
-    pub page: usize,
     /// Working directory for cwd-scoped searches.
     #[serde(default)]
     pub cwd: Option<PathBuf>,
@@ -66,11 +63,6 @@ pub struct GrepInput {
     /// lines and distinct files, never a page.
     #[serde(default)]
     pub count: bool,
-}
-
-/// Default page number for grep (1-based).
-const fn default_page() -> usize {
-    1
 }
 
 /// A classified hit from the grep pipeline.
@@ -98,11 +90,18 @@ enum HitClass {
 
 /// Outcome of a grep query.
 ///
-/// Normal queries render a paginated tree; `--count` (`GrepInput::count`)
-/// short-circuits to a numeric summary instead of a page.
+/// Normal queries render the full tree, bounded by the shared overflow valve;
+/// `--count` (`GrepInput::count`) short-circuits to a numeric summary.
 pub enum GrepOutcome {
-    /// Rendered, paginated tree output.
-    Rendered(String),
+    /// Rendered tree output, truncated to the line budget by the overflow
+    /// valve.
+    Rendered {
+        /// The (possibly truncated) output for stdout.
+        output: String,
+        /// A stderr receipt naming the full-output spill file, present only
+        /// when the valve truncated the display.
+        receipt: Option<String>,
+    },
     /// `--count` summary: a dumb `grep -c`-style tally from the ripgrep pass.
     Count {
         /// Number of matching lines (a line with multiple matches counts
@@ -118,9 +117,8 @@ pub struct GrepServer {
     pub(super) client_manager: Arc<LspClientManager>,
     pub(super) fs_manager: Arc<FilesystemManager>,
     pub(super) symbol_index: Option<Arc<std::sync::Mutex<SymbolIndex>>>,
+    /// Line budget for the shared overflow valve (truncate-and-spill).
     pub(super) budget: usize,
-    /// Single-slot result cache for sequential page fetches.
-    pub(super) cache: std::sync::Mutex<super::result_cache::ResultCache>,
 }
 
 impl GrepServer {
@@ -134,37 +132,11 @@ impl GrepServer {
         parent_id: Option<&str>,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<GrepOutcome> {
-        use super::result_cache::{GrepCacheParams, cache_key};
-
         let input: GrepInput = serde_json::from_value(params.clone())
             .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
 
         if input.pattern.is_empty() {
             return Err(anyhow!("pattern must be non-empty"));
-        }
-
-        if input.page == 0 {
-            return Err(anyhow!("page must be >= 1"));
-        }
-
-        // Compute cache key from pipeline-affecting parameters.
-        let key = cache_key(&GrepCacheParams {
-            pattern: &input.pattern,
-            paths: &input.paths,
-            exclude: input.exclude.as_deref(),
-            include_gitignored: input.include_gitignored,
-            include_hidden: input.include_hidden,
-            cwd: input.cwd.as_deref(),
-            budget: self.budget,
-        });
-
-        // Check cache before running the pipeline. Count queries bypass it:
-        // the cache stores rendered pages, and a count is a different shape.
-        if !input.count
-            && let Ok(cache) = self.cache.lock()
-            && let Some(cached) = cache.get(key, input.page, &self.fs_manager)
-        {
-            return Ok(GrepOutcome::Rendered(cached));
         }
 
         // cwd-scoped search: present when no glob or relative glob.
@@ -189,7 +161,10 @@ impl GrepServer {
                         files: 0,
                     }
                 } else {
-                    GrepOutcome::Rendered(String::new())
+                    GrepOutcome::Rendered {
+                        output: String::new(),
+                        receipt: None,
+                    }
                 });
             }
             expanded
@@ -207,7 +182,6 @@ impl GrepServer {
         let arms = split_alternation(&input.pattern);
 
         let mut all_output = String::new();
-        let mut touched: Vec<PathBuf> = Vec::new();
         for arm in &arms {
             let arm_input = GrepInput {
                 pattern: arm.clone(),
@@ -215,11 +189,10 @@ impl GrepServer {
                 exclude: input.exclude.clone(),
                 include_gitignored: input.include_gitignored,
                 include_hidden: input.include_hidden,
-                page: input.page,
                 cwd: cwd.clone(),
                 count: false,
             };
-            let (output, witnesses) = self
+            let output = self
                 .run(arm_input, parent_id, cancel, cwd.as_deref())
                 .await?;
             if !output.is_empty() {
@@ -228,26 +201,31 @@ impl GrepServer {
                 }
                 all_output.push_str(&output);
             }
-            touched.extend(witnesses);
         }
 
         if all_output.is_empty() {
-            return Ok(GrepOutcome::Rendered(String::new()));
+            return Ok(GrepOutcome::Rendered {
+                output: String::new(),
+                receipt: None,
+            });
         }
 
-        // Paginate first (borrows), then move output into cache. `touched` is the
-        // union of witnesses across alternation arms — matched files (content)
-        // and walked directories (membership) — so a host edit or a new matching
-        // file invalidates the cache (bug #26 residual).
-        touched.sort();
-        touched.dedup();
-        let paginated = paginate(&all_output, self.budget, input.page);
-        let roots = self.client_manager.roots();
-        if let Ok(mut cache) = self.cache.lock() {
-            cache.put(key, all_output, &roots, &touched, &self.fs_manager);
-        }
-
-        Ok(GrepOutcome::Rendered(paginated))
+        // Bound volume with the shared overflow valve: truncate the display at
+        // the line budget and spill the full output to a runtime-dir file, with
+        // the pointer carried out as a stderr receipt (stdout stays a byte-clean
+        // ripgrep superset). Grep lines are self-contained, so a hard line cut is
+        // safe — no block boundary needed.
+        let v = overflow::valve(
+            &all_output,
+            self.budget,
+            &crate::paths::runtime_dir(),
+            overflow::GREP_PREFIX,
+            None,
+        );
+        Ok(GrepOutcome::Rendered {
+            output: v.display,
+            receipt: v.receipt,
+        })
     }
 
     /// Resolves the concrete filesystem roots a pathless (`.`/cwd-scoped) or
@@ -326,7 +304,7 @@ impl GrepServer {
         parent_id: Option<&str>,
         cancel: &tokio_util::sync::CancellationToken,
         cwd: Option<&Path>,
-    ) -> Result<(String, Vec<PathBuf>)> {
+    ) -> Result<String> {
         debug!("Grep request: pattern={}", input.pattern);
 
         // All paths are literal — no glob interpretation. When no paths are
@@ -352,12 +330,10 @@ impl GrepServer {
         )?;
 
         if rg.file_lines.is_empty() {
-            return Ok((String::new(), Vec::new()));
+            return Ok(String::new());
         }
 
         // Step 2: Ensure servers exist for matched files and wait for readiness.
-        // `rg_paths` is also the cache's file-mtime snapshot set (the files
-        // whose content the rendered output depends on).
         let rg_paths: Vec<PathBuf> = rg.file_lines.keys().map(PathBuf::from).collect();
         self.client_manager
             .ensure_and_wait_for_paths(&rg_paths)
@@ -555,7 +531,7 @@ impl GrepServer {
         }
 
         if hits.is_empty() {
-            return Ok((String::new(), Vec::new()));
+            return Ok(String::new());
         }
 
         // Enrich definition-like hits (Symbol, PrepareRenameSymbol).
@@ -580,16 +556,7 @@ impl GrepServer {
         }
 
         let rendered = render_results(&enrichments, &self.fs_manager, cwd);
-        // Witnesses = matched files (content) + every directory the output's
-        // membership depends on: the search roots and the subdirectories the
-        // walk descended into. A file added directly to a root bumps the root's
-        // mtime; one added deeper bumps its parent (which the walk visited). The
-        // walker does not reliably surface the root entry itself, so include the
-        // roots explicitly.
-        let mut witnesses = rg_paths;
-        witnesses.extend(rg.dirs);
-        witnesses.extend(effective_roots);
-        Ok((rendered, witnesses))
+        Ok(rendered)
     }
 
     /// Checks `prepareRename` at a position to decide whether a hit is a
@@ -1216,10 +1183,8 @@ impl GrepServer {
                         return WalkState::Continue;
                     };
                     let path = entry.path();
-                    // Record traversed directories as result-cache membership
-                    // witnesses (a new file added here bumps this dir's mtime).
+                    // Directories carry no matches and are not searched.
                     if entry.file_type().is_some_and(|ft| ft.is_dir()) {
-                        state.local.dirs.push(path.to_path_buf());
                         return WalkState::Continue;
                     }
                     // File decision: trust the walker's cached `d_type` (no
@@ -1303,7 +1268,7 @@ impl GrepServer {
 
 // ─── Rendering ─────────────────────────────────────────────────────────
 
-/// Renders grep results with page-based paging.
+/// Renders grep results as the full one-atom tree.
 ///
 /// Every result is one atom — `path:line  <source line>` (decision 024).
 /// The top-level list is the matches (definitions and occurrences alike),
@@ -1312,8 +1277,8 @@ impl GrepServer {
 /// workspace root (bare absolute path header) for absolute patterns, or under
 /// a `cwd: ~/…` context header for cwd-scoped searches.
 ///
-/// Returns the full unpaginated output. Pagination is applied by the
-/// caller (`execute`).
+/// Returns the complete output. Volume is bounded downstream by the shared
+/// overflow valve (`overflow::valve`) in [`GrepServer::execute`].
 fn render_results(
     enrichments: &[(&GrepHit, Option<SymbolEnrichment>)],
     fs_manager: &FilesystemManager,
@@ -1833,12 +1798,6 @@ struct RipgrepMatches {
     /// text (one-atom model, decision 024) plus the first match's column for
     /// hit classification and `prepareRename` positioning.
     file_line_texts: HashMap<String, HashMap<u32, Vec<(String, u32)>>>,
-    /// Directories the walk traversed. Their mtimes are the result cache's
-    /// membership witnesses: a new matching file added anywhere under the scope
-    /// bumps its parent directory's mtime (which the walk visited), so a stale
-    /// cached page is invalidated even though no existing match's mtime moved
-    /// (bug #26 add/remove gap).
-    dirs: Vec<PathBuf>,
     /// Every regular file the walk visited, with its `(absolute path, mtime)`
     /// — not just the files that matched the pattern. Feeds the WS31 changed-set
     /// baseline diff (Consumer A): the manager filters these to the union of
@@ -1853,7 +1812,6 @@ impl RipgrepMatches {
     fn merge(parts: Vec<ThreadMatches>) -> Self {
         let mut file_lines: BTreeMap<String, Vec<u32>> = BTreeMap::new();
         let mut file_line_texts: HashMap<String, HashMap<u32, Vec<(String, u32)>>> = HashMap::new();
-        let mut dirs: Vec<PathBuf> = Vec::new();
         let mut files: Vec<(PathBuf, i64)> = Vec::new();
 
         for part in parts {
@@ -1866,14 +1824,12 @@ impl RipgrepMatches {
                     entry.entry(line).or_default().extend(texts);
                 }
             }
-            dirs.extend(part.dirs);
             files.extend(part.files);
         }
 
         Self {
             file_lines,
             file_line_texts,
-            dirs,
             files,
         }
     }
@@ -1912,8 +1868,6 @@ struct ThreadMatches {
     file_lines: BTreeMap<String, Vec<u32>>,
     /// Per-file, per-line `(full source line, first-match column)`.
     file_line_texts: HashMap<String, HashMap<u32, Vec<(String, u32)>>>,
-    /// Directories visited by this thread (result-cache membership witnesses).
-    dirs: Vec<PathBuf>,
     /// Every regular file this thread visited, `(absolute path, mtime)` — the
     /// WS31 changed-set baseline observation set.
     files: Vec<(PathBuf, i64)>,
@@ -2134,12 +2088,11 @@ mod tests {
 
     // ─── Rendering ──────────────────────────────────────────────────────
 
-    /// Helper: render + paginate with no enrichment.
-    fn render(hits: &[GrepHit], budget: usize, page: usize, fs: &FilesystemManager) -> String {
+    /// Helper: render with no enrichment.
+    fn render(hits: &[GrepHit], fs: &FilesystemManager) -> String {
         let enrichments: Vec<(&GrepHit, Option<SymbolEnrichment>)> =
             hits.iter().map(|h| (h, None)).collect();
-        let full = render_results(&enrichments, fs, None);
-        paginate(&full, budget, page)
+        render_results(&enrichments, fs, None)
     }
 
     #[test]
@@ -2153,7 +2106,7 @@ mod tests {
             "let x = 1; // configure the widget",
         )];
 
-        let output = render(&hits, 10_000, 1, &fs);
+        let output = render(&hits, &fs);
 
         assert!(
             output.contains("src/a.rs:10  let x = 1; // configure the widget"),
@@ -2177,7 +2130,7 @@ mod tests {
             ref_hit("/project/src/util.rs", 30, "    handle(input);"),
         ];
 
-        let output = render(&hits, 10_000, 1, &fs);
+        let output = render(&hits, &fs);
 
         assert!(
             output.contains("config.yaml:16  handle: process"),
@@ -2199,7 +2152,7 @@ mod tests {
             ref_hit("/project/src/main.rs", 100, "    let pattern = compile();"),
         ];
 
-        let output = render(&hits, 10_000, 1, &fs);
+        let output = render(&hits, &fs);
 
         // Both atoms rendered with 1-based lines and their full source text.
         assert!(
@@ -2275,83 +2228,7 @@ mod tests {
         );
     }
 
-    // ─── Paging ───────────────────────────────────────────────────────
-
-    #[test]
-    fn grep_page_header_single_page() {
-        let fs = test_fs("/project");
-        let hits = [sym_hit(
-            "/project/src/handler.rs",
-            100,
-            "handle_grep",
-            "function",
-            "fn handle_grep() {",
-        )];
-
-        let output = render(&hits, 10_000, 1, &fs);
-
-        assert!(
-            !output.contains("[page"),
-            "single-page result should have no page header: {output}"
-        );
-        assert!(
-            output.contains("fn handle_grep() {"),
-            "should contain content: {output}"
-        );
-    }
-
-    #[test]
-    fn grep_paged() {
-        let fs = test_fs("/project");
-
-        let mut hits = Vec::new();
-        for i in 0..50 {
-            hits.push(sym_hit(
-                &format!("/project/src/file_{i}.rs"),
-                i * 10,
-                &format!("test_symbol_{i}"),
-                "function",
-                &format!("fn test_symbol_{i}() {{"),
-            ));
-        }
-
-        let page1 = render(&hits, 200, 1, &fs);
-        let page2 = render(&hits, 200, 2, &fs);
-
-        assert!(
-            page1.starts_with("[page 1/"),
-            "page 1 should have header: {page1}"
-        );
-        assert!(
-            page2.starts_with("[page 2/"),
-            "page 2 should have header: {page2}"
-        );
-        assert_ne!(page1, page2, "page 1 and 2 should differ");
-    }
-
-    #[test]
-    fn grep_page_beyond_last_clamps() {
-        let fs = test_fs("/project");
-        let hits = [sym_hit(
-            "/project/src/handler.rs",
-            100,
-            "handle_grep",
-            "function",
-            "fn handle_grep() {",
-        )];
-
-        let output = render(&hits, 10_000, 99, &fs);
-
-        // Beyond-last clamps to last page, no header for single page.
-        assert!(
-            !output.contains("[page"),
-            "single page should have no header: {output}"
-        );
-        assert!(
-            output.contains("fn handle_grep() {"),
-            "clamped page should contain content: {output}"
-        );
-    }
+    // ─── Path headers ─────────────────────────────────────────────────
 
     #[test]
     fn grep_bare_path_headers() {
@@ -2364,7 +2241,7 @@ mod tests {
             "fn handle_grep() {",
         )];
 
-        let output = render(&hits, 10_000, 1, &fs);
+        let output = render(&hits, &fs);
 
         assert!(
             !output.contains("Root:"),
@@ -2391,7 +2268,7 @@ mod tests {
             "fn orphan_fn() {",
         )];
 
-        let output = render(&hits, 10_000, 1, &fs);
+        let output = render(&hits, &fs);
 
         assert!(
             !output.contains("OutOfRoots:"),
@@ -2411,7 +2288,7 @@ mod tests {
             sym_hit("/other/path/b.rs", 20, "fn_b", "function", "fn fn_b() {"),
         ];
 
-        let output = render(&hits, 10_000, 1, &fs);
+        let output = render(&hits, &fs);
 
         // Both grouped under one /other/path header, not two
         let header_count = output.matches("/other/path\n").count();
@@ -2628,12 +2505,13 @@ mod tests {
     }
 
     #[test]
-    fn cross_page_citation_is_a_resolvable_pointer() {
-        // The paging invariant (decision 024): when a definition and a citing
-        // edge land on DIFFERENT pages, the collapsed citation is still an
-        // absolute pointer to an atom rendered full elsewhere in the result —
-        // nothing is withheld. Here B's full atom and the A→B citation are
-        // forced onto separate pages by a tiny budget; both pages remain valid.
+    fn citation_and_full_atom_both_present_in_result() {
+        // Decision 024 invariant: when a definition's edge cites another
+        // top-level match, the edge collapses to a `path:line  name` citation
+        // AND that target is still rendered full elsewhere in the result —
+        // nothing is withheld. (Previously this also exercised cross-page
+        // resolution; with paging retired the whole result is one stream, so the
+        // invariant is simply that both forms are present.)
         let fs = test_fs("/project");
         let hit_a = sym_hit("/project/a.rs", 0, "FnA", "function", "fn FnA() {");
         let mut enrichment_a = empty_enrichment();
@@ -2647,43 +2525,10 @@ mod tests {
         let full = render_results(&enrichments, &fs, None);
 
         // The full result holds BOTH the citation and B's full atom.
-        let citation = "b.rs:1  FnB";
-        let full_atom = "b.rs:1  fn FnB() {";
-        assert!(full.contains(citation), "citation present: {full}");
-        assert!(full.contains(full_atom), "B full atom present: {full}");
-
-        // Page with a tiny budget so the citation and B's full atom are forced
-        // onto SEPARATE pages, then walk every page. Paging never withholds:
-        // the citation appears on exactly one page, the full atom on exactly
-        // one page, and across the page set BOTH survive — the citation is an
-        // absolute `path:line` pointer to a guaranteed-present atom, never a
-        // dangle, regardless of which page each lands on.
-        let mut all_pages = String::new();
-        let mut citation_pages = 0;
-        let mut full_atom_pages = 0;
-        for page in 1..=10 {
-            let rendered = paginate(&full, 24, page);
-            // Count membership on each page (the page header line is ignored).
-            if rendered.contains(citation) {
-                citation_pages += 1;
-            }
-            if rendered.contains(full_atom) {
-                full_atom_pages += 1;
-            }
-            all_pages.push_str(&rendered);
-            all_pages.push('\n');
-        }
-        // Distinct pages: the full atom (the long line) cannot fit on the same
-        // 24-char page as the citation, so they are genuinely separated.
+        assert!(full.contains("b.rs:1  FnB"), "citation present: {full}");
         assert!(
-            citation_pages >= 1 && full_atom_pages >= 1,
-            "both the citation and the full atom appear on some page: {all_pages}"
-        );
-        // Across the full page set, the citation and its target both survive —
-        // nothing withheld, the pointer resolves.
-        assert!(
-            all_pages.contains(citation) && all_pages.contains(full_atom),
-            "across all pages, citation and its target both survive: {all_pages}"
+            full.contains("b.rs:1  fn FnB() {"),
+            "B full atom present: {full}"
         );
     }
 
@@ -2799,73 +2644,6 @@ mod tests {
         let a10 = a.find("a.rs:10").expect("a.rs:10 present");
         let b5 = a.find("b.rs:5").expect("b.rs:5 present");
         assert!(a3 < a10 && a10 < b5, "atoms ordered by (file, line): {a}");
-    }
-
-    // ─── Paginate unit tests ──────────────────────────────────────────
-
-    #[test]
-    fn paginate_single_page() {
-        let output = paginate("line one\nline two", 1000, 1);
-        assert!(
-            !output.contains("[page"),
-            "single page should have no header: {output}"
-        );
-        assert!(output.contains("line one"), "missing content: {output}");
-    }
-
-    #[test]
-    fn paginate_multi_page() {
-        let output1 = paginate("aaa\nbbb\nccc", 5, 1);
-        let output2 = paginate("aaa\nbbb\nccc", 5, 2);
-        assert!(output1.starts_with("[page 1/"), "page 1 header: {output1}");
-        assert!(output1.contains("aaa"), "page 1 content: {output1}");
-        assert!(
-            !output1.contains("bbb"),
-            "page 1 excludes page 2: {output1}"
-        );
-        assert!(output2.starts_with("[page 2/"), "page 2 header: {output2}");
-        assert!(output2.contains("bbb"), "page 2 content: {output2}");
-        assert!(
-            !output2.contains("ccc"),
-            "page 2 excludes page 3: {output2}"
-        );
-    }
-
-    #[test]
-    fn paginate_beyond_last_clamps() {
-        let output = paginate("aaa\nbbb", 1000, 5);
-        // Beyond-last clamps to last page and shows content, no header for single page.
-        assert!(
-            !output.contains("[page"),
-            "single page should have no header: {output}"
-        );
-        assert!(output.contains("aaa"), "clamped page has content: {output}");
-    }
-
-    #[test]
-    fn paginate_splits_over_budget_not_at_boundary() {
-        // "aaaa" (4 chars + 1 newline = 5) + "bbbb" (4 + 1 = 5) = 10 budget chars.
-        // Budget 10: both fit → single page (verifies > not >=).
-        // Budget 9: second line pushes to 10 > 9 → split.
-        let text = "aaaa\nbbbb";
-
-        // At budget: single page (verifies > not >=)
-        let at = paginate(text, 10, 1);
-        assert!(
-            !at.contains("[page"),
-            "budget=len should be single page with no header: {at}"
-        );
-        assert!(at.contains("aaaa"), "page has first line: {at}");
-        assert!(at.contains("bbbb"), "page has second line: {at}");
-
-        // Over budget: two pages (verifies newline counted in budget)
-        let over1 = paginate(text, 9, 1);
-        let over2 = paginate(text, 9, 2);
-        assert!(over1.starts_with("[page 1/2]"), "page 1 of 2: {over1}");
-        assert!(over1.contains("aaaa"), "page 1 content: {over1}");
-        assert!(!over1.contains("bbbb"), "page 1 excludes page 2: {over1}");
-        assert!(over2.starts_with("[page 2/2]"), "page 2 of 2: {over2}");
-        assert!(over2.contains("bbbb"), "page 2 content: {over2}");
     }
 
     // ─── extract_location_path ──────────────────────────────────────────
@@ -3394,12 +3172,5 @@ mod tests {
             "--include-gitignored surfaces the ignored dir's contents: {:?}",
             with_ignored.file_lines
         );
-    }
-
-    // ─── default_page ───────────────────────────────────────────────────
-
-    #[test]
-    fn default_page_is_one() {
-        assert_eq!(default_page(), 1);
     }
 }

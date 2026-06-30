@@ -437,8 +437,8 @@ pub struct FilesystemManager {
     classification: ClassificationTables,
     /// Per-root generation counter, bumped by
     /// [`bump_generations()`](Self::bump_generations) when files are
-    /// modified. Used by [`SymbolIndex`] enrichment cache and
-    /// [`ResultCache`] for invalidation.
+    /// modified. Used by the [`SymbolIndex`] enrichment cache for
+    /// invalidation.
     root_generations: std::sync::Mutex<HashMap<PathBuf, u64>>,
     /// Per-root last-seen mtimes for the LSP changed-set nudge (WS31 Consumer A).
     /// Inner key is the path **relative to the root** (the root prefix is the
@@ -787,8 +787,8 @@ impl FilesystemManager {
     ///
     /// The generation starts at 0 and is bumped by
     /// [`bump_generations()`](Self::bump_generations) when files are
-    /// modified. Used by the enrichment cache in [`SymbolIndex`] and
-    /// [`ResultCache`] for staleness checks.
+    /// modified. Used by the enrichment cache in [`SymbolIndex`] for
+    /// staleness checks.
     #[must_use]
     pub fn root_generation(&self, root: &Path) -> u64 {
         self.root_generations

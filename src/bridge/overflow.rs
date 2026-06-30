@@ -1,14 +1,19 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
-//! Runtime-dir overflow reports shared by two truncating surfaces.
+//! Runtime-dir overflow reports shared by the truncating surfaces.
 //!
-//! `catenary diagnostics` (cli-prerelease ticket 11) and `catenary sed`'s preview
-//! (ticket 11a) both bound their stdout in memory and spill the *complete* output
-//! to a file under `<runtime_dir>/catenary/` when that bound is hit, ending the
-//! truncated preview with a `… full … at <path>` pointer so the agent can read or
-//! `catenary grep` the dropped tail. This module owns the one mechanism; the two
-//! surfaces differ only in:
+//! `catenary diagnostics` (cli-prerelease ticket 11), `catenary sed`'s preview
+//! (ticket 11a), and the `catenary grep`/`glob` overflow valve (pipeable-output
+//! ticket 03) all bound their stdout in memory and spill the *complete* output to
+//! a file under `<runtime_dir>/catenary/` when that bound is hit, so the agent can
+//! read or `catenary grep` the dropped tail. This module owns the one writer; the
+//! surfaces differ in how they pointer the spill: diagnostics and sed end the
+//! truncated body with an in-band `… full … at <path>` line, while the grep/glob
+//! [`valve`] keeps stdout byte-clean and returns the pointer as a separate
+//! stderr [`receipt`](Valved::receipt).
+//!
+//! The diagnostics and sed surfaces differ only in:
 //!
 //! - **scope key** — diagnostics names its file per live session
 //!   (`diagnostics-<session_id>.txt`, overwritten each run); sed mints a fresh
@@ -43,6 +48,19 @@ const SUFFIX: &str = ".txt";
 /// long-running daemon that runs many previews would grow the dir unbounded
 /// between restarts.
 pub const MAX_SED_OVERFLOW_FILES: usize = 8;
+
+/// Filename prefix for `catenary grep` overflow spill files.
+pub const GREP_PREFIX: &str = "grep-";
+/// Filename prefix for `catenary glob` overflow spill files.
+pub const GLOB_PREFIX: &str = "glob-";
+
+/// Most recent query (`grep-*`/`glob-*`) spill files a single daemon retains
+/// *per prefix*.
+///
+/// Each grep/glob overflow mints a fresh UUID, so the files never overwrite;
+/// without a cap a long-running daemon that truncates many large queries would
+/// grow the dir unbounded between restarts.
+pub const MAX_QUERY_OVERFLOW_FILES: usize = 8;
 
 /// The directory holding overflow report files under `base`.
 fn dir(base: &Path) -> PathBuf {
@@ -157,9 +175,11 @@ pub fn sweep_sed(base: &Path) -> usize {
     removed
 }
 
-/// Enforce the in-lifetime last-N cap on `sed-*.txt` reports, removing the oldest
-/// beyond [`MAX_SED_OVERFLOW_FILES`] by modification time. Best-effort.
-fn enforce_sed_cap(base: &Path) {
+/// Enforce the in-lifetime last-`max` cap on `<prefix>*.txt` reports, removing
+/// the oldest beyond `max` by modification time. Best-effort. Shared by the sed
+/// preview ([`SED_PREFIX`], [`MAX_SED_OVERFLOW_FILES`]) and the grep/glob valve
+/// ([`GREP_PREFIX`]/[`GLOB_PREFIX`], [`MAX_QUERY_OVERFLOW_FILES`]).
+fn enforce_cap(base: &Path, prefix: &str, max: usize) {
     let Ok(entries) = std::fs::read_dir(dir(base)) else {
         return;
     };
@@ -168,19 +188,19 @@ fn enforce_sed_cap(base: &Path) {
         .filter(|e| {
             e.file_name()
                 .to_str()
-                .is_some_and(|n| key_of(n, SED_PREFIX).is_some())
+                .is_some_and(|n| key_of(n, prefix).is_some())
         })
         .filter_map(|e| {
             let mtime = e.metadata().ok()?.modified().ok()?;
             Some((mtime, e.path()))
         })
         .collect();
-    if files.len() <= MAX_SED_OVERFLOW_FILES {
+    if files.len() <= max {
         return;
     }
     // Newest first, then drop everything past the cap.
     files.sort_unstable_by_key(|f| std::cmp::Reverse(f.0));
-    for (_, path) in files.into_iter().skip(MAX_SED_OVERFLOW_FILES) {
+    for (_, path) in files.into_iter().skip(max) {
         let _ = std::fs::remove_file(path);
     }
 }
@@ -274,12 +294,130 @@ impl SedOverflowWriter {
         let path = sed_path(&self.base, &self.id);
         let persisted = file.persist(&path).is_ok();
         if persisted {
-            enforce_sed_cap(&self.base);
+            enforce_cap(&self.base, SED_PREFIX, MAX_SED_OVERFLOW_FILES);
             Some(path)
         } else {
             None
         }
     }
+}
+
+// ── Query valve: grep / glob, per-invocation truncate-and-spill ──────────────
+
+/// Outcome of applying the overflow [`valve`] to a query's rendered output.
+pub struct Valved {
+    /// The output to print to stdout: `full` verbatim when within the line
+    /// budget, truncated to the budget (at a block boundary for glob) otherwise.
+    pub display: String,
+    /// `Some(receipt)` when truncation spilled the complete output to a file —
+    /// a one-line stderr notice naming the line count and spill path. `None`
+    /// when the output fit the budget, or when the spill write failed and the
+    /// full output is emitted instead (mirrors diagnostics: never lose output).
+    pub receipt: Option<String>,
+}
+
+/// Writes the complete query output to a fresh per-invocation spill file
+/// `<base>/catenary/<prefix><uuid>.txt`, enforces the in-lifetime cap, and
+/// returns the path.
+///
+/// A fresh UUID per invocation means spills never overwrite (the query is a
+/// stateless grep-class request with no session to key on), so
+/// [`enforce_cap`] bounds the dir between daemon restarts and
+/// [`sweep_query`] clears leftovers at startup.
+fn write_query_overflow(base: &Path, prefix: &str, full: &str) -> std::io::Result<PathBuf> {
+    let d = dir(base);
+    std::fs::create_dir_all(&d)?;
+    let path = d.join(format!("{prefix}{}{SUFFIX}", uuid::Uuid::new_v4()));
+    std::fs::write(&path, full)?;
+    enforce_cap(base, prefix, MAX_QUERY_OVERFLOW_FILES);
+    Ok(path)
+}
+
+/// Remove every `grep-*`/`glob-*` query spill file under `base`. Returns the
+/// count removed. A missing overflow directory is not an error (nothing to
+/// sweep).
+///
+/// Run at daemon startup: query spills are per-invocation (a fresh UUID, never
+/// overwritten) and unreferenced by any session, so a previous daemon's
+/// leftovers are all reaped. Self-contained — no live-session set needed, the
+/// query analog of [`sweep_sed`].
+#[must_use]
+pub fn sweep_query(base: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir(base)) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.starts_with(GREP_PREFIX) || n.starts_with(GLOB_PREFIX))
+            && std::fs::remove_file(entry.path()).is_ok()
+        {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// Bounds a query's display at `budget_lines`, spilling the **complete** output
+/// to a runtime-dir file and returning a stderr receipt when it truncates.
+///
+/// Within budget (`total <= budget_lines`) the output passes through untouched
+/// with no receipt. Over budget, the display is cut to `budget_lines` and the
+/// full output is written to `<base>/catenary/<prefix><uuid>.txt`; the receipt
+/// points at it. If the spill write fails the full output is emitted with no
+/// receipt — nothing is ever lost (mirrors the diagnostics overflow path).
+///
+/// `boundary` backs the cut up to the last line that *begins* a complete
+/// top-level block, so a file's outline is never severed mid-tree: glob passes
+/// `Some(predicate)` (the first dropped line must start a fresh block), grep
+/// passes `None` (a hard line cut — every grep line is self-contained). A single
+/// block larger than the whole budget falls back to a hard cut.
+#[must_use]
+pub fn valve(
+    full: &str,
+    budget_lines: usize,
+    base: &Path,
+    prefix: &str,
+    boundary: Option<&dyn Fn(&str) -> bool>,
+) -> Valved {
+    let lines: Vec<&str> = full.lines().collect();
+    let total = lines.len();
+    if total <= budget_lines {
+        return Valved {
+            display: full.to_string(),
+            receipt: None,
+        };
+    }
+    let cut = boundary.map_or(budget_lines, |is_boundary| {
+        // The first DROPPED line (`lines[cut]`) must begin a fresh block.
+        let mut k = budget_lines;
+        while k > 1 && !is_boundary(lines[k]) {
+            k -= 1;
+        }
+        if is_boundary(lines[k]) {
+            k
+        } else {
+            // A single block spans past the budget — hard cut.
+            budget_lines
+        }
+    });
+    let display: String = lines[..cut].iter().flat_map(|l| [*l, "\n"]).collect();
+    write_query_overflow(base, prefix, full).map_or_else(
+        // Spill failed — emit the full output, lose nothing (mirrors diagnostics).
+        |_| Valved {
+            display: full.to_string(),
+            receipt: None,
+        },
+        |path| Valved {
+            display,
+            receipt: Some(format!(
+                "output truncated to protect context; full output ({total} lines) at {}",
+                path.display()
+            )),
+        },
+    )
 }
 
 #[cfg(test)]
@@ -440,6 +578,79 @@ mod tests {
         assert!(
             count <= MAX_SED_OVERFLOW_FILES,
             "in-lifetime cap keeps at most {MAX_SED_OVERFLOW_FILES}, found {count}"
+        );
+    }
+
+    // ── Query valve (grep / glob, per-invocation truncate-and-spill) ─
+
+    #[test]
+    fn valve_within_budget_passes_through() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let full = "a\nb\nc\n";
+        let v = valve(full, 10, dir.path(), GREP_PREFIX, None);
+        assert_eq!(v.display, full);
+        assert!(v.receipt.is_none(), "no truncation → no receipt");
+        assert_eq!(sweep_query(dir.path()), 0, "no spill file written");
+    }
+
+    #[test]
+    fn valve_hard_cut_truncates_and_spills_full_output() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path();
+        // 5 lines, budget 2 → display holds 2 lines, full output spilled.
+        let full = "l0\nl1\nl2\nl3\nl4";
+        let v = valve(full, 2, base, GREP_PREFIX, None);
+        assert_eq!(
+            v.display, "l0\nl1\n",
+            "hard cut at the budget line: {:?}",
+            v.display
+        );
+        let receipt = v.receipt.expect("truncation → receipt");
+        assert!(
+            receipt.contains("full output (5 lines) at "),
+            "receipt names the total line count + path: {receipt}"
+        );
+        // The spill file holds the COMPLETE output.
+        let path = receipt
+            .rsplit(" at ")
+            .next()
+            .map(std::path::PathBuf::from)
+            .expect("path in receipt");
+        assert_eq!(std::fs::read_to_string(&path).expect("read spill"), full);
+    }
+
+    #[test]
+    fn valve_boundary_backs_up_to_block_start() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path();
+        // Two "files": header `f` then two `:` detail lines each. A non-`:` line
+        // is a block boundary (the glob predicate). Budget 4 would cut mid-block
+        // (the first dropped line `:b1` is NOT a boundary), so the valve backs
+        // the cut up to the second header at index 3.
+        let full = "fa\n:a0\n:a1\nfb\n:b0\n:b1";
+        let is_boundary = |l: &str| !l.trim_start().starts_with(':');
+        let v = valve(full, 4, base, GLOB_PREFIX, Some(&is_boundary));
+        assert_eq!(
+            v.display, "fa\n:a0\n:a1\n",
+            "cut backed up to the start of the second file's block: {:?}",
+            v.display
+        );
+        assert!(v.receipt.is_some(), "truncation → receipt");
+    }
+
+    #[test]
+    fn sweep_query_removes_grep_and_glob_spills() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path();
+        // Force a spill for each prefix.
+        let _ = valve("x\ny\nz", 1, base, GREP_PREFIX, None);
+        let _ = valve("x\ny\nz", 1, base, GLOB_PREFIX, None);
+        // A diagnostics file must survive the query sweep (cross-scope safety).
+        write_diagnostics(base, "sess", "diag").expect("write diag");
+        assert_eq!(sweep_query(base), 2, "both query spills reaped");
+        assert!(
+            diagnostics_path(base, "sess").exists(),
+            "query sweep leaves diagnostics files alone"
         );
     }
 }

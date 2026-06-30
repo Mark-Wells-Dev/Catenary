@@ -59,10 +59,6 @@ enum Command {
         #[arg(long = "exclude-pattern")]
         exclude: Option<String>,
 
-        /// Page number for paged results.
-        #[arg(long, default_value = "1")]
-        page: usize,
-
         /// Report the match count ("N matches in M files") instead of results.
         #[arg(long)]
         count: bool,
@@ -91,10 +87,6 @@ enum Command {
         /// Exclude matches by glob pattern (e.g., tests/**).
         #[arg(long = "exclude-pattern")]
         exclude: Option<String>,
-
-        /// Page number for paged results.
-        #[arg(long, default_value = "1")]
-        page: usize,
 
         /// Report the path count ("N paths") instead of results.
         #[arg(long)]
@@ -518,7 +510,6 @@ fn main() -> Result<()> {
             pattern,
             scope,
             exclude,
-            page,
             count,
             include_gitignored,
             include_hidden,
@@ -530,7 +521,6 @@ fn main() -> Result<()> {
                 pattern,
                 paths,
                 exclude,
-                page,
                 count,
                 include_gitignored,
                 include_hidden,
@@ -542,7 +532,6 @@ fn main() -> Result<()> {
         Some(Command::Glob {
             paths,
             exclude,
-            page,
             count,
             include_gitignored,
             include_hidden,
@@ -553,7 +542,6 @@ fn main() -> Result<()> {
                 &mut out,
                 paths,
                 exclude,
-                page,
                 count,
                 include_gitignored,
                 include_hidden,
@@ -961,12 +949,14 @@ Run catenary commands bare
   expands them gitignore-aware rather than the shell.
 
 Navigate directly
-  Locate files with `catenary glob`, search with `catenary grep`. Never
-  brute-force by piping shell output through filters, and never pipe
-  Catenary's own output through `head`/`tail`/`wc` — use `--page` and
-  `--count`. Results are LSP-enriched automatically wherever a server covers
-  the file. Where none does, `catenary grep` only *flags* the location: open
-  the file and read it — there is no grep-fragment middle ground.";
+  Locate files with `catenary glob`, search with `catenary grep`. Both are
+  pipe-friendly: stdout carries clean results, so `| head`/`| tail`/`| grep`
+  compose normally. When output is large it is truncated to a line budget and
+  the complete result is spilled to a file named in a stderr notice — read or
+  `catenary grep` that file for the rest (use `--count` for a bare tally).
+  Results are LSP-enriched automatically wherever a server covers the file.
+  Where none does, `catenary grep` only *flags* the location: open the file and
+  read it — there is no grep-fragment middle ground.";
 
 /// Print an overview of Catenary's workflow and commands.
 ///
@@ -1132,6 +1122,7 @@ fn run_daemon_main() -> Result<()> {
         // reaped. Authoritative GC — no teardown signal is reliable across hosts.
         sweep_diagnostics_overflow();
         sweep_sed_overflow();
+        sweep_query_overflow();
 
         let threshold: catenary_mcp::logging::Severity = config
             .notifications
@@ -1338,6 +1329,20 @@ fn sweep_sed_overflow() {
     }
 }
 
+/// Remove `grep-*`/`glob-*` query overflow spill files left by a previous daemon.
+///
+/// Each grep/glob overflow valve mints a fresh per-invocation UUID (a stateless
+/// grep-class query, no session to key on), so a prior daemon's spills are
+/// unreferenced and reaped wholesale at startup (pipeable-output ticket 03). An
+/// in-lifetime last-N cap per prefix bounds the dir while the daemon runs.
+#[cfg(unix)]
+fn sweep_query_overflow() {
+    let removed = catenary_mcp::bridge::overflow::sweep_query(&catenary_mcp::paths::runtime_dir());
+    if removed > 0 {
+        info!("swept {removed} stale grep/glob overflow file(s)");
+    }
+}
+
 /// One-time reclaim of the legacy `SQLite` database (observability ticket 07).
 ///
 /// Older daemons left a `catenary.db` (plus its `-wal` / `-shm` siblings) under
@@ -1448,7 +1453,6 @@ async fn run_grep(
     pattern: String,
     paths: Vec<PathBuf>,
     exclude: Option<String>,
-    page: usize,
     count: bool,
     include_gitignored: bool,
     include_hidden: bool,
@@ -1472,7 +1476,6 @@ async fn run_grep(
             pattern,
             paths: resolved.forward.clone(),
             exclude,
-            page,
             count,
             include_gitignored,
             include_hidden,
@@ -1490,6 +1493,11 @@ async fn run_grep(
         );
     } else {
         render_search_outcome(out, &cwd, &resolved, &response.output, queried, &kind);
+        // The overflow valve's receipt goes to STDERR so stdout stays a
+        // byte-clean ripgrep superset (pipeable-output ticket 03).
+        if let Some(receipt) = &response.receipt {
+            eprintln!("{receipt}");
+        }
     }
     Ok(())
 }
@@ -1515,6 +1523,10 @@ struct SearchResponse {
     /// glob `--count`: resolved-path total.
     #[serde(default)]
     paths: Option<usize>,
+    /// Overflow-valve receipt for stderr, present only when the display was
+    /// truncated and the full output spilled to a runtime-dir file.
+    #[serde(default)]
+    receipt: Option<String>,
 }
 
 /// Renders the `catenary grep --count` summary: `N matches in M files`.
@@ -1593,7 +1605,6 @@ async fn run_glob(
     out: &mut cli::Output,
     paths: Vec<PathBuf>,
     exclude: Option<String>,
-    page: usize,
     count: bool,
     include_gitignored: bool,
     include_hidden: bool,
@@ -1612,7 +1623,6 @@ async fn run_glob(
             cwd: Some(cwd.clone()),
             paths: resolved.forward.clone(),
             exclude,
-            page,
             count,
             include_gitignored,
             include_hidden,
@@ -1633,6 +1643,11 @@ async fn run_glob(
             queried,
             &SearchKind::Glob,
         );
+        // The overflow valve's receipt goes to STDERR so a piped `glob … | grep`
+        // gets clean truncated data (pipeable-output ticket 03).
+        if let Some(receipt) = &response.receipt {
+            eprintln!("{receipt}");
+        }
     }
     Ok(())
 }
@@ -2320,7 +2335,6 @@ mod tests {
             pattern,
             scope,
             exclude,
-            page,
             count,
             include_gitignored,
             include_hidden,
@@ -2331,7 +2345,6 @@ mod tests {
         assert_eq!(pattern, "foo");
         assert!(scope.is_empty());
         assert!(exclude.is_none());
-        assert_eq!(page, 1);
         assert!(!count);
         assert!(!include_gitignored);
         assert!(!include_hidden);
@@ -2377,8 +2390,6 @@ mod tests {
             "src/",
             "--exclude-pattern",
             "tests/",
-            "--page",
-            "3",
             "--count",
             "--include-gitignored",
             "--include-hidden",
@@ -2388,7 +2399,6 @@ mod tests {
             pattern,
             scope,
             exclude,
-            page,
             count,
             include_gitignored,
             include_hidden,
@@ -2399,10 +2409,17 @@ mod tests {
         assert_eq!(pattern, "foo|bar");
         assert_eq!(scope, vec!["src/"]);
         assert_eq!(exclude.as_deref(), Some("tests/"));
-        assert_eq!(page, 3);
         assert!(count);
         assert!(include_gitignored);
         assert!(include_hidden);
+    }
+
+    #[test]
+    fn test_cli_grep_page_flag_is_rejected() {
+        use clap::Parser;
+        // `--page` was retired with paging (pipeable-output ticket 03).
+        let result = Args::try_parse_from(["catenary", "grep", "foo", "--page", "2"]);
+        assert!(result.is_err(), "grep --page should no longer parse");
     }
 
     #[test]
@@ -2422,7 +2439,6 @@ mod tests {
         let Some(Command::Glob {
             paths,
             exclude,
-            page,
             count,
             include_gitignored,
             include_hidden,
@@ -2432,7 +2448,6 @@ mod tests {
         };
         assert_eq!(paths, vec!["src/"]);
         assert!(exclude.is_none());
-        assert_eq!(page, 1);
         assert!(!count);
         assert!(!include_gitignored);
         assert!(!include_hidden);
@@ -2467,8 +2482,6 @@ mod tests {
             "src/",
             "--exclude-pattern",
             "target/**",
-            "--page",
-            "2",
             "--count",
             "--include-gitignored",
             "--include-hidden",
@@ -2477,7 +2490,6 @@ mod tests {
         let Some(Command::Glob {
             paths,
             exclude,
-            page,
             count,
             include_gitignored,
             include_hidden,
@@ -2487,10 +2499,17 @@ mod tests {
         };
         assert_eq!(paths, vec!["src/"]);
         assert_eq!(exclude.as_deref(), Some("target/**"));
-        assert_eq!(page, 2);
         assert!(count);
         assert!(include_gitignored);
         assert!(include_hidden);
+    }
+
+    #[test]
+    fn test_cli_glob_page_flag_is_rejected() {
+        use clap::Parser;
+        // `--page` was retired with paging (pipeable-output ticket 03).
+        let result = Args::try_parse_from(["catenary", "glob", "src/", "--page", "2"]);
+        assert!(result.is_err(), "glob --page should no longer parse");
     }
 
     #[test]

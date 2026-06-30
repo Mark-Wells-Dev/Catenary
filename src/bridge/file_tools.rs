@@ -11,7 +11,10 @@
 //! - Enriched: file listing with defensive maps from symbol index (LSP available)
 //! - Plain: file listing with entry flags (no LSP)
 //!
-//! When results exceed the budget, output is paged via the `page` parameter.
+//! Volume is bounded by the shared overflow valve (`overflow::valve`): the
+//! display is truncated at a line budget — at a complete file boundary, so an
+//! outline is never cut mid-tree — and the full output spills to a runtime-dir
+//! file announced by a stderr receipt.
 
 use anyhow::{Result, anyhow};
 use ignore::WalkBuilder;
@@ -26,6 +29,7 @@ use super::SourceLines;
 use super::filesystem_manager::{
     FilesystemManager, STAT_RETRY_ATTEMPTS, format_file_size, mtime_nanos,
 };
+use super::overflow;
 use super::session::{ResolvedGlob, expand_search_paths};
 use crate::lsp::{LspClientManager, WalkBreadth};
 use crate::symbol_index::{Symbol, SymbolIndex};
@@ -42,9 +46,6 @@ pub struct GlobInput {
     /// Glob pattern to exclude from results.
     #[serde(default)]
     pub exclude: Option<String>,
-    /// Page number for paged results (1-based, default: 1).
-    #[serde(default = "default_page")]
-    pub page: usize,
     /// Include gitignored files (default: false).
     #[serde(default)]
     pub include_gitignored: bool,
@@ -56,15 +57,10 @@ pub struct GlobInput {
     pub cwd: Option<PathBuf>,
     /// Return a path count instead of rendered results (default: false).
     ///
-    /// Short-circuits pagination and LSP enrichment: the pipeline reports the
-    /// number of resolved filesystem paths, never a page.
+    /// Short-circuits the overflow valve and LSP enrichment: the pipeline
+    /// reports the number of resolved filesystem paths, never a rendered tree.
     #[serde(default)]
     pub count: bool,
-}
-
-/// Default page number (1-based).
-const fn default_page() -> usize {
-    1
 }
 
 /// A filesystem entry collected during the glob directory pipeline.
@@ -97,11 +93,18 @@ struct GlobEntry {
 
 /// Outcome of a glob query.
 ///
-/// Normal queries render a paginated tree; `--count` (`GlobInput::count`)
-/// short-circuits to a path count instead of a page.
+/// Normal queries render the full tree, bounded by the shared overflow valve;
+/// `--count` (`GlobInput::count`) short-circuits to a path count.
 pub enum GlobOutcome {
-    /// Rendered, paginated tree output.
-    Rendered(String),
+    /// Rendered tree output, truncated to the line budget (at a file boundary)
+    /// by the overflow valve.
+    Rendered {
+        /// The (possibly truncated) output for stdout.
+        output: String,
+        /// A stderr receipt naming the full-output spill file, present only
+        /// when the valve truncated the display.
+        receipt: Option<String>,
+    },
     /// `--count` summary: number of resolved filesystem paths.
     Count {
         /// Number of paths the query resolves to (files counted once each,
@@ -117,11 +120,10 @@ pub struct GlobServer {
     pub(super) client_manager: Arc<LspClientManager>,
     pub(super) fs_manager: Arc<FilesystemManager>,
     pub(super) symbol_index: Option<Arc<Mutex<SymbolIndex>>>,
+    /// Line budget for the shared overflow valve (truncate-and-spill).
     pub(super) budget: usize,
     pub(super) outline_threshold: usize,
     pub(super) outline_suppress: Vec<globset::GlobMatcher>,
-    /// Single-slot result cache for sequential page fetches.
-    pub(super) cache: std::sync::Mutex<super::result_cache::ResultCache>,
 }
 
 impl GlobServer {
@@ -136,9 +138,6 @@ impl GlobServer {
         parent_id: Option<&str>,
         _cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<GlobOutcome> {
-        use super::pagination::paginate;
-        use super::result_cache::{GlobCacheParams, cache_key};
-
         let input: GlobInput = serde_json::from_value(params.clone())
             .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
 
@@ -147,27 +146,6 @@ impl GlobServer {
         }
 
         tracing::debug!("glob: {} path(s)", input.paths.len());
-
-        let page = input.page.max(1);
-
-        // Compute cache key from pipeline-affecting parameters.
-        let key = cache_key(&GlobCacheParams {
-            paths: &input.paths,
-            exclude: input.exclude.as_deref(),
-            include_gitignored: input.include_gitignored,
-            include_hidden: input.include_hidden,
-            cwd: input.cwd.as_deref(),
-            budget: self.budget,
-        });
-
-        // Check cache before running the pipeline. Count queries bypass it:
-        // the cache stores rendered pages, and a count is a different shape.
-        if !input.count
-            && let Ok(cache) = self.cache.lock()
-            && let Some(cached) = cache.get(key, page, &self.fs_manager)
-        {
-            return Ok(GlobOutcome::Rendered(cached));
-        }
 
         // Compile exclude pattern via ResolvedGlob. The CLI router
         // resolves exclude against cwd before dispatch, so patterns
@@ -179,8 +157,8 @@ impl GlobServer {
             .map(ResolvedGlob::new)
             .transpose()?;
 
-        // Count mode short-circuits pagination and enrichment — report the
-        // number of resolved paths, not a page.
+        // Count mode short-circuits the overflow valve and enrichment — report
+        // the number of resolved paths, not a rendered tree.
         if input.count {
             let paths = self.count_paths(&input, exclude.as_ref())?;
             return Ok(GlobOutcome::Count { paths });
@@ -189,33 +167,34 @@ impl GlobServer {
         // cwd-scoped search: present when the original pattern was relative.
         let cwd = input.cwd.as_deref();
 
-        // Run pipeline — handlers return full unpaginated output plus the set
-        // of files the output depends on. Existing paths dispatch directly;
-        // unexpanded glob patterns are expanded daemon-side.
-        let (full_output, mut touched) = self
+        // Run pipeline — handlers return the complete output. Existing paths
+        // dispatch directly; unexpanded glob patterns are expanded daemon-side.
+        let full_output = self
             .handle_literal_paths(&input.paths, &input, exclude.as_ref(), cwd, parent_id)
             .await?;
 
-        // Paginate first (borrows), then move output into cache. `touched` is the
-        // witness set (rendered files + their directories); dedup so repeated
-        // dirs aren't re-statted. Their mtimes invalidate the cache on a host
-        // edit or a sibling add/remove (bug #26 residual).
-        touched.sort();
-        touched.dedup();
-        let paginated = paginate(&full_output, self.budget, page);
-        let roots = self.client_manager.roots();
-        if let Ok(mut cache) = self.cache.lock() {
-            cache.put(key, full_output, &roots, &touched, &self.fs_manager);
-        }
-
-        Ok(GlobOutcome::Rendered(paginated))
+        // Bound volume with the shared overflow valve: truncate the display at
+        // the line budget and spill the full output to a runtime-dir file, with
+        // the pointer carried out as a stderr receipt. Back the cut up to the
+        // last complete file boundary so an outline is never severed mid-tree.
+        let v = overflow::valve(
+            &full_output,
+            self.budget,
+            &crate::paths::runtime_dir(),
+            overflow::GLOB_PREFIX,
+            Some(&is_outline_boundary),
+        );
+        Ok(GlobOutcome::Rendered {
+            output: v.display,
+            receipt: v.receipt,
+        })
     }
 
     /// Single file: header with defensive map (if symbols available).
     ///
     /// Single files bypass `outline_threshold` — they get a map unless the
     /// grammar is not installed or the path matches `outline_suppress`.
-    /// Returns the full unpaginated output.
+    /// Returns the complete output.
     #[allow(
         clippy::significant_drop_tightening,
         reason = "guard must live for all index queries"
@@ -328,7 +307,7 @@ impl GlobServer {
         exclude: Option<&ResolvedGlob>,
         cwd: Option<&Path>,
         parent_id: Option<&str>,
-    ) -> Result<(String, Vec<PathBuf>)> {
+    ) -> Result<String> {
         let resolved = expand_search_paths(paths, input.include_gitignored, input.include_hidden);
 
         // Scoped changed-set nudge (WS31 ticket 04): glob enriches with
@@ -344,12 +323,6 @@ impl GlobServer {
         self.nudge_scoped(&resolved, input, exclude).await;
 
         let mut full = String::new();
-        // Result-cache witnesses: files (content) and the directories they're
-        // listed in (membership) — so a host edit *or* an add/remove of a
-        // sibling invalidates a cached page (bug #26). A directory's mtime moves
-        // only on a direct entry add/remove/rename, not on a content edit, so
-        // witnessing it doesn't cause spurious misses.
-        let mut touched: Vec<PathBuf> = Vec::new();
         for path in &resolved {
             // Directories first — `is_dir()` follows symlinks, so a
             // symlink-to-dir lists its contents (rather than rendering as a
@@ -357,14 +330,10 @@ impl GlobServer {
             // `collect_scoped_observations` so the listing and the changed-set
             // nudge classify a symlink-to-dir the same way (WS31-review walk-2).
             if path.is_dir() {
-                let (output, files) = self
+                let output = self
                     .handle_glob_dir(path, input, exclude, cwd, parent_id)
                     .await?;
                 full.push_str(&output);
-                touched.extend(files);
-                // The listed dir itself: catches add/remove/rename of an
-                // immediate entry (including subdirs) in the rendered listing.
-                touched.push(path.clone());
             } else if path_is_file_or_symlink_with_retry(path) {
                 // Re-stat with a bounded retry: a transient
                 // `is_file()`/`is_symlink()` miss (an atomic-rename write racing
@@ -382,16 +351,11 @@ impl GlobServer {
                 )
                 .await;
                 full.push_str(&self.handle_glob_file(path, cwd));
-                touched.push(path.clone());
-                // Parent dir: catches a new sibling from a pattern-glob expansion.
-                if let Some(parent) = path.parent() {
-                    touched.push(parent.to_path_buf());
-                }
             }
             // Skip non-existent paths silently — shell expansion
             // shouldn't produce them, but be defensive.
         }
-        Ok((full, touched))
+        Ok(full)
     }
 
     /// Routes glob's scoped changed-set nudge (WS31 ticket 04,
@@ -455,7 +419,7 @@ impl GlobServer {
     ///
     /// Collects immediate children, applies visibility and exclude filters,
     /// detects flags (gitignored, snapshot, broken). Output shape is
-    /// capability-driven, not volume-driven. Returns the full unpaginated output.
+    /// capability-driven, not volume-driven. Returns the complete output.
     #[allow(
         clippy::significant_drop_tightening,
         reason = "guard must live for all index queries"
@@ -467,7 +431,7 @@ impl GlobServer {
         exclude: Option<&ResolvedGlob>,
         cwd: Option<&Path>,
         parent_id: Option<&str>,
-    ) -> Result<(String, Vec<PathBuf>)> {
+    ) -> Result<String> {
         let canonical = dir
             .canonicalize()
             .map_err(|e| anyhow!("Path does not exist: {}: {e}", dir.display()))?;
@@ -475,7 +439,7 @@ impl GlobServer {
         let entries = self.collect_dir_entries(&canonical, input, exclude)?;
 
         if entries.is_empty() {
-            return Ok(("Directory is empty".to_string(), Vec::new()));
+            return Ok("Directory is empty".to_string());
         }
 
         // Populate symbol index for eligible files.
@@ -530,9 +494,7 @@ impl GlobServer {
             "\t",
         );
         full.push_str(&content);
-        // `file_paths` (the dir's eligible files) is the cache's mtime-snapshot
-        // set — editing any listed file invalidates the cached listing.
-        Ok((full, file_paths))
+        Ok(full)
     }
 
     /// Extracts file info: `(line_count, binary_size)`.
@@ -745,6 +707,19 @@ fn is_snapshot(name: &str) -> bool {
 }
 
 // ─── Symbol rendering ─────────────────────────────────────────────────
+
+/// Whether a glob output line *begins* a complete top-level block, i.e. is a
+/// safe place for the overflow valve to truncate.
+///
+/// A symbol-detail row renders `{indent}:{line}  {decl}` (see
+/// [`render_symbol_line`]), so any line that does **not** start with `:` (after
+/// its indentation) is a file or directory header — the start of a fresh
+/// outline. Cutting there never severs a file's outline mid-tree. This module
+/// owns the glob line format, so it owns the boundary predicate the shared
+/// valve calls back into.
+fn is_outline_boundary(line: &str) -> bool {
+    !line.trim_start().starts_with(':')
+}
 
 /// Renders a single outline node as the one atom: `:line  <source line>[/]`.
 ///
@@ -1221,14 +1196,6 @@ fn canonical_key(path: &Path) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use globset::Glob;
-
-    #[test]
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    fn test_default_page_deserialization() {
-        let input: GlobInput =
-            serde_json::from_value(serde_json::json!({"paths": ["src/"]})).expect("deserialize");
-        assert_eq!(input.page, 1, "default page should be 1");
-    }
 
     #[test]
     fn ws31_review_r2_live_retry_recovers_transient_miss() {
@@ -2300,7 +2267,6 @@ mod tests {
             budget: 2000,
             outline_threshold: 200,
             outline_suppress: vec![],
-            cache: std::sync::Mutex::new(crate::bridge::result_cache::ResultCache::new(2000)),
         }
     }
 

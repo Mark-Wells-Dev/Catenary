@@ -490,35 +490,6 @@ fn test_glob_tier2_file_listing() -> Result<()> {
 }
 
 #[test]
-fn test_glob_budget_small() -> Result<()> {
-    let mut bridge = BridgeProcess::spawn_with_config(|root| {
-        for i in 0..40 {
-            std::fs::write(
-                root.join(format!("test_item_{i:03}.txt")),
-                format!("line {i}\n"),
-            )?;
-        }
-        let config_path = root.join("config.toml");
-        std::fs::write(&config_path, "[tools.glob]\nbudget = 1000\n")?;
-        Ok(config_path)
-    })?;
-    bridge.initialize()?;
-
-    let text = bridge.call_tool_text(
-        "glob",
-        &json!({ "paths": [bridge.root_path().to_string_lossy().to_string()] }),
-    )?;
-
-    // With small budget, output should be compact.
-    assert!(
-        text.len() <= 1200, // some tolerance
-        "Output should be budget-constrained: len={}, text:\n{text}",
-        text.len()
-    );
-    Ok(())
-}
-
-#[test]
 fn test_glob_bucket_drill() -> Result<()> {
     let dir = tempfile::tempdir()?;
 
@@ -636,7 +607,7 @@ fn test_glob_separator_bucketing() -> Result<()> {
             )?;
         }
         let config_path = root.join("config.toml");
-        std::fs::write(&config_path, "[tools.glob]\nbudget = 1000\n")?;
+        std::fs::write(&config_path, "[tools.glob]\noutline_threshold = 200\n")?;
         Ok(config_path)
     })?;
     bridge2.initialize()?;
@@ -926,33 +897,64 @@ fn test_glob_no_maps_needed() -> Result<()> {
 #[test]
 fn test_glob_dir_large_file_paged() -> Result<()> {
     let dir = tempfile::tempdir()?;
-    // File with many symbols — exceeds budget so output is paged.
-    std::fs::write(
-        dir.path().join(format!("big.{MOCK_EXT}")),
-        gen_mock_content(250),
-    )?;
-    // Threshold of 5 so file qualifies for maps. Budget of 1000.
-    let config = "[tools.glob]\nbudget = 1000\noutline_threshold = 5\n";
+    // Several outlined files so the directory listing exceeds the line budget
+    // and the overflow valve truncates BETWEEN files (never mid-tree).
+    for f in 0..5 {
+        std::fs::write(
+            dir.path().join(format!("file_{f}.{MOCK_EXT}")),
+            gen_mock_content(10),
+        )?;
+    }
+    // Threshold of 5 so files qualify for maps; a small line budget forces the
+    // valve to fire and truncate at a file boundary.
+    let config = "[tools]\nline_budget = 25\n\n[tools.glob]\noutline_threshold = 5\n";
     let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), Some(config))?;
     bridge.initialize()?;
 
-    let text = bridge.call_tool_text(
-        "glob",
+    let resp = bridge.call_search_raw(
+        "tool/glob",
         &json!({ "paths": [dir.path().to_string_lossy().to_string()] }),
     )?;
+    let output = resp
+        .get("output")
+        .and_then(serde_json::Value::as_str)
+        .context("output")?;
+    let receipt = resp
+        .get("receipt")
+        .and_then(serde_json::Value::as_str)
+        .context("expected an overflow receipt when the listing exceeds the budget")?;
 
-    // With stable shape, maps are always rendered and paged: outline nodes
-    // render their declaration source lines, with no `<Kind>` label.
+    // Outline declaration lines still render (no `<Kind>` label).
     assert!(
-        text.contains("fn func_") || text.contains("struct Struct_"),
-        "Should show declaration lines in maps: {text}"
+        output.contains("fn func_") || output.contains("struct Struct_"),
+        "Should show declaration lines in maps: {output}"
     );
     assert!(
-        !text.contains('<'),
-        "Outline should have no kind label: {text}"
+        !output.contains('<'),
+        "Outline should have no kind label: {output}"
     );
-    // Output should be paged since maps exceed budget.
-    assert!(text.contains("[page 1/"), "Should have page header: {text}");
+
+    // The spill file holds the complete listing; the display is a strict prefix.
+    let path = receipt
+        .rsplit(" at ")
+        .next()
+        .context("spill path in receipt")?;
+    let spilled = std::fs::read_to_string(path).context("read spill file")?;
+    let shown = output.lines().count();
+    assert!(
+        spilled.lines().count() > shown,
+        "spill holds the full listing ({} lines) vs {shown} shown",
+        spilled.lines().count()
+    );
+
+    // File-boundary truncation: the first DROPPED line begins a fresh block (a
+    // file/dir header), never a `:` symbol-detail row mid-outline.
+    if let Some(first_dropped) = spilled.lines().nth(shown) {
+        assert!(
+            !first_dropped.trim_start().starts_with(':'),
+            "truncation lands on a file boundary, not mid-tree; dropped: {first_dropped:?}"
+        );
+    }
     Ok(())
 }
 
@@ -1203,7 +1205,7 @@ fn test_glob_bounding_ranges() -> Result<()> {
         "\n\nfn alpha\nstruct Beta\n\n\n\n\n\n\n\n\n",
     )?;
 
-    let config = "[tools.glob]\noutline_threshold = 5\nbudget = 5000\n";
+    let config = "[tools.glob]\noutline_threshold = 5\n";
     let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), Some(config))?;
     bridge.initialize()?;
 
@@ -1363,49 +1365,46 @@ fn test_glob_composing_flags() -> Result<()> {
 }
 
 #[test]
-fn test_glob_paging() -> Result<()> {
+fn test_glob_overflow_spills_full_outline() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let file = dir.path().join(format!("huge.{MOCK_EXT}"));
-    // Many symbols to exceed budget in single-file mode.
+    // Many symbols so the single-file outline exceeds the line budget.
     std::fs::write(&file, gen_mock_content(500))?;
 
-    let config = "[tools.glob]\nbudget = 1000\n";
+    let config = "[tools]\nline_budget = 50\n";
     let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), Some(config))?;
     bridge.initialize()?;
 
-    // First page — should show [page 1/N] where N > 1.
-    let text1 = bridge.call_tool_text(
-        "glob",
+    let resp = bridge.call_search_raw(
+        "tool/glob",
         &json!({ "paths": [file.to_str().context("file path")?] }),
     )?;
+    let output = resp
+        .get("output")
+        .and_then(serde_json::Value::as_str)
+        .context("output")?;
+    let receipt = resp
+        .get("receipt")
+        .and_then(serde_json::Value::as_str)
+        .context("expected an overflow receipt when the outline exceeds the budget")?;
 
+    // The truncated display is a strict prefix; the spill file holds the COMPLETE
+    // outline, including the last symbols that did not fit.
+    let path = receipt
+        .rsplit(" at ")
+        .next()
+        .context("spill path in receipt")?;
+    let spilled = std::fs::read_to_string(path).context("read spill file")?;
     assert!(
-        text1.contains("[page 1/"),
-        "First page should have page header: {text1}"
+        spilled.lines().count() > output.lines().count(),
+        "spill holds the full outline ({} lines) vs {} shown",
+        spilled.lines().count(),
+        output.lines().count()
     );
-    // Verify it's not a single page.
     assert!(
-        !text1.contains("[page 1/1]"),
-        "Should have multiple pages: {text1}"
-    );
-
-    // Second page via page parameter.
-    let text2 = bridge.call_tool_text(
-        "glob",
-        &json!({
-            "paths": [file.to_str().context("file path")?],
-            "page": 2
-        }),
-    )?;
-
-    assert!(
-        text2.contains("[page 2/"),
-        "Second page should have page 2 header: {text2}"
-    );
-    // Second page should have different symbols than first.
-    assert!(
-        !text2.is_empty(),
-        "Second page should have content: {text2}"
+        spilled.contains("func_498") || spilled.contains("Struct_499"),
+        "spill file holds the complete outline, got tail:\n{}",
+        spilled.lines().rev().take(3).collect::<Vec<_>>().join("\n")
     );
     Ok(())
 }
@@ -1446,7 +1445,7 @@ fn test_glob_budget_minimum() -> Result<()> {
             std::fs::write(root.join(format!("item_{i:03}.txt")), format!("line {i}\n"))?;
         }
         let config_path = root.join("config.toml");
-        std::fs::write(&config_path, "[tools.glob]\nbudget = 500\n")?;
+        std::fs::write(&config_path, "[tools.glob]\noutline_threshold = 200\n")?;
         Ok(config_path)
     })?;
     bridge.initialize()?;
@@ -1526,7 +1525,7 @@ fn test_glob_dedup_mixed() -> Result<()> {
         "fn unique_func\nstruct UniqueType\n\n\n\n\n\n\n\n\n",
     )?;
 
-    let config = "[tools.glob]\noutline_threshold = 5\nbudget = 5000\n";
+    let config = "[tools.glob]\noutline_threshold = 5\n";
     let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), Some(config))?;
     bridge.initialize()?;
 

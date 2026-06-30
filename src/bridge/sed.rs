@@ -55,6 +55,15 @@ const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 /// Lines of unchanged context shown around each hunk in a preview diff.
 const DIFF_CONTEXT: usize = 3;
 
+/// Per-page character budget for the `catenary sed` preview pagination.
+///
+/// `sed`'s preview keeps the page-based [`paginate`] surface (orthogonal to the
+/// grep/glob overflow valve, which `sed` does not use). This is the page size in
+/// characters. It was previously sourced incidentally from the (now-removed)
+/// `[tools.grep] budget`; a fixed default decouples it from the retired
+/// char-budget config knobs (pipeable-output ticket 03).
+pub const PREVIEW_BUDGET: usize = 4000;
+
 /// Maximum changed (`+`/`-`) lines rendered for a single file in a preview diff
 /// before truncating with a "… N more changed lines" marker. Bounds any one file
 /// so a repo-wide rename can't bury the preview; `paginate` then pages the

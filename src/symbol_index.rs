@@ -669,7 +669,7 @@ impl SymbolIndex {
     /// 2. The source file's `mtime_nanos`, re-stat-ed and compared (`!=`)
     ///    against the value recorded at cache time — catches a host
     ///    `Edit`/`Write` that bumps no generation, and a stat failure (file
-    ///    removed). Mirrors [`ResultCache`]'s witness-mtime check. A cached
+    ///    removed). A cached
     ///    `source_mtime` of `None` (the stat failed at cache time) is treated
     ///    as an always-miss: comparing it to a still-failing read stat would
     ///    leave `None == None` and serve an unstattable entry forever, so the

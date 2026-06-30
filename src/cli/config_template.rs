@@ -159,14 +159,16 @@ const TEMPLATE: &str = r#"# Catenary recommended config
 
 # ── Tool budgets ─────────────────────────────────────────────────
 #
-# Output budgets in characters. Larger budgets give the agent more
-# context but consume more of the conversation window.
+# line_budget: shared display line budget for `catenary grep`/`glob`. When a
+#   query's output exceeds this many lines the display is truncated (at a file
+#   boundary for glob) and the COMPLETE output is spilled to a runtime-dir file,
+#   announced by a stderr notice — read or `catenary grep` that file for the
+#   rest. The single volume knob for both search surfaces. Default 1000, min 1.
 
-# [tools.grep]
-# budget = 4000
+# [tools]
+# line_budget = 1000
 
 # [tools.glob]
-# budget = 2000
 # outline_threshold = 200
 
 # ── Diagnostics (`catenary diagnostics`) ─────────────────────────
