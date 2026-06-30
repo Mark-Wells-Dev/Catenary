@@ -206,6 +206,14 @@ struct WordTok {
     /// True if any character of the word was quoted — a quoted word can never
     /// be a reserved word or an operator.
     had_quote: bool,
+    /// The byte offset in [`text`](Self::text) at which the word's first quoted
+    /// run begins, or `None` when the word has no quoted run. Captured as the
+    /// length of the accumulated word buffer the moment the first quote opens;
+    /// the unquoted leading bytes are pushed 1:1, so this equals the length of
+    /// the unquoted prefix in the interpreted `text`. Distinguishes a word whose
+    /// `NAME=` is unquoted (an assignment prefix; the value after `=` is data)
+    /// from one quoted at or before the `=` (a command literal like `'x=y'`).
+    first_quote_at: Option<usize>,
 }
 
 /// Lex the (heredoc-stripped) input into a flat token stream.
@@ -233,6 +241,7 @@ fn lex(input: &str) -> Vec<Token> {
     let mut word: Vec<u8> = Vec::new();
     let mut subs: Vec<String> = Vec::new();
     let mut had_quote = false;
+    let mut first_quote_at: Option<usize> = None;
     let mut in_word = false;
 
     // Flush the in-progress word as a `Word` token (classifying it as a reserved
@@ -246,6 +255,7 @@ fn lex(input: &str) -> Vec<Token> {
                 &mut word,
                 &mut subs,
                 &mut had_quote,
+                &mut first_quote_at,
                 &mut in_word,
             )
         };
@@ -308,6 +318,9 @@ fn lex(input: &str) -> Vec<Token> {
             b'\'' => {
                 in_word = true;
                 had_quote = true;
+                if first_quote_at.is_none() {
+                    first_quote_at = Some(word.len());
+                }
                 let end = memchr_byte(bytes, b'\'', i + 1).unwrap_or(n);
                 push_bytes(&mut word, &bytes[i + 1..end.min(n)]);
                 i = if end < n { end + 1 } else { n };
@@ -316,6 +329,9 @@ fn lex(input: &str) -> Vec<Token> {
             b'"' => {
                 in_word = true;
                 had_quote = true;
+                if first_quote_at.is_none() {
+                    first_quote_at = Some(word.len());
+                }
                 i = lex_double_quote(bytes, i + 1, &mut word, &mut subs);
             }
             // ── `$` — `$'…'`, `$(…)`, or a plain `$word` ────────────────────
@@ -324,6 +340,9 @@ fn lex(input: &str) -> Vec<Token> {
                 if i + 1 < n && bytes[i + 1] == b'\'' {
                     // `$'…'` ANSI-C quoting.
                     had_quote = true;
+                    if first_quote_at.is_none() {
+                        first_quote_at = Some(word.len());
+                    }
                     i = lex_ansi_c_quote(bytes, i + 2, &mut word);
                 } else if i + 1 < n && bytes[i + 1] == b'(' {
                     // `$(…)` command substitution (or `$((…))` arithmetic).
@@ -403,6 +422,7 @@ fn flush_word(
     word: &mut Vec<u8>,
     subs: &mut Vec<String>,
     had_quote: &mut bool,
+    first_quote_at: &mut Option<usize>,
     in_word: &mut bool,
 ) {
     if *in_word {
@@ -414,8 +434,10 @@ fn flush_word(
             text,
             subs: std::mem::take(subs),
             had_quote: *had_quote,
+            first_quote_at: *first_quote_at,
         }));
         *had_quote = false;
+        *first_quote_at = None;
         *in_word = false;
     }
 }
@@ -1026,15 +1048,25 @@ fn collect_subs(w: &WordTok, cmd: &mut SimpleCommand) {
     }
 }
 
+/// Whether `w` is a leading `NAME=value` assignment prefix. The `NAME=` part
+/// must be unquoted — the value after `=` may be quoted and is data. A word
+/// whose first quoted run opens at or before the assignment `=` (e.g. `'x=y'`)
+/// is a command literal, not an assignment prefix.
+fn is_assignment_prefix(w: &WordTok) -> bool {
+    ENV_VAR_RE.is_match(&w.text)
+        && w.first_quote_at
+            .is_none_or(|q| w.text.find('=').is_some_and(|eq| eq < q))
+}
+
 /// Assign the command name (after `VAR=` prefixes, path-stripped) and argv from
 /// the collected words.
 fn assign_name_and_argv(words: &[&WordTok], cmd: &mut SimpleCommand) {
     // Skip leading `VAR=value` assignment words to find the command position.
     let mut name_idx = None;
     for (i, w) in words.iter().enumerate() {
-        // An assignment prefix is an unquoted `NAME=...`; a quoted word is never
-        // an assignment prefix in command position.
-        if !w.had_quote && ENV_VAR_RE.is_match(&w.text) {
+        // An assignment prefix is a `NAME=...` whose `NAME=` is unquoted; the
+        // value after `=` may be quoted and is data, not a command.
+        if is_assignment_prefix(w) {
             continue;
         }
         name_idx = Some(i);
@@ -2054,6 +2086,56 @@ mod tests {
         let script = parse("FOO=bar");
         assert_eq!(script, ParsedScript::default());
         assert!(script.command_positions().is_empty());
+    }
+
+    #[test]
+    fn bare_quoted_assignment_is_no_command() {
+        // Bug 52: a `NAME=` assignment whose value is quoted is still an
+        // assignment, not a command — the quoted value must not leak to command
+        // position. The `=` is unquoted in every case here (the quote opens after
+        // it), so `is_assignment_prefix` skips the whole word.
+        assert!(
+            positions("x='/a/b/zzz'").is_empty(),
+            "quoted value leaked: {:?}",
+            positions("x='/a/b/zzz'")
+        );
+        assert!(
+            positions("x=/a/b/zzz").is_empty(),
+            "unquoted value leaked: {:?}",
+            positions("x=/a/b/zzz")
+        );
+        assert!(
+            positions("x='\"/a/b/zzz\"'").is_empty(),
+            "nested-quoted value leaked: {:?}",
+            positions("x='\"/a/b/zzz\"'")
+        );
+        let json = "j='{\"jsonrpc\":\"2.0\",\"uri\":\"file:///home/u/ws/x\"}'";
+        assert!(
+            positions(json).is_empty(),
+            "quoted JSON value leaked: {:?}",
+            positions(json)
+        );
+    }
+
+    #[test]
+    fn quoted_assignment_value_skipped_finds_command() {
+        // Bug 52: a leading assignment with a quoted value is skipped, and the
+        // following word is recovered as the command.
+        assert_eq!(positions("FOO='/a/b' make test"), vec!["make"]);
+    }
+
+    #[test]
+    fn fully_quoted_word_is_command_not_assignment() {
+        // Bug 52: a word quoted at or before the `=` (`'x=y'`) is a command
+        // literal, not an assignment prefix — it surfaces as the command.
+        assert_eq!(positions("'x=y'"), vec!["x=y"]);
+    }
+
+    #[test]
+    fn quoted_path_argument_unchanged() {
+        // Bug 52 regression guard: a quoted path *argument* (not an assignment)
+        // is unaffected — only the command `printf` surfaces.
+        assert_eq!(positions("printf '%s' '/a/b/zzz'"), vec!["printf"]);
     }
 
     #[test]

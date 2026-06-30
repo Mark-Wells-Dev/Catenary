@@ -1018,6 +1018,8 @@ const SEED_CORPUS: &[&str] = &[
     "cat <<EOF\nprose then $(rm x) then more\nEOF",
     "cat <<'EOF'\n$(rm x)\nEOF",
     "git commit -F - <<EOF\nran tests; shipped\nEOF",
+    // ── Bug 52 — quoted assignment value must not leak to command position ────
+    "VAR='/a/b/x'",
 ];
 
 // ── proptest strategy ─────────────────────────────────────────────────────────
