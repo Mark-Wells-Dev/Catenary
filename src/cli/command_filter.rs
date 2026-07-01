@@ -894,8 +894,13 @@ fn catenary_occ_denial(occ: &CatenaryOcc) -> Option<String> {
     if occ.wrapped {
         return Some(substitution_denial(sub));
     }
-    if occ.piped_in {
-        return Some(stdin_denial(sub));
+    // `… | catenary X`: Search commands read stdin (ticket 04), so a downstream
+    // pipe is valid for them (`stdin_denial` returns `None`); the no-stdin
+    // classes still deny. This is the retired bug-19 / ADR-013 post-pipe guard.
+    if occ.piped_in
+        && let Some(msg) = stdin_denial(sub)
+    {
+        return Some(msg);
     }
     if let Some(down) = &occ.piped_out {
         return Some(out_pipe_denial(sub, down));
@@ -933,23 +938,29 @@ fn substitution_denial(sub: Sub) -> String {
     )
 }
 
-/// `… | catenary X` — catenary does not read stdin.
-fn stdin_denial(sub: Sub) -> String {
+/// `… | catenary X` — the pipe-in verdict for a downstream `catenary` command.
+///
+/// The Search class (`grep`/`glob`) reads stdin (ticket 04), so a downstream
+/// pipe position is a valid invocation — `None`. This retires the bug-19 /
+/// ADR-013 post-pipe guard, whose rationale ("catenary grep ignores stdin, so
+/// the pipe is a no-op") evaporated once stdin landed. The no-stdin classes
+/// (correlated `diagnostics`/`sed`, and the bare lifecycle commands) still
+/// deny with a class-appropriate message.
+fn stdin_denial(sub: Sub) -> Option<String> {
     match sub {
-        Sub::Grep => "`catenary grep` doesn't read stdin — it searches the filesystem. \
-             Give it a glob pattern path and narrow with `--exclude-pattern`, e.g. \
-             `catenary grep \"p\" 'src/**/*.rs' --exclude-pattern 'tests/**'`."
-            .to_string(),
-        Sub::Glob => "`catenary glob` doesn't read stdin — it browses the filesystem. \
-             Give it a path or glob pattern, e.g. `catenary glob 'src/**/*.rs'`."
-            .to_string(),
-        Sub::Sed => "`catenary sed` takes `<pattern> <replacement> [paths]`, not stdin. \
+        // Search reads stdin now — a downstream pipe is valid, not an error.
+        Sub::Grep | Sub::Glob => None,
+        Sub::Sed => Some(
+            "`catenary sed` takes `<pattern> <replacement> [paths]`, not stdin. \
              Pass a glob pattern path."
-            .to_string(),
-        Sub::Diagnostics => "`catenary diagnostics` takes no input — run it bare.".to_string(),
-        Sub::EditingStart | Sub::EditingStop | Sub::Roots | Sub::Primer | Sub::Commands => {
-            format!("`catenary {}` takes no stdin — run it bare.", sub.label())
+                .to_string(),
+        ),
+        Sub::Diagnostics => {
+            Some("`catenary diagnostics` takes no input — run it bare.".to_string())
         }
+        Sub::EditingStart | Sub::EditingStop | Sub::Roots | Sub::Primer | Sub::Commands => Some(
+            format!("`catenary {}` takes no stdin — run it bare.", sub.label()),
+        ),
     }
 }
 
@@ -959,8 +970,10 @@ fn out_pipe_denial(sub: Sub, downstream: &str) -> String {
     match sub {
         Sub::Grep | Sub::Glob => match downstream {
             "head" | "tail" => format!(
-                "`catenary {tool}` output is paged — use `--page N` (default 1), not \
-                 `{downstream}`."
+                "`catenary {tool}` output is line-budgeted — the overflow valve \
+                 truncates it and spills the full result to a file (stderr \
+                 receipt), so read it directly instead of `{downstream}`. Narrow \
+                 with `--exclude-pattern`."
             ),
             "wc" => format!(
                 "Use `--count` for totals — piping `catenary {tool}` into `wc` also \
@@ -975,14 +988,15 @@ fn out_pipe_denial(sub: Sub, downstream: &str) -> String {
             }
             _ => format!(
                 "`catenary {tool}` owns its output — don't pipe it into `{downstream}`. \
-                 Size output with `--page`, narrow with `--exclude-pattern`, and read \
-                 the result directly."
+                 Output is line-budgeted (the overflow valve spills the full result \
+                 to a file); narrow with `--exclude-pattern` and read the result \
+                 directly."
             ),
         },
         Sub::Sed => format!(
             "`catenary sed` output is structured (file list + match counts) — don't \
-             pipe it into `{downstream}`. Use `--page N`; narrow with \
-             `--exclude-pattern`. `--in-place` writes the files directly."
+             pipe it into `{downstream}`. Narrow with `--exclude-pattern`; \
+             `--in-place` writes the files directly."
         ),
         Sub::Diagnostics => format!(
             "`catenary diagnostics` clears on run and writes the full report to a \
@@ -1003,7 +1017,8 @@ fn redirect_denial(sub: Sub) -> String {
     match sub {
         Sub::Grep | Sub::Glob => format!(
             "`catenary {}` results are printed for you to read — don't redirect them to \
-             a file. Page large output with `--page N`.",
+             a file. Large output is line-budgeted and the overflow valve spills the \
+             full result to a file automatically (stderr receipt).",
             sub.label()
         ),
         Sub::Sed => "`catenary sed` edits files directly with `--in-place` (or previews \
@@ -1623,6 +1638,53 @@ mod tests {
         let rules = basic_rules();
         assert!(check_command("cat file | grep foo", &rules, None).is_some());
         assert!(check_command("ls | grep foo", &rules, None).is_some());
+    }
+
+    // ── Native `grep` uniformly deniable (pipeable-output ticket 05) ──
+    //
+    // Once `catenary grep` reads stdin (ticket 04) and runs downstream of a pipe,
+    // native `grep` no longer needs the mid-pipe carve-out (the `pipeline` list).
+    // A config that lists `grep` in neither `allow` nor `pipeline` therefore
+    // denies it *uniformly* — first command *and* mid-pipe, with no positional
+    // exception — and (via the scan redirect) nudges to `catenary grep` in every
+    // position. The recommended default keeps `grep` in the pipeline; removing it
+    // is a per-config choice this mechanism enables, not one catenary forces.
+
+    /// Recommended rules with `grep` removed from the pipeline — the per-config
+    /// "deny native grep" choice. The scan→`catenary grep` redirect guidance
+    /// (shipped with the recommended config) is retained.
+    fn rules_denying_grep() -> ResolvedCommands {
+        let mut rules = recommended_rules();
+        rules.pipeline.remove("grep");
+        rules
+    }
+
+    #[test]
+    fn native_grep_denied_first_command_and_mid_pipe() {
+        let rules = rules_denying_grep();
+        // First command: denied (no positional carve-out).
+        let first = check_command("grep pattern src", &rules, None)
+            .expect("native grep denied as the first command");
+        assert_eq!(first.reason, DenialReason::NotAllowed);
+        // Mid-pipe: denied too — the carve-out is gone. `cat` is allowlisted, so
+        // the denial lands specifically on `grep`, not the upstream.
+        let mid = check_command("cat src/main.rs | grep pattern", &rules, None)
+            .expect("native grep denied mid-pipe");
+        assert_eq!(mid.command, "grep");
+        assert_eq!(mid.reason, DenialReason::NotAllowed);
+    }
+
+    #[test]
+    fn native_grep_denial_redirects_to_catenary_grep_uniformly() {
+        let rules = rules_denying_grep();
+        for cmd in ["grep pattern src", "cat src/main.rs | grep pattern"] {
+            let denial = check_command(cmd, &rules, None).expect("native grep denied");
+            let msg = format_denial(&denial.command, &rules, &denial, None, None);
+            assert!(
+                msg.contains("catenary grep"),
+                "`{cmd}` must nudge to catenary grep, got: {msg}",
+            );
+        }
     }
 
     // ── Heredoc is stdin input, not an allow/deny knob (ticket 08) ────
@@ -3476,17 +3538,61 @@ mod tests {
 
     #[test]
     fn matcher_denies_pipe_out() {
-        assert!(deny_text("catenary grep p | head").contains("--page"));
+        // Piping catenary's structured output into a downstream tool is still
+        // denied, but the hints no longer name the retired `--page` flag
+        // (pipeable-output tickets 03/03a) — they point at the overflow valve.
+        let head = deny_text("catenary grep p | head");
+        assert!(
+            head.contains("line-budgeted") && !head.contains("--page"),
+            "got: {head}",
+        );
         assert!(deny_text("catenary grep p | wc -l").contains("--count"));
-        assert!(deny_text("catenary glob src | tail").contains("--page"));
+        let tail = deny_text("catenary glob src | tail");
+        assert!(
+            tail.contains("line-budgeted") && !tail.contains("--page"),
+            "got: {tail}",
+        );
         // post-filtering structured output
         assert!(deny_text("catenary grep p | grep foo").contains("post-filter"));
     }
 
     #[test]
-    fn matcher_denies_pipe_in() {
-        assert!(deny_text("chezmoi managed | catenary grep p").contains("stdin"));
-        assert!(deny_text("ls | catenary glob src").contains("stdin"));
+    fn matcher_allows_search_pipe_in() {
+        // Ticket 05: the bug-19 / ADR-013 post-pipe guard is retired. `catenary
+        // grep`/`glob` read stdin (ticket 04), so a downstream pipe position is a
+        // valid invocation — the catenary matcher no longer denies it (the
+        // upstream foreign segment is allowlist-checked separately, hence
+        // `has_foreign: true`).
+        assert_eq!(
+            analyze_catenary_command("chezmoi managed | catenary grep p"),
+            CatenaryAction::Allow { has_foreign: true },
+        );
+        assert_eq!(
+            analyze_catenary_command("ls | catenary glob src"),
+            CatenaryAction::Allow { has_foreign: true },
+        );
+        assert_eq!(
+            analyze_catenary_command("cat src/main.rs | catenary grep p"),
+            CatenaryAction::Allow { has_foreign: true },
+        );
+    }
+
+    #[test]
+    fn matcher_denies_pipe_in_for_no_stdin_classes() {
+        // The correlated/lifecycle classes take no stdin and stay bare-only, so a
+        // downstream pipe still denies — the post-pipe guard is retired only for
+        // the Search class.
+        assert!(
+            matches!(
+                analyze_catenary_command("git log | catenary diagnostics"),
+                CatenaryAction::Deny(_),
+            ),
+            "piped-in diagnostics must still deny",
+        );
+        assert!(
+            deny_text("echo x | catenary roots add /tmp/p").contains("stdin"),
+            "piped-in lifecycle command must still deny on stdin",
+        );
     }
 
     #[test]
@@ -3735,7 +3841,12 @@ mod tests {
             ("catenary grep p src", Allow),
             ("catenary grep p | head", DenyCatenary),
             ("catenary grep p | wc -l", DenyCatenary),
-            ("chezmoi managed | catenary grep p", DenyCatenary), // bugs/19
+            // pipe-in retired (ticket 05): search reads stdin now — a downstream
+            // pipe is valid, so only the *upstream* segment is judged. Allowlisted
+            // upstream → the whole call runs; an unlisted upstream denies on its
+            // own name (not on the pipe).
+            ("cat src/main.rs | catenary grep p", Allow),
+            ("chezmoi managed | catenary grep p", DenyForeign(NotAllowed)), // upstream unlisted
             ("cd src && catenary grep p", Allow),
             ("$(catenary grep p)", DenyCatenary),
             ("catenary grep p &", DenyCatenary),
@@ -4171,15 +4282,22 @@ mod tests {
     // ── out_pipe_denial message coverage ────────────────────────────
 
     #[test]
-    fn out_pipe_head_tail_names_paging() {
-        // The `"head" | "tail"` arm renders the paging nudge — distinct from the
-        // generic fall-through ("owns its output"). Deleting the arm would route
-        // `catenary grep | head` to the `_` arm and drop the paging wording.
+    fn out_pipe_head_tail_names_overflow_valve() {
+        // The `"head" | "tail"` arm renders the overflow-valve nudge ("read it
+        // directly"; the full result spills to a file) — distinct from the
+        // generic fall-through. It must not name the retired `--page` flag
+        // (pipeable-output tickets 03/03a). Deleting the arm would route
+        // `catenary grep | head` to the `_` arm and drop the "read it directly"
+        // wording.
         for down in ["head", "tail"] {
             let msg = deny_text(&format!("catenary grep p | {down}"));
             assert!(
-                msg.contains("output is paged") && msg.contains("--page N"),
-                "`catenary grep | {down}` must give the paging nudge, got: {msg:?}",
+                msg.contains("line-budgeted") && msg.contains("read it directly"),
+                "`catenary grep | {down}` must give the overflow-valve nudge, got: {msg:?}",
+            );
+            assert!(
+                !msg.contains("--page"),
+                "the retired `--page` flag must not appear, got: {msg:?}",
             );
             assert!(
                 msg.contains(down),
@@ -4194,8 +4312,8 @@ mod tests {
         // cannot accidentally pass by matching wc's text.
         let msg = deny_text("catenary grep p | wc -l");
         assert!(
-            msg.contains("--count") && !msg.contains("output is paged"),
-            "`| wc` must give the --count nudge, not the paging one, got: {msg:?}",
+            msg.contains("--count") && !msg.contains("read it directly"),
+            "`| wc` must give the --count nudge, not the overflow one, got: {msg:?}",
         );
     }
 
