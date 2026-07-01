@@ -463,10 +463,14 @@ pub fn extract_command_names(cmd: &str) -> Vec<String> {
 // - `grep`/`glob` (stateless, self-scoping) may `cd`-prefix and `&&`/`;`/`||`
 //   chain with allowlisted foreign commands, any count.
 //
-// Both classes reject output-ownership violations (pipe, redirect,
-// command/process-substitution *wrapping*, backgrounding `&`) and deny with a
-// pedagogical message naming the right tool/flag. The matcher only recognizes
-// and classifies; it performs no IO. Foreign commands keep the allowlist regime
+// Both classes reject substitution-*wrapping* (`$(catenary …)` captures the
+// output) and backgrounding (`&`; the harness auto-backgrounds and drops stdout,
+// bug 15). The output-ownership pipe/redirect denials are retired (decision
+// 025): `grep`/`glob` and `sed` previews emit complete, client-owned output, so
+// they may pipe or redirect freely; only the handoff-carrying commands
+// (`diagnostics`/`sed --in-place`/lifecycle) stay bare-only, so a pipe or
+// redirect on them is a bare-only violation. The matcher only recognizes and
+// classifies; it performs no IO. Foreign commands keep the allowlist regime
 // ([`check_command`]).
 
 /// Correlation class of a recognized catenary subcommand (ADR 013/014).
@@ -670,9 +674,12 @@ struct CatenaryScan {
 /// `for`-loop body) would wedge the daemon (decision 020 §5). That gate is
 /// **structural** — it counts the parse's command positions and inspects its
 /// compound flag, never a substring scan, so an under-counted separator can
-/// never mistake a chained command for isolated. Both classes also reject pipes,
-/// file redirects, substitution-wrapping, and backgrounding. Unrecognized or
-/// non-agent subcommands are denied.
+/// never mistake a chained command for isolated. Both classes reject
+/// substitution-wrapping and backgrounding; the output-ownership pipe/redirect
+/// denials are retired for the handoff-free commands
+/// (`grep`/`glob`/`sed`-preview), which emit complete, client-owned output
+/// (decision 025), while a pipe or redirect on a handoff command is a bare-only
+/// violation. Unrecognized or non-agent subcommands are denied.
 #[must_use]
 pub fn analyze_catenary_command(cmd: &str) -> CatenaryAction {
     // The parse strips heredoc bodies, `#` comments, and `\`-newline joins, and
@@ -902,12 +909,22 @@ fn catenary_occ_denial(occ: &CatenaryOcc) -> Option<String> {
     {
         return Some(msg);
     }
-    if let Some(down) = &occ.piped_out {
-        return Some(out_pipe_denial(sub, down));
+    // Output-ownership pipe/redirect denials are retired for the handoff-free
+    // commands (decision 025): `grep`/`glob` and `sed` previews emit complete,
+    // client-owned output, so piping or redirecting them is as valid as piping
+    // `grep` itself. Only the handoff-carrying commands (`diagnostics`,
+    // `sed --in-place`, the bare lifecycle commands) stay bare-only, so a
+    // pipe-out or a file redirect on them is a bare-only violation.
+    if occ_needs_isolation(occ) {
+        if let Some(down) = &occ.piped_out {
+            return Some(out_pipe_denial(sub, down));
+        }
+        if occ.redirected {
+            return Some(redirect_denial(sub));
+        }
     }
-    if occ.redirected {
-        return Some(redirect_denial(sub));
-    }
+    // Backgrounding is denied on the bug-15 ground (the harness auto-backgrounds
+    // and stdout is dropped), not output ownership.
     if occ.backgrounded {
         return Some(background_denial(sub));
     }
@@ -964,82 +981,44 @@ fn stdin_denial(sub: Sub) -> Option<String> {
     }
 }
 
-/// `catenary X | downstream` — catenary owns its (structured, budgeted) output.
+/// `catenary X | downstream` for a handoff-carrying (bare-only) command.
+///
+/// Only reached for commands that take a hook→IPC handoff (`diagnostics`,
+/// `sed --in-place`, the bare lifecycle commands) — the caller gates on
+/// [`occ_needs_isolation`]. `grep`/`glob` and `sed` previews emit complete,
+/// client-owned output (decision 025) and pipe freely, so they never reach here.
+/// Teaches the bare form / class split, not the retired volume model.
 fn out_pipe_denial(sub: Sub, downstream: &str) -> String {
-    let tool = sub.label();
-    match sub {
-        Sub::Grep | Sub::Glob => match downstream {
-            "head" | "tail" => format!(
-                "`catenary {tool}` output is line-budgeted — the overflow valve \
-                 truncates it and spills the full result to a file (stderr \
-                 receipt), so read it directly instead of `{downstream}`. Narrow \
-                 with `--exclude-pattern`."
-            ),
-            "wc" => format!(
-                "Use `--count` for totals — piping `catenary {tool}` into `wc` also \
-                 counts headers and context lines."
-            ),
-            "grep" | "egrep" | "fgrep" | "rg" | "ag" | "sort" | "uniq" | "cut" | "awk" | "sed" => {
-                format!(
-                    "`catenary {tool}` returns structured, enriched results — don't \
-                 post-filter with `{downstream}`. Narrow the query: tighten the \
-                 pattern or add `--exclude-pattern`."
-                )
-            }
-            _ => format!(
-                "`catenary {tool}` owns its output — don't pipe it into `{downstream}`. \
-                 Output is line-budgeted (the overflow valve spills the full result \
-                 to a file); narrow with `--exclude-pattern` and read the result \
-                 directly."
-            ),
-        },
-        Sub::Sed => format!(
-            "`catenary sed` output is structured (file list + match counts) — don't \
-             pipe it into `{downstream}`. Narrow with `--exclude-pattern`; \
-             `--in-place` writes the files directly."
-        ),
-        Sub::Diagnostics => format!(
-            "`catenary diagnostics` clears on run and writes the full report to a \
-             runtime-dir file (path printed); the preview is already budgeted, errors \
-             first. Don't pipe it into `{downstream}` — read the preview, or `catenary \
-             grep \"pattern\" <report-file>` to filter the full set."
-        ),
-        Sub::EditingStart | Sub::EditingStop | Sub::Roots | Sub::Primer | Sub::Commands => {
-            format!(
-                "`catenary {tool}` owns its output — run it bare, don't pipe it into \
-                 `{downstream}`."
-            )
-        }
-    }
+    format!(
+        "`catenary {}` takes a daemon handoff and must run bare — don't pipe it \
+         into `{downstream}`. Run it as its own command and read the output \
+         directly.",
+        sub.label()
+    )
 }
 
+/// `catenary X > file` for a handoff-carrying (bare-only) command.
+///
+/// Only reached for handoff-carrying commands — the caller gates on
+/// [`occ_needs_isolation`]. `grep`/`glob` and `sed` previews emit complete,
+/// client-owned output (decision 025) and may redirect freely (the
+/// `catenary sed … > preview.diff` workflow is now permitted), so they never
+/// reach here. Teaches the bare form, not the retired volume model.
 fn redirect_denial(sub: Sub) -> String {
-    match sub {
-        Sub::Grep | Sub::Glob => format!(
-            "`catenary {}` results are printed for you to read — don't redirect them to \
-             a file. Large output is line-budgeted and the overflow valve spills the \
-             full result to a file automatically (stderr receipt).",
-            sub.label()
-        ),
-        Sub::Sed => "`catenary sed` edits files directly with `--in-place` (or previews \
-             to you) — there's nothing to redirect."
-            .to_string(),
-        Sub::Diagnostics => "`catenary diagnostics` already writes its full report to a \
-             runtime-dir file (path printed) — run it bare and read the printed path."
-            .to_string(),
-        Sub::EditingStart | Sub::EditingStop | Sub::Roots | Sub::Primer | Sub::Commands => {
-            format!(
-                "`catenary {}` output is delivered to you directly — don't redirect it.",
-                sub.label()
-            )
-        }
-    }
+    format!(
+        "`catenary {}` takes a daemon handoff and must run bare — don't redirect \
+         it to a file. Run it as its own command and read the output directly.",
+        sub.label()
+    )
 }
 
+/// `catenary X &` — backgrounding is denied on the bug-15 ground, not output
+/// ownership: the harness auto-backgrounds the command and its stdout is dropped.
 fn background_denial(sub: Sub) -> String {
     format!(
-        "Don't background `catenary {}` with `&` — its output is delivered to you \
-         directly and backgrounding drops it. Run it in the foreground.",
+        "Don't background `catenary {}` with `&` — the harness auto-backgrounds it \
+         and its stdout is dropped, so you'd get no output. Run it in the \
+         foreground.",
         sub.label()
     )
 }
@@ -3397,7 +3376,8 @@ mod tests {
 
     #[test]
     fn matcher_denies_commands_pipe_and_chain() {
-        // `catenary commands` is lifecycle/bare-only and owns its output.
+        // `catenary commands` is lifecycle/bare-only — it takes a daemon handoff,
+        // so a pipe or chain is a bare-only violation.
         assert!(
             matches!(
                 analyze_catenary_command("catenary commands | grep git"),
@@ -3537,23 +3517,26 @@ mod tests {
     // ---- Deny table: output ownership (both classes) ----
 
     #[test]
-    fn matcher_denies_pipe_out() {
-        // Piping catenary's structured output into a downstream tool is still
-        // denied, but the hints no longer name the retired `--page` flag
-        // (pipeable-output tickets 03/03a) — they point at the overflow valve.
-        let head = deny_text("catenary grep p | head");
-        assert!(
-            head.contains("line-budgeted") && !head.contains("--page"),
-            "got: {head}",
-        );
-        assert!(deny_text("catenary grep p | wc -l").contains("--count"));
-        let tail = deny_text("catenary glob src | tail");
-        assert!(
-            tail.contains("line-budgeted") && !tail.contains("--page"),
-            "got: {tail}",
-        );
-        // post-filtering structured output
-        assert!(deny_text("catenary grep p | grep foo").contains("post-filter"));
+    fn matcher_allows_search_pipe_out() {
+        // Ticket 07 / decision 025: search output is complete and client-owned,
+        // so piping it downstream is now allowed — the out-pipe denial is retired
+        // for `grep`/`glob`. (Downstream foreign segments are allowlist-checked
+        // separately, hence `has_foreign: true`.)
+        for cmd in [
+            "catenary grep p | head",
+            "catenary grep p | wc -l",
+            "catenary glob src | tail",
+            "catenary grep p | grep foo",
+            // `2>&1 |` around a search command is fine too — stderr no longer
+            // carries a receipt (ticket 06).
+            "catenary grep p 2>&1 | head",
+        ] {
+            assert_eq!(
+                analyze_catenary_command(cmd),
+                CatenaryAction::Allow { has_foreign: true },
+                "{cmd} should be an allow with foreign downstream",
+            );
+        }
     }
 
     #[test]
@@ -3596,9 +3579,41 @@ mod tests {
     }
 
     #[test]
-    fn matcher_denies_redirect() {
-        assert!(deny_text("catenary grep p > out.txt").contains("redirect"));
-        assert!(deny_text("catenary diagnostics > out.txt").contains("runtime-dir"));
+    fn matcher_allows_search_redirect() {
+        // Ticket 07 / decision 025: search + sed-preview output is complete and
+        // client-owned, so a file redirect is now allowed.
+        assert_eq!(
+            analyze_catenary_command("catenary grep p > out.txt"),
+            CatenaryAction::Allow { has_foreign: false },
+        );
+        assert_eq!(
+            analyze_catenary_command("catenary glob src > out.txt"),
+            CatenaryAction::Allow { has_foreign: false },
+        );
+        // The decision-025 workflow `catenary sed … > preview.diff` (a preview,
+        // no `--in-place`) is permitted and routes to the handoff-free action.
+        assert_eq!(
+            analyze_catenary_command("catenary sed a b > preview.diff"),
+            CatenaryAction::Sed { in_place: false },
+        );
+    }
+
+    #[test]
+    fn matcher_denies_handoff_redirect_no_stale_hints() {
+        // A handoff-carrying command stays bare-only: a redirect still denies,
+        // but the message teaches the bare form and drops the retired volume
+        // hints (spill file / runtime-dir report / `--page`).
+        let diag = deny_text("catenary diagnostics > out.txt");
+        assert!(
+            diag.contains("redirect") && diag.contains("bare"),
+            "must teach the bare form: {diag}",
+        );
+        for stale in ["runtime-dir", "--page", "spill", "overflow valve"] {
+            assert!(
+                !diag.contains(stale),
+                "stale hint `{stale}` must be gone: {diag}",
+            );
+        }
     }
 
     #[test]
@@ -3745,13 +3760,13 @@ mod tests {
     #[test]
     fn matcher_bugs16_piped_lifecycle_is_clear_pipe_deny() {
         // A piped lifecycle command yields a clear pipe-deny, not a routed
-        // action and not (downstream) the boundary block.
-        let msg = deny_text("catenary editing start | head");
-        assert!(
-            msg.contains("run it bare") || msg.contains("owns its output"),
-            "got: {msg}"
-        );
-        assert!(deny_text("catenary diagnostics | head").contains("preview"));
+        // action and not (downstream) the boundary block. The message teaches the
+        // bare form (no retired volume hints).
+        let start = deny_text("catenary editing start | head");
+        assert!(start.contains("bare"), "got: {start}");
+        let diag = deny_text("catenary diagnostics | head");
+        assert!(diag.contains("bare"), "got: {diag}");
+        assert!(!diag.contains("runtime-dir"), "no stale hint: {diag}");
     }
 
     // ---- check_command skips catenary segments ----
@@ -3839,8 +3854,13 @@ mod tests {
             ("git commit -m \"fix a & b\"", Allow), // quoted `&` is not a separator
             // ── catenary regime 1: search ──
             ("catenary grep p src", Allow),
-            ("catenary grep p | head", DenyCatenary),
-            ("catenary grep p | wc -l", DenyCatenary),
+            // pipe-out + redirect retired for search (ticket 07 / decision 025):
+            // complete, client-owned output pipes/redirects as freely as `grep`.
+            ("catenary grep p | head", Allow),
+            ("catenary grep p | wc -l", Allow),
+            ("catenary grep p > out.txt", Allow),
+            ("catenary grep p 2>&1 | head", Allow),
+            ("catenary sed a b > preview.diff", Allow),
             // pipe-in retired (ticket 05): search reads stdin now — a downstream
             // pipe is valid, so only the *upstream* segment is judged. Allowlisted
             // upstream → the whole call runs; an unlisted upstream denies on its
@@ -4279,42 +4299,31 @@ mod tests {
         }
     }
 
-    // ── out_pipe_denial message coverage ────────────────────────────
+    // ── handoff-command pipe-out deny message coverage ──────────────
 
     #[test]
-    fn out_pipe_head_tail_names_overflow_valve() {
-        // The `"head" | "tail"` arm renders the overflow-valve nudge ("read it
-        // directly"; the full result spills to a file) — distinct from the
-        // generic fall-through. It must not name the retired `--page` flag
-        // (pipeable-output tickets 03/03a). Deleting the arm would route
-        // `catenary grep | head` to the `_` arm and drop the "read it directly"
-        // wording.
-        for down in ["head", "tail"] {
-            let msg = deny_text(&format!("catenary grep p | {down}"));
+    fn handoff_pipe_out_teaches_bare_form_no_stale_hints() {
+        // Piping a handoff-carrying command (`diagnostics` here) is a bare-only
+        // violation. The message teaches the bare form and names the downstream,
+        // and carries none of the retired volume hints (spill file / runtime-dir
+        // report / `--page` / overflow valve).
+        for down in ["head", "tail", "wc"] {
+            let msg = deny_text(&format!("catenary diagnostics | {down}"));
             assert!(
-                msg.contains("line-budgeted") && msg.contains("read it directly"),
-                "`catenary grep | {down}` must give the overflow-valve nudge, got: {msg:?}",
-            );
-            assert!(
-                !msg.contains("--page"),
-                "the retired `--page` flag must not appear, got: {msg:?}",
+                msg.contains("bare"),
+                "must teach the bare form, got: {msg:?}"
             );
             assert!(
                 msg.contains(down),
-                "the message should name the downstream `{down}`, got: {msg:?}",
+                "should name the downstream `{down}`, got: {msg:?}",
             );
+            for stale in ["--page", "runtime-dir", "overflow valve", "spill"] {
+                assert!(
+                    !msg.contains(stale),
+                    "stale hint `{stale}` must be gone, got: {msg:?}",
+                );
+            }
         }
-    }
-
-    #[test]
-    fn out_pipe_wc_distinct_from_head() {
-        // A neighbouring arm renders a different message, so deleting head|tail
-        // cannot accidentally pass by matching wc's text.
-        let msg = deny_text("catenary grep p | wc -l");
-        assert!(
-            msg.contains("--count") && !msg.contains("read it directly"),
-            "`| wc` must give the --count nudge, not the overflow one, got: {msg:?}",
-        );
     }
 
     // ── set_cli_command / render_subcommand_help coverage ───────────
