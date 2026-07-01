@@ -44,8 +44,8 @@ pub(crate) struct DiagEntry {
 /// Outcome of a `catenary diagnostics` run: the budgeted preview text plus the
 /// clean/dirty status the CLI maps to its exit code.
 pub struct DiagnosticsOutcome {
-    /// Preview text for stdout. Includes the `… N more — full report at <path>`
-    /// pointer line when the full set spilled to the overflow file.
+    /// The complete report text for stdout (decision 025) — every diagnostic,
+    /// no volume branch.
     pub output: String,
     /// `true` when at least one diagnostic met the dirty severity threshold
     /// (exit code 1); `false` is clean (exit code 0).
@@ -190,7 +190,6 @@ impl DiagnosticsServer {
         &self,
         files: &[PathBuf],
         parent_id: Option<&str>,
-        session_id: &str,
     ) -> DiagnosticsOutcome {
         if files.is_empty() {
             return DiagnosticsOutcome {
@@ -394,8 +393,8 @@ impl DiagnosticsServer {
         // render → budget/format.
         let file_results = self.aggregate_feeds(feeds);
 
-        // ── Phase 3: classify, budget, and format ────────────────
-        let outcome = self.format_output(&canonical_paths, &file_results, &uncovered, session_id);
+        // ── Phase 3: classify and format ─────────────────────────
+        let outcome = self.format_output(&canonical_paths, &file_results, &uncovered);
 
         // ── Phase 4: invalidate caches ────────────────────────────
         self.fs.bump_generations(&canonical_paths);
@@ -459,23 +458,20 @@ impl DiagnosticsServer {
         rendered
     }
 
-    /// Classifies files from server results, applies the single-shot preview
-    /// budget, writes the overflow file when needed, and reports the
-    /// clean/dirty status.
+    /// Classifies files from server results, renders the complete report, and
+    /// reports the clean/dirty status.
     ///
     /// Root-grouped file entries with diagnostics, or `[no LSP coverage]`
     /// notes. Clean files are **omitted** — the linter idiom (silent on
     /// success): a fully-clean batch yields empty output (misc 111). Root
     /// headers are collapsed when only one printed file exists under that
-    /// root. On overflow (more diagnostics than the configured budget) the
-    /// complete report is written to the per-session runtime-dir file and the
-    /// preview ends with a `… N more — full report at <path>` pointer line.
+    /// root. The report is always complete (decision 025) — every diagnostic
+    /// prints, with no volume branch.
     fn format_output(
         &self,
         canonical_paths: &[PathBuf],
         file_results: &BTreeMap<String, (String, Vec<DiagEntry>)>,
         uncovered: &[UncoveredEntry],
-        session_id: &str,
     ) -> DiagnosticsOutcome {
         let mut diag_files: Vec<DiagnosticFile> = Vec::new();
 
@@ -515,51 +511,26 @@ impl DiagnosticsServer {
                 });
 
         // `[tools]` is absent in many configs — fall back to defaults so the
-        // budget (50) and dirty threshold (error) always apply.
-        let tools = self
+        // dirty threshold (error) always applies.
+        let dirty_threshold = self
             .client_manager
             .config()
             .tools
             .clone()
-            .unwrap_or_default();
-        let budgeted = budget_diagnostics(
-            &diag_files,
-            uncovered,
-            tools.diagnostics_budget(),
-            tools.dirty_severity(),
-        );
+            .unwrap_or_default()
+            .dirty_severity();
+        let dirty = diag_files
+            .iter()
+            .flat_map(|f| &f.entries)
+            .any(|e| crate::filter::severity_passes(e.severity, dirty_threshold));
 
-        let output = if budgeted.overflow_count == 0 {
-            budgeted.preview
-        } else {
-            // Overflow: persist the complete report so the agent can read or
-            // `catenary grep` it, and point at it. If the write fails, fall
-            // back to the full report inline — losing the tail silently would
-            // break the complete-batch guarantee.
-            match crate::bridge::overflow::write_diagnostics(
-                &crate::paths::runtime_dir(),
-                session_id,
-                &budgeted.full,
-            ) {
-                Ok(path) => format!(
-                    "{}\u{2026} {} more \u{2014} full report at {}\n",
-                    budgeted.preview,
-                    budgeted.overflow_count,
-                    path.display(),
-                ),
-                Err(e) => {
-                    warn!(
-                        session_id = %session_id,
-                        "failed to write diagnostics overflow file: {e}",
-                    );
-                    budgeted.full
-                }
-            }
-        };
+        // The report is always complete (decision 025): render every diagnostic
+        // inline — no budget, no spill, no pointer line.
+        let output = format_diagnostics(&diag_files, uncovered);
 
         DiagnosticsOutcome {
             output,
-            dirty: budgeted.dirty,
+            dirty,
             errors,
             warnings,
         }
@@ -1503,93 +1474,6 @@ fn format_diagnostics(diag_files: &[DiagnosticFile], uncovered: &[UncoveredEntry
     output
 }
 
-/// Result of applying the single-shot preview budget to a diagnostics run.
-struct BudgetedDiagnostics {
-    /// The complete report (every diagnostic). Written to the overflow file
-    /// when `overflow_count > 0`.
-    full: String,
-    /// The budgeted preview (first N diagnostics, errors before warnings). Equal
-    /// to `full` when nothing overflowed. Carries no overflow pointer line — the
-    /// caller appends it once it knows the written path.
-    preview: String,
-    /// Diagnostics dropped from the preview (`total - budget`), or `0` when the
-    /// full set fit.
-    overflow_count: usize,
-    /// `true` when at least one diagnostic met `dirty_threshold`.
-    dirty: bool,
-}
-
-/// Apply the errors-first single-shot budget to the classified diagnostics.
-///
-/// Pure: renders both the complete report and a preview capped at `budget`
-/// diagnostics, with errors selected before warnings so a truncation never
-/// hides an error behind a warning. Within each file the surviving entries keep
-/// their original position order. Uncovered files are not budgeted — they are
-/// one line each and always shown. `dirty` is `true` when any diagnostic's
-/// severity meets `dirty_threshold` (LSP encoding: lower = more severe).
-fn budget_diagnostics(
-    diag_files: &[DiagnosticFile],
-    uncovered: &[UncoveredEntry],
-    budget: usize,
-    dirty_threshold: u8,
-) -> BudgetedDiagnostics {
-    let full = format_diagnostics(diag_files, uncovered);
-
-    let dirty = diag_files
-        .iter()
-        .flat_map(|f| &f.entries)
-        .any(|e| crate::filter::severity_passes(e.severity, dirty_threshold));
-
-    let total: usize = diag_files.iter().map(|f| f.entries.len()).sum();
-
-    if total <= budget {
-        return BudgetedDiagnostics {
-            preview: full.clone(),
-            full,
-            overflow_count: 0,
-            dirty,
-        };
-    }
-
-    // Globally select the `budget` most-severe entries (stable → ties keep
-    // document order), then rebuild each file with its selected entries in
-    // original position order. `sort_by_key` is stable, so errors come first
-    // and equal-severity entries retain their (file, position) order.
-    let mut ranked: Vec<(usize, usize)> = diag_files
-        .iter()
-        .enumerate()
-        .flat_map(|(fi, f)| f.entries.iter().enumerate().map(move |(ei, _)| (fi, ei)))
-        .collect();
-    ranked.sort_by_key(|&(fi, ei)| diag_files[fi].entries[ei].severity);
-    let selected: HashSet<(usize, usize)> = ranked.into_iter().take(budget).collect();
-
-    let preview_files: Vec<DiagnosticFile> = diag_files
-        .iter()
-        .enumerate()
-        .filter_map(|(fi, f)| {
-            let entries: Vec<DiagEntry> = f
-                .entries
-                .iter()
-                .enumerate()
-                .filter(|(ei, _)| selected.contains(&(fi, *ei)))
-                .map(|(_, e)| e.clone())
-                .collect();
-            (!entries.is_empty()).then(|| DiagnosticFile {
-                display: f.display.clone(),
-                root: f.root.clone(),
-                entries,
-            })
-        })
-        .collect();
-
-    BudgetedDiagnostics {
-        preview: format_diagnostics(&preview_files, uncovered),
-        full,
-        overflow_count: total - budget,
-        dirty,
-    }
-}
-
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
@@ -2087,25 +1971,11 @@ mod tests {
         );
     }
 
-    // ── budget + overflow tests ─────────────────────────────────────
+    // ── complete-report rendering (decision 025) ────────────────────
 
     #[test]
-    fn budget_diagnostics_under_budget_no_overflow() {
-        let diag_files = vec![DiagnosticFile {
-            display: "a.rs".to_string(),
-            root: PathBuf::from("/r"),
-            entries: vec![de(1, ":1:1 [error] e: one"), de(2, ":2:1 [warning] w: two")],
-        }];
-        let b = budget_diagnostics(&diag_files, &[], 50, 1);
-        assert_eq!(b.overflow_count, 0);
-        assert_eq!(b.preview, b.full);
-        assert!(b.dirty, "an error is dirty at threshold error");
-        assert!(b.preview.contains("one") && b.preview.contains("two"));
-    }
-
-    #[test]
-    fn budget_diagnostics_errors_before_warnings() {
-        // warning, error, warning — a budget of 1 must keep the error.
+    fn format_diagnostics_renders_every_entry() {
+        // No budget, no truncation: every diagnostic in the batch prints.
         let diag_files = vec![DiagnosticFile {
             display: "a.rs".to_string(),
             root: PathBuf::from("/r"),
@@ -2115,38 +1985,11 @@ mod tests {
                 de(2, ":3:1 [warning] w: warn-c"),
             ],
         }];
-        let b = budget_diagnostics(&diag_files, &[], 1, 1);
-        assert_eq!(b.overflow_count, 2);
-        assert!(b.preview.contains("err-b"), "error survives: {}", b.preview);
+        let out = format_diagnostics(&diag_files, &[]);
         assert!(
-            !b.preview.contains("warn-a"),
-            "warning dropped: {}",
-            b.preview
+            out.contains("warn-a") && out.contains("err-b") && out.contains("warn-c"),
+            "the complete report keeps every diagnostic: {out}"
         );
-        assert!(
-            !b.preview.contains("warn-c"),
-            "warning dropped: {}",
-            b.preview
-        );
-        // The complete set is preserved in `full`.
-        assert!(
-            b.full.contains("warn-a") && b.full.contains("err-b") && b.full.contains("warn-c"),
-            "full keeps everything: {}",
-            b.full
-        );
-    }
-
-    #[test]
-    fn budget_diagnostics_dirty_threshold() {
-        let diag_files = vec![DiagnosticFile {
-            display: "a.rs".to_string(),
-            root: PathBuf::from("/r"),
-            entries: vec![de(2, ":1:1 [warning] w: warn")],
-        }];
-        // Warnings-only is clean at the default error threshold.
-        assert!(!budget_diagnostics(&diag_files, &[], 50, 1).dirty);
-        // ...but dirty when the threshold is lowered to warning.
-        assert!(budget_diagnostics(&diag_files, &[], 50, 2).dirty);
     }
 
     // ── cross-feeder dedup + provisional tests (linters ticket 05) ──

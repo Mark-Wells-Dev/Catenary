@@ -19,10 +19,8 @@
 //! `no outline` marker rather than silently outline-less. The kind is implicit
 //! in each declaration source line — no `SymbolKind` ever surfaces.
 //!
-//! Volume is bounded by the shared overflow valve (`overflow::valve`): the
-//! display is truncated at a line budget — at a complete file boundary, so an
-//! outline is never cut mid-tree — and the full output spills to a runtime-dir
-//! file announced by a stderr receipt.
+//! The output is always complete (decision 025): the full outline prints, with
+//! no volume branch — the host caps only the final read at the end of a pipeline.
 
 use anyhow::{Result, anyhow};
 use ignore::WalkBuilder;
@@ -37,7 +35,6 @@ use super::SourceLines;
 use super::filesystem_manager::{
     FilesystemManager, STAT_RETRY_ATTEMPTS, format_file_size, mtime_nanos,
 };
-use super::overflow;
 use super::session::{ResolvedGlob, expand_search_paths};
 use crate::lsp::{LspClientManager, WalkBreadth};
 use crate::symbol_index::{Symbol, SymbolIndex};
@@ -65,8 +62,8 @@ pub struct GlobInput {
     pub cwd: Option<PathBuf>,
     /// Return a path count instead of rendered results (default: false).
     ///
-    /// Short-circuits the overflow valve and LSP enrichment: the pipeline
-    /// reports the number of resolved filesystem paths, never a rendered tree.
+    /// Short-circuits LSP enrichment: the pipeline reports the number of
+    /// resolved filesystem paths, never a rendered tree.
     #[serde(default)]
     pub count: bool,
 }
@@ -101,17 +98,13 @@ struct GlobEntry {
 
 /// Outcome of a glob query.
 ///
-/// Normal queries render the full tree, bounded by the shared overflow valve;
-/// `--count` (`GlobInput::count`) short-circuits to a path count.
+/// Normal queries render the complete tree to stdout; `--count`
+/// (`GlobInput::count`) short-circuits to a path count.
 pub enum GlobOutcome {
-    /// Rendered tree output, truncated to the line budget (at a file boundary)
-    /// by the overflow valve.
+    /// The complete rendered tree output for stdout.
     Rendered {
-        /// The (possibly truncated) output for stdout.
+        /// The complete output for stdout.
         output: String,
-        /// A stderr receipt naming the full-output spill file, present only
-        /// when the valve truncated the display.
-        receipt: Option<String>,
     },
     /// `--count` summary: number of resolved filesystem paths.
     Count {
@@ -128,8 +121,6 @@ pub struct GlobServer {
     pub(super) client_manager: Arc<LspClientManager>,
     pub(super) fs_manager: Arc<FilesystemManager>,
     pub(super) symbol_index: Option<Arc<Mutex<SymbolIndex>>>,
-    /// Line budget for the shared overflow valve (truncate-and-spill).
-    pub(super) budget: usize,
     /// Glob patterns whose outlines are suppressed from automatic display (an
     /// explicit user opt-out, e.g. generated/vendored files — not an
     /// intent-guess gate). Symbols remain available; the entry is flagged
@@ -168,8 +159,8 @@ impl GlobServer {
             .map(ResolvedGlob::new)
             .transpose()?;
 
-        // Count mode short-circuits the overflow valve and enrichment — report
-        // the number of resolved paths, not a rendered tree.
+        // Count mode short-circuits enrichment — report the number of resolved
+        // paths, not a rendered tree.
         if input.count {
             let paths = self.count_paths(&input, exclude.as_ref())?;
             return Ok(GlobOutcome::Count { paths });
@@ -180,25 +171,13 @@ impl GlobServer {
 
         // Run pipeline — handlers return the complete output. Existing paths
         // dispatch directly; unexpanded glob patterns are expanded daemon-side.
-        let full_output = self
+        // The output is always complete (decision 025): the full outline prints,
+        // with no volume branch — the host caps only the final read.
+        let output = self
             .handle_literal_paths(&input.paths, &input, exclude.as_ref(), cwd, parent_id)
             .await?;
 
-        // Bound volume with the shared overflow valve: truncate the display at
-        // the line budget and spill the full output to a runtime-dir file, with
-        // the pointer carried out as a stderr receipt. Back the cut up to the
-        // last complete file boundary so an outline is never severed mid-tree.
-        let v = overflow::valve(
-            &full_output,
-            self.budget,
-            &crate::paths::runtime_dir(),
-            overflow::GLOB_PREFIX,
-            Some(&is_outline_boundary),
-        );
-        Ok(GlobOutcome::Rendered {
-            output: v.display,
-            receipt: v.receipt,
-        })
+        Ok(GlobOutcome::Rendered { output })
     }
 
     /// Single file: header `path  (N lines)` + its fully-expanded outline.
@@ -701,24 +680,6 @@ fn is_snapshot(name: &str) -> bool {
 }
 
 // ─── Symbol rendering ─────────────────────────────────────────────────
-
-/// Whether a glob output line *begins* a complete top-level block, i.e. is a
-/// safe place for the overflow valve to truncate.
-///
-/// An outline node renders `{indent}{line}  {decl}` (see [`render_symbol_line`])
-/// — a run of digits (the 1-based line number) followed by exactly two spaces.
-/// Every other line (a file or directory header, the `cwd:`/`(no LSP …)`
-/// banner) begins a fresh block. Cutting there never severs a file's outline
-/// mid-tree. A header whose name is *all* digits with no extension is the one
-/// ambiguous case (treated as a node); it is vanishingly rare and only costs a
-/// slightly earlier cut. This module owns the glob line format, so it owns the
-/// boundary predicate the shared valve calls back into.
-fn is_outline_boundary(line: &str) -> bool {
-    let trimmed = line.trim_start().as_bytes();
-    let digits = trimmed.iter().take_while(|b| b.is_ascii_digit()).count();
-    // A node row is `<digits>  <decl>`: at least one digit, then two spaces.
-    !(digits > 0 && trimmed.get(digits) == Some(&b' ') && trimmed.get(digits + 1) == Some(&b' '))
-}
 
 /// Renders a single outline node: `{indent}{line}  <declaration source line>`.
 ///
@@ -1242,24 +1203,6 @@ mod tests {
         assert_eq!(file_descriptor(&entry, true), "(1.5 MB)");
     }
 
-    // ─── is_outline_boundary (overflow-valve cut predicate) ──────────
-
-    #[test]
-    fn test_is_outline_boundary() {
-        // Headers / banners begin a fresh block — safe cut points.
-        assert!(is_outline_boundary("src/lib.rs  (92 lines)"));
-        assert!(is_outline_boundary("\tfoo.rs  (3 lines, no outline)"));
-        assert!(is_outline_boundary("\tsub/  (2 files, 0 dirs)"));
-        assert!(is_outline_boundary("/abs/path/  (empty)"));
-        assert!(is_outline_boundary("cwd: ~/proj"));
-        // A filename that merely starts with a digit is still a header.
-        assert!(is_outline_boundary("3d_model.rs  (10 lines)"));
-        // Outline node rows (`<line>  <decl>`) are NOT boundaries.
-        assert!(!is_outline_boundary("\t10  pub trait Animal"));
-        assert!(!is_outline_boundary("\t\t12  fn name(&self) -> String"));
-        assert!(!is_outline_boundary("1  fn main()"));
-    }
-
     // ─── has_symbols_available ───────────────────────────────────────
 
     #[test]
@@ -1724,7 +1667,6 @@ mod tests {
             client_manager,
             fs_manager,
             symbol_index: None,
-            budget: 2000,
             outline_suppress: vec![],
         }
     }

@@ -220,10 +220,6 @@ pub struct GrepResponse {
     /// Distinct-file count, present only for a `--count` response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub files: Option<usize>,
-    /// Overflow-valve receipt for stderr, present only when the display was
-    /// truncated and the full output spilled to a runtime-dir file.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub receipt: Option<String>,
 }
 
 /// IPC request payload for `catenary glob`.
@@ -334,10 +330,6 @@ pub struct GlobResponse {
     /// Resolved-path count, present only for a `--count` response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paths: Option<usize>,
-    /// Overflow-valve receipt for stderr, present only when the display was
-    /// truncated and the full output spilled to a runtime-dir file.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub receipt: Option<String>,
 }
 
 /// IPC request payload for `catenary sed`.
@@ -444,13 +436,10 @@ impl SedRequest {
 /// Returned as a single JSON line over the daemon IPC socket.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct SedResponse {
-    /// Rendered preview / write summary.
+    /// Rendered preview / write summary — always the complete output
+    /// (decision 025).
     #[serde(default)]
     pub output: String,
-    /// Overflow-valve receipt for stderr, present only when the preview / write
-    /// summary was truncated and the full output spilled to a runtime-dir file.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub receipt: Option<String>,
 }
 
 /// Resolves a pattern path against a base directory if it is relative.
@@ -2231,12 +2220,6 @@ async fn handle_hook_dispatch(
         );
         ctx.primary.touch_snapshot();
 
-        // Best-effort removal of this session's diagnostics overflow file. The
-        // authoritative GC is the daemon-startup sweep (no teardown signal is
-        // reliable — Antigravity has no session-end), but a graceful end lets
-        // us reclaim the runtime-dir file immediately.
-        crate::bridge::overflow::remove_diagnostics(&crate::paths::runtime_dir(), &session_id);
-
         if let Some(ref tracker) = ctx.root_tracker {
             // Leak backstop (workstream 30, ticket 03): reclaim any of THIS
             // session's worktree roots whose `WorktreeRemove` was missed at a
@@ -2522,23 +2505,20 @@ async fn handle_hook_dispatch(
         let response = tokio::select! {
             result = ctx.primary.grep.execute(&params, Some(&parent_id), &cancel).instrument(span.clone()) => {
                 match result {
-                    Ok(GrepOutcome::Rendered { output, receipt }) => GrepResponse {
+                    Ok(GrepOutcome::Rendered { output }) => GrepResponse {
                         output,
                         matches: None,
                         files: None,
-                        receipt,
                     },
                     Ok(GrepOutcome::Count { matches, files }) => GrepResponse {
                         output: String::new(),
                         matches: Some(matches),
                         files: Some(files),
-                        receipt: None,
                     },
                     Err(e) => GrepResponse {
                         output: format!("grep error: {e}"),
                         matches: None,
                         files: None,
-                        receipt: None,
                     },
                 }
             }
@@ -2630,20 +2610,17 @@ async fn handle_hook_dispatch(
         let response = tokio::select! {
             result = ctx.primary.glob.execute(&params, Some(&parent_id), &cancel).instrument(span.clone()) => {
                 match result {
-                    Ok(GlobOutcome::Rendered { output, receipt }) => GlobResponse {
+                    Ok(GlobOutcome::Rendered { output }) => GlobResponse {
                         output,
                         paths: None,
-                        receipt,
                     },
                     Ok(GlobOutcome::Count { paths }) => GlobResponse {
                         output: String::new(),
                         paths: Some(paths),
-                        receipt: None,
                     },
                     Err(e) => GlobResponse {
                         output: format!("glob error: {e}"),
                         paths: None,
-                        receipt: None,
                     },
                 }
             }
@@ -2930,7 +2907,7 @@ async fn handle_hook_dispatch(
                     outcome = ctx
                         .primary
                         .diagnostics
-                        .process_files_batched(&files, Some(&scope_id), &session_id) => outcome,
+                        .process_files_batched(&files, Some(&scope_id)) => outcome,
                     () = async {
                         use tokio::io::AsyncReadExt;
                         let mut probe = [0u8; 1];
@@ -3109,16 +3086,6 @@ async fn handle_hook_dispatch(
             "incoming hook",
         );
 
-        // One shared display line budget feeds every truncating surface's
-        // overflow valve (pipeable-output ticket 03); sed joins grep/glob on it
-        // (ticket 03a). Resolved the same way the search servers resolve theirs.
-        let line_budget = ctx
-            .primary
-            .config
-            .tools
-            .as_ref()
-            .map_or(1000, crate::config::ToolsConfig::line_budget);
-
         // Consume the staged identity before the write so the session can both
         // guard and accumulate. `None` ⇒ preview, or an expired/absent handoff
         // (writes proceed unguarded and untracked — the same degradation as an
@@ -3141,13 +3108,8 @@ async fn handle_hook_dispatch(
             .map(|(sid, _)| get_or_create_router(&ctx, sid.as_deref().unwrap_or("default"), &raw));
         let guard_session = router.as_ref().map(|r| r.session.clone());
 
-        // Volume is bounded by the shared overflow valve: the preview / write
-        // summary is truncated at `line_budget` and the full output spills to a
-        // per-invocation `sed-<uuid>.txt` under the runtime dir (swept at startup,
-        // bounded by an in-lifetime cap), with the pointer carried out as a stderr
-        // receipt — the same model as grep/glob (ticket 03a).
-        let base = crate::paths::runtime_dir();
-
+        // The output is always complete (decision 025): the full preview / write
+        // summary is rendered, with no volume branch.
         let outcome = match tokio::task::spawn_blocking(move || {
             // Per-file write guard: deny files whose root another session holds.
             // Rootless files (single-file coverage) carry no guardrail.
@@ -3161,7 +3123,7 @@ async fn handle_hook_dispatch(
                     })
                 })
             };
-            crate::bridge::sed::execute(&input, line_budget, &base, guard)
+            crate::bridge::sed::execute(&input, guard)
         })
         .await
         {
@@ -3169,7 +3131,6 @@ async fn handle_hook_dispatch(
             Err(e) => crate::bridge::sed::SedOutcome {
                 output: format!("sed error: {e}"),
                 changed: Vec::new(),
-                receipt: None,
             },
         };
 
@@ -3241,7 +3202,6 @@ async fn handle_hook_dispatch(
 
         let response = SedResponse {
             output: outcome.output,
-            receipt: outcome.receipt,
         };
         let mut payload = serde_json::to_vec(&response)?;
 
@@ -7456,14 +7416,12 @@ mod tests {
             output: "file.rs:10 matched line".to_string(),
             matches: None,
             files: None,
-            receipt: None,
         };
         let json = serde_json::to_string(&resp).expect("serialize");
         let parsed: GrepResponse = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed.output, "file.rs:10 matched line");
         assert!(parsed.matches.is_none());
         assert!(parsed.files.is_none());
-        assert!(parsed.receipt.is_none());
     }
 
     /// `GlobRequest` roundtrips through JSON with all fields.
@@ -7507,13 +7465,11 @@ mod tests {
         let resp = GlobResponse {
             output: "src/\n  main.rs (42 lines)".to_string(),
             paths: None,
-            receipt: None,
         };
         let json = serde_json::to_string(&resp).expect("serialize");
         let parsed: GlobResponse = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed.output, "src/\n  main.rs (42 lines)");
         assert!(parsed.paths.is_none());
-        assert!(parsed.receipt.is_none());
     }
 
     /// IPC method constants match expected wire values.

@@ -1188,14 +1188,6 @@ fn run_daemon_main() -> Result<()> {
         let reap_policy = config.reap_policy();
         let retention_days = config.log_retention_days;
 
-        // Sweep runtime-dir overflow files left by crashed/ended sessions
-        // (tickets 11 + 03 / 03a). At startup no session is connected yet, so
-        // every diagnostics file and grep/glob/sed valve spill belongs to a dead
-        // prior daemon and is reaped. Authoritative GC — no teardown signal is
-        // reliable across hosts.
-        sweep_diagnostics_overflow();
-        sweep_query_overflow();
-
         let threshold: catenary_mcp::logging::Severity = config
             .notifications
             .as_ref()
@@ -1367,43 +1359,6 @@ fn run_daemon_main() -> Result<()> {
     result
 }
 
-/// Remove diagnostics overflow files left by previous daemon runs.
-///
-/// Runs once at daemon startup, before any session connects, so no overflow
-/// file belongs to a live session — every one is from a dead prior daemon and
-/// is reclaimed (the live set is empty). Authoritative GC: no teardown signal
-/// is reliable across hosts (ticket 11). A graceful per-session end reclaims
-/// its own file immediately (router `handle_hook_dispatch`); this sweeps
-/// whatever a crash left behind. Best-effort: a filesystem error leaves files
-/// in place — they are tiny and reaped on a later run.
-#[cfg(unix)]
-fn sweep_diagnostics_overflow() {
-    let live: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let removed = catenary_mcp::bridge::overflow::sweep_diagnostics(
-        &catenary_mcp::paths::runtime_dir(),
-        &live,
-    );
-    if removed > 0 {
-        info!("swept {removed} stale diagnostics overflow file(s)");
-    }
-}
-
-/// Remove `grep-*`/`glob-*`/`sed-*` valve overflow spill files left by a previous
-/// daemon.
-///
-/// Each grep/glob/sed overflow valve mints a fresh per-invocation UUID (a
-/// stateless grep-class query, no session to key on), so a prior daemon's spills
-/// are unreferenced and reaped wholesale at startup (pipeable-output tickets 03 /
-/// 03a). An in-lifetime last-N cap per prefix bounds the dir while the daemon
-/// runs.
-#[cfg(unix)]
-fn sweep_query_overflow() {
-    let removed = catenary_mcp::bridge::overflow::sweep_query(&catenary_mcp::paths::runtime_dir());
-    if removed > 0 {
-        info!("swept {removed} stale grep/glob/sed overflow file(s)");
-    }
-}
-
 /// One-time reclaim of the legacy `SQLite` database (observability ticket 07).
 ///
 /// Older daemons left a `catenary.db` (plus its `-wal` / `-shm` siblings) under
@@ -1568,11 +1523,6 @@ async fn run_grep(
         );
     } else {
         render_search_outcome(out, &cwd, &resolved, &response.output, queried, &kind);
-        // The overflow valve's receipt goes to STDERR so stdout stays a
-        // byte-clean ripgrep superset (pipeable-output ticket 03).
-        if let Some(receipt) = &response.receipt {
-            eprintln!("{receipt}");
-        }
     }
     Ok(())
 }
@@ -1656,10 +1606,6 @@ struct SearchResponse {
     /// glob `--count`: resolved-path total.
     #[serde(default)]
     paths: Option<usize>,
-    /// Overflow-valve receipt for stderr, present only when the display was
-    /// truncated and the full output spilled to a runtime-dir file.
-    #[serde(default)]
-    receipt: Option<String>,
 }
 
 /// Renders the `catenary grep --count` summary: `N matches in M files`.
@@ -1776,11 +1722,6 @@ async fn run_glob(
             queried,
             &SearchKind::Glob,
         );
-        // The overflow valve's receipt goes to STDERR so a piped `glob … | grep`
-        // gets clean truncated data (pipeable-output ticket 03).
-        if let Some(receipt) = &response.receipt {
-            eprintln!("{receipt}");
-        }
     }
     Ok(())
 }
@@ -1856,11 +1797,6 @@ async fn run_sed(
     render_sed_outcome(out, &cwd, &response.output);
     for path in &resolved.missing {
         let _ = out.writeln(format_args!("path does not exist: {path}"));
-    }
-    // The overflow valve's receipt goes to STDERR so stdout stays the clean
-    // preview / write summary (pipeable-output ticket 03a, the grep/glob model).
-    if let Some(receipt) = &response.receipt {
-        eprintln!("{receipt}");
     }
     Ok(())
 }

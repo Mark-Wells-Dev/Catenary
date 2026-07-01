@@ -173,10 +173,6 @@ pub fn load_from_sources(sources: &[PathBuf]) -> Result<Config> {
 
     config.apply_env_overrides();
 
-    if let Some(ref mut tools) = config.tools {
-        tools.clamp_budgets();
-    }
-
     let errors = config.validate();
     if !errors.is_empty() {
         bail!("Configuration errors:\n{}", errors.join("\n"));

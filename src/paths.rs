@@ -8,7 +8,7 @@
 //!
 //! - [`state_dir`] — durable, per-host state (the Unix socket).
 //! - [`runtime_dir`] — ephemeral, tmpfs-backed runtime files (the `state.json`
-//!   snapshot, per-session diagnostics overflow reports).
+//!   snapshot).
 //! - [`cache_dir`] — regenerable, high-volume telemetry (the JSONL firehose).
 //!
 //! [`encode_cwd`] flattens an absolute path into a single filesystem-safe
@@ -35,10 +35,9 @@ pub fn state_dir() -> PathBuf {
 /// Resolve the Catenary runtime directory.
 ///
 /// Home for ephemeral, regenerable runtime files (the daemon-owned `state.json`
-/// snapshot and the per-session diagnostics overflow report) — tmpfs-backed and
-/// OS-cleared on logout on Linux, which is the semantically-correct place for
-/// them. Unlike the socket (which lives under [`state_dir`]), these files do not
-/// need to survive a logout.
+/// snapshot) — tmpfs-backed and OS-cleared on logout on Linux, which is the
+/// semantically-correct place for them. Unlike the socket (which lives under
+/// [`state_dir`]), these files do not need to survive a logout.
 ///
 /// Resolution order:
 /// 1. `CATENARY_RUNTIME_DIR` environment variable (cross-platform override).

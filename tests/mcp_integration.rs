@@ -976,8 +976,8 @@ fn test_grep_alternation() -> Result<()> {
     Ok(())
 }
 
-/// Volume valve: a broad pattern exceeding `line_budget` truncates the display
-/// and spills the complete output to a runtime-dir file announced by a receipt.
+/// Complete output (decision 025): a broad pattern prints every match to stdout,
+/// with no truncation — the host caps only the final read.
 #[test]
 fn test_grep_enrichment_threshold_broad() -> Result<()> {
     let mockls_bin = env!("CARGO_BIN_EXE_mockls");
@@ -996,8 +996,7 @@ fn test_grep_enrichment_threshold_broad() -> Result<()> {
         std::fs::write(
             &config_path,
             format!(
-                "[tools]\nline_budget = 10\n\n\
-                 [server.mockls]\n\
+                "[server.mockls]\n\
                  command = \"{mockls_bin}\"\n\
                  args = [\"{MOCK_LANG_A}\", \"--scan-roots\"]\n\n\
                  [language.{MOCK_LANG_A}]\nservers = [\"mockls\"]\n"
@@ -1013,44 +1012,23 @@ fn test_grep_enrichment_threshold_broad() -> Result<()> {
         .get("output")
         .and_then(serde_json::Value::as_str)
         .context("output")?;
-    let receipt = resp
-        .get("receipt")
-        .and_then(serde_json::Value::as_str)
-        .context("expected an overflow receipt when output exceeds the line budget")?;
 
-    // Display truncated to the line budget; results still present on stdout.
-    let shown = output.lines().count();
-    assert!(
-        shown <= 10,
-        "display truncated to the 10-line budget, got {shown} lines:\n{output}"
-    );
-    assert!(
-        output.contains("zz_broad"),
-        "results present, got:\n{output}"
-    );
+    // Every match prints — the complete result set, first through last.
+    for i in 0..30 {
+        assert!(
+            output.contains(&format!("zz_broad_{i}")),
+            "complete output holds zz_broad_{i}:\n{output}"
+        );
+    }
 
-    // The receipt (stderr-bound) names the truncation and the spill path.
+    // No volume machinery: no truncation marker on stdout, no receipt field.
     assert!(
-        receipt.contains("output truncated to protect context")
-            && receipt.contains("full output ("),
-        "receipt names the truncation + spill path: {receipt}"
-    );
-
-    // The spill file holds the COMPLETE output — more than the truncated display,
-    // including the last symbol that did not fit.
-    let path = receipt
-        .rsplit(" at ")
-        .next()
-        .context("spill path in receipt")?;
-    let spilled = std::fs::read_to_string(path).context("read spill file")?;
-    assert!(
-        spilled.lines().count() > shown,
-        "spill file holds the full output ({} lines) vs {shown} shown",
-        spilled.lines().count()
+        !output.contains("output truncated"),
+        "no truncation marker in complete output:\n{output}"
     );
     assert!(
-        spilled.contains("zz_broad_29"),
-        "spill file holds the complete result set, got:\n{spilled}"
+        resp.get("receipt").is_none(),
+        "no receipt field — output is always complete: {resp:?}"
     );
 
     Ok(())
@@ -2765,8 +2743,8 @@ fn test_grep_deprecated() -> Result<()> {
     Ok(())
 }
 
-/// Volume valve: many symbols exceed the line budget → the display is truncated
-/// and the complete result lives in the spill file (replaces the old page-2 fetch).
+/// Complete output (decision 025): 50 matching symbols all print to stdout — no
+/// budget, no paging, no spill file.
 #[test]
 fn test_grep_paged_integration() -> Result<()> {
     let mockls_bin = env!("CARGO_BIN_EXE_mockls");
@@ -2781,8 +2759,7 @@ fn test_grep_paged_integration() -> Result<()> {
         std::fs::write(
             &config_path,
             format!(
-                "[tools]\nline_budget = 10\n\n\
-                 [server.mockls]\n\
+                "[server.mockls]\n\
                  command = \"{mockls_bin}\"\n\
                  args = [\"{MOCK_LANG_A}\", \"--scan-roots\"]\n\n\
                  [language.{MOCK_LANG_A}]\nservers = [\"mockls\"]\n"
@@ -2798,36 +2775,20 @@ fn test_grep_paged_integration() -> Result<()> {
         .get("output")
         .and_then(serde_json::Value::as_str)
         .context("output")?;
-    let receipt = resp
-        .get("receipt")
-        .and_then(serde_json::Value::as_str)
-        .context("expected a receipt when 50 symbols exceed the budget")?;
-    assert!(
-        output.contains("demote_sym"),
-        "Expected results present, got:\n{output}"
-    );
 
-    // Not all 50 symbols fit the truncated display.
+    // All 50 symbols are present in the single complete result.
     let shown = (0..50)
         .filter(|i| output.contains(&format!("demote_sym_{i}")))
         .count();
-    assert!(
-        shown < 50,
-        "Expected truncated output (not all 50 symbols), got {shown}"
+    assert_eq!(
+        shown, 50,
+        "complete output holds all 50 symbols, got {shown}:\n{output}"
     );
 
-    // The complete result lives in the spill file (the old "page 2").
-    let path = receipt
-        .rsplit(" at ")
-        .next()
-        .context("spill path in receipt")?;
-    let spilled = std::fs::read_to_string(path).context("read spill file")?;
-    let spilled_count = (0..50)
-        .filter(|i| spilled.contains(&format!("demote_sym_{i}")))
-        .count();
-    assert_eq!(
-        spilled_count, 50,
-        "spill file holds all 50 symbols, got {spilled_count}"
+    // No volume machinery on the wire.
+    assert!(
+        resp.get("receipt").is_none(),
+        "no receipt field — output is always complete: {resp:?}"
     );
 
     Ok(())

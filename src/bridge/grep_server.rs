@@ -21,7 +21,6 @@ use super::filesystem_manager::{
     FilesystemManager, OBSERVED_STAT_MISS_MTIME, mtime_nanos, stat_with_retry,
 };
 use super::handler::display_path;
-use super::overflow;
 use crate::config::DispatchMethod;
 use crate::lsp::server::LspServer;
 use crate::lsp::{LspClientManager, WalkBreadth};
@@ -157,17 +156,13 @@ enum Anchor {
 
 /// Outcome of a grep query.
 ///
-/// Normal queries render the full tree, bounded by the shared overflow valve;
-/// `--count` (`GrepInput::count`) short-circuits to a numeric summary.
+/// Normal queries render the complete result to stdout; `--count`
+/// (`GrepInput::count`) short-circuits to a numeric summary.
 pub enum GrepOutcome {
-    /// Rendered tree output, truncated to the line budget by the overflow
-    /// valve.
+    /// The complete rendered output for stdout.
     Rendered {
-        /// The (possibly truncated) output for stdout.
+        /// The complete output for stdout.
         output: String,
-        /// A stderr receipt naming the full-output spill file, present only
-        /// when the valve truncated the display.
-        receipt: Option<String>,
     },
     /// `--count` summary: a dumb `grep -c`-style tally from the ripgrep pass.
     Count {
@@ -184,8 +179,6 @@ pub struct GrepServer {
     pub(super) client_manager: Arc<LspClientManager>,
     pub(super) fs_manager: Arc<FilesystemManager>,
     pub(super) symbol_index: Option<Arc<std::sync::Mutex<SymbolIndex>>>,
-    /// Line budget for the shared overflow valve (truncate-and-spill).
-    pub(super) budget: usize,
 }
 
 impl GrepServer {
@@ -230,7 +223,6 @@ impl GrepServer {
                 } else {
                     GrepOutcome::Rendered {
                         output: String::new(),
-                        receipt: None,
                     }
                 });
             }
@@ -250,7 +242,6 @@ impl GrepServer {
         // `-l`/`--files-with-matches`: a plain ripgrep pass, then just the
         // distinct matching files as cwd-relative paths (one per line) — no
         // enrichment, no `#scope`, no context (ripgrep drops context with `-l`).
-        // The list still rides the shared overflow valve.
         if input.flags.files_with_matches {
             return self.files_with_matches(&input, &search_paths, cwd.as_deref());
         }
@@ -275,29 +266,10 @@ impl GrepServer {
             .run(run_input, parent_id, cancel, cwd.as_deref())
             .await?;
 
-        if output.is_empty() {
-            return Ok(GrepOutcome::Rendered {
-                output: String::new(),
-                receipt: None,
-            });
-        }
-
-        // Bound volume with the shared overflow valve: truncate the display at
-        // the line budget and spill the full output to a runtime-dir file, with
-        // the pointer carried out as a stderr receipt (stdout stays a byte-clean
-        // ripgrep superset). Grep lines are self-contained, so a hard line cut is
-        // safe — no block boundary needed.
-        let v = overflow::valve(
-            &output,
-            self.budget,
-            &crate::paths::runtime_dir(),
-            overflow::GREP_PREFIX,
-            None,
-        );
-        Ok(GrepOutcome::Rendered {
-            output: v.display,
-            receipt: v.receipt,
-        })
+        // The command's output is always complete (decision 025): print every
+        // match. Grep lines are self-contained, so the host caps only the final
+        // read at the end of a pipeline.
+        Ok(GrepOutcome::Rendered { output })
     }
 
     /// Resolves the concrete filesystem roots a pathless (`.`/cwd-scoped) or
@@ -380,8 +352,8 @@ impl GrepServer {
     /// `-l`/`--files-with-matches`: a plain ripgrep pass, then the distinct
     /// matching files rendered as cwd-relative paths, one per line, sorted for
     /// byte-stable output. No enrichment, no `#scope`, no context (ripgrep drops
-    /// context with `-l`) — the list still rides the shared overflow valve, and a
-    /// path per line keeps it pipe-safe (`-l` composes with `| head`/`| grep`).
+    /// context with `-l`) — the complete list prints, and a path per line keeps
+    /// it pipe-safe (`-l` composes with `| head`/`| grep`).
     fn files_with_matches(
         &self,
         input: &GrepInput,
@@ -416,7 +388,6 @@ impl GrepServer {
         if rg.file_lines.is_empty() {
             return Ok(GrepOutcome::Rendered {
                 output: String::new(),
-                receipt: None,
             });
         }
 
@@ -428,17 +399,7 @@ impl GrepServer {
         paths.sort();
         let output = paths.join("\n");
 
-        let v = overflow::valve(
-            &output,
-            self.budget,
-            &crate::paths::runtime_dir(),
-            overflow::GREP_PREFIX,
-            None,
-        );
-        Ok(GrepOutcome::Rendered {
-            output: v.display,
-            receipt: v.receipt,
-        })
+        Ok(GrepOutcome::Rendered { output })
     }
 
     /// Grep pipeline: ripgrep + `documentSymbol` index + hit classification.
@@ -980,8 +941,7 @@ impl Sink for StreamSink {
 /// (`path:line:text`) — the superset contract, mechanized. The verbatim payload
 /// floats (variable start column, indentation preserved) with no padding.
 ///
-/// Returns the complete output. Volume is bounded downstream by the shared
-/// overflow valve (`overflow::valve`) in [`GrepServer::execute`].
+/// Returns the complete output (decision 025) — every match, no volume branch.
 fn render_results(hits: &[GrepHit], fs_manager: &FilesystemManager, cwd: Option<&Path>) -> String {
     use std::fmt::Write;
 

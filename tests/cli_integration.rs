@@ -833,24 +833,21 @@ fn test_glob_count_reports_paths() -> Result<()> {
     Ok(())
 }
 
-// ── sed preview overflow valve ─────────────────────────────────────
+// ── sed preview complete output ────────────────────────────────────
 
-/// End-to-end: a bare `catenary sed` preview that overflows the display line
-/// budget truncates stdout, spills the complete diff to a per-invocation
-/// `sed-<uuid>.txt` under the isolated runtime dir, and points the agent at it
-/// via a STDERR receipt — the shared overflow valve, the grep/glob model
-/// (pipeable-output ticket 03a). Exercises the daemon-side `line_budget` +
-/// `runtime_dir()` wiring the unit tests can't reach.
+/// End-to-end: a broad `catenary sed` preview prints the complete diff to stdout
+/// — every matched file's section — with no truncation, no STDERR receipt, and no
+/// spill file written under the runtime dir (decision 025). Exercises the
+/// daemon-side wiring the unit tests can't reach.
 #[test]
-fn test_sed_preview_valve_spills_and_receipts() -> Result<()> {
+fn test_sed_preview_prints_complete_output() -> Result<()> {
     let state_dir = tempfile::tempdir()?;
     let state_home = state_dir.path().to_str().context("state dir")?;
 
-    // Each file renders ~4 diff lines, so enough files push the body well past the
-    // default 1000-line budget and the valve truncates + spills.
+    // A broad multi-file preview: every file's diff must appear in the output.
     let root = tempfile::tempdir()?;
     let root_str = root.path().to_str().context("root path")?;
-    let total = 400;
+    let total = 50;
     for i in 0..total {
         std::fs::write(root.path().join(format!("f{i:04}.txt")), "foo\n")?;
     }
@@ -887,49 +884,31 @@ fn test_sed_preview_valve_spills_and_receipts() -> Result<()> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    // The daemon wrote exactly one sed-<uuid>.txt under the isolated runtime dir.
-    let overflow_dir = common::xdg_runtime_dir(state_dir.path()).join("catenary");
-    let mut sed_files: Vec<_> = std::fs::read_dir(&overflow_dir)
-        .context("read overflow dir")?
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| {
-            p.extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("txt"))
-                && p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with("sed-"))
-        })
-        .collect();
+    // The complete set prints to stdout: every matched file's diff section.
     assert_eq!(
-        sed_files.len(),
-        1,
-        "exactly one spill file written; stdout:\n{stdout}\nstderr:\n{stderr}"
-    );
-    let on_disk = sed_files.remove(0);
-    let name = on_disk
-        .file_name()
-        .and_then(|n| n.to_str())
-        .context("spill file name")?;
-
-    // The receipt rides out on STDERR and names the spill; stdout stays clean (the
-    // truncated preview, no in-band pointer).
-    assert!(
-        stderr.contains("output truncated") && stderr.contains(name),
-        "stderr receipt points at the spill ({name}); stderr:\n{stderr}"
-    );
-    assert!(
-        !stdout.contains("output truncated"),
-        "the receipt must not leak into stdout; stdout:\n{stdout}"
-    );
-    // The spill holds the complete set (one diff section per matched file, beyond
-    // what the truncated display showed).
-    let contents = std::fs::read_to_string(&on_disk)?;
-    assert_eq!(
-        contents.matches(" (1 match)").count(),
+        stdout.matches(" (1 match)").count(),
         total,
-        "spill holds every matched file's diff"
+        "stdout holds every matched file's diff:\n{stdout}"
     );
+    // No truncation marker on either stream.
+    assert!(
+        !stdout.contains("output truncated") && !stderr.contains("output truncated"),
+        "no truncation marker; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    // No spill file written under the isolated runtime dir.
+    let overflow_dir = common::xdg_runtime_dir(state_dir.path()).join("catenary");
+    if let Ok(entries) = std::fs::read_dir(&overflow_dir) {
+        let sed_files = entries
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with("sed-"))
+            })
+            .count();
+        assert_eq!(sed_files, 0, "no sed spill file is written");
+    }
 
     drop(bridge);
     Ok(())

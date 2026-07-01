@@ -298,16 +298,6 @@ impl Default for TuiConfig {
     }
 }
 
-/// Default diagnostics preview budget.
-const fn default_diagnostics_per_page() -> usize {
-    50
-}
-
-/// Default shared display line budget for the grep/glob overflow valve.
-const fn default_line_budget() -> usize {
-    1000
-}
-
 /// Default dirty-severity threshold for `catenary diagnostics`.
 fn default_diagnostics_severity() -> String {
     "error".to_string()
@@ -315,11 +305,11 @@ fn default_diagnostics_severity() -> String {
 
 /// Per-tool configuration.
 ///
-/// Configures output volume and tool-specific options under `[tools]`:
+/// Configures tool-specific options under `[tools]`:
 ///
 /// ```toml
 /// [tools]
-/// line_budget = 1000
+/// diagnostics_severity = "error"
 ///
 /// [tools.glob]
 /// outline_suppress = ["**/*.min.js"]
@@ -329,22 +319,6 @@ fn default_diagnostics_severity() -> String {
 pub struct ToolsConfig {
     /// Glob tool configuration.
     pub glob: GlobConfig,
-    /// Shared display line budget for the `catenary grep`/`glob` overflow valve.
-    /// When a query's rendered output exceeds this many lines the display is
-    /// truncated (at a file boundary for glob) and the **complete** output is
-    /// spilled to a runtime-dir file, announced by a stderr receipt. The single
-    /// volume knob for both search surfaces — "more output" is recovered from the
-    /// spill file, not a flag (pipeable-output ticket 03). Default 1000, min 1.
-    #[serde(default = "default_line_budget")]
-    pub line_budget: usize,
-    /// Single-shot preview budget for `catenary diagnostics`. When the run
-    /// produces more than this many diagnostics, the preview shows the first
-    /// N (errors before warnings, so a truncation never hides an error behind
-    /// a warning) and the **complete** set is written to a per-session file
-    /// under the runtime dir, named in a trailing `… N more — full report at
-    /// <path>` line. Not a replayable page — the set clears on run. Default: 50.
-    #[serde(default = "default_diagnostics_per_page")]
-    pub diagnostics_per_page: usize,
     /// Minimum diagnostic severity that marks a `catenary diagnostics` run
     /// "dirty" (exit code 1) — one of `error`, `warning`, `info`, `hint`.
     /// Default `error`, so the exit code means "does it compile": only
@@ -359,8 +333,6 @@ impl Default for ToolsConfig {
     fn default() -> Self {
         Self {
             glob: GlobConfig::default(),
-            line_budget: default_line_budget(),
-            diagnostics_per_page: default_diagnostics_per_page(),
             diagnostics_severity: default_diagnostics_severity(),
         }
     }
@@ -377,39 +349,6 @@ impl ToolsConfig {
     pub fn dirty_severity(&self) -> u8 {
         crate::filter::parse_severity(&self.diagnostics_severity)
             .unwrap_or(crate::filter::SEVERITY_ERROR)
-    }
-
-    /// The single-shot diagnostics preview budget, clamped to a minimum of 1.
-    #[must_use]
-    pub const fn diagnostics_budget(&self) -> usize {
-        if self.diagnostics_per_page == 0 {
-            1
-        } else {
-            self.diagnostics_per_page
-        }
-    }
-
-    /// The shared grep/glob overflow-valve line budget, clamped to a minimum
-    /// of 1.
-    #[must_use]
-    pub const fn line_budget(&self) -> usize {
-        if self.line_budget == 0 {
-            1
-        } else {
-            self.line_budget
-        }
-    }
-
-    /// Clamp budgets to their minimum values, warning on adjustment.
-    pub(crate) fn clamp_budgets(&mut self) {
-        if self.line_budget == 0 {
-            tracing::warn!(min = 1, "line_budget cannot be 0, clamping to 1",);
-            self.line_budget = 1;
-        }
-        if self.diagnostics_per_page == 0 {
-            tracing::warn!(min = 1, "diagnostics_per_page cannot be 0, clamping to 1",);
-            self.diagnostics_per_page = 1;
-        }
     }
 }
 
@@ -2238,40 +2177,21 @@ extensions = ["xyz"]
     // --- Per-tool config (tools.*) ---
 
     #[test]
-    fn test_default_budgets() -> anyhow::Result<()> {
+    fn test_legacy_budget_keys_ignored() -> anyhow::Result<()> {
+        // The `line_budget` / `diagnostics_per_page` knobs were removed
+        // (decision 025). Config parsing is lenient, so a config still carrying
+        // them parses cleanly — the keys are silently ignored.
         let dir = tempdir()?;
         let path = dir.path().join("config.toml");
-        fs::write(&path, "")?;
-
-        let config = Config::load_from_sources(&[path])?;
-        let tools = config.tools.unwrap_or_default();
-        assert_eq!(tools.line_budget, 1000);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_custom_line_budget() -> anyhow::Result<()> {
-        let dir = tempdir()?;
-        let path = dir.path().join("config.toml");
-        fs::write(&path, "[tools]\nline_budget = 8000\n")?;
+        fs::write(
+            &path,
+            "[tools]\nline_budget = 8000\ndiagnostics_per_page = 25\n",
+        )?;
 
         let config = Config::load_from_sources(&[path])?;
         let tools = config.tools.expect("tools should be Some");
-        assert_eq!(tools.line_budget, 8000);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_minimum_line_budget() -> anyhow::Result<()> {
-        let dir = tempdir()?;
-        let path = dir.path().join("config.toml");
-        fs::write(&path, "[tools]\nline_budget = 0\n")?;
-
-        let config = Config::load_from_sources(&[path])?;
-        let tools = config.tools.expect("tools should be Some");
-        assert_eq!(tools.line_budget, 1, "line_budget clamps 0 to 1");
+        // The surviving knob still defaults correctly alongside the legacy keys.
+        assert_eq!(tools.diagnostics_severity, "error");
 
         Ok(())
     }
@@ -2301,7 +2221,7 @@ extensions = ["xyz"]
         let config = Config::load_from_sources(&[path])?;
         assert!(config.tools.is_none());
         let tools = config.tools.unwrap_or_default();
-        assert_eq!(tools.line_budget, 1000);
+        assert_eq!(tools.diagnostics_severity, "error");
 
         Ok(())
     }
@@ -2310,11 +2230,11 @@ extensions = ["xyz"]
     fn test_partial_tools() -> anyhow::Result<()> {
         let dir = tempdir()?;
         let path = dir.path().join("config.toml");
-        fs::write(&path, "[tools]\nline_budget = 6000\n")?;
+        fs::write(&path, "[tools]\ndiagnostics_severity = \"warning\"\n")?;
 
         let config = Config::load_from_sources(&[path])?;
         let tools = config.tools.expect("tools should be Some");
-        assert_eq!(tools.line_budget, 6000);
+        assert_eq!(tools.diagnostics_severity, "warning");
         // glob uses defaults
         assert!(tools.glob.outline_suppress.is_empty());
 
@@ -2831,32 +2751,6 @@ servers = ["nonexistent"]
         Ok(())
     }
 
-    // ── default_diagnostics_per_page tests ──────────────────────────
-
-    #[test]
-    fn diagnostics_per_page_default_is_50() {
-        assert_eq!(default_diagnostics_per_page(), 50);
-    }
-
-    #[test]
-    fn line_budget_default_is_1000() {
-        assert_eq!(default_line_budget(), 1000);
-    }
-
-    #[test]
-    fn line_budget_accessor_clamps_zero_to_one() {
-        let tc = ToolsConfig {
-            line_budget: 0,
-            ..ToolsConfig::default()
-        };
-        assert_eq!(tc.line_budget(), 1);
-        let tc = ToolsConfig {
-            line_budget: 1500,
-            ..ToolsConfig::default()
-        };
-        assert_eq!(tc.line_budget(), 1500);
-    }
-
     #[test]
     fn diagnostics_severity_default_is_error() {
         let tc = ToolsConfig::default();
@@ -2874,58 +2768,6 @@ servers = ["nonexistent"]
         // An unrecognized value falls back to error rather than disabling the gate.
         tc.diagnostics_severity = "bogus".to_string();
         assert_eq!(tc.dirty_severity(), crate::filter::SEVERITY_ERROR);
-    }
-
-    #[test]
-    fn diagnostics_budget_clamps_zero_to_one() {
-        let tc = ToolsConfig {
-            diagnostics_per_page: 0,
-            ..ToolsConfig::default()
-        };
-        assert_eq!(tc.diagnostics_budget(), 1);
-        let tc = ToolsConfig {
-            diagnostics_per_page: 25,
-            ..ToolsConfig::default()
-        };
-        assert_eq!(tc.diagnostics_budget(), 25);
-    }
-
-    // ── clamp_budgets tests ─────────────────────────────────────────
-
-    #[test]
-    fn clamp_budgets_leaves_valid_values() {
-        let mut tc = ToolsConfig {
-            line_budget: 1000,
-            diagnostics_per_page: 50,
-            ..ToolsConfig::default()
-        };
-        tc.clamp_budgets();
-        assert_eq!(tc.line_budget, 1000);
-        assert_eq!(tc.diagnostics_per_page, 50);
-    }
-
-    #[test]
-    fn clamp_budgets_raises_below_minimum() {
-        let mut tc = ToolsConfig {
-            line_budget: 0,
-            diagnostics_per_page: 0,
-            ..ToolsConfig::default()
-        };
-        tc.clamp_budgets();
-        assert_eq!(tc.line_budget, 1, "line_budget should clamp to 1");
-        assert_eq!(tc.diagnostics_per_page, 1, "diagnostics should clamp to 1");
-    }
-
-    #[test]
-    fn clamp_budgets_at_exact_minimum_is_noop() {
-        let mut tc = ToolsConfig {
-            line_budget: 1,
-            diagnostics_per_page: 1,
-            ..ToolsConfig::default()
-        };
-        tc.clamp_budgets();
-        assert_eq!(tc.line_budget, 1, "at minimum should stay");
-        assert_eq!(tc.diagnostics_per_page, 1, "at minimum should stay");
     }
 
     // ── DispatchMethod tests ────────────────────────────────────────

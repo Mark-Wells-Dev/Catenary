@@ -463,12 +463,6 @@ impl Session {
             .map_err(|e| tracing::info!("symbol index unavailable: {e}"))
             .ok();
 
-        // One shared display line budget feeds both search surfaces' overflow
-        // valve (pipeable-output ticket 03); the per-tool char budgets are gone.
-        let line_budget = config
-            .tools
-            .as_ref()
-            .map_or(1000, crate::config::ToolsConfig::line_budget);
         let glob_config = config
             .tools
             .as_ref()
@@ -493,7 +487,6 @@ impl Session {
             client_manager: client_manager.clone(),
             fs_manager: fs_manager.clone(),
             symbol_index: symbol_index.clone(),
-            budget: line_budget,
         };
         let outline_suppress: Vec<globset::GlobMatcher> = glob_config
             .outline_suppress
@@ -513,7 +506,6 @@ impl Session {
             client_manager: client_manager.clone(),
             fs_manager: fs_manager.clone(),
             symbol_index: symbol_index.clone(),
-            budget: line_budget,
             outline_suppress,
         };
         Self {
@@ -555,11 +547,6 @@ impl Session {
         session_id: Arc<str>,
         editing_guardrail: Option<Arc<EditingGuardrail>>,
     ) -> Self {
-        let line_budget = primary
-            .config
-            .tools
-            .as_ref()
-            .map_or(1000, crate::config::ToolsConfig::line_budget);
         let glob_config = primary
             .config
             .tools
@@ -587,13 +574,11 @@ impl Session {
                 client_manager: primary.client_manager.clone(),
                 fs_manager: primary.fs_manager.clone(),
                 symbol_index: primary.symbol_index.clone(),
-                budget: line_budget,
             },
             glob: GlobServer {
                 client_manager: primary.client_manager.clone(),
                 fs_manager: primary.fs_manager.clone(),
                 symbol_index: primary.symbol_index.clone(),
-                budget: line_budget,
                 outline_suppress,
             },
             diagnostics: primary.diagnostics.clone(),

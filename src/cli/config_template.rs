@@ -157,16 +157,11 @@ const TEMPLATE: &str = r#"# Catenary recommended config
 # [language.python]
 # root_markers = []                        # disable for python
 
-# ── Tool budgets ─────────────────────────────────────────────────
+# ── Tools (`catenary grep`/`glob`/`sed`/`diagnostics`) ───────────
 #
-# line_budget: shared display line budget for `catenary grep`/`glob`. When a
-#   query's output exceeds this many lines the display is truncated (at a file
-#   boundary for glob) and the COMPLETE output is spilled to a runtime-dir file,
-#   announced by a stderr notice — read or `catenary grep` that file for the
-#   rest. The single volume knob for both search surfaces. Default 1000, min 1.
-
-# [tools]
-# line_budget = 1000
+# Every command emits its COMPLETE output (decision 025): no line budget, no
+# paging, no spill file — the host caps only the final read at the end of a
+# pipeline. There is no volume knob to configure.
 
 # [tools.glob]
 # outline_suppress: glob patterns whose outlines are hidden from automatic
@@ -175,17 +170,11 @@ const TEMPLATE: &str = r#"# Catenary recommended config
 
 # ── Diagnostics (`catenary diagnostics`) ─────────────────────────
 #
-# diagnostics_per_page: single-shot preview budget. When a run produces
-#   more than this many diagnostics, the preview shows the first N (errors
-#   before warnings) and the complete set is written to a per-session file
-#   under the runtime dir, named in a trailing "… N more — full report at
-#   <path>" line. Default: 50.
 # diagnostics_severity: the minimum severity that marks a run "dirty"
 #   (exit code 1) — one of error, warning, info, hint. Default "error", so
 #   the exit code means "does it compile"; warnings still print but exit 0.
 
 # [tools]
-# diagnostics_per_page = 50
 # diagnostics_severity = "error"
 "#;
 

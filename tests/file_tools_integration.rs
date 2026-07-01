@@ -1074,18 +1074,18 @@ fn test_glob_small_files_outlined_no_kind_label() -> Result<()> {
 }
 
 #[test]
-fn test_glob_dir_large_file_paged() -> Result<()> {
+fn test_glob_dir_prints_complete_listing() -> Result<()> {
     let dir = tempfile::tempdir()?;
-    // Several outlined files so the directory listing exceeds the line budget
-    // and the overflow valve truncates BETWEEN files (never mid-tree).
+    // Several outlined files: the complete listing prints, every file's full
+    // outline (decision 025 — no line budget, no truncation).
     for f in 0..5 {
         std::fs::write(
             dir.path().join(format!("file_{f}.{MOCK_EXT}")),
             gen_mock_content(10),
         )?;
     }
-    // A small line budget forces the valve to fire and truncate at a file
-    // boundary (threshold is inert under enrich-always; left to confirm so).
+    // Legacy keys (`line_budget`, `outline_threshold`) are silently ignored by
+    // lenient parsing — the listing is complete regardless.
     let config = "[tools]\nline_budget = 25\n\n[tools.glob]\noutline_threshold = 5\n";
     let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), Some(config))?;
     bridge.initialize()?;
@@ -1098,12 +1098,8 @@ fn test_glob_dir_large_file_paged() -> Result<()> {
         .get("output")
         .and_then(serde_json::Value::as_str)
         .context("output")?;
-    let receipt = resp
-        .get("receipt")
-        .and_then(serde_json::Value::as_str)
-        .context("expected an overflow receipt when the listing exceeds the budget")?;
 
-    // Outline declaration lines still render (no `<Kind>` label).
+    // Outline declaration lines render (no `<Kind>` label).
     assert!(
         output.contains("fn func_") || output.contains("struct Struct_"),
         "Should show declaration lines in maps: {output}"
@@ -1113,30 +1109,18 @@ fn test_glob_dir_large_file_paged() -> Result<()> {
         "Outline should have no kind label: {output}"
     );
 
-    // The spill file holds the complete listing; the display is a strict prefix.
-    let path = receipt
-        .rsplit(" at ")
-        .next()
-        .context("spill path in receipt")?;
-    let spilled = std::fs::read_to_string(path).context("read spill file")?;
-    let shown = output.lines().count();
-    assert!(
-        spilled.lines().count() > shown,
-        "spill holds the full listing ({} lines) vs {shown} shown",
-        spilled.lines().count()
-    );
-
-    // File-boundary truncation: the first DROPPED line begins a fresh block (a
-    // file/dir header), never an outline node mid-tree. Outline nodes render
-    // `{line}  {decl}` — a digit run then two spaces — so a header never starts
-    // with a digit (the filenames here are `file_N.mock`).
-    if let Some(first_dropped) = spilled.lines().nth(shown) {
-        let trimmed = first_dropped.trim_start();
+    // The complete listing prints: every file appears, none truncated away.
+    for f in 0..5 {
         assert!(
-            !trimmed.chars().next().is_some_and(|c| c.is_ascii_digit()),
-            "truncation lands on a file boundary, not mid-tree; dropped: {first_dropped:?}"
+            output.contains(&format!("file_{f}.{MOCK_EXT}")),
+            "complete listing holds file_{f}.{MOCK_EXT}:\n{output}"
         );
     }
+    // No volume machinery on the wire.
+    assert!(
+        resp.get("receipt").is_none(),
+        "no receipt field — output is always complete: {resp:?}"
+    );
     Ok(())
 }
 
@@ -1570,14 +1554,14 @@ fn test_glob_composing_flags() -> Result<()> {
 }
 
 #[test]
-fn test_glob_overflow_spills_full_outline() -> Result<()> {
+fn test_glob_prints_complete_outline() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let file = dir.path().join(format!("huge.{MOCK_EXT}"));
-    // Many symbols so the single-file outline exceeds the line budget.
+    // A large single-file outline: it prints in full (decision 025 — no budget,
+    // no spill), including the last symbols.
     std::fs::write(&file, gen_mock_content(500))?;
 
-    let config = "[tools]\nline_budget = 50\n";
-    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), Some(config))?;
+    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), None)?;
     bridge.initialize()?;
 
     let resp = bridge.call_search_raw(
@@ -1588,28 +1572,22 @@ fn test_glob_overflow_spills_full_outline() -> Result<()> {
         .get("output")
         .and_then(serde_json::Value::as_str)
         .context("output")?;
-    let receipt = resp
-        .get("receipt")
-        .and_then(serde_json::Value::as_str)
-        .context("expected an overflow receipt when the outline exceeds the budget")?;
 
-    // The truncated display is a strict prefix; the spill file holds the COMPLETE
-    // outline, including the last symbols that did not fit.
-    let path = receipt
-        .rsplit(" at ")
-        .next()
-        .context("spill path in receipt")?;
-    let spilled = std::fs::read_to_string(path).context("read spill file")?;
+    // The complete outline prints — first and last symbols both present.
     assert!(
-        spilled.lines().count() > output.lines().count(),
-        "spill holds the full outline ({} lines) vs {} shown",
-        spilled.lines().count(),
-        output.lines().count()
+        output.contains("func_0") || output.contains("Struct_1"),
+        "complete outline holds the first symbols:\n{}",
+        output.lines().take(3).collect::<Vec<_>>().join("\n")
     );
     assert!(
-        spilled.contains("func_498") || spilled.contains("Struct_499"),
-        "spill file holds the complete outline, got tail:\n{}",
-        spilled.lines().rev().take(3).collect::<Vec<_>>().join("\n")
+        output.contains("func_498") || output.contains("Struct_499"),
+        "complete outline holds the last symbols:\n{}",
+        output.lines().rev().take(3).collect::<Vec<_>>().join("\n")
+    );
+    // No volume machinery on the wire.
+    assert!(
+        resp.get("receipt").is_none(),
+        "no receipt field — output is always complete: {resp:?}"
     );
     Ok(())
 }
@@ -1644,7 +1622,7 @@ fn test_glob_no_grammar() -> Result<()> {
 }
 
 #[test]
-fn test_glob_budget_minimum() -> Result<()> {
+fn test_glob_lists_every_item() -> Result<()> {
     let mut bridge = BridgeProcess::spawn_with_config(|root| {
         for i in 0..40 {
             std::fs::write(root.join(format!("item_{i:03}.txt")), format!("line {i}\n"))?;
@@ -1660,18 +1638,15 @@ fn test_glob_budget_minimum() -> Result<()> {
         &json!({ "paths": [bridge.root_path().to_string_lossy().to_string()] }),
     )?;
 
-    // Volume is bounded in LINES by the overflow valve (clamped budget 1000),
-    // not in characters. 40 files + a header sit well under the budget, so the
-    // listing is untruncated and every item is present.
-    assert!(
-        text.lines().count() <= 1000,
-        "Output must stay within the line budget: {} lines:\n{text}",
-        text.lines().count()
-    );
-    assert!(
-        text.contains("item_000.txt") && text.contains("item_039.txt"),
-        "All items should be listed (no truncation at this size): {text}"
-    );
+    // The output is always complete (decision 025): every item is listed, none
+    // truncated away — first through last.
+    for i in 0..40 {
+        let item = format!("item_{i:03}.txt");
+        assert!(
+            text.contains(&item),
+            "complete listing holds {item}:\n{text}"
+        );
+    }
     Ok(())
 }
 
