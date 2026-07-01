@@ -169,7 +169,9 @@ const TEMPLATE: &str = r#"# Catenary recommended config
 # line_budget = 1000
 
 # [tools.glob]
-# outline_threshold = 200
+# outline_suppress: glob patterns whose outlines are hidden from automatic
+#   display (symbols stay available via `catenary glob <file>`). Default: none.
+# outline_suppress = ["**/*.min.js"]
 
 # ── Diagnostics (`catenary diagnostics`) ─────────────────────────
 #

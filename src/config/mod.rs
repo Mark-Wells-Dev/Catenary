@@ -322,7 +322,7 @@ fn default_diagnostics_severity() -> String {
 /// line_budget = 1000
 ///
 /// [tools.glob]
-/// outline_threshold = 200
+/// outline_suppress = ["**/*.min.js"]
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -414,23 +414,12 @@ impl ToolsConfig {
 }
 
 /// Glob tool configuration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct GlobConfig {
-    /// Minimum line count for defensive outlines. Default: 200.
-    pub outline_threshold: usize,
     /// Glob patterns whose outlines are suppressed from automatic display.
     /// Symbols remain available via `into`.
     pub outline_suppress: Vec<String>,
-}
-
-impl Default for GlobConfig {
-    fn default() -> Self {
-        Self {
-            outline_threshold: 200,
-            outline_suppress: Vec::new(),
-        }
-    }
 }
 
 pub(crate) const fn default_log_retention_days() -> i64 {
@@ -2288,19 +2277,6 @@ extensions = ["xyz"]
     }
 
     #[test]
-    fn test_glob_outline_threshold() -> anyhow::Result<()> {
-        let dir = tempdir()?;
-        let path = dir.path().join("config.toml");
-        fs::write(&path, "[tools.glob]\noutline_threshold = 500\n")?;
-
-        let config = Config::load_from_sources(&[path])?;
-        let tools = config.tools.expect("tools should be Some");
-        assert_eq!(tools.glob.outline_threshold, 500);
-
-        Ok(())
-    }
-
-    #[test]
     fn test_glob_outline_suppress() -> anyhow::Result<()> {
         let dir = tempdir()?;
         let path = dir.path().join("config.toml");
@@ -2340,7 +2316,7 @@ extensions = ["xyz"]
         let tools = config.tools.expect("tools should be Some");
         assert_eq!(tools.line_budget, 6000);
         // glob uses defaults
-        assert_eq!(tools.glob.outline_threshold, 200);
+        assert!(tools.glob.outline_suppress.is_empty());
 
         Ok(())
     }
