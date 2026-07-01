@@ -61,21 +61,22 @@ search root.
 ```bash
 catenary grep "pattern"
 catenary grep "foo|bar" "src/**/*.rs"
-catenary grep "TODO" --exclude-pattern "vendor/**" --page 2
+catenary grep "TODO" --exclude-pattern "vendor/**"
 catenary grep "pattern" --include-hidden --include-gitignored
 catenary grep "TODO" --count            # "N matches in M files"
 ```
 
 Quote glob patterns so Catenary expands them gitignore-aware rather than
-the shell. `catenary grep` owns its output: page through large results
-with `--page` and ask for a total with `--count` — don't pipe the output
-through `head`/`tail`/`wc`.
+the shell. `catenary grep` owns its line-budgeted output: the overflow
+valve truncates large results and spills the full output to a file (with a
+stderr receipt), so read them directly rather than piping through
+`head`/`tail`/`wc`. Ask for a total with `--count` and narrow with
+`--exclude-pattern`.
 
 | Flag | Description |
 |------|-------------|
 | `[PATH]...` | File or directory path(s) to scope the search (quoted globs allowed) |
 | `--exclude-pattern <pat>` | Glob pattern to exclude from matches |
-| `--page <n>` | Page number for paged results (default: 1) |
 | `--count` | Report the match count instead of results |
 | `--include-gitignored` | Include files ignored by .gitignore |
 | `--include-hidden` | Include hidden files and directories |
@@ -92,17 +93,17 @@ as the base for relative patterns.
 catenary glob "src/"
 catenary glob "src/main.rs"
 catenary glob "**/*.toml"
-catenary glob "**/*.rs" --exclude-pattern "tests/**" --page 2
+catenary glob "**/*.rs" --exclude-pattern "tests/**"
 catenary glob "**/*.rs" --count          # "N paths"
 ```
 
-Like `catenary grep`, glob owns its output — use `--page` and `--count`
-instead of piping into `head`/`tail`/`wc`.
+Like `catenary grep`, glob owns its line-budgeted output — the overflow
+valve spills the full result to a file (stderr receipt); read it directly
+and use `--count` for totals instead of piping into `head`/`tail`/`wc`.
 
 | Flag | Description |
 |------|-------------|
 | `--exclude-pattern <pat>` | Glob pattern to exclude from results |
-| `--page <n>` | Page number for paged results (default: 1) |
 | `--count` | Report the path count instead of results |
 | `--include-gitignored` | Include files ignored by .gitignore |
 | `--include-hidden` | Include hidden files and directories |
@@ -134,7 +135,6 @@ catenary sed 'Foo' 'Bar' 'src/' --in-place --preserve-case  # Foo→Bar, foo→b
 | `--preserve-case` | Case the replacement to match each hit |
 | `--first` | Replace only the first match per file (default: all) |
 | `--exclude-pattern <pat>` | Glob pattern to exclude from matches |
-| `--page <n>` | Page number for the paged preview |
 | `--include-gitignored` | Include files ignored by .gitignore |
 | `--include-hidden` | Include hidden files and directories |
 
