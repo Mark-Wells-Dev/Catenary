@@ -125,6 +125,14 @@ pub(crate) enum HookRequest {
         /// Host CLI session ID (Claude Code / Gemini CLI UUID).
         #[serde(default)]
         session_id: Option<String>,
+        /// Resolved shell-write targets to attribute (ws38 ticket 02,
+        /// decision 026). Absolute paths produced by the client-side write
+        /// resolver for an allowed shell command; the daemon filters them
+        /// through `covered_for_diagnostics` and accumulates them into the
+        /// caller's modified-set exactly like an Edit/Write. Empty for
+        /// non-shell tools and for commands that write nothing.
+        #[serde(default)]
+        writes: Vec<std::path::PathBuf>,
     },
 
     /// Enter editing mode via CLI command (`catenary editing start`).
@@ -521,6 +529,7 @@ mod tests {
             command,
             agent_id,
             session_id,
+            ..
         } = req
         else {
             unreachable!("expected PreTool");

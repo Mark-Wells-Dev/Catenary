@@ -249,11 +249,35 @@ pub struct Denial {
 ///
 /// Returns a [`Denial`] for the first denied command, or `None` if all
 /// commands are allowed.
+#[must_use]
 pub fn check_command(
     cmd: &str,
     rules: &ResolvedCommands,
     cwd: Option<&std::path::Path>,
 ) -> Option<Denial> {
+    check_and_resolve_command(cmd, rules, cwd).err()
+}
+
+/// Check the command against the allowlist **and** resolve its write-set.
+///
+/// The write-carrying twin of [`check_command`]: `Ok(writes)` means the
+/// command is allowed and `writes` is the complete set of paths it will write
+/// (ticket 02 attributes these into the issuing session's modified-set);
+/// `Err(denial)` means the command is denied — either by the foreign allowlist
+/// or because a write is opaque (the complete-or-deny contract, ws38 ticket 01,
+/// decision 026). `check_command` discards the write-set;
+/// [`crate::cli::hooks::run_pre_tool`] keeps it.
+///
+/// # Errors
+///
+/// Returns the first [`Denial`] in document order (allowlist violation before
+/// an opaque-write denial for the same line, since the allowlist walk runs
+/// first).
+pub fn check_and_resolve_command(
+    cmd: &str,
+    rules: &ResolvedCommands,
+    cwd: Option<&std::path::Path>,
+) -> Result<resolver::LineWrites, Denial> {
     // One faithful parse drives segmentation end-to-end (decision 020 §3): the
     // list operators (`;` / `&&` / `||` / newline / `&`) separate
     // `ParsedScript.pipelines`, `|` separates `Pipeline.commands` — so the pipe
@@ -269,22 +293,22 @@ pub fn check_command(
         saw_unresolved_cd: false,
     };
     if let Some(denial) = check_script(&script, rules, &mut cwd_state) {
-        return Some(denial);
+        return Err(denial);
     }
 
     // Resolve-or-deny (ws38 ticket 01, decision 026): every write the command
     // performs must resolve to its complete target set, or the command is
     // denied with a construct-naming teaching message. This replaces the
     // blanket bug-11 foreign-redirect denial — a resolvable redirect (or
-    // `cp`/`mv`/`tee`/`sed -i`/`rsync` write) is now allowed; attribution of
-    // the produced write-set is wired in ticket 02. The `allow_file_redirects`
+    // `cp`/`mv`/`tee`/`sed -i`/`rsync` write) is now allowed, and its resolved
+    // write-set flows to attribution (ticket 02). The `allow_file_redirects`
     // knob is inert: the resolver path is authoritative (retirement is
     // ticket 05). Catenary's own segments get the same treatment — the
     // canonical-form matcher owns their allow/deny shape, the resolver their
     // write-set.
     match resolver::resolve_script(&script, cwd) {
-        Ok(_writes) => None,
-        Err(opaque) => Some(Denial {
+        Ok(writes) => Ok(writes),
+        Err(opaque) => Err(Denial {
             command: opaque.command,
             reason: DenialReason::OpaqueWrite,
             unresolved_cd: cwd_state.saw_unresolved_cd,
@@ -3834,6 +3858,30 @@ mod tests {
         assert!(check_command("cargo build && catenary grep p", &rules, None).is_some());
     }
 
+    #[test]
+    fn check_and_resolve_surfaces_catenary_write_set() {
+        let rules = basic_rules();
+        // A catenary-only redirect resolves its target (folded-in edge,
+        // ws38 ticket 02): allowed, and the write-set carries the target so
+        // the daemon can attribute it.
+        let writes = check_and_resolve_command("catenary grep p > out.txt", &rules, None)
+            .expect("resolvable catenary redirect allowed");
+        assert!(
+            writes.writes.iter().any(|p| p.ends_with("out.txt")),
+            "resolved write-set should record the redirect target, got {:?}",
+            writes.writes,
+        );
+        // An opaque catenary redirect denies with the resolver's teaching
+        // message (complete-or-deny).
+        let denial = check_and_resolve_command("catenary grep p > $OUT", &rules, None)
+            .expect_err("opaque catenary redirect denied");
+        assert_eq!(denial.reason, DenialReason::OpaqueWrite);
+        // A plain catenary read records nothing.
+        let writes = check_and_resolve_command("catenary grep p src", &rules, None)
+            .expect("plain catenary read allowed");
+        assert!(writes.writes.is_empty(), "a read records no writes");
+    }
+
     // ── Consolidated composition guard (ticket 14) ───────────────────
     //
     // One table over the *combined* filter. It mirrors `run_pre_tool`'s
@@ -3863,11 +3911,14 @@ mod tests {
         };
         match analyze_catenary_command(cmd) {
             CatenaryAction::Deny(_) => Outcome::DenyCatenary,
-            CatenaryAction::NotCatenary | CatenaryAction::Allow { has_foreign: true } => {
-                foreign(cmd)
-            }
-            CatenaryAction::Allow { has_foreign: false }
-            | CatenaryAction::EditingStart
+            // Every allowed catenary line resolves its write-set through the
+            // same path (ws38 ticket 02 folded-in edge): a catenary-only
+            // redirect (`catenary grep p > f`) is now resolve-gated, so an
+            // opaque target denies while a literal one still allows. `catenary`
+            // segments are skipped by the allowlist walk, so a search chain's
+            // foreign part is still validated.
+            CatenaryAction::NotCatenary | CatenaryAction::Allow { .. } => foreign(cmd),
+            CatenaryAction::EditingStart
             | CatenaryAction::Diagnostics
             | CatenaryAction::Sed { .. } => Outcome::Allow,
         }
@@ -3912,6 +3963,10 @@ mod tests {
             ("catenary grep p > out.txt", Allow),
             ("catenary grep p 2>&1 | head", Allow),
             ("catenary sed a b > preview.diff", Allow),
+            // Catenary-only redirects are resolve-gated (ws38 ticket 02
+            // folded-in edge): a literal target attributes and allows, an
+            // opaque target denies with the resolver's teaching message.
+            ("catenary grep p > $OUT", DenyForeign(OpaqueWrite)),
             // pipe-in retired (ticket 05): search reads stdin now — a downstream
             // pipe is valid, so only the *upstream* segment is judged. Allowlisted
             // upstream → the whole call runs; an unlisted upstream denies on its

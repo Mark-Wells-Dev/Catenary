@@ -25,6 +25,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::cli::HostFormat;
+use crate::cli::command_filter::resolver::LineWrites;
 
 // ── Surface announcement (ticket 04) ────────────────────────────────────
 
@@ -770,11 +771,25 @@ pub fn run_pre_tool(format: HostFormat) {
             // segments are skipped by `check_command`. Always allowed,
             // including during editing, so we never fall through to
             // editing-state enforcement.
-            CatenaryAction::Allow { has_foreign } => {
-                if has_foreign
-                    && let Some(reason) = foreign_command_denial(&hook_json, shell_cmd, format)
-                {
-                    print!("{}", format_deny(&reason, format));
+            CatenaryAction::Allow { .. } => {
+                // Every allowed catenary line resolves its write-set and is
+                // opaque-gated through the same filter — including catenary-only
+                // redirects (`catenary grep p > f`), the folded-in edge of ws38
+                // ticket 02. A search chain's foreign segments
+                // (`cd src && catenary grep p`) stay allowlist-checked;
+                // `catenary` segments are skipped. On allow, the resolved
+                // write-set is attributed to the caller like an edit.
+                match foreign_command_outcome(&hook_json, shell_cmd, format) {
+                    Err(reason) => print!("{}", format_deny(&reason, format)),
+                    Ok(writes) if !writes.is_empty() => enforce_editing_state(
+                        &hook_json,
+                        tool_name,
+                        None,
+                        Some(shell_cmd.as_str()),
+                        format,
+                        &writes,
+                    ),
+                    Ok(_) => {}
                 }
                 return;
             }
@@ -782,27 +797,59 @@ pub fn run_pre_tool(format: HostFormat) {
         }
     }
 
-    // ── Command filter (regime 2: foreign allowlist) ─────────────
+    // ── Command filter (regime 2: foreign allowlist) + write resolution ──
     // Local-only enforcement: the client-side check (user config + cwd's
     // project config) is the sole authority — enforcement keys are
     // user-level, so it reaches the same verdict as any daemon round-trip
-    // would, and the local cwd is more accurate than the daemon's view.
-    if let Some(shell_cmd) = extract_shell_command(&hook_json, tool_name, format)
-        && let Some(reason) = foreign_command_denial(&hook_json, &shell_cmd, format)
-    {
-        print!("{}", format_deny(&reason, format));
-        return;
+    // would, and the local cwd is more accurate than the daemon's view. On
+    // allow the resolver's write-set rides into editing-state so covered
+    // targets are attributed to the caller like edits (ws38 ticket 02).
+    let mut resolved_writes: Vec<PathBuf> = Vec::new();
+    if let Some(shell_cmd) = extract_shell_command(&hook_json, tool_name, format) {
+        match foreign_command_outcome(&hook_json, &shell_cmd, format) {
+            Err(reason) => {
+                print!("{}", format_deny(&reason, format));
+                return;
+            }
+            Ok(writes) => resolved_writes = writes,
+        }
     }
 
     // ── Editing state enforcement (IPC to daemon / session) ──────
-    let Some(stream) = hook_connect(&hook_json) else {
+    let file_path = extract_file_path(&hook_json, format);
+    let shell_cmd = extract_shell_command(&hook_json, tool_name, format);
+    enforce_editing_state(
+        &hook_json,
+        tool_name,
+        file_path.as_deref(),
+        shell_cmd.as_deref(),
+        format,
+        &resolved_writes,
+    );
+}
+
+/// Send the `pre-tool/editing-state` request to the daemon and print any
+/// denial it returns.
+///
+/// The universal pre-tool transport: editing-state enforcement for every tool,
+/// plus (ws38 ticket 02) the resolved shell-write set carried in `writes` so
+/// the daemon attributes those targets into the caller's modified-set exactly
+/// like an Edit/Write. Silently no-ops when the daemon socket is unreachable
+/// (the host CLI's flow must not break on a hook transport error).
+fn enforce_editing_state(
+    hook_json: &serde_json::Value,
+    tool_name: &str,
+    file_path: Option<&str>,
+    shell_cmd: Option<&str>,
+    format: HostFormat,
+    writes: &[PathBuf],
+) {
+    let Some(stream) = hook_connect(hook_json) else {
         return;
     };
 
-    let file_path = extract_file_path(&hook_json, format);
-    let agent_id = extract_agent_id(&hook_json);
-    let session_id = extract_session_id(&hook_json, format);
-    let shell_cmd = extract_shell_command(&hook_json, tool_name, format);
+    let agent_id = extract_agent_id(hook_json);
+    let session_id = extract_session_id(hook_json, format);
 
     let mut request = serde_json::json!({
         "method": "pre-tool/editing-state",
@@ -810,16 +857,19 @@ pub fn run_pre_tool(format: HostFormat) {
         "agent_id": agent_id,
         "format": format.as_str(),
     });
-    if let Some(path) = &file_path {
+    if let Some(path) = file_path {
         request["file_path"] = serde_json::json!(path);
     }
-    if let Some(cmd) = &shell_cmd {
+    if let Some(cmd) = shell_cmd {
         request["command"] = serde_json::json!(cmd);
     }
     if let Some(sid) = session_id {
         request["session_id"] = serde_json::json!(sid);
     }
-    request["host_payload"] = prepare_host_payload(&hook_json);
+    if !writes.is_empty() {
+        request["writes"] = serde_json::json!(writes);
+    }
+    request["host_payload"] = prepare_host_payload(hook_json);
 
     let lines = ipc_exchange(stream, &request);
 
@@ -831,30 +881,42 @@ pub fn run_pre_tool(format: HostFormat) {
     }
 }
 
-/// Run the foreign-command allowlist filter (regime 2) and return the formatted
-/// denial reason, or `None` when the command is allowed.
+/// Run the foreign-command allowlist filter (regime 2) **and** the write
+/// resolver, returning the resolved write-set on allow or the formatted denial
+/// reason on deny.
+///
+/// `Ok(writes)` — the command is allowed; `writes` are the resolved (absolute
+/// when the cwd is known) write targets to attribute into the caller's
+/// modified-set (ws38 ticket 02). `Err(reason)` — the formatted denial to
+/// print, for an allowlist violation or an opaque write.
 ///
 /// The local [`check_shell_command`] is the sole authority: enforcement keys
-/// (`allow`/`pipeline`/`deny`/`deny_flags`/`allow_file_redirects`) are
-/// user-level, so the local path reaches the same verdict as any daemon
-/// round-trip would, and the local cwd is more accurate than the daemon's
-/// view. Catenary's own commands
-/// are skipped by [`check_command`](crate::cli::command_filter::check_command)
-/// — they run under the canonical-form matcher (regime 1), not the allowlist.
-fn foreign_command_denial(
+/// (`allow`/`pipeline`/`deny`/`deny_flags`) are user-level, so the local path
+/// reaches the same verdict as any daemon round-trip would, and the local cwd
+/// is more accurate than the daemon's view. Catenary's own commands are skipped
+/// by [`check_command`](crate::cli::command_filter::check_command) — they run
+/// under the canonical-form matcher (regime 1), not the allowlist — but their
+/// resolver-computed write-set still flows through here.
+fn foreign_command_outcome(
     hook_json: &serde_json::Value,
     shell_cmd: &str,
     format: HostFormat,
-) -> Option<String> {
-    let (denial, resolved) = check_shell_command(hook_json, shell_cmd, format)?;
-    let build_hint = resolve_client_build_hint(hook_json, &denial.command, &resolved, format);
-    Some(crate::cli::command_filter::format_denial(
-        &denial.command,
-        &resolved,
-        &denial,
-        Some(format),
-        build_hint.as_deref(),
-    ))
+) -> Result<Vec<PathBuf>, String> {
+    match check_shell_command(hook_json, shell_cmd, format) {
+        Ok(writes) => Ok(writes.writes.into_iter().collect()),
+        Err(boxed) => {
+            let (denial, resolved) = *boxed;
+            let build_hint =
+                resolve_client_build_hint(hook_json, &denial.command, &resolved, format);
+            Err(crate::cli::command_filter::format_denial(
+                &denial.command,
+                &resolved,
+                &denial,
+                Some(format),
+                build_hint.as_deref(),
+            ))
+        }
+    }
 }
 
 /// Check a shell command against the configured allowlist.
@@ -865,18 +927,28 @@ fn foreign_command_denial(
 /// matches what any daemon round-trip would reach, and the local cwd is more
 /// accurate than the daemon's view.
 ///
-/// Returns a [`Denial`](crate::cli::command_filter::Denial) and the resolved
-/// config on denial, or `None` if the command is allowed.
+/// `Ok(writes)` — the command is allowed and `writes` is its resolved
+/// write-set (ws38 ticket 02). `Err((denial, resolved))` — the command is
+/// denied, with the resolved config it was judged against.
 fn check_shell_command(
     hook_json: &serde_json::Value,
     cmd: &str,
     format: HostFormat,
-) -> Option<(
-    crate::cli::command_filter::Denial,
-    crate::config::ResolvedCommands,
-)> {
-    let config = crate::config::Config::load().ok()?;
-    let resolved = config.resolved_commands?;
+) -> Result<
+    LineWrites,
+    Box<(
+        crate::cli::command_filter::Denial,
+        crate::config::ResolvedCommands,
+    )>,
+> {
+    // A missing / unloadable config is not a denial — allow, with no writes to
+    // attribute (the resolver never ran).
+    let Ok(config) = crate::config::Config::load() else {
+        return Ok(LineWrites::default());
+    };
+    let Some(resolved) = config.resolved_commands else {
+        return Ok(LineWrites::default());
+    };
     let cwd = extract_cwd_str(hook_json, format).map(PathBuf::from);
     check_resolved_command(resolved, cmd, cwd)
 }
@@ -889,14 +961,17 @@ fn check_shell_command(
 /// testable without touching `Config::load()` (which reads process env and the
 /// user's home directory). Behavior is identical to the inlined form:
 ///
-/// - `client_enforcement_only` short-circuits to `None` (allow) **before** any
-///   project merge — that flag means "don't enforce client-side".
+/// - `client_enforcement_only` short-circuits to allow (`Ok`, empty write-set)
+///   **before** any project merge — that flag means "don't enforce
+///   client-side", so nothing is resolved or attributed.
 /// - the `cwd`'s nearest project `.catenary.toml` contributes its per-root
 ///   `build` tool (enforcement keys stay user-level; see
 ///   [`merge_project_commands`](crate::config::ResolvedCommands::merge_project_commands)).
-/// - an inactive allowlist (`!is_active()`) short-circuits to `None`.
-/// - otherwise the command faces [`check_command`]; a denial is returned with
-///   the resolved config it was judged against.
+/// - an inactive allowlist (`!is_active()`) short-circuits to allow.
+/// - otherwise the command faces
+///   [`check_and_resolve_command`](crate::cli::command_filter::check_and_resolve_command):
+///   `Ok(writes)` on allow, or `Err((denial, resolved))` on deny with the
+///   resolved config it was judged against.
 #[allow(
     clippy::needless_pass_by_value,
     reason = "owns `resolved`: it is reassigned by the project merge and returned \
@@ -906,12 +981,15 @@ fn check_resolved_command(
     mut resolved: crate::config::ResolvedCommands,
     cmd: &str,
     cwd: Option<PathBuf>,
-) -> Option<(
-    crate::cli::command_filter::Denial,
-    crate::config::ResolvedCommands,
-)> {
+) -> Result<
+    LineWrites,
+    Box<(
+        crate::cli::command_filter::Denial,
+        crate::config::ResolvedCommands,
+    )>,
+> {
     if resolved.client_enforcement_only {
-        return None;
+        return Ok(LineWrites::default());
     }
 
     // Merge with cwd's project config for per-root build support.
@@ -930,11 +1008,13 @@ fn check_resolved_command(
     }
 
     if !resolved.is_active() {
-        return None;
+        return Ok(LineWrites::default());
     }
 
-    let denial = crate::cli::command_filter::check_command(cmd, &resolved, cwd.as_deref())?;
-    Some((denial, resolved))
+    match crate::cli::command_filter::check_and_resolve_command(cmd, &resolved, cwd.as_deref()) {
+        Ok(writes) => Ok(writes),
+        Err(denial) => Err(Box::new((denial, resolved))),
+    }
 }
 
 /// Resolve build guidance for the client-side fallback path.
@@ -1411,8 +1491,8 @@ mod tests {
         // reason), not `None`. This is the assertion the `-> None` mutant
         // (allow-everything) must fail.
         let resolved = resolved_from_toml("[commands]\nallow = [\"git\", \"ls\"]\n");
-        let (denial, _) = check_resolved_command(resolved, "cargo build", None)
-            .expect("a command off the allowlist must be denied client-side");
+        let (denial, _) = *check_resolved_command(resolved, "cargo build", None)
+            .expect_err("a command off the allowlist must be denied client-side");
         assert_eq!(denial.command, "cargo");
         assert_eq!(
             denial.reason,
@@ -1422,10 +1502,10 @@ mod tests {
 
     #[test]
     fn check_resolved_command_allows_allowlisted_command() {
-        // An allowlisted command passes the gate → `None` (no denial).
+        // An allowlisted command passes the gate → `Ok` (no denial).
         let resolved = resolved_from_toml("[commands]\nallow = [\"git\", \"ls\"]\n");
         assert!(
-            check_resolved_command(resolved, "git status", None).is_none(),
+            check_resolved_command(resolved, "git status", None).is_ok(),
             "an allowlisted command must pass the client-side gate",
         );
     }
@@ -1434,7 +1514,7 @@ mod tests {
     fn check_resolved_command_client_enforcement_only_allows_all() {
         // `client_enforcement_only = true` means the daemon enforces, not the
         // client fallback — so even an off-allowlist command short-circuits to
-        // allow (`None`) here. (Built directly: TOML rejects
+        // allow (`Ok`) here. (Built directly: TOML rejects
         // `client_enforcement_only` alongside `allow`, see config validation.)
         let resolved = crate::config::ResolvedCommands {
             client_enforcement_only: true,
@@ -1442,7 +1522,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            check_resolved_command(resolved, "cargo build", None).is_none(),
+            check_resolved_command(resolved, "cargo build", None).is_ok(),
             "client_enforcement_only must bypass the client-side gate",
         );
     }
@@ -1450,14 +1530,14 @@ mod tests {
     #[test]
     fn check_resolved_command_inactive_allowlist_allows_all() {
         // An inactive allowlist (no allow/pipeline/build entries) is not
-        // enforced client-side, so every command is allowed (`None`).
+        // enforced client-side, so every command is allowed (`Ok`).
         let resolved = crate::config::ResolvedCommands::default();
         assert!(
             !resolved.is_active(),
             "an empty allowlist should be inactive",
         );
         assert!(
-            check_resolved_command(resolved, "cargo build", None).is_none(),
+            check_resolved_command(resolved, "cargo build", None).is_ok(),
             "an inactive allowlist must not deny client-side",
         );
     }

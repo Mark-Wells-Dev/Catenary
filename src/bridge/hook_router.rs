@@ -145,7 +145,7 @@ impl HookRouter {
                 command,
                 agent_id,
                 session_id,
-                ..
+                writes,
             } => {
                 let result = self.handle_enforce_editing(
                     &tool_name,
@@ -154,16 +154,30 @@ impl HookRouter {
                     session_id.as_deref(),
                     &agent_id,
                 );
-                // File tracking: accumulate when allowed and editing.
-                if result.is_none()
-                    && let Some(ref path) = file_path
-                {
-                    self.handle_file_accumulation(
-                        path,
-                        session_id.as_deref(),
-                        &agent_id,
-                        Some(&tool_name),
-                    );
+                // Accumulate only when the tool call is allowed (`result` is
+                // `None`) — a denied call must accumulate nothing (mirrors the
+                // Edit/Write guardrail-deny invariant, extended to opaque-write
+                // denials, which the client rejects before this dispatch).
+                if result.is_none() {
+                    // File tracking for Edit/Write tools.
+                    if let Some(ref path) = file_path {
+                        self.handle_file_accumulation(
+                            path,
+                            session_id.as_deref(),
+                            &agent_id,
+                            Some(&tool_name),
+                        );
+                    }
+                    // Resolved shell writes attribute exactly like edits
+                    // (ws38 ticket 02): covered targets enter the caller's
+                    // modified-set, the first one entering editing mode.
+                    if !writes.is_empty() {
+                        self.handle_shell_write_accumulation(
+                            &writes,
+                            session_id.as_deref(),
+                            &agent_id,
+                        );
+                    }
                 }
                 DispatchResult {
                     result,
@@ -439,19 +453,7 @@ impl HookRouter {
         // processing them is wasted work.
         let path = Path::new(file_path);
         if self.session.covered_for_diagnostics(path) {
-            self.session
-                .editing
-                .add_file(session_id, agent_id, PathBuf::from(file_path));
-            // Surface the edit on the snapshot session board (ticket 05): the
-            // first covered edit also makes status `editing` (the accumulator
-            // is now active), and set_last_action marks the snapshot dirty.
-            self.session
-                .set_last_action(format!("edited {}", self.session.display_path(path)));
-            debug!(
-                source = Source::HookDispatch.as_str(),
-                file = file_path,
-                "file accumulated for diagnostics",
-            );
+            self.record_covered_write(path, session_id, agent_id, "edited");
         } else {
             self.session
                 .editing
@@ -463,6 +465,82 @@ impl HookRouter {
             );
         }
         None
+    }
+
+    /// Record one covered write into the caller's modified-set and surface it
+    /// on the session board as `<verb> <path>`.
+    ///
+    /// The shared core of the Edit/Write path
+    /// ([`Self::handle_file_accumulation`], `verb = "edited"`) and the
+    /// resolved-shell-write path ([`Self::handle_shell_write_accumulation`],
+    /// `verb = "wrote"`), so both attribute identically. The first covered
+    /// write of an editing batch also flips the session-board status to
+    /// `editing` — `set_last_action` marks the snapshot dirty (ticket 05).
+    fn record_covered_write(
+        &self,
+        path: &Path,
+        session_id: Option<&str>,
+        agent_id: &str,
+        verb: &str,
+    ) {
+        self.session
+            .editing
+            .add_file(session_id, agent_id, path.to_path_buf());
+        self.session
+            .set_last_action(format!("{verb} {}", self.session.display_path(path)));
+        debug!(
+            source = Source::HookDispatch.as_str(),
+            file = %path.display(),
+            "file accumulated for diagnostics",
+        );
+    }
+
+    /// Accumulates the write-set the command filter resolved from a shell
+    /// command into the caller's modified-set.
+    ///
+    /// The shell-write twin of [`Self::handle_file_accumulation`] (ws38
+    /// ticket 02, decision 026): the writes were resolved and opaque-gated
+    /// client-side at `PreToolUse` — before the command runs — and carried
+    /// here on the allowed request. Covered targets (a diagnostic feeder covers
+    /// them and their root has not set `disable_diag`) enter the tracked set
+    /// under `(session_id, agent_id)`, the **first** covered write entering
+    /// editing mode implicitly — exactly like the first edit; uncovered targets
+    /// (`> hits.txt` with no feeder) record nothing and never gate. Recording
+    /// before execution means a command that then fails leaves phantom debt —
+    /// the safe direction: diagnostics walks it, finds it clean, and the debt
+    /// clears (the fail asymmetry, decision 026).
+    fn handle_shell_write_accumulation(
+        &self,
+        writes: &[PathBuf],
+        session_id: Option<&str>,
+        agent_id: &str,
+    ) {
+        let mut started = self.session.editing.is_editing(session_id, agent_id);
+        let mut filtered = 0usize;
+        for path in writes {
+            if self.session.covered_for_diagnostics(path) {
+                if !started {
+                    let _ = self.session.editing.start_editing(session_id, agent_id);
+                    started = true;
+                }
+                self.record_covered_write(path, session_id, agent_id, "wrote");
+            } else {
+                filtered += 1;
+            }
+        }
+        // `increment_filtered` is a no-op until the agent's editing entry
+        // exists, so buffer the count and apply it only once a covered write
+        // has started the entry — independent of write ordering (mirrors the
+        // sed identity-forward accumulation in `router.rs`). A command whose
+        // targets are all uncovered starts no entry and reports no filtered
+        // count: there is nothing to drain for this agent.
+        if started {
+            for _ in 0..filtered {
+                self.session
+                    .editing
+                    .increment_filtered(session_id, agent_id);
+            }
+        }
     }
 
     /// Force `done_editing` before the agent stops.
@@ -864,6 +942,7 @@ mod tests {
             command: None,
             agent_id: String::new(),
             session_id: None,
+            writes: Vec::new(),
         });
         assert!(
             res.result.is_none(),
@@ -898,6 +977,7 @@ mod tests {
             command: None,
             agent_id: String::new(),
             session_id: None,
+            writes: Vec::new(),
         });
         let r2 = router.dispatch(crate::hook::HookRequest::PreTool {
             tool_name: "Edit".to_string(),
@@ -905,6 +985,7 @@ mod tests {
             command: None,
             agent_id: String::new(),
             session_id: None,
+            writes: Vec::new(),
         });
 
         assert!(
@@ -939,6 +1020,7 @@ mod tests {
             command: None,
             agent_id: String::new(),
             session_id: None,
+            writes: Vec::new(),
         });
         assert!(
             res.result.is_none(),
@@ -1280,6 +1362,7 @@ mod tests {
             command: None,
             agent_id: String::new(),
             session_id: None,
+            writes: Vec::new(),
         });
         assert!(router.session.editing.has_files(None, ""));
 
@@ -1329,6 +1412,7 @@ mod tests {
             command: None,
             agent_id: String::new(),
             session_id: None,
+            writes: Vec::new(),
         });
         assert!(res.result.is_none(), "uncovered edit allowed");
         assert!(
@@ -1353,6 +1437,7 @@ mod tests {
             command: None,
             agent_id: String::new(),
             session_id: None,
+            writes: Vec::new(),
         });
         assert!(router.session.editing.has_files(None, ""));
 
@@ -1392,6 +1477,7 @@ mod tests {
             command: None,
             agent_id: String::new(),
             session_id: None,
+            writes: Vec::new(),
         });
         assert!(
             router.session.editing.has_files(None, ""),
@@ -1659,6 +1745,7 @@ mod tests {
             command: None,
             agent_id: String::new(),
             session_id: None,
+            writes: Vec::new(),
         });
         assert!(result.system_message.is_none(), "pre-tool should not drain");
         assert_eq!(
@@ -1813,6 +1900,7 @@ mod tests {
             command: None,
             agent_id: String::new(),
             session_id: None,
+            writes: Vec::new(),
         });
 
         let files = router.session.editing.drain_files(None, "");
@@ -1839,6 +1927,7 @@ mod tests {
             command: None,
             agent_id: String::new(),
             session_id: None,
+            writes: Vec::new(),
         });
 
         assert!(
@@ -1865,10 +1954,172 @@ mod tests {
             command: None,
             agent_id: String::new(),
             session_id: None,
+            writes: Vec::new(),
         });
 
         let files = router.session.editing.drain_files(None, "");
         assert!(files.is_empty(), "non-edit tool should not accumulate file");
+    }
+
+    // ── Resolved shell-write accumulation (ws38 ticket 02) ─────────────
+
+    #[test]
+    fn dispatch_shell_write_covered_accumulates_and_enters_editing() {
+        // A resolved shell write to a covered source file (e.g.
+        // `catenary grep pat > src/main.rs`) creates the same debt an Edit
+        // would: it enters editing mode implicitly and accumulates the target.
+        let (router, root) = test_router_with_root();
+        let target = PathBuf::from(format!("{}/src/main.rs", root.display()));
+        assert!(!router.session.editing.is_editing(None, ""));
+
+        let res = router.dispatch(crate::hook::HookRequest::PreTool {
+            tool_name: "Bash".to_string(),
+            file_path: None,
+            command: Some("catenary grep pat > src/main.rs".to_string()),
+            agent_id: String::new(),
+            session_id: None,
+            writes: vec![target.clone()],
+        });
+        assert!(
+            res.result.is_none(),
+            "allowed shell write, got {:?}",
+            res.result
+        );
+        assert!(
+            router.session.editing.is_editing(None, ""),
+            "first covered shell write enters editing mode"
+        );
+        let files = router.session.editing.drain_files(None, "");
+        assert_eq!(files, vec![target], "covered shell write accumulated");
+    }
+
+    #[test]
+    fn dispatch_shell_write_uncovered_does_not_accumulate_or_gate() {
+        // An uncovered artifact target (`catenary grep pat > hits.txt`, no
+        // feeder) records nothing and never enters editing mode — it can never
+        // gate.
+        let (router, root) = test_router_with_root();
+        let artifact = PathBuf::from(format!("{}/hits.txt", root.display()));
+        assert!(
+            !router.session.has_lsp_coverage(&artifact),
+            "a .txt artifact has no LSP coverage"
+        );
+
+        let res = router.dispatch(crate::hook::HookRequest::PreTool {
+            tool_name: "Bash".to_string(),
+            file_path: None,
+            command: Some("catenary grep pat > hits.txt".to_string()),
+            agent_id: String::new(),
+            session_id: None,
+            writes: vec![artifact],
+        });
+        assert!(res.result.is_none(), "allowed, got {:?}", res.result);
+        assert!(
+            !router.session.editing.is_editing(None, ""),
+            "an uncovered shell write must not enter editing mode"
+        );
+        let (files, _) = router.session.editing.drain_and_clear(None, "");
+        assert!(files.is_empty(), "uncovered shell write not accumulated");
+    }
+
+    #[test]
+    fn dispatch_shell_write_empty_set_is_noop() {
+        // A resolved command with no writes (e.g. a plain redirect to a sink,
+        // a pure delete, or a read) carries an empty set and gates nothing.
+        let (router, _root) = test_router_with_root();
+        let res = router.dispatch(crate::hook::HookRequest::PreTool {
+            tool_name: "Bash".to_string(),
+            file_path: None,
+            command: Some("git status".to_string()),
+            agent_id: String::new(),
+            session_id: None,
+            writes: Vec::new(),
+        });
+        assert!(res.result.is_none(), "allowed, got {:?}", res.result);
+        assert!(
+            !router.session.editing.is_editing(None, ""),
+            "an empty write-set must not enter editing mode"
+        );
+    }
+
+    #[test]
+    fn dispatch_shell_write_mixed_covers_only_the_covered_target() {
+        // A command writing both a covered source and an uncovered artifact
+        // (`sed -i … src/main.rs && … > out.txt`) accumulates only the covered
+        // target; the uncovered one is filtered, and the debt still gates.
+        let (router, root) = test_router_with_root();
+        let covered = PathBuf::from(format!("{}/src/main.rs", root.display()));
+        let uncovered = PathBuf::from(format!("{}/out.txt", root.display()));
+
+        router.dispatch(crate::hook::HookRequest::PreTool {
+            tool_name: "Bash".to_string(),
+            file_path: None,
+            command: Some("sed -i s/a/b/ src/main.rs > out.txt".to_string()),
+            agent_id: String::new(),
+            session_id: None,
+            writes: vec![covered.clone(), uncovered],
+        });
+        assert!(
+            router.session.editing.has_files(None, ""),
+            "the covered write arms the boundary block"
+        );
+        let (files, filtered) = router.session.editing.drain_and_clear(None, "");
+        assert_eq!(files, vec![covered], "only the covered target accumulated");
+        assert_eq!(filtered, 1, "the uncovered target is counted as filtered");
+    }
+
+    #[test]
+    fn dispatch_shell_write_denied_command_accumulates_nothing() {
+        // A denied command never reaches this dispatch with a write-set — the
+        // client rejects an opaque write before sending the request. The
+        // daemon-side invariant: a denied tool call (`result` is `Some`)
+        // accumulates nothing, even if writes were (defensively) present.
+        let (router, root, guardrail) = test_router_with_guardrail();
+        guardrail
+            .try_acquire(&root, "other-session")
+            .expect("foreign lock acquired");
+        let target = PathBuf::from(format!("{}/src/main.rs", root.display()));
+
+        // An Edit denied by the cross-session guardrail, carrying a stray
+        // write-set: the deny short-circuits accumulation entirely.
+        let result = router.dispatch(crate::hook::HookRequest::PreTool {
+            tool_name: "Edit".to_string(),
+            file_path: Some(format!("{}/src/main.rs", root.display())),
+            command: None,
+            agent_id: String::new(),
+            session_id: None,
+            writes: vec![target],
+        });
+        assert!(
+            matches!(result.result, Some(HookResult::Deny(_))),
+            "guardrail deny expected"
+        );
+        let (files, _) = router.session.editing.drain_and_clear(None, "");
+        assert!(files.is_empty(), "a denied call accumulates no writes");
+    }
+
+    #[test]
+    fn dispatch_shell_write_surfaces_last_action() {
+        // The covered shell write surfaces on the session board as
+        // "wrote <path>" — the faithful shell-write equivalent of the edit
+        // path's "edited <path>".
+        let (router, root) = test_router_with_root();
+        let target = PathBuf::from(format!("{}/src/main.rs", root.display()));
+        router.dispatch(crate::hook::HookRequest::PreTool {
+            tool_name: "Bash".to_string(),
+            file_path: None,
+            command: Some("cat tpl > src/main.rs".to_string()),
+            agent_id: String::new(),
+            session_id: None,
+            writes: vec![target],
+        });
+        let action = router.session.last_action();
+        assert!(
+            action
+                .as_ref()
+                .is_some_and(|a| a.summary.starts_with("wrote ")),
+            "covered shell write should surface as `wrote <path>`, got {action:?}",
+        );
     }
 
     #[test]
