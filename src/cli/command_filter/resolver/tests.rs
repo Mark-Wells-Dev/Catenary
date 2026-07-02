@@ -736,6 +736,266 @@ fn rsync_files_from_is_opaque() {
     );
 }
 
+// ── awk (checkable filter subset) ────────────────────────────────────────────
+
+#[test]
+fn awk_pure_filter_is_no_write() {
+    let t = tmp();
+    // A shell-level redirect still composes through the resolver, but the awk
+    // program itself writes nothing.
+    for cmd in [
+        "awk '{print $1}' a.txt",
+        "awk '/a/ && /b/'",
+        "awk '/a|b/ {print}'",
+        "awk -F: '{print $1}' a.txt",
+        "awk -v n=5 '$1 > n {print $2}' a.txt",
+        "awk 'BEGIN{if (1 > 0) print \"hi\"}'",
+        "gawk '{printf \"%s\\n\", $1}'",
+    ] {
+        assert_eq!(
+            classify(cmd, Some(t.path())),
+            SegmentClass::NoWrite,
+            "{cmd}"
+        );
+    }
+}
+
+#[test]
+fn awk_system_is_surgically_denied() {
+    assert_eq!(
+        err("awk 'BEGIN{system(\"x\")}'", None).construct,
+        "awk-system"
+    );
+    assert_eq!(
+        err("gawk '{system(\"rm \" $1)}'", None).construct,
+        "awk-system",
+    );
+}
+
+#[test]
+fn awk_in_program_redirect_is_surgically_denied() {
+    assert_eq!(err("awk '{print > \"f\"}'", None).construct, "awk-redirect");
+    assert_eq!(
+        err("awk '{print $1 >> \"log\"}'", None).construct,
+        "awk-redirect",
+    );
+    assert_eq!(
+        err("awk '{printf \"%s\", $1 > \"out\"}'", None).construct,
+        "awk-redirect",
+    );
+}
+
+#[test]
+fn awk_command_pipe_is_surgically_denied() {
+    assert_eq!(err("awk '{print | \"sort\"}'", None).construct, "awk-pipe");
+    assert_eq!(
+        err("awk '{\"date\" | getline d; print d}'", None).construct,
+        "awk-pipe",
+    );
+}
+
+#[test]
+fn gawk_inplace_records_file_arguments() {
+    let t = tmp();
+    touch(t.path(), "a.rs");
+    touch(t.path(), "b.rs");
+    assert_eq!(
+        ok("gawk -i inplace '{gsub(/x/,\"y\")}1' a.rs b.rs", t.path()),
+        paths(t.path(), &["a.rs", "b.rs"]),
+    );
+    // A `var=val` operand is an assignment, not a file — awk never edits it.
+    assert_eq!(
+        ok("gawk -i inplace '{print}' n=5 a.rs", t.path()),
+        paths(t.path(), &["a.rs"]),
+    );
+}
+
+#[test]
+fn gawk_inplace_suffix_records_backups() {
+    let t = tmp();
+    touch(t.path(), "a.rs");
+    assert_eq!(
+        ok(
+            "gawk -i inplace -v INPLACE_SUFFIX=.bak '{print}' a.rs",
+            t.path(),
+        ),
+        paths(t.path(), &["a.rs", "a.rs.bak"]),
+    );
+}
+
+#[test]
+fn awk_program_file_and_computed_and_extension_are_opaque() {
+    assert_eq!(
+        err("awk -f prog.awk a.txt", None).construct,
+        "awk-program-file"
+    );
+    assert_eq!(
+        err("awk \"$PROG\" a.txt", None).construct,
+        "awk-computed-program"
+    );
+    assert_eq!(
+        err("gawk -i json '{print}' a.txt", None).construct,
+        "awk-extension",
+    );
+    assert_eq!(
+        err("awk -Z '{print}' a.txt", None).construct,
+        "awk-unmodeled-flag"
+    );
+}
+
+// ── perl (checkable substitution subset) ─────────────────────────────────────
+
+#[test]
+fn perl_filter_is_no_write() {
+    let t = tmp();
+    for cmd in [
+        "perl -pe 's/a/b/' a.txt",
+        "perl -p -e 's/a/b/g; tr/x/y/' a.txt",
+        "perl -ne 's/a/b/' a.txt",
+        "perl -pe 'y/a-z/A-Z/'",
+    ] {
+        assert_eq!(
+            classify(cmd, Some(t.path())),
+            SegmentClass::NoWrite,
+            "{cmd}"
+        );
+    }
+}
+
+#[test]
+fn perl_inplace_records_files_and_backups() {
+    let t = tmp();
+    touch(t.path(), "a.rs");
+    touch(t.path(), "b.rs");
+    assert_eq!(
+        ok("perl -i -pe 's/a/b/' a.rs b.rs", t.path()),
+        paths(t.path(), &["a.rs", "b.rs"]),
+    );
+    assert_eq!(
+        ok("perl -i.bak -pe 's/a/b/' a.rs", t.path()),
+        paths(t.path(), &["a.rs", "a.rs.bak"]),
+    );
+    // Combined flag cluster.
+    assert_eq!(
+        ok("perl -pi -e 's/a/b/' a.rs", t.path()),
+        paths(t.path(), &["a.rs"]),
+    );
+}
+
+#[test]
+fn perl_lookaround_substitution_is_in_subset() {
+    // Look-around is what makes the `catenary sed` retirement lossless.
+    let t = tmp();
+    touch(t.path(), "a.rs");
+    assert_eq!(
+        ok("perl -i -pe 's/(?<=bar_)foo/baz/' a.rs", t.path()),
+        paths(t.path(), &["a.rs"]),
+    );
+}
+
+#[test]
+fn perl_eval_flag_is_surgically_denied() {
+    assert_eq!(
+        err("perl -i -pe 's/a/b/e' a.rs", None).construct,
+        "perl-e-flag"
+    );
+    assert_eq!(
+        err("perl -pe 's/(\\d+)/$1*2/ge' a.txt", None).construct,
+        "perl-e-flag",
+    );
+}
+
+#[test]
+fn perl_beyond_substitution_subset_is_opaque() {
+    // `print`-to-handle, `system`, `open` are not the substitution subset.
+    assert_eq!(
+        err("perl -ne 'print if /x/' a.txt", None).construct,
+        "perl-unverifiable-program",
+    );
+    assert_eq!(
+        err("perl -e 'system(\"rm -rf x\")'", None).construct,
+        "perl-unverifiable-program",
+    );
+    assert_eq!(
+        err("perl -pe 's/a/b/; open(F,\">z\")' a.txt", None).construct,
+        "perl-unverifiable-program",
+    );
+}
+
+#[test]
+fn perl_computed_module_and_program_file_are_opaque() {
+    assert_eq!(
+        err("perl -pe \"$PROG\" a.txt", None).construct,
+        "perl-computed-program"
+    );
+    assert_eq!(
+        err("perl -MFoo -pe 's/a/b/' a.txt", None).construct,
+        "perl-module-load"
+    );
+    assert_eq!(
+        err("perl -i edit.pl a.rs", None).construct,
+        "perl-program-file"
+    );
+    assert_eq!(
+        err("perl -i'orig_*' -pe 's/a/b/' a.rs", None).construct,
+        "perl-backup-template",
+    );
+}
+
+#[test]
+fn perl_script_file_keeps_the_inherited_boundary() {
+    assert_eq!(
+        resolve_command("perl edit.pl", None)
+            .expect("script file ok")
+            .writes,
+        BTreeSet::new(),
+    );
+}
+
+// ── Unbounded interpreters keep the layer-4 boundary (unchanged) ─────────────
+
+#[test]
+fn unbounded_interpreters_are_not_given_a_subset() {
+    // python/ruby/node admit no checkable subset — the resolver keeps them at
+    // the inherited layer-4 boundary (NoWrite); the foreign allowlist denies
+    // them by name. ws38 ticket 04 leaves this unchanged.
+    let t = tmp();
+    let cwd = Some(t.path());
+    for cmd in [
+        "python -c \"open('f','w').write('x')\"",
+        "ruby -e 'File.write(\"f\",\"x\")'",
+        "node -e 'require(\"fs\").writeFileSync(\"f\",\"x\")'",
+    ] {
+        assert_eq!(classify(cmd, cwd), SegmentClass::NoWrite, "{cmd}");
+    }
+}
+
+// ── xargs wrapping a checkable interpreter ────────────────────────────────────
+
+#[test]
+fn xargs_inplace_interpreter_targets_are_stdin_driven() {
+    assert_eq!(
+        err("grep -rl old . | xargs perl -i -pe 's/old/new/'", None).construct,
+        "stdin-driven-targets",
+    );
+    assert_eq!(
+        err("grep -rl old . | xargs gawk -i inplace '{print}'", None).construct,
+        "stdin-driven-targets",
+    );
+    // A pure-filter interpreter under xargs is a reader — no write.
+    assert_eq!(
+        resolve_command("echo a | xargs awk '{print}'", None)
+            .expect("filter")
+            .writes,
+        BTreeSet::new(),
+    );
+    // …but its program is still checked for hazards.
+    assert_eq!(
+        err("echo a | xargs awk '{system(\"x\")}'", None).construct,
+        "awk-system",
+    );
+}
+
 // ── Shell wrappers over a literal program ────────────────────────────────────
 
 #[test]
@@ -869,6 +1129,23 @@ fn sequential_composition_unions_per_segment_sets() {
     assert_eq!(
         ok("cp tpl.rs src/new.rs && sed -i 's/x/y/' src/*.rs", t.path()),
         paths(t.path(), &["src/new.rs", "src/lib.rs"]),
+    );
+}
+
+#[test]
+fn materialize_then_literal_perl_records_both_files() {
+    // Target discovery is materialize-then-literal: `catenary grep -l` finds
+    // the paths (a read), then they ride as literal argv into an in-place perl
+    // substitution — both files land in the recorded set (DESIGN review-trail 4).
+    let t = tmp();
+    touch(t.path(), "a.rs");
+    touch(t.path(), "b.rs");
+    assert_eq!(
+        ok(
+            "catenary grep -l pat && perl -i -pe 's/a/b/' a.rs b.rs",
+            t.path(),
+        ),
+        paths(t.path(), &["a.rs", "b.rs"]),
     );
 }
 

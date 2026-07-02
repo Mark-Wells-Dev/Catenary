@@ -42,6 +42,10 @@ use super::parse::{
     self, Assignment, ListOp, ParsedScript, Redirect, RedirectOp, SimpleCommand, WordMeta,
 };
 
+/// Checkable interpreter programs — the `awk` / `perl` program-check arm
+/// (ws38 ticket 04, decision 026, soundness layer 4).
+mod programs;
+
 /// Cap on filesystem entries visited by one glob expansion / tree walk. A
 /// pattern that would exceed it is classified Opaque ("too broad") rather
 /// than stalling the hook.
@@ -300,6 +304,11 @@ fn resolve_segment(cmd: &SimpleCommand, state: &mut State, ctx: SegCtx) -> Segme
         "tee" => run(resolve_tee(cmd, state), &seg_name),
         "sed" => run(resolve_sed(cmd, state), &seg_name),
         "rsync" => run(resolve_rsync(cmd, state), &seg_name),
+        // Checkable interpreter programs (ws38 ticket 04): a literal awk/perl
+        // program is data iff it parses into the pure filter/substitution
+        // subset — parsed, not trusted.
+        "awk" | "gawk" | "mawk" | "nawk" => run(programs::resolve_awk(cmd, state), &seg_name),
+        "perl" => run(programs::resolve_perl(cmd, state), &seg_name),
         "bash" | "sh" | "zsh" | "dash" | "ksh" => resolve_shell_wrapper(cmd, state, &seg_name),
         "xargs" => resolve_xargs(cmd, state, &seg_name),
         "dd" | "install" | "truncate" => SegmentClass::Opaque(
@@ -1973,10 +1982,28 @@ fn resolve_shell_wrapper(cmd: &SimpleCommand, state: &State, seg_name: &str) -> 
 
 // ── xargs (stdin-driven target lists) ────────────────────────────────────────
 
+/// Build a synthetic single-command from an `xargs`-wrapped command's tail (the
+/// argv slots from `from` onward), so a checkable writer's own program (a `sed`
+/// script, an `awk`/`perl` program) can be resolved as if invoked directly.
+fn wrapped_command(cmd: &SimpleCommand, from: usize, name: &str) -> SimpleCommand {
+    SimpleCommand {
+        name: Some(name.to_string()),
+        argv: cmd.argv.get(from..).unwrap_or_default().to_vec(),
+        argv_meta: cmd.argv_meta.get(from..).unwrap_or_default().to_vec(),
+        ..SimpleCommand::default()
+    }
+}
+
 /// `xargs [flags] CMD…`: the wrapped command's extra arguments arrive on
 /// stdin at runtime. A wrapped registry writer therefore has an unresolvable
 /// target list — Opaque; a wrapped filter/reader is `NoWrite`; `rm` stays a
 /// pure delete (unknown deletions carry no debt).
+#[allow(
+    clippy::too_many_lines,
+    reason = "one linear scan over xargs's flag grammar plus the wrapped-command \
+              dispatch; splitting it would scatter the shared stdin_targets \
+              closure across helpers"
+)]
 fn resolve_xargs(cmd: &SimpleCommand, state: &State, seg_name: &str) -> SegmentClass {
     let stdin_targets = |wrapped: &str| {
         SegmentClass::Opaque(
@@ -2053,13 +2080,36 @@ fn resolve_xargs(cmd: &SimpleCommand, state: &State, seg_name: &str) -> SegmentC
             }) {
                 return stdin_targets("sed -i");
             }
-            let synthetic = SimpleCommand {
-                name: Some("sed".to_string()),
-                argv: rest.to_vec(),
-                argv_meta: cmd.argv_meta.get(i + 1..).unwrap_or_default().to_vec(),
-                ..SimpleCommand::default()
-            };
-            run(resolve_sed(&synthetic, state), seg_name)
+            run(
+                resolve_sed(&wrapped_command(cmd, i + 1, "sed"), state),
+                seg_name,
+            )
+        }
+        "awk" | "gawk" | "mawk" | "nawk" => {
+            // gawk `-i inplace` under xargs edits stdin-named files; a pure
+            // filter still has its program checked for exec/redirect hazards.
+            let rest = &cmd.argv[i + 1..];
+            if rest.iter().any(|a| {
+                a.starts_with("--include")
+                    || (a.starts_with('-') && !a.starts_with("--") && a.contains('i'))
+            }) {
+                return stdin_targets(&format!("{wrapped} -i inplace"));
+            }
+            let inner = wrapped_command(cmd, i + 1, &wrapped);
+            run(programs::resolve_awk(&inner, state), seg_name)
+        }
+        "perl" => {
+            // `-i` under xargs edits stdin-named files; a pure filter still has
+            // its substitution program checked.
+            let rest = &cmd.argv[i + 1..];
+            if rest
+                .iter()
+                .any(|a| a.starts_with('-') && !a.starts_with("--") && a.contains('i'))
+            {
+                return stdin_targets("perl -i");
+            }
+            let inner = wrapped_command(cmd, i + 1, "perl");
+            run(programs::resolve_perl(&inner, state), seg_name)
         }
         "cp" | "mv" | "tee" | "rsync" | "dd" | "install" | "truncate" | "bash" | "sh" | "zsh"
         | "dash" | "ksh" | "eval" | "source" | "xargs" => stdin_targets(&wrapped),

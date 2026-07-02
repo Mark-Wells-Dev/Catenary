@@ -1462,6 +1462,25 @@ mod tests {
         assert!(check_command("git log | jq .", &rules, None).is_none());
     }
 
+    #[test]
+    fn unbounded_interpreters_stay_denied() {
+        // ws38 ticket 04: awk/perl gain a checkable subset, but the unbounded
+        // languages admit none — they stay denied by name (not in allow /
+        // pipeline / build), even when their program obviously writes.
+        let rules = recommended_rules();
+        for cmd in [
+            "python -c \"open('f','w').write('x')\"",
+            "ruby -e 'File.write(\"f\", \"x\")'",
+            "node -e 'require(\"fs\").writeFileSync(\"f\", \"x\")'",
+            "make test | python -c \"import sys; open('f','w')\"",
+        ] {
+            assert!(
+                check_command(cmd, &rules, None).is_some(),
+                "unbounded interpreter denied: {cmd}",
+            );
+        }
+    }
+
     // ── reads moved to `allow` (Decision 7, drop read-blocking) ───────
 
     #[test]
