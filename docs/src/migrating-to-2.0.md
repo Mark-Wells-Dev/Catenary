@@ -13,37 +13,35 @@ optional knobs — applies to you, and even those have safe defaults.
 
 | Change | Affects you if… | Action |
 |--------|-----------------|--------|
-| [Output redirection denied by default](#1-output-redirection-is-denied-by-default) | agent commands rely on `>`, `>>`, `&>`, or `2>file` | set `allow_file_redirects = true`, or route writes through the edit tool |
+| [Writes resolve-or-deny; `allow_file_redirects` retired](#1-writes-resolve-or-deny) | your config set `allow_file_redirects` | delete the key — the write model is now automatic |
 | [`awk`/`sed` dropped from the default pipeline](#2-awk-and-sed-removed-from-the-default-pipeline) | your `[commands].pipeline` lists `awk` or `sed` | remove them; use `catenary sed` for sweeps |
 | [Project `[commands]` enforcement keys ignored](#3-project-commands-enforcement-keys-are-ignored) | you set enforcement keys in a `.catenary.toml` | move them to user config |
 | [New diagnostics + notification knobs](#4-new-optional-knobs) | — (optional) | nothing required; tune if desired |
 
-## 1. Output redirection is denied by default
+## 1. Writes resolve-or-deny
 
-`allow_file_redirects` now defaults to **`false`**. Output redirections that
-point at a file — `>`, `>>`, `&>`, `2>file` — are denied unless you opt in.
+The `allow_file_redirects` knob is **retired**. There is no on/off switch for
+redirects any more, and setting the key has no effect (a stale config still
+loads — the key is silently ignored).
 
-A redirected write bypasses Catenary's tracked Edit/Write path, so the next
-`catenary diagnostics` batch can be incomplete: it reports fixes for the files
-Catenary saw change while the redirected write went unseen.
+In its place, every shell write is judged by one config-free rule:
+**resolve-or-deny**. Before a command runs, the `PreToolUse` hook resolves the
+complete set of files it will write — from shell grammar (`>`, `>>`, `&>`,
+heredoc targets), argument convention (`cp`, `mv`, `tee`, `sed -i`, `ln`),
+checkable interpreter programs (`awk`, `perl -pe`), or a state query
+(hook-expanded globs, git asked about its own index). A write whose target set
+resolves is **allowed and recorded** into your modified-set, so the next
+`catenary diagnostics` sees it; `catenary grep pat > hits.txt` is a first-class,
+tracked redirect. A write whose targets cannot be seen — `> $DYNAMIC`,
+`python -c "open(…,'w')"`, `xargs sed -i` — is **denied** with a message that
+teaches the resolvable form. File-descriptor duplications (`2>&1`, `>&2`) and
+device sinks (`/dev/null`, `/dev/stdout`, `/dev/stderr`) are never writes.
 
-File-descriptor duplications (`2>&1`, `>&2`) and device sinks (`/dev/null`,
-`/dev/stdout`, `/dev/stderr`) are **always allowed**, regardless of this flag —
-they do not write a file the diagnostics batch could miss.
+**If your config set `allow_file_redirects`**, delete the line. Resolvable
+redirects that used to need the opt-in now just work; the rare opaque one is
+denied with guidance.
 
-**If you depend on file redirection in agent commands**, opt back in at user
-scope:
-
-```toml
-# ~/.config/catenary/config.toml
-[commands]
-allow_file_redirects = true
-```
-
-Otherwise, no action is needed — prefer routing file writes through the host's
-edit tool so they land in the diagnostics batch.
-
-See [Command Filtering → Keys](configuration.md#keys).
+See [Command Filtering → The write model](configuration.md#the-write-model).
 
 ## 2. `awk` and `sed` removed from the default pipeline
 
@@ -80,7 +78,6 @@ In a project `.catenary.toml`, the `[commands]` table now honors **only**
 and is ignored at project scope:
 
 - `client_enforcement_only`
-- `allow_file_redirects`
 - `allow`
 - `pipeline`
 - `deny`
@@ -107,7 +104,6 @@ build = "make"
 ```toml
 # ~/.config/catenary/config.toml  — enforcement lives here now
 [commands]
-allow_file_redirects = true
 allow = ["git", "gh", "cp", "rm", "mkdir", "mv", "touch", "cat", "head", "diff"]
 pipeline = ["grep", "wc", "jq", "sort", "tr", "cut", "uniq"]
 

@@ -118,7 +118,7 @@ narrow one: **only `build` is project-scoped.**
 
 Everything else under `[commands]` is **user-level only**: command
 enforcement (`client_enforcement_only`, `allow`, `pipeline`, `deny`,
-`deny_flags`, `allow_file_redirects`) and denial `guidance`. A project
+`deny_flags`) and denial `guidance`. A project
 `.catenary.toml` that sets these keys still loads, but they are ignored
 with a warning; only `build` flows through
 `ResolvedCommands::merge_project_commands`. The warning is raised on raw-TOML
@@ -133,11 +133,11 @@ identity, so every connected session resolves the *same* set. A project
 that changed enforcement would thus change the filter *every* session sees,
 including agents in unrelated repos. This cuts both ways:
 
-- **Relaxing** (`allow_file_redirects = true`, a wider `allow`) would weaken
+- **Relaxing** (a wider `allow`) would weaken
   the filter for stricter repos sharing the daemon. Fails *loud* if the
   project instead wanted less and didn't get it — the agent hits a hook.
-- **Tightening / turning on** (`allow_file_redirects = false`,
-  `client_enforcement_only = false` to request enforcement) would fail
+- **Tightening / turning on**
+  (`client_enforcement_only = false` to request enforcement) would fail
   *silently*: enforcement is on/off for the whole daemon, so a project
   asking for more gets none, and because nothing engages, no agent ever
   hits a hook to reveal the dropped request. The silent direction is why

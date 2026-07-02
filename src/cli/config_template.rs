@@ -45,22 +45,21 @@ const TEMPLATE: &str = r#"# Catenary recommended config
 #   pipeline — commands allowed mid-pipeline (reading stdin), denied
 #              at pipeline position 0 (reading files directly).
 #   deny.*   — subcommand denylist within an allowed command.
-#   allow_file_redirects — permit `>`/`>>`/`2>file` redirects (default
-#              false). Redirected writes bypass the tracked Edit/Write
-#              path, so the diagnostics batch may be incomplete (it shows
-#              fixes for tracked files while the redirected write went
-#              unseen). fd-dups (`2>&1`, `>&2`) and device sinks
-#              (`/dev/null`, ...) are always allowed regardless.
+#
+# Writes resolve-or-deny: a redirect (`>`/`>>`/`&>`) or a `cp`/`mv`/
+# `tee`/`sed -i`/`git apply` write is allowed when the hook can see its
+# complete target set (recorded for the diagnostics batch), and denied
+# with a teaching message when it can't. fd-dups (`2>&1`, `>&2`) and
+# device sinks (`/dev/null`, ...) are never writes.
 #
 # Uncomment the [commands] section below to activate.
 
 # [commands]
 # # client_enforcement_only = true
-# # allow_file_redirects = false
 # build = "make"
 # # `allow` includes read/stdout-only tools (cat, head, less, diff,
-# # echo, ...): reads aren't a write vector, and redirected writes
-# # (`cat > f`) are caught by the redirect gate, not by blocking cat.
+# # echo, ...): reads aren't a write vector, and a redirected write
+# # (`cat > f`) is resolved and attributed, not blocked by denying cat.
 # allow = ["git", "gh", "cp", "rm", "mkdir", "mv", "touch",
 #          "chmod", "sleep", "cd", "true", "false", "which",
 #          "cat", "head", "tail", "less", "more", "diff",
@@ -99,11 +98,11 @@ const TEMPLATE: &str = r#"# Catenary recommended config
 # ── Project-local overrides (.catenary.toml) ─────────────────────
 #
 # A project .catenary.toml honors `build` only. Every other [commands]
-# key — client_enforcement_only, allow, pipeline, deny, deny_flags,
-# allow_file_redirects — is user-level only: the filter resolves
-# daemon-globally (one daemon serves every session), so a project can
-# neither relax it nor turn it on/off for itself. Those keys are ignored
-# (with a warning) in project config — keep them here in user config.
+# key — client_enforcement_only, allow, pipeline, deny, deny_flags — is
+# user-level only: the filter resolves daemon-globally (one daemon serves
+# every session), so a project can neither relax it nor turn it on/off for
+# itself. Those keys are ignored (with a warning) in project config — keep
+# them here in user config.
 #
 #   # Set the build tool for this project
 #   [commands]
@@ -367,10 +366,16 @@ mod tests {
     }
 
     #[test]
-    fn template_documents_allow_file_redirects() {
+    fn template_describes_resolve_or_deny_writes() {
+        // ws38 ticket 05 retired `allow_file_redirects`; the template now
+        // describes the resolve-or-deny write model instead of the knob.
         assert!(
-            TEMPLATE.contains("allow_file_redirects"),
-            "template should document the allow_file_redirects flag",
+            !TEMPLATE.contains("allow_file_redirects"),
+            "template must not mention the retired allow_file_redirects knob",
+        );
+        assert!(
+            TEMPLATE.contains("resolve-or-deny"),
+            "template should describe the resolve-or-deny write model",
         );
     }
 

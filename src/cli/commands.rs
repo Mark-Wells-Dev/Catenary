@@ -73,6 +73,17 @@ pub async fn run_ls_roots(out: &mut Output) -> Result<()> {
     Ok(())
 }
 
+/// The write-model line closing the active-allowlist `catenary commands`
+/// output (ws38 / decision 026). The lists above govern which programs may
+/// *run*; this line states how their *writes* are judged — resolve-or-deny —
+/// and that the one navigation opinion (bypassing Catenary's code intelligence)
+/// is what still denies outright.
+const WRITE_MODEL_LINE: &str = "Writes resolve-or-deny: a redirect or a \
+     `cp`/`mv`/`tee`/`sed -i`/`git apply` write is allowed when its complete \
+     target set resolves (recorded for `catenary diagnostics`) and denied with a \
+     teaching message when it can't. Navigation that bypasses code intelligence \
+     (native `grep`/`find`, `git ls-files`) stays denied.";
+
 /// Render the `catenary commands` output lines for a resolved command set and
 /// the build tool(s) resolved for the current directory.
 ///
@@ -104,6 +115,9 @@ fn render_command_lines(
             if lines.is_empty() {
                 vec!["No build tool, allow, pipeline, or deny rules are configured.".to_string()]
             } else {
+                // Close with the write model (ws38 / decision 026): writes are
+                // resolve-or-deny, and the one navigation opinion is unchanged.
+                lines.push(WRITE_MODEL_LINE.to_string());
                 lines
             }
         }
@@ -464,6 +478,8 @@ mod tests {
         );
         // No build tool resolved for the cwd → no build line.
         assert!(!joined.contains("Build tool:"), "{joined}");
+        // The active surface closes with the resolve-or-deny write model.
+        assert!(joined.contains("Writes resolve-or-deny"), "{joined}");
     }
 
     #[test]
@@ -501,14 +517,20 @@ mod tests {
     #[test]
     fn commands_build_only_shows_build_line() {
         // Active via a build tool, no allow / pipeline / deny rules: the build
-        // line is all there is to show.
+        // line plus the closing write-model line.
         let resolved = crate::config::ResolvedCommands {
             default_build: vec!["make".into()],
             ..crate::config::ResolvedCommands::default()
         };
         assert!(resolved.is_active());
         let lines = render_command_lines(Some(&resolved), &["make".to_string()]);
-        assert_eq!(lines, vec!["Build tool: make".to_string()]);
+        assert_eq!(lines.first().map(String::as_str), Some("Build tool: make"));
+        assert!(
+            lines
+                .last()
+                .is_some_and(|l| l.contains("Writes resolve-or-deny")),
+            "{lines:?}",
+        );
     }
 
     #[test]

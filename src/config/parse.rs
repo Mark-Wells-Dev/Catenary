@@ -963,17 +963,14 @@ servers = ["rust-analyzer"]
         let raw: toml::Value = toml::from_str("lsp = true\n").expect("valid toml");
         assert!(ignored_project_command_keys(&raw).is_empty());
 
-        // Explicit `= false` on the enforcement booleans is still flagged — the
+        // Explicit `= false` on the enforcement boolean is still flagged — the
         // silent, dangerous direction (a project asking for *more* enforcement
         // than the daemon-global, user-level filter grants).
-        let raw: toml::Value = toml::from_str(
-            "[commands]\nbuild = \"make\"\n\
-             client_enforcement_only = false\nallow_file_redirects = false\n",
-        )
-        .expect("valid toml");
+        let raw: toml::Value =
+            toml::from_str("[commands]\nbuild = \"make\"\nclient_enforcement_only = false\n")
+                .expect("valid toml");
         let ignored = ignored_project_command_keys(&raw);
         assert!(ignored.contains(&"client_enforcement_only"));
-        assert!(ignored.contains(&"allow_file_redirects"));
         assert!(!ignored.contains(&"build"));
 
         // Non-boolean enforcement keys and guidance are flagged by presence.

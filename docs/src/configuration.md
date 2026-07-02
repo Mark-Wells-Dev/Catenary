@@ -569,8 +569,8 @@ place instead of being dumped inline on every denial.
 [commands]
 build = "make"
 # `allow` includes read/stdout-only tools (cat, head, less, diff, ...):
-# reads aren't a write vector, and redirected writes (`cat > f`) are
-# caught by the redirect gate, not by blocking cat.
+# reads aren't a write vector, and a redirected write (`cat > f`) is
+# resolved and attributed by the write resolver, not blocked by denying cat.
 allow = ["git", "gh", "cp", "rm", "mkdir", "mv", "touch",
          "chmod", "sleep", "cd", "true", "false", "which",
          "cat", "head", "tail", "less", "more", "diff",
@@ -584,12 +584,14 @@ sqlite3 = ["-cmd"]
 
 Read and stdout-only tools (`cat`, `head`, `tail`, `less`, `diff`, …)
 live in `allow`, not `pipeline`: reads are not a write vector, and a
-redirected write like `cat > f` is caught by the redirect gate (see
-`allow_file_redirects` below), so there is no need to block them.
-`awk` and `sed` are deliberately **absent** from the default `pipeline` —
-both can execute arbitrary code and write files (`sed -i`, `awk`'s
-`system()`/`print > file`), which would bypass the tracked Edit/Write
-path. Route sweeping edits through `catenary sed` instead.
+redirected write like `cat > f` is handled by the [write model](#the-write-model)
+— resolved to its target and recorded, or denied when opaque — so there is no
+need to block the reader. `awk` and `sed` are deliberately **absent** from the
+default `pipeline`, but not because they are banned: their programs are
+**checked** by the resolver (a pure `awk` filter or `sed` script passes; an
+in-program `system()`/`print > file`, or `sed -i`, resolves to its write-set
+or is surgically denied), so keeping them out of the position-0 pipeline simply
+avoids masking that check behind a bare `awk 'prog'`.
 
 ### Keys
 
@@ -601,14 +603,33 @@ path. Route sweeping edits through `catenary sed` instead.
 | `pipeline` | Commands allowed mid-pipeline (reading stdin) but denied at pipeline position 0 (reading files directly). Prevents `grep foo bar.rs` while allowing `make test \| grep FAIL`. |
 | `deny.<cmd>` | Subcommand denylist within an allowed command. `git` is allowed, but `git grep` is denied. |
 | `deny_flags.<cmd>` | Flag denylist within an allowed command. `make` is allowed, but `make -C` is denied. |
-| `allow_file_redirects` | Permit `>`/`>>`/`2>file` redirects (default `false`). A redirected write bypasses the tracked Edit/Write path, so the diagnostics batch can be incomplete. fd-dups (`2>&1`, `>&2`) and device sinks (`/dev/null`, …) are always allowed regardless. |
 | `guidance.<group>` | Optional per-command hint shown on denial — a `message`, or a `redirect` naming the Catenary command to use instead (`grep` → `catenary grep`, `glob` → `catenary glob`). |
+
+### The write model
+
+The `allow`/`pipeline`/`deny` lists above govern which programs may **run**.
+How their **writes** are judged is a separate, config-free question:
+**resolve-or-deny**. Before a command runs, the `PreToolUse` hook resolves the
+complete set of files it will write — from shell grammar (`>`, `>>`, `&>`,
+heredoc targets), argument convention (`cp`, `mv`, `tee`, `sed -i`, `ln`),
+checkable interpreter programs (`awk`, `perl -pe`'s substitution subset), or a
+state query (hook-expanded globs, git asked about its own index). A write whose
+target set resolves is **allowed** and recorded into your modified-set, so the
+next `catenary diagnostics` sees it. A write whose targets cannot be seen
+(`> $DYNAMIC`, `python -c "open(…,'w')"`, `xargs sed -i`) is **denied** with a
+message that teaches the resolvable form. fd-dups (`2>&1`, `>&2`) and device
+sinks (`/dev/null`, …) are never writes.
+
+This is not a per-user knob — the design decides it (decision 026). There is no
+`allow_file_redirects` setting: a resolvable `>` *is* a first-class, tracked
+redirect; an opaque one is denied whatever the config says.
 
 ### Inspecting the surface
 
 `catenary commands` prints the active command surface for the current
 configuration — the cwd's build tool, then the allow / pipeline / denied
-sections, the same `[commands]` rules the `PreToolUse` hook enforces. Run it
+sections, and a closing line stating the resolve-or-deny write model — the same
+`[commands]` rules the `PreToolUse` hook enforces. Run it
 (via the host's shell tool) to see what's permitted; denial messages point
 here rather than dumping the whole surface inline. The build tool is resolved
 for the current directory the same way the denial hint is — the nearest
@@ -632,7 +653,7 @@ build = "make"
 
 **Only `build` is honored.** Every other `[commands]` key —
 `client_enforcement_only`, `allow`, `pipeline`, `deny`, `deny_flags`,
-`allow_file_redirects`, and `guidance` — is **user-level only** and is
+and `guidance` — is **user-level only** and is
 ignored at project scope (Catenary warns when it sees one). They must live
 in `~/.config/catenary/config.toml`.
 
@@ -642,9 +663,9 @@ true`) for itself.
 
 Why: the command filter resolves daemon-globally. One Catenary daemon
 serves every connected session, so a project that changed enforcement —
-relaxing it (`allow_file_redirects = true`, a wider `allow`) **or** trying
-to tighten it (`allow_file_redirects = false`, `client_enforcement_only =
-false`) — would change the filter *every* session sees, including agents
+relaxing it (a wider `allow`) **or** trying to tighten it
+(`client_enforcement_only = false` to request enforcement) — would change the
+filter *every* session sees, including agents
 in unrelated repos. Worse, the tighten/turn-on direction would fail
 *silently*: enforcement never engages, so no agent ever hits a hook to
 reveal that the project's request was dropped. Keeping enforcement

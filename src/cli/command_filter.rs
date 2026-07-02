@@ -301,9 +301,9 @@ pub fn check_and_resolve_command(
     // denied with a construct-naming teaching message. This replaces the
     // blanket bug-11 foreign-redirect denial — a resolvable redirect (or
     // `cp`/`mv`/`tee`/`sed -i`/`rsync` write) is now allowed, and its resolved
-    // write-set flows to attribution (ticket 02). The `allow_file_redirects`
-    // knob is inert: the resolver path is authoritative (retirement is
-    // ticket 05). Catenary's own segments get the same treatment — the
+    // write-set flows to attribution (ticket 02). The write model is the
+    // design's, not per-user config (the `allow_file_redirects` knob is
+    // retired, ticket 05). Catenary's own segments get the same treatment — the
     // canonical-form matcher owns their allow/deny shape, the resolver their
     // write-set.
     match resolver::resolve_script(&script, cwd) {
@@ -389,8 +389,7 @@ fn check_parsed_command(
     // (`resolver::resolve_script`, run by `check_command` after this walk)
     // resolves every redirect to its complete target set or denies the line
     // as an opaque write (ws38 ticket 01 — the bug-11 blanket deny flipped to
-    // resolve-or-deny; decision 026). The `allow_file_redirects` knob is
-    // inert on this path.
+    // resolve-or-deny; decision 026).
 
     if let Some((denied, reason)) =
         check_against_allowlist(command, pipe_pos, rules, cwd.effective_cwd.as_deref())
@@ -1479,6 +1478,43 @@ mod tests {
                 "unbounded interpreter denied: {cmd}",
             );
         }
+    }
+
+    #[test]
+    fn allowlisted_awk_system_still_denied_by_resolver() {
+        // The bug-12 awk/sed hazard is not a hardcoded denylist branch — it is
+        // config exclusion (awk/sed off the recommended pipeline) *plus* the
+        // resolver's program check. Proof the resolver covers it: even with awk
+        // allowlisted mid-pipeline, an in-program `system()` denies as an
+        // OpaqueWrite (construct-naming), never silently allowed.
+        let mut rules = basic_rules();
+        rules.pipeline.insert("awk".into());
+        let denial = check_command("echo x | awk 'BEGIN{system(\"rm -rf x\")}'", &rules, None)
+            .expect("awk system() denied by the resolver despite allowlisting");
+        assert_eq!(denial.reason, DenialReason::OpaqueWrite);
+        // A pure filter with the same allowlisting is allowed — the check is on
+        // the program, not the name.
+        assert!(
+            check_command("echo x | awk '{print $1}'", &rules, None).is_none(),
+            "a pure awk filter stays allowed",
+        );
+    }
+
+    #[test]
+    fn allowlisted_interpreter_inline_code_is_opaque_write() {
+        // ws38 ticket 05: even when a config *allowlists* the interpreter, inline
+        // code is denied as an OpaqueWrite at the resolver — the allowlist can no
+        // longer create an unattributed write. Plain script execution stays
+        // allowed (the executor boundary).
+        let mut rules = basic_rules();
+        rules.allow.insert("python".into());
+        let denial = check_command("python -c \"open('f','w')\"", &rules, None)
+            .expect("inline python code denied despite allowlisting");
+        assert_eq!(denial.reason, DenialReason::OpaqueWrite);
+        assert!(
+            check_command("python script.py", &rules, None).is_none(),
+            "a plain script executor stays allowed",
+        );
     }
 
     // ── reads moved to `allow` (Decision 7, drop read-blocking) ───────
@@ -3167,31 +3203,6 @@ mod tests {
         let rules = basic_rules();
         // The `>` is inside a quoted argument — not a real redirect.
         assert!(check_command("git commit -m \"a > b\"", &rules, None).is_none());
-    }
-
-    #[test]
-    fn allow_file_redirects_knob_is_inert() {
-        // ws38 ticket 01: the resolver path is authoritative — the knob no
-        // longer changes any verdict (its config retirement is ticket 05).
-        let mut rules = basic_rules();
-        // Resolvable: allowed with the knob in either state.
-        assert!(check_command("git status > out.txt", &rules, None).is_none());
-        rules.allow_file_redirects = true;
-        assert!(check_command("git status > out.txt", &rules, None).is_none());
-        // Opaque: denied with the knob in either state.
-        assert_eq!(
-            check_command("git status > $F", &rules, None)
-                .expect("opaque write denied despite the knob")
-                .reason,
-            DenialReason::OpaqueWrite,
-        );
-        rules.allow_file_redirects = false;
-        assert_eq!(
-            check_command("git status > $F", &rules, None)
-                .expect("opaque write denied")
-                .reason,
-            DenialReason::OpaqueWrite,
-        );
     }
 
     #[test]

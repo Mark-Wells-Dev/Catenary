@@ -519,6 +519,99 @@ fn mv_directory_enumerates_landings() {
     );
 }
 
+// ── ln (the link path is the write) ──────────────────────────────────────────
+
+#[test]
+fn ln_symlink_records_the_link_name() {
+    let t = tmp();
+    touch(t.path(), "target.rs");
+    // `ln -s TARGET LINK` → the link name is the write; the target is not.
+    assert_eq!(
+        ok("ln -s target.rs link.rs", t.path()),
+        paths(t.path(), &["link.rs"]),
+    );
+    // Hard link, same shape.
+    assert_eq!(
+        ok("ln target.rs hard.rs", t.path()),
+        paths(t.path(), &["hard.rs"])
+    );
+}
+
+#[test]
+fn ln_single_operand_links_basename_in_cwd() {
+    let t = tmp();
+    touch(t.path(), "src/mod.rs");
+    // `ln TARGET` → link `basename(TARGET)` in the cwd.
+    assert_eq!(
+        ok("ln -s src/mod.rs", t.path()),
+        paths(t.path(), &["mod.rs"])
+    );
+}
+
+#[test]
+fn ln_into_directory_records_the_landing() {
+    let t = tmp();
+    touch(t.path(), "a.rs");
+    std::fs::create_dir(t.path().join("d")).expect("mkdir");
+    // `ln TARGET DIR` (DIR exists) → the link lands at `DIR/basename(TARGET)`.
+    assert_eq!(ok("ln -s a.rs d", t.path()), paths(t.path(), &["d/a.rs"]));
+}
+
+#[test]
+fn ln_target_directory_flag_records_each_link() {
+    let t = tmp();
+    touch(t.path(), "a.rs");
+    touch(t.path(), "b.rs");
+    std::fs::create_dir(t.path().join("d")).expect("mkdir");
+    // `ln -t DIR TARGET…` → every operand is a target; a link per target.
+    assert_eq!(
+        ok("ln -s -t d a.rs b.rs", t.path()),
+        paths(t.path(), &["d/a.rs", "d/b.rs"]),
+    );
+    // Glued `-tDIR` form resolves the same.
+    assert_eq!(ok("ln -s -td a.rs", t.path()), paths(t.path(), &["d/a.rs"]));
+}
+
+#[test]
+fn ln_no_target_directory_flag_records_the_link() {
+    let t = tmp();
+    touch(t.path(), "a.rs");
+    std::fs::create_dir(t.path().join("existing")).expect("mkdir");
+    // `-T` forces the last operand to be the link name even when it names an
+    // existing directory.
+    assert_eq!(
+        ok("ln -sT a.rs existing", t.path()),
+        paths(t.path(), &["existing"]),
+    );
+    // `-T` with the wrong operand count is ambiguous → Opaque.
+    assert_eq!(err("ln -T a", None).construct, "ln-ambiguous-link");
+}
+
+#[test]
+fn ln_computed_link_name_is_opaque() {
+    // A variable link name can't be pinned — Opaque, fail-closed.
+    assert_eq!(
+        err("ln -s target.rs $LINK", None).construct,
+        "unbound-variable"
+    );
+}
+
+#[test]
+fn ln_unmodeled_flag_is_opaque() {
+    assert_eq!(
+        err("ln --backup=numbered -S .orig a b", None).construct,
+        "unmodeled-flag"
+    );
+}
+
+#[test]
+fn ln_under_xargs_is_stdin_driven() {
+    assert_eq!(
+        err("echo a | xargs ln -s target", None).construct,
+        "stdin-driven-targets",
+    );
+}
+
 #[test]
 fn rm_is_a_pure_delete() {
     assert_eq!(classify("rm -rf build/", None), SegmentClass::PureDelete);
@@ -955,19 +1048,37 @@ fn perl_script_file_keeps_the_inherited_boundary() {
     );
 }
 
-// ── Unbounded interpreters keep the layer-4 boundary (unchanged) ─────────────
+// ── Unbounded interpreters: inline code is Opaque, scripts keep the boundary ──
 
 #[test]
-fn unbounded_interpreters_are_not_given_a_subset() {
-    // python/ruby/node admit no checkable subset — the resolver keeps them at
-    // the inherited layer-4 boundary (NoWrite); the foreign allowlist denies
-    // them by name. ws38 ticket 04 leaves this unchanged.
+fn unbounded_interpreter_inline_code_is_opaque() {
+    // ws38 ticket 05: python/ruby/node inline code admits no checkable subset,
+    // so its write-set can't be bounded — Opaque at the resolver layer (not just
+    // denied by the allowlist), closing the vector where allowlisting the
+    // interpreter would let an unattributed write through.
+    for cmd in [
+        "python -c \"open('f','w').write('x')\"",
+        "python3 -c \"open('f','w')\"",
+        "ruby -e 'File.write(\"f\",\"x\")'",
+        "node -e 'require(\"fs\").writeFileSync(\"f\",\"x\")'",
+        "node --eval 'x'",
+        "node -p 'x'",
+    ] {
+        assert_eq!(err(cmd, None).construct, "unbounded-interpreter", "{cmd}");
+    }
+}
+
+#[test]
+fn unbounded_interpreter_script_keeps_the_layer4_boundary() {
+    // Plain script execution (no inline-code flag) is an executor — layer-4
+    // boundary, NoWrite; the allowlist governs whether it runs.
     let t = tmp();
     let cwd = Some(t.path());
     for cmd in [
-        "python -c \"open('f','w').write('x')\"",
-        "ruby -e 'File.write(\"f\",\"x\")'",
-        "node -e 'require(\"fs\").writeFileSync(\"f\",\"x\")'",
+        "python script.py",
+        "ruby app.rb",
+        "node server.js",
+        "python",
     ] {
         assert_eq!(classify(cmd, cwd), SegmentClass::NoWrite, "{cmd}");
     }
@@ -1219,10 +1330,12 @@ fn segment_class_table() {
         classify("catenary grep pat > hits.txt", cwd),
         SegmentClass::Recorded(_)
     ));
+    // Inline interpreter code is Opaque; a plain script executor is NoWrite.
     assert!(matches!(
         classify("python -c 'x'", cwd),
-        SegmentClass::NoWrite
+        SegmentClass::Opaque(_)
     ));
+    assert_eq!(classify("python script.py", cwd), SegmentClass::NoWrite);
 }
 
 // ── expand_word unit coverage ────────────────────────────────────────────────

@@ -190,13 +190,6 @@ pub struct CommandsConfig {
     /// Deliberate opt-out — no enforcement, no hint notification.
     #[serde(default)]
     pub client_enforcement_only: bool,
-    /// Permit output redirection (`>`, `>>`, `&>`, `2>file`) to a file
-    /// target. Default `false` — a redirected write bypasses the tracked
-    /// Edit/Write path, so the diagnostics batch would be incomplete.
-    /// fd-dups (`2>&1`, `>&2`) and device sinks (`/dev/null`, `/dev/stdout`,
-    /// `/dev/stderr`) are always allowed regardless of this flag.
-    #[serde(default)]
-    pub allow_file_redirects: bool,
     /// The project's build tool(s) (e.g., `"make"` or `["make", "npm"]`).
     pub build: Option<StringOrVec>,
     /// Commands the agent can run unconditionally.
@@ -219,13 +212,6 @@ pub struct CommandsConfig {
 pub struct ResolvedCommands {
     /// Deliberate opt-out — no enforcement, no hint notification.
     pub client_enforcement_only: bool,
-    /// Whether output redirection to a file target is permitted.
-    ///
-    /// `false` (the default) denies `>`/`>>`/`&>`/`2>file` pointing at a
-    /// file; fd-dups (`2>&1`, `>&2`) and device sinks (`/dev/null`,
-    /// `/dev/stdout`, `/dev/stderr`) stay allowed. See the command filter's
-    /// `redirects_to_file`.
-    pub allow_file_redirects: bool,
     /// User-level default build tools (from user config, no root context).
     ///
     /// Used as fallback when `cwd` doesn't match any root in `build`.
@@ -265,9 +251,6 @@ impl ResolvedCommands {
         if layer.client_enforcement_only {
             self.client_enforcement_only = true;
         }
-        if layer.allow_file_redirects {
-            self.allow_file_redirects = true;
-        }
         if let Some(ref build) = layer.build {
             self.default_build.clone_from(&build.0);
         }
@@ -300,9 +283,9 @@ impl ResolvedCommands {
 
     /// Merge per-root project **build** tools into this user-level baseline.
     ///
-    /// Command **enforcement** — `allow`/`pipeline`/`deny`/`deny_flags`/
-    /// `allow_file_redirects` — is **user-level only**: it is taken verbatim
-    /// from `self`, and a project `.catenary.toml` cannot relax or replace it.
+    /// Command **enforcement** — `allow`/`pipeline`/`deny`/`deny_flags` — is
+    /// **user-level only**: it is taken verbatim from `self`, and a project
+    /// `.catenary.toml` cannot relax or replace it.
     /// The filter resolves daemon-globally (`Session::merged_commands` reads the
     /// *shared* `LspClientManager`'s daemon-wide roots + project configs), so
     /// honoring project enforcement keys would let one session's repo change the
@@ -525,12 +508,11 @@ pub fn validate(config: &CommandsConfig) -> (Vec<String>, Vec<String>) {
             || config.pipeline.is_some()
             || config.deny.is_some()
             || config.deny_flags.is_some()
-            || config.build.is_some()
-            || config.allow_file_redirects)
+            || config.build.is_some())
     {
         errors.push(
             "[commands] `client_enforcement_only = true` with `allow`, `pipeline`, \
-             `deny`, `deny_flags`, `build`, or `allow_file_redirects` is contradictory — \
+             `deny`, `deny_flags`, or `build` is contradictory — \
              opt-out means no enforcement"
                 .to_string(),
         );
@@ -693,23 +675,21 @@ pub fn validate(config: &CommandsConfig) -> (Vec<String>, Vec<String>) {
 /// Only `build` is honored at project scope — it is per-root and benign (it
 /// names a build tool and relaxes nothing). Everything else is user-level
 /// only: command enforcement
-/// (`client_enforcement_only`/`allow`/`pipeline`/`deny`/`deny_flags`/
-/// `allow_file_redirects`) and denial `guidance`. The filter resolves
-/// daemon-globally (`Session::merged_commands`), so honoring any of these at
-/// project scope would change the filter *every* connected session sees. See
+/// (`client_enforcement_only`/`allow`/`pipeline`/`deny`/`deny_flags`) and
+/// denial `guidance`. The filter resolves daemon-globally
+/// (`Session::merged_commands`), so honoring any of these at project scope would
+/// change the filter *every* connected session sees. See
 /// [`merge_project_commands`](ResolvedCommands::merge_project_commands) and
 /// DESIGN Decision 5 Correction (ticket 15).
 ///
 /// The project-config loader warns on **presence** of any of these keys
 /// (detected on the raw TOML, not the parsed config) so an explicit `= false`
 /// on a boolean is caught too — `client_enforcement_only = false` (a project
-/// asking for enforcement the daemon won't grant) and `allow_file_redirects =
-/// false` (a project asking to tighten redirects) are silently ignored
+/// asking for enforcement the daemon won't grant) is silently ignored
 /// otherwise, which is the dangerous direction. Value-based detection cannot
 /// distinguish `= false` from absent.
 pub const PROJECT_IGNORED_COMMAND_KEYS: &[&str] = &[
     "client_enforcement_only",
-    "allow_file_redirects",
     "allow",
     "pipeline",
     "deny",
@@ -810,44 +790,15 @@ git = ["--no-verify", "--force"]
     }
 
     #[test]
-    fn deserialize_allow_file_redirects() {
+    fn legacy_allow_file_redirects_key_is_ignored() {
+        // ws38 ticket 05 retired `allow_file_redirects` (writes now resolve-or-
+        // deny at the resolver, not per user config). Lenient parsing silently
+        // ignores the legacy key — a stale config still loads, it just has no
+        // effect. Mirrors the `outline_threshold` retirement (`49a31a2`).
         let config: CommandsConfig =
-            toml::from_str("allow_file_redirects = true").expect("valid TOML");
-        assert!(config.allow_file_redirects);
-    }
-
-    #[test]
-    fn allow_file_redirects_defaults_false() {
-        let config: CommandsConfig = toml::from_str("allow = [\"git\"]").expect("valid TOML");
-        assert!(!config.allow_file_redirects);
-    }
-
-    #[test]
-    fn merge_sets_allow_file_redirects() {
-        let mut resolved = ResolvedCommands::default();
-        assert!(!resolved.allow_file_redirects);
-        resolved.merge(&CommandsConfig {
-            allow: Some(vec!["git".to_string()]),
-            allow_file_redirects: true,
-            ..CommandsConfig::default()
-        });
-        assert!(resolved.allow_file_redirects);
-    }
-
-    #[test]
-    fn merge_allow_file_redirects_sticky() {
-        // Once a layer opts in, a later layer that omits the flag (deserializes
-        // to false) cannot turn it back off.
-        let mut resolved = ResolvedCommands::default();
-        resolved.merge(&CommandsConfig {
-            allow_file_redirects: true,
-            ..CommandsConfig::default()
-        });
-        resolved.merge(&CommandsConfig {
-            allow: Some(vec!["git".to_string()]),
-            ..CommandsConfig::default()
-        });
-        assert!(resolved.allow_file_redirects);
+            toml::from_str("allow = [\"git\"]\nallow_file_redirects = true")
+                .expect("legacy key is ignored, not an error");
+        assert_eq!(config.allow.as_ref().expect("allow").len(), 1);
     }
 
     #[test]
@@ -1048,20 +999,6 @@ git = ["--no-verify", "--force"]
         let (errors, _) = validate(&config);
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("client_enforcement_only"));
-    }
-
-    #[test]
-    fn validate_client_enforcement_only_with_redirects() {
-        let config = CommandsConfig {
-            client_enforcement_only: true,
-            allow_file_redirects: true,
-            ..CommandsConfig::default()
-        };
-
-        let (errors, _) = validate(&config);
-        assert_eq!(errors.len(), 1);
-        assert!(errors[0].contains("client_enforcement_only"));
-        assert!(errors[0].contains("allow_file_redirects"));
     }
 
     #[test]
@@ -1285,8 +1222,8 @@ git = ["--no-verify", "--force"]
 
     #[test]
     fn merge_project_build_only() {
-        // Project enforcement keys (allow/pipeline/deny/deny_flags/redirects)
-        // are user-level only and must be ignored — only `build` overrides
+        // Project enforcement keys (allow/pipeline/deny/deny_flags) are
+        // user-level only and must be ignored — only `build` overrides
         // per-root. See DESIGN Decision 5 Correction (ticket 15).
         let mut user = ResolvedCommands::default();
         user.merge(&CommandsConfig {
@@ -1305,7 +1242,6 @@ git = ["--no-verify", "--force"]
                 pipeline: Some(vec!["jq".into()]),
                 deny: Some(HashMap::from([("git".into(), vec!["ls-files".into()])])),
                 deny_flags: Some(HashMap::from([("git".into(), vec!["--no-verify".into()])])),
-                allow_file_redirects: true,
                 build: Some(StringOrVec(vec!["npm".into()])),
                 ..CommandsConfig::default()
             },
@@ -1323,51 +1259,11 @@ git = ["--no-verify", "--force"]
         assert!(git_deny.contains("push"));
         assert!(!git_deny.contains("ls-files"), "project deny ignored");
         assert!(merged.deny_flags.is_empty(), "project deny_flags ignored");
-        assert!(!merged.allow_file_redirects, "project redirects ignored");
 
         // Only `build` is honored per-root.
         assert_eq!(
             merged.build.get(&root).map(Vec::as_slice),
             Some(["npm".to_string()].as_slice()),
-        );
-    }
-
-    #[test]
-    fn user_redirects_not_overridable_by_project() {
-        let root = PathBuf::from("/project");
-
-        // User denies; a project root tries to enable → stays denied.
-        let mut user_deny = ResolvedCommands::default();
-        user_deny.merge(&CommandsConfig {
-            allow: Some(vec!["git".into()]),
-            ..CommandsConfig::default()
-        });
-        assert!(!user_deny.allow_file_redirects);
-        let project_on = HashMap::from([(
-            root.clone(),
-            CommandsConfig {
-                allow_file_redirects: true,
-                ..CommandsConfig::default()
-            },
-        )]);
-        let merged = user_deny.merge_project_commands(std::slice::from_ref(&root), &project_on);
-        assert!(
-            !merged.allow_file_redirects,
-            "project cannot opt into redirects",
-        );
-
-        // User enables; a project root omitting the flag → stays enabled.
-        let mut user_allow = ResolvedCommands::default();
-        user_allow.merge(&CommandsConfig {
-            allow: Some(vec!["git".into()]),
-            allow_file_redirects: true,
-            ..CommandsConfig::default()
-        });
-        let merged =
-            user_allow.merge_project_commands(std::slice::from_ref(&root), &HashMap::new());
-        assert!(
-            merged.allow_file_redirects,
-            "user redirects preserved through project merge",
         );
     }
 
@@ -1383,7 +1279,6 @@ git = ["--no-verify", "--force"]
         // included; see the const docs).
         for key in [
             "client_enforcement_only",
-            "allow_file_redirects",
             "allow",
             "pipeline",
             "deny",

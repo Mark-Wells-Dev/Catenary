@@ -1142,8 +1142,8 @@ fn build_command(tokens: &[Token]) -> Option<SimpleCommand> {
 /// redirects.
 ///
 /// Redirects are collected because a redirect *following* the compound's close
-/// binds to the whole compound and must reach the gate's `allow_file_redirects`
-/// enforcement (bug 45). When a compound has no top-level list operator its
+/// binds to the whole compound and must reach the write resolver so its target
+/// is recorded or denied (bug 45). When a compound has no top-level list operator its
 /// closing delimiter and any trailing redirect stay in the same segment that
 /// began with the `(` / reserved word, so they route through here rather than
 /// the `Token::Redir` arm of [`build_command`]. The brace-group form escaped the
@@ -1919,7 +1919,8 @@ mod tests {
     // and the trailing redirect stay in the segment that began with `(`, which
     // routes through `collect_rest`. That sweep used to drop every `Token::Redir`
     // (it collected only words), so the bound redirect vanished — a SECURITY
-    // under-count for the gate's `allow_file_redirects` enforcement. The fix
+    // under-count for the write resolver (a redirect the resolver never sees is
+    // an unattributed write). The fix
     // sweeps the redirects too; these cases pin it (the differential oracle, which
     // had been scoped to the brace-group form to dodge this bug, now also covers
     // the subshell form in `oracle.rs`).

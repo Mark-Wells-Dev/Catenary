@@ -24,19 +24,23 @@ upgrading.
 
 ### Breaking changes (configuration)
 
-- **Output redirection is denied by default.** `allow_file_redirects` now
-  defaults to `false`: redirections to a file (`>`, `>>`, `&>`, `2>file`) are
-  denied unless the flag is set. A redirected write bypasses the tracked
-  Edit/Write path, so the diagnostics batch could be incomplete. fd-dups
-  (`2>&1`, `>&2`) and device sinks (`/dev/null`, `/dev/stdout`, `/dev/stderr`)
-  stay allowed regardless.
-- **`awk` and `sed` removed from the recommended command pipeline.** Both can
-  exec arbitrary code and write files in-band (`sed -i`, `awk` `system()` /
-  `print > file`), bypassing the tracked edit path; they are now denied at every
-  pipeline position. Route sweeping edits through the new `catenary sed`.
+- **Writes resolve-or-deny.** There is no `allow_file_redirects` knob. Before a
+  command runs, the hook resolves the complete set of files it will write — from
+  shell grammar (`>`, `>>`, `&>`, heredoc targets), argument convention (`cp`,
+  `mv`, `tee`, `sed -i`, `ln`), checkable interpreter programs (`awk`,
+  `perl -pe`), or a state query (hook-expanded globs, git's own index). A write
+  whose target set resolves is allowed and recorded into the diagnostics batch;
+  an opaque one (`> $DYNAMIC`, `python -c`, `xargs sed -i`) is denied with a
+  teaching message. fd-dups (`2>&1`, `>&2`) and device sinks (`/dev/null`,
+  `/dev/stdout`, `/dev/stderr`) are never writes.
+- **`awk` and `sed` removed from the recommended command pipeline.** Their
+  programs are checked by the write resolver (a pure filter passes; an in-program
+  `system()`/`print > file`, or `sed -i`, resolves or is surgically denied), so
+  they are kept out of the position-0 pipeline rather than masked behind a bare
+  `awk 'prog'`. Route sweeping edits through the new `catenary sed`.
 - **Project `.catenary.toml` `[commands]` enforcement keys are ignored.** Only
   `build` is honored at project scope. `client_enforcement_only`,
-  `allow_file_redirects`, `allow`, `pipeline`, `deny`, `deny_flags`, and
+  `allow`, `pipeline`, `deny`, `deny_flags`, and
   `guidance` resolve at user scope only (the filter resolves daemon-globally for
   every connected session). Move any project-level allowlist to user config;
   Catenary warns when it sees one of these keys in a project file.
@@ -62,16 +66,16 @@ upgrading.
 
 - The command filter is **allowlist-based**: only explicitly permitted commands
   run; everything else is denied with a dump of the allowed configuration. Read
-  and stdout-only tools (`cat`, `head`, `diff`, …) live in `allow`; the redirect
-  gate, not command blocking, guards redirected writes.
+  and stdout-only tools (`cat`, `head`, `diff`, …) live in `allow`; the
+  resolve-or-deny write model, not command blocking, handles redirected writes.
 
 ### Migration
 
 See the [Migration guide](docs/src/migrating-to-2.0.md) for per-change
 before/after examples and exact remediation steps. In short:
 
-- Re-enable redirection with `allow_file_redirects = true` (user config) if you
-  rely on it, or route writes through the edit tool.
+- Delete any `allow_file_redirects` line — the write model is now automatic
+  (resolvable redirects just work; opaque ones are denied with guidance).
 - Drop `awk`/`sed` from your `pipeline`; use `catenary sed` for sweeps.
 - Move any project `[commands]` enforcement keys into
   `~/.config/catenary/config.toml`.

@@ -313,6 +313,7 @@ fn resolve_segment(cmd: &SimpleCommand, state: &mut State, ctx: SegCtx) -> Segme
         "rm" | "rmdir" => SegmentClass::PureDelete,
         "cp" => run(resolve_cp(cmd, state), &seg_name),
         "mv" => run(resolve_mv(cmd, state), &seg_name),
+        "ln" => run(resolve_ln(cmd, state), &seg_name),
         "tee" => run(resolve_tee(cmd, state), &seg_name),
         "sed" => run(resolve_sed(cmd, state), &seg_name),
         "rsync" => run(resolve_rsync(cmd, state), &seg_name),
@@ -321,6 +322,14 @@ fn resolve_segment(cmd: &SimpleCommand, state: &mut State, ctx: SegCtx) -> Segme
         // subset — parsed, not trusted.
         "awk" | "gawk" | "mawk" | "nawk" => run(programs::resolve_awk(cmd, state), &seg_name),
         "perl" => run(programs::resolve_perl(cmd, state), &seg_name),
+        // Unbounded interpreters (ws38 ticket 05): inline code (`python -c`,
+        // `ruby -e`, `node -e`) admits no checkable subset, so its write-set
+        // can't be bounded — Opaque, naming the checkable alternatives. Plain
+        // script execution (`python script.py`) keeps the layer-4 executor
+        // boundary (NoWrite); the allowlist governs whether it runs at all.
+        "python" | "python2" | "python3" | "ruby" | "node" | "nodejs" => {
+            resolve_interpreter(name, cmd, &seg_name)
+        }
         // git splits by authorship: sync navigation is a no-debt barrier,
         // content introduction resolves via a git state query (ws38 ticket 03).
         "git" => git::resolve_git(cmd, state, &seg_name),
@@ -1339,6 +1348,236 @@ fn mover_landings(
     Ok(())
 }
 
+// ── ln (the link path is the write) ──────────────────────────────────────────
+
+/// `ln [flags] TARGET… LINK` → the link path(s) (decision 026: a symlink
+/// landing is a write — `ln -s X path` changes what `path` is; the *target* it
+/// points at is not written, so only the link name is recorded). The four
+/// forms: `ln TARGET` (link `basename(TARGET)` in cwd), `ln TARGET LINK`,
+/// `ln TARGET… DIR` (a link per target under `DIR`), and the `-t DIR` /
+/// `-T` explicit forms. `-f`/`-s`/`-i`/… leave the write-set unchanged; a
+/// computed link name or an unmodeled flag is Opaque, fail-closed.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one linear argv scan over ln's flag grammar plus the four landing \
+              forms; splitting the flag parse from the landing computation would \
+              scatter the shared target_dir / no_target_dir / operands state"
+)]
+fn resolve_ln(cmd: &SimpleCommand, state: &State) -> Result<SegmentClass, Unresolved> {
+    let unmodeled = |flag: &str| {
+        u(
+            "unmodeled-flag",
+            format!(
+                "`ln {flag}` changes where the link lands in a way the resolver doesn't \
+                 model, so the link path can't be attributed. Use the plain `ln [-s] \
+                 TARGET LINK` form."
+            ),
+        )
+    };
+    let ambiguous = |msg: &'static str| u("ln-ambiguous-link", msg);
+
+    let mut operands: Vec<(&str, WordMeta)> = Vec::new();
+    let mut target_dir: Option<(String, WordMeta)> = None;
+    let mut no_target_dir = false;
+    let mut after_ddash = false;
+    let mut expect_tdir = false;
+
+    for (i, arg) in cmd.argv.iter().enumerate() {
+        let meta = cmd.argv_meta.get(i).copied().unwrap_or_default();
+        if expect_tdir {
+            expect_tdir = false;
+            target_dir = Some((arg.clone(), meta));
+            continue;
+        }
+        if after_ddash || arg == "-" || !arg.starts_with('-') {
+            operands.push((arg.as_str(), meta));
+            continue;
+        }
+        if arg == "--" {
+            after_ddash = true;
+            continue;
+        }
+        if let Some(long) = arg.strip_prefix("--") {
+            let (name, value) = long
+                .split_once('=')
+                .map_or((long, None), |(n, v)| (n, Some(v)));
+            match name {
+                "symbolic" | "force" | "interactive" | "no-dereference" | "logical"
+                | "physical" | "relative" | "verbose" | "backup" | "directory" => {}
+                "no-target-directory" => no_target_dir = true,
+                "target-directory" => match value {
+                    Some(v) => target_dir = Some((v.to_string(), meta)),
+                    None => expect_tdir = true,
+                },
+                _ => return Err(unmodeled(arg)),
+            }
+            continue;
+        }
+        // Short cluster: booleans may combine; `-t` takes a value (glued or the
+        // next arg); anything else is unmodeled.
+        let short = &arg[1..];
+        for (j, c) in short.char_indices() {
+            match c {
+                's' | 'f' | 'i' | 'n' | 'v' | 'b' | 'L' | 'P' | 'r' | 'd' | 'F' => {}
+                'T' => no_target_dir = true,
+                't' => {
+                    let rest = &short[j + c.len_utf8()..];
+                    if rest.is_empty() {
+                        expect_tdir = true;
+                    } else {
+                        target_dir = Some((rest.to_string(), meta));
+                    }
+                    break;
+                }
+                _ => return Err(unmodeled(&format!("-{c}"))),
+            }
+        }
+    }
+
+    if expect_tdir {
+        return Err(unmodeled("-t"));
+    }
+
+    // `-t DIR` / `--target-directory=DIR`: every operand is a target, each
+    // linking at `DIR/basename(target)`.
+    if let Some((dir_word, dir_meta)) = target_dir {
+        let dir = expand_destination(&dir_word, dir_meta, state)?;
+        let mut writes = BTreeSet::new();
+        for (t_word, t_meta) in &operands {
+            for tp in expand_list_operand(t_word, *t_meta, state)? {
+                if let Some(base) = base_name(&tp) {
+                    writes.insert(dir.join(base));
+                }
+            }
+        }
+        return Ok(SegmentClass::Recorded(writes));
+    }
+
+    // `-T` / `--no-target-directory`: the last operand is always the link name.
+    if no_target_dir {
+        if operands.len() == 2 {
+            let (link_word, link_meta) = operands[1];
+            let link = expand_destination(link_word, link_meta, state)?;
+            return Ok(SegmentClass::Recorded(BTreeSet::from([link])));
+        }
+        return Err(ambiguous(
+            "`ln -T` expects exactly a TARGET and a LINK, so this form's link path \
+             can't be pinned. Use `ln -T TARGET LINK`.",
+        ));
+    }
+
+    let Some(((dst_word, dst_meta), targets)) = operands.split_last() else {
+        // No operands — `ln` errors before writing.
+        return Ok(SegmentClass::NoWrite);
+    };
+
+    // Single operand: `ln TARGET` links `basename(TARGET)` into the cwd.
+    if targets.is_empty() {
+        let target = expand_destination(dst_word, *dst_meta, state)?;
+        let Some(base) = target.file_name() else {
+            return Err(ambiguous(
+                "This `ln` target has no file-name component, so the link path can't be \
+                 pinned. Name the link explicitly (`ln TARGET LINK`).",
+            ));
+        };
+        let link = resolve_path(&base.to_string_lossy(), state)?;
+        return Ok(SegmentClass::Recorded(BTreeSet::from([link])));
+    }
+
+    // `ln TARGET… DST`: DST is a link name (one target) or a directory (a link
+    // per target under it) — resolved by a directory state query.
+    let dst = expand_destination(dst_word, *dst_meta, state)?;
+    let dst_is_dir = query_is_dir(&dst);
+    let mut writes = BTreeSet::new();
+    for (t_word, t_meta) in targets {
+        for tp in expand_list_operand(t_word, *t_meta, state)? {
+            link_landings(&tp, &dst, dst_is_dir, &mut writes);
+        }
+    }
+    Ok(SegmentClass::Recorded(writes))
+}
+
+/// Landing path for one link of an `ln TARGET… DST`: a directory `DST` takes
+/// `DST/basename(target)`; a plain-file `DST` is the link itself. When `DST`'s
+/// dir-ness can't be queried, both interpretations are recorded
+/// (over-recording, the safe direction — the same shape as [`mover_landings`]).
+fn link_landings(target: &Path, dst: &Path, dst_is_dir: DirQ, writes: &mut BTreeSet<PathBuf>) {
+    match dst_is_dir {
+        DirQ::Yes => {
+            if let Some(base) = base_name(target) {
+                writes.insert(dst.join(base));
+            }
+        }
+        DirQ::No => {
+            writes.insert(dst.to_path_buf());
+        }
+        DirQ::Unknown => {
+            writes.insert(dst.to_path_buf());
+            if let Some(base) = base_name(target) {
+                writes.insert(dst.join(base));
+            }
+        }
+    }
+}
+
+// ── Unbounded interpreters (inline code is unattributable) ───────────────────
+
+/// Classify an unbounded interpreter (`python`/`ruby`/`node`): inline code
+/// (`-c`/`-e`/…) is Opaque — no checkable subset bounds its writes — while a
+/// bare invocation or a script-file executor keeps the layer-4 boundary
+/// (`NoWrite`). This closes the vector where allowlisting the interpreter would
+/// otherwise let `python -c "open(…,'w')"` write unattributed (ws38 ticket 05).
+fn resolve_interpreter(name: &str, cmd: &SimpleCommand, seg_name: &str) -> SegmentClass {
+    interpreter_inline_flag(name, &cmd.argv).map_or(SegmentClass::NoWrite, |flag| {
+        SegmentClass::Opaque(unbounded_interpreter(name, &flag).into_opaque(seg_name))
+    })
+}
+
+/// The inline-code flag an unbounded interpreter was invoked with, if any.
+///
+/// `python`/`python2`/`python3` → `-c`; `ruby` → `-e`; `node`/`nodejs` →
+/// `-e`/`-p`/`--eval`/`--print`. Scanning stops at `--` (end of options);
+/// short letters are matched inside a cluster, long flags by name (with or
+/// without `=value`).
+fn interpreter_inline_flag(name: &str, argv: &[String]) -> Option<String> {
+    let (shorts, longs): (&[char], &[&str]) = match name {
+        "python" | "python2" | "python3" => (&['c'], &[]),
+        "ruby" => (&['e'], &[]),
+        "node" | "nodejs" => (&['e', 'p'], &["eval", "print"]),
+        _ => return None,
+    };
+    for arg in argv {
+        if arg == "--" {
+            break;
+        }
+        if let Some(long) = arg.strip_prefix("--") {
+            let head = long.split('=').next().unwrap_or(long);
+            if longs.contains(&head) {
+                return Some(format!("--{head}"));
+            }
+        } else if let Some(short) = arg.strip_prefix('-')
+            && let Some(c) = short.chars().find(|c| shorts.contains(c))
+        {
+            return Some(format!("-{c}"));
+        }
+    }
+    None
+}
+
+/// The unbounded-interpreter denial: inline code the resolver can't check for
+/// writes, pointing at the checkable alternatives.
+fn unbounded_interpreter(name: &str, flag: &str) -> Unresolved {
+    u(
+        "unbounded-interpreter",
+        format!(
+            "`{name} {flag}` runs inline code the resolver can't check for writes, so any \
+             file it writes would go unattributed. For an in-place edit use a checkable \
+             subset — `sed -i`, `perl -i -pe 's/…/…/'` (look-around supported), or `awk` \
+             as a pure filter — whose write-sets resolve."
+        ),
+    )
+}
+
 // ── tee ──────────────────────────────────────────────────────────────────────
 
 /// `tee [flags] FILE…` → its file operands, mid-pipeline or terminal. Flags
@@ -2152,8 +2391,15 @@ fn resolve_xargs(cmd: &SimpleCommand, state: &State, seg_name: &str) -> SegmentC
             let inner = wrapped_command(cmd, i + 1, "perl");
             run(programs::resolve_perl(&inner, state), seg_name)
         }
-        "cp" | "mv" | "tee" | "rsync" | "dd" | "install" | "truncate" | "bash" | "sh" | "zsh"
-        | "dash" | "ksh" | "eval" | "source" | "xargs" => stdin_targets(&wrapped),
+        // Unbounded interpreters: inline code stays Opaque under xargs too; a
+        // plain script executor is NoWrite (the stdin args are its argv, not a
+        // write target).
+        "python" | "python2" | "python3" | "ruby" | "node" | "nodejs" => {
+            let inner = wrapped_command(cmd, i + 1, &wrapped);
+            resolve_interpreter(&wrapped, &inner, seg_name)
+        }
+        "cp" | "mv" | "ln" | "tee" | "rsync" | "dd" | "install" | "truncate" | "bash" | "sh"
+        | "zsh" | "dash" | "ksh" | "eval" | "source" | "xargs" => stdin_targets(&wrapped),
         _ => SegmentClass::NoWrite,
     }
 }
