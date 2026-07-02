@@ -66,6 +66,24 @@ pub(crate) struct Pipeline {
     /// bit is what the catenary gate needs to deny a backgrounded invocation
     /// (ticket 04).
     pub(crate) backgrounded: bool,
+    /// The list operator that terminated this pipeline (`None` for the final,
+    /// unterminated one). The write resolver reads it to tell whether the
+    /// *next* pipeline executes unconditionally (`;`/newline/`&`) or
+    /// conditionally (`&&`/`||`) — a conditional `VAR=value` binding cannot be
+    /// trusted for later write-target resolution (ws38 ticket 01).
+    pub(crate) terminator: Option<ListOp>,
+}
+
+/// The kind of list operator that terminated a pipeline, as the write
+/// resolver needs it: does the *following* pipeline always execute?
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ListOp {
+    /// `;`, newline, or backgrounding `&` — the next pipeline always runs.
+    Seq,
+    /// `&&` — the next pipeline runs only on success.
+    And,
+    /// `||` — the next pipeline runs only on failure.
+    Or,
 }
 
 /// A simple command: a command-position word, its arguments, redirections, and
@@ -79,6 +97,13 @@ pub(crate) struct SimpleCommand {
     pub(crate) name: Option<String>,
     /// The remaining words after the command word, in order.
     pub(crate) argv: Vec<String>,
+    /// Expansion provenance for each `argv` word, index-parallel to
+    /// [`Self::argv`]. Read by the write resolver (ws38 ticket 01).
+    pub(crate) argv_meta: Vec<WordMeta>,
+    /// The leading `VAR=value` assignment words (skipped when locating the
+    /// command word), in order. The write resolver reads them to bind `$VAR`
+    /// write targets appearing later in the same command line.
+    pub(crate) assignments: Vec<Assignment>,
     /// The redirections attached to this command.
     pub(crate) redirects: Vec<Redirect>,
     /// Command substitutions (`$(…)`, `` `…` ``, `<(…)`, `>(…)`) found anywhere
@@ -88,6 +113,65 @@ pub(crate) struct SimpleCommand {
     /// (`for`/`while`/`until`/`if`/`case`/`{`) or a `(` subshell. The parser
     /// only *recognizes* compounds; policy is the caller's (ticket 04).
     pub(crate) is_compound: bool,
+    /// The `for`/`select` loop variable, when this segment is a loop header.
+    /// The write resolver taints it — its runtime value is per-iteration.
+    pub(crate) loop_var: Option<String>,
+}
+
+/// A `VAR=value` assignment word, as the write resolver needs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Assignment {
+    /// The variable name (the part before `=`).
+    pub(crate) name: String,
+    /// The cooked value text (after `=`): quotes interpreted away, expansions
+    /// *not* performed.
+    pub(crate) value: String,
+    /// Expansion provenance of the whole assignment word.
+    pub(crate) meta: WordMeta,
+}
+
+/// Expansion provenance of a word, tracked per character channel by the lexer.
+///
+/// The write resolver (ws38 ticket 01) needs more than a word's cooked text:
+/// it must know *which shell expansions are live* in it. An unquoted `$`,
+/// glob, or brace expands at runtime; the same byte arriving through a quoted
+/// or escaped channel is literal filename data. One flag per expansion family
+/// keeps the resolver's fail-closed rules cheap — any ambiguity (a
+/// literal-channel metacharacter alongside a live one) is visible as a flag
+/// combination and classified opaque rather than guessed at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "one orthogonal provenance bit per expansion family; a state \
+              machine would obscure the resolver's independent checks"
+)]
+pub(crate) struct WordMeta {
+    /// A live (expanding) `$` reached the word: bare `$NAME`, or `$…` inside
+    /// double quotes. Not set by `'$'`, `\$`, or `$'…'` (literal channels).
+    pub(crate) live_dollar: bool,
+    /// A live glob character (`*`, `?`, `[`) reached the word unquoted.
+    pub(crate) live_glob: bool,
+    /// A live `{` / `}` reached the word unquoted (candidate brace expansion).
+    pub(crate) live_brace: bool,
+    /// The word starts with a live (unquoted) `~` (candidate tilde expansion).
+    pub(crate) live_tilde: bool,
+    /// An expansion-capable metacharacter reached the word through a literal
+    /// channel: single/ANSI-C quotes, a backslash escape, or a double-quoted
+    /// glob/brace/tilde.
+    pub(crate) literal_meta: bool,
+    /// The word carried `$(…)` / `` `…` `` value substitutions (their output
+    /// becomes word text at runtime).
+    pub(crate) value_subs: bool,
+    /// The word carried `<(…)` / `>(…)` process substitutions (a `/dev/fd`
+    /// pipe path, not runtime text).
+    pub(crate) process_subs: bool,
+}
+
+impl WordMeta {
+    /// Whether any live (runtime) expansion is present in the word.
+    pub(crate) const fn any_live(self) -> bool {
+        self.live_dollar || self.live_glob || self.live_brace || self.live_tilde
+    }
 }
 
 /// A redirection operator and its target.
@@ -99,6 +183,8 @@ pub(crate) struct Redirect {
     /// duplication (`2>&1`) this is the `&N` form; for a file redirect it is
     /// the target path. Empty when the operator had no following word.
     pub(crate) target: String,
+    /// Expansion provenance of the target word (default for a missing word).
+    pub(crate) target_meta: WordMeta,
 }
 
 /// The kind of a redirection operator.
@@ -214,6 +300,22 @@ struct WordTok {
     /// `NAME=` is unquoted (an assignment prefix; the value after `=` is data)
     /// from one quoted at or before the `=` (a command literal like `'x=y'`).
     first_quote_at: Option<usize>,
+    /// Expansion provenance of the word (which expansion families are live vs
+    /// literal), read by the write resolver (ws38 ticket 01).
+    meta: WordMeta,
+}
+
+/// Note bytes that entered the word through a *literal* channel (quotes /
+/// escapes): an expansion-capable metacharacter among them flips
+/// [`WordMeta::literal_meta`], marking that the cooked text contains
+/// metacharacters that must **not** be expanded.
+fn note_literal_bytes(meta: &mut WordMeta, bytes: &[u8]) {
+    if bytes
+        .iter()
+        .any(|b| matches!(b, b'$' | b'`' | b'~' | b'*' | b'?' | b'[' | b'{' | b'}'))
+    {
+        meta.literal_meta = true;
+    }
 }
 
 /// Lex the (heredoc-stripped) input into a flat token stream.
@@ -243,6 +345,7 @@ fn lex(input: &str) -> Vec<Token> {
     let mut had_quote = false;
     let mut first_quote_at: Option<usize> = None;
     let mut in_word = false;
+    let mut meta = WordMeta::default();
 
     // Flush the in-progress word as a `Word` token (classifying it as a reserved
     // word only when unquoted), resetting the word-building state. Threading the
@@ -257,6 +360,7 @@ fn lex(input: &str) -> Vec<Token> {
                 &mut had_quote,
                 &mut first_quote_at,
                 &mut in_word,
+                &mut meta,
             )
         };
     }
@@ -305,6 +409,7 @@ fn lex(input: &str) -> Vec<Token> {
                 } else if i + 1 < n {
                     // Escaped char: keep the following byte literally.
                     in_word = true;
+                    note_literal_bytes(&mut meta, &bytes[i + 1..=i + 1]);
                     push_byte(&mut word, bytes[i + 1]);
                     i += 2;
                 } else {
@@ -322,6 +427,7 @@ fn lex(input: &str) -> Vec<Token> {
                     first_quote_at = Some(word.len());
                 }
                 let end = memchr_byte(bytes, b'\'', i + 1).unwrap_or(n);
+                note_literal_bytes(&mut meta, &bytes[i + 1..end.min(n)]);
                 push_bytes(&mut word, &bytes[i + 1..end.min(n)]);
                 i = if end < n { end + 1 } else { n };
             }
@@ -332,7 +438,7 @@ fn lex(input: &str) -> Vec<Token> {
                 if first_quote_at.is_none() {
                     first_quote_at = Some(word.len());
                 }
-                i = lex_double_quote(bytes, i + 1, &mut word, &mut subs);
+                i = lex_double_quote(bytes, i + 1, &mut word, &mut subs, &mut meta);
             }
             // ── `$` — `$'…'`, `$(…)`, or a plain `$word` ────────────────────
             b'$' => {
@@ -343,13 +449,17 @@ fn lex(input: &str) -> Vec<Token> {
                     if first_quote_at.is_none() {
                         first_quote_at = Some(word.len());
                     }
+                    let mark = word.len();
                     i = lex_ansi_c_quote(bytes, i + 2, &mut word);
+                    note_literal_bytes(&mut meta, &word[mark..]);
                 } else if i + 1 < n && bytes[i + 1] == b'(' {
                     // `$(…)` command substitution (or `$((…))` arithmetic).
                     let (inner, next) = scan_balanced(bytes, i + 2, b'(', b')');
                     subs.push(inner);
+                    meta.value_subs = true;
                     i = next;
                 } else {
+                    meta.live_dollar = true;
                     word.push(b'$');
                     i += 1;
                 }
@@ -359,6 +469,7 @@ fn lex(input: &str) -> Vec<Token> {
                 in_word = true;
                 let (inner, next) = scan_backtick(bytes, i + 1);
                 subs.push(inner);
+                meta.value_subs = true;
                 i = next;
             }
             // ── Process substitution `<(…)` / `>(…)` ────────────────────────
@@ -366,6 +477,7 @@ fn lex(input: &str) -> Vec<Token> {
                 in_word = true;
                 let (inner, next) = scan_balanced(bytes, i + 2, b'(', b')');
                 subs.push(inner);
+                meta.process_subs = true;
                 i = next;
             }
             // ── Parentheses (subshell grouping) ─────────────────────────────
@@ -403,6 +515,16 @@ fn lex(input: &str) -> Vec<Token> {
             }
             // ── Ordinary word byte ──────────────────────────────────────────
             _ => {
+                // An unquoted metacharacter is a *live* expansion candidate:
+                // globs and braces anywhere in the word, tilde only when it
+                // opens the word (`in_word` false and nothing accumulated —
+                // `''~` is quoted-opened and does not tilde-expand).
+                match c {
+                    b'*' | b'?' | b'[' => meta.live_glob = true,
+                    b'{' | b'}' => meta.live_brace = true,
+                    b'~' if !in_word && word.is_empty() => meta.live_tilde = true,
+                    _ => {}
+                }
                 in_word = true;
                 push_byte(&mut word, c);
                 i += 1;
@@ -417,6 +539,12 @@ fn lex(input: &str) -> Vec<Token> {
 /// the word-building state. Factored out of [`lex`] so the per-call reset lives
 /// behind a function boundary — the final flush at end of input then does not
 /// read as a dead store.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the lexer's word-building state is threaded as one flat set of \
+              &mut locals; bundling them into a struct would obscure the single \
+              linear scan in `lex`"
+)]
 fn flush_word(
     tokens: &mut Vec<Token>,
     word: &mut Vec<u8>,
@@ -424,6 +552,7 @@ fn flush_word(
     had_quote: &mut bool,
     first_quote_at: &mut Option<usize>,
     in_word: &mut bool,
+    meta: &mut WordMeta,
 ) {
     if *in_word {
         // Convert the accumulated raw bytes to text exactly once, at the word
@@ -435,6 +564,7 @@ fn flush_word(
             subs: std::mem::take(subs),
             had_quote: *had_quote,
             first_quote_at: *first_quote_at,
+            meta: std::mem::take(meta),
         }));
         *had_quote = false;
         *first_quote_at = None;
@@ -487,11 +617,16 @@ fn fd_redirect_after(bytes: &[u8], i: usize) -> bool {
 /// Lex a double-quoted run starting just after the opening `"`, appending the
 /// interpreted content to `word` and any `$(…)` / `` `…` `` substitutions found
 /// inside to `subs`. Returns the index just past the closing `"` (or end).
+///
+/// Provenance: inside double quotes `$` still expands (live), while globs,
+/// braces, and tildes are quoted (literal) — `meta` records both channels for
+/// the write resolver.
 fn lex_double_quote(
     bytes: &[u8],
     start: usize,
     word: &mut Vec<u8>,
     subs: &mut Vec<String>,
+    meta: &mut WordMeta,
 ) -> usize {
     let n = bytes.len();
     let mut i = start;
@@ -506,6 +641,7 @@ fn lex_double_quote(
                     if next == b'\n' {
                         i += 2; // line continuation inside double quotes
                     } else if matches!(next, b'$' | b'`' | b'"' | b'\\') {
+                        note_literal_bytes(meta, &bytes[i + 1..=i + 1]);
                         push_byte(word, next);
                         i += 2;
                     } else {
@@ -520,14 +656,22 @@ fn lex_double_quote(
             b'`' => {
                 let (inner, next) = scan_backtick(bytes, i + 1);
                 subs.push(inner);
+                meta.value_subs = true;
                 i = next;
             }
             b'$' if i + 1 < n && bytes[i + 1] == b'(' => {
                 let (inner, next) = scan_balanced(bytes, i + 2, b'(', b')');
                 subs.push(inner);
+                meta.value_subs = true;
                 i = next;
             }
             other => {
+                if other == b'$' {
+                    // `"$NAME"` expands — a live dollar even though quoted.
+                    meta.live_dollar = true;
+                } else {
+                    note_literal_bytes(meta, &bytes[i..=i]);
+                }
                 push_byte(word, other);
                 i += 1;
             }
@@ -855,6 +999,13 @@ fn segment(tokens: &[Token]) -> ParsedScript {
             continue;
         }
         pipeline.backgrounded = sep == Some(Control::Amp);
+        pipeline.terminator = sep.map(|c| match c {
+            Control::AndAnd => ListOp::And,
+            Control::OrOr => ListOp::Or,
+            // `|` never terminates a list segment (stripped by the pipeline
+            // split); folded into the unconditional arm for totality.
+            Control::Semi | Control::Amp | Control::Newline | Control::Pipe => ListOp::Seq,
+        });
         pipelines.push(pipeline);
     }
     ParsedScript { pipelines }
@@ -891,6 +1042,7 @@ fn build_pipeline(tokens: &[Token]) -> Pipeline {
     Pipeline {
         commands,
         backgrounded: false,
+        terminator: None,
     }
 }
 
@@ -916,6 +1068,11 @@ fn build_command(tokens: &[Token]) -> Option<SimpleCommand> {
             // of allowlisted commands must be allowed).
             Token::Reserved("for" | "select") => {
                 cmd.is_compound = true;
+                // Capture the loop variable so the write resolver can taint it
+                // (its runtime value is per-iteration, never resolvable).
+                if let Some(var) = tokens.get(idx + 1).and_then(token_word) {
+                    cmd.loop_var = Some(var.text.clone());
+                }
                 collect_subs_only(&tokens[idx..], &mut cmd);
                 idx = tokens.len();
             }
@@ -943,6 +1100,7 @@ fn build_command(tokens: &[Token]) -> Option<SimpleCommand> {
                     cmd.redirects.push(Redirect {
                         op: *op,
                         target: t.text.clone(),
+                        target_meta: t.meta,
                     });
                     collect_subs(t, &mut cmd);
                     idx += 2;
@@ -950,6 +1108,7 @@ fn build_command(tokens: &[Token]) -> Option<SimpleCommand> {
                     cmd.redirects.push(Redirect {
                         op: *op,
                         target: String::new(),
+                        target_meta: WordMeta::default(),
                     });
                     idx += 1;
                 }
@@ -968,6 +1127,7 @@ fn build_command(tokens: &[Token]) -> Option<SimpleCommand> {
         && cmd.argv.is_empty()
         && cmd.redirects.is_empty()
         && cmd.substitutions.is_empty()
+        && cmd.assignments.is_empty()
         && !cmd.is_compound
     {
         return None;
@@ -1011,6 +1171,7 @@ fn collect_rest<'a>(tokens: &'a [Token], words: &mut Vec<&'a WordTok>, cmd: &mut
                     cmd.redirects.push(Redirect {
                         op: *op,
                         target: t.text.clone(),
+                        target_meta: t.meta,
                     });
                     collect_subs(t, cmd);
                     idx += 2;
@@ -1018,6 +1179,7 @@ fn collect_rest<'a>(tokens: &'a [Token], words: &mut Vec<&'a WordTok>, cmd: &mut
                     cmd.redirects.push(Redirect {
                         op: *op,
                         target: String::new(),
+                        target_meta: WordMeta::default(),
                     });
                     idx += 1;
                 }
@@ -1059,7 +1221,9 @@ fn is_assignment_prefix(w: &WordTok) -> bool {
 }
 
 /// Assign the command name (after `VAR=` prefixes, path-stripped) and argv from
-/// the collected words.
+/// the collected words. The skipped assignment words are retained on
+/// [`SimpleCommand::assignments`] for the write resolver, and each argv word
+/// carries its [`WordMeta`] in the index-parallel `argv_meta`.
 fn assign_name_and_argv(words: &[&WordTok], cmd: &mut SimpleCommand) {
     // Skip leading `VAR=value` assignment words to find the command position.
     let mut name_idx = None;
@@ -1067,6 +1231,13 @@ fn assign_name_and_argv(words: &[&WordTok], cmd: &mut SimpleCommand) {
         // An assignment prefix is a `NAME=...` whose `NAME=` is unquoted; the
         // value after `=` may be quoted and is data, not a command.
         if is_assignment_prefix(w) {
+            if let Some((name, value)) = w.text.split_once('=') {
+                cmd.assignments.push(Assignment {
+                    name: name.to_string(),
+                    value: value.to_string(),
+                    meta: w.meta,
+                });
+            }
             continue;
         }
         name_idx = Some(i);
@@ -1083,6 +1254,7 @@ fn assign_name_and_argv(words: &[&WordTok], cmd: &mut SimpleCommand) {
         .iter()
         .map(|w| w.text.clone())
         .collect();
+    cmd.argv_meta = words[name_idx + 1..].iter().map(|w| w.meta).collect();
 }
 
 /// Strip the leading path from a command word (`/usr/bin/git` → `git`).
@@ -2081,11 +2253,17 @@ mod tests {
 
     #[test]
     fn bare_assignment_is_no_command() {
-        // `build_command`: a stage of only `VAR=value` assignments has no command
-        // word and produces NO command (the `!cmd.is_compound` empty-stage guard).
+        // `build_command`: a stage of only `VAR=value` assignments has no
+        // command word — no command position is projected. The segment itself
+        // is retained (name `None`) carrying the assignment, so the write
+        // resolver can bind `$VAR` targets later in the line (ws38 ticket 01).
         let script = parse("FOO=bar");
-        assert_eq!(script, ParsedScript::default());
         assert!(script.command_positions().is_empty());
+        let cmd = sole("FOO=bar");
+        assert_eq!(cmd.name, None);
+        assert_eq!(cmd.assignments.len(), 1);
+        assert_eq!(cmd.assignments[0].name, "FOO");
+        assert_eq!(cmd.assignments[0].value, "bar");
     }
 
     #[test]

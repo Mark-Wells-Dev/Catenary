@@ -50,13 +50,19 @@ pub(crate) mod parse;
 #[cfg(any(test, feature = "fuzzing"))]
 pub mod oracle;
 
+/// Write resolver (ws38 ticket 01, decision 026).
+///
+/// Classifies every segment into Recorded / PureDelete / NoWrite / Opaque.
+/// The foreign-redirect gate reads it — a resolvable write is allowed (its
+/// complete write-set produced for attribution, ticket 02), an opaque one
+/// denies with a teaching message.
+pub mod resolver;
+
 use crate::config::ResolvedCommands;
 
-/// Device sinks allowed as redirect targets even in the deny state.
-///
-/// These don't write the working tree, so a redirect to one never threatens
-/// batch completeness. Anything more exotic flips `allow_file_redirects`
-/// rather than growing this set.
+/// Device sinks that are never file writes when they appear as redirect
+/// targets (`> /dev/null`). The write resolver skips them when producing a
+/// segment's write-set.
 const DEVICE_SINKS: [&str; 3] = ["/dev/null", "/dev/stdout", "/dev/stderr"];
 
 /// Whether a single [`Redirect`](parse::Redirect) writes a non-device-sink file.
@@ -208,9 +214,11 @@ pub enum DenialReason {
     DeniedSubcommand,
     /// Command is allowed but a specific flag is denied.
     DeniedFlag,
-    /// Command redirects output to a file target (`>`, `>>`, `&>`, `2>file`).
-    /// A redirected write bypasses the tracked Edit/Write path.
-    OutputRedirect,
+    /// The command writes through a form the write resolver cannot see
+    /// completely (ws38 ticket 01, decision 026): the complete-or-deny
+    /// contract denies rather than under-record. The teaching message rides
+    /// [`Denial::message`].
+    OpaqueWrite,
 }
 
 /// Result of a command check that was denied.
@@ -228,6 +236,9 @@ pub struct Denial {
     /// any `cd` commands earlier in the pipeline. Used for cwd-aware build
     /// guidance.
     pub effective_cwd: Option<std::path::PathBuf>,
+    /// The construct-naming teaching message for an
+    /// [`OpaqueWrite`](DenialReason::OpaqueWrite) denial.
+    pub message: Option<String>,
 }
 
 /// Check all commands in a shell command string against the allowlist rules.
@@ -257,7 +268,30 @@ pub fn check_command(
         effective_cwd: cwd.map(std::path::PathBuf::from),
         saw_unresolved_cd: false,
     };
-    check_script(&script, rules, &mut cwd_state)
+    if let Some(denial) = check_script(&script, rules, &mut cwd_state) {
+        return Some(denial);
+    }
+
+    // Resolve-or-deny (ws38 ticket 01, decision 026): every write the command
+    // performs must resolve to its complete target set, or the command is
+    // denied with a construct-naming teaching message. This replaces the
+    // blanket bug-11 foreign-redirect denial — a resolvable redirect (or
+    // `cp`/`mv`/`tee`/`sed -i`/`rsync` write) is now allowed; attribution of
+    // the produced write-set is wired in ticket 02. The `allow_file_redirects`
+    // knob is inert: the resolver path is authoritative (retirement is
+    // ticket 05). Catenary's own segments get the same treatment — the
+    // canonical-form matcher owns their allow/deny shape, the resolver their
+    // write-set.
+    match resolver::resolve_script(&script, cwd) {
+        Ok(_writes) => None,
+        Err(opaque) => Some(Denial {
+            command: opaque.command,
+            reason: DenialReason::OpaqueWrite,
+            unresolved_cd: cwd_state.saw_unresolved_cd,
+            effective_cwd: cwd_state.effective_cwd,
+            message: Some(opaque.message),
+        }),
+    }
 }
 
 /// Effective working directory threaded across a script's commands.
@@ -327,27 +361,12 @@ fn check_parsed_command(
         return None;
     }
 
-    // Output redirection to a file bypasses the tracked Edit/Write path, making
-    // the diagnostics batch incomplete. Deny it before the allow/deny decision
-    // so an otherwise-allowed command can't carry a redirect through. Gated by
-    // `allow_file_redirects`. Read off the faithful parse (ticket 03): the whole
-    // redirect family — every MULTIOS / brace target, `>>` / `>|` / `&>` /
-    // fd-targeted `N>` — with fd-dup / close / `>(cmd)` excluded and an
-    // unverifiable `$var` target failing closed (decision 020 §8a). A redirect
-    // *inside* a `$()` / `` `…` `` / `<(…)` / `>(…)` substitution is already
-    // caught by the substitution recursion at the top of this function (each sub
-    // is re-checked through this same guard), so it needs no separate sweep here.
-    // A heredoc (`<<`) lexes to `RedirectOp::Read` (input), so it never shields
-    // an output redirect: `cat <<EOF > out.txt` still denies on the `> out.txt`
-    // write (bug 11).
-    if !rules.allow_file_redirects && command.redirects.iter().any(redirect_writes_file) {
-        return Some(Denial {
-            command: name.to_string(),
-            reason: DenialReason::OutputRedirect,
-            unresolved_cd: cwd.saw_unresolved_cd,
-            effective_cwd: cwd.effective_cwd.clone(),
-        });
-    }
+    // Output redirection is no longer denied here: the write resolver
+    // (`resolver::resolve_script`, run by `check_command` after this walk)
+    // resolves every redirect to its complete target set or denies the line
+    // as an opaque write (ws38 ticket 01 — the bug-11 blanket deny flipped to
+    // resolve-or-deny; decision 026). The `allow_file_redirects` knob is
+    // inert on this path.
 
     if let Some((denied, reason)) =
         check_against_allowlist(command, pipe_pos, rules, cwd.effective_cwd.as_deref())
@@ -357,6 +376,7 @@ fn check_parsed_command(
             reason,
             unresolved_cd: cwd.saw_unresolved_cd,
             effective_cwd: cwd.effective_cwd.clone(),
+            message: None,
         });
     }
 
@@ -1102,23 +1122,6 @@ fn resolve_client_vars(msg: &str, format: Option<super::HostFormat>) -> String {
     msg.replace("{READ}", read).replace("{EDIT}", edit)
 }
 
-/// Denial message for output redirection to a file target.
-///
-/// A redirected write skips the host's edit tool, so post-edit diagnostics
-/// can't observe it — the message routes the agent back through the tracked
-/// path and names the `allow_file_redirects` escape hatch. Used by both the
-/// full and short denial forms (it carries the same essential guidance).
-fn format_redirect_denial(format: Option<super::HostFormat>) -> String {
-    let edit = format.map_or("Edit", super::HostFormat::edit_tool);
-    format!(
-        "Output redirection to a file isn't allowed — a redirected write \
-         bypasses the {edit} tool, so post-edit diagnostics can't see it. \
-         Use {edit} to write files. (`2>&1`, `>&2`, and `/dev/null`-style \
-         sinks are still allowed; set `allow_file_redirects = true` under \
-         `[commands]` to permit file redirects.)"
-    )
-}
-
 /// Format the opening line based on denial reason.
 fn format_opening_line(denied_cmd: &str, reason: DenialReason) -> String {
     match reason {
@@ -1134,10 +1137,10 @@ fn format_opening_line(denied_cmd: &str, reason: DenialReason) -> String {
         DenialReason::DeniedFlag => {
             format!("`{denied_cmd}` isn't allowed (denied flag).")
         }
-        // OutputRedirect denials early-return in the callers; this arm only
-        // satisfies exhaustiveness.
-        DenialReason::OutputRedirect => {
-            format!("`{denied_cmd}` isn't allowed (output redirection).")
+        // OpaqueWrite denials early-return in the callers with the resolver's
+        // teaching message; this arm only satisfies exhaustiveness.
+        DenialReason::OpaqueWrite => {
+            format!("`{denied_cmd}` writes through a form the hook can't resolve.")
         }
     }
 }
@@ -1220,10 +1223,14 @@ pub fn format_denial(
     format: Option<super::HostFormat>,
     build_hint: Option<&str>,
 ) -> String {
-    // Output-redirection denial: a fixed message pointing at the edit tool,
-    // independent of the command name, its guidance entry, and the build hint.
-    if denial.reason == DenialReason::OutputRedirect {
-        return format_redirect_denial(format);
+    // Opaque-write denial: the resolver's construct-naming teaching message
+    // is the whole denial — it already names the resolvable alternative
+    // (ws38 ticket 01), independent of guidance entries and build hints.
+    if denial.reason == DenialReason::OpaqueWrite {
+        if let Some(msg) = &denial.message {
+            return msg.clone();
+        }
+        return format_opening_line(denied_cmd, denial.reason);
     }
 
     // Guidance hint (static, build-resolved, or redirect).
@@ -1441,12 +1448,18 @@ mod tests {
     }
 
     #[test]
-    fn cat_redirect_still_denied() {
-        // Read is fine; the *redirect* is the write vector caught by ticket 01,
-        // not by blocking `cat` itself.
+    fn cat_redirect_resolves_or_denies() {
+        // ws38 ticket 01: the blanket redirect deny is flipped to
+        // resolve-or-deny. A literal target resolves (its write-set is
+        // produced for attribution); an opaque one still denies.
         let rules = recommended_rules();
-        let denial = check_command("cat foo > bar.rs", &rules, None).expect("redirect denied");
-        assert_eq!(denial.reason, DenialReason::OutputRedirect);
+        assert!(
+            check_command("cat foo > bar.rs", &rules, None).is_none(),
+            "a resolvable redirect is allowed",
+        );
+        let denial =
+            check_command("cat foo > $TARGET", &rules, None).expect("opaque redirect denied");
+        assert_eq!(denial.reason, DenialReason::OpaqueWrite);
     }
 
     #[test]
@@ -1509,18 +1522,25 @@ mod tests {
 
     #[test]
     fn echo_printf_seq_allowed() {
-        // stdout-only generators are allowed; their redirect forms are denied.
+        // stdout-only generators are allowed; their resolvable redirect forms
+        // are allowed too (ws38: the write-set resolves), while an opaque
+        // target still denies.
         let rules = recommended_rules();
         for cmd in ["echo hello", "printf '%s' x", "seq 1 5"] {
             assert!(check_command(cmd, &rules, None).is_none(), "{cmd} allowed");
         }
         for cmd in ["echo hello > f.txt", "printf x > f.txt", "seq 1 5 > f.txt"] {
-            let denial = check_command(cmd, &rules, None).expect("redirect denied");
-            assert_eq!(
-                denial.reason,
-                DenialReason::OutputRedirect,
-                "{cmd} redirect denied",
+            assert!(
+                check_command(cmd, &rules, None).is_none(),
+                "{cmd} resolvable redirect allowed",
             );
+        }
+        // Opaque targets: an unbound variable and a command-substitution
+        // target (its inner command is allowlisted, so the resolver's
+        // classification — not the allowlist — is what denies).
+        for cmd in ["echo hello > $F", "seq 1 5 > $(cat names.txt)"] {
+            let denial = check_command(cmd, &rules, None).expect("opaque redirect denied");
+            assert_eq!(denial.reason, DenialReason::OpaqueWrite, "{cmd} denied");
         }
     }
 
@@ -1910,8 +1930,15 @@ mod tests {
         #[test]
         fn cp_mv() {
             let rules = python_equivalent_rules();
+            // Non-recursive cp resolves even without a cwd (both landing
+            // interpretations recorded — over-recording, safe).
             assert!(check_command("cp foo bar", &rules, None).is_none());
-            assert!(check_command("mv foo bar", &rules, None).is_none());
+            // mv must query the source's dir-ness (a directory source moves a
+            // whole tree), so it needs the hook cwd — which production always
+            // has.
+            let tmp = tempfile::tempdir().expect("tempdir");
+            std::fs::write(tmp.path().join("foo"), b"x").expect("touch foo");
+            assert!(check_command("mv foo bar", &rules, Some(tmp.path())).is_none());
         }
 
         #[test]
@@ -2386,6 +2413,7 @@ mod tests {
             command: cmd.to_string(),
             reason: DenialReason::NotAllowed,
             unresolved_cd: false,
+            message: None,
         }
     }
 
@@ -2682,6 +2710,7 @@ mod tests {
             reason: DenialReason::NotAllowed,
             unresolved_cd: true,
             effective_cwd: None,
+            message: None,
         };
         let msg = format_denial("npm", &rules, &denial, None, None);
         assert!(
@@ -2698,6 +2727,7 @@ mod tests {
             reason: DenialReason::NotAllowed,
             unresolved_cd: false,
             effective_cwd: None,
+            message: None,
         };
         let msg = format_denial("npm", &rules, &denial, None, None);
         assert!(
@@ -2735,6 +2765,7 @@ mod tests {
             reason: DenialReason::PipelinePosition,
             unresolved_cd: false,
             effective_cwd: None,
+            message: None,
         };
         let msg = format_denial("grep", &rules, &denial, None, None);
         assert!(
@@ -2751,6 +2782,7 @@ mod tests {
             reason: DenialReason::PipelinePosition,
             unresolved_cd: false,
             effective_cwd: None,
+            message: None,
         };
         let msg = format_denial("grep", &rules, &denial, None, None);
         assert!(
@@ -2767,6 +2799,7 @@ mod tests {
             reason: DenialReason::DeniedSubcommand,
             unresolved_cd: false,
             effective_cwd: None,
+            message: None,
         };
         let msg = format_denial("git grep", &rules, &denial, None, None);
         assert!(
@@ -2962,6 +2995,7 @@ mod tests {
             reason: DenialReason::DeniedFlag,
             unresolved_cd: false,
             effective_cwd: None,
+            message: None,
         };
         let msg = format_denial("make -C", &rules, &denial, None, None);
         assert!(
@@ -3010,55 +3044,61 @@ mod tests {
         assert_eq!(denial.reason, DenialReason::NotAllowed);
     }
 
-    // ── Output redirection tests ────────────────────────────────────
+    // ── Write resolution: resolve-or-deny (ws38 ticket 01) ──────────
+    //
+    // The bug-11 blanket redirect deny is flipped: a redirect whose complete
+    // write-set the resolver can see is allowed (the set feeds attribution,
+    // ticket 02); an opaque one denies with a construct-naming teaching
+    // message. `resolver::tests` owns the per-form coverage; these tests pin
+    // the wiring through `check_command`.
 
     #[test]
-    fn redirect_to_file_denied() {
-        let rules = basic_rules();
-        // git is allowed, but the redirect must still be denied.
-        let denial = check_command("git status > out.txt", &rules, None).expect("redirect denied");
-        assert_eq!(denial.reason, DenialReason::OutputRedirect);
-    }
-
-    #[test]
-    fn redirect_append_denied() {
-        let rules = basic_rules();
-        let denial =
-            check_command("git log >> out.txt", &rules, None).expect("append redirect denied");
-        assert_eq!(denial.reason, DenialReason::OutputRedirect);
-    }
-
-    #[test]
-    fn redirect_glued_target_denied() {
-        let rules = basic_rules();
-        for cmd in ["echo x>file", "make test 2>file", "make test &>file"] {
-            let denial = check_command(cmd, &rules, None).expect("glued redirect denied");
-            assert_eq!(
-                denial.reason,
-                DenialReason::OutputRedirect,
-                "glued redirect should be OutputRedirect: {cmd}",
+    fn resolvable_redirects_are_allowed() {
+        // recommended_rules: every command here is allowlisted, so the
+        // verdict under test is the resolver's.
+        let rules = recommended_rules();
+        for cmd in [
+            "git status > out.txt",
+            "git log >> out.txt",
+            "echo x>file",
+            "make test 2>file",
+            "make test &>file",
+            "git status >| out.txt",
+            // A heredoc never shields the redirect (bug 11); the `> file.rs`
+            // target is simply resolved now.
+            "cat <<'EOF' > file.rs\nfn main() {}\nEOF",
+        ] {
+            assert!(
+                check_command(cmd, &rules, None).is_none(),
+                "resolvable write should be allowed: {cmd}",
             );
         }
     }
 
     #[test]
-    fn redirect_clobber_denied() {
+    fn opaque_redirects_are_denied_with_teaching() {
         let rules = basic_rules();
-        let denial =
-            check_command("git status >| out.txt", &rules, None).expect("clobber redirect denied");
-        assert_eq!(denial.reason, DenialReason::OutputRedirect);
+        for cmd in [
+            "echo hi > $F",
+            "make test > ${OUT:-default}",
+            "echo x > ~user/f",
+        ] {
+            let denial = check_command(cmd, &rules, None).expect("opaque write denied");
+            assert_eq!(denial.reason, DenialReason::OpaqueWrite, "{cmd}");
+            assert!(denial.message.is_some(), "teaching message present: {cmd}");
+        }
     }
 
     #[test]
-    fn heredoc_plus_redirect_denied() {
-        // Required ticket-08 outcome: a heredoc never shields an output
-        // redirect. `<<` lexes to `RedirectOp::Read` (input, ignored by the
-        // guard); the `> file.rs` write is a separate `RedirectOp::Write` the
-        // guard catches (bug 11).
+    fn opaque_write_denial_message_is_the_teaching_text() {
         let rules = basic_rules();
-        let denial = check_command("cat <<'EOF' > file.rs\nfn main() {}\nEOF", &rules, None)
-            .expect("heredoc + redirect denied");
-        assert_eq!(denial.reason, DenialReason::OutputRedirect);
+        let denial = check_command("echo hi > $F", &rules, None).expect("denied");
+        let msg = format_denial(&denial.command, &rules, &denial, None, None);
+        assert!(msg.contains("$F"), "names the construct: {msg}");
+        assert!(
+            msg.contains("Bind it"),
+            "teaches the resolvable form: {msg}"
+        );
     }
 
     #[test]
@@ -3087,11 +3127,28 @@ mod tests {
     }
 
     #[test]
-    fn allow_file_redirects_true_permits() {
+    fn allow_file_redirects_knob_is_inert() {
+        // ws38 ticket 01: the resolver path is authoritative — the knob no
+        // longer changes any verdict (its config retirement is ticket 05).
         let mut rules = basic_rules();
-        rules.allow_file_redirects = true;
-        // git is allowed and the flag lifts the redirect deny.
+        // Resolvable: allowed with the knob in either state.
         assert!(check_command("git status > out.txt", &rules, None).is_none());
+        rules.allow_file_redirects = true;
+        assert!(check_command("git status > out.txt", &rules, None).is_none());
+        // Opaque: denied with the knob in either state.
+        assert_eq!(
+            check_command("git status > $F", &rules, None)
+                .expect("opaque write denied despite the knob")
+                .reason,
+            DenialReason::OpaqueWrite,
+        );
+        rules.allow_file_redirects = false;
+        assert_eq!(
+            check_command("git status > $F", &rules, None)
+                .expect("opaque write denied")
+                .reason,
+            DenialReason::OpaqueWrite,
+        );
     }
 
     #[test]
@@ -3100,18 +3157,6 @@ mod tests {
         // vector is denied (NotAllowed) rather than waved through.
         let rules = basic_rules();
         assert!(check_command("make test | tee src/x.rs", &rules, None).is_some());
-    }
-
-    #[test]
-    fn redirect_denial_message_points_at_edit_tool() {
-        let rules = basic_rules();
-        let denial = check_command("git status > out.txt", &rules, None).expect("denied");
-        let msg = format_denial("git", &rules, &denial, None, None);
-        assert!(msg.contains("Edit"), "message names edit tool: {msg}");
-        assert!(
-            msg.contains("allow_file_redirects"),
-            "message names the escape hatch: {msg}",
-        );
     }
 
     // ── Ticket-03 redirect-guard cases (parse-driven) ───────────────
@@ -3126,11 +3171,10 @@ mod tests {
     }
 
     #[test]
-    fn echo_real_redirect_denied() {
+    fn echo_real_redirect_resolves() {
+        // The real redirect is a resolved, recorded write now (ws38).
         let rules = basic_rules();
-        let denial =
-            check_command("echo hi > out.txt", &rules, None).expect("real redirect denied");
-        assert_eq!(denial.reason, DenialReason::OutputRedirect);
+        assert!(check_command("echo hi > out.txt", &rules, None).is_none());
     }
 
     #[test]
@@ -3149,59 +3193,65 @@ mod tests {
     }
 
     #[test]
-    fn redirect_inside_substitution_denied() {
-        // The redirect lives inside a command substitution; recursing the guard
-        // into the substitution catches it (the byte scanner only saw the top
-        // segment).
+    fn opaque_write_inside_substitution_denied() {
+        // The write lives inside a command substitution; the resolver's
+        // substitution recursion still classifies it. A resolvable nested
+        // write is allowed; an opaque one denies at any depth.
         let rules = basic_rules();
-        let denial =
-            check_command("echo $(date > stamp)", &rules, None).expect("nested redirect denied");
-        assert_eq!(denial.reason, DenialReason::OutputRedirect);
+        assert!(
+            check_command("echo $(git status > stamp)", &rules, None).is_none(),
+            "resolvable nested write allowed",
+        );
+        let denial = check_command("echo $(git status > $STAMP)", &rules, None)
+            .expect("opaque nested write denied");
+        assert_eq!(denial.reason, DenialReason::OpaqueWrite);
+        let denial = check_command("echo $(echo $(git log > $DEEP))", &rules, None)
+            .expect("opaque write two substitution levels deep must still deny");
+        assert_eq!(denial.reason, DenialReason::OpaqueWrite);
     }
 
     #[test]
-    fn redirect_nested_two_levels_in_substitution_denied() {
-        // A redirect two substitution levels deep is still caught: the guard's
-        // own recursion (`check_parsed_command` → `check_script` →
-        // `check_parsed_command`) descends every `$()` level and re-applies the
-        // redirect guard at each. This is why the redundant top-level
-        // `command.substitutions … parse_redirects_to_file` sweep was removed
-        // without loss of coverage — the leading recursion subsumes it at any
-        // depth, not just one level.
+    fn dup_out_to_file_target_resolves_or_denies() {
+        // `>&file` (a non-fd target) is the zsh/bash combined-stream file
+        // write, not a descriptor duplication — a real write, resolved like
+        // any other (§8a fail-closed shape preserved for opaque targets).
         let rules = basic_rules();
-        let denial = check_command("echo $(echo $(date > deep.txt))", &rules, None)
-            .expect("redirect nested two levels deep must still deny");
-        assert_eq!(denial.reason, DenialReason::OutputRedirect);
+        assert!(check_command("make test >&out.log", &rules, None).is_none());
+        assert_eq!(
+            check_command("make test >&$LOG", &rules, None)
+                .expect("opaque dup-out target denied")
+                .reason,
+            DenialReason::OpaqueWrite,
+        );
     }
 
     #[test]
-    fn dup_out_to_file_target_denied() {
-        // `>&file` (a non-fd target) is the zsh/bash combined-stream file write,
-        // not a descriptor duplication — so it is a real file write (§8a).
+    fn multios_targets_all_resolved() {
+        // MULTIOS: `> a > b` writes *both* targets — each resolves; one opaque
+        // target anywhere denies the line.
         let rules = basic_rules();
-        let denial =
-            check_command("make test >&out.log", &rules, None).expect("dup-to-file-target denied");
-        assert_eq!(denial.reason, DenialReason::OutputRedirect);
-    }
-
-    #[test]
-    fn multios_targets_all_gated() {
-        // MULTIOS: `> a > b` writes *both* targets — each is its own redirect
-        // and any one of them trips the guard (§8a).
-        let rules = basic_rules();
-        let denial =
-            check_command("echo hi > a > b", &rules, None).expect("multios redirect denied");
-        assert_eq!(denial.reason, DenialReason::OutputRedirect);
+        assert!(check_command("echo hi > a > b", &rules, None).is_none());
+        assert_eq!(
+            check_command("echo hi > a > $B", &rules, None)
+                .expect("one opaque multios target denies")
+                .reason,
+            DenialReason::OpaqueWrite,
+        );
     }
 
     #[test]
     fn variable_redirect_target_fails_closed() {
-        // `> $f` is an unverifiable target — the parser does not expand it, so it
-        // is not a device sink and the guard denies (fail closed, §8a).
+        // `> $f` is an unverifiable target unless bound in the same command
+        // line — the resolver denies (complete-or-deny), and a same-line
+        // binding resolves it.
         let rules = basic_rules();
         let denial =
             check_command("echo hi > $f", &rules, None).expect("variable target fails closed");
-        assert_eq!(denial.reason, DenialReason::OutputRedirect);
+        assert_eq!(denial.reason, DenialReason::OpaqueWrite);
+        assert!(
+            check_command("f=out.txt; echo hi > $f", &rules, None).is_none(),
+            "same-line binding resolves the target",
+        );
     }
 
     // ── is_unresolvable_cd_target tests ─────────────────────────────
@@ -3825,21 +3875,22 @@ mod tests {
 
     #[test]
     fn composition_table() {
-        use DenialReason::{NotAllowed, OutputRedirect, PipelinePosition};
+        use DenialReason::{NotAllowed, OpaqueWrite, PipelinePosition};
         use Outcome::{Allow, DenyCatenary, DenyForeign};
         let rules = recommended_rules();
         let cases: &[(&str, Outcome)] = &[
-            // ── Foreign allowlist + redirect gate (01) + reads (03) ──
+            // ── Foreign allowlist + resolve-or-deny writes (ws38) + reads ──
             ("git status", Allow),
             ("cat src/main.rs", Allow),
-            ("git status > out.txt", DenyForeign(OutputRedirect)),
-            ("cat foo > bar.rs", DenyForeign(OutputRedirect)),
+            // Resolvable redirects are recorded writes, allowed (ws38 01).
+            ("git status > out.txt", Allow),
+            ("cat foo > bar.rs", Allow),
+            ("cat <<'EOF' > f.rs\nfn x(){}\nEOF", Allow),
+            // Opaque write targets deny with a teaching message.
+            ("git status > $OUT", DenyForeign(OpaqueWrite)),
+            ("echo x > $(cat name)", DenyForeign(OpaqueWrite)),
             ("make test 2>&1", Allow),
             ("make test > /dev/null", Allow),
-            (
-                "cat <<'EOF' > f.rs\nfn x(){}\nEOF",
-                DenyForeign(OutputRedirect),
-            ),
             // ── awk/sed out of the pipeline (02) ──
             ("git log | sed -n 'w /tmp/x'", DenyForeign(NotAllowed)),
             ("git log | sort", Allow),
