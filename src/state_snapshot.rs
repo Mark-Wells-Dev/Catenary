@@ -235,7 +235,7 @@ pub struct SessionEntry {
     /// Bumped on **every** `get_or_create_router` call — i.e. every
     /// non-catenary tool the `PreToolUse` hook forwards (`Read`, `Edit`,
     /// `Bash`, …) — so it advances far more often than `last_action`, which
-    /// only moves on edit / diagnostics / sed. It is the recency / liveness
+    /// only moves on edit / diagnostics. It is the recency / liveness
     /// signal the board has no death event for (ticket 05a).
     pub last_seen: String,
     /// The session's workspace roots, taken from its own hook payload

@@ -108,36 +108,6 @@ and use `--count` for totals instead of piping into `head`/`tail`/`wc`.
 | `--include-gitignored` | Include files ignored by .gitignore |
 | `--include-hidden` | Include hidden files and directories |
 
-### `catenary sed`
-
-Regex find-and-replace across files — the tracked mass-edit surface for
-sweeps too broad for the host's Edit tool. Previews by default (resolved
-file list plus per-file match counts, writing nothing); `--in-place`
-applies the edits and folds the changed files into the diagnostics batch,
-so run `catenary diagnostics` afterward. Capture groups are `$1` (not
-`\1`); `\n`/`\t`/`\r` are interpreted.
-
-Single-quote the pattern and replacement so the shell leaves regex
-metacharacters and `$1` capture references intact:
-
-```bash
-catenary sed 'old_name' 'new_name' 'src/**/*.rs'            # preview
-catenary sed 'old_name' 'new_name' 'src/**/*.rs' --in-place
-catenary sed '(\w+)_old' '$1_new' 'src/' --in-place
-catenary sed 'Foo' 'Bar' 'src/' --in-place --preserve-case  # Foo→Bar, foo→bar
-```
-
-| Flag | Description |
-|------|-------------|
-| `[PATH]...` | File/directory path(s) or quoted glob pattern(s). Required — never rewrites the whole tree implicitly |
-| `--in-place` | Apply the edits (default: preview) |
-| `--ignore-case` | Case-insensitive matching |
-| `--preserve-case` | Case the replacement to match each hit |
-| `--first` | Replace only the first match per file (default: all) |
-| `--exclude-pattern <pat>` | Glob pattern to exclude from matches |
-| `--include-gitignored` | Include files ignored by .gitignore |
-| `--include-hidden` | Include hidden files and directories |
-
 ### `catenary diagnostics`
 
 Print LSP diagnostics for every file you've edited since the last run,
@@ -153,9 +123,8 @@ exits 0.
 catenary diagnostics
 ```
 
-`catenary diagnostics` and `catenary sed --in-place` are load-bearing,
-correlated commands — run each **bare**, as its own step (no pipes, no
-`&&`/`;` chaining), and read the result. While a batch of covered edits is
+`catenary diagnostics` is a load-bearing command — run it **bare**, as its
+own step (no pipes, no `&&`/`;` chaining), and read the result. While a batch of covered edits is
 pending, the command filter blocks unrelated commands until you run
 `catenary diagnostics`. The exit code signals compile state: non-zero when
 the run is "dirty" (an error by default — see `diagnostics_severity` in

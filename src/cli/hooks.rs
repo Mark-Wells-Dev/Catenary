@@ -754,17 +754,6 @@ pub fn run_pre_tool(format: HostFormat) {
                 handle_done_editing_hook(&hook_json, format);
                 return;
             }
-            // `catenary sed --in-place` writes through the daemon, which knows
-            // the runtime-changed set but not the agent's identity. Stage the
-            // identity forward (`pre-tool/sed`) so the daemon can accumulate the
-            // swept files. A preview (`in_place = false`) is a stateless query —
-            // nothing to stage; just allow it.
-            CatenaryAction::Sed { in_place } => {
-                if in_place {
-                    handle_sed_hook(&hook_json, format);
-                }
-                return;
-            }
             // Canonical search/tool command. A `cd`/foreign-chained search
             // (or an arg-substitution carrying a foreign command) still has
             // its foreign segments allowlist-checked (regime 2); `catenary`
@@ -1175,41 +1164,6 @@ fn handle_done_editing_hook(hook_json: &serde_json::Value, format: HostFormat) {
 
     let mut request = serde_json::json!({
         "method": "pre-tool/editing-stop",
-        "agent_id": agent_id,
-        "format": format.as_str(),
-    });
-    if let Some(sid) = session_id {
-        request["session_id"] = serde_json::json!(sid);
-    }
-    request["host_payload"] = prepare_host_payload(hook_json);
-
-    let lines = ipc_exchange(stream, &request);
-
-    if let Some(line) = lines.first()
-        && let Ok(envelope) = serde_json::from_str::<crate::hook::HookResponseEnvelope>(line)
-        && let Some(crate::hook::HookResult::Deny(reason)) = &envelope.result
-    {
-        print!("{}", format_deny(reason, format));
-    }
-}
-
-/// Handle `PreToolUse` for `catenary sed --in-place`.
-///
-/// Sends `pre-tool/sed` IPC to the daemon to stage the *identity-forward*
-/// handoff: the hook holds `(session_id, agent_id)` but not the runtime-changed
-/// set, so it deposits the identity under the `sed` key. The sed process then
-/// connects, performs the write, and the daemon accumulates the changed files
-/// under the staged identity. Allow (silent) — the `catenary sed` command runs.
-fn handle_sed_hook(hook_json: &serde_json::Value, format: HostFormat) {
-    let Some(stream) = hook_connect(hook_json) else {
-        return;
-    };
-
-    let agent_id = extract_agent_id(hook_json);
-    let session_id = extract_session_id(hook_json, format);
-
-    let mut request = serde_json::json!({
-        "method": "pre-tool/sed",
         "agent_id": agent_id,
         "format": format.as_str(),
     });

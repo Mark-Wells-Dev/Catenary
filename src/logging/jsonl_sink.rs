@@ -21,7 +21,7 @@
 //! ├── servers/<server>@<enc-root>.jsonl  # autonomous server lifecycle, sharded by server identity
 //! ├── grep/<ts>_<uuid>.jsonl             # one invocation = one file (cmd record + triggered LSP)
 //! ├── glob/<ts>_<uuid>.jsonl
-//! └── sessions/<session_id>.jsonl        # hook decisions · edits · diagnostics(+LSP) · sed(+LSP)
+//! └── sessions/<session_id>.jsonl        # hook decisions · edits · diagnostics(+LSP)
 //! ```
 //!
 //! **Each scope shards by its own id at the top level**; `cwd` is a *record
@@ -152,7 +152,7 @@ enum ReapClass {
 /// is pulled out of its file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Scope {
-    /// Hook-correlated work (editing, `diagnostics`, `sed`), keyed by the
+    /// Hook-correlated work (editing, `diagnostics`), keyed by the
     /// session id. Lives at `sessions/<session_id>.jsonl` — `session_id` is the
     /// primary forensic axis, so it shards at the top level (a direct open for
     /// `query --session`, not a cross-dir scan).

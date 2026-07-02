@@ -98,9 +98,9 @@ language detection.
 ## Serving
 
 Once initialized, the daemon serves requests from two sockets: CLI
-commands and hook events over the IPC socket (grep, glob, sed,
-diagnostics, roots, editing enforcement) and MCP traffic over the MCP
-socket (the bridge proxy forwards the handshake and root updates). Each
+commands and hook events over the IPC socket (grep, glob, diagnostics,
+roots, editing enforcement) and MCP traffic over the MCP socket (the
+bridge proxy forwards the handshake and root updates). Each
 CLI command follows this sequence:
 
 1. **File change notification.** The walk a command already performs
@@ -118,8 +118,6 @@ CLI command follows this sequence:
      search, LSP enrichment.
    - `glob` → `GlobServer` — file listing with structural symbol
      outlines from LSP `documentSymbol`.
-   - `sed --in-place` → regex find-and-replace, folding the changed
-     files into the tracked editing batch.
    - `diagnostics` → ends the editing batch, runs batched diagnostics
      across all modified files (editing starts implicitly on the first
      covered edit — there is no separate start command).
@@ -139,8 +137,9 @@ CLI command follows this sequence:
 Editing mode brackets a batch of file edits. It starts implicitly on the
 first edit to a server-covered file — there is no separate start command
 — and ends when the agent runs `catenary diagnostics`. The host CLI's
-Edit/Write tools (and `catenary sed`) modify files directly; Catenary's
-`PreToolUse` hook tracks which files are modified. When `catenary
+Edit/Write tools modify files directly — as do native shell writes like
+`sed -i`, whose write-set the `PreToolUse` hook resolves; the hook tracks
+which files are modified. When `catenary
 diagnostics` runs, `DiagnosticsServer` opens all modified files on their
 respective language servers, waits for each server to settle, retrieves
 diagnostics, and prints a consolidated report to stdout.

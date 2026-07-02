@@ -60,10 +60,14 @@ const TEMPLATE: &str = r#"# Catenary recommended config
 # # `allow` includes read/stdout-only tools (cat, head, less, diff,
 # # echo, ...): reads aren't a write vector, and a redirected write
 # # (`cat > f`) is resolved and attributed, not blocked by denying cat.
+# # `sed` and `perl` are allowed as bulk writers: their in-place edits
+# # (`sed -i`, `perl -i -pe`) are script-checked and resolved into the
+# # diagnostics batch, and an unparseable/executing script (`sed -i 'w …'`,
+# # `perl -e system(…)`) is surgically denied by the resolver.
 # allow = ["git", "gh", "cp", "rm", "mkdir", "mv", "touch",
 #          "chmod", "sleep", "cd", "true", "false", "which",
 #          "cat", "head", "tail", "less", "more", "diff",
-#          "echo", "printf", "seq"]
+#          "echo", "printf", "seq", "sed", "perl"]
 # pipeline = ["grep", "wc", "jq", "sort", "tr", "cut", "uniq"]
 #
 # [commands.deny]
@@ -76,10 +80,6 @@ const TEMPLATE: &str = r#"# Catenary recommended config
 #
 # # Per-command guidance — optional hints shown when a command is denied.
 # # Groups map commands to a message. {EDIT} resolves per-client.
-#
-# [commands.guidance.edit]
-# message = "Use {EDIT} for surgical edits, `catenary sed` for sweeps."
-# commands = ["sed"]
 #
 # [commands.guidance.scan]
 # redirect = "grep"
@@ -156,7 +156,7 @@ const TEMPLATE: &str = r#"# Catenary recommended config
 # [language.python]
 # root_markers = []                        # disable for python
 
-# ── Tools (`catenary grep`/`glob`/`sed`/`diagnostics`) ───────────
+# ── Tools (`catenary grep`/`glob`/`diagnostics`) ─────────────────
 #
 # Every command emits its COMPLETE output (decision 025): no line budget, no
 # paging, no spill file — the host caps only the final read at the end of a
@@ -298,19 +298,17 @@ mod tests {
     }
 
     #[test]
-    fn template_pipeline_drops_awk_and_sed() {
-        // awk and sed are interpreters whose program string is a quoted
-        // argument the filter quote-masks before parsing, so it can't see
-        // their in-band exec/write side effects (awk system()/print>, sed
-        // -i/w, GNU sed e). Same unparseable hazard python is denied for, so
-        // they are dropped from the recommended pipeline (bugs/12 / Decision
-        // 6). The mass-edit slice is rehomed onto `catenary sed`.
+    fn template_pipeline_drops_awk() {
+        // awk's program string is a quoted argument the filter quote-masks
+        // before parsing, so the pipeline position can't see its in-band
+        // exec/write side effects (awk system()/print>). It stays out of the
+        // recommended pipeline (bugs/12 / Decision 6); the resolver's program
+        // check is the safety net when it is invoked.
         let pipeline = test_recommended::config()
             .pipeline
             .expect("recommended config has a pipeline list");
         let has = |c: &str| pipeline.iter().any(|p| p == c);
         assert!(!has("awk"), "pipeline should not include awk");
-        assert!(!has("sed"), "pipeline should not include sed");
         // Pure filters that cannot exec/write stay.
         assert!(has("cut"), "cut stays in pipeline");
         assert!(has("jq"), "jq stays in pipeline");
@@ -318,27 +316,18 @@ mod tests {
     }
 
     #[test]
-    fn template_edit_guidance_points_to_catenary_sed() {
-        // With sed out of the pipeline it is denied at every position, so the
-        // edit guidance always fires. It names both surfaces: the host edit
-        // tool for surgical edits and `catenary sed` for sweeps (the redirect
-        // that makes the removal a rehome, not a capability loss).
-        let guidance = test_recommended::config()
-            .guidance
-            .expect("recommended config has guidance groups");
-        let edit = guidance.get("edit").expect("edit guidance group");
-        let msg = edit
-            .message
-            .as_deref()
-            .expect("edit guidance group has a message");
-        assert!(
-            msg.contains("catenary sed"),
-            "edit guidance should name catenary sed: {msg:?}",
-        );
-        assert!(
-            msg.contains("{EDIT}"),
-            "edit guidance should keep the per-client edit-tool template var: {msg:?}",
-        );
+    fn template_allows_sed_and_perl_as_resolved_writers() {
+        // `catenary sed` is retired (ws38 ticket 06): native `sed -i` /
+        // `perl -i -pe` are the bulk writers now, allowlisted so their
+        // script-checked in-place edits resolve into the diagnostics batch
+        // (an unparseable/executing script is surgically denied by the
+        // resolver, not by keeping the command off the allowlist).
+        let allow = test_recommended::config()
+            .allow
+            .expect("recommended config has an allow list");
+        let has = |c: &str| allow.iter().any(|p| p == c);
+        assert!(has("sed"), "sed is an allowed resolved writer");
+        assert!(has("perl"), "perl is an allowed resolved writer");
     }
 
     #[test]

@@ -7,8 +7,9 @@ scanning.
 
 Two CLI search commands — `catenary grep` and `catenary glob` — plus a
 tracked editing surface: edits flow through the host's Edit/Write tools
-(or `catenary sed` for sweeps), and `catenary diagnostics` reports the
-errors and warnings for every file touched. Editing is tracked
+(or native `sed -i` for sweeps, whose writes the hook tracks too), and
+`catenary diagnostics` reports the errors and warnings for every file
+touched. Editing is tracked
 automatically — the first edit starts it, there is no start step. The
 agent never needs to know which language server handles which file.
 

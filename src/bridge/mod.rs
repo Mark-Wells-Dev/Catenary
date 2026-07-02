@@ -21,8 +21,6 @@ mod hook_router;
 mod linter;
 /// Path validation for LSP-aware operations and config file protection.
 pub mod path_security;
-/// `catenary sed` — the tracked mass-edit surface.
-pub mod sed;
 /// Shared container for tool servers and cross-tool infrastructure.
 pub mod session;
 
@@ -137,13 +135,13 @@ impl SourceLines {
 /// a host `Edit`/`Write` (and any other external write the daemon has no signal
 /// for — `git checkout`, formatters) leaves the rows in place, so without this
 /// check `grep`/`glob` would serve a pre-edit outline and pre-edit enclosing
-/// labels until a later `catenary diagnostics`/`sed` pass happened to cover the
+/// labels until a later `catenary diagnostics` pass happened to cover the
 /// file (bug #26). One `stat` per file decides both cases; files that don't
 /// exist on disk are skipped.
 ///
 /// A genuinely-stale file additionally bumps its root's generation counter so
 /// the per-position enrichment cache and the paged result cache re-derive,
-/// mirroring the `sed` and diagnostics invalidation paths. First-time fills are
+/// mirroring the diagnostics invalidation path. First-time fills are
 /// not bumped — there is no prior generation to invalidate, and bumping would
 /// needlessly evict unrelated files in the same root.
 ///

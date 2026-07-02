@@ -501,27 +501,26 @@ pub fn extract_command_names(cmd: &str) -> Vec<String> {
 // (ADR 013), separate from the foreign allowlist: only recognized subcommands,
 // in a bare canonical shape, split by correlation class.
 //
-// - `diagnostics`/`sed` (load-bearing, correlated) must be **bare** — the sole
-//   command in the call — so their hook→CLI handoff (ticket 17) consumes fast.
+// - `diagnostics` (load-bearing, correlated) must be **bare** — the sole
+//   command in the call — so its hook→CLI handoff (ticket 17) consumes fast.
 // - `grep`/`glob` (stateless, self-scoping) may `cd`-prefix and `&&`/`;`/`||`
 //   chain with allowlisted foreign commands, any count.
 //
 // Both classes reject substitution-*wrapping* (`$(catenary …)` captures the
 // output) and backgrounding (`&`; the harness auto-backgrounds and drops stdout,
 // bug 15). The output-ownership pipe/redirect denials are retired (decision
-// 025): `grep`/`glob` and `sed` previews emit complete, client-owned output, so
-// they may pipe or redirect freely; only the handoff-carrying commands
-// (`diagnostics`/`sed --in-place`/lifecycle) stay bare-only, so a pipe or
-// redirect on them is a bare-only violation. The matcher only recognizes and
-// classifies; it performs no IO. Foreign commands keep the allowlist regime
-// ([`check_command`]).
+// 025): `grep`/`glob` emit complete, client-owned output, so they may pipe or
+// redirect freely; only the handoff-carrying `diagnostics`/lifecycle commands
+// stay bare-only, so a pipe or redirect on them is a bare-only violation. The
+// matcher only recognizes and classifies; it performs no IO. Foreign commands
+// keep the allowlist regime ([`check_command`]).
 
 /// Correlation class of a recognized catenary subcommand (ADR 013/014).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CatenaryClass {
     /// `grep`/`glob` — stateless, self-scoping; may chain/`cd`, any count.
     Search,
-    /// `diagnostics`/`sed` — load-bearing, correlated; bare only.
+    /// `diagnostics` — load-bearing, correlated; bare only.
     Correlated,
     /// `editing start`/`roots`/`primer` — bare lifecycle/management.
     Lifecycle,
@@ -532,7 +531,9 @@ enum CatenaryClass {
 enum Sub {
     Grep,
     Glob,
-    /// Forward-registered (CLI command lands in ticket 08).
+    /// Retired: `catenary sed` came out in ws38 ticket 06 — native `sed -i` is
+    /// a resolved, tracked write now. Still recognized so a stray invocation
+    /// gets a retirement redirect, not a generic "unknown command".
     Sed,
     /// `catenary diagnostics` — prints diagnostics for the edited files.
     Diagnostics,
@@ -641,10 +642,6 @@ struct CatenaryOcc {
     backgrounded: bool,
     /// Catenary is *wrapped* in a `$()`/`<()`/backtick substitution.
     wrapped: bool,
-    /// `catenary sed --in-place` (the write form). `--in-place` is a literal
-    /// flag (no shell expansion), so it reads identically hook-side and
-    /// CLI-side — the hook stages an identity handoff only for the write form.
-    in_place: bool,
 }
 
 /// What the `PreToolUse` hook should do with a shell command, after recognizing
@@ -661,14 +658,6 @@ pub enum CatenaryAction {
     /// A bare, canonical `catenary diagnostics` — stage the done-editing handoff
     /// (internal `pre-tool/editing-stop`), then allow the command to run.
     Diagnostics,
-    /// A bare, canonical `catenary sed`. `--in-place` is the write form: the
-    /// hook stages an identity-forward handoff (internal `pre-tool/sed`) so the
-    /// daemon can attribute the runtime-changed set. A preview (`in_place =
-    /// false`) is a stateless query — no handoff. Either way the command runs.
-    Sed {
-        /// Whether `--in-place` was passed (write vs preview).
-        in_place: bool,
-    },
     /// A canonical catenary command (`grep`/`glob`/`roots`/`primer`).
     /// `has_foreign` is true when the call also contains foreign segments (a
     /// search chain) whose allowlist must still be checked.
@@ -708,21 +697,21 @@ struct CatenaryScan {
 /// rather than the ad-hoc scanners (ticket 04). Pure — no IO. See
 /// [`CatenaryAction`].
 ///
-/// The two regimes are split by correlation class: `grep`/`glob`/`sed`-preview
-/// carry no hook→IPC handoff, so they may be `cd`-prefixed and `&&`/`;`/`||`-
-/// chained with allowlisted foreign commands, any count. The correlated, load-
-/// bearing commands — `catenary diagnostics` and `catenary sed --in-place` —
-/// take the handoff and must therefore be the *sole* command of the whole
-/// script: a non-isolated invocation (`sleep 100; catenary diagnostics`, or a
-/// `for`-loop body) would wedge the daemon (decision 020 §5). That gate is
-/// **structural** — it counts the parse's command positions and inspects its
-/// compound flag, never a substring scan, so an under-counted separator can
-/// never mistake a chained command for isolated. Both classes reject
-/// substitution-wrapping and backgrounding; the output-ownership pipe/redirect
-/// denials are retired for the handoff-free commands
-/// (`grep`/`glob`/`sed`-preview), which emit complete, client-owned output
-/// (decision 025), while a pipe or redirect on a handoff command is a bare-only
-/// violation. Unrecognized or non-agent subcommands are denied.
+/// The two regimes are split by correlation class: `grep`/`glob` carry no
+/// hook→IPC handoff, so they may be `cd`-prefixed and `&&`/`;`/`||`-chained
+/// with allowlisted foreign commands, any count. The correlated, load-bearing
+/// `catenary diagnostics` takes the handoff and must therefore be the *sole*
+/// command of the whole script: a non-isolated invocation (`sleep 100; catenary
+/// diagnostics`, or a `for`-loop body) would wedge the daemon (decision 020 §5).
+/// That gate is **structural** — it counts the parse's command positions and
+/// inspects its compound flag, never a substring scan, so an under-counted
+/// separator can never mistake a chained command for isolated. Both classes
+/// reject substitution-wrapping and backgrounding; the output-ownership
+/// pipe/redirect denials are retired for the handoff-free `grep`/`glob`, which
+/// emit complete, client-owned output (decision 025), while a pipe or redirect
+/// on a handoff command is a bare-only violation. The retired `catenary sed` /
+/// `editing stop` tokens get a teaching redirect; unrecognized or non-agent
+/// subcommands are denied.
 #[must_use]
 pub fn analyze_catenary_command(cmd: &str) -> CatenaryAction {
     // The parse strips heredoc bodies, `#` comments, and `\`-newline joins, and
@@ -747,6 +736,18 @@ pub fn analyze_catenary_command(cmd: &str) -> CatenaryAction {
         return CatenaryAction::Deny(editing_stop_retired_denial());
     }
 
+    // `catenary sed` is retired — native `sed -i` is a resolved, tracked write
+    // now (ws38 ticket 06). Catch it in any form, before the output-ownership
+    // and bare-only denials, so the agent learns the native form rather than a
+    // generic complaint.
+    if scan
+        .occs
+        .iter()
+        .any(|o| matches!(o.recog, Recog::Agent(Sub::Sed)))
+    {
+        return CatenaryAction::Deny(sed_retired_denial());
+    }
+
     // First occurrence with a per-command problem wins (document order).
     for occ in &scan.occs {
         if let Some(msg) = catenary_occ_denial(occ) {
@@ -767,10 +768,10 @@ pub fn analyze_catenary_command(cmd: &str) -> CatenaryAction {
     let has_foreign = scan.has_foreign_segment || scan.inner_foreign_substitution;
 
     // Isolation gate (decision 020 §7.1). An occurrence that takes the hook→IPC
-    // handoff — `diagnostics`, `editing start`, `sed --in-place`, and the bare
-    // lifecycle commands (`roots`/`primer`/`commands`) — must be the *sole*
-    // command of the whole script: a non-isolated invocation wedges the daemon.
-    // `grep`/`glob` and a `sed` *preview* carry no handoff, so they chain freely.
+    // handoff — `diagnostics`, `editing start`, and the bare lifecycle commands
+    // (`roots`/`primer`/`commands`) — must be the *sole* command of the whole
+    // script: a non-isolated invocation wedges the daemon. `grep`/`glob` carry
+    // no handoff, so they chain freely.
     if scan.occs.iter().any(occ_needs_isolation) {
         // Canonical only when the script is exactly *one* top-level command — no
         // chaining (one command position), no compound wrapper, and the lone
@@ -784,39 +785,32 @@ pub fn analyze_catenary_command(cmd: &str) -> CatenaryAction {
         return match subs.first() {
             Some(Sub::EditingStart) => CatenaryAction::EditingStart,
             Some(Sub::Diagnostics) => CatenaryAction::Diagnostics,
-            // A sed reaching the isolation gate is the `--in-place` write form
-            // (a preview never triggers it); route it to the identity handoff.
-            Some(Sub::Sed) => CatenaryAction::Sed { in_place: true },
             // A bare lifecycle command (`roots`/`primer`/`commands`).
             _ => CatenaryAction::Allow { has_foreign },
         };
     }
 
-    // No handoff anywhere — `grep`/`glob` and `sed` previews chain freely. A lone
-    // bare `sed` preview still routes to the `Sed` action (no handoff); every
-    // other clean form is a plain allow that carries the foreign-check flag.
-    if scan.total_top_level == 1 && matches!(subs.first(), Some(Sub::Sed)) {
-        return CatenaryAction::Sed { in_place: false };
-    }
+    // No handoff anywhere — `grep`/`glob` chain freely.
     CatenaryAction::Allow { has_foreign }
 }
 
 /// Whether a clean catenary occurrence takes the hook→IPC handoff and so must be
 /// the sole command of the script (the isolation gate, decision 020 §7.1):
-/// `diagnostics`, `editing start`, `sed --in-place`, and the bare lifecycle
-/// commands (`roots`/`primer`/`commands`). A `grep`/`glob` search or a `sed`
-/// *preview* carries no handoff and chains freely. `NotAgent`/`Unknown`
-/// occurrences were already denied before this runs.
+/// `diagnostics`, `editing start`, and the bare lifecycle commands
+/// (`roots`/`primer`/`commands`). A `grep`/`glob` search carries no handoff and
+/// chains freely. `NotAgent`/`Unknown` and the retired `sed`/`editing stop`
+/// redirects were already handled before this runs.
 const fn occ_needs_isolation(occ: &CatenaryOcc) -> bool {
     match occ.recog {
-        // `sed` is correlated only in its `--in-place` write form.
-        Recog::Agent(Sub::Sed) => occ.in_place,
         // diagnostics / editing start / roots / primer / commands take the
-        // handoff (or are bare-only lifecycle).
+        // handoff (or are bare-only lifecycle). The retired `editing stop` /
+        // `sed` redirects are caught before this runs; grouped here for
+        // exhaustiveness.
         Recog::Agent(
             Sub::Diagnostics
             | Sub::EditingStart
             | Sub::EditingStop
+            | Sub::Sed
             | Sub::Roots
             | Sub::Primer
             | Sub::Commands,
@@ -877,8 +871,6 @@ fn scan_catenary_into(script: &parse::ParsedScript, scan: &mut CatenaryScan) {
                 } else {
                     None
                 };
-                let in_place = matches!(recog, Recog::Agent(Sub::Sed))
-                    && command.argv.iter().any(|a| a == "--in-place");
                 scan.occs.push(CatenaryOcc {
                     recog,
                     piped_in: pipe_pos > 0,
@@ -886,7 +878,6 @@ fn scan_catenary_into(script: &parse::ParsedScript, scan: &mut CatenaryScan) {
                     redirected: command.redirects.iter().any(redirect_writes_file),
                     backgrounded: pipeline.backgrounded,
                     wrapped: false,
-                    in_place,
                 });
             } else {
                 scan.has_foreign_segment = true;
@@ -915,7 +906,6 @@ fn scan_substitution(sub: &parse::ParsedScript, scan: &mut CatenaryScan) {
                     redirected: false,
                     backgrounded: false,
                     wrapped: true,
-                    in_place: false,
                 });
             } else {
                 scan.inner_foreign_substitution = true;
@@ -953,11 +943,11 @@ fn catenary_occ_denial(occ: &CatenaryOcc) -> Option<String> {
         return Some(msg);
     }
     // Output-ownership pipe/redirect denials are retired for the handoff-free
-    // commands (decision 025): `grep`/`glob` and `sed` previews emit complete,
-    // client-owned output, so piping or redirecting them is as valid as piping
-    // `grep` itself. Only the handoff-carrying commands (`diagnostics`,
-    // `sed --in-place`, the bare lifecycle commands) stay bare-only, so a
-    // pipe-out or a file redirect on them is a bare-only violation.
+    // commands (decision 025): `grep`/`glob` emit complete, client-owned
+    // output, so piping or redirecting them is as valid as piping `grep`
+    // itself. Only the handoff-carrying commands (`diagnostics`, the bare
+    // lifecycle commands) stay bare-only, so a pipe-out or a file redirect on
+    // them is a bare-only violation.
     if occ_needs_isolation(occ) {
         if let Some(down) = &occ.piped_out {
             return Some(out_pipe_denial(sub, down));
@@ -975,7 +965,7 @@ fn catenary_occ_denial(occ: &CatenaryOcc) -> Option<String> {
 }
 
 /// The recognized agent-facing command surface, for "unknown subcommand" denials.
-const CATENARY_SURFACE: &str = "Available: `grep`, `glob`, `sed`, `diagnostics`, \
+const CATENARY_SURFACE: &str = "Available: `grep`, `glob`, `diagnostics`, \
      `editing start`, `roots add/rm/ls`, `commands`, `primer`. Run `catenary primer` \
      for the workflow.";
 
@@ -1004,33 +994,35 @@ fn substitution_denial(sub: Sub) -> String {
 /// pipe position is a valid invocation — `None`. This retires the bug-19 /
 /// ADR-013 post-pipe guard, whose rationale ("catenary grep ignores stdin, so
 /// the pipe is a no-op") evaporated once stdin landed. The no-stdin classes
-/// (correlated `diagnostics`/`sed`, and the bare lifecycle commands) still
-/// deny with a class-appropriate message.
+/// (correlated `diagnostics` and the bare lifecycle commands) still deny with a
+/// class-appropriate message. The retired `sed`/`editing stop` redirects are
+/// handled before this runs; their arm here only satisfies exhaustiveness.
 fn stdin_denial(sub: Sub) -> Option<String> {
     match sub {
         // Search reads stdin now — a downstream pipe is valid, not an error.
         Sub::Grep | Sub::Glob => None,
-        Sub::Sed => Some(
-            "`catenary sed` takes `<pattern> <replacement> [paths]`, not stdin. \
-             Pass a glob pattern path."
-                .to_string(),
-        ),
         Sub::Diagnostics => {
             Some("`catenary diagnostics` takes no input — run it bare.".to_string())
         }
-        Sub::EditingStart | Sub::EditingStop | Sub::Roots | Sub::Primer | Sub::Commands => Some(
-            format!("`catenary {}` takes no stdin — run it bare.", sub.label()),
-        ),
+        Sub::Sed
+        | Sub::EditingStart
+        | Sub::EditingStop
+        | Sub::Roots
+        | Sub::Primer
+        | Sub::Commands => Some(format!(
+            "`catenary {}` takes no stdin — run it bare.",
+            sub.label()
+        )),
     }
 }
 
 /// `catenary X | downstream` for a handoff-carrying (bare-only) command.
 ///
-/// Only reached for commands that take a hook→IPC handoff (`diagnostics`,
-/// `sed --in-place`, the bare lifecycle commands) — the caller gates on
-/// [`occ_needs_isolation`]. `grep`/`glob` and `sed` previews emit complete,
-/// client-owned output (decision 025) and pipe freely, so they never reach here.
-/// Teaches the bare form / class split, not the retired volume model.
+/// Only reached for commands that take a hook→IPC handoff (`diagnostics`, the
+/// bare lifecycle commands) — the caller gates on [`occ_needs_isolation`].
+/// `grep`/`glob` emit complete, client-owned output (decision 025) and pipe
+/// freely, so they never reach here. Teaches the bare form / class split, not
+/// the retired volume model.
 fn out_pipe_denial(sub: Sub, downstream: &str) -> String {
     format!(
         "`catenary {}` takes a daemon handoff and must run bare — don't pipe it \
@@ -1043,10 +1035,10 @@ fn out_pipe_denial(sub: Sub, downstream: &str) -> String {
 /// `catenary X > file` for a handoff-carrying (bare-only) command.
 ///
 /// Only reached for handoff-carrying commands — the caller gates on
-/// [`occ_needs_isolation`]. `grep`/`glob` and `sed` previews emit complete,
-/// client-owned output (decision 025) and may redirect freely (the
-/// `catenary sed … > preview.diff` workflow is now permitted), so they never
-/// reach here. Teaches the bare form, not the retired volume model.
+/// [`occ_needs_isolation`]. `grep`/`glob` emit complete, client-owned output
+/// (decision 025) and may redirect freely (`catenary grep p > hits.txt` is
+/// permitted), so they never reach here. Teaches the bare form, not the retired
+/// volume model.
 fn redirect_denial(sub: Sub) -> String {
     format!(
         "`catenary {}` takes a daemon handoff and must run bare — don't redirect \
@@ -1083,8 +1075,8 @@ fn bare_only_denial(subs: &[Sub]) -> String {
         })
         .map_or("diagnostics", |s| s.label());
     format!(
-        "Run `catenary {label}` as its own command — `diagnostics` / `sed --in-place` \
-         and the editing-lifecycle commands take a daemon handoff and must be the SOLE \
+        "Run `catenary {label}` as its own command — `diagnostics` and the \
+         editing-lifecycle commands take a daemon handoff and must be the SOLE \
          command (no `cd` prefix, no `&&`/`;`/`||` chain, not combined with another \
          command). It must reach the daemon promptly to attribute correctly."
     )
@@ -1095,6 +1087,15 @@ fn bare_only_denial(subs: &[Sub]) -> String {
 fn editing_stop_retired_denial() -> String {
     "`catenary editing stop` is now `catenary diagnostics` — run `catenary \
      diagnostics` to print diagnostics for your edits."
+        .to_string()
+}
+
+/// Teaching redirect for the retired `catenary sed` — native `sed -i` is a
+/// resolved, tracked write now (ws38 ticket 06, decision 026 §4).
+fn sed_retired_denial() -> String {
+    "`catenary sed` is retired — native `sed -i 's/a/b/' <files>` is tracked \
+     (write-resolution). Preview with plain `sed 's/a/b/' <file>` to stdout and \
+     review with `git diff`."
         .to_string()
 }
 
@@ -1401,10 +1402,11 @@ mod tests {
     /// config`). Derived from the template via
     /// [`config_template::test_recommended`](crate::cli::config_template) so
     /// these behavioral tests track the real default — no hand-maintained
-    /// mirror to drift (bugs/12). After ticket 02 the template pipeline
-    /// excludes `awk`/`sed` and the edit guidance points `sed` at `catenary
-    /// sed`. (The `python_equivalent`/`basic` fixtures keep a permissive
-    /// pipeline on purpose — they test parser mechanics, not the default.)
+    /// mirror to drift (bugs/12). The template pipeline excludes `awk`, while
+    /// `sed`/`perl` are allowed bulk writers whose in-place edits the resolver
+    /// script-checks (ws38 ticket 06). (The `python_equivalent`/`basic`
+    /// fixtures keep a permissive pipeline on purpose — they test parser
+    /// mechanics, not the default.)
     fn recommended_rules() -> ResolvedCommands {
         let mut rules = ResolvedCommands::default();
         rules.merge(&crate::cli::config_template::test_recommended::config());
@@ -1431,24 +1433,27 @@ mod tests {
     }
 
     #[test]
-    fn sed_denied_mid_pipeline() {
-        // sed's `w`/GNU `e` and `-i` write/exec from the program string; with
-        // sed out of the pipeline, the mid-pipeline allowance no longer lets
-        // `… | sed 'w file'` through.
+    fn sed_write_command_denied_mid_pipeline() {
+        // `sed` is allowlisted (ws38 06), but its in-script `w`/`e` writes/execs
+        // are unattributable — the resolver denies them wherever they appear,
+        // including mid-pipeline where the program string would otherwise slip by.
         let rules = recommended_rules();
         assert!(check_command("git log | sed -n 'w /tmp/x'", &rules, None).is_some());
     }
 
     #[test]
-    fn sed_deny_guidance_names_catenary_sed() {
+    fn sed_write_command_denied_with_teaching_message() {
         let rules = recommended_rules();
         let denial = check_command("git log | sed -n 'w /tmp/x'", &rules, None)
-            .expect("sed denied mid-pipeline");
+            .expect("sed `w` write denied by the resolver");
+        assert_eq!(denial.reason, DenialReason::OpaqueWrite);
         let msg = format_denial(&denial.command, &rules, &denial, None, None);
-        assert!(msg.contains("Edit"), "names the edit tool: {msg}");
+        // The resolver's construct-naming teaching message points at the tracked
+        // form (`sed -i` on the target files), not at the retired `catenary sed`.
+        assert!(msg.contains("sed -i"), "teaches native sed -i: {msg}");
         assert!(
-            msg.contains("catenary sed"),
-            "points at catenary sed: {msg}"
+            !msg.contains("catenary sed"),
+            "must not point at the retired catenary sed: {msg}"
         );
     }
 
@@ -1545,15 +1550,17 @@ mod tests {
     fn unquoted_heredoc_substitution_is_gated() {
         // Bug 46: an *unquoted* `<<EOF` body is not opaque stdin — the shell
         // expands `$(…)` / `` `…` `` in it and runs them. `cat` (which owns the
-        // heredoc) is allowed, but a `sed --in-place` smuggled into the body via
-        // a substitution must still be denied, just as the bare command is.
+        // heredoc) is allowed, but an unattributable writer smuggled into the
+        // body via a substitution must still be gated, just as the bare command
+        // is. Native `sed -i` is a tracked write now (ws38 06), so the smuggled
+        // command here is a sed `w` write — opaque, so the resolver denies it.
         let rules = recommended_rules();
         assert!(
-            check_command("cat <<EOF\n`sed --in-place 's/a/b/' f`\nEOF", &rules, None).is_some(),
+            check_command("cat <<EOF\n`sed -i 'w hijack' f`\nEOF", &rules, None).is_some(),
             "backtick substitution in an unquoted heredoc body must be gated",
         );
         assert!(
-            check_command("cat <<EOF\n$(sed -i 's/a/b/' f)\nEOF", &rules, None).is_some(),
+            check_command("cat <<EOF\n$(sed -i 'w hijack' f)\nEOF", &rules, None).is_some(),
             "$(…) substitution in an unquoted heredoc body must be gated",
         );
     }
@@ -1564,7 +1571,7 @@ mod tests {
         // `$(…)` text is literal stdin and `cat` alone runs — nothing is denied.
         let rules = recommended_rules();
         assert!(
-            check_command("cat <<'EOF'\n$(sed -i 's/a/b/' f)\nEOF", &rules, None).is_none(),
+            check_command("cat <<'EOF'\n$(sed -i 'w hijack' f)\nEOF", &rules, None).is_none(),
             "quoted-delimiter heredoc body is inert",
         );
         // And bare prose in an *unquoted* body (no real substitution) is still
@@ -3493,19 +3500,21 @@ mod tests {
     }
 
     #[test]
-    fn matcher_routes_bare_sed() {
-        // `--in-place` is the write form → identity handoff staged by the hook.
-        assert_eq!(
-            analyze_catenary_command("catenary sed --in-place a b src"),
-            CatenaryAction::Sed { in_place: true },
-        );
-        // A bare preview is a stateless query → no handoff.
-        assert_eq!(
-            analyze_catenary_command("catenary sed a b src"),
-            CatenaryAction::Sed { in_place: false },
-        );
-        // Still bare-only: a prefix/chain is denied before the action is read.
-        assert!(deny_text("cd src && catenary sed --in-place a b .").contains("its own"));
+    fn matcher_redirects_retired_sed() {
+        // `catenary sed` is retired (ws38 06) — every form gets the teaching
+        // redirect to native `sed -i`, in a bare invocation or a chain.
+        for cmd in [
+            "catenary sed --in-place a b src",
+            "catenary sed a b src",
+            "cd src && catenary sed --in-place a b .",
+            "catenary sed a b > preview.diff",
+        ] {
+            let msg = deny_text(cmd);
+            assert!(
+                msg.contains("`catenary sed` is retired") && msg.contains("sed -i"),
+                "`{cmd}` should teach native sed -i, got: {msg}",
+            );
+        }
     }
 
     #[test]
@@ -3684,8 +3693,8 @@ mod tests {
 
     #[test]
     fn matcher_allows_search_redirect() {
-        // Ticket 07 / decision 025: search + sed-preview output is complete and
-        // client-owned, so a file redirect is now allowed.
+        // Ticket 07 / decision 025: search output is complete and client-owned,
+        // so a file redirect is now allowed.
         assert_eq!(
             analyze_catenary_command("catenary grep p > out.txt"),
             CatenaryAction::Allow { has_foreign: false },
@@ -3693,12 +3702,6 @@ mod tests {
         assert_eq!(
             analyze_catenary_command("catenary glob src > out.txt"),
             CatenaryAction::Allow { has_foreign: false },
-        );
-        // The decision-025 workflow `catenary sed … > preview.diff` (a preview,
-        // no `--in-place`) is permitted and routes to the handoff-free action.
-        assert_eq!(
-            analyze_catenary_command("catenary sed a b > preview.diff"),
-            CatenaryAction::Sed { in_place: false },
         );
     }
 
@@ -3782,21 +3785,15 @@ mod tests {
             diag_chain.contains("catenary diagnostics"),
             "got: {diag_chain}"
         );
-
-        // The correlated `sed` is the `--in-place` write form (it takes the
-        // handoff); a chained preview is allowed (see `matcher_sed_preview_*`).
-        let sed_chain = deny_text("make x && catenary sed --in-place a b f");
-        assert!(sed_chain.contains("as its own command"), "got: {sed_chain}");
-        assert!(sed_chain.contains("catenary sed"), "got: {sed_chain}");
     }
 
     #[test]
     fn matcher_denies_two_correlated_in_one_call() {
-        // Two correlated subs chained: the unified denial names the first
-        // isolation-needing command in document order (`sed`).
-        let msg = deny_text("catenary sed a b f && catenary diagnostics");
+        // Two correlated invocations chained: the unified bare-only denial names
+        // the isolation-needing command (`diagnostics`).
+        let msg = deny_text("catenary diagnostics && catenary diagnostics");
         assert!(msg.contains("as its own command"), "got: {msg}");
-        assert!(msg.contains("catenary sed"), "got: {msg}");
+        assert!(msg.contains("catenary diagnostics"), "got: {msg}");
     }
 
     #[test]
@@ -3948,9 +3945,7 @@ mod tests {
             // segments are skipped by the allowlist walk, so a search chain's
             // foreign part is still validated.
             CatenaryAction::NotCatenary | CatenaryAction::Allow { .. } => foreign(cmd),
-            CatenaryAction::EditingStart
-            | CatenaryAction::Diagnostics
-            | CatenaryAction::Sed { .. } => Outcome::Allow,
+            CatenaryAction::EditingStart | CatenaryAction::Diagnostics => Outcome::Allow,
         }
     }
 
@@ -3972,8 +3967,10 @@ mod tests {
             ("echo x > $(cat name)", DenyForeign(OpaqueWrite)),
             ("make test 2>&1", Allow),
             ("make test > /dev/null", Allow),
-            // ── awk/sed out of the pipeline (02) ──
-            ("git log | sed -n 'w /tmp/x'", DenyForeign(NotAllowed)),
+            // ── awk out of the pipeline; sed writes are resolver-checked ──
+            // `sed` is allowlisted (ws38 06), but its `w` write is unattributable,
+            // so the resolver denies with a construct-naming teaching message.
+            ("git log | sed -n 'w /tmp/x'", DenyForeign(OpaqueWrite)),
             ("git log | sort", Allow),
             // ── positional grep-nudge (09/16/bugs19) ──
             ("grep pattern src", DenyForeign(PipelinePosition)),
@@ -3992,7 +3989,7 @@ mod tests {
             ("catenary grep p | wc -l", Allow),
             ("catenary grep p > out.txt", Allow),
             ("catenary grep p 2>&1 | head", Allow),
-            ("catenary sed a b > preview.diff", Allow),
+            ("catenary sed a b > preview.diff", DenyCatenary), // retired → native sed
             // Catenary-only redirects are resolve-gated (ws38 ticket 02
             // folded-in edge): a literal target attributes and allows, an
             // opaque target denies with the resolver's teaching message.
@@ -4013,8 +4010,8 @@ mod tests {
             ("catenary diagnostics && make test", DenyCatenary), // bare-only
             ("catenary diagnostics > out.txt", DenyCatenary),
             ("make x & catenary diagnostics", DenyCatenary), // & seen → bare-only
-            ("catenary sed --in-place a b src", Allow),
-            ("catenary editing stop", DenyCatenary), // retired → diagnostics
+            ("catenary sed --in-place a b src", DenyCatenary), // retired → native sed
+            ("catenary editing stop", DenyCatenary),         // retired → diagnostics
             ("catenary frobnicate", DenyCatenary),
             ("catenary daemon", DenyCatenary), // not agent-invocable
             // ── catenary regime 1: top-level global reads (bug 22) ──
@@ -4295,32 +4292,22 @@ mod tests {
     }
 
     #[test]
-    fn ticket04_sed_preview_chains_freely() {
-        // `catenary sed -e 's/a/b/' f.rs` (preview) in a chain → allowed (no
-        // handoff): only `--in-place` is correlated.
-        assert_eq!(
-            analyze_catenary_command("cd src && catenary sed -e 's/a/b/' f.rs"),
-            CatenaryAction::Allow { has_foreign: true },
-        );
-        // A bare preview still routes to the (handoff-free) `Sed` action.
-        assert_eq!(
-            analyze_catenary_command("catenary sed -e 's/a/b/' f.rs"),
-            CatenaryAction::Sed { in_place: false },
-        );
-    }
-
-    #[test]
-    fn ticket04_sed_in_place_chained_denied() {
-        // `catenary sed --in-place ...; echo done` → denied (correlated, must be
-        // the sole command).
-        assert!(
-            matches!(
-                analyze_catenary_command("catenary sed --in-place a b f.rs; echo done"),
-                CatenaryAction::Deny(_),
-            ),
-            "a chained `catenary sed --in-place` must deny on isolation",
-        );
-        assert!(deny_text("catenary sed --in-place a b f.rs; echo done").contains("its own"));
+    fn ticket06_retired_catenary_sed_redirects() {
+        // `catenary sed` is retired (ws38 06): any form — bare, chained, or
+        // `--in-place` — gets the teaching redirect to native `sed -i`.
+        for cmd in [
+            "catenary sed -e 's/a/b/' f.rs",
+            "cd src && catenary sed -e 's/a/b/' f.rs",
+            "catenary sed --in-place a b f.rs; echo done",
+        ] {
+            assert!(
+                matches!(
+                    analyze_catenary_command(cmd),
+                    CatenaryAction::Deny(ref m) if m.contains("`catenary sed` is retired"),
+                ),
+                "`{cmd}` should teach native sed -i",
+            );
+        }
     }
 
     #[test]
@@ -4351,13 +4338,14 @@ mod tests {
 
     #[test]
     fn ticket04_for_loop_redirect_style_sed_denied() {
-        // `for f in *; do sed -i s/a/b/ "$f"; done` → denied: `sed` is not an
-        // allowed first-position command (the redirect-style in-place edit is
-        // not the tracked path).
+        // `for f in *; do sed -i s/a/b/ "$f"; done` → denied: `sed` is
+        // allowlisted (ws38 06), but the per-iteration loop variable `$f` is a
+        // computed target the resolver can't see, so the write is opaque.
         let rules = recommended_rules();
         let denial = check_command(r#"for f in *; do sed -i s/a/b/ "$f"; done"#, &rules, None)
-            .expect("sed inside a for loop must be denied");
+            .expect("sed with an opaque loop-variable target must be denied");
         assert_eq!(denial.command, "sed");
+        assert_eq!(denial.reason, DenialReason::OpaqueWrite);
     }
 
     #[test]
@@ -4414,10 +4402,11 @@ mod tests {
             ("catenary diagnostics", Allow),
             ("sleep 100; catenary diagnostics", DenyCatenary),
             ("for f in *.rs; do catenary diagnostics; done", DenyCatenary),
+            // `catenary sed` is retired → teaching redirect.
             ("catenary sed --in-place a b f.rs; echo done", DenyCatenary),
-            // Chain-free: search + sed-preview carry no handoff.
+            ("cd src && catenary sed -e 's/a/b/' f.rs", DenyCatenary),
+            // Chain-free: search carries no handoff.
             ("cd src && catenary grep foo", Allow),
-            ("cd src && catenary sed -e 's/a/b/' f.rs", Allow),
             // Compound allow: a `for` loop of allowlisted commands runs.
             (r#"for f in *.rs; do git add "$f"; done"#, Allow),
             // Compound deny: the allowlist still gates every body command.
@@ -4425,9 +4414,11 @@ mod tests {
                 "for f in *; do cargo build; done",
                 DenyForeign(DenialReason::NotAllowed),
             ),
+            // Native `sed` is allowlisted, but the loop variable `$f` is an
+            // opaque target — the resolver denies the write.
             (
                 r#"for f in *; do sed -i s/a/b/ "$f"; done"#,
-                DenyForeign(DenialReason::NotAllowed),
+                DenyForeign(DenialReason::OpaqueWrite),
             ),
         ];
         for (cmd, want) in cases {

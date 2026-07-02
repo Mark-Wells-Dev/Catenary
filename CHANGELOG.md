@@ -37,7 +37,11 @@ upgrading.
   programs are checked by the write resolver (a pure filter passes; an in-program
   `system()`/`print > file`, or `sed -i`, resolves or is surgically denied), so
   they are kept out of the position-0 pipeline rather than masked behind a bare
-  `awk 'prog'`. Route sweeping edits through the new `catenary sed`.
+  `awk 'prog'`. Native `sed`/`perl` are on the recommended allowlist as top-level
+  writes: sweep with `sed -i` (or `perl -i -pe` for look-around/back-references),
+  whose write-set the resolver records into the diagnostics batch — an opaque
+  write (`sed -f script`, an in-program `w`/`e`, a computed `$VAR` script) is
+  surgically denied.
 - **Project `.catenary.toml` `[commands]` enforcement keys are ignored.** Only
   `build` is honored at project scope. `client_enforcement_only`,
   `allow`, `pipeline`, `deny`, `deny_flags`, and
@@ -47,10 +51,6 @@ upgrading.
 
 ### Added
 
-- **`catenary sed`** — a tracked mass-edit surface for multi-file
-  substitutions, with a diff-style preview. Substitutions flow through the
-  tracked edit path so the diagnostics batch stays complete (the replacement for
-  pipeline `sed`).
 - **`[tools].diagnostics_per_page`** (default `50`) — single-shot preview budget
   for `catenary diagnostics`. Overflow is written to a per-session report file
   under the runtime dir, referenced by a trailing
@@ -76,7 +76,8 @@ before/after examples and exact remediation steps. In short:
 
 - Delete any `allow_file_redirects` line — the write model is now automatic
   (resolvable redirects just work; opaque ones are denied with guidance).
-- Drop `awk`/`sed` from your `pipeline`; use `catenary sed` for sweeps.
+- Drop `awk`/`sed` from your `pipeline`; sweep with native `sed -i` /
+  `perl -i -pe` (the resolver records their writes into the diagnostics batch).
 - Move any project `[commands]` enforcement keys into
   `~/.config/catenary/config.toml`.
 

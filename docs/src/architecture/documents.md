@@ -104,8 +104,9 @@ start` step to race against parallel tool calls — and ends when the agent
 runs `catenary diagnostics`. During editing mode:
 
 - **No LSP traffic for intermediate edits.** The agent edits freely
-  with the host CLI's native Edit/Write tools (or `catenary sed`). No
-  `didOpen`, no `didChange`, no diagnostic retrieval per edit.
+  with the host CLI's native Edit/Write tools (or native `sed -i`, whose
+  writes the hook resolves and tracks). No `didOpen`, no `didChange`, no
+  diagnostic retrieval per edit.
 - **Path accumulation.** The `PreToolUse` hook detects edit-tool
   calls and accumulates the modified file paths in `EditingManager`.
   Paths are deduplicated — editing the same file twice records it
@@ -115,7 +116,7 @@ runs `catenary diagnostics`. During editing mode:
 - **Boundary enforcement.** While a **non-empty covered tracked set**
   is pending, the `PreToolUse` hook blocks tool calls that would leave
   the edit batch. Read/Write, `ToolSearch`, filesystem-only Bash (`rm`,
-  `cp`, `mv`), and canonical Catenary commands (`grep`/`glob`/`sed`,
+  `cp`, `mv`), and canonical Catenary commands (`grep`/`glob`,
   the lifecycle commands) stay allowed; everything else is denied with a
   message that lists the tracked files and tells the agent to run
   `catenary diagnostics`. The block gates on the tracked set, not an

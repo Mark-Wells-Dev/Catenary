@@ -50,7 +50,7 @@ enum Command {
     /// uppercase letter); `-i` forces insensitive, `-s` forces sensitive.
     Grep {
         /// Regex pattern (Rust `regex` syntax, | for alternation; no look-around —
-        /// unlike `catenary sed`, grep runs the linear ripgrep engine).
+        /// grep runs the linear ripgrep engine).
         pattern: String,
 
         /// File or directory path(s) to scope the search.
@@ -143,58 +143,6 @@ enum Command {
         /// Report the path count ("N paths") instead of results.
         #[arg(long)]
         count: bool,
-
-        /// Include files ignored by .gitignore.
-        #[arg(long)]
-        include_gitignored: bool,
-
-        /// Include hidden files and directories.
-        #[arg(long)]
-        include_hidden: bool,
-    },
-
-    /// Regex find-and-replace across files (the tracked mass-edit surface).
-    ///
-    /// Previews by default (resolved file list + per-file match counts, writes
-    /// nothing); `--in-place` applies the edits and folds the changed files into
-    /// the diagnostics batch — run `catenary diagnostics` after. Capture groups
-    /// are `$1` (not `\1`); `\n`/`\t`/`\r` are interpreted. Quote glob patterns
-    /// so Catenary expands them gitignore-aware. Invoke via the host's shell tool.
-    Sed {
-        /// Regex pattern: Rust `regex` syntax plus look-around and
-        /// back-references (`Dft(?!Norm)`), | for alternation.
-        pattern: String,
-
-        /// Replacement text. $1 references a capture group, $0 the whole match,
-        /// $$ a literal $; \n/\t/\r are interpreted. (`&` is a literal `&`.)
-        /// Single pass — replacement text is never re-scanned for further matches.
-        replacement: String,
-
-        /// File or directory path(s), or quoted glob pattern(s).
-        ///
-        /// Required — `catenary sed` never rewrites the whole tree implicitly.
-        #[arg(name = "PATH")]
-        paths: Vec<String>,
-
-        /// Apply the edits (default: preview — shows files + match counts).
-        #[arg(long)]
-        in_place: bool,
-
-        /// Case-insensitive matching.
-        #[arg(long)]
-        ignore_case: bool,
-
-        /// Case the replacement to match each hit (Omni→Lattice, omni→lattice).
-        #[arg(long)]
-        preserve_case: bool,
-
-        /// Replace only the first match per file (default: all).
-        #[arg(long)]
-        first: bool,
-
-        /// Exclude matches by glob pattern (e.g., tests/**).
-        #[arg(long = "exclude-pattern")]
-        exclude: Option<String>,
 
         /// Include files ignored by .gitignore.
         #[arg(long)]
@@ -507,7 +455,7 @@ fn main() -> Result<()> {
             // For agent-facing subcommands, append `-h` output so the
             // agent sees correct usage without a second round-trip.
             let raw = e.to_string();
-            let subcommand = ["grep", "glob", "sed", "diagnostics", "editing", "roots"]
+            let subcommand = ["grep", "glob", "diagnostics", "editing", "roots"]
                 .into_iter()
                 .find(|cmd| raw.contains(&format!("catenary {cmd}")));
             if let Some(cmd) = subcommand
@@ -623,37 +571,6 @@ fn main() -> Result<()> {
         }
         #[cfg(not(unix))]
         Some(Command::Glob { .. }) => Err(anyhow::anyhow!("daemon mode requires Unix")),
-        #[cfg(unix)]
-        Some(Command::Sed {
-            pattern,
-            replacement,
-            paths,
-            in_place,
-            ignore_case,
-            preserve_case,
-            first,
-            exclude,
-            include_gitignored,
-            include_hidden,
-        }) => {
-            let paths = to_literal_paths(paths);
-            let mut out = cli::Output::stdout(false);
-            build_runtime()?.block_on(run_sed(
-                &mut out,
-                pattern,
-                replacement,
-                paths,
-                in_place,
-                ignore_case,
-                preserve_case,
-                first,
-                exclude,
-                include_gitignored,
-                include_hidden,
-            ))
-        }
-        #[cfg(not(unix))]
-        Some(Command::Sed { .. }) => Err(anyhow::anyhow!("daemon mode requires Unix")),
         #[cfg(unix)]
         Some(Command::Diagnostics { ignored_args }) => {
             // Accept-and-warn (bug 32): `catenary diagnostics` takes no
@@ -1011,12 +928,14 @@ The edit→diagnostics loop
 
 Deny-as-guidance
   A blocked command is not a wall — the denial names the command to run
-  instead (`grep` → `catenary grep`, `ls`/`find` → `catenary glob`, raw
-  `sed -i` → `catenary sed`). Read the reason and run the named command.
+  instead (`grep` → `catenary grep`, `ls`/`find` → `catenary glob`). Read
+  the reason and run the named command. Writing is up to you: edit with the
+  host tools, or run a shell writer (`sed -i`, `perl -i -pe`, `>`) — the
+  hook resolves its target set into the diagnostics batch, or denies it.
 
 Run catenary commands bare
-  `catenary diagnostics` and `catenary sed --in-place` stand alone — no
-  pipes, no `&&`/`;` chaining. Run each as its own step and read the result.
+  `catenary diagnostics` stands alone — no pipes, no `&&`/`;` chaining. Run
+  it as its own step and read the result.
   Quote glob patterns (`catenary grep 'fn main' 'src/**/*.rs'`) so Catenary
   expands them gitignore-aware rather than the shell.
 
@@ -1046,7 +965,7 @@ fn run_primer(out: &mut cli::Output) {
     use clap::CommandFactory;
     let _ = out.writeln(format_args!("{PRIMER_PREAMBLE}"));
     let app = Args::command();
-    let agent_commands = ["grep", "glob", "sed", "diagnostics", "roots", "commands"];
+    let agent_commands = ["grep", "glob", "diagnostics", "roots", "commands"];
     for name in agent_commands {
         let Some(sub) = app.find_subcommand(name) else {
             continue;
@@ -1724,142 +1643,6 @@ async fn run_glob(
         );
     }
     Ok(())
-}
-
-/// Runs a sed substitution against the running daemon.
-///
-/// Resolves path arguments under the same literal-first contract as
-/// `catenary grep`/`glob`, but with one deliberate divergence: a path is
-/// **required** (sed must never rewrite the whole tree implicitly), so an empty
-/// path list is a loud error that writes nothing. Preview is the default;
-/// `--in-place` writes and folds the changed files into the diagnostics batch.
-///
-/// # Errors
-///
-/// Returns an error only on genuine faults (no daemon, transport failure,
-/// malformed response) — soft conditions exit 0 so a parallel tool batch is not
-/// cancelled.
-#[cfg(unix)]
-#[allow(
-    clippy::too_many_arguments,
-    clippy::fn_params_excessive_bools,
-    reason = "1:1 with the clap-parsed sed flags"
-)]
-async fn run_sed(
-    out: &mut cli::Output,
-    pattern: String,
-    replacement: String,
-    paths: Vec<PathBuf>,
-    in_place: bool,
-    ignore_case: bool,
-    preserve_case: bool,
-    first: bool,
-    exclude: Option<String>,
-    include_gitignored: bool,
-    include_hidden: bool,
-) -> Result<()> {
-    use catenary_mcp::router::{METHOD_SED, SedRequest, SedResponse};
-
-    let cwd = std::env::current_dir().context("cannot determine working directory")?;
-
-    if paths.is_empty() {
-        let _ = out.writeln(format_args!(
-            "{}",
-            catenary_mcp::bridge::sed::REQUIRES_PATH_MSG
-        ));
-        return Ok(());
-    }
-
-    let resolved = resolve_search_paths(&paths, &cwd);
-    // Query only when at least one argument resolved to a path or pattern; an
-    // all-missing invocation just reports the missing paths.
-    let queried = !resolved.forward.is_empty();
-
-    let response = if queried {
-        let request = SedRequest {
-            cwd: Some(cwd.clone()),
-            pattern,
-            replacement,
-            paths: resolved.forward.clone(),
-            in_place,
-            ignore_case,
-            preserve_case,
-            first,
-            exclude,
-            include_gitignored,
-            include_hidden,
-        };
-        sed_ipc(METHOD_SED, &request).await?
-    } else {
-        SedResponse::default()
-    };
-
-    render_sed_outcome(out, &cwd, &response.output);
-    for path in &resolved.missing {
-        let _ = out.writeln(format_args!("path does not exist: {path}"));
-    }
-    Ok(())
-}
-
-/// Renders a `catenary sed` outcome: the cwd anchor (always, since sed writes —
-/// *where* matters) followed by the daemon-rendered preview / write summary.
-///
-/// The daemon owns the body (file list, per-file counts, drop report, or the
-/// loud-zero `no matches for:` line), so the CLI only frames it with the cwd
-/// anchor; the caller appends any `path does not exist` lines.
-fn render_sed_outcome(out: &mut cli::Output, cwd: &Path, daemon_output: &str) {
-    let _ = out.writeln(format_args!("cwd: {}", compress_home(cwd)));
-    let body = daemon_output.trim_end_matches('\n');
-    if !body.is_empty() {
-        let _ = out.writeln(format_args!("{body}"));
-    }
-}
-
-/// Sends a `tool/sed` request to the daemon and returns the parsed
-/// [`SedResponse`].
-///
-/// Mirrors [`search_ipc`]: connects to the daemon IPC socket, serializes
-/// `request` with `method` injected, and reads the single response line (the
-/// rendered output is a JSON-escaped string, so one line suffices). A non-zero
-/// exit is reserved for genuine faults.
-///
-/// # Errors
-///
-/// Returns an error if no daemon is running or the query fails.
-#[cfg(unix)]
-async fn sed_ipc<R: serde::Serialize + Sync>(
-    method: &str,
-    request: &R,
-) -> Result<catenary_mcp::router::SedResponse> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-
-    let ipc_path = catenary_mcp::router::socket_path();
-    let stream = tokio::net::UnixStream::connect(&ipc_path)
-        .await
-        .context("no daemon running — start a Catenary session first")?;
-    let (reader, mut writer) = stream.into_split();
-
-    let mut envelope = serde_json::to_value(request)?;
-    envelope
-        .as_object_mut()
-        .context("request is not an object")?
-        .insert(
-            "method".to_string(),
-            serde_json::Value::String(method.to_string()),
-        );
-    let mut payload = serde_json::to_string(&envelope)?;
-    payload.push('\n');
-    writer.write_all(payload.as_bytes()).await?;
-
-    let mut buf_reader = BufReader::new(reader);
-    let mut line = String::new();
-    buf_reader.read_line(&mut line).await?;
-
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
-        return Ok(catenary_mcp::router::SedResponse::default());
-    }
-    serde_json::from_str(trimmed).context("invalid sed response from daemon")
 }
 
 /// Confirms editing mode is active on the running daemon.
@@ -2694,15 +2477,6 @@ mod tests {
     }
 
     #[test]
-    fn test_cli_sed_page_flag_is_rejected() {
-        use clap::Parser;
-        // sed moved off pagination onto the shared overflow valve, so `--page`
-        // is retired here too (pipeable-output ticket 03a).
-        let result = Args::try_parse_from(["catenary", "sed", "old", "new", "src/", "--page", "2"]);
-        assert!(result.is_err(), "sed --page should no longer parse");
-    }
-
-    #[test]
     fn test_cli_glob_missing_path() {
         use clap::Parser;
         let result = Args::try_parse_from(["catenary", "glob"]);
@@ -2785,7 +2559,6 @@ mod tests {
         for needle in [
             "catenary grep",
             "catenary glob",
-            "catenary sed",
             "catenary diagnostics",
             "catenary roots",
             "catenary commands",

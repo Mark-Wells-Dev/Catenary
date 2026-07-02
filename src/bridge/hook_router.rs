@@ -293,7 +293,7 @@ impl HookRouter {
     /// edits, or an explicit `editing start` with no coverable edit yet) flows
     /// free: friction tracks value. While a covered set is pending, Read/Write,
     /// `ToolSearch`, filesystem-only Bash, and canonical Catenary commands
-    /// (search/`sed`/lifecycle) stay allowed; everything else is blocked.
+    /// (search/lifecycle) stay allowed; everything else is blocked.
     fn handle_enforce_editing(
         &self,
         tool_name: &str,
@@ -359,9 +359,9 @@ impl HookRouter {
         // A Catenary command reaching the boundary (the client-side
         // canonical-form matcher normally intercepts these) is classified by
         // the matcher rather than the generic boundary block, which would echo
-        // the command the agent just ran (bugs/16). Canonical search/`sed`/
-        // lifecycle commands are allowed during editing; a non-canonical form
-        // gets the matcher's clear message.
+        // the command the agent just ran (bugs/16). Canonical search/lifecycle
+        // commands are allowed during editing; a non-canonical form gets the
+        // matcher's clear message.
         if is_bash_tool(tool_name) {
             use crate::cli::command_filter::CatenaryAction;
             match command.map(crate::cli::command_filter::analyze_catenary_command) {
@@ -369,7 +369,6 @@ impl HookRouter {
                 Some(
                     CatenaryAction::EditingStart
                     | CatenaryAction::Diagnostics
-                    | CatenaryAction::Sed { .. }
                     | CatenaryAction::Allow { .. },
                 ) => return None,
                 Some(CatenaryAction::NotCatenary) | None => {}
@@ -530,8 +529,7 @@ impl HookRouter {
         }
         // `increment_filtered` is a no-op until the agent's editing entry
         // exists, so buffer the count and apply it only once a covered write
-        // has started the entry — independent of write ordering (mirrors the
-        // sed identity-forward accumulation in `router.rs`). A command whose
+        // has started the entry — independent of write ordering. A command whose
         // targets are all uncovered starts no entry and reports no filtered
         // count: there is nothing to drain for this agent.
         if started {
@@ -1442,13 +1440,11 @@ mod tests {
         assert!(router.session.editing.has_files(None, ""));
 
         // Canonical Catenary commands stay allowed mid-editing even with a
-        // covered set pending: search, the renamed boundary command, and the
-        // `sed --in-place` edit op (ticket 08).
+        // covered set pending: search and the boundary diagnostics command.
         for cmd in [
             "catenary grep needle",
             "catenary glob foo.rs",
             "catenary diagnostics",
-            "catenary sed --in-place foo bar src/main.rs",
         ] {
             let result = router.handle_enforce_editing("Bash", None, Some(cmd), None, "");
             assert!(

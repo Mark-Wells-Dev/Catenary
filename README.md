@@ -9,8 +9,8 @@
 
 Catenary hands an AI coding agent a small, opinionated set of
 code-intelligent commands — and a hook that keeps it on them. Reach for
-`grep` and you're redirected to `catenary grep`; reach for `sed -i` and
-you get `catenary sed`. Every command the agent can run is backed by a
+`grep` and you're redirected to `catenary grep`; reach for `ls` or `find`
+and you get `catenary glob`. Every command the agent can run is backed by a
 language server, so it navigates code by meaning instead of brute-forcing
 text. The generic path isn't blocked for safety — it's off the menu, so
 the code-intelligent one is the only path left.
@@ -30,7 +30,7 @@ surface and enforces it:
   agent issues.
 - Denied commands aren't dead ends — each denial **names the
   code-intelligent command to run instead** (`grep` → `catenary grep`,
-  `ls`/`find` → `catenary glob`, `sed -i` → `catenary sed`).
+  `ls`/`find` → `catenary glob`).
 - Edits flow through the host's tracked Edit/Write tools, so LSP
   diagnostics come back automatically when the agent runs `catenary
   diagnostics`.
@@ -61,7 +61,6 @@ never re-reads a file just to check whether its edit compiled.
 |---------|--------------|
 | `catenary grep <pattern>` | Symbol, reference, and text search — LSP-enriched within tracked roots |
 | `catenary glob <path>` | File outlines, directory listings, glob matches |
-| `catenary sed <pat> <repl> <path>` | Tracked regex find-and-replace — the mass-edit surface |
 
 **The edit → diagnostics loop** — run in the host's shell tool:
 
@@ -76,8 +75,9 @@ catenary diagnostics      # print LSP diagnostics for every file you
 `catenary diagnostics` is the *end* of an edit batch: it opens the
 modified files on their servers, waits for each to settle, and prints the
 errors and warnings — like a linter, it's silent on success. For sweeps
-too broad for per-file edits, `catenary sed --in-place` folds the changed
-files into the same diagnostics batch.
+too broad for per-file edits, reach for native `sed -i` — the hook
+resolves its write-set and folds the changed files into the same
+diagnostics batch.
 
 **Workspace roots** — manage which directories are indexed:
 
@@ -100,7 +100,7 @@ agents ──▶  Catenary daemon  ──▶  shared LSP server pool
 
 reached through four decoupled surfaces:
 
-  CLI     grep · glob · sed · diagnostics   — via the host's shell tool
+  CLI     grep · glob · diagnostics         — via the host's shell tool
   Hooks   allowlist enforcement             — one PreToolUse hook
   MCP     heartbeat + workspace roots       — no query tools
   TUI     live observability                — protocol & trace traffic

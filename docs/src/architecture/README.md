@@ -12,11 +12,11 @@ Every external interaction crosses one of four boundaries:
 
 - **CLI** — agent ↔ Catenary. The agent invokes CLI commands via the
   host's shell tool: `catenary grep`, `catenary glob` for search;
-  `catenary sed` for tracked mass edits; `catenary diagnostics` for the
-  batched diagnostic report (editing is tracked implicitly — the first
-  edit starts it, there is no start step). Commands connect to the daemon
-  over a Unix domain socket, send a request, and print the result to
-  stdout.
+  `catenary diagnostics` for the batched diagnostic report (editing is
+  tracked implicitly — the first edit starts it, there is no start step).
+  Mass edits go through native `sed -i` — the host writes and the hook
+  resolves and tracks the write-set. Commands connect to the daemon over a
+  Unix domain socket, send a request, and print the result to stdout.
 - **MCP** — agent ↔ Catenary. A pure connection surface for session
   management and workspace root discovery. No application-level tools.
 - **LSP** — Catenary ↔ language servers. Catenary spawns and manages
@@ -70,10 +70,10 @@ went in and came out are linked by `parent_id` in the firehose records.
                 ┌─────────────────────────────────────────────────────┐
                 │                    Catenary daemon                  │
                 │                                                     │
-Agent ◄──CLI──► │  IPC router ──► GrepServer / GlobServer / sed       │
+Agent ◄──CLI──► │  IPC router ──► GrepServer / GlobServer /           │
   (grep, glob,  │                  DiagnosticsServer                  │
-   sed,         │                       │                             │
-   diagnostics) │                 LspClientManager                    │
+   diagnostics) │                       │                             │
+                │                 LspClientManager                    │
                 │                 ┌─────┴──────┐                     │
                 │            LspClient    LspClient                  │
                 │                 │            │                      │

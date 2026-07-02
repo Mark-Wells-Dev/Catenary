@@ -78,7 +78,6 @@ toml = "0.9.11"
 crossterm = "0.28"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_28"] }
 dirs = "6.0.0"
-fancy-regex = "0.18"
 futures = "0.3"
 globset = "0.4"
 grep-matcher = "0.1.8"

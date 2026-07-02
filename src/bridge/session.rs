@@ -263,17 +263,6 @@ fn has_glob_metachar(s: &str) -> bool {
     s.contains(['*', '?', '[', '{'])
 }
 
-/// Whether a single `path` is excluded by `.gitignore`, repo-scoped.
-///
-/// Standalone convenience over [`is_gitignored`] for callers checking one path
-/// (e.g. `catenary sed`'s explicit-file drop reporting) with no batch to
-/// amortize the per-parent cache over.
-#[must_use]
-pub(crate) fn path_is_gitignored(path: &Path) -> bool {
-    let mut cache = HashMap::new();
-    is_gitignored(path, &mut cache)
-}
-
 /// Whether `path` is excluded by `.gitignore`, repo-scoped like ripgrep.
 ///
 /// Outside a git repository nothing is gitignored, so the directory walk is
@@ -375,7 +364,7 @@ pub struct Session {
     /// flush time (observability ticket 05).
     pub(crate) snapshot: Option<Arc<crate::state_snapshot::SnapshotWriter>>,
     /// The session's most recent attributable action, surfaced on the snapshot
-    /// session board. Set at edit / diagnostics / sed boundaries.
+    /// session board. Set at edit / diagnostics boundaries.
     last_action: std::sync::Mutex<Option<crate::state_snapshot::LastAction>>,
     /// When the daemon last saw a hook dispatch from this session (ISO 8601),
     /// surfaced on the snapshot session board. Bumped on **every**
@@ -603,8 +592,8 @@ impl Session {
     /// Records the session's most recent action and marks the snapshot dirty.
     ///
     /// Surfaced on the snapshot session board's `last_action` field
-    /// (observability ticket 05). Called at edit, diagnostics, and `sed`
-    /// boundaries. The snapshot lock is taken only after the `last_action`
+    /// (observability ticket 05). Called at edit and diagnostics boundaries.
+    /// The snapshot lock is taken only after the `last_action`
     /// guard is dropped, so this never inverts lock order against the flush
     /// path (which reads `last_action` while pulling the board).
     pub fn set_last_action(&self, summary: impl Into<String>) {
@@ -637,7 +626,7 @@ impl Session {
     /// `get_or_create_router` chokepoint), so it tracks recency — the only
     /// uniform liveness signal a hook session has, since the hook side carries
     /// no authoritative death event (ticket 05a). Distinct from
-    /// [`Self::set_last_action`], which moves only on edit / diagnostics / sed.
+    /// [`Self::set_last_action`], which moves only on edit / diagnostics.
     /// Like that method, the snapshot lock is taken only after the `last_seen`
     /// guard is dropped, so it never inverts lock order against the flush path.
     pub fn touch_last_seen(&self) {
@@ -838,39 +827,6 @@ impl Session {
     #[must_use]
     pub fn covered_for_diagnostics(&self, path: &Path) -> bool {
         self.has_coverage(path) && !self.diag_disabled(path)
-    }
-
-    /// Drops cached symbols and bumps the enrichment generation for files
-    /// written outside the diagnostics batch (currently `catenary sed
-    /// --in-place`).
-    ///
-    /// This eager invalidate is the daemon's *granularity-independent* backstop
-    /// for its own writes. The lazy `grep`/`glob` path (`ensure_symbols`)
-    /// already re-populates when a file's recorded mtime is stale
-    /// ([`SymbolIndex::symbols_outdated`](crate::symbol_index::SymbolIndex::symbols_outdated),
-    /// bug #26), and the result-cache witness path checks mtime too — but both
-    /// rely on the on-disk mtime *visibly advancing*, which a coarse-mtime or
-    /// NFS/SMB/FUSE mount can defeat when `sed` rewrites a file within the
-    /// filesystem's mtime resolution. Clearing the rows unconditionally and
-    /// bumping the per-root generation does not depend on mtime: it forces a
-    /// fresh `documentSymbol` on the next access (bug #23) and invalidates the
-    /// enrichment cache outright. So this is *not* dead redundancy now that the
-    /// lazy backstop exists — it strictly dominates that backstop for the
-    /// daemon's own writes on hostile filesystems. Both effects are in-memory —
-    /// no read-path cost. **Keep it.**
-    pub fn invalidate_symbols(&self, files: &[PathBuf]) {
-        if files.is_empty() {
-            return;
-        }
-        if let Some(index) = &self.symbol_index {
-            let idx = index
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for file in files {
-                let _ = idx.invalidate(file);
-            }
-        }
-        self.fs_manager.bump_generations(files);
     }
 
     /// Returns the shared `LspClientManager`.

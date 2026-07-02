@@ -68,9 +68,6 @@ pub const METHOD_GREP: &str = "tool/grep";
 /// IPC method string for glob requests.
 pub const METHOD_GLOB: &str = "tool/glob";
 
-/// IPC method string for sed requests.
-pub const METHOD_SED: &str = "tool/sed";
-
 /// Compact, lexically-sortable UTC timestamp prefix for per-invocation search
 /// files (`grep/<ts>_<uuid>.jsonl`).
 ///
@@ -332,116 +329,6 @@ pub struct GlobResponse {
     pub paths: Option<usize>,
 }
 
-/// IPC request payload for `catenary sed`.
-///
-/// Sent as a JSON line over the daemon IPC socket with `"method": "tool/sed"`.
-/// [`to_input`](Self::to_input) resolves relative paths and the exclude pattern
-/// against `cwd` before dispatching to the substitute engine.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[allow(
-    clippy::struct_excessive_bools,
-    reason = "orthogonal CLI flags, 1:1 with the clap-parsed sed surface"
-)]
-pub struct SedRequest {
-    /// Working directory from the CLI process (for resolving relative paths).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cwd: Option<PathBuf>,
-    /// Search pattern (`fancy-regex`: the `regex` dialect plus look-around and
-    /// back-references).
-    pub pattern: String,
-    /// Replacement text (`$1` captures; C-escapes interpreted; sed escapes
-    /// rejected by the daemon-side validator).
-    pub replacement: String,
-    /// File/directory paths and glob patterns to scope the edit.
-    #[serde(default)]
-    pub paths: Vec<PathBuf>,
-    /// Apply the edit in place; otherwise preview only.
-    #[serde(default)]
-    pub in_place: bool,
-    /// Case-insensitive matching.
-    #[serde(default)]
-    pub ignore_case: bool,
-    /// Case the replacement to match each hit.
-    #[serde(default)]
-    pub preserve_case: bool,
-    /// Replace only the first match per file.
-    #[serde(default)]
-    pub first: bool,
-    /// Glob pattern to exclude from the edit set.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub exclude: Option<String>,
-    /// Include files ignored by `.gitignore`.
-    #[serde(default)]
-    pub include_gitignored: bool,
-    /// Include hidden files and directories.
-    #[serde(default)]
-    pub include_hidden: bool,
-}
-
-impl SedRequest {
-    /// Resolves relative paths and the exclude pattern against `cwd`, producing
-    /// the daemon-side [`crate::bridge::sed::SedInput`] for the substitute
-    /// engine.
-    ///
-    /// Mirrors [`GlobRequest::to_params`]: paths become absolute, an explicit
-    /// hidden target auto-enables `include_hidden`, and a basename `exclude`
-    /// (no `/`) gets a `**/` prefix for depth-independent matching.
-    fn to_input(&self) -> crate::bridge::sed::SedInput {
-        let mut include_hidden = self.include_hidden;
-        let mut paths = Vec::with_capacity(self.paths.len());
-        for p in &self.paths {
-            if !p.is_absolute()
-                && crate::bridge::session::ResolvedGlob::targets_hidden(&p.to_string_lossy())
-            {
-                include_hidden = true;
-            }
-            if p.is_absolute() {
-                paths.push(p.clone());
-            } else {
-                paths.push(
-                    self.cwd
-                        .as_ref()
-                        .map_or_else(|| p.clone(), |cwd| cwd.join(p)),
-                );
-            }
-        }
-
-        let exclude = self.exclude.as_ref().map(|exclude| {
-            if exclude.contains('/') {
-                self.cwd
-                    .as_ref()
-                    .map_or_else(|| exclude.clone(), |cwd| resolve_relative(exclude, cwd))
-            } else {
-                format!("**/{exclude}")
-            }
-        });
-
-        crate::bridge::sed::SedInput {
-            pattern: self.pattern.clone(),
-            replacement: self.replacement.clone(),
-            paths,
-            in_place: self.in_place,
-            ignore_case: self.ignore_case,
-            preserve_case: self.preserve_case,
-            first: self.first,
-            exclude,
-            include_gitignored: self.include_gitignored,
-            include_hidden,
-        }
-    }
-}
-
-/// IPC response for `catenary sed`.
-///
-/// Returned as a single JSON line over the daemon IPC socket.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-pub struct SedResponse {
-    /// Rendered preview / write summary — always the complete output
-    /// (decision 025).
-    #[serde(default)]
-    pub output: String,
-}
-
 /// Resolves a pattern path against a base directory if it is relative.
 ///
 /// Tilde-expands the pattern first. Absolute paths and `~` paths are
@@ -648,17 +535,15 @@ struct HookDispatchContext {
     worktree_watcher: Option<crate::worktree_watch::WorktreeWatcher>,
     /// Per-key hook→CLI handoff (ADR 014). Replaces the single global slot +
     /// 1-permit semaphore: each [`HandoffKey`] serializes independently, so a
-    /// `diagnostics` handoff never stalls a `sed` handoff — or any other
-    /// session — daemon-wide.
+    /// staged `diagnostics` handoff never stalls another session daemon-wide.
     handoff: KeyedHandoff,
 }
 
 /// A staged hook→CLI handoff, deposited under a [`HandoffKey`] by the
 /// `PreToolUse` hook and consumed by the matching CLI command.
 ///
-/// The payload direction differs by key (see [`HandoffPayload`]): `diagnostics`
-/// is *data-back* (the drained file set), `sed` is *identity-forward* (the
-/// session identity the daemon keys the runtime-changed set under).
+/// The payload (see [`HandoffPayload`]) is *data-back*: `diagnostics` snapshots
+/// the drained file set for the CLI command to retrieve.
 ///
 /// Dropping this struct drops the owned semaphore permit, releasing the key's
 /// serialization lock for the next same-key stage.
@@ -676,7 +561,7 @@ struct HandoffContext {
     permit: tokio::sync::OwnedSemaphorePermit,
 }
 
-/// The direction-specific payload of a staged [`HandoffContext`].
+/// The payload of a staged [`HandoffContext`].
 enum HandoffPayload {
     /// `diagnostics` — *data-back*: the hook snapshots the accumulated set and
     /// the `catenary diagnostics` CLI command retrieves it. The accumulator is
@@ -703,47 +588,33 @@ enum HandoffPayload {
         /// (bug 37 scoping — drain only the requesting agent's set).
         agent_id: String,
     },
-    /// `sed` — *identity-forward*: the hook (the only holder of identity for
-    /// this tool-use) stages it; the `catenary sed --in-place` process connects,
-    /// performs the write, and the daemon accumulates the runtime-changed set
-    /// under this identity.
-    SedIdentity {
-        /// Session ID from the host payload (`None` for hooks without one).
-        session_id: Option<String>,
-        /// Agent ID from the host payload.
-        agent_id: String,
-    },
 }
 
 /// Correlation key for the hook→CLI handoff — the catenary subcommand alone
 /// (ADR 014).
 ///
 /// `cwd`, pattern, and path are recorded for observability bucketing but are
-/// *not* key material. Only the two load-bearing, bare-only commands stage a
-/// handoff; stateless `grep`/`glob` self-scope with a daemon-minted UUID and
-/// never correlate here.
+/// *not* key material. Only the load-bearing, bare-only `diagnostics` command
+/// stages a handoff; stateless `grep`/`glob` self-scope with a daemon-minted
+/// UUID and never correlate here.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum HandoffKey {
     /// `catenary diagnostics` — data-back: the hook stages the accumulated
     /// file set, the CLI drains it.
     Diagnostics,
-    /// `catenary sed` — identity-forward: the hook stages session identity,
-    /// the sed process reports its runtime-changed set. Wired by ticket 08;
-    /// the key and its semaphore exist now so 08 plugs into the final
-    /// mechanism rather than rebuilding it.
-    Sed,
 }
 
 impl HandoffKey {
     /// Every handoff key — used to eagerly create the per-key semaphores.
-    /// Cardinality is ≤ 2 by design (ADR 014).
-    const ALL: [Self; 2] = [Self::Diagnostics, Self::Sed];
+    /// Cardinality 1 today (ADR 014); the registry stays keyed so a future
+    /// correlated command plugs into the mechanism rather than rebuilding it.
+    const ALL: [Self; 1] = [Self::Diagnostics];
 }
 
 /// Per-key handoff self-heal timeout.
 ///
 /// Clears a staged handoff the CLI never consumes — e.g. the host killed the
-/// `catenary diagnostics` / `catenary sed` subprocess between `PreToolUse` and
+/// `catenary diagnostics` subprocess between `PreToolUse` and
 /// command execution — so a stuck stage can't hold its key's permit forever.
 /// Scoped to one [`HandoffKey`] (ADR 014): clearing frees only the *next
 /// same-key* handoff, never a daemon-wide stall.
@@ -763,10 +634,10 @@ const HANDOFF_TIMEOUT: Duration = Duration::from_secs(10);
 /// Replaces the single global slot + 1-permit semaphore. Each [`HandoffKey`]
 /// gets its own 1-permit semaphore — **same-key in-order serialization** (a
 /// second `diagnostics` stage blocks until the first is consumed; no
-/// overwrite, no double-consume) — and its own slot + timeout — **per-key
-/// independence** (a `diagnostics` handoff and a `sed` handoff proceed
-/// concurrently, and neither can stall the daemon as the old global lock
-/// could). Cardinality ≤ 2.
+/// overwrite, no double-consume) — and its own slot + timeout, so a stuck
+/// stage self-heals without stalling the daemon as the old global lock could.
+/// Cardinality 1 today; the registry stays keyed for future correlated
+/// commands.
 #[derive(Clone)]
 struct KeyedHandoff {
     /// Per-key serialization semaphores (1 permit each), created eagerly for
@@ -1990,10 +1861,10 @@ fn get_or_create_router(
 
     // Bump `last_seen` on EVERY dispatch, not only on create. Every agent tool
     // call funnels through here — including the Bash hooks that wrap
-    // `catenary grep`/`glob`/`diagnostics`/`sed` (only those commands' own
+    // `catenary grep`/`glob`/`diagnostics` (only those commands' own
     // subprocess IPC bypasses the session) — so `last_seen` is the one uniform
     // liveness signal a hook session has, far richer than `last_action`, which
-    // moves only on edit / diagnostics / sed. The bump takes the session's own
+    // moves only on edit / diagnostics. The bump takes the session's own
     // lock and marks the snapshot dirty (coalesced, ticket 04's `$/progress`
     // I/O model) — the registry guard above dropped at the end of its
     // statement, so the heavily-shared registry lock is never held across it
@@ -2679,8 +2550,8 @@ async fn handle_hook_dispatch(
 
         let router = get_or_create_router(&ctx, &session_id, &raw);
 
-        // The PreToolUse hook forwards the real `agent_id` from the host CLI
-        // (mirrors the sed-handoff prepare path). Drain only the requesting
+        // The PreToolUse hook forwards the real `agent_id` from the host CLI.
+        // Drain only the requesting
         // agent's bucket — flattening every agent's bucket would consume a
         // sibling subagent's accumulated set, since subagents share the
         // parent's `session_id` and differ only by `agent_id` (bug 37).
@@ -2786,25 +2657,22 @@ async fn handle_hook_dispatch(
         // releasing the permit immediately. The permit must not be held during
         // the diagnostics pipeline (which may take seconds). Consuming the
         // HandoffContext drops it, releasing the owned semaphore permit.
-        let handoff = ctx.handoff.consume(HandoffKey::Diagnostics).and_then(|h| {
-            match h.payload {
-                HandoffPayload::Diagnostics {
-                    files,
-                    filtered,
-                    session_id,
-                    editing_session,
-                    agent_id,
-                } => Some((
-                    files,
-                    filtered,
-                    session_id,
-                    editing_session,
-                    agent_id,
-                    h.parent_id,
-                )),
-                // The diagnostics key only ever carries a diagnostics payload.
-                HandoffPayload::SedIdentity { .. } => None,
-            }
+        let handoff = ctx.handoff.consume(HandoffKey::Diagnostics).map(|h| {
+            let HandoffPayload::Diagnostics {
+                files,
+                filtered,
+                session_id,
+                editing_session,
+                agent_id,
+            } = h.payload;
+            (
+                files,
+                filtered,
+                session_id,
+                editing_session,
+                agent_id,
+                h.parent_id,
+            )
         });
 
         // Drain-on-consume (bug 32): the slot was just taken, so this attempt
@@ -2991,229 +2859,6 @@ async fn handle_hook_dispatch(
             "covered": covered,
         });
         let mut payload = serde_json::to_vec(&envelope)?;
-        payload.push(b'\n');
-        writer.write_all(&payload).await?;
-        writer.shutdown().await?;
-        return Ok(());
-    }
-
-    // ── Sed handoff: prepare (identity-forward) ──────────────────
-    //
-    // `pre-tool/sed` is sent by the PreToolUse hook when the agent runs
-    // `catenary sed --in-place`. The hook is the only holder of
-    // `(session_id, agent_id)` for this tool-use, but the changed set is a
-    // runtime result the daemon computes — so the hook stages the *identity*
-    // and the sed process reports its changed set back (the inverse of the
-    // diagnostics data-back handoff).
-    if method == "pre-tool/sed" {
-        let scope_id = uuid::Uuid::new_v4().to_string();
-
-        // Ensure the session exists for TUI discovery and host_payload cwd.
-        let _ = get_or_create_router(&ctx, &session_id, &raw);
-
-        let agent_id = raw
-            .get("agent_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-
-        // Acquire the `sed` handoff permit. Per-key (ADR 014): blocks only behind
-        // another in-flight *sed* handoff, never daemon-wide, for milliseconds.
-        let permit = ctx.handoff.acquire(HandoffKey::Sed).await?;
-        let handoff_parent_id = uuid::Uuid::new_v4().to_string();
-
-        ctx.handoff.stage(
-            HandoffKey::Sed,
-            HandoffContext {
-                parent_id: handoff_parent_id,
-                payload: HandoffPayload::SedIdentity {
-                    session_id: Some(session_id.clone()),
-                    agent_id,
-                },
-                permit,
-            },
-        );
-
-        debug!(
-            source = Source::DaemonDispatch.as_str(),
-            session_id = %session_id,
-            "sed identity handoff staged",
-        );
-
-        emit_hook_event(
-            tracing::Level::DEBUG,
-            &session_id,
-            &method,
-            Some(&scope_id),
-            &raw.to_string(),
-            "incoming hook",
-        );
-        emit_hook_event(
-            tracing::Level::DEBUG,
-            &session_id,
-            &method,
-            Some(&scope_id),
-            "{\"status\":\"ok\"}",
-            "outgoing hook response",
-        );
-
-        writer.write_all(b"{\"status\":\"ok\"}\n").await?;
-        writer.shutdown().await?;
-        return Ok(());
-    }
-
-    // ── Sed: run ─────────────────────────────────────────────────
-    //
-    // `tool/sed` is sent by the `catenary sed` CLI command. For `--in-place` the
-    // staged identity is consumed *up front* — the per-session `Session` both
-    // guards writes (the cross-session per-root editing guardrail, exactly as
-    // Edit/Write do) and, after the run, accumulates the changed set through the
-    // same `covered_for_diagnostics` gate. The substitute engine itself runs on a
-    // blocking thread so a broad sweep can't stall the daemon.
-    if method == METHOD_SED {
-        let sed_req: SedRequest =
-            serde_json::from_value(raw.clone()).map_err(|e| anyhow!("invalid sed request: {e}"))?;
-        let in_place = sed_req.in_place;
-        let input = sed_req.to_input();
-        let parent_id = uuid::Uuid::new_v4().to_string();
-
-        emit_hook_event(
-            tracing::Level::INFO,
-            "cli",
-            &method,
-            Some(&parent_id),
-            &raw.to_string(),
-            "incoming hook",
-        );
-
-        // Consume the staged identity before the write so the session can both
-        // guard and accumulate. `None` ⇒ preview, or an expired/absent handoff
-        // (writes proceed unguarded and untracked — the same degradation as an
-        // expired diagnostics handoff).
-        let identity = if in_place {
-            ctx.handoff
-                .consume(HandoffKey::Sed)
-                .and_then(|h| match h.payload {
-                    HandoffPayload::SedIdentity {
-                        session_id,
-                        agent_id,
-                    } => Some((session_id, agent_id)),
-                    HandoffPayload::Diagnostics { .. } => None,
-                })
-        } else {
-            None
-        };
-        let router = identity
-            .as_ref()
-            .map(|(sid, _)| get_or_create_router(&ctx, sid.as_deref().unwrap_or("default"), &raw));
-        let guard_session = router.as_ref().map(|r| r.session.clone());
-
-        // The output is always complete (decision 025): the full preview / write
-        // summary is rendered, with no volume branch.
-        let outcome = match tokio::task::spawn_blocking(move || {
-            // Per-file write guard: deny files whose root another session holds.
-            // Rootless files (single-file coverage) carry no guardrail.
-            let guard = |path: &Path| -> bool {
-                guard_session.as_ref().is_none_or(|session| {
-                    session.resolve_root(path).is_none_or(|root| {
-                        session
-                            .editing_guardrail
-                            .as_ref()
-                            .is_none_or(|g| g.try_acquire(&root, &session.instance_id).is_ok())
-                    })
-                })
-            };
-            crate::bridge::sed::execute(&input, guard)
-        })
-        .await
-        {
-            Ok(outcome) => outcome,
-            Err(e) => crate::bridge::sed::SedOutcome {
-                output: format!("sed error: {e}"),
-                changed: Vec::new(),
-            },
-        };
-
-        // Bug #23: the daemon performed the write, so refresh the shared
-        // SymbolIndex (and enrichment cache) for the changed files — grep/glob
-        // enrichment would otherwise serve pre-rename enclosing-symbol labels
-        // and ranges until a later access finds an empty table. Unconditional
-        // (independent of the editing handoff identity); empty on preview, where
-        // it is a no-op.
-        ctx.primary.invalidate_symbols(&outcome.changed);
-
-        // Identity-forward accumulation: route the LSP-covered changed files
-        // into the editing set, exactly like an Edit/Write would.
-        if let Some((sid, agent_id)) = identity
-            && let Some(router) = router.as_ref()
-            && !outcome.changed.is_empty()
-        {
-            let mut started = false;
-            let mut accumulated = 0usize;
-            let mut filtered = 0usize;
-            for file in &outcome.changed {
-                if router.session.covered_for_diagnostics(file) {
-                    if !started {
-                        let _ = router
-                            .session
-                            .editing
-                            .start_editing(sid.as_deref(), &agent_id);
-                        started = true;
-                    }
-                    router
-                        .session
-                        .editing
-                        .add_file(sid.as_deref(), &agent_id, file.clone());
-                    accumulated += 1;
-                } else {
-                    filtered += 1;
-                }
-            }
-            // `increment_filtered` is per-agent and a no-op until the agent's
-            // editing entry exists. Apply the buffered count only once the
-            // entry has been started by a covered file — this also makes the
-            // count independent of changed-file ordering. A sed that touches
-            // only uncovered files starts no entry and reports no filtered
-            // count (there is nothing to drain for this agent).
-            if started {
-                for _ in 0..filtered {
-                    router
-                        .session
-                        .editing
-                        .increment_filtered(sid.as_deref(), &agent_id);
-                }
-            }
-            debug!(
-                source = Source::DaemonDispatch.as_str(),
-                changed = outcome.changed.len(),
-                accumulated,
-                filtered,
-                "sed: accumulated changed files for diagnostics",
-            );
-
-            // Surface the sed write on the snapshot session board (ticket 05).
-            let summary = if outcome.changed.len() == 1 {
-                format!("sed {}", router.session.display_path(&outcome.changed[0]))
-            } else {
-                format!("sed {} files", outcome.changed.len())
-            };
-            router.session.set_last_action(summary);
-        }
-
-        let response = SedResponse {
-            output: outcome.output,
-        };
-        let mut payload = serde_json::to_vec(&response)?;
-
-        emit_hook_event(
-            tracing::Level::INFO,
-            "cli",
-            &method,
-            Some(&parent_id),
-            std::str::from_utf8(&payload).unwrap_or_default(),
-            "outgoing hook response",
-        );
-
         payload.push(b'\n');
         writer.write_all(&payload).await?;
         writer.shutdown().await?;
@@ -5538,182 +5183,7 @@ mod tests {
         shutdown.cancel();
     }
 
-    /// `catenary sed --in-place` writes the file and the daemon accumulates the
-    /// runtime-changed set under the hook-staged `(session_id, agent_id)`
-    /// (the identity-forward handoff, ADR 014 / ticket 08).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn sed_identity_handoff() {
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let ipc_path = ipc_socket_in(dir.path());
-
-        // Root the session at the tempdir so the edited file has LSP coverage
-        // (tier 1–2) and is accumulated rather than filtered.
-        let manager = Arc::new(bind_with_session_roots(
-            dir.path(),
-            vec![dir.path().to_path_buf()],
-        ));
-        let shutdown = manager.shutdown_token();
-        let m = Arc::clone(&manager);
-        tokio::spawn(async move {
-            let _ = m.accept_loop().await;
-        });
-
-        let file = dir.path().join("rename_me.rs");
-        std::fs::write(&file, "let omni = 1;\n").expect("write file");
-
-        // The PreToolUse hook stages the identity forward.
-        let stage = serde_json::json!({
-            "method": "pre-tool/sed",
-            "agent_id": "",
-            "session_id": "sess-1",
-        });
-        let line = hook_roundtrip(&ipc_path, &stage).await;
-        assert!(line.contains("ok"), "stage should succeed, got: {line}");
-
-        // The sed process connects, writes, and reports its changed set.
-        let run = serde_json::json!({
-            "method": "tool/sed",
-            "pattern": "omni",
-            "replacement": "lattice",
-            "paths": [file.to_string_lossy()],
-            "in_place": true,
-        });
-        let response = hook_roundtrip(&ipc_path, &run).await;
-        let parsed: SedResponse =
-            serde_json::from_str(response.trim()).expect("parse sed response");
-        assert!(
-            parsed.output.contains("replacements"),
-            "in-place run reports replacements, got: {}",
-            parsed.output
-        );
-
-        // The write landed.
-        assert_eq!(
-            std::fs::read_to_string(&file).expect("read"),
-            "let lattice = 1;\n"
-        );
-
-        // The changed file is accumulated under the staged (session_id, agent_id).
-        let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
-        let sessions = ctx.sessions.lock().expect("lock sessions");
-        let router = Arc::clone(&sessions.get("sess-1").expect("session sess-1").router);
-        drop(sessions);
-        let tracked = router.session.editing.files(Some("sess-1"), "");
-        assert_eq!(
-            tracked,
-            vec![file],
-            "the changed file is keyed under the staged identity",
-        );
-
-        shutdown.cancel();
-    }
-
-    /// Bug #23: a `catenary sed --in-place` write invalidates the shared
-    /// `SymbolIndex` for the changed files, so `grep`/`glob` enrichment
-    /// re-indexes fresh instead of serving pre-rename enclosing-symbol labels.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn sed_in_place_invalidates_symbol_index() {
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let ipc_path = ipc_socket_in(dir.path());
-
-        let manager = Arc::new(bind_with_session_roots(
-            dir.path(),
-            vec![dir.path().to_path_buf()],
-        ));
-        let shutdown = manager.shutdown_token();
-        let m = Arc::clone(&manager);
-        tokio::spawn(async move {
-            let _ = m.accept_loop().await;
-        });
-
-        let file = dir.path().join("rename_me.rs");
-        std::fs::write(&file, "let omni = 1;\n").expect("write file");
-
-        // Pre-seed the shared symbol index with (synthetic) pre-rename symbols,
-        // as an earlier grep/glob/diagnostics access would have.
-        let index = {
-            let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
-            Arc::clone(ctx.primary.symbol_index.as_ref().expect("symbol index"))
-        };
-        let symbols = serde_json::json!([{
-            "name": "omni",
-            "kind": 13,
-            "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 13 } },
-            "selectionRange": { "start": { "line": 0, "character": 4 }, "end": { "line": 0, "character": 8 } }
-        }]);
-        {
-            let idx = index.lock().expect("lock symbol index");
-            idx.populate_from_document_symbols(&file, &symbols)
-                .expect("populate");
-            assert!(
-                idx.has_symbols_for(&file),
-                "symbols are present before the sed write",
-            );
-        }
-
-        // Stage identity + run the in-place rename.
-        let stage = serde_json::json!({
-            "method": "pre-tool/sed",
-            "agent_id": "",
-            "session_id": "sess-1",
-        });
-        let line = hook_roundtrip(&ipc_path, &stage).await;
-        assert!(line.contains("ok"), "stage should succeed, got: {line}");
-
-        let run = serde_json::json!({
-            "method": "tool/sed",
-            "pattern": "omni",
-            "replacement": "lattice",
-            "paths": [file.to_string_lossy()],
-            "in_place": true,
-        });
-        let response = hook_roundtrip(&ipc_path, &run).await;
-        let parsed: SedResponse =
-            serde_json::from_str(response.trim()).expect("parse sed response");
-        assert!(
-            parsed.output.contains("replacements"),
-            "in-place run reports replacements, got: {}",
-            parsed.output
-        );
-        assert_eq!(
-            std::fs::read_to_string(&file).expect("read"),
-            "let lattice = 1;\n",
-        );
-
-        // The stale rows were dropped — the next enrichment access re-indexes.
-        {
-            let idx = index.lock().expect("lock symbol index");
-            assert!(
-                idx.needs_population(&file),
-                "sed --in-place invalidated the stale symbol rows",
-            );
-        }
-
-        shutdown.cancel();
-    }
-
     // ── Keyed handoff structure tests (ADR 014) ───────────────────────
-
-    /// Different keys are independent: holding the `diagnostics` permit must
-    /// not block a `sed` acquire (the `timeout` would only elapse if it did).
-    #[tokio::test]
-    async fn keyed_handoff_keys_are_independent() {
-        let handoff = KeyedHandoff::new();
-
-        // Hold the diagnostics permit for the whole test.
-        let _diag = handoff
-            .acquire(HandoffKey::Diagnostics)
-            .await
-            .expect("acquire diagnostics");
-
-        // A sed acquire proceeds immediately — its own permit, independent key.
-        let sed =
-            tokio::time::timeout(Duration::from_secs(1), handoff.acquire(HandoffKey::Sed)).await;
-        assert!(
-            sed.is_ok(),
-            "sed handoff must not block on a held diagnostics permit",
-        );
-    }
 
     /// The same key serializes in order: a second `diagnostics` acquire blocks
     /// until the first permit is released (no overwrite, no double-consume).
@@ -5780,22 +5250,18 @@ mod tests {
             .consume(HandoffKey::Diagnostics)
             .expect("consume staged context");
         assert_eq!(consumed.parent_id, "scope-1");
-        if let HandoffPayload::Diagnostics {
+        let HandoffPayload::Diagnostics {
             files,
             filtered,
             session_id,
             editing_session,
             agent_id,
-        } = &consumed.payload
-        {
-            assert_eq!(files, &vec![PathBuf::from("/tmp/a.rs")]);
-            assert_eq!(*filtered, 2);
-            assert_eq!(session_id, "sess-1");
-            assert_eq!(editing_session.as_deref(), Some("sess-1"));
-            assert_eq!(agent_id, "");
-        } else {
-            unreachable!("expected diagnostics payload");
-        }
+        } = &consumed.payload;
+        assert_eq!(files, &vec![PathBuf::from("/tmp/a.rs")]);
+        assert_eq!(*filtered, 2);
+        assert_eq!(session_id, "sess-1");
+        assert_eq!(editing_session.as_deref(), Some("sess-1"));
+        assert_eq!(agent_id, "");
 
         // Slot is now empty — a second consume yields None.
         assert!(
@@ -5814,13 +5280,13 @@ mod tests {
     }
 
     /// A never-connecting stage is cleared by its per-key timeout, releasing the
-    /// permit — and only its own key is affected.
+    /// permit for the next same-key stage.
     ///
     /// Injects a short self-heal timeout via [`KeyedHandoff::with_timeout`] so
     /// the clear-on-timeout path runs fast, independent of the production
     /// [`HANDOFF_TIMEOUT`].
     #[tokio::test]
-    async fn keyed_handoff_timeout_clears_only_its_key() {
+    async fn keyed_handoff_timeout_clears_stage() {
         let handoff = KeyedHandoff::with_timeout(Duration::from_millis(50));
 
         let permit = handoff
@@ -5857,12 +5323,6 @@ mod tests {
             .acquire(HandoffKey::Diagnostics)
             .await
             .expect("permit released on timeout");
-
-        // The untouched `sed` key is unaffected by the diagnostics timeout.
-        let _sed = handoff
-            .acquire(HandoffKey::Sed)
-            .await
-            .expect("sed key independent of diagnostics timeout");
     }
 
     // ── Version handshake tests ──────────────────────────────────────

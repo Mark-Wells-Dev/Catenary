@@ -14,7 +14,7 @@ optional knobs — applies to you, and even those have safe defaults.
 | Change | Affects you if… | Action |
 |--------|-----------------|--------|
 | [Writes resolve-or-deny; `allow_file_redirects` retired](#1-writes-resolve-or-deny) | your config set `allow_file_redirects` | delete the key — the write model is now automatic |
-| [`awk`/`sed` dropped from the default pipeline](#2-awk-and-sed-removed-from-the-default-pipeline) | your `[commands].pipeline` lists `awk` or `sed` | remove them; use `catenary sed` for sweeps |
+| [`awk`/`sed` dropped from the default pipeline](#2-awk-and-sed-removed-from-the-default-pipeline) | your `[commands].pipeline` lists `awk` or `sed` | remove them; sweep with native `sed -i` / `perl -i -pe` |
 | [Project `[commands]` enforcement keys ignored](#3-project-commands-enforcement-keys-are-ignored) | you set enforcement keys in a `.catenary.toml` | move them to user config |
 | [New diagnostics + notification knobs](#4-new-optional-knobs) | — (optional) | nothing required; tune if desired |
 
@@ -62,10 +62,11 @@ For that reason they are denied at every pipeline position now.
 file is honored as written, so they keep working until you regenerate or edit
 your config — but they are an exec/write hole and should be dropped.
 
-For sweeping multi-file edits, use the new **`catenary sed`** surface
-(see [below](#4-new-optional-knobs) and
-[CLI & Dashboard](cli.md)): its substitutions flow through the tracked edit
-path, so diagnostics stay complete.
+For sweeping multi-file edits, reach for native `sed -i` (or `perl -i -pe`
+when you need look-around or back-references): the `PreToolUse` hook resolves
+the write-set from the command line and records the touched files into the
+diagnostics batch, so diagnostics stay complete. See [Command Filtering → The
+write model](configuration.md#the-write-model).
 
 Regenerate the recommended template any time with `catenary config`.
 
