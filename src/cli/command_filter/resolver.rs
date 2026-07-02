@@ -42,6 +42,10 @@ use super::parse::{
     self, Assignment, ListOp, ParsedScript, Redirect, RedirectOp, SimpleCommand, WordMeta,
 };
 
+/// Git authorship split (ws38 ticket 03, decision 026 §2): sync navigation
+/// between committed states carries no debt (and barriers downstream state
+/// queries); content introduction resolves its write-set by querying git.
+mod git;
 /// Checkable interpreter programs — the `awk` / `perl` program-check arm
 /// (ws38 ticket 04, decision 026, soundness layer 4).
 mod programs;
@@ -156,6 +160,14 @@ struct State {
     /// A variable-mutating command (`read`, `declare`, `export`, …) ran:
     /// every later `$…` write target is unresolvable.
     vars_tainted: bool,
+    /// A git **sync** form (`checkout <branch>`, `pull`, `merge`, `rebase`,
+    /// `reset`, `restore` to HEAD) ran earlier in this command line: it moved
+    /// the working tree between committed states **without recording a set**,
+    /// so a downstream **state-query** resolution (glob expansion, git query)
+    /// is computed against a base about to move — Opaque, the same poisoning
+    /// shape as an opaque `cd` (ws38 ticket 03, decision 026). Literal targets
+    /// downstream are unaffected; recorded movers (`cp`/`mv`) are not barriers.
+    barrier: bool,
 }
 
 impl State {
@@ -164,6 +176,7 @@ impl State {
             cwd: cwd.map_or_else(|| Cwd::Rel(PathBuf::new()), |p| Cwd::Abs(p.to_path_buf())),
             bindings: HashMap::new(),
             vars_tainted: false,
+            barrier: false,
         }
     }
 }
@@ -292,11 +305,10 @@ fn resolve_segment(cmd: &SimpleCommand, state: &mut State, ctx: SegCtx) -> Segme
         return finish(recorded, SegmentClass::NoWrite);
     }
 
-    // The registry: argument-convention writers, wrappers, and the explicit
-    // opaque executors. Everything else is NoWrite — program-internal writes
-    // of allowlisted tools keep decision 022's inherited accepted boundary
-    // (soundness layer 4), and git keeps its current allowlist treatment
-    // untouched until ticket 03.
+    // The registry: argument-convention writers, wrappers, git's authorship
+    // split, and the explicit opaque executors. Everything else is NoWrite —
+    // program-internal writes of allowlisted tools keep decision 022's
+    // inherited accepted boundary (soundness layer 4).
     let class = match name {
         "rm" | "rmdir" => SegmentClass::PureDelete,
         "cp" => run(resolve_cp(cmd, state), &seg_name),
@@ -309,6 +321,10 @@ fn resolve_segment(cmd: &SimpleCommand, state: &mut State, ctx: SegCtx) -> Segme
         // subset — parsed, not trusted.
         "awk" | "gawk" | "mawk" | "nawk" => run(programs::resolve_awk(cmd, state), &seg_name),
         "perl" => run(programs::resolve_perl(cmd, state), &seg_name),
+        // git splits by authorship: sync navigation is a no-debt barrier,
+        // content introduction resolves via a git state query (ws38 ticket 03).
+        "git" => git::resolve_git(cmd, state, &seg_name),
+        "patch" => git::resolve_patch(cmd, state, &seg_name),
         "bash" | "sh" | "zsh" | "dash" | "ksh" => resolve_shell_wrapper(cmd, state, &seg_name),
         "xargs" => resolve_xargs(cmd, state, &seg_name),
         "dd" | "install" | "truncate" => SegmentClass::Opaque(
@@ -685,6 +701,21 @@ fn poisoned_cwd() -> Unresolved {
     )
 }
 
+/// The git-sync-barrier classification (an unrecorded working-tree mover
+/// upstream). A sync form (`checkout <branch>`, `pull`, `merge`, `rebase`,
+/// `reset`, `restore` to HEAD) moves the working tree between committed states
+/// without recording a set, so a downstream state-query resolution is computed
+/// against a base about to move — Opaque (ws38 ticket 03, decision 026).
+fn git_barrier() -> Unresolved {
+    u(
+        "git-sync-barrier",
+        "An earlier git sync in this command (e.g. `git checkout`/`pull`/`merge`/\
+         `rebase`) moves the working tree, so a glob or git state query after it \
+         can't be resolved against a stable base. Run the sync as its own command, \
+         or name the files literally.",
+    )
+}
+
 /// Normalize `.`/`..` lexically without touching the filesystem, preserving
 /// leading `..` components of relative paths.
 fn normalize(path: &Path) -> PathBuf {
@@ -921,6 +952,12 @@ fn parse_brace_range(inner: &str) -> Option<Vec<String>> {
 /// pattern path (nullglob off: the shell passes the word through, and a
 /// creator like `tee` writes a file by that literal name).
 fn expand_glob(word: &str, state: &State) -> Result<Vec<PathBuf>, Unresolved> {
+    // A git sync form earlier in this line moved the working tree without
+    // recording a set: the tree this glob would expand against is about to
+    // change, so the expansion can't be trusted — Opaque (ws38 ticket 03).
+    if state.barrier {
+        return Err(git_barrier());
+    }
     let abs = match (Path::new(word).is_absolute(), &state.cwd) {
         (true, _) => normalize(Path::new(word)),
         (false, Cwd::Abs(base)) => normalize(&base.join(word)),
@@ -1972,6 +2009,10 @@ fn resolve_shell_wrapper(cmd: &SimpleCommand, state: &State, seg_name: &str) -> 
         cwd: state.cwd.clone(),
         bindings: HashMap::new(),
         vars_tainted: false,
+        // The inner shell runs after this line's earlier segments, so a git
+        // sync barrier already set upstream still poisons state queries inside
+        // the wrapped program.
+        barrier: state.barrier,
     };
     let mut writes = BTreeSet::new();
     match resolve_into(&script, &mut inner_state, &mut writes) {

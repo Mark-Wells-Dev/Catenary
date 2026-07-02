@@ -6,6 +6,9 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+use tempfile::TempDir;
 
 use super::{
     OpaqueWrite, Position, SegCtx, SegmentClass, State, expand_word, resolve_command,
@@ -1241,4 +1244,352 @@ fn expand_word_empty_is_opaque() {
     let state = State::new(None);
     let got = expand_word("", parse::WordMeta::default(), &state, Position::Single);
     assert_eq!(got.expect_err("empty").construct, "empty-target");
+}
+
+// ── git: authorship split (ws38 ticket 03) ───────────────────────────────────
+
+/// Run a git command in `dir`, asserting success. Identity is pinned via env so
+/// the fixture doesn't depend on the host's git config.
+fn git(dir: &Path, args: &[&str]) {
+    let status = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@e")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@e")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("run git");
+    assert!(status.success(), "git {args:?} failed");
+}
+
+/// Capture the stdout of a git command in `dir`.
+fn git_capture(dir: &Path, args: &[&str]) -> Vec<u8> {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .output()
+        .expect("git output");
+    assert!(out.status.success(), "git {args:?} failed");
+    out.stdout
+}
+
+/// A fresh git repository in a tempdir, with a pinned identity.
+fn git_repo() -> TempDir {
+    let t = tmp();
+    git(t.path(), &["init", "-q"]);
+    git(t.path(), &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    t
+}
+
+/// The canonical repository root (git reports realpaths, so query results are
+/// joined against the canonicalized root — see [`git_repo`] callers).
+fn root_of(t: &TempDir) -> PathBuf {
+    t.path().canonicalize().expect("canonicalize repo root")
+}
+
+fn write(dir: &Path, rel: &str, body: &str) {
+    std::fs::write(dir.join(rel), body).expect("write file");
+}
+
+fn commit(dir: &Path, rel: &str, body: &str) {
+    write(dir, rel, body);
+    git(dir, &["add", rel]);
+    git(dir, &["commit", "-qm", "c"]);
+}
+
+// Sync rows: allow, no writes, no denial (no git query needed — the resolver
+// classifies without executing the navigation).
+
+#[test]
+fn git_sync_forms_record_nothing() {
+    let t = tmp();
+    for cmd in [
+        "git pull",
+        "git pull origin main",
+        "git merge topic",
+        "git rebase main",
+        "git switch main",
+        "git checkout main",
+        "git checkout -b feature",
+        "git checkout -b feature origin/main",
+        "git checkout $BRANCH",
+        "git reset --hard",
+        "git reset --hard HEAD~1",
+        "git reset",
+        "git restore src/lib.rs",
+        "git restore --staged src/lib.rs",
+        "git checkout -- src/lib.rs",
+        "git fetch",
+        "git fetch --all",
+    ] {
+        assert_eq!(
+            resolve_command(cmd, Some(t.path()))
+                .unwrap_or_else(|op| panic!("{cmd:?} should be allowed, got {op:?}"))
+                .writes,
+            BTreeSet::new(),
+            "{cmd}",
+        );
+    }
+}
+
+#[test]
+fn git_fetch_and_clone_are_no_write() {
+    let t = tmp();
+    assert_eq!(
+        classify("git fetch --all", Some(t.path())),
+        SegmentClass::NoWrite
+    );
+    assert_eq!(
+        classify("git clone https://x/y.git", Some(t.path())),
+        SegmentClass::NoWrite
+    );
+    // Read/write-index subcommands keep the inherited boundary.
+    assert_eq!(
+        classify("git add -A", Some(t.path())),
+        SegmentClass::NoWrite
+    );
+    assert_eq!(
+        classify("git commit -m x", Some(t.path())),
+        SegmentClass::NoWrite
+    );
+}
+
+#[test]
+fn git_clean_is_a_pure_delete() {
+    let t = tmp();
+    assert_eq!(
+        classify("git clean -fdx", Some(t.path())),
+        SegmentClass::PureDelete
+    );
+    // A pure-delete git segment carries no line-level debt.
+    assert_eq!(
+        resolve_command("git clean -fd", Some(t.path()))
+            .expect("clean ok")
+            .writes,
+        BTreeSet::new(),
+    );
+}
+
+// Content rows: resolve the queried set against a real repository.
+
+#[test]
+fn git_stash_pop_records_the_stashed_files() {
+    let t = git_repo();
+    let root = root_of(&t);
+    commit(&root, "a.rs", "one\n");
+    write(&root, "a.rs", "two\n");
+    git(&root, &["stash", "-q"]);
+    assert_eq!(
+        ok("git stash pop", &root),
+        BTreeSet::from([root.join("a.rs")]),
+    );
+    // `stash apply` resolves the same way.
+    assert_eq!(
+        ok("git stash apply", &root),
+        BTreeSet::from([root.join("a.rs")]),
+    );
+}
+
+#[test]
+fn git_checkout_pathspec_records_the_diff() {
+    let t = git_repo();
+    let root = root_of(&t);
+    commit(&root, "a.rs", "v1\n");
+    commit(&root, "a.rs", "v2\n");
+    // HEAD~1 (v1) differs from the working tree (v2) at a.rs.
+    assert_eq!(
+        ok("git checkout HEAD~1 -- a.rs", &root),
+        BTreeSet::from([root.join("a.rs")]),
+    );
+    // The no-`--` `checkout <ref> <pathspec>` form resolves the same.
+    assert_eq!(
+        ok("git checkout HEAD~1 a.rs", &root),
+        BTreeSet::from([root.join("a.rs")]),
+    );
+}
+
+#[test]
+fn git_restore_source_records_the_diff() {
+    let t = git_repo();
+    let root = root_of(&t);
+    commit(&root, "a.rs", "v1\n");
+    commit(&root, "a.rs", "v2\n");
+    assert_eq!(
+        ok("git restore --source=HEAD~1 a.rs", &root),
+        BTreeSet::from([root.join("a.rs")]),
+    );
+    assert_eq!(
+        ok("git restore --source HEAD~1 a.rs", &root),
+        BTreeSet::from([root.join("a.rs")]),
+    );
+}
+
+#[test]
+fn git_apply_records_the_numstat_set() {
+    let t = git_repo();
+    let root = root_of(&t);
+    commit(&root, "a.rs", "one\ntwo\n");
+    write(&root, "a.rs", "one\nTWO\n");
+    let diff = git_capture(&root, &["diff"]);
+    std::fs::write(root.join("change.patch"), diff).expect("write patch");
+    git(&root, &["checkout", "-q", "--", "a.rs"]);
+    assert_eq!(
+        ok("git apply change.patch", &root),
+        BTreeSet::from([root.join("a.rs")]),
+    );
+}
+
+// The queries resolve repo-relative results against the *root*, not the cwd —
+// proven by running from a subdirectory.
+
+#[test]
+fn git_query_paths_resolve_against_repo_root_from_a_subdir() {
+    let t = git_repo();
+    let root = root_of(&t);
+    commit(&root, "top.rs", "one\n");
+    std::fs::create_dir(root.join("sub")).expect("mkdir sub");
+    write(&root, "top.rs", "two\n");
+    git(&root, &["stash", "-q"]);
+    let sub = root.join("sub");
+    // From `sub`, git reports the stashed path repo-relative ("top.rs"); it must
+    // join the repo root, not the cwd.
+    let got = ok("git stash pop", &sub);
+    assert_eq!(got, BTreeSet::from([root.join("top.rs")]));
+    assert!(
+        !got.contains(&sub.join("top.rs")),
+        "must not resolve against the cwd: {got:?}",
+    );
+}
+
+// Barrier composition: a sync mover poisons a downstream state query, but not a
+// downstream literal target.
+
+#[test]
+fn git_sync_barriers_a_downstream_glob() {
+    let t = tmp();
+    touch(t.path(), "src/lib.rs");
+    let op = err(
+        "git checkout main && sed -i 's/a/b/' src/*.rs",
+        Some(t.path()),
+    );
+    assert_eq!(op.construct, "git-sync-barrier");
+}
+
+#[test]
+fn git_sync_leaves_a_downstream_literal_target() {
+    let t = tmp();
+    assert_eq!(
+        ok("git checkout main && sed -i 's/a/b/' src/lib.rs", t.path()),
+        paths(t.path(), &["src/lib.rs"]),
+    );
+}
+
+#[test]
+fn git_sync_barrier_poisons_a_git_content_query() {
+    let t = git_repo();
+    let root = root_of(&t);
+    commit(&root, "a.rs", "v1\n");
+    commit(&root, "a.rs", "v2\n");
+    // The sync sets the barrier; the later content query is then opaque.
+    let op = resolve_command(
+        "git checkout main && git checkout HEAD~1 -- a.rs",
+        Some(&root),
+    )
+    .expect_err("barriered content query");
+    assert_eq!(op.construct, "git-sync-barrier");
+}
+
+#[test]
+fn git_fetch_does_not_barrier_a_downstream_glob() {
+    // fetch writes only `.git/`, so a following glob is still resolvable.
+    let t = tmp();
+    touch(t.path(), "a.rs");
+    touch(t.path(), "b.rs");
+    assert_eq!(
+        ok("git fetch && sed -i 's/x/y/' *.rs", t.path()),
+        paths(t.path(), &["a.rs", "b.rs"]),
+    );
+}
+
+// Opaque content forms: computed refs/paths and stdin patches deny with a
+// teaching message.
+
+#[test]
+fn git_computed_ref_in_pathspec_form_is_opaque() {
+    let t = git_repo();
+    let root = root_of(&t);
+    commit(&root, "a.rs", "v1\n");
+    assert_eq!(
+        resolve_command("git checkout $REF -- a.rs", Some(&root))
+            .expect_err("computed ref")
+            .construct,
+        "git-opaque-ref",
+    );
+    assert_eq!(
+        resolve_command("git restore --source=$REF a.rs", Some(&root))
+            .expect_err("computed source")
+            .construct,
+        "git-opaque-ref",
+    );
+}
+
+#[test]
+fn git_apply_from_stdin_is_opaque() {
+    let op = err("git apply", None);
+    assert_eq!(op.construct, "git-stdin-patch");
+    assert_eq!(
+        err("cat patch | git apply", None).construct,
+        "git-stdin-patch",
+    );
+}
+
+#[test]
+fn git_content_form_without_cwd_is_opaque() {
+    assert_eq!(
+        err("git checkout HEAD~1 -- a.rs", None).construct,
+        "git-no-cwd",
+    );
+}
+
+// The standalone `patch` utility.
+
+#[test]
+fn patch_records_the_named_target() {
+    let t = tmp();
+    assert_eq!(
+        ok("patch a.rs < changes.diff", t.path()),
+        paths(t.path(), &["a.rs"]),
+    );
+    assert_eq!(
+        ok("patch -p1 src/lib.rs < changes.diff", t.path()),
+        paths(t.path(), &["src/lib.rs"]),
+    );
+}
+
+#[test]
+fn patch_from_stdin_without_a_target_is_opaque() {
+    assert_eq!(
+        err("patch -p1 < changes.diff", None).construct,
+        "git-stdin-patch"
+    );
+}
+
+#[test]
+fn patch_output_relocation_is_opaque() {
+    let t = tmp();
+    assert_eq!(
+        resolve_command("patch -o out.rs a.rs < changes.diff", Some(t.path()))
+            .expect_err("relocated")
+            .construct,
+        "git-patch-relocated",
+    );
 }
