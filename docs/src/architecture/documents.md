@@ -123,7 +123,10 @@ runs `catenary diagnostics`. During editing mode:
   editing-mode bit — an empty set flows free, so friction tracks value.
 - **Batched diagnostics.** When the agent runs `catenary diagnostics`,
   the `DiagnosticsServer` runs a single consolidated diagnostic pipeline
-  across all modified files.
+  across all modified files. Naming paths (`catenary diagnostics <paths>`)
+  scopes the pipeline to exactly those files and pays only their share of
+  the gate — a partial pull leaves the tracked set (and the boundary
+  block) armed for the files not yet diagnosed.
 
 ### The `catenary diagnostics` pipeline
 

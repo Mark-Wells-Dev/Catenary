@@ -238,6 +238,49 @@ impl EditingManager {
             .unwrap_or_default()
     }
 
+    /// Drops the named file paths from an agent's accumulated set, leaving any
+    /// unlisted files in place. Returns the paths actually removed (a path not
+    /// in the set is a no-op).
+    ///
+    /// The per-file counterpart to [`drain_and_clear`](Self::drain_and_clear):
+    /// `catenary diagnostics <paths>` pays the editing debt for exactly those
+    /// files (ws37 ticket 02, decision 3) — diagnosing a file pays its debt
+    /// regardless of clean/dirty — leaving the rest of the bucket armed. It
+    /// drops only listed files (never `clear_all`, bug 37); when that empties
+    /// the file list the whole `(session_id, agent_id)` entry is removed, so a
+    /// bucket a scoped pull drained looks identical to a bare drain (`is_active`
+    /// / `is_editing` go false, and the caller releases the guardrail). Matching
+    /// is by exact path equality; the caller resolves relative paths to absolute
+    /// before dispatch.
+    pub fn drop_files(
+        &self,
+        session_id: Option<&str>,
+        agent_id: &str,
+        files: &[PathBuf],
+    ) -> Vec<PathBuf> {
+        let key = editing_key(session_id, agent_id);
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(entry) = state.get_mut(&key) else {
+            return Vec::new();
+        };
+        let mut removed = Vec::new();
+        entry.files.retain(|p| {
+            if files.contains(p) {
+                removed.push(p.clone());
+                false
+            } else {
+                true
+            }
+        });
+        if entry.files.is_empty() {
+            state.remove(&key);
+        }
+        removed
+    }
+
     /// Clears all editing state. Returns the number of entries removed.
     ///
     /// Used by `SessionStart` cleanup to clear stale state when the
@@ -409,6 +452,63 @@ mod tests {
         let (files, filtered) = em.drain_and_clear(None, "agent-a");
         assert!(files.is_empty());
         assert_eq!(filtered, 0);
+    }
+
+    #[test]
+    fn drop_files_pays_partial_debt() {
+        let em = EditingManager::new();
+        em.start_editing(None, "agent-a").expect("start");
+        em.add_file(None, "agent-a", PathBuf::from("/src/a.rs"));
+        em.add_file(None, "agent-a", PathBuf::from("/src/b.rs"));
+
+        let removed = em.drop_files(None, "agent-a", &[PathBuf::from("/src/a.rs")]);
+        assert_eq!(removed, vec![PathBuf::from("/src/a.rs")]);
+        assert_eq!(
+            em.files(None, "agent-a"),
+            vec![PathBuf::from("/src/b.rs")],
+            "the unlisted file survives a scoped drop"
+        );
+        assert!(
+            em.has_files(None, "agent-a"),
+            "partial pay leaves the bucket armed"
+        );
+    }
+
+    #[test]
+    fn drop_files_emptying_bucket_removes_entry() {
+        let em = EditingManager::new();
+        em.start_editing(None, "agent-a").expect("start");
+        em.add_file(None, "agent-a", PathBuf::from("/src/a.rs"));
+
+        let removed = em.drop_files(None, "agent-a", &[PathBuf::from("/src/a.rs")]);
+        assert_eq!(removed, vec![PathBuf::from("/src/a.rs")]);
+        assert!(
+            !em.is_editing(None, "agent-a"),
+            "draining the last file removes the entry (mirrors a bare drain)"
+        );
+        assert!(!em.is_active(), "no accumulator remains");
+    }
+
+    #[test]
+    fn drop_files_unedited_path_is_noop() {
+        let em = EditingManager::new();
+        em.start_editing(None, "agent-a").expect("start");
+        em.add_file(None, "agent-a", PathBuf::from("/src/a.rs"));
+
+        let removed = em.drop_files(None, "agent-a", &[PathBuf::from("/src/unedited.rs")]);
+        assert!(removed.is_empty(), "a path not in the set drops nothing");
+        assert_eq!(
+            em.files(None, "agent-a"),
+            vec![PathBuf::from("/src/a.rs")],
+            "the debt set is unchanged by a no-op drop"
+        );
+    }
+
+    #[test]
+    fn drop_files_missing_entry_is_noop() {
+        let em = EditingManager::new();
+        let removed = em.drop_files(None, "agent-a", &[PathBuf::from("/src/a.rs")]);
+        assert!(removed.is_empty(), "no entry → nothing to drop");
     }
 
     #[test]

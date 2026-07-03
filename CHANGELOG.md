@@ -82,6 +82,14 @@ upgrading.
   beneath the dirty ones (`[no edited files]` for a genuinely empty set). This
   retires the old silent-on-clean behavior — a clean file is now stated
   explicitly, never inferred from empty output.
+- **`catenary diagnostics [paths…]` — scoped, on-demand lint.** Paths are now
+  first-class: bare still reports and clears the whole edited set, but naming
+  paths diagnoses exactly those (relative to the shell's cwd) and pays only
+  their share of the edit gate. The gate is a debt paid by *diagnosing*, not
+  fixing — a partial pull leaves the gate armed for the files you didn't name,
+  and editing a paid file re-arms it. A named path that was never edited is
+  simply linted, paying nothing. This retires the old accept-and-warn note that
+  told you paths "take no arguments" and were ignored.
 - The command filter is **allowlist-based**: only explicitly permitted commands
   run; everything else is denied with a dump of the allowed configuration. Read
   and stdout-only tools (`cat`, `head`, `diff`, …) live in `allow`; the

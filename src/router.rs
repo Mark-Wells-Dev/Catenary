@@ -2593,8 +2593,13 @@ async fn handle_hook_dispatch(
             "diagnostics: snapshotted files from EditingManager (clear deferred to consume)",
         );
 
-        // Release the editing guardrail.
-        ctx.editing_guardrail.release_all(&session_id);
+        // The editing guardrail is NOT released here anymore (ws37 ticket 02,
+        // decision 3). The gate is a debt paid by *diagnosing*, so the release
+        // moves to the consume step (`tool/editing-stop`) and goes conditional:
+        // release iff the debt set is empty after the diagnosed files are
+        // dropped. Prepare only snapshots — a scoped pull that leaves debt keeps
+        // the gate armed, and a faulted attempt that never consumes leaves both
+        // the debt set and the lock intact (drain-on-consume, bug 32).
 
         // Mint the scope UUID for the done-editing IPC execution.
         // This is separate from the prepare handler's own scope_id —
@@ -2653,6 +2658,22 @@ async fn handle_hook_dispatch(
     // command (internal method name unchanged). Takes the file list from the
     // handoff slot, runs process_files_batched, and returns diagnostics.
     if method == "tool/editing-stop" {
+        // Scoped paths from the consume request (ws37 ticket 02). The CLI
+        // resolves relative paths against its cwd before dispatch, so these are
+        // absolute. The bare form sends an empty set → the whole debt set is
+        // drained and reported (today's behavior); a non-empty set means the
+        // agent named files to diagnose on demand and pay their debt.
+        let scoped_files: Vec<PathBuf> = raw
+            .get("files")
+            .and_then(serde_json::Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(PathBuf::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let scoped = !scoped_files.is_empty();
+
         // Take the file list and parent_id from the `diagnostics` slot,
         // releasing the permit immediately. The permit must not be held during
         // the diagnostics pipeline (which may take seconds). Consuming the
@@ -2675,12 +2696,22 @@ async fn handle_hook_dispatch(
             )
         });
 
-        // Drain-on-consume (bug 32): the slot was just taken, so this attempt
-        // owns the round-trip. Clear the requesting agent's accumulator NOW —
-        // the prepare step only snapshotted it. A failed attempt that never
-        // reached here left the set intact; this consume is the success that
-        // earns the clear. Scoped to the requesting `(editing_session,
-        // agent_id)` bucket so a sibling agent's set survives (bug 37).
+        // Drain-on-consume (bug 32) + conditional guardrail release (ws37 ticket
+        // 02, decision 3): the slot was just taken, so this attempt owns the
+        // round-trip. Pay the debt NOW — the prepare step only snapshotted it. A
+        // failed attempt that never reached here left the set intact; this
+        // consume is the success that earns the clear. Scoped to the requesting
+        // `(editing_session, agent_id)` bucket so a sibling agent's set survives
+        // (bug 37).
+        //
+        // Bare (no scoped paths) drains the whole bucket; a scoped pull drops
+        // ONLY the named files (never `clear_all`, bug 37) — a named path not in
+        // the bucket is a no-op drop. Then the guardrail releases iff the debt
+        // set is now empty: a partial pull keeps the gate armed, the bare form
+        // always empties → always releases, and re-editing a paid file re-arms
+        // it. Uses the handoff-carried `session_id` (the value prepare would
+        // have released with — the bare consume request itself carries no
+        // session identity).
         if let Some((_, _, session_id, editing_session, agent_id, _)) = &handoff {
             let editing = ctx
                 .sessions
@@ -2689,16 +2720,45 @@ async fn handle_hook_dispatch(
                 .get(session_id)
                 .map(|e| e.router.session.clone());
             if let Some(session) = editing {
-                let (cleared, _) = session
+                if scoped {
+                    let dropped = session.editing.drop_files(
+                        editing_session.as_deref(),
+                        agent_id,
+                        &scoped_files,
+                    );
+                    debug!(
+                        source = Source::DaemonDispatch.as_str(),
+                        session_id = %session_id,
+                        agent_id = %agent_id,
+                        dropped = dropped.len(),
+                        requested = scoped_files.len(),
+                        "diagnostics: paid scoped debt on consume (drain-on-consume)",
+                    );
+                } else {
+                    let (cleared, _) = session
+                        .editing
+                        .drain_and_clear(editing_session.as_deref(), agent_id);
+                    debug!(
+                        source = Source::DaemonDispatch.as_str(),
+                        session_id = %session_id,
+                        agent_id = %agent_id,
+                        cleared = cleared.len(),
+                        "diagnostics: cleared accumulator on consume (drain-on-consume)",
+                    );
+                }
+                // Release the editing guardrail iff the debt is now fully paid.
+                if !session
                     .editing
-                    .drain_and_clear(editing_session.as_deref(), agent_id);
-                debug!(
-                    source = Source::DaemonDispatch.as_str(),
-                    session_id = %session_id,
-                    agent_id = %agent_id,
-                    cleared = cleared.len(),
-                    "diagnostics: cleared accumulator on consume (drain-on-consume)",
-                );
+                    .has_files(editing_session.as_deref(), agent_id)
+                {
+                    ctx.editing_guardrail.release_all(session_id);
+                    debug!(
+                        source = Source::DaemonDispatch.as_str(),
+                        session_id = %session_id,
+                        agent_id = %agent_id,
+                        "diagnostics: debt set empty — editing guardrail released",
+                    );
+                }
             }
         }
 
@@ -2730,8 +2790,19 @@ async fn handle_hook_dispatch(
         // genuinely empty set (covered == 0, empty receipt).
         let (dirty, output, covered) = if let Some((files, filtered, session_id, _, _, _)) = handoff
         {
-            let covered = files.len();
-            if files.is_empty() {
+            // A scoped pull diagnoses exactly the named paths; the bare form
+            // diagnoses the drained debt snapshot. The accumulation-time
+            // `filtered` count (files skipped for lack of coverage) applies only
+            // to the bare drain — a scoped pull names files explicitly, so an
+            // uncovered named file renders `[no LSP coverage]` in the receipt and
+            // the accumulation note is suppressed.
+            let (diag_files, filtered) = if scoped {
+                (scoped_files, 0)
+            } else {
+                (files, filtered)
+            };
+            let covered = diag_files.len();
+            if diag_files.is_empty() {
                 // Nothing covered to diagnose — the note (if any) stands alone.
                 // If edits were made but none had LSP coverage, the editing
                 // session still ended: record an `editing_done` milestone so the
@@ -2775,7 +2846,7 @@ async fn handle_hook_dispatch(
                     outcome = ctx
                         .primary
                         .diagnostics
-                        .process_files_batched(&files, Some(&scope_id)) => outcome,
+                        .process_files_batched(&diag_files, Some(&scope_id)) => outcome,
                     () = async {
                         use tokio::io::AsyncReadExt;
                         let mut probe = [0u8; 1];
@@ -2817,7 +2888,7 @@ async fn handle_hook_dispatch(
                         "{} errors, {} warnings · {} files",
                         outcome.errors,
                         outcome.warnings,
-                        files.len()
+                        diag_files.len()
                     ),
                     Some(session_id.clone()),
                 );
@@ -2850,9 +2921,10 @@ async fn handle_hook_dispatch(
         // Structured response mirroring the grep/glob JSON envelope. `output` is
         // the rendered per-file receipt the CLI prints verbatim. `status` is a
         // clean/dirty label the CLI no longer maps to an exit code (ws37 ticket
-        // 01) — it is retained for telemetry. `covered` (the handed-off file
-        // count) lets the CLI print `[no edited files]` for a genuinely empty
-        // set (covered == 0, empty receipt).
+        // 01) — it is retained for telemetry. `covered` (the diagnosed file
+        // count — the scoped paths, or the drained debt set for a bare pull)
+        // lets the CLI print `[no edited files]` for a genuinely empty set
+        // (covered == 0, empty receipt; scoped pulls are always non-empty).
         let envelope = serde_json::json!({
             "status": if dirty { "dirty" } else { "clean" },
             "output": output,
@@ -5091,6 +5163,399 @@ mod tests {
             assert!(
                 !router.session.editing.has_files(Some("sess-1"), ""),
                 "consume must clear the accumulator (drain-on-consume)"
+            );
+        }
+
+        shutdown.cancel();
+    }
+
+    /// ws37 ticket 02: a scoped `catenary diagnostics <path>` pays only the
+    /// named file's debt. The consume carries an explicit `files` param; the
+    /// daemon drops ONLY those from the bucket and, because debt remains, keeps
+    /// the editing guardrail armed. The rest of the debt set survives.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scoped_diagnostics_pays_partial_debt_keeps_gate_armed() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let ipc_path = ipc_socket_in(dir.path());
+
+        let manager = Arc::new(bind_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        let req = serde_json::json!({
+            "method": "pre-tool/editing-start",
+            "agent_id": "",
+            "session_id": "sess-1"
+        });
+        let _ = hook_roundtrip(&ipc_path, &req).await;
+
+        let root = dir.path().to_path_buf();
+        let file_a = root.join("a.rs");
+        let file_b = root.join("b.rs");
+        {
+            let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
+            let sessions = ctx.sessions.lock().expect("lock");
+            let router = Arc::clone(&sessions.get("sess-1").expect("sess-1").router);
+            drop(sessions);
+            router
+                .session
+                .editing
+                .add_file(Some("sess-1"), "", file_a.clone());
+            router
+                .session
+                .editing
+                .add_file(Some("sess-1"), "", file_b.clone());
+            // Arm the guardrail on the root the way a covered edit would.
+            ctx.editing_guardrail
+                .try_acquire(&root, "sess-1")
+                .expect("arm guardrail");
+        }
+
+        let prepare = serde_json::json!({
+            "method": "pre-tool/editing-stop",
+            "agent_id": "",
+            "session_id": "sess-1"
+        });
+        let line = hook_roundtrip(&ipc_path, &prepare).await;
+        assert!(line.contains("ok"), "prepare should succeed, got: {line}");
+
+        // Scoped consume: pay only file_a's debt.
+        let consume = serde_json::json!({
+            "method": "tool/editing-stop",
+            "files": [file_a.to_string_lossy()],
+        });
+        let response = hook_roundtrip_full(&ipc_path, &consume).await;
+        assert!(
+            !response.contains("handoff expired"),
+            "scoped consume must find the staged handoff, got: {response}",
+        );
+
+        {
+            let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
+            let sessions = ctx.sessions.lock().expect("lock");
+            let router = Arc::clone(&sessions.get("sess-1").expect("sess-1").router);
+            drop(sessions);
+            assert_eq!(
+                router.session.editing.files(Some("sess-1"), ""),
+                vec![file_b.clone()],
+                "a scoped pull drops only the named file; the rest of the debt survives",
+            );
+            // Debt remains → the guardrail stays armed: another session can't
+            // claim the root.
+            assert!(
+                ctx.editing_guardrail.try_acquire(&root, "other").is_err(),
+                "a partial pull leaves debt, so the gate stays armed",
+            );
+        }
+
+        shutdown.cancel();
+    }
+
+    /// ws37 ticket 02: a bare `catenary diagnostics` pays the whole debt. The
+    /// guardrail release moved from prepare to consume (decision 3) and is
+    /// conditional — the bare form always empties the bucket, so it always
+    /// releases the gate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bare_diagnostics_pays_all_debt_releases_gate() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let ipc_path = ipc_socket_in(dir.path());
+
+        let manager = Arc::new(bind_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        let req = serde_json::json!({
+            "method": "pre-tool/editing-start",
+            "agent_id": "",
+            "session_id": "sess-1"
+        });
+        let _ = hook_roundtrip(&ipc_path, &req).await;
+
+        let root = dir.path().to_path_buf();
+        {
+            let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
+            let sessions = ctx.sessions.lock().expect("lock");
+            let router = Arc::clone(&sessions.get("sess-1").expect("sess-1").router);
+            drop(sessions);
+            router
+                .session
+                .editing
+                .add_file(Some("sess-1"), "", root.join("a.rs"));
+            router
+                .session
+                .editing
+                .add_file(Some("sess-1"), "", root.join("b.rs"));
+            ctx.editing_guardrail
+                .try_acquire(&root, "sess-1")
+                .expect("arm guardrail");
+        }
+
+        let prepare = serde_json::json!({
+            "method": "pre-tool/editing-stop",
+            "agent_id": "",
+            "session_id": "sess-1"
+        });
+        let _ = hook_roundtrip(&ipc_path, &prepare).await;
+
+        // Bare consume (no `files`): drains + reports the whole debt set.
+        let consume = serde_json::json!({"method": "tool/editing-stop"});
+        let _ = hook_roundtrip_full(&ipc_path, &consume).await;
+
+        {
+            let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
+            let sessions = ctx.sessions.lock().expect("lock");
+            let router = Arc::clone(&sessions.get("sess-1").expect("sess-1").router);
+            drop(sessions);
+            assert!(
+                !router.session.editing.has_files(Some("sess-1"), ""),
+                "a bare pull drains the whole debt set",
+            );
+            // Debt empty → the guardrail released: another session can claim the
+            // root.
+            assert!(
+                ctx.editing_guardrail.try_acquire(&root, "other").is_ok(),
+                "the bare form empties the bucket, so the gate releases at consume",
+            );
+        }
+
+        shutdown.cancel();
+    }
+
+    /// ws37 ticket 02: re-editing a paid file re-arms the gate. After a scoped
+    /// pull empties the debt and releases the guardrail, editing the file again
+    /// re-accumulates it and re-locks the root.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn re_editing_a_paid_file_rearms_the_gate() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let ipc_path = ipc_socket_in(dir.path());
+
+        let manager = Arc::new(bind_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        let req = serde_json::json!({
+            "method": "pre-tool/editing-start",
+            "agent_id": "",
+            "session_id": "sess-1"
+        });
+        let _ = hook_roundtrip(&ipc_path, &req).await;
+
+        let root = dir.path().to_path_buf();
+        let file_a = root.join("a.rs");
+        {
+            let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
+            let sessions = ctx.sessions.lock().expect("lock");
+            let router = Arc::clone(&sessions.get("sess-1").expect("sess-1").router);
+            drop(sessions);
+            router
+                .session
+                .editing
+                .add_file(Some("sess-1"), "", file_a.clone());
+            ctx.editing_guardrail
+                .try_acquire(&root, "sess-1")
+                .expect("arm guardrail");
+        }
+
+        let prepare = serde_json::json!({
+            "method": "pre-tool/editing-stop",
+            "agent_id": "",
+            "session_id": "sess-1"
+        });
+        let _ = hook_roundtrip(&ipc_path, &prepare).await;
+
+        // Pay file_a's debt in full.
+        let consume = serde_json::json!({
+            "method": "tool/editing-stop",
+            "files": [file_a.to_string_lossy()],
+        });
+        let _ = hook_roundtrip_full(&ipc_path, &consume).await;
+
+        {
+            let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
+            let sessions = ctx.sessions.lock().expect("lock");
+            let router = Arc::clone(&sessions.get("sess-1").expect("sess-1").router);
+            drop(sessions);
+            assert!(
+                !router.session.editing.has_files(Some("sess-1"), ""),
+                "paying the only file empties the debt set",
+            );
+            // Released: probe then free it so the re-edit below can re-lock.
+            assert!(
+                ctx.editing_guardrail.try_acquire(&root, "other").is_ok(),
+                "paying the only file releases the guardrail",
+            );
+            ctx.editing_guardrail.release(&root, "other");
+
+            // Re-edit re-arms: the edit hook re-enters editing mode
+            // (`start_editing`, which recreates the entry a full pull removed),
+            // re-accumulates the file, and re-locks the root.
+            router
+                .session
+                .editing
+                .start_editing(Some("sess-1"), "")
+                .expect("re-enter editing on re-edit");
+            router
+                .session
+                .editing
+                .add_file(Some("sess-1"), "", file_a.clone());
+            ctx.editing_guardrail
+                .try_acquire(&root, "sess-1")
+                .expect("re-arm guardrail on re-edit");
+            assert_eq!(
+                router.session.editing.files(Some("sess-1"), ""),
+                vec![file_a.clone()],
+                "the paid file is back in the debt set after re-editing",
+            );
+            assert!(
+                ctx.editing_guardrail.try_acquire(&root, "other").is_err(),
+                "re-editing a paid file re-arms the gate",
+            );
+        }
+
+        shutdown.cancel();
+    }
+
+    /// ws37 ticket 02: a scoped pull of an UNEDITED path reports diagnostics but
+    /// the gate-drop is a no-op — the debt set is unchanged and the guardrail
+    /// stays armed. One pipeline serves "lint this" and "verify my edit."
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scoped_diagnostics_unedited_path_is_noop_drop() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let ipc_path = ipc_socket_in(dir.path());
+
+        let manager = Arc::new(bind_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        let req = serde_json::json!({
+            "method": "pre-tool/editing-start",
+            "agent_id": "",
+            "session_id": "sess-1"
+        });
+        let _ = hook_roundtrip(&ipc_path, &req).await;
+
+        let root = dir.path().to_path_buf();
+        let edited = root.join("edited.rs");
+        let unedited = root.join("unedited.rs");
+        {
+            let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
+            let sessions = ctx.sessions.lock().expect("lock");
+            let router = Arc::clone(&sessions.get("sess-1").expect("sess-1").router);
+            drop(sessions);
+            router
+                .session
+                .editing
+                .add_file(Some("sess-1"), "", edited.clone());
+            ctx.editing_guardrail
+                .try_acquire(&root, "sess-1")
+                .expect("arm guardrail");
+        }
+
+        let prepare = serde_json::json!({
+            "method": "pre-tool/editing-stop",
+            "agent_id": "",
+            "session_id": "sess-1"
+        });
+        let _ = hook_roundtrip(&ipc_path, &prepare).await;
+
+        // Scoped pull of a file NOT in the debt set.
+        let consume = serde_json::json!({
+            "method": "tool/editing-stop",
+            "files": [unedited.to_string_lossy()],
+        });
+        let response = hook_roundtrip_full(&ipc_path, &consume).await;
+        assert!(
+            !response.contains("handoff expired"),
+            "an unedited scoped pull still rides the handoff (attribution fires), got: {response}",
+        );
+
+        {
+            let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
+            let sessions = ctx.sessions.lock().expect("lock");
+            let router = Arc::clone(&sessions.get("sess-1").expect("sess-1").router);
+            drop(sessions);
+            assert_eq!(
+                router.session.editing.files(Some("sess-1"), ""),
+                vec![edited.clone()],
+                "querying an unedited file drops nothing — the debt set is unchanged",
+            );
+            assert!(
+                ctx.editing_guardrail.try_acquire(&root, "other").is_err(),
+                "a no-op drop leaves the gate armed",
+            );
+        }
+
+        shutdown.cancel();
+    }
+
+    /// ws37 ticket 02: drain-on-consume for the scoped path. A scoped consume
+    /// whose handoff was never prepared (a faulted/denied round-trip) is an
+    /// expired slot — it drops nothing, leaving the debt set intact.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scoped_diagnostics_without_handoff_leaves_debt_intact() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let ipc_path = ipc_socket_in(dir.path());
+
+        let manager = Arc::new(bind_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        let req = serde_json::json!({
+            "method": "pre-tool/editing-start",
+            "agent_id": "",
+            "session_id": "sess-1"
+        });
+        let _ = hook_roundtrip(&ipc_path, &req).await;
+
+        let root = dir.path().to_path_buf();
+        let file_a = root.join("a.rs");
+        {
+            let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
+            let sessions = ctx.sessions.lock().expect("lock");
+            let router = Arc::clone(&sessions.get("sess-1").expect("sess-1").router);
+            drop(sessions);
+            router
+                .session
+                .editing
+                .add_file(Some("sess-1"), "", file_a.clone());
+        }
+
+        // Consume WITHOUT a prepared handoff: the slot is empty (expired), so
+        // the drain-on-consume drop never fires.
+        let consume = serde_json::json!({
+            "method": "tool/editing-stop",
+            "files": [file_a.to_string_lossy()],
+        });
+        let response = hook_roundtrip_full(&ipc_path, &consume).await;
+        assert!(
+            response.contains("handoff expired"),
+            "a scoped consume with no staged handoff is an expired slot, got: {response}",
+        );
+
+        {
+            let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
+            let sessions = ctx.sessions.lock().expect("lock");
+            let router = Arc::clone(&sessions.get("sess-1").expect("sess-1").router);
+            drop(sessions);
+            assert_eq!(
+                router.session.editing.files(Some("sess-1"), ""),
+                vec![file_a.clone()],
+                "a faulted scoped call drops nothing (drain-on-consume, bug 32)",
             );
         }
 

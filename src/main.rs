@@ -153,31 +153,31 @@ enum Command {
         include_hidden: bool,
     },
 
-    /// Print diagnostics for the files you've edited, then clear the set.
+    /// Print diagnostics for the files you've edited, or lint the named paths.
     ///
-    /// Runs the LSP diagnostics pipeline over every file edited since the
-    /// last run and prints a per-file receipt: each diagnosed file is listed,
-    /// with its errors and warnings beneath it or `[clean]` beside it when the
-    /// file is clean. When nothing was edited it prints `[no edited files]`.
+    /// Bare — runs the LSP diagnostics pipeline over every file edited since
+    /// the last run and prints a per-file receipt: each diagnosed file is
+    /// listed, with its errors and warnings beneath it or `[clean]` beside it
+    /// when the file is clean, then clears the set (`[no edited files]` for an
+    /// empty set). With paths — diagnoses exactly those files (on-demand lint)
+    /// and pays their editing debt, dropping them from the gate; the gate stays
+    /// armed while any edited file remains unpaid. Paying is *diagnosing*, not
+    /// fixing — a file's debt is cleared by looking at it, clean or dirty.
     /// Exits `0` whenever the run completed — clean *or* dirty — and `2` only
     /// on a genuine fault (no daemon, IPC failure); it never exits `1`, so a
-    /// dirty result is not misread as a failed call. Then resets so the next
-    /// edit starts a fresh set. Editing begins implicitly on the first edit —
-    /// there is no separate start step. Invoke via the host's shell tool.
+    /// dirty result is not misread as a failed call. Editing begins implicitly
+    /// on the first edit — there is no separate start step. Invoke via the
+    /// host's shell tool.
     Diagnostics {
-        /// Ignored trailing arguments.
+        /// File or directory path(s) to diagnose. Omit to report the whole
+        /// edited set.
         ///
-        /// `catenary diagnostics` takes no arguments — it always reports the
-        /// FULL edited set, not a subset scoped to paths. Unlike every other
-        /// `catenary` file command, passing paths here is a natural mistake;
-        /// rather than a clap usage error (which would strand the staged hook
-        /// handoff and drain the edited set, bug 32), any stray args are
-        /// accepted, a note is printed to stderr, and the command proceeds as
-        /// the no-arg form. `trailing_var_arg` + `allow_hyphen_values` swallow
-        /// anything — even hyphen-led tokens — so no input reaches clap as an
-        /// unknown flag.
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
-        ignored_args: Vec<String>,
+        /// Relative paths resolve against the current working directory. A
+        /// named path is diagnosed and its editing debt paid — dropped from the
+        /// gate — whether or not it was edited; a path outside the edited set is
+        /// simply linted and pays nothing.
+        #[arg(name = "PATH")]
+        paths: Vec<String>,
     },
 
     /// Editing mode (start). Optional — editing starts implicitly on the
@@ -573,18 +573,11 @@ fn main() -> Result<()> {
         #[cfg(not(unix))]
         Some(Command::Glob { .. }) => Err(anyhow::anyhow!("daemon mode requires Unix")),
         #[cfg(unix)]
-        Some(Command::Diagnostics { ignored_args }) => {
-            // Accept-and-warn (bug 32): `catenary diagnostics` takes no
-            // arguments, but every OTHER catenary file command does — so a stray
-            // path here is a natural fat-finger. Rather than a clap usage error
-            // (exit 2) that strands the staged hook handoff and drains the edited
-            // set, swallow the args, print an informational note to stderr making
-            // clear the paths were IGNORED and the FULL edited set was reported,
-            // then proceed exactly as the no-arg form. The exit contract is
-            // unchanged (0 clean / 1 dirty / 2 fault).
-            if !ignored_args.is_empty() {
-                eprintln!("{}", diagnostics_ignored_args_note());
-            }
+        Some(Command::Diagnostics { paths }) => {
+            // Scoped paths are first-class (ws37 ticket 02, retiring bug 32's
+            // accept-and-warn note): bare reports the whole edited set; with
+            // paths the named files are diagnosed on demand and their editing
+            // debt paid. The paths ride the consume request's `files` param.
             let mut out = cli::Output::stdout(false);
             // Exit-code contract (ws37 ticket 01, amending cli-prerelease
             // ticket 11): `0` = the run completed and its results are valid,
@@ -593,7 +586,7 @@ fn main() -> Result<()> {
             // clean/dirty distinction lives entirely in the stdout receipt, so
             // an agent's harness reads `0` as "trust this output" for a dirty
             // run too, instead of discarding valid diagnostics.
-            match build_runtime().and_then(|rt| rt.block_on(run_done_editing(&mut out))) {
+            match build_runtime().and_then(|rt| rt.block_on(run_done_editing(&mut out, &paths))) {
                 Ok(()) => Ok(()),
                 Err(e) => {
                     eprintln!("{e:#}");
@@ -1706,16 +1699,6 @@ async fn run_start_editing(out: &mut cli::Output) -> Result<()> {
 #[cfg(unix)]
 const NO_EDITED_FILES_SENTINEL: &str = "[no edited files]";
 
-/// The stderr note for accept-and-warn on stray `catenary diagnostics` args
-/// (bug 32). Makes explicit that the paths were IGNORED and the FULL edited set
-/// was reported, not a subset scoped to those paths — so the output can't be
-/// misread as scoped. Split out for unit testing.
-#[cfg(unix)]
-const fn diagnostics_ignored_args_note() -> &'static str {
-    "note: catenary diagnostics takes no arguments; the paths were ignored and \
-     diagnostics were reported for ALL edited files, not just those paths"
-}
-
 /// The daemon's `tool/editing-stop` response envelope (mirrors the grep/glob
 /// JSON pattern): the rendered per-file receipt `output` plus the covered-file
 /// count.
@@ -1737,31 +1720,58 @@ struct DiagnosticsResponse {
     covered: usize,
 }
 
-/// Implements `catenary diagnostics`: prints diagnostics for the edited
-/// files and clears the tracked set.
+/// Implements `catenary diagnostics [paths…]`: prints diagnostics for the
+/// edited files (bare) or the named paths (scoped), and pays the corresponding
+/// editing debt.
 ///
 /// Connects to the daemon's IPC socket and sends `tool/editing-stop` (the
-/// internal handoff method name is unchanged by the user-facing rename).
-/// The `PreToolUse` hook has already prepared the handoff — this command
-/// retrieves the diagnostics and prints the per-file receipt. Success (clean
-/// *or* dirty) returns `Ok(())`, which the dispatcher maps to exit `0`.
+/// internal handoff method name is unchanged by the user-facing rename). The
+/// `PreToolUse` hook has already prepared the handoff — this command retrieves
+/// the diagnostics and prints the per-file receipt. When `paths` is non-empty,
+/// they ride the request's `files` param: the daemon diagnoses exactly those
+/// and drops them from the gate (scoped). Relative paths resolve against the
+/// CLI's cwd before dispatch — the daemon runs under a different cwd — matching
+/// how `grep`/`glob` forward paths. Success (clean *or* dirty) returns
+/// `Ok(())`, which the dispatcher maps to exit `0`.
 ///
 /// # Errors
 ///
 /// Returns an error (mapped to fault exit `2`) if no daemon is running, the
-/// IPC fails, or the response is malformed.
+/// IPC fails, the working directory can't be resolved, or the response is
+/// malformed.
 #[cfg(unix)]
-async fn run_done_editing(out: &mut cli::Output) -> Result<()> {
+async fn run_done_editing(out: &mut cli::Output, paths: &[String]) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     let ipc_path = catenary_mcp::router::socket_path();
+
+    // Resolve relative scoped paths against the CLI's cwd (the daemon runs under
+    // a different cwd). Bare form (no paths) sends an empty set → the daemon
+    // drains + reports the whole debt set (today's behavior).
+    let files: Vec<String> = if paths.is_empty() {
+        Vec::new()
+    } else {
+        let cwd = std::env::current_dir().context("cannot determine working directory")?;
+        paths
+            .iter()
+            .map(|p| {
+                let path = std::path::Path::new(p);
+                let resolved = if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    cwd.join(path)
+                };
+                resolved.to_string_lossy().into_owned()
+            })
+            .collect()
+    };
 
     let stream = tokio::net::UnixStream::connect(&ipc_path)
         .await
         .context("catenary daemon not running")?;
 
     let (reader, mut writer) = stream.into_split();
-    let request = serde_json::json!({"method": "tool/editing-stop"});
+    let request = serde_json::json!({"method": "tool/editing-stop", "files": files});
     let mut payload = serde_json::to_string(&request)?;
     payload.push('\n');
     writer.write_all(payload.as_bytes()).await?;
@@ -2131,28 +2141,24 @@ mod tests {
         use clap::Parser;
         let args = Args::try_parse_from(["catenary", "diagnostics"]);
         let args = args.expect("diagnostics should parse");
-        let Some(Command::Diagnostics { ignored_args }) = args.command else {
+        let Some(Command::Diagnostics { paths }) = args.command else {
             unreachable!("expected Diagnostics");
         };
-        assert!(
-            ignored_args.is_empty(),
-            "bare diagnostics has no trailing args"
-        );
+        assert!(paths.is_empty(), "bare diagnostics has no path args");
     }
 
     #[test]
-    fn diagnostics_with_paths_parses_not_rejected() {
-        // Accept-and-warn (bug 32): stray paths must PARSE (no clap exit-2
-        // reject), so the command can connect + consume the staged handoff and
-        // complete the prepare→consume round-trip. The paths are captured into
-        // `ignored_args` for the stderr note.
+    fn diagnostics_with_paths_parses_as_scoped() {
+        // Scoped paths are first-class (ws37 ticket 02): they parse into `paths`
+        // and ride the consume request's `files` param so the daemon diagnoses
+        // exactly those and drops them from the gate.
         use clap::Parser;
         let args = Args::try_parse_from(["catenary", "diagnostics", "a.rs", "b.rs"])
-            .expect("stray paths must parse, not be rejected");
-        let Some(Command::Diagnostics { ignored_args }) = args.command else {
+            .expect("scoped paths must parse");
+        let Some(Command::Diagnostics { paths }) = args.command else {
             unreachable!("expected Diagnostics");
         };
-        assert_eq!(ignored_args, vec!["a.rs".to_string(), "b.rs".to_string()]);
+        assert_eq!(paths, vec!["a.rs".to_string(), "b.rs".to_string()]);
     }
 
     #[test]
@@ -3071,28 +3077,6 @@ mod tests {
         emit_diagnostics_response(&mut out, r#"{"output":""}"#)
             .expect("empty receipt returns Ok → exit 0");
         assert_eq!(out.into_string().trim(), NO_EDITED_FILES_SENTINEL);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn diagnostics_ignored_args_note_names_full_set() {
-        // Accept-and-warn (bug 32): the note must make clear the paths were
-        // IGNORED and the FULL edited set was reported — not a subset scoped to
-        // those paths — so the output can't be misread as scoped.
-        let note = diagnostics_ignored_args_note();
-        assert!(note.starts_with("note:"), "an informational note: {note}");
-        assert!(
-            note.contains("takes no arguments"),
-            "states the command is argless: {note}",
-        );
-        assert!(
-            note.contains("ignored"),
-            "states the paths were ignored: {note}",
-        );
-        assert!(
-            note.contains("ALL edited files"),
-            "states the FULL set was reported, not a subset: {note}",
-        );
     }
 
     #[cfg(unix)]

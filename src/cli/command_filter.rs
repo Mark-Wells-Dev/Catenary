@@ -4252,11 +4252,42 @@ mod tests {
             analyze_catenary_command("catenary diagnostics"),
             CatenaryAction::Diagnostics,
         );
-        // Trailing args keep it one `SimpleCommand`, so the count-based gate
-        // still passes it as isolated (the CLI accept-and-warns separately).
+        // Scoped paths keep it one `SimpleCommand`, so the count-based gate
+        // still passes it as isolated — the paths are a first-class scoped set
+        // (ws37 ticket 02), not a denial trigger.
         assert_eq!(
             analyze_catenary_command("catenary diagnostics src/main.rs"),
             CatenaryAction::Diagnostics,
+        );
+    }
+
+    #[test]
+    fn ws37_scoped_diagnostics_paths_are_not_a_denial_trigger() {
+        // ws37 ticket 02: `catenary diagnostics <paths>` as the sole command is
+        // a valid scoped pull — positional args never turn it into a denial, and
+        // the bare-only isolation gate is untouched (a *chained* scoped form
+        // still denies on isolation, below).
+        for cmd in [
+            "catenary diagnostics src/main.rs",
+            "catenary diagnostics src/main.rs src/lib.rs",
+            "catenary diagnostics ./relative/path.rs",
+            "catenary diagnostics .",
+        ] {
+            assert_eq!(
+                analyze_catenary_command(cmd),
+                CatenaryAction::Diagnostics,
+                "scoped sole-command diagnostics must stay handed-off, not denied: {cmd}",
+            );
+        }
+        // The isolation gate itself is NOT weakened: a scoped pull chained after
+        // another command still denies (the daemon-wedge hazard is structural,
+        // counting command positions — not a per-arg check).
+        assert!(
+            matches!(
+                analyze_catenary_command("sleep 1; catenary diagnostics src/main.rs"),
+                CatenaryAction::Deny(_),
+            ),
+            "a chained scoped diagnostics must still deny on isolation",
         );
     }
 

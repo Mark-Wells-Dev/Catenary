@@ -108,30 +108,41 @@ freely — and `--count` answers "how many" without the listing.
 
 ### `catenary diagnostics`
 
-Print LSP diagnostics for every file you've edited since the last run,
-then clear the set. Editing is tracked automatically — the first edit to
-a server-covered file starts it, there is no start step — so this command
-is the *end* of an edit batch: it opens all modified files on their
-servers, waits for each to settle, and prints a **per-file receipt** —
-every diagnosed file listed, its errors and warnings beneath it, or
-`[clean]` beside it when the file is clean. When nothing was edited it
-prints `[no edited files]`.
+Print LSP diagnostics for the files you've edited, or lint the paths you
+name. Editing is tracked automatically — the first edit to a
+server-covered file starts it, there is no start step. Bare, this command
+is the *end* of an edit batch: it opens every modified file on its server,
+waits for each to settle, and prints a **per-file receipt** — every
+diagnosed file listed, its errors and warnings beneath it, or `[clean]`
+beside it when the file is clean — then clears the set. When nothing was
+edited it prints `[no edited files]`.
 
 ```bash
-catenary diagnostics
+catenary diagnostics                 # the whole edited set
+catenary diagnostics src/main.rs     # lint one file on demand
+catenary diagnostics src/ lib.rs     # a scoped set (relative to cwd)
 ```
 
-`catenary diagnostics` is a load-bearing command — run it **bare**, as its
-own step (no pipes, no `&&`/`;` chaining), and read the result. While a batch of covered edits is
-pending, the command filter blocks unrelated commands until you run
-`catenary diagnostics`. **The exit code is a trust signal, not a lint
-result:** it exits `0` whenever the run completed — clean *or* dirty —
-and `2` only on a genuine fault (no daemon, IPC failure). It never exits
-`1`, so a run that found errors is not mistaken for a failed call — read
-the receipt for the errors, not the exit code. (Whether a run is labeled
-"dirty" is tunable via `diagnostics_severity` in
-[Configuration](configuration.md#diagnostics), but that is a status label
-only and does not change the exit code.)
+**The edit gate is a debt paid by *diagnosing*, not fixing.** Every
+server-covered file you edit joins the gate; each file's debt is cleared
+by *looking at* it — pulling its diagnostics, clean or dirty — after which
+you choose whether to fix. Bare pays the whole set at once. Naming paths
+pays exactly those and drops them from the gate: a **partial** pull leaves
+the gate **armed** for the files you didn't name, so the command filter
+keeps blocking unrelated commands until the rest are diagnosed. Editing a
+paid file re-arms it. A named path that was never edited is simply linted
+on demand — it pays nothing, since it owed nothing. Relative paths resolve
+against the shell's current working directory.
+
+`catenary diagnostics` is a load-bearing command — run it (bare or scoped)
+as its **own step** (no pipes, no `&&`/`;` chaining), and read the result.
+**The exit code is a trust signal, not a lint result:** it exits `0`
+whenever the run completed — clean *or* dirty — and `2` only on a genuine
+fault (no daemon, IPC failure). It never exits `1`, so a run that found
+errors is not mistaken for a failed call — read the receipt for the
+errors, not the exit code. (Whether a run is labeled "dirty" is tunable
+via `diagnostics_severity` in [Configuration](configuration.md#diagnostics),
+but that is a status label only and does not change the exit code.)
 
 ### `catenary query`
 
