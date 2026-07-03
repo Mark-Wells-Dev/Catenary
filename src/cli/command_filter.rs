@@ -3847,6 +3847,26 @@ mod tests {
         }
     }
 
+    /// Regression pin (misc 123 / feedback 08 finding 3): `catenary stop` is a
+    /// host-only daemon-lifecycle command — an agent must never be able to turn
+    /// the daemon off (and disrupt every other session). The stop-confirmation
+    /// UX (a human-TTY-only prompt, `--force` to skip) does NOT open an agent
+    /// path: `recognize_catenary_sub` keeps classifying `stop` as `NotAgent`,
+    /// and the `--force` flag does not change that. Do not weaken without a
+    /// maintainer ruling.
+    #[test]
+    fn recognize_catenary_stop_stays_not_agent() {
+        assert_eq!(recognize_catenary_sub(&["stop"]), Recog::NotAgent);
+        // Trailing args (the new `--force`) don't reclassify it.
+        assert_eq!(
+            recognize_catenary_sub(&["stop", "--force"]),
+            Recog::NotAgent,
+        );
+        // And the full pipeline still denies both forms for the agent surface.
+        assert!(deny_text("catenary stop").contains("host CLI hooks"));
+        assert!(deny_text("catenary stop --force").contains("host CLI hooks"));
+    }
+
     // ---- Foreign regime unaffected ----
 
     #[test]

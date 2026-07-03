@@ -250,7 +250,19 @@ enum Command {
     },
 
     /// Stop the running Catenary daemon.
-    Stop,
+    ///
+    /// With a terminal on stdin and one or more connected sessions, prints the
+    /// session board (host, workspace roots, connected-since) and asks for
+    /// confirmation before disconnecting them — declining leaves the daemon
+    /// running. `--force` skips the prompt, as does a non-interactive stdin
+    /// (scripts, the documented upgrade flow); the post-stop reconnect warning
+    /// is unchanged.
+    Stop {
+        /// Stop without the interactive confirmation prompt, even when live
+        /// sessions are connected.
+        #[arg(long)]
+        force: bool,
+    },
 
     /// Print the CLI version and the running daemon's version.
     ///
@@ -681,12 +693,12 @@ fn main() -> Result<()> {
             cli::update::run_update(&mut out, check, force)
         }
         #[cfg(unix)]
-        Some(Command::Stop) => {
+        Some(Command::Stop { force }) => {
             let mut out = cli::Output::stdout(false);
-            build_runtime()?.block_on(run_stop(&mut out))
+            build_runtime()?.block_on(run_stop(&mut out, force))
         }
         #[cfg(not(unix))]
-        Some(Command::Stop) => Err(anyhow::anyhow!("daemon mode requires Unix")),
+        Some(Command::Stop { .. }) => Err(anyhow::anyhow!("daemon mode requires Unix")),
         #[cfg(unix)]
         Some(Command::Version) => {
             let mut out = cli::Output::stdout(false);
@@ -1276,12 +1288,34 @@ fn drain_db_at(db: &Path) -> u64 {
 /// Connects to the daemon's IPC socket and sends a shutdown request.
 /// If no daemon is running, prints a message and returns successfully.
 ///
+/// With a terminal on stdin and one or more sessions on the `state.json`
+/// board, the human is shown the board (host, roots, connected-since) and
+/// asked to confirm *before* the kill — declining exits `0` with the daemon
+/// still running (feedback 08 finding 3). `force` (`--force`) and a
+/// non-interactive stdin (scripts, the documented upgrade flow) skip straight
+/// to the stop; the post-stop reconnect warning is unchanged.
+///
 /// # Errors
 ///
 /// Returns an error if the shutdown request fails after connecting.
 #[cfg(unix)]
-async fn run_stop(out: &mut cli::Output) -> Result<()> {
+async fn run_stop(out: &mut cli::Output, force: bool) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    // Human-TTY confirmation: the daemon already records its connected sessions
+    // in the `state.json` snapshot, so read the board and confirm before the
+    // disconnect rather than apologizing after. Only a real terminal on stdin
+    // can answer, so a piped/redirected stdin (and `--force`) proceeds silently.
+    if !force && std::io::stdin().is_terminal() {
+        let sessions = live_session_board();
+        if !sessions.is_empty() {
+            let _ = out.writeln(format_args!("{}", render_stop_board(&sessions)));
+            if !confirm_stop(out)? {
+                let _ = out.writeln(format_args!("Left the daemon running."));
+                return Ok(());
+            }
+        }
+    }
 
     let ipc_path = catenary_mcp::router::socket_path();
 
@@ -1319,6 +1353,88 @@ async fn run_stop(out: &mut cli::Output) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Reads the daemon's `state.json` snapshot and returns its session board.
+///
+/// The snapshot is the daemon's own record of connected sessions (host,
+/// workspace roots, connected-since); reading it is a cheap file read with no
+/// daemon round-trip. A missing or unparseable snapshot yields an empty board,
+/// so `catenary stop` never prompts when it cannot see any sessions.
+#[cfg(unix)]
+fn live_session_board() -> Vec<catenary_mcp::state_snapshot::SessionEntry> {
+    use catenary_mcp::tui::data::{DataSource, StateJsonDataSource};
+
+    StateJsonDataSource::new()
+        .load()
+        .map(|snapshot| snapshot.sessions)
+        .unwrap_or_default()
+}
+
+/// Renders the pre-stop session board for the TTY confirmation.
+///
+/// Lists each connected session's host/client name, connected-since, and
+/// workspace root(s) — the facts the human needs to weigh the disconnect,
+/// drawn from the daemon's `state.json` snapshot (feedback 08 finding 3).
+/// Returns the board as a multi-line string with no trailing prompt.
+#[cfg(unix)]
+fn render_stop_board(sessions: &[catenary_mcp::state_snapshot::SessionEntry]) -> String {
+    use catenary_mcp::tui::format::elapsed_short;
+
+    let n = sessions.len();
+    let plural = if n == 1 { "" } else { "s" };
+    let mut lines = vec![
+        format!("{n} connected session{plural} will lose Catenary tooling if the daemon stops:"),
+        String::new(),
+    ];
+    for session in sessions {
+        let client = if session.client.name.is_empty() {
+            "unknown"
+        } else {
+            session.client.name.as_str()
+        };
+        let since = elapsed_short(&session.started_at);
+        let header = if since.is_empty() {
+            format!("  {client}")
+        } else {
+            format!("  {client} · connected {since} ago")
+        };
+        lines.push(header);
+        if session.roots.is_empty() {
+            lines.push("    (no workspace roots)".to_string());
+        } else {
+            for root in &session.roots {
+                lines.push(format!("    {root}"));
+            }
+        }
+    }
+    lines.join("\n")
+}
+
+/// Prompts the human at the terminal: stop the daemon anyway? Defaults to *no*.
+///
+/// Reads one line from stdin. Only an explicit `y`/`yes` (case-insensitive)
+/// confirms; anything else — a bare Enter, `n`, or EOF — declines, so the safe
+/// default is to leave the daemon running.
+///
+/// # Errors
+///
+/// Returns an error if writing the prompt or reading the reply fails.
+#[cfg(unix)]
+fn confirm_stop(out: &mut cli::Output) -> Result<bool> {
+    use std::io::Write;
+
+    out.write_str(format_args!("\nStop the daemon anyway? [y/N] "))?;
+    out.flush()?;
+
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer)? == 0 {
+        // EOF with no input — decline (safe default).
+        let _ = out.writeln(format_args!(""));
+        return Ok(false);
+    }
+    let answer = answer.trim().to_ascii_lowercase();
+    Ok(answer == "y" || answer == "yes")
 }
 
 /// Runs a grep query against the running daemon, or a plain ripgrep pass over
@@ -2133,6 +2249,94 @@ mod tests {
         let args = Args::try_parse_from(["catenary", "version"]);
         let args = args.expect("version subcommand should parse");
         assert!(matches!(args.command, Some(Command::Version)));
+    }
+
+    // ── CLI stop subcommand tests (misc 123) ──────────────────────
+
+    #[test]
+    fn stop_defaults_to_confirming() {
+        use clap::Parser;
+        let bare = Args::try_parse_from(["catenary", "stop"]).expect("bare stop parses");
+        assert!(
+            matches!(bare.command, Some(Command::Stop { force: false })),
+            "bare `catenary stop` keeps the confirmation prompt",
+        );
+        let forced =
+            Args::try_parse_from(["catenary", "stop", "--force"]).expect("stop --force parses");
+        assert!(
+            matches!(forced.command, Some(Command::Stop { force: true })),
+            "`--force` sets the skip-prompt flag",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_board_lists_client_roots_and_connected_since() {
+        use catenary_mcp::state_snapshot::{ClientInfo, SessionEntry, now_iso};
+
+        let sessions = vec![
+            SessionEntry {
+                client: ClientInfo {
+                    name: "claude".to_string(),
+                    version: None,
+                },
+                started_at: now_iso(),
+                roots: vec!["/home/mark/Projects/Catenary".to_string()],
+                ..SessionEntry::default()
+            },
+            // An empty client name renders as "unknown".
+            SessionEntry {
+                client: ClientInfo::default(),
+                started_at: now_iso(),
+                roots: vec!["/home/mark/Projects/homelab".to_string()],
+                ..SessionEntry::default()
+            },
+        ];
+
+        let board = render_stop_board(&sessions);
+        assert!(
+            board.starts_with("2 connected sessions will lose Catenary tooling"),
+            "plural header: {board}",
+        );
+        assert!(board.contains("claude · connected"), "client name: {board}");
+        assert!(
+            board.contains("unknown · connected"),
+            "empty client falls back to unknown: {board}",
+        );
+        assert!(
+            board.contains("    /home/mark/Projects/Catenary"),
+            "first root listed: {board}",
+        );
+        assert!(
+            board.contains("    /home/mark/Projects/homelab"),
+            "second root listed: {board}",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_board_singular_and_missing_roots() {
+        use catenary_mcp::state_snapshot::{ClientInfo, SessionEntry, now_iso};
+
+        let sessions = vec![SessionEntry {
+            client: ClientInfo {
+                name: "opencode".to_string(),
+                version: None,
+            },
+            started_at: now_iso(),
+            roots: vec![],
+            ..SessionEntry::default()
+        }];
+
+        let board = render_stop_board(&sessions);
+        assert!(
+            board.starts_with("1 connected session will lose Catenary tooling"),
+            "singular header: {board}",
+        );
+        assert!(
+            board.contains("(no workspace roots)"),
+            "rootless session labeled: {board}",
+        );
     }
 
     // ── CLI grep subcommand tests ──────────────────────────────────

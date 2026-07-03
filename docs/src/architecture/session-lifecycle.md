@@ -186,6 +186,18 @@ or on SIGINT/SIGTERM:
 disconnects and drops off the `state.json` board while the daemon keeps
 serving the rest.)
 
+### Confirming a stop
+
+Run in an interactive terminal with sessions still connected, `catenary
+stop` prints the session board first — each connected session's host,
+workspace root(s), and how long it has been connected, read from the
+`state.json` snapshot — and asks for confirmation before disconnecting
+anyone. Declining (the default) exits `0` with the daemon left running.
+`--force` skips the prompt (scripts, and the documented upgrade flow), and a
+non-interactive stdin skips it too. After the stop, a warning still names how
+many sessions lost tooling — each needs a `/mcp` reconnect, since a host
+restart alone won't respawn the daemon.
+
 ## TUI monitoring
 
 Running `catenary` with no subcommand in an interactive terminal launches

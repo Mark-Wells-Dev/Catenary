@@ -88,6 +88,15 @@ upgrading.
   addition to `patterns` path globs. Reuses the same shebang detection as
   language classification; the read is lazy (only when the path globs miss). The
   default `shellcheck` ships `["sh", "bash", "dash", "ksh"]`.
+- **`catenary stop` confirms before disconnecting live sessions.** Run in an
+  interactive terminal with sessions still connected, it now prints the session
+  board first — each session's host, workspace root(s), and connected-since,
+  read from the `state.json` snapshot — and asks for confirmation before the
+  disconnect; declining exits `0` with the daemon left running. `--force` skips
+  the prompt, and a non-interactive stdin (scripts, the documented upgrade flow)
+  skips it too. The post-stop reconnect warning is unchanged. `catenary stop`
+  remains host-only — the command filter still classifies it as not
+  agent-invocable.
 
 ### Changed
 

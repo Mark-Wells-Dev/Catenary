@@ -228,3 +228,26 @@ catenary doctor rust-analyzer
 
 Verbose mode prints the resolved command, binary path, stderr capture,
 full `initialize` request/response JSON, and capabilities list.
+
+### `catenary stop`
+
+Stop the running daemon. When you run it in an interactive terminal and
+sessions are still connected, it prints the session board first — each
+connected session's host, workspace root(s), and how long it has been
+connected (read from the `state.json` snapshot) — and asks for confirmation
+before disconnecting anyone. Declining (the default) exits `0` with the
+daemon left running.
+
+```sh
+catenary stop            # confirm before disconnecting live sessions
+catenary stop --force    # skip the prompt (scripts, upgrade flow)
+```
+
+`--force` skips the prompt, and a non-interactive stdin skips it too, so
+scripts and the documented upgrade flow are unaffected. After the stop, a
+warning names how many sessions lost tooling — each needs a `/mcp` reconnect,
+since a host restart alone won't respawn the daemon.
+
+| Flag | Description |
+|------|-------------|
+| `--force` | Stop without the confirmation prompt, even with live sessions |
