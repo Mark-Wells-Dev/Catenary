@@ -996,10 +996,10 @@ fn test_grep_enrichment_threshold_broad() -> Result<()> {
         std::fs::write(
             &config_path,
             format!(
-                "[server.mockls]\n\
+                "[lsp.server.mockls]\n\
                  command = \"{mockls_bin}\"\n\
                  args = [\"{MOCK_LANG_A}\", \"--scan-roots\"]\n\n\
-                 [language.{MOCK_LANG_A}]\nservers = [\"mockls\"]\n"
+                 [lsp.language.{MOCK_LANG_A}]\nservers = [\"mockls\"]\n"
             ),
         )?;
         Ok(config_path)
@@ -1924,13 +1924,13 @@ fn test_grep_prepare_rename_priority_chain() -> Result<()> {
         std::fs::write(
             &config_path,
             format!(
-                "[server.mockls-fail]\n\
+                "[lsp.server.mockls-fail]\n\
                  command = \"{mockls_bin}\"\n\
                  args = [\"{MOCK_LANG_A}\", \"--scan-roots\", \"--fail-on\", \"textDocument/prepareRename\"]\n\n\
-                 [server.mockls-ok]\n\
+                 [lsp.server.mockls-ok]\n\
                  command = \"{mockls_bin}\"\n\
                  args = [\"{MOCK_LANG_A}\", \"--scan-roots\"]\n\n\
-                 [language.{MOCK_LANG_A}]\n\
+                 [lsp.language.{MOCK_LANG_A}]\n\
                  servers = [\"mockls-fail\", \"mockls-ok\"]\n"
             ),
         )?;
@@ -2759,10 +2759,10 @@ fn test_grep_paged_integration() -> Result<()> {
         std::fs::write(
             &config_path,
             format!(
-                "[server.mockls]\n\
+                "[lsp.server.mockls]\n\
                  command = \"{mockls_bin}\"\n\
                  args = [\"{MOCK_LANG_A}\", \"--scan-roots\"]\n\n\
-                 [language.{MOCK_LANG_A}]\nservers = [\"mockls\"]\n"
+                 [lsp.language.{MOCK_LANG_A}]\nservers = [\"mockls\"]\n"
             ),
         )?;
         Ok(config_path)

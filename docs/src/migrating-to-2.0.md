@@ -70,7 +70,7 @@ write model](configuration.md#the-write-model).
 
 Regenerate the recommended template any time with `catenary config`.
 
-See [Command Filtering → Example](configuration.md#example).
+See [Command Filtering → Recommended `[commands]` config](configuration.md#recommended-commands-config).
 
 ## 3. Project `[commands]` enforcement keys are ignored
 

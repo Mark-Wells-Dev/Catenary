@@ -31,7 +31,7 @@ detail on how classification tables are built and layered.
 
 For the PKGBUILD example: the file has no extension and no shebang,
 but the default config has `filenames = ["PKGBUILD"]` on
-`[language.shellscript]`. Filename match → `shellscript`.
+`[lsp.language.shellscript]`. Filename match → `shellscript`.
 
 ## Three-tier routing model
 
@@ -41,13 +41,13 @@ path P:
 
 ### Tier 1 — Project-scoped
 
-If P's workspace root has a `.catenary.toml` with a `[language.X]`
+If P's workspace root has a `.catenary.toml` with a `[lsp.language.X]`
 entry for P's language, the instance is bound to that root. Separate
 process, isolated config. The instance always uses `Scope::Root(root)`
 regardless of whether the server supports `workspaceFolders`.
 
 This is Rule A from the configuration model: the presence of
-`[language.X]` in a project config is the signal for isolation. Users
+`[lsp.language.X]` in a project config is the signal for isolation. Users
 opt in explicitly by writing the entry. See
 [Tier promotion](configuration.md#tier-promotion) for the full
 resolution matrix.
@@ -70,7 +70,7 @@ for its language. Two sub-cases based on server capabilities:
 ### Tier 3 — Single-file
 
 P is outside all active workspace roots. A server marked
-`single_file = true` in `[server.*]` is spawned with a null workspace
+`single_file = true` in `[lsp.server.*]` is spawned with a null workspace
 (`rootUri: null`, `workspaceFolders: null`) to serve the file with a
 `Scope::SingleFile` instance. If the server rejects null-workspace
 initialization, the `(language, server)` pair is negative-cached so it
@@ -135,7 +135,7 @@ semantics.
 ### Request/response — priority chain
 
 For methods like `textDocument/definition` and
-`textDocument/references`, the `servers` list order in `[language.*]`
+`textDocument/references`, the `servers` list order in `[lsp.language.*]`
 defines priority. Dispatch iterates servers in that order:
 
 1. Check capability — does this server support the method?
@@ -176,7 +176,7 @@ Opt-out is available at two levels:
 - **Per-binding:** `{ name = "bash-language-server", diagnostics = false }`
   in the `servers` list suppresses diagnostics from that server for
   that language.
-- **Language-level:** `diagnostics = false` on `[language.shellscript]`
+- **Language-level:** `diagnostics = false` on `[lsp.language.shellscript]`
   suppresses diagnostics from all servers for that language.
 
 The effective filter is AND: both the language-level flag and the
@@ -186,7 +186,7 @@ switch that overrides any per-binding setting.
 
 ## `file_patterns` filtering
 
-`file_patterns` on `[server.*]` is a dispatch-layer narrowing
+`file_patterns` on `[lsp.server.*]` is a dispatch-layer narrowing
 mechanism. It contains filename-level globs (matched against the
 filename component, not the full path) that limit which files within
 a language the server handles.
@@ -212,13 +212,13 @@ Putting it all together — a `textDocument/references` request for a
 symbol in a file named `PKGBUILD`:
 
 1. **Classification.** `PKGBUILD` has no extension. No shebang.
-   Filename match against `[language.shellscript]` filenames →
+   Filename match against `[lsp.language.shellscript]` filenames →
    language is `shellscript`.
 
 2. **Root resolution.** `FilesystemManager::resolve_root` finds the
    owning workspace root via longest-prefix match.
 
-3. **Language config lookup.** `[language.shellscript]` has:
+3. **Language config lookup.** `[lsp.language.shellscript]` has:
    ```toml
    servers = ["termux-language-server", "bash-language-server"]
    ```

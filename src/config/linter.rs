@@ -3,7 +3,7 @@
 
 //! Linter definitions — standalone linters run as a second diagnostic feeder.
 //!
-//! A `[linter.<name>]` section configures a standalone linter (shellcheck,
+//! A `[linter.rule.<name>]` section configures a standalone linter (shellcheck,
 //! actionlint, yamllint, or any SARIF-emitting tool) that Catenary runs over the
 //! modified-file set during `catenary diagnostics`, translating its output into
 //! LSP-shaped diagnostics that merge with the LSP feeder's. The blessed adapters
@@ -18,7 +18,7 @@ use serde::Deserialize;
 
 use crate::lsp::glob::LspGlob;
 
-/// A single `[linter.<name>]` configuration entry.
+/// A single `[linter.rule.<name>]` configuration entry.
 ///
 /// Lives on both the user [`Config`](super::Config) and the per-root
 /// [`ProjectConfig`](super::ProjectConfig). The effective set for a root is the

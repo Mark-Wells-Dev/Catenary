@@ -1663,7 +1663,7 @@ mod tests {
         std::fs::create_dir_all(&subdir).expect("create subdirs");
         std::fs::write(
             root.path().join(".catenary.toml"),
-            "[language.rust]\nservers = [\"rust-analyzer\"]\n",
+            "[lsp.language.rust]\nservers = [\"rust-analyzer\"]\n",
         )
         .expect("write config");
 
@@ -1690,7 +1690,7 @@ mod tests {
         let root = tempfile::tempdir().expect("tempdir");
         std::fs::write(
             root.path().join(".catenary.toml"),
-            "[language.python]\nservers = [\"pyright\"]\n",
+            "[lsp.language.python]\nservers = [\"pyright\"]\n",
         )
         .expect("write config");
 

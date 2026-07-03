@@ -30,14 +30,14 @@ Use `file_patterns` to add `termux-language-server` alongside
 [bash-language-server](shell.md) for packaging files:
 
 ```toml
-[server.termux-ls]
+[lsp.server.termux-ls]
 command = "termux-language-server"
 args = ["--stdio"]
 file_patterns = ["PKGBUILD", "*.ebuild", "*.eclass"]
 
-# bash-ls is built-in — no [server.bash-ls] needed
+# bash-ls is built-in — no [lsp.server.bash-ls] needed
 
-[language.shellscript]
+[lsp.language.shellscript]
 servers = ["termux-ls", "bash-ls"]
 ```
 
@@ -53,19 +53,19 @@ For the full set of termux-language-server language IDs, define
 each as a [custom language](../configuration.md#custom-languages):
 
 ```toml
-[server.termux-ls]
+[lsp.server.termux-ls]
 command = "termux-language-server"
 args = ["--stdio"]
 
-[language.pkgbuild]
+[lsp.language.pkgbuild]
 filenames = ["PKGBUILD"]
 servers = ["termux-ls"]
 
-[language.ebuild]
+[lsp.language.ebuild]
 extensions = ["ebuild"]
 servers = ["termux-ls"]
 
-[language.eclass]
+[lsp.language.eclass]
 extensions = ["eclass"]
 servers = ["termux-ls"]
 ```

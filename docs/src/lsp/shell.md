@@ -22,7 +22,7 @@ npm install -g bash-language-server
 
 ## Config
 
-Catenary ships a built-in definition for `bash-ls` — no `[server.*]`
+Catenary ships a built-in definition for `bash-ls` — no `[lsp.server.*]`
 config is needed. If `bash-language-server` is on PATH, it works
 automatically.
 
@@ -39,12 +39,12 @@ For PKGBUILD and other packaging scripts, combine `bash-ls`
 with [termux-language-server](termux.md) for enhanced support:
 
 ```toml
-[server.termux-ls]
+[lsp.server.termux-ls]
 command = "termux-language-server"
 args = ["--stdio"]
 file_patterns = ["PKGBUILD", "*.ebuild"]
 
-[language.shellscript]
+[lsp.language.shellscript]
 servers = ["termux-ls", "bash-ls"]
 ```
 

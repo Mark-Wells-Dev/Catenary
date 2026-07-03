@@ -5,21 +5,21 @@ Catenary loads configuration from multiple sources, in order of priority
 
 1. **Built-in defaults**: Server definitions (`defaults/servers.toml`) and language classification with server bindings (`defaults/languages.toml`). Common language servers work without any config — if the binary is on PATH, Catenary uses it.
 2. **User config**: `~/.config/catenary/config.toml`.
-3. **Project config**: `.catenary.toml` in each workspace root. Discovered when roots are added (at startup or via `catenary roots add`). Scoped to `[language.*]`, `[server.*]`, and `[commands]` `build` only — every other `[commands]` key and all other sections are user-level (see [Project-scoped commands](#project-scoped-commands)).
+3. **Project config**: `.catenary.toml` in each workspace root. Discovered when roots are added (at startup or via `catenary roots add`). Scoped to `[lsp]` (the `disable` toggle plus `[lsp.server.*]` / `[lsp.language.*]` definitions), `[linter]` (`disable` plus `[linter.rule.*]`), `[diagnostics]` (`disable`), and `[commands]` `build` only — every other `[commands]` key and all other sections are user-level (see [Project-scoped commands](#project-scoped-commands)).
 4. **Explicit file**: `--config <path>`.
 5. **Environment variables**: Prefixed with `CATENARY_` (e.g., `CATENARY_LOG_RETENTION_DAYS=30`). Use `__` for nested keys (e.g., `CATENARY_ICONS__PRESET=nerd`).
 
 ## Language Servers
 
-Configuration uses two sections: `[server.*]` defines how to run a
-language server, and `[language.*]` binds languages to servers.
+Configuration uses two sections: `[lsp.server.*]` defines how to run a
+language server, and `[lsp.language.*]` binds languages to servers.
 
 ```toml
-[server.<name>]
+[lsp.server.<name>]
 command = "server-binary"
 args = ["arg1", "arg2"]
 
-[language.<language-id>]
+[lsp.language.<language-id>]
 servers = ["<name>"]
 ```
 
@@ -27,12 +27,12 @@ servers = ["<name>"]
 
 Catenary ships built-in definitions for ~25 common language servers. If
 the server binary is on PATH and the language has a default binding, LSP
-intelligence works without any `[server.*]` or `[language.*]` config.
+intelligence works without any `[lsp.server.*]` or `[lsp.language.*]` config.
 
 Run `catenary config` to see the full list of built-in servers.
 
-A user-defined `[server.X]` completely replaces the built-in default for
-`X` — no merging. If you define `[server.rust-analyzer]`, your definition
+A user-defined `[lsp.server.X]` completely replaces the built-in default for
+`X` — no merging. If you define `[lsp.server.rust-analyzer]`, your definition
 is used and the built-in is ignored entirely.
 
 ### Example
@@ -42,19 +42,19 @@ customisation — `initialization_options`, `settings`, `env`, etc.:
 
 ```toml
 # Override the built-in rust-analyzer with custom options
-[server.rust-analyzer]
+[lsp.server.rust-analyzer]
 env = { CLIPPY_DISABLE_DOCS_LINKS = "1" }
 
-[server.rust-analyzer.initialization_options]
+[lsp.server.rust-analyzer.initialization_options]
 check.command = "clippy"
 cargo.features = "all"
 diagnostics.disabled = ["inactive-code"]
 
 # Override pyright with workspace settings
-[server.pyright.settings.python]
+[lsp.server.pyright.settings.python]
 pythonPath = "/usr/bin/python3"
 
-[server.pyright.settings.python.analysis]
+[lsp.server.pyright.settings.python.analysis]
 exclude = ["**/target", "**/node_modules"]
 extraPaths = []
 ```
@@ -62,21 +62,21 @@ extraPaths = []
 To define a server from scratch (or one without a built-in default):
 
 ```toml
-[server.phpactor]
+[lsp.server.phpactor]
 command = "phpactor"
 args = ["language-server"]
 
-[language.php]
+[lsp.language.php]
 servers = ["phpactor"]
 ```
 
 ### Initialization Options
 
 Server-specific options passed during the LSP `initialize` request.
-These go on the `[server.*]` entry:
+These go on the `[lsp.server.*]` entry:
 
 ```toml
-[server.rust-analyzer.initialization_options]
+[lsp.server.rust-analyzer.initialization_options]
 check.command = "clippy"
 cargo.features = "all"
 ```
@@ -87,33 +87,33 @@ Refer to your language server's documentation for available options.
 
 Some language servers request configuration from the client via
 `workspace/configuration`. The `settings` table provides these values
-on the `[server.*]` entry. The TOML nesting mirrors the JSON object
+on the `[lsp.server.*]` entry. The TOML nesting mirrors the JSON object
 the server expects — Catenary matches the `section` path from each
 request and returns the corresponding subtree.
 
 ```toml
-[server.pyright.settings.python]
+[lsp.server.pyright.settings.python]
 pythonPath = "/usr/bin/python3"
 
-[server.pyright.settings.python.analysis]
+[lsp.server.pyright.settings.python.analysis]
 exclude = ["**/target", "**/node_modules"]
 extraPaths = []
 ```
 
 When pyright sends `workspace/configuration` with
 `{ "items": [{ "section": "python.analysis" }] }`, Catenary returns
-the matching subtree from `[server.pyright.settings]`.
+the matching subtree from `[lsp.server.pyright.settings]`.
 
 Items with no matching path receive `{}`.
 
 ### Diagnostic Severity
 
-`min_severity` on `[server.*]` filters which diagnostics are delivered to
+`min_severity` on `[lsp.server.*]` filters which diagnostics are delivered to
 agents. Valid values: `"error"`, `"warning"`, `"information"`, `"hint"`.
 When absent, all severities are delivered.
 
 ```toml
-[server.lattice]
+[lsp.server.lattice]
 command = "lattice"
 args = ["serve"]
 min_severity = "warning"
@@ -121,12 +121,12 @@ min_severity = "warning"
 
 ### Environment Variables
 
-`env` on `[server.*]` sets environment variables on the spawned server
+`env` on `[lsp.server.*]` sets environment variables on the spawned server
 process. Variables are added to the inherited environment — if a key
 already exists, the config value wins.
 
 ```toml
-[server.rust-analyzer]
+[lsp.server.rust-analyzer]
 command = "rustup"
 args = ["run", "stable", "rust-analyzer"]
 env = { CLIPPY_DISABLE_DOCS_LINKS = "1" }
@@ -138,19 +138,19 @@ to language servers that read them from the environment.
 
 ### Multi-server Bindings
 
-The `servers` list on `[language.*]` supports multiple servers. List order
+The `servers` list on `[lsp.language.*]` supports multiple servers. List order
 defines dispatch priority — for request/response methods, Catenary tries
 each server in order and returns the first non-empty result.
 
 ```toml
-[language.shellscript]
+[lsp.language.shellscript]
 servers = ["termux-ls", "bash-ls"]
 ```
 
 To suppress diagnostics from a specific server, use inline-table syntax:
 
 ```toml
-[language.shellscript]
+[lsp.language.shellscript]
 servers = [
     "termux-ls",
     { name = "bash-ls", diagnostics = false },
@@ -163,7 +163,7 @@ To suppress all diagnostics for a language, set `diagnostics = false` on the
 language entry:
 
 ```toml
-[language.markdown]
+[lsp.language.markdown]
 servers = ["lattice"]
 diagnostics = false
 ```
@@ -171,7 +171,7 @@ diagnostics = false
 Precedence: `language.diagnostics AND binding.diagnostics`. Either `false`
 suppresses delivery.
 
-| `[language.*].diagnostics` | Per-binding `diagnostics` | Effective |
+| `[lsp.language.*].diagnostics` | Per-binding `diagnostics` | Effective |
 |---|---|---|
 | unset / `true` | unset / `true` | deliver |
 | `false` | any | suppress (language-wide) |
@@ -181,7 +181,7 @@ To suppress specific LSP methods from a server for a language binding, use
 `disabled_methods`:
 
 ```toml
-[language.shellscript]
+[lsp.language.shellscript]
 servers = [
     "termux-ls",
     { name = "bash-ls", disabled_methods = ["textDocument/references"] },
@@ -194,21 +194,21 @@ remain available. Method names use the LSP protocol form.
 
 ### Dispatch Filtering
 
-`file_patterns` on `[server.*]` narrows which files a server handles
+`file_patterns` on `[lsp.server.*]` narrows which files a server handles
 within its language. Patterns match against the filename (not the full path).
 Servers without `file_patterns` handle all files for their language.
 
 ```toml
-[server.termux-ls]
+[lsp.server.termux-ls]
 command = "termux-language-server"
 args = ["--stdio"]
 file_patterns = ["PKGBUILD", "*.ebuild"]
 
-[server.bash-ls]
+[lsp.server.bash-ls]
 command = "bash-language-server"
 args = ["start"]
 
-[language.shellscript]
+[lsp.language.shellscript]
 servers = ["termux-ls", "bash-ls"]
 ```
 
@@ -219,14 +219,14 @@ first (higher priority), with `bash-ls` as fallback.
 
 ### Single-file Mode
 
-`single_file = true` on `[server.*]` enables tier 3 routing: files
+`single_file = true` on `[lsp.server.*]` enables tier 3 routing: files
 outside all workspace roots get a dedicated server instance with
 `rootUri: null` and `workspaceFolders: null` (per the LSP spec's
 single-file semantics). The server operates on individual documents
 without workspace context.
 
 ```toml
-[server.bash-ls]
+[lsp.server.bash-ls]
 command = "bash-language-server"
 args = ["start"]
 single_file = true
@@ -253,7 +253,7 @@ the server config maintainers who know which servers handle it well.
 
 ### Root Markers
 
-`root_markers` on `[language.*]` defines project boundary files for
+`root_markers` on `[lsp.language.*]` defines project boundary files for
 sub-root resolution. When a file in a workspace root needs a server
 instance that doesn't exist yet, Catenary walks up from the file
 toward the workspace root boundary, stopping at the first directory
@@ -261,7 +261,7 @@ containing any marker. That directory becomes the server instance's
 root.
 
 ```toml
-[language.rust]
+[lsp.language.rust]
 root_markers = ["Cargo.toml"]
 ```
 
@@ -271,7 +271,7 @@ config load time and matched against directory entries. This is useful
 for ecosystems where project files have varying names:
 
 ```toml
-[language.csharp]
+[lsp.language.csharp]
 root_markers = ["*.sln", "*.csproj"]
 ```
 
@@ -289,11 +289,11 @@ per-language:
 
 ```toml
 # Custom markers
-[language.rust]
+[lsp.language.rust]
 root_markers = ["rust-toolchain.toml"]
 
 # Disable markers entirely
-[language.python]
+[lsp.language.python]
 root_markers = []
 ```
 
@@ -315,11 +315,11 @@ root_markers = []
 
 ### Custom Languages
 
-Define a custom language by adding a `[language.*]` entry with
+Define a custom language by adding a `[lsp.language.*]` entry with
 classification fields and a server binding:
 
 ```toml
-[language.pkgbuild]
+[lsp.language.pkgbuild]
 filenames = ["PKGBUILD"]
 servers = ["termux-ls"]
 ```
@@ -340,10 +340,11 @@ Classification precedence (highest first): shebang > filename > extension.
 
 Place a `.catenary.toml` in a workspace root to override language and
 server configuration, set the per-project build tool, and toggle the
-diagnostic feeders for that root. Supported keys are the three feeder
-toggles (`disable_lsp`, `disable_lint`, `disable_diag`), `[language.*]`,
-`[server.*]`, and `[commands]` (the build tool only — command
-**enforcement** is user-level; see
+diagnostic feeders for that root. Each subsystem is one self-contained
+table: `[lsp]` (its `disable` toggle plus `[lsp.server.*]` / `[lsp.language.*]`
+definitions), `[linter]` (its `disable` toggle plus `[linter.rule.*]` linter
+definitions), `[diagnostics]` (its `disable` toggle), and `[commands]` (the
+build tool only — command **enforcement** is user-level; see
 [Project-scoped commands](#project-scoped-commands)). Other sections
 (`[notifications]`, `[icons]`, etc.) are user-level and belong in
 `~/.config/catenary/config.toml`.
@@ -355,83 +356,86 @@ the session.
 ### Disabling feeders per root
 
 Three orthogonal, per-root toggles control each diagnostic feeder
-independently. All default to `false` and are scoped to the root whose
-`.catenary.toml` declares them — a multi-project daemon honours each
-root's choice separately.
+independently — the `disable` key nested under each subsystem's table.
+All default to `false` and are scoped to the root whose `.catenary.toml`
+declares them — a multi-project daemon honours each root's choice
+separately.
 
 ```toml
 # .catenary.toml
-disable_lsp = true   # no language servers for this root
-disable_diag = true  # diagnostics surface off, navigation kept
+[lsp]
+disable = true   # no language servers for this root
+
+[diagnostics]
+disable = true   # diagnostics surface off, navigation kept
 ```
 
-- **`disable_lsp`** — drops the LSP feeder: no language servers spawn for
+- **`[lsp] disable`** — drops the LSP feeder: no language servers spawn for
   this root, so there is no grep/glob enrichment and no LSP diagnostics.
   The root stays tracked everywhere else (`catenary roots ls`, the build
   tool, command resolution, the editing gate). Useful for media
   collections, data directories, or any root where a language server is
   pure overhead. (Polarity flip of the old `lsp = false`.)
-- **`disable_lint`** — drops the standalone-linter feeder: no linter
-  diagnostics for this root. (No effect yet — the linter framework is not
-  shipped; the toggle is parsed and reported by `catenary doctor`.)
-- **`disable_diag`** — suppresses the diagnostics **surface** (the
+- **`[linter] disable`** — drops the standalone-linter feeder: no linter
+  diagnostics for this root.
+- **`[diagnostics] disable`** — suppresses the diagnostics **surface** (the
   editing→`catenary diagnostics` gate and its output) while keeping LSP
   servers running for grep/glob navigation. Use it when you want code
   intelligence but no edit-time diagnostics friction.
 
-`disable_lsp` together with `disable_lint` also zeroes diagnostics, but
-kills navigation too; `disable_diag` keeps navigation — that is the
+`[lsp] disable` together with `[linter] disable` also zeroes diagnostics, but
+kills navigation too; `[diagnostics] disable` keeps navigation — that is the
 distinction.
 
 > **Migration:** The `lsp` key (and its old `enabled` alias) was removed
-> in 2.0. Replace `lsp = false` with `disable_lsp = true` — the polarity
-> flips. A leftover `lsp`/`enabled` key is now a hard error, flagged by
-> `catenary doctor`.
+> in 2.0. Replace `lsp = false` with a `[lsp]` table carrying
+> `disable = true` — the polarity flips. A leftover `lsp`/`enabled` key is
+> now a hard error, flagged by `catenary doctor`.
 
 ### Merge Semantics
 
 Project config is deep-merged with user config at the key level:
 
 - **Scalars replace** — `command`, `args`, `min_severity`.
-- **Tables deep-merge by key** — a project `[server.rust-analyzer]` with just
-  `settings` inherits `command` and `args` from the user's (or built-in) `[server.rust-analyzer]`.
+- **Tables deep-merge by key** — a project `[lsp.server.rust-analyzer]` with just
+  `settings` inherits `command` and `args` from the user's (or built-in) `[lsp.server.rust-analyzer]`.
 - **Arrays replace** — `servers`, `file_patterns`, `extensions`,
   `filenames`, `shebangs`.
 
-### Example
+### Project override example
 
 Override rust-analyzer settings for a specific project:
 
 ```toml
 # .catenary.toml (in project root)
-[server.rust-analyzer.settings.rust-analyzer]
+[lsp.server.rust-analyzer.settings.rust-analyzer]
 check.targets = ["aarch64-unknown-linux-gnu"]
 cargo.features = ["embedded"]
 ```
 
-This merges with the built-in (or user-defined) `[server.rust-analyzer]`
+This merges with the built-in (or user-defined) `[lsp.server.rust-analyzer]`
 definition — the project inherits `command`, `args`, and
 `initialization_options`, and overrides only the `settings` subtree.
 
 ### Tier Promotion
 
-Adding a `[language.*]` entry in project config promotes that language
+Adding a `[lsp.language.*]` entry in project config promotes that language
 to a project-scoped server instance — a separate process bound to this
-root. Without a `[language.*]` entry, the shared server instance serves
+root. Without a `[lsp.language.*]` entry, the shared server instance serves
 this root with `scopeUri`-merged settings.
 
 ```toml
 # .catenary.toml — promotes rust to a project-scoped instance
-[language.rust]
+[lsp.language.rust]
 servers = ["rust-analyzer"]
 
-[server.rust-analyzer.settings.rust-analyzer]
+[lsp.server.rust-analyzer.settings.rust-analyzer]
 cargo.features = ["embedded"]
 ```
 
 ## Language IDs
 
-The `[language.<language-id>]` key in the language section must match the LSP language identifier.
+The `[lsp.language.<language-id>]` key in the language section must match the LSP language identifier.
 Catenary auto-detects languages from file extensions, filenames, and
 shebangs (`#!` lines in extensionless scripts). Any language with an LSP
 server works — this table covers what Catenary recognises automatically.
@@ -563,7 +567,7 @@ place instead of being dumped inline on every denial.
    no enforcement.
 3. **`allow = [...]` present** — active allowlist. Enforce.
 
-### Example
+### Recommended `[commands]` config
 
 ```toml
 [commands]
@@ -644,7 +648,7 @@ It is a stateless read, so it runs even while the command filter is active.
 
 In `.catenary.toml`, `[commands]` honors **only** `build` — the per-root
 build tool ("in this project, the build tool is `make`"). Even disabled
-roots (`lsp = false`) contribute `commands.build`. In multi-root sessions
+roots (`[lsp] disable = true`) contribute `commands.build`. In multi-root sessions
 `build` is collected per-root; the evaluator resolves which root a command
 targets via `cwd`.
 

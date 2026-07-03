@@ -317,7 +317,7 @@ impl ClassificationTables {
 
 /// A workspace root folded into one value: its path, its loaded
 /// `.catenary.toml` project config, and the [`ClassificationTables`] derived
-/// from that config's `[language.*]` section.
+/// from that config's `[lsp.language.*]` section.
 ///
 /// This replaces the formerly-parallel `(path → ProjectConfig)` side-table
 /// (`LspClientManager.project_configs`) and the per-root classification map.
@@ -343,7 +343,7 @@ pub struct Root {
 
 impl Root {
     /// Builds a root from an explicit path + config, deriving its
-    /// classification tables from the config's `[language.*]` section.
+    /// classification tables from the config's `[lsp.language.*]` section.
     #[must_use]
     pub fn new(path: PathBuf, config: ProjectConfig) -> Self {
         let classification = ClassificationTables::from_project_config(&config.language);
@@ -407,7 +407,7 @@ impl Root {
         &self.config
     }
 
-    /// The classification tables derived from the root's `[language.*]`.
+    /// The classification tables derived from the root's `[lsp.language.*]`.
     #[must_use]
     pub const fn classification(&self) -> &ClassificationTables {
         &self.classification
@@ -1791,7 +1791,7 @@ mod tests {
         }
     }
 
-    /// Builds an `Arc<Root>` carrying a project config whose `[language.*]`
+    /// Builds an `Arc<Root>` carrying a project config whose `[lsp.language.*]`
     /// section is `languages` — the modern way to attach per-root
     /// classification (the classification tables are derived on the `Root`).
     fn root_with_langs(

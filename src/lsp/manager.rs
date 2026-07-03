@@ -326,8 +326,8 @@ impl LspClientManager {
 
     /// The effective linter set for a root (workstream 34 ticket 01).
     ///
-    /// The user config's `[linter.*]` unioned with the root's project
-    /// `[linter.*]`, the project winning on a name collision (so a project entry
+    /// The user config's `[linter.rule.*]` unioned with the root's project
+    /// `[linter.rule.*]`, the project winning on a name collision (so a project entry
     /// can override or `disable` a user-configured linter). Each entry carries
     /// its compiled routing globs, ready for [`LinterConfig::matches`].
     ///
@@ -348,7 +348,7 @@ impl LspClientManager {
     ///
     /// Built from the seeded code default
     /// ([`DiagnosticWeights::rust_analyzer_default`]) overlaid with the user-level
-    /// `[server.*]` / `[linter.*]` weight fields, then the root's project
+    /// `[lsp.server.*]` / `[linter.rule.*]` weight fields, then the root's project
     /// `.catenary.toml` overrides (project winning). Consumed per file by the
     /// `catenary diagnostics` cross-feeder reconciliation — the dedup keeper and
     /// the provisional challenge — over the merged set from every feeder.
@@ -387,7 +387,7 @@ impl LspClientManager {
     /// Whether a standalone linter covers `file` (workstream 34 ticket 01).
     ///
     /// Resolves `file` to its owning root and matches the **root-relative** path
-    /// against that root's effective `[linter.*]` patterns (user ∪ project),
+    /// against that root's effective `[linter.rule.*]` patterns (user ∪ project),
     /// reusing [`LspGlob`]. Out-of-root files and `disable_lint` roots are never
     /// covered; an entry with `disable = true` or no patterns contributes
     /// nothing. This is the routing predicate behind both the editing-boundary
@@ -469,7 +469,7 @@ impl LspClientManager {
 
         // Each tracked root already carries its `.catenary.toml` config +
         // classification (loaded at birth, ticket 00a) — no config loading
-        // here. Surface any orphan `[server.*]` entries while we hold every
+        // here. Surface any orphan `[lsp.server.*]` entries while we hold every
         // root's config.
         for root in self.fs.root_views() {
             crate::config::validate::warn_orphan_project_servers(
@@ -546,7 +546,7 @@ impl LspClientManager {
     }
 
     /// Returns whether any server for this language is configured for
-    /// single-file mode (`single_file = true` in `[server.*]`).
+    /// single-file mode (`single_file = true` in `[lsp.server.*]`).
     ///
     /// Used by the hook layer to decide whether out-of-root edits
     /// should be gated by `start_editing`. Servers that failed at
@@ -577,7 +577,7 @@ impl LspClientManager {
     /// still counts as covered (granularity Decision 3): a warm language's
     /// in-root file must not be silently dropped just because no instance has
     /// spawned yet. Files whose language has no `servers` binding —
-    /// classification-only entries, or types absent from every `[language.*]`
+    /// classification-only entries, or types absent from every `[lsp.language.*]`
     /// table (`.txt`, logs, data/scratch files) — return `false`, so
     /// non-served in-root edits flow free.
     #[must_use]
@@ -718,12 +718,12 @@ impl LspClientManager {
 
     /// Returns clients for a file path, filtered by capability,
     /// `file_patterns`, and `disabled_methods`, in priority order
-    /// (from the `servers` list in `[language.*]`).
+    /// (from the `servers` list in `[lsp.language.*]`).
     ///
     /// Resolves language from path via `FilesystemManager`, iterates
     /// the binding's servers, filters by:
     /// 1. `disabled_methods` on the binding (per-binding suppression)
-    /// 2. `file_patterns` on `[server.*]` (filename-level glob)
+    /// 2. `file_patterns` on `[lsp.server.*]` (filename-level glob)
     /// 3. The given capability check
     ///
     /// `method` is the [`DispatchMethod`] being dispatched. Pass
@@ -1035,7 +1035,9 @@ impl LspClientManager {
             self.config
                 .server
                 .get(server_name)
-                .ok_or_else(|| anyhow!("Server '{server_name}' not found in [server.*] config"))?
+                .ok_or_else(|| {
+                    anyhow!("Server '{server_name}' not found in [lsp.server.*] config")
+                })?
                 .clone()
         };
 
@@ -1222,7 +1224,7 @@ impl LspClientManager {
             .config
             .server
             .get(server_name)
-            .ok_or_else(|| anyhow!("Server '{server_name}' not found in [server.*] config"))?
+            .ok_or_else(|| anyhow!("Server '{server_name}' not found in [lsp.server.*] config"))?
             .clone();
 
         let mut clients = self.clients.lock().await;
@@ -2022,7 +2024,7 @@ impl LspClientManager {
     /// Whether a language is project-scoped in the given root.
     ///
     /// Rule A: returns `true` if the root's project config has a
-    /// `[language.{lang}]` entry. This triggers tier 1 — an
+    /// `[lsp.language.{lang}]` entry. This triggers tier 1 — an
     /// isolated per-root instance.
     #[must_use]
     pub fn is_project_scoped(&self, lang: &str, root: &Path) -> bool {
@@ -2033,8 +2035,8 @@ impl LspClientManager {
 
     /// Returns the effective `ServerDef` for a server in a root.
     ///
-    /// Deep-merges the root's project `[server.{name}]` (if any)
-    /// over the user-level `[server.{name}]`. Returns user-level
+    /// Deep-merges the root's project `[lsp.server.{name}]` (if any)
+    /// over the user-level `[lsp.server.{name}]`. Returns user-level
     /// def unchanged if no project override exists.
     #[must_use]
     pub fn effective_server_def(&self, server_name: &str, root: &Path) -> Option<ServerDef> {
@@ -2095,8 +2097,8 @@ impl LspClientManager {
 
     /// Returns the effective settings `Value` for a server in a root.
     ///
-    /// Deep-merges the root's project `[server.{name}].settings`
-    /// over the user-level `[server.{name}].settings`.
+    /// Deep-merges the root's project `[lsp.server.{name}].settings`
+    /// over the user-level `[lsp.server.{name}].settings`.
     #[must_use]
     pub fn effective_settings(&self, server_name: &str, root: &Path) -> Option<serde_json::Value> {
         let user_settings = self
@@ -2792,7 +2794,7 @@ mod tests {
 
         let manager = LspClientManager::new(config, test_logging(), test_fs_with_roots(&["/tmp"]));
 
-        // Add project config with [language.{MOCK_LANG_A}] (Rule A).
+        // Add project config with [lsp.language.{MOCK_LANG_A}] (Rule A).
         let mut pc = crate::config::ProjectConfig::default();
         pc.language.insert(
             MOCK_LANG_A.to_string(),
@@ -4568,7 +4570,7 @@ mod tests {
 
         let manager = LspClientManager::new(config, test_logging(), test_fs_with_roots(&["/tmp"]));
 
-        // Add project config with [language.{MOCK_LANG_A}] (Rule A).
+        // Add project config with [lsp.language.{MOCK_LANG_A}] (Rule A).
         let mut pc = crate::config::ProjectConfig::default();
         pc.language.insert(
             MOCK_LANG_A.to_string(),
@@ -4672,7 +4674,7 @@ mod tests {
 
         // Write .catenary.toml for root_b so the root is config-complete when
         // it is born (ticket 00a) — root_a has none and loads bare.
-        let project_toml = format!("[language.{MOCK_LANG_A}]\nservers = [\"{server_name}\"]\n");
+        let project_toml = format!("[lsp.language.{MOCK_LANG_A}]\nservers = [\"{server_name}\"]\n");
         std::fs::write(root_b.path().join(".catenary.toml"), project_toml).expect("write");
 
         let fs = test_fs();
@@ -4714,7 +4716,7 @@ mod tests {
             .name
             .clone();
 
-        let project_toml = format!("[language.{MOCK_LANG_A}]\nservers = [\"{server_name}\"]\n");
+        let project_toml = format!("[lsp.language.{MOCK_LANG_A}]\nservers = [\"{server_name}\"]\n");
         std::fs::write(root.path().join(".catenary.toml"), project_toml).expect("write");
 
         let fs = test_fs();
@@ -4758,7 +4760,7 @@ mod tests {
             .clone();
 
         // Only root_b is project-scoped.
-        let project_toml = format!("[language.{MOCK_LANG_A}]\nservers = [\"{server_name}\"]\n");
+        let project_toml = format!("[lsp.language.{MOCK_LANG_A}]\nservers = [\"{server_name}\"]\n");
         std::fs::write(root_b.path().join(".catenary.toml"), project_toml).expect("write");
 
         let fs = test_fs();
@@ -4855,7 +4857,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sync_roots_add_project_scoped() -> Result<()> {
-        // Adding a root with project [language.*] spawns Scope::Root,
+        // Adding a root with project [lsp.language.*] spawns Scope::Root,
         // no didChangeWorkspaceFolders to workspace instance.
         let root_a = tempfile::tempdir().expect("tempdir");
         let root_b = tempfile::tempdir().expect("tempdir");
@@ -4882,7 +4884,7 @@ mod tests {
             .await?;
         assert!(ws.lock().await.supports_workspace_folders());
 
-        // root_b is project-scoped (carries a `[language.*]` config).
+        // root_b is project-scoped (carries a `[lsp.language.*]` config).
         let mut pc = crate::config::ProjectConfig::default();
         pc.language.insert(
             MOCK_LANG_A.to_string(),
@@ -5819,7 +5821,7 @@ mod tests {
     }
 
     /// `effective_weights` seeds the rust-analyzer default, overlays the
-    /// user-level `[server.*]` / `[linter.*]` weights, and lets a per-root
+    /// user-level `[lsp.server.*]` / `[linter.rule.*]` weights, and lets a per-root
     /// project override win (linters ticket 05).
     #[test]
     fn test_effective_weights_layers_seed_user_and_project() {
@@ -5937,7 +5939,7 @@ mod tests {
         );
     }
 
-    /// A project `[linter.<name>] disable = true` overrides a user linter of the
+    /// A project `[linter.rule.<name>] disable = true` overrides a user linter of the
     /// same name (ticket 01 — project wins on a name collision).
     #[test]
     fn test_lint_covers_project_disable_overrides_user() {
@@ -6110,7 +6112,7 @@ mod tests {
         );
     }
 
-    /// A config-bearing root's `[language.*]` classification reaches
+    /// A config-bearing root's `[lsp.language.*]` classification reaches
     /// `FilesystemManager` (the tables are derived on the `Root`, ticket 00a).
     #[test]
     fn test_root_config_feeds_classification() {
@@ -6138,7 +6140,7 @@ mod tests {
         );
     }
 
-    /// A root with no `[language.*]` classification falls through to the global
+    /// A root with no `[lsp.language.*]` classification falls through to the global
     /// tables (no per-root entry).
     #[test]
     fn test_root_config_empty_classification_falls_through() {

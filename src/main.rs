@@ -204,7 +204,7 @@ enum Command {
     /// Check language server health. Tests all configured servers by default.
     /// Pass a server name for verbose single-server diagnostics.
     Doctor {
-        /// Server name for verbose single-server mode (matches [server.*]
+        /// Server name for verbose single-server mode (matches [lsp.server.*]
         /// config keys). When omitted, tests all servers with one-line
         /// summaries.
         server: Option<String>,

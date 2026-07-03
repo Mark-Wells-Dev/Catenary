@@ -205,7 +205,7 @@ into two steps:
    `LspClient`, and runs `initialize` with the workspace roots.
 
 2. **Scope determination.** From the `initialize` response:
-   - If project-scoped (Rule A — root has `[language.*]` in
+   - If project-scoped (Rule A — root has `[lsp.language.*]` in
      `.catenary.toml`): scope is forced to `Scope::Root(root)`
      regardless of capabilities.
    - If workspace-capable (`workspaceFolders` supported): scope is
@@ -218,7 +218,7 @@ into two steps:
    Files outside all workspace roots take a separate path:
    `spawn_single_file` sets `Scope::SingleFile` *before* `initialize`
    (the scope is known without the handshake) and initializes with a
-   null workspace. It is gated on `single_file = true` in `[server.*]`,
+   null workspace. It is gated on `single_file = true` in `[lsp.server.*]`,
    and a server that rejects null-workspace init is negative-cached. See
    the single-file tier in [Routing & Dispatch](routing.md).
 

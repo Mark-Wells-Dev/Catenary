@@ -16,317 +16,317 @@
 
 # ── Systems ─────────────────────────────────────────────────────────
 
-[language.rust]
+[lsp.language.rust]
 extensions = ["rs"]
 servers = ["rust-analyzer"]
 root_markers = ["Cargo.toml"]
 
-[language.go]
+[lsp.language.go]
 extensions = ["go"]
 servers = ["gopls"]
 root_markers = ["go.mod"]
 
-[language.c]
+[lsp.language.c]
 extensions = ["c"]
 servers = ["clangd"]
 root_markers = ["compile_commands.json", ".clangd"]
 
-[language.cpp]
+[lsp.language.cpp]
 extensions = ["cpp", "cc", "cxx", "h", "hpp"]
 servers = ["clangd"]
 root_markers = ["compile_commands.json", ".clangd"]
 
-[language.zig]
+[lsp.language.zig]
 extensions = ["zig"]
 servers = ["zls"]
 root_markers = ["build.zig"]
 
-[language.d]
+[lsp.language.d]
 extensions = ["d"]
 root_markers = ["dub.json", "dub.sdl"]
 
-[language.v]
+[lsp.language.v]
 extensions = ["v"]
 
-[language.nim]
+[lsp.language.nim]
 extensions = ["nim"]
 
 # ── JVM ─────────────────────────────────────────────────────────────
 
-# [language.java]  — no canonical default server (jdtls requires Eclipse runtime)
-[language.java]
+# [lsp.language.java]  — no canonical default server (jdtls requires Eclipse runtime)
+[lsp.language.java]
 extensions = ["java"]
 root_markers = ["pom.xml", "build.gradle", "build.gradle.kts"]
 
-[language.kotlin]
+[lsp.language.kotlin]
 extensions = ["kt", "kts"]
 shebangs = ["kotlin"]
 servers = ["kotlin-ls"]
 root_markers = ["build.gradle", "build.gradle.kts"]
 
-[language.scala]
+[lsp.language.scala]
 extensions = ["scala", "sc"]
 shebangs = ["scala"]
 servers = ["metals"]
 root_markers = ["build.sbt", "build.sc"]
 
-[language.groovy]
+[lsp.language.groovy]
 extensions = ["groovy", "gvy"]
 shebangs = ["groovy"]
 
-[language.clojure]
+[lsp.language.clojure]
 extensions = ["clj", "cljs", "cljc"]
 
 # ── .NET ────────────────────────────────────────────────────────────
 
-[language.csharp]
+[lsp.language.csharp]
 extensions = ["cs"]
 servers = ["csharp-ls"]
 root_markers = ["*.sln", "*.csproj"]
 
-[language.fsharp]
+[lsp.language.fsharp]
 extensions = ["fs", "fsx", "fsi"]
 servers = ["fsautocomplete"]
 root_markers = ["*.sln", "*.fsproj"]
 
 # ── Apple ───────────────────────────────────────────────────────────
 
-[language.swift]
+[lsp.language.swift]
 extensions = ["swift"]
 shebangs = ["swift"]
 servers = ["sourcekit-lsp"]
 
-[language.objective-c]
+[lsp.language.objective-c]
 extensions = ["m", "mm"]
 
 # ── Scripting ───────────────────────────────────────────────────────
 
-[language.python]
+[lsp.language.python]
 extensions = ["py"]
 shebangs = ["python", "python3", "python2"]
 servers = ["pyright"]
 root_markers = ["pyrightconfig.json", "pyproject.toml", "setup.py"]
 
-[language.ruby]
+[lsp.language.ruby]
 extensions = ["rb"]
 filenames = ["Gemfile", "Rakefile"]
 shebangs = ["ruby", "irb"]
 root_markers = ["Gemfile"]
 
-[language.perl]
+[lsp.language.perl]
 extensions = ["pl", "pm"]
 shebangs = ["perl"]
 
-[language.php]
+[lsp.language.php]
 extensions = ["php"]
 shebangs = ["php"]
 servers = ["intelephense"]
 root_markers = ["composer.json"]
 
-[language.lua]
+[lsp.language.lua]
 extensions = ["lua"]
 shebangs = ["lua", "luajit"]
 servers = ["lua-ls"]
 root_markers = [".luarc.json", ".luarc.jsonc"]
 
-[language.tcl]
+[lsp.language.tcl]
 extensions = ["tcl"]
 shebangs = ["tclsh", "wish"]
 
-[language.crystal]
+[lsp.language.crystal]
 extensions = ["cr"]
 shebangs = ["crystal"]
 root_markers = ["shard.yml"]
 
 # ── JavaScript / TypeScript ─────────────────────────────────────────
 
-[language.javascript]
+[lsp.language.javascript]
 extensions = ["js", "mjs", "cjs"]
 shebangs = ["node", "nodejs"]
 servers = ["typescript-ls"]
 root_markers = ["package.json"]
 
-[language.typescript]
+[lsp.language.typescript]
 extensions = ["ts", "mts", "cts"]
 shebangs = ["deno"]
 servers = ["typescript-ls"]
 root_markers = ["tsconfig.json"]
 
-[language.typescriptreact]
+[lsp.language.typescriptreact]
 extensions = ["tsx"]
 servers = ["typescript-ls"]
 root_markers = ["tsconfig.json"]
 
-[language.javascriptreact]
+[lsp.language.javascriptreact]
 extensions = ["jsx"]
 servers = ["typescript-ls"]
 root_markers = ["package.json"]
 
 # ── Functional ──────────────────────────────────────────────────────
 
-[language.haskell]
+[lsp.language.haskell]
 extensions = ["hs", "lhs"]
 servers = ["haskell-ls"]
 root_markers = ["hie.yaml", "cabal.project", "stack.yaml"]
 
-[language.ocaml]
+[lsp.language.ocaml]
 extensions = ["ml", "mli"]
 servers = ["ocamllsp"]
 root_markers = ["dune-project"]
 
-[language.elm]
+[lsp.language.elm]
 extensions = ["elm"]
 servers = ["elm-ls"]
 root_markers = ["elm.json"]
 
-[language.gleam]
+[lsp.language.gleam]
 extensions = ["gleam"]
 root_markers = ["gleam.toml"]
 
-[language.elixir]
+[lsp.language.elixir]
 extensions = ["ex", "exs"]
 shebangs = ["elixir", "iex"]
 root_markers = ["mix.exs"]
 
-[language.erlang]
+[lsp.language.erlang]
 extensions = ["erl", "hrl"]
 shebangs = ["erl"]
 root_markers = ["rebar.config"]
 
-[language.purescript]
+[lsp.language.purescript]
 extensions = ["purs"]
 
 # ── Shell ───────────────────────────────────────────────────────────
 
-[language.shellscript]
+[lsp.language.shellscript]
 extensions = ["sh", "bash", "zsh", "ebuild", "eclass", "install"]
 filenames = ["PKGBUILD"]
 shebangs = ["bash", "sh", "zsh", "dash", "ksh"]
 servers = ["bash-ls"]
 
-[language.fish]
+[lsp.language.fish]
 extensions = ["fish"]
 shebangs = ["fish"]
 
-[language.powershell]
+[lsp.language.powershell]
 extensions = ["ps1", "psm1", "psd1"]
 
 # ── Data science ────────────────────────────────────────────────────
 
-[language.r]
+[lsp.language.r]
 extensions = ["r", "R"]
 shebangs = ["Rscript"]
 servers = ["r-ls"]
 
-[language.julia]
+[lsp.language.julia]
 extensions = ["jl"]
 shebangs = ["julia"]
 servers = ["julia-ls"]
 
-[language.mojo]
+[lsp.language.mojo]
 extensions = ["mojo"]
 
 # ── Web frontend ────────────────────────────────────────────────────
 
-[language.html]
+[lsp.language.html]
 extensions = ["html", "htm"]
 servers = ["vscode-html"]
 
-[language.css]
+[lsp.language.css]
 extensions = ["css"]
 servers = ["vscode-css"]
 
-[language.scss]
+[lsp.language.scss]
 extensions = ["scss"]
 servers = ["vscode-css"]
 
-[language.sass]
+[lsp.language.sass]
 extensions = ["sass"]
 
-[language.less]
+[lsp.language.less]
 extensions = ["less"]
 servers = ["vscode-css"]
 
-[language.svelte]
+[lsp.language.svelte]
 extensions = ["svelte"]
 servers = ["svelte-ls"]
 root_markers = ["svelte.config.js", "svelte.config.ts"]
 
-[language.vue]
+[lsp.language.vue]
 extensions = ["vue"]
 
 # ── Data / config ───────────────────────────────────────────────────
 
-[language.json]
+[lsp.language.json]
 extensions = ["json", "jsonc"]
 servers = ["vscode-json"]
 
-[language.yaml]
+[lsp.language.yaml]
 extensions = ["yaml", "yml"]
 servers = ["yaml-ls"]
 
-[language.toml]
+[lsp.language.toml]
 extensions = ["toml"]
 filenames = ["Cargo.toml", "Cargo.lock"]
 servers = ["taplo"]
 
-[language.xml]
+[lsp.language.xml]
 extensions = ["xml", "xsl", "xslt", "xsd"]
 
-[language.sql]
+[lsp.language.sql]
 extensions = ["sql"]
 servers = ["sql-ls"]
 
-[language.graphql]
+[lsp.language.graphql]
 extensions = ["graphql", "gql"]
 
-[language.proto]
+[lsp.language.proto]
 extensions = ["proto"]
 
 # ── Markup / docs ───────────────────────────────────────────────────
 
-[language.markdown]
+[lsp.language.markdown]
 extensions = ["md", "mdx"]
 servers = ["lattice"]
 root_markers = [".lattice.toml", ".git"]
 
-[language.restructuredtext]
+[lsp.language.restructuredtext]
 extensions = ["rst"]
 
-[language.latex]
+[lsp.language.latex]
 extensions = ["tex", "latex"]
 
-[language.typst]
+[lsp.language.typst]
 extensions = ["typ"]
 
 # ── Infrastructure / config languages ───────────────────────────────
 
-[language.nix]
+[lsp.language.nix]
 extensions = ["nix"]
 servers = ["nil"]
 root_markers = ["flake.nix"]
 
-[language.terraform]
+[lsp.language.terraform]
 extensions = ["tf", "tfvars"]
 servers = ["terraform-ls"]
 
-[language.cmake]
+[lsp.language.cmake]
 extensions = ["cmake"]
 filenames = ["CMakeLists.txt"]
 servers = ["cmake-ls"]
 
-[language.dart]
+[lsp.language.dart]
 extensions = ["dart"]
 servers = ["dart-ls"]
 root_markers = ["pubspec.yaml"]
 
-[language.dockerfile]
+[lsp.language.dockerfile]
 extensions = ["dockerfile"]
 filenames = ["Dockerfile"]
 servers = ["docker-ls"]
 
-[language.makefile]
+[lsp.language.makefile]
 filenames = ["Makefile", "GNUmakefile"]
 
-[language.just]
+[lsp.language.just]
 filenames = ["Justfile", "justfile"]

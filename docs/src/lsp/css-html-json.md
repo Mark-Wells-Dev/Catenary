@@ -25,7 +25,7 @@ npm install -g vscode-langservers-extracted
 ## Config
 
 Catenary ships built-in definitions for `vscode-css`, `vscode-html`,
-and `vscode-json` — no `[server.*]` config is needed. If the binaries
+and `vscode-json` — no `[lsp.server.*]` config is needed. If the binaries
 are on PATH, they work automatically for CSS, SCSS, Less, HTML, JSON,
 and JSONC files.
 

@@ -12,8 +12,8 @@ use crate::lsp::glob::LspGlob;
 
 /// Server definition — how to run and configure a language server.
 ///
-/// Defined in `[server.*]` config sections, referenced by name from
-/// `[language.*]` entries. This is adapter-level config consumed by
+/// Defined in `[lsp.server.*]` config sections, referenced by name from
+/// `[lsp.language.*]` entries. This is adapter-level config consumed by
 /// the LSP client layer — the routing core never sees it directly.
 ///
 /// **Sync note:** Config-visible fields must be listed in
@@ -87,7 +87,7 @@ pub struct ServerDef {
     pub weight: Option<u32>,
 
     /// Per-sub-source weight overrides for a multi-source server
-    /// (`[server.<name>.sources]`, linters ticket 05).
+    /// (`[lsp.server.<name>.sources]`, linters ticket 05).
     ///
     /// rust-analyzer emits three sources — `rust-analyzer` (native), `rustc`,
     /// and `clippy` (flycheck) — that need different weights. The native source

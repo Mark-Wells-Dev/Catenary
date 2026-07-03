@@ -16,7 +16,7 @@
 //! rust-analyzer/flycheck weight default (rust-analyzer native `10`, rustc/clippy
 //! `100`, provisional `^E[0-9]+$`). The seed ships in code, so no precedence/weight
 //! config is written; the only override is lowering mockls's own harness
-//! diagnostic below the native weight (via a `[server.*.sources]` sub-table) so it
+//! diagnostic below the native weight (via a `[lsp.server.*.sources]` sub-table) so it
 //! does not challenge the native preview cases.
 
 mod common;
@@ -34,7 +34,7 @@ const MOCK_LANG: &str = "pR3cD";
 ///
 /// The seeded rust-analyzer/flycheck weights apply with no config. mockls always
 /// emits its own `source: "mockls"` diagnostic alongside the extras; a
-/// `[server.*.sources]` sub-table pins that source's weight below rust-analyzer's
+/// `[lsp.server.*.sources]` sub-table pins that source's weight below rust-analyzer's
 /// native `10` so the harness diagnostic never *challenges* a provisional native
 /// preview (it is the heavier-source challenge, not the preview, under test).
 fn write_config(dir: &Path, extra_diagnostics: &[&str]) -> Result<PathBuf> {
@@ -54,12 +54,12 @@ fn write_config(dir: &Path, extra_diagnostics: &[&str]) -> Result<PathBuf> {
     std::fs::write(
         &config_path,
         format!(
-            "[server.mockls-{MOCK_LANG}]\n\
+            "[lsp.server.mockls-{MOCK_LANG}]\n\
              command = \"{mockls_bin}\"\n\
              args = [{args_line}]\n\n\
-             [server.mockls-{MOCK_LANG}.sources]\n\
+             [lsp.server.mockls-{MOCK_LANG}.sources]\n\
              mockls = 1\n\n\
-             [language.{MOCK_LANG}]\n\
+             [lsp.language.{MOCK_LANG}]\n\
              servers = [\"mockls-{MOCK_LANG}\"]\n"
         ),
     )?;

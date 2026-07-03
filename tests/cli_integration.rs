@@ -212,10 +212,10 @@ fn test_doctor_single_server_found() -> Result<()> {
     std::fs::write(
         config_dir.join("config.toml"),
         format!(
-            "[server.mockls-test]\n\
+            "[lsp.server.mockls-test]\n\
              command = \"{mockls_bin}\"\n\
              args = [\"test\"]\n\n\
-             [language.test]\n\
+             [lsp.language.test]\n\
              servers = [\"mockls-test\"]\n"
         ),
     )?;
@@ -285,10 +285,10 @@ fn test_doctor_single_server_not_found() -> Result<()> {
     std::fs::write(
         config_dir.join("config.toml"),
         format!(
-            "[server.mockls-test]\n\
+            "[lsp.server.mockls-test]\n\
              command = \"{mockls_bin}\"\n\
              args = [\"test\"]\n\n\
-             [language.test]\n\
+             [lsp.language.test]\n\
              servers = [\"mockls-test\"]\n"
         ),
     )?;
@@ -331,10 +331,10 @@ fn test_doctor_no_args_unchanged() -> Result<()> {
     std::fs::write(
         config_dir.join("config.toml"),
         format!(
-            "[server.mockls-test]\n\
+            "[lsp.server.mockls-test]\n\
              command = \"{mockls_bin}\"\n\
              args = [\"test\"]\n\n\
-             [language.test]\n\
+             [lsp.language.test]\n\
              servers = [\"mockls-test\"]\n"
         ),
     )?;
@@ -384,20 +384,20 @@ fn test_doctor_parallel_all_ready() -> Result<()> {
     std::fs::write(
         config_dir.join("config.toml"),
         format!(
-            "[server.alpha-server]\n\
+            "[lsp.server.alpha-server]\n\
              command = \"{mockls_bin}\"\n\
              args = [\"alpha\"]\n\n\
-             [server.beta-server]\n\
+             [lsp.server.beta-server]\n\
              command = \"{mockls_bin}\"\n\
              args = [\"beta\"]\n\n\
-             [server.gamma-server]\n\
+             [lsp.server.gamma-server]\n\
              command = \"{mockls_bin}\"\n\
              args = [\"gamma\"]\n\n\
-             [language.alpha]\n\
+             [lsp.language.alpha]\n\
              servers = [\"alpha-server\"]\n\n\
-             [language.beta]\n\
+             [lsp.language.beta]\n\
              servers = [\"beta-server\"]\n\n\
-             [language.gamma]\n\
+             [lsp.language.gamma]\n\
              servers = [\"gamma-server\"]\n"
         ),
     )?;
@@ -448,15 +448,15 @@ fn test_doctor_parallel_one_fails() -> Result<()> {
     std::fs::write(
         config_dir.join("config.toml"),
         format!(
-            "[server.good-server]\n\
+            "[lsp.server.good-server]\n\
              command = \"{mockls_bin}\"\n\
              args = [\"test\"]\n\n\
-             [server.bad-server]\n\
+             [lsp.server.bad-server]\n\
              command = \"nonexistent-binary-xyz-12345\"\n\
              args = []\n\n\
-             [language.good]\n\
+             [lsp.language.good]\n\
              servers = [\"good-server\"]\n\n\
-             [language.bad]\n\
+             [lsp.language.bad]\n\
              servers = [\"bad-server\"]\n"
         ),
     )?;
@@ -499,20 +499,20 @@ fn test_doctor_output_sorted() -> Result<()> {
     std::fs::write(
         config_dir.join("config.toml"),
         format!(
-            "[server.zulu-server]\n\
+            "[lsp.server.zulu-server]\n\
              command = \"{mockls_bin}\"\n\
              args = [\"zulu\"]\n\n\
-             [server.alpha-server]\n\
+             [lsp.server.alpha-server]\n\
              command = \"{mockls_bin}\"\n\
              args = [\"alpha\"]\n\n\
-             [server.mike-server]\n\
+             [lsp.server.mike-server]\n\
              command = \"{mockls_bin}\"\n\
              args = [\"mike\"]\n\n\
-             [language.zulu]\n\
+             [lsp.language.zulu]\n\
              servers = [\"zulu-server\"]\n\n\
-             [language.alpha]\n\
+             [lsp.language.alpha]\n\
              servers = [\"alpha-server\"]\n\n\
-             [language.mike]\n\
+             [lsp.language.mike]\n\
              servers = [\"mike-server\"]\n"
         ),
     )?;
@@ -554,15 +554,15 @@ fn test_doctor_parallel_timeout() -> Result<()> {
     std::fs::write(
         config_dir.join("config.toml"),
         format!(
-            "[server.fast-server]\n\
+            "[lsp.server.fast-server]\n\
              command = \"{mockls_bin}\"\n\
              args = [\"fast\"]\n\n\
-             [server.hanging-server]\n\
+             [lsp.server.hanging-server]\n\
              command = \"{mockls_bin}\"\n\
              args = [\"hang\", \"--hang-on\", \"initialize\"]\n\n\
-             [language.fast]\n\
+             [lsp.language.fast]\n\
              servers = [\"fast-server\"]\n\n\
-             [language.hang]\n\
+             [lsp.language.hang]\n\
              servers = [\"hanging-server\"]\n"
         ),
     )?;
@@ -606,10 +606,10 @@ fn test_doctor_piped_no_ansi() -> Result<()> {
     std::fs::write(
         config_dir.join("config.toml"),
         format!(
-            "[server.mockls-pipe]\n\
+            "[lsp.server.mockls-pipe]\n\
              command = \"{mockls_bin}\"\n\
              args = [\"test\"]\n\n\
-             [language.test]\n\
+             [lsp.language.test]\n\
              servers = [\"mockls-pipe\"]\n"
         ),
     )?;

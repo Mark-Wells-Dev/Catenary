@@ -12,14 +12,14 @@
 //! heavier source reported for the file without corroborating it (the misc-115
 //! rust-analyzer-vs-flycheck phantom).
 //!
-//! Weights are **co-located on the source definition** (`[server.*]` /
-//! `[linter.*]`): a definition `weight` is the fallback for the source it emits
-//! natively, a `[server.<name>.sources]` sub-table overrides individual
+//! Weights are **co-located on the source definition** (`[lsp.server.*]` /
+//! `[linter.rule.*]`): a definition `weight` is the fallback for the source it emits
+//! natively, a `[lsp.server.<name>.sources]` sub-table overrides individual
 //! sub-sources (rust-analyzer's `rustc`/`clippy` flycheck sources), and a
 //! `provisional` regex marks the native source's provisional code band. The
 //! shipped rust-analyzer/flycheck default is seeded **in code**
 //! ([`DiagnosticWeights::rust_analyzer_default`]) so it survives a user
-//! redefining `[server.rust-analyzer]`.
+//! redefining `[lsp.server.rust-analyzer]`.
 
 use std::collections::HashMap;
 
@@ -38,8 +38,8 @@ pub const BASELINE_WEIGHT: u32 = 50;
 ///
 /// Built by
 /// [`LspClientManager::effective_weights`](crate::lsp::LspClientManager::effective_weights)
-/// from the seeded code default overlaid with a root's effective `[server.*]` /
-/// `[linter.*]` definitions. Consumed by the `catenary diagnostics` cross-feeder
+/// from the seeded code default overlaid with a root's effective `[lsp.server.*]` /
+/// `[linter.rule.*]` definitions. Consumed by the `catenary diagnostics` cross-feeder
 /// reconciliation.
 #[derive(Debug, Clone)]
 pub struct DiagnosticWeights {
@@ -56,7 +56,7 @@ impl DiagnosticWeights {
     /// `E####` findings are provisional (misc 115, bug 42).
     ///
     /// Seeded in code (not `defaults/servers.toml`) so it survives a user
-    /// redefining `[server.rust-analyzer]` with, e.g., a custom command. Keyed on
+    /// redefining `[lsp.server.rust-analyzer]` with, e.g., a custom command. Keyed on
     /// the LSP `source` field, so it is inert for any root whose diagnostics
     /// carry none of those sources.
     #[must_use]
@@ -93,13 +93,13 @@ impl DiagnosticWeights {
             .is_some_and(|re| re.is_match(code))
     }
 
-    /// Overlays a `[server.<name>]` definition's weights onto the set.
+    /// Overlays a `[lsp.server.<name>]` definition's weights onto the set.
     ///
     /// The definition `weight` is the fallback for the native source (named after
-    /// the definition); each `[server.<name>.sources]` entry overrides an
+    /// the definition); each `[lsp.server.<name>.sources]` entry overrides an
     /// individual sub-source; `provisional` compiles into the native source's
     /// band. Absent fields leave the seeded/earlier values untouched, so a user
-    /// redefining `[server.rust-analyzer]` without weight fields keeps the seeded
+    /// redefining `[lsp.server.rust-analyzer]` without weight fields keeps the seeded
     /// default.
     pub fn apply_server_def(&mut self, name: &str, def: &ServerDef) {
         if let Some(weight) = def.weight {
@@ -116,7 +116,7 @@ impl DiagnosticWeights {
         }
     }
 
-    /// Overlays a `[linter.<name>]` definition's weight onto the set.
+    /// Overlays a `[linter.rule.<name>]` definition's weight onto the set.
     ///
     /// A linter is a 1:1 emitter (source name == definition name), so only the
     /// fallback `weight` applies.

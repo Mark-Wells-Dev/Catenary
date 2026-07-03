@@ -172,7 +172,7 @@ async fn run_linter(
                 linter = name,
                 command = %linter.command,
                 "linter '{name}' not found ({}); skipping — install it or set \
-                 [linter.{name}] disable = true",
+                 [linter.rule.{name}] disable = true",
                 linter.command,
             );
             return Vec::new();

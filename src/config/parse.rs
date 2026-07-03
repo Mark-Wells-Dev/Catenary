@@ -24,11 +24,10 @@ const DEFAULT_LANGUAGES: &str = include_str!("../../defaults/languages.toml");
 
 /// Embedded default server definitions (lowest-priority layer).
 ///
-/// Parsed separately from `DEFAULT_LANGUAGES` because
-/// `deserialize_source` rejects `[server.*]`-only configs (migration
-/// guard for old user configs). Built-in server defs are merged into
-/// `config.server` before any user/project config, so user entries
-/// with the same key completely replace the built-in default.
+/// A `[lsp.server.*]`-only document (linters ticket 04). Parsed via
+/// [`parse_server_defaults`] straight into the server map, then merged into
+/// `config.server` before any user/project config, so user entries with the
+/// same key completely replace the built-in default.
 pub const DEFAULT_SERVERS: &str = include_str!("../../defaults/servers.toml");
 
 /// TOML deserialization target for a single config source.
@@ -36,16 +35,20 @@ pub const DEFAULT_SERVERS: &str = include_str!("../../defaults/servers.toml");
 /// Each TOML file is deserialized into this struct. The `commands` field
 /// is validated per-layer and folded into `Config::resolved_commands`
 /// during merge, then discarded — it never appears on the final `Config`.
+///
+/// Subsystem definitions are namespaced under their own tables (linters
+/// ticket 04): the LSP server / language maps live under `[lsp.server.*]` /
+/// `[lsp.language.*]` and the linter definitions under `[linter.rule.*]`, so
+/// each subsystem is one self-contained section. Sub-keys are named (no serde
+/// flatten). The old top-level `[server.*]` / `[language.*]` / `[linter.<name>]`
+/// forms are hard-errored in [`deserialize_source`].
 #[derive(Debug, Deserialize, Clone)]
 struct RawConfig {
     #[serde(default = "default_log_retention_days")]
     log_retention_days: i64,
 
     #[serde(default)]
-    language: HashMap<String, LanguageConfig>,
-
-    #[serde(default)]
-    server: HashMap<String, ServerDef>,
+    lsp: RawLspSection,
 
     #[serde(default)]
     notifications: Option<NotificationConfig>,
@@ -66,10 +69,37 @@ struct RawConfig {
     roots: Option<RootsConfig>,
 
     #[serde(default)]
-    linter: HashMap<String, LinterConfig>,
+    linter: RawLinterSection,
 
     #[serde(default)]
     commands: Option<CommandsConfig>,
+}
+
+/// The `[lsp]` table: LSP server + language definitions (linters ticket 04).
+///
+/// `[lsp.server.*]` and `[lsp.language.*]` replace the old top-level
+/// `[server.*]` / `[language.*]`. The per-root `[lsp] disable` toggle is parsed
+/// separately in [`load_project_config`] (project scope only), so it has no
+/// field here — an unrecognized `disable` key in a user config is simply
+/// ignored.
+#[derive(Debug, Deserialize, Clone, Default)]
+struct RawLspSection {
+    #[serde(default)]
+    server: HashMap<String, ServerDef>,
+
+    #[serde(default)]
+    language: HashMap<String, LanguageConfig>,
+}
+
+/// The `[linter]` table: standalone-linter definitions (linters ticket 04).
+///
+/// `[linter.rule.*]` replaces the old top-level `[linter.<name>]`. The per-root
+/// `[linter] disable` toggle is parsed separately in [`load_project_config`]
+/// (project scope only), so it has no field here.
+#[derive(Debug, Deserialize, Clone, Default)]
+struct RawLinterSection {
+    #[serde(default)]
+    rule: HashMap<String, LinterConfig>,
 }
 
 /// Load configuration from standard paths or a specific file.
@@ -87,8 +117,10 @@ struct RawConfig {
 ///
 /// Returns an error if:
 /// - A configuration file exists but cannot be read or parsed.
-/// - A file uses the deprecated `[server.*]` key without `[language.*]`.
-/// - A `[language.*]` entry uses the removed `inherit` field.
+/// - A file uses the old top-level `[server.*]` / `[language.*]` /
+///   `[linter.<name>]` keys (renamed to `[lsp.server.*]` / `[lsp.language.*]`
+///   / `[linter.rule.*]` in linters ticket 04).
+/// - A `[lsp.language.*]` entry uses the removed `inherit` field.
 /// - A concrete language entry has no `servers` list.
 pub fn load() -> Result<Config> {
     let sources = config_sources();
@@ -224,58 +256,86 @@ pub const SERVER_DEF_KEYS: &[&str] = &[
     "provisional",
 ];
 
-/// Deserialize a TOML source, handling the `[server.*]` / `[language.*]`
-/// disambiguation.
+/// Returns a migration error message when a config still uses the
+/// pre-namespacing top-level definition keys (linters ticket 04), else `None`.
 ///
-/// Three cases:
-/// - `[server.*]` with `command` fields and NO `[language.*]` → old deprecated
-///   format. **Hard error** directing the user to `catenary doctor`.
-/// - Both `[server.*]` and `[language.*]` → new format. `[server.*]` entries
-///   are parsed as `ServerDef`.
-/// - Only `[language.*]` (or neither) → intermediate/new format, parsed directly.
+/// Detects the old top-level `[server.*]` / `[language.*]` tables and old
+/// `[linter.<name>]` definition sub-tables (any `[linter]` key other than the
+/// namespaced `rule` map and the `disable` toggle). Callers hard-error with the
+/// returned rename guidance — mirroring the 2.0 `[server.*]` guard this replaces.
+fn pre_namespacing_error(raw: &toml::Value) -> Option<String> {
+    if raw.get("server").is_some() {
+        return Some(
+            "config uses the old top-level [server.*] key — rename [server.<name>] to \
+             [lsp.server.<name>]. Run `catenary doctor` for guidance."
+                .to_string(),
+        );
+    }
+    if raw.get("language").is_some() {
+        return Some(
+            "config uses the old top-level [language.*] key — rename [language.<name>] to \
+             [lsp.language.<name>]. Run `catenary doctor` for guidance."
+                .to_string(),
+        );
+    }
+    if let Some(linter_table) = raw.get("linter").and_then(toml::Value::as_table) {
+        let stale: Vec<&str> = linter_table
+            .keys()
+            .map(String::as_str)
+            .filter(|k| *k != "rule" && *k != "disable")
+            .collect();
+        if !stale.is_empty() {
+            return Some(format!(
+                "config uses old top-level [linter.<name>] definitions ({}) — rename \
+                 [linter.<name>] to [linter.rule.<name>]. Run `catenary doctor` for guidance.",
+                stale.join(", "),
+            ));
+        }
+    }
+    None
+}
+
+/// Hard-errors when a config uses the pre-namespacing top-level definition keys.
 ///
-/// Additionally, `[language.*]` entries containing inline server definition
-/// fields (`command`, `args`, `initialization_options`, `settings`) are
-/// rejected with a migration message — these fields now live in `[server.*]`.
+/// Thin wrapper over [`pre_namespacing_error`] for the user-config path.
+fn reject_pre_namespacing_keys(raw: &toml::Value) -> Result<()> {
+    if let Some(msg) = pre_namespacing_error(raw) {
+        bail!("{msg}");
+    }
+    Ok(())
+}
+
+/// Deserialize a TOML source, enforcing the `[lsp.*]` / `[linter.rule.*]`
+/// namespacing (linters ticket 04).
+///
+/// The subsystem definitions live under their own tables — `[lsp.server.*]`,
+/// `[lsp.language.*]`, and `[linter.rule.*]`. The old top-level `[server.*]`,
+/// `[language.*]`, and `[linter.<name>]` forms are **hard-errored** with the
+/// exact rename, directing the user to `catenary doctor`.
+///
+/// Additionally, `[lsp.language.*]` entries containing the removed `inherit`
+/// field or inline server definition fields (`command`, `args`,
+/// `initialization_options`, `settings`, …) are rejected with a migration
+/// message — those fields now live in `[lsp.server.*]`.
 fn deserialize_source(contents: &str) -> Result<RawConfig> {
     let raw: toml::Value = toml::from_str(contents).context("Failed to parse TOML")?;
 
-    let has_server = raw.get("server").is_some();
-    let has_language = raw.get("language").is_some();
+    reject_pre_namespacing_keys(&raw)?;
 
-    if has_server && !has_language {
-        // Old deprecated format: [server.*] used as language-keyed entries.
-        // Check if any entry has a `command` field (distinguishes old format
-        // from an accidental empty [server.*] table).
-        let is_old_format = raw
-            .get("server")
-            .and_then(toml::Value::as_table)
-            .is_some_and(|t| {
-                t.values().any(|v| {
-                    v.as_table()
-                        .is_some_and(|entry| entry.contains_key("command"))
-                })
-            });
-
-        if is_old_format {
-            bail!(
-                "Config uses deprecated [server.*] key for language definitions — \
-                 rename [server.*] entries to [language.*] and define servers \
-                 in [server.*] with the new format. Run `catenary doctor` for guidance."
-            );
-        }
-    }
-
-    // Reject [language.*] entries that contain inline server definition fields.
-    // These fields now belong in [server.*].
-    if let Some(lang_table) = raw.get("language").and_then(toml::Value::as_table) {
+    // Reject [lsp.language.*] entries that contain inline server definition
+    // fields or the removed `inherit` field. These belong in [lsp.server.*].
+    if let Some(lang_table) = raw
+        .get("lsp")
+        .and_then(|v| v.get("language"))
+        .and_then(toml::Value::as_table)
+    {
         for (lang_key, entry) in lang_table {
             if let Some(entry_table) = entry.as_table() {
                 if entry_table.contains_key("inherit") {
                     bail!(
-                        "[language.{lang_key}] uses the removed `inherit` field — \
+                        "[lsp.language.{lang_key}] uses the removed `inherit` field — \
                          copy the base language's `servers` list into \
-                         [language.{lang_key}] instead. Run `catenary doctor` for guidance.",
+                         [lsp.language.{lang_key}] instead. Run `catenary doctor` for guidance.",
                     );
                 }
 
@@ -286,10 +346,10 @@ fn deserialize_source(contents: &str) -> Result<RawConfig> {
                     .collect();
                 if !stale.is_empty() {
                     bail!(
-                        "[language.{lang_key}] contains server definition fields ({}) — \
-                         these now belong in [server.*]. Move them to a [server.*] \
+                        "[lsp.language.{lang_key}] contains server definition fields ({}) — \
+                         these now belong in [lsp.server.*]. Move them to a [lsp.server.*] \
                          entry and reference it via `servers = [\"...\"]` in \
-                         [language.{lang_key}]. Run `catenary doctor` for guidance.",
+                         [lsp.language.{lang_key}]. Run `catenary doctor` for guidance.",
                         stale.join(", "),
                     );
                 }
@@ -344,19 +404,19 @@ fn has_old_commands_format(raw: &toml::Value) -> bool {
             .is_some_and(|d| d.values().any(toml::Value::is_str))
 }
 
-/// Parse a `[server.*]` TOML document into a map of server definitions.
+/// Parse a `[lsp.server.*]` TOML document into a map of server definitions.
 ///
 /// Used for the embedded `defaults/servers.toml` which contains only
-/// `[server.*]` entries. This bypasses `deserialize_source` which
-/// rejects server-only configs as the old deprecated format.
+/// `[lsp.server.*]` entries (linters ticket 04) — parsed straight into the
+/// server map so the defaults skip the full merge/validation pass.
 fn parse_server_defaults(contents: &str) -> Result<HashMap<String, ServerDef>> {
     #[derive(Deserialize)]
     struct ServerOnly {
         #[serde(default)]
-        server: HashMap<String, ServerDef>,
+        lsp: RawLspSection,
     }
     let parsed: ServerOnly = toml::from_str(contents).context("Failed to parse server TOML")?;
-    Ok(parsed.server)
+    Ok(parsed.lsp.server)
 }
 
 /// Merge a raw config layer into the resolved config. Later values override.
@@ -367,8 +427,8 @@ fn parse_server_defaults(contents: &str) -> Result<HashMap<String, ServerDef>> {
 /// source differs from the default. Cannot distinguish "user explicitly
 /// set the default" from "absent", but acceptable for simple numeric knobs.
 ///
-/// **Maps** (`language`, `server`): key-level merge. Later source wins
-/// per-key; keys absent from the later source are preserved.
+/// **Maps** (`lsp.language`, `lsp.server`, `linter.rule`): key-level merge.
+/// Later source wins per-key; keys absent from the later source are preserved.
 ///
 /// **Structured sections** (`notifications`, `icons`, `tui`, `tools`,
 /// `observability`, `roots`): `Option<T>` on `Config`. `None` means the source
@@ -384,14 +444,14 @@ fn merge(config: &mut Config, other: RawConfig) {
     if other.log_retention_days != default_log_retention_days() {
         config.log_retention_days = other.log_retention_days;
     }
-    for (key, value) in other.language {
+    for (key, value) in other.lsp.language {
         if let Some(existing) = config.language.get_mut(&key) {
             existing.merge(value);
         } else {
             config.language.insert(key, value);
         }
     }
-    for (key, value) in other.server {
+    for (key, value) in other.lsp.server {
         config.server.insert(key, value);
     }
     if other.notifications.is_some() {
@@ -412,7 +472,7 @@ fn merge(config: &mut Config, other: RawConfig) {
     if other.roots.is_some() {
         config.roots = other.roots;
     }
-    for (key, value) in other.linter {
+    for (key, value) in other.linter.rule {
         config.linter.insert(key, value);
     }
     if let Some(ref cmds) = other.commands {
@@ -505,26 +565,21 @@ pub(super) fn parse_server_specs(val: &str) -> Vec<(String, ServerDef, LanguageC
 
 /// Top-level keys allowed in `.catenary.toml` project config files.
 ///
-/// The per-root feeder/surface toggles live nested under their subsystem
-/// tables: `[lsp] disable`, `[linter] disable`, `[diagnostics] disable`
-/// (linters 02). `[diagnostics]` also carries `[[diagnostics.precedence]]`.
-/// The unsupported-key warning skips all of these.
-const PROJECT_CONFIG_ALLOWED_KEYS: &[&str] = &[
-    "lsp",
-    "linter",
-    "diagnostics",
-    "language",
-    "server",
-    "commands",
-];
+/// Every subsystem is one self-contained table (linters ticket 04): `[lsp]`
+/// carries `disable` + `[lsp.server.*]` + `[lsp.language.*]`, `[linter]` carries
+/// `disable` + `[linter.rule.*]`, and `[diagnostics]` carries `disable`. Plus an
+/// optional top-level `[commands]`. The unsupported-key warning skips all of
+/// these; the old top-level `[server.*]` / `[language.*]` / `[linter.<name>]`
+/// forms are hard-errored earlier with a rename hint.
+const PROJECT_CONFIG_ALLOWED_KEYS: &[&str] = &["lsp", "linter", "diagnostics", "commands"];
 
 /// Per-root project configuration from `.catenary.toml`.
 ///
-/// Contains the three orthogonal feeder toggles, `[language.*]` and
-/// `[server.*]` sections, and an optional `[commands]` section. A root with
-/// any toggle set still contributes `[commands]` config (both `build` and
-/// `allow`) — the toggles only suppress the matching diagnostic feeder or
-/// surface, never command/build resolution.
+/// Contains the three orthogonal feeder toggles, the `[lsp.server.*]` /
+/// `[lsp.language.*]` sections, `[linter.rule.*]` linter definitions, and an
+/// optional `[commands]` section. A root with any toggle set still contributes
+/// `[commands]` config (both `build` and `allow`) — the toggles only suppress
+/// the matching diagnostic feeder or surface, never command/build resolution.
 #[derive(Debug, Clone, Default)]
 pub struct ProjectConfig {
     /// Drops the LSP feeder for this root (default `false`).
@@ -546,15 +601,15 @@ pub struct ProjectConfig {
     /// off, but LSP servers still run for grep/glob navigation. A surface
     /// suppressor, not a feeder toggle.
     pub disable_diag: bool,
-    /// Language definitions from the project config.
+    /// Language definitions from the project config (`[lsp.language.*]`).
     pub language: HashMap<String, LanguageConfig>,
-    /// Server definitions from the project config.
+    /// Server definitions from the project config (`[lsp.server.*]`).
     pub server: HashMap<String, ServerDef>,
-    /// Standalone-linter definitions from the project config (`[linter.*]`).
+    /// Standalone-linter definitions from the project config (`[linter.rule.*]`).
     ///
     /// The per-root half of the linter feeder (workstream 34 ticket 01). Merged
-    /// with the user `[linter.*]` (project wins on a name collision) to form the
-    /// root's effective linter set.
+    /// with the user `[linter.rule.*]` (project wins on a name collision) to form
+    /// the root's effective linter set.
     pub linter: HashMap<String, LinterConfig>,
     /// Command filter configuration from the project config.
     ///
@@ -595,8 +650,10 @@ fn ignored_project_command_keys(raw: &toml::Value) -> Vec<&'static str> {
 /// Returns an error if:
 /// - The file exists but cannot be read.
 /// - The file contains invalid TOML.
-/// - A `[language.*]` entry uses the removed `inherit` field.
-/// - A `[language.*]` entry contains inline server definition fields.
+/// - It uses the old top-level `[server.*]` / `[language.*]` / `[linter.<name>]`
+///   keys (renamed under `[lsp.*]` / `[linter.rule.*]` in linters ticket 04).
+/// - A `[lsp.language.*]` entry uses the removed `inherit` field.
+/// - A `[lsp.language.*]` entry contains inline server definition fields.
 #[allow(clippy::too_many_lines, reason = "sequential validation steps")]
 pub fn load_project_config(root: &std::path::Path) -> Result<Option<ProjectConfig>> {
     let config_path = root.join(".catenary.toml");
@@ -610,6 +667,14 @@ pub fn load_project_config(root: &std::path::Path) -> Result<Option<ProjectConfi
     let raw: toml::Value = toml::from_str(&contents)
         .with_context(|| format!("Failed to parse project config: {}", config_path.display()))?;
 
+    // Hard-error on the pre-namespacing top-level definition keys (linters
+    // ticket 04): `[server.*]` / `[language.*]` / `[linter.<name>]` moved under
+    // `[lsp.server.*]` / `[lsp.language.*]` / `[linter.rule.*]`. Checked before
+    // the generic unsupported-key warning so the targeted rename hint wins.
+    if let Some(msg) = pre_namespacing_error(&raw) {
+        bail!("Project config {}: {msg}", config_path.display());
+    }
+
     // Warn on unsupported top-level keys.
     if let Some(table) = raw.as_table() {
         for key in table.keys() {
@@ -619,7 +684,7 @@ pub fn load_project_config(root: &std::path::Path) -> Result<Option<ProjectConfi
                     path = %config_path.display(),
                     key = key.as_str(),
                     "Project config {}: unsupported section [{}] — \
-                     only [language.*], [server.*], and [commands] are \
+                     only [lsp.*], [linter.*], [diagnostics], and [commands] are \
                      allowed in .catenary.toml. Move [{key}] to your \
                      user config (~/.config/catenary/config.toml).",
                     config_path.display(),
@@ -648,15 +713,19 @@ pub fn load_project_config(root: &std::path::Path) -> Result<Option<ProjectConfi
         }
     }
 
-    // Validate [language.*] entries for rejected fields, same as user config.
-    if let Some(lang_table) = raw.get("language").and_then(toml::Value::as_table) {
+    // Validate [lsp.language.*] entries for rejected fields, same as user config.
+    if let Some(lang_table) = raw
+        .get("lsp")
+        .and_then(|v| v.get("language"))
+        .and_then(toml::Value::as_table)
+    {
         for (lang_key, entry) in lang_table {
             if let Some(entry_table) = entry.as_table() {
                 if entry_table.contains_key("inherit") {
                     bail!(
-                        "Project config {}: [language.{lang_key}] uses the removed \
+                        "Project config {}: [lsp.language.{lang_key}] uses the removed \
                          `inherit` field — copy the base language's `servers` list \
-                         into [language.{lang_key}] instead.",
+                         into [lsp.language.{lang_key}] instead.",
                         config_path.display(),
                     );
                 }
@@ -668,8 +737,8 @@ pub fn load_project_config(root: &std::path::Path) -> Result<Option<ProjectConfi
                     .collect();
                 if !stale.is_empty() {
                     bail!(
-                        "Project config {}: [language.{lang_key}] contains server \
-                         definition fields ({}) — these belong in [server.*].",
+                        "Project config {}: [lsp.language.{lang_key}] contains server \
+                         definition fields ({}) — these belong in [lsp.server.*].",
                         config_path.display(),
                         stale.join(", "),
                     );
@@ -700,13 +769,15 @@ pub fn load_project_config(root: &std::path::Path) -> Result<Option<ProjectConfi
     let disable_lint = parse_section_disable(&raw, "linter", &config_path)?;
     let disable_diag = parse_section_disable(&raw, "diagnostics", &config_path)?;
 
-    // Deserialize only the supported sections.
-    let mut language: HashMap<String, LanguageConfig> = raw
-        .get("language")
+    // Deserialize only the supported sections. The LSP definitions live under
+    // the `[lsp]` table (linters ticket 04): `[lsp.language.*]` / `[lsp.server.*]`.
+    let lsp = raw.get("lsp");
+    let mut language: HashMap<String, LanguageConfig> = lsp
+        .and_then(|v| v.get("language"))
         .map(|v| {
             toml::Value::try_into(v.clone()).with_context(|| {
                 format!(
-                    "Failed to parse [language.*] in project config: {}",
+                    "Failed to parse [lsp.language.*] in project config: {}",
                     config_path.display()
                 )
             })
@@ -714,12 +785,12 @@ pub fn load_project_config(root: &std::path::Path) -> Result<Option<ProjectConfi
         .transpose()?
         .unwrap_or_default();
 
-    let mut server: HashMap<String, ServerDef> = raw
-        .get("server")
+    let mut server: HashMap<String, ServerDef> = lsp
+        .and_then(|v| v.get("server"))
         .map(|v| {
             toml::Value::try_into(v.clone()).with_context(|| {
                 format!(
-                    "Failed to parse [server.*] in project config: {}",
+                    "Failed to parse [lsp.server.*] in project config: {}",
                     config_path.display()
                 )
             })
@@ -733,14 +804,14 @@ pub fn load_project_config(root: &std::path::Path) -> Result<Option<ProjectConfi
     for (name, server_def) in &mut server {
         server_def.compile_patterns().with_context(|| {
             format!(
-                "Project config {}: [server.{name}] file_patterns compilation failed",
+                "Project config {}: [lsp.server.{name}] file_patterns compilation failed",
                 config_path.display()
             )
         })?;
         if let Some(pattern) = &server_def.provisional {
             regex::Regex::new(pattern).with_context(|| {
                 format!(
-                    "Project config {}: [server.{name}] provisional '{pattern}' is not a valid regex",
+                    "Project config {}: [lsp.server.{name}] provisional '{pattern}' is not a valid regex",
                     config_path.display()
                 )
             })?;
@@ -751,7 +822,7 @@ pub fn load_project_config(root: &std::path::Path) -> Result<Option<ProjectConfi
     for (name, lang_config) in &mut language {
         lang_config.compile_markers().with_context(|| {
             format!(
-                "Project config {}: [language.{name}] root_markers compilation failed",
+                "Project config {}: [lsp.language.{name}] root_markers compilation failed",
                 config_path.display()
             )
         })?;
@@ -766,27 +837,25 @@ pub fn load_project_config(root: &std::path::Path) -> Result<Option<ProjectConfi
                 || !server_def.file_patterns.is_empty())
         {
             bail!(
-                "Project config {}: [server.{name}] has an empty `command`",
+                "Project config {}: [lsp.server.{name}] has an empty `command`",
                 config_path.display()
             );
         }
     }
 
-    // Parse [linter.*] definitions (ticket 01). The `[linter]` table also holds
-    // the `disable` feeder toggle (parsed above), so strip that key before the
-    // remaining sub-tables deserialize as the linter definition map. `disable`
-    // is therefore a reserved linter name at project scope.
+    // Parse [linter.rule.*] definitions (linters tickets 01/04). The `[linter]`
+    // table also holds the `disable` feeder toggle (parsed above); the linter
+    // definitions are the named `[linter.rule.*]` sub-table.
     let mut linter: HashMap<String, LinterConfig> = match raw.get("linter") {
-        Some(toml::Value::Table(table)) => {
-            let mut table = table.clone();
-            table.remove("disable");
-            toml::Value::Table(table).try_into().with_context(|| {
+        Some(toml::Value::Table(table)) => match table.get("rule") {
+            Some(rule) => toml::Value::try_into(rule.clone()).with_context(|| {
                 format!(
-                    "Failed to parse [linter.*] in project config: {}",
+                    "Failed to parse [linter.rule.*] in project config: {}",
                     config_path.display()
                 )
-            })?
-        }
+            })?,
+            None => HashMap::new(),
+        },
         Some(_) => bail!(
             "Project config {}: `[linter]` must be a table",
             config_path.display(),
@@ -803,13 +872,13 @@ pub fn load_project_config(root: &std::path::Path) -> Result<Option<ProjectConfi
             && (!linter_config.args.is_empty() || !linter_config.patterns.is_empty())
         {
             bail!(
-                "Project config {}: [linter.{name}] has an empty `command`",
+                "Project config {}: [linter.rule.{name}] has an empty `command`",
                 config_path.display()
             );
         }
         linter_config.compile_patterns().with_context(|| {
             format!(
-                "Project config {}: [linter.{name}] patterns compilation failed",
+                "Project config {}: [linter.rule.{name}] patterns compilation failed",
                 config_path.display()
             )
         })?;
@@ -923,11 +992,11 @@ mod project_config_tests {
         fs::write(
             dir.path().join(".catenary.toml"),
             r#"
-[server.rust-analyzer]
+[lsp.server.rust-analyzer]
 command = "rust-analyzer"
 settings = { checkOnSave = true }
 
-[language.rust]
+[lsp.language.rust]
 servers = ["rust-analyzer"]
 "#,
         )?;
@@ -1027,7 +1096,7 @@ allow = ["git", "kubectl"]
         fs::write(
             dir.path().join(".catenary.toml"),
             r#"
-[language.typescriptreact]
+[lsp.language.typescriptreact]
 inherit = "typescript"
 "#,
         )
@@ -1048,7 +1117,7 @@ inherit = "typescript"
         fs::write(
             dir.path().join(".catenary.toml"),
             r#"
-[language.rust]
+[lsp.language.rust]
 command = "rust-analyzer"
 "#,
         )
@@ -1058,7 +1127,7 @@ command = "rust-analyzer"
         assert!(result.is_err());
         let err = format!("{:#}", result.expect_err("should error"));
         assert!(
-            err.contains("command") && err.contains("[server.*]"),
+            err.contains("command") && err.contains("[lsp.server.*]"),
             "error should mention server definition migration: {err}",
         );
     }
@@ -1072,7 +1141,7 @@ command = "rust-analyzer"
 [tui]
 auto_add_sessions = false
 
-[language.rust]
+[lsp.language.rust]
 servers = []
 ",
         )?;
@@ -1091,11 +1160,11 @@ servers = []
         fs::write(
             dir.path().join(".catenary.toml"),
             r#"
-[server.pyright]
+[lsp.server.pyright]
 command = "pyright"
 settings = { python = { analysis = { typeCheckingMode = "strict" } } }
 
-[language.python]
+[lsp.language.python]
 servers = ["pyright"]
 "#,
         )?;
@@ -1113,7 +1182,7 @@ servers = ["pyright"]
         let dir = tempdir()?;
         fs::write(
             dir.path().join(".catenary.toml"),
-            "\n[language.rust]\nservers = []\n",
+            "\n[lsp.language.rust]\nservers = []\n",
         )?;
 
         let result = load_project_config(dir.path())?;
@@ -1158,13 +1227,13 @@ servers = ["pyright"]
 
     #[test]
     fn test_load_project_config_disable_lint_coexists_with_definitions() -> Result<()> {
-        // The `[linter]` table carries both the `disable` toggle and the linter
-        // definition sub-tables; `disable` is stripped before the rest parse.
+        // The `[linter]` table carries both the `disable` toggle and the
+        // `[linter.rule.*]` definition sub-table (linters ticket 04).
         let dir = tempdir()?;
         fs::write(
             dir.path().join(".catenary.toml"),
             "[linter]\ndisable = true\n\n\
-             [linter.shellcheck]\ncommand = \"shellcheck\"\npatterns = [\"**/*.sh\"]\n",
+             [linter.rule.shellcheck]\ncommand = \"shellcheck\"\npatterns = [\"**/*.sh\"]\n",
         )?;
 
         let result = load_project_config(dir.path())?;
@@ -1177,6 +1246,10 @@ servers = ["pyright"]
         assert!(
             !config.linter.contains_key("disable"),
             "the disable toggle is not a linter definition"
+        );
+        assert!(
+            !config.linter.contains_key("rule"),
+            "the rule namespace key is not a linter definition"
         );
 
         Ok(())
@@ -1371,7 +1444,7 @@ allow = ["git"]
         let dir = tempdir()?;
         fs::write(
             dir.path().join(".catenary.toml"),
-            "\n[language.rust]\nservers = []\n",
+            "\n[lsp.language.rust]\nservers = []\n",
         )?;
 
         let result = load_project_config(dir.path())?;
@@ -1480,11 +1553,11 @@ cargo = "Use make instead"
         fs::write(
             dir.path().join(".catenary.toml"),
             r#"
-[server.rust-analyzer]
+[lsp.server.rust-analyzer]
 command = "rust-analyzer"
 env = { CLIPPY_DISABLE_DOCS_LINKS = "1", RUST_LOG = "info" }
 
-[language.rust]
+[lsp.language.rust]
 servers = ["rust-analyzer"]
 "#,
         )?;
@@ -1508,11 +1581,11 @@ servers = ["rust-analyzer"]
         fs::write(
             dir.path().join(".catenary.toml"),
             r#"
-[server.pyright]
+[lsp.server.pyright]
 command = "pyright-langserver"
 args = ["--stdio"]
 
-[language.python]
+[lsp.language.python]
 servers = ["pyright"]
 "#,
         )?;
@@ -1532,7 +1605,7 @@ servers = ["pyright"]
         let dir = tempdir()?;
         fs::write(
             dir.path().join(".catenary.toml"),
-            "[linter.shellcheck]\ncommand = \"shellcheck\"\n\
+            "[linter.rule.shellcheck]\ncommand = \"shellcheck\"\n\
              args = [\"-f\", \"json1\"]\npatterns = [\"**/*.sh\"]\n",
         )?;
 
@@ -1554,7 +1627,7 @@ servers = ["pyright"]
         let dir = tempdir()?;
         fs::write(
             dir.path().join(".catenary.toml"),
-            "[linter.shellcheck]\ndisable = true\n",
+            "[linter.rule.shellcheck]\ndisable = true\n",
         )?;
 
         let config = load_project_config(dir.path())?.expect("project config");
@@ -1570,7 +1643,7 @@ servers = ["pyright"]
         let dir = tempdir().expect("tempdir");
         fs::write(
             dir.path().join(".catenary.toml"),
-            "[linter.shellcheck]\npatterns = [\"**/*.sh\"]\n",
+            "[linter.rule.shellcheck]\npatterns = [\"**/*.sh\"]\n",
         )
         .expect("write");
 
@@ -1584,7 +1657,7 @@ servers = ["pyright"]
         let dir = tempdir().expect("tempdir");
         fs::write(
             dir.path().join(".catenary.toml"),
-            "[linter.x]\ncommand = \"x\"\npatterns = [\"[bad\"]\n",
+            "[linter.rule.x]\ncommand = \"x\"\npatterns = [\"[bad\"]\n",
         )
         .expect("write");
 
@@ -1595,18 +1668,18 @@ servers = ["pyright"]
         );
     }
 
-    // ── Project config [server.*] diagnostic weights (ticket 05) ─────
+    // ── Project config [lsp.server.*] diagnostic weights (ticket 05) ─
 
     #[test]
     fn test_load_project_config_server_weights() -> Result<()> {
         let dir = tempdir().expect("tempdir");
         fs::write(
             dir.path().join(".catenary.toml"),
-            "[server.rust-analyzer]\n\
+            "[lsp.server.rust-analyzer]\n\
              command = \"rust-analyzer\"\n\
              weight = 5\n\
              provisional = \"^E[0-9]+$\"\n\n\
-             [server.rust-analyzer.sources]\n\
+             [lsp.server.rust-analyzer.sources]\n\
              rustc = 90\n",
         )
         .expect("write");
@@ -1624,7 +1697,7 @@ servers = ["pyright"]
         let dir = tempdir().expect("tempdir");
         fs::write(
             dir.path().join(".catenary.toml"),
-            "[server.rust-analyzer]\n\
+            "[lsp.server.rust-analyzer]\n\
              command = \"rust-analyzer\"\n\
              provisional = \"^E[0-9+$\"\n",
         )
@@ -1635,5 +1708,143 @@ servers = ["pyright"]
             result.is_err(),
             "invalid provisional regex must fail project-config load"
         );
+    }
+
+    // ── Config namespacing migration guards (ticket 04) ──────────────
+
+    #[test]
+    fn test_load_project_config_lsp_disable_with_definitions() -> Result<()> {
+        // `[lsp]` is one self-contained table: `disable` alongside the
+        // `[lsp.server.*]` / `[lsp.language.*]` definitions.
+        let dir = tempdir()?;
+        fs::write(
+            dir.path().join(".catenary.toml"),
+            "[lsp]\ndisable = true\n\n\
+             [lsp.server.rust-analyzer]\ncommand = \"rust-analyzer\"\n\n\
+             [lsp.language.rust]\nservers = [\"rust-analyzer\"]\n",
+        )?;
+
+        let config = load_project_config(dir.path())?.expect("project config");
+        assert!(config.disable_lsp, "[lsp] disable should be true");
+        assert!(
+            config.server.contains_key("rust-analyzer"),
+            "[lsp.server.*] definition parses alongside the toggle"
+        );
+        assert!(
+            config.language.contains_key("rust"),
+            "[lsp.language.*] definition parses alongside the toggle"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_project_config_rejects_top_level_server() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join(".catenary.toml"),
+            "[server.rust-analyzer]\ncommand = \"rust-analyzer\"\n",
+        )
+        .expect("write");
+
+        let err = format!(
+            "{:#}",
+            load_project_config(dir.path()).expect_err("old [server.*] should error")
+        );
+        assert!(
+            err.contains("[lsp.server.<name>]"),
+            "error should point to the [lsp.server.*] rename: {err}",
+        );
+    }
+
+    #[test]
+    fn test_load_project_config_rejects_top_level_language() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join(".catenary.toml"),
+            "[language.rust]\nservers = [\"rust-analyzer\"]\n",
+        )
+        .expect("write");
+
+        let err = format!(
+            "{:#}",
+            load_project_config(dir.path()).expect_err("old [language.*] should error")
+        );
+        assert!(
+            err.contains("[lsp.language.<name>]"),
+            "error should point to the [lsp.language.*] rename: {err}",
+        );
+    }
+
+    #[test]
+    fn test_load_project_config_rejects_top_level_linter_def() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join(".catenary.toml"),
+            "[linter.shellcheck]\ncommand = \"shellcheck\"\npatterns = [\"**/*.sh\"]\n",
+        )
+        .expect("write");
+
+        let err = format!(
+            "{:#}",
+            load_project_config(dir.path()).expect_err("old [linter.<name>] should error")
+        );
+        assert!(
+            err.contains("[linter.rule.<name>]") && err.contains("shellcheck"),
+            "error should point to the [linter.rule.*] rename: {err}",
+        );
+    }
+
+    #[test]
+    fn deserialize_source_rejects_top_level_server() {
+        let err = format!(
+            "{:#}",
+            deserialize_source("[server.rust-analyzer]\ncommand = \"rust-analyzer\"\n")
+                .expect_err("old [server.*] should error"),
+        );
+        assert!(
+            err.contains("[lsp.server.<name>]"),
+            "error should point to the [lsp.server.*] rename: {err}",
+        );
+    }
+
+    #[test]
+    fn deserialize_source_rejects_top_level_language() {
+        let err = format!(
+            "{:#}",
+            deserialize_source("[language.rust]\nservers = [\"rust-analyzer\"]\n")
+                .expect_err("old [language.*] should error"),
+        );
+        assert!(
+            err.contains("[lsp.language.<name>]"),
+            "error should point to the [lsp.language.*] rename: {err}",
+        );
+    }
+
+    #[test]
+    fn deserialize_source_rejects_top_level_linter_def() {
+        let err = format!(
+            "{:#}",
+            deserialize_source("[linter.shellcheck]\ncommand = \"shellcheck\"\n")
+                .expect_err("old [linter.<name>] should error"),
+        );
+        assert!(
+            err.contains("[linter.rule.<name>]"),
+            "error should point to the [linter.rule.*] rename: {err}",
+        );
+    }
+
+    #[test]
+    fn deserialize_source_accepts_namespaced_definitions() -> Result<()> {
+        // The new form parses: [lsp.server.*] / [lsp.language.*] / [linter.rule.*].
+        let config = deserialize_source(
+            "[lsp.server.rust-analyzer]\ncommand = \"rust-analyzer\"\n\n\
+             [lsp.language.rust]\nservers = [\"rust-analyzer\"]\n\n\
+             [linter.rule.shellcheck]\ncommand = \"shellcheck\"\npatterns = [\"**/*.sh\"]\n",
+        )?;
+        assert!(config.lsp.server.contains_key("rust-analyzer"));
+        assert!(config.lsp.language.contains_key("rust"));
+        assert!(config.linter.rule.contains_key("shellcheck"));
+        Ok(())
     }
 }

@@ -9,13 +9,13 @@
 # Server / language split
 # ─────────────────────────────────────────────────────────────────────
 #
-# Configuration uses two sections:
+# LSP configuration lives under the [lsp] table in two sub-sections:
 #
-#   [server.<name>]            — defines HOW to run a language server
+#   [lsp.server.<name>]        — defines HOW to run a language server
 #   command = "server-binary"
 #   args    = ["arg1", "arg2"]
 #
-#   [language.<language-id>]   — BINDS a language to one or more servers
+#   [lsp.language.<language-id>]   — BINDS a language to one or more servers
 #   servers = ["<name>"]
 #
 # The language-id should match the LSP language identifier (e.g., "rust",
@@ -27,7 +27,7 @@
 # and the language has a default binding, LSP intelligence just works.
 # Run `catenary config` to see the full list of built-in servers.
 #
-# A user-defined [server.X] completely replaces the built-in default for
+# A user-defined [lsp.server.X] completely replaces the built-in default for
 # X — no merging. You only need config to customize: initialization
 # options, settings, env, custom binaries, or new servers.
 
@@ -36,35 +36,35 @@
 # ─────────────────────────────────────────────────────────────────────
 #
 # Built-in rust/python/typescript/go/c/cpp bindings already work, so the
-# [language.*] bindings below are optional — the defaults already supply
-# them. They are spelled out here to show the split: a [server.*]
-# definition paired with a [language.*] binding that references it by name.
+# [lsp.language.*] bindings below are optional — the defaults already supply
+# them. They are spelled out here to show the split: a [lsp.server.*]
+# definition paired with a [lsp.language.*] binding that references it by name.
 
 # Strip lint URLs from rust-analyzer diagnostics (saves agent context),
 # and run clippy on save.
-[server.rust-analyzer]
+[lsp.server.rust-analyzer]
 command = "rustup"
 args = ["run", "stable", "rust-analyzer"]
 env = { CLIPPY_DISABLE_DOCS_LINKS = "1" }
 
-[server.rust-analyzer.initialization_options]
+[lsp.server.rust-analyzer.initialization_options]
 check.command = "clippy"
 
-[language.rust]
+[lsp.language.rust]
 servers = ["rust-analyzer"]
 
 # Server settings are returned in workspace/configuration responses. The
 # TOML nesting mirrors the JSON object the server expects. A user-defined
-# [server.X] fully replaces the built-in, so repeat command/args when you
+# [lsp.server.X] fully replaces the built-in, so repeat command/args when you
 # add settings.
-[server.pyright]
+[lsp.server.pyright]
 command = "pyright-langserver"
 args = ["--stdio"]
 
-[server.pyright.settings.python.analysis]
+[lsp.server.pyright.settings.python.analysis]
 exclude = ["**/target", "**/node_modules"]
 
-[language.python]
+[lsp.language.python]
 servers = ["pyright"]
 
 # ─────────────────────────────────────────────────────────────────────
@@ -77,24 +77,24 @@ servers = ["pyright"]
 # bind to typescript-ls in the built-in defaults — this is only needed
 # when you define your own variant.)
 #
-# [language.typescript]
+# [lsp.language.typescript]
 # servers = ["typescript-ls"]
 #
-# [language.typescriptreact]
+# [lsp.language.typescriptreact]
 # servers = ["typescript-ls"]   # same list as typescript
 
 # ─────────────────────────────────────────────────────────────────────
 # Defining a server from scratch
 # ─────────────────────────────────────────────────────────────────────
 #
-# For a server without a built-in default, define [server.*] and bind it
-# from [language.*]:
+# For a server without a built-in default, define [lsp.server.*] and bind it
+# from [lsp.language.*]:
 #
-# [server.phpactor]
+# [lsp.server.phpactor]
 # command = "phpactor"
 # args = ["language-server"]
 #
-# [language.php]
+# [lsp.language.php]
 # servers = ["phpactor"]
 
 # ─────────────────────────────────────────────────────────────────────
@@ -103,50 +103,50 @@ servers = ["pyright"]
 #
 # Markdown defaults to Lattice (https://github.com/TwoWells/Lattice), a
 # Two Wells sibling project shipped as an LSP server. The built-in
-# [server.lattice] definition handles it automatically. To re-enable
+# [lsp.server.lattice] definition handles it automatically. To re-enable
 # marksman instead, bind it (marksman stays defined in the built-in
 # defaults):
 #
-# [language.markdown]
+# [lsp.language.markdown]
 # servers = ["marksman"]
 
 # ─────────────────────────────────────────────────────────────────────
 # Additional servers (uncomment as needed)
 # ─────────────────────────────────────────────────────────────────────
 #
-# These all ship as built-in [server.*] defaults and built-in
-# [language.*] bindings — uncomment and customize only to override.
+# These all ship as built-in [lsp.server.*] defaults and built-in
+# [lsp.language.*] bindings — uncomment and customize only to override.
 
-# [server.bash-ls]
+# [lsp.server.bash-ls]
 # command = "bash-language-server"
 # args = ["start"]
 # single_file = true            # also serve files outside any workspace root
 #
-# [language.shellscript]
+# [lsp.language.shellscript]
 # servers = ["bash-ls"]
 
-# [server.yaml-ls]
+# [lsp.server.yaml-ls]
 # command = "yaml-language-server"
 # args = ["--stdio"]
 #
-# [language.yaml]
+# [lsp.language.yaml]
 # servers = ["yaml-ls"]
 
-# [server.taplo]
+# [lsp.server.taplo]
 # command = "taplo"
 # args = ["lsp", "stdio"]
 #
-# [language.toml]
+# [lsp.language.toml]
 # servers = ["taplo"]
 
-# [server.lua-ls]
+# [lsp.server.lua-ls]
 # command = "lua-language-server"
 #
-# [language.lua]
+# [lsp.language.lua]
 # servers = ["lua-ls"]
 
-# [server.zls]
+# [lsp.server.zls]
 # command = "zls"
 #
-# [language.zig]
+# [lsp.language.zig]
 # servers = ["zls"]

@@ -23,7 +23,7 @@ npm install -g typescript typescript-language-server
 ## Config
 
 Catenary ships a built-in definition for `typescript-ls` — no
-`[server.*]` config is needed. If `typescript-language-server` is on
+`[lsp.server.*]` config is needed. If `typescript-language-server` is on
 PATH, it works automatically for TypeScript, JavaScript, TSX, and JSX
 files.
 

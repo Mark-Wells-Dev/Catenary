@@ -12,7 +12,7 @@
 //! depending on any linter being installed.
 //!
 //! Output format is selected by `--format`, mirroring the adapter the feeder
-//! dispatches by `[linter.<name>]` key:
+//! dispatches by `[linter.rule.<name>]` key:
 //! - `shellcheck` → `shellcheck -f json1` (`{"comments": [...]}`),
 //! - `actionlint` → `actionlint -format '{{json .}}'` (a JSON array),
 //! - `yamllint` → `yamllint -f parsable` (one finding per text line),

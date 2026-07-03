@@ -290,7 +290,7 @@ pub async fn run_doctor(out: &mut Output, project_root: &Path, show_diff: bool) 
         let _ = out.writeln(format_args!(
             "{}",
             out.colors.yellow(&format!(
-                "⚠  Server '{name}' is defined but not referenced by any [language.*] entry"
+                "⚠  Server '{name}' is defined but not referenced by any [lsp.language.*] entry"
             )),
         ));
     }
@@ -302,8 +302,8 @@ pub async fn run_doctor(out: &mut Output, project_root: &Path, show_diff: bool) 
         let _ = out.writeln(format_args!(
             "{}",
             out.colors.yellow(&format!(
-                "⚠  Extension '.{ext}' claimed by both [language.{first}] and \
-                 [language.{second}] — first wins"
+                "⚠  Extension '.{ext}' claimed by both [lsp.language.{first}] and \
+                 [lsp.language.{second}] — first wins"
             )),
         ));
     }
@@ -815,8 +815,12 @@ pub async fn run_doctor_single(
 /// Check config source files for old-format entries and print migration guidance.
 ///
 /// Reads each config file as raw TOML (independent of `Config::load`) to detect:
-/// - `[server.*]` with no `[language.*]` (old deprecated format)
-/// - `[language.*]` entries containing `command`/`args` etc. (intermediate format)
+/// - the pre-namespacing top-level `[server.*]` / `[language.*]` /
+///   `[linter.<name>]` tables (renamed under `[lsp.*]` / `[linter.rule.*]` in
+///   linters ticket 04) — walked so nested sub-tables (e.g.
+///   `[server.<name>.sources]`) migrate too
+/// - `[lsp.language.*]` entries containing `command`/`args` etc. (fields that
+///   belong on `[lsp.server.*]`) or the removed `inherit` field
 ///
 /// Prints the equivalent new-format config for each detected old entry.
 fn doctor_check_config(out: &mut Output) {
@@ -831,26 +835,35 @@ fn doctor_check_config(out: &mut Output) {
             continue;
         };
 
-        let has_server = raw.get("server").is_some();
-        let has_language = raw.get("language").is_some();
-
-        // Old deprecated format: [server.*] with command fields and no [language.*]
-        if has_server
-            && !has_language
-            && let Some(table) = raw.get("server").and_then(toml::Value::as_table)
-        {
-            for (key, entry) in table {
-                if let Some(entry_table) = entry.as_table()
-                    && entry_table.contains_key("command")
-                {
-                    found_issues = true;
-                    print_migration(out, source, key, entry_table, true);
-                }
+        // Pre-namespacing top-level definition tables (linters ticket 04).
+        if let Some(table) = raw.get("server").and_then(toml::Value::as_table) {
+            found_issues = true;
+            print_namespace_rename(out, source, "server", "lsp.server", table);
+        }
+        if let Some(table) = raw.get("language").and_then(toml::Value::as_table) {
+            found_issues = true;
+            print_namespace_rename(out, source, "language", "lsp.language", table);
+        }
+        // Old `[linter.<name>]` definitions — any `[linter]` sub-table other than
+        // the namespaced `rule` map and the `disable` toggle.
+        if let Some(linter_table) = raw.get("linter").and_then(toml::Value::as_table) {
+            let old_defs: toml::map::Map<String, toml::Value> = linter_table
+                .iter()
+                .filter(|(k, v)| k.as_str() != "rule" && k.as_str() != "disable" && v.is_table())
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            if !old_defs.is_empty() {
+                found_issues = true;
+                print_namespace_rename(out, source, "linter", "linter.rule", &old_defs);
             }
         }
 
-        // [language.*] entries with removed or stale fields
-        if let Some(table) = raw.get("language").and_then(toml::Value::as_table) {
+        // [lsp.language.*] entries with removed or stale fields
+        if let Some(table) = raw
+            .get("lsp")
+            .and_then(|v| v.get("language"))
+            .and_then(toml::Value::as_table)
+        {
             for (key, entry) in table {
                 if let Some(entry_table) = entry.as_table() {
                     // Removed field: inherit
@@ -863,21 +876,21 @@ fn doctor_check_config(out: &mut Output) {
                         let _ = out.writeln(format_args!(
                             "{}",
                             out.colors.yellow(&format!(
-                                "⚠  {}: [language.{key}] uses removed `inherit` field — \
-                                 copy `servers` list from [language.{target}] into \
-                                 [language.{key}] instead.",
+                                "⚠  {}: [lsp.language.{key}] uses removed `inherit` field — \
+                                 copy `servers` list from [lsp.language.{target}] into \
+                                 [lsp.language.{key}] instead.",
                                 source.display(),
                             )),
                         ));
                     }
 
-                    // Intermediate format: inline server definition fields
+                    // Inline server definition fields — belong on [lsp.server.*].
                     let has_server_fields = crate::config::SERVER_DEF_KEYS
                         .iter()
                         .any(|k| entry_table.contains_key(*k));
                     if has_server_fields {
                         found_issues = true;
-                        print_migration(out, source, key, entry_table, false);
+                        print_migration(out, source, key, entry_table);
                     }
                 }
             }
@@ -1034,8 +1047,8 @@ fn doctor_check_project_config(
                     let _ = out.writeln(format_args!(
                         "  {}",
                         out.colors.yellow(&format!(
-                            "⚠  [server.{server_name}] has a `command` but no \
-                             [language.*] references it"
+                            "⚠  [lsp.server.{server_name}] has a `command` but no \
+                             [lsp.language.*] references it"
                         )),
                     ));
                 }
@@ -1051,8 +1064,8 @@ fn doctor_check_project_config(
                         let _ = out.writeln(format_args!(
                             "  {}",
                             out.colors.red(&format!(
-                                "✗  [language.{lang_key}] references server '{}', \
-                                 but no [server.{}] is defined in project or user config",
+                                "✗  [lsp.language.{lang_key}] references server '{}', \
+                                 but no [lsp.server.{}] is defined in project or user config",
                                 binding.name, binding.name,
                             )),
                         ));
@@ -1073,23 +1086,70 @@ fn doctor_check_project_config(
     let _ = out.writeln(format_args!(""));
 }
 
-/// Print migration guidance for a single old-format entry.
+/// Print a namespace-rename hint for a pre-04 top-level definition table.
+///
+/// Walks every nested table header under `old_root` — so sub-tables like
+/// `[server.<name>.sources]` or `[server.<name>.initialization_options]` migrate
+/// too, not just the top-level key — and prints each `[old] → [new]` rename
+/// (`new_root` prefix-swapped for `old_root`).
+fn print_namespace_rename(
+    out: &mut Output,
+    source: &Path,
+    old_root: &str,
+    new_root: &str,
+    table: &toml::map::Map<String, toml::Value>,
+) {
+    let _ = out.writeln(format_args!(
+        "{}",
+        out.colors.yellow(&format!(
+            "⚠  {}: [{old_root}.*] moved under [{new_root}.*] (linters ticket 04) — \
+             rename these table headers:",
+            source.display(),
+        )),
+    ));
+
+    let mut headers = Vec::new();
+    for (name, value) in table {
+        if let Some(sub) = value.as_table() {
+            collect_table_headers(&format!("{old_root}.{name}"), sub, &mut headers);
+        }
+    }
+    for header in &headers {
+        // `header` is guaranteed to start with `old_root`; swap the prefix.
+        let new_header = format!("{new_root}{}", &header[old_root.len()..]);
+        let _ = out.writeln(format_args!("    [{header}]  →  [{new_header}]"));
+    }
+    let _ = out.writeln(format_args!(""));
+}
+
+/// Collects the header path for `table` and every nested sub-table, parent
+/// first, into `headers`. `path` is the dotted TOML header for `table`.
+fn collect_table_headers(
+    path: &str,
+    table: &toml::map::Map<String, toml::Value>,
+    headers: &mut Vec<String>,
+) {
+    headers.push(path.to_string());
+    for (key, value) in table {
+        if let Some(sub) = value.as_table() {
+            collect_table_headers(&format!("{path}.{key}"), sub, headers);
+        }
+    }
+}
+
+/// Print migration guidance for a `[lsp.language.*]` entry that inlines server
+/// definition fields (they belong on `[lsp.server.*]`).
 fn print_migration(
     out: &mut Output,
     source: &Path,
     key: &str,
     entry: &toml::map::Map<String, toml::Value>,
-    is_server_section: bool,
 ) {
-    let section = if is_server_section {
-        "server"
-    } else {
-        "language"
-    };
     let _ = out.writeln(format_args!(
         "{}",
         out.colors.yellow(&format!(
-            "⚠  {}: [{section}.{key}] uses old format — migrate to [language.*] + [server.*]:",
+            "⚠  {}: [lsp.language.{key}] inlines server definition fields — \
+             split into [lsp.language.*] + [lsp.server.*]:",
             source.display(),
         )),
     ));
@@ -1103,7 +1163,7 @@ fn print_migration(
     // Build old-format display
     let _ = out.writeln(format_args!(""));
     let _ = out.writeln(format_args!("  Old:"));
-    let _ = out.writeln(format_args!("    [{section}.{key}]"));
+    let _ = out.writeln(format_args!("    [lsp.language.{key}]"));
     for (k, v) in entry {
         let _ = out.writeln(format_args!("    {k} = {v}"));
     }
@@ -1121,13 +1181,13 @@ fn print_migration(
 
     let _ = out.writeln(format_args!(""));
     let _ = out.writeln(format_args!("  New:"));
-    let _ = out.writeln(format_args!("    [language.{key}]"));
+    let _ = out.writeln(format_args!("    [lsp.language.{key}]"));
     let _ = out.writeln(format_args!("    servers = [\"{server_name}\"]"));
     for (k, v) in &lang_fields {
         let _ = out.writeln(format_args!("    {k} = {v}"));
     }
     let _ = out.writeln(format_args!(""));
-    let _ = out.writeln(format_args!("    [server.{server_name}]"));
+    let _ = out.writeln(format_args!("    [lsp.server.{server_name}]"));
     for (k, v) in &server_fields {
         let _ = out.writeln(format_args!("    {k} = {v}"));
     }

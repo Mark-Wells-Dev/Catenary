@@ -167,11 +167,11 @@ pub struct Config {
     /// [`Config::companion_rules`].
     pub roots: Option<RootsConfig>,
 
-    /// Standalone-linter definitions keyed by linter name (`[linter.*]`).
+    /// Standalone-linter definitions keyed by linter name (`[linter.rule.*]`).
     ///
     /// The user-level half of the linter feeder (workstream 34 ticket 01). The
     /// effective set for a root is this map unioned with the root's project
-    /// `[linter.*]` — see
+    /// `[linter.rule.*]` — see
     /// [`LspClientManager::effective_linters`](crate::lsp::LspClientManager::effective_linters).
     pub linter: HashMap<String, LinterConfig>,
 }
@@ -382,8 +382,10 @@ impl Config {
     ///
     /// Returns an error if:
     /// - A configuration file exists but cannot be read or parsed.
-    /// - A file uses the deprecated `[server.*]` key without `[language.*]`.
-    /// - A `[language.*]` entry uses the removed `inherit` field.
+    /// - A file uses the old top-level server / language / linter definition
+    ///   tables (renamed to `[lsp.server.*]` / `[lsp.language.*]` /
+    ///   `[linter.rule.*]` in linters ticket 04).
+    /// - A `[lsp.language.*]` entry uses the removed `inherit` field.
     /// - A concrete language entry has no `servers` list.
     pub fn load() -> Result<Self> {
         parse::load()
@@ -497,10 +499,10 @@ mod tests {
         fs::write(
             &config_path,
             r#"
-[server.rust-analyzer]
+[lsp.server.rust-analyzer]
 command = "rust-analyzer-local"
 
-[language.rust]
+[lsp.language.rust]
 servers = ["rust-analyzer"]
 "#,
         )?;
@@ -527,7 +529,7 @@ servers = ["rust-analyzer"]
         fs::write(
             &config_path,
             r#"
-[linter.yamllint]
+[linter.rule.yamllint]
 command = "yamllint"
 args = ["-f", "parsable"]
 patterns = ["**/*.{yml,yaml}"]
@@ -551,7 +553,7 @@ patterns = ["**/*.{yml,yaml}"]
 
         fs::write(
             &config_path,
-            "[linter.x]\ncommand = \"x\"\npatterns = [\"[bad\"]\n",
+            "[linter.rule.x]\ncommand = \"x\"\npatterns = [\"[bad\"]\n",
         )
         .expect("write config");
 
@@ -568,7 +570,8 @@ patterns = ["**/*.{yml,yaml}"]
         let dir = tempdir().expect("tempdir");
         let config_path = dir.path().join("config.toml");
 
-        fs::write(&config_path, "[linter.x]\npatterns = [\"**/*.sh\"]\n").expect("write config");
+        fs::write(&config_path, "[linter.rule.x]\npatterns = [\"**/*.sh\"]\n")
+            .expect("write config");
 
         let result = Config::load_from_sources(&[config_path]);
         let err = format!("{:#}", result.expect_err("empty command should error"));
@@ -583,6 +586,8 @@ patterns = ["**/*.{yml,yaml}"]
         let dir = tempdir().expect("tempdir");
         let config_path = dir.path().join("config.toml");
 
+        // The old top-level `[server.*]` key is hard-errored with the rename to
+        // `[lsp.server.*]` (linters ticket 04).
         fs::write(
             &config_path,
             r#"
@@ -596,8 +601,8 @@ command = "rust-analyzer"
         assert!(result.is_err());
         let err = format!("{:#}", result.expect_err("should error"));
         assert!(
-            err.contains("deprecated"),
-            "error should mention deprecated: {err}",
+            err.contains("[lsp.server.<name>]"),
+            "error should point to the [lsp.server.*] rename: {err}",
         );
     }
 
@@ -609,19 +614,19 @@ command = "rust-analyzer"
         fs::write(
             &config_path,
             r#"
-[server.rust-analyzer]
+[lsp.server.rust-analyzer]
 command = "rust-analyzer"
 args = ["--log-level", "info"]
 
-[server.clangd]
+[lsp.server.clangd]
 command = "clangd"
 args = ["--background-index"]
 settings = { checkOnSave = true }
 
-[language.rust]
+[lsp.language.rust]
 servers = ["rust-analyzer"]
 
-[language.c]
+[lsp.language.c]
 servers = ["clangd"]
 "#,
         )?;
@@ -653,10 +658,10 @@ servers = ["clangd"]
         fs::write(
             &config_path,
             r#"
-[server.rust-analyzer]
+[lsp.server.rust-analyzer]
 command = "rust-analyzer"
 
-[language.rust]
+[lsp.language.rust]
 servers = ["rust-analyzer"]
 "#,
         )?;
@@ -677,14 +682,14 @@ servers = ["rust-analyzer"]
         fs::write(
             &source1,
             r#"
-[server.rust-analyzer]
+[lsp.server.rust-analyzer]
 command = "rust-analyzer"
 
-[server.clangd]
+[lsp.server.clangd]
 command = "clangd"
 args = ["--background-index"]
 
-[language.rust]
+[lsp.language.rust]
 servers = ["rust-analyzer"]
 "#,
         )?;
@@ -693,15 +698,15 @@ servers = ["rust-analyzer"]
         fs::write(
             &source2,
             r#"
-[server.rust-analyzer]
+[lsp.server.rust-analyzer]
 command = "rust-analyzer"
 
-[server.clangd]
+[lsp.server.clangd]
 command = "clangd"
 args = ["--background-index", "--clang-tidy"]
 settings = { checkOnSave = true }
 
-[language.rust]
+[lsp.language.rust]
 servers = ["rust-analyzer"]
 "#,
         )?;
@@ -723,13 +728,13 @@ servers = ["rust-analyzer"]
         fs::write(
             &config_path,
             r#"
-[server.rust-analyzer]
+[lsp.server.rust-analyzer]
 command = "rust-analyzer"
 
-[server.bad-server]
+[lsp.server.bad-server]
 command = ""
 
-[language.rust]
+[lsp.language.rust]
 servers = ["rust-analyzer"]
 "#,
         )
@@ -752,13 +757,13 @@ servers = ["rust-analyzer"]
         fs::write(
             &config_path,
             r#"
-[server.tsserver]
+[lsp.server.tsserver]
 command = "typescript-language-server"
 
-[language.typescript]
+[lsp.language.typescript]
 servers = ["tsserver"]
 
-[language.typescriptreact]
+[lsp.language.typescriptreact]
 inherit = "typescript"
 "#,
         )
@@ -783,7 +788,7 @@ inherit = "typescript"
         fs::write(
             &config_path,
             r"
-[language.custom]
+[lsp.language.custom]
 diagnostics = false
 ",
         )
@@ -806,11 +811,11 @@ diagnostics = false
         fs::write(
             &config_path,
             r#"
-[server.tsserver]
+[lsp.server.tsserver]
 command = "typescript-language-server"
 args = ["--stdio"]
 
-[language.typescript]
+[lsp.language.typescript]
 servers = ["tsserver"]
 "#,
         )?;
@@ -871,10 +876,10 @@ servers = ["tsserver"]
             r#"
 log_retention_days = 14
 
-[server.rust-analyzer]
+[lsp.server.rust-analyzer]
 command = "rust-analyzer-local"
 
-[language.rust]
+[lsp.language.rust]
 servers = ["rust-analyzer"]
 "#,
         )?;
@@ -903,22 +908,22 @@ log_retention_days = 30
         fs::write(
             &config_path,
             r#"
-[server.rust-analyzer]
+[lsp.server.rust-analyzer]
 command = "rust-analyzer"
 args = ["--log-level", "info"]
 min_severity = "warning"
 
-[server.clangd]
+[lsp.server.clangd]
 command = "clangd"
 args = ["--background-index"]
 
-[language.rust]
+[lsp.language.rust]
 servers = ["rust-analyzer"]
 
-[language.c]
+[lsp.language.c]
 servers = ["clangd"]
 
-[language.cpp]
+[lsp.language.cpp]
 servers = ["clangd"]
 "#,
         )?;
@@ -958,7 +963,7 @@ servers = ["clangd"]
         fs::write(
             &config_path,
             r#"
-[language.rust]
+[lsp.language.rust]
 command = "rust-analyzer"
 "#,
         )
@@ -968,7 +973,7 @@ command = "rust-analyzer"
         assert!(result.is_err());
         let err = format!("{:#}", result.expect_err("should error"));
         assert!(
-            err.contains("command") && err.contains("[server.*]"),
+            err.contains("command") && err.contains("[lsp.server.*]"),
             "error should mention server definition migration: {err}",
         );
     }
@@ -981,11 +986,11 @@ command = "rust-analyzer"
         fs::write(
             &config_path,
             r#"
-[language.shellscript]
+[lsp.language.shellscript]
 single_file = true
 servers = ["bash-language-server"]
 
-[server.bash-language-server]
+[lsp.server.bash-language-server]
 command = "bash-language-server"
 args = ["start"]
 "#,
@@ -996,7 +1001,7 @@ args = ["start"]
         assert!(result.is_err());
         let err = format!("{:#}", result.expect_err("should error"));
         assert!(
-            err.contains("single_file") && err.contains("[server.*]"),
+            err.contains("single_file") && err.contains("[lsp.server.*]"),
             "error should mention server definition migration: {err}",
         );
     }
@@ -1030,7 +1035,7 @@ args = ["start"]
             assert!(
                 SERVER_DEF_KEYS.contains(&key.as_str()),
                 "ServerDef field `{key}` missing from SERVER_DEF_KEYS — \
-                 add it so misplaced-field detection catches it on [language.*]",
+                 add it so misplaced-field detection catches it on [lsp.language.*]",
             );
         }
 
@@ -1053,7 +1058,7 @@ args = ["start"]
         fs::write(
             &config_path,
             r#"
-[language.rust]
+[lsp.language.rust]
 servers = ["nonexistent-server"]
 "#,
         )
@@ -1079,7 +1084,7 @@ servers = ["nonexistent-server"]
         fs::write(
             &config_path,
             r"
-[language.rust]
+[lsp.language.rust]
 servers = []
 ",
         )?;
@@ -1100,23 +1105,23 @@ servers = []
 
     #[test]
     fn server_def_weight_fields_parse() -> anyhow::Result<()> {
-        // Co-located weight / sources / provisional on a `[server.*]` def parse
+        // Co-located weight / sources / provisional on a `[lsp.server.*]` def parse
         // into the ServerDef fields the weight resolver reads.
         let dir = tempdir()?;
         let config_path = dir.path().join("config.toml");
         fs::write(
             &config_path,
             r#"
-[server.rust-analyzer]
+[lsp.server.rust-analyzer]
 command = "rust-analyzer"
 weight = 10
 provisional = "^E[0-9]+$"
 
-[server.rust-analyzer.sources]
+[lsp.server.rust-analyzer.sources]
 rustc = 100
 clippy = 100
 
-[language.rust]
+[lsp.language.rust]
 servers = ["rust-analyzer"]
 "#,
         )?;
@@ -1139,11 +1144,11 @@ servers = ["rust-analyzer"]
         fs::write(
             &config_path,
             r#"
-[server.rust-analyzer]
+[lsp.server.rust-analyzer]
 command = "rust-analyzer"
 provisional = "^E[0-9+$"
 
-[language.rust]
+[lsp.language.rust]
 servers = ["rust-analyzer"]
 "#,
         )
@@ -1163,7 +1168,7 @@ servers = ["rust-analyzer"]
         fs::write(
             &config_path,
             r#"
-[linter.shellcheck]
+[linter.rule.shellcheck]
 command = "shellcheck"
 patterns = ["**/*.sh"]
 weight = 70
@@ -1183,11 +1188,11 @@ weight = 70
         fs::write(
             &config_path,
             r#"
-[server.tsserver]
+[lsp.server.tsserver]
 command = "typescript-language-server"
 min_severity = "warning"
 
-[language.typescript]
+[lsp.language.typescript]
 servers = ["tsserver"]
 "#,
         )?;
@@ -1250,7 +1255,7 @@ servers = ["tsserver"]
     /// `extensions`, so `.rs` files stopped classifying and routed nowhere).
     #[test]
     fn test_apply_server_specs_preserves_builtin_classification() -> anyhow::Result<()> {
-        // Built-in config: [language.rust] extensions=["rs"], servers=["rust-analyzer"],
+        // Built-in config: [lsp.language.rust] extensions=["rs"], servers=["rust-analyzer"],
         // root_markers=["Cargo.toml"].
         let mut config = Config::load_from_sources(&[])?;
 
@@ -1311,10 +1316,10 @@ servers = ["tsserver"]
         fs::write(
             &config_path,
             r#"
-[server.tsserver]
+[lsp.server.tsserver]
 command = "typescript-language-server"
 
-[language.typescript]
+[lsp.language.typescript]
 servers = ["tsserver"]
 "#,
         )?;
@@ -1340,10 +1345,10 @@ servers = ["tsserver"]
         fs::write(
             &config_path,
             r#"
-[server.rust-analyzer]
+[lsp.server.rust-analyzer]
 command = "rust-analyzer"
 
-[language.rust]
+[lsp.language.rust]
 servers = ["rust-analyzer"]
 "#,
         )?;
@@ -1363,7 +1368,7 @@ servers = ["rust-analyzer"]
         fs::write(
             &config_path,
             r#"
-[language.rust]
+[lsp.language.rust]
 command = "rust-analyzer"
 "#,
         )
@@ -1374,7 +1379,7 @@ command = "rust-analyzer"
         assert!(result.is_err());
         let err = format!("{:#}", result.expect_err("should error"));
         assert!(
-            err.contains("[server.*]"),
+            err.contains("[lsp.server.*]"),
             "error should mention server migration: {err}",
         );
     }
@@ -1585,10 +1590,10 @@ command = "rust-analyzer"
         fs::write(
             &path,
             r#"
-[server.foo]
+[lsp.server.foo]
 command = "foo-server"
 
-[language.test]
+[lsp.language.test]
 servers = ["foo"]
 "#,
         )?;
@@ -1609,10 +1614,10 @@ servers = ["foo"]
         fs::write(
             &path,
             r#"
-[server.foo]
+[lsp.server.foo]
 command = "foo-server"
 
-[language.test]
+[lsp.language.test]
 servers = [{ name = "foo", diagnostics = false }]
 "#,
         )?;
@@ -1633,13 +1638,13 @@ servers = [{ name = "foo", diagnostics = false }]
         fs::write(
             &path,
             r#"
-[server.alpha]
+[lsp.server.alpha]
 command = "alpha-server"
 
-[server.beta]
+[lsp.server.beta]
 command = "beta-server"
 
-[language.test]
+[lsp.language.test]
 servers = ["alpha", { name = "beta", diagnostics = false }]
 "#,
         )?;
@@ -1669,10 +1674,10 @@ servers = ["alpha", { name = "beta", diagnostics = false }]
         fs::write(
             &path,
             r#"
-[server.foo]
+[lsp.server.foo]
 command = "foo-server"
 
-[language.test]
+[lsp.language.test]
 servers = [{ name = "foo", typo = true }]
 "#,
         )
@@ -1694,10 +1699,10 @@ servers = [{ name = "foo", typo = true }]
         fs::write(
             &path,
             r#"
-[server.alpha]
+[lsp.server.alpha]
 command = "alpha-server"
 
-[language.test]
+[lsp.language.test]
 servers = [{ name = "alpha", disabled_methods = ["textDocument/references"] }]
 "#,
         )?;
@@ -1722,10 +1727,10 @@ servers = [{ name = "alpha", disabled_methods = ["textDocument/references"] }]
         fs::write(
             &path,
             r#"
-[server.alpha]
+[lsp.server.alpha]
 command = "alpha-server"
 
-[language.test]
+[lsp.language.test]
 servers = [{ name = "alpha", disabled_methods = ["textDocument/typo"] }]
 "#,
         )
@@ -1747,10 +1752,10 @@ servers = [{ name = "alpha", disabled_methods = ["textDocument/typo"] }]
         fs::write(
             &path,
             r#"
-[server.alpha]
+[lsp.server.alpha]
 command = "alpha-server"
 
-[language.test]
+[lsp.language.test]
 servers = [{ name = "alpha", disabled_methods = ["textDocument/diagnostic"] }]
 "#,
         )
@@ -1772,10 +1777,10 @@ servers = [{ name = "alpha", disabled_methods = ["textDocument/diagnostic"] }]
         fs::write(
             &path,
             r#"
-[server.foo]
+[lsp.server.foo]
 command = "foo-server"
 
-[language.test]
+[lsp.language.test]
 servers = ["foo"]
 "#,
         )?;
@@ -1794,10 +1799,10 @@ servers = ["foo"]
         fs::write(
             &path,
             r#"
-[server.foo]
+[lsp.server.foo]
 command = "foo-server"
 
-[language.test]
+[lsp.language.test]
 servers = ["foo"]
 "#,
         )?;
@@ -1816,10 +1821,10 @@ servers = ["foo"]
         fs::write(
             &path,
             r#"
-[server.md-server]
+[lsp.server.md-server]
 command = "md-server"
 
-[language.markdown]
+[lsp.language.markdown]
 servers = ["md-server"]
 diagnostics = false
 "#,
@@ -1900,11 +1905,11 @@ diagnostics = false
         fs::write(
             &path,
             r#"
-[server.foo]
+[lsp.server.foo]
 command = "foo-server"
 min_severity = "warning"
 
-[language.test]
+[lsp.language.test]
 servers = ["foo"]
 "#,
         )?;
@@ -1923,10 +1928,10 @@ servers = ["foo"]
         fs::write(
             &path,
             r#"
-[server.foo]
+[lsp.server.foo]
 command = "foo-server"
 
-[language.rust]
+[lsp.language.rust]
 servers = ["foo"]
 min_severity = "warning"
 "#,
@@ -1937,7 +1942,7 @@ min_severity = "warning"
         assert!(result.is_err());
         let err = format!("{:#}", result.expect_err("should error"));
         assert!(
-            err.contains("min_severity") && err.contains("[server.*]"),
+            err.contains("min_severity") && err.contains("[lsp.server.*]"),
             "error should mention moving min_severity to server: {err}",
         );
     }
@@ -1949,10 +1954,10 @@ min_severity = "warning"
         fs::write(
             &path,
             r#"
-[server.foo]
+[lsp.server.foo]
 command = "foo-server"
 
-[language.test]
+[lsp.language.test]
 servers = ["foo"]
 "#,
         )?;
@@ -1973,10 +1978,10 @@ servers = ["foo"]
         fs::write(
             &path,
             r#"
-[server.rust-analyzer]
+[lsp.server.rust-analyzer]
 command = "rust-analyzer"
 
-[language.rust]
+[lsp.language.rust]
 servers = ["rust-analyzer"]
 "#,
         )?;
@@ -2004,10 +2009,10 @@ servers = ["rust-analyzer"]
         fs::write(
             &path,
             r#"
-[server.bash-ls]
+[lsp.server.bash-ls]
 command = "bash-language-server"
 
-[language.shellscript]
+[lsp.language.shellscript]
 servers = ["bash-ls"]
 filenames = ["PKGBUILD", "APKBUILD"]
 "#,
@@ -2040,11 +2045,11 @@ filenames = ["PKGBUILD", "APKBUILD"]
         fs::write(
             &path,
             r#"
-[server.pkgbuild-ls]
+[lsp.server.pkgbuild-ls]
 command = "pkgbuild-ls"
 file_patterns = ["PKGBUILD"]
 
-[language.shellscript]
+[lsp.language.shellscript]
 servers = ["pkgbuild-ls"]
 "#,
         )?;
@@ -2063,11 +2068,11 @@ servers = ["pkgbuild-ls"]
         fs::write(
             &path,
             r#"
-[server.bad]
+[lsp.server.bad]
 command = "bad-server"
 file_patterns = ["[invalid"]
 
-[language.test]
+[lsp.language.test]
 servers = ["bad"]
 "#,
         )
@@ -2089,11 +2094,11 @@ servers = ["bad"]
         fs::write(
             &path,
             r#"
-[server.bad]
+[lsp.server.bad]
 command = "bad-server"
 file_patterns = [""]
 
-[language.test]
+[lsp.language.test]
 servers = ["bad"]
 "#,
         )
@@ -2115,7 +2120,7 @@ servers = ["bad"]
         fs::write(
             &path,
             r#"
-[language.custom]
+[lsp.language.custom]
 extensions = ["rs", ""]
 "#,
         )
@@ -2138,10 +2143,10 @@ extensions = ["rs", ""]
         fs::write(
             &base,
             r#"
-[server.foo]
+[lsp.server.foo]
 command = "foo-server"
 
-[language.test]
+[lsp.language.test]
 servers = ["foo"]
 extensions = ["abc"]
 filenames = ["TestFile"]
@@ -2152,7 +2157,7 @@ filenames = ["TestFile"]
         fs::write(
             &overlay,
             r#"
-[language.test]
+[lsp.language.test]
 extensions = ["xyz"]
 "#,
         )?;
@@ -2521,10 +2526,10 @@ build = "npm"
         fs::write(
             &config_path,
             r#"
-[server.rust-analyzer]
+[lsp.server.rust-analyzer]
 command = "rust-analyzer"
 
-[language.rust]
+[lsp.language.rust]
 servers = ["rust-analyzer"]
 "#,
         )
@@ -2548,10 +2553,10 @@ servers = ["rust-analyzer"]
         fs::write(
             &config_path,
             r#"
-[server.rust-analyzer]
+[lsp.server.rust-analyzer]
 command = "rust-analyzer"
 
-[language.rust]
+[lsp.language.rust]
 servers = ["rust-analyzer"]
 root_markers = ["rust-toolchain.toml"]
 "#,
@@ -2576,10 +2581,10 @@ root_markers = ["rust-toolchain.toml"]
         fs::write(
             &config_path,
             r#"
-[server.rust-analyzer]
+[lsp.server.rust-analyzer]
 command = "rust-analyzer"
 
-[language.rust]
+[lsp.language.rust]
 servers = ["rust-analyzer"]
 root_markers = []
 "#,
@@ -2608,10 +2613,10 @@ root_markers = []
         fs::write(
             &config_path,
             r#"
-[server.my-custom-server]
+[lsp.server.my-custom-server]
 command = "my-server"
 
-[language.custom]
+[lsp.language.custom]
 servers = ["my-custom-server"]
 "#,
         )
@@ -2630,7 +2635,7 @@ servers = ["my-custom-server"]
 
     #[test]
     fn test_builtin_server_resolves() -> anyhow::Result<()> {
-        // servers = ["gopls"] with no user [server.gopls] should resolve
+        // servers = ["gopls"] with no user [lsp.server.gopls] should resolve
         // to the built-in definition.
         let config = Config::load_from_sources(&[])?;
         let go = config.language.get("go").expect("go language config");
@@ -2642,17 +2647,17 @@ servers = ["my-custom-server"]
 
     #[test]
     fn test_user_server_overrides_builtin() -> anyhow::Result<()> {
-        // User [server.rust-analyzer] with custom command completely
+        // User [lsp.server.rust-analyzer] with custom command completely
         // replaces the built-in.
         let dir = tempdir()?;
         let config_path = dir.path().join("config.toml");
         fs::write(
             &config_path,
             r#"
-[server.rust-analyzer]
+[lsp.server.rust-analyzer]
 command = "rust-analyzer"
 
-[language.rust]
+[lsp.language.rust]
 servers = ["rust-analyzer"]
 "#,
         )?;
@@ -2669,17 +2674,17 @@ servers = ["rust-analyzer"]
 
     #[test]
     fn test_builtin_no_merge() -> anyhow::Result<()> {
-        // User defines [server.rust-analyzer] with only command — built-in
+        // User defines [lsp.server.rust-analyzer] with only command — built-in
         // args are NOT inherited.
         let dir = tempdir()?;
         let config_path = dir.path().join("config.toml");
         fs::write(
             &config_path,
             r#"
-[server.rust-analyzer]
+[lsp.server.rust-analyzer]
 command = "rust-analyzer"
 
-[language.rust]
+[lsp.language.rust]
 servers = ["rust-analyzer"]
 "#,
         )?;
@@ -2706,7 +2711,7 @@ servers = ["rust-analyzer"]
         fs::write(
             &config_path,
             r#"
-[language.custom]
+[lsp.language.custom]
 extensions = ["xyz"]
 servers = ["nonexistent"]
 "#,
@@ -2847,7 +2852,7 @@ servers = ["nonexistent"]
     /// file users are told to "Copy to ~/.config/catenary/config.toml" — must
     /// load cleanly through the real config loader (the same `deserialize_source`
     /// → merge → validate path `Config::load` uses). This guards against the
-    /// example drifting back to the pre-split format (`[language.*]` with inline
+    /// example drifting back to the pre-split format (`[lsp.language.*]` with inline
     /// `command`/`args`, or the removed `inherit` field), which the migration
     /// guards in `deserialize_source` hard-reject (bug 27).
     #[test]
@@ -2863,12 +2868,12 @@ servers = ["nonexistent"]
         );
 
         // Full loader pipeline: parse + migration guards + merge + validate.
-        // A pre-split example (inline `command` on [language.*], or `inherit`)
+        // A pre-split example (inline `command` on [lsp.language.*], or `inherit`)
         // makes this `?` propagate the migration-guard `bail!` and fail the test.
         let config = Config::load_from_sources(&[example])?;
 
         // Spot-check the split format took effect: the rust-analyzer override
-        // is a [server.*] definition with a command, and the markdown default
+        // is a [lsp.server.*] definition with a command, and the markdown default
         // resolves to lattice (decision 015), not marksman.
         let ra = config
             .server

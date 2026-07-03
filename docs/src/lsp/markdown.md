@@ -27,11 +27,11 @@ lattice --version
 
 ## Config
 
-Catenary ships a built-in definition for `lattice` — no `[server.*]` config is
+Catenary ships a built-in definition for `lattice` — no `[lsp.server.*]` config is
 needed. If `lattice` is on PATH it works automatically:
 
 ```toml
-[server.lattice]
+[lsp.server.lattice]
 command = "lattice"
 args = ["serve"]
 ```
@@ -63,7 +63,7 @@ definition — it is simply no longer the default. Re-enable it with a one-line
 binding (no need to redefine the server):
 
 ```toml
-[language.markdown]
+[lsp.language.markdown]
 servers = ["marksman"]
 ```
 

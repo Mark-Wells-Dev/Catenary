@@ -25,7 +25,7 @@ npm install -g intelephense
 ## Config
 
 Catenary ships a built-in definition for `intelephense` — no
-`[server.*]` config is needed. If `intelephense` is on PATH, it works
+`[lsp.server.*]` config is needed. If `intelephense` is on PATH, it works
 automatically.
 
 ## Notes
@@ -47,11 +47,11 @@ composer global require phpactor/phpactor
 ```
 
 ```toml
-[server.phpactor]
+[lsp.server.phpactor]
 command = "phpactor"
 args = ["language-server"]
 
-[language.php]
+[lsp.language.php]
 servers = ["phpactor"]
 ```
 

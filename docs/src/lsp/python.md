@@ -30,17 +30,17 @@ npm install -g pyright
 
 ## Config
 
-Catenary ships a built-in definition for pyright — no `[server.*]`
+Catenary ships a built-in definition for pyright — no `[lsp.server.*]`
 config is needed. If `pyright-langserver` is on PATH, it works
 automatically.
 
 To customise settings, add to `~/.config/catenary/config.toml`:
 
 ```toml
-[server.pyright.settings.python]
+[lsp.server.pyright.settings.python]
 pythonPath = "/usr/bin/python3"
 
-[server.pyright.settings.python.analysis]
+[lsp.server.pyright.settings.python.analysis]
 exclude = ["**/target", "**/node_modules"]
 extraPaths = []
 ```
@@ -48,7 +48,7 @@ extraPaths = []
 ## Settings
 
 Pyright requests configuration via `workspace/configuration`. Use the `settings`
-table on the `[server.*]` entry to provide Python interpreter paths, analysis
+table on the `[lsp.server.*]` entry to provide Python interpreter paths, analysis
 exclusions, and other options (shown above).
 
 Without these settings, pyright may fall back to scanning the entire workspace
@@ -75,10 +75,10 @@ pip install python-lsp-server
 ```
 
 ```toml
-[server.pylsp]
+[lsp.server.pylsp]
 command = "pylsp"
 
-[language.python]
+[lsp.language.python]
 servers = ["pylsp"]
 ```
 
@@ -91,10 +91,10 @@ pip install jedi-language-server
 ```
 
 ```toml
-[server.jedi]
+[lsp.server.jedi]
 command = "jedi-language-server"
 
-[language.python]
+[lsp.language.python]
 servers = ["jedi"]
 ```
 

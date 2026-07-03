@@ -24,6 +24,17 @@ upgrading.
 
 ### Breaking changes (configuration)
 
+- **Subsystem config namespacing.** Definitions now live under their subsystem
+  table so each subsystem is one self-contained section (`disable` + its
+  config): `[server.*]` → `[lsp.server.*]`, `[language.*]` → `[lsp.language.*]`,
+  and `[linter.<name>]` → `[linter.rule.<name>]`. The `[lsp]` table now carries
+  the per-root `disable` toggle alongside `[lsp.server.*]` / `[lsp.language.*]`,
+  and `[linter]` carries `disable` alongside `[linter.rule.*]`. Co-located
+  diagnostic-weight fields ride along: `[lsp.server.<name>].weight`,
+  `[lsp.server.<name>.sources]`, and `[lsp.server.<name>].provisional`. The old
+  top-level `[server.*]` / `[language.*]` / `[linter.<name>]` forms are now a
+  hard error naming the exact rename; `catenary doctor` flags each stale table
+  header (nested sub-tables like `[lsp.server.<name>.sources]` included).
 - **Writes resolve-or-deny.** There is no `allow_file_redirects` knob. Before a
   command runs, the hook resolves the complete set of files it will write — from
   shell grammar (`>`, `>>`, `&>`, heredoc targets), argument convention (`cp`,

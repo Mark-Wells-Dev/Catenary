@@ -14,7 +14,7 @@
 //! `LinterFeeder` subprocess path — spawn → parse → route → render — and the
 //! cross-feeder merge, using the hermetic `mocklint` tool (ticket 06) in place of
 //! any installed linter. `mocklint` emits canned findings in a chosen adapter's
-//! output shape for the file paths it is handed, so a `[linter.<name>]` whose
+//! output shape for the file paths it is handed, so a `[linter.rule.<name>]` whose
 //! `command` points at it exercises the same path a real shellcheck/SARIF tool
 //! would, without depending on the binary being present.
 
@@ -39,7 +39,7 @@ fn toml_array(items: &[&str]) -> String {
         .join(", ")
 }
 
-/// Writes a config with a single `[linter.<name>]` pointing `command` at
+/// Writes a config with a single `[linter.rule.<name>]` pointing `command` at
 /// `mocklint`. No LSP server is configured, so the file is covered by lint alone.
 fn write_linter_config(
     dir: &Path,
@@ -52,7 +52,7 @@ fn write_linter_config(
     std::fs::write(
         &config_path,
         format!(
-            "[linter.{name}]\n\
+            "[linter.rule.{name}]\n\
              command = \"{mocklint}\"\n\
              args = [{}]\n\
              patterns = [{}]\n",
@@ -63,7 +63,7 @@ fn write_linter_config(
     Ok(config_path)
 }
 
-/// A standalone `[linter.shellcheck]` (no LSP server) renders its finding through
+/// A standalone `[linter.rule.shellcheck]` (no LSP server) renders its finding through
 /// the real spawn → parse (shellcheck `json1`) → route → render path.
 #[test]
 fn linter_only_shellcheck_renders() -> Result<()> {
@@ -172,11 +172,11 @@ fn fail_soft_malformed_output_dropped() -> Result<()> {
         std::fs::write(
             &config_path,
             format!(
-                "[linter.shellcheck]\n\
+                "[linter.rule.shellcheck]\n\
                  command = \"{mocklint}\"\n\
                  args = [\"--format\", \"shellcheck\", \"--diag\", \"SC2086|1|6|Double quote\"]\n\
                  patterns = [\"**/*.sh\"]\n\n\
-                 [linter.broken]\n\
+                 [linter.rule.broken]\n\
                  command = \"{mocklint}\"\n\
                  args = [\"--raw\", \"{{not json\"]\n\
                  patterns = [\"**/*.sh\"]\n",
@@ -202,7 +202,7 @@ fn fail_soft_malformed_output_dropped() -> Result<()> {
 
 /// Writes a config wiring both an LSP feeder (`mockls`, emitting its native
 /// diagnostic plus an out-of-band `shellcheck|SC2086` extra) and a
-/// `[linter.shellcheck]` feeder (`mocklint`, emitting `SC2086` + `SC2148`) over
+/// `[linter.rule.shellcheck]` feeder (`mocklint`, emitting `SC2086` + `SC2148`) over
 /// the same `MOCK_LANG` file — the bash-language-server-wrapping-shellcheck
 /// scenario the workstream is built around.
 fn write_cross_feeder_config(dir: &Path) -> Result<PathBuf> {
@@ -212,13 +212,13 @@ fn write_cross_feeder_config(dir: &Path) -> Result<PathBuf> {
     std::fs::write(
         &config_path,
         format!(
-            "[server.mockls-{MOCK_LANG}]\n\
+            "[lsp.server.mockls-{MOCK_LANG}]\n\
              command = \"{mockls}\"\n\
              args = [\"{MOCK_LANG}\", \"--log-pid-suffix\", \
              \"--extra-diagnostic\", \"shellcheck|SC2086|wrapped by language server\"]\n\n\
-             [language.{MOCK_LANG}]\n\
+             [lsp.language.{MOCK_LANG}]\n\
              servers = [\"mockls-{MOCK_LANG}\"]\n\n\
-             [linter.shellcheck]\n\
+             [linter.rule.shellcheck]\n\
              command = \"{mocklint}\"\n\
              args = [\"--format\", \"shellcheck\", \
              \"--diag\", \"SC2086|1|1|Double quote to prevent globbing\", \
@@ -292,13 +292,13 @@ fn cross_feeder_heavier_source_wins_over_first_seen() -> Result<()> {
         std::fs::write(
             &config_path,
             format!(
-                "[server.mockls-{MOCK_LANG}]\n\
+                "[lsp.server.mockls-{MOCK_LANG}]\n\
                  command = \"{mockls}\"\n\
                  args = [\"{MOCK_LANG}\", \"--log-pid-suffix\", \
                  \"--extra-diagnostic\", \"native-analysis|SC2086|server-side preview\"]\n\n\
-                 [language.{MOCK_LANG}]\n\
+                 [lsp.language.{MOCK_LANG}]\n\
                  servers = [\"mockls-{MOCK_LANG}\"]\n\n\
-                 [linter.shellcheck]\n\
+                 [linter.rule.shellcheck]\n\
                  command = \"{mocklint}\"\n\
                  args = [\"--format\", \"shellcheck\", \"--diag\", \"SC2086|1|1|standalone finding\"]\n\
                  patterns = [\"**/*.{MOCK_LANG}\"]\n\

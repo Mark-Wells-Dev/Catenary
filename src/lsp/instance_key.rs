@@ -67,7 +67,7 @@ impl fmt::Display for Scope {
 pub struct InstanceKey {
     /// LSP language identifier (from config key).
     pub language_id: String,
-    /// Server name (references a `[server.*]` config entry).
+    /// Server name (references a `[lsp.server.*]` config entry).
     pub server: String,
     /// Routing scope.
     pub scope: Scope,

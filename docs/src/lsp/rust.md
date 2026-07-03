@@ -23,15 +23,15 @@ rustup component add rust-analyzer
 ## Config
 
 Catenary ships a built-in definition for `rust-analyzer` that invokes
-`rustup run stable rust-analyzer` — no `[server.*]` config is needed.
+`rustup run stable rust-analyzer` — no `[lsp.server.*]` config is needed.
 
 To customise, add to `~/.config/catenary/config.toml`:
 
 ```toml
-[server.rust-analyzer]
+[lsp.server.rust-analyzer]
 env = { CLIPPY_DISABLE_DOCS_LINKS = "1" }
 
-[server.rust-analyzer.initialization_options]
+[lsp.server.rust-analyzer.initialization_options]
 check.command = "clippy"
 cargo.features = "all"
 diagnostics.disabled = ["inactive-code"]

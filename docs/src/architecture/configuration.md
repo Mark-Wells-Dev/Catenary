@@ -7,7 +7,7 @@ tradeoffs were made. For syntax reference and usage examples, see the
 
 ## Why the language/server split
 
-Early Catenary configs merged everything into `[language.*]` entries —
+Early Catenary configs merged everything into `[lsp.language.*]` entries —
 each language carried its own `command`, `args`, `settings`, and server
 identity. This worked when the mapping was one-to-one: one language, one
 server.
@@ -17,23 +17,23 @@ Two scenarios broke it:
 1. **Multiple servers per language.** PKGBUILD files are shellscript,
    but they benefit from both `termux-language-server` (package-specific
    hover, diagnostics) and `bash-language-server` (shell fundamentals —
-   definitions, references, symbols). A single `[language.shellscript]`
+   definitions, references, symbols). A single `[lsp.language.shellscript]`
    entry can't hold two server definitions.
 
 2. **One server for multiple languages.** `clangd` serves both C and
    C++. Under the old model, its `command`, `args`, and `settings` had
-   to be duplicated across `[language.c]` and `[language.cpp]`.
+   to be duplicated across `[lsp.language.c]` and `[lsp.language.cpp]`.
 
 The fix is a relational split:
 
-- **`[language.*]`** answers "what" — which servers handle this
+- **`[lsp.language.*]`** answers "what" — which servers handle this
   language, and how files are classified into it.
-- **`[server.*]`** answers "how" — the binary, arguments,
+- **`[lsp.server.*]`** answers "how" — the binary, arguments,
   initialization options, settings, severity filter, and dispatch
   filter for a server process.
 
-A `[server.*]` entry is defined once and referenced by name from any
-number of `[language.*]` entries. A `[language.*]` entry's `servers`
+A `[lsp.server.*]` entry is defined once and referenced by name from any
+number of `[lsp.language.*]` entries. A `[lsp.language.*]` entry's `servers`
 list can reference multiple servers. This is a many-to-many
 relationship.
 
@@ -55,7 +55,7 @@ per-field basis:
    (`[commands]`, `[notifications]`, `[icons]`, `[tui]`, `[tools]`).
 
 3. **Project config** (`.catenary.toml` per workspace root) — scoped
-   to `[language.*]`, `[server.*]`, and `[commands]`. Discovered at
+   to `[lsp.language.*]`, `[lsp.server.*]`, and `[commands]`. Discovered at
    root addition time. See [Project config scope](#project-config-scope)
    below.
 
@@ -77,9 +77,9 @@ fields (`extensions`, `filenames`, `shebangs`) without repeating them.
 For nested structures:
 
 - **Scalars replace.** `command`, `args`, `min_severity`, `diagnostics`.
-- **Tables deep-merge by key.** A project `[server.rust-analyzer]` with
+- **Tables deep-merge by key.** A project `[lsp.server.rust-analyzer]` with
   only `settings` inherits `command` and `args` from the user's (or
-  built-in) `[server.rust-analyzer]`.
+  built-in) `[lsp.server.rust-analyzer]`.
 - **Arrays replace.** `servers`, `file_patterns`, `extensions`,
   `filenames`, `shebangs`, and array-valued settings entries. No
   concatenation, no deduplication.
@@ -93,7 +93,7 @@ convention.
 
 ## Project config scope
 
-`.catenary.toml` is restricted to `[language.*]`, `[server.*]`, and
+`.catenary.toml` is restricted to `[lsp.language.*]`, `[lsp.server.*]`, and
 `[commands]`. Other sections are rejected with a warning and guidance
 to move them to user config. This is a deliberate narrowing from the
 earlier model where project config could contain any section.
@@ -113,7 +113,7 @@ narrow one: **only `build` is project-scoped.**
   cargo/npm/go directly?" is inherently per-project. The evaluator
   resolves `cwd` (from the hook JSON payload) to a root via
   longest-prefix match, then looks up that root's build tool. Disabled
-  roots (`lsp = false`) still contribute `build`, so a root can name its
+  roots (`[lsp] disable = true`) still contribute `build`, so a root can name its
   build tool without spawning servers.
 
 Everything else under `[commands]` is **user-level only**: command
@@ -155,7 +155,7 @@ server routing, server configuration, and the per-project build tool.
 
 ## Per-root settings resolution
 
-When a project `.catenary.toml` exists, its `[server.*]` entries are
+When a project `.catenary.toml` exists, its `[lsp.server.*]` entries are
 deep-merged with user-level server definitions. The merged settings are
 stored per-root on `LspServer` alongside the user-level baseline:
 
@@ -182,7 +182,7 @@ File classification — "what language is this file?" — is config-driven.
 Three dimensions, checked in precedence order (highest first):
 
 1. **Shebang** — the file's `#!` line declares its interpreter.
-   Matched against the `shebangs` field on `[language.*]`.
+   Matched against the `shebangs` field on `[lsp.language.*]`.
 2. **Filename** — exact filename match against the `filenames` field.
 3. **Extension** — file extension match against the `extensions` field.
 
@@ -197,7 +197,7 @@ override any of it through the normal merge rules. Setting a
 classification field to an empty array clears the default (since arrays
 replace). This makes the classification system fully extensible without
 code changes — defining a custom language is just adding a
-`[language.*]` entry with classification fields and a server binding.
+`[lsp.language.*]` entry with classification fields and a server binding.
 
 Per-root classification tables from project configs override global
 tables for files within that root. `FilesystemManager` resolves the
@@ -207,7 +207,7 @@ root for a file path and uses the appropriate classification table.
 
 Tier promotion is the mechanism for handling conflicting server
 configurations across workspace roots. It is triggered by Rule A:
-when a project `.catenary.toml` contains a `[language.X]` entry.
+when a project `.catenary.toml` contains a `[lsp.language.X]` entry.
 
 Without project config, servers are shared. A workspace-capable server
 (one that supports `workspaceFolders`) gets a single `Scope::Workspace`
@@ -222,31 +222,31 @@ A single rust-analyzer process can't satisfy both, because the
 `cargo.target` setting isn't per-scope — it applies to the whole
 workspace.
 
-The solution: each root adds `[language.rust]` to its `.catenary.toml`.
+The solution: each root adds `[lsp.language.rust]` to its `.catenary.toml`.
 This triggers Rule A — Catenary spawns a separate `Scope::Root`
 instance for each root, with its own process and its own settings.
 
 ```toml
 # Root A: .catenary.toml
-[language.rust]
+[lsp.language.rust]
 servers = ["rust-analyzer"]
 
-[server.rust-analyzer.settings.rust-analyzer]
+[lsp.server.rust-analyzer.settings.rust-analyzer]
 cargo.target = "x86_64-unknown-linux-gnu"
 ```
 
 ```toml
 # Root B: .catenary.toml
-[language.rust]
+[lsp.language.rust]
 servers = ["rust-analyzer"]
 
-[server.rust-analyzer.settings.rust-analyzer]
+[lsp.server.rust-analyzer.settings.rust-analyzer]
 cargo.target = "aarch64-unknown-linux-gnu"
 ```
 
 The rule is explicit and binding-driven. Users signal "I want an
-isolated process for this project" by writing a `[language.*]` entry.
-The alternative — implicit promotion based on which `[server.*]` fields
+isolated process for this project" by writing a `[lsp.language.*]` entry.
+The alternative — implicit promotion based on which `[lsp.server.*]` fields
 are present — was rejected because config shape would silently determine
 instance topology, making the model hard to reason about.
 
@@ -254,10 +254,10 @@ The resolution matrix:
 
 | Project has | User has | Result |
 |---|---|---|
-| nothing | `[language.X]` + `[server.Y]` | User's tier 2 Y serves this root |
-| `[server.Y.settings]` only | `[language.X]` + `[server.Y]` | Tier 2 Y serves; project settings `scopeUri`-merged |
-| `[language.X]` + no `[server.Y]` | `[language.X]` + `[server.Y]` | Tier 1 Y with user's spawn def; user's tier 2 Y serves other roots |
-| `[language.X]` + `[server.Y]` | `[language.X]` + `[server.Y]` | Tier 1 Y with project's spawn def |
+| nothing | `[lsp.language.X]` + `[lsp.server.Y]` | User's tier 2 Y serves this root |
+| `[lsp.server.Y.settings]` only | `[lsp.language.X]` + `[lsp.server.Y]` | Tier 2 Y serves; project settings `scopeUri`-merged |
+| `[lsp.language.X]` + no `[lsp.server.Y]` | `[lsp.language.X]` + `[lsp.server.Y]` | Tier 1 Y with user's spawn def; user's tier 2 Y serves other roots |
+| `[lsp.language.X]` + `[lsp.server.Y]` | `[lsp.language.X]` + `[lsp.server.Y]` | Tier 1 Y with project's spawn def |
 
 No automatic conflict detection or instance splitting. The user makes
 the call by where they place the config.

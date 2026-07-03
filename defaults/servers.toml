@@ -1,7 +1,7 @@
 # Built-in server definitions.
 #
 # Loaded as the lowest-priority config layer. User and project
-# `[server.*]` entries completely replace the built-in default for
+# `[lsp.server.*]` entries completely replace the built-in default for
 # that name — no merging.
 #
 # Names follow Decision 011 (server naming convention):
@@ -14,151 +14,151 @@
 # preferences.
 #
 # Diagnostic source weights (misc 115) are co-located on the source definition:
-# as of linters ticket 05 a `[server.*]` may set `weight` (native-source trust),
-# a `[server.*.sources]` sub-table (per-sub-source overrides, e.g. flycheck
-# `rustc`/`clippy`), and `provisional` (the native source's provisional code
-# band). The rust-analyzer / flycheck default (`rust-analyzer = 10`,
+# as of linters ticket 05 a `[lsp.server.*]` may set `weight` (native-source
+# trust), a `[lsp.server.*.sources]` sub-table (per-sub-source overrides, e.g.
+# flycheck `rustc`/`clippy`), and `provisional` (the native source's provisional
+# code band). The rust-analyzer / flycheck default (`rust-analyzer = 10`,
 # `rustc`/`clippy = 100`, provisional `^E[0-9]+$`) ships in code
 # (`DiagnosticWeights::rust_analyzer_default`), not here, so it survives a user
-# redefining `[server.rust-analyzer]`, and is keyed on the LSP `source` field, so
-# it is inert for any root whose diagnostics carry none of those sources.
+# redefining `[lsp.server.rust-analyzer]`, and is keyed on the LSP `source` field,
+# so it is inert for any root whose diagnostics carry none of those sources.
 
 # ── Own name ─────────────────────────────────────────────────────
 
-[server.rust-analyzer]
+[lsp.server.rust-analyzer]
 command = "rustup"
 args = ["run", "stable", "rust-analyzer"]
 
-[server.gopls]
+[lsp.server.gopls]
 command = "gopls"
 
-[server.clangd]
+[lsp.server.clangd]
 command = "clangd"
 
-[server.zls]
+[lsp.server.zls]
 command = "zls"
 
-[server.pyright]
+[lsp.server.pyright]
 command = "pyright-langserver"
 args = ["--stdio"]
 
-[server.taplo]
+[lsp.server.taplo]
 command = "taplo"
 args = ["lsp", "stdio"]
 
-[server.lattice]
+[lsp.server.lattice]
 command = "lattice"
 args = ["serve"]
 
-[server.marksman]
+[lsp.server.marksman]
 command = "marksman"
 args = ["server"]
 
-[server.intelephense]
+[lsp.server.intelephense]
 command = "intelephense"
 args = ["--stdio"]
 
-[server.vscode-css]
+[lsp.server.vscode-css]
 command = "vscode-css-language-server"
 args = ["--stdio"]
 
-[server.vscode-html]
+[lsp.server.vscode-html]
 command = "vscode-html-language-server"
 args = ["--stdio"]
 
-[server.vscode-json]
+[lsp.server.vscode-json]
 command = "vscode-json-language-server"
 args = ["--stdio"]
 
-[server.vscode-eslint]
+[lsp.server.vscode-eslint]
 command = "vscode-eslint-language-server"
 args = ["--stdio"]
 
 # ── {name}-ls ────────────────────────────────────────────────────
 
-[server.bash-ls]
+[lsp.server.bash-ls]
 command = "bash-language-server"
 args = ["start"]
 
-[server.haskell-ls]
+[lsp.server.haskell-ls]
 command = "haskell-language-server-wrapper"
 args = ["--lsp"]
 
-[server.typescript-ls]
+[lsp.server.typescript-ls]
 command = "typescript-language-server"
 args = ["--stdio"]
 
-[server.lua-ls]
+[lsp.server.lua-ls]
 command = "lua-language-server"
 
-[server.vim-ls]
+[lsp.server.vim-ls]
 command = "vim-language-server"
 args = ["--stdio"]
 
-[server.yaml-ls]
+[lsp.server.yaml-ls]
 command = "yaml-language-server"
 args = ["--stdio"]
 
-[server.ansible-ls]
+[lsp.server.ansible-ls]
 command = "ansible-language-server"
 args = ["--stdio"]
 
-[server.cmake-ls]
+[lsp.server.cmake-ls]
 command = "cmake-language-server"
 
-[server.sql-ls]
+[lsp.server.sql-ls]
 command = "sql-language-server"
 args = ["up", "--method", "stdio"]
 
-[server.docker-ls]
+[lsp.server.docker-ls]
 command = "docker-langserver"
 args = ["--stdio"]
 
-[server.csharp-ls]
+[lsp.server.csharp-ls]
 command = "csharp-ls"
 
-[server.fsautocomplete]
+[lsp.server.fsautocomplete]
 command = "fsautocomplete"
 args = ["--adaptive-lsp-server-enabled"]
 
-[server.kotlin-ls]
+[lsp.server.kotlin-ls]
 command = "kotlin-language-server"
 
-[server.ocamllsp]
+[lsp.server.ocamllsp]
 command = "ocamllsp"
 
-[server.elm-ls]
+[lsp.server.elm-ls]
 command = "elm-language-server"
 args = ["--stdio"]
 
-[server.svelte-ls]
+[lsp.server.svelte-ls]
 command = "svelteserver"
 args = ["--stdio"]
 
-[server.nil]
+[lsp.server.nil]
 command = "nil"
 
-[server.terraform-ls]
+[lsp.server.terraform-ls]
 command = "terraform-ls"
 args = ["serve"]
 
-[server.sourcekit-lsp]
+[lsp.server.sourcekit-lsp]
 command = "sourcekit-lsp"
 
-[server.metals]
+[lsp.server.metals]
 command = "metals"
 
-[server.dart-ls]
+[lsp.server.dart-ls]
 command = "dart"
 args = ["language-server"]
 
 # ── Runtime-embedded ─────────────────────────────────────────────
 
-[server.julia-ls]
+[lsp.server.julia-ls]
 command = "julia"
 args = ["--startup-file=no", "--history-file=no", "-e",
         "using LanguageServer; runserver()"]
 
-[server.r-ls]
+[lsp.server.r-ls]
 command = "R"
 args = ["--slave", "-e", "languageserver::run()"]

@@ -110,7 +110,8 @@ const TEMPLATE: &str = r#"# Catenary recommended config
 #
 #   # Disable Catenary LSP for this workspace entirely
 #   # (the project build tool still applies)
-#   lsp = false
+#   [lsp]
+#   disable = true
 
 # ── Notifications ────────────────────────────────────────────────
 #
@@ -129,7 +130,7 @@ const TEMPLATE: &str = r#"# Catenary recommended config
 # Per-server environment variables. Added to the inherited
 # environment (config value wins on conflict).
 #
-# [server.rust-analyzer]
+# [lsp.server.rust-analyzer]
 # env = { CLIPPY_DISABLE_DOCS_LINKS = "1" }
 
 # ── Root markers ──────────────────────────────────────────────────
@@ -147,13 +148,13 @@ const TEMPLATE: &str = r#"# Catenary recommended config
 # Exact filenames use a fast exists() check; globs read directory
 # entries and match against compiled patterns.
 #
-# [language.rust]
+# [lsp.language.rust]
 # root_markers = ["rust-toolchain.toml"]   # custom markers
 #
-# [language.csharp]
+# [lsp.language.csharp]
 # root_markers = ["*.sln", "*.csproj"]     # glob patterns
 #
-# [language.python]
+# [lsp.language.python]
 # root_markers = []                        # disable for python
 
 # ── Tools (`catenary grep`/`glob`/`diagnostics`) ─────────────────
@@ -189,7 +190,7 @@ pub fn print_template(out: &mut Output) {
 /// Generate a commented-out reference section listing all built-in
 /// server defaults.
 ///
-/// Each `[server.*]` entry from `defaults/servers.toml` is rendered as
+/// Each `[lsp.server.*]` entry from `defaults/servers.toml` is rendered as
 /// a comment block so users can discover canonical names and override
 /// selectively.
 fn generate_defaults_section() -> String {
@@ -206,11 +207,11 @@ fn generate_defaults_section() -> String {
     );
     let _ = writeln!(
         out,
-        "# one by name in a [language.*] servers list and it works without"
+        "# one by name in a [lsp.language.*] servers list and it works without"
     );
     let _ = writeln!(
         out,
-        "# a [server.*] entry. To override, uncomment and modify."
+        "# a [lsp.server.*] entry. To override, uncomment and modify."
     );
 
     for line in crate::config::DEFAULT_SERVERS.lines() {
@@ -452,7 +453,7 @@ mod tests {
     #[test]
     fn template_defaults_section_contains_all_servers() {
         let section = generate_defaults_section();
-        // Every [server.*] key from defaults/servers.toml must appear.
+        // Every [lsp.server.*] key from defaults/servers.toml must appear.
         let expected = [
             "rust-analyzer",
             "gopls",

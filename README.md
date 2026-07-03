@@ -133,12 +133,20 @@ client. Plugins and extensions provide hooks and the MCP declaration but
 Add your language servers to `~/.config/catenary/config.toml`:
 
 ```toml
-[language.rust]
+# Define how to run each server under [lsp.server.*], then bind a
+# language to it under [lsp.language.*].
+[lsp.server.rust-analyzer]
 command = "rust-analyzer"
 
-[language.python]
+[lsp.server.pyright]
 command = "pyright-langserver"
 args = ["--stdio"]
+
+[lsp.language.rust]
+servers = ["rust-analyzer"]
+
+[lsp.language.python]
+servers = ["pyright"]
 ```
 
 ### 3. Connect your agent

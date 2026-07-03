@@ -797,9 +797,9 @@ impl Session {
     /// Whether a standalone linter covers this file (workstream 34 ticket 01).
     ///
     /// Resolves the file to its owning root and matches the root-relative path
-    /// against that root's effective `[linter.*]` patterns (user ∪ project),
+    /// against that root's effective `[linter.rule.*]` patterns (user ∪ project),
     /// reusing `LspGlob`. Out-of-root files and `disable_lint` roots are never
-    /// covered. With no `[linter.*]` configured (defaults ship in ticket 03)
+    /// covered. With no `[linter.rule.*]` configured (defaults ship in ticket 03)
     /// this is `false`, so the coverage gate is unchanged until a linter is set.
     #[must_use]
     pub fn has_lint_coverage(&self, path: &Path) -> bool {
@@ -1392,15 +1392,15 @@ mod tests {
 
     #[test]
     fn has_lint_coverage_matches_configured_linter() {
-        // A root-level `[linter.*]` with a matching path glob covers a file even
-        // when no language server backs it — the gate tracks lint-only files.
+        // A root-level `[linter.rule.*]` with a matching path glob covers a file
+        // even when no language server backs it — the gate tracks lint-only files.
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path().join("workspace");
         std::fs::create_dir_all(&root).expect("create workspace dir");
         std::fs::write(
             root.join(".catenary.toml"),
-            "[linter.shellcheck]\ncommand = \"shellcheck\"\n\
+            "[linter.rule.shellcheck]\ncommand = \"shellcheck\"\n\
              args = [\"-f\", \"json1\"]\npatterns = [\"**/*.sh\"]\n",
         )
         .expect("write config");
@@ -1430,7 +1430,7 @@ mod tests {
 
     #[test]
     fn has_lint_coverage_false_without_linters() {
-        // With no `[linter.*]` configured (defaults ship in ticket 03), every
+        // With no `[linter.rule.*]` configured (defaults ship in ticket 03), every
         // file is lint-uncovered — the gate is unchanged.
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         let tmp = tempfile::tempdir().expect("tempdir");

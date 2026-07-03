@@ -31,7 +31,7 @@ pub fn validate(config: &Config) -> Vec<String> {
             if !config.server.contains_key(&binding.name) {
                 errors.push(format!(
                     "Language '{key}' references server '{}', \
-                     but no [server.{}] is defined",
+                     but no [lsp.server.{}] is defined",
                     binding.name, binding.name,
                 ));
             }
@@ -122,8 +122,8 @@ pub fn validate(config: &Config) -> Vec<String> {
     errors
 }
 
-/// Validates `[linter.*]` definitions, appending any errors (workstream 34
-/// ticket 01).
+/// Validates `[linter.rule.*]` definitions, appending any errors (workstream 34
+/// tickets 01/04).
 ///
 /// Each linter must have a non-empty `command`, and every routing pattern must
 /// be a non-empty, valid glob.
@@ -148,10 +148,10 @@ fn validate_linters(config: &Config, errors: &mut Vec<String>) {
     }
 }
 
-/// Warns about orphan `[server.*]` entries in a project config.
+/// Warns about orphan `[lsp.server.*]` entries in a project config.
 ///
 /// A project server def is an orphan if it has spawn fields (`command`)
-/// but neither the project's `[language.*]` nor the user's `[language.*]`
+/// but neither the project's `[lsp.language.*]` nor the user's `[lsp.language.*]`
 /// references it. Settings-only overrides (no `command`) are not orphans
 /// — they override user-level server settings for this root.
 pub fn warn_orphan_project_servers(
@@ -180,8 +180,8 @@ pub fn warn_orphan_project_servers(
                 source = Source::ConfigValidation.as_str(),
                 root = %root.display(),
                 server = server_name.as_str(),
-                "Project config at {}: [server.{server_name}] has a `command` \
-                 but no [language.*] references it — this server will never be spawned",
+                "Project config at {}: [lsp.server.{server_name}] has a `command` \
+                 but no [lsp.language.*] references it — this server will never be spawned",
                 root.display(),
             );
         }

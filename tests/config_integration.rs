@@ -30,10 +30,10 @@ fn write_mockls_config(dir: &Path) -> Result<PathBuf> {
     std::fs::write(
         &config_path,
         format!(
-            "[server.mockls-{MOCK_LANG_A}]\n\
+            "[lsp.server.mockls-{MOCK_LANG_A}]\n\
              command = \"{mockls_bin}\"\n\
              args = [\"{MOCK_LANG_A}\"]\n\n\
-             [language.{MOCK_LANG_A}]\n\
+             [lsp.language.{MOCK_LANG_A}]\n\
              servers = [\"mockls-{MOCK_LANG_A}\"]\n"
         ),
     )?;

@@ -98,7 +98,7 @@ impl<'de> Deserialize<'de> for DispatchMethod {
 /// to `{ name, diagnostics: true, disabled_methods: [] }`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerBinding {
-    /// Server name (references a `[server.*]` entry).
+    /// Server name (references a `[lsp.server.*]` entry).
     pub name: String,
 
     /// Whether this server delivers diagnostics for this language.
@@ -220,14 +220,14 @@ where
 
 /// Per-language configuration for how Catenary handles a language.
 ///
-/// Each entry references one or more server definitions from `[server.*]`
+/// Each entry references one or more server definitions from `[lsp.server.*]`
 /// via the `servers` list and controls diagnostic severity filtering.
 /// Classification fields (`extensions`, `filenames`, `shebangs`) define
 /// how files are mapped to this language.
 #[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
 pub struct LanguageConfig {
-    /// Ordered list of server bindings (references `[server.*]` entries).
+    /// Ordered list of server bindings (references `[lsp.server.*]` entries).
     /// Order defines dispatch priority.
     ///
     /// `None` means the entry did not specify a `servers` key — merge

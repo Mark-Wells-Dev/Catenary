@@ -28,7 +28,7 @@ go install golang.org/x/tools/gopls@latest
 
 ## Config
 
-Catenary ships a built-in definition for `gopls` — no `[server.*]`
+Catenary ships a built-in definition for `gopls` — no `[lsp.server.*]`
 config is needed. If `gopls` is on PATH, it works automatically.
 
 ## Notes
