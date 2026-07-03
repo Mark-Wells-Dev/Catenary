@@ -11,10 +11,20 @@ use std::process::{Command, Stdio};
 use tempfile::TempDir;
 
 use super::{
-    OpaqueWrite, Position, SegCtx, SegmentClass, State, expand_word, resolve_command,
-    resolve_segment,
+    OpaqueWrite, Position, SegCtx, SegmentClass, State, WriteToolset, expand_word, resolve_command,
+    resolve_script_with, resolve_segment,
 };
 use crate::cli::command_filter::parse;
+
+/// Resolve against a specific writer toolset (allowlist subset), expecting an
+/// opaque denial; returns it.
+fn err_with(cmd: &str, cwd: Option<&Path>, toolset: WriteToolset) -> OpaqueWrite {
+    let script = parse::parse(cmd);
+    match resolve_script_with(&script, cwd, toolset) {
+        Ok(lw) => panic!("expected {cmd:?} to be opaque, resolved to {lw:?}"),
+        Err(op) => op,
+    }
+}
 
 /// Resolve expecting success; returns the recorded write-set.
 fn ok(cmd: &str, cwd: &Path) -> BTreeSet<PathBuf> {
@@ -1704,5 +1714,413 @@ fn patch_output_relocation_is_opaque() {
             .expect_err("relocated")
             .construct,
         "git-patch-relocated",
+    );
+}
+
+// ── Cold-agent denial wording (ticket 119) ───────────────────────────────────
+
+/// The closed denial set, swept for cold-agent language: every reworded reason
+/// states the cause in plain terms, offers a principled proceed clause, and
+/// closes with the decision-023 write-model pointer — with no insider
+/// vocabulary reaching the agent. One table drives every form reachable without
+/// a filesystem/git fixture; the filesystem-query, git-query, and config-aware
+/// forms are pinned in the tests that follow.
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one flat (command, construct, phrase) table over the closed denial \
+              set — splitting it would scatter the single sweep it exists to pin"
+)]
+fn cold_agent_denial_wording_pins() {
+    // (command, construct, a distinctive phrase from the reworded message)
+    let cases: &[(&str, &str, &str)] = &[
+        // resolver.rs — shell grammar & variables
+        (
+            "echo x >",
+            "dangling-redirect",
+            "names no file for the hook to track",
+        ),
+        (
+            "echo x > $(n)",
+            "command-substitution-target",
+            "only at runtime",
+        ),
+        (
+            "echo x > '$A'$B",
+            "mixed-quoting",
+            "which parts expand into the filename",
+        ),
+        (
+            "R=-r; cp $R a b",
+            "computed-flag",
+            "changing which files it writes",
+        ),
+        (
+            "cd $DIR && echo x > f",
+            "opaque-cwd",
+            "can't place the relative write targets",
+        ),
+        (
+            "read F; echo x > $F",
+            "runtime-variables",
+            "what a later `$…` write target expands to",
+        ),
+        (
+            "echo x > $1",
+            "special-parameter",
+            "get their values only at runtime",
+        ),
+        (
+            "echo x > ${F:-x}",
+            "parameter-expansion-form",
+            "compute their value at runtime",
+        ),
+        (
+            "true && F=a; echo x > $F",
+            "tainted-variable",
+            "can't tell what it expands to",
+        ),
+        (
+            "echo x > $F",
+            "unbound-variable",
+            "can't read the runtime environment",
+        ),
+        (
+            "echo x > ~root/f",
+            "tilde-user",
+            "another user's home only at runtime",
+        ),
+        (
+            "echo x > *.txt",
+            "glob-single-target",
+            "can match several files or none",
+        ),
+        // resolver.rs — movers & tools
+        (
+            "cp a {b,c}",
+            "multi-word-destination",
+            "which single file is the target",
+        ),
+        (
+            "cp -t d a",
+            "unmodeled-flag",
+            "send writes somewhere the hook can't predict",
+        ),
+        (
+            "ln --backup=numbered -S .o a b",
+            "unmodeled-flag",
+            "put the link somewhere the hook can't predict",
+        ),
+        ("ln -T a", "ln-ambiguous-link", "which name is the link"),
+        (
+            "dd if=/dev/zero of=img",
+            "unmodeled-writer",
+            "can't trace to a path",
+        ),
+        (
+            "eval \"echo x > f\"",
+            "dynamic-execution",
+            "commands assembled at runtime",
+        ),
+        (
+            "python -c 'x'",
+            "unbounded-interpreter",
+            "runs inline code the hook can't check",
+        ),
+        // resolver.rs — sed
+        (
+            "sed -f p.sed f",
+            "sed-script-file",
+            "reads the script from a separate file",
+        ),
+        (
+            "sed -i \"s/$X/y/\" f",
+            "computed-sed-script",
+            "assembled at runtime",
+        ),
+        (
+            "sed -i 'v 4' f",
+            "sed-unverifiable-script",
+            "only edits text",
+        ),
+        (
+            "sed -i 'w x' f",
+            "sed-write-command",
+            "the hook can't see to track",
+        ),
+        (
+            "sed -i '1e ls' f",
+            "sed-exec-command",
+            "the hook can't see what files it writes",
+        ),
+        (
+            "sed -i 's/a/b/w x' f",
+            "sed-s-write-flag",
+            "the hook can't see to track",
+        ),
+        (
+            "sed -i 's/a/b/e' f",
+            "sed-s-exec-flag",
+            "the hook can't see what files it writes",
+        ),
+        (
+            "sed -i'b/*' 's/a/b/' f",
+            "sed-backup-template",
+            "backup paths the hook can't predict",
+        ),
+        (
+            "sed -Q 's/a/b/' f",
+            "unmodeled-flag",
+            "tell the script apart from the files",
+        ),
+        // resolver.rs — rsync, shell wrappers, xargs
+        (
+            "rsync -av host:src .",
+            "rsync-remote",
+            "what a remote rsync endpoint would write",
+        ),
+        (
+            "rsync -a --files-from=l src dst",
+            "rsync-files-from",
+            "the list of things to transfer",
+        ),
+        (
+            "bash --verbose -c 'echo x'",
+            "unmodeled-shell-flag",
+            "find the `-c` program to check",
+        ),
+        (
+            "bash -c \"$PROG\"",
+            "computed-shell-program",
+            "program assembled at runtime",
+        ),
+        (
+            "echo f | xargs tee",
+            "stdin-driven-targets",
+            "reads its write targets from stdin",
+        ),
+        (
+            "xargs -Z cat",
+            "unmodeled-flag",
+            "find the wrapped command to check",
+        ),
+        // git.rs
+        (
+            "git -C x checkout HEAD~1 -- a.rs",
+            "git-relocated-repo",
+            "against another repository",
+        ),
+        (
+            "git checkout $REF -- a.rs",
+            "git-opaque-ref",
+            "ask git which files it would change",
+        ),
+        (
+            "git checkout HEAD -- $P",
+            "git-opaque-paths",
+            "ask git which files it would change",
+        ),
+        (
+            "git apply $P",
+            "git-opaque-patch",
+            "which files the patch touches",
+        ),
+        (
+            "git checkout HEAD~1 -- a.rs",
+            "git-no-cwd",
+            "given none for the call",
+        ),
+        (
+            "git checkout -p",
+            "git-interactive-select",
+            "picks hunks interactively",
+        ),
+        (
+            "git checkout --pathspec-from-file=f",
+            "git-pathspec-from-file",
+            "reads the path list from a file",
+        ),
+        (
+            "git apply",
+            "git-stdin-patch",
+            "come from a diff the hook can't read",
+        ),
+        (
+            "patch -o out a < d",
+            "git-patch-relocated",
+            "sends its output somewhere the hook can't predict",
+        ),
+        // programs.rs — awk
+        (
+            "awk 'BEGIN{system(\"x\")}'",
+            "awk-system",
+            "the hook can't see what files it writes",
+        ),
+        (
+            "awk '{print | \"sort\"}'",
+            "awk-pipe",
+            "the hook can't see what files it writes",
+        ),
+        (
+            "awk '{print > \"f\"}'",
+            "awk-redirect",
+            "the hook can't see to track",
+        ),
+        (
+            "awk -f p.awk a",
+            "awk-program-file",
+            "reads the program from a separate file",
+        ),
+        (
+            "awk \"$P\" a",
+            "awk-computed-program",
+            "assembled at runtime",
+        ),
+        (
+            "gawk -i json '{print}' a",
+            "awk-extension",
+            "run arbitrary code the hook can't check",
+        ),
+        (
+            "awk -Z '{print}' a",
+            "awk-unmodeled-flag",
+            "tell the program apart from the files",
+        ),
+        // programs.rs — perl
+        (
+            "perl -pe 's/a/b/e' a",
+            "perl-e-flag",
+            "runs the replacement as code",
+        ),
+        (
+            "perl -e 'system(\"x\")'",
+            "perl-unverifiable-program",
+            "only substitutes text",
+        ),
+        (
+            "perl -pe \"$P\" a",
+            "perl-computed-program",
+            "assembled at runtime",
+        ),
+        (
+            "perl -i edit.pl a",
+            "perl-program-file",
+            "can't tell which files change",
+        ),
+        (
+            "perl -MFoo -pe 's/a/b/' a",
+            "perl-module-load",
+            "run arbitrary code the hook can't check",
+        ),
+        (
+            "perl -i'o*' -pe 's/a/b/' a",
+            "perl-backup-template",
+            "backup paths the hook can't predict",
+        ),
+        (
+            "perl --frob -pe 's/a/b/' a",
+            "perl-unmodeled-flag",
+            "tell the program apart from the files",
+        ),
+    ];
+    for (cmd, construct, needle) in cases {
+        let op = err(cmd, None);
+        assert_eq!(
+            &op.construct, construct,
+            "construct for {cmd:?}: {}",
+            op.message,
+        );
+        assert!(
+            op.message.contains(needle),
+            "wording for {cmd:?} missing {needle:?}: {}",
+            op.message,
+        );
+        // The decision-023 pointer closes every denial.
+        assert!(
+            op.message.ends_with("Write model: `catenary commands`."),
+            "023 pointer missing for {cmd:?}: {}",
+            op.message,
+        );
+        // No insider vocabulary reaches the cold agent.
+        for banned in [
+            "the resolver",
+            "write-set",
+            "content-introducing",
+            "unattributable",
+        ] {
+            assert!(
+                !op.message.contains(banned),
+                "insider term {banned:?} in {cmd:?}: {}",
+                op.message,
+            );
+        }
+    }
+}
+
+/// The unbounded-interpreter proceed clause is config-aware: it names an
+/// in-place editor only when the live allowlist permits it, and otherwise
+/// points at the always-available host edit tools (the build-key precedent).
+#[test]
+fn unbounded_interpreter_proceed_tracks_the_allowlist() {
+    let cmd = "python -c \"open('f','w')\"";
+    // `sed` allowlisted, `perl` not: the proceed names sed and not perl.
+    let only_sed = err_with(cmd, None, WriteToolset::from_allowed(|t| t == "sed"));
+    assert_eq!(only_sed.construct, "unbounded-interpreter");
+    assert!(
+        only_sed.message.contains("`sed -i`"),
+        "{}",
+        only_sed.message
+    );
+    assert!(
+        !only_sed.message.contains("perl"),
+        "perl is not allowlisted: {}",
+        only_sed.message,
+    );
+    // Nothing allowlisted: fall back to the host edit tools, naming no editor.
+    let none = err_with(cmd, None, WriteToolset::from_allowed(|_| false));
+    assert!(
+        none.message.contains("host's edit tools"),
+        "{}",
+        none.message,
+    );
+    assert!(
+        !none.message.contains("`sed -i`") && !none.message.contains("`perl"),
+        "no shell editor named when none is allowlisted: {}",
+        none.message,
+    );
+}
+
+/// The unmodeled-writer proceed clause names `cp`/`mv` only when the allowlist
+/// permits them; otherwise it offers the redirect / host-edit fallback.
+#[test]
+fn unmodeled_writer_proceed_tracks_the_allowlist() {
+    let cmd = "install -m 755 a /usr/bin/a";
+    let with_cp = err_with(cmd, None, WriteToolset::from_allowed(|t| t == "cp"));
+    assert_eq!(with_cp.construct, "unmodeled-writer");
+    assert!(
+        with_cp.message.contains("Copy with `cp`"),
+        "{}",
+        with_cp.message,
+    );
+    let none = err_with(cmd, None, WriteToolset::from_allowed(|_| false));
+    assert!(
+        !none.message.contains("`cp`") && !none.message.contains("`mv`"),
+        "no mover named when none is allowlisted: {}",
+        none.message,
+    );
+    assert!(none.message.contains("redirect"), "{}", none.message);
+}
+
+/// A content-query git form in a directory that isn't a repository: the git
+/// query fails, so the write-set can't be read — `git-query-failed`.
+#[test]
+fn git_content_query_failure_is_opaque() {
+    let t = tmp();
+    let op = resolve_command("git stash pop", Some(t.path())).expect_err("not a repo");
+    assert_eq!(op.construct, "git-query-failed");
+    assert!(
+        op.message.contains("which files this command would change"),
+        "{}",
+        op.message,
     );
 }

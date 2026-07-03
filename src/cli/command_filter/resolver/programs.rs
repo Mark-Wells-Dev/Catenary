@@ -715,9 +715,9 @@ fn scan_perl_section(bytes: &[u8], mut i: usize, delim: u8) -> Option<usize> {
 fn awk_system() -> Unresolved {
     u(
         "awk-system",
-        "The awk `system()` call runs a shell command from inside the program — an \
-         unresolvable exec whose writes can't be attributed. Run the command directly, \
-         or use awk as a pure filter.",
+        "The awk `system()` call runs a shell command from inside the program, so the \
+         hook can't see what files it writes. Run that command directly, or use awk as \
+         a plain filter.",
     )
 }
 
@@ -725,8 +725,8 @@ fn awk_pipe() -> Unresolved {
     u(
         "awk-pipe",
         "An awk command pipe (`print | \"cmd\"` or `\"cmd\" | getline`) runs a shell \
-         command from inside the program — unresolvable. Drop the pipe and use awk as a \
-         pure filter, or run the command directly.",
+         command from inside the program, so the hook can't see what files it writes. \
+         Drop the pipe and use awk as a plain filter, or run the command directly.",
     )
 }
 
@@ -734,24 +734,25 @@ fn awk_redirect() -> Unresolved {
     u(
         "awk-redirect",
         "An in-program awk output redirect (`print`/`printf … > file` or `>> file`) \
-         writes a file named inside the program — an unattributable write. Use gawk \
-         `-i inplace` to edit files, or a shell redirect, both of which resolve.",
+         writes a file named inside the program, which the hook can't see to track. \
+         Edit files with gawk `-i inplace`, or send output through a shell redirect.",
     )
 }
 
 fn awk_program_file() -> Unresolved {
     u(
         "awk-program-file",
-        "`awk -f`/`--file` reads the program from a file the hook can't check for \
-         exec/redirect constructs. Inline the program as a literal argument.",
+        "`awk -f`/`--file` reads the program from a separate file the hook can't check \
+         for commands that run or redirect. Inline the program as a literal argument.",
     )
 }
 
 fn awk_computed_program() -> Unresolved {
     u(
         "awk-computed-program",
-        "This awk program is computed at runtime (`$VAR` / `$(…)` / an unquoted glob), \
-         so it can't be checked for exec/redirect constructs. Quote a literal program.",
+        "This awk program is assembled at runtime (`$VAR` / `$(…)` / an unquoted glob), \
+         so the hook can't check it for commands that run or redirect. Quote a literal \
+         program.",
     )
 }
 
@@ -759,9 +760,9 @@ fn awk_extension(value: &str) -> Unresolved {
     u(
         "awk-extension",
         format!(
-            "gawk `-i {value}` loads an extension that can run arbitrary code — only \
-             `-i inplace` (in-place editing) is modeled. Use `-i inplace`, or run the \
-             work another way."
+            "gawk `-i {value}` loads an extension that can run arbitrary code the hook \
+             can't check — only `-i inplace` (in-place editing) is recognized. Use \
+             `-i inplace`, or make the edit with the host's edit tools."
         ),
     )
 }
@@ -770,8 +771,8 @@ fn awk_unmodeled_flag(flag: &str) -> Unresolved {
     u(
         "awk-unmodeled-flag",
         format!(
-            "`awk {flag}` isn't a flag the resolver models, so the program/file split \
-             can't be trusted. Use the plain `awk [-F sep] [-v var=val] 'program' \
+            "`awk {flag}` isn't a flag the hook recognizes, so it can't tell the program \
+             apart from the files. Use the plain `awk [-F sep] [-v var=val] 'program' \
              file…` form."
         ),
     )
@@ -780,25 +781,26 @@ fn awk_unmodeled_flag(flag: &str) -> Unresolved {
 fn perl_e_flag() -> Unresolved {
     u(
         "perl-e-flag",
-        "The perl `s///e` flag evaluates the replacement as code — an unresolvable \
-         exec. Drop the `e` flag; a plain `s///` substitution resolves.",
+        "The perl `s///e` flag runs the replacement as code, so the hook can't see what \
+         files it writes. Drop the `e` flag; a plain `s///` substitution is fine.",
     )
 }
 
 fn perl_unverifiable_program() -> Unresolved {
     u(
         "perl-unverifiable-program",
-        "This perl program couldn't be verified as pure substitution (the checked \
-         subset: `;`-separated `s///`, `tr///`, `y///` statements with `/`-style \
-         delimiters, flags other than `/e`). Simplify it, or run the work another way.",
+        "The hook couldn't confirm this perl program only substitutes text (the \
+         recognized subset: `;`-separated `s///`, `tr///`, `y///` statements with \
+         `/`-style delimiters, flags other than `/e`), so it can't tell whether it also \
+         writes files. Simplify it, or make the edit with the host's edit tools.",
     )
 }
 
 fn perl_computed_program() -> Unresolved {
     u(
         "perl-computed-program",
-        "This perl program is computed at runtime (`$VAR` / `$(…)` / an unquoted glob), \
-         so it can't be checked. Quote a literal `-e` program.",
+        "This perl program is assembled at runtime (`$VAR` / `$(…)` / an unquoted glob), \
+         so the hook can't check it for writes. Quote a literal `-e` program.",
     )
 }
 
@@ -806,7 +808,7 @@ fn perl_program_file() -> Unresolved {
     u(
         "perl-program-file",
         "`perl -i` with a script file (no `-e`) edits files through a program the hook \
-         can't check, so the write-set can't be bounded. Inline a literal `s///` \
+         can't check, so it can't tell which files change. Inline a literal `s///` \
          program with `-pe`.",
     )
 }
@@ -814,16 +816,16 @@ fn perl_program_file() -> Unresolved {
 fn perl_module_load() -> Unresolved {
     u(
         "perl-module-load",
-        "`perl -M`/`-m` loads a module that can run arbitrary code — unresolvable. Use \
-         a plain `-pe 's///'` substitution.",
+        "`perl -M`/`-m` loads a module that can run arbitrary code the hook can't check. \
+         Use a plain `-pe 's///'` substitution.",
     )
 }
 
 fn perl_backup_template() -> Unresolved {
     u(
         "perl-backup-template",
-        "A `perl -i` backup suffix containing `*` is a template whose backup paths the \
-         resolver doesn't model. Use a plain suffix like `-i.bak`.",
+        "A `perl -i` backup suffix containing `*` is a template that expands to backup \
+         paths the hook can't predict. Use a plain suffix like `-i.bak`.",
     )
 }
 
@@ -831,8 +833,9 @@ fn perl_unmodeled_flag(flag: &str) -> Unresolved {
     u(
         "perl-unmodeled-flag",
         format!(
-            "`perl {flag}` isn't a flag the resolver models, so the program/file split \
-             can't be trusted. Use the plain `perl -i[.bak] -pe 's///' file…` form."
+            "`perl {flag}` isn't a flag the hook recognizes, so it can't tell the \
+             program apart from the files. Use the plain `perl -i[.bak] -pe 's///' \
+             file…` form."
         ),
     )
 }

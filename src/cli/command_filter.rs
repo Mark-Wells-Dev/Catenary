@@ -306,7 +306,12 @@ pub fn check_and_resolve_command(
     // retired, ticket 05). Catenary's own segments get the same treatment — the
     // canonical-form matcher owns their allow/deny shape, the resolver their
     // write-set.
-    match resolver::resolve_script(&script, cwd) {
+    // A denial's sanctioned-proceed clause names another shell tool only when
+    // the live allowlist permits it (else it points at the host edit tools) —
+    // so the fix never bounces the agent into a second denial. Writers run at
+    // position 0, so `allow` (not `pipeline`) is the relevant membership.
+    let toolset = resolver::WriteToolset::from_allowed(|tool| rules.allow.contains(tool));
+    match resolver::resolve_script_with(&script, cwd, toolset) {
         Ok(writes) => Ok(writes),
         Err(opaque) => Err(Denial {
             command: opaque.command,

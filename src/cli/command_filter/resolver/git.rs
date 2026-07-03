@@ -733,92 +733,94 @@ fn git_query(cwd: &Path, args: &[&str]) -> Option<Vec<String>> {
 fn opaque_ref() -> Unresolved {
     u(
         "git-opaque-ref",
-        "This git ref is computed (`$VAR` / `$(…)` / an unquoted glob), so the file \
-         set it would introduce can't be queried. Name the ref literally.",
+        "This git ref is assembled at runtime (`$VAR` / `$(…)` / an unquoted glob), so \
+         the hook can't ask git which files it would change. Name the ref literally.",
     )
 }
 
 fn opaque_paths() -> Unresolved {
     u(
         "git-opaque-paths",
-        "A pathspec here is computed (`$VAR` / `$(…)` / an unquoted glob), so the \
-         write-set can't be queried. Name the paths literally (a quoted git pathspec \
-         like `'*.rs'` is fine).",
+        "A pathspec here is assembled at runtime (`$VAR` / `$(…)` / an unquoted glob), \
+         so the hook can't ask git which files it would change. Name the paths \
+         literally (a quoted git pathspec like `'*.rs'` is fine).",
     )
 }
 
 fn opaque_patch() -> Unresolved {
     u(
         "git-opaque-patch",
-        "The patch argument is computed, so its file set can't be read at hook time. \
-         Pass the patch as a literal file path.",
+        "The patch argument is assembled at runtime, so the hook can't read which files \
+         the patch touches. Pass the patch as a literal file path.",
     )
 }
 
 fn relocated_repo() -> Unresolved {
     u(
         "git-relocated-repo",
-        "`git -C` / `--git-dir` / `--work-tree` (or `git apply --directory`) relocates \
-         the repository, which the resolver doesn't model for content-introducing \
-         forms. Run the command from inside the target repository.",
+        "`git -C` / `--git-dir` / `--work-tree` (or `git apply --directory`) runs git \
+         against another repository, so the hook can't attribute the files it would \
+         write there. Run it from inside that repository.",
     )
 }
 
 fn no_cwd() -> Unresolved {
     u(
         "git-no-cwd",
-        "This git content form needs a working directory to query git for its \
-         write-set, but the hook has none for the call. Run it where the repository is.",
+        "This git command needs a working directory so the hook can ask git which files \
+         it would change, but it was given none for the call. Run it where the \
+         repository is.",
     )
 }
 
 fn query_failed() -> Unresolved {
     u(
         "git-query-failed",
-        "git couldn't resolve the file set for this command — it isn't a repository \
-         here, or the ref / patch / stash is unknown. Check the arguments, or apply \
-         the change through the host edit tools.",
+        "git couldn't tell the hook which files this command would change — this isn't a \
+         repository here, or the ref / patch / stash is unknown. Check the arguments, or \
+         apply the change through the host's edit tools.",
     )
 }
 
 fn patch_relocated() -> Unresolved {
     u(
         "git-patch-relocated",
-        "This `patch` form redirects or relocates its output (`-o` / `-d` / `-D` / \
-         `--prefix`), which the resolver doesn't model. Patch the file in place \
-         (`patch file.rs < changes.diff`), or write the output with a redirect.",
+        "This `patch` form sends its output somewhere the hook can't predict (`-o` / \
+         `-d` / `-D` / `--prefix`). Patch the file in place, or write the output with a \
+         redirect.",
     )
 }
 
 fn stdin_patch() -> Unresolved {
     u(
         "git-stdin-patch",
-        "The patch's target files come from a diff the hook can't read (stdin, or no \
-         file argument). Name the patch file: `git apply changes.diff`, or for `patch` \
-         name the file being patched: `patch file.rs < changes.diff`.",
+        "The files this patch would change come from a diff the hook can't read (stdin, \
+         or no file argument). Name the patch file as an argument — and for `patch`, \
+         name the file being patched.",
     )
 }
 
 fn rename_patch() -> Unresolved {
     u(
         "git-rename-patch",
-        "This patch renames files, whose targets the resolver doesn't model yet. \
-         Apply the rename through the host edit tools, or split it out.",
+        "This patch renames files, and the hook can't yet tell which paths the rename \
+         produces. Apply the rename through the host's edit tools, or split it out.",
     )
 }
 
 fn interactive_select() -> Unresolved {
     u(
         "git-interactive-select",
-        "`-p` / `--patch` selects hunks interactively, so the write-set is decided at \
-         runtime. Apply the whole set (drop `-p`), or use the host edit tools.",
+        "`-p` / `--patch` picks hunks interactively, so which files change is decided at \
+         runtime and the hook can't see it in advance. Apply the whole set (drop `-p`), \
+         or use the host's edit tools.",
     )
 }
 
 fn pathspec_from_file() -> Unresolved {
     u(
         "git-pathspec-from-file",
-        "`--pathspec-from-file` takes the path list from a file at runtime, so the \
-         write-set can't be resolved. Pass the paths on the command line.",
+        "`--pathspec-from-file` reads the path list from a file at runtime, so the hook \
+         can't tell which files change. Pass the paths on the command line.",
     )
 }

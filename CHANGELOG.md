@@ -91,6 +91,18 @@ upgrading.
 
 ### Changed
 
+- **Write-resolver denials rewritten for a cold agent.** Every denial from the
+  write resolver (an opaque redirect target, `git -C`/`--work-tree`, `sed`/`awk`/
+  `perl` writers and computed programs, `xargs`-driven targets, `dd`/`install`/
+  `truncate`, and the rest of the closed ~65-message set) now states its cause
+  in plain terms for an agent with no Catenary background — "the hook can't tell
+  which file this targets" rather than "the resolver doesn't model X" — offers
+  the sanctioned way to proceed as one principled clause, and closes with the
+  decision-023 pointer to `catenary commands`. Where the proceed clause names
+  another shell tool (`sed -i`/`perl -i -pe` for an in-place edit, `cp`/`mv` for
+  a copy), it is computed against the live allowlist and names only tools the
+  agent may run, falling back to the always-available host edit tools. No change
+  to which commands are denied — this is a message sweep only.
 - **SessionStart / SubagentStart inline the full prevention payload.** The
   Claude Code session hooks no longer inject a pointer ("run `catenary
   primer`") — they inline the primer's content directly into

@@ -121,7 +121,24 @@ pub(crate) fn resolve_script(
     script: &ParsedScript,
     cwd: Option<&Path>,
 ) -> Result<LineWrites, OpaqueWrite> {
+    resolve_script_with(script, cwd, WriteToolset::unrestricted())
+}
+
+/// Resolve an already-parsed script against a specific writer [`WriteToolset`]
+/// (the allowlist subset a denial's proceed clause may name). The config-aware
+/// twin of [`resolve_script`]: the hook passes the toolset built from the
+/// session's live allowlist so a denial suggests only tools the agent can run.
+///
+/// # Errors
+///
+/// Returns the first [`OpaqueWrite`] in document order.
+pub(crate) fn resolve_script_with(
+    script: &ParsedScript,
+    cwd: Option<&Path>,
+    toolset: WriteToolset,
+) -> Result<LineWrites, OpaqueWrite> {
     let mut state = State::new(cwd);
+    state.toolset = toolset;
     let mut writes = BTreeSet::new();
     resolve_into(script, &mut state, &mut writes)?;
     Ok(LineWrites { writes })
@@ -168,6 +185,10 @@ struct State {
     /// shape as an opaque `cd` (ws38 ticket 03, decision 026). Literal targets
     /// downstream are unaffected; recorded movers (`cp`/`mv`) are not barriers.
     barrier: bool,
+    /// Which writer tools the active allowlist permits, so a denial's proceed
+    /// clause names only tools the agent can actually run (see
+    /// [`WriteToolset`]).
+    toolset: WriteToolset,
 }
 
 impl State {
@@ -177,6 +198,7 @@ impl State {
             bindings: HashMap::new(),
             vars_tainted: false,
             barrier: false,
+            toolset: WriteToolset::unrestricted(),
         }
     }
 }
@@ -238,11 +260,108 @@ impl Unresolved {
     }
 }
 
-/// Shorthand constructor for [`Unresolved`].
+/// Shorthand constructor for [`Unresolved`]. Every denial closes with the
+/// decision-023 pointer at the write model — `catenary commands`, whose output
+/// ends with the two-sentence write-model summary a cold agent (one with no
+/// Catenary background) otherwise lacks. The reason and the sanctioned proceed
+/// clause before it stand on their own; the pointer is only where to read the
+/// whole picture.
 fn u(construct: &'static str, message: impl Into<String>) -> Unresolved {
-    Unresolved {
-        construct,
-        message: message.into(),
+    let mut message = message.into();
+    message.push_str(" Write model: `catenary commands`.");
+    Unresolved { construct, message }
+}
+
+/// The writer tools a denial's proceed clause may name (a subset of the
+/// allowlist). The hook resolves each command against the active allowlist, so
+/// suggesting a tool the allowlist forbids would only bounce the agent into a
+/// second denial — the proceed clause names a shell tool only when it is
+/// permitted, and otherwise points at the host edit tools (always available).
+const WRITER_TOOLS: [&str; 4] = ["sed", "perl", "cp", "mv"];
+
+/// Which resolvable writer tools the active command allowlist permits, so a
+/// denial's sanctioned-proceed clause names only tools the agent can actually
+/// run — the config-aware analogue of the build-key hint that names the
+/// configured build tool. Threaded from the allowlist at hook time;
+/// [`WriteToolset::unrestricted`] (every tool nameable) backs the config-free
+/// [`resolve_command`] entry point and the unit tests.
+#[derive(Debug, Clone)]
+pub(crate) struct WriteToolset {
+    allowed: BTreeSet<&'static str>,
+}
+
+impl WriteToolset {
+    /// Every writer tool nameable — the config-free default.
+    fn unrestricted() -> Self {
+        Self {
+            allowed: WRITER_TOOLS.into_iter().collect(),
+        }
+    }
+
+    /// Build from an allowlist-membership predicate (`is_allowed("sed")`, …).
+    pub(crate) fn from_allowed(is_allowed: impl Fn(&str) -> bool) -> Self {
+        Self {
+            allowed: WRITER_TOOLS
+                .into_iter()
+                .filter(|&t| is_allowed(t))
+                .collect(),
+        }
+    }
+
+    /// Whether the allowlist permits naming `tool`.
+    fn has(&self, tool: &str) -> bool {
+        self.allowed.contains(tool)
+    }
+
+    /// The sanctioned way to make an in-place text edit: the permitted checkable
+    /// editors, falling back to the always-available host edit tools.
+    fn inplace_hint(&self) -> String {
+        let mut tools = Vec::new();
+        if self.has("sed") {
+            tools.push("`sed -i`");
+        }
+        if self.has("perl") {
+            tools.push("`perl -i -pe`");
+        }
+        if tools.is_empty() {
+            "Make the edit with the host's edit tools.".to_string()
+        } else {
+            format!(
+                "Make the edit with a checkable form like {} — whose targets the hook \
+                 can track — or with the host's edit tools.",
+                join_or(&tools),
+            )
+        }
+    }
+
+    /// The sanctioned way to create or copy a file: the permitted movers, a
+    /// redirect, or the host edit tools.
+    fn copy_hint(&self) -> String {
+        let mut tools = Vec::new();
+        if self.has("cp") {
+            tools.push("`cp`");
+        }
+        if self.has("mv") {
+            tools.push("`mv`");
+        }
+        if tools.is_empty() {
+            "Write the file through a redirect, or with the host's edit tools.".to_string()
+        } else {
+            format!(
+                "Copy with {}, write the file through a redirect, or use the host's \
+                 edit tools.",
+                join_or(&tools),
+            )
+        }
+    }
+}
+
+/// Join tool names into a proceed clause: `[a]` → `a`, `[a, b]` → `a or b`.
+fn join_or(items: &[&str]) -> String {
+    if let [a, b] = items {
+        format!("{a} or {b}")
+    } else {
+        items.join(", ")
     }
 }
 
@@ -328,7 +447,7 @@ fn resolve_segment(cmd: &SimpleCommand, state: &mut State, ctx: SegCtx) -> Segme
         // script execution (`python script.py`) keeps the layer-4 executor
         // boundary (NoWrite); the allowlist governs whether it runs at all.
         "python" | "python2" | "python3" | "ruby" | "node" | "nodejs" => {
-            resolve_interpreter(name, cmd, &seg_name)
+            resolve_interpreter(name, cmd, &seg_name, &state.toolset)
         }
         // git splits by authorship: sync navigation is a no-debt barrier,
         // content introduction resolves via a git state query (ws38 ticket 03).
@@ -340,9 +459,9 @@ fn resolve_segment(cmd: &SimpleCommand, state: &mut State, ctx: SegCtx) -> Segme
             u(
                 "unmodeled-writer",
                 format!(
-                    "`{name}` writes files in a way the resolver doesn't model yet, so its \
-                     write-set can't be attributed. Use `cp`/`mv` or a redirect, whose \
-                     targets resolve."
+                    "`{name}` writes files in a way the hook can't trace to a path, so it \
+                     can't track what the command changes. {}",
+                    state.toolset.copy_hint(),
                 ),
             )
             .into_opaque(&seg_name),
@@ -351,9 +470,9 @@ fn resolve_segment(cmd: &SimpleCommand, state: &mut State, ctx: SegCtx) -> Segme
             u(
                 "dynamic-execution",
                 format!(
-                    "`{name}` executes dynamically assembled commands the hook can't \
-                     resolve, so any write inside it would go unattributed. Run the \
-                     commands directly."
+                    "`{name}` runs commands assembled at runtime, so the hook can't see \
+                     which files they write. Run those commands directly instead of \
+                     through `{name}`."
                 ),
             )
             .into_opaque(&seg_name),
@@ -541,8 +660,8 @@ fn expand_redirect_target(redirect: &Redirect, state: &State) -> Result<Vec<Path
     {
         return Err(u(
             "dangling-redirect",
-            "A redirect operator with no target can't be resolved (the shell would \
-             reject it). Name the target file.",
+            "A redirect with no target names no file for the hook to track (the shell \
+             would reject it too). Name the target file.",
         ));
     }
     expand_word(
@@ -579,9 +698,9 @@ fn expand_word(
     if meta.value_subs {
         return Err(u(
             "command-substitution-target",
-            "`$(…)`/backtick output names this write target at runtime, so the write \
-             can't be attributed. Materialize the name first, then pass the path \
-             literally.",
+            "`$(…)`/backtick output names this write target only at runtime, so the hook \
+             can't tell which file gets written. Materialize the name first, then pass \
+             the path literally.",
         ));
     }
     if meta.process_subs {
@@ -593,22 +712,23 @@ fn expand_word(
         }
         return Err(u(
             "process-substitution-target",
-            "A write target mixing text with `<(…)`/`>(…)` can't be resolved. Name a \
-             plain file path.",
+            "A write target mixing text with `<(…)`/`>(…)` doesn't name a file the hook \
+             can track. Name a plain file path.",
         ));
     }
     if text.is_empty() {
         return Err(u(
             "empty-target",
-            "An empty write target can't be resolved. Name the target file.",
+            "An empty write target names no file for the hook to track. Name the target \
+             file.",
         ));
     }
     if meta.literal_meta && meta.any_live() {
         return Err(u(
             "mixed-quoting",
             "This write target mixes quoted and unquoted expansion characters, so the \
-             hook can't tell which parts expand. Use a fully literal path, or a single \
-             unquoted `$NAME` bound in this command.",
+             hook can't tell which parts expand into the filename. Use a fully literal \
+             path, or a single unquoted `$NAME` bound in this command.",
         ));
     }
     if !meta.any_live() {
@@ -626,8 +746,9 @@ fn expand_word(
             if s.starts_with('-') && !w.starts_with('-') {
                 return Err(u(
                     "computed-flag",
-                    "A variable here expands to a `-` word, which the tool would read \
-                     as a flag — that changes what gets written. Pass flags literally.",
+                    "A variable here expands to a word starting with `-`, which the tool \
+                     reads as a flag — changing which files it writes. Pass flags \
+                     literally.",
                 ));
             }
             substituted.push(s);
@@ -654,16 +775,17 @@ fn expand_word(
         if w.is_empty() {
             return Err(u(
                 "empty-target",
-                "A write target here expands to an empty word. Name the target file.",
+                "This write target expands to an empty word, naming no file the hook can \
+                 track. Name the target file.",
             ));
         }
         if has_glob_chars(w) {
             if pos == Position::Single {
                 return Err(u(
                     "glob-single-target",
-                    "A glob in a single-file write position is ambiguous (it can match \
-                     several files or none). Name the file explicitly; globs resolve in \
-                     file-list positions like `sed -i 's/a/b/' src/*.rs`.",
+                    "A glob in a single-file write position (a redirect or a copy \
+                     destination) can match several files or none, so the hook can't \
+                     tell which one gets written. Name the file explicitly.",
                 ));
             }
             paths.extend(expand_glob(w, state)?);
@@ -704,9 +826,9 @@ fn resolve_path(word: &str, state: &State) -> Result<PathBuf, Unresolved> {
 fn poisoned_cwd() -> Unresolved {
     u(
         "opaque-cwd",
-        "An earlier `cd` in this command has an unresolvable target, so relative \
-         write targets after it can't be resolved. `cd` to a literal directory, or \
-         use absolute paths.",
+        "An earlier `cd` in this command changed to a directory the hook can't \
+         determine, so it can't place the relative write targets that follow. Give \
+         `cd` a literal directory, or use absolute paths.",
     )
 }
 
@@ -718,10 +840,10 @@ fn poisoned_cwd() -> Unresolved {
 fn git_barrier() -> Unresolved {
     u(
         "git-sync-barrier",
-        "An earlier git sync in this command (e.g. `git checkout`/`pull`/`merge`/\
-         `rebase`) moves the working tree, so a glob or git state query after it \
-         can't be resolved against a stable base. Run the sync as its own command, \
-         or name the files literally.",
+        "An earlier git sync here (`git checkout`/`pull`/`merge`/`rebase`) is about to \
+         change the files on disk, so the hook can't tell what a later glob or git \
+         query would match. Run the sync as its own command, or name the files \
+         literally.",
     )
 }
 
@@ -753,9 +875,9 @@ fn substitute_vars(text: &str, state: &State) -> Result<String, Unresolved> {
     if state.vars_tainted {
         return Err(u(
             "runtime-variables",
-            "An earlier command here (`read`/`declare`/`export`/…) can rebind \
-             variables at runtime, so `$…` write targets after it can't be resolved. \
-             Write the target path literally.",
+            "An earlier command here (`read`/`declare`/`export`/…) can change variables \
+             at runtime, so the hook can't know what a later `$…` write target expands \
+             to. Write the target path literally.",
         ));
     }
     let bytes = text.as_bytes();
@@ -802,8 +924,9 @@ fn substitute_vars(text: &str, state: &State) -> Result<String, Unresolved> {
             _ => {
                 return Err(u(
                     "special-parameter",
-                    "Special/positional parameters (`$1`, `$@`, `$?`, …) in a write \
-                     target can't be resolved at hook time. Pass a literal path.",
+                    "Special/positional parameters (`$1`, `$@`, `$?`, …) get their values \
+                     only at runtime, so the hook can't tell which file this targets. \
+                     Pass a literal path.",
                 ));
             }
         }
@@ -815,9 +938,9 @@ fn substitute_vars(text: &str, state: &State) -> Result<String, Unresolved> {
 fn param_form() -> Unresolved {
     u(
         "parameter-expansion-form",
-        "`${…}` operator forms (defaults, indirection, arrays, slicing) can't be \
-         statically resolved for a write target. Use a plain `$NAME` bound in this \
-         command, or a literal path.",
+        "`${…}` operator forms (defaults, indirection, arrays, slicing) compute their \
+         value at runtime, so the hook can't tell which file this targets. Use a plain \
+         `$NAME` bound in this command, or a literal path.",
     )
 }
 
@@ -839,18 +962,17 @@ fn lookup_binding<'a>(name: &str, state: &'a State) -> Result<&'a str, Unresolve
             "tainted-variable",
             format!(
                 "`${name}` is set conditionally, per-iteration, or from computed \
-                 content in this command, so a write target using it can't be \
-                 resolved. Bind it once, unconditionally (`{name}=out.txt; …`), or \
-                 write the path literally."
+                 content here, so the hook can't tell what it expands to. Bind it once, \
+                 unconditionally, earlier in the same command, or write the path \
+                 literally."
             ),
         )),
         None => Err(u(
             "unbound-variable",
             format!(
-                "`${name}` isn't bound in this command — the hook can't read the \
-                 runtime environment, so the write can't be attributed. Bind it in \
-                 the same command line (`{name}=out.txt; … > \"${name}\"`) or write \
-                 the path literally."
+                "`${name}` isn't set in this command, and the hook can't read the \
+                 runtime environment, so it can't tell which file the write targets. \
+                 Bind it earlier in the same command, or write the path literally."
             ),
         )),
     }
@@ -866,7 +988,8 @@ fn tilde_expand(word: &str) -> Result<String, Unresolved> {
         dirs::home_dir().ok_or_else(|| {
             u(
                 "tilde-no-home",
-                "`~` can't be resolved (no home directory). Use an absolute path.",
+                "`~` can't be expanded here — there's no home directory to stand in for \
+                 it. Use an absolute path.",
             )
         })
     };
@@ -878,7 +1001,8 @@ fn tilde_expand(word: &str) -> Result<String, Unresolved> {
     }
     Err(u(
         "tilde-user",
-        "`~user` paths can't be resolved at hook time. Use an absolute path or `~/…`.",
+        "`~user` expands to another user's home only at runtime, so the hook can't tell \
+         what path it names. Use an absolute path or `~/…`.",
     ))
 }
 
@@ -973,8 +1097,8 @@ fn expand_glob(word: &str, state: &State) -> Result<Vec<PathBuf>, Unresolved> {
         (false, Cwd::Rel(_)) => {
             return Err(u(
                 "no-cwd-for-query",
-                "This glob needs a filesystem query, but the hook has no working \
-                 directory for the call. Use absolute paths.",
+                "Matching this glob means looking at the filesystem, but the hook wasn't \
+                 given a working directory to look in. Use absolute paths.",
             ));
         }
         (false, Cwd::Poisoned) => return Err(poisoned_cwd()),
@@ -987,8 +1111,8 @@ fn expand_glob(word: &str, state: &State) -> Result<Vec<PathBuf>, Unresolved> {
         .map_err(|_| {
             u(
                 "glob-form",
-                "This pattern isn't a glob form the hook can expand (unclosed `[`?). \
-                 Name the files explicitly.",
+                "This pattern isn't a glob form the hook can expand to a file list \
+                 (unclosed `[`?). Name the files explicitly.",
             )
         })?
         .compile_matcher();
@@ -1027,8 +1151,8 @@ fn walk_and_match(
     let glob_too_broad = || {
         u(
             "glob-too-broad",
-            "This glob is too broad to expand at hook time. Narrow the pattern or \
-             list the files.",
+            "This glob matches too many files for the hook to enumerate before the \
+             command runs. Narrow the pattern, or list the files explicitly.",
         )
     };
     if *budget == 0 {
@@ -1081,8 +1205,8 @@ fn walk_tree(root: &Path) -> Result<Vec<PathBuf>, Unresolved> {
         if *budget == 0 {
             return Err(u(
                 "tree-too-large",
-                "This directory tree is too large to enumerate at hook time. Copy or \
-                 sync a narrower directory.",
+                "This directory tree is too large for the hook to enumerate before the \
+                 command runs. Copy or sync a narrower directory.",
             ));
         }
         *budget -= 1;
@@ -1130,9 +1254,8 @@ fn split_operands<'a>(
         u(
             "unmodeled-flag",
             format!(
-                "`{tool} {flag}` changes where writes land in a way the resolver \
-                 doesn't model, so the write-set can't be attributed. Use the plain \
-                 `{tool} SRC… DST` form."
+                "`{tool} {flag}` can send writes somewhere the hook can't predict, so it \
+                 can't track where the files land. Use the plain `{tool} SRC… DST` form."
             ),
         )
     };
@@ -1190,7 +1313,8 @@ fn expand_destination(word: &str, meta: WordMeta, state: &State) -> Result<PathB
         Err(u(
             "multi-word-destination",
             "This destination expands to several words (or to a device sink), so the \
-             write-set can't be pinned. Name one destination path.",
+             hook can't tell which single file is the target. Name one destination \
+             path.",
         ))
     }
 }
@@ -1290,9 +1414,8 @@ fn mover_landings(
         u(
             "no-cwd-for-query",
             format!(
-                "`{tool}` needs a filesystem query (directory enumeration) to resolve \
-                 this write-set, but the hook has no working directory for the call. \
-                 Use absolute paths."
+                "`{tool}` needs to enumerate a directory to know what it writes, but the \
+                 hook wasn't given a working directory for the call. Use absolute paths."
             ),
         )
     };
@@ -1368,9 +1491,8 @@ fn resolve_ln(cmd: &SimpleCommand, state: &State) -> Result<SegmentClass, Unreso
         u(
             "unmodeled-flag",
             format!(
-                "`ln {flag}` changes where the link lands in a way the resolver doesn't \
-                 model, so the link path can't be attributed. Use the plain `ln [-s] \
-                 TARGET LINK` form."
+                "`ln {flag}` can put the link somewhere the hook can't predict, so it \
+                 can't track where it lands. Use the plain `ln [-s] TARGET LINK` form."
             ),
         )
     };
@@ -1461,8 +1583,8 @@ fn resolve_ln(cmd: &SimpleCommand, state: &State) -> Result<SegmentClass, Unreso
             return Ok(SegmentClass::Recorded(BTreeSet::from([link])));
         }
         return Err(ambiguous(
-            "`ln -T` expects exactly a TARGET and a LINK, so this form's link path \
-             can't be pinned. Use `ln -T TARGET LINK`.",
+            "`ln -T` expects exactly a TARGET and a LINK; with any other operand count \
+             the hook can't tell which name is the link. Use `ln -T TARGET LINK`.",
         ));
     }
 
@@ -1476,8 +1598,8 @@ fn resolve_ln(cmd: &SimpleCommand, state: &State) -> Result<SegmentClass, Unreso
         let target = expand_destination(dst_word, *dst_meta, state)?;
         let Some(base) = target.file_name() else {
             return Err(ambiguous(
-                "This `ln` target has no file-name component, so the link path can't be \
-                 pinned. Name the link explicitly (`ln TARGET LINK`).",
+                "This `ln` target has no final path component, so the hook can't tell \
+                 what the link would be named. Name the link explicitly.",
             ));
         };
         let link = resolve_path(&base.to_string_lossy(), state)?;
@@ -1527,9 +1649,14 @@ fn link_landings(target: &Path, dst: &Path, dst_is_dir: DirQ, writes: &mut BTree
 /// bare invocation or a script-file executor keeps the layer-4 boundary
 /// (`NoWrite`). This closes the vector where allowlisting the interpreter would
 /// otherwise let `python -c "open(…,'w')"` write unattributed (ws38 ticket 05).
-fn resolve_interpreter(name: &str, cmd: &SimpleCommand, seg_name: &str) -> SegmentClass {
+fn resolve_interpreter(
+    name: &str,
+    cmd: &SimpleCommand,
+    seg_name: &str,
+    toolset: &WriteToolset,
+) -> SegmentClass {
     interpreter_inline_flag(name, &cmd.argv).map_or(SegmentClass::NoWrite, |flag| {
-        SegmentClass::Opaque(unbounded_interpreter(name, &flag).into_opaque(seg_name))
+        SegmentClass::Opaque(unbounded_interpreter(name, &flag, toolset).into_opaque(seg_name))
     })
 }
 
@@ -1564,16 +1691,15 @@ fn interpreter_inline_flag(name: &str, argv: &[String]) -> Option<String> {
     None
 }
 
-/// The unbounded-interpreter denial: inline code the resolver can't check for
-/// writes, pointing at the checkable alternatives.
-fn unbounded_interpreter(name: &str, flag: &str) -> Unresolved {
+/// The unbounded-interpreter denial: inline code the hook can't check for
+/// writes, pointing at the checkable alternatives the allowlist permits.
+fn unbounded_interpreter(name: &str, flag: &str, toolset: &WriteToolset) -> Unresolved {
     u(
         "unbounded-interpreter",
         format!(
-            "`{name} {flag}` runs inline code the resolver can't check for writes, so any \
-             file it writes would go unattributed. For an in-place edit use a checkable \
-             subset — `sed -i`, `perl -i -pe 's/…/…/'` (look-around supported), or `awk` \
-             as a pure filter — whose write-sets resolve."
+            "`{name} {flag}` runs inline code the hook can't check for writes, so it \
+             can't tell which files the command creates. {}",
+            toolset.inplace_hint(),
         ),
     )
 }
@@ -1625,8 +1751,8 @@ fn resolve_sed(cmd: &SimpleCommand, state: &State) -> Result<SegmentClass, Unres
     if suffix.contains('*') || suffix.contains('/') {
         return Err(u(
             "sed-backup-template",
-            "A `sed -i` backup suffix containing `*` or `/` is a GNU template whose \
-             backup paths the resolver doesn't model. Use a plain suffix like \
+            "A `sed -i` backup suffix containing `*` or `/` is a GNU template that \
+             expands to backup paths the hook can't predict. Use a plain suffix like \
              `-i.bak`.",
         ));
     }
@@ -1658,8 +1784,8 @@ fn parse_sed_argv(cmd: &SimpleCommand) -> Result<SedInvocation, Unresolved> {
         u(
             "unmodeled-flag",
             format!(
-                "`sed {flag}` isn't a flag the resolver models, so the script/file \
-                 split can't be trusted. Use the plain `sed [-n] [-i[SUF]] SCRIPT \
+                "`sed {flag}` isn't a flag the hook recognizes, so it can't tell the \
+                 script apart from the files. Use the plain `sed [-n] [-i[SUF]] SCRIPT \
                  FILE…` form."
             ),
         )
@@ -1667,9 +1793,9 @@ fn parse_sed_argv(cmd: &SimpleCommand) -> Result<SedInvocation, Unresolved> {
     let computed_script = || {
         u(
             "computed-sed-script",
-            "This sed script is computed at runtime (`$VAR` / `$(…)` / an unquoted \
-             glob), so it can't be checked for write/exec commands. Quote a literal \
-             script.",
+            "This sed script is assembled at runtime (`$VAR` / `$(…)` / an unquoted \
+             glob), so the hook can't check it for commands that write or run files. \
+             Quote a literal script.",
         )
     };
     let mut scripts: Vec<String> = Vec::new();
@@ -1721,8 +1847,9 @@ fn parse_sed_argv(cmd: &SimpleCommand) -> Result<SedInvocation, Unresolved> {
                 _ if long == "file" || long.starts_with("file=") => {
                     return Err(u(
                         "sed-script-file",
-                        "`sed -f`/`--file` reads the script from a file the hook can't \
-                         check for write/exec commands. Inline the script.",
+                        "`sed -f`/`--file` reads the script from a separate file the hook \
+                         can't check for commands that write or run files. Inline the \
+                         script as a literal argument.",
                     ));
                 }
                 _ => return Err(unknown(arg)),
@@ -1754,8 +1881,9 @@ fn parse_sed_argv(cmd: &SimpleCommand) -> Result<SedInvocation, Unresolved> {
                     'f' => {
                         return Err(u(
                             "sed-script-file",
-                            "`sed -f`/`--file` reads the script from a file the hook \
-                             can't check for write/exec commands. Inline the script.",
+                            "`sed -f`/`--file` reads the script from a separate file the \
+                             hook can't check for commands that write or run files. \
+                             Inline the script as a literal argument.",
                         ));
                     }
                     'l' => {
@@ -1799,9 +1927,10 @@ fn check_sed_script(script: &str) -> Result<(), Unresolved> {
     let unverifiable = || {
         u(
             "sed-unverifiable-script",
-            "This sed script couldn't be verified as pure editing (the checked subset: \
-             `s///`, `y///`, addresses, `d p n N h H g G x q b t : { }` and `a i c` \
-             text). Simplify or split the script.",
+            "The hook couldn't confirm this sed script only edits text (the recognized \
+             subset: `s///`, `y///`, addresses, `d p n N h H g G x q b t : { }` and \
+             `a i c` text), so it can't tell whether it also writes or runs files. \
+             Simplify the script, or make the edit with the host's edit tools.",
         )
     };
     let bytes = script.as_bytes();
@@ -1824,16 +1953,17 @@ fn check_sed_script(script: &str) -> Result<(), Unresolved> {
             b'w' | b'W' => {
                 return Err(u(
                     "sed-write-command",
-                    "The sed `w`/`W` command writes to a file named inside the script — \
-                     an unattributable write. Use `sed -i` on the target files, or a \
-                     redirect, both of which resolve.",
+                    "The sed `w`/`W` command writes to a file named inside the script, \
+                     which the hook can't see to track. Write to the target files with \
+                     `sed -i`, or use a redirect.",
                 ));
             }
             b'e' => {
                 return Err(u(
                     "sed-exec-command",
-                    "The GNU sed `e` command executes a shell command from inside the \
-                     script — unresolvable. Run the command directly.",
+                    "The GNU sed `e` command runs a shell command from inside the \
+                     script, so the hook can't see what files it writes. Run that \
+                     command directly.",
                 ));
             }
             b's' => {
@@ -1841,14 +1971,14 @@ fn check_sed_script(script: &str) -> Result<(), Unresolved> {
                     SedSubErr::WriteFlag => u(
                         "sed-s-write-flag",
                         "The sed `s///w FILE` flag writes to a file named inside the \
-                         script — an unattributable write. Drop the `w` flag; use \
-                         `sed -i` or a redirect instead.",
+                         script, which the hook can't see to track. Drop the `w` flag \
+                         and write with `sed -i` or a redirect.",
                     ),
                     SedSubErr::ExecFlag => u(
                         "sed-s-exec-flag",
-                        "The GNU sed `s///e` flag executes the pattern space as a shell \
-                         command — unresolvable. Drop the `e` flag and run the command \
-                         directly.",
+                        "The GNU sed `s///e` flag runs the pattern space as a shell \
+                         command, so the hook can't see what files it writes. Drop the \
+                         `e` flag and run the command directly.",
                     ),
                     SedSubErr::Unparseable => unverifiable(),
                 })?;
@@ -2072,8 +2202,9 @@ fn resolve_rsync(cmd: &SimpleCommand, state: &State) -> Result<SegmentClass, Unr
     {
         return Err(u(
             "rsync-files-from",
-            "`rsync --files-from` takes the transfer list from a file at runtime, so \
-             the write-set can't be resolved. Pass the sources on the command line.",
+            "`rsync --files-from` reads the list of things to transfer from a file at \
+             runtime, so the hook can't tell which files it writes. Pass the sources on \
+             the command line.",
         ));
     }
     let operands = split_operands(cmd, &RSYNC_FLAGS, "rsync")?;
@@ -2081,8 +2212,8 @@ fn resolve_rsync(cmd: &SimpleCommand, state: &State) -> Result<SegmentClass, Unr
         if is_remote_rsync_operand(op) {
             return Err(u(
                 "rsync-remote",
-                "Remote rsync endpoints aren't modeled — the hook can't enumerate the \
-                 write-set. Run local-to-local rsync, or copy explicitly.",
+                "The hook can't see what a remote rsync endpoint would write. Run rsync \
+                 between local paths, or copy the files explicitly.",
             ));
         }
     }
@@ -2152,8 +2283,9 @@ fn rsync_landings(
         }
         DirQ::Unknown => Err(u(
             "no-cwd-for-query",
-            "`rsync` enumerates the write-set from its sources — a filesystem query — \
-             but the hook has no working directory for the call. Use absolute paths.",
+            "`rsync` works out what it writes by enumerating its sources on disk, but \
+             the hook wasn't given a working directory for the call. Use absolute \
+             paths.",
         )),
     }
 }
@@ -2181,9 +2313,9 @@ fn resolve_shell_wrapper(cmd: &SimpleCommand, state: &State, seg_name: &str) -> 
                     u(
                         "unmodeled-shell-flag",
                         format!(
-                            "`{seg_name} {arg}` isn't a flag the resolver models, so it \
-                             can't locate the `-c` program to check. Use the plain \
-                             `{seg_name} -c 'program'` form."
+                            "`{seg_name} {arg}` isn't a flag the hook recognizes, so it \
+                             can't find the `-c` program to check for writes. Use the \
+                             plain `{seg_name} -c 'program'` form."
                         ),
                     )
                     .into_opaque(seg_name),
@@ -2206,9 +2338,9 @@ fn resolve_shell_wrapper(cmd: &SimpleCommand, state: &State, seg_name: &str) -> 
             u(
                 "unmodeled-shell-flag",
                 format!(
-                    "`{seg_name} {arg}` isn't a flag the resolver models, so it can't \
-                     locate the `-c` program to check. Use the plain `{seg_name} -c \
-                     'program'` form."
+                    "`{seg_name} {arg}` isn't a flag the hook recognizes, so it can't \
+                     find the `-c` program to check for writes. Use the plain \
+                     `{seg_name} -c 'program'` form."
                 ),
             )
             .into_opaque(seg_name),
@@ -2232,10 +2364,9 @@ fn resolve_shell_wrapper(cmd: &SimpleCommand, state: &State, seg_name: &str) -> 
             u(
                 "computed-shell-program",
                 format!(
-                    "`{seg_name} -c` with a computed program (`\"$PROG\"`, `$(…)`, an \
-                     unquoted glob) can't be checked, so any write inside it would go \
-                     unattributed. Quote a literal program: `{seg_name} -c 'echo x > \
-                     f'`."
+                    "`{seg_name} -c` with a program assembled at runtime (`\"$PROG\"`, \
+                     `$(…)`, an unquoted glob) can't be checked, so the hook can't see \
+                     what files it writes. Quote a literal program."
                 ),
             )
             .into_opaque(seg_name),
@@ -2252,6 +2383,7 @@ fn resolve_shell_wrapper(cmd: &SimpleCommand, state: &State, seg_name: &str) -> 
         // sync barrier already set upstream still poisons state queries inside
         // the wrapped program.
         barrier: state.barrier,
+        toolset: state.toolset.clone(),
     };
     let mut writes = BTreeSet::new();
     match resolve_into(&script, &mut inner_state, &mut writes) {
@@ -2290,9 +2422,9 @@ fn resolve_xargs(cmd: &SimpleCommand, state: &State, seg_name: &str) -> SegmentC
             u(
                 "stdin-driven-targets",
                 format!(
-                    "`xargs {wrapped}` takes its write targets from stdin at runtime, \
-                     so they can't be attributed. Materialize the list (e.g. `catenary \
-                     grep -l PAT`), then pass the paths as literal arguments."
+                    "`xargs {wrapped}` reads its write targets from stdin at runtime, so \
+                     the hook can't tell which files it changes. Pass the file list as \
+                     literal path arguments instead of piping it in."
                 ),
             )
             .into_opaque(seg_name),
@@ -2328,10 +2460,10 @@ fn resolve_xargs(cmd: &SimpleCommand, state: &State, seg_name: &str) -> SegmentC
                     u(
                         "unmodeled-flag",
                         format!(
-                            "`xargs {arg}` isn't a flag the resolver models, so it \
-                             can't locate the wrapped command to check. Use plain \
-                             `xargs CMD` — or materialize the list and pass literal \
-                             paths."
+                            "`xargs {arg}` isn't a flag the hook recognizes, so it \
+                             can't find the wrapped command to check. Use plain \
+                             `xargs CMD`, or pass the file list as literal path \
+                             arguments."
                         ),
                     )
                     .into_opaque(seg_name),
@@ -2396,7 +2528,7 @@ fn resolve_xargs(cmd: &SimpleCommand, state: &State, seg_name: &str) -> SegmentC
         // write target).
         "python" | "python2" | "python3" | "ruby" | "node" | "nodejs" => {
             let inner = wrapped_command(cmd, i + 1, &wrapped);
-            resolve_interpreter(&wrapped, &inner, seg_name)
+            resolve_interpreter(&wrapped, &inner, seg_name, &state.toolset)
         }
         "cp" | "mv" | "ln" | "tee" | "rsync" | "dd" | "install" | "truncate" | "bash" | "sh"
         | "zsh" | "dash" | "ksh" | "eval" | "source" | "xargs" => stdin_targets(&wrapped),
