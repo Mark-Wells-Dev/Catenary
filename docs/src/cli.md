@@ -187,7 +187,11 @@ the gate **armed** for the files you didn't name, so the command filter
 keeps blocking unrelated commands until the rest are diagnosed. Editing a
 paid file re-arms it. A named path that was never edited is simply linted
 on demand — it pays nothing, since it owed nothing. Relative paths resolve
-against the shell's current working directory.
+against the shell's current working directory. A named path that does not
+exist, or that resolves **outside every mounted root**, is never dropped in
+silence — the receipt still names it on its own line and says why (`path
+does not exist`, or that it is not a mounted root, naming the enclosing
+project a `catenary roots add` would mount).
 
 `catenary diagnostics` is a load-bearing command — run it (bare or scoped)
 as its **own step** (no pipes, no `&&`/`;` chaining), and read the result.

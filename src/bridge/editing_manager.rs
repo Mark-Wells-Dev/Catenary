@@ -8,7 +8,7 @@
 //! database persistence needed since the session owns the [`super::session::Session`]
 //! which owns the `EditingManager`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -40,6 +40,10 @@ struct EditingState {
     files: Vec<PathBuf>,
     /// Files skipped during accumulation for lack of LSP coverage.
     filtered: usize,
+    /// Distinct enclosing project roots of the filtered (out-of-root) edits,
+    /// for the root-aware bare-run note (ephemeral-roots ticket 01 / bug 58).
+    /// Empty when a filtered edit had no detectable enclosing project root.
+    filtered_roots: BTreeSet<PathBuf>,
 }
 
 /// In-memory editing state manager.
@@ -155,6 +159,25 @@ impl EditingManager {
             .map_or(0, |state| state.filtered)
     }
 
+    /// Returns the distinct enclosing project roots of the agent's filtered
+    /// (out-of-root) edits, without draining the editing state.
+    ///
+    /// Companion to [`filtered`](Self::filtered): the `pre-tool/editing-stop`
+    /// prepare hook snapshots both into the handoff so a bare `catenary
+    /// diagnostics` can name the roots that have no language servers running
+    /// (ephemeral-roots ticket 01 / bug 58). Empty when no filtered edit
+    /// carried a detectable enclosing root.
+    #[must_use]
+    pub fn filtered_roots(&self, session_id: Option<&str>, agent_id: &str) -> BTreeSet<PathBuf> {
+        let key = editing_key(session_id, agent_id);
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+            .map(|state| state.filtered_roots.clone())
+            .unwrap_or_default()
+    }
+
     /// Accumulates a modified file path for an agent in editing mode.
     ///
     /// Idempotent — duplicate paths are not added.
@@ -211,6 +234,39 @@ impl EditingManager {
         {
             entry.filtered += 1;
         }
+    }
+
+    /// Records a filtered (out-of-root / uncovered) edit for an agent,
+    /// **creating** the editing entry if none exists yet.
+    ///
+    /// Unlike [`increment_filtered`](Self::increment_filtered) — a no-op until an
+    /// editing entry exists — this ensures a *standalone* out-of-root edit (one
+    /// with no covering edit alongside it to open the entry) is still counted, so
+    /// a later bare `catenary diagnostics` surfaces it instead of the bare
+    /// `[no edited files]` lie (ephemeral-roots ticket 01 / bug 58). The entry it
+    /// creates carries no files, so it never trips the boundary block and is
+    /// silently cleared at the agent's stop if never diagnosed.
+    ///
+    /// `root` is the filtered edit's enclosing project root when detectable
+    /// (walk `.git` up from the path), recorded for the root-aware note; `None`
+    /// only bumps the count.
+    pub fn record_filtered_edit(
+        &self,
+        session_id: Option<&str>,
+        agent_id: &str,
+        root: Option<PathBuf>,
+    ) {
+        let key = editing_key(session_id, agent_id);
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = state.entry(key).or_default();
+        entry.filtered += 1;
+        if let Some(root) = root {
+            entry.filtered_roots.insert(root);
+        }
+        drop(state);
     }
 
     /// Drains accumulated file paths for a single agent and removes its
@@ -411,6 +467,63 @@ mod tests {
     fn filtered_zero_when_not_editing() {
         let em = EditingManager::new();
         assert_eq!(em.filtered(None, "ghost"), 0);
+    }
+
+    #[test]
+    fn record_filtered_edit_creates_entry_when_standalone() {
+        // The bug-58 case: an out-of-root edit arrives with no covered edit
+        // alongside it, so no editing entry exists yet. `increment_filtered`
+        // would be a no-op; `record_filtered_edit` creates the entry so the
+        // count survives to the next bare `catenary diagnostics`.
+        let em = EditingManager::new();
+        assert!(
+            !em.is_editing(None, ""),
+            "no entry before the filtered edit"
+        );
+        em.record_filtered_edit(None, "", Some(PathBuf::from("/home/dev/Lattice")));
+        assert_eq!(
+            em.filtered(None, ""),
+            1,
+            "count survives with no prior entry"
+        );
+        // The filtered-only entry carries no files, so it never trips the gate.
+        assert!(
+            !em.has_files(None, ""),
+            "a filtered-only entry has no covered files"
+        );
+        assert_eq!(
+            em.filtered_roots(None, ""),
+            BTreeSet::from([PathBuf::from("/home/dev/Lattice")]),
+            "the enclosing root rides along for root-aware wording"
+        );
+    }
+
+    #[test]
+    fn record_filtered_edit_without_root_only_counts() {
+        // No detectable enclosing root → the count bumps but no root is named.
+        let em = EditingManager::new();
+        em.record_filtered_edit(None, "", None);
+        em.record_filtered_edit(None, "", None);
+        assert_eq!(em.filtered(None, ""), 2);
+        assert!(
+            em.filtered_roots(None, "").is_empty(),
+            "no root recorded when none was detectable"
+        );
+    }
+
+    #[test]
+    fn record_filtered_edit_dedups_roots() {
+        // Several filtered edits under one project name the root once.
+        let em = EditingManager::new();
+        let root = PathBuf::from("/home/dev/Lattice");
+        em.record_filtered_edit(None, "", Some(root.clone()));
+        em.record_filtered_edit(None, "", Some(root.clone()));
+        assert_eq!(em.filtered(None, ""), 2, "every filtered edit counts");
+        assert_eq!(
+            em.filtered_roots(None, ""),
+            BTreeSet::from([root]),
+            "the distinct root is named once"
+        );
     }
 
     #[test]

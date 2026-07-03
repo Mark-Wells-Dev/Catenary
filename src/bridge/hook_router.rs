@@ -480,23 +480,36 @@ impl HookRouter {
         agent_id: &str,
         tool_name: Option<&str>,
     ) -> Option<HookResult> {
-        if !self.session.editing.is_editing(session_id, agent_id)
-            || !tool_name.is_some_and(is_edit_tool)
-        {
+        if !tool_name.is_some_and(is_edit_tool) {
             return None;
         }
 
         // Only accumulate files a diagnostic feeder covers whose root has not
         // suppressed the diagnostics surface — files without coverage (or in a
-        // `disable_diag` root) have nothing to report in done_editing, so
-        // processing them is wasted work.
+        // `disable_diag` root) have nothing to report in done_editing.
         let path = Path::new(file_path);
         if self.session.covered_for_diagnostics(path) {
-            self.record_covered_write(path, session_id, agent_id, "edited");
+            // A covered edit entered editing mode in `handle_enforce_editing`
+            // (an allowed, non-guardrail-denied covered edit always does), so
+            // the entry exists — accumulate the file into it.
+            if self.session.editing.is_editing(session_id, agent_id) {
+                self.record_covered_write(path, session_id, agent_id, "edited");
+            }
         } else {
+            // Out-of-root / uncovered edit: `handle_enforce_editing` let it flow
+            // free WITHOUT entering editing mode, so a *standalone* one (no
+            // covered edit alongside it) leaves no editing entry for the old
+            // `increment_filtered` to bump — that gap is why a bare `catenary
+            // diagnostics` after only out-of-root edits lied with
+            // `[no edited files]` (bug 58 / ephemeral-roots ticket 01).
+            // `record_filtered_edit` creates the entry when needed and carries
+            // the enclosing project root (walk `.git` up) for the root-aware
+            // note. The entry holds no files, so it never trips the gate and is
+            // cleared silently at stop if never diagnosed.
+            let root = crate::companions::enclosing_worktree_root(path);
             self.session
                 .editing
-                .increment_filtered(session_id, agent_id);
+                .record_filtered_edit(session_id, agent_id, root);
             debug!(
                 source = Source::HookDispatch.as_str(),
                 file = file_path,
@@ -1049,8 +1062,13 @@ mod tests {
     }
 
     #[test]
-    fn uncovered_file_no_mode_no_gate() {
-        // No roots → no LSP coverage for the edited file.
+    fn uncovered_standalone_edit_counts_filtered_but_never_gates() {
+        // Bug 58 regression: no roots → no LSP coverage for the edited file, and
+        // no covered edit alongside it to open the editing entry. The edit is
+        // allowed (never gates), accumulates NO covered file — but it IS counted
+        // as filtered now, so a later bare `catenary diagnostics` surfaces it
+        // instead of the bare `[no edited files]` lie. (Before the fix this
+        // standalone out-of-root edit vanished: filtered stayed 0.)
         let router = test_router();
         let res = router.dispatch(crate::hook::HookRequest::PreTool {
             tool_name: "Edit".to_string(),
@@ -1065,15 +1083,19 @@ mod tests {
             "uncovered edit allowed, got {:?}",
             res.result
         );
+        // The filtered-only entry holds no covered files, so the boundary block
+        // (which gates on a non-empty covered set) never fires: the edit still
+        // never gates unrelated commands.
         assert!(
-            !router.session.editing.is_editing(None, ""),
-            "uncovered edit must not enter editing mode"
+            !router.session.editing.has_files(None, ""),
+            "uncovered edit accumulates no covered file, so it never gates"
         );
         let (files, filtered) = router.session.editing.drain_and_clear(None, "");
         assert!(files.is_empty(), "uncovered file not accumulated");
-        // Not in editing mode → accumulation returns early, so the file is
-        // not even counted as filtered.
-        assert_eq!(filtered, 0);
+        assert_eq!(
+            filtered, 1,
+            "the standalone out-of-root edit is counted as filtered (bug 58)"
+        );
     }
 
     #[test]

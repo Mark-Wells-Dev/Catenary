@@ -257,6 +257,27 @@ upgrading.
 
 ### Fixed
 
+- **`catenary diagnostics` never renders silence for an out-of-root or
+  nonexistent named path.** A scoped `catenary diagnostics <path>` that named a
+  path outside every mounted root — or one that did not exist (a relative path
+  resolving against the wrong cwd) — used to drop it in the path-resolution/
+  root-awareness gate and render completely empty stdout, indistinguishable from
+  a hang. Every named path now renders exactly one receipt line: `path does not
+  exist` for a missing path; `[no language servers running for <root> — not a
+  mounted root; see 'catenary roots -h']` when an enclosing project root is
+  detectable (walking `.git` up from the path), naming what a `catenary roots
+  add` would mount; or a plain `[outside every mounted root; …]` line when no
+  enclosing project root is found. The lines compose with the unavailable-server
+  banner and never touch the recovery machinery.
+- **A bare `catenary diagnostics` after only out-of-root edits no longer lies
+  with `[no edited files]`.** An out-of-root edit that arrived with no covered
+  edit alongside it never entered editing mode, so the filtered-edit counter
+  (which was a no-op until an editing entry existed) never incremented — the edit
+  vanished and the next bare run reported `[no edited files]` as if nothing had
+  been touched. The filtered edit now records itself even when it stands alone,
+  so the run surfaces `(N edits outside tracked roots — …)`; where the edit's
+  enclosing project root is detectable the note names it (`no language servers
+  running for ~/Projects/Lattice`).
 - **`catenary doctor` migration guidance now actually prints, in one pass.** The
   doctor migration walker raw-parsed each config source with a value-expression
   parser (`toml`'s `FromStr for Value`, which parses `[1, 2]`/`{a = 1}`, not a

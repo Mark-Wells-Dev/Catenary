@@ -132,6 +132,32 @@ struct UncoveredEntry {
     root: PathBuf,
 }
 
+/// A named path a scoped pull could not scope: it does not exist, or it
+/// resolves outside every mounted root.
+///
+/// A scoped `catenary diagnostics <path>` names paths directly, so each named
+/// path is a direct request that earns an explicit receipt line — never the
+/// silent drop that used to render empty stdout (bug 58 / ephemeral-roots
+/// ticket 01). These entries carry no mounted root to group under, so they
+/// render as flat one-line receipts appended to the body.
+struct OutOfScopeEntry {
+    /// The named path as resolved (home-compressed), for display.
+    display: String,
+    /// Why the path could not be scoped.
+    kind: OutOfScopeKind,
+}
+
+/// The reason a named path fell out of scope, driving its receipt wording.
+enum OutOfScopeKind {
+    /// The named path does not exist on disk (it could not be canonicalized).
+    Missing,
+    /// The named path exists but resolves outside every mounted root. Carries
+    /// the enclosing project root when one is detectable (walk `.git` up from
+    /// the path) — what a `catenary roots add` would mount — or `None` when no
+    /// enclosing project root is found.
+    OutsideRoots { enclosing_root: Option<PathBuf> },
+}
+
 /// A covered file that a feeder verified with no diagnostics.
 ///
 /// Listed in the receipt as `[clean]` beside its path — the explicit
@@ -268,7 +294,7 @@ impl DiagnosticsServer {
         // no-capability directories expanded to their covered files. Also yields
         // the per-file server assignment, so a file that dies before producing a
         // result can name the server(s) that owed it one (bug 56).
-        let (mut canonical_paths, uncovered, path_servers) =
+        let (mut canonical_paths, uncovered, out_of_scope, path_servers) =
             self.fan_out(&plan.fan_out, parent_id, &mut feeds).await;
 
         // Whole-root + capable scopes: one workspace/diagnostic request each,
@@ -286,6 +312,7 @@ impl DiagnosticsServer {
             &canonical_paths,
             &file_results,
             &uncovered,
+            &out_of_scope,
             &path_servers,
             plan.directory_scoped,
         );
@@ -303,10 +330,12 @@ impl DiagnosticsServer {
     /// → settle → health probe → didSave all → settle → retrieve per file → close
     /// all) → linter feeders. Populates `feeds` with each file's raw feeder
     /// diagnostics and returns the covered `canonical_paths`, the uncovered list,
-    /// and a per-file map of the diagnostic server(s) assigned to each covered
-    /// file (keyed by canonical-path string). The last is how a file that never
-    /// produced a result — because its server died mid-pipeline — can still name
-    /// the server that owed it one in the unverified receipt line (bug 56).
+    /// the out-of-scope list (named paths that do not exist or resolve outside
+    /// every mounted root — bug 58 / ephemeral-roots ticket 01), and a per-file
+    /// map of the diagnostic server(s) assigned to each covered file (keyed by
+    /// canonical-path string). The last is how a file that never produced a
+    /// result — because its server died mid-pipeline — can still name the server
+    /// that owed it one in the unverified receipt line (bug 56).
     ///
     /// Cross-file diagnostics (e.g., a renamed type that breaks importers) are
     /// correct because every server sees the complete final state before
@@ -324,10 +353,11 @@ impl DiagnosticsServer {
     ) -> (
         Vec<PathBuf>,
         Vec<UncoveredEntry>,
+        Vec<OutOfScopeEntry>,
         BTreeMap<String, BTreeSet<String>>,
     ) {
         if files.is_empty() {
-            return (Vec::new(), Vec::new(), BTreeMap::new());
+            return (Vec::new(), Vec::new(), Vec::new(), BTreeMap::new());
         }
 
         // Ensure servers exist for all files before looking them up.
@@ -338,6 +368,10 @@ impl DiagnosticsServer {
         // ── Phase 1: resolve + canonicalize ────────────────────────
         let mut canonical_paths: Vec<PathBuf> = Vec::new();
         let mut uncovered: Vec<UncoveredEntry> = Vec::new();
+        // Named paths that could not be scoped: nonexistent, or outside every
+        // mounted root. Kept explicit so a scoped pull never renders empty
+        // stdout for a named path (bug 58 / ephemeral-roots ticket 01).
+        let mut out_of_scope: Vec<OutOfScopeEntry> = Vec::new();
         // The lint-covered subset, fanned out to standalone linters in Phase 2b
         // (workstream 34 ticket 01). A file can be both LSP- and lint-covered.
         let mut lint_candidates: Vec<PathBuf> = Vec::new();
@@ -357,12 +391,24 @@ impl DiagnosticsServer {
             let file_str = file.to_string_lossy();
 
             // Resolve to absolute if needed (the editing-manager drain
-            // already returns absolute paths, but be defensive).
+            // already returns absolute paths, but be defensive). A path that
+            // cannot be made absolute (a relative path with no resolvable cwd)
+            // is treated as nonexistent rather than dropped silently — a named
+            // path is a direct request and earns a line (bug 58).
             let Ok(path) = resolve_path(&file_str) else {
+                out_of_scope.push(OutOfScopeEntry {
+                    display: super::compress_home(std::path::Path::new(file_str.as_ref())),
+                    kind: OutOfScopeKind::Missing,
+                });
                 continue;
             };
 
+            // The LSP-awareness gate declined the path: it is either nonexistent
+            // or outside every mounted root. Classify it so the receipt says
+            // which — instead of the silent drop that rendered empty stdout for
+            // a named out-of-root/nonexistent path (bug 58 / ticket 01).
             let Ok(canonical) = validator.validate_read(&path) else {
+                out_of_scope.push(classify_out_of_scope(&path));
                 continue;
             };
 
@@ -554,7 +600,7 @@ impl DiagnosticsServer {
             }
         }
 
-        (canonical_paths, uncovered, path_servers)
+        (canonical_paths, uncovered, out_of_scope, path_servers)
     }
 
     /// Routes a scoped diagnostics request across the fan-out and workspace-pull
@@ -823,11 +869,17 @@ impl DiagnosticsServer {
     /// its unverified list to `M files unverified` — since the dirty files are
     /// the signal. The diagnostics themselves are never collapsed (decision 025);
     /// only the clean and unverified lists are.
+    ///
+    /// `out_of_scope` carries the named paths that could not be scoped
+    /// (nonexistent, or outside every mounted root); each renders one explicit
+    /// line appended to the body so a scoped pull never renders empty stdout for
+    /// a named path (bug 58 / ephemeral-roots ticket 01).
     fn format_output(
         &self,
         canonical_paths: &[PathBuf],
         file_results: &BTreeMap<String, (String, Vec<DiagEntry>)>,
         uncovered: &[UncoveredEntry],
+        out_of_scope: &[OutOfScopeEntry],
         path_servers: &BTreeMap<String, BTreeSet<String>>,
         collapse_clean: bool,
     ) -> DiagnosticsOutcome {
@@ -916,13 +968,20 @@ impl DiagnosticsServer {
         // inline — no budget, no spill, no pointer line. A directory/whole-root
         // scope collapses the `[clean]` and unverified lists to counts (ticket 04
         // / bug 56).
-        let output = format_diagnostics(
+        let mut output = format_diagnostics(
             &diag_files,
             uncovered,
             &clean_files,
             &unverified_files,
             collapse_clean,
         );
+
+        // A scoped pull's named paths that fell out of scope (nonexistent, or
+        // outside every mounted root) render as flat one-line receipts appended
+        // to the body — after the root-grouped sections and the unavailable
+        // banner, so the change composes with the banner rather than displacing
+        // it (bug 58 / ephemeral-roots ticket 01).
+        output.push_str(&render_out_of_scope(out_of_scope));
 
         DiagnosticsOutcome {
             output,
@@ -1860,6 +1919,81 @@ fn format_diagnostics_entries(
         .collect()
 }
 
+/// Classifies a named path the LSP-awareness gate declined into its receipt
+/// category (bug 58 / ephemeral-roots ticket 01).
+///
+/// The gate ([`PathValidator::validate_read`]) fails a path for one of two
+/// reasons, and the receipt must say which: the path does not exist (it will
+/// not canonicalize → [`OutOfScopeKind::Missing`]), or it exists but resolves
+/// outside every mounted root ([`OutOfScopeKind::OutsideRoots`]). For the
+/// latter, the enclosing project root is detected by walking `.git` up from the
+/// path (the general anchor, [`crate::companions::enclosing_worktree_root`]) so
+/// the receipt can name what a `catenary roots add` would mount; a path with no
+/// enclosing project root carries `None`.
+fn classify_out_of_scope(resolved: &std::path::Path) -> OutOfScopeEntry {
+    resolved.canonicalize().map_or_else(
+        |_| OutOfScopeEntry {
+            display: super::compress_home(resolved),
+            kind: OutOfScopeKind::Missing,
+        },
+        |canonical| {
+            let enclosing_root = crate::companions::enclosing_worktree_root(&canonical);
+            OutOfScopeEntry {
+                display: super::compress_home(&canonical),
+                kind: OutOfScopeKind::OutsideRoots { enclosing_root },
+            }
+        },
+    )
+}
+
+/// Renders the out-of-scope named-path lines for a scoped receipt.
+///
+/// One line per named path that could not be scoped, never a silent drop (bug
+/// 58 / ephemeral-roots ticket 01). The lines are flat — these paths have no
+/// mounted root to group under — and each says *why* there is no verdict:
+///
+/// - nonexistent → `<path> [path does not exist]`;
+/// - outside every root, enclosing project root detectable → `<path> [no
+///   language servers running for <root> — not a mounted root; see `catenary
+///   roots -h`]`;
+/// - outside every root, no enclosing project root → `<path> [outside every
+///   mounted root; see `catenary roots -h`]`.
+///
+/// Returns the empty string when there is nothing out of scope, so the caller
+/// appends it unconditionally without a trailing blank line.
+fn render_out_of_scope(entries: &[OutOfScopeEntry]) -> String {
+    use std::fmt::Write;
+
+    let mut out = String::new();
+    for entry in entries {
+        match &entry.kind {
+            OutOfScopeKind::Missing => {
+                _ = writeln!(out, "{} [path does not exist]", entry.display);
+            }
+            OutOfScopeKind::OutsideRoots {
+                enclosing_root: Some(root),
+            } => {
+                _ = writeln!(
+                    out,
+                    "{} [no language servers running for {} \u{2014} not a mounted root; see `catenary roots -h`]",
+                    entry.display,
+                    super::compress_home(root),
+                );
+            }
+            OutOfScopeKind::OutsideRoots {
+                enclosing_root: None,
+            } => {
+                _ = writeln!(
+                    out,
+                    "{} [outside every mounted root; see `catenary roots -h`]",
+                    entry.display,
+                );
+            }
+        }
+    }
+    out
+}
+
 /// Formats the per-file receipt.
 ///
 /// Bare root-path section headers. Every diagnosed file is listed: dirty files
@@ -2636,6 +2770,144 @@ mod tests {
         assert_eq!(
             out, "unavailable: server-a\nunavailable: server-b\nBODY",
             "each joined server banners once, sorted, above the body: {out}"
+        );
+    }
+
+    // ── out-of-scope named paths (bug 58 / ephemeral-roots ticket 01) ──
+
+    #[test]
+    fn render_out_of_scope_empty_is_empty() {
+        // Nothing out of scope → the appended string is empty, so the caller
+        // never adds a stray blank line to an otherwise complete receipt.
+        assert_eq!(render_out_of_scope(&[]), "");
+    }
+
+    #[test]
+    fn render_out_of_scope_missing_line() {
+        // A named path that does not exist renders the literal
+        // `path does not exist`, closing the ws37-02 empty-stdout edge.
+        let entries = vec![OutOfScopeEntry {
+            display: "~/gone/file.rs".to_string(),
+            kind: OutOfScopeKind::Missing,
+        }];
+        assert_eq!(
+            render_out_of_scope(&entries),
+            "~/gone/file.rs [path does not exist]\n",
+        );
+    }
+
+    #[test]
+    fn render_out_of_scope_names_enclosing_root() {
+        // Outside every mounted root with a detectable enclosing project root:
+        // the line names the root and says it is not mounted, pointing at the
+        // command that would mount it.
+        let entries = vec![OutOfScopeEntry {
+            display: "~/Projects/Lattice/README.md".to_string(),
+            kind: OutOfScopeKind::OutsideRoots {
+                enclosing_root: Some(PathBuf::from("/home/dev/Projects/Lattice")),
+            },
+        }];
+        let out = render_out_of_scope(&entries);
+        assert!(
+            out.starts_with("~/Projects/Lattice/README.md [no language servers running for "),
+            "names the path and reason: {out}"
+        );
+        assert!(
+            out.contains("Projects/Lattice \u{2014} not a mounted root"),
+            "names the enclosing root and its unmounted status: {out}"
+        );
+        assert!(
+            out.contains("see `catenary roots -h`]"),
+            "points at the command that mounts it: {out}"
+        );
+        assert!(out.ends_with('\n'), "one complete line: {out:?}");
+    }
+
+    #[test]
+    fn render_out_of_scope_plain_line_without_root() {
+        // Outside every root with no detectable project root: a plain
+        // out-of-scope line, same family, no root named.
+        let entries = vec![OutOfScopeEntry {
+            display: "/etc/hostname".to_string(),
+            kind: OutOfScopeKind::OutsideRoots {
+                enclosing_root: None,
+            },
+        }];
+        assert_eq!(
+            render_out_of_scope(&entries),
+            "/etc/hostname [outside every mounted root; see `catenary roots -h`]\n",
+        );
+    }
+
+    #[test]
+    fn render_out_of_scope_one_line_per_path() {
+        // A mixed set renders exactly one line per named path — never a silent
+        // branch (the scoped-receipt contract).
+        let entries = vec![
+            OutOfScopeEntry {
+                display: "~/a/missing.rs".to_string(),
+                kind: OutOfScopeKind::Missing,
+            },
+            OutOfScopeEntry {
+                display: "~/b/outside.rs".to_string(),
+                kind: OutOfScopeKind::OutsideRoots {
+                    enclosing_root: None,
+                },
+            },
+        ];
+        let out = render_out_of_scope(&entries);
+        assert_eq!(out.lines().count(), 2, "one line per named path: {out}");
+    }
+
+    #[test]
+    fn classify_out_of_scope_missing_path() {
+        // A path that cannot be canonicalized is nonexistent, not out-of-root.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("does_not_exist.rs");
+        let entry = classify_out_of_scope(&missing);
+        assert!(
+            matches!(entry.kind, OutOfScopeKind::Missing),
+            "nonexistent path classifies as Missing"
+        );
+    }
+
+    #[test]
+    fn classify_out_of_scope_detects_enclosing_git_root() {
+        // An existing path outside every root whose ancestor carries `.git`
+        // resolves to that enclosing project root (the `.git` general anchor).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().canonicalize().expect("canonical tempdir");
+        std::fs::create_dir(root.join(".git")).expect("create .git");
+        let file = root.join("README.md");
+        std::fs::write(&file, "# readme").expect("write file");
+
+        let detected = match classify_out_of_scope(&file).kind {
+            OutOfScopeKind::OutsideRoots { enclosing_root } => enclosing_root,
+            OutOfScopeKind::Missing => None,
+        };
+        assert_eq!(
+            detected.as_deref(),
+            Some(root.as_path()),
+            "detects the enclosing .git root"
+        );
+    }
+
+    #[test]
+    fn classify_out_of_scope_no_root_when_no_git() {
+        // An existing path outside every root with no `.git` ancestor carries
+        // no enclosing root → the plain out-of-scope line.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("loose.txt");
+        std::fs::write(&file, "loose").expect("write file");
+        let entry = classify_out_of_scope(&file);
+        assert!(
+            matches!(
+                entry.kind,
+                OutOfScopeKind::OutsideRoots {
+                    enclosing_root: None
+                }
+            ),
+            "no `.git` ancestor → no enclosing root"
         );
     }
 
