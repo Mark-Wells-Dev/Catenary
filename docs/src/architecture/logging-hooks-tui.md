@@ -203,6 +203,33 @@ Hook methods, each corresponding to a host CLI lifecycle event:
 | `subagent-start/mount-worktree` | `SubagentStart` | Mount an `isolation:"worktree"` subagent's git worktree as its own `worktree:{session_id}:{path}` LSP root |
 | `worktree-remove/unmount-worktree` | `WorktreeRemove` | Tear down a `worktree:*` root — fires only for non-git VCS / `--worktree` session exit (see worktree-root teardown below) |
 
+### Teaching-payload injection
+
+`SessionStart` and `SubagentStart` inject the **full prevention payload**
+into the agent's context via `hookSpecificOutput.additionalContext` (a Claude
+Code channel) — not a pointer to run `catenary primer`, but the primer's
+content inlined. One module, `src/cli/teaching.rs`, is the single source: the
+`catenary primer` command and both hooks render the same
+`teaching::payload_body()`, so the on-demand command and the pushed hook
+context can never drift.
+
+The payload has three tiers (~600–800 tokens): the **live commands surface**
+(the allow / pipeline / deny surface resolved from the config at emission time,
+rendered by the same machinery `catenary commands` prints, closing with the
+write-model line), the **invariants** (the edit→diagnostics loop, bare-only vs
+pipe-friendly command classes, the glob quoting / pattern-path form), and
+compact **flag synopses** for `grep`/`glob`, each ending in a
+`full: catenary <cmd> --help` breadcrumb. It names no `catenary primer` /
+`catenary commands` pointer — inlining is the point.
+
+`SessionStart` re-injects across context discontinuities: it fires on
+`startup` / `clear` / `compact` (re-stamping the payload the discontinuity may
+have dropped) and skips only `resume` (which restores the prior transcript
+verbatim). `SubagentStart` fires once per subagent spawn and appends a
+per-agent debt line (a subagent's diagnostic debt is tracked per-agent); its
+`additionalContext` lands in the subagent's own window under one shared label,
+so the payload is self-contained and prefix-identifiable.
+
 ### Hook contracts by host
 
 Different host CLIs have different hook surfaces. The hook definitions

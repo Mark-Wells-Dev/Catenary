@@ -72,6 +72,17 @@ upgrading.
 
 ### Changed
 
+- **SessionStart / SubagentStart inline the full prevention payload.** The
+  Claude Code session hooks no longer inject a pointer ("run `catenary
+  primer`") — they inline the primer's content directly into
+  `additionalContext`: the live allow / pipeline / deny surface (resolved from
+  the config at emission time), the workflow invariants (the edit→diagnostics
+  loop, bare-only vs pipe-friendly commands, the glob quoting / pattern-path
+  form), and compact `grep`/`glob` flag synopses with `--help` breadcrumbs.
+  `catenary primer` remains and now renders that identical payload from one
+  shared module (`src/cli/teaching.rs`), so the on-demand command and the
+  pushed hook context cannot drift; `catenary commands` is unchanged.
+  `SubagentStart` adds a per-agent diagnostic-debt line.
 - **`catenary glob` outlines show types and callables only.** The file and
   directory outline is now a map, not a mirror: it recurses into containers
   (modules/namespaces/packages and classes/interfaces/enums/structs/impls) and

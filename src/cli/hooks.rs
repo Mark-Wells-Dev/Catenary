@@ -27,59 +27,50 @@ use std::time::Duration;
 use crate::cli::HostFormat;
 use crate::cli::command_filter::resolver::LineWrites;
 
-// ── Surface announcement (ticket 04) ────────────────────────────────────
+// ── Teaching payload injection (ws36 ticket 01) ──────────────────────────
 
-/// The Catenary surface announcement, injected into the agent's context at
-/// every context discontinuity (`SessionStart` for `startup`/`clear`/`compact`,
-/// and every `SubagentStart`).
-///
-/// A pointer, not a payload: it names `catenary primer` and `catenary commands`
-/// rather than inlining a surface description that drifts. The two commands
-/// regenerate from the live binary, so the injected context can never go stale.
-///
-/// Single source of truth — both call sites share this constant so the wording
-/// cannot drift between them.
-const SURFACE_ANNOUNCEMENT: &str = "Catenary exposes a code-intelligence tool surface through the `catenary` CLI (not via MCP) and enforces editing and command policy with a hook that runs before each tool use. Run `catenary primer` for the tool reference and the edit→diagnostics loop; run `catenary commands` for the allowed/denied shell-command surface.";
-
-/// Returns the verbatim Catenary surface announcement.
-///
-/// Shared by the `SessionStart` and `SubagentStart` hook handlers so the
-/// wording is defined once.
-#[must_use]
-const fn surface_announcement() -> &'static str {
-    SURFACE_ANNOUNCEMENT
-}
-
-/// Decide whether a `SessionStart` hook should inject the surface announcement,
+/// Decide whether a `SessionStart` hook should inject the teaching payload,
 /// given the payload's `source` field.
 ///
-/// The announcement is injected whenever the new context does *not* already
-/// contain it:
+/// The payload is injected whenever the new context does *not* already contain
+/// it:
 /// - `startup` (fresh), `clear` (`/clear` wiped it), `compact` (summarization
 ///   may have dropped it) → **inject**.
 /// - `resume` → **skip** — resume restores the prior transcript verbatim, so the
-///   announcement is already present.
+///   payload is already present.
 ///
 /// A missing or unknown `source` is treated as **inject**: a missing source most
 /// likely means a fresh start, and only `resume` is a context that provably
-/// already carries the announcement.
+/// already carries the payload.
 #[must_use]
 fn session_start_should_announce(source: Option<&str>) -> bool {
     source != Some("resume")
 }
 
-/// Build the `hookSpecificOutput` object that carries the surface announcement
-/// in its `additionalContext` field, for the given hook event.
+/// The teaching payload to inject at `SessionStart`, or `None` when it should
+/// be withheld (a non-inject `source`, or a non-Claude host — `additionalContext`
+/// is a Claude Code channel). Computed only when it will be used, so the
+/// config-load IO is skipped on the withhold paths.
+#[must_use]
+fn session_start_context(announce: bool, format: HostFormat) -> Option<String> {
+    (announce && matches!(format, HostFormat::Claude)).then(crate::cli::teaching::payload_body)
+}
+
+/// Build the `hookSpecificOutput` object that carries the teaching payload in
+/// its `additionalContext` field, for the given hook event.
 ///
 /// `hook_event_name` is `"SessionStart"` or `"SubagentStart"` — the Claude Code
 /// structured-output shape is
 /// `{"hookSpecificOutput": {"hookEventName": <event>, "additionalContext": <string>}}`.
 /// This builds only the inner object; callers nest it under `hookSpecificOutput`.
 #[must_use]
-fn announcement_hook_specific_output(hook_event_name: &str) -> serde_json::Value {
+fn announcement_hook_specific_output(
+    hook_event_name: &str,
+    additional_context: &str,
+) -> serde_json::Value {
     serde_json::json!({
         "hookEventName": hook_event_name,
-        "additionalContext": surface_announcement(),
+        "additionalContext": additional_context,
     })
 }
 
@@ -410,22 +401,24 @@ pub fn run_session_start(format: HostFormat) {
     }
 
     let Ok(stdin_data) = std::io::read_to_string(std::io::stdin()) else {
-        emit_session_start(builder, false, format);
+        emit_session_start(builder, None);
         return;
     };
     let Ok(hook_json) = serde_json::from_str::<serde_json::Value>(&stdin_data) else {
-        emit_session_start(builder, false, format);
+        emit_session_start(builder, None);
         return;
     };
 
-    // Source gating (ticket 04): inject the surface announcement unless the
+    // Source gating (ws36 ticket 01): inject the teaching payload unless the
     // context provably already carries it (`resume`). `source` is read here,
-    // CLI-side, from the full hook payload.
+    // CLI-side, from the full hook payload; the payload itself is resolved live
+    // (`session_start_context`) so its commands surface reflects this session.
     let source = hook_json.get("source").and_then(|v| v.as_str());
     let announce = session_start_should_announce(source);
 
     let Some(stream) = hook_connect(&hook_json) else {
-        emit_session_start(builder, announce, format);
+        let ctx = session_start_context(announce, format);
+        emit_session_start(builder, ctx.as_deref());
         return;
     };
 
@@ -462,7 +455,8 @@ pub fn run_session_start(format: HostFormat) {
         }
     }
 
-    emit_session_start(builder, announce, format);
+    let ctx = session_start_context(announce, format);
+    emit_session_start(builder, ctx.as_deref());
 }
 
 /// Clean up session state on exit (`SessionEnd` hook handler).
@@ -496,8 +490,8 @@ pub fn run_session_end(format: HostFormat) {
     let _ = ipc_exchange(stream, &request);
 }
 
-/// Mount a subagent's worktree as a workspace root and announce the Catenary
-/// surface (`SubagentStart` hook handler).
+/// Mount a subagent's worktree as a workspace root and inject the Catenary
+/// teaching payload (`SubagentStart` hook handler).
 ///
 /// Fires once at subagent spawn. Two **decoupled** effects:
 /// - **Mount (conditional):** forwards `cwd` (the worktree of an
@@ -505,11 +499,12 @@ pub fn run_session_end(format: HostFormat) {
 ///   mounts the worktree under `worktree:{session_id}:{path}` iff its canonical
 ///   project root is already tracked (the Explore/Plan self-scoping is enforced
 ///   daemon-side). Best effort — the host CLI ignores all flow-control fields.
-/// - **Announcement (unconditional, ticket 04):** every subagent spawn is a
-///   fresh context that never had the announcement, so the surface announcement
-///   is emitted via `hookSpecificOutput.additionalContext` for **every**
-///   subagent, regardless of whether a worktree was mounted. This is a Claude
-///   Code channel; no other supported host spawns subagents.
+/// - **Teaching payload (unconditional, ws36 ticket 01):** every subagent spawn
+///   is a fresh context that never had the payload, so the shared teaching body
+///   plus a per-agent debt line is emitted via
+///   `hookSpecificOutput.additionalContext` for **every** subagent, regardless
+///   of whether a worktree was mounted. This is a Claude Code channel; no other
+///   supported host spawns subagents.
 pub fn run_subagent_start(format: HostFormat) {
     let Ok(stdin_data) = std::io::read_to_string(std::io::stdin()) else {
         emit_subagent_start_announcement(format);
@@ -521,7 +516,7 @@ pub fn run_subagent_start(format: HostFormat) {
     };
 
     // Mount (conditional): best-effort daemon round-trip. Decoupled from the
-    // announcement below — most subagents mount nothing but all are announced.
+    // payload injection below — most subagents mount nothing but all are taught.
     if let Some(stream) = hook_connect(&hook_json) {
         let mut request = serde_json::json!({
             "method": "subagent-start/mount-worktree",
@@ -541,7 +536,7 @@ pub fn run_subagent_start(format: HostFormat) {
     emit_subagent_start_announcement(format);
 }
 
-/// Emit the unconditional `SubagentStart` surface announcement.
+/// Emit the unconditional `SubagentStart` teaching payload.
 ///
 /// Prints a single object carrying `hookSpecificOutput.additionalContext` for
 /// Claude; other hosts get nothing (no other supported host spawns subagents).
@@ -551,14 +546,20 @@ fn emit_subagent_start_announcement(format: HostFormat) {
     }
 }
 
-/// Build the `SubagentStart` hook-response object carrying the surface
-/// announcement, or `None` for non-Claude hosts.
+/// Build the `SubagentStart` hook-response object carrying the teaching
+/// payload, or `None` for non-Claude hosts.
+///
+/// The payload is the shared body plus a per-agent debt line
+/// ([`crate::cli::teaching::subagent_payload`]) — self-contained and
+/// prefix-identifiable, since a subagent's `additionalContext` lands in its own
+/// window under one shared label alongside other hooks' context.
 fn build_subagent_start_response(format: HostFormat) -> Option<serde_json::Value> {
     if !matches!(format, HostFormat::Claude) {
         return None;
     }
+    let ctx = crate::cli::teaching::subagent_payload();
     Some(serde_json::json!({
-        "hookSpecificOutput": announcement_hook_specific_output("SubagentStart"),
+        "hookSpecificOutput": announcement_hook_specific_output("SubagentStart", &ctx),
     }))
 }
 
@@ -601,20 +602,19 @@ pub fn run_worktree_remove(format: HostFormat) {
 /// Carries up to two coexisting surfaces in **one** JSON object:
 /// - a top-level `systemMessage` (the user-facing notification drain), present
 ///   when the builder has content;
-/// - `hookSpecificOutput.additionalContext` (the silent surface announcement),
-///   present when `announce` is true (source gating, ticket 04) and the host is
-///   Claude — `additionalContext` is a Claude Code channel.
+/// - `hookSpecificOutput.additionalContext` (the silent teaching payload),
+///   present when `additional_context` is `Some` — the caller
+///   ([`session_start_context`]) already gates it on the inject `source` and the
+///   Claude host (`additionalContext` is a Claude Code channel).
 ///
 /// Returns `None` when neither surface has content, so nothing is emitted.
 fn build_session_start_response(
     builder: crate::hook::response::SystemMessageBuilder,
-    announce: bool,
-    format: HostFormat,
+    additional_context: Option<&str>,
 ) -> Option<serde_json::Value> {
     let system_message = builder.finish();
-    let inject = announce && matches!(format, HostFormat::Claude);
 
-    if system_message.is_none() && !inject {
+    if system_message.is_none() && additional_context.is_none() {
         return None;
     }
 
@@ -622,23 +622,25 @@ fn build_session_start_response(
     if let Some(msg) = system_message {
         obj.insert("systemMessage".to_string(), serde_json::Value::String(msg));
     }
-    if inject {
+    if let Some(ctx) = additional_context {
         obj.insert(
             "hookSpecificOutput".to_string(),
-            announcement_hook_specific_output("SessionStart"),
+            announcement_hook_specific_output("SessionStart", ctx),
         );
     }
     Some(serde_json::Value::Object(obj))
 }
 
 /// Finalize and print the `SessionStart` hook response (notification drain +
-/// surface announcement) as a single JSON object.
+/// teaching payload) as a single JSON object.
+///
+/// The Claude-host gate lives in [`session_start_context`], which yields
+/// `Some` context only for Claude — so this needs no `format`.
 fn emit_session_start(
     builder: crate::hook::response::SystemMessageBuilder,
-    announce: bool,
-    format: HostFormat,
+    additional_context: Option<&str>,
 ) {
-    if let Some(obj) = build_session_start_response(builder, announce, format) {
+    if let Some(obj) = build_session_start_response(builder, additional_context) {
         print!("{obj}");
     }
 }
@@ -1975,16 +1977,7 @@ mod tests {
         assert!(extract_shell_command(&json, "write_to_file", HostFormat::Antigravity).is_none(),);
     }
 
-    // ── Surface announcement tests (ticket 04) ────────────────────────────
-
-    /// The expected verbatim announcement, mirrored here so a wording change
-    /// must be made deliberately in two places.
-    const EXPECTED_ANNOUNCEMENT: &str = "Catenary exposes a code-intelligence tool surface through the `catenary` CLI (not via MCP) and enforces editing and command policy with a hook that runs before each tool use. Run `catenary primer` for the tool reference and the edit→diagnostics loop; run `catenary commands` for the allowed/denied shell-command surface.";
-
-    #[test]
-    fn surface_announcement_is_verbatim() {
-        assert_eq!(surface_announcement(), EXPECTED_ANNOUNCEMENT);
-    }
+    // ── Teaching payload injection tests (ws36 ticket 01) ─────────────────
 
     // ── SessionStart source gating ───────────────────────────────────────
 
@@ -2004,78 +1997,91 @@ mod tests {
     fn session_start_announces_for_missing_or_unknown_source() {
         // Missing source most likely means a fresh start → inject.
         assert!(session_start_should_announce(None));
-        // Unknown source: only `resume` provably already carries the
-        // announcement, so anything else injects.
+        // Unknown source: only `resume` provably already carries the payload,
+        // so anything else injects.
         assert!(session_start_should_announce(Some("something-new")));
+    }
+
+    // ── session_start_context: inject/host gating carries the live payload ─
+
+    #[test]
+    fn session_start_context_carries_payload_for_claude_inject() {
+        let ctx = session_start_context(true, HostFormat::Claude)
+            .expect("Claude inject should carry the teaching payload");
+        // The static invariants tier is always present regardless of config.
+        assert!(
+            ctx.contains("The edit→diagnostics loop"),
+            "payload body should be inlined: {ctx}",
+        );
+        // No pointer to the on-demand commands — the content is inlined.
+        assert!(!ctx.contains("catenary primer"), "no primer pointer: {ctx}");
+    }
+
+    #[test]
+    fn session_start_context_absent_when_not_announcing() {
+        assert!(session_start_context(false, HostFormat::Claude).is_none());
+    }
+
+    #[test]
+    fn session_start_context_absent_for_non_claude() {
+        // additionalContext is a Claude Code channel.
+        assert!(session_start_context(true, HostFormat::Gemini).is_none());
+        assert!(session_start_context(true, HostFormat::Antigravity).is_none());
     }
 
     // ── announcement_hook_specific_output shape ──────────────────────────
 
     #[test]
     fn announcement_hook_specific_output_shape() {
-        let session = announcement_hook_specific_output("SessionStart");
+        let session = announcement_hook_specific_output("SessionStart", "BODY");
         assert_eq!(session["hookEventName"], "SessionStart");
-        assert_eq!(session["additionalContext"], EXPECTED_ANNOUNCEMENT);
+        assert_eq!(session["additionalContext"], "BODY");
 
-        let subagent = announcement_hook_specific_output("SubagentStart");
+        let subagent = announcement_hook_specific_output("SubagentStart", "OTHER");
         assert_eq!(subagent["hookEventName"], "SubagentStart");
-        assert_eq!(subagent["additionalContext"], EXPECTED_ANNOUNCEMENT);
+        assert_eq!(subagent["additionalContext"], "OTHER");
     }
 
-    // ── SessionStart response: additionalContext presence by source ──────
+    // ── SessionStart response: additionalContext presence ────────────────
 
     #[test]
-    fn session_start_response_injects_for_inject_sources() {
-        for source in ["startup", "clear", "compact"] {
-            let builder = crate::hook::response::SystemMessageBuilder::new();
-            let announce = session_start_should_announce(Some(source));
-            let obj = build_session_start_response(builder, announce, HostFormat::Claude)
-                .expect("announcement should produce an object");
-            assert_eq!(
-                obj["hookSpecificOutput"]["hookEventName"], "SessionStart",
-                "source {source} should set hookEventName",
-            );
-            assert_eq!(
-                obj["hookSpecificOutput"]["additionalContext"], EXPECTED_ANNOUNCEMENT,
-                "source {source} should inject the announcement",
-            );
-            // No systemMessage when the builder is empty.
-            assert!(
-                obj.get("systemMessage").is_none(),
-                "no drain content → no systemMessage",
-            );
-        }
-    }
-
-    #[test]
-    fn session_start_response_skips_announcement_for_resume() {
+    fn session_start_response_injects_context() {
         let builder = crate::hook::response::SystemMessageBuilder::new();
-        let announce = session_start_should_announce(Some("resume"));
-        // Empty builder + no announcement → nothing emitted.
+        let obj = build_session_start_response(builder, Some("BODY"))
+            .expect("context should produce an object");
+        assert_eq!(obj["hookSpecificOutput"]["hookEventName"], "SessionStart");
+        assert_eq!(obj["hookSpecificOutput"]["additionalContext"], "BODY");
+        // No systemMessage when the builder is empty.
         assert!(
-            build_session_start_response(builder, announce, HostFormat::Claude).is_none(),
-            "resume with no drain content should emit nothing",
+            obj.get("systemMessage").is_none(),
+            "no drain content → no systemMessage",
         );
     }
 
     #[test]
-    fn session_start_resume_still_emits_drain_without_announcement() {
+    fn session_start_response_empty_when_nothing_to_say() {
+        let builder = crate::hook::response::SystemMessageBuilder::new();
+        // No drain, no context (withheld source / non-Claude) → no object.
+        assert!(build_session_start_response(builder, None).is_none());
+    }
+
+    #[test]
+    fn session_start_resume_still_emits_drain_without_context() {
         use crate::logging::Severity;
         let mut builder = crate::hook::response::SystemMessageBuilder::new();
         builder.push_direct(Severity::Error, "config error");
-        let announce = session_start_should_announce(Some("resume"));
-        let obj = build_session_start_response(builder, announce, HostFormat::Claude)
+        // Context withheld (resume) but the drain still surfaces.
+        let obj = build_session_start_response(builder, None)
             .expect("drain content should produce an object");
-        // systemMessage present (the drain), but no announcement on resume.
         assert!(
             obj["systemMessage"]
                 .as_str()
                 .is_some_and(|s| s.contains("config error")),
-            "drain content should still surface on resume",
+            "drain content should still surface when context is withheld",
         );
         assert!(
             obj.get("hookSpecificOutput").is_none(),
-            "resume must not inject additionalContext",
+            "withheld context must not inject additionalContext",
         );
     }
 
@@ -2084,9 +2090,9 @@ mod tests {
         use crate::logging::Severity;
         let mut builder = crate::hook::response::SystemMessageBuilder::new();
         builder.push_direct(Severity::Info, "cleared 2 stale editing state entries");
-        let obj = build_session_start_response(builder, true, HostFormat::Claude)
+        let obj = build_session_start_response(builder, Some("BODY"))
             .expect("both surfaces should produce an object");
-        // ONE object carries both top-level systemMessage and the announcement.
+        // ONE object carries both top-level systemMessage and the payload.
         assert!(
             obj["systemMessage"]
                 .as_str()
@@ -2094,43 +2100,31 @@ mod tests {
             "systemMessage (drain) must be present",
         );
         assert_eq!(obj["hookSpecificOutput"]["hookEventName"], "SessionStart");
-        assert_eq!(
-            obj["hookSpecificOutput"]["additionalContext"],
-            EXPECTED_ANNOUNCEMENT,
-        );
+        assert_eq!(obj["hookSpecificOutput"]["additionalContext"], "BODY");
         // Exactly the two expected top-level keys.
         let map = obj.as_object().expect("object");
         assert_eq!(map.len(), 2, "exactly systemMessage + hookSpecificOutput");
     }
 
-    #[test]
-    fn session_start_response_empty_when_nothing_to_say() {
-        let builder = crate::hook::response::SystemMessageBuilder::new();
-        // No drain, no announcement → no object.
-        assert!(build_session_start_response(builder, false, HostFormat::Claude).is_none());
-    }
+    // ── SubagentStart: unconditional payload with the per-agent debt line ─
 
     #[test]
-    fn session_start_response_non_claude_omits_announcement() {
-        // additionalContext is a Claude Code channel; other hosts get only the
-        // drain, never the announcement.
-        let builder = crate::hook::response::SystemMessageBuilder::new();
-        assert!(
-            build_session_start_response(builder, true, HostFormat::Gemini).is_none(),
-            "non-Claude host with no drain emits nothing even when announce=true",
-        );
-    }
-
-    // ── SubagentStart: unconditional announcement ────────────────────────
-
-    #[test]
-    fn subagent_start_response_always_announces_for_claude() {
+    fn subagent_start_response_announces_payload_for_claude() {
         let obj = build_subagent_start_response(HostFormat::Claude)
             .expect("subagent start should always announce on Claude");
         assert_eq!(obj["hookSpecificOutput"]["hookEventName"], "SubagentStart");
-        assert_eq!(
-            obj["hookSpecificOutput"]["additionalContext"],
-            EXPECTED_ANNOUNCEMENT,
+        let ctx = obj["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .expect("additionalContext string");
+        // Prefix-identifiable (shares one labeled block with other hooks).
+        assert!(
+            ctx.starts_with("Catenary —"),
+            "prefix-identifiable header: {ctx}"
+        );
+        // The per-agent debt line the SubagentStart variant adds.
+        assert!(
+            ctx.contains("your diagnostic debt is tracked per-agent"),
+            "per-agent debt line present: {ctx}",
         );
     }
 

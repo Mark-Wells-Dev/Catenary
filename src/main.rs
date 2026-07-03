@@ -922,85 +922,16 @@ fn render_search_outcome(
     }
 }
 
-/// Hand-written workflow preamble, emitted above the auto-generated
-/// command reference in [`run_primer`].
+/// Print the shared teaching payload — Catenary's full prevention content.
 ///
-/// These are the *invariants* — the edit→diagnostics loop, the pull model,
-/// deny-as-guidance, bare canonical form, and the navigation model. They are
-/// stable and rarely change. The per-command reference below them
-/// regenerates from clap help, so adding a flag or command never touches
-/// this text.
-const PRIMER_PREAMBLE: &str = "\
-Catenary — LSP-powered code intelligence, driven from the shell.
-
-Catenary manages a pool of language servers and exposes them through the
-commands below. Read these invariants first; the per-command reference
-follows.
-
-The edit→diagnostics loop
-  Editing is tracked automatically — the first edit starts it, there is no
-  start step. After a batch of edits, run `catenary diagnostics` to see the
-  errors and warnings for every file you touched; it then clears the set.
-  Diagnostics are *pulled*: you get them only when you run the command.
-  Nothing is ever pushed into another command's output.
-
-Deny-as-guidance
-  A blocked command is not a wall — the denial names the command to run
-  instead (`grep` → `catenary grep`, `ls`/`find` → `catenary glob`). Read
-  the reason and run the named command. Writing is up to you: edit with the
-  host tools, or run a shell writer (`sed -i`, `perl -i -pe`, `>`) — the
-  hook resolves its target set into the diagnostics batch, or denies it.
-
-Run catenary commands bare
-  `catenary diagnostics` stands alone — no pipes, no `&&`/`;` chaining. Run
-  it as its own step and read the result.
-  Quote glob patterns (`catenary grep 'fn main' 'src/**/*.rs'`,
-  `catenary glob 'src/**/*.rs'`) so Catenary expands them gitignore-aware
-  rather than the shell. A glob PATH may be absolute or cwd-relative, and the
-  anchor belongs in the pattern (`catenary glob '/abs/dir/**/*.md'`) — there is
-  no separate directory argument.
-
-Navigate directly
-  Locate files with `catenary glob`, search with `catenary grep`. Both are
-  pipe-friendly: stdout carries clean results, so `| head`/`| tail`/`| grep`
-  compose normally. When output is large it is truncated to a line budget and
-  the complete result is spilled to a file named in a stderr notice — read or
-  `catenary grep` that file for the rest (use `--count` for a bare tally).
-  Results are LSP-enriched automatically wherever a server covers the file.
-  Where none does, `catenary grep` only *flags* the location: open the file and
-  read it — there is no grep-fragment middle ground.";
-
-/// Print an overview of Catenary's workflow and commands.
-///
-/// Two layers: a hand-written workflow preamble ([`PRIMER_PREAMBLE`], the
-/// stable invariants) followed by an auto-generated reference. The reference
-/// extracts the agent-facing subcommands from the derive-generated CLI
-/// definition, so when help text changes (via doc comments on the derive
-/// structs) or a flag is added, `primer` updates automatically.
-///
-/// `editing` is deliberately absent from the reference: editing starts
-/// implicitly on the first edit (`catenary editing start` survives only as
-/// an idempotent no-op) and `editing stop` was renamed to `diagnostics`, so
-/// neither belongs in agent-facing guidance.
+/// `catenary primer` is one of three surfaces that render the same payload
+/// ([`cli::teaching::payload_body`]); the `SessionStart` / `SubagentStart`
+/// hooks inline the identical body into the agent's context. Keeping the
+/// single source means the on-demand command and the pushed hook context can
+/// never drift. The commands-surface tier is resolved live from the config, so
+/// the allow / pipeline / deny surface is always this session's actual one.
 fn run_primer(out: &mut cli::Output) {
-    use clap::CommandFactory;
-    let _ = out.writeln(format_args!("{PRIMER_PREAMBLE}"));
-    let app = Args::command();
-    let agent_commands = ["grep", "glob", "diagnostics", "roots", "commands"];
-    for name in agent_commands {
-        let Some(sub) = app.find_subcommand(name) else {
-            continue;
-        };
-        let _ = out.writeln(format_args!(
-            "\n─────────────────────────────────────────────────"
-        ));
-        let mut sub = sub.clone();
-        sub = sub
-            .bin_name(format!("catenary {name}"))
-            .disable_help_subcommand(true);
-        let help = sub.render_help();
-        let _ = out.writeln(format_args!("{help}"));
-    }
+    let _ = out.writeln(format_args!("{}", cli::teaching::payload_body()));
 }
 
 /// Builds a standard tokio multi-thread runtime.
@@ -2560,54 +2491,70 @@ mod tests {
     }
 
     #[test]
-    fn primer_renders_preamble_and_reference() {
-        // The primer is two layers: a hand-written workflow preamble and the
-        // auto-generated reference for each agent-facing subcommand (bin name
-        // rewritten to `catenary <name>`). Capturing through `Output::buffer`
-        // proves the handler writes via `Output` (not raw `println!`) and
-        // emits both layers with the final command surface.
+    fn primer_renders_the_teaching_payload() {
+        // The primer prints the shared teaching payload: invariants, the flag
+        // synopses, and the `--help` breadcrumbs. Capturing through
+        // `Output::buffer` proves the handler writes via `Output` (not raw
+        // `println!`).
         let mut out = cli::Output::buffer(80);
         run_primer(&mut out);
         let text = out.into_string();
 
-        // Preamble (the stable invariants).
+        // The invariants tier.
         assert!(
             text.contains("The edit→diagnostics loop"),
-            "primer should emit the workflow preamble"
+            "primer should emit the edit→diagnostics invariant"
         );
-        assert!(
-            text.contains("Deny-as-guidance"),
-            "primer preamble should teach deny-as-guidance"
-        );
-
-        // Auto-generated reference, final surface.
+        // The flag-synopsis tier plus its point-of-use `--help` breadcrumbs.
         for needle in [
             "catenary grep",
             "catenary glob",
             "catenary diagnostics",
             "catenary roots",
-            "catenary commands",
             "--count",
+            "full: catenary grep --help",
+            "full: catenary glob --help",
         ] {
             assert!(
                 text.contains(needle),
-                "primer reference should document {needle}"
+                "primer payload should document {needle}"
             );
         }
     }
 
     #[test]
-    fn primer_no_retired_commands() {
-        // `editing start` is implicit and `editing stop` was renamed to
-        // `diagnostics`; neither belongs in agent-facing guidance, so the
-        // reference must not advertise the `editing` subcommand at all.
+    fn primer_is_the_shared_payload_body() {
+        // The primer surface is byte-equal to the SessionStart payload body
+        // (both call `cli::teaching::payload_body`), modulo the trailing newline
+        // `writeln` adds.
+        let mut out = cli::Output::buffer(80);
+        run_primer(&mut out);
+        let printed = out.into_string();
+        assert_eq!(
+            printed.trim_end_matches('\n'),
+            cli::teaching::payload_body()
+        );
+    }
+
+    #[test]
+    fn primer_has_no_pointers_or_retired_commands() {
+        // Inlining is the point — no `catenary primer` / `catenary commands`
+        // pointer — and the retired `editing` / `sed` subcommands must not
+        // appear in agent-facing guidance.
         let mut out = cli::Output::buffer(80);
         run_primer(&mut out);
         let text = out.into_string();
-        for retired in ["catenary editing", "editing start", "editing stop"] {
+        for retired in [
+            "catenary editing",
+            "editing start",
+            "editing stop",
+            "catenary primer",
+            "catenary commands",
+            "catenary sed",
+        ] {
             assert!(
                 !text.contains(retired),
-                "primer must not mention retired `{retired}`"
+                "primer must not mention `{retired}`"
             );
         }
     }
@@ -2643,14 +2590,14 @@ mod tests {
     }
 
     #[test]
-    fn primer_preamble_teaches_glob_pattern_form() {
-        // The pattern teaching is also swept into the primer preamble.
+    fn primer_teaches_glob_pattern_form() {
+        // The pattern teaching is carried in the payload's invariants tier.
         let mut out = cli::Output::buffer(80);
         run_primer(&mut out);
         let text = out.into_string();
         assert!(
             text.contains("catenary glob 'src/**/*.rs'"),
-            "primer preamble teaches the glob pattern form: {text}"
+            "primer teaches the glob pattern form: {text}"
         );
     }
 

@@ -10,6 +10,7 @@ pub mod doctor;
 pub mod hooks;
 pub mod install;
 pub mod jsonl_reader;
+pub mod teaching;
 pub mod update;
 pub mod version;
 

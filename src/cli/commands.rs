@@ -90,10 +90,14 @@ const WRITE_MODEL_LINE: &str = "Writes resolve-or-deny: a redirect or a \
 /// Mirrors the states the `PreToolUse` hook distinguishes: a deliberate
 /// opt-out (`client_enforcement_only`), an active allowlist (the cwd build
 /// tool plus the surface sections), or no `[commands]` section at all. Pure —
-/// the IO (config load + cwd build resolution) lives in [`run_commands`] — so
-/// the branching is unit-testable. `build_tools` is the already-resolved set
-/// for the cwd (empty when none applies).
-fn render_command_lines(
+/// the IO (config load + cwd build resolution) lives in
+/// [`resolve_commands_for_cwd`] — so the branching is unit-testable.
+/// `build_tools` is the already-resolved set for the cwd (empty when none
+/// applies).
+///
+/// Shared with the teaching payload (`crate::cli::teaching`) so its live
+/// commands-surface tier is the *same* rendering `catenary commands` prints.
+pub(crate) fn render_command_lines(
     resolved: Option<&crate::config::ResolvedCommands>,
     build_tools: &[String],
 ) -> Vec<String> {
@@ -128,23 +132,24 @@ fn render_command_lines(
     }
 }
 
-/// Print the active allowed-command surface for the current configuration.
+/// Resolve the live command surface for the current working directory.
 ///
 /// Loads the user-level command-filter config — the same `[commands]` surface
-/// the `PreToolUse` hook enforces — merges the nearest `.catenary.toml`'s
+/// the `PreToolUse` hook enforces — and merges the nearest `.catenary.toml`'s
 /// per-root build tool for the current directory (reusing the same
 /// [`find_project_config`](crate::cli::hooks::find_project_config) walk as the
-/// client-side denial path, so the build tool shown here matches the denial
-/// hint), and prints the cwd build tool plus the allow / pipeline / denied
-/// sections. Stateless: no daemon connection, matching `catenary doctor`'s
-/// command-filter check. Denial messages point the agent here so the full
-/// surface lives in one place instead of being dumped inline on every first
-/// denial.
+/// client-side denial path, so the build tool resolved here matches the denial
+/// hint). Returns the resolved `[commands]` table (if any) and the build
+/// tool(s) that apply to the cwd.
+///
+/// Shared by [`run_commands`] and the teaching payload
+/// (`crate::cli::teaching`), so both project the *same* runtime surface.
 ///
 /// # Errors
 ///
 /// Returns an error if the configuration cannot be loaded or parsed.
-pub fn run_commands(out: &mut Output) -> Result<()> {
+pub(crate) fn resolve_commands_for_cwd()
+-> Result<(Option<crate::config::ResolvedCommands>, Vec<String>)> {
     let config = crate::config::Config::load().context("load Catenary configuration")?;
     let cwd = std::env::current_dir().ok();
 
@@ -169,6 +174,22 @@ pub fn run_commands(out: &mut Output) -> Result<()> {
         .map(|r| r.build_for_cwd(cwd.as_deref()).to_vec())
         .unwrap_or_default();
 
+    Ok((resolved, build_tools))
+}
+
+/// Print the active allowed-command surface for the current configuration.
+///
+/// Resolves the live surface via [`resolve_commands_for_cwd`] and prints the
+/// cwd build tool plus the allow / pipeline / denied sections. Stateless: no
+/// daemon connection, matching `catenary doctor`'s command-filter check.
+/// Denial messages point the agent here so the full surface lives in one place
+/// instead of being dumped inline on every first denial.
+///
+/// # Errors
+///
+/// Returns an error if the configuration cannot be loaded or parsed.
+pub fn run_commands(out: &mut Output) -> Result<()> {
+    let (resolved, build_tools) = resolve_commands_for_cwd()?;
     for line in render_command_lines(resolved.as_ref(), &build_tools) {
         let _ = out.writeln(format_args!("{line}"));
     }
