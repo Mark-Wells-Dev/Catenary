@@ -231,6 +231,17 @@ upgrading.
   `N files clean` collapse with no linter-specific wording. A linter that never
   completed (not installed, spawn or parse failure) still records nothing and
   leaves its file unverified — only an actual run verifies.
+- **`perl` is a nicer sed, not a script host.** `perl` is allowlisted for its
+  text-processing role — inline checkable `-e`/`-E` substitutions only. A perl
+  invocation with **no** literal program is now denied: both the script-file
+  shape (`perl script.pl`, with or without `-p`/`-n`) and the stdin-program
+  shape (bare `perl` in a pipeline), and the same under `xargs`. A script the
+  hook can't see would run in-script `open`/`unlink`/`system` writes
+  unattributed and read files outside `catenary grep`/`glob` — the decision-026
+  gap. The denial names the inline checkable form (`perl -i -pe 's///`, config
+  permitting) or the host edit tools. Pure introspection (`perl -v`/`-V`/`-h`
+  with no file operands) still passes; `perl -e`/`-pe` filters and `perl -i`
+  in-place edits are unchanged.
 - **Diagnostics settle no longer reports `[clean]` over a CPU-starved flycheck
   child.** Under host CPU saturation a runnable child can present an all-zero
   50 ms sampling window — no user/system CPU or page-fault deltas while ticks

@@ -22,7 +22,12 @@
 //!   filter (∅) or, in-place, the file arguments plus `-i.bak` backups. Perl
 //!   regex look-around (`(?<=…)`) is expressly in-subset — it is what makes the
 //!   `catenary sed` retirement lossless. Beyond the subset or non-literal →
-//!   Opaque with a teaching message.
+//!   Opaque with a teaching message. An invocation with **no** literal `-e`/`-E`
+//!   program — a script-file operand (`perl script.pl`) or a program read from
+//!   stdin (bare `perl`) — is denied: perl is allowlisted for its sed role only,
+//!   so a script the hook can't see would hide its writes and reads (the
+//!   decision 026 gap class). Pure introspection (`-v`/`-V`/`-h`, no file
+//!   operands) is the sole exception.
 //!
 //! Unbounded languages (`python -c`, `ruby -e`, `node -e`) admit no checkable
 //! subset; they are not handled here — the resolver's default arm keeps them at
@@ -31,7 +36,7 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-use super::{SegmentClass, State, Unresolved, expand_list_operand, u};
+use super::{SegmentClass, State, Unresolved, WriteToolset, expand_list_operand, u};
 use crate::cli::command_filter::parse::{SimpleCommand, WordMeta};
 
 // ── awk ──────────────────────────────────────────────────────────────────────
@@ -490,20 +495,29 @@ fn skip_awk_regex(bytes: &[u8], mut i: usize) -> usize {
 /// `-i.bak` backups in-place).
 pub(super) fn resolve_perl(cmd: &SimpleCommand, state: &State) -> Result<SegmentClass, Unresolved> {
     let parsed = parse_perl_argv(cmd)?;
-    if parsed.has_program_flag {
-        if parsed.program_computed {
-            return Err(perl_computed_program());
+    if !parsed.has_program_flag {
+        // perl is allowlisted for its sed role — inline `-e`/`-E` substitutions
+        // only. Without a literal program, a script-file operand
+        // (`perl script.pl`) or a program read from stdin (bare `perl`) runs
+        // code the hook can't see, hiding its writes and reads. Sole exception:
+        // pure introspection (`-v`/`-V`/`-h`) with no file operands.
+        if parsed.introspection && parsed.files.is_empty() {
+            return Ok(SegmentClass::NoWrite);
         }
-        check_perl_program(&parsed.programs.join("\n"))?;
+        return Err(if parsed.files.is_empty() {
+            perl_stdin_program(&state.toolset)
+        } else {
+            perl_script_file(&state.toolset)
+        });
     }
+    if parsed.program_computed {
+        return Err(perl_computed_program());
+    }
+    check_perl_program(&parsed.programs.join("\n"))?;
     let Some(suffix) = &parsed.in_place else {
-        // Filter, or a script file at the inherited layer-4 boundary: no write.
+        // A literal-program filter: write-set ∅.
         return Ok(SegmentClass::NoWrite);
     };
-    if !parsed.has_program_flag {
-        // `-i` with an unseeable script file: the write-set can't be bounded.
-        return Err(perl_program_file());
-    }
     if suffix.contains('*') {
         return Err(perl_backup_template());
     }
@@ -530,6 +544,9 @@ struct PerlParsed {
     program_computed: bool,
     /// Whether a `-e`/`-E` program flag was seen.
     has_program_flag: bool,
+    /// Whether a `-v`/`-V`/`-h` introspection flag was seen. Pure introspection
+    /// (no program, no file operands) is the sole no-`-e` invocation allowed.
+    introspection: bool,
     /// `-i[SUFFIX]` backup suffix, if in-place (`""` for a bare `-i`).
     in_place: Option<String>,
     /// File operands (`-` excluded).
@@ -626,9 +643,16 @@ fn parse_perl_short_cluster(
                     ci += 1;
                 }
             }
+            // Introspection flags: version / verbose config / help. A pure
+            // introspection run (no program, no file operands) is the sole
+            // no-`-e` invocation that stays a filter.
+            b'v' | b'V' | b'h' => {
+                parsed.introspection = true;
+                ci += 1;
+            }
             // Boolean flags that neither write nor load code.
             b'p' | b'n' | b'a' | b's' | b'w' | b'W' | b'X' | b'T' | b't' | b'u' | b'U' | b'c'
-            | b'g' | b'f' | b'x' | b'v' | b'V' | b'h' => ci += 1,
+            | b'g' | b'f' | b'x' => ci += 1,
             other => return Err(perl_unmodeled_flag(&format!("-{}", other as char))),
         }
     }
@@ -804,12 +828,25 @@ fn perl_computed_program() -> Unresolved {
     )
 }
 
-fn perl_program_file() -> Unresolved {
+fn perl_script_file(toolset: &WriteToolset) -> Unresolved {
     u(
-        "perl-program-file",
-        "`perl -i` with a script file (no `-e`) edits files through a program the hook \
-         can't check, so it can't tell which files change. Inline a literal `s///` \
-         program with `-pe`.",
+        "perl-script-file",
+        format!(
+            "A perl script file (no `-e`/`-E`) runs a program the hook can't see, so it \
+             can't tell which files the script writes or reads. {}",
+            toolset.inplace_hint(),
+        ),
+    )
+}
+
+fn perl_stdin_program(toolset: &WriteToolset) -> Unresolved {
+    u(
+        "perl-stdin-program",
+        format!(
+            "Bare perl (no `-e`/`-E`) reads its program from stdin, which the hook can't \
+             see, so it can't tell which files the program writes or reads. {}",
+            toolset.inplace_hint(),
+        ),
     )
 }
 

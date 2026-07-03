@@ -1038,9 +1038,10 @@ fn perl_computed_module_and_program_file_are_opaque() {
         err("perl -MFoo -pe 's/a/b/' a.txt", None).construct,
         "perl-module-load"
     );
+    // A script file with `-i` (no `-e`) is the script-file shape, denied.
     assert_eq!(
         err("perl -i edit.pl a.rs", None).construct,
-        "perl-program-file"
+        "perl-script-file"
     );
     assert_eq!(
         err("perl -i'orig_*' -pe 's/a/b/' a.rs", None).construct,
@@ -1049,12 +1050,37 @@ fn perl_computed_module_and_program_file_are_opaque() {
 }
 
 #[test]
-fn perl_script_file_keeps_the_inherited_boundary() {
+fn perl_no_literal_program_is_denied() {
+    // perl is a nicer sed, not a script host (misc 126): with no `-e`/`-E`
+    // program the hook can't see the code, so both shapes are denied — a
+    // script-file operand (with or without `-p`/`-n`) and the stdin-program
+    // form (bare perl in a pipeline).
+    assert_eq!(err("perl edit.pl", None).construct, "perl-script-file");
+    assert_eq!(err("perl -p edit.pl", None).construct, "perl-script-file");
+    assert_eq!(err("perl -n edit.pl", None).construct, "perl-script-file");
     assert_eq!(
-        resolve_command("perl edit.pl", None)
-            .expect("script file ok")
-            .writes,
-        BTreeSet::new(),
+        err("printf 'prog' | perl", None).construct,
+        "perl-stdin-program",
+    );
+    assert_eq!(err("perl", None).construct, "perl-stdin-program");
+}
+
+#[test]
+fn perl_pure_introspection_is_allowed() {
+    // The sole no-`-e` exception: `-v`/`-V`/`-h` with no file operands.
+    for cmd in ["perl -v", "perl -V", "perl -h"] {
+        assert_eq!(classify(cmd, None), SegmentClass::NoWrite, "{cmd}");
+    }
+    // …but an introspection flag alongside a file operand is not pure — denied.
+    assert_eq!(err("perl -v edit.pl", None).construct, "perl-script-file");
+}
+
+#[test]
+fn xargs_perl_script_file_is_denied() {
+    // xargs-arm parity: a wrapped perl with no literal program is denied too.
+    assert_eq!(
+        err("echo x | xargs perl script.pl", None).construct,
+        "perl-script-file",
     );
 }
 
@@ -2003,9 +2029,14 @@ fn cold_agent_denial_wording_pins() {
             "assembled at runtime",
         ),
         (
-            "perl -i edit.pl a",
-            "perl-program-file",
-            "can't tell which files change",
+            "perl edit.pl a",
+            "perl-script-file",
+            "runs a program the hook can't see",
+        ),
+        (
+            "printf p | perl",
+            "perl-stdin-program",
+            "reads its program from stdin",
         ),
         (
             "perl -MFoo -pe 's/a/b/' a",

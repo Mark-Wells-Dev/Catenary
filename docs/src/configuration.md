@@ -578,6 +578,9 @@ build = "make"
 # `sed` and `perl` are allowed as bulk writers: their in-place edits
 # (`sed -i`, `perl -i -pe`) are script-checked and resolved into the
 # diagnostics batch; an unparseable/executing script is surgically denied.
+# perl is a nicer sed here — inline `-e`/`-E` programs only; a script file
+# (`perl script.pl`) or a program read from stdin (bare `perl`) runs code the
+# hook can't see and is denied.
 allow = ["git", "gh", "cp", "rm", "mkdir", "mv", "touch",
          "chmod", "sleep", "cd", "true", "false", "which",
          "cat", "head", "tail", "less", "more", "diff",
