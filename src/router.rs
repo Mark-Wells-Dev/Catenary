@@ -2721,13 +2721,13 @@ async fn handle_hook_dispatch(
             "incoming hook",
         );
 
-        // `dirty` drives the CLI's clean/dirty exit code (ticket 11). Faults
-        // (no daemon, IPC/parse failure) are detected CLI-side and exit 2; the
-        // daemon only ever reports clean or dirty here. `covered` is the count
-        // of LSP-covered files in the handoff: it lets the CLI distinguish "no
-        // edited files" (covered == 0, empty output) from a genuinely clean
-        // covered set (covered > 0, empty output) and synthesize the right
-        // sentinel (`[no edited files]` vs `[clean]`, bug 32 secondary).
+        // `dirty` is a status label only (ws37 ticket 01): the CLI exits `0`
+        // whether clean or dirty — the clean/dirty distinction lives in the
+        // per-file receipt (`output`), where clean files carry `[clean]` and
+        // dirty files their diagnostics. Faults (no daemon, IPC/parse failure)
+        // are detected CLI-side and exit `2`. `covered` is the count of covered
+        // files in the handoff: it lets the CLI print `[no edited files]` for a
+        // genuinely empty set (covered == 0, empty receipt).
         let (dirty, output, covered) = if let Some((files, filtered, session_id, _, _, _)) = handoff
         {
             let covered = files.len();
@@ -2847,12 +2847,12 @@ async fn handle_hook_dispatch(
             "outgoing hook response",
         );
 
-        // Structured response so the CLI can map status → exit code while still
-        // printing the diagnostics text. Mirrors the grep/glob JSON envelope.
-        // `covered` (the LSP-covered file count) lets the CLI pick the right
-        // empty-output sentinel: `[no edited files]` (covered == 0) vs `[clean]`
-        // (covered > 0) — bug 32 secondary, making "nothing to report"
-        // observable rather than a silent exit 0.
+        // Structured response mirroring the grep/glob JSON envelope. `output` is
+        // the rendered per-file receipt the CLI prints verbatim. `status` is a
+        // clean/dirty label the CLI no longer maps to an exit code (ws37 ticket
+        // 01) — it is retained for telemetry. `covered` (the handed-off file
+        // count) lets the CLI print `[no edited files]` for a genuinely empty
+        // set (covered == 0, empty receipt).
         let envelope = serde_json::json!({
             "status": if dirty { "dirty" } else { "clean" },
             "output": output,
@@ -4756,8 +4756,8 @@ mod tests {
 
     #[test]
     fn out_of_roots_note_appended_to_mixed_batch() {
-        // Covered-file diagnostics output (clean files are silent post
-        // misc 111 — only files with diagnostics render).
+        // A dirty covered-file receipt (the note-appension is orthogonal to how
+        // clean/dirty files render in the receipt itself).
         let covered = "src/main.rs:\n\t:1:1 [error] e: boom";
 
         // Nothing filtered → output is untouched.
@@ -4904,8 +4904,9 @@ mod tests {
         let req = serde_json::json!({"method": "tool/editing-stop"});
         let response = hook_roundtrip_full(&ipc_path, &req).await;
         // With no LSP servers the file is uncovered (rendered as
-        // "[no LSP coverage]", not "[clean]" — clean files are silent post
-        // misc 111). The response should not be the expired message.
+        // "[no LSP coverage]", not "[clean]" — a `[clean]` line is for a
+        // covered file a feeder verified, not an uncovered one). The response
+        // should not be the expired message.
         assert!(
             !response.contains("handoff expired"),
             "handoff should not be expired, got: {response}",

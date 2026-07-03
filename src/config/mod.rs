@@ -319,12 +319,12 @@ fn default_diagnostics_severity() -> String {
 pub struct ToolsConfig {
     /// Glob tool configuration.
     pub glob: GlobConfig,
-    /// Minimum diagnostic severity that marks a `catenary diagnostics` run
-    /// "dirty" (exit code 1) — one of `error`, `warning`, `info`, `hint`.
-    /// Default `error`, so the exit code means "does it compile": only
-    /// error-severity diagnostics gate, and a server's constant unused-var
-    /// warnings don't block every test run. Warnings still print; they just
-    /// exit 0. An unrecognized value falls back to `error`.
+    /// Minimum diagnostic severity that labels a `catenary diagnostics` run
+    /// "dirty" (vs "clean") — one of `error`, `warning`, `info`, `hint`.
+    /// Default `error`. The label is a telemetry/status signal only: the run
+    /// always exits `0` and the receipt prints every diagnostic regardless
+    /// (ws37 ticket 01), so this no longer gates an exit code. An unrecognized
+    /// value falls back to `error`.
     #[serde(default = "default_diagnostics_severity")]
     pub diagnostics_severity: String,
 }
@@ -340,7 +340,8 @@ impl Default for ToolsConfig {
 
 impl ToolsConfig {
     /// The LSP severity (1=Error … 4=Hint) at or above which a diagnostic
-    /// marks a `catenary diagnostics` run dirty (exit code 1).
+    /// labels a `catenary diagnostics` run dirty (a status label only — the
+    /// run exits `0` regardless, ws37 ticket 01).
     ///
     /// Parses [`Self::diagnostics_severity`], falling back to
     /// [`SEVERITY_ERROR`](crate::filter::SEVERITY_ERROR) for an unrecognized

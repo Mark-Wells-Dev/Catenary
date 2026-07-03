@@ -169,9 +169,9 @@ const TEMPLATE: &str = r#"# Catenary recommended config
 
 # ── Diagnostics (`catenary diagnostics`) ─────────────────────────
 #
-# diagnostics_severity: the minimum severity that marks a run "dirty"
-#   (exit code 1) — one of error, warning, info, hint. Default "error", so
-#   the exit code means "does it compile"; warnings still print but exit 0.
+# diagnostics_severity: the minimum severity that labels a run "dirty" (vs
+#   "clean") — one of error, warning, info, hint. Default "error". A status
+#   label only: the run always exits 0 and prints every diagnostic.
 
 # [tools]
 # diagnostics_severity = "error"

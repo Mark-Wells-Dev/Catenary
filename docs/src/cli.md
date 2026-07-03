@@ -114,10 +114,10 @@ Print LSP diagnostics for every file you've edited since the last run,
 then clear the set. Editing is tracked automatically — the first edit to
 a server-covered file starts it, there is no start step — so this command
 is the *end* of an edit batch: it opens all modified files on their
-servers, waits for each to settle, and prints the errors and warnings —
-listing only the files that have them. Like a linter (`ruff`, `clippy`,
-`eslint`), it is **silent on success**: a clean batch prints nothing and
-exits 0.
+servers, waits for each to settle, and prints a **per-file receipt** —
+every diagnosed file listed, its errors and warnings beneath it, or
+`[clean]` beside it when the file is clean. When nothing was edited it
+prints `[no edited files]`.
 
 ```bash
 catenary diagnostics
@@ -126,9 +126,14 @@ catenary diagnostics
 `catenary diagnostics` is a load-bearing command — run it **bare**, as its
 own step (no pipes, no `&&`/`;` chaining), and read the result. While a batch of covered edits is
 pending, the command filter blocks unrelated commands until you run
-`catenary diagnostics`. The exit code signals compile state: non-zero when
-the run is "dirty" (an error by default — see `diagnostics_severity` in
-[Configuration](configuration.md#diagnostics)).
+`catenary diagnostics`. **The exit code is a trust signal, not a lint
+result:** it exits `0` whenever the run completed — clean *or* dirty —
+and `2` only on a genuine fault (no daemon, IPC failure). It never exits
+`1`, so a run that found errors is not mistaken for a failed call — read
+the receipt for the errors, not the exit code. (Whether a run is labeled
+"dirty" is tunable via `diagnostics_severity` in
+[Configuration](configuration.md#diagnostics), but that is a status label
+only and does not change the exit code.)
 
 ### `catenary query`
 

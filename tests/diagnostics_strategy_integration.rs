@@ -131,8 +131,10 @@ fn test_diagnostics_server_death() -> Result<()> {
         .unwrap_or_default();
 
     // Should either get diagnostics (if server published before dying),
-    // a status message, a notify error, or empty output (a clean batch is
-    // silent post misc 111). No raw infrastructure messages to agent.
+    // a status message, a notify error, or empty output (a server that dies
+    // before retrieval produces no result, so the file is neither `[clean]`
+    // nor dirty — it stays out of the receipt). No raw infrastructure
+    // messages to agent.
     let is_acceptable = text.contains("mock diagnostic")
         || text.contains("[no language server]")
         || text.trim().is_empty()
@@ -383,8 +385,8 @@ fn test_diagnostics_settle_holds_through_unbracketed_child_flycheck() -> Result<
 
 /// mockls with `--progress-on-change --no-push-diagnostics`: server sends
 /// progress tokens but never publishes diagnostics. After settle, the push
-/// cache is empty and pull is not supported → clean, which is silent
-/// (empty output) post misc 111.
+/// cache is empty and pull is not supported → the file is verified clean and
+/// listed explicitly as `[clean]` (ws37 ticket 01, retiring silent-on-clean).
 #[test]
 fn test_diagnostics_no_push_no_pull_returns_clean() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -400,8 +402,8 @@ fn test_diagnostics_no_push_no_pull_returns_clean() -> Result<()> {
     let text = bridge.call_diagnostics(file.to_str().context("path")?)?;
 
     assert!(
-        text.trim().is_empty(),
-        "Server with no push and no pull should return clean (silent) after settle. Got: {text}"
+        text.contains("[clean]") && text.contains("test."),
+        "Server with no push and no pull should list the file as `[clean]`. Got: {text}"
     );
 
     Ok(())
@@ -455,9 +457,9 @@ fn test_near_threshold_flycheck() -> Result<()> {
 }
 
 /// mockls with `--pull-diagnostics --fail-pull --no-push-diagnostics`:
-/// pull fails on first call → downgrade to push-only → clean (silent).
-/// Second call skips pull (downgraded) → clean (silent). Clean is empty
-/// output post misc 111.
+/// pull fails on first call → downgrade to push-only → clean. Second call
+/// skips pull (downgraded) → clean. A verified-clean file is listed
+/// explicitly as `[clean]` (ws37 ticket 01, retiring silent-on-clean).
 #[test]
 fn test_pull_downgrade_no_push() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -470,18 +472,18 @@ fn test_pull_downgrade_no_push() -> Result<()> {
     )?;
     bridge.initialize()?;
 
-    // First call: pull fails → downgrade → clean (silent)
+    // First call: pull fails → downgrade → clean → `[clean]`
     let text1 = bridge.call_diagnostics(file.to_str().context("path")?)?;
     assert!(
-        text1.trim().is_empty(),
-        "Failed pull with no push should return clean (silent). Got: {text1}"
+        text1.contains("[clean]"),
+        "Failed pull with no push should list the file as `[clean]`. Got: {text1}"
     );
 
-    // Second call: pull skipped (downgraded) → clean (silent)
+    // Second call: pull skipped (downgraded) → clean → `[clean]`
     let text2 = bridge.call_diagnostics(file.to_str().context("path")?)?;
     assert!(
-        text2.trim().is_empty(),
-        "Downgraded server should return clean (silent) without retrying pull. Got: {text2}"
+        text2.contains("[clean]"),
+        "Downgraded server should list the file as `[clean]` without retrying pull. Got: {text2}"
     );
 
     Ok(())
@@ -714,9 +716,9 @@ fn test_diagnostics_one_server_dies() -> Result<()> {
 
     // mockls-crash dies after 3 responses (initialize response +
     // initialized ack + didOpen). mockls-stable should still produce
-    // diagnostics (or be silent when clean, post misc 111).
+    // diagnostics (or list the file `[clean]` if it verified no diagnostics).
     assert!(
-        text.contains("mock diagnostic") || text.trim().is_empty(),
+        text.contains("mock diagnostic") || text.contains("[clean]"),
         "Surviving server should still contribute. Got:\n{text}"
     );
     // Should NOT be entirely "[no language server]"

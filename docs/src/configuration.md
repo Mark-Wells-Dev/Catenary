@@ -774,7 +774,7 @@ diagnostics_severity = "error"    # default
 | Option | Default | Description |
 |--------|---------|-------------|
 | `diagnostics_per_page` | `50` | Single-shot preview budget. When a run produces more than this many diagnostics, the preview shows the first N (errors before warnings) and the complete set is written to a per-session file under the runtime dir, named in a trailing "… N more — full report at `<path>`" line. |
-| `diagnostics_severity` | `"error"` | Minimum severity that marks a run "dirty" (exit code `1`). One of `"error"`, `"warning"`, `"info"`, `"hint"`. With the default, the exit code means "does it compile" — warnings still print but exit `0`. |
+| `diagnostics_severity` | `"error"` | Minimum severity that labels a run "dirty" (vs "clean"). One of `"error"`, `"warning"`, `"info"`, `"hint"`. A status label only — the run always exits `0` and prints every diagnostic (see [`catenary diagnostics`](cli.md#catenary-diagnostics)); it no longer gates an exit code. |
 
 ## Icons
 

@@ -249,10 +249,10 @@ fn test_batch_file_open_failure() -> Result<()> {
         missing.to_str().context("path missing")?,
     ])?;
 
-    // The good file should still produce results (or be silent when clean,
-    // post misc 111).
+    // The good file should still produce results despite the missing sibling
+    // (a clean good file would instead carry a `[clean]` line).
     assert!(
-        text.contains("mock diagnostic") || text.trim().is_empty(),
+        text.contains("mock diagnostic") || text.contains("[clean]"),
         "Good file should produce output despite missing file. Got:\n{text}"
     );
 
@@ -261,8 +261,8 @@ fn test_batch_file_open_failure() -> Result<()> {
 
 // ─── Clean files ────────────────────────────────────────────────────
 
-/// Files where the server produces no diagnostics are silent — the linter
-/// idiom (misc 111): a clean batch emits nothing.
+/// Files a server verified with no diagnostics are listed explicitly as
+/// `[clean]` — clean is stated, never silence (ws37 ticket 01).
 #[test]
 fn test_batch_clean_files() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -282,9 +282,14 @@ fn test_batch_clean_files() -> Result<()> {
         file_b.to_str().context("path b")?,
     ])?;
 
+    // Both verified-clean files appear with a `[clean]` line beside them.
     assert!(
-        text.trim().is_empty(),
-        "Files with no diagnostics should be silent (clean). Got:\n{text}"
+        text.contains("cln_a") && text.contains("cln_b"),
+        "Both clean files should be listed. Got:\n{text}"
+    );
+    assert!(
+        text.matches("[clean]").count() == 2,
+        "Each clean file should carry a `[clean]` line. Got:\n{text}"
     );
 
     Ok(())

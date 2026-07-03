@@ -56,14 +56,25 @@ upgrading.
   under the runtime dir, referenced by a trailing
   `… N more — full report at <path>` line.
 - **`[tools].diagnostics_severity`** (default `"error"`) — minimum severity that
-  marks a `catenary diagnostics` run "dirty" (exit code `1`). With the default,
-  the exit code means "does it compile" — warnings still print but exit `0`.
+  labels a `catenary diagnostics` run "dirty" (vs "clean"). A status label only:
+  the run always exits `0` and prints every diagnostic; it does not gate an exit
+  code.
 - **`[notifications].threshold`** (default `"warn"`) — documents and exposes the
   minimum severity promoted to user-facing notifications (one of `"debug"`,
   `"info"`, `"warn"`, `"error"`).
 
 ### Changed
 
+- **`catenary diagnostics` exit contract + per-file receipt.** The command now
+  exits `0` whenever it ran correctly — clean *or* dirty — and `2` only on a
+  genuine fault (no daemon, IPC failure); it **never** exits `1`. The exit code
+  is a trust signal for the agent harness ("did the call succeed?"), not a lint
+  result, so a dirty run is no longer misread as a failed call. The clean/dirty
+  distinction moves entirely into stdout as a **per-file receipt**: every
+  diagnosed file is listed, `[clean]` beside the clean ones and diagnostics
+  beneath the dirty ones (`[no edited files]` for a genuinely empty set). This
+  retires the old silent-on-clean behavior — a clean file is now stated
+  explicitly, never inferred from empty output.
 - The command filter is **allowlist-based**: only explicitly permitted commands
   run; everything else is denied with a dump of the allowed configuration. Read
   and stdout-only tools (`cat`, `head`, `diff`, …) live in `allow`; the

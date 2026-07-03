@@ -156,13 +156,14 @@ enum Command {
     /// Print diagnostics for the files you've edited, then clear the set.
     ///
     /// Runs the LSP diagnostics pipeline over every file edited since the
-    /// last run: prints only the files that have errors or warnings, and
-    /// nothing when a covered set is clean (the linter idiom — silent on
-    /// success, exit 0). When nothing was edited it prints `[no edited files]`
-    /// so an empty/drained set is distinguishable from a silent clean run.
-    /// Then resets so the next edit starts a fresh set. Editing begins
-    /// implicitly on the first edit — there is no separate start step. Invoke
-    /// via the host's shell tool.
+    /// last run and prints a per-file receipt: each diagnosed file is listed,
+    /// with its errors and warnings beneath it or `[clean]` beside it when the
+    /// file is clean. When nothing was edited it prints `[no edited files]`.
+    /// Exits `0` whenever the run completed — clean *or* dirty — and `2` only
+    /// on a genuine fault (no daemon, IPC failure); it never exits `1`, so a
+    /// dirty result is not misread as a failed call. Then resets so the next
+    /// edit starts a fresh set. Editing begins implicitly on the first edit —
+    /// there is no separate start step. Invoke via the host's shell tool.
     Diagnostics {
         /// Ignored trailing arguments.
         ///
@@ -585,13 +586,15 @@ fn main() -> Result<()> {
                 eprintln!("{}", diagnostics_ignored_args_note());
             }
             let mut out = cli::Output::stdout(false);
-            // Exit-code contract (ticket 11): 0 clean / 1 dirty / 2 fault. A
-            // fault (no daemon, IPC failure, malformed response) surfaces as
-            // `Err` and is distinct from a dirty `1` so the agent can tell
-            // "found errors" from "the tool broke".
+            // Exit-code contract (ws37 ticket 01, amending cli-prerelease
+            // ticket 11): `0` = the run completed and its results are valid,
+            // clean *or* dirty; `2` = a genuine fault (no daemon, IPC failure,
+            // malformed response) surfaced as `Err`. `1` is NEVER emitted — the
+            // clean/dirty distinction lives entirely in the stdout receipt, so
+            // an agent's harness reads `0` as "trust this output" for a dirty
+            // run too, instead of discarding valid diagnostics.
             match build_runtime().and_then(|rt| rt.block_on(run_done_editing(&mut out))) {
-                Ok(DiagnosticsExit::Clean) => Ok(()),
-                Ok(DiagnosticsExit::Dirty) => std::process::exit(1),
+                Ok(()) => Ok(()),
                 Err(e) => {
                     eprintln!("{e:#}");
                     std::process::exit(2);
@@ -1693,13 +1696,13 @@ async fn run_start_editing(out: &mut cli::Output) -> Result<()> {
     Ok(())
 }
 
-/// Sentinel printed when the edited set is empty (0 covered files in the
-/// handoff): "nothing to report" made observable rather than a silent exit 0.
+/// Sentinel printed when the edited set is genuinely empty (0 covered files in
+/// the handoff): "nothing to report" made observable rather than a silent exit.
 ///
-/// This is the ONLY synthesized empty-output sentinel: a clean COVERED set stays
-/// silent (misc 111 / decision 022, the linter idiom). The sentinel exists so a
-/// drained/never-populated set is distinguishable from a clean covered run — the
-/// silent loss bug 32 surfaces.
+/// A clean COVERED set is NOT silent — the daemon renders a `[clean]` receipt
+/// line per covered file (ws37 ticket 01, retiring silent-on-clean). So an empty
+/// daemon receipt means the set had no covered files; this sentinel keeps that
+/// case distinguishable from a set that produced a receipt.
 #[cfg(unix)]
 const NO_EDITED_FILES_SENTINEL: &str = "[no edited files]";
 
@@ -1713,34 +1716,23 @@ const fn diagnostics_ignored_args_note() -> &'static str {
      diagnostics were reported for ALL edited files, not just those paths"
 }
 
-/// Clean/dirty outcome of `catenary diagnostics`, mapped to the process exit
-/// code by the dispatcher (`0` clean / `1` dirty). A genuine fault (no daemon,
-/// IPC failure, malformed response) propagates as `Err` and exits `2`.
-#[cfg(unix)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DiagnosticsExit {
-    /// No diagnostic met the dirty severity threshold.
-    Clean,
-    /// At least one diagnostic met the dirty severity threshold.
-    Dirty,
-}
-
 /// The daemon's `tool/editing-stop` response envelope (mirrors the grep/glob
-/// JSON pattern): a clean/dirty `status` plus the rendered diagnostics `output`.
+/// JSON pattern): the rendered per-file receipt `output` plus the covered-file
+/// count.
+///
+/// The daemon still sends a clean/dirty `status`, but the CLI no longer reads it
+/// (ws37 ticket 01): the run exits `0` whether clean or dirty, and the receipt
+/// itself carries the distinction, so `status` is ignored here.
 #[cfg(unix)]
 #[derive(Default, serde::Deserialize)]
 struct DiagnosticsResponse {
-    /// `"clean"` or `"dirty"`. Anything else is treated as clean.
-    #[serde(default)]
-    status: String,
-    /// Rendered diagnostics preview (may include the overflow pointer line).
+    /// Rendered per-file receipt: every diagnosed file, `[clean]` beside the
+    /// clean ones and diagnostics beneath the dirty ones.
     #[serde(default)]
     output: String,
-    /// Count of LSP-covered files the daemon checked. Lets the CLI distinguish
-    /// the 0-file case (`[no edited files]`) from a clean covered set
-    /// (`[clean]`) when `output` is empty — bug 32 secondary. Absent on a
-    /// pre-fix daemon → defaults to 0, which collapses to the
-    /// `[no edited files]` sentinel only when output is also empty.
+    /// Count of covered files in the handoff. Lets the CLI print
+    /// `[no edited files]` for a genuinely empty set (covered == 0) rather than
+    /// a silent exit. Absent on a pre-fix daemon → defaults to 0.
     #[serde(default)]
     covered: usize,
 }
@@ -1751,15 +1743,15 @@ struct DiagnosticsResponse {
 /// Connects to the daemon's IPC socket and sends `tool/editing-stop` (the
 /// internal handoff method name is unchanged by the user-facing rename).
 /// The `PreToolUse` hook has already prepared the handoff — this command
-/// retrieves the diagnostics, prints them, and returns the clean/dirty status
-/// so the caller can set the exit code.
+/// retrieves the diagnostics and prints the per-file receipt. Success (clean
+/// *or* dirty) returns `Ok(())`, which the dispatcher maps to exit `0`.
 ///
 /// # Errors
 ///
-/// Returns an error (mapped to a fault exit code) if no daemon is running, the
+/// Returns an error (mapped to fault exit `2`) if no daemon is running, the
 /// IPC fails, or the response is malformed.
 #[cfg(unix)]
-async fn run_done_editing(out: &mut cli::Output) -> Result<DiagnosticsExit> {
+async fn run_done_editing(out: &mut cli::Output) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     let ipc_path = catenary_mcp::router::socket_path();
@@ -1789,27 +1781,31 @@ async fn run_done_editing(out: &mut cli::Output) -> Result<DiagnosticsExit> {
     emit_diagnostics_response(out, &response)
 }
 
-/// Parse a `tool/editing-stop` response, print its diagnostics text, and map
-/// `status` to the clean/dirty exit. Split from the IPC for unit testing.
+/// Parse a `tool/editing-stop` response and print the per-file receipt. Split
+/// from the IPC for unit testing.
+///
+/// The receipt is rendered daemon-side (every diagnosed file listed, `[clean]`
+/// beside the clean ones and diagnostics beneath the dirty ones); this fn prints
+/// it and owns the genuinely-empty case. `Ok(())` (clean *or* dirty) maps to
+/// exit `0`.
 ///
 /// # Errors
 ///
 /// Returns an error if the response is not valid JSON — a malformed response is
-/// a fault.
+/// a fault (mapped to exit `2`).
 #[cfg(unix)]
-fn emit_diagnostics_response(out: &mut cli::Output, response: &str) -> Result<DiagnosticsExit> {
+fn emit_diagnostics_response(out: &mut cli::Output, response: &str) -> Result<()> {
     let parsed: DiagnosticsResponse = serde_json::from_str(response.trim())
         .context("invalid diagnostics response from daemon")?;
 
     let trimmed = parsed.output.trim();
     if trimmed.is_empty() {
-        // Empty daemon output is ambiguous: it means EITHER a clean covered set
-        // OR nothing was edited (set drained / never populated). The
-        // covered-file count disambiguates them. Only the 0-file case gets a
-        // sentinel — that is the silent loss bug 32 needs to surface. A clean
-        // COVERED set stays SILENT (misc 111 / decision 022, the linter idiom):
-        // no diagnostics, no output, exit 0. Re-synthesizing `[clean]` here
-        // would reverse that deliberate decision.
+        // A clean COVERED set is no longer silent — the daemon renders a
+        // `[clean]` receipt line per covered file — so empty output means the
+        // set had no covered files. Print the sentinel for a genuinely empty
+        // set (covered == 0). The residual covered > 0 case (every handed-off
+        // file dropped during resolve/validate) is a rare defensive edge with
+        // nothing to render.
         if parsed.covered == 0 {
             let _ = out.writeln(format_args!("{NO_EDITED_FILES_SENTINEL}"));
         }
@@ -1817,11 +1813,7 @@ fn emit_diagnostics_response(out: &mut cli::Output, response: &str) -> Result<Di
         let _ = out.writeln(format_args!("{trimmed}"));
     }
 
-    Ok(if parsed.status == "dirty" {
-        DiagnosticsExit::Dirty
-    } else {
-        DiagnosticsExit::Clean
-    })
+    Ok(())
 }
 
 /// Sends an add-root or rm-root request to the running daemon.
@@ -3028,38 +3020,41 @@ mod tests {
         assert_eq!(out.into_string(), "7 paths\n");
     }
 
-    // ── diagnostics exit-code contract (ticket 11) ─────────────────
+    // ── diagnostics exit contract + receipt (ws37 ticket 01) ────────
+    //
+    // The dispatcher maps `Ok(())` → exit `0` (the run completed, clean OR
+    // dirty) and `Err` → exit `2` (a fault). It emits `1` for nothing, so these
+    // tests pin the CLI boundary: clean/dirty/empty all return `Ok(())`, and
+    // only a malformed response is an `Err`.
 
     #[cfg(unix)]
     #[test]
-    fn diagnostics_clean_exit_0() {
-        // Silent on clean (misc 111 / decision 022, the linter idiom): a clean
-        // COVERED set (covered > 0, empty output) prints NOTHING and exits 0.
-        // Bug 32's secondary fix deliberately does NOT synthesize `[clean]`
-        // here — that would reverse the silent-on-clean decision; only the
-        // 0-file case gets a sentinel.
+    fn diagnostics_clean_receipt_prints_clean_and_exits_0() {
+        // Clean is explicit, never silence (retiring misc 111 / decision 022):
+        // the daemon renders a `[clean]` receipt line per covered file, and the
+        // CLI prints it. `Ok(())` maps to exit 0.
         let mut out = cli::Output::buffer(80);
-        let status =
-            emit_diagnostics_response(&mut out, r#"{"status":"clean","output":"","covered":3}"#)
-                .expect("clean response parses");
-        assert_eq!(status, DiagnosticsExit::Clean);
-        assert!(
-            out.into_string().is_empty(),
-            "a clean covered run must print nothing (silent on clean)",
+        emit_diagnostics_response(
+            &mut out,
+            r#"{"output":"/root/file.rs [clean]","covered":1}"#,
+        )
+        .expect("clean receipt returns Ok → exit 0");
+        assert_eq!(
+            out.into_string().trim(),
+            "/root/file.rs [clean]",
+            "a clean covered run prints the `[clean]` receipt, not silence",
         );
     }
 
     #[cfg(unix)]
     #[test]
     fn diagnostics_zero_files_prints_no_edited_files_sentinel() {
-        // Bug 32 secondary: the 0-file case (covered == 0, empty output) prints
-        // `[no edited files]`, distinct from a silent clean-covered run, so a
-        // drained/empty set is observable rather than a silent exit 0.
+        // The genuinely-empty set (covered == 0, empty receipt) prints
+        // `[no edited files]` so a drained/empty set is observable rather than a
+        // silent exit. `Ok(())` maps to exit 0.
         let mut out = cli::Output::buffer(80);
-        let status =
-            emit_diagnostics_response(&mut out, r#"{"status":"clean","output":"","covered":0}"#)
-                .expect("clean response parses");
-        assert_eq!(status, DiagnosticsExit::Clean);
+        emit_diagnostics_response(&mut out, r#"{"output":"","covered":0}"#)
+            .expect("empty set returns Ok → exit 0");
         assert_eq!(
             out.into_string().trim(),
             NO_EDITED_FILES_SENTINEL,
@@ -3070,13 +3065,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn diagnostics_zero_files_sentinel_when_covered_absent() {
-        // A pre-fix daemon omits `covered`; it defaults to 0, so an empty-output
-        // clean response collapses to the [no edited files] sentinel rather than
-        // a silent exit 0.
+        // A pre-fix daemon omits `covered`; it defaults to 0, so an empty
+        // receipt collapses to the [no edited files] sentinel.
         let mut out = cli::Output::buffer(80);
-        let status = emit_diagnostics_response(&mut out, r#"{"status":"clean","output":""}"#)
-            .expect("clean response parses");
-        assert_eq!(status, DiagnosticsExit::Clean);
+        emit_diagnostics_response(&mut out, r#"{"output":""}"#)
+            .expect("empty receipt returns Ok → exit 0");
         assert_eq!(out.into_string().trim(), NO_EDITED_FILES_SENTINEL);
     }
 
@@ -3104,35 +3097,32 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn diagnostics_dirty_exit_1() {
+    fn diagnostics_dirty_receipt_prints_and_exits_0() {
+        // A dirty run's diagnostics print beneath the file, and the CLI still
+        // returns `Ok(())` → exit 0 (never 1): a dirty result is a valid result,
+        // not a failed call. This is the whole point of the amended contract.
         let mut out = cli::Output::buffer(80);
-        let status = emit_diagnostics_response(
-            &mut out,
-            r#"{"status":"dirty","output":":1:1 [error] e: boom"}"#,
-        )
-        .expect("dirty response parses");
-        assert_eq!(status, DiagnosticsExit::Dirty);
+        emit_diagnostics_response(&mut out, r#"{"output":":1:1 [error] e: boom"}"#)
+            .expect("dirty receipt returns Ok → exit 0, never 1");
         assert!(out.into_string().contains("boom"));
     }
 
     #[cfg(unix)]
     #[test]
-    fn diagnostics_warnings_only_exit_0() {
-        // A warnings-only run is reported clean by the daemon → exit 0.
+    fn diagnostics_warnings_only_prints_and_exits_0() {
+        // A warnings-only run: the daemon labels it clean, but the warnings
+        // still render in the receipt and the CLI returns `Ok(())` → exit 0.
         let mut out = cli::Output::buffer(80);
-        let status = emit_diagnostics_response(
-            &mut out,
-            r#"{"status":"clean","output":":2:1 [warning] w: meh"}"#,
-        )
-        .expect("response parses");
-        assert_eq!(status, DiagnosticsExit::Clean);
+        emit_diagnostics_response(&mut out, r#"{"output":":2:1 [warning] w: meh"}"#)
+            .expect("receipt returns Ok → exit 0");
+        assert!(out.into_string().contains("meh"));
     }
 
     #[cfg(unix)]
     #[test]
     fn diagnostics_malformed_response_is_fault() {
         // A malformed response is a fault (mapped to exit 2 by the dispatcher),
-        // not silently treated as clean.
+        // not silently treated as a completed run.
         let mut out = cli::Output::buffer(80);
         assert!(emit_diagnostics_response(&mut out, "not json").is_err());
     }

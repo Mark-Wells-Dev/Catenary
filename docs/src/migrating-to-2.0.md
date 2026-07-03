@@ -132,9 +132,9 @@ diagnostics_severity = "error"    # default
   before warnings) and the complete set is written to a per-session file under
   the runtime dir, named in a trailing `… N more — full report at <path>` line.
 - **`diagnostics_severity`** (default `"error"`) — the minimum severity that
-  marks a run "dirty" (exit code `1`). One of `"error"`, `"warning"`, `"info"`,
-  `"hint"`. With the default, the exit code means "does it compile": warnings
-  still print but exit `0`.
+  labels a run "dirty" (vs "clean"). One of `"error"`, `"warning"`, `"info"`,
+  `"hint"`. A status label only: the run always exits `0` and prints every
+  diagnostic; it no longer gates an exit code.
 
 See [Configuration → Diagnostics](configuration.md#diagnostics).
 
