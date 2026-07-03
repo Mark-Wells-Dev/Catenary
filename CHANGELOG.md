@@ -97,6 +97,17 @@ upgrading.
   skips it too. The post-stop reconnect warning is unchanged. `catenary stop`
   remains host-only — the command filter still classifies it as not
   agent-invocable.
+- **Docs: "Disabling Catenary per project," one subsection per host.** The
+  [Installation guide](docs/src/installation.md) now documents the project-scoped
+  opt-out for each host — presented as an option, not a recommendation. Claude
+  Code (`.claude/settings.json` `enabledPlugins` `"catenary@catenary": false`)
+  and Gemini CLI (`gemini extensions disable catenary --scope workspace`) each
+  have a clean per-project switch; OpenCode and Antigravity have no native
+  per-plugin disable, so the guide states that plainly and gives the file-removal
+  path instead. Each subsection spells out what stops (hooks — enforcement,
+  command filtering, tracking — plus MCP wiring where the plugin carries it) and
+  what remains (the daemon keeps serving other projects, nothing to uninstall,
+  re-enabling resumes cleanly because editing state is per-session).
 
 ### Changed
 
