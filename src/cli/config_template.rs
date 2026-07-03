@@ -78,11 +78,15 @@ const TEMPLATE: &str = r#"# Catenary recommended config
 # make = ["-C"]
 # cargo = ["--manifest-path"]
 #
-# # allow_flags — the allow-side dual of deny_flags. A keyed command must be
+# # allow_flags — the allow-side dual of deny_flags: a keyed command must be
 # # invoked in one of the listed forms or it is denied naming them. Forms are
 # # positive anchors: `-pe` matches any invocation carrying both `-p` and `-e`.
-# # This is policy only — the write resolver's own denials (an unauditable
-# # `perl script.pl`) still run regardless of what is listed.
+# # Listing a form can only narrow, never re-open: the write auditor still
+# # runs on whatever passes the form gate. For perl that means a script file
+# # (`perl script.pl` — even behind an allowed `-i`) stays denied because the
+# # hook can't see the program, and a literal `-e` program must be a
+# # recognizable substitution (`s///`, `tr///`, `y///`) to run. Net effect of
+# # the entry below: perl is available as a nicer sed, nothing more.
 # [commands.allow_flags]
 # perl = ["-i", "-pe", "-e"]
 #
