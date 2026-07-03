@@ -177,6 +177,15 @@ upgrading.
 
 ### Fixed
 
+- **`catenary diagnostics` no longer prints empty stdout when every file's
+  server produced no result.** A file whose language server died mid-pipeline
+  (or never answered) resolves to no result, so it earns neither a `[clean]`
+  line nor diagnostics — and an all-such set used to render as completely empty
+  stdout, indistinguishable from a hang or silent failure, while still clearing
+  the gate. Each unverified file now appears in the receipt as an explicit
+  `[unverified — <server> returned no result]` line (a directory/whole-root
+  scope folds them to an `M files unverified` count alongside the clean count).
+  Render-only: whether an unverified file pays its editing debt is unchanged.
 - **Diagnostics settle no longer reports `[clean]` over a CPU-starved flycheck
   child.** Under host CPU saturation a runnable child can present an all-zero
   50 ms sampling window — no user/system CPU or page-fault deltas while ticks

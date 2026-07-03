@@ -130,12 +130,16 @@ fn test_diagnostics_server_death() -> Result<()> {
         .call_diagnostics(file.to_str().context("path")?)
         .unwrap_or_default();
 
-    // Should either get diagnostics (if server published before dying),
-    // a status message, a notify error, or empty output (a server that dies
-    // before retrieval produces no result, so the file is neither `[clean]`
-    // nor dirty — it stays out of the receipt). No raw infrastructure
-    // messages to agent.
+    // Should either get diagnostics (if server published before dying), a status
+    // message, a notify error, or an `[unverified — <server> returned no result]`
+    // line (bug 56): a server that dies before retrieval produces no result, so
+    // the file is neither `[clean]` nor dirty, but it is still surfaced as an
+    // explicit unverified line rather than vanishing into empty stdout. An empty
+    // string is still tolerated for the degenerate case where the CLI call itself
+    // faults (IPC error → `unwrap_or_default`). No raw infrastructure messages to
+    // the agent.
     let is_acceptable = text.contains("mock diagnostic")
+        || text.contains("unverified")
         || text.contains("[no language server]")
         || text.trim().is_empty()
         || text.contains("Notify error");

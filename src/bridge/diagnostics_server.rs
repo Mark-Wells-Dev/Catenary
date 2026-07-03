@@ -45,8 +45,9 @@ pub(crate) struct DiagEntry {
 /// clean/dirty status label.
 pub struct DiagnosticsOutcome {
     /// The complete per-file receipt for stdout (decision 025) — every
-    /// diagnosed file, `[clean]` beside the clean ones and diagnostics beneath
-    /// the dirty ones; no volume branch.
+    /// diagnosed file, `[clean]` beside the clean ones, diagnostics beneath the
+    /// dirty ones, and an `[unverified — <server> returned no result]` line for
+    /// any file whose server produced nothing (bug 56); no volume branch.
     pub output: String,
     /// `true` when at least one diagnostic met the dirty severity threshold.
     /// A status label only (workstream 37 ticket 01): the run exits `0`
@@ -142,6 +143,28 @@ struct CleanEntry {
     /// Grouping root: workspace root, or parent directory for
     /// files outside all roots.
     root: PathBuf,
+}
+
+/// A covered file whose server produced no result — the server died mid-pipeline
+/// or never answered, so the file is neither `[clean]` nor diagnosed.
+///
+/// Listed in the receipt as an explicit `[unverified — <server> returned no
+/// result]` line beside its path (bug 56): the deliberate ticket-01 rule that
+/// [`FileOutcome::NoResults`] earns no `[clean]` line is right, but an
+/// all-`NoResults` set used to omit every file and render as empty stdout —
+/// indistinguishable from a hang or silent failure, while still paying the debt.
+/// Surfacing the unverified remainder keeps the receipt honest. Carries the same
+/// display + grouping-root shape as [`CleanEntry`], plus the name of the
+/// server(s) that failed to answer. Debt/gate semantics are unchanged — this is
+/// a render-only line.
+struct UnverifiedEntry {
+    display: String,
+    /// Grouping root: workspace root, or parent directory for
+    /// files outside all roots.
+    root: PathBuf,
+    /// The diagnostic server(s) assigned to the file that produced no result,
+    /// joined for display (e.g. `rust-analyzer`).
+    server: String,
 }
 
 /// Classification outcome for a single file in the batch pipeline.
@@ -242,8 +265,10 @@ impl DiagnosticsServer {
         let mut feeds: BTreeMap<String, FileFeed> = BTreeMap::new();
 
         // Fan-out engine (ticket 02's path): explicit files plus sub-root /
-        // no-capability directories expanded to their covered files.
-        let (mut canonical_paths, uncovered) =
+        // no-capability directories expanded to their covered files. Also yields
+        // the per-file server assignment, so a file that dies before producing a
+        // result can name the server(s) that owed it one (bug 56).
+        let (mut canonical_paths, uncovered, path_servers) =
             self.fan_out(&plan.fan_out, parent_id, &mut feeds).await;
 
         // Whole-root + capable scopes: one workspace/diagnostic request each,
@@ -261,6 +286,7 @@ impl DiagnosticsServer {
             &canonical_paths,
             &file_results,
             &uncovered,
+            &path_servers,
             plan.directory_scoped,
         );
 
@@ -276,8 +302,11 @@ impl DiagnosticsServer {
     /// Pipeline: resolve + canonicalize → group by server → per server (open all
     /// → settle → health probe → didSave all → settle → retrieve per file → close
     /// all) → linter feeders. Populates `feeds` with each file's raw feeder
-    /// diagnostics and returns the covered `canonical_paths` plus the uncovered
-    /// list.
+    /// diagnostics and returns the covered `canonical_paths`, the uncovered list,
+    /// and a per-file map of the diagnostic server(s) assigned to each covered
+    /// file (keyed by canonical-path string). The last is how a file that never
+    /// produced a result — because its server died mid-pipeline — can still name
+    /// the server that owed it one in the unverified receipt line (bug 56).
     ///
     /// Cross-file diagnostics (e.g., a renamed type that breaks importers) are
     /// correct because every server sees the complete final state before
@@ -292,9 +321,13 @@ impl DiagnosticsServer {
         files: &[PathBuf],
         parent_id: Option<&str>,
         feeds: &mut BTreeMap<String, FileFeed>,
-    ) -> (Vec<PathBuf>, Vec<UncoveredEntry>) {
+    ) -> (
+        Vec<PathBuf>,
+        Vec<UncoveredEntry>,
+        BTreeMap<String, BTreeSet<String>>,
+    ) {
         if files.is_empty() {
-            return (Vec::new(), Vec::new());
+            return (Vec::new(), Vec::new(), BTreeMap::new());
         }
 
         // Ensure servers exist for all files before looking them up.
@@ -313,6 +346,11 @@ impl DiagnosticsServer {
         // Keyed by server name for stable (alphabetical) iteration order.
         let mut server_groups: BTreeMap<String, (Arc<Mutex<LspClient>>, Vec<PathBuf>)> =
             BTreeMap::new();
+
+        // Canonical-path string → the diagnostic server(s) assigned to it. Lets a
+        // file that resolves `NoResults` (its server died before producing) name
+        // the responsible server in the unverified receipt line (bug 56).
+        let mut path_servers: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
 
         let validator = self.path_validator.read().await;
         for file in files {
@@ -365,8 +403,13 @@ impl DiagnosticsServer {
                 lint_candidates.push(canonical.clone());
             }
 
+            let key = canonical.to_string_lossy().to_string();
             for client_mutex in &clients {
                 let name = client_mutex.lock().await.server_name().to_string();
+                path_servers
+                    .entry(key.clone())
+                    .or_default()
+                    .insert(name.clone());
                 server_groups
                     .entry(name)
                     .or_insert_with(|| (Arc::clone(client_mutex), Vec::new()))
@@ -481,7 +524,7 @@ impl DiagnosticsServer {
             }
         }
 
-        (canonical_paths, uncovered)
+        (canonical_paths, uncovered, path_servers)
     }
 
     /// Routes a scoped diagnostics request across the fan-out and workspace-pull
@@ -732,7 +775,8 @@ impl DiagnosticsServer {
     /// reports the clean/dirty status.
     ///
     /// Root-grouped file entries: dirty files list their diagnostics beneath,
-    /// clean files carry a `[clean]` line beside their path, uncovered files a
+    /// clean files carry a `[clean]` line beside their path, unverified files an
+    /// `[unverified — <server> returned no result]` line, uncovered files a
     /// `[no LSP coverage]` note. Clean is **explicit**, never silence
     /// (workstream 37 ticket 01, retiring misc 111 / decision 022): the receipt
     /// is proof of the debt paid, so every diagnosed file appears. Root headers
@@ -740,19 +784,26 @@ impl DiagnosticsServer {
     /// report is always complete (decision 025) — every diagnostic prints, with
     /// no volume branch.
     ///
+    /// `path_servers` maps each covered file to the diagnostic server(s) assigned
+    /// to it, so a [`FileOutcome::NoResults`] file (its server died before
+    /// producing) can name the responsible server in its unverified line (bug 56).
+    ///
     /// `collapse_clean` (a directory/whole-root scope, ticket 04) folds each
-    /// root's `[clean]` list to a single `N files clean` line — the dirty files
-    /// are the signal. The diagnostics themselves are never collapsed
-    /// (decision 025); only the clean list is.
+    /// root's `[clean]` list to a single `N files clean` line — and, likewise,
+    /// its unverified list to `M files unverified` — since the dirty files are
+    /// the signal. The diagnostics themselves are never collapsed (decision 025);
+    /// only the clean and unverified lists are.
     fn format_output(
         &self,
         canonical_paths: &[PathBuf],
         file_results: &BTreeMap<String, (String, Vec<DiagEntry>)>,
         uncovered: &[UncoveredEntry],
+        path_servers: &BTreeMap<String, BTreeSet<String>>,
         collapse_clean: bool,
     ) -> DiagnosticsOutcome {
         let mut diag_files: Vec<DiagnosticFile> = Vec::new();
         let mut clean_files: Vec<CleanEntry> = Vec::new();
+        let mut unverified_files: Vec<UnverifiedEntry> = Vec::new();
 
         for cp in canonical_paths {
             let key = cp.to_string_lossy().to_string();
@@ -776,10 +827,31 @@ impl DiagnosticsServer {
                 FileOutcome::Clean => {
                     clean_files.push(CleanEntry { display, root });
                 }
-                // No feeder produced a result (the server died mid-pipeline):
-                // the file was NOT verified, so it earns neither a `[clean]`
-                // line nor a diagnostics block — it stays out of the receipt.
-                FileOutcome::NoResults => {}
+                // No feeder produced a result (the server died mid-pipeline or
+                // never answered): the file was NOT verified, so it earns neither
+                // a `[clean]` line nor diagnostics. It is still surfaced as an
+                // explicit `[unverified — <server> returned no result]` line
+                // (bug 56) — naming the server(s) that owed it a result — so an
+                // all-`NoResults` set can never render as empty stdout,
+                // indistinguishable from a hang. Debt/gate semantics are
+                // unchanged: the drain still clears it. Only a server-assigned
+                // file names a server here; a lint-only file that produced
+                // nothing carries no server, so it stays out of the receipt as
+                // before.
+                FileOutcome::NoResults => {
+                    if let Some(servers) = path_servers.get(&key) {
+                        let server = servers
+                            .iter()
+                            .map(String::as_str)
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        unverified_files.push(UnverifiedEntry {
+                            display,
+                            root,
+                            server,
+                        });
+                    }
+                }
             }
         }
 
@@ -812,8 +884,15 @@ impl DiagnosticsServer {
 
         // The report is always complete (decision 025): render every diagnostic
         // inline — no budget, no spill, no pointer line. A directory/whole-root
-        // scope collapses the `[clean]` list to a count (ticket 04).
-        let output = format_diagnostics(&diag_files, uncovered, &clean_files, collapse_clean);
+        // scope collapses the `[clean]` and unverified lists to counts (ticket 04
+        // / bug 56).
+        let output = format_diagnostics(
+            &diag_files,
+            uncovered,
+            &clean_files,
+            &unverified_files,
+            collapse_clean,
+        );
 
         DiagnosticsOutcome {
             output,
@@ -1697,10 +1776,13 @@ fn format_diagnostics_entries(
 ///
 /// Bare root-path section headers. Every diagnosed file is listed: dirty files
 /// with their diagnostics beneath, clean files with a `[clean]` line beside the
-/// path, uncovered files noted with `[no LSP coverage]`. Clean is **explicit**,
+/// path, unverified files with an `[unverified — <server> returned no result]`
+/// line, uncovered files noted with `[no LSP coverage]`. Clean is **explicit**,
 /// never silence (workstream 37 ticket 01, retiring misc 111 / decision 022) —
 /// the receipt is proof of the debt the run paid, so every file it diagnosed
-/// appears and counts toward the collapse total.
+/// appears and counts toward the collapse total. An `unverified` file (its
+/// server died before producing a result) appears for the same reason (bug 56):
+/// an all-`NoResults` set must never render as empty stdout.
 ///
 /// When a root contains a single (printed) file, the root and filename
 /// are collapsed into one path (e.g. `/tmp/scratch.sh`). Multi-file
@@ -1709,18 +1791,26 @@ fn format_diagnostics_entries(
 ///
 /// `collapse_clean` (a directory/whole-root scope, ticket 04) replaces a
 /// multi-file root's per-file `[clean]` lines with a single `N files clean`
-/// count — the dirty files are the signal. It never touches diagnostics or the
-/// single-file collapsed path (a lone clean file still shows its name).
+/// count, and its per-file unverified lines with an `M files unverified` count —
+/// the dirty files are the signal. It never touches diagnostics or the
+/// single-file collapsed path (a lone clean or unverified file still shows its
+/// name).
+#[allow(
+    clippy::too_many_lines,
+    reason = "one linear renderer: the four file categories (dirty / clean / unverified / uncovered) each render in the collapsed and multi-file branches, top-to-bottom"
+)]
 fn format_diagnostics(
     diag_files: &[DiagnosticFile],
     uncovered: &[UncoveredEntry],
     clean: &[CleanEntry],
+    unverified: &[UnverifiedEntry],
     collapse_clean: bool,
 ) -> String {
     use std::fmt::Write;
 
     let mut root_diag: BTreeMap<&PathBuf, Vec<(&str, &[DiagEntry])>> = BTreeMap::new();
     let mut root_clean: BTreeMap<&PathBuf, Vec<&str>> = BTreeMap::new();
+    let mut root_unverified: BTreeMap<&PathBuf, Vec<(&str, &str)>> = BTreeMap::new();
     let mut root_uncovered: BTreeMap<&PathBuf, Vec<&str>> = BTreeMap::new();
 
     for df in diag_files {
@@ -1732,6 +1822,12 @@ fn format_diagnostics(
     for ce in clean {
         root_clean.entry(&ce.root).or_default().push(&ce.display);
     }
+    for ue in unverified {
+        root_unverified
+            .entry(&ue.root)
+            .or_default()
+            .push((&ue.display, &ue.server));
+    }
     for ue in uncovered {
         root_uncovered
             .entry(&ue.root)
@@ -1742,6 +1838,7 @@ fn format_diagnostics(
     let mut all_roots: BTreeSet<&PathBuf> = BTreeSet::new();
     all_roots.extend(root_diag.keys());
     all_roots.extend(root_clean.keys());
+    all_roots.extend(root_unverified.keys());
     all_roots.extend(root_uncovered.keys());
 
     let mut output = String::new();
@@ -1749,8 +1846,9 @@ fn format_diagnostics(
     for root in &all_roots {
         let diag_count = root_diag.get(root).map_or(0, Vec::len);
         let clean_count = root_clean.get(root).map_or(0, Vec::len);
+        let unverified_count = root_unverified.get(root).map_or(0, Vec::len);
         let uncovered_count = root_uncovered.get(root).map_or(0, Vec::len);
-        let total = diag_count + clean_count + uncovered_count;
+        let total = diag_count + clean_count + unverified_count + uncovered_count;
         let collapsed = total == 1;
 
         if !output.is_empty() {
@@ -1772,6 +1870,15 @@ fn format_diagnostics(
             if let Some(clean_files) = root_clean.get(root) {
                 for f in clean_files {
                     _ = writeln!(output, "{} [clean]", root.join(f).display());
+                }
+            }
+            if let Some(unv_files) = root_unverified.get(root) {
+                for (display, server) in unv_files {
+                    _ = writeln!(
+                        output,
+                        "{} [unverified \u{2014} {server} returned no result]",
+                        root.join(display).display()
+                    );
                 }
             }
             if let Some(uncov_files) = root_uncovered.get(root) {
@@ -1802,6 +1909,22 @@ fn format_diagnostics(
                 } else {
                     for f in clean_files {
                         _ = writeln!(output, "\t{f} [clean]");
+                    }
+                }
+            }
+            if let Some(unv_files) = root_unverified.get(root) {
+                if collapse_clean {
+                    // Directory/whole-root scope: fold the unverified list to a
+                    // count alongside the clean count (bug 56).
+                    let n = unv_files.len();
+                    let plural = if n == 1 { "" } else { "s" };
+                    _ = writeln!(output, "\t{n} file{plural} unverified");
+                } else {
+                    for (display, server) in unv_files {
+                        _ = writeln!(
+                            output,
+                            "\t{display} [unverified \u{2014} {server} returned no result]"
+                        );
                     }
                 }
             }
@@ -1922,7 +2045,7 @@ mod tests {
             root: PathBuf::from("/test"),
             entries: vec![de(1, ":1:1 [error] test: msg")],
         }];
-        let output = format_diagnostics(&diag_files, &[], &[], false);
+        let output = format_diagnostics(&diag_files, &[], &[], &[], false);
         assert!(!output.contains("[LSP available]"), "output: {output}");
         // Single file under root → collapsed path.
         assert!(output.contains("/test/file.rs:"), "output: {output}");
@@ -1939,7 +2062,7 @@ mod tests {
             root: PathBuf::from("/test"),
             entries,
         }];
-        let output = format_diagnostics(&diag_files, &[], &[], false);
+        let output = format_diagnostics(&diag_files, &[], &[], &[], false);
         // All entries should be present (no paging).
         for i in 0..5 {
             assert!(output.contains(&format!("msg {i}")), "output: {output}");
@@ -1951,7 +2074,7 @@ mod tests {
         // A batch with no diagnosed files at all — no dirty, clean, or
         // uncovered entries — renders nothing. The empty-set sentinel
         // (`[no edited files]`) is the CLI's job, not the formatter's.
-        let output = format_diagnostics(&[], &[], &[], false);
+        let output = format_diagnostics(&[], &[], &[], &[], false);
         assert!(output.is_empty(), "expected empty output, got: {output:?}");
     }
 
@@ -1963,7 +2086,7 @@ mod tests {
             display: "file.rs".to_string(),
             root: PathBuf::from("/test"),
         }];
-        let output = format_diagnostics(&[], &[], &clean, false);
+        let output = format_diagnostics(&[], &[], &clean, &[], false);
         // Single file under root → collapsed path with `[clean]` beside it.
         assert_eq!(output.trim(), "/test/file.rs [clean]", "output: {output}");
     }
@@ -1987,7 +2110,7 @@ mod tests {
                 entries: vec![de(2, ":5:1 [warning] test: beta warning")],
             },
         ];
-        let output = format_diagnostics(&diag_files, &[], &[], false);
+        let output = format_diagnostics(&diag_files, &[], &[], &[], false);
         // /alpha has 2 diag files → expanded with directory header.
         let alpha_pos = output.find("/alpha\n").expect("missing /alpha header");
         assert!(output.contains("\tsrc/lib.rs:"), "output: {output}");
@@ -2017,7 +2140,7 @@ mod tests {
             display: "src/main.rs".to_string(),
             root: PathBuf::from("/alpha"),
         }];
-        let output = format_diagnostics(&diag_files, &[], &clean, false);
+        let output = format_diagnostics(&diag_files, &[], &clean, &[], false);
         // Two printed files under /alpha → directory header, indented entries.
         assert!(output.contains("/alpha\n"), "output: {output}");
         assert!(output.contains("\tsrc/lib.rs:"), "output: {output}");
@@ -2032,7 +2155,7 @@ mod tests {
             root: PathBuf::from("/tmp"),
             entries: vec![de(2, ":3:1 [warning] test: standalone warning")],
         }];
-        let output = format_diagnostics(&diag_files, &[], &[], false);
+        let output = format_diagnostics(&diag_files, &[], &[], &[], false);
         // Single file → collapsed path.
         assert!(output.contains("/tmp/scratch.sh:"), "output: {output}");
         assert!(output.contains("\t:3:1 [warning]"), "output: {output}");
@@ -2049,7 +2172,7 @@ mod tests {
             root: PathBuf::from("/test"),
             entries: vec![de(1, ":1:1 [error] test: msg")],
         }];
-        let output = format_diagnostics(&diag_files, &[], &[], false);
+        let output = format_diagnostics(&diag_files, &[], &[], &[], false);
         // No status header — output starts directly with file content.
         assert!(!output.contains("[LSP available]"), "output: {output}");
         // Bare path, no prefix.
@@ -2063,7 +2186,7 @@ mod tests {
             display: "data.csv".to_string(),
             root: PathBuf::from("/project"),
         }];
-        let output = format_diagnostics(&[], &uncovered, &[], false);
+        let output = format_diagnostics(&[], &uncovered, &[], &[], false);
         // Single file → collapsed path with [no LSP coverage].
         assert!(output.contains("/project/data.csv\n"), "output: {output}");
         assert!(output.contains("\t[no LSP coverage]"), "output: {output}");
@@ -2083,7 +2206,7 @@ mod tests {
             display: "data.csv".to_string(),
             root: PathBuf::from("/project"),
         }];
-        let output = format_diagnostics(&[], &uncovered, &clean, false);
+        let output = format_diagnostics(&[], &uncovered, &clean, &[], false);
         assert!(output.contains("/project\n"), "output: {output}");
         assert!(output.contains("\tlib.rs [clean]"), "output: {output}");
         assert!(output.contains("\tdata.csv"), "output: {output}");
@@ -2104,7 +2227,7 @@ mod tests {
                 root: PathBuf::from("/project"),
             })
             .collect();
-        let output = format_diagnostics(&[], &[], &clean, true);
+        let output = format_diagnostics(&[], &[], &clean, &[], true);
         assert!(output.contains("/project\n"), "output: {output}");
         assert!(output.contains("\t3 files clean"), "output: {output}");
         assert!(!output.contains("a.rs"), "clean names leaked: {output}");
@@ -2129,7 +2252,7 @@ mod tests {
                 root: PathBuf::from("/project"),
             })
             .collect();
-        let output = format_diagnostics(&diag_files, &[], &clean, true);
+        let output = format_diagnostics(&diag_files, &[], &clean, &[], true);
         assert!(output.contains("\tbroken.rs:"), "output: {output}");
         assert!(
             output.contains("\t\t:1:1 [error] test: boom"),
@@ -2152,9 +2275,132 @@ mod tests {
             display: "ok.rs".to_string(),
             root: PathBuf::from("/project"),
         }];
-        let output = format_diagnostics(&diag_files, &[], &clean, true);
+        let output = format_diagnostics(&diag_files, &[], &clean, &[], true);
         assert!(output.contains("\t1 file clean"), "output: {output}");
         assert!(!output.contains("ok.rs"), "clean name leaked: {output}");
+    }
+
+    // ── unverified rendering (bug 56) ─────────────────────────────
+
+    /// Build an [`UnverifiedEntry`] (test ergonomics).
+    fn ue(display: &str, root: &str, server: &str) -> UnverifiedEntry {
+        UnverifiedEntry {
+            display: display.to_string(),
+            root: PathBuf::from(root),
+            server: server.to_string(),
+        }
+    }
+
+    #[test]
+    fn format_unverified_file_listed_explicitly() {
+        // A file whose server produced no result earns an explicit unverified
+        // line beside its path — never silence (bug 56). Single file under root →
+        // collapsed path.
+        let unverified = vec![ue("file.rs", "/test", "rust-analyzer")];
+        let output = format_diagnostics(&[], &[], &[], &unverified, false);
+        assert_eq!(
+            output.trim(),
+            "/test/file.rs [unverified \u{2014} rust-analyzer returned no result]",
+            "output: {output}"
+        );
+    }
+
+    #[test]
+    fn format_all_unverified_never_empty() {
+        // An all-`NoResults` set renders one unverified line per file — never the
+        // empty stdout that used to be indistinguishable from a hang (bug 56).
+        let unverified = vec![
+            ue("src/a.rs", "/project", "rust-analyzer"),
+            ue("src/b.rs", "/project", "rust-analyzer"),
+        ];
+        let output = format_diagnostics(&[], &[], &[], &unverified, false);
+        assert!(!output.trim().is_empty(), "must never be empty: {output:?}");
+        // Two files under /project → directory header, indented per-file lines.
+        assert!(output.contains("/project\n"), "output: {output}");
+        assert!(
+            output.contains("\tsrc/a.rs [unverified \u{2014} rust-analyzer returned no result]"),
+            "output: {output}"
+        );
+        assert!(
+            output.contains("\tsrc/b.rs [unverified \u{2014} rust-analyzer returned no result]"),
+            "output: {output}"
+        );
+    }
+
+    #[test]
+    fn format_unverified_beside_clean_and_dirty() {
+        // A dirty file, a clean sibling, and an unverified sibling under one root
+        // all appear: diagnostics beneath the dirty one, `[clean]` beside the
+        // clean one, and the unverified line beside the third (bug 56).
+        let diag_files = vec![DiagnosticFile {
+            display: "src/lib.rs".to_string(),
+            root: PathBuf::from("/alpha"),
+            entries: vec![de(1, ":1:1 [error] test: alpha error")],
+        }];
+        let clean = vec![CleanEntry {
+            display: "src/main.rs".to_string(),
+            root: PathBuf::from("/alpha"),
+        }];
+        let unverified = vec![ue("src/dead.rs", "/alpha", "rust-analyzer")];
+        let output = format_diagnostics(&diag_files, &[], &clean, &unverified, false);
+        // Three printed files under /alpha → directory header, indented entries.
+        assert!(output.contains("/alpha\n"), "output: {output}");
+        assert!(output.contains("\tsrc/lib.rs:"), "output: {output}");
+        assert!(output.contains("\t\t:1:1 [error]"), "output: {output}");
+        assert!(output.contains("\tsrc/main.rs [clean]"), "output: {output}");
+        assert!(
+            output.contains("\tsrc/dead.rs [unverified \u{2014} rust-analyzer returned no result]"),
+            "output: {output}"
+        );
+    }
+
+    #[test]
+    fn format_collapses_unverified_when_directory_scoped() {
+        // A directory/whole-root scope folds the per-file unverified list to a
+        // single count line, alongside the clean count (bug 56). The individual
+        // unverified filenames and per-file marker must NOT appear.
+        let clean: Vec<CleanEntry> = ["a.rs", "b.rs"]
+            .iter()
+            .map(|f| CleanEntry {
+                display: (*f).to_string(),
+                root: PathBuf::from("/project"),
+            })
+            .collect();
+        let unverified = vec![
+            ue("x.rs", "/project", "rust-analyzer"),
+            ue("y.rs", "/project", "rust-analyzer"),
+            ue("z.rs", "/project", "rust-analyzer"),
+        ];
+        let output = format_diagnostics(&[], &[], &clean, &unverified, true);
+        assert!(output.contains("/project\n"), "output: {output}");
+        assert!(output.contains("\t2 files clean"), "output: {output}");
+        assert!(output.contains("\t3 files unverified"), "output: {output}");
+        assert!(
+            !output.contains("x.rs"),
+            "unverified names leaked: {output}"
+        );
+        assert!(
+            !output.contains("[unverified"),
+            "per-file marker leaked: {output}"
+        );
+    }
+
+    #[test]
+    fn format_singular_unverified_count_when_collapsed() {
+        // A single unverified file under a multi-file collapsed root uses the
+        // singular grammar. One dirty + one unverified → multi-file branch.
+        let diag_files = vec![DiagnosticFile {
+            display: "broken.rs".to_string(),
+            root: PathBuf::from("/project"),
+            entries: vec![de(1, ":1:1 [error] test: boom")],
+        }];
+        let unverified = vec![ue("dead.rs", "/project", "rust-analyzer")];
+        let output = format_diagnostics(&diag_files, &[], &[], &unverified, true);
+        assert!(output.contains("\t1 file unverified"), "output: {output}");
+        assert!(
+            !output.contains("dead.rs"),
+            "unverified name leaked: {output}"
+        );
     }
 
     // ── enclosing symbol tests ────────────────────────────────────
@@ -2415,7 +2661,7 @@ mod tests {
                 de(2, ":3:1 [warning] w: warn-c"),
             ],
         }];
-        let out = format_diagnostics(&diag_files, &[], &[], false);
+        let out = format_diagnostics(&diag_files, &[], &[], &[], false);
         assert!(
             out.contains("warn-a") && out.contains("err-b") && out.contains("warn-c"),
             "the complete report keeps every diagnostic: {out}"

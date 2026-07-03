@@ -132,8 +132,12 @@ server-covered file starts it, there is no start step. Bare, this command
 is the *end* of an edit batch: it opens every modified file on its server,
 waits for each to settle, and prints a **per-file receipt** — every
 diagnosed file listed, its errors and warnings beneath it, or `[clean]`
-beside it when the file is clean — then clears the set. When nothing was
-edited it prints `[no edited files]`.
+beside it when the file is clean — then clears the set. When a file's
+server dies before answering (or produces nothing), the file is neither
+clean nor dirty; it is still listed, as `[unverified — <server> returned no
+result]`, so an all-unverified run can never render as empty stdout
+(mistakable for a hang). When nothing was edited it prints
+`[no edited files]`.
 
 ```bash
 catenary diagnostics                 # the whole edited set
@@ -151,10 +155,11 @@ surfaces cross-file diagnostics a per-file pull can miss. A server without
 that capability, or any *sub-root* directory, falls back to the per-file
 pass (identical results, more work). Because a whole-root run can span many
 files, the receipt **collapses the clean files to a count** (`N files
-clean`) and lists only the files that have diagnostics — the complete
-diagnostics still print in full; only the clean list is folded. The
-edit-loop receipt (a handful of files) stays per-file, with `[clean]` beside
-each clean one.
+clean`) — and likewise any unverified files (`M files unverified`) — and
+lists only the files that have diagnostics — the complete diagnostics still
+print in full; only the clean and unverified lists are folded. The
+edit-loop receipt (a handful of files) stays per-file, with `[clean]` or the
+`[unverified — …]` line beside each.
 
 **The edit gate is a debt paid by *diagnosing*, not fixing.** Every
 server-covered file you edit joins the gate; each file's debt is cleared
