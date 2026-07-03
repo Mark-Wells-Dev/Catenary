@@ -123,14 +123,9 @@ surfaces you may want to set.
 
 ```toml
 [tools]
-diagnostics_per_page = 50         # default
 diagnostics_severity = "error"    # default
 ```
 
-- **`diagnostics_per_page`** (default `50`) — single-shot preview budget. When a
-  run produces more diagnostics than this, the preview shows the first N (errors
-  before warnings) and the complete set is written to a per-session file under
-  the runtime dir, named in a trailing `… N more — full report at <path>` line.
 - **`diagnostics_severity`** (default `"error"`) — the minimum severity that
   labels a run "dirty" (vs "clean"). One of `"error"`, `"warning"`, `"info"`,
   `"hint"`. A status label only: the run always exits `0` and prints every

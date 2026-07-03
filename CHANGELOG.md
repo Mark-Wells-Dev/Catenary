@@ -51,10 +51,6 @@ upgrading.
 
 ### Added
 
-- **`[tools].diagnostics_per_page`** (default `50`) — single-shot preview budget
-  for `catenary diagnostics`. Overflow is written to a per-session report file
-  under the runtime dir, referenced by a trailing
-  `… N more — full report at <path>` line.
 - **`[tools].diagnostics_severity`** (default `"error"`) — minimum severity that
   labels a `catenary diagnostics` run "dirty" (vs "clean"). A status label only:
   the run always exits `0` and prints every diagnostic; it does not gate an exit

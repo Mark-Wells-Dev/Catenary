@@ -67,10 +67,9 @@ catenary grep "TODO" --count            # "N matches in M files"
 ```
 
 Quote glob patterns so Catenary expands them gitignore-aware rather than
-the shell. `catenary grep` owns its line-budgeted output: the overflow
-valve truncates large results and spills the full output to a file (with a
-stderr receipt), so read them directly rather than piping through
-`head`/`tail`/`wc`. Ask for a total with `--count` and narrow with
+the shell. Output is complete every time — no truncation, paging, or spill
+files — and composes freely with pipes and redirects (`catenary grep p |
+head` works). Ask for a total with `--count` and narrow with
 `--exclude-pattern`.
 
 | Flag | Description |
@@ -97,9 +96,8 @@ catenary glob "**/*.rs" --exclude-pattern "tests/**"
 catenary glob "**/*.rs" --count          # "N paths"
 ```
 
-Like `catenary grep`, glob owns its line-budgeted output — the overflow
-valve spills the full result to a file (stderr receipt); read it directly
-and use `--count` for totals instead of piping into `head`/`tail`/`wc`.
+Like `catenary grep`, glob emits complete output — pipe or redirect it
+freely — and `--count` answers "how many" without the listing.
 
 | Flag | Description |
 |------|-------------|
