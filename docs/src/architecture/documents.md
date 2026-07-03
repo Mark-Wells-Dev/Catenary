@@ -118,9 +118,14 @@ runs `catenary diagnostics`. During editing mode:
   the edit batch. Read/Write, `ToolSearch`, filesystem-only Bash (`rm`,
   `cp`, `mv`), and canonical Catenary commands (`grep`/`glob`,
   the lifecycle commands) stay allowed; everything else is denied with a
-  message that lists the tracked files and tells the agent to run
-  `catenary diagnostics`. The block gates on the tracked set, not an
-  editing-mode bit — an empty set flows free, so friction tracks value.
+  message framed as a helpful next step, not a fault: it lists the
+  edited-but-not-yet-diagnosed files **grouped under each diagnostic feeder**
+  (LSP server / linter) tracking them, then teaches the two ways to clear
+  them — bare `catenary diagnostics` (all) and `catenary diagnostics <those
+  files>` (scoped, shown with the agent's real outstanding paths) — and names
+  the blocked command to re-run once the debt is paid. The block gates on the
+  tracked set, not an editing-mode bit — an empty set flows free, so friction
+  tracks value.
 - **Batched diagnostics.** When the agent runs `catenary diagnostics`,
   the `DiagnosticsServer` runs a single consolidated diagnostic pipeline
   across all modified files. Naming paths (`catenary diagnostics <paths>`)

@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
 use anyhow::{Result, anyhow};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -406,6 +406,87 @@ impl LspClientManager {
         self.effective_linters(&root)
             .values()
             .any(|linter| !linter.disable && linter.matches(rel))
+    }
+
+    /// Names every diagnostic feeder — LSP server or standalone linter —
+    /// configured to track `file`, sorted and deduplicated.
+    ///
+    /// A config-level projection of the editing-gate coverage predicates
+    /// ([`Session::has_lsp_coverage`] + [`Self::lint_covers`]) that returns the
+    /// feeders *by name* rather than a bool: an in-root file's LSP feeders are
+    /// the configured servers bound to its language (the `has_configured_server`
+    /// predicate — instance state is irrelevant, so a cold per-root instance of
+    /// a warm language still counts) unless the root turns LSP off; an
+    /// out-of-root file's are the single-file servers with a positive cache; a
+    /// file's linter feeders are the root's effective `[linter.rule.*]` entries
+    /// whose globs match. Every feeder named here would report on the file when
+    /// `catenary diagnostics` runs, so a file the gate tracks
+    /// (`Session::covered_for_diagnostics`) always yields at least one. The
+    /// editing-gate message groups its outstanding files by these names.
+    ///
+    /// [`Session::has_lsp_coverage`]: crate::bridge::session::Session::has_lsp_coverage
+    #[must_use]
+    pub fn diagnostic_feeder_names(&self, file: &Path) -> Vec<String> {
+        let mut names: BTreeSet<String> = BTreeSet::new();
+
+        let lang = self.fs.language_id(file).or_else(|| {
+            file.extension()
+                .and_then(|e| e.to_str())
+                .map(str::to_string)
+        });
+
+        match self.fs.resolve_root(file) {
+            Some(root) => {
+                // In-root LSP feeders: every configured server bound to the
+                // language, unless the root turns LSP off.
+                if !self.is_lsp_disabled(&root)
+                    && let Some(id) = lang.as_deref()
+                    && let Some(lc) = self.config.resolve_language(id)
+                {
+                    for binding in lc.servers() {
+                        if self.config.server.contains_key(&binding.name) {
+                            names.insert(binding.name.clone());
+                        }
+                    }
+                }
+                // Linter feeders: the root's effective rules whose globs match
+                // the root-relative path.
+                if !self.is_lint_disabled(&root)
+                    && let Ok(rel) = file.strip_prefix(&root)
+                {
+                    for (name, linter) in self.effective_linters(&root) {
+                        if !linter.disable && linter.matches(rel) {
+                            names.insert(name);
+                        }
+                    }
+                }
+            }
+            None => {
+                // Out-of-root LSP feeders: single-file servers with a positive
+                // (non-failed) cache entry — mirrors `has_single_file_coverage`.
+                if let Some(id) = lang.as_deref()
+                    && let Some(lc) = self.config.resolve_language(id)
+                {
+                    let failures = self
+                        .single_file_failures
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    for binding in lc.servers() {
+                        if self
+                            .config
+                            .server
+                            .get(&binding.name)
+                            .is_some_and(|def| def.single_file)
+                            && !failures.contains(&(id.to_string(), binding.name.clone()))
+                        {
+                            names.insert(binding.name.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        names.into_iter().collect()
     }
 
     /// Resolves the effective root for a server instance given a file path.

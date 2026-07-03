@@ -836,6 +836,22 @@ impl Session {
         self.client_manager.lint_covers(path)
     }
 
+    /// The diagnostic feeders — LSP servers and standalone linters — that track
+    /// `path`, sorted and deduplicated by name.
+    ///
+    /// A config-level projection of the editing-gate coverage predicates
+    /// ([`has_lsp_coverage`](Self::has_lsp_coverage) +
+    /// [`has_lint_coverage`](Self::has_lint_coverage)): every feeder here would
+    /// report on the file when `catenary diagnostics` runs. The editing-gate
+    /// message groups its outstanding files by these names so the agent sees
+    /// which tool checks each. A file the gate tracks
+    /// ([`covered_for_diagnostics`](Self::covered_for_diagnostics)) always
+    /// yields at least one feeder.
+    #[must_use]
+    pub fn diagnostic_feeders(&self, path: &Path) -> Vec<String> {
+        self.client_manager.diagnostic_feeder_names(path)
+    }
+
     /// Whether the diagnostics surface is suppressed for the file's root
     /// (`disable_diag`, ticket 00).
     ///

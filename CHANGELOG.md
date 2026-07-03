@@ -108,6 +108,15 @@ upgrading.
   and editing a paid file re-arms it. A named path that was never edited is
   simply linted, paying nothing. This retires the old accept-and-warn note that
   told you paths "take no arguments" and were ignored.
+- **The editing-gate message teaches the pull, named by feeder.** When a
+  command is held because edits are still undiagnosed, the message now reads as
+  a helpful next step rather than a fault: it lists the outstanding files
+  **grouped under each diagnostic feeder** (the LSP server or linter that
+  tracks each) and teaches both ways to clear them — bare `catenary
+  diagnostics` (all) and `catenary diagnostics <those files>` (scoped, shown
+  with your actual outstanding paths) — then names the command to re-run. No
+  inferred intent, no internal jargon: just the files that haven't been
+  diagnosed yet and the exact command to diagnose them.
 - The command filter is **allowlist-based**: only explicitly permitted commands
   run; everything else is denied with a dump of the allowed configuration. Read
   and stdout-only tools (`cat`, `head`, `diff`, …) live in `allow`; the

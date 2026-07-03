@@ -380,14 +380,17 @@ impl HookRouter {
         )))
     }
 
-    /// Build the intent-neutral boundary-block deny message.
+    /// Build the editing-gate message — a helpful next step, not a fault.
     ///
-    /// Names the blocked command (the shell command when present, else the tool
-    /// name), lists the covered files currently tracked for diagnostics, and
-    /// points at `catenary diagnostics`. It carries no inferred intent
-    /// ("before testing"/"before building" are guesses and often wrong) — it
-    /// anchors only on what Catenary knows: coverable edits exist and have not
-    /// been diagnosed.
+    /// Lists the files edited-but-not-yet-diagnosed, grouped under each
+    /// diagnostic feeder (LSP server / linter) tracking them, then teaches the
+    /// two ways to clear them: bare `catenary diagnostics` (all) and
+    /// `catenary diagnostics <those files>` (scoped, shown with the agent's real
+    /// outstanding paths). The blocked command is named only to close the loop
+    /// ("then re-run it"). It carries no inferred intent
+    /// ("before testing"/"before building" are guesses and often wrong) and no
+    /// Catenary-internals vocabulary — it anchors only on what the agent needs:
+    /// these edited files haven't been diagnosed yet, here's the command.
     fn boundary_block_message(
         &self,
         session_id: Option<&str>,
@@ -395,16 +398,53 @@ impl HookRouter {
         command: Option<&str>,
         tool_name: &str,
     ) -> String {
+        use std::collections::BTreeMap;
         use std::fmt::Write as _;
-        let what = command.unwrap_or(tool_name);
-        let mut msg = format!(
-            "command `{what}` is blocked\n\
-             The following files are tracked via a language server:\n"
-        );
-        for file in self.session.editing.files(session_id, agent_id) {
-            let _ = writeln!(msg, "  {}", file.display());
+
+        let files = self.session.editing.files(session_id, agent_id);
+
+        // Group the outstanding files under each feeder tracking them. A file
+        // both a language server and a linter cover appears under both — the
+        // agent sees every tool that will check it. `BTreeMap` gives a stable
+        // (alphabetical) feeder order. A file with no resolvable feeder still
+        // appears (via `unattributed`) so nothing silently drops off the debt.
+        let mut by_feeder: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut unattributed: Vec<String> = Vec::new();
+        for file in &files {
+            let shown = file.display().to_string();
+            let feeders = self.session.diagnostic_feeders(file);
+            if feeders.is_empty() {
+                unattributed.push(shown);
+            } else {
+                for feeder in feeders {
+                    by_feeder.entry(feeder).or_default().push(shown.clone());
+                }
+            }
         }
-        msg.push_str("Call `catenary diagnostics` to proceed.");
+
+        let mut msg = String::from("These files were edited but haven't been diagnosed yet:\n");
+        for (feeder, group) in &by_feeder {
+            let _ = writeln!(msg, "  {feeder}");
+            for file in group {
+                let _ = writeln!(msg, "    {file}");
+            }
+        }
+        for file in &unattributed {
+            let _ = writeln!(msg, "  {file}");
+        }
+
+        let scoped = files
+            .iter()
+            .map(|f| f.display().to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let _ = writeln!(
+            msg,
+            "Run `catenary diagnostics` to check them all, or name paths to check only some:"
+        );
+        let _ = writeln!(msg, "  catenary diagnostics {scoped}");
+        let what = command.unwrap_or(tool_name);
+        let _ = write!(msg, "Then re-run `{what}`.");
         msg
     }
 
@@ -762,8 +802,8 @@ mod tests {
             unreachable!("expected Deny for make test, got {result:?}");
         };
         assert!(
-            reason.contains("`make test` is blocked") && reason.contains("catenary diagnostics"),
-            "foreign cmd → boundary block, got: {reason}"
+            reason.contains("make test") && reason.contains("catenary diagnostics"),
+            "foreign cmd → boundary block names the command and the fix, got: {reason}"
         );
     }
 
@@ -1371,7 +1411,7 @@ mod tests {
             unreachable!("expected boundary block, got {result:?}");
         };
         assert!(
-            reason.contains("`make test` is blocked"),
+            reason.contains("make test"),
             "message should name the command, got: {reason}"
         );
         assert!(
@@ -1481,6 +1521,146 @@ mod tests {
         );
     }
 
+    // ── Gate message: feeder grouping (ticket 03) ───────────────────────
+
+    #[test]
+    fn gate_message_groups_files_by_lsp_feeder() {
+        // Two served .rs files → both grouped under the language server, both
+        // command forms shown, the scoped one with the real paths.
+        let (router, root) = test_router_with_root();
+        let main_rs = root.join("src/main.rs");
+        let lib_rs = root.join("src/lib.rs");
+        let _ = router.session.editing.start_editing(None, "");
+        router.session.editing.add_file(None, "", main_rs.clone());
+        router.session.editing.add_file(None, "", lib_rs.clone());
+
+        let msg = router.boundary_block_message(None, "", Some("make test"), "Bash");
+
+        assert!(
+            msg.contains("rust-analyzer"),
+            "names the tracking LSP feeder: {msg}"
+        );
+        assert!(
+            msg.contains(&main_rs.display().to_string()),
+            "lists main.rs: {msg}"
+        );
+        assert!(
+            msg.contains(&lib_rs.display().to_string()),
+            "lists lib.rs: {msg}"
+        );
+        // Bare form (all) and scoped form (the agent's real files).
+        assert!(
+            msg.contains("Run `catenary diagnostics` to check them all"),
+            "teaches the bare form: {msg}"
+        );
+        assert!(
+            msg.contains(&format!(
+                "catenary diagnostics {} {}",
+                main_rs.display(),
+                lib_rs.display()
+            )),
+            "teaches the scoped form with the real files: {msg}"
+        );
+        // Helpful next step, names the blocked command to re-run.
+        assert!(
+            msg.contains("make test"),
+            "closes the loop on the blocked command: {msg}"
+        );
+        // No fault framing, no Catenary-internals vocabulary.
+        assert!(!msg.contains("is blocked"), "not a fault message: {msg}");
+        for banned in ["handoff", "consume", "guardrail"] {
+            assert!(
+                !msg.contains(banned),
+                "no internals vocab ({banned}): {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn gate_message_groups_files_by_linter_feeder() {
+        // A .txt file has no language server; a linter rule covers it, so the
+        // gate tracks it and the message attributes it to the linter alone.
+        let (router, root) = test_router_with_project_config(
+            "[linter.rule.mocklint]\ncommand = \"mocklint\"\npatterns = [\"**/*.txt\"]\n",
+        );
+        let notes = root.join("notes.txt");
+        assert!(
+            router.session.covered_for_diagnostics(&notes),
+            "lint-covered .txt is gated for diagnostics"
+        );
+        assert_eq!(
+            router.session.diagnostic_feeders(&notes),
+            vec!["mocklint".to_string()],
+            "linter-only feeder attribution"
+        );
+
+        let _ = router.session.editing.start_editing(None, "");
+        router.session.editing.add_file(None, "", notes.clone());
+        let msg = router.boundary_block_message(None, "", Some("cargo build"), "Bash");
+
+        assert!(msg.contains("mocklint"), "names the linter feeder: {msg}");
+        assert!(
+            msg.contains(&notes.display().to_string()),
+            "lists the tracked file: {msg}"
+        );
+        assert!(
+            !msg.contains("rust-analyzer"),
+            "no phantom LSP feeder for a lint-only file: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("catenary diagnostics {}", notes.display())),
+            "scoped form names the file: {msg}"
+        );
+    }
+
+    #[test]
+    fn gate_message_groups_files_across_mixed_feeders() {
+        // A linter rule that matches both .rs and .txt: the served .rs file is
+        // tracked by rust-analyzer AND the linter (listed under both); the .txt
+        // by the linter only. The scoped form still names each file once.
+        let (router, root) = test_router_with_project_config(
+            "[linter.rule.mocklint]\ncommand = \"mocklint\"\npatterns = [\"**/*.rs\", \"**/*.txt\"]\n",
+        );
+        let main_rs = root.join("src/main.rs");
+        let notes = root.join("notes.txt");
+
+        assert_eq!(
+            router.session.diagnostic_feeders(&main_rs),
+            vec!["mocklint".to_string(), "rust-analyzer".to_string()],
+            "a mixed file lists both feeders, alphabetically"
+        );
+        assert_eq!(
+            router.session.diagnostic_feeders(&notes),
+            vec!["mocklint".to_string()],
+            "a lint-only file lists just the linter"
+        );
+
+        let _ = router.session.editing.start_editing(None, "");
+        router.session.editing.add_file(None, "", main_rs.clone());
+        router.session.editing.add_file(None, "", notes.clone());
+        let msg = router.boundary_block_message(None, "", Some("make check"), "Bash");
+
+        assert!(msg.contains("rust-analyzer"), "names the LSP feeder: {msg}");
+        assert!(msg.contains("mocklint"), "names the linter feeder: {msg}");
+        assert!(
+            msg.contains(&main_rs.display().to_string()),
+            "lists the mixed file: {msg}"
+        );
+        assert!(
+            msg.contains(&notes.display().to_string()),
+            "lists the lint-only file: {msg}"
+        );
+        // The scoped command dedups to one entry per file, in edit order.
+        assert!(
+            msg.contains(&format!(
+                "catenary diagnostics {} {}",
+                main_rs.display(),
+                notes.display()
+            )),
+            "scoped form names each outstanding file once: {msg}"
+        );
+    }
+
     // ── Test helpers ────────────────────────────────────────────────────
 
     /// Create a `HookRouter` with minimal dependencies for handler unit tests.
@@ -1541,6 +1721,52 @@ mod tests {
 
         let root = dir.path().join("workspace");
         std::fs::create_dir_all(&root).expect("create workspace dir");
+
+        let instance_id: Arc<str> = "test-session".into();
+        let notification_router = Arc::new(
+            crate::logging::notification_router::NotificationRouter::new(
+                crate::logging::Severity::Warn,
+            ),
+        );
+        notification_router.register_session(&instance_id);
+        let session = Arc::new(Session::new(
+            config,
+            vec![root.clone()],
+            logging,
+            instance_id.clone(),
+            handle,
+            notification_router,
+            None,
+        ));
+
+        let router = HookRouter::new(session, instance_id, "test".to_string());
+
+        (
+            TestHookRouter {
+                _dir: dir,
+                _runtime: runtime,
+                router,
+            },
+            root,
+        )
+    }
+
+    /// Create a `HookRouter` rooted at a fresh workspace whose `.catenary.toml`
+    /// is seeded with `project_config` before the session loads it.
+    ///
+    /// `Root::load` reads the project config at birth, so a `[linter.rule.*]`
+    /// entry written here registers a standalone-linter feeder — used to
+    /// exercise the gate message's linter-only and mixed-feeder grouping.
+    fn test_router_with_project_config(project_config: &str) -> (TestHookRouter, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("workspace");
+        std::fs::create_dir_all(&root).expect("create workspace dir");
+        std::fs::write(root.join(".catenary.toml"), project_config).expect("write project config");
+
+        let config = Config::default_with_classification();
+        let logging = crate::logging::LoggingServer::new();
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let handle = runtime.handle().clone();
 
         let instance_id: Arc<str> = "test-session".into();
         let notification_router = Arc::new(
