@@ -209,6 +209,16 @@ pub struct CommandsConfig {
     /// policy, not soundness — the write resolver's own denials run regardless
     /// and are never re-opened by a listed form.
     pub allow_flags: Option<HashMap<String, Vec<String>>>,
+    /// Commands the user opts in as **script hosts** (misc 129): a modeled
+    /// substitution engine (`perl`/`awk`/`sed`) whose program-file / bare form
+    /// relaxes from today's soundness denial to the unbounded-interpreter
+    /// executor boundary (`NoWrite`) — the same layer-4 stance `python
+    /// script.py` keeps. Inline programs (`perl -e`, `awk 'prog'`, `sed
+    /// 'script'`) keep their substitution audit; only the forms whose program
+    /// the hook cannot see relax. User-scope only, like every enforcement key;
+    /// keys must name a command in `allow`/`pipeline`/`build`. Listing an
+    /// already-unbounded interpreter (`python`/`ruby`/`node`) is a warned no-op.
+    pub script_hosts: Option<Vec<String>>,
     /// Per-command guidance groups.
     /// Key = group name (e.g., `"read"`, `"build"`), value = group config.
     pub guidance: Option<HashMap<String, GuidanceGroup>>,
@@ -242,6 +252,10 @@ pub struct ResolvedCommands {
     /// command name, value = set of permitted forms. An invocation of a keyed
     /// command must match at least one form or it is denied.
     pub allow_flags: HashMap<String, HashSet<String>>,
+    /// Commands opted in as **script hosts** (the misc-129 lever). Threaded into
+    /// the write resolver, where a listed command's program-file / bare form
+    /// classifies `NoWrite` (the executor boundary) instead of the audit denial.
+    pub script_hosts: HashSet<String>,
     /// Per-command guidance messages for denial responses.
     /// Key = command name, value = guidance entry.
     pub guidance: HashMap<String, GuidanceEntry>,
@@ -295,6 +309,9 @@ impl ResolvedCommands {
                     .extend(forms.iter().cloned());
             }
         }
+        if let Some(ref script_hosts) = layer.script_hosts {
+            self.script_hosts = script_hosts.iter().cloned().collect();
+        }
         if let Some(ref groups) = layer.guidance {
             self.guidance = flatten_guidance(groups);
         }
@@ -303,7 +320,7 @@ impl ResolvedCommands {
     /// Merge per-root project **build** tools into this user-level baseline.
     ///
     /// Command **enforcement** — `allow`/`pipeline`/`deny`/`deny_flags`/
-    /// `allow_flags` — is
+    /// `allow_flags`/`script_hosts` — is
     /// **user-level only**: it is taken verbatim from `self`, and a project
     /// `.catenary.toml` cannot relax or replace it.
     /// The filter resolves daemon-globally (`Session::merged_commands` reads the
@@ -520,7 +537,7 @@ impl BuildGuidance {
 #[allow(clippy::too_many_lines, reason = "validation covers many fields")]
 pub fn validate(config: &CommandsConfig) -> (Vec<String>, Vec<String>) {
     let mut errors = Vec::new();
-    let warnings = Vec::new();
+    let mut warnings = Vec::new();
 
     // client_enforcement_only with active fields is contradictory
     if config.client_enforcement_only
@@ -529,12 +546,13 @@ pub fn validate(config: &CommandsConfig) -> (Vec<String>, Vec<String>) {
             || config.deny.is_some()
             || config.deny_flags.is_some()
             || config.allow_flags.is_some()
+            || config.script_hosts.is_some()
             || config.build.is_some())
     {
         errors.push(
             "[commands] `client_enforcement_only = true` with `allow`, `pipeline`, \
-             `deny`, `deny_flags`, `allow_flags`, or `build` is contradictory — \
-             opt-out means no enforcement"
+             `deny`, `deny_flags`, `allow_flags`, `script_hosts`, or `build` is \
+             contradictory — opt-out means no enforcement"
                 .to_string(),
         );
     }
@@ -693,6 +711,59 @@ pub fn validate(config: &CommandsConfig) -> (Vec<String>, Vec<String>) {
         }
     }
 
+    // script_hosts (misc 129): the executor-boundary opt-in. An empty list (or
+    // an empty entry) is a config mistake, not the default — omit the key
+    // instead — so it is an error, matching the `allow_flags` precedent. A
+    // command not yet in `allow`/`pipeline`/`build`, or an already-unbounded
+    // interpreter, is a warned no-op (unlike `allow_flags`, an unlisted command
+    // is inert, not a lock-out). A command in *both* `script_hosts` and
+    // `allow_flags` has contradictory intent — a flagless script-file form
+    // matches no `allow_flags` anchor, so the form gate denies it — warn naming
+    // the conflict.
+    if let Some(ref script_hosts) = config.script_hosts {
+        if script_hosts.is_empty() {
+            errors.push(
+                "[commands] `script_hosts` is an empty list — omit the key to keep the \
+                 default (no script hosts)"
+                    .to_string(),
+            );
+        }
+        let allow_flags_keys: HashSet<&str> = config
+            .allow_flags
+            .as_ref()
+            .map(|m| m.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        for host in script_hosts {
+            if host.is_empty() {
+                errors.push("[commands] `script_hosts` contains an empty string".to_string());
+                continue;
+            }
+            if UNBOUNDED_INTERPRETERS.contains(&host.as_str()) {
+                warnings.push(format!(
+                    "[commands] script_hosts lists `{host}`, already an unbounded \
+                     interpreter (script execution is its default) — listing it has no \
+                     effect",
+                ));
+            } else if !allow_set.contains(host.as_str())
+                && !pipeline_set.contains(host.as_str())
+                && !build_set.contains(host.as_str())
+            {
+                warnings.push(format!(
+                    "[commands] script_hosts lists `{host}` which is not in `allow`, \
+                     `pipeline`, or `build` — it has no effect until `{host}` is permitted",
+                ));
+            }
+            if allow_flags_keys.contains(host.as_str()) {
+                warnings.push(format!(
+                    "[commands] `{host}` is in both `script_hosts` and `allow_flags` — a \
+                     flagless script-file form matches no `allow_flags` anchor, so the \
+                     form gate denies it; drop the `allow_flags.{host}` entry to run \
+                     `{host}` as a script host",
+                ));
+            }
+        }
+    }
+
     // Guidance validation
     if let Some(ref groups) = config.guidance {
         for (name, group) in groups {
@@ -722,13 +793,19 @@ pub fn validate(config: &CommandsConfig) -> (Vec<String>, Vec<String>) {
     (errors, warnings)
 }
 
+/// Interpreters that are **already** unbounded script hosts (`python script.py`
+/// runs by default once the interpreter is allowlisted): listing one in
+/// `script_hosts` is a warned no-op. Mirrors the resolver's
+/// unbounded-interpreter dispatch set (misc 129).
+const UNBOUNDED_INTERPRETERS: &[&str] = &["python", "python2", "python3", "ruby", "node", "nodejs"];
+
 /// `[commands]` keys that Catenary **ignores** in a *project* `.catenary.toml`.
 ///
 /// Only `build` is honored at project scope — it is per-root and benign (it
 /// names a build tool and relaxes nothing). Everything else is user-level
 /// only: command enforcement
 /// (`client_enforcement_only`/`allow`/`pipeline`/`deny`/`deny_flags`/
-/// `allow_flags`) and
+/// `allow_flags`/`script_hosts`) and
 /// denial `guidance`. The filter resolves daemon-globally
 /// (`Session::merged_commands`), so honoring any of these at project scope would
 /// change the filter *every* connected session sees. See
@@ -748,6 +825,7 @@ pub const PROJECT_IGNORED_COMMAND_KEYS: &[&str] = &[
     "deny",
     "deny_flags",
     "allow_flags",
+    "script_hosts",
     "guidance",
 ];
 
@@ -852,6 +930,43 @@ sed = ["-n"]
         let allow_flags = config.allow_flags.as_ref().expect("allow_flags");
         assert_eq!(allow_flags.get("perl").expect("perl").len(), 3);
         assert_eq!(allow_flags.get("sed").expect("sed").len(), 1);
+    }
+
+    #[test]
+    fn deserialize_script_hosts() {
+        let config: CommandsConfig = toml::from_str(
+            r#"
+allow = ["perl", "awk"]
+script_hosts = ["perl", "awk"]
+"#,
+        )
+        .expect("valid TOML");
+
+        assert_eq!(
+            config.script_hosts.as_deref(),
+            Some(["perl".to_string(), "awk".to_string()].as_slice()),
+        );
+    }
+
+    #[test]
+    fn merge_script_hosts_replaces_across_layers() {
+        let user = CommandsConfig {
+            allow: Some(vec!["perl".to_string(), "awk".to_string()]),
+            script_hosts: Some(vec!["perl".to_string()]),
+            ..CommandsConfig::default()
+        };
+        let override_layer = CommandsConfig {
+            script_hosts: Some(vec!["awk".to_string()]),
+            ..CommandsConfig::default()
+        };
+
+        let mut resolved = ResolvedCommands::default();
+        resolved.merge(&user);
+        resolved.merge(&override_layer);
+
+        // Like `allow`/`pipeline`, a later layer replaces the flat list.
+        assert!(resolved.script_hosts.contains("awk"));
+        assert!(!resolved.script_hosts.contains("perl"));
     }
 
     #[test]
@@ -1405,6 +1520,106 @@ sed = ["-n"]
         assert!(errors[0].contains("empty form string"));
     }
 
+    // ── script_hosts: the executor-boundary opt-in (misc 129) ───────
+
+    #[test]
+    fn validate_script_hosts_key_in_allow_ok() {
+        let config = CommandsConfig {
+            allow: Some(vec!["perl".to_string()]),
+            script_hosts: Some(vec!["perl".to_string()]),
+            ..CommandsConfig::default()
+        };
+
+        let (errors, warnings) = validate(&config);
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn validate_script_hosts_key_not_permitted_warns() {
+        // Not in allow/pipeline/build: a warned no-op, not an error — an
+        // unlisted command is simply inert (unlike allow_flags's lock-out).
+        let config = CommandsConfig {
+            allow: Some(vec!["git".to_string()]),
+            script_hosts: Some(vec!["perl".to_string()]),
+            ..CommandsConfig::default()
+        };
+
+        let (errors, warnings) = validate(&config);
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("script_hosts"));
+        assert!(warnings[0].contains("perl"));
+        assert!(warnings[0].contains("not in `allow`, `pipeline`, or `build`"));
+    }
+
+    #[test]
+    fn validate_script_hosts_unbounded_interpreter_warns() {
+        // python is already a script host under the allowlist — listing it is a
+        // warned no-op, even when it is allowed.
+        let config = CommandsConfig {
+            allow: Some(vec!["python".to_string()]),
+            script_hosts: Some(vec!["python".to_string()]),
+            ..CommandsConfig::default()
+        };
+
+        let (errors, warnings) = validate(&config);
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("python"));
+        assert!(warnings[0].contains("unbounded interpreter"));
+    }
+
+    #[test]
+    fn validate_script_hosts_empty_list_errors() {
+        let config = CommandsConfig {
+            allow: Some(vec!["perl".to_string()]),
+            script_hosts: Some(vec![]),
+            ..CommandsConfig::default()
+        };
+
+        let (errors, _) = validate(&config);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("empty list"));
+    }
+
+    #[test]
+    fn validate_script_hosts_empty_string_errors() {
+        let config = CommandsConfig {
+            allow: Some(vec!["perl".to_string()]),
+            script_hosts: Some(vec![String::new()]),
+            ..CommandsConfig::default()
+        };
+
+        let (errors, _) = validate(&config);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("empty string"));
+    }
+
+    #[test]
+    fn validate_script_hosts_allow_flags_conflict_warns() {
+        // A command in both levers has contradictory intent: the form gate would
+        // deny the flagless script-file form the script host wants to run.
+        let config = CommandsConfig {
+            allow: Some(vec!["perl".to_string()]),
+            allow_flags: Some(HashMap::from([(
+                "perl".to_string(),
+                vec!["-pe".to_string()],
+            )])),
+            script_hosts: Some(vec!["perl".to_string()]),
+            ..CommandsConfig::default()
+        };
+
+        let (errors, warnings) = validate(&config);
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("both `script_hosts` and `allow_flags`")),
+            "expected a conflict warning: {warnings:?}",
+        );
+    }
+
     #[test]
     fn validate_only_client_enforcement_only() {
         let config = CommandsConfig {
@@ -1442,6 +1657,7 @@ sed = ["-n"]
                 deny: Some(HashMap::from([("git".into(), vec!["ls-files".into()])])),
                 deny_flags: Some(HashMap::from([("git".into(), vec!["--no-verify".into()])])),
                 allow_flags: Some(HashMap::from([("perl".into(), vec!["-pe".into()])])),
+                script_hosts: Some(vec!["perl".into()]),
                 build: Some(StringOrVec(vec!["npm".into()])),
                 ..CommandsConfig::default()
             },
@@ -1460,6 +1676,10 @@ sed = ["-n"]
         assert!(!git_deny.contains("ls-files"), "project deny ignored");
         assert!(merged.deny_flags.is_empty(), "project deny_flags ignored");
         assert!(merged.allow_flags.is_empty(), "project allow_flags ignored");
+        assert!(
+            merged.script_hosts.is_empty(),
+            "project script_hosts ignored"
+        );
 
         // Only `build` is honored per-root.
         assert_eq!(
@@ -1485,6 +1705,7 @@ sed = ["-n"]
             "deny",
             "deny_flags",
             "allow_flags",
+            "script_hosts",
             "guidance",
         ] {
             assert!(

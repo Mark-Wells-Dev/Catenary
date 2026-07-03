@@ -118,7 +118,7 @@ narrow one: **only `build` is project-scoped.**
 
 Everything else under `[commands]` is **user-level only**: command
 enforcement (`client_enforcement_only`, `allow`, `pipeline`, `deny`,
-`deny_flags`, `allow_flags`) and denial `guidance`. A project
+`deny_flags`, `allow_flags`, `script_hosts`) and denial `guidance`. A project
 `.catenary.toml` that sets these keys still loads, but they are ignored
 with a warning; only `build` flows through
 `ResolvedCommands::merge_project_commands`. The warning is raised on raw-TOML

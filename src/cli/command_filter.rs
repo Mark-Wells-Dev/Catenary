@@ -383,7 +383,12 @@ pub fn check_and_resolve_command(
     // so the fix never bounces the agent into a second denial. Writers run at
     // position 0, so `allow` (not `pipeline`) is the relevant membership.
     let toolset = resolver::WriteToolset::from_allowed(|tool| rules.allow.contains(tool));
-    match resolver::resolve_script_with(&script, cwd, toolset) {
+    // The user's script-host opt-in (misc 129): a listed `perl`/`awk`/`sed`'s
+    // program-file / bare form resolves at the executor boundary instead of the
+    // audit denial. Empty (the default) leaves every modeled engine's soundness
+    // denial exactly as it was.
+    let script_hosts = resolver::ScriptHosts::from_names(rules.script_hosts.iter().cloned());
+    match resolver::resolve_script_with(&script, cwd, toolset, script_hosts) {
         Ok(writes) => Ok(writes),
         Err(opaque) => Err(Denial {
             command: opaque.command,
@@ -1277,9 +1282,11 @@ fn format_disallowed_form_denial(cmd: &str, forms: &std::collections::HashSet<St
     )
 }
 
-/// Render the allowed-command surface as sorted lines: `Allowed`, `Allowed in
-/// pipelines`, `Denied subcommands`, `Denied flags`, and `Restricted to forms`.
-/// Sections with no entries are omitted.
+/// Render the allowed-command surface as sorted lines; sections with no entries
+/// are omitted.
+///
+/// The lines are `Allowed`, `Allowed in pipelines`, `Denied subcommands`,
+/// `Denied flags`, `Restricted to forms`, and `Script hosts`.
 ///
 /// This is the canonical surface listing — `catenary commands` prints it and
 /// denial messages point there rather than inlining it. Build tools are
@@ -1341,6 +1348,12 @@ pub fn format_command_surface(commands: &ResolvedCommands) -> Vec<String> {
         }
         form_pairs.sort_unstable();
         parts.push(format!("Restricted to forms: {}", form_pairs.join(", ")));
+    }
+
+    if !commands.script_hosts.is_empty() {
+        let mut sorted: Vec<&str> = commands.script_hosts.iter().map(String::as_str).collect();
+        sorted.sort_unstable();
+        parts.push(format!("Script hosts: {}", sorted.join(", ")));
     }
 
     parts
@@ -2735,6 +2748,10 @@ mod tests {
             !surface.contains("Restricted to forms"),
             "empty allow_flags should be omitted"
         );
+        assert!(
+            !surface.contains("Script hosts"),
+            "empty script_hosts should be omitted"
+        );
     }
 
     #[test]
@@ -3402,6 +3419,146 @@ mod tests {
             surface.contains("perl -pe"),
             "should list perl -pe: {surface}",
         );
+    }
+
+    // ── script_hosts: the executor-boundary opt-in (misc 129) ───────
+
+    /// perl/awk/sed allowlisted, all three opted in as script hosts.
+    fn rules_with_script_hosts() -> ResolvedCommands {
+        let mut rules = basic_rules();
+        rules.allow.insert("perl".into());
+        rules.allow.insert("awk".into());
+        rules.allow.insert("sed".into());
+        rules.script_hosts = HashSet::from(["perl".into(), "awk".into(), "sed".into()]);
+        rules
+    }
+
+    #[test]
+    fn script_hosts_perl_script_file_allowed() {
+        // With perl a script host, `perl script.pl [args]` classifies NoWrite
+        // (the executor boundary) instead of the misc-126 denial.
+        let rules = rules_with_script_hosts();
+        assert!(
+            check_command("perl script.pl", &rules, None).is_none(),
+            "perl script.pl should run as a script host",
+        );
+        assert!(
+            check_command("perl script.pl a b c", &rules, None).is_none(),
+            "perl script.pl with args should run as a script host",
+        );
+    }
+
+    #[test]
+    fn script_hosts_perl_stdin_program_allowed() {
+        // The bare stdin-program shape (bare `perl`) mirrors the
+        // unbounded-interpreter treatment when perl is a script host.
+        let rules = rules_with_script_hosts();
+        assert!(
+            check_command("perl", &rules, None).is_none(),
+            "bare perl (stdin program) should run as a script host",
+        );
+    }
+
+    #[test]
+    fn script_hosts_perl_inline_nonsubstitution_still_denied() {
+        // Inline `-e` code stays the denied vector even for a script host: a
+        // non-substitution program is not checkable (python-consistent).
+        let rules = rules_with_script_hosts();
+        let denial = check_command("perl -e 'print 1'", &rules, None)
+            .expect("perl -e non-substitution still denied");
+        assert_eq!(denial.reason, DenialReason::OpaqueWrite);
+    }
+
+    #[test]
+    fn script_hosts_perl_inplace_still_resolves_writes() {
+        // `-i` keeps its write-set resolution into the diagnostics batch — the
+        // script-host opt-in does not blanket-NoWrite an inline substitution.
+        let rules = rules_with_script_hosts();
+        let writes = check_and_resolve_command("perl -i -pe 's/a/b/' f", &rules, None)
+            .expect("perl -i resolves")
+            .writes;
+        assert!(
+            writes.iter().any(|p| p.ends_with("f")),
+            "perl -i should still record its in-place write to f: {writes:?}",
+        );
+    }
+
+    #[test]
+    fn script_hosts_awk_program_file_allowed() {
+        // awk's `-f progfile` denial relaxes to the executor boundary.
+        let rules = rules_with_script_hosts();
+        assert!(
+            check_command("awk -f prog.awk data.txt", &rules, None).is_none(),
+            "awk -f progfile should run as a script host",
+        );
+    }
+
+    #[test]
+    fn script_hosts_sed_script_file_allowed() {
+        // sed's `-f scriptfile` denial relaxes to the executor boundary.
+        let rules = rules_with_script_hosts();
+        assert!(
+            check_command("sed -f script.sed data.txt", &rules, None).is_none(),
+            "sed -f scriptfile should run as a script host",
+        );
+    }
+
+    #[test]
+    fn script_hosts_absent_keeps_soundness_denial() {
+        // Default (no opt-in): every modeled engine's program-file denial stands
+        // exactly as misc-126 landed it.
+        let mut rules = basic_rules();
+        rules.allow.insert("perl".into());
+        rules.allow.insert("awk".into());
+        rules.allow.insert("sed".into());
+        for cmd in [
+            "perl script.pl",
+            "awk -f prog.awk data.txt",
+            "sed -f script.sed data.txt",
+        ] {
+            let denial = check_command(cmd, &rules, None);
+            assert!(denial.is_some(), "{cmd} should still be denied by default");
+            assert_eq!(
+                denial.expect("denied").reason,
+                DenialReason::OpaqueWrite,
+                "{cmd}",
+            );
+        }
+    }
+
+    #[test]
+    fn script_hosts_only_listed_command_relaxes() {
+        // Opting perl in does not relax awk or sed.
+        let mut rules = basic_rules();
+        rules.allow.insert("perl".into());
+        rules.allow.insert("awk".into());
+        rules.allow.insert("sed".into());
+        rules.script_hosts = HashSet::from(["perl".into()]);
+        assert!(
+            check_command("perl script.pl", &rules, None).is_none(),
+            "perl relaxes",
+        );
+        assert!(
+            check_command("awk -f prog.awk d", &rules, None).is_some(),
+            "awk stays denied without its own opt-in",
+        );
+        assert!(
+            check_command("sed -f s.sed d", &rules, None).is_some(),
+            "sed stays denied without its own opt-in",
+        );
+    }
+
+    #[test]
+    fn surface_script_hosts_section() {
+        let rules = rules_with_script_hosts();
+        let surface = format_command_surface(&rules).join("\n");
+        let line = surface
+            .lines()
+            .find(|l| l.starts_with("Script hosts:"))
+            .expect("script hosts line");
+        assert!(line.contains("awk"), "should list awk: {line}");
+        assert!(line.contains("perl"), "should list perl: {line}");
+        assert!(line.contains("sed"), "should list sed: {line}");
     }
 
     #[test]

@@ -11,8 +11,8 @@ use std::process::{Command, Stdio};
 use tempfile::TempDir;
 
 use super::{
-    OpaqueWrite, Position, SegCtx, SegmentClass, State, WriteToolset, expand_word, resolve_command,
-    resolve_script_with, resolve_segment,
+    OpaqueWrite, Position, ScriptHosts, SegCtx, SegmentClass, State, WriteToolset, expand_word,
+    resolve_command, resolve_script_with, resolve_segment,
 };
 use crate::cli::command_filter::parse;
 
@@ -20,7 +20,28 @@ use crate::cli::command_filter::parse;
 /// opaque denial; returns it.
 fn err_with(cmd: &str, cwd: Option<&Path>, toolset: WriteToolset) -> OpaqueWrite {
     let script = parse::parse(cmd);
-    match resolve_script_with(&script, cwd, toolset) {
+    match resolve_script_with(&script, cwd, toolset, ScriptHosts::default()) {
+        Ok(lw) => panic!("expected {cmd:?} to be opaque, resolved to {lw:?}"),
+        Err(op) => op,
+    }
+}
+
+/// Resolve with a set of opted-in script hosts (misc 129), expecting success;
+/// returns the recorded write-set.
+fn ok_hosts(cmd: &str, cwd: Option<&Path>, hosts: &[&str]) -> BTreeSet<PathBuf> {
+    let script = parse::parse(cmd);
+    let hosts = ScriptHosts::from_names(hosts.iter().map(|&s| s.to_string()));
+    resolve_script_with(&script, cwd, WriteToolset::from_allowed(|_| true), hosts)
+        .unwrap_or_else(|op| panic!("expected {cmd:?} to resolve, got {op:?}"))
+        .writes
+}
+
+/// Resolve with a set of opted-in script hosts (misc 129), expecting an opaque
+/// denial; returns it.
+fn err_hosts(cmd: &str, cwd: Option<&Path>, hosts: &[&str]) -> OpaqueWrite {
+    let script = parse::parse(cmd);
+    let hosts = ScriptHosts::from_names(hosts.iter().map(|&s| s.to_string()));
+    match resolve_script_with(&script, cwd, WriteToolset::from_allowed(|_| true), hosts) {
         Ok(lw) => panic!("expected {cmd:?} to be opaque, resolved to {lw:?}"),
         Err(op) => op,
     }
@@ -1081,6 +1102,94 @@ fn xargs_perl_script_file_is_denied() {
     assert_eq!(
         err("echo x | xargs perl script.pl", None).construct,
         "perl-script-file",
+    );
+}
+
+// ── Script hosts: the executor-boundary opt-in (misc 129) ────────────────────
+
+#[test]
+fn script_hosts_perl_script_file_is_the_executor_boundary() {
+    // With perl a script host, both no-program shapes relax to NoWrite — the
+    // same layer-4 boundary python's script execution keeps.
+    assert!(ok_hosts("perl script.pl", None, &["perl"]).is_empty());
+    assert!(ok_hosts("perl script.pl a b c", None, &["perl"]).is_empty());
+    assert!(ok_hosts("perl -p edit.pl", None, &["perl"]).is_empty());
+    assert!(ok_hosts("printf 'prog' | perl", None, &["perl"]).is_empty());
+    assert!(ok_hosts("perl", None, &["perl"]).is_empty());
+}
+
+#[test]
+fn script_hosts_perl_inline_keeps_the_substitution_audit() {
+    // Literal `-e`/`-E` still faces the audit even for a script host: a
+    // non-substitution inline program stays the denied vector, and `s///e`
+    // (eval) is still surgically denied — python-consistent.
+    assert_eq!(
+        err_hosts("perl -e 'print 1'", None, &["perl"]).construct,
+        "perl-unverifiable-program",
+    );
+    assert_eq!(
+        err_hosts("perl -pe 's/a/b/e'", None, &["perl"]).construct,
+        "perl-e-flag",
+    );
+}
+
+#[test]
+fn script_hosts_perl_inplace_still_records_writes() {
+    let t = tmp();
+    // `-i` keeps its write-set resolution into the diagnostics batch.
+    assert_eq!(
+        ok_hosts("perl -i -pe 's/a/b/' f", Some(t.path()), &["perl"]),
+        paths(t.path(), &["f"]),
+    );
+}
+
+#[test]
+fn script_hosts_awk_program_file_is_the_executor_boundary() {
+    assert!(ok_hosts("awk -f prog.awk data.txt", None, &["awk"]).is_empty());
+    assert!(ok_hosts("awk --file=prog.awk data.txt", None, &["awk"]).is_empty());
+    // A bare inline program is still checked (only `-f` relaxes).
+    assert_eq!(
+        err_hosts("awk '{system(\"x\")}' f", None, &["awk"]).construct,
+        "awk-system",
+    );
+}
+
+#[test]
+fn script_hosts_sed_script_file_is_the_executor_boundary() {
+    assert!(ok_hosts("sed -f script.sed data.txt", None, &["sed"]).is_empty());
+    assert!(ok_hosts("sed --file=script.sed data.txt", None, &["sed"]).is_empty());
+    // A bare inline script is still audited (only `-f` relaxes): `w` writes a
+    // file the hook can't see inside the script.
+    let t = tmp();
+    let _denied = err_hosts("sed -i '/x/w out.txt' f", Some(t.path()), &["sed"]);
+}
+
+#[test]
+fn script_hosts_only_the_listed_command_relaxes() {
+    // Opting perl in leaves awk and sed exactly as misc-126 denied them.
+    assert!(ok_hosts("perl script.pl", None, &["perl"]).is_empty());
+    assert_eq!(
+        err_hosts("awk -f prog.awk d", None, &["perl"]).construct,
+        "awk-program-file",
+    );
+    assert_eq!(
+        err_hosts("sed -f s.sed d", None, &["perl"]).construct,
+        "sed-script-file",
+    );
+}
+
+#[test]
+fn script_hosts_default_denial_points_at_the_lever() {
+    // The agent-facing denial names the user-level opt-in so it can be relayed.
+    assert!(
+        err("perl edit.pl", None).message.contains("script_hosts"),
+        "perl-script-file denial should mention the lever",
+    );
+    assert!(
+        err("printf 'prog' | perl", None)
+            .message
+            .contains("script_hosts"),
+        "perl-stdin-program denial should mention the lever",
     );
 }
 

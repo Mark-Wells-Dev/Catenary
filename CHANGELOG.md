@@ -95,6 +95,20 @@ upgrading.
   name a command in `allow`/`pipeline`/`build`, and an empty form list is a
   config error. `catenary commands` renders the constraint. The recommended
   config now ships `perl = ["-i", "-pe", "-e"]`.
+- **`[commands] script_hosts`** — a user-level opt-in that lets a modeled
+  substitution engine (`perl`/`awk`/`sed`) run its **script-file** form as a full
+  script host: `script_hosts = ["perl"]` re-classes `perl script.pl` (and the
+  bare stdin-program shape, plus `awk -f`/`sed -f`) from the misc-126 soundness
+  denial to the unbounded-interpreter executor boundary (`NoWrite`) — the same
+  layer-4 stance `python script.py` keeps. Inline `-e`/`-E` code still faces the
+  substitution audit (`perl -e 'print 1'` stays denied), and `perl -i` still
+  resolves its write-set. The layers compose default deny → `script_hosts`
+  (executor boundary) → `allow_flags` (narrowing); a command in both
+  `script_hosts` and `allow_flags` is a warned contradiction. User-level only
+  (ignored at project scope); keys must name a command in `allow`/`pipeline`/
+  `build`, listing an already-unbounded interpreter is a warned no-op, and an
+  empty list is a config error. `catenary commands` renders a `Script hosts:`
+  line. The default (key absent) is byte-identical to prior behavior.
 - **Batteries-included default linters.** `catenary diagnostics` is a
   multi-feeder aggregator: it now ships a default standalone-linter set
   (`defaults/linters.toml`), inherited by any root that does not customize or

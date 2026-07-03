@@ -614,6 +614,7 @@ avoids masking that check behind a bare `awk 'prog'`.
 | `deny.<cmd>` | Subcommand denylist within an allowed command. `git` is allowed, but `git grep` is denied. |
 | `deny_flags.<cmd>` | Flag denylist within an allowed command. `make` is allowed, but `make -C` is denied. |
 | `allow_flags.<cmd>` | Allowed **invocation forms** for a permitted command (the allow-side dual of `deny_flags`). When present, an invocation must match one listed form or it is denied naming them. See [Allowed forms](#allowed-forms-allow_flags). |
+| `script_hosts` | Commands opted in as **script hosts** — a modeled substitution engine (`perl`/`awk`/`sed`) whose script-file form runs at the executor boundary instead of the default soundness denial. See [Script hosts](#script-hosts-script_hosts). |
 | `guidance.<group>` | Optional per-command hint shown on denial — a `message`, or a `redirect` naming the Catenary command to use instead (`grep` → `catenary grep`, `glob` → `catenary glob`). |
 
 ### Allowed forms (`allow_flags`)
@@ -650,6 +651,45 @@ still win: a denied flag is denied even inside a listed form. Like the other
 enforcement keys, `allow_flags` is user-level only (ignored at project scope),
 and its keys must name commands already in `allow`, `pipeline`, or `build`; an
 empty form list is a config error (an allow set that permits nothing).
+
+### Script hosts (`script_hosts`)
+
+`allow_flags` narrows *within* what the [write model](#the-write-model) already
+permits; `script_hosts` reaches the other direction. By default a modeled
+substitution engine — `perl`, `awk`, `sed` — is a **nicer sed, not a script
+host**: an inline program (`perl -pe 's///'`, `awk 'prog'`, `sed 'script'`) is
+checked and runs, but a **script file** the hook can't read (`perl script.pl`,
+`awk -f prog.awk`, `sed -f script.sed`) is denied — its in-program writes and
+reads are invisible. That is the sound default.
+
+`script_hosts` is the opt-in that relaxes it. A command listed here has its
+script-file (and bare stdin-program) form re-classed to the **executor
+boundary** — the same layer-4 stance `python script.py` keeps: `NoWrite`, with
+the allowlist alone governing whether it runs.
+
+```toml
+[commands]
+allow = ["perl"]
+script_hosts = ["perl"]
+```
+
+With that config, `perl script.pl args` runs. Inline `-e`/`-E` code still faces
+the substitution audit (a non-substitution `perl -e 'print 1'` stays denied —
+inline code remains the denied vector, exactly as it is for `python -c`), and
+`perl -i` still resolves its write-set into the diagnostics batch.
+
+The three layers compose in order: **default deny** (a script the hook can't
+read) → **`script_hosts`** (re-class that form to the executor boundary) →
+**`allow_flags`** (narrow which forms may run at all). Because a flagless
+`perl script.pl` matches no `allow_flags` anchor, listing a command in *both*
+`script_hosts` and `allow_flags` is contradictory — Catenary warns; drop the
+`allow_flags` entry to use the command as a script host.
+
+Like the other enforcement keys, `script_hosts` is user-level only (ignored at
+project scope). Its keys must name a command in `allow`, `pipeline`, or `build`
+(an unlisted command is a warned no-op), and listing an already-unbounded
+interpreter (`python`/`ruby`/`node`, a script host by default) is a warned
+no-op too; an empty list is a config error.
 
 ### The write model
 
@@ -699,7 +739,7 @@ build = "make"
 
 **Only `build` is honored.** Every other `[commands]` key —
 `client_enforcement_only`, `allow`, `pipeline`, `deny`, `deny_flags`,
-`allow_flags`, and `guidance` — is **user-level only** and is
+`allow_flags`, `script_hosts`, and `guidance` — is **user-level only** and is
 ignored at project scope (Catenary warns when it sees one). They must live
 in `~/.config/catenary/config.toml`.
 

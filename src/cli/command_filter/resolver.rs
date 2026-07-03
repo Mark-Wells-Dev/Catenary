@@ -121,13 +121,20 @@ pub(crate) fn resolve_script(
     script: &ParsedScript,
     cwd: Option<&Path>,
 ) -> Result<LineWrites, OpaqueWrite> {
-    resolve_script_with(script, cwd, WriteToolset::unrestricted())
+    resolve_script_with(
+        script,
+        cwd,
+        WriteToolset::unrestricted(),
+        ScriptHosts::default(),
+    )
 }
 
 /// Resolve an already-parsed script against a specific writer [`WriteToolset`]
-/// (the allowlist subset a denial's proceed clause may name). The config-aware
-/// twin of [`resolve_script`]: the hook passes the toolset built from the
-/// session's live allowlist so a denial suggests only tools the agent can run.
+/// (the allowlist subset a denial's proceed clause may name) and the user's
+/// [`ScriptHosts`] opt-in. The config-aware twin of [`resolve_script`]: the hook
+/// passes the toolset and script-host set built from the session's live config
+/// so a denial suggests only tools the agent can run, and a listed script host's
+/// program-file form resolves at the executor boundary.
 ///
 /// # Errors
 ///
@@ -136,9 +143,11 @@ pub(crate) fn resolve_script_with(
     script: &ParsedScript,
     cwd: Option<&Path>,
     toolset: WriteToolset,
+    script_hosts: ScriptHosts,
 ) -> Result<LineWrites, OpaqueWrite> {
     let mut state = State::new(cwd);
     state.toolset = toolset;
+    state.script_hosts = script_hosts;
     let mut writes = BTreeSet::new();
     resolve_into(script, &mut state, &mut writes)?;
     Ok(LineWrites { writes })
@@ -189,6 +198,10 @@ struct State {
     /// clause names only tools the agent can actually run (see
     /// [`WriteToolset`]).
     toolset: WriteToolset,
+    /// Commands the user opted in as script hosts (misc 129): a listed
+    /// `perl`/`awk`/`sed`'s program-file / bare form relaxes to the
+    /// unbounded-interpreter executor boundary instead of the audit denial.
+    script_hosts: ScriptHosts,
 }
 
 impl State {
@@ -199,6 +212,7 @@ impl State {
             vars_tainted: false,
             barrier: false,
             toolset: WriteToolset::unrestricted(),
+            script_hosts: ScriptHosts::default(),
         }
     }
 }
@@ -365,6 +379,35 @@ fn join_or(items: &[&str]) -> String {
     }
 }
 
+/// The commands the user opted in as **script hosts** (misc 129). A modeled
+/// substitution engine (`perl`/`awk`/`sed`) named here has its program-file /
+/// bare-invocation form relaxed from the modeled-engine audit denial to the
+/// unbounded-interpreter executor boundary ([`SegmentClass::NoWrite`]) — the
+/// same layer-4 stance `python script.py` keeps ("the allowlist governs whether
+/// it runs at all"). Inline programs (`perl -e`, `awk 'prog'`, `sed 'script'`)
+/// still face their substitution audit; only the forms whose program the hook
+/// cannot see relax. Threaded from the user-scope `[commands] script_hosts` list
+/// at hook time; [`ScriptHosts::default`] (the empty set — no relaxation) backs
+/// the config-free [`resolve_command`] entry point and the unit tests.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ScriptHosts {
+    hosts: BTreeSet<String>,
+}
+
+impl ScriptHosts {
+    /// Build from the configured command names.
+    pub(crate) fn from_names(names: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            hosts: names.into_iter().collect(),
+        }
+    }
+
+    /// Whether the command `name` was opted in as a script host.
+    fn contains(&self, name: &str) -> bool {
+        self.hosts.contains(name)
+    }
+}
+
 /// Resolve one segment: substitutions (subshells), redirects (uniform shell
 /// grammar), variable effects, then the per-command registry.
 fn resolve_segment(cmd: &SimpleCommand, state: &mut State, ctx: SegCtx) -> SegmentClass {
@@ -434,13 +477,15 @@ fn resolve_segment(cmd: &SimpleCommand, state: &mut State, ctx: SegCtx) -> Segme
         "mv" => run(resolve_mv(cmd, state), &seg_name),
         "ln" => run(resolve_ln(cmd, state), &seg_name),
         "tee" => run(resolve_tee(cmd, state), &seg_name),
-        "sed" => run(resolve_sed(cmd, state), &seg_name),
+        "sed" => run(resolve_sed(cmd, state, name), &seg_name),
         "rsync" => run(resolve_rsync(cmd, state), &seg_name),
         // Checkable interpreter programs (ws38 ticket 04): a literal awk/perl
         // program is data iff it parses into the pure filter/substitution
-        // subset — parsed, not trusted.
-        "awk" | "gawk" | "mawk" | "nawk" => run(programs::resolve_awk(cmd, state), &seg_name),
-        "perl" => run(programs::resolve_perl(cmd, state), &seg_name),
+        // subset — parsed, not trusted. When the user opts the command in as a
+        // script host (misc 129), its unseeable program-file / bare form relaxes
+        // to the executor boundary instead of denying.
+        "awk" | "gawk" | "mawk" | "nawk" => run(programs::resolve_awk(cmd, state, name), &seg_name),
+        "perl" => run(programs::resolve_perl(cmd, state, name), &seg_name),
         // Unbounded interpreters (ws38 ticket 05): inline code (`python -c`,
         // `ruby -e`, `node -e`) admits no checkable subset, so its write-set
         // can't be bounded — Opaque, naming the checkable alternatives. Plain
@@ -1734,12 +1779,29 @@ struct SedInvocation {
     files: Vec<(String, WordMeta)>,
 }
 
+/// The machine-readable construct name of the `sed -f`/`--file` denial — a
+/// script the hook can't see. When `sed` is a script host (misc 129), this shape
+/// relaxes to the executor boundary instead of denying.
+const SED_SCRIPT_FILE: &str = "sed-script-file";
+
 /// `sed -i` / `-i.bak` → its file arguments plus the backup side-write, with
 /// the **script checked**: only the pure editing subset passes; `w`/`W`/`e`
 /// (and `s///w`, `s///e`) are surgically denied naming the construct
 /// (bug 12's lesson, fail-closed). A pure script without `-i` writes nothing.
-fn resolve_sed(cmd: &SimpleCommand, state: &State) -> Result<SegmentClass, Unresolved> {
-    let inv = parse_sed_argv(cmd)?;
+/// When `sed` is an opted-in script host (misc 129), a `-f`/`--file` script the
+/// hook can't see relaxes to the unbounded-interpreter executor boundary
+/// (`NoWrite`) instead of the audit denial.
+fn resolve_sed(cmd: &SimpleCommand, state: &State, name: &str) -> Result<SegmentClass, Unresolved> {
+    let inv = match parse_sed_argv(cmd) {
+        Ok(inv) => inv,
+        // A script host's program file is the executor boundary: the allowlist
+        // governs whether it runs; its in-script writes keep the layer-4
+        // accepted boundary — NoWrite.
+        Err(unres) if unres.construct == SED_SCRIPT_FILE && state.script_hosts.contains(name) => {
+            return Ok(SegmentClass::NoWrite);
+        }
+        Err(unres) => return Err(unres),
+    };
     if inv.script.is_empty() {
         // No script: sed errors out before writing anything.
         return Ok(SegmentClass::NoWrite);
@@ -1846,7 +1908,7 @@ fn parse_sed_argv(cmd: &SimpleCommand) -> Result<SedInvocation, Unresolved> {
                 _ if long.starts_with("line-length=") => {}
                 _ if long == "file" || long.starts_with("file=") => {
                     return Err(u(
-                        "sed-script-file",
+                        SED_SCRIPT_FILE,
                         "`sed -f`/`--file` reads the script from a separate file the hook \
                          can't check for commands that write or run files. Inline the \
                          script as a literal argument.",
@@ -1880,7 +1942,7 @@ fn parse_sed_argv(cmd: &SimpleCommand) -> Result<SedInvocation, Unresolved> {
                     }
                     'f' => {
                         return Err(u(
-                            "sed-script-file",
+                            SED_SCRIPT_FILE,
                             "`sed -f`/`--file` reads the script from a separate file the \
                              hook can't check for commands that write or run files. \
                              Inline the script as a literal argument.",
@@ -2384,6 +2446,9 @@ fn resolve_shell_wrapper(cmd: &SimpleCommand, state: &State, seg_name: &str) -> 
         // the wrapped program.
         barrier: state.barrier,
         toolset: state.toolset.clone(),
+        // The script-host opt-in is line-wide config — a wrapped program's
+        // interpreters relax the same way (misc 129).
+        script_hosts: state.script_hosts.clone(),
     };
     let mut writes = BTreeSet::new();
     match resolve_into(&script, &mut inner_state, &mut writes) {
@@ -2493,7 +2558,7 @@ fn resolve_xargs(cmd: &SimpleCommand, state: &State, seg_name: &str) -> SegmentC
                 return stdin_targets("sed -i");
             }
             run(
-                resolve_sed(&wrapped_command(cmd, i + 1, "sed"), state),
+                resolve_sed(&wrapped_command(cmd, i + 1, "sed"), state, "sed"),
                 seg_name,
             )
         }
@@ -2508,7 +2573,7 @@ fn resolve_xargs(cmd: &SimpleCommand, state: &State, seg_name: &str) -> SegmentC
                 return stdin_targets(&format!("{wrapped} -i inplace"));
             }
             let inner = wrapped_command(cmd, i + 1, &wrapped);
-            run(programs::resolve_awk(&inner, state), seg_name)
+            run(programs::resolve_awk(&inner, state, &wrapped), seg_name)
         }
         "perl" => {
             // `-i` under xargs edits stdin-named files; a pure filter still has
@@ -2521,7 +2586,7 @@ fn resolve_xargs(cmd: &SimpleCommand, state: &State, seg_name: &str) -> SegmentC
                 return stdin_targets("perl -i");
             }
             let inner = wrapped_command(cmd, i + 1, "perl");
-            run(programs::resolve_perl(&inner, state), seg_name)
+            run(programs::resolve_perl(&inner, state, "perl"), seg_name)
         }
         // Unbounded interpreters: inline code stays Opaque under xargs too; a
         // plain script executor is NoWrite (the stdin args are its argv, not a

@@ -84,6 +84,7 @@ and is ignored at project scope:
 - `deny`
 - `deny_flags`
 - `allow_flags`
+- `script_hosts`
 - `guidance`
 
 Catenary warns when it sees one of these in a project file.

@@ -41,11 +41,32 @@ use crate::cli::command_filter::parse::{SimpleCommand, WordMeta};
 
 // ── awk ──────────────────────────────────────────────────────────────────────
 
+/// The machine-readable construct name of the `awk -f`/`--file` denial — a
+/// program the hook can't see. When `awk` is a script host (misc 129), this
+/// shape relaxes to the executor boundary instead of denying.
+const AWK_PROGRAM_FILE: &str = "awk-program-file";
+
 /// Resolve an `awk`/`gawk`/`mawk`/`nawk` segment: check the program parses into
 /// the pure-filter subset, then classify the write-set (∅ for a filter, the
-/// file arguments for gawk `-i inplace`).
-pub(super) fn resolve_awk(cmd: &SimpleCommand, state: &State) -> Result<SegmentClass, Unresolved> {
-    let parsed = parse_awk_argv(cmd)?;
+/// file arguments for gawk `-i inplace`). When `name` is an opted-in script host
+/// (misc 129), a `-f`/`--file` program the hook can't see relaxes to the
+/// unbounded-interpreter executor boundary (`NoWrite`) instead of the audit
+/// denial.
+pub(super) fn resolve_awk(
+    cmd: &SimpleCommand,
+    state: &State,
+    name: &str,
+) -> Result<SegmentClass, Unresolved> {
+    let parsed = match parse_awk_argv(cmd) {
+        Ok(parsed) => parsed,
+        // A script host's program file is the executor boundary: the allowlist
+        // governs whether it runs; its in-program writes keep the layer-4
+        // accepted boundary — NoWrite.
+        Err(unres) if unres.construct == AWK_PROGRAM_FILE && state.script_hosts.contains(name) => {
+            return Ok(SegmentClass::NoWrite);
+        }
+        Err(unres) => return Err(unres),
+    };
     if let Some((program, computed)) = &parsed.program {
         if *computed {
             return Err(awk_computed_program());
@@ -492,8 +513,15 @@ fn skip_awk_regex(bytes: &[u8], mut i: usize) -> usize {
 
 /// Resolve a `perl` segment: check the program is a literal pure-substitution
 /// run, then classify the write-set (∅ for a filter, the file arguments plus
-/// `-i.bak` backups in-place).
-pub(super) fn resolve_perl(cmd: &SimpleCommand, state: &State) -> Result<SegmentClass, Unresolved> {
+/// `-i.bak` backups in-place). When `name` is an opted-in script host (misc
+/// 129), a script-file operand / bare stdin program relaxes to the
+/// unbounded-interpreter executor boundary (`NoWrite`) instead of the audit
+/// denial; inline `-e`/`-E` programs still face the substitution audit.
+pub(super) fn resolve_perl(
+    cmd: &SimpleCommand,
+    state: &State,
+    name: &str,
+) -> Result<SegmentClass, Unresolved> {
     let parsed = parse_perl_argv(cmd)?;
     if !parsed.has_program_flag {
         // perl is allowlisted for its sed role — inline `-e`/`-E` substitutions
@@ -502,6 +530,13 @@ pub(super) fn resolve_perl(cmd: &SimpleCommand, state: &State) -> Result<Segment
         // code the hook can't see, hiding its writes and reads. Sole exception:
         // pure introspection (`-v`/`-V`/`-h`) with no file operands.
         if parsed.introspection && parsed.files.is_empty() {
+            return Ok(SegmentClass::NoWrite);
+        }
+        // misc 129: when the user opts perl in as a script host, the unseeable
+        // script-file / stdin shape relaxes to the executor boundary — the same
+        // layer-4 stance `python script.py` keeps. Inline `-e`/`-E` code stays
+        // the denied vector below (python-consistent).
+        if state.script_hosts.contains(name) {
             return Ok(SegmentClass::NoWrite);
         }
         return Err(if parsed.files.is_empty() {
@@ -765,7 +800,7 @@ fn awk_redirect() -> Unresolved {
 
 fn awk_program_file() -> Unresolved {
     u(
-        "awk-program-file",
+        AWK_PROGRAM_FILE,
         "`awk -f`/`--file` reads the program from a separate file the hook can't check \
          for commands that run or redirect. Inline the program as a literal argument.",
     )
@@ -833,7 +868,8 @@ fn perl_script_file(toolset: &WriteToolset) -> Unresolved {
         "perl-script-file",
         format!(
             "A perl script file (no `-e`/`-E`) runs a program the hook can't see, so it \
-             can't tell which files the script writes or reads. {}",
+             can't tell which files the script writes or reads. {} Running perl as a \
+             script host is a user-level `[commands] script_hosts` opt-in.",
             toolset.inplace_hint(),
         ),
     )
@@ -844,7 +880,8 @@ fn perl_stdin_program(toolset: &WriteToolset) -> Unresolved {
         "perl-stdin-program",
         format!(
             "Bare perl (no `-e`/`-E`) reads its program from stdin, which the hook can't \
-             see, so it can't tell which files the program writes or reads. {}",
+             see, so it can't tell which files the program writes or reads. {} Running \
+             perl as a script host is a user-level `[commands] script_hosts` opt-in.",
             toolset.inplace_hint(),
         ),
     )

@@ -90,6 +90,16 @@ const TEMPLATE: &str = r#"# Catenary recommended config
 # [commands.allow_flags]
 # perl = ["-i", "-pe", "-e"]
 #
+# # script_hosts — the opt-in above the form gate: it lets a modeled
+# # substitution engine (perl/awk/sed) run its unseeable script-file form as a
+# # full script host — the executor boundary, like `python script.py` — instead
+# # of the default soundness denial. Inline programs keep their substitution
+# # audit; only the script-file / stdin shape relaxes. Layering is default deny
+# # -> script_hosts (executor boundary) -> allow_flags (narrowing). A command
+# # can't be in both script_hosts and allow_flags (a flagless script matches no
+# # form anchor), so drop the allow_flags entry to make it a script host.
+# # script_hosts = ["perl"]
+#
 # # Per-command guidance — optional hints shown when a command is denied.
 # # Groups map commands to a message. {EDIT} resolves per-client.
 #
@@ -111,7 +121,7 @@ const TEMPLATE: &str = r#"# Catenary recommended config
 #
 # A project .catenary.toml honors `build` only. Every other [commands]
 # key — client_enforcement_only, allow, pipeline, deny, deny_flags,
-# allow_flags — is
+# allow_flags, script_hosts — is
 # user-level only: the filter resolves daemon-globally (one daemon serves
 # every session), so a project can neither relax it nor turn it on/off for
 # itself. Those keys are ignored (with a warning) in project config — keep
@@ -410,6 +420,21 @@ mod tests {
         assert!(
             TEMPLATE.contains("[commands.allow_flags]"),
             "template should contain [commands.allow_flags] section",
+        );
+    }
+
+    #[test]
+    fn template_mentions_script_hosts_lever() {
+        // The misc-129 lever is named near the allow_flags block, but only as a
+        // comment — it must not become an active key in the recommended config
+        // (that would conflict with the shipped `allow_flags.perl`).
+        assert!(
+            TEMPLATE.contains("script_hosts"),
+            "template should mention the script_hosts lever",
+        );
+        assert!(
+            test_recommended::config().script_hosts.is_none(),
+            "recommended config must not activate script_hosts",
         );
     }
 
