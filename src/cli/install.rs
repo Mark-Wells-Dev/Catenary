@@ -1755,41 +1755,40 @@ mod tests {
     #[test]
     fn install_writes_pointer_per_host() {
         // The primer (`catenary primer`) is the single source of agent-facing
-        // guidance (Decision 12 / ticket 10). Each host's always-on
-        // instruction surface carries a thin pointer to it, not a copy — so a
-        // new or changed host is a one-line pointer, never a re-authoring.
-        // These are the files the marketplace/extension serve (Claude, Gemini)
-        // or the install embeds verbatim (Antigravity, `AGY_RULES`).
+        // guidance (Decision 12 / ticket 10). The remaining pointer hosts carry a
+        // thin pointer to it, not a copy — so a new or changed host is a one-line
+        // pointer, never a re-authoring. These are the files the marketplace
+        // serves (Claude) or the install embeds verbatim (Antigravity,
+        // `AGY_RULES`).
         //
-        // OpenCode is the exception (workstream 36 ticket 02): its shipped
-        // `catenary.md` demotes to a bootstrap/fallback that inlines the SSOT
-        // teaching (runtime data excluded) rather than pointing at the primer —
-        // the plugin registers a runtime-regenerated instructions file for the
-        // live surface. Its freshness is pinned in `cli::teaching` instead.
+        // OpenCode and Gemini are the exceptions (workstream 36 tickets 02/06):
+        // their shipped instruction files demote to a bootstrap/fallback that
+        // inlines the SSOT teaching (runtime data excluded) rather than pointing
+        // at the primer — the live surface rides the plugin's runtime-regenerated
+        // instructions file (OpenCode) or the SessionStart `additionalContext`
+        // payload (Gemini). Their freshness is pinned in `cli::teaching` instead.
         const CLAUDE_SKILL: &str = include_str!("../../plugins/catenary/skills/primer/SKILL.md");
         const GEMINI_CONTEXT: &str = include_str!("../../gemini-context.md");
 
-        for (host, surface) in [
-            ("claude", CLAUDE_SKILL),
-            ("gemini", GEMINI_CONTEXT),
-            ("antigravity", AGY_RULES),
-        ] {
+        for (host, surface) in [("claude", CLAUDE_SKILL), ("antigravity", AGY_RULES)] {
             assert!(
                 surface.contains("catenary primer"),
                 "{host} instruction surface should point at `catenary primer`",
             );
         }
 
-        // The OpenCode fallback inlines the teaching — no primer pointer, and no
-        // runtime data (the allow surface / build tool only ride the plugin's
-        // runtime-regenerated file).
-        assert!(
-            !OC_RULES.contains("catenary primer"),
-            "the OpenCode fallback should inline the teaching, not point at the primer",
-        );
-        assert!(
-            OC_RULES.contains("The edit→diagnostics loop"),
-            "the OpenCode fallback should inline the SSOT invariants",
-        );
+        // The OpenCode and Gemini fallbacks inline the teaching — no primer
+        // pointer, and no runtime data (the allow surface / build tool only ride
+        // the runtime channel).
+        for (host, surface) in [("opencode", OC_RULES), ("gemini", GEMINI_CONTEXT)] {
+            assert!(
+                !surface.contains("catenary primer"),
+                "the {host} fallback should inline the teaching, not point at the primer",
+            );
+            assert!(
+                surface.contains("The edit→diagnostics loop"),
+                "the {host} fallback should inline the SSOT invariants",
+            );
+        }
     }
 }

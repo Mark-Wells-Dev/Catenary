@@ -48,12 +48,16 @@ fn session_start_should_announce(source: Option<&str>) -> bool {
 }
 
 /// The teaching payload to inject at `SessionStart`, or `None` when it should
-/// be withheld (a non-inject `source`, or a non-Claude host — `additionalContext`
-/// is a Claude Code channel). Computed only when it will be used, so the
-/// config-load IO is skipped on the withhold paths.
+/// be withheld (a non-inject `source`, or a host whose `SessionStart` cannot
+/// carry it). Claude Code and Gemini CLI both read the identical
+/// `hookSpecificOutput.additionalContext` field at `SessionStart` (Gemini
+/// injects it as the first turn in history), so both receive the payload;
+/// Antigravity and OpenCode use other channels. Computed only when it will be
+/// used, so the config-load IO is skipped on the withhold paths.
 #[must_use]
 fn session_start_context(announce: bool, format: HostFormat) -> Option<String> {
-    (announce && matches!(format, HostFormat::Claude)).then(crate::cli::teaching::payload_body)
+    (announce && matches!(format, HostFormat::Claude | HostFormat::Gemini))
+        .then(crate::cli::teaching::payload_body)
 }
 
 /// The raw stdout body emitted by `catenary hook session-start
@@ -633,7 +637,8 @@ pub fn run_worktree_remove(format: HostFormat) {
 /// - `hookSpecificOutput.additionalContext` (the silent teaching payload),
 ///   present when `additional_context` is `Some` — the caller
 ///   ([`session_start_context`]) already gates it on the inject `source` and the
-///   Claude host (`additionalContext` is a Claude Code channel).
+///   host (Claude Code and Gemini CLI both read `additionalContext` at
+///   `SessionStart`).
 ///
 /// Returns `None` when neither surface has content, so nothing is emitted.
 fn build_session_start_response(
@@ -662,8 +667,9 @@ fn build_session_start_response(
 /// Finalize and print the `SessionStart` hook response (notification drain +
 /// teaching payload) as a single JSON object.
 ///
-/// The Claude-host gate lives in [`session_start_context`], which yields
-/// `Some` context only for Claude — so this needs no `format`.
+/// The host gate lives in [`session_start_context`], which yields `Some`
+/// context only for the hosts whose `SessionStart` carries `additionalContext`
+/// (Claude Code / Gemini CLI) — so this needs no `format`.
 fn emit_session_start(
     builder: crate::hook::response::SystemMessageBuilder,
     additional_context: Option<&str>,
@@ -2046,15 +2052,52 @@ mod tests {
     }
 
     #[test]
-    fn session_start_context_absent_when_not_announcing() {
-        assert!(session_start_context(false, HostFormat::Claude).is_none());
+    fn session_start_context_carries_payload_for_gemini_inject() {
+        // ws36 ticket 06: Gemini CLI reads the identical
+        // `hookSpecificOutput.additionalContext` at SessionStart (injected as the
+        // first turn in history), so the ungated payload is the same SSOT body
+        // Claude receives — byte-equal to `payload_body`.
+        let ctx = session_start_context(true, HostFormat::Gemini)
+            .expect("Gemini inject should carry the teaching payload");
+        assert_eq!(ctx, crate::cli::teaching::payload_body());
+        assert!(
+            ctx.contains("The edit→diagnostics loop"),
+            "payload body should be inlined: {ctx}",
+        );
     }
 
     #[test]
-    fn session_start_context_absent_for_non_claude() {
-        // additionalContext is a Claude Code channel.
-        assert!(session_start_context(true, HostFormat::Gemini).is_none());
+    fn session_start_context_absent_when_not_announcing() {
+        assert!(session_start_context(false, HostFormat::Claude).is_none());
+        // Gemini also honors the resume/withhold gate.
+        assert!(session_start_context(false, HostFormat::Gemini).is_none());
+    }
+
+    #[test]
+    fn session_start_context_absent_for_other_hosts() {
+        // Antigravity and OpenCode carry teaching through other channels — only
+        // Claude Code and Gemini CLI read `additionalContext` at SessionStart.
         assert!(session_start_context(true, HostFormat::Antigravity).is_none());
+        assert!(session_start_context(true, HostFormat::OpenCode).is_none());
+    }
+
+    #[test]
+    fn gemini_session_start_emits_additional_context_equal_to_payload_body() {
+        // End-to-end shape: an announcing Gemini SessionStart produces a
+        // `hookSpecificOutput.additionalContext` byte-equal to the SSOT
+        // `payload_body` — the same field, shape, and content Claude reads.
+        let builder = crate::hook::response::SystemMessageBuilder::new();
+        let ctx = session_start_context(true, HostFormat::Gemini)
+            .expect("Gemini inject should carry the payload");
+        let obj = build_session_start_response(builder, Some(ctx.as_str()))
+            .expect("context should produce an object");
+        assert_eq!(obj["hookSpecificOutput"]["hookEventName"], "SessionStart");
+        assert_eq!(
+            obj["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .expect("additionalContext string"),
+            crate::cli::teaching::payload_body(),
+        );
     }
 
     #[test]

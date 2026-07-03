@@ -159,6 +159,20 @@ upgrading.
   structurally excluded (no allow surface, build tool, or roots), it covers the
   cold window before the plugin runs and plugin-disabled installs. A freshness
   gate pins the shipped file to the SSOT so the two cannot drift.
+- **Gemini CLI joins the runtime-sourced teaching column.** `catenary hook
+  session-start --format=gemini` was already registered but withheld the payload
+  behind a Claude-only gate; it now emits the same SSOT teaching body Claude
+  receives through `hookSpecificOutput.additionalContext` (Gemini injects it as
+  the first turn in history). The resume-skip is shared: Gemini restores the full
+  prior transcript on `--resume`, so the payload is re-injected only on
+  `startup`/`clear`, never on `resume`. The shipped
+  [gemini-context.md](gemini-context.md) demotes from a `catenary primer` pointer
+  stub to a bootstrap/fallback: regenerated from the same SSOT as the OpenCode
+  fallback with runtime data structurally excluded (no allow surface, build tool,
+  or roots), pinned by the same freshness gate, it is the compaction-proof
+  baseline (Gemini's `SessionStart` has no `compact` source and `PreCompress`
+  cannot inject — an accepted, documented gap, not papered over with per-turn
+  re-injection).
 - **`catenary glob` outlines show types and callables only.** The file and
   directory outline is now a map, not a mirror: it recurses into containers
   (modules/namespaces/packages and classes/interfaces/enums/structs/impls) and

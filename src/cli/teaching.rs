@@ -413,6 +413,25 @@ mod tests {
     }
 
     #[test]
+    fn shipped_gemini_context_is_fresh() {
+        // Freshness gate (ws36 ticket 06): the shipped Gemini context file
+        // (repo-root `gemini-context.md`, embedded as `GEMINI_CONTEXT_EXPECTED`
+        // and doctor freshness-checked) is the `fallback_body` rendering verbatim
+        // (files carry a trailing newline). Gemini's runtime teaching rides the
+        // SessionStart `additionalContext`; this file is the compaction-proof
+        // bootstrap/fallback. It shares the OpenCode fallback's SSOT renderer, so
+        // the two fallbacks cannot drift from each other or from the SSOT tiers —
+        // regenerate the file from `fallback_body`.
+        const SHIPPED: &str = include_str!("../../gemini-context.md");
+        assert_eq!(
+            SHIPPED,
+            format!("{}\n", fallback_body()),
+            "gemini-context.md is stale — regenerate it from \
+             `catenary::cli::teaching::fallback_body()`"
+        );
+    }
+
+    #[test]
     fn payload_stays_in_the_token_band() {
         // Size guard: the ticket targets ~600–800 tokens. Using a ~4 chars/token
         // proxy that band is ~2400–3200 chars; we allow a slightly wider
