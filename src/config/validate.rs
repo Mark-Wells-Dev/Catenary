@@ -145,6 +145,12 @@ fn validate_linters(config: &Config, errors: &mut Vec<String>) {
                 ));
             }
         }
+
+        for shebang in &linter.shebangs {
+            if shebang.is_empty() {
+                errors.push(format!("Linter '{name}' has an empty string in `shebangs`"));
+            }
+        }
     }
 }
 

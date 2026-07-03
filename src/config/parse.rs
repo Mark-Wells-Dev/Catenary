@@ -30,6 +30,14 @@ const DEFAULT_LANGUAGES: &str = include_str!("../../defaults/languages.toml");
 /// same key completely replace the built-in default.
 pub const DEFAULT_SERVERS: &str = include_str!("../../defaults/servers.toml");
 
+/// Embedded default linter definitions (lowest-priority layer).
+///
+/// A `[linter.rule.*]`-only document (workstream 34 ticket 03). Parsed via
+/// [`parse_linter_defaults`] straight into the linter map, then inserted before
+/// any user/project config, so a user/project entry with the same key completely
+/// replaces the built-in default for that name — mirroring [`DEFAULT_SERVERS`].
+pub const DEFAULT_LINTERS: &str = include_str!("../../defaults/linters.toml");
+
 /// TOML deserialization target for a single config source.
 ///
 /// Each TOML file is deserialized into this struct. The `commands` field
@@ -178,6 +186,15 @@ pub fn load_from_sources(sources: &[PathBuf]) -> Result<Config> {
     let defaults =
         deserialize_source(DEFAULT_LANGUAGES).context("Failed to parse embedded default config")?;
     merge(&mut config, defaults);
+
+    // Load embedded default linter definitions (lowest priority). A user/project
+    // [linter.rule.<name>] with the same name replaces the built-in default for
+    // that name (no merging), mirroring the server defaults.
+    let default_linters = parse_linter_defaults(DEFAULT_LINTERS)
+        .context("Failed to parse embedded default linter config")?;
+    for (key, value) in default_linters {
+        config.linter.insert(key, value);
+    }
 
     for source in sources {
         let contents = std::fs::read_to_string(source)
@@ -417,6 +434,22 @@ fn parse_server_defaults(contents: &str) -> Result<HashMap<String, ServerDef>> {
     }
     let parsed: ServerOnly = toml::from_str(contents).context("Failed to parse server TOML")?;
     Ok(parsed.lsp.server)
+}
+
+/// Parse a `[linter.rule.*]` TOML document into a map of linter definitions.
+///
+/// Used for the embedded `defaults/linters.toml` which contains only
+/// `[linter.rule.*]` entries (workstream 34 ticket 03) — parsed straight into
+/// the linter map so the defaults skip the full merge/validation pass. Routing
+/// globs are compiled later in [`load_from_sources`], alongside the user set.
+fn parse_linter_defaults(contents: &str) -> Result<HashMap<String, LinterConfig>> {
+    #[derive(Deserialize)]
+    struct LinterOnly {
+        #[serde(default)]
+        linter: RawLinterSection,
+    }
+    let parsed: LinterOnly = toml::from_str(contents).context("Failed to parse linter TOML")?;
+    Ok(parsed.linter.rule)
 }
 
 /// Merge a raw config layer into the resolved config. Later values override.

@@ -25,7 +25,8 @@ pub use commands::{BuildContext, BuildGuidance, CommandsConfig, GuidanceEntry, R
 pub use language::{DispatchMethod, LanguageConfig, ServerBinding};
 pub use linter::LinterConfig;
 pub use parse::{
-    DEFAULT_SERVERS, ProjectConfig, SERVER_DEF_KEYS, config_sources, load_project_config,
+    DEFAULT_LINTERS, DEFAULT_SERVERS, ProjectConfig, SERVER_DEF_KEYS, config_sources,
+    load_project_config,
 };
 pub use server::ServerDef;
 pub use weights::{BASELINE_WEIGHT, DiagnosticWeights};
@@ -579,6 +580,88 @@ patterns = ["**/*.{yml,yaml}"]
             err.contains("empty `command`"),
             "error should mention the empty linter command: {err}",
         );
+    }
+
+    #[test]
+    fn default_linters_ship_with_expected_shape() -> anyhow::Result<()> {
+        use std::path::Path;
+
+        // Defaults-only load: `defaults/linters.toml` is inherited by every root
+        // that does not customize or disable lint.
+        let config = Config::load_from_sources(&[])?;
+
+        // actionlint — path-scoped to workflow files, JSON via `-format`.
+        let actionlint = config.linter.get("actionlint").expect("default actionlint");
+        assert_eq!(actionlint.command, "actionlint");
+        assert_eq!(actionlint.args, ["-format", "{{json .}}"]);
+        assert!(actionlint.matches(Path::new(".github/workflows/ci.yml")));
+        assert!(actionlint.matches(Path::new(".github/workflows/cd.yaml")));
+        // Not every YAML — only those under .github/workflows.
+        assert!(!actionlint.matches(Path::new("docs/ci.yml")));
+
+        // yamllint — any YAML in the tree, top-level or nested.
+        let yamllint = config.linter.get("yamllint").expect("default yamllint");
+        assert_eq!(yamllint.command, "yamllint");
+        assert_eq!(yamllint.args, ["-f", "parsable"]);
+        assert!(yamllint.matches(Path::new("config.yaml")));
+        assert!(yamllint.matches(Path::new("k8s/deploy.yml")));
+        assert!(!yamllint.matches(Path::new("notes.txt")));
+
+        // shellcheck — `*.sh` path glob plus shebang routing for extensionless
+        // scripts, JSON via `-f json1`.
+        let shellcheck = config.linter.get("shellcheck").expect("default shellcheck");
+        assert_eq!(shellcheck.command, "shellcheck");
+        assert_eq!(shellcheck.args, ["-f", "json1"]);
+        assert!(shellcheck.matches(Path::new("scripts/build.sh")));
+        assert!(shellcheck.matches_shebang("bash"));
+        assert!(shellcheck.matches_shebang("sh"));
+        assert!(shellcheck.matches_shebang("dash"));
+        assert!(shellcheck.matches_shebang("ksh"));
+        // shellcheck rejects zsh — the default list omits it deliberately.
+        assert!(!shellcheck.matches_shebang("zsh"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn user_linter_replaces_default_for_that_name() -> anyhow::Result<()> {
+        use std::path::Path;
+
+        let dir = tempdir()?;
+        let config_path = dir.path().join("config.toml");
+        // Redefine shellcheck wholesale: a different command, a different routing
+        // pattern, and no shebang list.
+        fs::write(
+            &config_path,
+            r#"
+[linter.rule.shellcheck]
+command = "my-shellcheck"
+args = ["--wrapped"]
+patterns = ["**/*.bash"]
+"#,
+        )?;
+
+        let config = Config::load_from_sources(&[config_path])?;
+        let sc = config.linter.get("shellcheck").expect("shellcheck linter");
+        // Whole-entry replacement (mirrors the server-defaults semantics), not a
+        // field-level merge onto the built-in default.
+        assert_eq!(sc.command, "my-shellcheck");
+        assert_eq!(sc.args, ["--wrapped"]);
+        assert!(sc.matches(Path::new("x.bash")));
+        assert!(
+            !sc.matches(Path::new("x.sh")),
+            "the default *.sh pattern must be gone after replacement",
+        );
+        assert!(
+            sc.shebangs.is_empty(),
+            "the default shebang list is replaced, not merged",
+        );
+
+        // The other defaults are untouched by a single-name override.
+        assert!(config.linter.contains_key("actionlint"));
+        assert!(config.linter.contains_key("yamllint"));
+
+        Ok(())
     }
 
     #[test]

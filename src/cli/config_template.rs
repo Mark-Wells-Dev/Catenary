@@ -185,6 +185,7 @@ const TEMPLATE: &str = r#"# Catenary recommended config
 pub fn print_template(out: &mut Output) {
     let _ = out.write_str(format_args!("{TEMPLATE}"));
     let _ = out.write_str(format_args!("{}", generate_defaults_section()));
+    let _ = out.write_str(format_args!("{}", generate_linter_defaults_section()));
 }
 
 /// Generate a commented-out reference section listing all built-in
@@ -220,6 +221,46 @@ fn generate_defaults_section() -> String {
         } else if line.starts_with('#') {
             // Preserve original comment lines (section headers).
             let _ = writeln!(out, "# {line}");
+        } else {
+            let _ = writeln!(out, "# {line}");
+        }
+    }
+
+    out
+}
+
+/// Generate a commented-out reference section listing all built-in linter
+/// defaults.
+///
+/// Each `[linter.rule.*]` entry from `defaults/linters.toml` is rendered as a
+/// comment block so users can discover the shipped linters and override or
+/// disable one selectively — the linter analogue of
+/// [`generate_defaults_section`].
+fn generate_linter_defaults_section() -> String {
+    use std::fmt::Write;
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "\n# ── Built-in Linter Defaults ──────────────────────────────────"
+    );
+    let _ = writeln!(
+        out,
+        "# Catenary runs these standalone linters during `catenary diagnostics`"
+    );
+    let _ = writeln!(
+        out,
+        "# when the tool is installed (skipped otherwise). A [linter.rule.*] entry"
+    );
+    let _ = writeln!(
+        out,
+        "# with the same name replaces the default wholesale; set disable = true"
+    );
+    let _ = writeln!(out, "# to turn one off.");
+
+    for line in crate::config::DEFAULT_LINTERS.lines() {
+        if line.is_empty() {
+            let _ = writeln!(out, "#");
         } else {
             let _ = writeln!(out, "# {line}");
         }
@@ -507,6 +548,28 @@ mod tests {
             assert!(
                 line.is_empty() || line.starts_with('#'),
                 "defaults section line should be a comment: {line:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn template_linter_defaults_section_contains_all_linters() {
+        let section = generate_linter_defaults_section();
+        for name in ["actionlint", "yamllint", "shellcheck"] {
+            assert!(
+                section.contains(name),
+                "linter defaults section should contain linter '{name}'",
+            );
+        }
+    }
+
+    #[test]
+    fn template_linter_defaults_section_all_commented() {
+        let section = generate_linter_defaults_section();
+        for line in section.lines() {
+            assert!(
+                line.is_empty() || line.starts_with('#'),
+                "linter defaults section line should be a comment: {line:?}",
             );
         }
     }

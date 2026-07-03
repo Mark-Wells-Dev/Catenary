@@ -781,6 +781,119 @@ diagnostics_severity = "error"    # default
 Output is complete every time — there is no per-page budget, truncation,
 or overflow report file.
 
+## Linters
+
+`catenary diagnostics` is a multi-feeder aggregator: alongside the LSP
+feeder it runs **standalone linters** over the same modified-file set and
+merges their findings into one deduplicated view. A linter is one-shot
+(spawn → parse → exit), routed by root-relative path glob (plus an optional
+shebang list), and its output is translated into the same LSP-shaped
+diagnostics the language servers produce — so the merge/dedup pass runs
+feeder-blind.
+
+Each linter is a `[linter.rule.<name>]` entry. The adapter that parses its
+output is picked by the **name**: `shellcheck`, `actionlint`, and `yamllint`
+use hand-rolled parsers; every other name falls to a generic **SARIF**
+adapter (see [Custom linters (SARIF)](#custom-linters-sarif)).
+
+### Built-in linter defaults
+
+Catenary ships a batteries-included default set (`defaults/linters.toml`),
+inherited by any root that does not customize or disable lint — exactly like
+the built-in language servers. Install the tool and it just works; leave it
+uninstalled and the linter is skipped (one notify, never a hard error).
+
+| Linter | Routes on | Invocation | Code |
+|--------|-----------|------------|------|
+| `actionlint` | `.github/workflows/*.{yml,yaml}` | `-format '{{json .}}'` (JSON) | `kind` (coarse category) |
+| `yamllint` | `**/*.{yml,yaml}` | `-f parsable` (text) | trailing `(rule)` name |
+| `shellcheck` | `**/*.sh` **plus** shebang `sh`/`bash`/`dash`/`ksh` | `-f json1` (JSON) | `SC####` |
+
+These defaults deliberately **overlap** language-server coverage —
+`shellcheck` runs even though bash-language-server already wraps it. Catenary
+owns the aggregator: the same `source`/`code`/line from both feeders collapses
+to one entry (see [Diagnostics](#diagnostics)), so overlap is dedup'd rather
+than avoided by a "disable X when Y" config opinion.
+
+### Customize, inherit, disable
+
+Symmetric with the LSP feeder (three states):
+
+- **Inherit** — omit `[linter.rule.*]`; the shipped defaults apply.
+- **Customize** — a `[linter.rule.<name>]` entry with the same name
+  **replaces** the built-in default for that name wholesale (no field-level
+  merge), mirroring the `[lsp.server.*]` replacement semantics. Add a new name
+  to define an additional linter.
+- **Disable** — set `disable = true` on a `[linter.rule.<name>]` to drop that
+  one linter, or set `[linter] disable = true` in a project `.catenary.toml`
+  to drop the whole linter feeder for that root (see
+  [Disabling feeders per root](#disabling-feeders-per-root)).
+
+```toml
+# ~/.config/catenary/config.toml
+
+# Add a linter Catenary does not ship by default (SARIF adapter, by name).
+[linter.rule.hadolint]
+command = "hadolint"
+args = ["--format", "sarif"]
+patterns = ["**/Dockerfile", "**/Dockerfile.*"]
+
+# Replace the default shellcheck wholesale — e.g. to pass extra flags.
+[linter.rule.shellcheck]
+command = "shellcheck"
+args = ["-f", "json1", "--severity", "warning"]
+patterns = ["**/*.sh", "**/*.bash"]
+shebangs = ["sh", "bash", "dash", "ksh"]
+
+# Turn off the default yamllint without replacing it.
+[linter.rule.yamllint]
+disable = true
+```
+
+### `[linter.rule.*]` fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `command` | string | The executable to run (required). |
+| `args` | list | Arguments passed **before** the file paths. |
+| `patterns` | list | Root-relative path globs selecting which files this linter handles. Not filename globs — an unanchored `*.yaml` would fire on every YAML in the tree. |
+| `shebangs` | list | Interpreter basenames (`["bash", "sh"]`) that additionally route an **extensionless** script by its `#!` line. Empty ⇒ shebang routing off. |
+| `disable` | bool | Drops this linter for the root it resolves under (default `false`). |
+| `weight` | integer | Diagnostic trust weight for this linter's source, driving the cross-feeder dedup keeper (see [Diagnostics](#diagnostics)). Absent ⇒ the baseline weight. |
+
+The linter is invoked as `command <args…> <file…>` — the matching file
+paths are appended after `args`. Exit status is **ignored**: linters exit
+nonzero when they find issues, so the adapters key on parseable output, not
+on the exit code.
+
+### Shebang routing
+
+`patterns` are path globs, but a shell script often carries no extension —
+just a `#!/usr/bin/env bash` line. A linter that declares `shebangs` also
+routes an extensionless file whose interpreter basename is in the list, reusing
+the same `#!` detection as language classification (`#!/usr/bin/env bash` and
+`#!/bin/bash` both resolve to `bash`). The read is lazy — consulted only when
+the path globs miss — so a `.sh` match never touches the file. The default
+`shellcheck` ships `["sh", "bash", "dash", "ksh"]`, mirroring shellcheck's own
+supported interpreters (notably not `zsh`, which it rejects).
+
+### Custom linters (SARIF)
+
+Any `[linter.rule.<name>]` whose name is not one of the blessed adapters is
+parsed as **SARIF** (`runs[].results[]`: `tool.driver.name` → source, `ruleId`
+→ code, `region` → range, `level` → severity, `message.text` → message). One
+adapter covers every SARIF-emitting linter — there is no generic errorformat
+engine. A tool that does not speak SARIF is wrapped by the user to emit it
+(often a one-line `--format sarif`).
+
+```toml
+# A non-default SARIF-emitting linter.
+[linter.rule.ruff]
+command = "ruff"
+args = ["check", "--output-format", "sarif"]
+patterns = ["**/*.py"]
+```
+
 ## Icons
 
 The `[icons]` table controls icons in the TUI dashboard.

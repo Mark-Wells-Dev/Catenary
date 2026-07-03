@@ -1505,15 +1505,26 @@ mod tests {
     }
 
     #[test]
-    fn has_lint_coverage_false_without_linters() {
-        // With no `[linter.rule.*]` configured (defaults ship in ticket 03), every
-        // file is lint-uncovered — the gate is unchanged.
+    fn has_lint_coverage_from_default_linters() {
+        // Ticket 03: the shipped default linters (defaults/linters.toml) are
+        // inherited by every root, so a `.sh` file is lint-covered — and gated —
+        // even with no `[linter.rule.*]` in user or project config. A file that
+        // matches no default linter stays uncovered.
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path().join("workspace");
         std::fs::create_dir_all(&root).expect("create workspace dir");
         let session = session_with_root(rt.handle(), root.clone());
 
-        assert!(!session.has_lint_coverage(&root.join("scripts/deploy.sh")));
+        // Default shellcheck (`**/*.sh`) covers a shell script with no explicit config.
+        assert!(
+            session.has_lint_coverage(&root.join("scripts/deploy.sh")),
+            "the default shellcheck linter covers a .sh with no explicit config"
+        );
+        // A file matched by no default linter is uncovered.
+        assert!(
+            !session.has_lint_coverage(&root.join("notes.txt")),
+            "a file matching no default linter is not lint-covered"
+        );
     }
 }

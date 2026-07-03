@@ -388,10 +388,13 @@ impl LspClientManager {
     ///
     /// Resolves `file` to its owning root and matches the **root-relative** path
     /// against that root's effective `[linter.rule.*]` patterns (user ∪ project),
-    /// reusing [`LspGlob`]. Out-of-root files and `disable_lint` roots are never
-    /// covered; an entry with `disable = true` or no patterns contributes
-    /// nothing. This is the routing predicate behind both the editing-boundary
-    /// coverage gate and the diagnostics-batch fan-out.
+    /// reusing [`LspGlob`]. A linter that declares `shebangs` (e.g. the default
+    /// `shellcheck`) additionally covers an extensionless script whose `#!` line
+    /// names one of them (ticket 03). Out-of-root files and `disable_lint` roots
+    /// are never covered; an entry with `disable = true` or no routing (neither
+    /// patterns nor a matching shebang) contributes nothing. This is the routing
+    /// predicate behind both the editing-boundary coverage gate and the
+    /// diagnostics-batch fan-out.
     #[must_use]
     pub fn lint_covers(&self, file: &Path) -> bool {
         let Some(root) = self.fs.resolve_root(file) else {
@@ -405,7 +408,7 @@ impl LspClientManager {
         };
         self.effective_linters(&root)
             .values()
-            .any(|linter| !linter.disable && linter.matches(rel))
+            .any(|linter| !linter.disable && self.fs.linter_routes(linter, file, rel))
     }
 
     /// Names every diagnostic feeder — LSP server or standalone linter —

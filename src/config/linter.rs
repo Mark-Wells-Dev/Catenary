@@ -38,6 +38,21 @@ pub struct LinterConfig {
     pub args: Vec<String>,
     /// Root-relative path globs selecting which files this linter handles.
     pub patterns: Vec<String>,
+    /// Shebang interpreter basenames (e.g. `["bash", "sh"]`) that route an
+    /// **extensionless** script to this linter, in addition to [`Self::patterns`].
+    ///
+    /// A file routes to the linter when its root-relative path matches a pattern
+    /// glob **or** its `#!` interpreter basename is in this list. Empty (the
+    /// default) leaves shebang routing off — the linter routes on path globs
+    /// alone. The default `shellcheck` ships `["sh", "bash", "dash", "ksh"]` so
+    /// it catches shell scripts that carry a shebang but no `.sh` extension; the
+    /// list mirrors shellcheck's own supported interpreters (notably not `zsh`).
+    ///
+    /// The interpreter is extracted with the same single-pass scan Catenary uses
+    /// for language classification, so `#!/usr/bin/env bash` and `#!/bin/bash`
+    /// both resolve to `bash`. The read is lazy — only consulted when the path
+    /// globs miss and this list is non-empty.
+    pub shebangs: Vec<String>,
     /// Disables this linter for the root it resolves under (default `false`).
     ///
     /// A project entry can disable a user-configured linter by setting this on
@@ -74,6 +89,7 @@ impl LinterConfig {
             command: command.into(),
             args,
             patterns,
+            shebangs: Vec::new(),
             disable: false,
             weight: None,
             compiled_patterns: Vec::new(),
@@ -108,6 +124,17 @@ impl LinterConfig {
     #[must_use]
     pub fn matches(&self, rel: &Path) -> bool {
         self.compiled_patterns.iter().any(|g| g.is_match(rel))
+    }
+
+    /// Whether a shebang `interpreter` basename routes to this linter.
+    ///
+    /// Compared against [`Self::shebangs`] by exact match. The interpreter is the
+    /// basename resolved from a `#!` line (`bash`, not `/usr/bin/env bash`). An
+    /// empty [`Self::shebangs`] never matches, so a linter with no declared
+    /// shebangs routes on [`Self::patterns`] alone.
+    #[must_use]
+    pub fn matches_shebang(&self, interpreter: &str) -> bool {
+        self.shebangs.iter().any(|s| s == interpreter)
     }
 }
 
@@ -153,5 +180,25 @@ mod tests {
     fn invalid_glob_errors() {
         let err = LinterConfig::new("x", vec![], vec!["[unterminated".to_string()]);
         assert!(err.is_err(), "invalid glob must fail to compile");
+    }
+
+    #[test]
+    fn matches_shebang_by_interpreter_basename() {
+        let mut linter =
+            LinterConfig::new("shellcheck", vec![], vec!["**/*.sh".to_string()]).expect("compile");
+        linter.shebangs = vec!["sh".to_string(), "bash".to_string(), "dash".to_string()];
+        assert!(linter.matches_shebang("bash"));
+        assert!(linter.matches_shebang("sh"));
+        // Not a declared interpreter → no match (shellcheck rejects zsh).
+        assert!(!linter.matches_shebang("zsh"));
+        assert!(!linter.matches_shebang("python"));
+    }
+
+    #[test]
+    fn empty_shebangs_never_match() {
+        let linter =
+            LinterConfig::new("yamllint", vec![], vec!["**/*.yaml".to_string()]).expect("compile");
+        assert!(linter.shebangs.is_empty());
+        assert!(!linter.matches_shebang("bash"));
     }
 }

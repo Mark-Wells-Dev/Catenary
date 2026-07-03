@@ -130,7 +130,10 @@ impl DiagnosticFeeder for LinterFeeder<'_> {
                 }
                 let matching: Vec<PathBuf> = root_files
                     .iter()
-                    .filter(|f| f.strip_prefix(&root).is_ok_and(|rel| linter.matches(rel)))
+                    .filter(|f| {
+                        f.strip_prefix(&root)
+                            .is_ok_and(|rel| self.fs.linter_routes(linter, f, rel))
+                    })
                     .cloned()
                     .collect();
                 if matching.is_empty() {

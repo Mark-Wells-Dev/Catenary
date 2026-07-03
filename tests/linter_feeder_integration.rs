@@ -126,6 +126,44 @@ fn linter_only_sarif_renders() -> Result<()> {
     Ok(())
 }
 
+/// A shebang-routed extensionless script drives the feeder end-to-end (ticket
+/// 03). The file carries no `.sh` extension and matches no path glob, so only
+/// shebang routing can send it to the linter — proving `linter_routes` covers
+/// and fans out an extensionless `#!` script, not just glob-matched paths.
+#[test]
+fn shebang_routed_extensionless_script_renders() -> Result<()> {
+    let mocklint = env!("CARGO_BIN_EXE_mocklint");
+    let mut bridge = BridgeProcess::spawn_with_config(|root| {
+        // Extensionless script with a bash shebang — no `.sh`, no glob match.
+        std::fs::write(root.join("deploy"), "#!/usr/bin/env bash\necho $HOME\n")?;
+        let config_path = root.join("config.toml");
+        // A shellcheck linter with NO patterns and a bash shebang list: routing
+        // can only come from the shebang. `command` points at mocklint, so no
+        // real shellcheck binary is needed (the default shellcheck is replaced).
+        std::fs::write(
+            &config_path,
+            format!(
+                "[linter.rule.shellcheck]\n\
+                 command = \"{mocklint}\"\n\
+                 args = [\"--format\", \"shellcheck\", \"--diag\", \"SC2086|1|6|Double quote\"]\n\
+                 patterns = []\n\
+                 shebangs = [\"sh\", \"bash\", \"dash\", \"ksh\"]\n",
+            ),
+        )?;
+        Ok(config_path)
+    })?;
+    bridge.initialize()?;
+
+    let file = bridge.root_path().join("deploy");
+    let text = bridge.call_diagnostics(file.to_str().context("path")?)?;
+
+    assert!(
+        text.contains("shellcheck(SC2086)"),
+        "an extensionless script must route to shellcheck by shebang and render. Got:\n{text}"
+    );
+    Ok(())
+}
+
 /// Exit status is not failure: a linter that exits nonzero (as real linters do
 /// when they find issues) still has its parseable output rendered.
 #[test]

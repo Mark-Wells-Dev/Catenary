@@ -1,0 +1,41 @@
+# Built-in standalone-linter definitions (workstream 34).
+#
+# Loaded as the lowest-priority config layer, so any root that does not
+# customize or disable lint inherits this batteries-included set. User and
+# project `[linter.rule.*]` entries completely replace the built-in default for
+# that name — no merging — mirroring `defaults/servers.toml`.
+#
+# A `[linter.rule.<name>]` runs a standalone linter over the modified-file set
+# during `catenary diagnostics`, translating its output into LSP-shaped
+# diagnostics that merge with the LSP feeder's. The adapter is picked by the
+# linter name: `shellcheck` / `actionlint` / `yamllint` use the blessed
+# hand-rolled parsers; any other name falls to the generic SARIF adapter.
+#
+# Routing is by root-relative **path glob** (`patterns`), never a filename glob
+# — an unanchored `*.yaml` would fire on every YAML in the tree. shellcheck
+# additionally declares `shebangs`: an extensionless script whose `#!` line
+# names one of these interpreters routes to it even without a `.sh` extension.
+#
+# These defaults deliberately overlap language-server coverage (shellcheck vs.
+# bash-language-server's wrapped shellcheck). Catenary owns the aggregator and
+# dedups the overlap (the same `source`/`code`/line from both feeders collapses
+# to one); it does not ship a "disable X when Y" opinion.
+#
+# Fail-soft: a linter binary that is not installed is skipped with one notify,
+# so shipping a default costs nothing until the tool is present.
+
+[linter.rule.actionlint]
+command = "actionlint"
+args = ["-format", "{{json .}}"]
+patterns = [".github/workflows/*.{yml,yaml}"]
+
+[linter.rule.yamllint]
+command = "yamllint"
+args = ["-f", "parsable"]
+patterns = ["**/*.{yml,yaml}"]
+
+[linter.rule.shellcheck]
+command = "shellcheck"
+args = ["-f", "json1"]
+patterns = ["**/*.sh"]
+shebangs = ["sh", "bash", "dash", "ksh"]

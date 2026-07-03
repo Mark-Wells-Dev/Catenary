@@ -69,6 +69,25 @@ upgrading.
 - **`[notifications].threshold`** (default `"warn"`) — documents and exposes the
   minimum severity promoted to user-facing notifications (one of `"debug"`,
   `"info"`, `"warn"`, `"error"`).
+- **Batteries-included default linters.** `catenary diagnostics` is a
+  multi-feeder aggregator: it now ships a default standalone-linter set
+  (`defaults/linters.toml`), inherited by any root that does not customize or
+  disable lint — mirroring the built-in language servers. **actionlint**
+  (`.github/workflows/*.{yml,yaml}`), **yamllint** (`**/*.{yml,yaml}`), and
+  **shellcheck** (`**/*.sh` plus shebang routing for extensionless
+  `sh`/`bash`/`dash`/`ksh` scripts) run over the modified-file set and merge
+  into the diagnostics view. A linter that is not installed is skipped (one
+  notify, never a hard error). A `[linter.rule.<name>]` with the same name
+  replaces the built-in default wholesale (like `[lsp.server.*]`); a new name
+  adds a linter, and any non-blessed name is parsed as SARIF. Defaults
+  deliberately overlap language-server coverage (shellcheck vs.
+  bash-language-server's wrapped shellcheck) and are dedup'd rather than avoided
+  by a "disable X when Y" config opinion.
+- **`[linter.rule.<name>].shebangs`** — interpreter basenames (`["bash", "sh"]`)
+  that route an **extensionless** script to a linter by its `#!` line, in
+  addition to `patterns` path globs. Reuses the same shebang detection as
+  language classification; the read is lazy (only when the path globs miss). The
+  default `shellcheck` ships `["sh", "bash", "dash", "ksh"]`.
 
 ### Changed
 

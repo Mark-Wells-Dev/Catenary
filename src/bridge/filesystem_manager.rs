@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use ignore::WalkBuilder;
 
-use crate::config::ProjectConfig;
+use crate::config::{LinterConfig, ProjectConfig};
 use crate::source::Source;
 
 /// Files above this size are assumed binary without reading.
@@ -622,6 +622,44 @@ impl FilesystemManager {
         self.classify(path, &metadata)
             .language_id()
             .map(str::to_string)
+    }
+
+    /// Returns the raw shebang interpreter basename for a file, or `None`.
+    ///
+    /// Resolves `#!/usr/bin/env bash` and `#!/bin/bash` alike to `bash`, reusing
+    /// the same single-pass scan as classification (binary files and files
+    /// without a `#!` line yield `None`). Unlike [`Self::language_id`], this
+    /// returns the raw interpreter rather than a resolved language, so linter
+    /// routing can match it against a linter's declared shebang list.
+    #[must_use]
+    pub fn shebang_interpreter(&self, path: &Path) -> Option<String> {
+        let metadata = std::fs::metadata(path).ok()?;
+        scan_file(path, &metadata).and_then(|scan| scan.shebang_interpreter)
+    }
+
+    /// Whether `linter` routes to `file` (whose root-relative path is `rel`).
+    ///
+    /// A file routes when its root-relative path matches one of the linter's
+    /// path globs, **or** — for a linter that declares `shebangs` — when the
+    /// file's `#!` interpreter is in that list. The shebang read is lazy: it is
+    /// consulted only when the path globs miss and the linter declares shebangs,
+    /// so a `.sh` path-glob match never touches the file. This is the routing
+    /// predicate behind both the editing-boundary coverage gate
+    /// ([`LspClientManager::lint_covers`]) and the diagnostics-batch fan-out
+    /// ([`LinterFeeder`]).
+    ///
+    /// [`LspClientManager::lint_covers`]: crate::lsp::LspClientManager::lint_covers
+    /// [`LinterFeeder`]: crate::bridge::linter::LinterFeeder
+    #[must_use]
+    pub fn linter_routes(&self, linter: &LinterConfig, file: &Path, rel: &Path) -> bool {
+        if linter.matches(rel) {
+            return true;
+        }
+        if linter.shebangs.is_empty() {
+            return false;
+        }
+        self.shebang_interpreter(file)
+            .is_some_and(|interp| linter.matches_shebang(&interp))
     }
 
     /// Resolves the owning workspace root for a path.
@@ -1765,6 +1803,84 @@ mod tests {
         let metadata = std::fs::metadata(&path).expect("metadata");
         let info = mgr.classify(&path, &metadata);
         assert_eq!(info.root, None);
+    }
+
+    // --- Linter routing (path glob + shebang) ---
+
+    #[test]
+    fn shebang_interpreter_reads_env_and_direct_forms() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env_form = dir.path().join("a");
+        std::fs::write(&env_form, "#!/usr/bin/env bash\necho hi\n").expect("write");
+        let direct_form = dir.path().join("b");
+        std::fs::write(&direct_form, "#!/bin/bash -e\necho hi\n").expect("write");
+        let no_shebang = dir.path().join("c");
+        std::fs::write(&no_shebang, "echo hi\n").expect("write");
+
+        let mgr = FilesystemManager::new();
+        assert_eq!(mgr.shebang_interpreter(&env_form).as_deref(), Some("bash"));
+        assert_eq!(
+            mgr.shebang_interpreter(&direct_form).as_deref(),
+            Some("bash")
+        );
+        assert_eq!(mgr.shebang_interpreter(&no_shebang), None);
+        assert_eq!(
+            mgr.shebang_interpreter(dir.path().join("missing").as_path()),
+            None
+        );
+    }
+
+    #[test]
+    fn linter_routes_matches_path_glob_and_shebang() {
+        use crate::config::Config;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+
+        // `.sh` routes by path glob; an extensionless bash script routes by
+        // shebang alone (no `.sh` to match); a python script routes to neither.
+        let sh = root.join("build.sh");
+        std::fs::write(&sh, "echo hi\n").expect("write .sh");
+        let extensionless = root.join("deploy");
+        std::fs::write(&extensionless, "#!/usr/bin/env bash\necho hi\n").expect("write script");
+        let py = root.join("run");
+        std::fs::write(&py, "#!/usr/bin/env python3\nprint('hi')\n").expect("write py");
+
+        let mgr = FilesystemManager::new();
+        mgr.set_roots(vec![root]);
+
+        // The shipped default shellcheck: `**/*.sh` + shebangs [sh, bash, dash, ksh].
+        let config = Config::load_from_sources(&[]).expect("load defaults");
+        let shellcheck = config.linter.get("shellcheck").expect("default shellcheck");
+
+        assert!(mgr.linter_routes(shellcheck, &sh, Path::new("build.sh")));
+        assert!(
+            mgr.linter_routes(shellcheck, &extensionless, Path::new("deploy")),
+            "an extensionless bash script routes to shellcheck by shebang",
+        );
+        assert!(
+            !mgr.linter_routes(shellcheck, &py, Path::new("run")),
+            "a python shebang does not route to shellcheck",
+        );
+    }
+
+    #[test]
+    fn linter_routes_without_shebangs_is_path_glob_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        let script = root.join("deploy");
+        std::fs::write(&script, "#!/usr/bin/env bash\n").expect("write");
+
+        let mgr = FilesystemManager::new();
+        mgr.set_roots(vec![root.clone()]);
+
+        // A yamllint-shaped linter declares no shebangs → an extensionless shell
+        // script never routes, and a path-glob match short-circuits the file read.
+        let yamllint =
+            crate::config::LinterConfig::new("yamllint", vec![], vec!["**/*.yaml".to_string()])
+                .expect("compile");
+        assert!(!mgr.linter_routes(&yamllint, &script, Path::new("deploy")));
+        assert!(mgr.linter_routes(&yamllint, &root.join("a.yaml"), Path::new("a.yaml")));
     }
 
     // --- Per-root classification ---
