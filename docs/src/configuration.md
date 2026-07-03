@@ -571,10 +571,13 @@ build = "make"
 # `allow` includes read/stdout-only tools (cat, head, less, diff, ...):
 # reads aren't a write vector, and a redirected write (`cat > f`) is
 # resolved and attributed by the write resolver, not blocked by denying cat.
+# `sed` and `perl` are allowed as bulk writers: their in-place edits
+# (`sed -i`, `perl -i -pe`) are script-checked and resolved into the
+# diagnostics batch; an unparseable/executing script is surgically denied.
 allow = ["git", "gh", "cp", "rm", "mkdir", "mv", "touch",
          "chmod", "sleep", "cd", "true", "false", "which",
          "cat", "head", "tail", "less", "more", "diff",
-         "echo", "printf", "seq"]
+         "echo", "printf", "seq", "sed", "perl"]
 pipeline = ["grep", "wc", "jq", "sort", "tr", "cut", "uniq"]
 
 [commands.deny]

@@ -14,7 +14,7 @@ This file serves as the single point of truth for AI agents (Claude, Gemini, etc
 
 Catenary is a multi-surface intelligence router. A single daemon manages a pool
 of LSP servers and exposes them through four decoupled surfaces: the **CLI**
-(queries, search, and the editing lifecycle — `catenary grep`/`glob`/`sed`/
+(queries, search, and the editing lifecycle — `catenary grep`/`glob`/
 `diagnostics`, invoked via the host shell tool), **hooks** (editing enforcement,
 command filtering, file tracking), the **MCP server** (the protocol handshake
 plus the workspace-roots channel and user-facing notifications — it advertises no
