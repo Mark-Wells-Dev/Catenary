@@ -83,6 +83,7 @@ and is ignored at project scope:
 - `pipeline`
 - `deny`
 - `deny_flags`
+- `allow_flags`
 - `guidance`
 
 Catenary warns when it sees one of these in a project file.

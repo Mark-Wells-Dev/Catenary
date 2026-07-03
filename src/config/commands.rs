@@ -202,6 +202,13 @@ pub struct CommandsConfig {
     /// Per-command flag denylist. Scans all argument positions.
     /// Key = command name, value = list of denied flags.
     pub deny_flags: Option<HashMap<String, Vec<String>>>,
+    /// Per-command allowed **invocation forms** (the allow-side dual of
+    /// `deny_flags`). Key = command name, value = list of permitted forms,
+    /// e.g. `perl = ["-i", "-pe", "-e"]`. When a command has an entry, an
+    /// invocation must match at least one listed form or it is denied. This is
+    /// policy, not soundness — the write resolver's own denials run regardless
+    /// and are never re-opened by a listed form.
+    pub allow_flags: Option<HashMap<String, Vec<String>>>,
     /// Per-command guidance groups.
     /// Key = group name (e.g., `"read"`, `"build"`), value = group config.
     pub guidance: Option<HashMap<String, GuidanceGroup>>,
@@ -231,6 +238,10 @@ pub struct ResolvedCommands {
     /// Per-command flag denylist. Scans all argument positions.
     /// Key = command name, value = set of denied flags.
     pub deny_flags: HashMap<String, HashSet<String>>,
+    /// Per-command allowed invocation forms (the allow-side lever). Key =
+    /// command name, value = set of permitted forms. An invocation of a keyed
+    /// command must match at least one form or it is denied.
+    pub allow_flags: HashMap<String, HashSet<String>>,
     /// Per-command guidance messages for denial responses.
     /// Key = command name, value = guidance entry.
     pub guidance: HashMap<String, GuidanceEntry>,
@@ -276,6 +287,14 @@ impl ResolvedCommands {
                     .extend(flags.iter().cloned());
             }
         }
+        if let Some(ref allow_flags) = layer.allow_flags {
+            for (cmd, forms) in allow_flags {
+                self.allow_flags
+                    .entry(cmd.clone())
+                    .or_default()
+                    .extend(forms.iter().cloned());
+            }
+        }
         if let Some(ref groups) = layer.guidance {
             self.guidance = flatten_guidance(groups);
         }
@@ -283,7 +302,8 @@ impl ResolvedCommands {
 
     /// Merge per-root project **build** tools into this user-level baseline.
     ///
-    /// Command **enforcement** — `allow`/`pipeline`/`deny`/`deny_flags` — is
+    /// Command **enforcement** — `allow`/`pipeline`/`deny`/`deny_flags`/
+    /// `allow_flags` — is
     /// **user-level only**: it is taken verbatim from `self`, and a project
     /// `.catenary.toml` cannot relax or replace it.
     /// The filter resolves daemon-globally (`Session::merged_commands` reads the
@@ -508,11 +528,12 @@ pub fn validate(config: &CommandsConfig) -> (Vec<String>, Vec<String>) {
             || config.pipeline.is_some()
             || config.deny.is_some()
             || config.deny_flags.is_some()
+            || config.allow_flags.is_some()
             || config.build.is_some())
     {
         errors.push(
             "[commands] `client_enforcement_only = true` with `allow`, `pipeline`, \
-             `deny`, `deny_flags`, or `build` is contradictory — \
+             `deny`, `deny_flags`, `allow_flags`, or `build` is contradictory — \
              opt-out means no enforcement"
                 .to_string(),
         );
@@ -641,6 +662,37 @@ pub fn validate(config: &CommandsConfig) -> (Vec<String>, Vec<String>) {
         }
     }
 
+    // allow_flags: keys must be in allow, pipeline, or build; an empty form
+    // list means "never runnable" (an allow set that permits nothing), so it
+    // is an error rather than a silent lock-out.
+    if let Some(ref allow_flags) = config.allow_flags {
+        for (cmd, forms) in allow_flags {
+            if !allow_set.contains(cmd.as_str())
+                && !pipeline_set.contains(cmd.as_str())
+                && !build_set.contains(cmd.as_str())
+            {
+                errors.push(format!(
+                    "[commands] allow_flags.{cmd} references '{cmd}' which is not in \
+                     `allow`, `pipeline`, or `build` — can only constrain forms of \
+                     permitted commands",
+                ));
+            }
+            if forms.is_empty() {
+                errors.push(format!(
+                    "[commands] allow_flags.{cmd} has an empty form list — an empty \
+                     allow set means '{cmd}' is never runnable",
+                ));
+            }
+            for form in forms {
+                if form.is_empty() {
+                    errors.push(format!(
+                        "[commands] allow_flags.{cmd} contains an empty form string",
+                    ));
+                }
+            }
+        }
+    }
+
     // Guidance validation
     if let Some(ref groups) = config.guidance {
         for (name, group) in groups {
@@ -675,7 +727,8 @@ pub fn validate(config: &CommandsConfig) -> (Vec<String>, Vec<String>) {
 /// Only `build` is honored at project scope — it is per-root and benign (it
 /// names a build tool and relaxes nothing). Everything else is user-level
 /// only: command enforcement
-/// (`client_enforcement_only`/`allow`/`pipeline`/`deny`/`deny_flags`) and
+/// (`client_enforcement_only`/`allow`/`pipeline`/`deny`/`deny_flags`/
+/// `allow_flags`) and
 /// denial `guidance`. The filter resolves daemon-globally
 /// (`Session::merged_commands`), so honoring any of these at project scope would
 /// change the filter *every* connected session sees. See
@@ -694,6 +747,7 @@ pub const PROJECT_IGNORED_COMMAND_KEYS: &[&str] = &[
     "pipeline",
     "deny",
     "deny_flags",
+    "allow_flags",
     "guidance",
 ];
 
@@ -780,6 +834,51 @@ git = ["--no-verify", "--force"]
         let deny_flags = config.deny_flags.as_ref().expect("deny_flags");
         assert_eq!(deny_flags.get("make").expect("make").len(), 1);
         assert_eq!(deny_flags.get("git").expect("git").len(), 2);
+    }
+
+    #[test]
+    fn deserialize_allow_flags() {
+        let config: CommandsConfig = toml::from_str(
+            r#"
+allow = ["perl", "sed"]
+
+[allow_flags]
+perl = ["-i", "-pe", "-e"]
+sed = ["-n"]
+"#,
+        )
+        .expect("valid TOML");
+
+        let allow_flags = config.allow_flags.as_ref().expect("allow_flags");
+        assert_eq!(allow_flags.get("perl").expect("perl").len(), 3);
+        assert_eq!(allow_flags.get("sed").expect("sed").len(), 1);
+    }
+
+    #[test]
+    fn merge_allow_flags_unions_across_layers() {
+        let user = CommandsConfig {
+            allow: Some(vec!["perl".to_string()]),
+            allow_flags: Some(HashMap::from([(
+                "perl".to_string(),
+                vec!["-i".to_string()],
+            )])),
+            ..CommandsConfig::default()
+        };
+        let override_layer = CommandsConfig {
+            allow_flags: Some(HashMap::from([(
+                "perl".to_string(),
+                vec!["-pe".to_string()],
+            )])),
+            ..CommandsConfig::default()
+        };
+
+        let mut resolved = ResolvedCommands::default();
+        resolved.merge(&user);
+        resolved.merge(&override_layer);
+
+        let perl = resolved.allow_flags.get("perl").expect("perl forms");
+        assert!(perl.contains("-i"));
+        assert!(perl.contains("-pe"));
     }
 
     #[test]
@@ -1207,6 +1306,106 @@ git = ["--no-verify", "--force"]
     }
 
     #[test]
+    fn validate_allow_flags_key_not_in_any_list() {
+        let config = CommandsConfig {
+            allow: Some(vec!["git".to_string()]),
+            allow_flags: Some(HashMap::from([(
+                "perl".to_string(),
+                vec!["-pe".to_string()],
+            )])),
+            ..CommandsConfig::default()
+        };
+
+        let (errors, _) = validate(&config);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("allow_flags.perl"));
+        assert!(errors[0].contains("not in `allow`, `pipeline`, or `build`"));
+    }
+
+    #[test]
+    fn validate_allow_flags_key_in_allow_ok() {
+        let config = CommandsConfig {
+            allow: Some(vec!["perl".to_string()]),
+            allow_flags: Some(HashMap::from([(
+                "perl".to_string(),
+                vec!["-i".to_string(), "-pe".to_string()],
+            )])),
+            ..CommandsConfig::default()
+        };
+
+        let (errors, _) = validate(&config);
+        assert!(
+            errors.is_empty(),
+            "allow_flags key in allow is valid: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_allow_flags_key_in_pipeline_ok() {
+        let config = CommandsConfig {
+            allow: Some(vec!["git".to_string()]),
+            pipeline: Some(vec!["perl".to_string()]),
+            allow_flags: Some(HashMap::from([(
+                "perl".to_string(),
+                vec!["-pe".to_string()],
+            )])),
+            ..CommandsConfig::default()
+        };
+
+        let (errors, _) = validate(&config);
+        assert!(
+            errors.is_empty(),
+            "allow_flags key in pipeline is valid: {errors:?}",
+        );
+    }
+
+    #[test]
+    fn validate_allow_flags_key_in_build_ok() {
+        let config = CommandsConfig {
+            allow: Some(vec!["git".to_string()]),
+            build: Some(StringOrVec(vec!["make".to_string()])),
+            allow_flags: Some(HashMap::from([(
+                "make".to_string(),
+                vec!["-j".to_string()],
+            )])),
+            ..CommandsConfig::default()
+        };
+
+        let (errors, _) = validate(&config);
+        assert!(
+            errors.is_empty(),
+            "allow_flags key in build is valid: {errors:?}",
+        );
+    }
+
+    #[test]
+    fn validate_allow_flags_empty_list() {
+        let config = CommandsConfig {
+            allow: Some(vec!["perl".to_string()]),
+            allow_flags: Some(HashMap::from([("perl".to_string(), vec![])])),
+            ..CommandsConfig::default()
+        };
+
+        let (errors, _) = validate(&config);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("empty form list"));
+        assert!(errors[0].contains("never runnable"));
+    }
+
+    #[test]
+    fn validate_allow_flags_empty_string() {
+        let config = CommandsConfig {
+            allow: Some(vec!["perl".to_string()]),
+            allow_flags: Some(HashMap::from([("perl".to_string(), vec![String::new()])])),
+            ..CommandsConfig::default()
+        };
+
+        let (errors, _) = validate(&config);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("empty form string"));
+    }
+
+    #[test]
     fn validate_only_client_enforcement_only() {
         let config = CommandsConfig {
             client_enforcement_only: true,
@@ -1242,6 +1441,7 @@ git = ["--no-verify", "--force"]
                 pipeline: Some(vec!["jq".into()]),
                 deny: Some(HashMap::from([("git".into(), vec!["ls-files".into()])])),
                 deny_flags: Some(HashMap::from([("git".into(), vec!["--no-verify".into()])])),
+                allow_flags: Some(HashMap::from([("perl".into(), vec!["-pe".into()])])),
                 build: Some(StringOrVec(vec!["npm".into()])),
                 ..CommandsConfig::default()
             },
@@ -1259,6 +1459,7 @@ git = ["--no-verify", "--force"]
         assert!(git_deny.contains("push"));
         assert!(!git_deny.contains("ls-files"), "project deny ignored");
         assert!(merged.deny_flags.is_empty(), "project deny_flags ignored");
+        assert!(merged.allow_flags.is_empty(), "project allow_flags ignored");
 
         // Only `build` is honored per-root.
         assert_eq!(
@@ -1283,6 +1484,7 @@ git = ["--no-verify", "--force"]
             "pipeline",
             "deny",
             "deny_flags",
+            "allow_flags",
             "guidance",
         ] {
             assert!(

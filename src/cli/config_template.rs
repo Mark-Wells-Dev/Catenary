@@ -78,6 +78,14 @@ const TEMPLATE: &str = r#"# Catenary recommended config
 # make = ["-C"]
 # cargo = ["--manifest-path"]
 #
+# # allow_flags — the allow-side dual of deny_flags. A keyed command must be
+# # invoked in one of the listed forms or it is denied naming them. Forms are
+# # positive anchors: `-pe` matches any invocation carrying both `-p` and `-e`.
+# # This is policy only — the write resolver's own denials (an unauditable
+# # `perl script.pl`) still run regardless of what is listed.
+# [commands.allow_flags]
+# perl = ["-i", "-pe", "-e"]
+#
 # # Per-command guidance — optional hints shown when a command is denied.
 # # Groups map commands to a message. {EDIT} resolves per-client.
 #
@@ -98,7 +106,8 @@ const TEMPLATE: &str = r#"# Catenary recommended config
 # ── Project-local overrides (.catenary.toml) ─────────────────────
 #
 # A project .catenary.toml honors `build` only. Every other [commands]
-# key — client_enforcement_only, allow, pipeline, deny, deny_flags — is
+# key — client_enforcement_only, allow, pipeline, deny, deny_flags,
+# allow_flags — is
 # user-level only: the filter resolves daemon-globally (one daemon serves
 # every session), so a project can neither relax it nor turn it on/off for
 # itself. Those keys are ignored (with a warning) in project config — keep
@@ -393,6 +402,10 @@ mod tests {
         assert!(
             TEMPLATE.contains("[commands.deny_flags]"),
             "template should contain [commands.deny_flags] section",
+        );
+        assert!(
+            TEMPLATE.contains("[commands.allow_flags]"),
+            "template should contain [commands.allow_flags] section",
         );
     }
 

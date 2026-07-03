@@ -112,6 +112,10 @@ fn is_fd_dup_target(target: &str) -> bool {
 /// 2. It is in `pipeline` but at pipe position 0.
 /// 3. It is in `allow` but the specific subcommand is in `deny.<cmd>`.
 /// 4. It is otherwise allowed but uses a flag in `deny_flags.<cmd>`.
+/// 5. It has an `allow_flags.<cmd>` entry but the invocation matches none of
+///    the permitted forms (the allow-side form lever; `deny`/`deny_flags`
+///    take precedence, checked first). This is policy only — the write
+///    resolver's own soundness denials run afterward regardless.
 ///
 /// Returns the denied command name and reason if denied, `None` if allowed.
 ///
@@ -141,6 +145,9 @@ fn check_against_allowlist(
         if let Some(flag) = check_denied_flags(name, argv, rules) {
             return Some((format!("{name} {flag}"), DenialReason::DeniedFlag));
         }
+        if is_disallowed_form(name, argv, rules) {
+            return Some((name.to_string(), DenialReason::DisallowedForm));
+        }
         return None;
     }
 
@@ -158,6 +165,9 @@ fn check_against_allowlist(
         if let Some(flag) = check_denied_flags(name, argv, rules) {
             return Some((format!("{name} {flag}"), DenialReason::DeniedFlag));
         }
+        if is_disallowed_form(name, argv, rules) {
+            return Some((name.to_string(), DenialReason::DisallowedForm));
+        }
         return None;
     }
 
@@ -169,6 +179,9 @@ fn check_against_allowlist(
         }
         if let Some(flag) = check_denied_flags(name, argv, rules) {
             return Some((format!("{name} {flag}"), DenialReason::DeniedFlag));
+        }
+        if is_disallowed_form(name, argv, rules) {
+            return Some((name.to_string(), DenialReason::DisallowedForm));
         }
         return None;
     }
@@ -203,6 +216,61 @@ fn check_denied_flags(name: &str, argv: &[String], rules: &ResolvedCommands) -> 
     None
 }
 
+/// Cluster-normalize one flag token into its atoms for `allow_flags` matching.
+///
+/// A short cluster decomposes into per-character atoms (`"-pe"` → `["p", "e"]`),
+/// stopping at the first non-alphanumeric byte so a glued value or suffix is
+/// ignored (`"-i.bak"` → `["i"]`). A long flag is a single atom, `=value`
+/// stripped (`"--in-place=.bak"` → `["--in-place"]`). A bare `-` or a
+/// non-flag token (a positional) yields nothing. Short atoms are single-char
+/// strings and long atoms carry their `--` prefix, so the two namespaces never
+/// collide.
+fn form_atoms(token: &str) -> Vec<String> {
+    let Some(rest) = token.strip_prefix('-') else {
+        return Vec::new(); // positional, not a flag
+    };
+    if rest.is_empty() {
+        return Vec::new(); // bare `-` (stdin marker)
+    }
+    if let Some(long) = rest.strip_prefix('-') {
+        let flag = long.split_once('=').map_or(long, |(f, _)| f);
+        if flag.is_empty() {
+            return Vec::new(); // bare `--`
+        }
+        return vec![format!("--{flag}")];
+    }
+    rest.chars()
+        .take_while(char::is_ascii_alphanumeric)
+        .map(|c| c.to_string())
+        .collect()
+}
+
+/// The `allow_flags` form lever: whether a command with an `allow_flags.<name>`
+/// entry was invoked in a form that matches **none** of the permitted forms.
+///
+/// Each listed form is a positive anchor: cluster-normalized to its atoms
+/// (`"-pe"` ≡ `{p, e}`), it matches when the invocation *carries all* of those
+/// atoms — extra flags beyond the anchor do not disqualify the match (they stay
+/// governed by the write resolver's own modeling). Long and short forms are
+/// distinct atoms. A command with no entry is inert (returns `false`); a
+/// degenerate form that normalizes to no atoms never matches (fail closed).
+///
+/// This is a pure narrowing gate — when it passes, the write resolver still
+/// runs and can still deny (so a soundness denial like the misc-126
+/// script-file/stdin-program shape is never re-opened by a listed form).
+fn is_disallowed_form(name: &str, argv: &[String], rules: &ResolvedCommands) -> bool {
+    let Some(forms) = rules.allow_flags.get(name) else {
+        return false; // no entry — lever inert
+    };
+    let carried: std::collections::HashSet<String> =
+        argv.iter().flat_map(|token| form_atoms(token)).collect();
+    let matched = forms.iter().any(|form| {
+        let required = form_atoms(form);
+        !required.is_empty() && required.iter().all(|atom| carried.contains(atom))
+    });
+    !matched
+}
+
 /// Why a command was denied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DenialReason {
@@ -214,6 +282,10 @@ pub enum DenialReason {
     DeniedSubcommand,
     /// Command is allowed but a specific flag is denied.
     DeniedFlag,
+    /// Command has an `allow_flags.<cmd>` entry but the invocation matches none
+    /// of the permitted forms. The config-sourced teaching message (naming the
+    /// permitted forms) is built in [`format_denial`].
+    DisallowedForm,
     /// The command writes through a form the write resolver cannot see
     /// completely (ws38 ticket 01, decision 026): the complete-or-deny
     /// contract denies rather than under-record. The teaching message rides
@@ -1169,6 +1241,12 @@ fn format_opening_line(denied_cmd: &str, reason: DenialReason) -> String {
         DenialReason::DeniedFlag => {
             format!("`{denied_cmd}` isn't allowed (denied flag).")
         }
+        // DisallowedForm denials early-return in `format_denial` with the
+        // config-sourced message naming the permitted forms; this arm only
+        // satisfies exhaustiveness.
+        DenialReason::DisallowedForm => {
+            format!("`{denied_cmd}` isn't allowed in this invocation form.")
+        }
         // OpaqueWrite denials early-return in the callers with the resolver's
         // teaching message; this arm only satisfies exhaustiveness.
         DenialReason::OpaqueWrite => {
@@ -1182,9 +1260,26 @@ fn format_opening_line(denied_cmd: &str, reason: DenialReason) -> String {
 /// whole surface inline (decision 023).
 const SURFACE_POINTER: &str = "Run `catenary commands` for the allowed command surface.";
 
+/// Render the `allow_flags` (form-lever) denial: a config-sourced, misc-119
+/// voice message that names the permitted invocation forms. The forms are
+/// sorted for a deterministic listing.
+fn format_disallowed_form_denial(cmd: &str, forms: &std::collections::HashSet<String>) -> String {
+    let mut sorted: Vec<&str> = forms.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    let list = sorted
+        .iter()
+        .map(|f| format!("`{f}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "`{cmd}` is limited by the Catenary configuration to these invocation forms: {list}. \
+         This invocation matches none of them — re-run `{cmd}` in one of the permitted forms."
+    )
+}
+
 /// Render the allowed-command surface as sorted lines: `Allowed`, `Allowed in
-/// pipelines`, `Denied subcommands`, and `Denied flags`. Sections with no
-/// entries are omitted.
+/// pipelines`, `Denied subcommands`, `Denied flags`, and `Restricted to forms`.
+/// Sections with no entries are omitted.
 ///
 /// This is the canonical surface listing — `catenary commands` prints it and
 /// denial messages point there rather than inlining it. Build tools are
@@ -1235,6 +1330,19 @@ pub fn format_command_surface(commands: &ResolvedCommands) -> Vec<String> {
         parts.push(format!("Denied flags: {}", flag_pairs.join(", ")));
     }
 
+    if !commands.allow_flags.is_empty() {
+        let mut form_pairs: Vec<String> = Vec::new();
+        for (cmd, forms) in &commands.allow_flags {
+            let mut sorted_forms: Vec<&str> = forms.iter().map(String::as_str).collect();
+            sorted_forms.sort_unstable();
+            for form in sorted_forms {
+                form_pairs.push(format!("{cmd} {form}"));
+            }
+        }
+        form_pairs.sort_unstable();
+        parts.push(format!("Restricted to forms: {}", form_pairs.join(", ")));
+    }
+
     parts
 }
 
@@ -1261,6 +1369,16 @@ pub fn format_denial(
     if denial.reason == DenialReason::OpaqueWrite {
         if let Some(msg) = &denial.message {
             return msg.clone();
+        }
+        return format_opening_line(denied_cmd, denial.reason);
+    }
+
+    // Form-lever denial (`allow_flags`): the config-sourced message naming the
+    // permitted forms is the whole denial — it is the lever's teaching surface.
+    if denial.reason == DenialReason::DisallowedForm {
+        let lookup_cmd = denied_cmd.split_whitespace().next().unwrap_or(denied_cmd);
+        if let Some(forms) = commands.allow_flags.get(lookup_cmd) {
+            return format_disallowed_form_denial(lookup_cmd, forms);
         }
         return format_opening_line(denied_cmd, denial.reason);
     }
@@ -2613,6 +2731,10 @@ mod tests {
             !surface.contains("Denied flags"),
             "empty deny_flags should be omitted"
         );
+        assert!(
+            !surface.contains("Restricted to forms"),
+            "empty allow_flags should be omitted"
+        );
     }
 
     #[test]
@@ -3113,6 +3235,172 @@ mod tests {
         assert!(
             surface.contains("make -C"),
             "should list make -C: {surface}"
+        );
+    }
+
+    // ── allow_flags: the form lever (misc 127) ──────────────────────
+
+    /// perl allowlisted, restricted to the `-i` / `-pe` invocation forms.
+    fn rules_with_allow_flags() -> ResolvedCommands {
+        let mut rules = basic_rules();
+        rules.allow.insert("perl".into());
+        rules.allow_flags =
+            HashMap::from([("perl".into(), HashSet::from(["-i".into(), "-pe".into()]))]);
+        rules
+    }
+
+    #[test]
+    fn allow_flags_matching_form_allowed() {
+        // `-pe` carries {p, e} ⊇ the `-pe` anchor {p, e}: allowed by the lever,
+        // and the resolver sees a pure substitution (NoWrite).
+        let rules = rules_with_allow_flags();
+        assert!(
+            check_command("perl -pe 's/a/b/' f", &rules, None).is_none(),
+            "perl -pe should be allowed",
+        );
+    }
+
+    #[test]
+    fn allow_flags_in_place_form_recorded() {
+        // `-i -pe` carries {i, p, e}: matches both anchors; the resolver records
+        // the in-place write to `f`, so the command is allowed.
+        let rules = rules_with_allow_flags();
+        assert!(
+            check_command("perl -i -pe 's/a/b/' f", &rules, None).is_none(),
+            "perl -i -pe should be allowed (write recorded)",
+        );
+    }
+
+    #[test]
+    fn allow_flags_nonmatching_form_denied() {
+        // `-ne` carries {n, e}: neither {i} nor {p, e} is a subset, so the lever
+        // denies before the resolver — reason DisallowedForm, naming the forms.
+        let rules = rules_with_allow_flags();
+        let denial =
+            check_command("perl -ne 'print' f", &rules, None).expect("perl -ne should be denied");
+        assert_eq!(denial.reason, DenialReason::DisallowedForm);
+        assert_eq!(denial.command, "perl");
+    }
+
+    #[test]
+    fn allow_flags_denial_names_permitted_forms() {
+        let rules = rules_with_allow_flags();
+        let denial = check_command("perl -ne 'print' f", &rules, None).expect("denied");
+        let msg = format_denial("perl", &rules, &denial, None, None);
+        assert_eq!(
+            msg,
+            "`perl` is limited by the Catenary configuration to these invocation forms: \
+             `-i`, `-pe`. This invocation matches none of them — re-run `perl` in one of \
+             the permitted forms.",
+        );
+    }
+
+    #[test]
+    fn allow_flags_extra_flags_do_not_disqualify() {
+        // A superset invocation still matches: `-w -pe` carries {w, p, e} ⊇
+        // {p, e}. Extra flags are the resolver's business, not the lever's.
+        let rules = rules_with_allow_flags();
+        assert!(
+            check_command("perl -w -pe 's/a/b/' f", &rules, None).is_none(),
+            "extra -w must not disqualify the -pe match",
+        );
+    }
+
+    #[test]
+    fn allow_flags_no_entry_is_inert() {
+        // sed has no allow_flags entry — the lever never fires for it. (`echo`
+        // is the position-0 command here; `sed` is allowed mid-pipeline.)
+        let rules = rules_with_allow_flags();
+        assert!(
+            check_command("echo x | sed 's/a/b/'", &rules, None).is_none(),
+            "sed without an allow_flags entry is unaffected",
+        );
+    }
+
+    #[test]
+    fn allow_flags_deny_flags_wins() {
+        // deny_flags precedes allow_flags: even a `-pe` form that the lever
+        // would permit is denied when `-pe`… carries a denied flag. Here `-w`
+        // is denied, and `perl -w -pe` (a matching form) is still denied by the
+        // flag denylist.
+        let mut rules = rules_with_allow_flags();
+        rules.deny_flags = HashMap::from([("perl".into(), HashSet::from(["-w".into()]))]);
+        let denial =
+            check_command("perl -w -pe 's/a/b/' f", &rules, None).expect("deny_flags wins");
+        assert_eq!(denial.reason, DenialReason::DeniedFlag);
+        assert_eq!(denial.command, "perl -w");
+    }
+
+    #[test]
+    fn allow_flags_cannot_reopen_resolver_soundness() {
+        // The layering guarantee: a form the lever *permits* is still subject to
+        // the resolver. `perl -i script.pl` matches the `-i` anchor, so the
+        // lever passes — but the resolver denies the unauditable script file
+        // (misc 126). Soundness runs regardless; the lever only narrows.
+        let mut rules = basic_rules();
+        rules.allow.insert("perl".into());
+        rules.allow_flags = HashMap::from([("perl".into(), HashSet::from(["-i".into()]))]);
+        let denial =
+            check_command("perl -i script.pl", &rules, None).expect("resolver still denies");
+        assert_eq!(denial.reason, DenialReason::OpaqueWrite);
+    }
+
+    #[test]
+    fn allow_flags_script_file_denied_without_entry() {
+        // Baseline for the layering: without any allow_flags entry, the misc-126
+        // resolver denial owns `perl script.pl` (soundness, not the lever).
+        let mut rules = basic_rules();
+        rules.allow.insert("perl".into());
+        let denial = check_command("perl script.pl", &rules, None).expect("misc-126 denies");
+        assert_eq!(denial.reason, DenialReason::OpaqueWrite);
+    }
+
+    #[test]
+    fn allow_flags_e_anchor_matches_carrying_cluster() {
+        // Edge case pinned: an `-e` anchor {e} matches any cluster carrying `e`,
+        // so with `-e` permitted, `perl -ne` passes the lever (it carries e).
+        // The resolver then governs whether the program is checkable.
+        let mut rules = basic_rules();
+        rules.allow.insert("perl".into());
+        rules.allow_flags =
+            HashMap::from([("perl".into(), HashSet::from(["-i".into(), "-e".into()]))]);
+        // `-ne` carries {n, e} ⊇ {e}: lever passes. `print` is not a checkable
+        // substitution, so the resolver denies — not the lever.
+        let denial =
+            check_command("perl -ne 'print' f", &rules, None).expect("resolver denies program");
+        assert_eq!(denial.reason, DenialReason::OpaqueWrite);
+    }
+
+    #[test]
+    fn allow_flags_long_form_matched_as_typed() {
+        // Long forms are single atoms, distinct from short clusters. A `--foo`
+        // anchor matches only when the long flag is present, `=value` stripped.
+        let mut rules = basic_rules();
+        rules.allow.insert("git".into());
+        rules.allow_flags = HashMap::from([("git".into(), HashSet::from(["--no-pager".into()]))]);
+        assert!(
+            check_command("git --no-pager log", &rules, None).is_none(),
+            "matching long form allowed",
+        );
+        let denial = check_command("git log", &rules, None).expect("no long flag → denied");
+        assert_eq!(denial.reason, DenialReason::DisallowedForm);
+    }
+
+    #[test]
+    fn surface_restricted_forms_section() {
+        let rules = rules_with_allow_flags();
+        let surface = format_command_surface(&rules).join("\n");
+        assert!(
+            surface.contains("Restricted to forms:"),
+            "should have the form-restriction section: {surface}",
+        );
+        assert!(
+            surface.contains("perl -i"),
+            "should list perl -i: {surface}",
+        );
+        assert!(
+            surface.contains("perl -pe"),
+            "should list perl -pe: {surface}",
         );
     }
 

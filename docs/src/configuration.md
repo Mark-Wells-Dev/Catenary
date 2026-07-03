@@ -613,7 +613,43 @@ avoids masking that check behind a bare `awk 'prog'`.
 | `pipeline` | Commands allowed mid-pipeline (reading stdin) but denied at pipeline position 0 (reading files directly). Prevents `grep foo bar.rs` while allowing `make test \| grep FAIL`. |
 | `deny.<cmd>` | Subcommand denylist within an allowed command. `git` is allowed, but `git grep` is denied. |
 | `deny_flags.<cmd>` | Flag denylist within an allowed command. `make` is allowed, but `make -C` is denied. |
+| `allow_flags.<cmd>` | Allowed **invocation forms** for a permitted command (the allow-side dual of `deny_flags`). When present, an invocation must match one listed form or it is denied naming them. See [Allowed forms](#allowed-forms-allow_flags). |
 | `guidance.<group>` | Optional per-command hint shown on denial — a `message`, or a `redirect` naming the Catenary command to use instead (`grep` → `catenary grep`, `glob` → `catenary glob`). |
+
+### Allowed forms (`allow_flags`)
+
+`deny.<cmd>` and `deny_flags.<cmd>` subtract from what a permitted command may
+do. `allow_flags.<cmd>` is their allow-side dual: a per-command **whitelist of
+invocation forms**. When a command has an `allow_flags` entry, an invocation
+must match at least one listed form or it is denied with a message naming the
+permitted forms.
+
+```toml
+[commands]
+allow = ["perl"]
+
+[commands.allow_flags]
+# perl is a nicer sed here: only in-place edits and inline substitutions.
+perl = ["-i", "-pe", "-e"]
+```
+
+With that config, `perl -pe 's/a/b/' f` and `perl -i -pe 's/a/b/' f` run;
+`perl -ne 'print' f` is denied, naming `-i`, `-pe`, `-e`.
+
+Each form is a **positive anchor**, cluster-normalized: `-pe` is the flag set
+`{p, e}`, and an invocation matches when it *carries all* of the anchor's
+flags — so `-i -pe` and `-w -pe` both match the `-pe` anchor (extra flags do
+not disqualify a match; they stay governed by the write model below). Long and
+short forms are distinct tokens, matched as typed (`--in-place` ≠ `-i`).
+
+`allow_flags` is **policy, not soundness**. It can only *narrow*: it never
+re-opens a form the [write model](#the-write-model) denies. A `perl script.pl`
+runs a program the hook cannot audit, so it is denied whether or not a form is
+listed — an unauditable shape has no flag to allow. `deny`/`deny_flags` also
+still win: a denied flag is denied even inside a listed form. Like the other
+enforcement keys, `allow_flags` is user-level only (ignored at project scope),
+and its keys must name commands already in `allow`, `pipeline`, or `build`; an
+empty form list is a config error (an allow set that permits nothing).
 
 ### The write model
 
@@ -663,7 +699,7 @@ build = "make"
 
 **Only `build` is honored.** Every other `[commands]` key —
 `client_enforcement_only`, `allow`, `pipeline`, `deny`, `deny_flags`,
-and `guidance` — is **user-level only** and is
+`allow_flags`, and `guidance` — is **user-level only** and is
 ignored at project scope (Catenary warns when it sees one). They must live
 in `~/.config/catenary/config.toml`.
 

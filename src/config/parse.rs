@@ -1114,11 +1114,19 @@ servers = ["rust-analyzer"]
             "[commands]\nallow = [\"git\"]\npipeline = [\"grep\"]\n\
              [commands.deny]\ngit = [\"push\"]\n\
              [commands.deny_flags]\ngit = [\"-f\"]\n\
+             [commands.allow_flags]\nperl = [\"-pe\"]\n\
              [commands.guidance.scan]\nmessage = \"x\"\ncommands = [\"rg\"]\n",
         )
         .expect("valid toml");
         let ignored = ignored_project_command_keys(&raw);
-        for key in ["allow", "pipeline", "deny", "deny_flags", "guidance"] {
+        for key in [
+            "allow",
+            "pipeline",
+            "deny",
+            "deny_flags",
+            "allow_flags",
+            "guidance",
+        ] {
             assert!(ignored.contains(&key), "{key} should be flagged");
         }
     }

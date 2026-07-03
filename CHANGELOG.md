@@ -69,6 +69,18 @@ upgrading.
 - **`[notifications].threshold`** (default `"warn"`) — documents and exposes the
   minimum severity promoted to user-facing notifications (one of `"debug"`,
   `"info"`, `"warn"`, `"error"`).
+- **`[commands.allow_flags]`** — the allow-side dual of `deny_flags`: a
+  per-command whitelist of invocation forms (`perl = ["-i", "-pe", "-e"]`). When
+  a command has an entry, an invocation must match at least one listed form or it
+  is denied naming them. Forms are positive anchors, cluster-normalized (`-pe` ≡
+  `{p, e}`) — an invocation matches when it carries all of an anchor's flags;
+  extra flags stay governed by the write model. The lever is policy, never
+  soundness: it can only narrow, never re-open a form the resolver denies (an
+  unauditable `perl script.pl` is denied whatever is listed), and `deny`/
+  `deny_flags` still win. User-level only (ignored at project scope); keys must
+  name a command in `allow`/`pipeline`/`build`, and an empty form list is a
+  config error. `catenary commands` renders the constraint. The recommended
+  config now ships `perl = ["-i", "-pe", "-e"]`.
 - **Batteries-included default linters.** `catenary diagnostics` is a
   multi-feeder aggregator: it now ships a default standalone-linter set
   (`defaults/linters.toml`), inherited by any root that does not customize or
