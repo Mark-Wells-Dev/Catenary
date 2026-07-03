@@ -75,6 +75,54 @@ fn render(cli_version: &str, daemon: &DaemonVersion) -> Vec<String> {
     lines
 }
 
+/// Whether `daemon` is a *known* version mismatch against `cli_version`.
+///
+/// Pure so the decision is testable without a live daemon. Only a reachable
+/// daemon whose version differs qualifies — the condition that prepends the
+/// teaching-payload staleness note. A version match, no daemon
+/// ([`DaemonVersion::NotRunning`]), or an unresponsive daemon
+/// ([`DaemonVersion::Unresponsive`], version unknown) all return `false`: the
+/// degraded-payload path already covers unreachability, and an unknown version
+/// is nothing to compare.
+fn daemon_version_is_stale(cli_version: &str, daemon: &DaemonVersion) -> bool {
+    matches!(daemon, DaemonVersion::Reachable(v) if v != cli_version)
+}
+
+/// Whether the running daemon serves a different build than this CLI.
+///
+/// The synchronous entry point for the teaching payload
+/// ([`crate::cli::teaching::payload_body`]). It reuses the `catenary version`
+/// `tool/version` IPC probe ([`query_daemon_version`], with its short read
+/// timeout) — no new probing — and reports only a *known* mismatch. The probe is
+/// driven on a private current-thread runtime, so it is callable from the
+/// synchronous payload path (every host's session-start emission and `catenary
+/// primer` are sync, never inside a runtime). Returns `false` on any
+/// daemon-unreachable or version-unknown outcome, leaving the existing
+/// degraded-payload path as the sole signal there (no second warning), and
+/// `false` if the runtime cannot be built.
+#[cfg(unix)]
+#[must_use]
+pub fn daemon_is_stale() -> bool {
+    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        return false;
+    };
+    daemon_version_is_stale(CLI_VERSION, &runtime.block_on(query_daemon_version()))
+}
+
+/// Whether the running daemon serves a different build than this CLI (non-Unix
+/// stub).
+///
+/// The daemon is Unix-only, so off Unix there is nothing to probe and the
+/// teaching payload never carries the staleness note.
+#[cfg(not(unix))]
+#[must_use]
+pub fn daemon_is_stale() -> bool {
+    false
+}
+
 /// Query the running daemon's version over the IPC socket.
 ///
 /// Connects to the daemon's general-purpose IPC socket and sends
@@ -213,5 +261,41 @@ mod tests {
         );
         // Only the two lines — no extra hint.
         assert_eq!(lines.len(), 2, "exactly two lines: {lines:?}");
+    }
+
+    #[test]
+    fn reachable_same_version_is_not_stale() {
+        assert!(!daemon_version_is_stale(
+            "1.3.6",
+            &DaemonVersion::Reachable("1.3.6".to_string()),
+        ));
+    }
+
+    #[test]
+    fn reachable_different_version_is_stale() {
+        // A reachable daemon on a different build is the sole staleness case —
+        // the teaching payload prepends its note.
+        assert!(daemon_version_is_stale(
+            "1.3.7",
+            &DaemonVersion::Reachable("1.3.6-3-gabc1234".to_string()),
+        ));
+    }
+
+    #[test]
+    fn unresponsive_daemon_is_not_stale() {
+        // Version unknown → nothing to compare → no staleness note.
+        assert!(!daemon_version_is_stale(
+            "1.3.6",
+            &DaemonVersion::Unresponsive,
+        ));
+    }
+
+    #[test]
+    fn not_running_daemon_is_not_stale() {
+        // No daemon → the degraded-payload path covers it → no staleness note.
+        assert!(!daemon_version_is_stale(
+            "1.3.6",
+            &DaemonVersion::NotRunning
+        ));
     }
 }

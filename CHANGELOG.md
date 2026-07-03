@@ -120,6 +120,18 @@ upgrading.
   command filtering, tracking — plus MCP wiring where the plugin carries it) and
   what remains (the daemon keeps serving other projects, nothing to uninstall,
   re-enabling resumes cleanly because editing state is per-session).
+- **Session-start payload flags a stale daemon.** When the session-start
+  teaching payload is emitted and the serving daemon runs a different build than
+  the CLI, the payload now opens with one restrained note — the daemon's
+  behavior may predate the current docs, so observations should be treated as
+  potentially stale. It reuses the `catenary version` `tool/version` probe (same
+  short timeout, no new probing) and rides every surface identically:
+  `catenary primer`, the Claude `SessionStart` / `SubagentStart` context, and
+  the raw OpenCode payload all carry it byte-equal, because the line lives in the
+  shared payload body. A current daemon adds no line (zero cost); an unreachable
+  or unresponsive daemon is left to the existing degraded-payload path with no
+  second warning. The note informs evidence quality only — it does not instruct
+  a restart, since the daemon lifecycle is host-only.
 
 ### Changed
 

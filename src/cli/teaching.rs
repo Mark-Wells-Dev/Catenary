@@ -5,8 +5,9 @@
 //!
 //! One module renders the full prevention payload that `catenary primer`
 //! prints and that the `SessionStart` / `SubagentStart` hooks inline into the
-//! agent's context. Because all three surfaces call [`payload_body`], the
-//! wording can never drift between them.
+//! agent's context. Because all three surfaces emit through [`emitted_payload`]
+//! (the [`payload_body`] content plus the daemon-staleness note), the wording
+//! can never drift between them.
 //!
 //! The payload has three tiers (workstream 36, ticket 01):
 //! 1. **The live commands surface** — the allow / pipeline / deny surface
@@ -104,6 +105,18 @@ Subagent note: your diagnostic debt is tracked per-agent — the main agent's
 `catenary diagnostics` does not pay yours. Diagnose the files you edit before
 you finish.";
 
+/// One restrained line prepended to the payload when the serving daemon runs a
+/// different build than this CLI (detected via
+/// [`crate::cli::version::daemon_is_stale`], teaching-surface ticket 05).
+///
+/// It qualifies the agent's evidence — observations may reflect a daemon whose
+/// behavior predates the current CLI and docs — without naming internals or
+/// instructing a fix. The daemon lifecycle is host-only, so the line informs
+/// evidence quality; it does not tell the agent to restart anything.
+const DAEMON_STALENESS_NOTE: &str = "note: the serving daemon runs an older build than \
+    this CLI — its behavior may predate the current docs, so treat observations as \
+    potentially stale";
+
 /// Assemble the payload body from an already-resolved commands surface.
 ///
 /// Pure: the config IO lives in [`payload_body`]. Split out so the tiers can
@@ -136,6 +149,21 @@ fn render(resolved: Option<&crate::config::ResolvedCommands>, build_tools: &[Str
     s
 }
 
+/// Prepend the daemon-staleness note to `body` when `stale`.
+///
+/// The note opens the payload on its own line, set off from the header by a
+/// blank line; otherwise `body` is returned untouched, so the common
+/// (non-stale) case adds nothing — no line, zero cost. Pure so the shape and
+/// byte-equal placement are testable without a live daemon.
+#[must_use]
+fn with_staleness_note(stale: bool, body: String) -> String {
+    if stale {
+        format!("{DAEMON_STALENESS_NOTE}\n\n{body}")
+    } else {
+        body
+    }
+}
+
 /// Render the shared teaching payload body.
 ///
 /// The single source printed by `catenary primer` and inlined verbatim into
@@ -143,6 +171,11 @@ fn render(resolved: Option<&crate::config::ResolvedCommands>, build_tools: &[Str
 /// resolved live via [`resolve_commands_for_cwd`]; a config-load failure is
 /// degraded to an empty surface rather than propagated, so a hook never breaks
 /// the host's flow.
+///
+/// Pure prevention content — the daemon-staleness note is *not* part of this
+/// body; it is prepended at the host-emission boundary by [`emitted_payload`],
+/// so this stays deterministic for structural tests and independent of the
+/// running daemon.
 #[must_use]
 pub fn payload_body() -> String {
     let (resolved, build_tools) = resolve_commands_for_cwd().unwrap_or_default();
@@ -152,13 +185,42 @@ pub fn payload_body() -> String {
 /// Render the `SubagentStart` variant of the teaching payload.
 ///
 /// The same [`payload_body`] with the per-agent debt line appended, so the
-/// body is a clean prefix of the subagent payload.
+/// body is a clean prefix of the subagent payload. Like [`payload_body`], this
+/// carries no staleness note — [`emitted_subagent_payload`] adds it at the
+/// emission boundary.
 #[must_use]
 pub fn subagent_payload() -> String {
     let mut s = payload_body();
     s.push_str("\n\n");
     s.push_str(SUBAGENT_DEBT);
     s
+}
+
+/// The teaching payload as emitted to a host — [`payload_body`] with the
+/// daemon-staleness note prepended when the serving daemon runs a different
+/// build than this CLI (teaching-surface ticket 05).
+///
+/// This is what every session-start surface emits: `catenary primer`, the Claude
+/// `SessionStart` `additionalContext`, and the raw OpenCode payload all render
+/// from this one function, so the note is byte-equal across them — part of the
+/// payload, not a per-host fork. The staleness signal reuses the `catenary
+/// version` `tool/version` probe ([`crate::cli::version::daemon_is_stale`]); a
+/// current daemon adds no line (zero cost), and an unreachable or unresponsive
+/// daemon is left to the existing degraded-payload path with no second warning.
+#[must_use]
+pub fn emitted_payload() -> String {
+    with_staleness_note(crate::cli::version::daemon_is_stale(), payload_body())
+}
+
+/// The `SubagentStart` variant as emitted to a host — [`emitted_payload`] with
+/// the per-agent debt line appended.
+///
+/// The emitted body is a clean prefix, so when the daemon is stale the note
+/// stays the opening line for the subagent surface too, matching every other
+/// host's emission.
+#[must_use]
+pub fn emitted_subagent_payload() -> String {
+    with_staleness_note(crate::cli::version::daemon_is_stale(), subagent_payload())
 }
 
 /// Render the SSOT teaching payload with **runtime data structurally excluded**
@@ -394,6 +456,89 @@ mod tests {
         assert!(
             live.contains(FLAG_SYNOPSES),
             "live payload lost the flag synopses"
+        );
+    }
+
+    #[test]
+    fn staleness_note_prepends_one_line_and_preserves_the_body() {
+        // A stale daemon prepends the note as the payload's opening line, set off
+        // from the header by a blank line, with the full original body preserved
+        // verbatim after it — the line is part of the payload, not a fork.
+        let body = render(Some(&fixture_surface()), &["make".to_string()]);
+        let noted = with_staleness_note(true, body.clone());
+        assert!(
+            noted.starts_with(DAEMON_STALENESS_NOTE),
+            "payload must open with the staleness note: {noted}"
+        );
+        assert_eq!(
+            noted,
+            format!("{DAEMON_STALENESS_NOTE}\n\n{body}"),
+            "note is one prepended line, then the unchanged body"
+        );
+        // The note is a single line (no embedded newline).
+        assert!(
+            !DAEMON_STALENESS_NOTE.contains('\n'),
+            "the note is one line: {DAEMON_STALENESS_NOTE}"
+        );
+    }
+
+    #[test]
+    fn staleness_note_conveys_skew_without_a_restart_instruction() {
+        // Convey version skew and evidence quality; never instruct the agent to
+        // restart the daemon (host-only by ruling), and never leak internals.
+        assert!(
+            DAEMON_STALENESS_NOTE.contains("older build"),
+            "note conveys version skew: {DAEMON_STALENESS_NOTE}"
+        );
+        let lowered = DAEMON_STALENESS_NOTE.to_lowercase();
+        assert!(
+            !lowered.contains("restart") && !lowered.contains("catenary stop"),
+            "note must not instruct a daemon restart: {DAEMON_STALENESS_NOTE}"
+        );
+        for internal in ["socket", "ipc", "tool/version", "git describe"] {
+            assert!(
+                !lowered.contains(internal),
+                "note leaks internals ({internal:?}): {DAEMON_STALENESS_NOTE}"
+            );
+        }
+    }
+
+    #[test]
+    fn emitted_subagent_payload_extends_the_emitted_body() {
+        // The emitted subagent payload is the emitted body plus the per-agent
+        // debt line; the emitted body is a clean prefix, so when the daemon is
+        // stale the note stays the opening line for the subagent surface too.
+        // Deterministic: both derive from the same daemon observation.
+        let body = emitted_payload();
+        let sub = emitted_subagent_payload();
+        assert!(
+            sub.starts_with(&body),
+            "emitted body must prefix the emitted subagent payload"
+        );
+        assert!(
+            sub.ends_with(SUBAGENT_DEBT),
+            "emitted subagent payload must end with the debt line"
+        );
+        // The static invariants survive the emission wrapping.
+        assert!(
+            body.contains("The edit→diagnostics loop"),
+            "emitted body carries the invariants"
+        );
+    }
+
+    #[test]
+    fn no_staleness_note_leaves_the_body_untouched() {
+        // The common case: a current (or unreachable) daemon adds nothing — no
+        // line, zero cost.
+        let body = render(Some(&fixture_surface()), &["make".to_string()]);
+        assert_eq!(
+            with_staleness_note(false, body.clone()),
+            body,
+            "no staleness → the body is returned unchanged"
+        );
+        assert!(
+            !with_staleness_note(false, body).starts_with(DAEMON_STALENESS_NOTE),
+            "no note prefix when the daemon is current"
         );
     }
 

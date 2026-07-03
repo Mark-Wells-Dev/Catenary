@@ -57,7 +57,7 @@ fn session_start_should_announce(source: Option<&str>) -> bool {
 #[must_use]
 fn session_start_context(announce: bool, format: HostFormat) -> Option<String> {
     (announce && matches!(format, HostFormat::Claude | HostFormat::Gemini))
-        .then(crate::cli::teaching::payload_body)
+        .then(crate::cli::teaching::emitted_payload)
 }
 
 /// The raw stdout body emitted by `catenary hook session-start
@@ -71,7 +71,7 @@ fn session_start_context(announce: bool, format: HostFormat) -> Option<String> {
 /// responses).
 #[must_use]
 fn opencode_session_start_body() -> String {
-    crate::cli::teaching::payload_body()
+    crate::cli::teaching::emitted_payload()
 }
 
 /// Build the `hookSpecificOutput` object that carries the teaching payload in
@@ -413,10 +413,11 @@ pub fn run_session_start(format: HostFormat) {
     // --format=opencode` is how it obtains the payload. Emit the raw teaching
     // body to stdout — the plugin captures stdout verbatim and writes it to that
     // file, so this is plain text, not the Claude `hookSpecificOutput` envelope.
-    // No stdin read and no daemon round-trip: the body is the live runtime
-    // projection (`payload_body` resolves the commands surface against this
-    // process's cwd), and OpenCode re-reads the file every prompt step, so it
-    // rides every request with zero per-request plugin work.
+    // No stdin read: the body is the live runtime projection (`emitted_payload`
+    // resolves the commands surface against this process's cwd and prepends the
+    // daemon-staleness note via the `tool/version` probe when the daemon is
+    // stale), and OpenCode re-reads the file every prompt step, so it rides every
+    // request with zero per-request plugin work.
     if matches!(format, HostFormat::OpenCode) {
         print!("{}", opencode_session_start_body());
         return;
@@ -581,15 +582,16 @@ fn emit_subagent_start_announcement(format: HostFormat) {
 /// Build the `SubagentStart` hook-response object carrying the teaching
 /// payload, or `None` for non-Claude hosts.
 ///
-/// The payload is the shared body plus a per-agent debt line
-/// ([`crate::cli::teaching::subagent_payload`]) — self-contained and
+/// The payload is the shared body plus a per-agent debt line, with the
+/// daemon-staleness note prepended when the daemon is stale
+/// ([`crate::cli::teaching::emitted_subagent_payload`]) — self-contained and
 /// prefix-identifiable, since a subagent's `additionalContext` lands in its own
 /// window under one shared label alongside other hooks' context.
 fn build_subagent_start_response(format: HostFormat) -> Option<serde_json::Value> {
     if !matches!(format, HostFormat::Claude) {
         return None;
     }
-    let ctx = crate::cli::teaching::subagent_payload();
+    let ctx = crate::cli::teaching::emitted_subagent_payload();
     Some(serde_json::json!({
         "hookSpecificOutput": announcement_hook_specific_output("SubagentStart", &ctx),
     }))
@@ -2056,10 +2058,12 @@ mod tests {
         // ws36 ticket 06: Gemini CLI reads the identical
         // `hookSpecificOutput.additionalContext` at SessionStart (injected as the
         // first turn in history), so the ungated payload is the same SSOT body
-        // Claude receives — byte-equal to `payload_body`.
+        // Claude receives — byte-equal to the shared emitted payload (which may
+        // carry the ticket-05 staleness note, so the comparison must go through
+        // the same emission wrapper to stay environment-independent).
         let ctx = session_start_context(true, HostFormat::Gemini)
             .expect("Gemini inject should carry the teaching payload");
-        assert_eq!(ctx, crate::cli::teaching::payload_body());
+        assert_eq!(ctx, crate::cli::teaching::emitted_payload());
         assert!(
             ctx.contains("The edit→diagnostics loop"),
             "payload body should be inlined: {ctx}",
@@ -2084,8 +2088,10 @@ mod tests {
     #[test]
     fn gemini_session_start_emits_additional_context_equal_to_payload_body() {
         // End-to-end shape: an announcing Gemini SessionStart produces a
-        // `hookSpecificOutput.additionalContext` byte-equal to the SSOT
-        // `payload_body` — the same field, shape, and content Claude reads.
+        // `hookSpecificOutput.additionalContext` byte-equal to the shared
+        // emitted payload — the same field, shape, and content Claude reads
+        // (compared through the emission wrapper so a live stale daemon's
+        // ticket-05 note can't make the assertion environment-dependent).
         let builder = crate::hook::response::SystemMessageBuilder::new();
         let ctx = session_start_context(true, HostFormat::Gemini)
             .expect("Gemini inject should carry the payload");
@@ -2096,17 +2102,18 @@ mod tests {
             obj["hookSpecificOutput"]["additionalContext"]
                 .as_str()
                 .expect("additionalContext string"),
-            crate::cli::teaching::payload_body(),
+            crate::cli::teaching::emitted_payload(),
         );
     }
 
     #[test]
     fn opencode_session_start_body_is_the_raw_ssot_payload() {
         let body = opencode_session_start_body();
-        // Payload parity with the SSOT: byte-equal to the shared payload body
+        // Payload parity with the SSOT: byte-equal to the shared emitted payload
         // (the same source `catenary primer` and the Claude additionalContext
-        // render from), so the OpenCode instructions file cannot drift.
-        assert_eq!(body, crate::cli::teaching::payload_body());
+        // render from — including the daemon-staleness note under the same
+        // condition), so the OpenCode instructions file cannot drift.
+        assert_eq!(body, crate::cli::teaching::emitted_payload());
         // Emitter output shape: raw text, not the Claude structured-output
         // envelope — the plugin writes stdout verbatim into its instructions
         // file.
@@ -2216,10 +2223,16 @@ mod tests {
         let ctx = obj["hookSpecificOutput"]["additionalContext"]
             .as_str()
             .expect("additionalContext string");
-        // Prefix-identifiable (shares one labeled block with other hooks).
+        // The emitted subagent payload verbatim (the shared body, the per-agent
+        // debt line, and the daemon-staleness note when the daemon is stale).
+        // Compared against the same source so the check is deterministic
+        // regardless of daemon staleness.
+        assert_eq!(ctx, crate::cli::teaching::emitted_subagent_payload());
+        // Prefix-identifiable header present (it opens the block, or follows the
+        // one-line staleness note when the daemon is stale).
         assert!(
-            ctx.starts_with("Catenary —"),
-            "prefix-identifiable header: {ctx}"
+            ctx.contains("Catenary —"),
+            "prefix-identifiable header present: {ctx}"
         );
         // The per-agent debt line the SubagentStart variant adds.
         assert!(

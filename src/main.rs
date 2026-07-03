@@ -937,13 +937,15 @@ fn render_search_outcome(
 /// Print the shared teaching payload — Catenary's full prevention content.
 ///
 /// `catenary primer` is one of three surfaces that render the same payload
-/// ([`cli::teaching::payload_body`]); the `SessionStart` / `SubagentStart`
+/// ([`cli::teaching::emitted_payload`]); the `SessionStart` / `SubagentStart`
 /// hooks inline the identical body into the agent's context. Keeping the
 /// single source means the on-demand command and the pushed hook context can
 /// never drift. The commands-surface tier is resolved live from the config, so
-/// the allow / pipeline / deny surface is always this session's actual one.
+/// the allow / pipeline / deny surface is always this session's actual one, and
+/// a daemon-staleness note is prepended when the serving daemon runs a
+/// different build than this CLI.
 fn run_primer(out: &mut cli::Output) {
-    let _ = out.writeln(format_args!("{}", cli::teaching::payload_body()));
+    let _ = out.writeln(format_args!("{}", cli::teaching::emitted_payload()));
 }
 
 /// Builds a standard tokio multi-thread runtime.
@@ -2727,16 +2729,18 @@ mod tests {
     }
 
     #[test]
-    fn primer_is_the_shared_payload_body() {
-        // The primer surface is byte-equal to the SessionStart payload body
-        // (both call `cli::teaching::payload_body`), modulo the trailing newline
-        // `writeln` adds.
+    fn primer_is_the_shared_emitted_payload() {
+        // The primer surface is byte-equal to the SessionStart emitted payload
+        // (both call `cli::teaching::emitted_payload`, which includes the
+        // daemon-staleness note under the same condition), modulo the trailing
+        // newline `writeln` adds. Deterministic regardless of daemon staleness:
+        // both sides observe the same daemon state, so they agree.
         let mut out = cli::Output::buffer(80);
         run_primer(&mut out);
         let printed = out.into_string();
         assert_eq!(
             printed.trim_end_matches('\n'),
-            cli::teaching::payload_body()
+            cli::teaching::emitted_payload()
         );
     }
 
