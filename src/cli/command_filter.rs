@@ -581,10 +581,12 @@ impl Sub {
 enum Recog {
     /// An agent-facing subcommand.
     Agent(Sub),
-    /// A subcommand-less global read: `catenary --version`/`-V` or
-    /// `catenary --help`/`-h`. clap handles these globally, so they carry no
-    /// subcommand. A pure, side-effect-free introspection — no handoff, no
-    /// tracked-set interaction — so it is admitted (bug 22).
+    /// A global read: `catenary --version`/`-V`, `catenary --help`/`-h`
+    /// (subcommand-less — clap handles them globally, bug 22), or the `version`
+    /// subcommand (the same read plus a stateless daemon-version query, so
+    /// CLI/daemon staleness is visible at a glance). A pure, side-effect-free
+    /// introspection — no handoff, no tracked-set interaction — so it is
+    /// admitted.
     GlobalRead,
     /// A real catenary subcommand reserved for host hooks / interactive use.
     NotAgent,
@@ -612,13 +614,14 @@ fn recognize_catenary_sub(rest: &[&str]) -> Recog {
             Some("hook" | "stop" | "debug" | "config" | "doctor" | "install" | "update" | "daemon"),
             _,
         ) => Recog::NotAgent,
-        // Subcommand-less global read: clap's `--version`/`-V` and `--help`/`-h`
-        // short-circuit before any subcommand, so they reach here only when the
-        // *first* token is the flag (the subcommand arms above already claimed
-        // `catenary grep --help` via `grep`). Placed after the subcommand arms
-        // and before the `_ => Unknown` fallthrough so everything else stays
-        // fail-closed (bug 22).
-        (Some("--version" | "-V" | "--help" | "-h"), _) => Recog::GlobalRead,
+        // Global reads. clap's `--version`/`-V` and `--help`/`-h` short-circuit
+        // before any subcommand, so they reach here only when the *first* token
+        // is the flag (the subcommand arms above already claimed
+        // `catenary grep --help` via `grep`). The `version` subcommand is the
+        // same pure read plus a stateless daemon-version query. Placed after
+        // the subcommand arms and before the `_ => Unknown` fallthrough so
+        // everything else stays fail-closed (bug 22).
+        (Some("version" | "--version" | "-V" | "--help" | "-h"), _) => Recog::GlobalRead,
         _ => Recog::Unknown,
     }
 }
@@ -966,8 +969,8 @@ fn catenary_occ_denial(occ: &CatenaryOcc) -> Option<String> {
 
 /// The recognized agent-facing command surface, for "unknown subcommand" denials.
 const CATENARY_SURFACE: &str = "Available: `grep`, `glob`, `diagnostics`, \
-     `editing start`, `roots add/rm/ls`, `commands`, `primer`. Run `catenary primer` \
-     for the workflow.";
+     `editing start`, `roots add/rm/ls`, `commands`, `primer`, `version`. Run \
+     `catenary primer` for the workflow.";
 
 fn unknown_subcommand_denial() -> String {
     format!("That isn't a recognized `catenary` command. {CATENARY_SURFACE}")
@@ -3450,11 +3453,14 @@ mod tests {
         // bug 22: clap's global `--version`/`-V` and `--help`/`-h` carry no
         // subcommand, so the canonical-form matcher must admit the subcommand-
         // less forms as a pure read (no handoff, no isolation/redirect concern).
+        // The `version` subcommand is the same read plus a stateless daemon-
+        // version query — same class.
         for cmd in [
             "catenary --version",
             "catenary -V",
             "catenary --help",
             "catenary -h",
+            "catenary version",
         ] {
             assert_eq!(
                 analyze_catenary_command(cmd),
@@ -4019,6 +4025,7 @@ mod tests {
             ("catenary -V", Allow),
             ("catenary --help", Allow),
             ("catenary -h", Allow),
+            ("catenary version", Allow), // subcommand form: CLI + daemon versions
             ("catenary --frobnicate", DenyCatenary), // unknown flag stays closed
         ];
         for (cmd, want) in cases {
