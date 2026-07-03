@@ -242,6 +242,23 @@ upgrading.
   permitting) or the host edit tools. Pure introspection (`perl -v`/`-V`/`-h`
   with no file operands) still passes; `perl -e`/`-pe` filters and `perl -i`
   in-place edits are unchanged.
+- **An unavailable diagnostics server now degrades its files' coverage instead
+  of silently costing them.** A language server that dies mid-run — or fails to
+  start at all (the "dies during `initialize`" class) — leaves its files
+  unverified. Catenary now makes **one bounded, in-run attempt** to respawn the
+  server and re-run the unretrieved remainder of its batch (bounded by the same
+  spawn/initialize budgets — a slight stall, never an unbounded wait); if that
+  recovers, the files are verified normally. If it fails, coverage has
+  *degraded*: coverage is **effective, not nominal**, so a server that cannot be
+  brought back means its files owe nothing for this run — the same class as a
+  file no server covers, because the gap is Catenary's to close, never the
+  agent's. The receipt now **opens with a top-line banner naming the unavailable
+  server** (`unavailable: <server>`), with the per-file `[unverified — <server>
+  returned no result]` lines (and the `M files unverified` collapse) beneath it,
+  so degraded never reads as clean. The exit stays `0` and the editing gate
+  drains the degraded file exactly as a paid one — no armed states, retry
+  counters, or cross-run tracking; editing the file again re-arms it, and a
+  server that is back next run resumes the normal contract.
 - **Diagnostics settle no longer reports `[clean]` over a CPU-starved flycheck
   child.** Under host CPU saturation a runnable child can present an all-zero
   50 ms sampling window — no user/system CPU or page-fault deltas while ticks

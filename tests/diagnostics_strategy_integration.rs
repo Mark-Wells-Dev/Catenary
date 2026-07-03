@@ -733,3 +733,117 @@ fn test_diagnostics_one_server_dies() -> Result<()> {
 
     Ok(())
 }
+
+/// In-run bounded recovery (decision 027, ticket 05). The server dies during
+/// the batch's post-save settle on its FIRST life — before any diagnostic is
+/// retrieved, so the file resolves `NoResults`. One bounded respawn (the
+/// `--die-once-file` marker is now present, so the respawn runs healthy)
+/// re-runs the unretrieved remainder and verifies the file. The receipt shows
+/// the diagnostic, with no `unavailable:` banner and no unverified line.
+#[test]
+fn test_diagnostics_midrun_death_recovers_via_respawn() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
+    std::fs::write(&file, "echo hello\n")?;
+    let marker = dir.path().join("die_marker");
+
+    let mut bridge = spawn_mockls(
+        &[
+            "--advertise-save",
+            "--die-on",
+            "textDocument/didSave",
+            "--die-once-file",
+            marker.to_str().context("marker path")?,
+        ],
+        dir.path().to_str().context("path")?,
+    )?;
+    bridge.initialize()?;
+
+    let text = bridge.call_diagnostics(file.to_str().context("path")?)?;
+
+    assert!(
+        text.contains("mock diagnostic"),
+        "the bounded respawn should recover and verify the file. Got:\n{text}"
+    );
+    assert!(
+        !text.contains("unavailable:"),
+        "a recovered run carries no unavailable banner. Got:\n{text}"
+    );
+    assert!(
+        !text.contains("unverified"),
+        "a recovered file is verified, not unverified. Got:\n{text}"
+    );
+
+    Ok(())
+}
+
+/// A server that dies at every spawn degrades (decision 027, ticket 05).
+/// Every process dies on `didSave` (no `--die-once-file`): the first life dies
+/// mid-batch, the one bounded respawn dies again, so the file's coverage has
+/// degraded. The receipt opens with the `unavailable:` banner, lists the file
+/// `[unverified — …]`, never `[clean]`, and the run still exits `0`.
+#[test]
+fn test_diagnostics_twice_dead_degrades_with_banner() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
+    std::fs::write(&file, "echo hello\n")?;
+
+    let mut bridge = spawn_mockls(
+        &["--advertise-save", "--die-on", "textDocument/didSave"],
+        dir.path().to_str().context("path")?,
+    )?;
+    bridge.initialize()?;
+
+    let text = bridge.call_diagnostics(file.to_str().context("path")?)?;
+
+    assert!(
+        text.contains(&format!("unavailable: {MOCK_LANG_A}")),
+        "a twice-dead server opens the receipt with the unavailable banner. Got:\n{text}"
+    );
+    assert!(
+        text.contains("unverified"),
+        "the degraded file is listed unverified. Got:\n{text}"
+    );
+    assert!(
+        !text.contains("[clean]"),
+        "degraded must never read as clean. Got:\n{text}"
+    );
+
+    Ok(())
+}
+
+/// Spawn-failure lands in the same degradation path as mid-run death (decision
+/// 027, ticket 05, scope 2). A server that rejects `initialize` (the julia/r
+/// "dies during the handshake" class) leaves a dead tombstone that
+/// `diagnostic_servers` filters out. The file must degrade — `unavailable:`
+/// banner + `[unverified — …]` — never read as `[no LSP coverage]`, and the
+/// run still exits `0`.
+#[test]
+fn test_diagnostics_spawn_failure_degrades_with_banner() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
+    std::fs::write(&file, "echo hello\n")?;
+
+    let mut bridge = spawn_mockls(
+        &["--fail-on", "initialize"],
+        dir.path().to_str().context("path")?,
+    )?;
+    bridge.initialize()?;
+
+    let text = bridge.call_diagnostics(file.to_str().context("path")?)?;
+
+    assert!(
+        text.contains(&format!("unavailable: {MOCK_LANG_A}")),
+        "spawn-failure opens the receipt with the unavailable banner. Got:\n{text}"
+    );
+    assert!(
+        text.contains("unverified"),
+        "the spawn-failed file is listed unverified, not uncovered. Got:\n{text}"
+    );
+    assert!(
+        !text.contains("[no LSP coverage]"),
+        "a configured server that cannot start is a degradation, not absence. Got:\n{text}"
+    );
+
+    Ok(())
+}

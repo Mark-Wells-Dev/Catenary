@@ -1197,6 +1197,15 @@ impl LspClientManager {
             if let Some(writer) = &self.snapshot {
                 writer.update_state(&key, &ServerLifecycle::Failed);
             }
+            // Mark the instance's own lifecycle terminal too, not just the
+            // snapshot: a server that failed to initialize (the julia/r
+            // "dies during `initialize`" class) is Failed, not stuck
+            // Initializing. This lets the diagnostics degradation path
+            // (`unavailable_diagnostic_servers`, decision 027) recognize the
+            // tombstone as unavailable even when the process lingers after
+            // rejecting init, so the file degrades with an `unavailable:`
+            // banner instead of reading as `[no LSP coverage]`.
+            client.server().set_lifecycle(ServerLifecycle::Failed);
             // Tombstone: insert the dead client so `find_instance` returns
             // `Some` on subsequent calls.  `ensure_clients_for_paths` skips
             // bindings that already have an entry (dead or alive), and
@@ -1548,6 +1557,133 @@ impl LspClientManager {
         }
 
         clients
+    }
+
+    /// Returns the names of diagnostics-enabled server bindings for `path`'s
+    /// language whose instance exists but is **dead** — the
+    /// spawn-failure / dies-at-`initialize` class (e.g. a julia/r LS that
+    /// exits during the handshake leaves a dead tombstone).
+    ///
+    /// [`Self::diagnostic_servers`] returns only *live* clients, so a
+    /// spawn-failed file would otherwise read as `[no LSP coverage]` —
+    /// indistinguishable from a genuinely uncovered file. Decision 027 rules
+    /// that a configured server which cannot start is a **coverage
+    /// degradation**, not an absence of coverage: the caller routes such a
+    /// file to the degraded / unverified path (the receipt's `unavailable:`
+    /// banner) instead, with the same treatment a mid-run death gets. An empty
+    /// result means no configured diagnostic server is dead — the file is
+    /// either live-covered or genuinely uncovered.
+    ///
+    /// A `diagnostics = false` binding is intentionally silent, not
+    /// unavailable, so it is excluded (it stays `[no LSP coverage]`). Unrooted
+    /// files (tier-3 single-file servers) are out of scope here and yield an
+    /// empty result.
+    pub async fn unavailable_diagnostic_servers(&self, path: &Path) -> Vec<String> {
+        let Some(lang_id) = self.fs.language_id(path).or_else(|| {
+            path.extension()
+                .and_then(|e| e.to_str())
+                .map(str::to_string)
+        }) else {
+            return Vec::new();
+        };
+        let Some(lang_config) = self.config.resolve_language(&lang_id) else {
+            return Vec::new();
+        };
+        let Some(root) = self.fs.resolve_root(path) else {
+            return Vec::new();
+        };
+        let resolved = self.resolve_server_root(path, &lang_id, &root);
+
+        let clients = self.clients.lock().await;
+        let mut names = Vec::new();
+        for binding in lang_config.servers() {
+            if !lang_config.diagnostics_enabled(&binding.name) {
+                continue;
+            }
+            let Some(server_def) = self.config.server.get(&binding.name) else {
+                continue;
+            };
+            if !file_matches_patterns(path, &server_def.compiled_patterns) {
+                continue;
+            }
+            let mut instance = find_instance(&clients, &lang_id, &binding.name, &resolved);
+            if instance.is_none() && resolved != root {
+                // No instance at the marker root — fall back to a
+                // workspace-root instance (mirrors `get_servers`).
+                instance = find_instance(&clients, &lang_id, &binding.name, &root);
+            }
+            let Some(client) = instance else {
+                continue;
+            };
+            let locked = client.lock().await;
+            let dead = !locked.is_alive() || locked.lifecycle().is_terminal();
+            drop(locked);
+            if dead {
+                names.push(binding.name.clone());
+            }
+        }
+        drop(clients);
+        names
+    }
+
+    /// Respawns a dead per-root diagnostic server instance for in-run recovery
+    /// (decision 027 — the gate may stall, never wedge).
+    ///
+    /// Removes the dead tombstone (which `find_instance` would otherwise keep
+    /// returning, bailing "is dead") and spawns a fresh instance through the
+    /// normal spawn/initialize path — bounded by the same spawn and initialize
+    /// budgets as a first spawn, so a single bounded stall replaces an
+    /// unbounded wait. Returns the fresh, live client on success, or `None`
+    /// when the respawn or its initialize fails (the caller degrades: no
+    /// further attempts this run).
+    ///
+    /// Only `Scope::Root` instances are respawnable here — the per-file
+    /// fan-out's server groups are all root-scoped; a `SingleFile` key returns
+    /// `None`. A still-alive removed process is shut down first so it is never
+    /// leaked.
+    pub async fn respawn_diagnostic_server(
+        &self,
+        key: &InstanceKey,
+    ) -> Option<Arc<Mutex<LspClient>>> {
+        let root = key.scope.root_path()?.to_path_buf();
+
+        // Remove the tombstone under a tight lock, then shut down any lingering
+        // process outside it (a dead tombstone needs no shutdown; a still-alive
+        // one is closed so it is never leaked).
+        let removed = self.clients.lock().await.remove(key);
+        if let Some(old) = removed {
+            let mut old = old.lock().await;
+            if old.is_alive() {
+                let _ = old.shutdown().await;
+            }
+            drop(old);
+        }
+
+        let project_scoped = self.is_project_scoped(&key.language_id, &root);
+        match self
+            .spawn_inner(&key.server, &key.language_id, &root, project_scoped)
+            .await
+        {
+            Ok((_key, client)) => {
+                info!(
+                    source = Source::LspLifecycle.as_str(),
+                    server = key.server.as_str(),
+                    scope_root = %root.display(),
+                    "Respawned {} for in-run diagnostics recovery",
+                    key.server,
+                );
+                Some(client)
+            }
+            Err(e) => {
+                debug!(
+                    source = Source::LspLifecycle.as_str(),
+                    server = key.server.as_str(),
+                    scope_root = %root.display(),
+                    "Diagnostics recovery respawn failed: {e}",
+                );
+                None
+            }
+        }
     }
 
     /// Returns the live, diagnostics-enabled clients scoped to `root` that

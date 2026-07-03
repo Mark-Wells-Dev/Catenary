@@ -387,13 +387,37 @@ impl DiagnosticsServer {
                     // Lint-only coverage: no language server, but a matching
                     // linter will report. Treat it as covered so it is neither
                     // flagged `[no LSP coverage]` nor dropped, and so any linter
-                    // diagnostics render in the format pass.
+                    // diagnostics render in the format pass. Effective coverage:
+                    // a live linter covers the file even when the LSP server is
+                    // down, so this takes precedence over the degraded branch.
                     canonical_paths.push(canonical.clone());
                     lint_candidates.push(canonical);
-                } else {
+                    continue;
+                }
+                // A configured diagnostic server that cannot start (the
+                // spawn-failure / dies-at-`initialize` class) leaves a dead
+                // tombstone that `diagnostic_servers` filters out. Decision 027:
+                // that is a coverage *degradation*, not an absence — route the
+                // file to the degraded/unverified path (naming the dead
+                // server), never a bare `[no LSP coverage]`, so it earns the
+                // receipt's `unavailable:` banner and an `[unverified — …]`
+                // line, the same treatment a mid-run death gets. No live server
+                // means no batch runs for it, so it resolves `NoResults`.
+                let dead_servers = self
+                    .client_manager
+                    .unavailable_diagnostic_servers(&canonical)
+                    .await;
+                if dead_servers.is_empty() {
                     let display = self.display_rel(&canonical.to_string_lossy());
                     let root = self.resolve_root_or_parent(&canonical);
                     uncovered.push(UncoveredEntry { display, root });
+                } else {
+                    let key = canonical.to_string_lossy().to_string();
+                    let entry = path_servers.entry(key).or_default();
+                    for name in dead_servers {
+                        entry.insert(name);
+                    }
+                    canonical_paths.push(canonical);
                 }
                 continue;
             }
@@ -486,7 +510,7 @@ impl DiagnosticsServer {
         // Rendering is deferred to Phase 2c so dedup/precedence run on canonical
         // JSON, feeder-blind (ticket 02).
         for (client_mutex, paths) in server_groups.values() {
-            self.run_server_batch(client_mutex, paths, parent_id, feeds)
+            self.run_server_batch_with_recovery(client_mutex, paths, parent_id, feeds)
                 .await;
         }
 
@@ -905,6 +929,64 @@ impl DiagnosticsServer {
             dirty,
             errors,
             warnings,
+        }
+    }
+
+    /// Runs a server's batch, then makes one bounded recovery attempt if the
+    /// server died mid-batch (decision 027 — the gate may stall, never wedge).
+    ///
+    /// A file is present in `feeds` once any feeder recorded it (even clean);
+    /// a file assigned to this server but absent from `feeds` after the batch
+    /// is the documented [`FileOutcome::NoResults`] producer — the server
+    /// bailed before recording it. When that remainder is non-empty **and the
+    /// server died** (a terminal lifecycle — [`await_idle`](crate::lsp::settle)
+    /// sets it on root death, so this is a deterministic signal, never a
+    /// wall-clock probe), one respawn is attempted and the unretrieved
+    /// remainder is re-run against the fresh instance, bounded by the same
+    /// spawn/initialize budgets. If the respawn fails or dies again, the
+    /// still-unretrieved files stay `NoResults` and degrade through the receipt
+    /// (`unavailable:` banner + `[unverified — …]` lines).
+    ///
+    /// An alive, non-terminal server that merely failed to open a file is left
+    /// as-is — that is not an unavailability, and a respawn would not change it.
+    async fn run_server_batch_with_recovery(
+        &self,
+        client_mutex: &Arc<Mutex<LspClient>>,
+        paths: &[PathBuf],
+        parent_id: Option<&str>,
+        feeds: &mut BTreeMap<String, FileFeed>,
+    ) {
+        self.run_server_batch(client_mutex, paths, parent_id, feeds)
+            .await;
+
+        let remainder: Vec<PathBuf> = paths
+            .iter()
+            .filter(|p| !feeds.contains_key(p.to_string_lossy().as_ref()))
+            .cloned()
+            .collect();
+        if remainder.is_empty() {
+            return;
+        }
+
+        let key = {
+            let client = client_mutex.lock().await;
+            // Recover only from an actual death; an alive, non-terminal server
+            // is not an unavailability.
+            if client.is_alive() && !client.lifecycle().is_terminal() {
+                return;
+            }
+            client.server().key()
+        };
+        let Some(key) = key else {
+            return;
+        };
+
+        // One bounded respawn + re-run of the remainder. Any file still
+        // unretrieved afterwards stays `NoResults` (degrade — no further
+        // attempts this run).
+        if let Some(fresh) = self.client_manager.respawn_diagnostic_server(&key).await {
+            self.run_server_batch(&fresh, &remainder, parent_id, feeds)
+                .await;
         }
     }
 
@@ -1801,6 +1883,10 @@ fn format_diagnostics_entries(
 /// the dirty files are the signal. It never touches diagnostics or the
 /// single-file collapsed path (a lone clean or unverified file still shows its
 /// name).
+///
+/// When any file is unverified, the receipt **opens with an `unavailable:
+/// <server>` banner** ([`prepend_unavailable_banner`], decision 027) naming the
+/// server(s) that degraded, so degraded coverage never reads as clean.
 #[allow(
     clippy::too_many_lines,
     reason = "one linear renderer: the four file categories (dirty / clean / unverified / uncovered) each render in the collapsed and multi-file branches, top-to-bottom"
@@ -1943,7 +2029,42 @@ fn format_diagnostics(
         }
     }
 
-    output
+    prepend_unavailable_banner(unverified, output)
+}
+
+/// Prepends the `unavailable: <server>` banner to a rendered receipt when the
+/// run degraded a server's coverage (decision 027).
+///
+/// The unavailable servers are exactly those the unverified files name — a
+/// [`FileOutcome::NoResults`] file means its assigned server produced nothing
+/// (it died mid-run, or failed to start). A completed run that degraded a
+/// server therefore opens with a top-line banner naming it, so degraded never
+/// reads as clean; the per-file `[unverified — …]` lines (or the `M files
+/// unverified` collapse) stay beneath. Restrained wording — name the server,
+/// never dump internal state — and one line per distinct server, sorted. With
+/// no unverified files there is no banner (a fully-recovered run is silent
+/// about the transient death).
+fn prepend_unavailable_banner(unverified: &[UnverifiedEntry], body: String) -> String {
+    use std::fmt::Write;
+
+    let mut servers: BTreeSet<&str> = BTreeSet::new();
+    for ue in unverified {
+        for name in ue.server.split(", ") {
+            if !name.is_empty() {
+                servers.insert(name);
+            }
+        }
+    }
+    if servers.is_empty() {
+        return body;
+    }
+
+    let mut out = String::new();
+    for name in &servers {
+        _ = writeln!(out, "unavailable: {name}");
+    }
+    out.push_str(&body);
+    out
 }
 
 #[cfg(test)]
@@ -2304,9 +2425,12 @@ mod tests {
         // collapsed path.
         let unverified = vec![ue("file.rs", "/test", "rust-analyzer")];
         let output = format_diagnostics(&[], &[], &[], &unverified, false);
+        // The receipt opens with the `unavailable:` banner (decision 027),
+        // then the per-file `[unverified — …]` line beneath it.
         assert_eq!(
             output.trim(),
-            "/test/file.rs [unverified \u{2014} rust-analyzer returned no result]",
+            "unavailable: rust-analyzer\n\
+             /test/file.rs [unverified \u{2014} rust-analyzer returned no result]",
             "output: {output}"
         );
     }
@@ -2406,6 +2530,112 @@ mod tests {
         assert!(
             !output.contains("dead.rs"),
             "unverified name leaked: {output}"
+        );
+    }
+
+    // ── unavailable-server banner (decision 027) ──────────────────
+
+    #[test]
+    fn format_unavailable_banner_opens_receipt() {
+        // A run with a degraded server opens with a top-line banner naming it,
+        // and the per-file `[unverified — …]` line stays beneath (decision 027).
+        let unverified = vec![ue("file.rs", "/test", "rust-analyzer")];
+        let output = format_diagnostics(&[], &[], &[], &unverified, false);
+        let banner_pos = output
+            .find("unavailable: rust-analyzer")
+            .expect("banner present");
+        let unverified_pos = output.find("[unverified").expect("unverified line present");
+        assert!(
+            banner_pos < unverified_pos,
+            "banner must open the receipt, before the unverified lines: {output}"
+        );
+        // The banner is the very first line of the receipt.
+        assert!(
+            output.starts_with("unavailable: rust-analyzer\n"),
+            "receipt opens with the banner: {output}"
+        );
+    }
+
+    #[test]
+    fn format_no_banner_without_unverified() {
+        // A clean/dirty-only receipt (no unverified files, no degraded server)
+        // carries no banner — a fully-recovered run is silent about it.
+        let diag_files = vec![DiagnosticFile {
+            display: "file.rs".to_string(),
+            root: PathBuf::from("/test"),
+            entries: vec![de(1, ":1:1 [error] test: boom")],
+        }];
+        let clean = vec![CleanEntry {
+            display: "ok.rs".to_string(),
+            root: PathBuf::from("/test"),
+        }];
+        let output = format_diagnostics(&diag_files, &[], &clean, &[], false);
+        assert!(
+            !output.contains("unavailable:"),
+            "no banner without unverified files: {output}"
+        );
+    }
+
+    #[test]
+    fn format_banner_dedups_one_line_per_server() {
+        // Several unverified files behind the same server collapse to a single
+        // banner line — restrained, no per-file repetition.
+        let unverified = vec![
+            ue("src/a.rs", "/project", "rust-analyzer"),
+            ue("src/b.rs", "/project", "rust-analyzer"),
+            ue("src/c.rs", "/project", "rust-analyzer"),
+        ];
+        let output = format_diagnostics(&[], &[], &[], &unverified, false);
+        assert_eq!(
+            output.matches("unavailable: rust-analyzer").count(),
+            1,
+            "one banner line per distinct server: {output}"
+        );
+    }
+
+    #[test]
+    fn format_banner_lists_each_distinct_server_sorted() {
+        // Distinct unavailable servers each get a banner line, sorted.
+        let unverified = vec![
+            ue("a.jl", "/project", "julia-lsp"),
+            ue("b.rs", "/project", "rust-analyzer"),
+        ];
+        let output = format_diagnostics(&[], &[], &[], &unverified, false);
+        let julia = output.find("unavailable: julia-lsp").expect("julia banner");
+        let rust = output
+            .find("unavailable: rust-analyzer")
+            .expect("rust banner");
+        assert!(julia < rust, "banner lines sorted: {output}");
+    }
+
+    #[test]
+    fn format_banner_survives_directory_collapse() {
+        // Even when the unverified list collapses to a count, the banner still
+        // names the degraded server (derived from the entries, not the body).
+        let unverified = vec![
+            ue("x.rs", "/project", "rust-analyzer"),
+            ue("y.rs", "/project", "rust-analyzer"),
+        ];
+        let output = format_diagnostics(&[], &[], &[], &unverified, true);
+        assert!(
+            output.starts_with("unavailable: rust-analyzer\n"),
+            "banner opens the collapsed receipt: {output}"
+        );
+        assert!(
+            output.contains("\t2 files unverified"),
+            "collapsed count still beneath: {output}"
+        );
+    }
+
+    #[test]
+    fn prepend_unavailable_banner_splits_joined_servers() {
+        // A file whose server field joins multiple dead servers yields one
+        // banner line per server (split on ", "), deduped and sorted.
+        let unverified = vec![ue("f.rs", "/p", "server-b, server-a")];
+        let out = prepend_unavailable_banner(&unverified, String::from("BODY"));
+        assert_eq!(
+            out, "unavailable: server-a\nunavailable: server-b\nBODY",
+            "each joined server banners once, sorted, above the body: {out}"
         );
     }
 

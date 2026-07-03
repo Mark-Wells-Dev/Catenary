@@ -140,11 +140,21 @@ is the *end* of an edit batch: it opens every modified file on its server,
 waits for each to settle, and prints a **per-file receipt** — every
 diagnosed file listed, its errors and warnings beneath it, or `[clean]`
 beside it when the file is clean — then clears the set. When a file's
-server dies before answering (or produces nothing), the file is neither
-clean nor dirty; it is still listed, as `[unverified — <server> returned no
-result]`, so an all-unverified run can never render as empty stdout
-(mistakable for a hang). When nothing was edited it prints
-`[no edited files]`.
+server dies before answering — mid-run, or by failing to start at all —
+Catenary makes **one bounded, in-run attempt** to respawn it and re-run the
+remainder (a slight stall, never an unbounded wait); if that fails, coverage
+has **degraded**. Coverage is *effective, not nominal*: a server that cannot
+be brought back means its files owe nothing for this run — the same class as
+a file no server covers, because the gap is Catenary's to close, never
+yours. Such a file is neither clean nor dirty; it is listed as `[unverified
+— <server> returned no result]`, and the receipt **opens with a top-line
+banner naming the unavailable server** (`unavailable: <server>`) so degraded
+never reads as clean — the absence of evidence is not evidence of absence.
+An all-unverified run can never render as empty stdout (mistakable for a
+hang), and the exit stays `0`: the run completed and its receipt is
+truthful. The gate drains the degraded file exactly as a paid one — editing
+it again re-arms it, and a server that is back next run resumes the normal
+contract. When nothing was edited it prints `[no edited files]`.
 
 ```bash
 catenary diagnostics                 # the whole edited set

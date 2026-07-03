@@ -90,6 +90,24 @@ struct Args {
     #[arg(long)]
     fail_on: Vec<String>,
 
+    /// Exit the process (code 1) the instant this method is received, before
+    /// handling it — simulates a server that dies mid-run (repeatable). Unlike
+    /// `--drop-after`, which counts responses, this is keyed on a specific
+    /// method, so the death lands at a deterministic point in the pipeline
+    /// (e.g. `--die-on textDocument/didSave` dies during the batch's post-save
+    /// settle, before any diagnostic is retrieved → the file resolves
+    /// `NoResults`). With `--die-once-file`, only the first process arms.
+    #[arg(long)]
+    die_on: Vec<String>,
+
+    /// Gate `--die-on` to the FIRST process that creates this marker file:
+    /// that process dies as configured; any later process (a respawn) sees the
+    /// marker already present and runs healthy. Models a transient crash that a
+    /// single in-run respawn recovers. Without this flag, every process arms
+    /// `--die-on` (a server that dies at every spawn — twice-dead).
+    #[arg(long)]
+    die_once_file: Option<String>,
+
     /// Send workspace/configuration request after initialize.
     #[arg(long)]
     send_configuration_request: bool,
@@ -356,6 +374,10 @@ struct MockServer {
     definition_failed_once: bool,
     /// Workspace roots parsed from `initialize` params.
     workspace_roots: Vec<String>,
+    /// Whether `--die-on` is armed for THIS process (decision 027 recovery
+    /// tests). Always `true` when `--die-once-file` is unset; when set, `true`
+    /// only for the process that created the marker (the first life).
+    die_armed: bool,
 }
 
 impl MockServer {
@@ -381,6 +403,18 @@ impl MockServer {
             .as_ref()
             .and_then(|path| std::fs::File::create(log_path(path)).ok());
 
+        // Arm `--die-on` for this process. With `--die-once-file`, only the
+        // process that wins the atomic create (the first life) arms; a later
+        // respawn sees the marker and runs healthy, so one in-run respawn
+        // recovers. Without the marker, every process arms (twice-dead).
+        let die_armed = args.die_once_file.as_ref().is_none_or(|marker| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(marker)
+                .is_ok()
+        });
+
         Self {
             args,
             documents: BTreeMap::new(),
@@ -395,6 +429,7 @@ impl MockServer {
             request_log,
             definition_failed_once: false,
             workspace_roots: Vec::new(),
+            die_armed,
         }
     }
 
@@ -490,6 +525,13 @@ impl MockServer {
         let Some(method) = request.method.clone() else {
             return;
         };
+
+        // `--die-on`: exit the instant this method is received, before handling
+        // it (so no diagnostic is published/retrieved for it). Armed per-process
+        // by `--die-once-file` (see `MockServer::new`).
+        if self.die_armed && self.args.die_on.iter().any(|m| m == &method) {
+            std::process::exit(1);
+        }
 
         if request.id.is_some() {
             self.handle_request(&method, request);
@@ -2637,6 +2679,8 @@ mod tests {
             drop_after: None,
             hang_on: vec![],
             fail_on: vec![],
+            die_on: vec![],
+            die_once_file: None,
             send_configuration_request: false,
             publish_version: false,
             progress_on_change: false,
