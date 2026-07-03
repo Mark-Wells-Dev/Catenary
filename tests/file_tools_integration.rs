@@ -370,8 +370,9 @@ fn test_glob_quoted_pattern_expands_daemon_side() -> Result<()> {
     Ok(())
 }
 
-/// A quoted glob pattern that matches nothing yields empty daemon output
-/// (the CLI renders the loud `no files matched` anchor) — never an error.
+/// A quoted glob pattern that matches nothing yields empty daemon `output`
+/// (the loud `no matches for pattern` report travels in the separate
+/// `no_match_patterns` field, rendered CLI-side) — never an error.
 #[test]
 fn test_glob_quoted_pattern_zero_match_is_empty() -> Result<()> {
     let dir = tempfile::tempdir()?;

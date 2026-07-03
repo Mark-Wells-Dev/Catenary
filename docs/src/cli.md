@@ -83,10 +83,27 @@ head` works). Ask for a total with `--count` and narrow with
 ### `catenary glob`
 
 Browse the workspace: file outline, directory listing, or glob pattern
-match. Auto-detects intent from the pattern — a file path shows a symbol
+match. Auto-detects intent from each PATH — a file path shows a symbol
 outline, a directory path shows a listing with symbols, and a glob
-pattern shows matching files. Uses the shell's current working directory
-as the base for relative patterns.
+pattern shows matching files.
+
+A PATH may be a **glob pattern**: quote it so the shell doesn't expand it
+and Catenary walks it gitignore-aware instead. Patterns may be absolute or
+cwd-relative, and the anchor belongs *in the pattern* — there is no
+separate directory argument (`catenary glob 'src/**/*.rs'`,
+`catenary glob '/abs/dir/**/*.md'`). A pattern that expands to nothing is
+never silent: it reports `no matches for pattern: <pattern> (relative
+patterns anchor at cwd)`, per argument, even when sibling arguments render.
+
+The outline is a **map, not a mirror** — it renders **types and callables
+only**. It recurses into containers (modules/namespaces/packages and
+classes/interfaces/enums/structs/impls), showing the containers and their
+functions, methods, and constructors. Data members (fields, properties,
+enum variants, and variables/constants below the top level) are pruned, and
+a callable's interior (locals, loop vars, nested defs) is never entered —
+each callable is one line. The top level shows everything, so a
+module-level constant stays. (The underlying symbol index is unfiltered;
+only the outline render applies this map.)
 
 ```bash
 catenary glob "src/"
@@ -101,6 +118,7 @@ freely — and `--count` answers "how many" without the listing.
 
 | Flag | Description |
 |------|-------------|
+| `[PATH]...` | File, directory, or quoted glob pattern(s) — absolute or cwd-relative, anchor in the pattern |
 | `--exclude-pattern <pat>` | Glob pattern to exclude from results |
 | `--count` | Report the path count instead of results |
 | `--include-gitignored` | Include files ignored by .gitignore |

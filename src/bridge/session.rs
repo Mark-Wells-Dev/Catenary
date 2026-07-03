@@ -182,11 +182,34 @@ pub fn expand_search_paths(
     include_gitignored: bool,
     include_hidden: bool,
 ) -> Vec<PathBuf> {
+    expand_search_paths_reporting(paths, include_gitignored, include_hidden).0
+}
+
+/// Like [`expand_search_paths`], additionally reporting which **glob-pattern**
+/// arguments expanded to zero matches.
+///
+/// The second tuple element holds the indices (into `paths`) of
+/// metachar-bearing arguments that resolved to no path on disk — a pattern that
+/// matched nothing (or an unparseable glob). `catenary glob` surfaces these as
+/// a loud per-argument `no matches for pattern: <pattern>` report (misc 118),
+/// mirroring the CLI's `path does not exist` for metachar-free absents: without
+/// it, a pattern passed alongside other arguments expands silently against
+/// `cwd` and contributes nothing. A **metachar-free** absent is *not* reported
+/// here — that is the CLI's `path does not exist`, collected before dispatch —
+/// nor is an existing path a directory gitignore gate drops (naming it was not
+/// a pattern).
+#[must_use]
+pub fn expand_search_paths_reporting(
+    paths: &[PathBuf],
+    include_gitignored: bool,
+    include_hidden: bool,
+) -> (Vec<PathBuf>, Vec<usize>) {
     let mut resolved = Vec::new();
+    let mut no_match = Vec::new();
     // Per-parent cache of gitignore-visible entries, so a batch of
     // shell-expanded siblings only walks their directory once.
     let mut visible: HashMap<PathBuf, HashSet<PathBuf>> = HashMap::new();
-    for path in paths {
+    for (i, path) in paths.iter().enumerate() {
         // Re-stat with a bounded retry before treating a literal path as a
         // glob — a transient stat miss (e.g. an atomic-rename write between the
         // CLI probe and here) must never silently zero a path that is present
@@ -206,12 +229,19 @@ pub fn expand_search_paths(
             // that still does not resolve is a genuine "not found" — it is the
             // CLI's loud `path does not exist` (collected before dispatch), not
             // a glob that silently expands to an empty set.
+            let before = resolved.len();
             if let Ok(glob) = ResolvedGlob::new(&path.to_string_lossy()) {
                 resolved.extend(glob.expand(include_gitignored, include_hidden));
             }
+            // The pattern contributed no path — expanded to nothing or failed to
+            // compile. Record it so the caller can report it loudly instead of
+            // letting it vanish.
+            if resolved.len() == before {
+                no_match.push(i);
+            }
         }
     }
-    resolved
+    (resolved, no_match)
 }
 
 /// Number of `symlink_metadata` attempts before treating a miss as genuine.
@@ -1236,6 +1266,36 @@ mod tests {
         assert!(
             resolved.is_empty(),
             "metachar-free absent path is not glob-expanded: {resolved:?}"
+        );
+    }
+
+    #[test]
+    fn expand_search_paths_reporting_flags_only_zero_match_patterns() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::write(root.join("real.rs"), "x").expect("write");
+
+        // Arg 0: an existing file (renders, not a no-match).
+        // Arg 1: a metachar pattern matching `real.rs` (matches, not a no-match).
+        // Arg 2: a metachar pattern matching nothing → the sole no-match index.
+        // Arg 3: a metachar-free absent (the CLI's `path does not exist`, NOT a
+        //        pattern) → never reported here.
+        let args = vec![
+            root.join("real.rs"),
+            root.join("*.rs"),
+            root.join("*.none"),
+            root.join("ghost.rs"),
+        ];
+        let (resolved, no_match) = expand_search_paths_reporting(&args, false, false);
+
+        assert!(
+            resolved.contains(&root.join("real.rs")),
+            "existing file and matching pattern resolve: {resolved:?}"
+        );
+        assert_eq!(
+            no_match,
+            vec![2],
+            "only the zero-match pattern (arg 2) is flagged: {no_match:?}"
         );
     }
 

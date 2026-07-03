@@ -327,6 +327,12 @@ pub struct GlobResponse {
     /// Resolved-path count, present only for a `--count` response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paths: Option<usize>,
+    /// Glob-pattern arguments (original spelling) that expanded to zero
+    /// matches. The CLI renders each as a loud
+    /// `no matches for pattern: <pattern>` line (misc 118). Empty for a
+    /// `--count` response and for any query where every pattern matched.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub no_match_patterns: Vec<String>,
 }
 
 /// Resolves a pattern path against a base directory if it is relative.
@@ -2481,17 +2487,33 @@ async fn handle_hook_dispatch(
         let response = tokio::select! {
             result = ctx.primary.glob.execute(&params, Some(&parent_id), &cancel).instrument(span.clone()) => {
                 match result {
-                    Ok(GlobOutcome::Rendered { output }) => GlobResponse {
-                        output,
-                        paths: None,
-                    },
+                    Ok(GlobOutcome::Rendered { output, no_match_indices }) => {
+                        // Map each zero-match index back to the argument's
+                        // ORIGINAL spelling. `to_params` resolves `glob_req.paths`
+                        // to the absolute `params.paths` 1:1 in order, so the
+                        // index the glob pipeline reports lines up with
+                        // `glob_req.paths` — showing what the agent typed, the
+                        // way `path does not exist` does (misc 118).
+                        let no_match_patterns = no_match_indices
+                            .into_iter()
+                            .filter_map(|i| glob_req.paths.get(i))
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .collect();
+                        GlobResponse {
+                            output,
+                            paths: None,
+                            no_match_patterns,
+                        }
+                    }
                     Ok(GlobOutcome::Count { paths }) => GlobResponse {
                         output: String::new(),
                         paths: Some(paths),
+                        no_match_patterns: Vec::new(),
                     },
                     Err(e) => GlobResponse {
                         output: format!("glob error: {e}"),
                         paths: None,
+                        no_match_patterns: Vec::new(),
                     },
                 }
             }
@@ -7391,11 +7413,13 @@ mod tests {
         let resp = GlobResponse {
             output: "src/\n  main.rs (42 lines)".to_string(),
             paths: None,
+            no_match_patterns: vec!["src/**/none.rs".to_string()],
         };
         let json = serde_json::to_string(&resp).expect("serialize");
         let parsed: GlobResponse = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed.output, "src/\n  main.rs (42 lines)");
         assert!(parsed.paths.is_none());
+        assert_eq!(parsed.no_match_patterns, vec!["src/**/none.rs".to_string()]);
     }
 
     /// IPC method constants match expected wire values.

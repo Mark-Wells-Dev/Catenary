@@ -72,6 +72,24 @@ upgrading.
 
 ### Changed
 
+- **`catenary glob` outlines show types and callables only.** The file and
+  directory outline is now a map, not a mirror: it recurses into containers
+  (modules/namespaces/packages and classes/interfaces/enums/structs/impls) and
+  shows their functions, methods, and constructors, but prunes data members
+  (fields, properties, enum variants, and below-top-level variables/constants)
+  and never enters a callable's interior (locals, loop vars, nested defs — each
+  callable renders as one line). The top level still shows everything, so a
+  module-level constant remains. Only the outline render filters — the symbol
+  index stays complete, so `catenary grep`'s `#scope` symbol-path enrichment is
+  unaffected.
+- **`catenary glob` teaches the quoted-pattern form and never expands
+  silently.** `catenary glob --help` and the primer now explain that a PATH may
+  be a quoted glob pattern, absolute or cwd-relative, with the anchor written
+  into the pattern (`catenary glob 'src/**/*.rs'`) — there is no separate
+  directory argument. A pattern argument that expands to zero matches is now
+  reported loudly per argument as `no matches for pattern: <pattern> (relative
+  patterns anchor at cwd)`, even when a sibling argument renders — superseding
+  the old whole-result `no files matched` line for glob.
 - **`catenary diagnostics` exit contract + per-file receipt.** The command now
   exits `0` whenever it ran correctly — clean *or* dirty — and `2` only on a
   genuine fault (no daemon, IPC failure); it **never** exits `1`. The exit code

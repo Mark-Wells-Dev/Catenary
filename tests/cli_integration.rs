@@ -721,7 +721,7 @@ fn test_help_exits_zero_for_agent_subcommands() -> Result<()> {
 // ── quoted-glob exit-code contract ────────────────────────────────
 
 /// End-to-end: a quoted glob that matches nothing must exit 0 with a
-/// loud `no files matched` on stdout. The `catenary glob` binary talks
+/// loud `no matches for pattern` on stdout. The `catenary glob` binary talks
 /// to a live daemon (the pattern is expanded daemon-side), so a sibling
 /// tool call in the same parallel batch is never cancelled (`bugs/13`).
 #[test]
@@ -767,8 +767,8 @@ fn test_glob_quoted_zero_match_exits_zero_loud() -> Result<()> {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("no files matched"),
-        "stdout should loudly report zero matches, got:\n{stdout}"
+        stdout.contains("no matches for pattern: **/*.rs (relative patterns anchor at cwd)"),
+        "stdout should loudly report the zero-match pattern, got:\n{stdout}"
     );
 
     drop(bridge);

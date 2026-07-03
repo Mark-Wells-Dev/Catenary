@@ -35,7 +35,7 @@ use super::SourceLines;
 use super::filesystem_manager::{
     FilesystemManager, STAT_RETRY_ATTEMPTS, format_file_size, mtime_nanos,
 };
-use super::session::{ResolvedGlob, expand_search_paths};
+use super::session::{ResolvedGlob, expand_search_paths, expand_search_paths_reporting};
 use crate::lsp::{LspClientManager, WalkBreadth};
 use crate::symbol_index::{Symbol, SymbolIndex};
 
@@ -105,6 +105,12 @@ pub enum GlobOutcome {
     Rendered {
         /// The complete output for stdout.
         output: String,
+        /// Indices (into the request's `paths`) of glob-pattern arguments that
+        /// expanded to zero matches. The daemon reports these positionally so
+        /// the CLI can render a loud per-argument
+        /// `no matches for pattern: <pattern>` line against the *original*
+        /// argument spelling (misc 118).
+        no_match_indices: Vec<usize>,
     },
     /// `--count` summary: number of resolved filesystem paths.
     Count {
@@ -173,11 +179,14 @@ impl GlobServer {
         // dispatch directly; unexpanded glob patterns are expanded daemon-side.
         // The output is always complete (decision 025): the full outline prints,
         // with no volume branch — the host caps only the final read.
-        let output = self
+        let (output, no_match_indices) = self
             .handle_literal_paths(&input.paths, &input, exclude.as_ref(), cwd, parent_id)
             .await?;
 
-        Ok(GlobOutcome::Rendered { output })
+        Ok(GlobOutcome::Rendered {
+            output,
+            no_match_indices,
+        })
     }
 
     /// Single file: header `path  (N lines)` + its fully-expanded outline.
@@ -278,6 +287,11 @@ impl GlobServer {
     /// `ignore` walker ([`expand_search_paths`]). A shell-expanded (unquoted)
     /// glob arrives as concrete paths and an unexpanded (quoted) glob arrives
     /// as a pattern — both resolve to the same set here.
+    ///
+    /// Returns the rendered output plus the indices (into `paths`) of
+    /// glob-pattern arguments that expanded to zero matches — the CLI turns
+    /// these into a loud per-argument `no matches for pattern` report (misc
+    /// 118).
     async fn handle_literal_paths(
         &self,
         paths: &[PathBuf],
@@ -285,8 +299,9 @@ impl GlobServer {
         exclude: Option<&ResolvedGlob>,
         cwd: Option<&Path>,
         parent_id: Option<&str>,
-    ) -> Result<String> {
-        let resolved = expand_search_paths(paths, input.include_gitignored, input.include_hidden);
+    ) -> Result<(String, Vec<usize>)> {
+        let (resolved, no_match_indices) =
+            expand_search_paths_reporting(paths, input.include_gitignored, input.include_hidden);
 
         // Scoped changed-set nudge (WS31 ticket 04): glob enriches with
         // `documentSymbol` (outlines) only, so coherence is needed just for the
@@ -333,7 +348,7 @@ impl GlobServer {
             // Skip non-existent paths silently — shell expansion
             // shouldn't produce them, but be defensive.
         }
-        Ok(full)
+        Ok((full, no_match_indices))
     }
 
     /// Routes glob's scoped changed-set nudge (WS31 ticket 04,
@@ -679,6 +694,32 @@ fn is_snapshot(name: &str) -> bool {
     name.contains(".catenary_snapshot_")
 }
 
+// ─── Outline kind filter (types and callables only) ──────────────────
+
+/// Whether `kind` is a **container** the outline recurses into.
+///
+/// Two families, per the types-and-callables ruling (misc 117): module-like
+/// (`Module`/`Namespace`/`Package`) and type/impl (`Class`/`Interface`/`Enum`/
+/// `Struct`/`Object` — rust-analyzer emits `impl` blocks as `Object`). The
+/// outline descends through these at every depth; anything else terminates the
+/// descent. Kind strings are the [`symbol_kind_to_string`] taxonomy.
+///
+/// [`symbol_kind_to_string`]: crate::symbol_index::symbol_kind_to_string
+fn is_container_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "module" | "namespace" | "package" | "class" | "interface" | "enum" | "struct" | "object"
+    )
+}
+
+/// Whether `kind` is a **callable** the outline shows but never enters.
+///
+/// `Function`/`Method`/`Constructor` render as a single line; their interior
+/// (locals, loop vars, nested defs) is never descended into (misc 117).
+fn is_callable_kind(kind: &str) -> bool {
+    matches!(kind, "function" | "method" | "constructor")
+}
+
 // ─── Symbol rendering ─────────────────────────────────────────────────
 
 /// Renders a single outline node: `{indent}{line}  <declaration source line>`.
@@ -696,16 +737,34 @@ fn render_symbol_line(out: &mut String, sym: &Symbol, indent: &str, source: Opti
     let _ = writeln!(out, "{indent}{}  {text}", sym.line + 1);
 }
 
-/// Renders one file's **fully-expanded** outline, re-indented by tree depth.
+/// Renders one file's outline as a **map of types and callables**, re-indented
+/// by tree depth (misc 117).
 ///
 /// `syms` are the file's symbols at every depth, in ascending declaration-line
 /// order (as the index stores them). `documentSymbol` ranges nest — a child's
 /// `[line, end_line]` span lies within its parent's — so an interval stack
 /// recovers each node's depth: pop every ancestor whose span ends before this
-/// node begins, and the remaining stack height is the depth. The node is then
+/// node begins, and the remaining stack height is the depth. Shown nodes are
 /// indented `base_indent` + one tab per depth level (glob normalizes structure
 /// to tree depth, not source columns). The file is read once via
 /// [`SourceLines`] for each node's declaration text.
+///
+/// The outline is a map, not a mirror: it renders **types and callables only**.
+/// The filter, applied at every depth:
+/// - **Top level (depth 0) shows everything** — a module-level `const` /
+///   `static` / assignment is real API surface.
+/// - **Below top level**, a node is shown only when every ancestor is a
+///   [container](is_container_kind) (recursion descends through containers
+///   only) and the node itself is a container or a [callable](is_callable_kind).
+///   This prunes data members (`Field`/`Property`/`EnumMember`/`Variable`/
+///   `Constant`) and never enters a callable's interior (locals, loop vars,
+///   nested defs — a callable renders as one line).
+///
+/// Because every ancestor of a shown node is itself a shown container, the
+/// display depth of a shown node equals its span depth, so the interval stack's
+/// height still yields the correct indent. Filtering happens at the render
+/// only: the symbol index stays complete (grep's `#scope` enrichment and symbol
+/// queries need the full tree).
 fn render_full_outline(
     out: &mut String,
     file: &Path,
@@ -713,16 +772,24 @@ fn render_full_outline(
     base_indent: &str,
     sources: &mut SourceLines,
 ) {
-    // Stack of open ancestors' `end_line`s.
-    let mut open_ends: Vec<u32> = Vec::new();
+    // Stack of open ancestors: `(end_line, is_container)`. The container flag
+    // drives the types-and-callables filter — a node below top level is shown
+    // only when every ancestor is a container.
+    let mut open: Vec<(u32, bool)> = Vec::new();
     for sym in syms {
-        while open_ends.last().is_some_and(|&end| end < sym.line) {
-            open_ends.pop();
+        while open.last().is_some_and(|&(end, _)| end < sym.line) {
+            open.pop();
         }
-        let indent = format!("{base_indent}{}", "\t".repeat(open_ends.len()));
-        let source = sources.line(file, sym.line);
-        render_symbol_line(out, sym, &indent, source);
-        open_ends.push(sym.end_line);
+        let depth = open.len();
+        let container = is_container_kind(&sym.kind);
+        let show = depth == 0
+            || (open.iter().all(|&(_, c)| c) && (container || is_callable_kind(&sym.kind)));
+        if show {
+            let indent = format!("{base_indent}{}", "\t".repeat(depth));
+            let source = sources.line(file, sym.line);
+            render_symbol_line(out, sym, &indent, source);
+        }
+        open.push((sym.end_line, container));
     }
 }
 
@@ -1436,6 +1503,168 @@ mod tests {
         assert!(!out.contains('<'), "no kind label anywhere: {out:?}");
     }
 
+    // ─── outline filter: types and callables only (misc 117) ────────
+
+    /// Builds a `Symbol` for the filter tests. Source lines are unavailable
+    /// (the path is synthetic), so `render_full_outline` renders the bare name —
+    /// which is what these tests assert on.
+    fn sym(name: &str, kind: &str, line: u32, end_line: u32) -> Symbol {
+        Symbol {
+            name: name.to_string(),
+            kind: kind.to_string(),
+            line,
+            end_line,
+            scope: None,
+            scope_kind: None,
+            deprecated: false,
+        }
+    }
+
+    /// Renders a symbol tree through the outline filter and returns the output.
+    fn outline(syms: &[Symbol]) -> String {
+        let mut out = String::new();
+        let mut sources = SourceLines::new();
+        render_full_outline(
+            &mut out,
+            Path::new("/synthetic/filter.rs"),
+            syms,
+            "",
+            &mut sources,
+        );
+        out
+    }
+
+    #[test]
+    fn outline_prunes_locals_under_a_function() {
+        // A function's interior is never entered: locals and loop vars vanish,
+        // the function itself renders as one line (the Python field finding).
+        let syms = vec![
+            sym("compute", "function", 0, 6),
+            sym("rng", "variable", 1, 1),
+            sym("val", "variable", 2, 4),
+            sym("acc", "variable", 3, 3),
+        ];
+        assert_eq!(outline(&syms), "1  compute\n");
+    }
+
+    #[test]
+    fn outline_keeps_methods_under_an_impl() {
+        // `Object` is rust-analyzer's `impl` kind — a container the outline
+        // recurses into, so its methods (callables) are kept and indented.
+        let syms = vec![
+            sym("impl Widget", "object", 0, 10),
+            sym("new", "method", 1, 3),
+            sym("render", "method", 4, 8),
+        ];
+        assert_eq!(outline(&syms), "1  impl Widget\n\t2  new\n\t5  render\n");
+    }
+
+    #[test]
+    fn outline_prunes_fields_and_enum_variants() {
+        // Struct fields and enum variants are data members — pruned below top
+        // level; the containers themselves stay.
+        let syms = vec![
+            sym("Point", "struct", 0, 3),
+            sym("x", "field", 1, 1),
+            sym("y", "field", 2, 2),
+            sym("Color", "enum", 4, 7),
+            sym("Red", "member", 5, 5),
+            sym("Green", "member", 6, 6),
+        ];
+        assert_eq!(outline(&syms), "1  Point\n5  Color\n");
+    }
+
+    #[test]
+    fn outline_prunes_associated_const_inside_impl() {
+        // A `const` inside an impl is a member → pruned; a sibling method stays
+        // (the owned judgment call from the ruling).
+        let syms = vec![
+            sym("impl Widget", "object", 0, 6),
+            sym("MAX", "constant", 1, 1),
+            sym("build", "method", 2, 5),
+        ];
+        assert_eq!(outline(&syms), "1  impl Widget\n\t3  build\n");
+    }
+
+    #[test]
+    fn outline_keeps_module_recursion_at_depth_two() {
+        // Module-like containers recurse at every depth: a function two modules
+        // deep is kept and indented by its span depth.
+        let syms = vec![
+            sym("outer", "module", 0, 20),
+            sym("inner", "module", 1, 19),
+            sym("deep_fn", "function", 2, 3),
+        ];
+        assert_eq!(outline(&syms), "1  outer\n\t2  inner\n\t\t3  deep_fn\n");
+    }
+
+    #[test]
+    fn outline_keeps_top_level_constant() {
+        // Depth 0 shows everything — a module-level constant is API surface.
+        let syms = vec![
+            sym("MAX_SIZE", "constant", 0, 0),
+            sym("helper", "function", 1, 3),
+        ];
+        assert_eq!(outline(&syms), "1  MAX_SIZE\n2  helper\n");
+    }
+
+    #[test]
+    fn outline_does_not_enter_nested_defs_inside_a_function() {
+        // A nested def (closure/inner function) lives in a callable's interior
+        // and is never entered, even though it is itself a callable.
+        let syms = vec![
+            sym("outer_fn", "function", 0, 5),
+            sym("nested_fn", "function", 1, 3),
+            sym("local", "variable", 2, 2),
+        ];
+        assert_eq!(outline(&syms), "1  outer_fn\n");
+    }
+
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn outline_filter_leaves_symbol_index_complete_for_grep_enrichment() {
+        // The filter is a RENDER-only concern: the symbol index still holds every
+        // symbol (including the pruned local), so grep's `#scope` symbol-path
+        // enrichment and symbol queries keep the full tree.
+        let idx = SymbolIndex::new().expect("create index");
+        let path = PathBuf::from("/synthetic/enrich.rs");
+        idx.populate_from_document_symbols(
+            &path,
+            &serde_json::json!([{
+                "name": "compute",
+                "kind": 12,
+                "range": { "start": { "line": 0 }, "end": { "line": 3 } },
+                "selectionRange": { "start": { "line": 0 }, "end": { "line": 0 } },
+                "children": [{
+                    "name": "local",
+                    "kind": 13,
+                    "range": { "start": { "line": 1 }, "end": { "line": 1 } },
+                    "selectionRange": { "start": { "line": 1 }, "end": { "line": 1 } }
+                }]
+            }]),
+        )
+        .expect("populate");
+
+        // The index is complete — the local is queryable even though the outline
+        // prunes it.
+        let all = idx
+            .query(".*", Some(std::slice::from_ref(&path)))
+            .expect("query all");
+        let names: Vec<&str> = all.iter().map(|(_, s)| s.name.as_str()).collect();
+        assert!(
+            names.contains(&"compute"),
+            "index keeps the function: {names:?}"
+        );
+        assert!(
+            names.contains(&"local"),
+            "index keeps the pruned local for grep enrichment: {names:?}"
+        );
+
+        // The outline of those same symbols prunes the local.
+        let syms: Vec<Symbol> = all.into_iter().map(|(_, s)| s).collect();
+        assert_eq!(outline(&syms), "1  compute\n");
+    }
+
     // ─── compute_entry_flags ───────────────────────────────────────
 
     #[test]
@@ -1750,6 +1979,47 @@ mod tests {
             Some(real_file.clone()),
             "a present, resolvable path must yield Some(canonical): {}",
             real_file.display()
+        );
+    }
+
+    // ─── zero-match pattern reporting (misc 118) ────────────────────
+
+    /// `execute` surfaces the index of a glob-pattern argument that expanded to
+    /// zero matches, so the CLI can report it loudly. A single unmatched pattern
+    /// resolves to nothing (no dispatch, no LSP), so this stays fast and
+    /// server-free.
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn execute_reports_zero_match_pattern_index() {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let base = tmp.path().canonicalize().expect("canonicalize base");
+
+        let server = test_glob_server();
+        // A single absolute pattern whose base dir exists but matches no file.
+        let params = serde_json::json!({
+            "paths": [base.join("*.nomatch118").to_string_lossy()],
+        });
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let outcome = rt
+            .block_on(server.execute(&params, None, &cancel))
+            .expect("execute glob");
+
+        let GlobOutcome::Rendered {
+            output,
+            no_match_indices,
+        } = outcome
+        else {
+            unreachable!("a non-count glob yields Rendered");
+        };
+        assert!(
+            output.is_empty(),
+            "zero-match pattern renders nothing: {output:?}"
+        );
+        assert_eq!(
+            no_match_indices,
+            vec![0],
+            "the sole pattern argument (index 0) is flagged as a no-match"
         );
     }
 }
