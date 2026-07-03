@@ -43,6 +43,22 @@ pub enum ProcessState {
     Dead,
 }
 
+/// Whether [`ProcessState`]'s `Running`/`Blocked` distinction reflects the
+/// kernel's real scheduler state on this platform.
+///
+/// `true` on Linux (parsed from the `/proc/<pid>/stat` state char) and macOS
+/// (derived from `proc_pidinfo` running-thread counts): a `Running` sample
+/// there means the process is genuinely on a core or waiting in the run queue,
+/// and a `Blocked` sample means uninterruptible kernel I/O — both are
+/// pending-work signals independent of the sampled CPU deltas.
+///
+/// `false` on Windows and unsupported platforms. The Win32 API exposes no
+/// scheduler state, so [`sample`] reports every live process as `Running` as a
+/// liveness placeholder (see the Windows `sample_handle`); that value carries
+/// no run-queue information. Consumers must treat scheduler state as
+/// meaningless here and fall back to CPU deltas alone.
+pub const SCHEDULER_STATE_OBSERVABLE: bool = cfg!(any(target_os = "linux", target_os = "macos"));
+
 /// CPU and page fault deltas since the last sample.
 ///
 /// Returned by [`ProcessMonitor::sample`]. All deltas are 0 on the first

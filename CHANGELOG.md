@@ -122,6 +122,21 @@ upgrading.
   and stdout-only tools (`cat`, `head`, `diff`, …) live in `allow`; the
   resolve-or-deny write model, not command blocking, handles redirected writes.
 
+### Fixed
+
+- **Diagnostics settle no longer reports `[clean]` over a CPU-starved flycheck
+  child.** Under host CPU saturation a runnable child can present an all-zero
+  50 ms sampling window — no user/system CPU or page-fault deltas while ticks
+  of work remain queued — and the idle detector read that single window as
+  idle, settling early and withholding the child's diagnostics. The quiet
+  predicate now consults the scheduler state Catenary already samples per
+  process: a live process that is running (on a core or in the run queue) or
+  blocked (uninterruptible kernel I/O) keeps the settle open regardless of
+  deltas, and idle requires zero deltas, no new processes, and every live
+  process in a sleep-class state. Pressure-independent by construction — no
+  timing heuristics and no CPU budget. On platforms without observable
+  scheduler state (Windows), detection falls back to CPU deltas as before.
+
 ### Migration
 
 See the [Migration guide](docs/src/migrating-to-2.0.md) for per-change

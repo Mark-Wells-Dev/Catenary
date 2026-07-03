@@ -21,7 +21,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use catenary_proc::ProcessState;
+use catenary_proc::{ProcessState, SCHEDULER_STATE_OBSERVABLE};
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
@@ -76,7 +76,9 @@ impl IdleDetector {
     /// Two internal phases:
     /// 1. Wait for cumulative ticks to advance from baseline, or any nonzero
     ///    delta. Either proves the server was scheduled.
-    /// 2. Wait for all processes to show zero deltas with per-child gates.
+    /// 2. Wait for the tree to go quiet: zero deltas, no new PIDs, no live
+    ///    process runnable or blocked (scheduler-state ground truth), and
+    ///    per-child gates satisfied.
     #[must_use]
     pub fn after_activity(baseline_ticks: u64) -> Self {
         Self {
@@ -105,6 +107,13 @@ impl IdleDetector {
 
     /// Checks whether the server is idle given the current tree snapshot.
     ///
+    /// Idle requires zero CPU/page-fault deltas across the whole tree, no
+    /// newly-appeared PIDs, per-child activity gates satisfied, and — where
+    /// scheduler state is observable — every live process in a sleep-class
+    /// state. A live process that is runnable or blocked is pending work and
+    /// blocks idle regardless of deltas, so a child starved of CPU under host
+    /// pressure can no longer read as idle across an all-zero window (bug 55).
+    ///
     /// Returns `true` when idle is detected.
     #[allow(
         clippy::similar_names,
@@ -116,6 +125,7 @@ impl IdleDetector {
 
         let mut any_nonzero = false;
         let mut new_pids = false;
+        let mut any_pending = false;
 
         for ts in &snapshot.samples {
             let is_active = ts.delta_pfc > 0 || ts.delta_utime > 0 || ts.delta_stime > 0;
@@ -123,6 +133,17 @@ impl IdleDetector {
             if is_active {
                 any_nonzero = true;
                 self.active_pids.insert(ts.pid);
+            }
+
+            // Scheduler-state ground truth (bug 55): a live process that is
+            // runnable or blocked has pending work by definition, independent
+            // of the sampled deltas. Under CPU pressure a starved child sits
+            // in the run queue unscheduled for a whole 50ms window — zero
+            // utime/stime/pfc while ticks of work remain — and the delta-only
+            // predicate read that as idle, settling early and reporting
+            // `[clean]`. Blocks idle regardless of deltas; pressure-independent.
+            if is_pending_work(ts.state) {
+                any_pending = true;
             }
 
             if self.known_pids.insert(ts.pid) {
@@ -155,8 +176,10 @@ impl IdleDetector {
             }
         }
 
-        // Phase 2: quiet detection — all zeros, no new PIDs
-        if any_nonzero || new_pids {
+        // Phase 2: quiet detection. Idle requires zero deltas, no new PIDs,
+        // and no live process runnable or blocked (scheduler-state ground
+        // truth) — every live process must be in a sleep-class state.
+        if any_nonzero || new_pids || any_pending {
             return false;
         }
 
@@ -166,6 +189,22 @@ impl IdleDetector {
             .iter()
             .all(|ts| ts.state == ProcessState::Dead || self.active_pids.contains(&ts.pid))
     }
+}
+
+/// Whether a process sample represents pending work that must block idle
+/// regardless of the sampled CPU deltas.
+///
+/// On platforms where scheduler state is observable
+/// ([`catenary_proc::SCHEDULER_STATE_OBSERVABLE`]), a live process that is
+/// [`ProcessState::Running`] (on a core or waiting in the run queue — a
+/// starved-but-runnable process is still pending work) or
+/// [`ProcessState::Blocked`] (uninterruptible kernel I/O in flight) is not
+/// idle even across an all-zero sampling window. On platforms without
+/// observable scheduler state (Windows reports every live process as
+/// `Running` as a liveness placeholder), this is always `false` and idle
+/// detection falls back to CPU deltas alone.
+const fn is_pending_work(state: ProcessState) -> bool {
+    SCHEDULER_STATE_OBSERVABLE && matches!(state, ProcessState::Running | ProcessState::Blocked)
 }
 
 // ── await_idle ───────────────────────────────────────────────────────
@@ -386,6 +425,9 @@ mod tests {
         }
     }
 
+    /// A quiescent sample: zero deltas and a sleep-class state. Quiet means
+    /// sleep-class — a zero-delta `Running`/`Blocked` process is pending work,
+    /// not idle (bug 55), so quiet fixtures must be `Sleeping`.
     fn quiet_sample(pid: u32) -> TreeSample {
         TreeSample {
             pid,
@@ -393,7 +435,21 @@ mod tests {
             delta_utime: 0,
             delta_stime: 0,
             delta_pfc: 0,
-            state: ProcessState::Running,
+            state: ProcessState::Sleeping,
+        }
+    }
+
+    /// A zero-delta sample in an arbitrary state — for the scheduler-state
+    /// regression tests that assert Running/Blocked block idle while Sleeping
+    /// settles.
+    fn zero_delta_sample(pid: u32, state: ProcessState) -> TreeSample {
+        TreeSample {
+            pid,
+            ppid: 1,
+            delta_utime: 0,
+            delta_stime: 0,
+            delta_pfc: 0,
+            state,
         }
     }
 
@@ -552,6 +608,63 @@ mod tests {
         // Now quiet — idle
         let quiet = make_snapshot(vec![quiet_sample(100)]);
         assert!(detector.check(&quiet));
+    }
+
+    // ── Scheduler-state predicate (bug 55) ──────────────────────────
+
+    #[test]
+    fn running_zero_deltas_blocks_idle() {
+        // A runnable process with zero observed deltas is starved — sitting
+        // in the run queue waiting for a core while work remains pending —
+        // not idle. Scheduler state `Running` blocks idle regardless of
+        // deltas wherever scheduler state is observable.
+        let mut detector = IdleDetector::after_activity(0);
+
+        // Observe activity first so phase 1 is satisfied.
+        assert!(!detector.check(&make_snapshot(vec![active_sample(100)])));
+
+        // PID 100 now shows zero deltas but is still Running (starved under
+        // CPU pressure). Must NOT settle on observable-scheduler platforms.
+        let starved = make_snapshot(vec![zero_delta_sample(100, ProcessState::Running)]);
+        assert_eq!(
+            detector.check(&starved),
+            !SCHEDULER_STATE_OBSERVABLE,
+            "Running + zero deltas is a starved-but-runnable process; it must \
+             block idle where scheduler state is observable"
+        );
+    }
+
+    #[test]
+    fn blocked_zero_deltas_blocks_idle() {
+        // Uninterruptible sleep (`D`) has kernel I/O in flight — pending work
+        // — even with zero CPU deltas.
+        let mut detector = IdleDetector::after_activity(0);
+
+        assert!(!detector.check(&make_snapshot(vec![active_sample(100)])));
+
+        let blocked = make_snapshot(vec![zero_delta_sample(100, ProcessState::Blocked)]);
+        assert_eq!(
+            detector.check(&blocked),
+            !SCHEDULER_STATE_OBSERVABLE,
+            "Blocked (uninterruptible I/O) + zero deltas is pending work; it \
+             must block idle where scheduler state is observable"
+        );
+    }
+
+    #[test]
+    fn sleeping_zero_deltas_settles_after_activity() {
+        // Sleep-class is the only state that permits idle. After observing
+        // activity, a Sleeping process with zero deltas settles on every
+        // platform.
+        let mut detector = IdleDetector::after_activity(0);
+
+        assert!(!detector.check(&make_snapshot(vec![active_sample(100)])));
+
+        let sleeping = make_snapshot(vec![zero_delta_sample(100, ProcessState::Sleeping)]);
+        assert!(
+            detector.check(&sleeping),
+            "Sleeping + zero deltas after activity is genuinely idle"
+        );
     }
 
     // ── root_state unit tests ─────────────────────────────────────────
