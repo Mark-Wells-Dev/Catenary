@@ -160,6 +160,26 @@ enum FileOutcome {
     NoResults,
 }
 
+/// The routing decision for a scoped diagnostics request (workstream 37
+/// ticket 04, decision 5).
+///
+/// Produced by [`DiagnosticsServer::plan_scope`]: the requested paths split into
+/// a per-file fan-out set and a set of whole-root workspace-pull targets, plus
+/// the `directory_scoped` flag that drives the clean-collapse render rule.
+#[derive(Default)]
+struct ScopePlan {
+    /// Files for the per-file fan-out lifecycle: explicit file arguments plus
+    /// the expanded contents of sub-root / no-capability directories.
+    fan_out: Vec<PathBuf>,
+    /// Whole tracked roots to serve via one `workspace/diagnostic` request each,
+    /// paired with the capable clients covering the root.
+    workspace_targets: Vec<(PathBuf, Vec<Arc<Mutex<LspClient>>>)>,
+    /// Set when any requested path is a directory (`.`, a whole root, or a
+    /// sub-root). Triggers the clean-collapse receipt rule; a bare file set (the
+    /// edit-loop receipt) leaves it `false` and renders per-file.
+    directory_scoped: bool,
+}
+
 /// Handles `PostToolUse` hook requests: file-change notification with LSP
 /// diagnostics collection and formatting.
 pub struct DiagnosticsServer {
@@ -186,22 +206,22 @@ impl DiagnosticsServer {
         }
     }
 
-    /// Processes multiple file changes with a batched lifecycle so
-    /// servers see all modified files simultaneously.
+    /// Processes a scoped diagnostics request, routing by capability and scope
+    /// (workstream 37 ticket 04) and rendering one unified receipt.
     ///
-    /// Pipeline: resolve + canonicalize → group by server → per
-    /// server (open all → settle → health probe → didSave all →
-    /// settle → retrieve per file → close all) → format → bump
-    /// generations.
+    /// The requested paths are split ([`Self::plan_scope`]) into two mechanisms:
     ///
-    /// Cross-file diagnostics (e.g., a renamed type that breaks
-    /// importers) are correct because every server sees the complete
-    /// final state before producing diagnostics.
-    #[allow(
-        clippy::type_complexity,
-        clippy::too_many_lines,
-        reason = "batch pipeline: the server-grouping map is local; the phased lifecycle (resolve / nudge / LSP / linter / format) reads top-to-bottom"
-    )]
+    /// - **whole tracked root + a `workspace/diagnostic`-capable server** → one
+    ///   [`Self::workspace_pull`] off the server's existing project model (no
+    ///   per-file `didOpen`/`didClose` churn; cross-file diagnostics surfaced);
+    /// - **everything else** (explicit files, sub-root directories, roots with no
+    ///   capable server) → the per-file [`Self::fan_out`] lifecycle (ticket 02's
+    ///   path, the always-available fallback).
+    ///
+    /// Both mechanisms feed one per-file map, so the aggregation, classification,
+    /// and receipt render once. A directory/whole-root scope collapses the
+    /// `[clean]` list to a count (`plan.directory_scoped`); the edit-loop receipt
+    /// (a file set) stays per-file exactly as ticket 01 shipped it.
     pub async fn process_files_batched(
         &self,
         files: &[PathBuf],
@@ -214,6 +234,67 @@ impl DiagnosticsServer {
                 errors: 0,
                 warnings: 0,
             };
+        }
+
+        // ── Phase 0: scope routing ─────────────────────────────────
+        let plan = self.plan_scope(files).await;
+
+        let mut feeds: BTreeMap<String, FileFeed> = BTreeMap::new();
+
+        // Fan-out engine (ticket 02's path): explicit files plus sub-root /
+        // no-capability directories expanded to their covered files.
+        let (mut canonical_paths, uncovered) =
+            self.fan_out(&plan.fan_out, parent_id, &mut feeds).await;
+
+        // Whole-root + capable scopes: one workspace/diagnostic request each,
+        // merged into the same per-file map the fan-out populated.
+        for (root, clients) in &plan.workspace_targets {
+            self.workspace_pull(root, clients, &mut feeds, &mut canonical_paths)
+                .await;
+        }
+
+        // ── Phase 2c: cross-feeder aggregation (ticket 02) ─────────
+        let file_results = self.aggregate_feeds(feeds);
+
+        // ── Phase 3: classify and format ─────────────────────────
+        let outcome = self.format_output(
+            &canonical_paths,
+            &file_results,
+            &uncovered,
+            plan.directory_scoped,
+        );
+
+        // ── Phase 4: invalidate caches ────────────────────────────
+        self.fs.bump_generations(&canonical_paths);
+
+        outcome
+    }
+
+    /// The per-file fan-out lifecycle: the always-available diagnostics engine
+    /// (ticket 02's path), now factored behind the ticket-04 scope router.
+    ///
+    /// Pipeline: resolve + canonicalize → group by server → per server (open all
+    /// → settle → health probe → didSave all → settle → retrieve per file → close
+    /// all) → linter feeders. Populates `feeds` with each file's raw feeder
+    /// diagnostics and returns the covered `canonical_paths` plus the uncovered
+    /// list.
+    ///
+    /// Cross-file diagnostics (e.g., a renamed type that breaks importers) are
+    /// correct because every server sees the complete final state before
+    /// producing diagnostics.
+    #[allow(
+        clippy::type_complexity,
+        clippy::too_many_lines,
+        reason = "batch pipeline: the server-grouping map is local; the phased lifecycle (resolve / nudge / LSP / linter) reads top-to-bottom"
+    )]
+    async fn fan_out(
+        &self,
+        files: &[PathBuf],
+        parent_id: Option<&str>,
+        feeds: &mut BTreeMap<String, FileFeed>,
+    ) -> (Vec<PathBuf>, Vec<UncoveredEntry>) {
+        if files.is_empty() {
+            return (Vec::new(), Vec::new());
         }
 
         // Ensure servers exist for all files before looking them up.
@@ -361,10 +442,8 @@ impl DiagnosticsServer {
         // Key: canonical path string → the file's accumulated feeder entries.
         // Rendering is deferred to Phase 2c so dedup/precedence run on canonical
         // JSON, feeder-blind (ticket 02).
-        let mut feeds: BTreeMap<String, FileFeed> = BTreeMap::new();
-
         for (client_mutex, paths) in server_groups.values() {
-            self.run_server_batch(client_mutex, paths, parent_id, &mut feeds)
+            self.run_server_batch(client_mutex, paths, parent_id, feeds)
                 .await;
         }
 
@@ -402,20 +481,195 @@ impl DiagnosticsServer {
             }
         }
 
-        // ── Phase 2c: cross-feeder aggregation (ticket 02) ─────────
-        // Per file, over the merged set from every feeder: dedup identical
-        // findings, reconcile source precedence (per-root policy), then render.
-        // This is the order the ticket fixes — merge → dedup → precedence →
-        // render → budget/format.
-        let file_results = self.aggregate_feeds(feeds);
+        (canonical_paths, uncovered)
+    }
 
-        // ── Phase 3: classify and format ─────────────────────────
-        let outcome = self.format_output(&canonical_paths, &file_results, &uncovered);
+    /// Routes a scoped diagnostics request across the fan-out and workspace-pull
+    /// mechanisms (workstream 37 ticket 04, decision 5).
+    ///
+    /// Each requested path is classified:
+    ///
+    /// - a **file** (or any non-directory) → fan-out;
+    /// - a **directory that is a whole tracked root** *and* has a live,
+    ///   `workspace/diagnostic`-capable server → a workspace-pull target;
+    /// - any **other directory** (a sub-root, or a root whose server lacks the
+    ///   capability / is not yet spawned) → expanded to its covered files and
+    ///   fanned out.
+    ///
+    /// `directory_scoped` is set whenever any requested path is a directory — the
+    /// signal for the clean-collapse render rule, independent of which mechanism
+    /// serves it.
+    async fn plan_scope(&self, files: &[PathBuf]) -> ScopePlan {
+        let mut plan = ScopePlan::default();
+        let tracked_roots = self.fs.roots();
 
-        // ── Phase 4: invalidate caches ────────────────────────────
-        self.fs.bump_generations(&canonical_paths);
+        for file in files {
+            let Ok(abs) = resolve_path(&file.to_string_lossy()) else {
+                plan.fan_out.push(file.clone());
+                continue;
+            };
+            if !abs.is_dir() {
+                plan.fan_out.push(abs);
+                continue;
+            }
 
-        outcome
+            // A directory scope: `.`, a whole root, or a sub-root directory.
+            plan.directory_scoped = true;
+
+            // Whole tracked root? Compare canonically so a symlinked or
+            // non-canonical `.` still matches the registered root value.
+            let matched_root = tracked_roots
+                .iter()
+                .find(|root| same_path(root.as_path(), &abs));
+            if let Some(root) = matched_root {
+                // `disable_diag` roots surface nothing — neither mechanism.
+                if self.client_manager.is_diag_disabled(root) {
+                    continue;
+                }
+                let clients = self.client_manager.workspace_diagnostic_clients(root).await;
+                if !clients.is_empty() {
+                    plan.workspace_targets.push((root.clone(), clients));
+                    continue;
+                }
+            }
+
+            // Sub-root directory, or a root with no capable/live server: expand
+            // to the covered files and fan them out (the fallback).
+            plan.fan_out.extend(self.expand_directory(&abs));
+        }
+
+        plan
+    }
+
+    /// Walks a directory (gitignore-aware, hidden-skipping) and returns the
+    /// files a diagnostic feeder covers.
+    ///
+    /// Only files whose language resolves to a configured server binding or that
+    /// a standalone linter covers are kept — a whole-directory scope diagnoses
+    /// the diagnosable files, it does not flag every unrelated file as
+    /// `[no LSP coverage]`. Shares the walk scope of [`stat_walk`] and the grep
+    /// walker (respects `.gitignore`, skips hidden entries).
+    fn expand_directory(&self, dir: &std::path::Path) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        let walker = WalkBuilder::new(dir).git_ignore(true).hidden(true).build();
+        for entry in walker.flatten() {
+            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+                continue;
+            }
+            let path = entry.path().to_path_buf();
+            // Detect language the same way `get_servers` does: the filesystem
+            // classifier first, then the raw extension (a synthesized/config
+            // language whose extension the classifier doesn't index still routes
+            // by its extension).
+            let lang = self.fs.language_id(&path).or_else(|| {
+                path.extension()
+                    .and_then(|e| e.to_str())
+                    .map(str::to_string)
+            });
+            let lsp_covered = lang.is_some_and(|lang| {
+                self.client_manager
+                    .config()
+                    .resolve_language(&lang)
+                    .is_some()
+            });
+            if lsp_covered || self.client_manager.lint_covers(&path) {
+                files.push(path);
+            }
+        }
+        files
+    }
+
+    /// Issues one `workspace/diagnostic` request per capable server for `root`
+    /// and merges the per-file reports into the shared `feeds` map.
+    ///
+    /// Off the server's existing project model — no per-file `didOpen`/`didClose`
+    /// churn — so quick-fix code actions and enclosing-symbol labels (both of
+    /// which need an open document) are deliberately skipped on this path; the
+    /// cross-file diagnostics the per-file pull can miss are the payoff. Every
+    /// reported document (clean ones included) is recorded in `feeds` and
+    /// `canonical_paths` so the receipt classifies and collapses it. The
+    /// server's own project scope bounds the report to `root`; a stray report
+    /// outside `root` is dropped defensively.
+    async fn workspace_pull(
+        &self,
+        root: &std::path::Path,
+        clients: &[Arc<Mutex<LspClient>>],
+        feeds: &mut BTreeMap<String, FileFeed>,
+        canonical_paths: &mut Vec<PathBuf>,
+    ) {
+        for client_mutex in clients {
+            let client = client_mutex.lock().await;
+            let server_name = client.server_name().to_string();
+            let ctx = Arc::new(FeederContext {
+                command: client.server_command().to_string(),
+                version: client.server_version().map(str::to_string),
+                language_id: client.language().to_string(),
+            });
+            let reports = match client.workspace_diagnostics().await {
+                Ok(reports) => reports,
+                Err(e) => {
+                    debug!(
+                        server = %server_name,
+                        "workspace/diagnostic failed, skipping: {e}",
+                    );
+                    continue;
+                }
+            };
+            drop(client);
+
+            for (uri, diagnostics) in reports {
+                let Some(path) = uri_to_pathbuf(&uri) else {
+                    continue;
+                };
+                if !path.starts_with(root) {
+                    continue;
+                }
+                let diagnostics = self.filter_min_severity(&server_name, diagnostics);
+
+                let key = path.to_string_lossy().to_string();
+                let display = self.display_rel(&key);
+                let file_feed = feeds.entry(key).or_insert_with(|| FileFeed {
+                    display,
+                    entries: Vec::new(),
+                });
+                for value in diagnostics {
+                    file_feed.entries.push(FeederEntry {
+                        value,
+                        fixes: Vec::new(),
+                        enclosing: None,
+                        ctx: Arc::clone(&ctx),
+                    });
+                }
+                if !canonical_paths.contains(&path) {
+                    canonical_paths.push(path);
+                }
+            }
+        }
+    }
+
+    /// Applies a server's configured `min_severity` floor to a diagnostic set.
+    ///
+    /// Mirrors the per-file pull's pre-render filter so the workspace-pull path
+    /// honours the same `[server.*].min_severity` policy. A diagnostic with no
+    /// severity is kept (it never gates).
+    fn filter_min_severity(&self, server_name: &str, diagnostics: Vec<Value>) -> Vec<Value> {
+        let min_severity = self
+            .client_manager
+            .config()
+            .server
+            .get(server_name)
+            .and_then(|sd| sd.min_severity.as_deref())
+            .and_then(crate::filter::parse_severity);
+        match min_severity {
+            Some(threshold) => diagnostics
+                .into_iter()
+                .filter(|d| {
+                    crate::lsp::extract::diagnostic_severity(d)
+                        .is_none_or(|sev| crate::filter::severity_passes(sev, threshold))
+                })
+                .collect(),
+            None => diagnostics,
+        }
     }
 
     /// Cross-feeder aggregation: per file, dedup → provisional drop → render
@@ -485,11 +739,17 @@ impl DiagnosticsServer {
     /// are collapsed when only one printed file exists under that root. The
     /// report is always complete (decision 025) — every diagnostic prints, with
     /// no volume branch.
+    ///
+    /// `collapse_clean` (a directory/whole-root scope, ticket 04) folds each
+    /// root's `[clean]` list to a single `N files clean` line — the dirty files
+    /// are the signal. The diagnostics themselves are never collapsed
+    /// (decision 025); only the clean list is.
     fn format_output(
         &self,
         canonical_paths: &[PathBuf],
         file_results: &BTreeMap<String, (String, Vec<DiagEntry>)>,
         uncovered: &[UncoveredEntry],
+        collapse_clean: bool,
     ) -> DiagnosticsOutcome {
         let mut diag_files: Vec<DiagnosticFile> = Vec::new();
         let mut clean_files: Vec<CleanEntry> = Vec::new();
@@ -551,8 +811,9 @@ impl DiagnosticsServer {
             .any(|e| crate::filter::severity_passes(e.severity, dirty_threshold));
 
         // The report is always complete (decision 025): render every diagnostic
-        // inline — no budget, no spill, no pointer line.
-        let output = format_diagnostics(&diag_files, uncovered, &clean_files);
+        // inline — no budget, no spill, no pointer line. A directory/whole-root
+        // scope collapses the `[clean]` list to a count (ticket 04).
+        let output = format_diagnostics(&diag_files, uncovered, &clean_files, collapse_clean);
 
         DiagnosticsOutcome {
             output,
@@ -1048,6 +1309,28 @@ pub(crate) fn resolve_path(file: &str) -> Result<PathBuf> {
     }
 }
 
+/// Whether two paths denote the same location.
+///
+/// Compares canonically so a symlinked or non-canonical `.` still matches the
+/// registered workspace-root value; falls back to a literal comparison when
+/// either side won't canonicalize (a root that is gone from disk, say).
+fn same_path(a: &std::path::Path, b: &std::path::Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => a == b,
+    }
+}
+
+/// Converts a `file://` URI (as produced by [`crate::lsp::lang::path_to_uri`])
+/// back to a filesystem path.
+///
+/// Catenary emits unencoded `file://<path>` URIs and the servers it drives echo
+/// them, so a plain prefix strip is sufficient; a non-`file://` URI yields
+/// `None`.
+fn uri_to_pathbuf(uri: &str) -> Option<PathBuf> {
+    uri.strip_prefix("file://").map(PathBuf::from)
+}
+
 /// Classifies a file based on its rendered cross-feeder diagnostics.
 ///
 /// - `Some(entries)` non-empty → [`FileOutcome::HasDiagnostics`]
@@ -1423,10 +1706,16 @@ fn format_diagnostics_entries(
 /// are collapsed into one path (e.g. `/tmp/scratch.sh`). Multi-file
 /// roots get a directory header with indented file entries beneath.
 /// Root headers are only emitted for roots that have something to print.
+///
+/// `collapse_clean` (a directory/whole-root scope, ticket 04) replaces a
+/// multi-file root's per-file `[clean]` lines with a single `N files clean`
+/// count — the dirty files are the signal. It never touches diagnostics or the
+/// single-file collapsed path (a lone clean file still shows its name).
 fn format_diagnostics(
     diag_files: &[DiagnosticFile],
     uncovered: &[UncoveredEntry],
     clean: &[CleanEntry],
+    collapse_clean: bool,
 ) -> String {
     use std::fmt::Write;
 
@@ -1505,8 +1794,15 @@ fn format_diagnostics(
                 }
             }
             if let Some(clean_files) = root_clean.get(root) {
-                for f in clean_files {
-                    _ = writeln!(output, "\t{f} [clean]");
+                if collapse_clean {
+                    // Directory/whole-root scope: fold the clean list to a count.
+                    let n = clean_files.len();
+                    let plural = if n == 1 { "" } else { "s" };
+                    _ = writeln!(output, "\t{n} file{plural} clean");
+                } else {
+                    for f in clean_files {
+                        _ = writeln!(output, "\t{f} [clean]");
+                    }
                 }
             }
             if let Some(uncov_files) = root_uncovered.get(root) {
@@ -1626,7 +1922,7 @@ mod tests {
             root: PathBuf::from("/test"),
             entries: vec![de(1, ":1:1 [error] test: msg")],
         }];
-        let output = format_diagnostics(&diag_files, &[], &[]);
+        let output = format_diagnostics(&diag_files, &[], &[], false);
         assert!(!output.contains("[LSP available]"), "output: {output}");
         // Single file under root → collapsed path.
         assert!(output.contains("/test/file.rs:"), "output: {output}");
@@ -1643,7 +1939,7 @@ mod tests {
             root: PathBuf::from("/test"),
             entries,
         }];
-        let output = format_diagnostics(&diag_files, &[], &[]);
+        let output = format_diagnostics(&diag_files, &[], &[], false);
         // All entries should be present (no paging).
         for i in 0..5 {
             assert!(output.contains(&format!("msg {i}")), "output: {output}");
@@ -1655,7 +1951,7 @@ mod tests {
         // A batch with no diagnosed files at all — no dirty, clean, or
         // uncovered entries — renders nothing. The empty-set sentinel
         // (`[no edited files]`) is the CLI's job, not the formatter's.
-        let output = format_diagnostics(&[], &[], &[]);
+        let output = format_diagnostics(&[], &[], &[], false);
         assert!(output.is_empty(), "expected empty output, got: {output:?}");
     }
 
@@ -1667,7 +1963,7 @@ mod tests {
             display: "file.rs".to_string(),
             root: PathBuf::from("/test"),
         }];
-        let output = format_diagnostics(&[], &[], &clean);
+        let output = format_diagnostics(&[], &[], &clean, false);
         // Single file under root → collapsed path with `[clean]` beside it.
         assert_eq!(output.trim(), "/test/file.rs [clean]", "output: {output}");
     }
@@ -1691,7 +1987,7 @@ mod tests {
                 entries: vec![de(2, ":5:1 [warning] test: beta warning")],
             },
         ];
-        let output = format_diagnostics(&diag_files, &[], &[]);
+        let output = format_diagnostics(&diag_files, &[], &[], false);
         // /alpha has 2 diag files → expanded with directory header.
         let alpha_pos = output.find("/alpha\n").expect("missing /alpha header");
         assert!(output.contains("\tsrc/lib.rs:"), "output: {output}");
@@ -1721,7 +2017,7 @@ mod tests {
             display: "src/main.rs".to_string(),
             root: PathBuf::from("/alpha"),
         }];
-        let output = format_diagnostics(&diag_files, &[], &clean);
+        let output = format_diagnostics(&diag_files, &[], &clean, false);
         // Two printed files under /alpha → directory header, indented entries.
         assert!(output.contains("/alpha\n"), "output: {output}");
         assert!(output.contains("\tsrc/lib.rs:"), "output: {output}");
@@ -1736,7 +2032,7 @@ mod tests {
             root: PathBuf::from("/tmp"),
             entries: vec![de(2, ":3:1 [warning] test: standalone warning")],
         }];
-        let output = format_diagnostics(&diag_files, &[], &[]);
+        let output = format_diagnostics(&diag_files, &[], &[], false);
         // Single file → collapsed path.
         assert!(output.contains("/tmp/scratch.sh:"), "output: {output}");
         assert!(output.contains("\t:3:1 [warning]"), "output: {output}");
@@ -1753,7 +2049,7 @@ mod tests {
             root: PathBuf::from("/test"),
             entries: vec![de(1, ":1:1 [error] test: msg")],
         }];
-        let output = format_diagnostics(&diag_files, &[], &[]);
+        let output = format_diagnostics(&diag_files, &[], &[], false);
         // No status header — output starts directly with file content.
         assert!(!output.contains("[LSP available]"), "output: {output}");
         // Bare path, no prefix.
@@ -1767,7 +2063,7 @@ mod tests {
             display: "data.csv".to_string(),
             root: PathBuf::from("/project"),
         }];
-        let output = format_diagnostics(&[], &uncovered, &[]);
+        let output = format_diagnostics(&[], &uncovered, &[], false);
         // Single file → collapsed path with [no LSP coverage].
         assert!(output.contains("/project/data.csv\n"), "output: {output}");
         assert!(output.contains("\t[no LSP coverage]"), "output: {output}");
@@ -1787,11 +2083,78 @@ mod tests {
             display: "data.csv".to_string(),
             root: PathBuf::from("/project"),
         }];
-        let output = format_diagnostics(&[], &uncovered, &clean);
+        let output = format_diagnostics(&[], &uncovered, &clean, false);
         assert!(output.contains("/project\n"), "output: {output}");
         assert!(output.contains("\tlib.rs [clean]"), "output: {output}");
         assert!(output.contains("\tdata.csv"), "output: {output}");
         assert!(output.contains("\t\t[no LSP coverage]"), "output: {output}");
+    }
+
+    // ── clean-collapse rendering (ws37 ticket 04) ─────────────────
+
+    #[test]
+    fn format_collapses_clean_list_when_directory_scoped() {
+        // A directory/whole-root scope folds the per-file `[clean]` list to a
+        // single count — the dirty files are the signal (decision 5). The
+        // individual clean filenames must NOT appear.
+        let clean: Vec<CleanEntry> = ["a.rs", "b.rs", "c.rs"]
+            .iter()
+            .map(|f| CleanEntry {
+                display: (*f).to_string(),
+                root: PathBuf::from("/project"),
+            })
+            .collect();
+        let output = format_diagnostics(&[], &[], &clean, true);
+        assert!(output.contains("/project\n"), "output: {output}");
+        assert!(output.contains("\t3 files clean"), "output: {output}");
+        assert!(!output.contains("a.rs"), "clean names leaked: {output}");
+        assert!(
+            !output.contains("[clean]"),
+            "per-file marker leaked: {output}"
+        );
+    }
+
+    #[test]
+    fn format_collapse_keeps_dirty_files_inline() {
+        // Clean collapses to a count; the dirty file still lists every
+        // diagnostic beneath it (decision 025 — diagnostics are never collapsed).
+        let diag_files = vec![DiagnosticFile {
+            display: "broken.rs".to_string(),
+            root: PathBuf::from("/project"),
+            entries: vec![de(1, ":1:1 [error] test: boom")],
+        }];
+        let clean: Vec<CleanEntry> = (0..5)
+            .map(|i| CleanEntry {
+                display: format!("ok{i}.rs"),
+                root: PathBuf::from("/project"),
+            })
+            .collect();
+        let output = format_diagnostics(&diag_files, &[], &clean, true);
+        assert!(output.contains("\tbroken.rs:"), "output: {output}");
+        assert!(
+            output.contains("\t\t:1:1 [error] test: boom"),
+            "output: {output}"
+        );
+        assert!(output.contains("\t5 files clean"), "output: {output}");
+        assert!(!output.contains("ok0.rs"), "clean names leaked: {output}");
+    }
+
+    #[test]
+    fn format_singular_clean_count_when_collapsed() {
+        // A single clean file under a multi-file root still collapses (the
+        // grammar is singular). Here one dirty + one clean → multi-file branch.
+        let diag_files = vec![DiagnosticFile {
+            display: "broken.rs".to_string(),
+            root: PathBuf::from("/project"),
+            entries: vec![de(1, ":1:1 [error] test: boom")],
+        }];
+        let clean = vec![CleanEntry {
+            display: "ok.rs".to_string(),
+            root: PathBuf::from("/project"),
+        }];
+        let output = format_diagnostics(&diag_files, &[], &clean, true);
+        assert!(output.contains("\t1 file clean"), "output: {output}");
+        assert!(!output.contains("ok.rs"), "clean name leaked: {output}");
     }
 
     // ── enclosing symbol tests ────────────────────────────────────
@@ -2052,7 +2415,7 @@ mod tests {
                 de(2, ":3:1 [warning] w: warn-c"),
             ],
         }];
-        let out = format_diagnostics(&diag_files, &[], &[]);
+        let out = format_diagnostics(&diag_files, &[], &[], false);
         assert!(
             out.contains("warn-a") && out.contains("err-b") && out.contains("warn-c"),
             "the complete report keeps every diagnostic: {out}"

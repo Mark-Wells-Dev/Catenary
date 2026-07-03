@@ -307,6 +307,21 @@ pub fn text_document_diagnostic(uri: &str) -> Value {
     })
 }
 
+/// Builds `WorkspaceDiagnosticParams`.
+///
+/// `identifier` is the optional `diagnosticProvider.identifier` the server
+/// advertised. `previousResultIds` is sent empty for now — a full pull off the
+/// server's project model — but the field is present so a future incremental
+/// pull can supply cached per-document result IDs without a params change.
+#[must_use]
+pub fn workspace_diagnostic(identifier: Option<&str>) -> Value {
+    let mut params = json!({ "previousResultIds": [] });
+    if let Some(id) = identifier {
+        params["identifier"] = json!(id);
+    }
+    params
+}
+
 /// Builds `TypeHierarchySubtypesParams`.
 ///
 /// `item` is a pass-through `TypeHierarchyItem` from the prepare response.
@@ -667,6 +682,23 @@ mod tests {
             json!({
                 "textDocument": { "uri": "file:///foo.rs" }
             })
+        );
+    }
+
+    #[test]
+    fn workspace_diagnostic_empty_previous_result_ids() {
+        // A full pull with no identifier: only the (empty) previousResultIds.
+        assert_eq!(
+            workspace_diagnostic(None),
+            json!({ "previousResultIds": [] })
+        );
+    }
+
+    #[test]
+    fn workspace_diagnostic_carries_identifier() {
+        assert_eq!(
+            workspace_diagnostic(Some("rustc")),
+            json!({ "previousResultIds": [], "identifier": "rustc" })
         );
     }
 

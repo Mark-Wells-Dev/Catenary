@@ -1550,6 +1550,41 @@ impl LspClientManager {
         clients
     }
 
+    /// Returns the live, diagnostics-enabled clients scoped to `root` that
+    /// advertise `workspace/diagnostic` support.
+    ///
+    /// The whole-root `catenary diagnostics .` scope (workstream 37 ticket 04)
+    /// routes to one `workspace/diagnostic` request per returned client instead
+    /// of the per-file fan-out. Matched exactly on the instance's scope root (a
+    /// sub-root directory or an untracked path never matches), then filtered by
+    /// the per-language `diagnostics_enabled` binding and the runtime capability.
+    /// An empty result routes the scope back to the fan-out fallback — so a
+    /// not-yet-spawned or incapable server degrades gracefully.
+    pub async fn workspace_diagnostic_clients(&self, root: &Path) -> Vec<Arc<Mutex<LspClient>>> {
+        let clients = self.clients.lock().await;
+        let mut result = Vec::new();
+        for (key, client) in clients.iter() {
+            if key.scope.root_path() != Some(root) {
+                continue;
+            }
+            let diag_enabled = self
+                .config
+                .resolve_language(&key.language_id)
+                .is_some_and(|lc| lc.diagnostics_enabled(&key.server));
+            if !diag_enabled {
+                continue;
+            }
+            let locked = client.lock().await;
+            let capable = locked.is_alive() && locked.server().supports_workspace_diagnostics();
+            drop(locked);
+            if capable {
+                result.push(client.clone());
+            }
+        }
+        drop(clients);
+        result
+    }
+
     /// Spawns LSP servers for new languages detected in the given file paths.
     ///
     /// Used by workspace-wide tools (grep, glob) to discover languages added

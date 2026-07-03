@@ -139,7 +139,22 @@ edited it prints `[no edited files]`.
 catenary diagnostics                 # the whole edited set
 catenary diagnostics src/main.rs     # lint one file on demand
 catenary diagnostics src/ lib.rs     # a scoped set (relative to cwd)
+catenary diagnostics .               # the whole workspace root
 ```
+
+**Whole-root scope (`.`).** Naming a directory lints every covered file
+beneath it; naming a whole tracked workspace root (`.`) lints the entire
+project. When the covering language server advertises whole-workspace pull
+(`workspace/diagnostic`), Catenary serves `.` with **one** request off the
+server's existing project model — no per-file open/close churn, and it
+surfaces cross-file diagnostics a per-file pull can miss. A server without
+that capability, or any *sub-root* directory, falls back to the per-file
+pass (identical results, more work). Because a whole-root run can span many
+files, the receipt **collapses the clean files to a count** (`N files
+clean`) and lists only the files that have diagnostics — the complete
+diagnostics still print in full; only the clean list is folded. The
+edit-loop receipt (a handful of files) stays per-file, with `[clean]` beside
+each clean one.
 
 **The edit gate is a debt paid by *diagnosing*, not fixing.** Every
 server-covered file you edit joins the gate; each file's debt is cleared

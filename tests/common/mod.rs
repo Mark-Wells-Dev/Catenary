@@ -568,6 +568,44 @@ impl BridgeProcess {
         Ok(diagnostics_output(&text))
     }
 
+    /// Runs the **scoped** `catenary diagnostics <paths>` form (ws37 tickets
+    /// 02/04): prepares the handoff, then consumes it with an explicit `files`
+    /// set — a whole-root `.`, a sub-root directory, or explicit files — without
+    /// accumulating any edited set first. Returns the rendered receipt text.
+    pub fn call_diagnostics_scoped(&self, paths: &[&str]) -> Result<String> {
+        let socket_path = self.wait_for_ipc_socket()?;
+
+        // Enter editing mode via CLI path (parity with the accumulating helpers;
+        // the scoped pull names its own set, so nothing is accumulated).
+        ipc_request(
+            &socket_path,
+            &json!({
+                "method": "pre-tool/editing-start",
+                "agent_id": ""
+            }),
+        )?;
+
+        // Prepare handoff (stages the slot the consume step drains).
+        ipc_request(
+            &socket_path,
+            &json!({
+                "method": "pre-tool/editing-stop",
+                "agent_id": ""
+            }),
+        )?;
+
+        // Consume with the explicit scoped `files` set.
+        let text = ipc_request_long(
+            &socket_path,
+            &json!({
+                "method": "tool/editing-stop",
+                "files": paths,
+            }),
+        )?;
+
+        Ok(diagnostics_output(&text))
+    }
+
     /// Drives the real `catenary hook pre-tool` binary (the `run_pre_tool`
     /// dispatch) for a Claude `Bash` `tool_input.command`, against this test's
     /// daemon, and returns the hook's stdout — a deny JSON, or empty on allow.

@@ -146,6 +146,7 @@ pub struct LspServer {
     capabilities: OnceLock<Value>,
 
     supports_pull_diagnostics: AtomicBool,
+    supports_workspace_diagnostics: OnceLock<bool>,
     supports_text_document_sync: OnceLock<bool>,
     supports_definition: OnceLock<bool>,
     supports_references: OnceLock<bool>,
@@ -232,6 +233,7 @@ impl LspServer {
         Self {
             capabilities: OnceLock::new(),
             supports_pull_diagnostics: AtomicBool::new(false),
+            supports_workspace_diagnostics: OnceLock::new(),
             supports_text_document_sync: OnceLock::new(),
             supports_definition: OnceLock::new(),
             supports_references: OnceLock::new(),
@@ -337,6 +339,17 @@ impl LspServer {
         };
         self.supports_pull_diagnostics
             .store(has("diagnosticProvider"), Ordering::SeqCst);
+        // `workspace/diagnostic` is gated on the nested
+        // `diagnosticProvider.workspaceDiagnostics` boolean (LSP 3.17), not on
+        // the provider's mere presence — a server can pull per-document without
+        // serving the whole-workspace request.
+        let _ = self.supports_workspace_diagnostics.set(
+            capabilities
+                .get("diagnosticProvider")
+                .and_then(|d| d.get("workspaceDiagnostics"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        );
         let _ = self
             .supports_text_document_sync
             .set(has("textDocumentSync"));
@@ -403,6 +416,33 @@ impl LspServer {
     /// if the server fails the actual request.
     pub fn supports_pull_diagnostics(&self) -> bool {
         self.supports_pull_diagnostics.load(Ordering::SeqCst)
+    }
+
+    /// Returns whether the server supports whole-workspace pull diagnostics.
+    ///
+    /// Set from the nested `diagnosticProvider.workspaceDiagnostics` capability
+    /// (LSP 3.17). Gates the whole-root `catenary diagnostics .` scope onto a
+    /// single `workspace/diagnostic` request off the server's existing project
+    /// model, in place of the per-file fan-out (workstream 37 ticket 04).
+    pub fn supports_workspace_diagnostics(&self) -> bool {
+        self.supports_workspace_diagnostics
+            .get()
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// Returns the diagnostic pull `identifier`, if the server advertised one.
+    ///
+    /// The optional `diagnosticProvider.identifier` disambiguates pull requests
+    /// when a server exposes several diagnostic sources; it rides the
+    /// `workspace/diagnostic` params so a repeated pull can be attributed and,
+    /// with result IDs, served incrementally.
+    pub fn diagnostic_identifier(&self) -> Option<String> {
+        self.capabilities()
+            .get("diagnosticProvider")
+            .and_then(|d| d.get("identifier"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
     }
 
     /// Permanently disables pull diagnostics for this server.
@@ -2139,6 +2179,37 @@ mod tests {
     fn supports_diagnostics_neither() {
         let server = server_with_caps(json!({}));
         assert!(!server.supports_diagnostics());
+    }
+
+    #[test]
+    fn workspace_diagnostics_gated_on_nested_flag() {
+        // A pull provider without `workspaceDiagnostics` supports per-file pull
+        // but NOT the whole-workspace request.
+        let per_file = server_with_caps(json!({
+            "diagnosticProvider": { "workspaceDiagnostics": false }
+        }));
+        assert!(per_file.supports_pull_diagnostics());
+        assert!(!per_file.supports_workspace_diagnostics());
+
+        // The nested flag flips workspace support on.
+        let workspace = server_with_caps(json!({
+            "diagnosticProvider": { "workspaceDiagnostics": true }
+        }));
+        assert!(workspace.supports_workspace_diagnostics());
+
+        // Absent provider → no workspace support.
+        assert!(!server_with_caps(json!({})).supports_workspace_diagnostics());
+    }
+
+    #[test]
+    fn diagnostic_identifier_read_from_capability() {
+        let with_id = server_with_caps(json!({
+            "diagnosticProvider": { "identifier": "rustc", "workspaceDiagnostics": true }
+        }));
+        assert_eq!(with_id.diagnostic_identifier().as_deref(), Some("rustc"));
+        // No identifier advertised → None.
+        let without = server_with_caps(json!({ "diagnosticProvider": {} }));
+        assert!(without.diagnostic_identifier().is_none());
     }
 
     // ── Mutant audit: publishes_version tracking ─────────────────

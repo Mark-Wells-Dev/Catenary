@@ -59,6 +59,16 @@ struct Args {
     #[arg(long)]
     pull_diagnostics: bool,
 
+    /// Advertise `diagnosticProvider.workspaceDiagnostics` and serve
+    /// `workspace/diagnostic` (whole-workspace pull, LSP 3.17). Implies a
+    /// `diagnosticProvider`. A scanned document is reported dirty (one error
+    /// diagnostic) when its content contains the marker `DIRTY`, else clean
+    /// (a `full` report with empty items) — so a test can shape the
+    /// dirty/clean mix a `catenary diagnostics .` receipt collapses. Pair with
+    /// `--scan-roots` so the project model is populated without per-file opens.
+    #[arg(long)]
+    workspace_diagnostics: bool,
+
     /// Return an error for `textDocument/diagnostic` pull requests.
     /// Used with `--pull-diagnostics` to test runtime downgrade behavior.
     #[arg(long)]
@@ -600,6 +610,7 @@ impl MockServer {
                 }
                 Some(self.handle_pull_diagnostics(&request.params))
             }
+            "workspace/diagnostic" => Some(self.handle_workspace_diagnostics()),
             "textDocument/codeAction" => Some(self.handle_code_action(&request.params)),
             "textDocument/prepareRename" => self.handle_prepare_rename(&request.params),
             "callHierarchy/outgoingCalls" => self.handle_outgoing_calls(&request.params),
@@ -903,10 +914,13 @@ impl MockServer {
             capabilities["codeActionProvider"] = serde_json::json!(true);
         }
 
-        if self.args.pull_diagnostics {
+        if self.args.pull_diagnostics || self.args.workspace_diagnostics {
+            // `workspaceDiagnostics` gates the whole-workspace pull; with it we
+            // also advertise `interFileDependencies` (the server reasons across
+            // files), matching a real workspace-diagnostic server.
             capabilities["diagnosticProvider"] = serde_json::json!({
-                "interFileDependencies": false,
-                "workspaceDiagnostics": false
+                "interFileDependencies": self.args.workspace_diagnostics,
+                "workspaceDiagnostics": self.args.workspace_diagnostics
             });
         }
 
@@ -1664,6 +1678,41 @@ impl MockServer {
             "kind": "full",
             "items": items
         })
+    }
+
+    /// Serves `workspace/diagnostic`: one `full` report per scanned document off
+    /// the in-memory project model — no per-file open required.
+    ///
+    /// A document is dirty (one error diagnostic, plus any `--extra-diagnostic`)
+    /// when its content contains the marker `DIRTY`; otherwise it reports clean
+    /// (empty `items`). Reporting clean documents too lets a `catenary
+    /// diagnostics .` receipt exercise the clean-collapse render rule.
+    fn handle_workspace_diagnostics(&self) -> Value {
+        let extra = parse_extra_diagnostics(&self.args.extra_diagnostic);
+        let mut reports = Vec::new();
+        for (uri, content) in &self.documents {
+            let mut diagnostics = Vec::new();
+            if content.contains("DIRTY") {
+                let line_count = content.lines().count();
+                diagnostics.push(serde_json::json!({
+                    "range": {
+                        "start": { "line": 0, "character": 0 },
+                        "end": { "line": 0, "character": 1 }
+                    },
+                    "severity": 1,
+                    "source": "mockls",
+                    "message": format!("mockls: workspace diagnostic ({line_count} lines)")
+                }));
+                diagnostics.extend(extra.iter().cloned());
+            }
+            reports.push(serde_json::json!({
+                "uri": uri,
+                "kind": "full",
+                "version": Value::Null,
+                "items": diagnostics
+            }));
+        }
+        serde_json::json!({ "items": reports })
     }
 
     fn handle_code_action(&self, params: &Value) -> Value {
@@ -2582,6 +2631,7 @@ mod tests {
             diagnostics_delay: 0,
             no_push_diagnostics: false,
             pull_diagnostics: false,
+            workspace_diagnostics: false,
             fail_pull: false,
             diagnostics_on_save: false,
             drop_after: None,

@@ -159,6 +159,17 @@ upgrading.
   with your actual outstanding paths) — then names the command to re-run. No
   inferred intent, no internal jargon: just the files that haven't been
   diagnosed yet and the exact command to diagnose them.
+- **`catenary diagnostics .` — whole-workspace scope.** Naming a whole tracked
+  root routes by capability: when the covering language server advertises
+  `workspace/diagnostic`, Catenary serves the root with **one** whole-workspace
+  request off the server's existing project model — no per-file open/close
+  churn, and it surfaces cross-file diagnostics a per-file pull can miss. A
+  server without that capability, or any sub-root directory, transparently
+  falls back to the per-file pass (same results). Because a whole-root run can
+  span many files, the receipt **collapses the clean files to a count**
+  (`N files clean`) and lists only the files with diagnostics; the diagnostics
+  themselves always print in full. The edit-loop receipt (a handful of files)
+  stays per-file, with `[clean]` beside each clean one.
 - The command filter is **allowlist-based**: only explicitly permitted commands
   run; everything else is denied with a dump of the allowed configuration. Read
   and stdout-only tools (`cat`, `head`, `diff`, …) live in `allow`; the

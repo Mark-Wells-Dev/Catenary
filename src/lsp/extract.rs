@@ -143,6 +143,35 @@ pub fn document_diagnostic_report(result: &Value) -> Vec<Value> {
     }
 }
 
+/// Extracts per-file diagnostics from a `WorkspaceDiagnosticReport`.
+///
+/// Returns a `(uri, diagnostics)` pair for every `full` document report,
+/// **including clean ones** (empty `items`) — the caller needs the clean set to
+/// render the `[clean]` receipt (workstream 37 ticket 04). An `unchanged`
+/// report carries no new diagnostics (the client's cached result stands) and is
+/// skipped; a malformed entry (missing `uri`) is skipped.
+#[must_use]
+pub fn workspace_diagnostic_report(result: &Value) -> Vec<(String, Vec<Value>)> {
+    let Some(items) = result.get("items").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut reports = Vec::new();
+    for item in items {
+        let Some(uri) = item.get("uri").and_then(Value::as_str) else {
+            continue;
+        };
+        if item.get("kind").and_then(Value::as_str) == Some("full") {
+            let diags = item
+                .get("items")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            reports.push((uri.to_string(), diags));
+        }
+    }
+    reports
+}
+
 // ── Individual diagnostic fields ────────────────────────────────────
 
 /// Extracts the severity from a diagnostic (1=Error, 2=Warning, 3=Info, 4=Hint).
@@ -529,6 +558,55 @@ mod tests {
             "items": [{ "message": "err" }]
         });
         assert!(document_diagnostic_report(&result).is_empty());
+    }
+
+    // ── WorkspaceDiagnosticReport extractor ──────────────────────────
+
+    #[test]
+    fn workspace_diagnostic_report_mixed_full_reports() {
+        // Dirty and clean documents both arrive as `full` reports; the clean one
+        // (empty items) is retained so the receipt can render/collapse it.
+        let result = json!({
+            "items": [
+                {
+                    "uri": "file:///p/dirty.rs",
+                    "kind": "full",
+                    "items": [{ "message": "boom", "severity": 1 }]
+                },
+                {
+                    "uri": "file:///p/clean.rs",
+                    "kind": "full",
+                    "items": []
+                }
+            ]
+        });
+        let reports = workspace_diagnostic_report(&result);
+        assert_eq!(reports.len(), 2);
+        assert_eq!(reports[0].0, "file:///p/dirty.rs");
+        assert_eq!(reports[0].1.len(), 1);
+        assert_eq!(reports[1].0, "file:///p/clean.rs");
+        assert!(reports[1].1.is_empty());
+    }
+
+    #[test]
+    fn workspace_diagnostic_report_skips_unchanged_and_malformed() {
+        // `unchanged` reports carry no new diagnostics; a report missing `uri`
+        // is malformed. Both are dropped.
+        let result = json!({
+            "items": [
+                { "uri": "file:///p/a.rs", "kind": "unchanged", "resultId": "x" },
+                { "kind": "full", "items": [{ "message": "no uri" }] },
+                { "uri": "file:///p/b.rs", "kind": "full", "items": [] }
+            ]
+        });
+        let reports = workspace_diagnostic_report(&result);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].0, "file:///p/b.rs");
+    }
+
+    #[test]
+    fn workspace_diagnostic_report_no_items_is_empty() {
+        assert!(workspace_diagnostic_report(&json!({})).is_empty());
     }
 
     // ── Diagnostic extractors ───────────────────────────────────────

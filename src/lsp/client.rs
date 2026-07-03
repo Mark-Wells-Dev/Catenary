@@ -857,6 +857,34 @@ impl LspClient {
         Ok(super::extract::document_diagnostic_report(&result))
     }
 
+    /// Pulls whole-workspace diagnostics via `workspace/diagnostic`.
+    ///
+    /// One request off the server's existing project model — no per-file
+    /// `didOpen`/`didClose` churn — returns a `(uri, diagnostics)` pair per
+    /// covered document, clean ones included (workstream 37 ticket 04). Gated on
+    /// the `diagnosticProvider.workspaceDiagnostics` capability. `previousResultIds`
+    /// is sent empty (a full pull); the shape leaves room for a future
+    /// result-ID-incremental pull.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the server lacks the capability, or the request fails
+    /// or times out.
+    pub async fn workspace_diagnostics(&self) -> Result<Vec<(String, Vec<Value>)>> {
+        self.require_capability(
+            "workspace/diagnostic",
+            LspServer::supports_workspace_diagnostics,
+        )?;
+        let identifier = self.server.diagnostic_identifier();
+        let result = self
+            .request(
+                "workspace/diagnostic",
+                params::workspace_diagnostic(identifier.as_deref()),
+            )
+            .await?;
+        Ok(super::extract::workspace_diagnostic_report(&result))
+    }
+
     /// Gets cached diagnostics for a specific URI.
     pub fn get_diagnostics(&self, uri: &str) -> Vec<Value> {
         let cache = self
