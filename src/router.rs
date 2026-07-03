@@ -303,6 +303,17 @@ impl GlobRequest {
         );
         params["include_hidden"] = serde_json::Value::Bool(include_hidden);
 
+        // Preserve each argument's original spelling (pre-absolutization) so the
+        // glob pipeline can echo a pattern in a cardinality header exactly as the
+        // agent typed it (misc 121) — the same original-spelling contract the
+        // zero-match report uses. 1:1 with `params["paths"]` above.
+        params["display_paths"] = serde_json::Value::Array(
+            self.paths
+                .iter()
+                .map(|p| serde_json::Value::String(p.to_string_lossy().into_owned()))
+                .collect(),
+        );
+
         if let Some(ref exclude) = self.exclude {
             let effective = if exclude.contains('/') {
                 self.cwd

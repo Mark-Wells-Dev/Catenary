@@ -35,7 +35,7 @@ use super::SourceLines;
 use super::filesystem_manager::{
     FilesystemManager, STAT_RETRY_ATTEMPTS, format_file_size, mtime_nanos,
 };
-use super::session::{ResolvedGlob, expand_search_paths, expand_search_paths_reporting};
+use super::session::{ResolvedGlob, expand_search_paths, expand_search_paths_grouped};
 use crate::lsp::{LspClientManager, WalkBreadth};
 use crate::symbol_index::{Symbol, SymbolIndex};
 
@@ -60,6 +60,16 @@ pub struct GlobInput {
     /// Working directory for cwd-scoped searches (relative patterns).
     #[serde(default)]
     pub cwd: Option<PathBuf>,
+    /// Original argument spellings, as the agent typed them, 1:1 with `paths`.
+    ///
+    /// `paths` holds the cwd-absolutized forms the pipeline expands;
+    /// `display_paths` preserves the pre-resolution spelling so a glob pattern's
+    /// cardinality header (misc 121) echoes what the agent typed — e.g.
+    /// `src/lsp/*.rs`, not its absolute form — matching the zero-match report's
+    /// original-spelling contract (misc 118). Empty when a caller builds params
+    /// without spellings; the header then falls back to the absolute pattern.
+    #[serde(default)]
+    pub display_paths: Vec<String>,
     /// Return a path count instead of rendered results (default: false).
     ///
     /// Short-circuits LSP enrichment: the pipeline reports the number of
@@ -292,6 +302,15 @@ impl GlobServer {
     /// glob-pattern arguments that expanded to zero matches — the CLI turns
     /// these into a loud per-argument `no matches for pattern` report (misc
     /// 118).
+    ///
+    /// A glob-pattern argument that matched **≥1** path opens with a one-line
+    /// cardinality header — `N files match <pattern>` (singular grammar for one)
+    /// — printed *before* that pattern's per-file listings, so a
+    /// `| head`-truncated view still shows the true count (misc 121). The header
+    /// uses the pattern's original spelling ([`GlobInput::display_paths`]),
+    /// matching the zero-match report. Directory and single-file arguments
+    /// render unchanged — a directory already shows its own structure and a
+    /// named file is its own answer.
     async fn handle_literal_paths(
         &self,
         paths: &[PathBuf],
@@ -300,8 +319,14 @@ impl GlobServer {
         cwd: Option<&Path>,
         parent_id: Option<&str>,
     ) -> Result<(String, Vec<usize>)> {
-        let (resolved, no_match_indices) =
-            expand_search_paths_reporting(paths, input.include_gitignored, input.include_hidden);
+        // Per-argument resolution so each pattern's matches stay grouped for its
+        // cardinality header; the flat set drives the nudge, exactly as before.
+        let groups =
+            expand_search_paths_grouped(paths, input.include_gitignored, input.include_hidden);
+        let resolved: Vec<PathBuf> = groups
+            .iter()
+            .flat_map(|g| g.resolved.iter().cloned())
+            .collect();
 
         // Scoped changed-set nudge (WS31 ticket 04): glob enriches with
         // `documentSymbol` (outlines) only, so coherence is needed just for the
@@ -316,37 +341,63 @@ impl GlobServer {
         self.nudge_scoped(&resolved, input, exclude).await;
 
         let mut full = String::new();
-        for path in &resolved {
-            // Directories first — `is_dir()` follows symlinks, so a
-            // symlink-to-dir lists its contents (rather than rendering as a
-            // single file header). This dir-first order matches
-            // `collect_scoped_observations` so the listing and the changed-set
-            // nudge classify a symlink-to-dir the same way (WS31-review walk-2).
-            if path.is_dir() {
-                let output = self
-                    .handle_glob_dir(path, input, exclude, cwd, parent_id)
-                    .await?;
-                full.push_str(&output);
-            } else if path_is_file_or_symlink_with_retry(path) {
-                // Re-stat with a bounded retry: a transient
-                // `is_file()`/`is_symlink()` miss (an atomic-rename write racing
-                // this fresh stat) must not silently skip a named file that
-                // `expand_search_paths` already confirmed present on disk.
-                self.client_manager
-                    .ensure_and_wait_for_paths(std::slice::from_ref(path))
-                    .await;
-                super::ensure_symbols(
-                    self.symbol_index.as_ref(),
-                    &self.client_manager,
-                    &self.fs_manager,
-                    std::slice::from_ref(path),
-                    parent_id,
-                )
-                .await;
-                full.push_str(&self.handle_glob_file(path, cwd));
+        let mut no_match_indices = Vec::new();
+        for (i, group) in groups.iter().enumerate() {
+            if group.is_pattern {
+                if group.resolved.is_empty() {
+                    // A pattern that matched nothing is reported loudly CLI-side
+                    // (misc 118); nothing renders here.
+                    no_match_indices.push(i);
+                    continue;
+                }
+                // A pattern with ≥1 match opens with its cardinality header, so a
+                // `| head`-truncated view still shows the true count (misc 121).
+                // Echo the original spelling (falling back to the absolute
+                // pattern when a caller supplied no `display_paths`).
+                let display = input
+                    .display_paths
+                    .get(i)
+                    .cloned()
+                    .or_else(|| paths.get(i).map(|p| p.to_string_lossy().into_owned()))
+                    .unwrap_or_default();
+                let _ = writeln!(
+                    full,
+                    "{}",
+                    match_count_header(group.resolved.len(), &display)
+                );
             }
-            // Skip non-existent paths silently — shell expansion
-            // shouldn't produce them, but be defensive.
+            for path in &group.resolved {
+                // Directories first — `is_dir()` follows symlinks, so a
+                // symlink-to-dir lists its contents (rather than rendering as a
+                // single file header). This dir-first order matches
+                // `collect_scoped_observations` so the listing and the changed-set
+                // nudge classify a symlink-to-dir the same way (WS31-review walk-2).
+                if path.is_dir() {
+                    let output = self
+                        .handle_glob_dir(path, input, exclude, cwd, parent_id)
+                        .await?;
+                    full.push_str(&output);
+                } else if path_is_file_or_symlink_with_retry(path) {
+                    // Re-stat with a bounded retry: a transient
+                    // `is_file()`/`is_symlink()` miss (an atomic-rename write racing
+                    // this fresh stat) must not silently skip a named file that
+                    // `expand_search_paths` already confirmed present on disk.
+                    self.client_manager
+                        .ensure_and_wait_for_paths(std::slice::from_ref(path))
+                        .await;
+                    super::ensure_symbols(
+                        self.symbol_index.as_ref(),
+                        &self.client_manager,
+                        &self.fs_manager,
+                        std::slice::from_ref(path),
+                        parent_id,
+                    )
+                    .await;
+                    full.push_str(&self.handle_glob_file(path, cwd));
+                }
+                // Skip non-existent paths silently — shell expansion
+                // shouldn't produce them, but be defensive.
+            }
         }
         Ok((full, no_match_indices))
     }
@@ -664,6 +715,23 @@ impl GlobServer {
         }
         Ok(total)
     }
+}
+
+// ─── Glob pattern cardinality header ──────────────────────────────────
+
+/// Formats a glob pattern's cardinality header — one line, printed before the
+/// pattern's per-file listings so a `| head`-truncated view still shows the
+/// true count (misc 121). Singular grammar for a lone match: `1 file matches
+/// <pattern>`; plural otherwise: `N files match <pattern>`. `count` is always
+/// ≥1 (a zero-match pattern renders the `no matches for pattern` report
+/// instead).
+fn match_count_header(count: usize, display: &str) -> String {
+    let (noun, verb) = if count == 1 {
+        ("file", "matches")
+    } else {
+        ("files", "match")
+    };
+    format!("{count} {noun} {verb} {display}")
 }
 
 // ─── Outline eligibility ──────────────────────────────────────────────
@@ -1241,6 +1309,24 @@ mod tests {
         assert_eq!(pluralize_lines(1), "1 line");
         assert_eq!(pluralize_lines(2), "2 lines");
         assert_eq!(pluralize_lines(92), "92 lines");
+    }
+
+    #[test]
+    fn test_match_count_header() {
+        // Singular grammar for a lone match; plural for the rest. `count` is
+        // always ≥1 here (a zero-match pattern renders the loud report instead).
+        assert_eq!(
+            match_count_header(1, "src/lsp/glob.rs"),
+            "1 file matches src/lsp/glob.rs"
+        );
+        assert_eq!(
+            match_count_header(2, "src/lsp/*.rs"),
+            "2 files match src/lsp/*.rs"
+        );
+        assert_eq!(
+            match_count_header(42, "src/**/*.rs"),
+            "42 files match src/**/*.rs"
+        );
     }
 
     #[test]

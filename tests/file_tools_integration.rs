@@ -389,6 +389,112 @@ fn test_glob_quoted_pattern_zero_match_is_empty() -> Result<()> {
     Ok(())
 }
 
+/// A glob **pattern** argument opens with a `N files match <pattern>` header,
+/// printed before the per-file listings, echoing the original spelling — so a
+/// `| head`-truncated view still shows the true count (misc 121).
+#[test]
+fn test_glob_pattern_opens_with_match_count_header() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::create_dir_all(dir.path().join("src/inner"))?;
+    std::fs::write(dir.path().join("src/main.rs"), "fn main() {}")?;
+    std::fs::write(dir.path().join("src/inner/lib.rs"), "fn lib() {}")?;
+    std::fs::write(dir.path().join("src/notes.txt"), "notes")?;
+
+    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text("glob", &json!({ "paths": ["src/**/*.rs"] }))?;
+
+    assert!(
+        text.contains("2 files match src/**/*.rs"),
+        "plural cardinality header with original spelling: {text}"
+    );
+    let header_pos = text
+        .find("2 files match")
+        .expect("header present in output");
+    let main_pos = text.find("main.rs").expect("main.rs listed in output");
+    assert!(
+        header_pos < main_pos,
+        "header precedes the per-file listings: {text}"
+    );
+    Ok(())
+}
+
+/// A pattern with exactly one match uses singular grammar: `1 file matches`.
+#[test]
+fn test_glob_pattern_header_singular_for_one_match() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::create_dir(dir.path().join("src"))?;
+    std::fs::write(dir.path().join("src/only.rs"), "fn only() {}")?;
+    std::fs::write(dir.path().join("src/notes.txt"), "notes")?;
+
+    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text("glob", &json!({ "paths": ["src/**/*.rs"] }))?;
+
+    assert!(
+        text.contains("1 file matches src/**/*.rs"),
+        "singular grammar for a lone match: {text}"
+    );
+    Ok(())
+}
+
+/// Multiple pattern arguments each get their own header, in argument order.
+#[test]
+fn test_glob_multiple_patterns_each_get_a_header() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(dir.path().join("a.rs"), "fn a() {}")?;
+    std::fs::write(dir.path().join("b.txt"), "b")?;
+
+    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text("glob", &json!({ "paths": ["*.rs", "*.txt"] }))?;
+
+    assert!(
+        text.contains("1 file matches *.rs"),
+        "*.rs header present: {text}"
+    );
+    assert!(
+        text.contains("1 file matches *.txt"),
+        "*.txt header present: {text}"
+    );
+    let rs_pos = text
+        .find("1 file matches *.rs")
+        .expect("*.rs header present");
+    let txt_pos = text
+        .find("1 file matches *.txt")
+        .expect("*.txt header present");
+    assert!(
+        rs_pos < txt_pos,
+        "one header each, in argument order: {text}"
+    );
+    Ok(())
+}
+
+/// A directory argument renders unchanged — no cardinality header (only glob
+/// **pattern** arguments earn one; a directory shows its own structure).
+#[test]
+fn test_glob_directory_argument_has_no_match_header() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(dir.path().join("main.rs"), "fn main() {}")?;
+
+    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text(
+        "glob",
+        &json!({ "paths": [dir.path().to_string_lossy().to_string()] }),
+    )?;
+
+    assert!(
+        !text.contains("files match") && !text.contains("file matches"),
+        "a directory listing carries no cardinality header: {text}"
+    );
+    Ok(())
+}
+
 /// grep applies the same expansion to its path arguments: a quoted glob
 /// scopes the search to the files it matches.
 #[test]

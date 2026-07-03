@@ -185,6 +185,92 @@ pub fn expand_search_paths(
     expand_search_paths_reporting(paths, include_gitignored, include_hidden).0
 }
 
+/// One search-path argument's resolution: the concrete paths it contributed and
+/// whether it was a glob pattern (as opposed to an existing file/directory).
+///
+/// [`expand_search_paths_grouped`] returns one of these per argument, in
+/// argument order, so callers that render per-argument structure — glob's
+/// cardinality header (misc 121) and its `no matches for pattern` report
+/// (misc 118) — know which resolved paths belong to which argument and whether
+/// that argument was a pattern worth announcing.
+pub struct ArgResolution {
+    /// The paths this argument resolved to: a single existing file/directory,
+    /// or the (sorted) matches of a glob pattern. Empty when the argument
+    /// contributed nothing — a zero-match pattern, a metachar-free absent, or a
+    /// named gitignored directory the gate dropped.
+    pub resolved: Vec<PathBuf>,
+    /// True when the argument was a glob pattern expanded daemon-side — a
+    /// metachar-bearing argument with no literal path on disk. False for an
+    /// existing file/directory or a metachar-free absent. Only a pattern earns a
+    /// cardinality header (≥1 match) or a `no matches for pattern` report (0).
+    pub is_pattern: bool,
+}
+
+/// Resolves each search-path argument independently, preserving argument order.
+///
+/// The per-argument primitive behind [`expand_search_paths`] and
+/// [`expand_search_paths_reporting`]: each argument is classified exactly as
+/// those flatten it — an existing file/directory (gitignore-gated for a named
+/// directory), a metachar-bearing glob pattern expanded via
+/// [`ResolvedGlob::expand`], or a metachar-free absent that contributes nothing
+/// — but the results stay grouped by argument. Callers that render per-argument
+/// structure (glob's cardinality header and zero-match report) need to know
+/// which resolved paths came from which argument; callers that only want the
+/// flat set fold the groups.
+#[must_use]
+pub fn expand_search_paths_grouped(
+    paths: &[PathBuf],
+    include_gitignored: bool,
+    include_hidden: bool,
+) -> Vec<ArgResolution> {
+    let mut groups = Vec::with_capacity(paths.len());
+    // Per-parent cache of gitignore-visible entries, so a batch of
+    // shell-expanded siblings only walks their directory once.
+    let mut visible: HashMap<PathBuf, HashSet<PathBuf>> = HashMap::new();
+    for path in paths {
+        // Re-stat with a bounded retry before treating a literal path as a
+        // glob — a transient stat miss (e.g. an atomic-rename write between the
+        // CLI probe and here) must never silently zero a path present on disk.
+        if path_exists_with_retry(path) {
+            // A named existing file bypasses the gitignore (and hidden) gate —
+            // the user named that exact file, so it is searched unconditionally
+            // (misc 110). The gate still governs directory walks: a named
+            // gitignored directory is dropped unless `include_gitignored`.
+            // `is_file()` follows symlinks, so a symlink-to-file is a file and a
+            // symlink-to-dir or broken symlink falls into the gated branch.
+            let mut resolved = Vec::new();
+            if path.is_file() || include_gitignored || !is_gitignored(path, &mut visible) {
+                resolved.push(path.clone());
+            }
+            groups.push(ArgResolution {
+                resolved,
+                is_pattern: false,
+            });
+        } else if has_glob_metachar(&path.to_string_lossy()) {
+            // Only metachar-bearing args expand as globs. A metachar-free path
+            // that still does not resolve is a genuine "not found" — it is the
+            // CLI's loud `path does not exist` (collected before dispatch), not
+            // a glob that silently expands to an empty set.
+            let mut resolved = Vec::new();
+            if let Ok(glob) = ResolvedGlob::new(&path.to_string_lossy()) {
+                resolved.extend(glob.expand(include_gitignored, include_hidden));
+            }
+            groups.push(ArgResolution {
+                resolved,
+                is_pattern: true,
+            });
+        } else {
+            // Metachar-free absent: contributes nothing and is not a pattern
+            // (the CLI reports it as `path does not exist`).
+            groups.push(ArgResolution {
+                resolved: Vec::new(),
+                is_pattern: false,
+            });
+        }
+    }
+    groups
+}
+
 /// Like [`expand_search_paths`], additionally reporting which **glob-pattern**
 /// arguments expanded to zero matches.
 ///
@@ -206,40 +292,17 @@ pub fn expand_search_paths_reporting(
 ) -> (Vec<PathBuf>, Vec<usize>) {
     let mut resolved = Vec::new();
     let mut no_match = Vec::new();
-    // Per-parent cache of gitignore-visible entries, so a batch of
-    // shell-expanded siblings only walks their directory once.
-    let mut visible: HashMap<PathBuf, HashSet<PathBuf>> = HashMap::new();
-    for (i, path) in paths.iter().enumerate() {
-        // Re-stat with a bounded retry before treating a literal path as a
-        // glob — a transient stat miss (e.g. an atomic-rename write between the
-        // CLI probe and here) must never silently zero a path that is present
-        // on disk.
-        if path_exists_with_retry(path) {
-            // A named existing file bypasses the gitignore (and hidden) gate —
-            // the user named that exact file, so it is searched unconditionally
-            // (misc 110). The gate still governs directory walks: a named
-            // gitignored directory is dropped here unless `include_gitignored`.
-            // `is_file()` follows symlinks, so a symlink-to-file is a file and a
-            // symlink-to-dir or broken symlink falls into the gated branch.
-            if path.is_file() || include_gitignored || !is_gitignored(path, &mut visible) {
-                resolved.push(path.clone());
-            }
-        } else if has_glob_metachar(&path.to_string_lossy()) {
-            // Only metachar-bearing args expand as globs. A metachar-free path
-            // that still does not resolve is a genuine "not found" — it is the
-            // CLI's loud `path does not exist` (collected before dispatch), not
-            // a glob that silently expands to an empty set.
-            let before = resolved.len();
-            if let Ok(glob) = ResolvedGlob::new(&path.to_string_lossy()) {
-                resolved.extend(glob.expand(include_gitignored, include_hidden));
-            }
-            // The pattern contributed no path — expanded to nothing or failed to
-            // compile. Record it so the caller can report it loudly instead of
-            // letting it vanish.
-            if resolved.len() == before {
-                no_match.push(i);
-            }
+    for (i, group) in expand_search_paths_grouped(paths, include_gitignored, include_hidden)
+        .into_iter()
+        .enumerate()
+    {
+        // A pattern that contributed no path — expanded to nothing or failed to
+        // compile — is recorded so the caller can report it loudly (misc 118)
+        // instead of letting it vanish.
+        if group.is_pattern && group.resolved.is_empty() {
+            no_match.push(i);
         }
+        resolved.extend(group.resolved);
     }
     (resolved, no_match)
 }
@@ -1312,6 +1375,57 @@ mod tests {
             no_match,
             vec![2],
             "only the zero-match pattern (arg 2) is flagged: {no_match:?}"
+        );
+    }
+
+    #[test]
+    fn expand_search_paths_grouped_separates_patterns_from_paths() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::write(root.join("real.rs"), "x").expect("write");
+        std::fs::write(root.join("other.rs"), "x").expect("write");
+
+        // Arg 0: an existing file (not a pattern, one resolved path).
+        // Arg 1: a pattern matching both `.rs` files (a pattern, two matches).
+        // Arg 2: a pattern matching nothing (a pattern, zero matches).
+        // Arg 3: a metachar-free absent (not a pattern, contributes nothing).
+        let args = vec![
+            root.join("real.rs"),
+            root.join("*.rs"),
+            root.join("*.none"),
+            root.join("ghost.rs"),
+        ];
+        let groups = expand_search_paths_grouped(&args, false, false);
+        assert_eq!(groups.len(), 4, "one group per argument, in order");
+
+        assert!(!groups[0].is_pattern, "existing file is not a pattern");
+        assert_eq!(
+            groups[0].resolved,
+            vec![root.join("real.rs")],
+            "{:?}",
+            groups[0].resolved
+        );
+
+        assert!(groups[1].is_pattern, "metachar arg is a pattern");
+        assert_eq!(groups[1].resolved.len(), 2, "{:?}", groups[1].resolved);
+        assert!(groups[1].resolved.contains(&root.join("real.rs")));
+        assert!(groups[1].resolved.contains(&root.join("other.rs")));
+
+        assert!(groups[2].is_pattern, "zero-match arg is still a pattern");
+        assert!(
+            groups[2].resolved.is_empty(),
+            "zero-match pattern contributes nothing: {:?}",
+            groups[2].resolved
+        );
+
+        assert!(
+            !groups[3].is_pattern,
+            "metachar-free absent is not a pattern"
+        );
+        assert!(
+            groups[3].resolved.is_empty(),
+            "metachar-free absent contributes nothing: {:?}",
+            groups[3].resolved
         );
     }
 

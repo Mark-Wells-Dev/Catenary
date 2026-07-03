@@ -141,6 +141,15 @@ upgrading.
   reported loudly per argument as `no matches for pattern: <pattern> (relative
   patterns anchor at cwd)`, even when a sibling argument renders — superseding
   the old whole-result `no files matched` line for glob.
+- **`catenary glob` pattern results open with a cardinality header.** Each glob
+  **pattern** argument now leads with one line — `N files match <pattern>`
+  (singular grammar for one: `1 file matches <pattern>`) — printed *before* its
+  per-file listings, so a `| head`-truncated view still shows the true count
+  even when the first file's outline overflows the pipe. The header echoes the
+  pattern's original spelling, mirroring the zero-match report; the count
+  agrees with `--count`. Directory and single-file arguments are unchanged (a
+  directory renders its own structure, a named file is its own answer), and a
+  zero-match pattern keeps the loud `no matches for pattern` line.
 - **`catenary diagnostics` exit contract + per-file receipt.** The command now
   exits `0` whenever it ran correctly — clean *or* dirty — and `2` only on a
   genuine fault (no daemon, IPC failure); it **never** exits `1`. The exit code

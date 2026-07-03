@@ -91,9 +91,15 @@ A PATH may be a **glob pattern**: quote it so the shell doesn't expand it
 and Catenary walks it gitignore-aware instead. Patterns may be absolute or
 cwd-relative, and the anchor belongs *in the pattern* — there is no
 separate directory argument (`catenary glob 'src/**/*.rs'`,
-`catenary glob '/abs/dir/**/*.md'`). A pattern that expands to nothing is
-never silent: it reports `no matches for pattern: <pattern> (relative
-patterns anchor at cwd)`, per argument, even when sibling arguments render.
+`catenary glob '/abs/dir/**/*.md'`). Each pattern argument's results open
+with a one-line cardinality header — `N files match <pattern>` (singular
+grammar for one) — printed *before* the per-file listings, so a
+`| head`-truncated view still shows the true count. A pattern that expands
+to nothing is never silent either: it reports `no matches for pattern:
+<pattern> (relative patterns anchor at cwd)`, per argument, even when
+sibling arguments render. (Directory and single-file arguments render
+unchanged — a directory shows its own structure, a named file is its own
+answer.)
 
 The outline is a **map, not a mirror** — it renders **types and callables
 only**. It recurses into containers (modules/namespaces/packages and
@@ -108,8 +114,9 @@ only the outline render applies this map.)
 ```bash
 catenary glob "src/"
 catenary glob "src/main.rs"
-catenary glob "**/*.toml"
+catenary glob "**/*.toml"                 # opens "N files match **/*.toml"
 catenary glob "**/*.rs" --exclude-pattern "tests/**"
+catenary glob "**/*.rs" | head -3        # header shows the true count first
 catenary glob "**/*.rs" --count          # "N paths"
 ```
 

@@ -832,3 +832,81 @@ fn test_glob_count_reports_paths() -> Result<()> {
     drop(bridge);
     Ok(())
 }
+
+// ── pattern cardinality header ────────────────────────────────────
+
+/// End-to-end: `catenary glob 'src/**/*.rs'` opens its output with the
+/// `N files match <pattern>` cardinality header (misc 121), spelled as the
+/// agent typed it, and the count agrees with `--count`. The header lands on the
+/// first line so a `| head`-truncated view still shows the true count even when
+/// the first file's outline is large.
+#[test]
+fn test_glob_pattern_header_matches_count_via_binary() -> Result<()> {
+    let state_dir = tempfile::tempdir()?;
+    let state_home = state_dir.path().to_str().context("state dir")?;
+
+    let root = tempfile::tempdir()?;
+    let root_str = root.path().to_str().context("root path")?;
+    std::fs::create_dir_all(root.path().join("src"))?;
+    std::fs::write(root.path().join("src/a.rs"), "fn a() {}\n")?;
+    std::fs::write(root.path().join("src/b.rs"), "fn b() {}\n")?;
+    std::fs::write(root.path().join("src/c.rs"), "fn c() {}\n")?;
+    std::fs::write(root.path().join("src/notes.txt"), "notes\n")?;
+
+    // Start a daemon bound to this state dir (no LSP servers needed).
+    let mut bridge = common::BridgeProcess::spawn_in_state(state_home, |cmd| {
+        cmd.env("CATENARY_ROOTS", root_str);
+    })?;
+    bridge.initialize()?;
+
+    // Wait for the IPC socket the `glob` binary will connect to.
+    let ipc_sock = common::xdg_state_home(state_dir.path())
+        .join("catenary")
+        .join("catenary.sock");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !ipc_sock.exists() && std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    // The rendered pattern glob opens with the header on line 1.
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
+    isolate_env(&mut cmd, state_home);
+    cmd.current_dir(root.path())
+        .args(["glob", "src/**/*.rs"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = cmd.output().context("failed to run catenary glob")?;
+    assert!(
+        output.status.success(),
+        "glob must exit 0, got {:?}; stderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let first_line = stdout.lines().next().unwrap_or_default();
+    assert_eq!(
+        first_line, "3 files match src/**/*.rs",
+        "the cardinality header (original spelling) leads the output, got:\n{stdout}"
+    );
+
+    // The header count agrees with `--count`.
+    let mut count_cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
+    isolate_env(&mut count_cmd, state_home);
+    count_cmd
+        .current_dir(root.path())
+        .args(["glob", "src/**/*.rs", "--count"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let count_output = count_cmd
+        .output()
+        .context("failed to run catenary glob --count")?;
+    let count_stdout = String::from_utf8_lossy(&count_output.stdout);
+    assert_eq!(
+        count_stdout.trim(),
+        "3 paths",
+        "the header count matches --count, got:\n{count_stdout}"
+    );
+
+    drop(bridge);
+    Ok(())
+}
