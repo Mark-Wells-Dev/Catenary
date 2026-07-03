@@ -805,22 +805,27 @@ pub fn ipc_request(socket_path: &Path, request: &Value) -> Result<String> {
     ipc_request_with_timeout(socket_path, request, Duration::from_secs(10))
 }
 
-/// Like [`ipc_request`], but with a 60-second read timeout and — crucially — it
+/// Like [`ipc_request`], but with a 3-minute read timeout and — crucially — it
 /// does NOT shutdown the write side after sending.
 ///
 /// Used for `tool/editing-stop`, which blocks on the diagnostics pipeline.
 /// Under parallel test load, CPU contention stretches flycheck wall time well
-/// past the default 10-second timeout. The daemon races that pipeline against
-/// client disconnect (bug 24); a write-shutdown reads as EOF on the daemon side
-/// and would trip the disconnect branch before the response is sent. This
-/// mirrors the production `catenary diagnostics` client (`run_done_editing`),
-/// which keeps the write half open while awaiting the response — same
-/// non-half-closing contract as [`ipc_tool_request`].
+/// past the default 10-second timeout — and since the bug-55 fix the settle
+/// *correctly holds* while a starved-but-runnable flycheck child waits for a
+/// core, so saturated wall time inflates several-fold rather than settling
+/// over the busy child. The budget here is harness liveness only (nextest's
+/// own per-test termination still bounds a genuine wedge); it must comfortably
+/// exceed worst-case saturation inflation, not measure anything. The daemon
+/// races the pipeline against client disconnect (bug 24); a write-shutdown
+/// reads as EOF on the daemon side and would trip the disconnect branch before
+/// the response is sent. This mirrors the production `catenary diagnostics`
+/// client (`run_done_editing`), which keeps the write half open while awaiting
+/// the response — same non-half-closing contract as [`ipc_tool_request`].
 pub fn ipc_request_long(socket_path: &Path, request: &Value) -> Result<String> {
     use std::io::Read as _;
     let mut stream =
         std::os::unix::net::UnixStream::connect(socket_path).context("connect to notify socket")?;
-    stream.set_read_timeout(Some(Duration::from_mins(1)))?;
+    stream.set_read_timeout(Some(Duration::from_mins(3)))?;
     writeln!(stream, "{request}").context("write to notify socket")?;
     let mut response = String::new();
     stream
