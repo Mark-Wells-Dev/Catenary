@@ -134,6 +134,19 @@ upgrading.
   shared module (`src/cli/teaching.rs`), so the on-demand command and the
   pushed hook context cannot drift; `catenary commands` is unchanged.
   `SubagentStart` adds a per-agent diagnostic-debt line.
+- **OpenCode joins the runtime-sourced teaching column.** `catenary hook
+  session-start --format=opencode` emits the same SSOT payload (the live allow
+  surface + invariants + flag synopses) as raw text, and the OpenCode plugin's
+  `config` hook regenerates a runtime instructions file from it and registers
+  the path on `config.instructions`. OpenCode re-reads that file into every
+  request's system prompt, so the live surface rides every request and survives
+  compaction with zero per-request work — mirroring Claude Code's SessionStart.
+  The shipped
+  [plugins/catenary-opencode/catenary.md](plugins/catenary-opencode/catenary.md)
+  demotes to a bootstrap/fallback: regenerated from the same SSOT with runtime data
+  structurally excluded (no allow surface, build tool, or roots), it covers the
+  cold window before the plugin runs and plugin-disabled installs. A freshness
+  gate pins the shipped file to the SSOT so the two cannot drift.
 - **`catenary glob` outlines show types and callables only.** The file and
   directory outline is now a map, not a mirror: it recurses into containers
   (modules/namespaces/packages and classes/interfaces/enums/structs/impls) and

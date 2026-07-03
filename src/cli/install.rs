@@ -1760,6 +1760,12 @@ mod tests {
         // new or changed host is a one-line pointer, never a re-authoring.
         // These are the files the marketplace/extension serve (Claude, Gemini)
         // or the install embeds verbatim (Antigravity, `AGY_RULES`).
+        //
+        // OpenCode is the exception (workstream 36 ticket 02): its shipped
+        // `catenary.md` demotes to a bootstrap/fallback that inlines the SSOT
+        // teaching (runtime data excluded) rather than pointing at the primer —
+        // the plugin registers a runtime-regenerated instructions file for the
+        // live surface. Its freshness is pinned in `cli::teaching` instead.
         const CLAUDE_SKILL: &str = include_str!("../../plugins/catenary/skills/primer/SKILL.md");
         const GEMINI_CONTEXT: &str = include_str!("../../gemini-context.md");
 
@@ -1767,12 +1773,23 @@ mod tests {
             ("claude", CLAUDE_SKILL),
             ("gemini", GEMINI_CONTEXT),
             ("antigravity", AGY_RULES),
-            ("opencode", OC_RULES),
         ] {
             assert!(
                 surface.contains("catenary primer"),
                 "{host} instruction surface should point at `catenary primer`",
             );
         }
+
+        // The OpenCode fallback inlines the teaching — no primer pointer, and no
+        // runtime data (the allow surface / build tool only ride the plugin's
+        // runtime-regenerated file).
+        assert!(
+            !OC_RULES.contains("catenary primer"),
+            "the OpenCode fallback should inline the teaching, not point at the primer",
+        );
+        assert!(
+            OC_RULES.contains("The edit→diagnostics loop"),
+            "the OpenCode fallback should inline the SSOT invariants",
+        );
     }
 }

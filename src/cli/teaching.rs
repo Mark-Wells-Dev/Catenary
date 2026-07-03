@@ -161,6 +161,29 @@ pub fn subagent_payload() -> String {
     s
 }
 
+/// Render the SSOT teaching payload with **runtime data structurally excluded**
+/// — the header, the invariants, and the flag synopses, but *not* the live
+/// commands-surface tier.
+///
+/// The allow surface, build tool, and roots are runtime data no generated file
+/// may carry (workstream 36 runtime-data rule), so this rendering drops Tier 1
+/// entirely — structurally, not just resolved-to-empty. It is the content of
+/// the shipped OpenCode fallback instructions file
+/// (`plugins/catenary-opencode/catenary.md`): a bootstrap/fallback for the cold
+/// window before the plugin regenerates the live file, and for plugin-disabled
+/// installs. A freshness-gate test pins the shipped file to this rendering, so
+/// the two cannot drift.
+#[must_use]
+pub fn fallback_body() -> String {
+    let mut s = String::with_capacity(2048);
+    s.push_str(HEADER);
+    s.push_str("\n\n");
+    s.push_str(INVARIANTS);
+    s.push_str("\n\n");
+    s.push_str(FLAG_SYNOPSES);
+    s
+}
+
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
@@ -311,6 +334,81 @@ mod tests {
         assert!(
             sub.ends_with(SUBAGENT_DEBT),
             "subagent payload must end with the debt line"
+        );
+    }
+
+    #[test]
+    fn fallback_body_excludes_runtime_data() {
+        // The OpenCode fallback must carry no runtime data (workstream 36
+        // runtime-data rule): no live commands surface, no build tool, no allow
+        // list. Those only ever appear in the runtime-sourced projection
+        // (`payload_body`). The Tier-1 label and its distinctive markers must be
+        // structurally absent — not merely resolved to empty.
+        let fb = fallback_body();
+        for forbidden in [
+            SHELL_SURFACE_LABEL,
+            "Build tool:",
+            "Allowed:",
+            "Allowed in pipelines",
+            "resolve-or-deny",
+        ] {
+            assert!(
+                !fb.contains(forbidden),
+                "fallback carries runtime data {forbidden:?}: {fb}"
+            );
+        }
+    }
+
+    #[test]
+    fn fallback_body_carries_the_static_tiers() {
+        // Everything build-knowable survives: the header, the invariants, and
+        // the flag synopses — parity with the SSOT's static tiers.
+        let fb = fallback_body();
+        assert!(fb.starts_with(HEADER), "fallback missing the header: {fb}");
+        assert!(
+            fb.contains("The edit→diagnostics loop"),
+            "fallback missing the invariants: {fb}"
+        );
+        assert!(
+            fb.contains("full: catenary glob --help"),
+            "fallback missing the flag synopses: {fb}"
+        );
+    }
+
+    #[test]
+    fn fallback_body_is_the_ssot_static_tiers() {
+        // Parity with the SSOT: the fallback draws its static tiers from the
+        // same consts the live payload uses, so the two cannot drift. The live
+        // payload interleaves the runtime surface between the header and the
+        // invariants; the fallback is exactly those static tiers with the
+        // runtime tier removed.
+        let fb = fallback_body();
+        let expected = format!("{HEADER}\n\n{INVARIANTS}\n\n{FLAG_SYNOPSES}");
+        assert_eq!(fb, expected);
+        // The live payload shares the same invariants / synopses source.
+        let live = render(Some(&fixture_surface()), &["make".to_string()]);
+        assert!(
+            live.contains(INVARIANTS),
+            "live payload lost the invariants"
+        );
+        assert!(
+            live.contains(FLAG_SYNOPSES),
+            "live payload lost the flag synopses"
+        );
+    }
+
+    #[test]
+    fn shipped_opencode_fallback_is_fresh() {
+        // Freshness gate: the shipped OpenCode fallback instructions file is the
+        // `fallback_body` rendering verbatim (files carry a trailing newline).
+        // If a tier's wording changes, this pins the shipped file to the SSOT so
+        // the two cannot drift — regenerate the file from `fallback_body`.
+        const SHIPPED: &str = include_str!("../../plugins/catenary-opencode/catenary.md");
+        assert_eq!(
+            SHIPPED,
+            format!("{}\n", fallback_body()),
+            "plugins/catenary-opencode/catenary.md is stale — regenerate it from \
+             `catenary::cli::teaching::fallback_body()`"
         );
     }
 

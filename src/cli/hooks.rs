@@ -56,6 +56,20 @@ fn session_start_context(announce: bool, format: HostFormat) -> Option<String> {
     (announce && matches!(format, HostFormat::Claude)).then(crate::cli::teaching::payload_body)
 }
 
+/// The raw stdout body emitted by `catenary hook session-start
+/// --format=opencode`.
+///
+/// The live teaching payload verbatim — the same SSOT body as `catenary primer`
+/// and the Claude `SessionStart` `additionalContext` — for the OpenCode plugin
+/// to write into its runtime-regenerated instructions file. Not a JSON
+/// envelope: the plugin captures stdout as the file's content, so this is the
+/// bare payload text (unlike the Claude/Gemini/Antigravity structured
+/// responses).
+#[must_use]
+fn opencode_session_start_body() -> String {
+    crate::cli::teaching::payload_body()
+}
+
 /// Build the `hookSpecificOutput` object that carries the teaching payload in
 /// its `additionalContext` field, for the given hook event.
 ///
@@ -389,6 +403,20 @@ fn truncate_host_strings(value: &mut serde_json::Value, max_chars: usize) {
 pub fn run_session_start(format: HostFormat) {
     use crate::hook::response::SystemMessageBuilder;
     use crate::logging::Severity;
+
+    // OpenCode (ws36 ticket 02): the plugin's `config` hook registers a
+    // runtime-regenerated instructions file, and `catenary hook session-start
+    // --format=opencode` is how it obtains the payload. Emit the raw teaching
+    // body to stdout — the plugin captures stdout verbatim and writes it to that
+    // file, so this is plain text, not the Claude `hookSpecificOutput` envelope.
+    // No stdin read and no daemon round-trip: the body is the live runtime
+    // projection (`payload_body` resolves the commands surface against this
+    // process's cwd), and OpenCode re-reads the file every prompt step, so it
+    // rides every request with zero per-request plugin work.
+    if matches!(format, HostFormat::OpenCode) {
+        print!("{}", opencode_session_start_body());
+        return;
+    }
 
     let mut builder = SystemMessageBuilder::new();
 
@@ -2027,6 +2055,35 @@ mod tests {
         // additionalContext is a Claude Code channel.
         assert!(session_start_context(true, HostFormat::Gemini).is_none());
         assert!(session_start_context(true, HostFormat::Antigravity).is_none());
+    }
+
+    #[test]
+    fn opencode_session_start_body_is_the_raw_ssot_payload() {
+        let body = opencode_session_start_body();
+        // Payload parity with the SSOT: byte-equal to the shared payload body
+        // (the same source `catenary primer` and the Claude additionalContext
+        // render from), so the OpenCode instructions file cannot drift.
+        assert_eq!(body, crate::cli::teaching::payload_body());
+        // Emitter output shape: raw text, not the Claude structured-output
+        // envelope — the plugin writes stdout verbatim into its instructions
+        // file.
+        assert!(
+            !body.contains("hookSpecificOutput"),
+            "opencode body must not be the Claude envelope: {body}"
+        );
+        assert!(
+            !body.contains("additionalContext"),
+            "opencode body must not be the Claude envelope: {body}"
+        );
+        assert!(
+            !body.trim_start().starts_with('{'),
+            "opencode body must be raw text, not JSON: {body}"
+        );
+        // Carries the invariants tier (payload parity).
+        assert!(
+            body.contains("The edit→diagnostics loop"),
+            "opencode body should inline the invariants: {body}"
+        );
     }
 
     // ── announcement_hook_specific_output shape ──────────────────────────
