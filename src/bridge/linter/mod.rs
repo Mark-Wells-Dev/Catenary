@@ -46,6 +46,12 @@ use crate::lsp::LspClientManager;
 /// `diagnostics` are LSP-diagnostic JSON objects (`source` / `code` / `range` /
 /// `severity` / `message`); `command` is the producing linter's command, used
 /// to pick the (passthrough) message filter at translation time.
+///
+/// A **present result with empty `diagnostics`** means the linter ran and found
+/// nothing — a verification, not an absence (bug 56 ruling 2 / ticket 06): the
+/// downstream feeder records it so the file classifies Clean. A linter that
+/// never completed (not installed, spawn or parse failure) emits no result for
+/// the file at all, leaving it unverified.
 pub struct FeederDiagnostics {
     /// Absolute path of the file these diagnostics belong to (matched back onto
     /// the batch's canonical inputs).
@@ -152,6 +158,13 @@ impl DiagnosticFeeder for LinterFeeder<'_> {
 /// failure each yields an empty result (after one `warn!`) rather than
 /// propagating. Exit status is **not** consulted — linters exit nonzero when
 /// they find issues.
+///
+/// A completed run (spawn + parse both succeeded) emits one [`FeederDiagnostics`]
+/// per file it was handed — carrying that file's diagnostics, or an empty vec for
+/// a file it found nothing wrong with. An empty result is a verification, not an
+/// absence (bug 56 ruling 2 / ticket 06); the fail-soft early returns above emit
+/// nothing, so a linter that never completed leaves its files unverified rather
+/// than falsely clean.
 async fn run_linter(
     name: &str,
     linter: &LinterConfig,
@@ -217,12 +230,19 @@ async fn run_linter(
         }
     }
 
-    by_file
-        .into_iter()
-        .map(|(file, diagnostics)| FeederDiagnostics {
-            file,
+    // Emit a per-file result for every file the linter ran against — with its
+    // diagnostics, or an empty vec for a file it found nothing wrong with. The
+    // empty results are the verifications (bug 56 ruling 2 / ticket 06): the
+    // feeder records them so the file classifies Clean rather than dropping to
+    // NoResults, mirroring `retrieve_diagnostics`' record-even-with-zero rule.
+    // Only reached once spawn + parse both succeed, so a linter that never
+    // completed emits nothing and leaves its files unverified.
+    files
+        .iter()
+        .map(|file| FeederDiagnostics {
+            file: file.clone(),
             command: linter.command.clone(),
-            diagnostics,
+            diagnostics: by_file.remove(file).unwrap_or_default(),
         })
         .collect()
 }
@@ -376,5 +396,42 @@ mod tests {
         let files = vec![PathBuf::from("/proj/x.sh")];
         let out = run_linter("catenary-nonexistent-linter-xyz", &linter, root, &files).await;
         assert!(out.is_empty(), "uninstalled linter is skipped, not fatal");
+        // A linter that never ran emits nothing, so the downstream feeder records
+        // no result and the file stays unverified — never falsely `[clean]`
+        // (bug 56 ruling 2 / ticket 06). Contrast the clean-run case below.
+    }
+
+    #[tokio::test]
+    async fn run_linter_clean_run_records_empty_result_per_file() {
+        // A linter that runs to completion and reports nothing (`true` exits 0 with
+        // empty stdout) is a verification: run_linter emits one result per file it
+        // was handed, each carrying empty diagnostics, so the feeder records the
+        // file Clean instead of dropping it (bug 56 ruling 2 / ticket 06). This is
+        // the ran-and-found-nothing half of the distinction that
+        // feed_skips_uninstalled_linter covers for never-ran.
+        let linter =
+            LinterConfig::new("true", vec![], vec!["**/*.sh".to_string()]).expect("compile");
+        let root = Path::new("/proj");
+        let files = vec![PathBuf::from("/proj/a.sh"), PathBuf::from("/proj/b.sh")];
+        let out = run_linter("shellcheck", &linter, root, &files).await;
+        assert_eq!(
+            out.len(),
+            2,
+            "a completed clean run records one result per file"
+        );
+        assert!(
+            out.iter().all(|f| f.diagnostics.is_empty()),
+            "a ran-and-found-nothing result carries empty diagnostics",
+        );
+        assert!(
+            out.iter()
+                .any(|f| f.file.as_path() == Path::new("/proj/a.sh")),
+            "the first ran-against file is recorded",
+        );
+        assert!(
+            out.iter()
+                .any(|f| f.file.as_path() == Path::new("/proj/b.sh")),
+            "the second ran-against file is recorded",
+        );
     }
 }

@@ -211,6 +211,17 @@ upgrading.
   `[unverified — <server> returned no result]` line (a directory/whole-root
   scope folds them to an `M files unverified` count alongside the clean count).
   Render-only: whether an unverified file pays its editing debt is unchanged.
+- **A lint-only file whose linter ran and found nothing now earns `[clean]`.**
+  The linter feeder skipped empty results, so a lint-only file (e.g. a
+  shellscript routed to shellcheck) that its linter verified clean produced no
+  feeder entry, classified `NoResults`, and — carrying no assigned server —
+  stayed out of the receipt entirely. An empty lint result is a verification, not
+  an absence: the feeder now records ran-and-found-nothing as an empty result so
+  the file classifies clean, mirroring the language-server path's record-even-
+  with-zero-diagnostics rule. Lint-clean files join the `[clean]` list and the
+  `N files clean` collapse with no linter-specific wording. A linter that never
+  completed (not installed, spawn or parse failure) still records nothing and
+  leaves its file unverified — only an actual run verifies.
 - **Diagnostics settle no longer reports `[clean]` over a CPU-starved flycheck
   child.** Under host CPU saturation a runnable child can present an all-zero
   50 ms sampling window — no user/system CPU or page-fault deltas while ticks

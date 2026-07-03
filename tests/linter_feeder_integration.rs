@@ -93,6 +93,80 @@ fn linter_only_shellcheck_renders() -> Result<()> {
     Ok(())
 }
 
+/// A lint-only shellscript whose linter runs and finds nothing renders `[clean]`
+/// — an empty lint result is a verification, not an absence (bug 56 ruling 2 /
+/// ticket 06). `mocklint` with no `--diag` emits an empty shellcheck document, so
+/// the feeder records the file clean rather than dropping it to `NoResults`. The
+/// config clears the default `shellscript` LSP binding so the file is lint-only
+/// and the outcome does not depend on `bash-language-server` being installed.
+#[test]
+fn linter_only_shellcheck_clean_renders_clean() -> Result<()> {
+    let mocklint = env!("CARGO_BIN_EXE_mocklint");
+    let mut bridge = BridgeProcess::spawn_with_config(|root| {
+        std::fs::write(root.join("build.sh"), "echo hi\n")?;
+        let config_path = root.join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[lsp.language.shellscript]\n\
+                 servers = []\n\n\
+                 [linter.rule.shellcheck]\n\
+                 command = \"{mocklint}\"\n\
+                 args = [\"--format\", \"shellcheck\"]\n\
+                 patterns = [\"**/*.sh\"]\n",
+            ),
+        )?;
+        Ok(config_path)
+    })?;
+    bridge.initialize()?;
+
+    let file = bridge.root_path().join("build.sh");
+    let text = bridge.call_diagnostics(file.to_str().context("path")?)?;
+
+    assert!(
+        text.contains("build.sh [clean]"),
+        "a lint-only file the linter verified with no findings must render [clean]. Got:\n{text}"
+    );
+    assert!(
+        !text.contains("shellcheck(SC"),
+        "a clean run carries no finding. Got:\n{text}"
+    );
+    Ok(())
+}
+
+/// A linter *process failure* is not a verification: a lint-only shellscript whose
+/// linter cannot run (bogus command → spawn `NotFound`) is never marked `[clean]`.
+/// Only an actual run that found nothing earns clean — never-ran stays unverified
+/// (bug 56 ruling 2 / ticket 06). The `shellscript` LSP binding is cleared so the
+/// file is lint-only and the outcome is not confounded by a language server.
+#[test]
+fn linter_process_failure_not_marked_clean() -> Result<()> {
+    let mut bridge = BridgeProcess::spawn_with_config(|root| {
+        std::fs::write(root.join("build.sh"), "echo hi\n")?;
+        let config_path = root.join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[lsp.language.shellscript]\n\
+             servers = []\n\n\
+             [linter.rule.shellcheck]\n\
+             command = \"catenary-nonexistent-linter-xyz\"\n\
+             args = []\n\
+             patterns = [\"**/*.sh\"]\n",
+        )?;
+        Ok(config_path)
+    })?;
+    bridge.initialize()?;
+
+    let file = bridge.root_path().join("build.sh");
+    let text = bridge.call_diagnostics(file.to_str().context("path")?)?;
+
+    assert!(
+        !text.contains("[clean]"),
+        "a file whose only linter never ran must not be marked clean. Got:\n{text}"
+    );
+    Ok(())
+}
+
 /// A non-blessed linter name falls to the generic SARIF adapter; the source comes
 /// from the SARIF `tool.driver.name` (`--source`).
 #[test]

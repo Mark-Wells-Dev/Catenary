@@ -499,6 +499,18 @@ impl DiagnosticsServer {
         if !lint_candidates.is_empty() {
             let feeder = super::linter::LinterFeeder::new(&self.client_manager, &self.fs);
             for feed in feeder.feed(&lint_candidates).await {
+                let key = feed.file.to_string_lossy().to_string();
+                let display = self.display_rel(&key);
+                // Record the file even when the linter ran and found nothing, so
+                // it classifies Clean, not NoResults — an empty lint result is a
+                // verification, not an absence (bug 56 ruling 2 / ticket 06),
+                // mirroring retrieve_diagnostics' record-even-with-zero rule. A
+                // linter that never completed (not installed, spawn/parse failure)
+                // yields no feed for the file, so it stays unverified.
+                let file_feed = feeds.entry(key).or_insert_with(|| FileFeed {
+                    display,
+                    entries: Vec::new(),
+                });
                 if feed.diagnostics.is_empty() {
                     continue;
                 }
@@ -506,12 +518,6 @@ impl DiagnosticsServer {
                     command: feed.command,
                     version: None,
                     language_id: String::new(),
-                });
-                let key = feed.file.to_string_lossy().to_string();
-                let display = self.display_rel(&key);
-                let file_feed = feeds.entry(key).or_insert_with(|| FileFeed {
-                    display,
-                    entries: Vec::new(),
                 });
                 for value in feed.diagnostics {
                     file_feed.entries.push(FeederEntry {
