@@ -186,6 +186,22 @@ upgrading.
 
 ### Fixed
 
+- **`catenary doctor` migration guidance now actually prints, in one pass.** The
+  doctor migration walker raw-parsed each config source with a value-expression
+  parser (`toml`'s `FromStr for Value`, which parses `[1, 2]`/`{a = 1}`, not a
+  document), so it failed on every real config and silently skipped every
+  source — the guard error pointed at guidance that never appeared. The walker
+  now document-parses each source and renders the rename block for every stale
+  namespace (`[server.*]` / `[language.*]` / `[linter.<name>]`) in a single run.
+  The guard error itself now names every present old class at once (no
+  rename-rerun-rename loop), and doctor's own render drops the self-referential
+  "run `catenary doctor`" pointer now that the guidance prints directly above it
+  (daemon startup and `catenary commands` keep the pointer).
+- **`catenary doctor` no longer warns about orphaned embedded-default servers.**
+  The "defined but not referenced" warning fired for built-in default server
+  definitions left unrouted by a user `[lsp.language.*]` override — normal
+  operation, not user error (16 spurious warnings on a maintainer config). It
+  now warns only for user-defined servers nothing routes to.
 - **`catenary diagnostics` no longer prints empty stdout when every file's
   server produced no result.** A file whose language server died mid-pipeline
   (or never answered) resolves to no result, so it earns neither a `[clean]`

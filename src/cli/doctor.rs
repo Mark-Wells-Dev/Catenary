@@ -240,16 +240,28 @@ pub async fn run_doctor(out: &mut Output, project_root: &Path, show_diff: bool) 
     let _ = out.writeln(format_args!("Catenary {}", env!("CATENARY_VERSION")));
     let _ = out.writeln(format_args!(""));
 
-    // Check config sources for old-format entries before loading
-    doctor_check_config(out);
+    // Check config sources for old-format entries before loading. The walker
+    // reports whether it printed migration guidance, so the config-load error
+    // below can drop the self-referential "run catenary doctor" pointer.
+    let printed_guidance = doctor_check_config(out, &crate::config::config_sources());
 
     // Load configuration — report errors inline instead of bailing
     let config = match crate::config::Config::load() {
         Ok(c) => c,
         Err(e) => {
+            let rendered = format!("{e:#}");
+            // When the walker printed rename guidance directly above, rewrite
+            // the guard's self-referential pointer to point at that guidance
+            // instead of back at the command the user is already inside
+            // (feedback 08 finding 1).
+            let rendered = if printed_guidance {
+                rewrite_guard_pointer(&rendered)
+            } else {
+                rendered
+            };
             let _ = out.writeln(format_args!(
                 "{}",
-                out.colors.red(&format!("✗ Config error: {e:#}"))
+                out.colors.red(&format!("✗ Config error: {rendered}"))
             ));
             let _ = out.writeln(format_args!(""));
             return Ok(());
@@ -273,19 +285,10 @@ pub async fn run_doctor(out: &mut Output, project_root: &Path, show_diff: bool) 
         let _ = out.writeln(format_args!("{}", out.colors.red(&format!("✗  {err}"))));
     }
 
-    // Unreferenced server warnings
-    let referenced: HashSet<&str> = config
-        .language
-        .values()
-        .flat_map(|lc| lc.servers().iter().map(|b| b.name.as_str()))
-        .collect();
-    let mut unreferenced: Vec<&str> = config
-        .server
-        .keys()
-        .filter(|name| !referenced.contains(name.as_str()))
-        .map(String::as_str)
-        .collect();
-    unreferenced.sort_unstable();
+    // Unreferenced server warnings — user-defined servers only. An embedded
+    // default orphaned by a user [lsp.language.*] override is normal operation,
+    // not user error (feedback 08 finding 2).
+    let unreferenced = unreferenced_user_servers(&config);
     for name in &unreferenced {
         let _ = out.writeln(format_args!(
             "{}",
@@ -823,15 +826,21 @@ pub async fn run_doctor_single(
 ///   belong on `[lsp.server.*]`) or the removed `inherit` field
 ///
 /// Prints the equivalent new-format config for each detected old entry.
-fn doctor_check_config(out: &mut Output) {
-    let sources = crate::config::config_sources();
+///
+/// Returns whether any migration issue was found (and thus whether guidance was
+/// printed) so the caller can drop the self-referential "run catenary doctor"
+/// pointer from a subsequent config-load error (feedback 08 finding 1).
+fn doctor_check_config(out: &mut Output, sources: &[PathBuf]) -> bool {
     let mut found_issues = false;
 
-    for source in &sources {
+    for source in sources {
         let Ok(contents) = std::fs::read_to_string(source) else {
             continue;
         };
-        let Ok(raw) = contents.parse::<toml::Value>() else {
+        // Document parse: `str::parse::<toml::Value>()` uses `FromStr for
+        // Value`, which parses a value *expression* and fails on every
+        // document — the bug that made this whole walker dead code (bug 57).
+        let Ok(raw) = toml::from_str::<toml::Value>(&contents) else {
             continue;
         };
 
@@ -935,6 +944,43 @@ fn doctor_check_config(out: &mut Output) {
     if found_issues {
         let _ = out.writeln(format_args!(""));
     }
+    found_issues
+}
+
+/// User-defined servers that no `[lsp.language.*]` entry routes to.
+///
+/// Embedded defaults are exempt: a default server orphaned by a user language
+/// override is normal operation, not user error (feedback 08 finding 2 /
+/// misc 120). Only servers absent from the embedded default set warn. The
+/// result is sorted for stable output.
+fn unreferenced_user_servers(config: &crate::config::Config) -> Vec<&str> {
+    let referenced: HashSet<&str> = config
+        .language
+        .values()
+        .flat_map(|lc| lc.servers().iter().map(|b| b.name.as_str()))
+        .collect();
+    let defaults = crate::config::default_server_names();
+    let mut unreferenced: Vec<&str> = config
+        .server
+        .keys()
+        .filter(|name| !referenced.contains(name.as_str()) && !defaults.contains(name.as_str()))
+        .map(String::as_str)
+        .collect();
+    unreferenced.sort_unstable();
+    unreferenced
+}
+
+/// Rewrite a config-load error for doctor's own render.
+///
+/// The migration walker's rename guidance prints directly above the error in
+/// doctor, so the guard's "run `catenary doctor`" pointer is rewritten to point
+/// at that guidance instead of back at the command the user is already inside
+/// (feedback 08 finding 1). Other surfaces keep the pointer verbatim.
+fn rewrite_guard_pointer(rendered: &str) -> String {
+    rendered.replace(
+        crate::config::MIGRATION_GUIDANCE_POINTER,
+        "See the rename guidance above.",
+    )
 }
 
 /// Check a project root for `.catenary.toml` and validate its contents.
@@ -967,7 +1013,7 @@ fn doctor_check_project_config(
     // gives a targeted migration hint pointing at the replacement toggle.
     let removed_key = std::fs::read_to_string(&config_path)
         .ok()
-        .and_then(|c| c.parse::<toml::Value>().ok())
+        .and_then(|c| toml::from_str::<toml::Value>(&c).ok())
         .and_then(|raw| {
             // A `[lsp]` *table* is valid (it carries `disable`); only a bare
             // scalar `lsp`, or any `enabled`, is the removed key.
@@ -2362,6 +2408,123 @@ fn find_script_path_in_json(json: &serde_json::Value, needle: &str) -> Option<St
 mod tests {
     use super::*;
     use std::fs;
+
+    // ── doctor_check_config walker (bug 57) ─────────────────────────
+
+    #[test]
+    fn doctor_check_config_walks_all_three_pre_namespacing_classes() {
+        // Regression for bug 57: the walker raw-parsed each source with
+        // `contents.parse::<toml::Value>()`, which in toml 0.9 parses a value
+        // *expression* and fails on every document — silently skipping every
+        // source, so the walker printed nothing at runtime. A pre-namespacing
+        // config file must now produce the rename block for all three
+        // namespaces in one pass.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = tmp.path().join("config.toml");
+        fs::write(
+            &cfg,
+            "[server.rust-analyzer]\ncommand = \"rust-analyzer\"\n\n\
+             [language.rust]\nservers = [\"rust-analyzer\"]\n\n\
+             [linter.shellcheck]\ncommand = \"shellcheck\"\n",
+        )
+        .expect("write config");
+
+        let mut out = Output::buffer(200);
+        let found = doctor_check_config(&mut out, &[cfg]);
+        let text = out.into_string();
+
+        assert!(found, "walker should report issues, got:\n{text}");
+        assert!(
+            text.contains("[server.rust-analyzer]  →  [lsp.server.rust-analyzer]"),
+            "server rename block missing:\n{text}",
+        );
+        assert!(
+            text.contains("[language.rust]  →  [lsp.language.rust]"),
+            "language rename block missing:\n{text}",
+        );
+        assert!(
+            text.contains("[linter.shellcheck]  →  [linter.rule.shellcheck]"),
+            "linter rename block missing:\n{text}",
+        );
+    }
+
+    #[test]
+    fn doctor_check_config_silent_for_namespaced_config() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = tmp.path().join("config.toml");
+        fs::write(
+            &cfg,
+            "[lsp.server.rust-analyzer]\ncommand = \"rust-analyzer\"\n\n\
+             [lsp.language.rust]\nservers = [\"rust-analyzer\"]\n\n\
+             [linter.rule.shellcheck]\ncommand = \"shellcheck\"\npatterns = [\"**/*.sh\"]\n",
+        )
+        .expect("write config");
+
+        let mut out = Output::buffer(200);
+        let found = doctor_check_config(&mut out, &[cfg]);
+        assert!(
+            !found,
+            "a fully namespaced config should trigger no migration guidance",
+        );
+        assert!(out.into_string().is_empty(), "no output for a clean config");
+    }
+
+    // ── guard pointer rewrite (feedback 08 finding 1) ───────────────
+
+    #[test]
+    fn guard_pointer_rewritten_for_doctor_render() {
+        // In doctor's own render the migration guidance prints above the error,
+        // so the guard's "run catenary doctor" pointer must be rewritten —
+        // pointing a user at the command they are already inside is unhelpful.
+        let msg = format!(
+            "Failed to parse config file: /x/config.toml: config uses \
+             pre-namespacing top-level keys — foo. {}",
+            crate::config::MIGRATION_GUIDANCE_POINTER,
+        );
+        let rewritten = rewrite_guard_pointer(&msg);
+        assert!(
+            !rewritten.contains("catenary doctor"),
+            "doctor render must not point back at itself: {rewritten}",
+        );
+        assert!(
+            rewritten.contains("See the rename guidance above."),
+            "rewrite should point at the guidance above: {rewritten}",
+        );
+    }
+
+    // ── unreferenced-server warning scope (feedback 08 finding 2) ────
+
+    #[test]
+    fn unreferenced_warning_exempts_embedded_defaults() {
+        // A user server nothing routes to warns; an embedded default orphaned
+        // by a user language override does not (feedback 08 finding 2).
+        let defaults = crate::config::default_server_names();
+        let a_default = defaults
+            .iter()
+            .next()
+            .expect("embedded defaults must be non-empty")
+            .clone();
+
+        let mut config = crate::config::Config::default();
+        config
+            .server
+            .insert(a_default.clone(), crate::config::ServerDef::default());
+        config.server.insert(
+            "user-orphan-xyz".to_string(),
+            crate::config::ServerDef::default(),
+        );
+        // No [lsp.language.*] entry references either server.
+
+        let unref = unreferenced_user_servers(&config);
+        assert!(
+            unref.contains(&"user-orphan-xyz"),
+            "a genuinely orphaned user server must still warn: {unref:?}",
+        );
+        assert!(
+            !unref.iter().any(|n| *n == a_default),
+            "an orphaned embedded default must be exempt: {unref:?}",
+        );
+    }
 
     // ── user_config_path_in tests ───────────────────────────────
 

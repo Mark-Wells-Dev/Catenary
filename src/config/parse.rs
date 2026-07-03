@@ -273,25 +273,36 @@ pub const SERVER_DEF_KEYS: &[&str] = &[
     "provisional",
 ];
 
+/// Pointer sentence appended to every pre-namespacing migration guard error.
+///
+/// A single source of truth so the surfaces that render config-load errors stay
+/// in sync. Non-doctor surfaces (daemon startup, `catenary commands`) keep it
+/// verbatim, directing the user to the doctor migration walker. `catenary
+/// doctor` rewrites it in its own render — the walker's rename guidance prints
+/// directly above the error there, so pointing back at doctor would be
+/// self-referential (feedback 08 finding 1). See `src/cli/doctor.rs`.
+pub const MIGRATION_GUIDANCE_POINTER: &str = "Run `catenary doctor` for guidance.";
+
 /// Returns a migration error message when a config still uses the
 /// pre-namespacing top-level definition keys (linters ticket 04), else `None`.
 ///
 /// Detects the old top-level `[server.*]` / `[language.*]` tables and old
 /// `[linter.<name>]` definition sub-tables (any `[linter]` key other than the
-/// namespaced `rule` map and the `disable` toggle). Callers hard-error with the
-/// returned rename guidance — mirroring the 2.0 `[server.*]` guard this replaces.
+/// namespaced `rule` map and the `disable` toggle). **All present classes are
+/// reported in one message** so a config carrying more than one old form does
+/// not force a rename-rerun-rename loop (feedback 08 finding 1). Callers
+/// hard-error with the returned rename guidance.
 fn pre_namespacing_error(raw: &toml::Value) -> Option<String> {
+    let mut clauses: Vec<String> = Vec::new();
+
     if raw.get("server").is_some() {
-        return Some(
-            "config uses the old top-level [server.*] key — rename [server.<name>] to \
-             [lsp.server.<name>]. Run `catenary doctor` for guidance."
-                .to_string(),
+        clauses.push(
+            "rename the old top-level [server.<name>] tables to [lsp.server.<name>]".to_string(),
         );
     }
     if raw.get("language").is_some() {
-        return Some(
-            "config uses the old top-level [language.*] key — rename [language.<name>] to \
-             [lsp.language.<name>]. Run `catenary doctor` for guidance."
+        clauses.push(
+            "rename the old top-level [language.<name>] tables to [lsp.language.<name>]"
                 .to_string(),
         );
     }
@@ -302,14 +313,22 @@ fn pre_namespacing_error(raw: &toml::Value) -> Option<String> {
             .filter(|k| *k != "rule" && *k != "disable")
             .collect();
         if !stale.is_empty() {
-            return Some(format!(
-                "config uses old top-level [linter.<name>] definitions ({}) — rename \
-                 [linter.<name>] to [linter.rule.<name>]. Run `catenary doctor` for guidance.",
+            clauses.push(format!(
+                "rename the old top-level [linter.<name>] definitions ({}) to [linter.rule.<name>]",
                 stale.join(", "),
             ));
         }
     }
-    None
+
+    if clauses.is_empty() {
+        return None;
+    }
+
+    Some(format!(
+        "config uses pre-namespacing top-level keys (linters ticket 04) — {}. \
+         {MIGRATION_GUIDANCE_POINTER}",
+        clauses.join("; "),
+    ))
 }
 
 /// Hard-errors when a config uses the pre-namespacing top-level definition keys.
@@ -352,7 +371,7 @@ fn deserialize_source(contents: &str) -> Result<RawConfig> {
                     bail!(
                         "[lsp.language.{lang_key}] uses the removed `inherit` field — \
                          copy the base language's `servers` list into \
-                         [lsp.language.{lang_key}] instead. Run `catenary doctor` for guidance.",
+                         [lsp.language.{lang_key}] instead. {MIGRATION_GUIDANCE_POINTER}",
                     );
                 }
 
@@ -366,7 +385,7 @@ fn deserialize_source(contents: &str) -> Result<RawConfig> {
                         "[lsp.language.{lang_key}] contains server definition fields ({}) — \
                          these now belong in [lsp.server.*]. Move them to a [lsp.server.*] \
                          entry and reference it via `servers = [\"...\"]` in \
-                         [lsp.language.{lang_key}]. Run `catenary doctor` for guidance.",
+                         [lsp.language.{lang_key}]. {MIGRATION_GUIDANCE_POINTER}",
                         stale.join(", "),
                     );
                 }
@@ -434,6 +453,21 @@ fn parse_server_defaults(contents: &str) -> Result<HashMap<String, ServerDef>> {
     }
     let parsed: ServerOnly = toml::from_str(contents).context("Failed to parse server TOML")?;
     Ok(parsed.lsp.server)
+}
+
+/// Names of the embedded default `[lsp.server.*]` definitions.
+///
+/// Doctor exempts these from its "defined but not referenced" warning — an
+/// embedded default orphaned by a user `[lsp.language.*]` override is normal
+/// operation, not user error (feedback 08 finding 2 / misc 120). A user def
+/// that reuses a default name adopts the exemption; the warning targets
+/// genuinely orphaned *user* server definitions. Returns an empty set if the
+/// embedded defaults somehow fail to parse (they are validated elsewhere).
+#[must_use]
+pub fn default_server_names() -> std::collections::HashSet<String> {
+    parse_server_defaults(DEFAULT_SERVERS)
+        .map(|servers| servers.into_keys().collect())
+        .unwrap_or_default()
 }
 
 /// Parse a `[linter.rule.*]` TOML document into a map of linter definitions.
@@ -1864,6 +1898,51 @@ servers = ["pyright"]
         assert!(
             err.contains("[linter.rule.<name>]"),
             "error should point to the [linter.rule.*] rename: {err}",
+        );
+    }
+
+    #[test]
+    fn pre_namespacing_error_reports_all_classes_in_one_message() {
+        // A config carrying all three old top-level forms must be flagged in
+        // ONE message — no rename-rerun-rename loop (feedback 08 finding 1).
+        let raw: toml::Value = toml::from_str(
+            "[server.rust-analyzer]\ncommand = \"rust-analyzer\"\n\n\
+             [language.rust]\nservers = [\"rust-analyzer\"]\n\n\
+             [linter.shellcheck]\ncommand = \"shellcheck\"\n",
+        )
+        .expect("valid toml");
+        let msg = pre_namespacing_error(&raw).expect("all three old classes should error");
+        assert!(
+            msg.contains("[lsp.server.<name>]"),
+            "names the server rename: {msg}",
+        );
+        assert!(
+            msg.contains("[lsp.language.<name>]"),
+            "names the language rename: {msg}",
+        );
+        assert!(
+            msg.contains("[linter.rule.<name>]") && msg.contains("shellcheck"),
+            "names the linter rename with the stale name: {msg}",
+        );
+        assert!(
+            msg.contains(MIGRATION_GUIDANCE_POINTER),
+            "keeps the guidance pointer: {msg}",
+        );
+    }
+
+    #[test]
+    fn pre_namespacing_error_none_for_namespaced_config() {
+        // The namespaced forms (`rule` map, `disable` toggle, `[lsp.*]`) must
+        // not trip the guard.
+        let raw: toml::Value = toml::from_str(
+            "[lsp.server.rust-analyzer]\ncommand = \"rust-analyzer\"\n\n\
+             [linter]\ndisable = true\n\n\
+             [linter.rule.shellcheck]\ncommand = \"shellcheck\"\n",
+        )
+        .expect("valid toml");
+        assert!(
+            pre_namespacing_error(&raw).is_none(),
+            "a fully namespaced config must not trigger the guard",
         );
     }
 

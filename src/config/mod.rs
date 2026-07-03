@@ -25,8 +25,8 @@ pub use commands::{BuildContext, BuildGuidance, CommandsConfig, GuidanceEntry, R
 pub use language::{DispatchMethod, LanguageConfig, ServerBinding};
 pub use linter::LinterConfig;
 pub use parse::{
-    DEFAULT_LINTERS, DEFAULT_SERVERS, ProjectConfig, SERVER_DEF_KEYS, config_sources,
-    load_project_config,
+    DEFAULT_LINTERS, DEFAULT_SERVERS, MIGRATION_GUIDANCE_POINTER, ProjectConfig, SERVER_DEF_KEYS,
+    config_sources, default_server_names, load_project_config,
 };
 pub use server::ServerDef;
 pub use weights::{BASELINE_WEIGHT, DiagnosticWeights};
