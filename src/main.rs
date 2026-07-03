@@ -1189,6 +1189,13 @@ fn run_daemon_main() -> Result<()> {
     // daemon).
     manager.spawn_worktree_watch_reaper(rt.handle());
 
+    // Ephemeral-root idle-expiry reaper (ephemeral-roots ticket 02): tears down
+    // activity-mounted `ephemeral:*` roots after they go idle past the timeout.
+    // Spawned AFTER `with_session` so the tracker + ephemeral clock exist; a
+    // no-op for a session-less manager. These roots have no MCP heartbeat to pin
+    // on, so the idle detector is their only release signal (DESIGN.md).
+    manager.spawn_ephemeral_root_reaper(rt.handle());
+
     info!(
         source = Source::DaemonLifecycle.as_str(),
         "daemon serving workspace: {workspace_display}",

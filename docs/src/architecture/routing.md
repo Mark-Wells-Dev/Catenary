@@ -77,15 +77,24 @@ initialization, the `(language, server)` pair is negative-cached so it
 is not retried. Servers without `single_file = true` are skipped — a
 file outside all roots resolves to nothing for them.
 
-### Roots are explicit
+### Roots are explicit (pinned), with ephemeral activity mounts
 
-Only roots added via `--root` or `catenary roots add` are active. Catenary never
-auto-discovers roots from file paths. A file outside all active roots
-has no owning root; it routes only to single-file-capable servers
-(tier 3), never to a root- or workspace-scoped instance. This is
-deliberate: implicit root discovery would make
-the routing model hard to predict, especially in multi-root sessions
-where adjacent directories might contain unrelated projects.
+Roots added via `--root`, `catenary roots add`, or the MCP workspace-roots
+channel are **pinned**: active for the session's lifetime. Catenary does not
+auto-discover pinned roots from file paths — implicit pinned discovery would
+make the routing model hard to predict, especially in multi-root sessions where
+adjacent directories might contain unrelated projects.
+
+A `catenary grep`, `glob`, or `diagnostics` touching a path **outside every
+mounted root** is the one exception: Catenary detects the enclosing project root
+(walking `.git` up from the path) and mounts it as an **ephemeral** root so the
+query is enriched/diagnosed from a real server. An ephemeral mount is scoped to
+the single enclosing root (never a sibling, no companion templating) and
+**expires after a few minutes of inactivity** — every qualifying activity
+refreshes its idle clock, and `catenary roots add` on it upgrades it to pinned.
+`catenary roots ls` and the `state.json` root board distinguish the two classes.
+A file with no detectable enclosing project root still has no owning root; it
+routes only to single-file-capable servers (tier 3).
 
 ## Instance keying
 

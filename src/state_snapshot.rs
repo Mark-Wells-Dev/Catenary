@@ -260,6 +260,34 @@ pub trait SessionBoard: Send + Sync {
     fn sessions(&self) -> Vec<SessionEntry>;
 }
 
+/// A tracked workspace root and its class, for the daemon-level root board.
+///
+/// The root board is a daemon-wide view (like the server board), distinct from
+/// the per-session [`SessionEntry::roots`] (which mirror a session's own hook
+/// payload). It exists so ephemeral, activity-mounted roots (ephemeral-roots
+/// ticket 02) are visible on `state.json` and distinguished from pinned roots.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RootEntry {
+    /// The canonical root path.
+    pub path: String,
+    /// `true` when the root is held only by an activity-mount contributor and
+    /// will expire on idle; `false` for a pinned root (`hook` / `mcp:*` /
+    /// `worktree:*`).
+    pub ephemeral: bool,
+}
+
+/// Source of the live root board, pulled at each snapshot flush.
+///
+/// The daemon's [`SessionManager`](crate::router) owns the `RootTracker`; it
+/// implements this so the [`SnapshotWriter`] can serialize the current tracked
+/// roots with their class. Pulled (not pushed) so the board always reflects the
+/// live tracker — including ephemeral mounts that come and go between flushes.
+pub trait RootBoard: Send + Sync {
+    /// Builds the current root board. Called outside the snapshot lock.
+    fn roots(&self) -> Vec<RootEntry>;
+}
+
 /// A bounded `warn`/`error` alert — "when to look".
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -347,6 +375,8 @@ pub struct Snapshot {
     pub servers: Vec<ServerEntry>,
     /// Session board.
     pub sessions: Vec<SessionEntry>,
+    /// Daemon-level tracked-root board (pinned + ephemeral).
+    pub roots: Vec<RootEntry>,
     /// Bounded `warn`/`error` alert ring (newest-first).
     pub alerts: Vec<Alert>,
     /// Bounded curated activity ring (milestones, newest-first).
@@ -596,16 +626,19 @@ impl SnapshotState {
     ///
     /// `sessions` is pulled from the [`SessionBoard`] by the caller (outside
     /// this struct's lock) and injected here, sorted by id for stable output.
-    fn to_json(&self, sessions: &[SessionEntry]) -> String {
+    fn to_json(&self, sessions: &[SessionEntry], roots: &[RootEntry]) -> String {
         let mut servers: Vec<&ServerEntry> = self.servers.values().collect();
         servers.sort_by(|a, b| a.id.cmp(&b.id));
         let mut sessions: Vec<&SessionEntry> = sessions.iter().collect();
         sessions.sort_by(|a, b| a.id.cmp(&b.id));
+        let mut roots: Vec<&RootEntry> = roots.iter().collect();
+        roots.sort_by(|a, b| a.path.cmp(&b.path));
         let view = SnapshotView {
             schema: SCHEMA,
             daemon: self.daemon.to_meta(),
             servers,
             sessions,
+            roots,
             alerts: self.alerts.iter().collect(),
             activity: self.activity.iter().collect(),
         };
@@ -623,6 +656,7 @@ struct SnapshotView<'a> {
     daemon: DaemonMeta<'a>,
     servers: Vec<&'a ServerEntry>,
     sessions: Vec<&'a SessionEntry>,
+    roots: Vec<&'a RootEntry>,
     alerts: Vec<&'a Alert>,
     activity: Vec<&'a Milestone>,
 }
@@ -638,6 +672,9 @@ struct Inner {
     /// exists. Pulled at flush time; absent until set (initial snapshots and
     /// transport-only tests serialize an empty session board).
     session_board: OnceLock<Arc<dyn SessionBoard>>,
+    /// Live root source (the daemon's `RootTracker`), wired once alongside the
+    /// session board. Pulled at flush; absent until set (empty root board).
+    root_board: OnceLock<Arc<dyn RootBoard>>,
 }
 
 impl Inner {
@@ -658,6 +695,17 @@ impl Inner {
             .unwrap_or_default()
     }
 
+    /// Pulls the current root board, or an empty list when none is wired.
+    ///
+    /// Called *outside* the snapshot lock, for the same lock-ordering reason as
+    /// [`Self::sessions`]: the board acquires the `RootTracker`'s own lock.
+    fn roots(&self) -> Vec<RootEntry> {
+        self.root_board
+            .get()
+            .map(|board| board.roots())
+            .unwrap_or_default()
+    }
+
     /// Serializes then writes atomically.
     ///
     /// Clears the dirty flag under the lock, pulls the live session board with
@@ -671,12 +719,13 @@ impl Inner {
             state.dirty = false;
             state.urgent = false;
         }
-        // Pull sessions with the snapshot lock released (avoids lock-order
-        // inversion with the SessionManager locks the board acquires).
+        // Pull sessions + roots with the snapshot lock released (avoids
+        // lock-order inversion with the SessionManager locks the boards acquire).
         let sessions = self.sessions();
+        let roots = self.roots();
         let json = {
             let state = self.lock_state();
-            state.to_json(&sessions)
+            state.to_json(&sessions, &roots)
         };
         match write_atomic(&self.path, &json) {
             Ok(()) => {
@@ -737,6 +786,7 @@ impl SnapshotWriter {
             coalesce,
             flush_count: AtomicU64::new(0),
             session_board: OnceLock::new(),
+            root_board: OnceLock::new(),
         });
         let task_inner = inner.clone();
         runtime.spawn(async move { flush_loop(task_inner).await });
@@ -798,6 +848,17 @@ impl SnapshotWriter {
     /// after wiring serializes any already-connected sessions.
     pub fn set_session_board(&self, board: Arc<dyn SessionBoard>) {
         if self.inner.session_board.set(board).is_ok() {
+            self.touch();
+        }
+    }
+
+    /// Wires the live root source (the daemon's `RootTracker`).
+    ///
+    /// Called once, after the manager exists. Subsequent calls are ignored
+    /// (set-once). Marks the snapshot dirty so the first flush after wiring
+    /// serializes any already-tracked roots.
+    pub fn set_root_board(&self, board: Arc<dyn RootBoard>) {
+        if self.inner.root_board.set(board).is_ok() {
             self.touch();
         }
     }
@@ -999,7 +1060,7 @@ mod tests {
         state.update_state(&key, &ServerLifecycle::Probing);
 
         let json: serde_json::Value =
-            serde_json::from_str(&state.to_json(&[])).expect("valid json");
+            serde_json::from_str(&state.to_json(&[], &[])).expect("valid json");
         let server = &json["servers"][0];
         // Full lifecycle — NOT the lossy display_state ("initializing").
         assert_eq!(server["state"], "probing");
@@ -1654,7 +1715,17 @@ mod tests {
         });
 
         let session = session_entry("mcp:7f3a", SessionStatus::Editing, vec!["/p/Catenary"]);
-        let json = state.to_json(std::slice::from_ref(&session));
+        let roots = vec![
+            RootEntry {
+                path: "/p/Catenary".to_string(),
+                ephemeral: false,
+            },
+            RootEntry {
+                path: "/p/Lattice".to_string(),
+                ephemeral: true,
+            },
+        ];
+        let json = state.to_json(std::slice::from_ref(&session), &roots);
 
         let snapshot: Snapshot = serde_json::from_str(&json).expect("reader parses writer output");
         assert_eq!(snapshot.schema, SCHEMA);
@@ -1675,6 +1746,14 @@ mod tests {
         assert_eq!(snapshot.sessions.len(), 1);
         assert_eq!(snapshot.sessions[0].id, "mcp:7f3a");
         assert_eq!(snapshot.sessions[0].status, SessionStatus::Editing);
+
+        // The daemon-level root board round-trips, sorted by path, with the
+        // pinned/ephemeral class preserved.
+        assert_eq!(snapshot.roots.len(), 2);
+        assert_eq!(snapshot.roots[0].path, "/p/Catenary");
+        assert!(!snapshot.roots[0].ephemeral, "pinned root");
+        assert_eq!(snapshot.roots[1].path, "/p/Lattice");
+        assert!(snapshot.roots[1].ephemeral, "ephemeral root");
 
         assert_eq!(snapshot.alerts.len(), 1);
         assert_eq!(snapshot.alerts[0].level, "error");

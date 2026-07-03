@@ -58,7 +58,17 @@ pub async fn run_ls_roots(out: &mut Output) -> Result<()> {
             .map(|arr| arr.iter().filter_map(|s| s.as_str()).collect::<Vec<&str>>())
             .unwrap_or_default();
 
-        let source_label = if sources.is_empty() {
+        // Distinguish the classes (ephemeral-roots ticket 02): an ephemeral,
+        // activity-mounted root shows `[ephemeral · expires when idle]` instead
+        // of its raw `ephemeral:*` contributor key; a pinned root keeps its
+        // contributor sources.
+        let ephemeral = entry
+            .get("ephemeral")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let label = if ephemeral {
+            "ephemeral \u{b7} expires when idle".to_string()
+        } else if sources.is_empty() {
             "unknown".to_string()
         } else {
             sources.join(", ")
@@ -66,7 +76,7 @@ pub async fn run_ls_roots(out: &mut Output) -> Result<()> {
 
         let _ = out.writeln(format_args!(
             "{path}  {}",
-            out.colors.dim(&format!("[{source_label}]"))
+            out.colors.dim(&format!("[{label}]"))
         ));
     }
 

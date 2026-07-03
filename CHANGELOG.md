@@ -62,6 +62,20 @@ upgrading.
 
 ### Added
 
+- **Activity-mounted ephemeral roots.** A `catenary grep`, `glob`, or
+  `diagnostics` touching a path outside every mounted root now detects the
+  enclosing project root (walking `.git` up from the path), **mounts it
+  ephemerally**, and serves the enriched/diagnosed result from the
+  freshly-attached server(s) — no `catenary roots add` required. The mount
+  **expires after a few minutes of inactivity**; every qualifying activity
+  (search, outline, diagnostics, edit tracking) refreshes its idle clock, so an
+  active root never expires out from under you and an idle one cleans itself up.
+  `catenary roots add` on an ephemerally-mounted root **upgrades it to pinned**
+  and stops the expiry; `catenary roots ls` and the `state.json` root board
+  distinguish the two classes. Only the single enclosing root mounts (never a
+  sibling), and companion-root templating does not apply to ephemeral mounts.
+  This supersedes the out-of-root receipt-honesty fallback wherever a root is
+  mountable; the fallback still answers for unmountable paths.
 - **`[tools].diagnostics_severity`** (default `"error"`) — minimum severity that
   labels a `catenary diagnostics` run "dirty" (vs "clean"). A status label only:
   the run always exits `0` and prints every diagnostic; it does not gate an exit

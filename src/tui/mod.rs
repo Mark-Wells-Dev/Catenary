@@ -1054,6 +1054,7 @@ mod tests {
                 roots: vec!["/p/Catenary".to_string()],
                 ..SessionEntry::default()
             }],
+            roots: Vec::new(),
             alerts: vec![Alert {
                 at: "2026-06-08T14:32:00.000Z".to_string(),
                 level: "error".to_string(),

@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use tokio_util::sync::CancellationToken;
@@ -516,6 +516,43 @@ impl crate::state_snapshot::SessionBoard for SessionBoardImpl {
     }
 }
 
+/// The daemon-level [`crate::state_snapshot::RootBoard`] source, backed by the
+/// live [`RootTracker`]. Pulled at each snapshot flush so `state.json` carries
+/// the current tracked roots with their class (ephemeral-roots ticket 02).
+#[cfg(unix)]
+struct RootBoardImpl {
+    tracker: RootTracker,
+}
+
+#[cfg(unix)]
+impl crate::state_snapshot::RootBoard for RootBoardImpl {
+    fn roots(&self) -> Vec<crate::state_snapshot::RootEntry> {
+        self.tracker
+            .list_roots()
+            .into_iter()
+            .map(|(path, sources)| crate::state_snapshot::RootEntry {
+                path: path.display().to_string(),
+                ephemeral: root_is_ephemeral(&sources),
+            })
+            .collect()
+    }
+}
+
+/// Classifies a tracked root as ephemeral from its contributor sources.
+///
+/// A root is ephemeral iff **every** contributor holding it is an
+/// `ephemeral:*` key — i.e. it is held only by activity mounts. Any pinned
+/// contributor (`hook` / `mcp:*` / `worktree:*`) makes it pinned, which is why
+/// `roots add` upgrades a root by adding a `hook` contributor (and this feature
+/// then drops the ephemeral one). An empty source list is never ephemeral.
+#[cfg(unix)]
+fn root_is_ephemeral(sources: &[String]) -> bool {
+    !sources.is_empty()
+        && sources
+            .iter()
+            .all(|s| s.starts_with(EPHEMERAL_CONTRIBUTOR_PREFIX))
+}
+
 /// Shared context for session-aware hook dispatch.
 ///
 /// When set on [`SessionManager`], hook connections are routed to
@@ -554,6 +591,11 @@ struct HookDispatchContext {
     /// 1-permit semaphore: each [`HandoffKey`] serializes independently, so a
     /// staged `diagnostics` handoff never stalls another session daemon-wide.
     handoff: KeyedHandoff,
+    /// Per-root idle clock for activity-mounted ephemeral roots (ephemeral-roots
+    /// ticket 02). A CLI query touching a path outside every mounted root mounts
+    /// its enclosing project root under an `ephemeral:*` contributor and records
+    /// activity here; the idle reaper reads it to tear the mount down.
+    ephemeral_mounts: EphemeralMounts,
 }
 
 /// A staged hook→CLI handoff, deposited under a [`HandoffKey`] by the
@@ -1058,6 +1100,264 @@ fn reap_missing_worktree_roots(tracker: &RootTracker) -> Vec<String> {
     removed
 }
 
+// ── Ephemeral, activity-mounted roots (ephemeral-roots ticket 02) ───────────
+
+/// Contributor-key prefix for activity-mounted ephemeral roots.
+///
+/// A `RootTracker` contributor keyed `ephemeral:{canonical root path}` (decision
+/// 021's namespace discipline — a dedicated class beside `mcp:{fd}` / `hook` /
+/// `worktree:*`, keyed on the canonical root path). A CLI query (`grep` / `glob`
+/// / `diagnostics`) touching a path outside every mounted root mounts the
+/// enclosing project root under this key; the idle-expiry reaper tears it down.
+#[cfg(unix)]
+const EPHEMERAL_CONTRIBUTOR_PREFIX: &str = "ephemeral:";
+
+/// How long an ephemeral root survives without a refreshing activity before the
+/// reaper tears it down. In the ticket's 5–10 minute band; the reaper sweep
+/// interval adds at most one [`EPHEMERAL_ROOT_SWEEP_INTERVAL`] of slack, keeping
+/// the worst case under 10 minutes.
+#[cfg(unix)]
+const EPHEMERAL_ROOT_IDLE_TIMEOUT: Duration = Duration::from_mins(7);
+
+/// How often the idle-expiry reaper wakes to sweep inactive ephemeral roots.
+#[cfg(unix)]
+const EPHEMERAL_ROOT_SWEEP_INTERVAL: Duration = Duration::from_mins(1);
+
+/// Builds the `ephemeral:{canonical root path}` contributor key for a root.
+#[cfg(unix)]
+fn ephemeral_contributor(root: &Path) -> String {
+    format!("{EPHEMERAL_CONTRIBUTOR_PREFIX}{}", root.display())
+}
+
+/// Per-root idle clock for activity-mounted ephemeral roots.
+///
+/// Holds the last-activity [`Instant`] of every ephemeral root, keyed by
+/// canonical path. Every qualifying activity (search, outline, diagnostics, edit
+/// tracking) [`touch`](Self::touch)es the covering root; the idle reaper reads
+/// [`expired`](Self::expired) to decide teardown. The clock is the *only*
+/// release signal — an activity-created mount has no MCP heartbeat to pin on
+/// (DESIGN.md), so inactivity is the correct expiry.
+///
+/// `Instant`-based and injectable: the reaper's `now`/`idle` are parameters, so
+/// tests drive expiry deterministically (a stale `Instant::now() - Duration`)
+/// with no wall-clock sleep (zero-flake doctrine).
+#[cfg(unix)]
+#[derive(Clone)]
+struct EphemeralMounts {
+    inner: Arc<std::sync::Mutex<HashMap<PathBuf, Instant>>>,
+}
+
+#[cfg(unix)]
+impl EphemeralMounts {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Records `now` as the last-activity time for `root` (mount or refresh).
+    fn touch(&self, root: &Path, now: Instant) {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(root.to_path_buf(), now);
+    }
+
+    /// Refreshes every ephemeral root that encloses `path` (an ancestor-or-equal
+    /// of it). `path` should already be canonicalized so it lines up with the
+    /// canonical root keys. A qualifying activity on a file under an ephemeral
+    /// root keeps that root alive.
+    fn touch_covering(&self, path: &Path, now: Instant) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (root, last) in inner.iter_mut() {
+            if path.starts_with(root) {
+                *last = now;
+            }
+        }
+    }
+
+    /// Drops a root's clock entry (on idle expiry or upgrade-to-pinned).
+    fn remove(&self, root: &Path) {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(root);
+    }
+
+    /// Returns the roots whose last activity is at least `idle` before `now`.
+    ///
+    /// `saturating_duration_since` guards against a `last` in the future (clock
+    /// skew is impossible for a monotonic `Instant`, but the saturating form is
+    /// panic-free regardless).
+    fn expired(&self, now: Instant, idle: Duration) -> Vec<PathBuf> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|(_, last)| now.saturating_duration_since(**last) >= idle)
+            .map(|(root, _)| root.clone())
+            .collect()
+    }
+
+    /// The set of roots that currently carry an idle clock (test-only).
+    #[cfg(test)]
+    fn roots(&self) -> Vec<PathBuf> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .cloned()
+            .collect()
+    }
+}
+
+/// Decides whether a touched path warrants mounting an enclosing ephemeral root.
+///
+/// Returns the canonical enclosing project root to mount, or `None` when no
+/// mount is warranted. `Some(root)` iff:
+///
+/// - the touched path is **not** already inside any tracked root (equal to or
+///   under one — the "outside every mounted root" test, which also rejects a
+///   path under a mounted sub-root), and
+/// - an enclosing project root is detectable by walking `.git` up from the path
+///   ([`crate::companions::enclosing_worktree_root`]), and
+/// - that root is not itself already tracked.
+///
+/// `canonical_touched` should be canonicalized by the caller when the path
+/// exists so the comparison lines up with the tracker's canonical roots; a glob
+/// pattern or not-yet-existing path (which cannot canonicalize) still resolves
+/// its enclosing `.git` by lexical ancestor walk. Scope guard: only the single
+/// enclosing root is returned — never a sibling — and companion templating is
+/// never applied to it.
+#[cfg(unix)]
+fn ephemeral_root_to_mount(
+    canonical_touched: &Path,
+    tracked: &HashSet<PathBuf>,
+) -> Option<PathBuf> {
+    // Already inside a tracked root → covered, no ephemeral mount.
+    if tracked.iter().any(|r| canonical_touched.starts_with(r)) {
+        return None;
+    }
+    let root = crate::companions::enclosing_worktree_root(canonical_touched)?;
+    let root = root.canonicalize().unwrap_or(root);
+    // Belt-and-suspenders vs the check above (a canonicalization mismatch): the
+    // enclosing root is already a tracked root.
+    if tracked.contains(&root) {
+        return None;
+    }
+    Some(root)
+}
+
+/// Reaps every ephemeral root idle beyond `idle` as of `now`, returning the
+/// reaped root paths so the caller can re-sync + log.
+///
+/// Pure [`RootTracker`] + [`EphemeralMounts`] mutation — no async, no
+/// `sync_roots` (the reaper loop owns the single re-sync once it has the reaped
+/// set), mirroring [`reap_missing_worktree_roots`]. `now`/`idle` are injected so
+/// tests drive expiry with no wall-clock wait. A reaped root with outstanding
+/// debt is coverage loss, not a wedge (decision 027): the removed server means
+/// the file degrades to uncovered, and a later `catenary diagnostics` on it
+/// re-mounts (activity) or degrades honestly — the gate never strands.
+#[cfg(unix)]
+fn reap_idle_ephemeral_roots(
+    tracker: &RootTracker,
+    mounts: &EphemeralMounts,
+    now: Instant,
+    idle: Duration,
+) -> Vec<PathBuf> {
+    let expired = mounts.expired(now, idle);
+    for root in &expired {
+        tracker.remove_contributor(&ephemeral_contributor(root));
+        mounts.remove(root);
+    }
+    expired
+}
+
+/// Resolves a query's path arguments to absolute touched paths.
+///
+/// Absolute args pass through; relative args (including glob patterns like
+/// `src/**/*.rs`) are joined onto `cwd`. When no paths are named, the query's
+/// effective target is `cwd` itself, so it is returned as the single touched
+/// path (mounting the enclosing root of a bare `grep` run inside an out-of-root
+/// checkout). Returns empty when there is nothing to resolve (no paths, no cwd).
+#[cfg(unix)]
+fn resolve_touched_paths(paths: &[PathBuf], cwd: Option<&Path>) -> Vec<PathBuf> {
+    if paths.is_empty() {
+        return cwd.map(Path::to_path_buf).into_iter().collect();
+    }
+    paths
+        .iter()
+        .map(|p| match cwd {
+            Some(base) if p.is_relative() => base.join(p),
+            _ => p.clone(),
+        })
+        .collect()
+}
+
+/// Mounts an ephemeral root for every touched path outside every mounted root,
+/// and refreshes the idle clock of every ephemeral root the touched paths fall
+/// under (ephemeral-roots ticket 02).
+///
+/// Called by the `grep` / `glob` / `diagnostics` handlers before they execute,
+/// so the enriched/diagnosed result is served from the freshly-attached
+/// server(s). A new mount adds an `ephemeral:{path}` contributor and re-syncs
+/// the union (the same `sync_roots` path root removal rides, so the fresh server
+/// spawns exactly as a pinned root's would); the sync happens once, after all
+/// paths are processed. Idempotent per path: an already-mounted root only has
+/// its clock refreshed. First-touch pays the new server's spawn/index (an
+/// accepted slight stall); existing roots are never torn down here, so other
+/// roots' work is not blocked. Scope guard: only enclosing roots mount, never
+/// siblings, and companion templating is never applied.
+#[cfg(unix)]
+async fn ensure_ephemeral_mounts(
+    ctx: &HookDispatchContext,
+    touched: &[PathBuf],
+    now: Instant,
+    session_id: &str,
+) {
+    let Some(tracker) = &ctx.root_tracker else {
+        return;
+    };
+    let mounts = &ctx.ephemeral_mounts;
+    let mut mounted = false;
+    for path in touched {
+        // Canonicalize when the path exists so the comparison lines up with the
+        // tracker's canonical roots; a glob pattern / not-yet-existing path keeps
+        // its resolved spelling (its enclosing `.git` still resolves lexically).
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+        // Every qualifying activity refreshes the covering root's idle clock.
+        mounts.touch_covering(&canonical, now);
+        let existing: HashSet<PathBuf> = tracker.global_roots().into_iter().collect();
+        if let Some(root) = ephemeral_root_to_mount(&canonical, &existing) {
+            let contributor = ephemeral_contributor(&root);
+            tracker.set_roots(&contributor, vec![root.clone()]);
+            mounts.touch(&root, now);
+            mounted = true;
+            info!(
+                source = Source::DaemonDispatch.as_str(),
+                session_id = %session_id,
+                root = %root.display(),
+                contributor = %contributor,
+                "mounted ephemeral root on out-of-root activity",
+            );
+        }
+    }
+    if mounted {
+        if let Err(e) = ctx.primary.sync_roots(tracker.global_roots_rich()).await {
+            debug!(
+                source = Source::DaemonDispatch.as_str(),
+                "root sync after ephemeral mount failed: {e}",
+            );
+        }
+        // The root board changed — flush the snapshot so `state.json` shows the
+        // new ephemeral mount promptly (the board is pulled at flush time).
+        ctx.primary.touch_snapshot();
+    }
+}
+
 /// Core daemon component that manages MCP and hook socket connections.
 ///
 /// Binds two Unix domain sockets: one for MCP connections from `catenary
@@ -1482,12 +1782,17 @@ impl SessionManager {
         self.root_tracker = Some(root_tracker.clone());
 
         let sessions = Arc::new(std::sync::Mutex::new(HashMap::new()));
-        // Wire the live session board onto the daemon snapshot so `state.json`
-        // carries the rich session board (observability ticket 05). The writer
-        // pulls this at each flush; `None` outside daemon mode.
+        // Wire the live session board + root board onto the daemon snapshot so
+        // `state.json` carries the rich session board (observability ticket 05)
+        // and the daemon-level tracked-root board with pinned/ephemeral classes
+        // (ephemeral-roots ticket 02). The writer pulls both at each flush;
+        // `None` outside daemon mode.
         if let Some(snapshot) = &session.snapshot {
             snapshot.set_session_board(Arc::new(SessionBoardImpl {
                 sessions: sessions.clone(),
+            }));
+            snapshot.set_root_board(Arc::new(RootBoardImpl {
+                tracker: root_tracker.clone(),
             }));
         }
 
@@ -1520,6 +1825,7 @@ impl SessionManager {
             editing_guardrail: Arc::new(EditingGuardrail::new()),
             handoff: KeyedHandoff::new(),
             worktree_watcher,
+            ephemeral_mounts: EphemeralMounts::new(),
         });
         self
     }
@@ -1579,6 +1885,67 @@ impl SessionManager {
                         count = removed.len(),
                         "reaped leaked worktree roots whose dir is gone",
                     );
+                }
+            }
+        });
+    }
+
+    /// Spawns the idle-expiry reaper for activity-mounted ephemeral roots
+    /// (ephemeral-roots ticket 02).
+    ///
+    /// Every [`EPHEMERAL_ROOT_SWEEP_INTERVAL`] it reaps every `ephemeral:*`
+    /// contributor idle beyond [`EPHEMERAL_ROOT_IDLE_TIMEOUT`]
+    /// ([`reap_idle_ephemeral_roots`]) and, when anything was reaped, re-syncs
+    /// the reduced union once — the same `sync_roots` path a pinned root's
+    /// removal rides, so the ephemeral server shuts down cleanly (`shutdown` /
+    /// `exit`, no leaked server) exactly as the worktree lifecycle does. Each
+    /// expiry emits an `info!` firehose event (no user-notification noise).
+    ///
+    /// A reaped root with outstanding debt is coverage loss, not a wedge
+    /// (decision 027) — the idle clock is refreshed by every qualifying activity,
+    /// so a root under active diagnosis never expires mid-run; only a genuinely
+    /// idle root does, and its debt degrades honestly on the next run.
+    ///
+    /// A detached background task mirroring [`Self::spawn_worktree_root_gc`]:
+    /// consumes the immediate first tick, then runs until daemon exit. No-op
+    /// unless [`Self::with_session`] wired the tracker + primary session.
+    pub fn spawn_ephemeral_root_reaper(&self, rt: &tokio::runtime::Handle) {
+        let (Some(tracker), Some(ctx)) = (&self.root_tracker, &self.hook_ctx) else {
+            return;
+        };
+        let tracker = tracker.clone();
+        let session = ctx.primary.clone();
+        let mounts = ctx.ephemeral_mounts.clone();
+        rt.spawn(async move {
+            let mut ticker = tokio::time::interval(EPHEMERAL_ROOT_SWEEP_INTERVAL);
+            ticker.tick().await; // consume the immediate first tick
+            loop {
+                ticker.tick().await;
+                let expired = reap_idle_ephemeral_roots(
+                    &tracker,
+                    &mounts,
+                    Instant::now(),
+                    EPHEMERAL_ROOT_IDLE_TIMEOUT,
+                );
+                if !expired.is_empty() {
+                    // Same sync the request handlers use: re-sync the (now
+                    // smaller) union once, shutting down the reaped roots' servers.
+                    if let Err(e) = session.sync_roots(tracker.global_roots_rich()).await {
+                        debug!(
+                            source = Source::DaemonDispatch.as_str(),
+                            "root sync after ephemeral-root expiry failed: {e}",
+                        );
+                    }
+                    for root in &expired {
+                        info!(
+                            source = Source::DaemonDispatch.as_str(),
+                            root = %root.display(),
+                            "expired idle ephemeral root",
+                        );
+                    }
+                    // The root board changed — flush the snapshot so the
+                    // expired mount leaves `state.json` promptly.
+                    session.touch_snapshot();
                 }
             }
         });
@@ -2069,9 +2436,14 @@ async fn handle_hook_dispatch(
         let roots_json: Vec<serde_json::Value> = roots
             .into_iter()
             .map(|(path, sources)| {
+                // Classify by contributor prefix (ticket 02): an ephemeral root
+                // is held only by `ephemeral:*` contributors. The CLI renders the
+                // class distinctly (`catenary roots ls`).
+                let ephemeral = root_is_ephemeral(&sources);
                 serde_json::json!({
                     "path": path.display().to_string(),
                     "sources": sources,
+                    "ephemeral": ephemeral,
                 })
             })
             .collect();
@@ -2413,6 +2785,16 @@ async fn handle_hook_dispatch(
             );
         });
 
+        // Ephemeral mount (ticket 02): a searched path outside every mounted
+        // root mounts its enclosing project root so the hits are LSP-enriched
+        // from the fresh server. Refreshes the idle clock of any ephemeral root
+        // the paths fall under. Instrumented with the search span so the mount
+        // event shards into this grep's firehose scope.
+        let grep_touched = resolve_touched_paths(&grep_req.paths, grep_req.cwd.as_deref());
+        ensure_ephemeral_mounts(&ctx, &grep_touched, Instant::now(), "")
+            .instrument(span.clone())
+            .await;
+
         // Race grep execution against client disconnect so a killed
         // CLI process doesn't leave the pipeline running indefinitely.
         let cancel_on_disconnect = cancel.clone();
@@ -2517,6 +2899,16 @@ async fn handle_hook_dispatch(
                 "incoming hook",
             );
         });
+
+        // Ephemeral mount (ticket 02): an outlined path outside every mounted
+        // root mounts its enclosing project root so the listing is enriched from
+        // the fresh server. Refreshes the idle clock of any covering ephemeral
+        // root. Instrumented with the search span so the mount event shards into
+        // this glob's firehose scope.
+        let glob_touched = resolve_touched_paths(&glob_req.paths, glob_req.cwd.as_deref());
+        ensure_ephemeral_mounts(&ctx, &glob_touched, Instant::now(), "")
+            .instrument(span.clone())
+            .await;
 
         // Race glob execution against client disconnect so a killed
         // CLI process doesn't leave the pipeline running indefinitely.
@@ -2886,6 +3278,15 @@ async fn handle_hook_dispatch(
                         covered,
                     )
                 } else {
+                    // Ephemeral mount (ticket 02): any diagnosed file outside
+                    // every mounted root mounts its enclosing project root so the
+                    // fresh server can diagnose it — the mounting query pays the
+                    // spawn/index. Covers a scoped `catenary diagnostics <path>`
+                    // on an out-of-root file, and a bare drain whose debt lives
+                    // under a since-expired ephemeral root (re-mount = activity,
+                    // refreshing its clock). Runs before the pipeline so
+                    // `process_files_batched` sees the file as covered.
+                    ensure_ephemeral_mounts(&ctx, &diag_files, Instant::now(), &session_id).await;
                     // Reflect the run on the session board: status → diagnostics
                     // for its duration (the editing accumulator was cleared on
                     // consume, just above), then record the result as last_action
@@ -3020,6 +3421,14 @@ async fn handle_hook_dispatch(
             let canonical = path.canonicalize().unwrap_or(path);
             if let Some(ref tracker) = ctx.root_tracker {
                 tracker.add_roots("hook", std::slice::from_ref(&canonical));
+                // Upgrade an ephemerally-mounted root to pinned (ticket 02): drop
+                // its `ephemeral:*` contributor and idle clock so it no longer
+                // expires. The `hook` contributor just added keeps the root in the
+                // union, so this drops no server — no re-index churn.
+                let upgraded = tracker.remove_root(&ephemeral_contributor(&canonical), &canonical);
+                if upgraded {
+                    ctx.ephemeral_mounts.remove(&canonical);
+                }
                 let global = tracker.global_roots_rich();
                 if let Err(e) = ctx.primary.sync_roots(global).await {
                     debug!(
@@ -3030,6 +3439,7 @@ async fn handle_hook_dispatch(
                 info!(
                     source = Source::DaemonDispatch.as_str(),
                     path = %canonical.display(),
+                    upgraded_from_ephemeral = upgraded,
                     "added root via hook contributor",
                 );
             }
@@ -3140,6 +3550,17 @@ async fn handle_hook_dispatch(
         serde_json::from_value(raw.clone()).map_err(|e| anyhow!("Invalid hook request: {e}"))?;
 
     let result = router.dispatch(request);
+
+    // Edit tracking is a qualifying activity (ticket 02): a `PreToolUse` edit of
+    // a file under an ephemeral root refreshes that root's idle clock, so an
+    // agent actively editing under it never has it expire mid-work. This only
+    // *refreshes* — edits never mount (a query does), keeping the edit hook fast.
+    if let Some(file_path) = raw.get("file_path").and_then(|v| v.as_str()) {
+        let path = Path::new(file_path);
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        ctx.ephemeral_mounts
+            .touch_covering(&canonical, Instant::now());
+    }
 
     let envelope = HookResponseEnvelope {
         result: result.result,
@@ -7263,6 +7684,298 @@ mod tests {
             "the project root survives the immediate reap",
         );
         assert!(!watcher.is_registered(&contributor), "the watch is dropped");
+    }
+
+    // ── Ephemeral, activity-mounted roots (ephemeral-roots ticket 02) ─────
+    //
+    // An out-of-root CLI query (grep/glob/diagnostics) mounts the enclosing
+    // project root under an `ephemeral:{path}` contributor; the idle reaper
+    // tears it down. The pure predicate + idle clock + reaper are driven with an
+    // injected `now`/`idle` (no wall-clock sleep — zero-flake doctrine), and the
+    // live mount + `roots add` upgrade are exercised over the IPC socket.
+
+    /// A minimal marker-ed project: a dir with a `.git` dir and one non-code
+    /// file (so no LSP server spawns for it — the tests stay off real servers).
+    fn marker_project(base: &Path, name: &str) -> (PathBuf, PathBuf) {
+        let project = base.join(name);
+        std::fs::create_dir_all(project.join(".git")).expect("mkdir .git");
+        let file = project.join("notes.txt");
+        std::fs::write(&file, "hello world\n").expect("write file");
+        (project, file)
+    }
+
+    /// Round-trip `tool/roots-ls` and return `(path, ephemeral)` pairs.
+    async fn roots_ls_classes(ipc_path: &Path) -> Vec<(String, bool)> {
+        let resp = hook_roundtrip(ipc_path, &serde_json::json!({"method": "tool/roots-ls"})).await;
+        let json: serde_json::Value = serde_json::from_str(&resp).expect("roots-ls json");
+        json.get("roots")
+            .and_then(|r| r.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .map(|e| {
+                        let path = e
+                            .get("path")
+                            .and_then(serde_json::Value::as_str)
+                            .expect("path")
+                            .to_string();
+                        let ephemeral = e
+                            .get("ephemeral")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false);
+                        (path, ephemeral)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn ephemeral_root_to_mount_detects_enclosing_and_skips_covered() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().canonicalize().expect("canonicalize");
+        let (project, file) = marker_project(&base, "Lattice");
+        let file = file.canonicalize().expect("canonicalize file");
+
+        // Outside every tracked root, enclosing `.git` detectable → mount it.
+        let empty = HashSet::new();
+        assert_eq!(
+            ephemeral_root_to_mount(&file, &empty),
+            Some(project.clone()),
+            "an out-of-root file mounts its enclosing project root",
+        );
+
+        // Already inside a tracked root → covered, no mount.
+        let tracked: HashSet<PathBuf> = std::iter::once(project).collect();
+        assert_eq!(
+            ephemeral_root_to_mount(&file, &tracked),
+            None,
+            "a file under a tracked root is already covered",
+        );
+
+        // No enclosing `.git` → no mount (the ticket-01 fallback still answers).
+        let orphan = base.join("loose.txt");
+        std::fs::write(&orphan, "x").expect("write");
+        let orphan = orphan.canonicalize().expect("canon");
+        assert_eq!(ephemeral_root_to_mount(&orphan, &empty), None);
+    }
+
+    #[test]
+    fn ephemeral_mounts_touch_covering_and_expiry() {
+        let mounts = EphemeralMounts::new();
+        let root = PathBuf::from("/proj/eph");
+        let t0 = Instant::now();
+        mounts.touch(&root, t0);
+
+        // Fresh → not idle.
+        assert!(mounts.expired(t0, Duration::from_secs(1)).is_empty());
+
+        // A covering activity (a file under the root) refreshes the clock.
+        let later = t0 + Duration::from_mins(5);
+        mounts.touch_covering(&root.join("src/x.rs"), later);
+        assert!(
+            mounts.expired(later, Duration::from_secs(1)).is_empty(),
+            "touch_covering refreshed the root — not idle at `later`",
+        );
+
+        // An unrelated path does NOT refresh it → idle past the threshold.
+        let even_later = later + Duration::from_mins(10);
+        mounts.touch_covering(Path::new("/other/y.rs"), even_later);
+        assert_eq!(
+            mounts.expired(even_later, Duration::from_secs(1)),
+            vec![root.clone()],
+            "an unrelated path left the clock stale — now idle",
+        );
+
+        // Removal drops the clock entry entirely.
+        mounts.remove(&root);
+        assert!(
+            mounts
+                .expired(even_later, Duration::from_secs(1))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn reap_idle_ephemeral_roots_expires_only_idle() {
+        let tracker = RootTracker::new();
+        let mounts = EphemeralMounts::new();
+        let idle_root = PathBuf::from("/proj/idle");
+        let fresh_root = PathBuf::from("/proj/fresh");
+        tracker.set_roots(&ephemeral_contributor(&idle_root), vec![idle_root.clone()]);
+        tracker.set_roots(
+            &ephemeral_contributor(&fresh_root),
+            vec![fresh_root.clone()],
+        );
+
+        // Both mounted at t0; only `fresh_root` is refreshed at `later`. Using
+        // addition (never subtraction) keeps the Instants panic-free regardless
+        // of the monotonic clock's origin.
+        let t0 = Instant::now();
+        mounts.touch(&idle_root, t0);
+        mounts.touch(&fresh_root, t0);
+        let later = t0 + Duration::from_mins(10);
+        mounts.touch(&fresh_root, later);
+
+        let expired = reap_idle_ephemeral_roots(&tracker, &mounts, later, Duration::from_mins(5));
+        assert_eq!(
+            expired,
+            vec![idle_root.clone()],
+            "only the idle root expires"
+        );
+
+        let global = tracker.global_roots();
+        assert!(!global.contains(&idle_root), "idle ephemeral root reaped");
+        assert!(
+            global.contains(&fresh_root),
+            "fresh ephemeral root survives"
+        );
+        assert!(
+            !mounts.roots().contains(&idle_root),
+            "reaped clock entry gone"
+        );
+        assert!(
+            mounts.roots().contains(&fresh_root),
+            "fresh clock entry kept"
+        );
+    }
+
+    #[test]
+    fn root_is_ephemeral_classifies_by_contributor_prefix() {
+        assert!(root_is_ephemeral(&["ephemeral:/p".to_string()]));
+        assert!(!root_is_ephemeral(&["hook".to_string()]));
+        assert!(
+            !root_is_ephemeral(&["ephemeral:/p".to_string(), "hook".to_string()]),
+            "any pinned contributor makes the root pinned (an upgraded root)",
+        );
+        assert!(
+            !root_is_ephemeral(&[]),
+            "no contributors is never ephemeral"
+        );
+    }
+
+    #[test]
+    fn resolve_touched_paths_joins_relative_and_defaults_to_cwd() {
+        let cwd = Path::new("/home/w");
+        assert_eq!(
+            resolve_touched_paths(
+                &[PathBuf::from("src/a.rs"), PathBuf::from("/abs/b.rs")],
+                Some(cwd),
+            ),
+            vec![
+                PathBuf::from("/home/w/src/a.rs"),
+                PathBuf::from("/abs/b.rs"),
+            ],
+            "relative args join cwd; absolute args pass through",
+        );
+        assert_eq!(
+            resolve_touched_paths(&[], Some(cwd)),
+            vec![PathBuf::from("/home/w")],
+            "a bare query's touched target is its cwd",
+        );
+        assert!(
+            resolve_touched_paths(&[], None).is_empty(),
+            "no paths and no cwd → nothing to mount",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn grep_out_of_root_mounts_ephemeral_root() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let ipc_path = ipc_socket_in(dir.path());
+        let base = dir.path().canonicalize().expect("canonicalize");
+        let (project, file) = marker_project(&base, "Lattice");
+
+        // No mounted roots — the file is outside every root.
+        let manager = Arc::new(bind_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        // A grep touching the out-of-root file mounts its enclosing project root.
+        let _ = hook_roundtrip(
+            &ipc_path,
+            &serde_json::json!({
+                "method": "tool/grep",
+                "pattern": "hello",
+                "paths": [file.display().to_string()],
+            }),
+        )
+        .await;
+
+        let classes = roots_ls_classes(&ipc_path).await;
+        let entry = classes
+            .iter()
+            .find(|(p, _)| Path::new(p) == project)
+            .expect("enclosing project mounted ephemerally on out-of-root grep");
+        assert!(entry.1, "the activity-mounted root is classed ephemeral");
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn roots_add_upgrades_ephemeral_to_pinned() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let ipc_path = ipc_socket_in(dir.path());
+        let base = dir.path().canonicalize().expect("canonicalize");
+        let (project, file) = marker_project(&base, "Lattice");
+
+        let manager = Arc::new(bind_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        // Mount ephemerally via an out-of-root grep.
+        let _ = hook_roundtrip(
+            &ipc_path,
+            &serde_json::json!({
+                "method": "tool/grep",
+                "pattern": "hello",
+                "paths": [file.display().to_string()],
+            }),
+        )
+        .await;
+        assert!(
+            roots_ls_classes(&ipc_path)
+                .await
+                .iter()
+                .any(|(p, eph)| Path::new(p) == project && *eph),
+            "project starts ephemeral",
+        );
+
+        // `roots add` on it upgrades it to pinned (and stops expiry).
+        let _ = hook_roundtrip(
+            &ipc_path,
+            &serde_json::json!({
+                "method": "tool/roots-add",
+                "path": project.display().to_string(),
+            }),
+        )
+        .await;
+
+        let classes = roots_ls_classes(&ipc_path).await;
+        let entry = classes
+            .iter()
+            .find(|(p, _)| Path::new(p) == project)
+            .expect("project still tracked after upgrade");
+        assert!(!entry.1, "the upgraded root is now pinned, not ephemeral");
+
+        // The ephemeral contributor was dropped; only `hook` remains.
+        let sources = roots_ls(&ipc_path).await;
+        let s = sources
+            .iter()
+            .find(|(p, _)| Path::new(p) == project)
+            .expect("project present in sources");
+        assert_eq!(
+            s.1,
+            vec!["hook".to_string()],
+            "ephemeral contributor dropped on upgrade, hook remains",
+        );
+
+        shutdown.cancel();
     }
 
     #[test]
