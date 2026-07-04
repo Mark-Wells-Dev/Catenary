@@ -632,6 +632,35 @@ mod tests {
     }
 
     #[test]
+    fn shipped_antigravity_rules_are_fresh() {
+        // Freshness gate (teaching-surface ticket 10): the shipped Antigravity
+        // rules file (`plugins/catenary-antigravity/rules/catenary.md`, embedded
+        // as `ANTIGRAVITY_RULES_EXPECTED` and doctor freshness-checked) is the
+        // `fallback_body` rendering verbatim — the compaction-proof teaching leg.
+        // Rules files re-inject per conversation turn, so this file carries the
+        // static tiers every turn; teach-03's persisted `PreInvocation`
+        // `userMessage` carries the live surface once (and dies at compaction).
+        //
+        // Unlike gemini-context.md, this file opens with a YAML frontmatter block
+        // pinning `trigger: always_on` so the host loads it unconditionally every
+        // turn (host contract: agy SKILL.md, "Progressive Disclosure" — "Only
+        // `always_on` rules are loaded unconditionally"). The frontmatter breaks
+        // byte-equality with `fallback_body`, so the gate compares the body
+        // *after* the frontmatter block; the block itself is asserted separately.
+        const SHIPPED: &str = include_str!("../../plugins/catenary-antigravity/rules/catenary.md");
+        const FRONTMATTER: &str = "---\ntrigger: always_on\n---\n\n";
+        let body = SHIPPED.strip_prefix(FRONTMATTER).expect(
+            "antigravity rules file must open with the `trigger: always_on` frontmatter block",
+        );
+        assert_eq!(
+            body,
+            format!("{}\n", fallback_body()),
+            "rules/catenary.md body is stale — regenerate it from \
+             `catenary::cli::teaching::fallback_body()` (preserve the frontmatter block)"
+        );
+    }
+
+    #[test]
     fn payload_stays_in_the_token_band() {
         // Size guard: the ticket targets ~600–800 tokens. Using a ~4 chars/token
         // proxy that band is ~2400–3200 chars; we allow a slightly wider

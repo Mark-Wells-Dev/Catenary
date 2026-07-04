@@ -239,6 +239,17 @@ upgrading.
   duplicate). The shipped
   [plugins/catenary-antigravity/hooks.json](plugins/catenary-antigravity/hooks.json)
   registers the hook; a reinstall (`catenary install antigravity`) picks it up.
+  In the same motion the shipped
+  [plugins/catenary-antigravity/rules/catenary.md](plugins/catenary-antigravity/rules/catenary.md)
+  demotes from a `catenary primer` pointer stub to the generated `fallback_body()`
+  render (SSOT static tiers, runtime data structurally excluded), pinned by the
+  same freshness gate as gemini-context.md. Rules files re-inject per conversation
+  turn, so the file carries explicit `trigger: always_on` frontmatter to load
+  unconditionally every turn — making it this host's only compaction-proof teaching
+  leg (the persisted `userMessage` above dies at compaction with no observable
+  signal). The two now form a hybrid mirroring Gemini's: the rules file carries the
+  static tiers per turn, the `PreInvocation` `userMessage` carries the live surface
+  once.
 - **`catenary glob` outlines show types and callables only.** The file and
   directory outline is now a map, not a mirror: it recurses into containers
   (modules/namespaces/packages and classes/interfaces/enums/structs/impls) and
