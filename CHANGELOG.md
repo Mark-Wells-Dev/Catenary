@@ -193,27 +193,25 @@ upgrading.
   the path on `config.instructions`. OpenCode re-reads that file into every
   request's system prompt, so the live surface rides every request and survives
   compaction with zero per-request work — mirroring Claude Code's SessionStart.
-  The shipped
-  [plugins/catenary-opencode/catenary.md](plugins/catenary-opencode/catenary.md)
-  demotes to a bootstrap/fallback: regenerated from the same SSOT with runtime data
-  structurally excluded (no allow surface, build tool, or roots), it covers the
-  cold window before the plugin runs and plugin-disabled installs. A freshness
-  gate pins the shipped file to the SSOT so the two cannot drift.
+  (A shipped static fallback file originally accompanied this; the plugin-only
+  reshape below retired it — OpenCode teaching is runtime-only.)
 - **OpenCode integration is plugin-only — `catenary install opencode` no longer
-  edits `opencode.json`.** The installer now writes only the two Catenary-owned
-  files (`plugin/catenary.js` and the shipped
-  [catenary.md](plugins/catenary-opencode/catenary.md)) and never creates,
-  parses, or rewrites the user-owned `opencode.json`. The MCP heartbeat
-  (`mcp.catenary`) and the static rules registration that used to be merged into
-  that file now ride the plugin's `config` hook: the heartbeat is injected
-  unconditionally and first (`??=`, so it defers to any existing entry), and the
-  shipped rules file is registered on `config.instructions` with path-resolved
-  dedup so an older merged entry never double-registers. This retires a class of
-  install failures on comment-bearing / dotfile-managed configs, at the cost of
-  collapsing the disable story to one switch — disabling the plugin now drops
-  enforcement, teaching, and the heartbeat together. Upgrading users may remove
-  the previously merged `mcp.catenary` / `instructions` entries from
-  `opencode.json`; leaving them is harmless.
+  edits `opencode.json`.** The installer now writes exactly one Catenary-owned
+  file (`plugin/catenary.js`) and never creates, parses, or rewrites the
+  user-owned `opencode.json`. The MCP heartbeat (`mcp.catenary`) that used to be
+  merged into that file now rides the plugin's `config` hook, injected
+  unconditionally and first (`??=`, so it defers to any existing entry). Teaching
+  is **runtime-only**: the `config` hook regenerates the instructions file from
+  the binary and registers its path — there is no shipped static fallback,
+  because regeneration needs only the `catenary` binary and local config (nothing
+  daemon-side), so a regen failure means the install itself is broken and generic
+  teaching pointing at dead commands would be worse than silence. This retires a
+  class of install failures on comment-bearing / dotfile-managed configs, at the
+  cost of collapsing the disable story to one switch — disabling the plugin now
+  drops enforcement, teaching, and the heartbeat together. Upgrading users may
+  remove the previously merged `mcp.catenary` / `instructions` entries from
+  `opencode.json` and delete any old `~/.config/opencode/catenary.md`; leaving
+  the merged entries is harmless.
 - **Gemini CLI joins the runtime-sourced teaching column.** `catenary hook
   session-start --format=gemini` was already registered but withheld the payload
   behind a Claude-only gate; it now emits the same SSOT teaching body Claude
@@ -222,8 +220,8 @@ upgrading.
   prior transcript on `--resume`, so the payload is re-injected only on
   `startup`/`clear`, never on `resume`. The shipped
   [gemini-context.md](gemini-context.md) demotes from a `catenary primer` pointer
-  stub to a bootstrap/fallback: regenerated from the same SSOT as the OpenCode
-  fallback with runtime data structurally excluded (no allow surface, build tool,
+  stub to a bootstrap/fallback: regenerated from the SSOT's static tiers
+  (`fallback_body()`) with runtime data structurally excluded (no allow surface, build tool,
   or roots), pinned by the same freshness gate, it is the compaction-proof
   baseline (Gemini's `SessionStart` has no `compact` source and `PreCompress`
   cannot inject — an accepted, documented gap, not papered over with per-turn

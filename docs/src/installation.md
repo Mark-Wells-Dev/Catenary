@@ -49,25 +49,29 @@ catenary install opencode
 ```
 
 OpenCode has no `hooks.json` surface, so Catenary ships an in-process plugin.
-The install is **plugin-only**: it writes exactly two Catenary-owned files —
-`~/.config/opencode/plugin/catenary.js` (the plugin) and
-`~/.config/opencode/catenary.md` (the static teaching fallback) — and makes
-**zero edits to your `opencode.json`**. On config load the plugin injects the
-MCP heartbeat (`mcp.catenary`) and registers its teaching by itself, so nothing
-is merged into your config. Pass `--workspace` to install into the project
+The install is **plugin-only**: it writes exactly one Catenary-owned file —
+`~/.config/opencode/plugin/catenary.js` (the plugin) — and makes **zero edits to
+your `opencode.json`**. On config load the plugin injects the MCP heartbeat
+(`mcp.catenary`) and regenerates its teaching from the binary by itself, so
+nothing is merged into your config. Teaching is **runtime-only** — there is no
+shipped static fallback file. Pass `--workspace` to install into the project
 (`.opencode/`) instead of globally.
 
 Because the whole integration rides one plugin, there is a single disable
 switch and it turns off everything together — enforcement, teaching, and the MCP
-heartbeat: delete or rename `plugin/catenary.js`, or launch OpenCode with
-`OPENCODE_PURE=1` (which disables **all** external plugins). See [Disabling
-Catenary per project](#disabling-catenary-per-project) below.
+heartbeat: delete or rename that one file, `plugin/catenary.js`, or launch
+OpenCode with `OPENCODE_PURE=1` (which disables **all** external plugins). See
+[Disabling Catenary per project](#disabling-catenary-per-project) below.
 
 > **Upgrading from an earlier version?** Older releases merged an `mcp.catenary`
-> entry and an `instructions` reference to the rules file into your
-> `opencode.json`. The plugin now carries both, so those merged entries are
-> redundant — you may remove them, but leaving them is harmless: the plugin
-> defers to an existing `mcp.catenary` and never double-registers the rules.
+> entry and an `instructions` reference to a rules file into your
+> `opencode.json`, and shipped a static `~/.config/opencode/catenary.md`
+> teaching fallback. The plugin now carries the heartbeat and regenerates its
+> teaching from the binary at runtime, so those are all redundant: you may remove
+> the merged `mcp.catenary` / `instructions` entries, delete
+> `~/.config/opencode/catenary.md`, and drop any old `instructions` entry naming
+> it. Leaving the merged `mcp.catenary` entry is harmless — the plugin defers to
+> it.
 
 ### Manual MCP registration
 

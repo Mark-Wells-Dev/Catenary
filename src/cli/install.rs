@@ -952,22 +952,16 @@ fn install_antigravity_bundled(out: &mut Output, target: &Path, dry_run: bool) -
 
 // ── OpenCode install ───────────────────────────────────────────────
 
-/// Embedded OpenCode plugin files.
+/// Embedded OpenCode plugin file.
 const OC_PLUGIN_JS: &str = include_str!("../../plugins/catenary-opencode/catenary.js");
-const OC_RULES: &str = include_str!("../../plugins/catenary-opencode/catenary.md");
 
-/// Resolved install targets for OpenCode. Integration is plugin-only: both
-/// files are Catenary-owned and land in different places, and the user-owned
-/// `opencode.json` is never touched (the MCP heartbeat and the static rules
-/// registration ride the plugin's `config` hook, not a JSON merge).
+/// Resolved install targets for OpenCode. Integration is plugin-only: the single
+/// Catenary-owned plugin file is all that lands, and the user-owned
+/// `opencode.json` is never touched (the MCP heartbeat and the runtime teaching
+/// ride the plugin's `config` hook, not a JSON merge).
 struct OpenCodeTargets {
     /// Auto-discovered plugin file (`plugin/catenary.js`).
     plugin: PathBuf,
-    /// Catenary-owned agent rules (`catenary.md`). Registered on
-    /// `config.instructions` by the plugin's `config` hook rather than written
-    /// into a user-authored `AGENTS.md` — matching how every other host ships
-    /// its own rules file.
-    rules: PathBuf,
 }
 
 /// Resolve OpenCode install targets for the global (`~/.config/opencode/`) or
@@ -977,14 +971,11 @@ fn opencode_targets(workspace: bool) -> Result<OpenCodeTargets> {
         let root = std::env::current_dir().context("cannot determine current directory")?;
         Ok(OpenCodeTargets {
             plugin: root.join(".opencode/plugin/catenary.js"),
-            rules: root.join(".opencode/catenary.md"),
         })
     } else {
         let home = dirs::home_dir().context("cannot determine home directory")?;
-        let base = home.join(".config/opencode");
         Ok(OpenCodeTargets {
-            plugin: base.join("plugin/catenary.js"),
-            rules: base.join("catenary.md"),
+            plugin: home.join(".config/opencode/plugin/catenary.js"),
         })
     }
 }
@@ -992,10 +983,9 @@ fn opencode_targets(workspace: bool) -> Result<OpenCodeTargets> {
 /// Run `catenary install opencode [--workspace]`.
 ///
 /// Integration is plugin-only: writes (or symlinks) the auto-discovered plugin
-/// file and writes the Catenary-owned rules file — the only two artifacts. The
-/// user-owned `opencode.json` is never created or modified; the MCP heartbeat
-/// and the rules registration ride the plugin's `config` hook. No
-/// user-authored `AGENTS.md` is touched either.
+/// file — the only artifact. The user-owned `opencode.json` is never created or
+/// modified; the MCP heartbeat and the runtime teaching ride the plugin's
+/// `config` hook. No user-authored `AGENTS.md` is touched either.
 ///
 /// # Errors
 ///
@@ -1012,9 +1002,9 @@ pub fn run_install_opencode(
     install_opencode(out, source, &targets, dry_run)
 }
 
-/// Install the two Catenary-owned OpenCode files (plugin + rules) into `targets`.
-/// Never touches `opencode.json`. Split from [`run_install_opencode`] so tests
-/// can drive it against tempdir targets.
+/// Install the Catenary-owned OpenCode plugin file into `targets`. Never touches
+/// `opencode.json`. Split from [`run_install_opencode`] so tests can drive it
+/// against tempdir targets.
 fn install_opencode(
     out: &mut Output,
     source: Option<&str>,
@@ -1022,17 +1012,9 @@ fn install_opencode(
     dry_run: bool,
 ) -> Result<()> {
     match source.map(parse_source) {
-        Some(InstallSource::Local(path)) => {
-            install_opencode_local(out, &path, targets, dry_run)?;
-        }
-        Some(InstallSource::Remote(_)) | None => {
-            install_opencode_bundled(out, targets, dry_run)?;
-        }
+        Some(InstallSource::Local(path)) => install_opencode_local(out, &path, targets, dry_run),
+        Some(InstallSource::Remote(_)) | None => install_opencode_bundled(out, targets, dry_run),
     }
-
-    // The rules file is Catenary-owned, written like the plugin and independent
-    // of the plugin source mode.
-    install_opencode_rules(out, &targets.rules, dry_run)
 }
 
 /// Install the OpenCode plugin by symlinking to a local path (dev mode).
@@ -1141,54 +1123,6 @@ fn install_opencode_bundled(
         "  {} wrote plugin to {}",
         out.colors.green("✓"),
         target.display(),
-    ));
-
-    Ok(())
-}
-
-/// Write the Catenary-owned rules file (`catenary.md`). Unlike a user-authored
-/// `AGENTS.md`, this file belongs to Catenary, so it is written and
-/// staleness-checked like the plugin — a symlink (dev install) is left alone.
-/// It is surfaced to the agent when the plugin's `config` hook registers it on
-/// `config.instructions` at runtime, so the user's own rules files — and the
-/// user-owned `opencode.json` — are untouched.
-fn install_opencode_rules(out: &mut Output, rules: &Path, dry_run: bool) -> Result<()> {
-    // A symlink means a dev install — don't overwrite it.
-    if rules.is_symlink() {
-        let link_target = std::fs::read_link(rules).unwrap_or_default();
-        let _ = out.writeln(format_args!(
-            "  {} rules symlinked → {}",
-            out.colors.green("✓"),
-            link_target.display(),
-        ));
-        return Ok(());
-    }
-
-    let up_to_date = std::fs::read_to_string(rules).is_ok_and(|c| c == OC_RULES);
-    if up_to_date {
-        let _ = out.writeln(format_args!("  {} rules up to date", out.colors.green("✓")));
-        return Ok(());
-    }
-
-    if dry_run {
-        let _ = out.writeln(format_args!(
-            "  {} write rules to {}",
-            out.colors.dim("(dry-run)"),
-            rules.display(),
-        ));
-        return Ok(());
-    }
-
-    if let Some(parent) = rules.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create rules directory {}", parent.display()))?;
-    }
-    std::fs::write(rules, OC_RULES).with_context(|| format!("write {}", rules.display()))?;
-
-    let _ = out.writeln(format_args!(
-        "  {} wrote rules to {}",
-        out.colors.green("✓"),
-        rules.display(),
     ));
 
     Ok(())
@@ -1390,14 +1324,12 @@ mod tests {
     fn oc_targets(base: &Path) -> OpenCodeTargets {
         OpenCodeTargets {
             plugin: base.join("plugin/catenary.js"),
-            rules: base.join("catenary.md"),
         }
     }
 
     #[test]
     fn embedded_opencode_files_not_empty() {
         assert!(!OC_PLUGIN_JS.is_empty(), "plugin js should not be empty");
-        assert!(!OC_RULES.is_empty(), "rules should not be empty");
     }
 
     #[test]
@@ -1472,60 +1404,6 @@ mod tests {
         assert!(out.into_string().contains("symlinked"));
     }
 
-    #[test]
-    fn opencode_rules_written() {
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let rules = dir.path().join(".opencode/catenary.md");
-
-        let mut out = Output::buffer(80);
-        install_opencode_rules(&mut out, &rules, false).expect("write rules");
-
-        let content = std::fs::read_to_string(&rules).expect("rules should exist");
-        assert_eq!(content, OC_RULES);
-        assert!(out.into_string().contains("wrote rules"));
-    }
-
-    #[test]
-    fn opencode_rules_idempotent() {
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let rules = dir.path().join("catenary.md");
-
-        let mut out = Output::buffer(80);
-        install_opencode_rules(&mut out, &rules, false).expect("first write");
-
-        let mut out2 = Output::buffer(80);
-        install_opencode_rules(&mut out2, &rules, false).expect("second write");
-        assert!(out2.into_string().contains("up to date"));
-    }
-
-    #[test]
-    fn opencode_rules_staleness_rewrites() {
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let rules = dir.path().join("catenary.md");
-        // A Catenary-owned file with stale content is overwritten — it is ours,
-        // referenced via `instructions`, not a user-authored rules file.
-        std::fs::write(&rules, "# stale catenary rules\n").expect("write stale rules");
-
-        let mut out = Output::buffer(80);
-        install_opencode_rules(&mut out, &rules, false).expect("rewrite stale");
-
-        let content = std::fs::read_to_string(&rules).expect("rules should exist");
-        assert_eq!(content, OC_RULES);
-        assert!(out.into_string().contains("wrote rules"));
-    }
-
-    #[test]
-    fn opencode_rules_dry_run_no_file() {
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let rules = dir.path().join("catenary.md");
-
-        let mut out = Output::buffer(80);
-        install_opencode_rules(&mut out, &rules, true).expect("dry run");
-
-        assert!(!rules.exists(), "dry run should not write rules");
-        assert!(out.into_string().contains("(dry-run)"));
-    }
-
     // ── OpenCode is plugin-only (never touches opencode.json) ───────
 
     /// Integration is plugin-only: a full install writes only the two
@@ -1547,14 +1425,10 @@ mod tests {
         let mut out = Output::buffer(80);
         install_opencode(&mut out, None, &targets, false).expect("install should succeed");
 
-        // The two Catenary-owned files are written.
+        // The one Catenary-owned file is written.
         assert_eq!(
             std::fs::read_to_string(&targets.plugin).expect("plugin should exist"),
             OC_PLUGIN_JS,
-        );
-        assert_eq!(
-            std::fs::read_to_string(&targets.rules).expect("rules should exist"),
-            OC_RULES,
         );
 
         // The user config is byte-identical — never parsed, never rewritten.
@@ -1640,12 +1514,13 @@ mod tests {
         // serves (Claude) or the install embeds verbatim (Antigravity,
         // `AGY_RULES`).
         //
-        // OpenCode and Gemini are the exceptions (workstream 36 tickets 02/06):
-        // their shipped instruction files demote to a bootstrap/fallback that
-        // inlines the SSOT teaching (runtime data excluded) rather than pointing
-        // at the primer — the live surface rides the plugin's runtime-regenerated
-        // instructions file (OpenCode) or the SessionStart `additionalContext`
-        // payload (Gemini). Their freshness is pinned in `cli::teaching` instead.
+        // Gemini is the exception (workstream 36 ticket 06): its shipped context
+        // file demotes to a bootstrap/fallback that inlines the SSOT teaching
+        // (runtime data excluded) rather than pointing at the primer — the live
+        // surface rides the SessionStart `additionalContext` payload. Its
+        // freshness is pinned in `cli::teaching` instead. OpenCode ships no static
+        // instruction file at all (teaching-surface 08): its teaching is
+        // runtime-only, regenerated by the plugin's `config` hook.
         const CLAUDE_SKILL: &str = include_str!("../../plugins/catenary/skills/primer/SKILL.md");
         const GEMINI_CONTEXT: &str = include_str!("../../gemini-context.md");
 
@@ -1656,18 +1531,16 @@ mod tests {
             );
         }
 
-        // The OpenCode and Gemini fallbacks inline the teaching — no primer
-        // pointer, and no runtime data (the allow surface / build tool only ride
-        // the runtime channel).
-        for (host, surface) in [("opencode", OC_RULES), ("gemini", GEMINI_CONTEXT)] {
-            assert!(
-                !surface.contains("catenary primer"),
-                "the {host} fallback should inline the teaching, not point at the primer",
-            );
-            assert!(
-                surface.contains("The edit→diagnostics loop"),
-                "the {host} fallback should inline the SSOT invariants",
-            );
-        }
+        // The Gemini fallback inlines the teaching — no primer pointer, and no
+        // runtime data (the allow surface / build tool only ride the runtime
+        // channel).
+        assert!(
+            !GEMINI_CONTEXT.contains("catenary primer"),
+            "the gemini fallback should inline the teaching, not point at the primer",
+        );
+        assert!(
+            GEMINI_CONTEXT.contains("The edit→diagnostics loop"),
+            "the gemini fallback should inline the SSOT invariants",
+        );
     }
 }

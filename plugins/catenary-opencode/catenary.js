@@ -9,28 +9,31 @@
 //      `*`/all-tools matcher on the other hosts; the Rust side classifies and
 //      no-ops irrelevant tools) and enforce the decision it returns.
 //
-//   2. Config (`config`): three by-reference mutations of OpenCode's cached
+//   2. Config (`config`): two by-reference mutations of OpenCode's cached
 //      config object, in order. First — unconditionally, before anything
 //      fallible — inject the MCP heartbeat (`config.mcp.catenary`), the
 //      long-lived local client that keeps the daemon + warm LSP pool alive for
-//      the session (the daemon exits on last client disconnect). Then register
-//      the shipped static `catenary.md` fallback on `config.instructions`, with
-//      path-resolved dedup so an older merged install's entry never
-//      double-registers. Finally regenerate the per-worktree runtime
-//      instructions file from the binary — the same SSOT payload `catenary
-//      primer` prints, resolved live so it carries the session's allow surface —
-//      and append its path too (fail-open: a regen failure leaves the static
-//      fallback and the already-injected heartbeat intact). OpenCode's
-//      `Instruction.system()` re-reads every instruction file from disk on each
-//      prompt step, so the live surface rides every request and survives
-//      compaction with zero per-request plugin work. This mirrors Claude Code's
-//      SessionStart: the instructions file is ambient (read like a CLAUDE.md),
-//      not an injected turn.
+//      the session (the daemon exits on last client disconnect). Then
+//      regenerate the per-worktree runtime instructions file from the binary —
+//      the same SSOT payload `catenary primer` prints, resolved live so it
+//      carries the session's allow surface — and append its path to
+//      `config.instructions`. Teaching is runtime-only: regeneration needs only
+//      the `catenary` binary, the user config, and a writable tmp dir (nothing
+//      daemon-side — command allowance resolves from local config), so a regen
+//      failure means the install itself is broken, and generic teaching
+//      pointing at dead commands would be worse than silence. It therefore
+//      fails open to *no* teaching: a regen failure leaves `config.instructions`
+//      unmodified, with only the already-injected heartbeat surviving.
+//      OpenCode's `Instruction.system()` re-reads every instruction file from
+//      disk on each prompt step, so the live surface rides every request and
+//      survives compaction with zero per-request plugin work. This mirrors
+//      Claude Code's SessionStart: the instructions file is ambient (read like a
+//      CLAUDE.md), not an injected turn.
 //
-// Integration is plugin-only: `catenary install opencode` writes just the two
-// Catenary-owned files (this plugin + `catenary.md`) and never edits the
-// user-owned `opencode.json` — the heartbeat and the static registration that
-// used to be merged into it now ride the `config` hook above.
+// Integration is plugin-only: `catenary install opencode` writes just this one
+// Catenary-owned file (the plugin) and never edits the user-owned
+// `opencode.json` — the heartbeat that used to be merged into it now rides the
+// `config` hook above.
 //
 // The plugin is glue: no editing-state logic, no command parsing, no teaching
 // content. All policy and all payload text live in the `catenary` binary and are
@@ -45,15 +48,16 @@
 //   * Fallback channel: if this by-reference append stops taking effect, the
 //     `experimental.chat.system.transform` hook can inject per-request system
 //     blocks instead (per-request work — used only if the ambient file breaks).
-//   * Bootstrap/fallback: the shipped `catenary.md` (written beside this plugin
-//     by `catenary install opencode`, registered on `config.instructions` by the
-//     `config` hook above) carries the static teaching with runtime data
-//     structurally excluded. It covers the cold window before this plugin
-//     regenerates the live file. Disabling the plugin drops it too — teaching,
-//     the heartbeat, and enforcement now all ride this one plugin.
+//   * Runtime-only teaching: there is no shipped static fallback. Regeneration
+//     needs only the `catenary` binary, the user config, and a writable tmp dir
+//     (nothing daemon-side — command allowance resolves from local config), so a
+//     regen failure means the install itself is broken; generic teaching
+//     pointing at dead commands would then be worse than silence, so the hook
+//     fails open to no teaching. Disabling the plugin drops everything together
+//     — teaching, the heartbeat, and enforcement all ride this one plugin.
 
 import { tmpdir } from "node:os"
-import { join, dirname, resolve } from "node:path"
+import { join, dirname } from "node:path"
 import { mkdir, writeFile } from "node:fs/promises"
 import { createHash } from "node:crypto"
 
@@ -85,14 +89,6 @@ export const CatenaryPlugin = async ({ directory, worktree, client }) => {
     .slice(0, 16)
   const instructionsPath = join(tmpdir(), "catenary-opencode", `instructions-${scope}.md`)
 
-  // Absolute path to the shipped static rules file (`catenary.md`), which
-  // `catenary install opencode` writes one directory up from this plugin file
-  // (`<config-dir>/catenary.md` beside `<config-dir>/plugin/catenary.js`,
-  // `.opencode/catenary.md` beside `.opencode/plugin/catenary.js`). Absolute —
-  // mirroring the runtime file above — so OpenCode resolves it regardless of
-  // config dir. Registered by the `config` hook as the static teaching fallback.
-  const rulesPath = resolve(import.meta.dir, "..", "catenary.md")
-
   // Regenerate the instructions file from the binary. Runs the same SSOT emitter
   // the other hosts use (`catenary hook session-start`), in the project's
   // directory so the per-root `.catenary.toml` build tool resolves. Returns the
@@ -122,12 +118,11 @@ export const CatenaryPlugin = async ({ directory, worktree, client }) => {
   }
 
   return {
-    // Config: inject the MCP heartbeat, register the static teaching fallback,
-    // then regenerate + register the live instructions file. All three are
-    // by-reference mutations of the cached config. Fires on config load
-    // (session/process start) and any reload; `Instruction.system()` re-reads
-    // instruction files every prompt step, so registering once keeps the surface
-    // live for the session.
+    // Config: inject the MCP heartbeat, then regenerate + register the live
+    // instructions file. Both are by-reference mutations of the cached config.
+    // Fires on config load (session/process start) and any reload;
+    // `Instruction.system()` re-reads instruction files every prompt step, so
+    // registering once keeps the surface live for the session.
     config: async (config) => {
       // MCP heartbeat — inject unconditionally and *first*, two assignments
       // before anything fallible, so a later regen failure can never skip it.
@@ -136,33 +131,21 @@ export const CatenaryPlugin = async ({ directory, worktree, client }) => {
       config.mcp ??= {}
       config.mcp.catenary ??= { type: "local", command: ["catenary"], enabled: true }
 
-      // Static teaching fallback — register the shipped `catenary.md`. Covers the
-      // cold window before the live file below regenerates (and any regen
-      // failure). Path-resolved dedup: an older merged install may already list
-      // the rules, spelled relative to a config-file directory ("catenary.md"
-      // global, ".opencode/catenary.md" workspace) or as an absolute path.
-      // Resolve each existing entry to an absolute path — trying the config-file
-      // directory candidates for relative entries — and compare canonical paths,
-      // never raw strings, so the static rules never double-register.
-      if (!Array.isArray(config.instructions)) config.instructions = []
-      const configDirs = [dirname(import.meta.dir), directory, worktree].filter(Boolean)
-      const alreadyRegistered = config.instructions.some(
-        (entry) =>
-          typeof entry === "string" &&
-          configDirs.some((base) => resolve(base, entry) === rulesPath),
-      )
-      if (!alreadyRegistered) config.instructions.push(rulesPath)
-
       // Live teaching — regenerate the runtime instructions file and register it.
-      // Fail-open: a cold window / unreachable binary leaves the static fallback
-      // above (and the already-injected heartbeat) as the surface. Never break
-      // OpenCode's config load.
+      // Teaching is runtime-only: there is no static fallback. Fail-open — a cold
+      // window / unreachable binary means the install itself is broken (regen
+      // needs only the binary and local config, nothing daemon-side), and generic
+      // teaching pointing at dead commands would be worse than silence. So a regen
+      // failure returns early, leaving `config.instructions` unmodified and only
+      // the already-injected heartbeat surviving. Never break OpenCode's config
+      // load.
       let path
       try {
         path = await regenerateInstructions()
       } catch {
         return
       }
+      if (!Array.isArray(config.instructions)) config.instructions = []
       if (!config.instructions.includes(path)) config.instructions.push(path)
     },
 
