@@ -76,6 +76,16 @@ upgrading.
   `https://twowells.github.io/catenary/schemas/config.json`, auto-associated at
   the `taplo` server Catenary spawns (offline, zero setup), and referenced from a
   `#:schema` directive in the `catenary config` template.
+- **`catenary doctor` flags unknown config keys.** Doctor now walks each user
+  config source against the shipped JSON Schema — the same known-key SSOT taplo
+  validates against, so the two surfaces can never disagree and doctor inherits
+  every future key for free — and warns per unrecognized key with its location
+  (`` `smart_wait` (top level) ``, `` `typo_key` (in [tui]) ``). A dead knob left
+  over from a past rework no longer sits silently accepted. Openness is read from
+  the schema, so the server pass-through subtrees (`initialization_options`,
+  `settings`, `env`) and the wildcard-keyed maps (`[lsp.server.*]`,
+  `[roots.companions]`) never false-positive. Unknown keys warn, never error: an
+  older binary reading a newer config keeps working.
 - **Activity-mounted ephemeral roots.** A `catenary grep`, `glob`, or
   `diagnostics` touching a path outside every mounted root now detects the
   enclosing project root (walking `.git` up from the path), **mounts it

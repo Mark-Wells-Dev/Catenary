@@ -30,7 +30,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use serde_json::json;
+use serde_json::{Value, json};
 use tracing::debug;
 
 use super::Config;
@@ -143,6 +143,184 @@ fn associate_taplo(config: &mut Config, user_path: &Path, project_path: &Path) {
 /// Builds a `file://` URI for a local schema path.
 fn file_uri(path: &Path) -> String {
     format!("file://{}", path.display())
+}
+
+/// A key present in a raw user config document that the schema does not know.
+///
+/// Returned by [`unknown_user_config_keys`]; `catenary doctor` renders each as a
+/// warning naming the key and its location (misc 131).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownConfigKey {
+    /// The offending key name (e.g. `smart_wait`).
+    pub key: String,
+    /// Dotted TOML header of the table that contains the key, or the empty
+    /// string for a top-level key (e.g. `tui`, `lsp.server.rust-analyzer`).
+    pub location: String,
+}
+
+/// Collects every key in a raw user config document that the shipped user-config
+/// JSON Schema ([`USER_CONFIG_SCHEMA`]) does not recognize (misc 131).
+///
+/// The schema is the single source of truth for the known-key set (misc 133):
+/// walking against it means `catenary doctor` and the in-editor taplo validation
+/// can never disagree, and every future config key is inherited for free when
+/// the schema regenerates from the structs. Openness is read from the schema,
+/// never hardcoded — a table is exempt exactly when the schema leaves it open
+/// (`additionalProperties` absent or not `false`), so the server pass-through
+/// subtrees (`initialization_options`, `settings`, `env`) and the wildcard-keyed
+/// maps (`[lsp.server.*]`, `[roots.companions]`, …) never produce false
+/// positives.
+///
+/// Returns an empty vector when the embedded schema cannot be parsed (it is
+/// freshness-gated, so this is unreachable in practice) — detection is a nicety,
+/// never a hard failure.
+#[must_use]
+pub fn unknown_user_config_keys(doc: &toml::Value) -> Vec<UnknownConfigKey> {
+    let Ok(schema) = serde_json::from_str::<Value>(USER_CONFIG_SCHEMA) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    if let Some(table) = doc.as_table() {
+        walk_table(table, &schema, &schema, "", &mut out);
+    }
+    out
+}
+
+/// Resolves a local `#/definitions/<name>` reference against the schema root.
+fn resolve_ref<'a>(reference: &str, root: &'a Value) -> Option<&'a Value> {
+    let name = reference.strip_prefix("#/definitions/")?;
+    root.get("definitions")?.get(name)
+}
+
+/// Whether the JSON-Schema `type` field (a string or array of strings) admits an
+/// object.
+fn type_admits_object(type_field: Option<&Value>) -> bool {
+    match type_field {
+        Some(Value::String(name)) => name == "object",
+        Some(Value::Array(names)) => names.iter().any(|n| n.as_str() == Some("object")),
+        _ => false,
+    }
+}
+
+/// Whether a schema object describes a table: it declares `properties`,
+/// constrains `additionalProperties`, or types itself `object`.
+fn is_object_like(obj: &serde_json::Map<String, Value>) -> bool {
+    obj.contains_key("properties")
+        || obj.contains_key("additionalProperties")
+        || type_admits_object(obj.get("type"))
+}
+
+/// Resolves `schema` to the object-shaped fragment that validates a TOML table:
+/// follows `$ref` and picks the object branch out of `allOf`/`anyOf`/`oneOf`.
+///
+/// Returns `None` for a fully open or non-object schema (e.g. the
+/// `initialization_options` pass-through), signalling "accept without
+/// descending".
+fn object_schema<'a>(schema: &'a Value, root: &'a Value) -> Option<&'a Value> {
+    let obj = schema.as_object()?;
+    if let Some(Value::String(reference)) = obj.get("$ref") {
+        return resolve_ref(reference, root).and_then(|target| object_schema(target, root));
+    }
+    for combiner in ["allOf", "anyOf", "oneOf"] {
+        if let Some(Value::Array(branches)) = obj.get(combiner) {
+            return branches
+                .iter()
+                .find_map(|branch| object_schema(branch, root));
+        }
+    }
+    is_object_like(obj).then_some(schema)
+}
+
+/// Resolves the element schema of an array schema (`items`), following `$ref`
+/// and the `allOf`/`anyOf`/`oneOf` combiners.
+fn items_schema<'a>(schema: &'a Value, root: &'a Value) -> Option<&'a Value> {
+    let obj = schema.as_object()?;
+    if let Some(items) = obj.get("items") {
+        return Some(items);
+    }
+    if let Some(Value::String(reference)) = obj.get("$ref") {
+        return resolve_ref(reference, root).and_then(|target| items_schema(target, root));
+    }
+    for combiner in ["allOf", "anyOf", "oneOf"] {
+        if let Some(Value::Array(branches)) = obj.get(combiner)
+            && let Some(found) = branches
+                .iter()
+                .find_map(|branch| items_schema(branch, root))
+        {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Descends into a TOML value's nested tables/arrays, checking each against its
+/// schema. Scalars are leaves — only tables carry keys to validate.
+fn descend(
+    value: &toml::Value,
+    schema: &Value,
+    root: &Value,
+    path: &str,
+    out: &mut Vec<UnknownConfigKey>,
+) {
+    match value {
+        toml::Value::Table(table) => {
+            if let Some(object) = object_schema(schema, root) {
+                walk_table(table, object, root, path, out);
+            }
+            // Otherwise the schema is open (a pass-through subtree) — accept.
+        }
+        toml::Value::Array(elements) => {
+            if let Some(element_schema) = items_schema(schema, root) {
+                for element in elements {
+                    descend(element, element_schema, root, path, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Checks every key in `table` against `schema` (an object-shaped fragment),
+/// recording unknown keys and recursing into known/subtree values.
+fn walk_table(
+    table: &toml::map::Map<String, toml::Value>,
+    schema: &Value,
+    root: &Value,
+    path: &str,
+    out: &mut Vec<UnknownConfigKey>,
+) {
+    let Some(obj) = schema.as_object() else {
+        return;
+    };
+    let properties = obj.get("properties").and_then(Value::as_object);
+    let additional = obj.get("additionalProperties");
+
+    for (key, value) in table {
+        if let Some(property) = properties.and_then(|props| props.get(key)) {
+            descend(value, property, root, &child_path(path, key), out);
+            continue;
+        }
+        match additional {
+            // Closed table — an undeclared key is unknown.
+            Some(Value::Bool(false)) => out.push(UnknownConfigKey {
+                key: key.clone(),
+                location: path.to_owned(),
+            }),
+            // Open table (`true`, or absent per JSON Schema) — accept, no descent.
+            Some(Value::Bool(true)) | None => {}
+            // Map table — every value validates against the same subschema.
+            Some(subschema) => descend(value, subschema, root, &child_path(path, key), out),
+        }
+    }
+}
+
+/// Joins a dotted TOML header path with a child key.
+fn child_path(path: &str, key: &str) -> String {
+    if path.is_empty() {
+        key.to_owned()
+    } else {
+        format!("{path}.{key}")
+    }
 }
 
 #[cfg(test)]
@@ -475,6 +653,96 @@ mod tests {
         assert_eq!(
             project.get("$id").and_then(Value::as_str),
             Some(PROJECT_SCHEMA_URL)
+        );
+    }
+
+    // ── Unknown-key walker (misc 131) ────────────────────────────────────
+    //
+    // The walker derives its known-key set from the shipped schema (the same
+    // SSOT taplo validates against), walking a raw `toml::Value` and respecting
+    // exactly what the schema marks open.
+
+    /// Parses `config` as a TOML document and returns its unknown keys.
+    fn unknown_keys(config: &str) -> Vec<super::UnknownConfigKey> {
+        let doc = toml::from_str::<toml::Value>(config).expect("valid TOML");
+        super::unknown_user_config_keys(&doc)
+    }
+
+    /// The misc-131 repro: a dead top-level key nothing in the repo defines is
+    /// named with its (empty) top-level location.
+    #[test]
+    fn unknown_keys_flags_dead_top_level_key() {
+        let found = unknown_keys("smart_wait = true\n");
+        assert_eq!(found.len(), 1, "exactly one unknown key: {found:?}");
+        assert_eq!(found[0].key, "smart_wait");
+        assert_eq!(
+            found[0].location, "",
+            "a top-level key has an empty location"
+        );
+    }
+
+    /// A typo inside a known table is named with the table's header path.
+    #[test]
+    fn unknown_keys_flags_typo_in_known_table() {
+        let found = unknown_keys("[tui]\ntypo_key = 1\n");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].key, "typo_key");
+        assert_eq!(found[0].location, "tui");
+    }
+
+    /// The server pass-through subtrees stay open — `initialization_options`,
+    /// `settings`, and `env` accept arbitrary server-defined content silently.
+    #[test]
+    fn unknown_keys_silent_inside_passthrough_subtrees() {
+        let found = unknown_keys(
+            "[lsp.server.rust-analyzer]\ncommand = \"rust-analyzer\"\n\n\
+             [lsp.server.rust-analyzer.initialization_options]\n\
+             anything = true\nnested = { deep = 1 }\n\n\
+             [lsp.server.rust-analyzer.settings]\nwhatever = \"x\"\n\n\
+             [lsp.server.rust-analyzer.env]\nRUST_LOG = \"info\"\n",
+        );
+        assert!(
+            found.is_empty(),
+            "pass-through subtrees must stay silent: {found:?}"
+        );
+    }
+
+    /// Wildcard-keyed maps are respected: server names and companion matchers are
+    /// arbitrary keys (schema `additionalProperties`), never unknown keys — but a
+    /// typo *inside* a server definition still is.
+    #[test]
+    fn unknown_keys_respects_wildcard_map_keys() {
+        let found = unknown_keys(
+            "[lsp.server.my-custom-server]\ncommand = \"foo\"\ntypo_field = 3\n\n\
+             [roots.companions]\n\"*-internal\" = \"{base}\"\n",
+        );
+        assert_eq!(
+            found.len(),
+            1,
+            "only the serverdef typo is unknown: {found:?}"
+        );
+        assert_eq!(found[0].key, "typo_field");
+        assert_eq!(found[0].location, "lsp.server.my-custom-server");
+    }
+
+    /// A fully-known config produces zero warnings across every level.
+    #[test]
+    fn unknown_keys_empty_for_fully_known_config() {
+        let found = unknown_keys(
+            "log_retention_days = 14\n\n\
+             [tui]\nauto_add_sessions = false\n\n\
+             [notifications]\nthreshold = \"error\"\n\n\
+             [tools]\ndiagnostics_severity = \"warning\"\n\n\
+             [tools.glob]\noutline_suppress = [\"**/*.min.js\"]\n\n\
+             [lsp.server.rust-analyzer]\ncommand = \"rust-analyzer\"\n\n\
+             [lsp.language.rust]\nservers = [\"rust-analyzer\"]\n\n\
+             [commands]\nallow = [\"git\"]\n\n\
+             [commands.deny]\ngit = [\"push\"]\n\n\
+             [roots.companions]\n\"*-internal\" = \"{base}\"\n",
+        );
+        assert!(
+            found.is_empty(),
+            "a fully-known config must be silent: {found:?}"
         );
     }
 }

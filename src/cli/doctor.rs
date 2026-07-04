@@ -281,6 +281,12 @@ pub async fn run_doctor(out: &mut Output, project_root: &Path, show_diff: bool) 
         let _ = out.writeln(format_args!("{}", out.colors.red(&format!("✗  {err}"))));
     }
 
+    // Unknown config keys (misc 131). Reached only after a successful load, so a
+    // structurally-invalid config (pre-namespacing renames, inline server fields)
+    // is owned by `doctor_check_config` above and never double-reported here —
+    // this pass surfaces only the keys serde silently accepted.
+    let unknown_keys_found = doctor_check_unknown_keys(out, &crate::config::config_sources());
+
     // Unreferenced server warnings — user-defined servers only. An embedded
     // default orphaned by a user [lsp.language.*] override is normal operation,
     // not user error (feedback 08 finding 2).
@@ -307,7 +313,11 @@ pub async fn run_doctor(out: &mut Output, project_root: &Path, show_diff: bool) 
         ));
     }
 
-    if !validation_errors.is_empty() || !unreferenced.is_empty() || !dup_exts.is_empty() {
+    if !validation_errors.is_empty()
+        || unknown_keys_found
+        || !unreferenced.is_empty()
+        || !dup_exts.is_empty()
+    {
         let _ = out.writeln(format_args!(""));
     }
 
@@ -941,6 +951,49 @@ fn doctor_check_config(out: &mut Output, sources: &[PathBuf]) -> bool {
         let _ = out.writeln(format_args!(""));
     }
     found_issues
+}
+
+/// Warn per unknown key found in the user config sources (misc 131).
+///
+/// Reads each source as raw TOML and walks it against the embedded user-config
+/// JSON Schema ([`crate::config::schema::unknown_user_config_keys`]), whose
+/// closed key set is the same SSOT taplo validates against in-editor (misc 133),
+/// so the two surfaces can never disagree and doctor inherits every future key
+/// for free. Openness is read from the schema, so the server pass-through
+/// subtrees (`initialization_options`, `settings`, `env`) and wildcard-keyed
+/// maps (`[lsp.server.*]`, `[roots.companions]`) never false-positive.
+///
+/// Unknown keys warn, never error: forward compatibility means an older binary
+/// reading a newer config keeps working. Doctor is the audit surface — nothing
+/// reaches the notification queue. Returns whether any warning was printed (for
+/// output spacing).
+fn doctor_check_unknown_keys(out: &mut Output, sources: &[PathBuf]) -> bool {
+    let mut warned = false;
+    for source in sources {
+        let Ok(contents) = std::fs::read_to_string(source) else {
+            continue;
+        };
+        let Ok(raw) = toml::from_str::<toml::Value>(&contents) else {
+            continue;
+        };
+        for unknown in crate::config::schema::unknown_user_config_keys(&raw) {
+            warned = true;
+            let location = if unknown.location.is_empty() {
+                "top level".to_string()
+            } else {
+                format!("in [{}]", unknown.location)
+            };
+            let _ = out.writeln(format_args!(
+                "{}",
+                out.colors.yellow(&format!(
+                    "⚠  {}: `{}` ({location}) is not a Catenary config key — remove it",
+                    source.display(),
+                    unknown.key,
+                )),
+            ));
+        }
+    }
+    warned
 }
 
 /// User-defined servers that no `[lsp.language.*]` entry routes to.
@@ -2305,6 +2358,68 @@ mod tests {
             "a fully namespaced config should trigger no migration guidance",
         );
         assert!(out.into_string().is_empty(), "no output for a clean config");
+    }
+
+    // ── doctor_check_unknown_keys walker (misc 131) ─────────────────
+
+    #[test]
+    fn doctor_check_unknown_keys_names_dead_top_level_key() {
+        // The misc-131 repro: `smart_wait = true` — a key nothing in the repo
+        // defines — must be named with its top-level location.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = tmp.path().join("config.toml");
+        fs::write(&cfg, "smart_wait = true\n").expect("write config");
+
+        let mut out = Output::buffer(200);
+        let warned = doctor_check_unknown_keys(&mut out, &[cfg]);
+        let text = out.into_string();
+
+        assert!(warned, "walker should warn, got:\n{text}");
+        assert!(
+            text.contains("`smart_wait` (top level) is not a Catenary config key"),
+            "top-level location missing:\n{text}",
+        );
+    }
+
+    #[test]
+    fn doctor_check_unknown_keys_names_nested_typo_with_table_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = tmp.path().join("config.toml");
+        fs::write(&cfg, "[tui]\ntypo_key = 1\n").expect("write config");
+
+        let mut out = Output::buffer(200);
+        let warned = doctor_check_unknown_keys(&mut out, &[cfg]);
+        let text = out.into_string();
+
+        assert!(warned, "walker should warn, got:\n{text}");
+        assert!(
+            text.contains("`typo_key` (in [tui]) is not a Catenary config key"),
+            "nested location missing:\n{text}",
+        );
+    }
+
+    #[test]
+    fn doctor_check_unknown_keys_silent_for_known_and_passthrough() {
+        // A fully-known config with arbitrary content in the pass-through
+        // subtrees must produce no warnings.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = tmp.path().join("config.toml");
+        fs::write(
+            &cfg,
+            "[tui]\nauto_add_sessions = false\n\n\
+             [lsp.server.rust-analyzer]\ncommand = \"rust-analyzer\"\n\n\
+             [lsp.server.rust-analyzer.initialization_options]\ncheck = { command = \"clippy\" }\n\n\
+             [lsp.server.rust-analyzer.settings]\nanything = true\n",
+        )
+        .expect("write config");
+
+        let mut out = Output::buffer(200);
+        let warned = doctor_check_unknown_keys(&mut out, &[cfg]);
+        assert!(
+            !warned,
+            "known + pass-through config must be silent:\n{}",
+            out.into_string(),
+        );
     }
 
     // ── guard pointer rewrite (feedback 08 finding 1) ───────────────
