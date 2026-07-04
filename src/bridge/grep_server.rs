@@ -18,7 +18,7 @@ use std::sync::Arc;
 use tracing::debug;
 
 use super::filesystem_manager::{
-    FilesystemManager, OBSERVED_STAT_MISS_MTIME, mtime_nanos, stat_with_retry,
+    BinarySkip, FilesystemManager, OBSERVED_STAT_MISS_MTIME, mtime_nanos, stat_with_retry,
 };
 use super::handler::display_path;
 use crate::config::DispatchMethod;
@@ -157,12 +157,16 @@ enum Anchor {
 /// Outcome of a grep query.
 ///
 /// Normal queries render the complete result to stdout; `--count`
-/// (`GrepInput::count`) short-circuits to a numeric summary.
+/// (`GrepInput::count`) short-circuits to a numeric summary. Both carry the set
+/// of files that were **skipped** rather than searched ([`GrepSkips`]) so a skip
+/// is always reported, never silent (misc 135, bug 62).
 pub enum GrepOutcome {
     /// The complete rendered output for stdout.
     Rendered {
         /// The complete output for stdout.
         output: String,
+        /// Files in the search scope skipped instead of searched.
+        skipped: GrepSkips,
     },
     /// `--count` summary: a dumb `grep -c`-style tally from the ripgrep pass.
     Count {
@@ -171,7 +175,132 @@ pub enum GrepOutcome {
         matches: usize,
         /// Number of distinct files holding a match.
         files: usize,
+        /// Files in the search scope skipped instead of searched. A skip is
+        /// never conflated with a no-match (`--count` reports it separately).
+        skipped: GrepSkips,
     },
+}
+
+/// Files in the search scope that were skipped instead of searched (misc 135,
+/// bug 62).
+///
+/// Carried alongside every grep outcome so a skip is reported, never silent.
+/// Empty for the overwhelmingly common all-searched query, so a normal result
+/// renders byte-identically to before (no skip lines, no count suffix).
+///
+/// Explicitly-**named** files (a positional path arg, or a glob that expanded to
+/// the file) are reported per-file in `named` — a named path is a direct request
+/// and must never silently vanish. Directory-walk skips of **unnamed** files are
+/// aggregated by reason in `walked` so a binary-heavy tree cannot flood output.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GrepSkips {
+    /// Explicitly-named skipped files: `(cwd-relative path, reason label)`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub named: Vec<(String, String)>,
+    /// Directory-walk skips of unnamed files, aggregated by reason:
+    /// `(reason label, count)`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub walked: Vec<(String, usize)>,
+}
+
+impl GrepSkips {
+    /// True when nothing was skipped — the common case, rendered byte-identically
+    /// to a pre-misc-135 result.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.named.is_empty() && self.walked.is_empty()
+    }
+
+    /// Total number of skipped files (per-file named + aggregated walked).
+    #[must_use]
+    pub fn total(&self) -> usize {
+        self.named.len() + self.walked.iter().map(|(_, n)| *n).sum::<usize>()
+    }
+
+    /// The per-file and aggregate skip lines appended to the default (and `-l`)
+    /// grep output. A named file gets `skipped (<reason>): <path>`; walked files
+    /// collapse to `<n> file(s) skipped (<reason>)`.
+    #[must_use]
+    pub fn render_lines(&self) -> Vec<String> {
+        let mut lines = Vec::with_capacity(self.named.len() + self.walked.len());
+        for (path, reason) in &self.named {
+            lines.push(format!("skipped ({reason}): {path}"));
+        }
+        for (reason, count) in &self.walked {
+            let noun = if *count == 1 { "file" } else { "files" };
+            lines.push(format!("{count} {noun} skipped ({reason})"));
+        }
+        lines
+    }
+
+    /// The `--count` suffix, e.g. ` (1 skipped: too large (>10 MB))`, or `None`
+    /// when nothing was skipped (the count then renders exactly as before). A
+    /// single distinct reason is named plainly; multiple reasons list a
+    /// per-reason breakdown so `skipped` is never conflated with no-match.
+    #[must_use]
+    pub fn count_suffix(&self) -> Option<String> {
+        if self.is_empty() {
+            return None;
+        }
+        let total = self.total();
+        let mut by_reason: BTreeMap<&str, usize> = BTreeMap::new();
+        for (_, reason) in &self.named {
+            *by_reason.entry(reason.as_str()).or_default() += 1;
+        }
+        for (reason, count) in &self.walked {
+            *by_reason.entry(reason.as_str()).or_default() += *count;
+        }
+        let breakdown = if by_reason.len() == 1 {
+            by_reason
+                .keys()
+                .next()
+                .copied()
+                .unwrap_or_default()
+                .to_string()
+        } else {
+            by_reason
+                .iter()
+                .map(|(reason, count)| format!("{count} {reason}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        Some(format!(" ({total} skipped: {breakdown})"))
+    }
+
+    /// Folds the raw per-thread [`SkipRecord`]s from a ripgrep walk into the
+    /// wire-ready named/walked split, resolving each path to its display form.
+    /// Every path is counted once — a path both named and walked is reported as
+    /// named (the stronger, per-file signal).
+    fn from_records(
+        records: &[SkipRecord],
+        fs_manager: &FilesystemManager,
+        cwd: Option<&Path>,
+    ) -> Self {
+        let mut named: Vec<(String, String)> = Vec::new();
+        let mut walked_counts: BTreeMap<String, usize> = BTreeMap::new();
+        let mut seen: HashSet<PathBuf> = HashSet::new();
+        // Named first, so a path named *and* walked is reported per-file.
+        for rec in records.iter().filter(|r| r.named) {
+            if seen.insert(rec.path.clone()) {
+                named.push((
+                    rel_path(&rec.path, fs_manager, cwd),
+                    rec.reason.label().to_string(),
+                ));
+            }
+        }
+        for rec in records.iter().filter(|r| !r.named) {
+            if seen.insert(rec.path.clone()) {
+                *walked_counts
+                    .entry(rec.reason.label().to_string())
+                    .or_default() += 1;
+            }
+        }
+        named.sort();
+        Self {
+            named,
+            walked: walked_counts.into_iter().collect(),
+        }
+    }
 }
 
 /// Grep tool server: ripgrep + symbol index pipeline with LSP enrichment.
@@ -219,10 +348,12 @@ impl GrepServer {
                     GrepOutcome::Count {
                         matches: 0,
                         files: 0,
+                        skipped: GrepSkips::default(),
                     }
                 } else {
                     GrepOutcome::Rendered {
                         output: String::new(),
+                        skipped: GrepSkips::default(),
                     }
                 });
             }
@@ -262,14 +393,16 @@ impl GrepServer {
             count: false,
             flags: input.flags.clone(),
         };
-        let output = self
+        let (output, skipped) = self
             .run(run_input, parent_id, cancel, cwd.as_deref())
             .await?;
 
         // The command's output is always complete (decision 025): print every
         // match. Grep lines are self-contained, so the host caps only the final
-        // read at the end of a pipeline.
-        Ok(GrepOutcome::Rendered { output })
+        // read at the end of a pipeline. Skipped-but-in-scope files ride along in
+        // `skipped` so the completeness promise holds even for a file the walk
+        // could not search (misc 135).
+        Ok(GrepOutcome::Rendered { output, skipped })
     }
 
     /// Resolves the concrete filesystem roots a pathless (`.`/cwd-scoped) or
@@ -346,7 +479,14 @@ impl GrepServer {
 
         let matches: usize = rg.file_line_texts.values().map(HashMap::len).sum();
         let files = rg.file_line_texts.len();
-        Ok(GrepOutcome::Count { matches, files })
+        // A skip is not a no-match: report it separately so `--count` never
+        // conflates the two (misc 135, bug 62).
+        let skipped = GrepSkips::from_records(&rg.skips, &self.fs_manager, cwd);
+        Ok(GrepOutcome::Count {
+            matches,
+            files,
+            skipped,
+        })
     }
 
     /// `-l`/`--files-with-matches`: a plain ripgrep pass, then the distinct
@@ -385,9 +525,14 @@ impl GrepServer {
             &flags,
         )?;
 
+        // Skips ride along even for `-l`: a named file skipped instead of
+        // searched must not silently vanish from the file list (misc 135).
+        let skipped = GrepSkips::from_records(&rg.skips, &self.fs_manager, cwd);
+
         if rg.file_lines.is_empty() {
             return Ok(GrepOutcome::Rendered {
                 output: String::new(),
+                skipped,
             });
         }
 
@@ -399,7 +544,7 @@ impl GrepServer {
         paths.sort();
         let output = paths.join("\n");
 
-        Ok(GrepOutcome::Rendered { output })
+        Ok(GrepOutcome::Rendered { output, skipped })
     }
 
     /// Grep pipeline: ripgrep + `documentSymbol` index + hit classification.
@@ -410,7 +555,7 @@ impl GrepServer {
         parent_id: Option<&str>,
         cancel: &tokio_util::sync::CancellationToken,
         cwd: Option<&Path>,
-    ) -> Result<String> {
+    ) -> Result<(String, GrepSkips)> {
         debug!("Grep request: pattern={}", input.pattern);
 
         // All paths are literal — no glob interpretation. When no paths are
@@ -439,8 +584,13 @@ impl GrepServer {
             &input.flags,
         )?;
 
+        // Fold the walk's skip records (built before any early return) so a
+        // skip-only search — the bug-62 case, every match hidden behind a
+        // skipped file — still reports the skip instead of empty silence.
+        let skipped = GrepSkips::from_records(&rg.skips, &self.fs_manager, cwd);
+
         if rg.file_lines.is_empty() {
-            return Ok(String::new());
+            return Ok((String::new(), skipped));
         }
 
         // Step 2: Ensure servers exist for matched files and wait for readiness.
@@ -603,10 +753,10 @@ impl GrepServer {
         }
 
         if hits.is_empty() {
-            return Ok(String::new());
+            return Ok((String::new(), skipped));
         }
 
-        Ok(render_results(&hits, &self.fs_manager, cwd))
+        Ok((render_results(&hits, &self.fs_manager, cwd), skipped))
     }
 
     /// Searches workspace roots for pattern matches using the `grep-*` crates
@@ -616,6 +766,10 @@ impl GrepServer {
     /// # Errors
     ///
     /// Returns an error if the pattern is not a valid regex.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Single-pass parallel walk + skip recording"
+    )]
     fn ripgrep_matches(
         pattern: &str,
         roots: &[PathBuf],
@@ -691,6 +845,12 @@ impl GrepServer {
                 let invert = flags.invert;
                 let exclude = exclude.cloned();
                 let root = root.clone();
+                // A file root is an explicitly-named path (positional arg or a
+                // glob that expanded to it); its skip is reported per-file. A
+                // directory root's files are unnamed and aggregate (misc 135).
+                // Copied into a distinct local so the inner `move` closure owns
+                // it (mirroring `invert` above).
+                let named_root = root_is_file;
                 let fs_manager = Arc::clone(fs_manager);
                 let mut state = CollectOnDrop {
                     local: ThreadMatches::default(),
@@ -756,10 +916,25 @@ impl GrepServer {
                         return WalkState::Continue;
                     }
 
-                    // Skip binary files — no meaningful text matches
+                    // Skip a file the classifier treats as binary — either
+                    // genuine NUL-byte content or a file over the size cap
+                    // assumed binary without reading. The size-cap case is the
+                    // misc-135 / bug-62 mechanism: a large *text* file (e.g. a
+                    // 15.7 MB minified JS bundle) is misclassified because
+                    // `scan_file` returns `None` for `len > BINARY_SIZE_THRESHOLD`
+                    // (`filesystem_manager.rs`) WITHOUT reading a byte. Rather
+                    // than drop it silently — the old `0 matches in 0 files`
+                    // indistinguishable from a true no-match — record the skip
+                    // with its reason and whether it was explicitly named, so the
+                    // outcome reports it (never silence).
                     if let Some(md) = &metadata
-                        && fs_manager.is_binary(path, md)
+                        && let Some(reason) = fs_manager.binary_skip_reason(path, md)
                     {
+                        state.local.skips.push(SkipRecord {
+                            path: path.to_path_buf(),
+                            reason,
+                            named: named_root,
+                        });
                         return WalkState::Continue;
                     }
 
@@ -1063,10 +1238,12 @@ struct CollectOnDrop {
 impl Drop for CollectOnDrop {
     fn drop(&mut self) {
         let local = std::mem::take(&mut self.local);
-        // Flush when this thread saw any matches OR any files: the changed-set
-        // baseline (WS31) needs every visited file, even from a thread whose
-        // files held no pattern match.
-        if local.file_lines.is_empty() && local.files.is_empty() {
+        // Flush when this thread saw any matches OR any files OR any skips: the
+        // changed-set baseline (WS31) needs every visited file even from a thread
+        // whose files held no pattern match, and a thread whose only work was a
+        // skipped file must still surface that skip (misc 135). A skip always
+        // implies a visited file, so the `skips` clause is belt-and-suspenders.
+        if local.file_lines.is_empty() && local.files.is_empty() && local.skips.is_empty() {
             return;
         }
         // Recover a poisoned mutex rather than silently discard this thread's
@@ -1164,6 +1341,20 @@ impl Sink for MatchSink<'_> {
 
 // ─── Alternation splitting ────────────────────────────────────────────
 
+/// One file the ripgrep walk skipped instead of searching: its absolute path,
+/// why it was skipped, and whether the path was explicitly **named** (a file
+/// root — a positional arg or a glob that expanded to it) versus reached by a
+/// directory walk. Folded into the wire-ready [`GrepSkips`] by
+/// [`GrepSkips::from_records`] (misc 135, bug 62).
+struct SkipRecord {
+    /// Absolute path of the skipped file.
+    path: PathBuf,
+    /// Why the classifier treated it as unsearchable.
+    reason: BinarySkip,
+    /// The path was explicitly named (per-file reporting) vs walked (aggregated).
+    named: bool,
+}
+
 /// Result of a ripgrep line search.
 #[derive(Default)]
 struct RipgrepMatches {
@@ -1180,6 +1371,9 @@ struct RipgrepMatches {
     /// the delta per server. The stat is free here — the walk already reads each
     /// file (`grep_server.rs` ripgrep walk).
     files: Vec<(PathBuf, i64)>,
+    /// Files skipped instead of searched (binary content or over the size cap),
+    /// so the skip is reported rather than read as a no-match (misc 135).
+    skips: Vec<SkipRecord>,
 }
 
 impl RipgrepMatches {
@@ -1188,6 +1382,7 @@ impl RipgrepMatches {
         let mut file_lines: BTreeMap<String, Vec<u32>> = BTreeMap::new();
         let mut file_line_texts: HashMap<String, HashMap<u32, Vec<(String, u32)>>> = HashMap::new();
         let mut files: Vec<(PathBuf, i64)> = Vec::new();
+        let mut skips: Vec<SkipRecord> = Vec::new();
 
         for part in parts {
             for (file, lines) in part.file_lines {
@@ -1200,12 +1395,14 @@ impl RipgrepMatches {
                 }
             }
             files.extend(part.files);
+            skips.extend(part.skips);
         }
 
         Self {
             file_lines,
             file_line_texts,
             files,
+            skips,
         }
     }
 }
@@ -1246,6 +1443,8 @@ struct ThreadMatches {
     /// Every regular file this thread visited, `(absolute path, mtime)` — the
     /// WS31 changed-set baseline observation set.
     files: Vec<(PathBuf, i64)>,
+    /// Files this thread skipped instead of searching (misc 135).
+    skips: Vec<SkipRecord>,
 }
 
 #[cfg(test)]
@@ -1374,6 +1573,88 @@ mod tests {
         let fs = test_fs("/project");
         let hits = [hit("/project/src/a.rs", 9, "fn run() {", Anchor::TopLevel)];
         assert_eq!(render_results(&hits, &fs, None), "src/a.rs:10:fn run() {");
+    }
+
+    // ─── GrepSkips (misc 135 / bug 62) ────────────────────────────────────
+
+    #[test]
+    fn skips_empty_is_byte_identical_defaults() {
+        // The all-searched common case: nothing to report, so the count suffix
+        // is `None` (the count line is unchanged) and no skip lines render.
+        let skips = GrepSkips::default();
+        assert!(skips.is_empty());
+        assert_eq!(skips.total(), 0);
+        assert!(skips.count_suffix().is_none());
+        assert!(skips.render_lines().is_empty());
+    }
+
+    #[test]
+    fn skips_single_reason_count_suffix_names_it_plainly() {
+        let skips = GrepSkips {
+            named: vec![(
+                "big.js".to_string(),
+                BinarySkip::TooLarge.label().to_string(),
+            )],
+            walked: vec![],
+        };
+        assert_eq!(skips.total(), 1);
+        assert_eq!(
+            skips.count_suffix().as_deref(),
+            Some(" (1 skipped: too large (>10 MB))")
+        );
+    }
+
+    #[test]
+    fn skips_render_lines_names_then_aggregates() {
+        let skips = GrepSkips {
+            named: vec![(
+                "big.js".to_string(),
+                BinarySkip::TooLarge.label().to_string(),
+            )],
+            walked: vec![(BinarySkip::Binary.label().to_string(), 1)],
+        };
+        assert_eq!(
+            skips.render_lines(),
+            vec![
+                "skipped (too large (>10 MB)): big.js".to_string(),
+                "1 file skipped (binary)".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn skips_from_records_splits_named_and_walked_dedup() {
+        let fs = test_fs("/project");
+        let records = vec![
+            SkipRecord {
+                path: PathBuf::from("/project/big.js"),
+                reason: BinarySkip::TooLarge,
+                named: true,
+            },
+            SkipRecord {
+                path: PathBuf::from("/project/a.bin"),
+                reason: BinarySkip::Binary,
+                named: false,
+            },
+            SkipRecord {
+                path: PathBuf::from("/project/b.bin"),
+                reason: BinarySkip::Binary,
+                named: false,
+            },
+            // Same path both named and walked → reported once, as named.
+            SkipRecord {
+                path: PathBuf::from("/project/big.js"),
+                reason: BinarySkip::TooLarge,
+                named: false,
+            },
+        ];
+        let skips = GrepSkips::from_records(&records, &fs, Some(Path::new("/project")));
+        assert_eq!(
+            skips.named,
+            vec![("big.js".to_string(), "too large (>10 MB)".to_string())]
+        );
+        assert_eq!(skips.walked, vec![("binary".to_string(), 2)]);
+        assert_eq!(skips.total(), 3);
     }
 
     #[test]

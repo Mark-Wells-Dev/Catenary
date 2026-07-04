@@ -23,7 +23,7 @@ use crate::bridge::EditingGuardrail;
 use crate::bridge::HookRouter;
 use crate::bridge::filesystem_manager::Root;
 use crate::bridge::session::Session;
-use crate::bridge::{GlobOutcome, GrepFlags, GrepOutcome};
+use crate::bridge::{GlobOutcome, GrepFlags, GrepOutcome, GrepSkips};
 use crate::companions::expand_companions;
 use crate::hook::{HookRequest, HookResponseEnvelope, emit_hook_event, hook_outcome_level};
 use crate::logging::LoggingServer;
@@ -217,6 +217,11 @@ pub struct GrepResponse {
     /// Distinct-file count, present only for a `--count` response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub files: Option<usize>,
+    /// Files in the search scope skipped instead of searched (misc 135, bug 62).
+    /// Empty for the common all-searched query, so a normal response is byte-for-
+    /// byte unchanged on the wire (the field is omitted when empty).
+    #[serde(default, skip_serializing_if = "GrepSkips::is_empty")]
+    pub skipped: GrepSkips,
 }
 
 /// IPC request payload for `catenary glob`.
@@ -2886,20 +2891,27 @@ async fn handle_hook_dispatch(
         let response = tokio::select! {
             result = ctx.primary.grep.execute(&params, Some(&parent_id), &cancel).instrument(span.clone()) => {
                 match result {
-                    Ok(GrepOutcome::Rendered { output }) => GrepResponse {
+                    Ok(GrepOutcome::Rendered { output, skipped }) => GrepResponse {
                         output,
                         matches: None,
                         files: None,
+                        skipped,
                     },
-                    Ok(GrepOutcome::Count { matches, files }) => GrepResponse {
+                    Ok(GrepOutcome::Count {
+                        matches,
+                        files,
+                        skipped,
+                    }) => GrepResponse {
                         output: String::new(),
                         matches: Some(matches),
                         files: Some(files),
+                        skipped,
                     },
                     Err(e) => GrepResponse {
                         output: format!("grep error: {e}"),
                         matches: None,
                         files: None,
+                        skipped: GrepSkips::default(),
                     },
                 }
             }
@@ -8380,12 +8392,17 @@ mod tests {
             output: "file.rs:10 matched line".to_string(),
             matches: None,
             files: None,
+            skipped: GrepSkips::default(),
         };
         let json = serde_json::to_string(&resp).expect("serialize");
+        // An all-searched response omits `skipped` entirely — the wire is byte-
+        // for-byte what it was before misc 135.
+        assert!(!json.contains("skipped"), "empty skips are omitted: {json}");
         let parsed: GrepResponse = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed.output, "file.rs:10 matched line");
         assert!(parsed.matches.is_none());
         assert!(parsed.files.is_none());
+        assert!(parsed.skipped.is_empty());
     }
 
     /// `GlobRequest` roundtrips through JSON with all fields.

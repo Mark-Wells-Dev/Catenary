@@ -65,6 +65,34 @@ pub enum FileKind {
     Folder,
 }
 
+/// Why the classifier treats a file as unsearchable binary.
+///
+/// The two causes collapsed into the single [`FileKind::Binary`] verdict, split
+/// back out so a caller can report an honest skip reason (misc 135, bug 62).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinarySkip {
+    /// Larger than [`BINARY_SIZE_THRESHOLD`] — assumed binary and skipped
+    /// **without reading a byte**. This is the bug-62 mechanism: a large *text*
+    /// file (e.g. a 15.7 MB minified JS bundle) is misclassified purely by size.
+    TooLarge,
+    /// A NUL byte was found while scanning — genuinely binary content.
+    Binary,
+}
+
+impl BinarySkip {
+    /// Human-readable reason label for the grep skip-honesty surface (misc 135).
+    ///
+    /// The `TooLarge` label names the [`BINARY_SIZE_THRESHOLD`] (10 MB); keep the
+    /// two in sync if the threshold ever changes.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::TooLarge => "too large (>10 MB)",
+            Self::Binary => "binary",
+        }
+    }
+}
+
 /// Semantic change kind for a baseline diff entry (WS31 Consumer A).
 ///
 /// Drives **both** the per-server watch-**kind** mask filter and the wire
@@ -584,6 +612,30 @@ impl FilesystemManager {
     /// Returns `true` if the file is binary, using the cache when possible.
     pub fn is_binary(&self, path: &Path, metadata: &std::fs::Metadata) -> bool {
         matches!(self.classify(path, metadata).kind, FileKind::Binary)
+    }
+
+    /// Why a file is treated as unsearchable binary, or `None` when it is
+    /// searchable text.
+    ///
+    /// Splits the single [`is_binary`](Self::is_binary) verdict into its two
+    /// causes so a caller can report an honest skip reason (misc 135, bug 62):
+    /// the size-cap heuristic ([`BinarySkip::TooLarge`] — a file over
+    /// [`BINARY_SIZE_THRESHOLD`] assumed binary without reading, the bug-62
+    /// mechanism) versus genuine NUL-byte content ([`BinarySkip::Binary`]). The
+    /// size check is a metadata comparison (no I/O) and is tested **first**, so
+    /// the subsequent NUL check reflects only sub-threshold content.
+    pub fn binary_skip_reason(
+        &self,
+        path: &Path,
+        metadata: &std::fs::Metadata,
+    ) -> Option<BinarySkip> {
+        if metadata.len() > BINARY_SIZE_THRESHOLD {
+            return Some(BinarySkip::TooLarge);
+        }
+        if self.is_binary(path, metadata) {
+            return Some(BinarySkip::Binary);
+        }
+        None
     }
 
     /// Returns the line count if the file is text, or `None` if binary or folder.

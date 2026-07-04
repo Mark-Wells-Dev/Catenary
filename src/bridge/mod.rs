@@ -38,7 +38,7 @@ pub use diagnostics_server::DiagnosticsServer;
 pub use editing_guardrail::EditingGuardrail;
 pub use editing_manager::EditingManager;
 pub use file_tools::GlobOutcome;
-pub use grep_server::{GrepFlags, GrepOutcome, StreamOutcome, grep_stream};
+pub use grep_server::{GrepFlags, GrepOutcome, GrepSkips, StreamOutcome, grep_stream};
 pub use handler::expand_tilde;
 pub use hook_router::HookRouter;
 pub use hook_router::is_edit_tool;

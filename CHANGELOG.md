@@ -437,6 +437,20 @@ upgrading.
   process in a sleep-class state. Pressure-independent by construction — no
   timing heuristics and no CPU budget. On platforms without observable
   scheduler state (Windows), detection falls back to CPU deltas as before.
+- **`catenary grep` no longer silently skips a searchable file.** A file over
+  the 10 MB binary-scan cap is classified binary *without being read* (the size
+  heuristic in `scan_file`), so the grep walk dropped it with no trace — an
+  explicitly named 15.7 MB UTF-8 bundle returned `0 matches in 0 files`,
+  indistinguishable from a genuine no-match (the absence of evidence read as
+  evidence of absence). A skipped file is now reported, never silent: the
+  default output appends `skipped (<reason>): <path>` for every explicitly named
+  file (positional arg or a glob that expanded to it), directory-walk skips of
+  unnamed files collapse to `<n> file(s) skipped (<reason>)`, and `--count`
+  carries a `(<k> skipped: <reason>)` suffix so a skip is never conflated with a
+  no-match (e.g. `0 matches in 0 files (1 skipped: too large (>10 MB))`). The
+  reason distinguishes the size cap (`too large (>10 MB)`) from genuine NUL-byte
+  content (`binary`). A search with nothing skipped renders byte-identically to
+  before, and the exit stays `0` on this soft condition.
 
 ### Migration
 

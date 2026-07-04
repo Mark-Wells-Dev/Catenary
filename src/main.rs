@@ -1524,9 +1524,14 @@ async fn run_grep(
             out,
             response.matches.unwrap_or(0),
             response.files.unwrap_or(0),
+            &response.skipped,
         );
     } else {
         render_search_outcome(out, &cwd, &resolved, &response.output, queried, &kind);
+        // Skip lines follow the results/echo (and any missing-path lines), so a
+        // named path skipped instead of searched never silently vanishes (misc
+        // 135, bug 62). Nothing prints when nothing was skipped.
+        render_grep_skips(out, &response.skipped);
     }
     Ok(())
 }
@@ -1614,14 +1619,37 @@ struct SearchResponse {
     /// zero matches, reported per-argument (misc 118).
     #[serde(default)]
     no_match_patterns: Vec<String>,
+    /// grep: files in the search scope skipped instead of searched (misc 135,
+    /// bug 62). Empty for a normal all-searched query.
+    #[serde(default)]
+    skipped: catenary_mcp::bridge::GrepSkips,
 }
 
 /// Renders the `catenary grep --count` summary: `N matches in M files`.
 ///
 /// `matches` is the matching-line total (one per rendered leaf row); `files`
-/// is the number of distinct files holding them.
-fn render_grep_count(out: &mut cli::Output, matches: usize, files: usize) {
-    let _ = out.writeln(format_args!("{matches} matches in {files} files"));
+/// is the number of distinct files holding them. When any file was skipped
+/// instead of searched, a ` (K skipped: <reason>)` suffix follows so a skip is
+/// never conflated with a no-match (misc 135, bug 62); with nothing skipped the
+/// line is byte-identical to before.
+fn render_grep_count(
+    out: &mut cli::Output,
+    matches: usize,
+    files: usize,
+    skipped: &catenary_mcp::bridge::GrepSkips,
+) {
+    let suffix = skipped.count_suffix().unwrap_or_default();
+    let _ = out.writeln(format_args!("{matches} matches in {files} files{suffix}"));
+}
+
+/// Appends the per-file and aggregate skip lines to a default (or `-l`) grep
+/// result — a named skipped file as `skipped (<reason>): <path>`, walked files
+/// collapsed to `<n> file(s) skipped (<reason>)` (misc 135, bug 62). Emits
+/// nothing when nothing was skipped, so a normal result is unchanged.
+fn render_grep_skips(out: &mut cli::Output, skipped: &catenary_mcp::bridge::GrepSkips) {
+    for line in skipped.render_lines() {
+        let _ = out.writeln(format_args!("{line}"));
+    }
 }
 
 /// Renders the `catenary glob --count` summary: `N paths`.
@@ -3319,15 +3347,70 @@ mod tests {
     #[test]
     fn grep_count_matches_in_files() {
         let mut out = cli::Output::buffer(80);
-        render_grep_count(&mut out, 12, 3);
+        render_grep_count(&mut out, 12, 3, &catenary_mcp::bridge::GrepSkips::default());
         assert_eq!(out.into_string(), "12 matches in 3 files\n");
     }
 
     #[test]
     fn grep_count_zero_is_well_formed() {
         let mut out = cli::Output::buffer(80);
-        render_grep_count(&mut out, 0, 0);
+        render_grep_count(&mut out, 0, 0, &catenary_mcp::bridge::GrepSkips::default());
         assert_eq!(out.into_string(), "0 matches in 0 files\n");
+    }
+
+    #[test]
+    fn grep_count_reports_skip_without_conflating_no_match() {
+        // A named file skipped (over the size cap) is a skip, not a no-match:
+        // the `--count` line reports it in a suffix, never as `0 … 0` silence
+        // (misc 135, bug 62).
+        let skipped = catenary_mcp::bridge::GrepSkips {
+            named: vec![("big.js".to_string(), "too large (>10 MB)".to_string())],
+            walked: vec![],
+        };
+        let mut out = cli::Output::buffer(80);
+        render_grep_count(&mut out, 0, 0, &skipped);
+        assert_eq!(
+            out.into_string(),
+            "0 matches in 0 files (1 skipped: too large (>10 MB))\n"
+        );
+    }
+
+    #[test]
+    fn grep_count_skip_suffix_breaks_down_multiple_reasons() {
+        // Mixed reasons list a per-reason breakdown so the tally is honest.
+        let skipped = catenary_mcp::bridge::GrepSkips {
+            named: vec![("big.js".to_string(), "too large (>10 MB)".to_string())],
+            walked: vec![("binary".to_string(), 2)],
+        };
+        let mut out = cli::Output::buffer(80);
+        render_grep_count(&mut out, 5, 1, &skipped);
+        assert_eq!(
+            out.into_string(),
+            "5 matches in 1 files (3 skipped: 2 binary, 1 too large (>10 MB))\n"
+        );
+    }
+
+    #[test]
+    fn grep_skips_render_named_and_walked_lines() {
+        // A named file gets a per-file line; walked files aggregate by reason.
+        let skipped = catenary_mcp::bridge::GrepSkips {
+            named: vec![("big.js".to_string(), "too large (>10 MB)".to_string())],
+            walked: vec![("binary".to_string(), 3)],
+        };
+        let mut out = cli::Output::buffer(80);
+        render_grep_skips(&mut out, &skipped);
+        assert_eq!(
+            out.into_string(),
+            "skipped (too large (>10 MB)): big.js\n3 files skipped (binary)\n"
+        );
+    }
+
+    #[test]
+    fn grep_skips_empty_renders_nothing() {
+        // Nothing skipped → no lines, so a normal result is byte-identical.
+        let mut out = cli::Output::buffer(80);
+        render_grep_skips(&mut out, &catenary_mcp::bridge::GrepSkips::default());
+        assert_eq!(out.into_string(), "");
     }
 
     #[test]
