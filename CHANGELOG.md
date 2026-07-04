@@ -199,6 +199,21 @@ upgrading.
   structurally excluded (no allow surface, build tool, or roots), it covers the
   cold window before the plugin runs and plugin-disabled installs. A freshness
   gate pins the shipped file to the SSOT so the two cannot drift.
+- **OpenCode integration is plugin-only — `catenary install opencode` no longer
+  edits `opencode.json`.** The installer now writes only the two Catenary-owned
+  files (`plugin/catenary.js` and the shipped
+  [catenary.md](plugins/catenary-opencode/catenary.md)) and never creates,
+  parses, or rewrites the user-owned `opencode.json`. The MCP heartbeat
+  (`mcp.catenary`) and the static rules registration that used to be merged into
+  that file now ride the plugin's `config` hook: the heartbeat is injected
+  unconditionally and first (`??=`, so it defers to any existing entry), and the
+  shipped rules file is registered on `config.instructions` with path-resolved
+  dedup so an older merged entry never double-registers. This retires a class of
+  install failures on comment-bearing / dotfile-managed configs, at the cost of
+  collapsing the disable story to one switch — disabling the plugin now drops
+  enforcement, teaching, and the heartbeat together. Upgrading users may remove
+  the previously merged `mcp.catenary` / `instructions` entries from
+  `opencode.json`; leaving them is harmless.
 - **Gemini CLI joins the runtime-sourced teaching column.** `catenary hook
   session-start --format=gemini` was already registered but withheld the payload
   behind a Claude-only gate; it now emits the same SSOT teaching body Claude

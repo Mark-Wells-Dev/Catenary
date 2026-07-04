@@ -956,25 +956,18 @@ fn install_antigravity_bundled(out: &mut Output, target: &Path, dry_run: bool) -
 const OC_PLUGIN_JS: &str = include_str!("../../plugins/catenary-opencode/catenary.js");
 const OC_RULES: &str = include_str!("../../plugins/catenary-opencode/catenary.md");
 
-/// Resolved install targets for OpenCode. Unlike the command-hook hosts,
-/// OpenCode's plugin and rules land in different places, and the MCP heartbeat
-/// + rules reference merge into a user-owned `opencode.json`.
+/// Resolved install targets for OpenCode. Integration is plugin-only: both
+/// files are Catenary-owned and land in different places, and the user-owned
+/// `opencode.json` is never touched (the MCP heartbeat and the static rules
+/// registration ride the plugin's `config` hook, not a JSON merge).
 struct OpenCodeTargets {
     /// Auto-discovered plugin file (`plugin/catenary.js`).
     plugin: PathBuf,
-    /// Catenary-owned agent rules (`catenary.md`). Referenced from
-    /// `opencode.json`'s `instructions` array rather than written into a
-    /// user-authored `AGENTS.md` — matching how every other host ships its own
-    /// rules file.
+    /// Catenary-owned agent rules (`catenary.md`). Registered on
+    /// `config.instructions` by the plugin's `config` hook rather than written
+    /// into a user-authored `AGENTS.md` — matching how every other host ships
+    /// its own rules file.
     rules: PathBuf,
-    /// User-owned config the MCP heartbeat + rules reference merge into
-    /// (`opencode.json`).
-    config: PathBuf,
-    /// The rules path written into `opencode.json`'s `instructions` array.
-    /// OpenCode resolves instruction paths relative to the config file's
-    /// directory, so this is relative to `config`'s parent (no home-path leak,
-    /// portable across machines).
-    instructions: &'static str,
 }
 
 /// Resolve OpenCode install targets for the global (`~/.config/opencode/`) or
@@ -985,9 +978,6 @@ fn opencode_targets(workspace: bool) -> Result<OpenCodeTargets> {
         Ok(OpenCodeTargets {
             plugin: root.join(".opencode/plugin/catenary.js"),
             rules: root.join(".opencode/catenary.md"),
-            config: root.join("opencode.json"),
-            // Config dir is `<root>`; rules live under `.opencode/`.
-            instructions: ".opencode/catenary.md",
         })
     } else {
         let home = dirs::home_dir().context("cannot determine home directory")?;
@@ -995,23 +985,21 @@ fn opencode_targets(workspace: bool) -> Result<OpenCodeTargets> {
         Ok(OpenCodeTargets {
             plugin: base.join("plugin/catenary.js"),
             rules: base.join("catenary.md"),
-            config: base.join("opencode.json"),
-            // Config dir is `~/.config/opencode`; rules sit beside the config.
-            instructions: "catenary.md",
         })
     }
 }
 
 /// Run `catenary install opencode [--workspace]`.
 ///
-/// Writes (or symlinks) the auto-discovered plugin file, writes the
-/// Catenary-owned rules file, and merges the load-bearing MCP heartbeat plus
-/// the rules `instructions` reference into `opencode.json` — never touching a
-/// user-authored `AGENTS.md`.
+/// Integration is plugin-only: writes (or symlinks) the auto-discovered plugin
+/// file and writes the Catenary-owned rules file — the only two artifacts. The
+/// user-owned `opencode.json` is never created or modified; the MCP heartbeat
+/// and the rules registration ride the plugin's `config` hook. No
+/// user-authored `AGENTS.md` is touched either.
 ///
 /// # Errors
 ///
-/// Returns an error if file operations fail or `opencode.json` is malformed.
+/// Returns an error if file operations fail.
 pub fn run_install_opencode(
     out: &mut Output,
     source: Option<&str>,
@@ -1021,22 +1009,30 @@ pub fn run_install_opencode(
     let _ = out.writeln(format_args!("OpenCode:"));
 
     let targets = opencode_targets(workspace)?;
+    install_opencode(out, source, &targets, dry_run)
+}
 
+/// Install the two Catenary-owned OpenCode files (plugin + rules) into `targets`.
+/// Never touches `opencode.json`. Split from [`run_install_opencode`] so tests
+/// can drive it against tempdir targets.
+fn install_opencode(
+    out: &mut Output,
+    source: Option<&str>,
+    targets: &OpenCodeTargets,
+    dry_run: bool,
+) -> Result<()> {
     match source.map(parse_source) {
         Some(InstallSource::Local(path)) => {
-            install_opencode_local(out, &path, &targets, dry_run)?;
+            install_opencode_local(out, &path, targets, dry_run)?;
         }
         Some(InstallSource::Remote(_)) | None => {
-            install_opencode_bundled(out, &targets, dry_run)?;
+            install_opencode_bundled(out, targets, dry_run)?;
         }
     }
 
-    // Rules and the config merge are independent of the plugin source mode. The
-    // rules file is Catenary-owned (written like the plugin); the config merge
-    // is the one required write to the user's `opencode.json` in every mode —
-    // it carries both the MCP heartbeat and the rules `instructions` pointer.
-    install_opencode_rules(out, &targets.rules, dry_run)?;
-    merge_opencode_config(out, &targets.config, targets.instructions, dry_run)
+    // The rules file is Catenary-owned, written like the plugin and independent
+    // of the plugin source mode.
+    install_opencode_rules(out, &targets.rules, dry_run)
 }
 
 /// Install the OpenCode plugin by symlinking to a local path (dev mode).
@@ -1153,8 +1149,9 @@ fn install_opencode_bundled(
 /// Write the Catenary-owned rules file (`catenary.md`). Unlike a user-authored
 /// `AGENTS.md`, this file belongs to Catenary, so it is written and
 /// staleness-checked like the plugin — a symlink (dev install) is left alone.
-/// It is surfaced to the agent via `opencode.json`'s `instructions` array
-/// (see [`merge_opencode_config`]), so the user's own rules files are untouched.
+/// It is surfaced to the agent when the plugin's `config` hook registers it on
+/// `config.instructions` at runtime, so the user's own rules files — and the
+/// user-owned `opencode.json` — are untouched.
 fn install_opencode_rules(out: &mut Output, rules: &Path, dry_run: bool) -> Result<()> {
     // A symlink means a dev install — don't overwrite it.
     if rules.is_symlink() {
@@ -1192,107 +1189,6 @@ fn install_opencode_rules(out: &mut Output, rules: &Path, dry_run: bool) -> Resu
         "  {} wrote rules to {}",
         out.colors.green("✓"),
         rules.display(),
-    ));
-
-    Ok(())
-}
-
-/// Desired `mcp.catenary` entry for `opencode.json`. The persistent MCP
-/// connection is the long-lived client that keeps the daemon + warm LSP pool
-/// alive for the session (the daemon exits on last client disconnect).
-fn opencode_mcp_entry() -> serde_json::Value {
-    serde_json::json!({
-        "type": "local",
-        "command": ["catenary"],
-        "enabled": true,
-    })
-}
-
-/// Merge the MCP heartbeat and the rules `instructions` reference into
-/// `opencode.json` without clobbering other keys or instructions. Creates the
-/// file (with `$schema`) if absent.
-fn merge_opencode_config(
-    out: &mut Output,
-    config: &Path,
-    instructions: &str,
-    dry_run: bool,
-) -> Result<()> {
-    let desired_mcp = opencode_mcp_entry();
-
-    let mut root = match std::fs::read_to_string(config) {
-        Ok(s) => serde_json::from_str::<serde_json::Value>(&s)
-            .with_context(|| format!("parse {}", config.display()))?,
-        Err(_) => serde_json::json!({ "$schema": "https://opencode.ai/config.json" }),
-    };
-
-    let obj = root
-        .as_object_mut()
-        .with_context(|| format!("{} is not a JSON object", config.display()))?;
-
-    let mcp_present = obj
-        .get("mcp")
-        .and_then(|m| m.get("catenary"))
-        .is_some_and(|c| *c == desired_mcp);
-    let instructions_present = obj
-        .get("instructions")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|arr| arr.iter().any(|v| v.as_str() == Some(instructions)));
-
-    if mcp_present && instructions_present {
-        let _ = out.writeln(format_args!(
-            "  {} config up to date in {}",
-            out.colors.green("✓"),
-            config.display(),
-        ));
-        return Ok(());
-    }
-
-    if dry_run {
-        let _ = out.writeln(format_args!(
-            "  {} merge mcp.catenary + instructions into {}",
-            out.colors.dim("(dry-run)"),
-            config.display(),
-        ));
-        return Ok(());
-    }
-
-    // MCP heartbeat — set/replace `mcp.catenary`.
-    {
-        let mcp = obj
-            .entry("mcp")
-            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-        let mcp_obj = mcp
-            .as_object_mut()
-            .with_context(|| format!("`mcp` in {} is not a JSON object", config.display()))?;
-        mcp_obj.insert("catenary".to_string(), desired_mcp);
-    }
-
-    // Rules reference — append to `instructions`, preserving existing entries.
-    {
-        let instr = obj
-            .entry("instructions")
-            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
-        let arr = instr.as_array_mut().with_context(|| {
-            format!("`instructions` in {} is not a JSON array", config.display())
-        })?;
-        if !arr.iter().any(|v| v.as_str() == Some(instructions)) {
-            arr.push(serde_json::Value::String(instructions.to_string()));
-        }
-    }
-
-    if let Some(parent) = config.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create config directory {}", parent.display()))?;
-    }
-    let serialized = serde_json::to_string_pretty(&root)
-        .with_context(|| format!("serialize {}", config.display()))?;
-    std::fs::write(config, format!("{serialized}\n"))
-        .with_context(|| format!("write {}", config.display()))?;
-
-    let _ = out.writeln(format_args!(
-        "  {} merged MCP heartbeat + rules into {}",
-        out.colors.green("✓"),
-        config.display(),
     ));
 
     Ok(())
@@ -1495,8 +1391,6 @@ mod tests {
         OpenCodeTargets {
             plugin: base.join("plugin/catenary.js"),
             rules: base.join("catenary.md"),
-            config: base.join("opencode.json"),
-            instructions: "catenary.md",
         }
     }
 
@@ -1632,92 +1526,59 @@ mod tests {
         assert!(out.into_string().contains("(dry-run)"));
     }
 
-    // ── OpenCode config merge (MCP heartbeat + rules instructions) ──
+    // ── OpenCode is plugin-only (never touches opencode.json) ───────
 
+    /// Integration is plugin-only: a full install writes only the two
+    /// Catenary-owned files and never creates or modifies the user-owned
+    /// `opencode.json`. A pre-existing config with a sentinel body must survive
+    /// byte-for-byte.
     #[test]
-    fn merge_opencode_config_creates_file() {
+    fn install_opencode_never_touches_config() {
+        // A user config that would have tripped the old merge — a JSONC comment
+        // header (bug 61) plus an already-present absolute rules entry
+        // (finding 2). Both must now be left completely untouched.
+        const SENTINEL: &str = "// chezmoi:managed — do not edit\n{\n  \"instructions\": [\"/home/user/.config/opencode/catenary.md\"]\n}\n";
+
         let dir = tempfile::tempdir().expect("create tempdir");
+        let targets = oc_targets(dir.path());
         let config = dir.path().join("opencode.json");
+        std::fs::write(&config, SENTINEL).expect("write sentinel config");
 
         let mut out = Output::buffer(80);
-        merge_opencode_config(&mut out, &config, "catenary.md", false).expect("create config");
+        install_opencode(&mut out, None, &targets, false).expect("install should succeed");
 
-        let json: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&config).expect("config exists"))
-                .expect("valid json");
-        assert_eq!(json["mcp"]["catenary"], opencode_mcp_entry());
-        assert_eq!(json["instructions"][0], "catenary.md");
-        assert_eq!(json["$schema"], "https://opencode.ai/config.json");
-    }
-
-    #[test]
-    fn merge_opencode_config_preserves_existing_keys_and_instructions() {
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let config = dir.path().join("opencode.json");
-        std::fs::write(
-            &config,
-            r#"{"theme":"dark","instructions":["CONTRIBUTING.md"],"mcp":{"other":{"type":"local","command":["other"]}}}"#,
-        )
-        .expect("write existing config");
-
-        let mut out = Output::buffer(80);
-        merge_opencode_config(&mut out, &config, "catenary.md", false).expect("merge");
-
-        let json: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&config).expect("config exists"))
-                .expect("valid json");
-        assert_eq!(json["theme"], "dark", "top-level key preserved");
+        // The two Catenary-owned files are written.
         assert_eq!(
-            json["mcp"]["other"]["command"][0], "other",
-            "sibling mcp server preserved",
+            std::fs::read_to_string(&targets.plugin).expect("plugin should exist"),
+            OC_PLUGIN_JS,
         );
-        assert_eq!(json["mcp"]["catenary"], opencode_mcp_entry());
-        let instructions = json["instructions"].as_array().expect("instructions array");
-        assert!(
-            instructions.iter().any(|v| v == "CONTRIBUTING.md"),
-            "existing instruction preserved",
+        assert_eq!(
+            std::fs::read_to_string(&targets.rules).expect("rules should exist"),
+            OC_RULES,
         );
-        assert!(
-            instructions.iter().any(|v| v == "catenary.md"),
-            "catenary rules appended",
+
+        // The user config is byte-identical — never parsed, never rewritten.
+        assert_eq!(
+            std::fs::read_to_string(&config).expect("config still exists"),
+            SENTINEL,
+            "install must not modify opencode.json",
         );
     }
 
+    /// Absent an `opencode.json`, a full install must not create one.
     #[test]
-    fn merge_opencode_config_idempotent() {
+    fn install_opencode_creates_no_config() {
         let dir = tempfile::tempdir().expect("create tempdir");
+        let targets = oc_targets(dir.path());
         let config = dir.path().join("opencode.json");
 
         let mut out = Output::buffer(80);
-        merge_opencode_config(&mut out, &config, "catenary.md", false).expect("first merge");
+        install_opencode(&mut out, None, &targets, false).expect("install should succeed");
 
-        let mut out2 = Output::buffer(80);
-        merge_opencode_config(&mut out2, &config, "catenary.md", false).expect("second merge");
-        assert!(out2.into_string().contains("up to date"));
-
-        // The instruction must not be duplicated on re-run.
-        let json: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&config).expect("config exists"))
-                .expect("valid json");
-        let count = json["instructions"]
-            .as_array()
-            .expect("instructions array")
-            .iter()
-            .filter(|v| *v == "catenary.md")
-            .count();
-        assert_eq!(count, 1, "instruction should appear exactly once");
-    }
-
-    #[test]
-    fn merge_opencode_config_dry_run_no_file() {
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let config = dir.path().join("opencode.json");
-
-        let mut out = Output::buffer(80);
-        merge_opencode_config(&mut out, &config, "catenary.md", true).expect("dry run");
-
-        assert!(!config.exists(), "dry run should not write config");
-        assert!(out.into_string().contains("(dry-run)"));
+        assert!(
+            !config.exists(),
+            "install must not create opencode.json when none exists",
+        );
     }
 
     // ── List subcommand ────────────────────────────────────────────

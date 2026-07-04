@@ -42,6 +42,33 @@ gemini extensions install https://github.com/TwoWells/Catenary
 
 The extension registers hooks and the MCP connection.
 
+### OpenCode (plugin)
+
+```bash
+catenary install opencode
+```
+
+OpenCode has no `hooks.json` surface, so Catenary ships an in-process plugin.
+The install is **plugin-only**: it writes exactly two Catenary-owned files —
+`~/.config/opencode/plugin/catenary.js` (the plugin) and
+`~/.config/opencode/catenary.md` (the static teaching fallback) — and makes
+**zero edits to your `opencode.json`**. On config load the plugin injects the
+MCP heartbeat (`mcp.catenary`) and registers its teaching by itself, so nothing
+is merged into your config. Pass `--workspace` to install into the project
+(`.opencode/`) instead of globally.
+
+Because the whole integration rides one plugin, there is a single disable
+switch and it turns off everything together — enforcement, teaching, and the MCP
+heartbeat: delete or rename `plugin/catenary.js`, or launch OpenCode with
+`OPENCODE_PURE=1` (which disables **all** external plugins). See [Disabling
+Catenary per project](#disabling-catenary-per-project) below.
+
+> **Upgrading from an earlier version?** Older releases merged an `mcp.catenary`
+> entry and an `instructions` reference to the rules file into your
+> `opencode.json`. The plugin now carries both, so those merged entries are
+> redundant — you may remove them, but leaving them is harmless: the plugin
+> defers to an existing `mcp.catenary` and never double-registers the rules.
+
 ### Manual MCP registration
 
 For other clients, or if you prefer manual setup:
@@ -115,34 +142,25 @@ reference](https://geminicli.com/docs/extensions/reference/).
 
 ### OpenCode
 
-OpenCode has no native per-plugin disable switch — there is no `disabled_plugins`
-key in `opencode.json` (it is an open feature request). Plugins are auto-loaded
-from a plugin directory instead, so the per-project story depends on how
-Catenary was installed:
+Catenary integrates with OpenCode through a single in-process plugin, so there
+is one switch and it turns off the whole integration at once — enforcement,
+teaching, and the MCP heartbeat all ride this one plugin. OpenCode has no
+per-plugin disable key in `opencode.json` (it is an open feature request);
+plugins are auto-loaded from a plugin directory instead, so the per-project
+story depends on how Catenary was installed:
 
 - **Installed per-workspace** (`catenary install opencode --workspace`): the
-  plugin file lives in the project at `.opencode/plugin/catenary.js`. Delete
-  that file to disable Catenary in this project only; other projects are
+  plugin file lives in the project at `.opencode/plugin/catenary.js`. Delete or
+  rename that file to disable Catenary in this project only; other projects are
   untouched.
 - **Installed globally** (`~/.config/opencode/plugin/catenary.js`): there is no
-  per-project switch. Removing the global file disables Catenary in every
-  OpenCode project, not just one.
+  per-project switch. Removing or renaming the global file disables Catenary in
+  every OpenCode project. To turn it off for a single session without deleting
+  anything, launch OpenCode with `OPENCODE_PURE=1`, which disables **all**
+  external plugins (not just Catenary).
 
-You can drop the daemon heartbeat for a single project by disabling the MCP
-server in that project's `opencode.json`:
-
-```json
-{
-  "mcp": {
-    "catenary": {
-      "enabled": false
-    }
-  }
-}
-```
-
-This only stops the session-registration heartbeat — the enforcement plugin
-still runs, so it is not a full disable. See the [OpenCode plugin
+There is no partial toggle — no "keep teaching, drop the heartbeat" — because
+the plugin is the only integration surface. See the [OpenCode plugin
 docs](https://opencode.ai/docs/plugins/).
 
 ### Antigravity
