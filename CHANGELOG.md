@@ -381,6 +381,14 @@ upgrading.
   sinks exclude that origin. A genuinely broken server still surfaces where it
   matters (the `unavailable:` banner on the diagnostics receipt). The
   `[notifications] threshold` semantics are unchanged for Catenary's own events.
+- **`make check` clippy runs `--all-features`.** The lint pass now runs
+  `cargo clippy --tests --all-features -- -D warnings` instead of
+  `--features mockls`, so the CI gate lints the full feature surface — including
+  the `fuzzing`-gated differential oracle in its non-test compilation — exactly
+  as the user's rust-analyzer flycheck does under `cargo.features = "all"`. This
+  closes the clippy-surface divergence where a `catenary diagnostics` receipt
+  could flag a lint the gate never saw (feedback 09). No source changes were
+  needed: the widened surface flagged zero new warnings.
 
 ### Fixed
 

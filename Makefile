@@ -40,7 +40,7 @@ check:
 	 fi
 	@cargo update --quiet
 	@cargo fmt -- -l | sed 's/^/fmt: formatted /'
-	@cargo clippy --tests --features mockls --quiet -- -D warnings
+	@cargo clippy --tests --all-features --quiet -- -D warnings
 	@tries=0; while true; do \
 	   cargo deny --log-level error check; rc=$$?; \
 	   if [ $$rc -eq 0 ]; then break; \
