@@ -17,6 +17,10 @@
 //! - `run_session_start` — clear stale editing state (`SessionStart`)
 //! - `run_pre_invocation` — first-sighting teaching injection (Antigravity
 //!   `PreInvocation`)
+//! - `run_pre_compress` — lay a discontinuity mark on a real compaction (Gemini
+//!   `PreCompress`)
+//! - `run_before_agent` — re-inject the teaching payload once per pending
+//!   discontinuity mark (Gemini `BeforeAgent`)
 
 #![allow(
     clippy::print_stdout,
@@ -28,6 +32,13 @@ use std::time::Duration;
 
 use crate::cli::HostFormat;
 use crate::cli::command_filter::resolver::LineWrites;
+
+/// The bare JSON object a hook emits when it has nothing to inject or decide.
+///
+/// Used by the Gemini `PreCompress` (advisory, output ignored) and `BeforeAgent`
+/// (no pending discontinuity mark) hot paths. Matches the host contract's
+/// "nothing to do" shape, so it is a safe no-op on every surface.
+const EMPTY_HOOK_OUTPUT: &str = "{}";
 
 // ── Teaching payload injection (ws36 ticket 01) ──────────────────────────
 
@@ -77,15 +88,18 @@ fn opencode_session_start_body() -> String {
 }
 
 /// Build the Antigravity `PreInvocation` output that injects `payload` as a
-/// **persisted** `injectSteps` `userMessage` (teaching-surface ticket 03).
+/// **persisted** `injectSteps` `userMessage` (teaching-surface ticket 03; the
+/// payload is the per-session sliver as of ticket 14).
 ///
-/// This is the Antigravity analog of the Claude `SessionStart`
-/// `additionalContext`: a `userMessage` step is written into the conversation
-/// transcript and stales like any transcript content, unlike the per-model-call
-/// `ephemeralMessage` channel (excluded by maintainer ruling — it is transient
-/// per call, not a session-start surface). The daemon-side first-sighting ledger
-/// gates emission to exactly once per conversation, so this rides no per-turn
-/// cadence.
+/// `payload` is the per-session teaching sliver
+/// ([`crate::cli::teaching::session_sliver`]) — the cwd build tool the always-on
+/// rules file structurally cannot carry — not the full teaching body (that rides
+/// the rules file every turn). A `userMessage` step is written into the
+/// conversation transcript and stales like any transcript content, unlike the
+/// per-model-call `ephemeralMessage` channel (excluded by maintainer ruling — it
+/// is transient per call, not a session-start surface). The daemon-side
+/// first-sighting ledger gates emission to exactly once per conversation, so this
+/// rides no per-turn cadence.
 #[must_use]
 fn pre_invocation_injection(payload: &str) -> String {
     serde_json::json!({
@@ -456,14 +470,6 @@ pub fn run_session_start(format: HostFormat) {
         return;
     }
 
-    // Teaching-surface 12: Gemini's extension context file is re-read per prompt,
-    // so a `SessionStart` firing means "Gemini is active" — regenerate the
-    // installed context file to the live workspace-invariant surface. Fail-open
-    // and hash-gated (see `context_files`); it never blocks the injection below.
-    if matches!(format, HostFormat::Gemini) {
-        crate::cli::context_files::regenerate_gemini_context();
-    }
-
     let mut builder = SystemMessageBuilder::new();
 
     // Config validation — runs before IPC, no session needed.
@@ -533,16 +539,20 @@ pub fn run_session_start(format: HostFormat) {
     emit_session_start(builder, ctx.as_deref());
 }
 
-/// Inject the teaching payload on a conversation's first sighting (Antigravity
-/// `PreInvocation` hook handler, teaching-surface ticket 03).
+/// Inject the per-session teaching sliver on a conversation's first sighting
+/// (Antigravity `PreInvocation` hook handler, teaching-surface ticket 03; sliver
+/// as of ticket 14).
 ///
 /// Antigravity has no `SessionStart` surface; its `PreInvocation` hook fires
 /// before **every** model call carrying `invocationNum` and `conversationId`.
 /// Rather than inject per-call (the `ephemeralMessage` channel is transient and
-/// excluded by ruling), this delivers the ticket-01 SSOT payload
-/// ([`crate::cli::teaching::emitted_payload`]) as a single **persisted**
-/// `injectSteps` `userMessage` — the analog of the Claude `SessionStart`
-/// `additionalContext`, exactly once per conversation.
+/// excluded by ruling), this delivers, once per conversation, the per-session
+/// **sliver** ([`crate::cli::teaching::session_sliver`]) as a single
+/// **persisted** `injectSteps` `userMessage`. The always-on rules file already
+/// carries the workspace-invariant surface every turn (teaching-surface ticket
+/// 14), so the injection carries only the session-specific delta the rules file
+/// structurally cannot — the cwd build tool. When the cwd resolves no build tool
+/// there is no delta, so nothing is injected (the rules file has it all).
 ///
 /// First-sighting is decided **daemon-side**, keyed on `conversationId`, not by
 /// the stateless `invocationNum == 0` trigger: the daemon already sees
@@ -576,11 +586,14 @@ pub fn run_pre_invocation(format: HostFormat) {
         return;
     };
 
-    if pre_invocation_first_sighting(&hook_json, format) {
-        print!(
-            "{}",
-            pre_invocation_injection(&crate::cli::teaching::emitted_payload())
-        );
+    // Inject only on the first sighting, and only when there is a session-specific
+    // delta to carry — the rules file already delivers the shared surface. The
+    // sliver render is computed only on the first sighting, so the per-model-call
+    // hot path pays only the ledger round-trip, not a second config load.
+    if pre_invocation_first_sighting(&hook_json, format)
+        && let Some(sliver) = crate::cli::teaching::session_sliver()
+    {
+        print!("{}", pre_invocation_injection(&sliver));
     } else {
         print!("{}", empty_pre_invocation());
     }
@@ -611,6 +624,171 @@ fn pre_invocation_first_sighting(hook_json: &serde_json::Value, format: HostForm
         .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
         .and_then(|v| v.get("inject").and_then(serde_json::Value::as_bool))
         .unwrap_or(false)
+}
+
+// ── Gemini compaction re-injection (PreCompress + BeforeAgent, ticket 14) ────
+
+/// Lay a per-session discontinuity mark on a real compaction (Gemini
+/// `PreCompress` hook handler, teaching-surface ticket 14).
+///
+/// Gemini's `PreCompress` is the only compaction-adjacent hook, but it is a poor
+/// signal. **HARD GATE (bundle-pinned, Gemini CLI 0.46.0):**
+/// `firePreCompressEvent` fires in `ChatCompressionService.compress` *before* the
+/// token-threshold check, and `compress` runs on **every turn** on the default
+/// legacy path (context management defaults off) — so `PreCompress` fires on every
+/// turn, including below-threshold no-ops that compress nothing. Its only
+/// distinguishing field is `trigger` (`auto`|`manual`), and `auto` cannot tell a
+/// real auto-compaction from a per-turn no-op firing. Laying a mark on `auto`
+/// would therefore re-inject the teaching payload on (nearly) every turn, which
+/// the ticket rules "worse than the gap."
+///
+/// So the mark is laid only when compression **provably proceeds** — a `manual`
+/// trigger, which sets `force = true` and bypasses the threshold check (a user's
+/// `/compress`). The next `BeforeAgent` consumes the mark and re-injects once.
+///
+/// This host output is always [`EMPTY_HOOK_OUTPUT`]: `PreCompress` is advisory
+/// (`systemMessage`-only; flow-control fields are ignored per the host contract),
+/// so the mark is a pure side effect. No daemon is involved. Fail-soft: any error
+/// (unreadable stdin, unparsable JSON, `runtime_dir` write failure) logs at
+/// `debug` and still exits successfully with `{}`.
+pub fn run_pre_compress(format: HostFormat) {
+    // Only Gemini registers `PreCompress`; any other host is a defensive no-op.
+    if matches!(format, HostFormat::Gemini)
+        && let Err(e) = lay_discontinuity_mark_from_stdin(format)
+    {
+        tracing::debug!(error = %format!("{e:#}"), "pre-compress discontinuity mark failed");
+    }
+    print!("{EMPTY_HOOK_OUTPUT}");
+}
+
+/// Read the `PreCompress` stdin payload and, when it marks a *real* compaction,
+/// lay the per-session discontinuity mark. Errors propagate to the fail-soft
+/// caller ([`run_pre_compress`]).
+fn lay_discontinuity_mark_from_stdin(format: HostFormat) -> anyhow::Result<()> {
+    let stdin_data = std::io::read_to_string(std::io::stdin())?;
+    let hook_json: serde_json::Value = serde_json::from_str(&stdin_data)?;
+
+    let trigger = hook_json.get("trigger").and_then(serde_json::Value::as_str);
+    if !pre_compress_should_mark(trigger) {
+        return Ok(());
+    }
+
+    let Some(session_id) = extract_session_id(&hook_json, format) else {
+        return Ok(());
+    };
+    lay_discontinuity_mark(session_id)
+}
+
+/// Whether a `PreCompress` firing with the given `trigger` marks a *real* context
+/// discontinuity worth re-injecting the teaching payload for.
+///
+/// Only `manual` qualifies (see [`run_pre_compress`] for the full HARD-GATE
+/// reasoning): `manual` sets `force = true`, which bypasses the token-threshold
+/// check, so a `manual` firing provably proceeds to compress; `auto` fires on
+/// every turn and cannot be told apart from a below-threshold no-op. A
+/// missing/unknown trigger is treated as non-marking (conservative — never
+/// over-inject).
+#[must_use]
+fn pre_compress_should_mark(trigger: Option<&str>) -> bool {
+    trigger == Some("manual")
+}
+
+/// Write the per-session discontinuity marker under `runtime_dir`.
+///
+/// Creates the mark dir if needed and writes the marker (the trigger, for
+/// debuggability — existence is the signal). Keyed on the flattened `session_id`
+/// (the [`crate::paths::diagnostics_receipt_file`] pattern).
+fn lay_discontinuity_mark(session_id: &str) -> anyhow::Result<()> {
+    lay_mark_in(&crate::paths::discontinuity_mark_dir(), session_id)
+}
+
+/// [`lay_discontinuity_mark`] against an explicit mark directory (testable
+/// without touching the real `runtime_dir`).
+fn lay_mark_in(dir: &std::path::Path, session_id: &str) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(crate::paths::discontinuity_mark_file(session_id));
+    std::fs::write(&path, "manual\n")?;
+    Ok(())
+}
+
+/// Re-inject the teaching payload once per pending discontinuity mark (Gemini
+/// `BeforeAgent` hook handler, teaching-surface ticket 14).
+///
+/// `BeforeAgent` fires after a user submits a prompt, before the agent plans, and
+/// can inject `hookSpecificOutput.additionalContext` (appended to the turn's
+/// prompt). When a `PreCompress` mark is pending for this session, this consumes
+/// it and re-injects the full teaching payload once; otherwise it emits
+/// [`EMPTY_HOOK_OUTPUT`]. The hot (no-mark) path is a single filesystem `unlink`
+/// that check-and-clears the mark atomically (see [`take_discontinuity_mark`]).
+///
+/// Only Gemini registers `BeforeAgent`; any other host injects nothing.
+pub fn run_before_agent(format: HostFormat) {
+    if !matches!(format, HostFormat::Gemini) {
+        print!("{EMPTY_HOOK_OUTPUT}");
+        return;
+    }
+
+    // `session_id` (needed to key the mark) rides the payload, so read stdin, then
+    // one `unlink` decides. Any read/parse failure fails soft to the no-op output.
+    let Ok(stdin_data) = std::io::read_to_string(std::io::stdin()) else {
+        print!("{EMPTY_HOOK_OUTPUT}");
+        return;
+    };
+    let Ok(hook_json) = serde_json::from_str::<serde_json::Value>(&stdin_data) else {
+        print!("{EMPTY_HOOK_OUTPUT}");
+        return;
+    };
+    let Some(session_id) = extract_session_id(&hook_json, format) else {
+        print!("{EMPTY_HOOK_OUTPUT}");
+        return;
+    };
+
+    if take_discontinuity_mark(session_id) {
+        print!(
+            "{}",
+            before_agent_injection(&crate::cli::teaching::emitted_payload())
+        );
+    } else {
+        print!("{EMPTY_HOOK_OUTPUT}");
+    }
+}
+
+/// Consume the per-session discontinuity mark, returning whether one was pending.
+///
+/// The check-and-clear is a single `remove_file`: `Ok` means the mark existed and
+/// is now cleared (→ inject); an `Err` (typically `NotFound`) means no mark was
+/// pending (→ skip). One syscall, so the common no-mark path is cheap. Consuming
+/// the mark guarantees at most one injection per mark — and because a mark is laid
+/// only on a `manual` compaction (never per turn), injection is never per-turn.
+fn take_discontinuity_mark(session_id: &str) -> bool {
+    take_mark_in(&crate::paths::discontinuity_mark_dir(), session_id)
+}
+
+/// [`take_discontinuity_mark`] against an explicit mark directory (testable
+/// without touching the real `runtime_dir`).
+fn take_mark_in(dir: &std::path::Path, session_id: &str) -> bool {
+    let path = dir.join(crate::paths::discontinuity_mark_file(session_id));
+    std::fs::remove_file(&path).is_ok()
+}
+
+/// Build the Gemini `BeforeAgent` output that injects `payload` as
+/// `hookSpecificOutput.additionalContext`.
+///
+/// Bundle-pinned shape (Gemini CLI 0.46.0, `bundle/chunk-7VL2FI5R.js`): the host
+/// reads `hookSpecificOutput.additionalContext` (a string) via
+/// `getAdditionalContext()` (~L333587) and, for the `BeforeAgent` event, appends
+/// it to the turn's prompt as `<hook_context>…</hook_context>` (~L345738); the
+/// shape is documented in `bundle/docs/hooks/reference.md` (the `BeforeAgent`
+/// entry: `hookSpecificOutput.additionalContext` is "Text appended to the prompt
+/// for this turn only"). Reuses the shared [`announcement_hook_specific_output`]
+/// builder; its extra `hookEventName` key is ignored by Gemini, which only checks
+/// for `additionalContext`.
+#[must_use]
+fn before_agent_injection(payload: &str) -> String {
+    serde_json::json!({
+        "hookSpecificOutput": announcement_hook_specific_output("BeforeAgent", payload),
+    })
+    .to_string()
 }
 
 /// Clean up session state on exit (`SessionEnd` hook handler).
@@ -2388,27 +2566,26 @@ mod tests {
     }
 
     #[test]
-    fn pre_invocation_injection_carries_the_emitted_payload() {
-        // Payload parity with the SSOT: the injected `userMessage` is the shared
-        // emitted payload verbatim (the same source `catenary primer` and the
-        // Claude/Gemini SessionStart `additionalContext` render from, including
-        // the ticket-05 daemon-staleness note under the same condition), so the
-        // Antigravity teaching cannot drift from the other hosts'.
-        let payload = crate::cli::teaching::emitted_payload();
-        let out = pre_invocation_injection(&payload);
+    fn pre_invocation_injection_carries_only_the_sliver() {
+        // Ticket 14: the `PreInvocation` injection carries only the per-session
+        // sliver (the cwd build tool the always-on rules file structurally cannot
+        // carry), not the full SSOT payload — that rides the rules file every
+        // turn. The injection wrapper carries exactly what it is handed.
+        let sliver = "Catenary — this session's workspace specifics (...):\nBuild tool: make";
+        let out = pre_invocation_injection(sliver);
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
         assert_eq!(
             v["injectSteps"][0]["userMessage"]
                 .as_str()
                 .expect("userMessage string"),
-            payload,
+            sliver,
         );
-        // The SSOT invariants ride along (payload was inlined, not a pointer).
+        // The full teaching invariants are NOT here — they live on the rules file.
         assert!(
-            v["injectSteps"][0]["userMessage"]
+            !v["injectSteps"][0]["userMessage"]
                 .as_str()
                 .is_some_and(|s| s.contains("The edit→diagnostics loop")),
-            "injected payload inlines the invariants: {out}",
+            "the sliver must not carry the full invariants: {out}",
         );
     }
 
@@ -2423,6 +2600,74 @@ mod tests {
         assert!(
             v.as_object().expect("object").is_empty(),
             "no injectSteps on the no-op path: {out}",
+        );
+    }
+
+    // ── Gemini PreCompress + BeforeAgent compaction re-injection (ticket 14) ─
+
+    #[test]
+    fn pre_compress_marks_only_on_a_real_manual_compaction() {
+        // HARD GATE: PreCompress fires on every turn (before the threshold check),
+        // and only `manual` (force=true, threshold-bypassing) provably compresses.
+        // `auto` fires on every turn including no-ops, so it must NOT mark — else
+        // the payload re-injects on nearly every turn.
+        assert!(pre_compress_should_mark(Some("manual")));
+        assert!(!pre_compress_should_mark(Some("auto")));
+        assert!(!pre_compress_should_mark(None));
+        assert!(!pre_compress_should_mark(Some("something-else")));
+    }
+
+    #[test]
+    fn discontinuity_mark_is_consumed_at_most_once() {
+        // Lay a mark, then the first take consumes it (→ inject) and every later
+        // take finds nothing (→ skip). This is what bounds BeforeAgent to one
+        // injection per mark; combined with `manual`-only marking, it is never
+        // per-turn.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sid = "sess-abc-123";
+        assert!(
+            !take_mark_in(dir.path(), sid),
+            "no mark yet → nothing to consume"
+        );
+        lay_mark_in(dir.path(), sid).expect("lay mark");
+        assert!(
+            take_mark_in(dir.path(), sid),
+            "first take consumes the pending mark"
+        );
+        assert!(
+            !take_mark_in(dir.path(), sid),
+            "the mark is cleared — a second take injects nothing"
+        );
+    }
+
+    #[test]
+    fn discontinuity_marks_are_per_session() {
+        // Marks are keyed on session_id, so one session's compaction never
+        // re-injects into another's.
+        let dir = tempfile::tempdir().expect("tempdir");
+        lay_mark_in(dir.path(), "session-a").expect("lay mark a");
+        assert!(
+            !take_mark_in(dir.path(), "session-b"),
+            "session-b has no mark of its own"
+        );
+        assert!(
+            take_mark_in(dir.path(), "session-a"),
+            "session-a's mark is still pending"
+        );
+    }
+
+    #[test]
+    fn before_agent_injection_is_gemini_additional_context() {
+        // Bundle-pinned shape: `hookSpecificOutput.additionalContext` carries the
+        // payload; Gemini reads exactly this field for BeforeAgent.
+        let out = before_agent_injection("PAYLOAD");
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        assert_eq!(v["hookSpecificOutput"]["hookEventName"], "BeforeAgent");
+        assert_eq!(v["hookSpecificOutput"]["additionalContext"], "PAYLOAD");
+        // No Antigravity `injectSteps` shape leaks into the Gemini output.
+        assert!(
+            v.get("injectSteps").is_none(),
+            "BeforeAgent output must not carry injectSteps: {out}"
         );
     }
 }

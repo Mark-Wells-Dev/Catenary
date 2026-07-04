@@ -269,7 +269,7 @@ upgrading.
   the first turn in history). The resume-skip is shared: Gemini restores the full
   prior transcript on `--resume`, so the payload is re-injected only on
   `startup`/`clear`, never on `resume`. The shipped
-  [gemini-context.md](gemini-context.md) demotes from a `catenary primer` pointer
+  gemini-context.md demotes from a `catenary primer` pointer
   stub to a bootstrap/fallback: regenerated from the SSOT's static tiers
   (`fallback_body()`) with runtime data structurally excluded (no allow surface, build tool,
   or roots), pinned by the same freshness gate, it is the compaction-proof
@@ -304,7 +304,7 @@ upgrading.
   re-read their context file every prompt/turn, so Catenary rewrites its own
   installed artifact at hook time — the file becomes the compaction-proof delivery
   channel, not just a static bootstrap. A Gemini `SessionStart` regenerates the
-  extension's [gemini-context.md](gemini-context.md); an Antigravity
+  extension's gemini-context.md; an Antigravity
   `PreInvocation` regenerates the plugin's
   [rules/catenary.md](plugins/catenary-antigravity/rules/catenary.md). Each
   rewrite carries the workspace-invariant live
@@ -320,6 +320,38 @@ upgrading.
   carries an invisible generation stamp so `catenary doctor` accepts it as current.
   The `SessionStart` `additionalContext` and `PreInvocation` `userMessage`
   injection channels are unchanged.
+- **Gemini teaching goes hook-only; its context file is retired.** Source-reading
+  the installed Gemini CLI (0.46.0) falsified the ticket-12 premise: context files
+  are read once and cached (refresh only at startup / `/memory reload` / MCP
+  refresh / trust change — never per prompt), so hook-time rewrites never reached a
+  live session. The extension `contextFileName` and the shipped gemini-context.md
+  are dropped, along with the runtime regeneration and its freshness/doctor checks.
+  Gemini teaching now rides hooks exclusively: `SessionStart` re-stamps the full
+  payload (`startup`/`clear`), and two new hooks close the compaction gap —
+  `PreCompress` (`catenary hook pre-compress --format=gemini`) lays a per-session
+  discontinuity mark under `runtime_dir` (no daemon), and `BeforeAgent` (`catenary
+  hook before-agent --format=gemini`) consumes a pending mark to re-inject the
+  payload once via `hookSpecificOutput.additionalContext`. **Firing semantics,
+  bundle-pinned:** `PreCompress` fires *before* the token-threshold check and
+  `compress()` runs every turn on the default legacy path, so `PreCompress` fires
+  on every turn including below-threshold no-ops; its only field, `trigger`, cannot
+  tell a real auto-compaction from a no-op. The mark is therefore laid only on
+  `trigger: manual` (a user's `/compress`, which sets `force = true` and bypasses
+  the threshold — a provable compaction), and consumed at most once, so the payload
+  never re-injects per turn. Documented residual: an *auto*-compaction re-injects
+  nothing (it is indistinguishable from the every-turn no-op) — the accepted gap,
+  strictly preferred over per-turn injection.
+- **Antigravity's `PreInvocation` first-sighting shrinks to the per-session
+  sliver.** The always-on rules file already carries the workspace-invariant
+  surface every turn, so the once-per-conversation `PreInvocation` injection no
+  longer duplicates the full payload — it carries only the session-specific delta
+  the rules file structurally cannot (`teaching::session_sliver`): the cwd build
+  tool, as a self-labeled block. A test pins that the sliver and the rules-file body
+  share no line. When the cwd resolves no build tool there is no delta and nothing
+  is injected. The `context_files` header comment is corrected to the evidence: the
+  Gemini per-turn re-read claim was false (machinery now deleted); the Antigravity
+  cadence is unconfirmed, and the rewrite is correct either way — live if re-read
+  per turn, delivered by the next conversation start if cached.
 - **The teaching primer speaks an informative capability voice, not policy
   assertion.** The primer / SessionStart / SubagentStart payload and the runtime
   context files no longer assert that navigation "stays denied": the write-model

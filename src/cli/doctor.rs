@@ -24,9 +24,6 @@ const GEMINI_HOOKS_EXPECTED: &str = include_str!("../../hooks/hooks.json");
 const ANTIGRAVITY_HOOKS_EXPECTED: &str =
     include_str!("../../plugins/catenary-antigravity/hooks.json");
 
-/// Expected Gemini CLI context file, embedded at compile time.
-const GEMINI_CONTEXT_EXPECTED: &str = include_str!("../../gemini-context.md");
-
 /// Expected Antigravity rules file, embedded at compile time.
 const ANTIGRAVITY_RULES_EXPECTED: &str =
     include_str!("../../plugins/catenary-antigravity/rules/catenary.md");
@@ -539,7 +536,7 @@ pub async fn run_doctor(out: &mut Output, project_root: &Path, show_diff: bool) 
     let _ = out.writeln(format_args!(""));
     let _ = out.writeln(format_args!("{}:", out.colors.bold("Agent instructions")));
     check_claude_instructions(out);
-    check_gemini_instructions(out, show_diff);
+    check_gemini_instructions(out);
     check_antigravity_instructions(out, show_diff, project_root);
 
     // Legacy script migration warnings
@@ -1913,15 +1910,14 @@ fn check_claude_instructions(out: &mut Output) {
     }
 }
 
-/// Check Gemini CLI agent instruction files (context file).
+/// Check the installed Gemini CLI extension.
 ///
-/// Validates extension version against the current binary version.
-/// Linked extensions are always current by definition.
-#[allow(
-    clippy::too_many_lines,
-    reason = "Sequential discovery + version check + file check"
-)]
-fn check_gemini_instructions(out: &mut Output, show_diff: bool) {
+/// Validates the extension version against the current binary version; linked
+/// extensions are always current by definition. Gemini no longer ships a static
+/// context file — teaching-surface 14 retired it, so teaching rides the
+/// `SessionStart` / `PreCompress` / `BeforeAgent` hooks — so there is no
+/// instruction file to check.
+fn check_gemini_instructions(out: &mut Output) {
     let label = format!("{:<14}", "Gemini CLI");
     let Ok(home_str) = std::env::var("HOME") else {
         let _ = out.writeln(format_args!(
@@ -1967,7 +1963,7 @@ fn check_gemini_instructions(out: &mut Output, show_diff: bool) {
         ext_path
     };
 
-    // Read manifest for version and context file name
+    // Read manifest for version.
     let manifest_path = resolved.join("gemini-extension.json");
     let manifest = std::fs::read_to_string(&manifest_path)
         .ok()
@@ -1977,14 +1973,8 @@ fn check_gemini_instructions(out: &mut Output, show_diff: bool) {
         .as_ref()
         .and_then(|v| v.get("version").and_then(serde_json::Value::as_str));
 
-    let context_filename = manifest
-        .as_ref()
-        .and_then(|v| v.get("contextFileName").and_then(serde_json::Value::as_str))
-        .unwrap_or("gemini-context.md");
-
     // Version staleness — same reasoning as Claude check above.
     let expected_version = env!("CARGO_PKG_VERSION");
-    let is_stale = !is_linked && version.is_some_and(|v| v != expected_version);
 
     if is_linked {
         let _ = out.writeln(format_args!(
@@ -2014,38 +2004,6 @@ fn check_gemini_instructions(out: &mut Output, show_diff: bool) {
             "  {label}{}",
             out.colors.yellow("? cannot determine version"),
         ));
-    }
-
-    // Context file check
-    let context_path = resolved.join(context_filename);
-    match std::fs::read_to_string(&context_path) {
-        Ok(content) if content.trim().is_empty() => {
-            let _ = out.writeln(format_args!(
-                "  {label}{}",
-                out.colors.yellow(&format!("⚠ {context_filename} is empty")),
-            ));
-        }
-        Ok(content) => {
-            // Teaching-surface 12: the installed context file is rewritten per
-            // prompt to the live surface, so it diverges from the shipped
-            // bootstrap by design. Only diff a non-stamped, version-stale file
-            // against the bootstrap — a runtime-stamped file is current, not drift.
-            if is_stale && show_diff && !crate::cli::teaching::is_runtime_stamped(&content) {
-                show_unified_diff(
-                    out,
-                    &content,
-                    GEMINI_CONTEXT_EXPECTED,
-                    "installed",
-                    "expected",
-                );
-            }
-        }
-        Err(_) => {
-            let _ = out.writeln(format_args!(
-                "  {label}{}",
-                out.colors.red(&format!("✗ {context_filename} not found")),
-            ));
-        }
     }
 }
 
@@ -2702,14 +2660,6 @@ mod tests {
     }
 
     // ── embedded instruction file tests ────────────────────────────
-
-    #[test]
-    fn embedded_gemini_context_non_empty() {
-        assert!(
-            !GEMINI_CONTEXT_EXPECTED.trim().is_empty(),
-            "embedded gemini-context.md should not be empty",
-        );
-    }
 
     #[test]
     fn embedded_antigravity_rules_non_empty() {

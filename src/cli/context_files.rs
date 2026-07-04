@@ -1,34 +1,43 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
-//! Runtime regeneration of the host context files (teaching-surface ticket 12).
+//! Runtime regeneration of the Antigravity rules file (teaching-surface ticket
+//! 12; the Gemini leg was retired in ticket 14).
 //!
-//! Gemini's extension `contextFileName` and Antigravity's `always_on` rules file
-//! are both **re-read by their host per prompt/turn**. That makes a file rewritten
-//! at hook time the live, compaction-proof delivery channel: when the Gemini
-//! `SessionStart` or the Antigravity `PreInvocation` hook fires (detection = the
-//! host's own hook firing), Catenary regenerates the *installed* copy of its own
-//! artifact to the live workspace-invariant teaching surface
-//! ([`crate::cli::teaching::context_file_body`]).
+//! Antigravity's `always_on` rules file is re-injected into the model context
+//! every conversation turn, so a file rewritten at hook time is the live,
+//! compaction-proof delivery channel: when the Antigravity `PreInvocation` hook
+//! fires (detection = the host's own hook firing), Catenary regenerates the
+//! *installed* copy of its own rules file to the live workspace-invariant teaching
+//! surface ([`crate::cli::teaching::context_file_body`]).
+//!
+//! Whether Antigravity re-reads the rules file from disk *per turn* is
+//! **unconfirmed** — the host's agent source is opaque and no primary source
+//! documents the cadence. The rewrite is correct either way: if the file is
+//! re-read per turn, each turn sees the live surface; if it is cached per
+//! conversation, the rewrite still lands by the next conversation start — strictly
+//! better than install-time-only content. (The Gemini half of the original ticket-12
+//! premise — that its `contextFileName` is re-read per prompt — is now known
+//! **false**: Gemini caches context files at init, refreshing only at startup /
+//! `/memory reload` / MCP refresh / trust change. That machinery was deleted in
+//! ticket 14; Gemini teaching is now hook-only.)
 //!
 //! The rewrite is:
-//! - **Location-resolved the way `catenary install` does** — the Gemini extension
-//!   dir (`~/.gemini/extensions/{Catenary,catenary}`, following a `link` install's
-//!   `source`) and the Antigravity plugin dir
-//!   (`~/.gemini/config/plugins/catenary`). A missing location (host not
+//! - **Location-resolved the way `catenary install` does** — the Antigravity plugin
+//!   dir (`~/.gemini/config/plugins/catenary`). A missing location (plugin not
 //!   installed) is skipped silently.
 //! - **Link-install guarded** — a rewrite must never dirty a developer's git
-//!   worktree (the maintainer's own Gemini extension is a symlink into the repo).
-//!   The guard skips when the install dir is a symlink, or when the resolved
-//!   target's ancestry contains a `.git` dir/file (a git worktree).
+//!   worktree (a dev plugin install is a symlink into the repo). The guard skips
+//!   when the install dir is a symlink, or when the resolved target's ancestry
+//!   contains a `.git` dir/file (a git worktree).
 //! - **Hash-gated and atomic** — render, read, compare; only on a difference is a
 //!   temp file written and renamed into place (same dir, atomic). The no-op path
-//!   (Antigravity fires per model call) is one render + one read + compare.
+//!   (`PreInvocation` fires per model call) is one render + one read + compare.
 //! - **Fail-open** — every error path is swallowed at `debug` level. The hook's
 //!   primary job (injection / response) must never be blocked by the rewrite.
 //!
-//! The shipped files remain the cold bootstrap (build-time content unchanged); the
-//! runtime-rewritten installed file diverges from them by design, carrying a
+//! The shipped file remains the cold bootstrap (build-time content unchanged); the
+//! runtime-rewritten installed file diverges from it by design, carrying a
 //! generation stamp so `catenary doctor` accepts it (see
 //! [`crate::cli::teaching::is_runtime_stamped`]).
 
@@ -43,20 +52,6 @@ struct RewriteTarget {
     path: PathBuf,
     /// The install is a developer link/symlink (skip the rewrite).
     is_dev_link: bool,
-}
-
-/// Regenerate the installed Gemini context file to the live surface (fail-open).
-///
-/// Called from the Gemini `SessionStart` hook. Any error (host not installed,
-/// permissions, a link/worktree install) is swallowed at `debug` level so the
-/// hook's teaching injection is never blocked.
-pub(crate) fn regenerate_gemini_context() {
-    if let Err(e) = try_regenerate(
-        gemini_rewrite_target(),
-        crate::cli::teaching::gemini_context_file,
-    ) {
-        tracing::debug!(host = "gemini", error = %format!("{e:#}"), "context-file regeneration failed");
-    }
 }
 
 /// Regenerate the installed Antigravity rules file to the live surface (fail-open).
@@ -88,10 +83,10 @@ fn try_regenerate(
         return Ok(());
     };
 
-    // Link-install guard: never rewrite a developer's git worktree. The
-    // maintainer's Gemini extension is a symlink into the Catenary repo, so a
-    // naive rewrite would dirty the worktree and trip the shipped-file freshness
-    // test locally. Copy installs (no symlink, no `.git` ancestor) rewrite freely.
+    // Link-install guard: never rewrite a developer's git worktree. A dev plugin
+    // install is a symlink into the Catenary repo, so a naive rewrite would dirty
+    // the worktree and trip the shipped-file freshness test locally. Copy installs
+    // (no symlink, no `.git` ancestor) rewrite freely.
     if target.is_dev_link || resolves_into_git_worktree(&target.path) {
         tracing::debug!(
             path = %target.path.display(),
@@ -112,8 +107,8 @@ fn try_regenerate(
 /// The primary link-install detection. Canonicalizing first follows a link
 /// install's symlink into the developer repo, where an ancestor `.git` (a dir in
 /// a normal clone, a *file* in a linked worktree) is found and the rewrite is
-/// skipped. A copy install under `~/.gemini/...` has no `.git` ancestor and
-/// rewrites freely. Conservative by construction: a home dir that is itself a git
+/// skipped. A copy install under `~/.gemini/config/plugins/...` has no `.git`
+/// ancestor and rewrites freely. Conservative by construction: a home dir that is itself a git
 /// checkout (dotfile repos) reads as a worktree and is left alone — exactly the
 /// bias the guard wants, since rewriting there would dirty that repo too.
 fn resolves_into_git_worktree(path: &Path) -> bool {
@@ -147,54 +142,6 @@ fn write_if_changed(target: &Path, content: &str) -> Result<bool> {
         return Err(anyhow::Error::new(e).context(format!("rename temp into {}", target.display())));
     }
     Ok(true)
-}
-
-/// Resolve the installed Gemini context file to rewrite, the way `catenary
-/// install` / `catenary doctor` resolve it.
-///
-/// Finds the extension dir (`~/.gemini/extensions/{Catenary,catenary}`), reads
-/// `.gemini-extension-install.json` to detect a `link` install (whose real files
-/// live at `source`), and joins the manifest's `contextFileName` (default
-/// `gemini-context.md`). Returns `None` when Gemini is not installed.
-fn gemini_rewrite_target() -> Option<RewriteTarget> {
-    let home = dirs::home_dir()?;
-    let ext_dir = home.join(".gemini/extensions");
-    let ext_path = ["Catenary", "catenary"]
-        .iter()
-        .map(|name| ext_dir.join(name))
-        .find(|p| p.is_dir())?;
-
-    let meta = std::fs::read_to_string(ext_path.join(".gemini-extension-install.json"))
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
-
-    let is_link = meta
-        .as_ref()
-        .and_then(|m| m.get("type").and_then(serde_json::Value::as_str))
-        == Some("link");
-
-    let resolved = if is_link {
-        meta.as_ref()
-            .and_then(|m| m.get("source").and_then(serde_json::Value::as_str))
-            .map_or_else(|| ext_path.clone(), PathBuf::from)
-    } else {
-        ext_path
-    };
-
-    let context_filename = std::fs::read_to_string(resolved.join("gemini-extension.json"))
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .and_then(|v| {
-            v.get("contextFileName")
-                .and_then(serde_json::Value::as_str)
-                .map(std::string::ToString::to_string)
-        })
-        .unwrap_or_else(|| "gemini-context.md".to_string());
-
-    Some(RewriteTarget {
-        path: resolved.join(context_filename),
-        is_dev_link: is_link,
-    })
 }
 
 /// Resolve the installed Antigravity rules file to rewrite, the way `catenary
@@ -244,7 +191,7 @@ mod tests {
         // A linked git worktree marks its root with a `.git` *file*, not a dir.
         let repo = tempfile::tempdir().expect("tempdir");
         std::fs::write(repo.path().join(".git"), "gitdir: /elsewhere\n").expect("write .git file");
-        let target = repo.path().join("gemini-context.md");
+        let target = repo.path().join("catenary.md");
         std::fs::write(&target, "x").expect("write target");
         assert!(
             resolves_into_git_worktree(&target),
@@ -256,7 +203,7 @@ mod tests {
     fn git_worktree_guard_false_outside_repo() {
         // A copy install with no `.git` ancestor rewrites freely.
         let plain = tempfile::tempdir().expect("tempdir");
-        let target = plain.path().join("gemini-context.md");
+        let target = plain.path().join("catenary.md");
         std::fs::write(&target, "x").expect("write target");
         assert!(
             !resolves_into_git_worktree(&target),
@@ -313,7 +260,7 @@ mod tests {
         // backstop catches copy-into-repo installs too).
         let repo = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(repo.path().join(".git")).expect("mk .git dir");
-        let target = repo.path().join("gemini-context.md");
+        let target = repo.path().join("catenary.md");
 
         let res = try_regenerate(
             Some(RewriteTarget {
@@ -334,7 +281,7 @@ mod tests {
         // A plain (non-link, non-worktree) target is rewritten to the rendered
         // content and no-ops on a second identical run.
         let dir = tempfile::tempdir().expect("tempdir");
-        let target = dir.path().join("gemini-context.md");
+        let target = dir.path().join("catenary.md");
 
         let render = || "STAMPED BODY\n".to_string();
         try_regenerate(

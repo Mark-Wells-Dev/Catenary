@@ -12,6 +12,30 @@
         ]
       }
     ],
+    "BeforeAgent": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "name": "catenary-before-agent",
+            "type": "command",
+            "command": "catenary hook before-agent --format=gemini"
+          }
+        ]
+      }
+    ],
+    "PreCompress": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "name": "catenary-pre-compress",
+            "type": "command",
+            "command": "catenary hook pre-compress --format=gemini"
+          }
+        ]
+      }
+    ],
     "BeforeTool": [
       {
         "matcher": "",

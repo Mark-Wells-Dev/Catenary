@@ -1549,28 +1549,26 @@ mod tests {
         // teaching-surface 08 made OpenCode runtime-only (the plugin's `config`
         // hook regenerates its instructions).
         //
-        // Gemini and Antigravity keep static artifacts as compaction-proof legs
-        // (teaching-surface 06 / 10): bootstrap/fallbacks that inline the SSOT
+        // Antigravity keeps a static artifact as a compaction-proof leg
+        // (teaching-surface 10): a bootstrap/fallback that inlines the SSOT
         // teaching (runtime data excluded) rather than pointing at the primer —
-        // the live surface rides the runtime channel (Gemini's SessionStart
-        // `additionalContext`, Antigravity's `PreInvocation` `userMessage`).
-        // Their freshness is pinned in `cli::teaching`
-        // (`shipped_gemini_context_is_fresh`,
-        // `shipped_antigravity_rules_are_fresh`).
-        const GEMINI_CONTEXT: &str = include_str!("../../gemini-context.md");
-
-        // The Gemini and Antigravity fallbacks inline the teaching — no primer
-        // pointer, and no runtime data (the allow surface / build tool only ride
-        // the runtime channel).
-        for (host, surface) in [("gemini", GEMINI_CONTEXT), ("antigravity", AGY_RULES)] {
-            assert!(
-                !surface.contains("catenary primer"),
-                "the {host} fallback should inline the teaching, not point at the primer",
-            );
-            assert!(
-                surface.contains("The edit→diagnostics loop"),
-                "the {host} fallback should inline the SSOT invariants",
-            );
-        }
+        // the live surface rides the runtime channel (the `PreInvocation` sliver).
+        // Its freshness is pinned in `cli::teaching`
+        // (`shipped_antigravity_rules_are_fresh`). Gemini retired its static
+        // context file in teaching-surface 14 — its teaching is hook-only
+        // (`SessionStart` plus the `PreCompress`/`BeforeAgent` discontinuity
+        // re-injection), so no static Gemini surface remains to check.
+        //
+        // The Antigravity fallback inlines the teaching — no primer pointer, and
+        // no runtime data (the allow surface / build tool only ride the runtime
+        // channel).
+        assert!(
+            !AGY_RULES.contains("catenary primer"),
+            "the antigravity fallback should inline the teaching, not point at the primer",
+        );
+        assert!(
+            AGY_RULES.contains("The edit→diagnostics loop"),
+            "the antigravity fallback should inline the SSOT invariants",
+        );
     }
 }

@@ -4,7 +4,6 @@
   "version": "1.6.1",
   "description": "LSP-powered code intelligence for AI coding agents - search, diagnostics, and navigation for any language with an LSP server",
   "publisher": "TwoWells",
-  "contextFileName": "gemini-context.md",
   "mcpServers": {
     "catenary": {
       "command": "catenary"

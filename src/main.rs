@@ -414,6 +414,20 @@ enum HookCommand {
         #[arg(long, value_enum)]
         format: HostFormat,
     },
+    /// `PreCompress`: lay a discontinuity mark on a real compaction (Gemini).
+    #[command(name = "pre-compress")]
+    PreCompress {
+        /// Output format: "claude", "gemini", or "antigravity".
+        #[arg(long, value_enum)]
+        format: HostFormat,
+    },
+    /// `BeforeAgent`: re-inject the teaching payload once per discontinuity (Gemini).
+    #[command(name = "before-agent")]
+    BeforeAgent {
+        /// Output format: "claude", "gemini", or "antigravity".
+        #[arg(long, value_enum)]
+        format: HostFormat,
+    },
     /// `SessionEnd`: clean up session state (roots, editing).
     #[command(name = "session-end")]
     SessionEnd {
@@ -781,6 +795,8 @@ fn main() -> Result<()> {
                 HookCommand::PostAgent { format } => cli::hooks::run_post_agent(format),
                 HookCommand::SessionStart { format } => cli::hooks::run_session_start(format),
                 HookCommand::PreInvocation { format } => cli::hooks::run_pre_invocation(format),
+                HookCommand::PreCompress { format } => cli::hooks::run_pre_compress(format),
+                HookCommand::BeforeAgent { format } => cli::hooks::run_before_agent(format),
                 HookCommand::SessionEnd { format } => cli::hooks::run_session_end(format),
                 HookCommand::SubagentStart { format } => cli::hooks::run_subagent_start(format),
                 HookCommand::WorktreeRemove { format } => cli::hooks::run_worktree_remove(format),
@@ -2233,6 +2249,38 @@ mod tests {
             command,
             HookCommand::PreInvocation {
                 format: HostFormat::Antigravity
+            }
+        ));
+    }
+
+    #[test]
+    fn test_cli_hook_pre_compress() {
+        use clap::Parser;
+        let args = Args::try_parse_from(["catenary", "hook", "pre-compress", "--format=gemini"]);
+        let args = args.expect("hook pre-compress should parse");
+        let Some(Command::Hook { command }) = args.command else {
+            unreachable!("expected Hook command");
+        };
+        assert!(matches!(
+            command,
+            HookCommand::PreCompress {
+                format: HostFormat::Gemini
+            }
+        ));
+    }
+
+    #[test]
+    fn test_cli_hook_before_agent() {
+        use clap::Parser;
+        let args = Args::try_parse_from(["catenary", "hook", "before-agent", "--format=gemini"]);
+        let args = args.expect("hook before-agent should parse");
+        let Some(Command::Hook { command }) = args.command else {
+            unreachable!("expected Hook command");
+        };
+        assert!(matches!(
+            command,
+            HookCommand::BeforeAgent {
+                format: HostFormat::Gemini
             }
         ));
     }
