@@ -24,9 +24,9 @@ Bare-only vs pipe-friendly
   drops results (use `--count` for a bare tally).
 
 Navigate through Catenary
-  Find files with `catenary glob`, search contents with `catenary grep`; native
-  `grep`/`find`/`ls` are denied so results stay LSP-enriched. Quote glob
-  patterns so Catenary expands them gitignore-aware, not the shell
+  Find files with `catenary glob`, search contents with `catenary grep` so
+  results stay LSP-enriched — native `grep`/`find`/`ls` bypass that enrichment.
+  Quote glob patterns so Catenary expands them gitignore-aware, not the shell
   (`catenary grep 'fn main' 'src/**/*.rs'`, `catenary glob 'src/**/*.rs'`). A
   glob pattern is itself the path — absolute or cwd-relative, with the anchor
   written in (`catenary glob '/abs/dir/**/*.md'`); there is no separate

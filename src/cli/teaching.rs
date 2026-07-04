@@ -65,9 +65,9 @@ Bare-only vs pipe-friendly
   drops results (use `--count` for a bare tally).
 
 Navigate through Catenary
-  Find files with `catenary glob`, search contents with `catenary grep`; native
-  `grep`/`find`/`ls` are denied so results stay LSP-enriched. Quote glob
-  patterns so Catenary expands them gitignore-aware, not the shell
+  Find files with `catenary glob`, search contents with `catenary grep` so
+  results stay LSP-enriched — native `grep`/`find`/`ls` bypass that enrichment.
+  Quote glob patterns so Catenary expands them gitignore-aware, not the shell
   (`catenary grep 'fn main' 'src/**/*.rs'`, `catenary glob 'src/**/*.rs'`). A
   glob pattern is itself the path — absolute or cwd-relative, with the anchor
   written in (`catenary glob '/abs/dir/**/*.md'`); there is no separate
@@ -293,6 +293,75 @@ mod tests {
         assert!(
             body.contains("Writes resolve-or-deny"),
             "write-model line absent: {body}"
+        );
+    }
+
+    #[test]
+    fn payload_write_model_navigation_derives_from_config() {
+        // teaching-surface 07: the write-model line's navigation clause is
+        // derived from the live surface, not baked. A recommended-shaped surface
+        // (grep in pipeline under a scan-redirect group, find under a
+        // list-redirect group, git denies ls-files) names grep/find + git
+        // ls-files exactly as the former static line did.
+        use crate::config::{GuidanceEntry, ResolvedCommands};
+        let guidance = std::collections::HashMap::from([
+            (
+                "grep".to_string(),
+                GuidanceEntry::Redirect {
+                    command: "grep".into(),
+                },
+            ),
+            (
+                "find".to_string(),
+                GuidanceEntry::Redirect {
+                    command: "glob".into(),
+                },
+            ),
+        ]);
+        let recommended = ResolvedCommands {
+            allow: std::collections::HashSet::from(["git".into()]),
+            pipeline: std::collections::HashSet::from(["grep".into()]),
+            deny: std::collections::HashMap::from([(
+                "git".to_string(),
+                std::collections::HashSet::from(["ls-files".into()]),
+            )]),
+            guidance,
+            ..ResolvedCommands::default()
+        };
+        let body = render(Some(&recommended), &["make".to_string()]);
+        assert!(
+            body.contains("(native `grep`/`find`, `git ls-files`) stays denied."),
+            "recommended surface names the navigation examples: {body}"
+        );
+
+        // A surface that denies no navigation example (the fixture: no guidance,
+        // no git deny) drops the clause — the config-free resolve-or-deny half
+        // stays, but nothing is falsely asserted denied.
+        let neutral = render(Some(&fixture_surface()), &["make".to_string()]);
+        assert!(
+            neutral.contains("Writes resolve-or-deny"),
+            "resolve-or-deny half stays: {neutral}"
+        );
+        assert!(
+            !neutral.contains("stays denied"),
+            "no false denial claim when nothing is denied: {neutral}"
+        );
+    }
+
+    #[test]
+    fn invariants_navigation_line_is_config_neutral() {
+        // teaching-surface 07: the shared navigate invariant no longer asserts a
+        // config-specific denial ("native grep/find/ls are denied"); it states
+        // the config-free fact that native tools bypass LSP enrichment. This
+        // line rides both the live payload and the runtime-free fallbacks, so it
+        // must never claim a denial that a user's config may not make.
+        assert!(
+            !INVARIANTS.contains("are denied"),
+            "invariants must not assert a config-specific denial: {INVARIANTS}"
+        );
+        assert!(
+            INVARIANTS.contains("bypass that enrichment"),
+            "invariants state the config-free enrichment-bypass fact: {INVARIANTS}"
         );
     }
 
