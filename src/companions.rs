@@ -32,7 +32,8 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 use crate::bridge::expand_tilde;
@@ -60,7 +61,7 @@ use crate::source::Source;
 ///
 /// Semantics are **union**, not first-match — order is irrelevant. An empty
 /// table (the default) disables the feature.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
 #[serde(transparent)]
 pub struct CompanionRules {
     rules: HashMap<String, String>,

@@ -32,7 +32,8 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
-use serde::Deserialize;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
 use crate::paths::encode_cwd;
 use crate::source::Source;
@@ -60,8 +61,9 @@ pub const STALENESS_SWEEP_INTERVAL: Duration = Duration::from_hours(1);
 /// each, is ≈ `L × S × segments_kept × segment_bytes` for server streams plus
 /// `tool_dir_budget` per tool dir — bounded and, in realistic idle/typical use,
 /// in the low tens of MB.
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema)]
 #[serde(default)]
+#[schemars(deny_unknown_fields)]
 pub struct ReapPolicy {
     /// Stream segment size: a stream (`mcp`/`trace`/`servers`) rolls to a new
     /// segment once the live file reaches this many bytes.

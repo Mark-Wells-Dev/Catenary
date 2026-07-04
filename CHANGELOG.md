@@ -62,6 +62,20 @@ upgrading.
 
 ### Added
 
+- **JSON Schema for the config files.** Catenary now ships two
+  `schemars`-generated JSON Schemas under `schemas/` — `config.json` for the user
+  config (`~/.config/catenary/config.toml`) and `catenary-project.json` for a
+  project `.catenary.toml`. Both are generated from the same serde structs the
+  loader deserializes, with a byte-for-byte freshness gate so they cannot drift.
+  The schema closes the key set (a dead key like `smart_wait` is flagged
+  in-editor) while leaving the server pass-through subtrees
+  (`initialization_options`, `settings`, `env`) open; the project schema marks the
+  user-scope-only enforcement keys (`allow`, `deny_flags`, …) deprecated so the
+  editor warning matches the runtime warning. Delivery is validator-neutral: the
+  schema is published at
+  `https://twowells.github.io/catenary/schemas/config.json`, auto-associated at
+  the `taplo` server Catenary spawns (offline, zero setup), and referenced from a
+  `#:schema` directive in the `catenary config` template.
 - **Activity-mounted ephemeral roots.** A `catenary grep`, `glob`, or
   `diagnostics` touching a path outside every mounted root now detects the
   enclosing project root (walking `.git` up from the path), **mounts it

@@ -14,7 +14,8 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
 use crate::lsp::glob::LspGlob;
 
@@ -29,7 +30,7 @@ use crate::lsp::glob::LspGlob;
 /// `patterns` are **root-relative path globs** (e.g.
 /// `.github/workflows/*.{yml,yaml}`), not filename globs — an unanchored
 /// `*.yaml` would fire on every YAML in the tree.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct LinterConfig {
     /// The executable to run (e.g. `"shellcheck"`).

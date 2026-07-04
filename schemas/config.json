@@ -1,0 +1,1007 @@
+{
+  "$id": "https://twowells.github.io/catenary/schemas/config.json",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "additionalProperties": false,
+  "definitions": {
+    "CommandsConfig": {
+      "additionalProperties": false,
+      "description": "Top-level `[commands]` config section.\n\nDeserialized from TOML. The `deny` field uses a nested table: `[commands.deny]` with keys mapping to arrays of denied subcommands (e.g., `git = [\"grep\", \"ls-files\"]`).",
+      "properties": {
+        "allow": {
+          "default": null,
+          "description": "Commands the agent can run unconditionally.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "allow_flags": {
+          "additionalProperties": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "default": null,
+          "description": "Per-command allowed **invocation forms** (the allow-side dual of `deny_flags`). Key = command name, value = list of permitted forms, e.g. `perl = [\"-i\", \"-pe\", \"-e\"]`. When a command has an entry, an invocation must match at least one listed form or it is denied. This is policy, not soundness — the write resolver's own denials run regardless and are never re-opened by a listed form.",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "build": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/StringOrVec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The project's build tool(s) (e.g., `\"make\"` or `[\"make\", \"npm\"]`)."
+        },
+        "client_enforcement_only": {
+          "default": false,
+          "description": "Deliberate opt-out — no enforcement, no hint notification.",
+          "type": "boolean"
+        },
+        "deny": {
+          "additionalProperties": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "default": null,
+          "description": "Subcommand denylist within allowed commands. Key = command name, value = list of denied subcommands.",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "deny_flags": {
+          "additionalProperties": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "default": null,
+          "description": "Per-command flag denylist. Scans all argument positions. Key = command name, value = list of denied flags.",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "guidance": {
+          "additionalProperties": {
+            "$ref": "#/definitions/GuidanceGroup"
+          },
+          "default": null,
+          "description": "Per-command guidance groups. Key = group name (e.g., `\"read\"`, `\"build\"`), value = group config.",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "pipeline": {
+          "default": null,
+          "description": "Commands allowed mid-pipeline only (denied at pipeline position 0).",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "script_hosts": {
+          "default": null,
+          "description": "Commands the user opts in as **script hosts** (misc 129): a modeled substitution engine (`perl`/`awk`/`sed`) whose program-file / bare form relaxes from today's soundness denial to the unbounded-interpreter executor boundary (`NoWrite`) — the same layer-4 stance `python script.py` keeps. Inline programs (`perl -e`, `awk 'prog'`, `sed 'script'`) keep their substitution audit; only the forms whose program the hook cannot see relax. User-scope only, like every enforcement key; keys must name a command in `allow`/`pipeline`/`build`. Listing an already-unbounded interpreter (`python`/`ruby`/`node`) is a warned no-op.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "GlobConfig": {
+      "additionalProperties": false,
+      "description": "Glob tool configuration.",
+      "properties": {
+        "outline_suppress": {
+          "default": [],
+          "description": "Glob patterns whose outlines are suppressed from automatic display. Symbols remain available via `into`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "GuidanceGroup": {
+      "additionalProperties": false,
+      "description": "TOML shape for a single `[commands.guidance.<group>]` entry.\n\nEach group maps a set of commands to a guidance message. The `build` group is special: it uses per-context message templates instead of a single `message` string. Detection: if `message` is absent and any `message_*` field is present, or if the group name is `\"build\"`, it's treated as a build group.",
+      "properties": {
+        "commands": {
+          "default": [],
+          "description": "Commands this guidance applies to.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "message": {
+          "default": null,
+          "description": "Static hint message (e.g., `\"Use {EDIT} for surgical edits\"`). Absent for the `build` and `redirect` groups.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message_cwd_unknown": {
+          "default": null,
+          "description": "Build: message when cwd cannot be resolved.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message_default": {
+          "default": null,
+          "description": "Build: message when user config has a build tool.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message_default_absent": {
+          "default": null,
+          "description": "Build: message when user config has no build tool.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message_noproject": {
+          "default": null,
+          "description": "Build: message when no `.catenary.toml` exists.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message_project": {
+          "default": null,
+          "description": "Build: message when project config has a build tool.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message_project_absent": {
+          "default": null,
+          "description": "Build: message when project config has no build tool.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "redirect": {
+          "default": null,
+          "description": "Catenary subcommand to redirect to (e.g., `\"grep\"`, `\"glob\"`). When set, denials show a short message + the command's `-h` output.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "IconConfig": {
+      "additionalProperties": false,
+      "description": "Icon theme configuration.\n\nSet `preset` to choose a base icon set, then override individual icons as needed. Each override replaces the preset default for that slot.\n\n# Examples\n\n```toml [icons] preset = \"nerd\" ```",
+      "properties": {
+        "cancelled": {
+          "description": "Request cancelled icon.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "diag_error": {
+          "description": "Diagnostic error icon.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "diag_info": {
+          "description": "Diagnostic info icon.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "diag_ok": {
+          "description": "Diagnostic ok (clean) icon.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "diag_warn": {
+          "description": "Diagnostic warning icon.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "log_info": {
+          "description": "Server log info icon (collapsed `window/logMessage` runs at info level).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ls_active": {
+          "description": "Language server active icon.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ls_inactive": {
+          "description": "Language server inactive icon.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pinned": {
+          "description": "Pinned panel icon.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "preset": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/IconPreset"
+            }
+          ],
+          "default": "unicode",
+          "description": "Base icon preset (default: `unicode`)."
+        },
+        "progress": {
+          "description": "Progress spinner frames (animated).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "proto_error": {
+          "description": "Protocol error icon.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "proto_ok": {
+          "description": "Protocol success icon.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "server_state": {
+          "description": "Server state change event icon.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_shutdown": {
+          "description": "Session shutdown event icon.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_started": {
+          "description": "Session started event icon.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "spinner_cycle": {
+          "description": "Spinner cycle phase frames (loops during progress).",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "spinner_done": {
+          "description": "Spinner done frame (shown on progress end).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "spinner_grow": {
+          "description": "Spinner grow phase frames (plays once at start).",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "tool_default": {
+          "description": "Default tool icon (fallback).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tool_glob": {
+          "description": "Glob tool icon.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tool_search": {
+          "description": "Search tool icon.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tool_sed": {
+          "description": "Sed tool icon.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspace_closed": {
+          "description": "Workspace collapsed icon.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspace_open": {
+          "description": "Workspace expanded icon.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "IconPreset": {
+      "description": "Icon preset selecting a base set of icons.",
+      "oneOf": [
+        {
+          "description": "Safe Unicode symbols that render on any terminal font.",
+          "enum": [
+            "unicode"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Nerd Font glyphs (requires a patched font).",
+          "enum": [
+            "nerd"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Emoji icons (Unicode 17.0, requires emoji-capable font).",
+          "enum": [
+            "emoji"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "LanguageConfig": {
+      "additionalProperties": false,
+      "description": "Per-language configuration for how Catenary handles a language.\n\nEach entry references one or more server definitions from `[lsp.server.*]` via the `servers` list and controls diagnostic severity filtering. Classification fields (`extensions`, `filenames`, `shebangs`) define how files are mapped to this language.",
+      "properties": {
+        "diagnostics": {
+          "default": true,
+          "description": "Whether to deliver diagnostics for this language. Defaults to `true`. AND with per-binding `diagnostics` to determine effective delivery per server.",
+          "type": "boolean"
+        },
+        "extensions": {
+          "default": null,
+          "description": "File extensions (without dot) that classify as this language. Example: `[\"sh\", \"bash\", \"zsh\"]`",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "filenames": {
+          "default": null,
+          "description": "Exact filenames that classify as this language. Example: `[\"PKGBUILD\", \"Makefile\"]`",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "root_markers": {
+          "default": null,
+          "description": "Root marker filenames or glob patterns for sub-root resolution.\n\nWhen set, Catenary walks up from each file toward the workspace root boundary, stopping at the first directory containing any marker. That directory becomes the server instance's root. Different resolved roots produce different server instances.\n\nEntries without glob metacharacters (`*`, `?`, `[`) are treated as exact filenames (fast `exists()` check). Entries with glob metacharacters are compiled and matched against directory entries.\n\nMarkers are a property of the language ecosystem — `Cargo.toml` defines a Rust project boundary regardless of which server is used. Defaults are shipped in `defaults/languages.toml` for common languages. Override with explicit `root_markers = [...]` or disable with `root_markers = []`.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "servers": {
+          "default": null,
+          "description": "Ordered list of server bindings (references `[lsp.server.*]` entries). Order defines dispatch priority.\n\n`None` means the entry did not specify a `servers` key — merge preserves the earlier layer's value. `Some([])` means the entry explicitly cleared the list. `Some([...])` replaces.",
+          "items": {
+            "$ref": "#/definitions/ServerBinding"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "shebangs": {
+          "default": null,
+          "description": "Interpreter basenames for shebang detection. Matches `#!/bin/X` and `#!/usr/bin/env X`. Example: `[\"bash\", \"sh\", \"zsh\"]`",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "LinterConfig": {
+      "additionalProperties": false,
+      "description": "A single `[linter.rule.<name>]` configuration entry.\n\nLives on both the user [`Config`](super::Config) and the per-root [`ProjectConfig`](super::ProjectConfig). The effective set for a root is the user set unioned with that root's project set, the project winning on a name collision (so a project can override or [`disable`](Self::disable) a user-configured linter by name).\n\n`patterns` are **root-relative path globs** (e.g. `.github/workflows/*.{yml,yaml}`), not filename globs — an unanchored `*.yaml` would fire on every YAML in the tree.",
+      "properties": {
+        "args": {
+          "default": [],
+          "description": "Arguments passed before the file paths (e.g. `[\"-f\", \"json1\"]`).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "command": {
+          "default": "",
+          "description": "The executable to run (e.g. `\"shellcheck\"`).",
+          "type": "string"
+        },
+        "disable": {
+          "default": false,
+          "description": "Disables this linter for the root it resolves under (default `false`).\n\nA project entry can disable a user-configured linter by setting this on an entry with the same name.",
+          "type": "boolean"
+        },
+        "patterns": {
+          "default": [],
+          "description": "Root-relative path globs selecting which files this linter handles.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "shebangs": {
+          "default": [],
+          "description": "Shebang interpreter basenames (e.g. `[\"bash\", \"sh\"]`) that route an **extensionless** script to this linter, in addition to [`Self::patterns`].\n\nA file routes to the linter when its root-relative path matches a pattern glob **or** its `#!` interpreter basename is in this list. Empty (the default) leaves shebang routing off — the linter routes on path globs alone. The default `shellcheck` ships `[\"sh\", \"bash\", \"dash\", \"ksh\"]` so it catches shell scripts that carry a shebang but no `.sh` extension; the list mirrors shellcheck's own supported interpreters (notably not `zsh`).\n\nThe interpreter is extracted with the same single-pass scan Catenary uses for language classification, so `#!/usr/bin/env bash` and `#!/bin/bash` both resolve to `bash`. The read is lazy — only consulted when the path globs miss and this list is non-empty.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "weight": {
+          "default": null,
+          "description": "Diagnostic trust weight for this linter's source (linters ticket 05).\n\nA linter is a 1:1 emitter — the diagnostic `source` equals the linter name — so this single weight covers it. Higher = more trusted. Absent ⇒ the [`BASELINE_WEIGHT`](super::BASELINE_WEIGHT). Drives the cross-feeder dedup keeper and the provisional challenge.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "NotificationConfig": {
+      "additionalProperties": false,
+      "description": "Notification delivery configuration.\n\nControls which tracing events are promoted to user-facing notifications via `systemMessage`. Events below the threshold are silently dropped by the notification queue sink.\n\n# Examples\n\n```toml [notifications] threshold = \"warn\" desktop = true ```",
+      "properties": {
+        "desktop": {
+          "default": null,
+          "description": "Whether OS-level desktop notifications are enabled for error events. Defaults to `true`. Set to `false` to suppress desktop notifications while keeping `systemMessage` delivery. The `CATENARY_NOTIFY=0` environment variable overrides this to `false`.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "threshold": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/SeverityConfig"
+            }
+          ],
+          "default": "warn",
+          "description": "Minimum severity for notification delivery."
+        }
+      },
+      "type": "object"
+    },
+    "RawLinterSection": {
+      "additionalProperties": false,
+      "description": "The `[linter]` table: standalone-linter definitions (linters ticket 04).\n\n`[linter.rule.*]` replaces the old top-level `[linter.<name>]`. The per-root `[linter] disable` toggle is parsed separately in [`load_project_config`] (project scope only), so it has no field here.",
+      "properties": {
+        "rule": {
+          "additionalProperties": {
+            "$ref": "#/definitions/LinterConfig"
+          },
+          "default": {},
+          "description": "Standalone-linter definitions (`[linter.rule.*]`).",
+          "type": "object"
+        }
+      },
+      "type": "object"
+    },
+    "RawLspSection": {
+      "additionalProperties": false,
+      "description": "The `[lsp]` table: LSP server + language definitions (linters ticket 04).\n\n`[lsp.server.*]` and `[lsp.language.*]` replace the old top-level `[server.*]` / `[language.*]`. The per-root `[lsp] disable` toggle is parsed separately in [`load_project_config`] (project scope only), so it has no field here — an unrecognized `disable` key in a user config is simply ignored.",
+      "properties": {
+        "language": {
+          "additionalProperties": {
+            "$ref": "#/definitions/LanguageConfig"
+          },
+          "default": {},
+          "description": "Language definitions (`[lsp.language.*]`).",
+          "type": "object"
+        },
+        "server": {
+          "additionalProperties": {
+            "$ref": "#/definitions/ServerDef"
+          },
+          "default": {},
+          "description": "Server definitions (`[lsp.server.*]`).",
+          "type": "object"
+        }
+      },
+      "type": "object"
+    },
+    "ReapPolicy": {
+      "additionalProperties": false,
+      "description": "Tunable bounds for firehose reaping, shared by the on-write reapers ([`crate::logging::jsonl_sink`]) and the startup/periodic reapers here.\n\nSurfaced as the `[observability]` config section with these defaults; no user action is required. Bumping any knob is a one-line change with no format impact. Staleness reuses the existing `log_retention_days` config key (passed separately to [`sweep_stale`]); it is not duplicated here.\n\nAt the defaults, the worst-case footprint at `L` live projects, `S` servers each, is ≈ `L × S × segments_kept × segment_bytes` for server streams plus `tool_dir_budget` per tool dir — bounded and, in realistic idle/typical use, in the low tens of MB.",
+      "properties": {
+        "instance_keep": {
+          "default": 3,
+          "description": "Dead instance dirs retained at startup (`N_inst`). One daemon per host ⇒ every non-self instance dir is dead; the newest `N_inst` within [`Self::instance_max_age_days`] are kept, the rest `rm -rf`'d.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "instance_max_age_days": {
+          "default": 7,
+          "description": "Maximum age (days) of a retained dead instance dir (`X`). A dead dir older than this is reaped even if within [`Self::instance_keep`].",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "segment_bytes": {
+          "default": 2097152,
+          "description": "Stream segment size: a stream (`mcp`/`trace`/`servers`) rolls to a new segment once the live file reaches this many bytes.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "segments_kept": {
+          "default": 3,
+          "description": "Stream segments retained per stream, **including the live file** (`K`). `K = 3` with `segment_bytes = 2 MiB` ⇒ a 6 MiB per-stream ceiling. The oldest segment is dropped on each roll.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "tool_dir_budget": {
+          "default": 8388608,
+          "description": "Per-tool-dir (`grep`/`glob`) byte budget. On write, the oldest call files (by lexical ts-prefix) are evicted until the dir is under budget.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "RootsConfig": {
+      "additionalProperties": false,
+      "description": "Workspace-root configuration (`[roots]`).\n\nUser-level only. The lone field today is [`companions`](Self::companions); the section exists so companion-root rules have a stable home as more root-policy knobs land.",
+      "properties": {
+        "companions": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": null,
+          "description": "Companion-root derivation rules (`[roots.companions]`).\n\nA matcher → template map (see [`CompanionRules`]). **Absent ⇒ feature off** — Catenary ships no table and assumes no naming convention. Parsed only from the user config; a project `.catenary.toml` carrying `[roots]` is warned-and-ignored (it is not a project-allowed key) so a public repo cannot leak a private sibling path.",
+          "type": [
+            "object",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "ServerBinding": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "diagnostics": {
+              "description": "Whether this server delivers diagnostics for this language (default true).",
+              "type": "boolean"
+            },
+            "disabled_methods": {
+              "description": "LSP methods suppressed for this binding.",
+              "items": {
+                "enum": [
+                  "textDocument/references",
+                  "textDocument/documentSymbol",
+                  "textDocument/rename",
+                  "textDocument/implementation",
+                  "textDocument/prepareCallHierarchy",
+                  "textDocument/prepareTypeHierarchy"
+                ],
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "name": {
+              "description": "Server name (references a `[lsp.server.*]` entry).",
+              "type": "string"
+            }
+          },
+          "required": [
+            "name"
+          ],
+          "type": "object"
+        }
+      ],
+      "description": "A server reference: a bare `[lsp.server.*]` name, or an inline table selecting per-binding behavior."
+    },
+    "ServerDef": {
+      "additionalProperties": false,
+      "description": "Server definition — how to run and configure a language server.\n\nDefined in `[lsp.server.*]` config sections, referenced by name from `[lsp.language.*]` entries. This is adapter-level config consumed by the LSP client layer — the routing core never sees it directly.\n\n**Sync note:** Config-visible fields must be listed in [`super::parse::SERVER_DEF_KEYS`] for misplaced-field detection. `test_server_def_keys_sync` enforces this.",
+      "properties": {
+        "args": {
+          "default": [],
+          "description": "Arguments to pass to the command.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "command": {
+          "default": "",
+          "description": "The command to execute (e.g., \"rust-analyzer\", \"clangd\").",
+          "type": "string"
+        },
+        "env": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": null,
+          "description": "Environment variables to set on the spawned server process.\n\nVariables are **added** to the inherited environment. If a key already exists, the config value wins.",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "file_patterns": {
+          "default": [],
+          "description": "Glob patterns to filter which files this server handles within its language. Matched against the filename (not path). Servers without `file_patterns` handle all files for their language. Example: `[\"PKGBUILD\", \"*.ebuild\"]`",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "initialization_options": {
+          "default": null,
+          "description": "Initialization options to pass to the LSP server."
+        },
+        "min_severity": {
+          "default": null,
+          "description": "Minimum diagnostic severity to deliver to agents. Valid values: `\"error\"`, `\"warning\"`, `\"information\"`, `\"hint\"`. When absent, all severities are delivered.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provisional": {
+          "default": null,
+          "description": "Regex marking the native source's *provisional* diagnostic code band (linters ticket 05).\n\nA native finding whose `code` matches survives only if corroborated by a heavier source or unchallenged (no strictly-heavier source reported for the file). For rust-analyzer the band is the rustc error-code namespace (`^E[0-9]+$`): a native `E####` flycheck does not corroborate is a phantom (misc 115). Validated at config load; compiled lazily when weights are resolved.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "settings": {
+          "default": null,
+          "description": "Server-specific settings returned in `workspace/configuration` responses."
+        },
+        "single_file": {
+          "default": false,
+          "description": "Whether this server supports single-file mode (tier 3).\n\nWhen `true`, the server may be spawned with `rootUri: null` and `workspaceFolders: null` for files outside all workspace roots. Servers like `bash-language-server` work well without a project root; servers like `rust-analyzer` require one and should leave this `false` (the default).",
+          "type": "boolean"
+        },
+        "sources": {
+          "additionalProperties": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "default": {},
+          "description": "Per-sub-source weight overrides for a multi-source server (`[lsp.server.<name>.sources]`, linters ticket 05).\n\nrust-analyzer emits three sources — `rust-analyzer` (native), `rustc`, and `clippy` (flycheck) — that need different weights. The native source inherits [`weight`](Self::weight); each entry here overrides one sub-source by its emitted `source` name.",
+          "type": "object"
+        },
+        "weight": {
+          "default": null,
+          "description": "Diagnostic trust weight for the source this server emits natively (the source named after the definition), and the fallback for any sub-source not listed in [`sources`](Self::sources) (linters ticket 05).\n\nHigher = more trusted. Drives the cross-feeder dedup keeper and the provisional challenge. Absent ⇒ inherit the seeded default ([`DiagnosticWeights::rust_analyzer_default`](crate::config::DiagnosticWeights::rust_analyzer_default)) or the [`BASELINE_WEIGHT`](crate::config::BASELINE_WEIGHT) for an otherwise-unlisted source.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "SeverityConfig": {
+      "description": "Severity level for notification threshold configuration.\n\nDeserialized from lowercase TOML strings (`\"debug\"`, `\"info\"`, `\"warn\"`, `\"error\"`). Defaults to `Warn`.",
+      "oneOf": [
+        {
+          "description": "Include debug-level events (most verbose).",
+          "enum": [
+            "debug"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Include info-level and above.",
+          "enum": [
+            "info"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Include warn-level and above (default).",
+          "enum": [
+            "warn"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Only error-level events.",
+          "enum": [
+            "error"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "StringOrVec": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      ],
+      "description": "A single string or a list of strings."
+    },
+    "ToolsConfig": {
+      "additionalProperties": false,
+      "description": "Per-tool configuration.\n\nConfigures tool-specific options under `[tools]`:\n\n```toml [tools] diagnostics_severity = \"error\"\n\n[tools.glob] outline_suppress = [\"**/*.min.js\"] ```",
+      "properties": {
+        "diagnostics_severity": {
+          "default": "error",
+          "description": "Minimum diagnostic severity that labels a `catenary diagnostics` run \"dirty\" (vs \"clean\") — one of `error`, `warning`, `info`, `hint`. Default `error`. The label is a telemetry/status signal only: the run always exits `0` and the receipt prints every diagnostic regardless (ws37 ticket 01), so this no longer gates an exit code. An unrecognized value falls back to `error`.",
+          "type": "string"
+        },
+        "glob": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GlobConfig"
+            }
+          ],
+          "default": {
+            "outline_suppress": []
+          },
+          "description": "Glob tool configuration."
+        }
+      },
+      "type": "object"
+    },
+    "TuiConfig": {
+      "additionalProperties": false,
+      "description": "TUI configuration options.\n\nControls the interactive monitor's layout and behavior.",
+      "properties": {
+        "auto_add_sessions": {
+          "default": true,
+          "description": "Automatically add new sessions to the grid (default: true).",
+          "type": "boolean"
+        },
+        "capture_tool_output": {
+          "default": false,
+          "description": "Capture full tool output in `ToolResult` events for TUI detail expansion (default: false). Increases database size.",
+          "type": "boolean"
+        },
+        "focus_follows_mouse": {
+          "default": false,
+          "description": "Whether mouse hover changes focus (default: false).",
+          "type": "boolean"
+        },
+        "keep_dead_panels": {
+          "default": false,
+          "description": "Keep panels open after a session dies instead of closing them (default: false). Dead panels show the session ID with dimmed styling. When false, panels are closed on the next liveness check.",
+          "type": "boolean"
+        },
+        "sessions_width": {
+          "default": 0.25,
+          "description": "Preferred width of the Sessions tree as a fraction of the terminal (default: 0.25).",
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "type": "object"
+    }
+  },
+  "description": "Schema for the Catenary user config (~/.config/catenary/config.toml). Generated from the serde config structs (misc 133).",
+  "properties": {
+    "commands": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/CommandsConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "icons": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/IconConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "linter": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/RawLinterSection"
+        }
+      ],
+      "default": {
+        "rule": {}
+      }
+    },
+    "log_retention_days": {
+      "default": 7,
+      "description": "Log retention in days (default 7). `0` = no persistent logging; `-1` = retain forever.",
+      "format": "int64",
+      "type": "integer"
+    },
+    "lsp": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/RawLspSection"
+        }
+      ],
+      "default": {
+        "language": {},
+        "server": {}
+      }
+    },
+    "notifications": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/NotificationConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "observability": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ReapPolicy"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "roots": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/RootsConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "tools": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ToolsConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "tui": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/TuiConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    }
+  },
+  "title": "Catenary user configuration",
+  "type": "object"
+}

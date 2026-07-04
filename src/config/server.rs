@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::lsp::glob::LspGlob;
@@ -19,7 +20,8 @@ use crate::lsp::glob::LspGlob;
 /// **Sync note:** Config-visible fields must be listed in
 /// [`super::parse::SERVER_DEF_KEYS`] for misplaced-field detection.
 /// `test_server_def_keys_sync` enforces this.
-#[derive(Debug, Default, Deserialize, Serialize, Clone)]
+#[derive(Debug, Default, Deserialize, Serialize, Clone, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct ServerDef {
     /// The command to execute (e.g., "rust-analyzer", "clangd").
     #[serde(default)]

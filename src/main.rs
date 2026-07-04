@@ -1050,7 +1050,13 @@ fn run_daemon_main() -> Result<()> {
     // Safe here: the socket bind above proved we are the sole daemon.
     drain_legacy_db();
 
-    let config = catenary_mcp::config::Config::load()?;
+    let mut config = catenary_mcp::config::Config::load()?;
+
+    // Materialize the JSON Schemas to a local cache path and associate them with
+    // the config files at the taplo server Catenary spawns, so config edits get
+    // live validation + unknown-key squiggles offline, with zero setup (misc
+    // 133). Best-effort — a filesystem error leaves the config untouched.
+    catenary_mcp::config::schema::install_toml_schema_association(&mut config);
 
     let raw_roots: Vec<PathBuf> = match std::env::var("CATENARY_ROOTS") {
         Ok(val) if !val.is_empty() => std::env::split_paths(&val).collect(),

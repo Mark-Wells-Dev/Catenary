@@ -4,8 +4,9 @@
 //! Language configuration.
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use schemars::JsonSchema;
 use serde::de::{self, Deserializer};
+use serde::{Deserialize, Serialize};
 
 use crate::lsp::glob::{LspGlob, is_glob_pattern};
 
@@ -91,12 +92,24 @@ impl<'de> Deserialize<'de> for DispatchMethod {
     }
 }
 
+impl Serialize for DispatchMethod {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        // Serialize back to the LSP method name so a round trip matches the
+        // custom `Deserialize` above (the derived form would emit the Rust
+        // variant name instead).
+        serializer.serialize_str(self.as_str())
+    }
+}
+
 /// A server reference within a language binding.
 ///
 /// Supports both bare string form (`"foo"`) and inline-table form
 /// (`{ name = "foo", diagnostics = false }`). Bare strings expand
 /// to `{ name, diagnostics: true, disabled_methods: [] }`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ServerBinding {
     /// Server name (references a `[lsp.server.*]` entry).
     pub name: String,
@@ -204,6 +217,46 @@ impl<'de> Deserialize<'de> for ServerBinding {
     }
 }
 
+impl JsonSchema for ServerBinding {
+    fn schema_name() -> String {
+        "ServerBinding".to_owned()
+    }
+
+    fn json_schema(_gen: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+        // Mirror the custom `Deserialize`: a bare server-name string, or an
+        // inline table. The disabled-method enum is sourced from
+        // `DispatchMethod::ALL_NAMES` so it cannot drift from the parser.
+        serde_json::from_value(serde_json::json!({
+            "description": "A server reference: a bare `[lsp.server.*]` name, \
+                            or an inline table selecting per-binding behavior.",
+            "anyOf": [
+                { "type": "string" },
+                {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Server name (references a `[lsp.server.*]` entry)."
+                        },
+                        "diagnostics": {
+                            "type": "boolean",
+                            "description": "Whether this server delivers diagnostics for this language (default true)."
+                        },
+                        "disabled_methods": {
+                            "type": "array",
+                            "items": { "type": "string", "enum": DispatchMethod::ALL_NAMES },
+                            "description": "LSP methods suppressed for this binding."
+                        }
+                    },
+                    "required": ["name"],
+                    "additionalProperties": false
+                }
+            ]
+        }))
+        .unwrap_or(schemars::schema::Schema::Bool(true))
+    }
+}
+
 /// Deserializes a `servers` key as `Some(Vec<ServerBinding>)` when
 /// present, relying on `#[serde(default)]` to produce `None` when absent.
 ///
@@ -224,8 +277,9 @@ where
 /// via the `servers` list and controls diagnostic severity filtering.
 /// Classification fields (`extensions`, `filenames`, `shebangs`) define
 /// how files are mapped to this language.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, JsonSchema)]
 #[serde(default)]
+#[schemars(deny_unknown_fields)]
 pub struct LanguageConfig {
     /// Ordered list of server bindings (references `[lsp.server.*]` entries).
     /// Order defines dispatch priority.

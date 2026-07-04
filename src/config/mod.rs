@@ -7,6 +7,7 @@ mod language;
 mod linter;
 pub(crate) mod merge;
 mod parse;
+pub mod schema;
 mod server;
 pub(crate) mod validate;
 mod weights;
@@ -16,7 +17,8 @@ mod commands;
 use std::collections::HashMap;
 
 use anyhow::Result;
-use serde::Deserialize;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
 use crate::companions::CompanionRules;
 use crate::logging::reaper::ReapPolicy;
@@ -44,7 +46,7 @@ pub use weights::{BASELINE_WEIGHT, DiagnosticWeights};
 /// threshold = "warn"
 /// desktop = true
 /// ```
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct NotificationConfig {
     /// Minimum severity for notification delivery.
@@ -60,7 +62,7 @@ pub struct NotificationConfig {
 ///
 /// Deserialized from lowercase TOML strings (`"debug"`, `"info"`, `"warn"`,
 /// `"error"`). Defaults to `Warn`.
-#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum SeverityConfig {
     /// Include debug-level events (most verbose).
@@ -90,7 +92,7 @@ impl From<SeverityConfig> for crate::logging::Severity {
 /// User-level only. The lone field today is [`companions`](Self::companions);
 /// the section exists so companion-root rules have a stable home as more
 /// root-policy knobs land.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct RootsConfig {
     /// Companion-root derivation rules (`[roots.companions]`).
@@ -178,7 +180,7 @@ pub struct Config {
 }
 
 /// Icon preset selecting a base set of icons.
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum IconPreset {
     /// Safe Unicode symbols that render on any terminal font.
@@ -202,7 +204,8 @@ pub enum IconPreset {
 /// preset = "nerd"
 /// ```
 ///
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct IconConfig {
     /// Base icon preset (default: `unicode`).
     #[serde(default)]
@@ -260,8 +263,9 @@ pub struct IconConfig {
 /// TUI configuration options.
 ///
 /// Controls the interactive monitor's layout and behavior.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, JsonSchema)]
 #[serde(default)]
+#[schemars(deny_unknown_fields)]
 #[allow(
     clippy::struct_excessive_bools,
     reason = "config struct — each field is an independent toggle"
@@ -315,8 +319,9 @@ fn default_diagnostics_severity() -> String {
 /// [tools.glob]
 /// outline_suppress = ["**/*.min.js"]
 /// ```
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(default)]
+#[schemars(deny_unknown_fields)]
 pub struct ToolsConfig {
     /// Glob tool configuration.
     pub glob: GlobConfig,
@@ -355,8 +360,9 @@ impl ToolsConfig {
 }
 
 /// Glob tool configuration.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(default)]
+#[schemars(deny_unknown_fields)]
 pub struct GlobConfig {
     /// Glob patterns whose outlines are suppressed from automatic display.
     /// Symbols remain available via `into`.

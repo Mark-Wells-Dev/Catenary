@@ -23,7 +23,8 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
 /// Serde helper that deserializes a string or a list of strings,
 /// normalizing to `Vec<String>`.
@@ -33,8 +34,26 @@ use serde::Deserialize;
 /// build = "make"          # → vec!["make"]
 /// build = ["make", "npm"] # → vec!["make", "npm"]
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct StringOrVec(pub Vec<String>);
+
+impl JsonSchema for StringOrVec {
+    fn schema_name() -> String {
+        "StringOrVec".to_owned()
+    }
+
+    fn json_schema(_gen: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+        // Mirror the custom `Deserialize` (a bare string or a list of strings).
+        serde_json::from_value(serde_json::json!({
+            "description": "A single string or a list of strings.",
+            "anyOf": [
+                { "type": "string" },
+                { "type": "array", "items": { "type": "string" } }
+            ]
+        }))
+        .unwrap_or(schemars::schema::Schema::Bool(true))
+    }
+}
 
 impl<'de> Deserialize<'de> for StringOrVec {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -88,8 +107,9 @@ fn format_build_list(tools: &[String]) -> String {
 /// single `message` string. Detection: if `message` is absent and any
 /// `message_*` field is present, or if the group name is `"build"`, it's
 /// treated as a build group.
-#[derive(Debug, Default, Deserialize, Clone)]
+#[derive(Debug, Default, Deserialize, Serialize, Clone, JsonSchema)]
 #[serde(default)]
+#[schemars(deny_unknown_fields)]
 pub struct GuidanceGroup {
     /// Static hint message (e.g., `"Use {EDIT} for surgical edits"`).
     /// Absent for the `build` and `redirect` groups.
@@ -184,8 +204,9 @@ impl Default for BuildGuidance {
 /// Deserialized from TOML. The `deny` field uses a nested table:
 /// `[commands.deny]` with keys mapping to arrays of denied subcommands
 /// (e.g., `git = ["grep", "ls-files"]`).
-#[derive(Debug, Default, Deserialize, Clone)]
+#[derive(Debug, Default, Deserialize, Serialize, Clone, JsonSchema)]
 #[serde(default)]
+#[schemars(deny_unknown_fields)]
 pub struct CommandsConfig {
     /// Deliberate opt-out — no enforcement, no hint notification.
     #[serde(default)]

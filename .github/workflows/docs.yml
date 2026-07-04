@@ -6,6 +6,7 @@ on:
     tags: ['v*']
     paths:
       - 'docs/**'
+      - 'schemas/**'
       - '.github/workflows/docs.yml'
   workflow_dispatch:
 
@@ -90,6 +91,15 @@ jobs:
             <body><a href="stable/">Redirecting to stable docs…</a></body>
           </html>
           HTML
+
+      - name: Publish JSON Schemas
+        # misc 133: serve the committed config schemas at the stable URLs the
+        # `#:schema` directive and the SchemaStore entry reference
+        # (https://twowells.github.io/catenary/schemas/*.json). Taken from the
+        # current ref so the published schema always matches the shipped build.
+        run: |
+          mkdir -p site/schemas
+          cp schemas/*.json site/schemas/
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3

@@ -1,0 +1,575 @@
+{
+  "$id": "https://twowells.github.io/catenary/schemas/catenary-project.json",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "additionalProperties": false,
+  "definitions": {
+    "GuidanceGroup": {
+      "additionalProperties": false,
+      "description": "TOML shape for a single `[commands.guidance.<group>]` entry.\n\nEach group maps a set of commands to a guidance message. The `build` group is special: it uses per-context message templates instead of a single `message` string. Detection: if `message` is absent and any `message_*` field is present, or if the group name is `\"build\"`, it's treated as a build group.",
+      "properties": {
+        "commands": {
+          "default": [],
+          "description": "Commands this guidance applies to.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "message": {
+          "default": null,
+          "description": "Static hint message (e.g., `\"Use {EDIT} for surgical edits\"`). Absent for the `build` and `redirect` groups.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message_cwd_unknown": {
+          "default": null,
+          "description": "Build: message when cwd cannot be resolved.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message_default": {
+          "default": null,
+          "description": "Build: message when user config has a build tool.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message_default_absent": {
+          "default": null,
+          "description": "Build: message when user config has no build tool.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message_noproject": {
+          "default": null,
+          "description": "Build: message when no `.catenary.toml` exists.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message_project": {
+          "default": null,
+          "description": "Build: message when project config has a build tool.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message_project_absent": {
+          "default": null,
+          "description": "Build: message when project config has no build tool.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "redirect": {
+          "default": null,
+          "description": "Catenary subcommand to redirect to (e.g., `\"grep\"`, `\"glob\"`). When set, denials show a short message + the command's `-h` output.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "LanguageConfig": {
+      "additionalProperties": false,
+      "description": "Per-language configuration for how Catenary handles a language.\n\nEach entry references one or more server definitions from `[lsp.server.*]` via the `servers` list and controls diagnostic severity filtering. Classification fields (`extensions`, `filenames`, `shebangs`) define how files are mapped to this language.",
+      "properties": {
+        "diagnostics": {
+          "default": true,
+          "description": "Whether to deliver diagnostics for this language. Defaults to `true`. AND with per-binding `diagnostics` to determine effective delivery per server.",
+          "type": "boolean"
+        },
+        "extensions": {
+          "default": null,
+          "description": "File extensions (without dot) that classify as this language. Example: `[\"sh\", \"bash\", \"zsh\"]`",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "filenames": {
+          "default": null,
+          "description": "Exact filenames that classify as this language. Example: `[\"PKGBUILD\", \"Makefile\"]`",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "root_markers": {
+          "default": null,
+          "description": "Root marker filenames or glob patterns for sub-root resolution.\n\nWhen set, Catenary walks up from each file toward the workspace root boundary, stopping at the first directory containing any marker. That directory becomes the server instance's root. Different resolved roots produce different server instances.\n\nEntries without glob metacharacters (`*`, `?`, `[`) are treated as exact filenames (fast `exists()` check). Entries with glob metacharacters are compiled and matched against directory entries.\n\nMarkers are a property of the language ecosystem — `Cargo.toml` defines a Rust project boundary regardless of which server is used. Defaults are shipped in `defaults/languages.toml` for common languages. Override with explicit `root_markers = [...]` or disable with `root_markers = []`.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "servers": {
+          "default": null,
+          "description": "Ordered list of server bindings (references `[lsp.server.*]` entries). Order defines dispatch priority.\n\n`None` means the entry did not specify a `servers` key — merge preserves the earlier layer's value. `Some([])` means the entry explicitly cleared the list. `Some([...])` replaces.",
+          "items": {
+            "$ref": "#/definitions/ServerBinding"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "shebangs": {
+          "default": null,
+          "description": "Interpreter basenames for shebang detection. Matches `#!/bin/X` and `#!/usr/bin/env X`. Example: `[\"bash\", \"sh\", \"zsh\"]`",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "LinterConfig": {
+      "additionalProperties": false,
+      "description": "A single `[linter.rule.<name>]` configuration entry.\n\nLives on both the user [`Config`](super::Config) and the per-root [`ProjectConfig`](super::ProjectConfig). The effective set for a root is the user set unioned with that root's project set, the project winning on a name collision (so a project can override or [`disable`](Self::disable) a user-configured linter by name).\n\n`patterns` are **root-relative path globs** (e.g. `.github/workflows/*.{yml,yaml}`), not filename globs — an unanchored `*.yaml` would fire on every YAML in the tree.",
+      "properties": {
+        "args": {
+          "default": [],
+          "description": "Arguments passed before the file paths (e.g. `[\"-f\", \"json1\"]`).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "command": {
+          "default": "",
+          "description": "The executable to run (e.g. `\"shellcheck\"`).",
+          "type": "string"
+        },
+        "disable": {
+          "default": false,
+          "description": "Disables this linter for the root it resolves under (default `false`).\n\nA project entry can disable a user-configured linter by setting this on an entry with the same name.",
+          "type": "boolean"
+        },
+        "patterns": {
+          "default": [],
+          "description": "Root-relative path globs selecting which files this linter handles.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "shebangs": {
+          "default": [],
+          "description": "Shebang interpreter basenames (e.g. `[\"bash\", \"sh\"]`) that route an **extensionless** script to this linter, in addition to [`Self::patterns`].\n\nA file routes to the linter when its root-relative path matches a pattern glob **or** its `#!` interpreter basename is in this list. Empty (the default) leaves shebang routing off — the linter routes on path globs alone. The default `shellcheck` ships `[\"sh\", \"bash\", \"dash\", \"ksh\"]` so it catches shell scripts that carry a shebang but no `.sh` extension; the list mirrors shellcheck's own supported interpreters (notably not `zsh`).\n\nThe interpreter is extracted with the same single-pass scan Catenary uses for language classification, so `#!/usr/bin/env bash` and `#!/bin/bash` both resolve to `bash`. The read is lazy — only consulted when the path globs miss and this list is non-empty.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "weight": {
+          "default": null,
+          "description": "Diagnostic trust weight for this linter's source (linters ticket 05).\n\nA linter is a 1:1 emitter — the diagnostic `source` equals the linter name — so this single weight covers it. Higher = more trusted. Absent ⇒ the [`BASELINE_WEIGHT`](super::BASELINE_WEIGHT). Drives the cross-feeder dedup keeper and the provisional challenge.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "ProjectCommandsSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "allow": {
+          "deprecated": true,
+          "description": "User-scope only. Command enforcement resolves daemon-wide, so at project scope (.catenary.toml) Catenary ignores this key with a warning. Move it to your user config (~/.config/catenary/config.toml).",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "allow_flags": {
+          "additionalProperties": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "deprecated": true,
+          "description": "User-scope only. Command enforcement resolves daemon-wide, so at project scope (.catenary.toml) Catenary ignores this key with a warning. Move it to your user config (~/.config/catenary/config.toml).",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "build": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/StringOrVec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The project's build tool(s) — the one command key honored at project scope (per-root and benign)."
+        },
+        "client_enforcement_only": {
+          "deprecated": true,
+          "description": "User-scope only. Command enforcement resolves daemon-wide, so at project scope (.catenary.toml) Catenary ignores this key with a warning. Move it to your user config (~/.config/catenary/config.toml).",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "deny": {
+          "additionalProperties": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "deprecated": true,
+          "description": "User-scope only. Command enforcement resolves daemon-wide, so at project scope (.catenary.toml) Catenary ignores this key with a warning. Move it to your user config (~/.config/catenary/config.toml).",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "deny_flags": {
+          "additionalProperties": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "deprecated": true,
+          "description": "User-scope only. Command enforcement resolves daemon-wide, so at project scope (.catenary.toml) Catenary ignores this key with a warning. Move it to your user config (~/.config/catenary/config.toml).",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "guidance": {
+          "additionalProperties": {
+            "$ref": "#/definitions/GuidanceGroup"
+          },
+          "deprecated": true,
+          "description": "User-scope only. Command enforcement resolves daemon-wide, so at project scope (.catenary.toml) Catenary ignores this key with a warning. Move it to your user config (~/.config/catenary/config.toml).",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "pipeline": {
+          "deprecated": true,
+          "description": "User-scope only. Command enforcement resolves daemon-wide, so at project scope (.catenary.toml) Catenary ignores this key with a warning. Move it to your user config (~/.config/catenary/config.toml).",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "script_hosts": {
+          "deprecated": true,
+          "description": "User-scope only. Command enforcement resolves daemon-wide, so at project scope (.catenary.toml) Catenary ignores this key with a warning. Move it to your user config (~/.config/catenary/config.toml).",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "ProjectDiagnosticsSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "disable": {
+          "description": "Suppresses the diagnostics surface for this root.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "ProjectLinterSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "disable": {
+          "description": "Drops the linter feeder for this root.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "rule": {
+          "additionalProperties": {
+            "$ref": "#/definitions/LinterConfig"
+          },
+          "description": "Standalone-linter definitions (`[linter.rule.*]`).",
+          "type": [
+            "object",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "ProjectLspSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "disable": {
+          "description": "Drops the LSP feeder for this root.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "language": {
+          "additionalProperties": {
+            "$ref": "#/definitions/LanguageConfig"
+          },
+          "description": "Language definitions (`[lsp.language.*]`).",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "server": {
+          "additionalProperties": {
+            "$ref": "#/definitions/ServerDef"
+          },
+          "description": "Server definitions (`[lsp.server.*]`).",
+          "type": [
+            "object",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "ServerBinding": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "diagnostics": {
+              "description": "Whether this server delivers diagnostics for this language (default true).",
+              "type": "boolean"
+            },
+            "disabled_methods": {
+              "description": "LSP methods suppressed for this binding.",
+              "items": {
+                "enum": [
+                  "textDocument/references",
+                  "textDocument/documentSymbol",
+                  "textDocument/rename",
+                  "textDocument/implementation",
+                  "textDocument/prepareCallHierarchy",
+                  "textDocument/prepareTypeHierarchy"
+                ],
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "name": {
+              "description": "Server name (references a `[lsp.server.*]` entry).",
+              "type": "string"
+            }
+          },
+          "required": [
+            "name"
+          ],
+          "type": "object"
+        }
+      ],
+      "description": "A server reference: a bare `[lsp.server.*]` name, or an inline table selecting per-binding behavior."
+    },
+    "ServerDef": {
+      "additionalProperties": false,
+      "description": "Server definition — how to run and configure a language server.\n\nDefined in `[lsp.server.*]` config sections, referenced by name from `[lsp.language.*]` entries. This is adapter-level config consumed by the LSP client layer — the routing core never sees it directly.\n\n**Sync note:** Config-visible fields must be listed in [`super::parse::SERVER_DEF_KEYS`] for misplaced-field detection. `test_server_def_keys_sync` enforces this.",
+      "properties": {
+        "args": {
+          "default": [],
+          "description": "Arguments to pass to the command.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "command": {
+          "default": "",
+          "description": "The command to execute (e.g., \"rust-analyzer\", \"clangd\").",
+          "type": "string"
+        },
+        "env": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": null,
+          "description": "Environment variables to set on the spawned server process.\n\nVariables are **added** to the inherited environment. If a key already exists, the config value wins.",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "file_patterns": {
+          "default": [],
+          "description": "Glob patterns to filter which files this server handles within its language. Matched against the filename (not path). Servers without `file_patterns` handle all files for their language. Example: `[\"PKGBUILD\", \"*.ebuild\"]`",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "initialization_options": {
+          "default": null,
+          "description": "Initialization options to pass to the LSP server."
+        },
+        "min_severity": {
+          "default": null,
+          "description": "Minimum diagnostic severity to deliver to agents. Valid values: `\"error\"`, `\"warning\"`, `\"information\"`, `\"hint\"`. When absent, all severities are delivered.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provisional": {
+          "default": null,
+          "description": "Regex marking the native source's *provisional* diagnostic code band (linters ticket 05).\n\nA native finding whose `code` matches survives only if corroborated by a heavier source or unchallenged (no strictly-heavier source reported for the file). For rust-analyzer the band is the rustc error-code namespace (`^E[0-9]+$`): a native `E####` flycheck does not corroborate is a phantom (misc 115). Validated at config load; compiled lazily when weights are resolved.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "settings": {
+          "default": null,
+          "description": "Server-specific settings returned in `workspace/configuration` responses."
+        },
+        "single_file": {
+          "default": false,
+          "description": "Whether this server supports single-file mode (tier 3).\n\nWhen `true`, the server may be spawned with `rootUri: null` and `workspaceFolders: null` for files outside all workspace roots. Servers like `bash-language-server` work well without a project root; servers like `rust-analyzer` require one and should leave this `false` (the default).",
+          "type": "boolean"
+        },
+        "sources": {
+          "additionalProperties": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "default": {},
+          "description": "Per-sub-source weight overrides for a multi-source server (`[lsp.server.<name>.sources]`, linters ticket 05).\n\nrust-analyzer emits three sources — `rust-analyzer` (native), `rustc`, and `clippy` (flycheck) — that need different weights. The native source inherits [`weight`](Self::weight); each entry here overrides one sub-source by its emitted `source` name.",
+          "type": "object"
+        },
+        "weight": {
+          "default": null,
+          "description": "Diagnostic trust weight for the source this server emits natively (the source named after the definition), and the fallback for any sub-source not listed in [`sources`](Self::sources) (linters ticket 05).\n\nHigher = more trusted. Drives the cross-feeder dedup keeper and the provisional challenge. Absent ⇒ inherit the seeded default ([`DiagnosticWeights::rust_analyzer_default`](crate::config::DiagnosticWeights::rust_analyzer_default)) or the [`BASELINE_WEIGHT`](crate::config::BASELINE_WEIGHT) for an otherwise-unlisted source.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "StringOrVec": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      ],
+      "description": "A single string or a list of strings."
+    }
+  },
+  "description": "Schema for a project-local .catenary.toml. Only build and the LSP/linter/diagnostics feeder toggles are honored at project scope; user-scope-only enforcement keys are marked deprecated (misc 133).",
+  "properties": {
+    "commands": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ProjectCommandsSchema"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Command/build config. Only `build` is honored at project scope; the enforcement keys are user-scope only (marked deprecated)."
+    },
+    "diagnostics": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ProjectDiagnosticsSchema"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Diagnostics surface: the `disable` toggle."
+    },
+    "linter": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ProjectLinterSchema"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Linter feeder: per-root linter rules and the `disable` toggle."
+    },
+    "lsp": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ProjectLspSchema"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "LSP feeder: per-root server/language definitions and the `disable` toggle."
+    }
+  },
+  "title": "Catenary project configuration",
+  "type": "object"
+}

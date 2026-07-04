@@ -88,6 +88,13 @@ memchr = "2"
 notify = "8"
 os_pipe = "1"
 regex = "1.10"
+# `schemars` derives the JSON Schema for Catenary's config files (misc 133) from
+# the same serde structs the loader deserializes, so the shipped `schemas/*.json`
+# artifacts cannot drift from the runtime shape (byte-for-byte freshness gate in
+# `src/config/schema.rs`). A plain dependency: the derives ride the non-test
+# config structs and the generator path runs under the default-feature test set,
+# so `cargo machete` sees it and `make check` exercises the freshness gate.
+schemars = "0.8"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 similar = "2.6"

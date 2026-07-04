@@ -7,7 +7,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
 use crate::source::Source;
 
@@ -50,8 +51,11 @@ pub const DEFAULT_LINTERS: &str = include_str!("../../defaults/linters.toml");
 /// each subsystem is one self-contained section. Sub-keys are named (no serde
 /// flatten). The old top-level `[server.*]` / `[language.*]` / `[linter.<name>]`
 /// forms are hard-errored in [`deserialize_source`].
-#[derive(Debug, Deserialize, Clone)]
-struct RawConfig {
+#[derive(Debug, Deserialize, Serialize, Clone, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub(super) struct RawConfig {
+    /// Log retention in days (default 7). `0` = no persistent logging; `-1` =
+    /// retain forever.
     #[serde(default = "default_log_retention_days")]
     log_retention_days: i64,
 
@@ -90,11 +94,14 @@ struct RawConfig {
 /// separately in [`load_project_config`] (project scope only), so it has no
 /// field here — an unrecognized `disable` key in a user config is simply
 /// ignored.
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 struct RawLspSection {
+    /// Server definitions (`[lsp.server.*]`).
     #[serde(default)]
     server: HashMap<String, ServerDef>,
 
+    /// Language definitions (`[lsp.language.*]`).
     #[serde(default)]
     language: HashMap<String, LanguageConfig>,
 }
@@ -104,8 +111,10 @@ struct RawLspSection {
 /// `[linter.rule.*]` replaces the old top-level `[linter.<name>]`. The per-root
 /// `[linter] disable` toggle is parsed separately in [`load_project_config`]
 /// (project scope only), so it has no field here.
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 struct RawLinterSection {
+    /// Standalone-linter definitions (`[linter.rule.*]`).
     #[serde(default)]
     rule: HashMap<String, LinterConfig>,
 }
@@ -638,7 +647,8 @@ pub(super) fn parse_server_specs(val: &str) -> Vec<(String, ServerDef, LanguageC
 /// optional top-level `[commands]`. The unsupported-key warning skips all of
 /// these; the old top-level `[server.*]` / `[language.*]` / `[linter.<name>]`
 /// forms are hard-errored earlier with a rename hint.
-const PROJECT_CONFIG_ALLOWED_KEYS: &[&str] = &["lsp", "linter", "diagnostics", "commands"];
+pub(super) const PROJECT_CONFIG_ALLOWED_KEYS: &[&str] =
+    &["lsp", "linter", "diagnostics", "commands"];
 
 /// Per-root project configuration from `.catenary.toml`.
 ///
