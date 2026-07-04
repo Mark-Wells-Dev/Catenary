@@ -311,6 +311,20 @@ upgrading.
   carries an invisible generation stamp so `catenary doctor` accepts it as current.
   The `SessionStart` `additionalContext` and `PreInvocation` `userMessage`
   injection channels are unchanged.
+- **The teaching primer speaks an informative capability voice, not policy
+  assertion.** The primer / SessionStart / SubagentStart payload and the runtime
+  context files no longer assert that navigation "stays denied": the write-model
+  line's navigation half now names `catenary grep` and `catenary glob` as the
+  navigation tools — config-free and always present, replacing the teach-07
+  clause that named which native scanners the live config denied (a user may
+  enable those scanners, so the primer states capabilities, not policy). The
+  "Navigate through Catenary" invariant is reworded to the same voice: enrichment
+  rides along where a code intelligence source covers a hit, and `catenary grep`
+  reads stdin (`… | catenary grep PAT` — a plain pass, complete matches, no
+  enrichment) so matches always come back even where no source covers them. The
+  live allow / pipeline / deny lists — the session's actual policy — are
+  untouched; the shipped gemini-context.md and Antigravity rules regenerate from
+  `fallback_body()` under the same freshness gates.
 - **`catenary glob` outlines show types and callables only.** The file and
   directory outline is now a map, not a mirror: it recurses into containers
   (modules/namespaces/packages and classes/interfaces/enums/structs/impls) and

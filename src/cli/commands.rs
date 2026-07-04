@@ -83,90 +83,38 @@ pub async fn run_ls_roots(out: &mut Output) -> Result<()> {
     Ok(())
 }
 
-/// The config-free half of the write-model line closing the active-allowlist
+/// The writes half of the write-model line closing the active-allowlist
 /// `catenary commands` output (ws38 / decision 026). The lists above govern
 /// which programs may *run*; this states how their *writes* are judged —
-/// resolve-or-deny. The navigation half is appended per-config by
-/// [`navigation_sentence`] (teaching-surface ticket 07), so the surface never
-/// asserts a denial the resolved config does not actually make.
+/// resolve-or-deny. The navigation half ([`WRITE_MODEL_NAVIGATE`]) names the
+/// navigation tools in capability voice (teaching-surface ticket 13); both
+/// halves are config-free, so the surface never asserts a denial the resolved
+/// config may not make.
 const WRITE_MODEL_RESOLVE: &str = "Writes resolve-or-deny: a redirect or a \
      `cp`/`mv`/`tee`/`sed -i`/`git apply` write is allowed when its complete \
      target set resolves (recorded for `catenary diagnostics`) and denied with a \
      teaching message when it can't.";
 
-/// The canonical scan/list navigation examples, named in the write-model line
-/// only while the resolved config actually denies them (teaching-surface 07).
-/// Each is a redirect-guided native command that bypasses `catenary
-/// grep`/`glob`: `grep` stands for the scan class, `find` for the list class.
-const NAVIGATION_EXAMPLES: [&str; 2] = ["grep", "find"];
-
-/// Assemble the write-model line for a resolved command surface.
+/// The navigation half of the write-model line — the config-free capability
+/// pointer naming Catenary's navigation tools (teaching-surface ticket 13).
 ///
-/// The resolve-or-deny half ([`WRITE_MODEL_RESOLVE`]) is config-free and always
-/// present; the navigation half is derived from the live config by
-/// [`navigation_sentence`] and appended only when the config denies at least one
-/// navigation example — so the line stops leaking the recommended config's
-/// opinions into every surface (teaching-surface ticket 07).
-fn write_model_line(resolved: &crate::config::ResolvedCommands) -> String {
-    navigation_sentence(resolved).map_or_else(
-        || WRITE_MODEL_RESOLVE.to_string(),
-        |nav| format!("{WRITE_MODEL_RESOLVE} {nav}"),
-    )
-}
+/// The former teach-07 clause asserted which native scanners "stay denied"; the
+/// maintainer ruled that policy assertion out of the primer (a user may enable
+/// native `grep`/`find`), so this states the capability instead. It is
+/// config-independent and always present, so no surface claims a denial a user's
+/// config may not make. The enrichment behavior and the stdin pass are stated in
+/// full by the invariants (`crate::cli::teaching`).
+const WRITE_MODEL_NAVIGATE: &str = "`catenary grep` and `catenary glob` are the navigation tools.";
 
-/// Derive the navigation sentence of the write-model line from the resolved
-/// config, or `None` when the config denies none of the navigation examples.
+/// Assemble the write-model line for the active command surface.
 ///
-/// A scan/list example (`grep`/`find`) is named only when the guidance groups
-/// mark it a redirect-to-Catenary command *and* the config still denies it at
-/// the leading, navigation position — i.e. it is not unconditionally allowed (a
-/// pipeline-only entry still denies a leading `grep foo …`). The
-/// `git ls-files`-class example is named only from a live `[commands.deny] git`
-/// entry. When nothing qualifies the sentence is dropped entirely, so the
-/// surface never claims a denial the config does not make.
-fn navigation_sentence(resolved: &crate::config::ResolvedCommands) -> Option<String> {
-    let mut fragments: Vec<String> = Vec::new();
-
-    let scanners: Vec<&str> = NAVIGATION_EXAMPLES
-        .iter()
-        .copied()
-        .filter(|&cmd| is_denied_navigation(resolved, cmd))
-        .collect();
-    if !scanners.is_empty() {
-        let listed = scanners
-            .iter()
-            .map(|cmd| format!("`{cmd}`"))
-            .collect::<Vec<_>>()
-            .join("/");
-        fragments.push(format!("native {listed}"));
-    }
-
-    // The `git ls-files`-class example rides a live deny entry only.
-    if resolved
-        .deny
-        .get("git")
-        .is_some_and(|subs| subs.contains("ls-files"))
-    {
-        fragments.push("`git ls-files`".to_string());
-    }
-
-    if fragments.is_empty() {
-        return None;
-    }
-    Some(format!(
-        "Navigation that bypasses code intelligence ({}) stays denied.",
-        fragments.join(", ")
-    ))
-}
-
-/// Whether `cmd` is a redirect-guided navigation command the resolved config
-/// still denies at the leading position (i.e. not unconditionally allowed; a
-/// pipeline-only entry still denies the leading, navigation-position use).
-fn is_denied_navigation(resolved: &crate::config::ResolvedCommands, cmd: &str) -> bool {
-    matches!(
-        resolved.guidance_for(cmd),
-        Some(crate::config::GuidanceEntry::Redirect { .. })
-    ) && !resolved.allow.contains(cmd)
+/// Two config-free halves: [`WRITE_MODEL_RESOLVE`] states how writes are judged
+/// (resolve-or-deny) and [`WRITE_MODEL_NAVIGATE`] names the navigation tools in
+/// capability voice (teaching-surface ticket 13). Neither half is config-derived,
+/// so the line states capabilities the session always has, never a
+/// config-specific denial.
+fn write_model_line() -> String {
+    format!("{WRITE_MODEL_RESOLVE} {WRITE_MODEL_NAVIGATE}")
 }
 
 /// Render the `catenary commands` output lines for a resolved command set and
@@ -205,10 +153,11 @@ pub(crate) fn render_command_lines(
                 vec!["No build tool, allow, pipeline, or deny rules are configured.".to_string()]
             } else {
                 // Close with the write model (ws38 / decision 026): writes are
-                // resolve-or-deny, and the navigation examples are derived from
-                // the resolved config so the surface never asserts a denial it
-                // does not make (teaching-surface ticket 07).
-                lines.push(write_model_line(r));
+                // resolve-or-deny, and the navigation tools are named in
+                // capability voice — both halves config-free, so the surface
+                // never asserts a denial the config may not make (teaching-surface
+                // ticket 13).
+                lines.push(write_model_line());
                 lines
             }
         }
@@ -693,133 +642,46 @@ mod tests {
         );
     }
 
-    // ── write-model navigation derivation (teaching-surface 07) ──────
-
-    /// A resolved surface mirroring the recommended config's navigation shape:
-    /// `grep` sits in `pipeline` under a scan-redirect guidance group, `find`
-    /// under a list-redirect group, and `git` denies the `ls-files` subcommand.
-    fn recommended_navigation_surface() -> crate::config::ResolvedCommands {
-        use crate::config::GuidanceEntry;
-        let guidance = std::collections::HashMap::from([
-            (
-                "grep".to_string(),
-                GuidanceEntry::Redirect {
-                    command: "grep".into(),
-                },
-            ),
-            (
-                "find".to_string(),
-                GuidanceEntry::Redirect {
-                    command: "glob".into(),
-                },
-            ),
-        ]);
-        crate::config::ResolvedCommands {
-            allow: std::collections::HashSet::from(["git".into()]),
-            pipeline: std::collections::HashSet::from(["grep".into()]),
-            deny: std::collections::HashMap::from([(
-                "git".to_string(),
-                std::collections::HashSet::from([
-                    "grep".into(),
-                    "ls-files".into(),
-                    "ls-tree".into(),
-                ]),
-            )]),
-            guidance,
-            ..crate::config::ResolvedCommands::default()
-        }
-    }
+    // ── write-model navigation capability (teaching-surface 13) ──────
 
     #[test]
-    fn write_model_recommended_config_names_grep_find_and_git_ls_files() {
-        // Reader experience unchanged: with the recommended navigation shape the
-        // rendered line names grep/find + git ls-files exactly as the former
-        // static line did (the resolve-or-deny half is unchanged, config-free).
+    fn write_model_names_the_navigation_tools_in_capability_voice() {
+        // teaching-surface 13: the write-model line's navigation half states a
+        // capability — grep/glob are the navigation tools — replacing the former
+        // teach-07 clause that asserted which native scanners "stay denied". Both
+        // halves are config-free, so the exact line is fixed.
         assert_eq!(
-            write_model_line(&recommended_navigation_surface()),
-            format!(
-                "{WRITE_MODEL_RESOLVE} Navigation that bypasses code intelligence \
-                 (native `grep`/`find`, `git ls-files`) stays denied."
-            ),
+            write_model_line(),
+            format!("{WRITE_MODEL_RESOLVE} {WRITE_MODEL_NAVIGATE}"),
+        );
+        assert_eq!(
+            WRITE_MODEL_NAVIGATE,
+            "`catenary grep` and `catenary glob` are the navigation tools.",
         );
     }
 
     #[test]
-    fn write_model_allowing_native_grep_makes_no_false_claim() {
-        // A config that unconditionally allows native `grep` and denies no git
-        // subcommand must not claim grep (or anything) stays denied — the
-        // navigation half is dropped and only the config-free half remains.
-        use crate::config::GuidanceEntry;
-        let resolved = crate::config::ResolvedCommands {
-            allow: std::collections::HashSet::from(["grep".into(), "git".into()]),
-            guidance: std::collections::HashMap::from([(
-                "grep".to_string(),
-                GuidanceEntry::Redirect {
-                    command: "grep".into(),
-                },
-            )]),
-            ..crate::config::ResolvedCommands::default()
-        };
-        let line = write_model_line(&resolved);
-        assert_eq!(line, WRITE_MODEL_RESOLVE, "navigation half dropped: {line}");
-        assert!(!line.contains("stays denied"), "no denial claim: {line}");
-        assert!(!line.contains("`grep`"), "grep not named denied: {line}");
+    fn write_model_asserts_no_navigation_denial() {
+        // The maintainer's ruling (teach 13): the primer states capabilities, not
+        // policy — the navigation half must never claim navigation "stays denied"
+        // or that native scanners "bypass" anything. (The resolve-or-deny half
+        // legitimately says a *write* is "denied when it can't" resolve; that is
+        // the write model, not a navigation-policy assertion.)
+        let line = write_model_line();
+        for forbidden in ["stays denied", "bypass", "code intelligence"] {
+            assert!(
+                !line.contains(forbidden),
+                "write-model line asserts navigation policy ({forbidden:?}): {line}"
+            );
+        }
         assert!(
             line.contains("Writes resolve-or-deny"),
-            "resolve-or-deny half stays: {line}",
+            "resolve-or-deny half stays: {line}"
         );
-    }
-
-    #[test]
-    fn write_model_names_only_the_denied_navigation_examples() {
-        // `grep` denied (pipeline-only, redirect-guided); `find` allowed; `git`
-        // denies `ls-files`. The sentence names grep + git ls-files, not find.
-        use crate::config::GuidanceEntry;
-        let guidance = std::collections::HashMap::from([
-            (
-                "grep".to_string(),
-                GuidanceEntry::Redirect {
-                    command: "grep".into(),
-                },
-            ),
-            (
-                "find".to_string(),
-                GuidanceEntry::Redirect {
-                    command: "glob".into(),
-                },
-            ),
-        ]);
-        let resolved = crate::config::ResolvedCommands {
-            allow: std::collections::HashSet::from(["find".into()]),
-            pipeline: std::collections::HashSet::from(["grep".into()]),
-            deny: std::collections::HashMap::from([(
-                "git".to_string(),
-                std::collections::HashSet::from(["ls-files".into()]),
-            )]),
-            guidance,
-            ..crate::config::ResolvedCommands::default()
-        };
-        assert_eq!(
-            navigation_sentence(&resolved).expect("some examples denied"),
-            "Navigation that bypasses code intelligence (native `grep`, `git ls-files`) \
-             stays denied.",
+        assert!(
+            line.contains("`catenary grep` and `catenary glob`"),
+            "navigation tools named: {line}"
         );
-    }
-
-    #[test]
-    fn write_model_git_example_only_when_ls_files_denied() {
-        // A git deny that omits `ls-files` contributes no git example, and a
-        // non-redirect-guided command contributes no scanner — so the whole
-        // navigation sentence is dropped.
-        let resolved = crate::config::ResolvedCommands {
-            allow: std::collections::HashSet::from(["git".into()]),
-            deny: std::collections::HashMap::from([(
-                "git".to_string(),
-                std::collections::HashSet::from(["grep".into()]),
-            )]),
-            ..crate::config::ResolvedCommands::default()
-        };
-        assert!(navigation_sentence(&resolved).is_none());
     }
 
     // ── parse_since tests ────────────────────────────────────────────

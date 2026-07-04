@@ -65,15 +65,15 @@ Bare-only vs pipe-friendly
   drops results (use `--count` for a bare tally).
 
 Navigate through Catenary
-  Find files with `catenary glob`, search contents with `catenary grep` so
-  results stay LSP-enriched — native `grep`/`find`/`ls` bypass that enrichment.
-  Quote glob patterns so Catenary expands them gitignore-aware, not the shell
-  (`catenary grep 'fn main' 'src/**/*.rs'`, `catenary glob 'src/**/*.rs'`). A
-  glob pattern is itself the path — absolute or cwd-relative, with the anchor
-  written in (`catenary glob '/abs/dir/**/*.md'`); there is no separate
-  directory argument. Where a server covers a hit its enrichment rides along;
-  where none does, `catenary grep` only flags the location — open the file and
-  read it.";
+  Search contents with `catenary grep`, find files with `catenary glob`. Quote
+  glob patterns so Catenary expands them gitignore-aware, not the shell
+  (`catenary grep 'fn main' 'src/**/*.rs'`, `catenary glob 'src/**/*.rs'`); the
+  pattern is itself the path, so there is no separate directory argument
+  (`catenary glob '/abs/dir/**/*.md'`). Where a code intelligence source
+  covers a hit its enrichment rides along; where none does, `catenary grep`
+  still returns the match. With no path argument, `… | catenary grep PAT` is a
+  plain pass over the stream — complete matches, no enrichment — so matches
+  come back with no source coverage.";
 
 /// Tier 3 — compact flag synopses. Long forms only, natural clusters
 /// brace-collapsed; only the two flags that need disambiguation (`--glob` vs
@@ -372,7 +372,7 @@ mod tests {
             "Bare-only vs pipe-friendly",
             "pipe-friendly",
             "catenary glob 'src/**/*.rs'",
-            "no separate\n  directory argument",
+            "no separate directory argument",
         ] {
             assert!(
                 body.contains(needle),
@@ -392,12 +392,15 @@ mod tests {
     }
 
     #[test]
-    fn payload_write_model_navigation_derives_from_config() {
-        // teaching-surface 07: the write-model line's navigation clause is
-        // derived from the live surface, not baked. A recommended-shaped surface
-        // (grep in pipeline under a scan-redirect group, find under a
-        // list-redirect group, git denies ls-files) names grep/find + git
-        // ls-files exactly as the former static line did.
+    fn primer_is_capability_voiced_under_both_configs() {
+        // teaching-surface 13 verification: rendered under a config that denies
+        // the native scanners AND under a deny-nothing config, the primer payload
+        // carries no assertion-voiced navigation-policy sentence and does carry
+        // the capability sentences (grep/glob are the navigation tools, plus the
+        // stdin pass). The navigation surface is config-free, so both renders read
+        // the same. (The former teach-07 clause named which scanners "stay
+        // denied"; the maintainer ruled that policy voice out of the primer — a
+        // user may enable native `grep`/`find`.)
         use crate::config::{GuidanceEntry, ResolvedCommands};
         let guidance = std::collections::HashMap::from([
             (
@@ -413,7 +416,7 @@ mod tests {
                 },
             ),
         ]);
-        let recommended = ResolvedCommands {
+        let denies = ResolvedCommands {
             allow: std::collections::HashSet::from(["git".into()]),
             pipeline: std::collections::HashSet::from(["grep".into()]),
             deny: std::collections::HashMap::from([(
@@ -423,40 +426,59 @@ mod tests {
             guidance,
             ..ResolvedCommands::default()
         };
-        let body = render(Some(&recommended), &["make".to_string()]);
-        assert!(
-            body.contains("(native `grep`/`find`, `git ls-files`) stays denied."),
-            "recommended surface names the navigation examples: {body}"
-        );
-
-        // A surface that denies no navigation example (the fixture: no guidance,
-        // no git deny) drops the clause — the config-free resolve-or-deny half
-        // stays, but nothing is falsely asserted denied.
-        let neutral = render(Some(&fixture_surface()), &["make".to_string()]);
-        assert!(
-            neutral.contains("Writes resolve-or-deny"),
-            "resolve-or-deny half stays: {neutral}"
-        );
-        assert!(
-            !neutral.contains("stays denied"),
-            "no false denial claim when nothing is denied: {neutral}"
-        );
+        let denies_body = render(Some(&denies), &["make".to_string()]);
+        // A deny-nothing surface (the fixture: no guidance, no git deny).
+        let neutral_body = render(Some(&fixture_surface()), &["make".to_string()]);
+        for body in [&denies_body, &neutral_body] {
+            // Capability voice present.
+            assert!(
+                body.contains("`catenary grep` and `catenary glob` are the navigation tools."),
+                "write-model line names the navigation tools in capability voice: {body}"
+            );
+            assert!(
+                body.contains("… | catenary grep PAT"),
+                "primer describes the stdin pass: {body}"
+            );
+            assert!(
+                body.contains("Writes resolve-or-deny"),
+                "resolve-or-deny half stays: {body}"
+            );
+            // No assertion-voiced navigation policy in either config.
+            for policy in ["stays denied", "bypass", "Navigation that bypasses"] {
+                assert!(
+                    !body.contains(policy),
+                    "primer asserts navigation policy ({policy:?}) under a config: {body}"
+                );
+            }
+        }
     }
 
     #[test]
-    fn invariants_navigation_line_is_config_neutral() {
-        // teaching-surface 07: the shared navigate invariant no longer asserts a
-        // config-specific denial ("native grep/find/ls are denied"); it states
-        // the config-free fact that native tools bypass LSP enrichment. This
-        // line rides both the live payload and the runtime-free fallbacks, so it
-        // must never claim a denial that a user's config may not make.
+    fn invariants_navigation_is_capability_voiced() {
+        // teaching-surface 13: the navigate invariant states capabilities, not
+        // policy — it names the navigation tools, describes the enrichment and
+        // the stdin pass, and must never assert a denial or a "bypass" framing (a
+        // user's config may allow the native scanners). This block rides both the
+        // live payload and the runtime-free fallbacks, so it must carry no claim a
+        // user's config may not make.
+        for policy in ["are denied", "stays denied", "bypass"] {
+            assert!(
+                !INVARIANTS.contains(policy),
+                "invariants assert policy ({policy:?}): {INVARIANTS}"
+            );
+        }
         assert!(
-            !INVARIANTS.contains("are denied"),
-            "invariants must not assert a config-specific denial: {INVARIANTS}"
+            INVARIANTS
+                .contains("Search contents with `catenary grep`, find files with `catenary glob`."),
+            "invariants name the navigation tools: {INVARIANTS}"
         );
         assert!(
-            INVARIANTS.contains("bypass that enrichment"),
-            "invariants state the config-free enrichment-bypass fact: {INVARIANTS}"
+            INVARIANTS.contains("… | catenary grep PAT"),
+            "invariants describe the stdin pass: {INVARIANTS}"
+        );
+        assert!(
+            INVARIANTS.contains("no source coverage"),
+            "invariants state matches return without server coverage: {INVARIANTS}"
         );
     }
 

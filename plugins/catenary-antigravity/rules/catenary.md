@@ -28,15 +28,15 @@ Bare-only vs pipe-friendly
   drops results (use `--count` for a bare tally).
 
 Navigate through Catenary
-  Find files with `catenary glob`, search contents with `catenary grep` so
-  results stay LSP-enriched — native `grep`/`find`/`ls` bypass that enrichment.
-  Quote glob patterns so Catenary expands them gitignore-aware, not the shell
-  (`catenary grep 'fn main' 'src/**/*.rs'`, `catenary glob 'src/**/*.rs'`). A
-  glob pattern is itself the path — absolute or cwd-relative, with the anchor
-  written in (`catenary glob '/abs/dir/**/*.md'`); there is no separate
-  directory argument. Where a server covers a hit its enrichment rides along;
-  where none does, `catenary grep` only flags the location — open the file and
-  read it.
+  Search contents with `catenary grep`, find files with `catenary glob`. Quote
+  glob patterns so Catenary expands them gitignore-aware, not the shell
+  (`catenary grep 'fn main' 'src/**/*.rs'`, `catenary glob 'src/**/*.rs'`); the
+  pattern is itself the path, so there is no separate directory argument
+  (`catenary glob '/abs/dir/**/*.md'`). Where a code intelligence source
+  covers a hit its enrichment rides along; where none does, `catenary grep`
+  still returns the match. With no path argument, `… | catenary grep PAT` is a
+  plain pass over the stream — complete matches, no enrichment — so matches
+  come back with no source coverage.
 
 Flag synopses (long forms; each has a short `-x` alias too)
   catenary grep PATTERN [PATH…]
