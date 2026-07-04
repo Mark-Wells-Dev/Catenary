@@ -213,6 +213,19 @@ upgrading.
   baseline (Gemini's `SessionStart` has no `compact` source and `PreCompress`
   cannot inject — an accepted, documented gap, not papered over with per-turn
   re-injection).
+- **Antigravity gets first-sighting teaching via `PreInvocation`.** Antigravity
+  has no `SessionStart` surface; its `PreInvocation` hook fires before every model
+  call. `catenary hook pre-invocation --format=antigravity` injects the same SSOT
+  payload Claude/Gemini/OpenCode carry as a **persisted** `injectSteps`
+  `userMessage` — the analog of the Claude `SessionStart` `additionalContext` —
+  delivered exactly once per conversation, never per turn (the transient
+  `ephemeralMessage` channel is deliberately excluded). First-sighting is decided
+  daemon-side, keyed on `conversationId`, so it is robust to `invocationNum`
+  semantics on resume; the ledger is fail-closed when the daemon is unreachable
+  (a skipped injection self-heals on the next reachable call rather than risking a
+  duplicate). The shipped
+  [plugins/catenary-antigravity/hooks.json](plugins/catenary-antigravity/hooks.json)
+  registers the hook; a reinstall (`catenary install antigravity`) picks it up.
 - **`catenary glob` outlines show types and callables only.** The file and
   directory outline is now a map, not a mirror: it recurses into containers
   (modules/namespaces/packages and classes/interfaces/enums/structs/impls) and

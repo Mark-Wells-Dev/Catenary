@@ -596,6 +596,11 @@ struct HookDispatchContext {
     /// its enclosing project root under an `ephemeral:*` contributor and records
     /// activity here; the idle reaper reads it to tear the mount down.
     ephemeral_mounts: EphemeralMounts,
+    /// Daemon-side first-sighting ledger for the Antigravity `PreInvocation`
+    /// teaching injection (teaching-surface ticket 03). Records each
+    /// `conversationId` the hook has taught, so the persisted `userMessage` is
+    /// injected exactly once per conversation.
+    first_sightings: FirstSightings,
 }
 
 /// A staged hook→CLI handoff, deposited under a [`HandoffKey`] by the
@@ -1214,6 +1219,45 @@ impl EphemeralMounts {
     }
 }
 
+/// Daemon-side first-sighting ledger for the Antigravity `PreInvocation`
+/// teaching injection (teaching-surface ticket 03).
+///
+/// Holds every `conversationId` (Antigravity's `session_id`) whose
+/// `PreInvocation` hook has already been told to inject the teaching payload.
+/// [`see`](Self::see) atomically records a conversation and reports whether this
+/// was its first sighting, so the persisted `injectSteps` `userMessage` is
+/// delivered exactly once per conversation — independent of `invocationNum`
+/// semantics on resume (a resumed conversation restores its transcript, so the
+/// daemon's memory, not the counter, is the dedup authority).
+///
+/// The ledger lives for the daemon's lifetime. A daemon restart forgets it,
+/// which at worst re-teaches an in-flight conversation once — a bounded,
+/// acceptable re-stamp, analogous to the Claude re-stamp on a context
+/// discontinuity. Antigravity sends no `session-end`, so entries are never
+/// evicted mid-conversation; memory is one short string per conversation.
+#[cfg(unix)]
+#[derive(Clone, Default)]
+struct FirstSightings {
+    inner: Arc<std::sync::Mutex<HashSet<String>>>,
+}
+
+#[cfg(unix)]
+impl FirstSightings {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records `conversation_id` and returns `true` iff it was **not** already
+    /// present — i.e. this is its first sighting and the teaching payload should
+    /// be injected now. Every later call for the same id returns `false`.
+    fn see(&self, conversation_id: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(conversation_id.to_string())
+    }
+}
+
 /// Decides whether a touched path warrants mounting an enclosing ephemeral root.
 ///
 /// Returns the canonical enclosing project root to mount, or `None` when no
@@ -1826,6 +1870,7 @@ impl SessionManager {
             handoff: KeyedHandoff::new(),
             worktree_watcher,
             ephemeral_mounts: EphemeralMounts::new(),
+            first_sightings: FirstSightings::new(),
         });
         self
     }
@@ -2467,6 +2512,46 @@ async fn handle_hook_dispatch(
         .and_then(|v| v.as_str())
         .unwrap_or("default")
         .to_string();
+
+    // ── Antigravity teaching first-sighting (teaching-surface ticket 03) ──
+    //
+    // Fires on every Antigravity `PreInvocation` (before each model call). The
+    // ledger is keyed on `conversationId` (the Antigravity `session_id`) and
+    // answers whether this is the conversation's first sighting — so the CLI
+    // injects the ticket-01 teaching payload as a persisted `injectSteps`
+    // `userMessage` exactly once per conversation, robust to `invocationNum`
+    // resume semantics. Daemon-authoritative and check-and-record-atomic:
+    // `see` returns `true` only for the first call per conversation.
+    //
+    // Short-circuits before get_or_create_router: this is a daemon-global
+    // ledger concern with no per-session editing/notification state.
+    if method == "pre-invocation/first-sighting" {
+        let scope_id = uuid::Uuid::new_v4().to_string();
+        let inject = ctx.first_sightings.see(&session_id);
+        let response = serde_json::json!({ "inject": inject }).to_string();
+
+        emit_hook_event(
+            tracing::Level::DEBUG,
+            &session_id,
+            &method,
+            Some(&scope_id),
+            &raw.to_string(),
+            "incoming hook",
+        );
+        emit_hook_event(
+            tracing::Level::DEBUG,
+            &session_id,
+            &method,
+            Some(&scope_id),
+            &response,
+            "outgoing hook response",
+        );
+
+        writer.write_all(response.as_bytes()).await?;
+        writer.write_all(b"\n").await?;
+        writer.shutdown().await?;
+        return Ok(());
+    }
 
     // ── Session-end cleanup ───────────────────────────────────────
     //
@@ -4811,6 +4896,75 @@ mod tests {
             response.get("version").and_then(serde_json::Value::as_str),
             Some(env!("CATENARY_VERSION")),
             "tool/version returns the daemon's CATENARY_VERSION",
+        );
+
+        shutdown.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+    }
+
+    // ── Antigravity PreInvocation first-sighting (teaching-surface ticket 03) ─
+
+    #[test]
+    fn first_sightings_see_is_true_once_per_conversation() {
+        // The core dedup: the first sighting of a conversation injects (`true`),
+        // every later one does not (`false`), and a distinct conversation is its
+        // own first sighting.
+        let ledger = FirstSightings::new();
+        assert!(ledger.see("conv-a"), "first sighting of conv-a injects");
+        assert!(
+            !ledger.see("conv-a"),
+            "second sighting of conv-a injects nothing"
+        );
+        assert!(!ledger.see("conv-a"), "and every later one, too");
+        assert!(
+            ledger.see("conv-b"),
+            "a different conversation is its own first sighting"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pre_invocation_first_sighting_injects_once_over_ipc() {
+        // End-to-end over the daemon's `handle_hook_dispatch` path: the first
+        // `pre-invocation/first-sighting` for a conversationId answers
+        // `inject: true`, the second answers `inject: false`, and a fresh
+        // conversationId answers `inject: true` again — so the CLI injects the
+        // persisted teaching `userMessage` exactly once per conversation.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let ipc_path = ipc_socket_in(dir.path());
+
+        let manager = Arc::new(bind_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
+        let m = Arc::clone(&manager);
+        let handle = tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        let req = |id: &str| {
+            serde_json::json!({
+                "method": "pre-invocation/first-sighting",
+                "format": "antigravity",
+                "session_id": id,
+            })
+        };
+        let inject = |resp: &str| -> bool {
+            serde_json::from_str::<serde_json::Value>(resp.trim())
+                .expect("first-sighting response json")
+                .get("inject")
+                .and_then(serde_json::Value::as_bool)
+                .expect("inject field")
+        };
+
+        assert!(
+            inject(&hook_roundtrip(&ipc_path, &req("conv-1")).await),
+            "first sighting of conv-1 injects",
+        );
+        assert!(
+            !inject(&hook_roundtrip(&ipc_path, &req("conv-1")).await),
+            "second sighting of conv-1 injects nothing",
+        );
+        assert!(
+            inject(&hook_roundtrip(&ipc_path, &req("conv-2")).await),
+            "a distinct conversation is its own first sighting",
         );
 
         shutdown.cancel();

@@ -1,5 +1,11 @@
 {
   "catenary-editing": {
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "catenary hook pre-invocation --format=antigravity"
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "write_to_file|replace_file_content|multi_replace_file_content|run_command",

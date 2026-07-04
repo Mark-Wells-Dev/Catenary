@@ -15,6 +15,8 @@
 //! - `run_pre_tool` — editing state enforcement (`PreToolUse` / `BeforeTool`)
 //! - `run_post_agent` — force `done_editing` (`Stop` / `AfterAgent`)
 //! - `run_session_start` — clear stale editing state (`SessionStart`)
+//! - `run_pre_invocation` — first-sighting teaching injection (Antigravity
+//!   `PreInvocation`)
 
 #![allow(
     clippy::print_stdout,
@@ -72,6 +74,37 @@ fn session_start_context(announce: bool, format: HostFormat) -> Option<String> {
 #[must_use]
 fn opencode_session_start_body() -> String {
     crate::cli::teaching::emitted_payload()
+}
+
+/// Build the Antigravity `PreInvocation` output that injects `payload` as a
+/// **persisted** `injectSteps` `userMessage` (teaching-surface ticket 03).
+///
+/// This is the Antigravity analog of the Claude `SessionStart`
+/// `additionalContext`: a `userMessage` step is written into the conversation
+/// transcript and stales like any transcript content, unlike the per-model-call
+/// `ephemeralMessage` channel (excluded by maintainer ruling — it is transient
+/// per call, not a session-start surface). The daemon-side first-sighting ledger
+/// gates emission to exactly once per conversation, so this rides no per-turn
+/// cadence.
+#[must_use]
+fn pre_invocation_injection(payload: &str) -> String {
+    serde_json::json!({
+        "injectSteps": [ { "userMessage": payload } ],
+    })
+    .to_string()
+}
+
+/// The Antigravity `PreInvocation` no-op output — a bare JSON object that
+/// injects nothing.
+///
+/// Emitted on every model call that is *not* a conversation's first sighting
+/// (the common case), and on the fail-closed paths (unparsable stdin, a
+/// non-Antigravity host, or an unreachable daemon). Matches the invocation-hook
+/// contract's "nothing to do" shape (`{}`), so injection happens once and only
+/// once.
+#[must_use]
+fn empty_pre_invocation() -> String {
+    "{}".to_string()
 }
 
 /// Build the `hookSpecificOutput` object that carries the teaching payload in
@@ -490,6 +523,78 @@ pub fn run_session_start(format: HostFormat) {
 
     let ctx = session_start_context(announce, format);
     emit_session_start(builder, ctx.as_deref());
+}
+
+/// Inject the teaching payload on a conversation's first sighting (Antigravity
+/// `PreInvocation` hook handler, teaching-surface ticket 03).
+///
+/// Antigravity has no `SessionStart` surface; its `PreInvocation` hook fires
+/// before **every** model call carrying `invocationNum` and `conversationId`.
+/// Rather than inject per-call (the `ephemeralMessage` channel is transient and
+/// excluded by ruling), this delivers the ticket-01 SSOT payload
+/// ([`crate::cli::teaching::emitted_payload`]) as a single **persisted**
+/// `injectSteps` `userMessage` — the analog of the Claude `SessionStart`
+/// `additionalContext`, exactly once per conversation.
+///
+/// First-sighting is decided **daemon-side**, keyed on `conversationId`, not by
+/// the stateless `invocationNum == 0` trigger: the daemon already sees
+/// Antigravity's hooks, and a per-conversation ledger is robust to whatever
+/// `invocationNum` does on resume (a resumed conversation restores its
+/// transcript — including the persisted `userMessage` — so re-injecting would
+/// duplicate it). Fail-closed when the daemon is unreachable: the ledger only
+/// records a sighting when the daemon actually answers, so a skipped injection
+/// self-heals on the next reachable model call rather than risking a duplicate.
+///
+/// Only Antigravity registers this hook; any other host is a defensive no-op.
+pub fn run_pre_invocation(format: HostFormat) {
+    if !matches!(format, HostFormat::Antigravity) {
+        print!("{}", empty_pre_invocation());
+        return;
+    }
+    let Ok(stdin_data) = std::io::read_to_string(std::io::stdin()) else {
+        print!("{}", empty_pre_invocation());
+        return;
+    };
+    let Ok(hook_json) = serde_json::from_str::<serde_json::Value>(&stdin_data) else {
+        print!("{}", empty_pre_invocation());
+        return;
+    };
+
+    if pre_invocation_first_sighting(&hook_json, format) {
+        print!(
+            "{}",
+            pre_invocation_injection(&crate::cli::teaching::emitted_payload())
+        );
+    } else {
+        print!("{}", empty_pre_invocation());
+    }
+}
+
+/// Ask the daemon whether this `PreInvocation` is the conversation's first
+/// sighting, returning `true` iff the teaching payload should be injected now.
+///
+/// The daemon owns the ledger (keyed on `conversationId`) and atomically
+/// check-and-records, so exactly one `PreInvocation` per conversation is told to
+/// inject. Fail-closed: a missing `conversationId` or an unreachable /
+/// unanswering daemon yields `false` (no injection), which self-heals on the
+/// next reachable call because the daemon recorded nothing.
+fn pre_invocation_first_sighting(hook_json: &serde_json::Value, format: HostFormat) -> bool {
+    let Some(session_id) = extract_session_id(hook_json, format) else {
+        return false;
+    };
+    let Some(stream) = hook_connect(hook_json) else {
+        return false;
+    };
+    let request = serde_json::json!({
+        "method": "pre-invocation/first-sighting",
+        "format": format.as_str(),
+        "session_id": session_id,
+    });
+    ipc_exchange(stream, &request)
+        .first()
+        .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .and_then(|v| v.get("inject").and_then(serde_json::Value::as_bool))
+        .unwrap_or(false)
 }
 
 /// Clean up session state on exit (`SessionEnd` hook handler).
@@ -2245,5 +2350,63 @@ mod tests {
     fn subagent_start_response_non_claude_is_none() {
         assert!(build_subagent_start_response(HostFormat::Gemini).is_none());
         assert!(build_subagent_start_response(HostFormat::Antigravity).is_none());
+    }
+
+    // ── Antigravity PreInvocation first-sighting injection (ws36 ticket 03) ─
+
+    #[test]
+    fn pre_invocation_injection_is_a_persisted_user_message() {
+        // The injection is a single persisted `injectSteps` `userMessage` — the
+        // analog of the Claude SessionStart `additionalContext`. The transient
+        // per-call `ephemeralMessage` channel is excluded by ruling, so it must
+        // never appear.
+        let out = pre_invocation_injection("BODY");
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        let steps = v["injectSteps"].as_array().expect("injectSteps array");
+        assert_eq!(steps.len(), 1, "exactly one injected step: {out}");
+        assert_eq!(steps[0]["userMessage"], "BODY");
+        assert!(
+            steps[0].get("ephemeralMessage").is_none(),
+            "ephemeralMessage is excluded (per-call-only channel): {out}",
+        );
+    }
+
+    #[test]
+    fn pre_invocation_injection_carries_the_emitted_payload() {
+        // Payload parity with the SSOT: the injected `userMessage` is the shared
+        // emitted payload verbatim (the same source `catenary primer` and the
+        // Claude/Gemini SessionStart `additionalContext` render from, including
+        // the ticket-05 daemon-staleness note under the same condition), so the
+        // Antigravity teaching cannot drift from the other hosts'.
+        let payload = crate::cli::teaching::emitted_payload();
+        let out = pre_invocation_injection(&payload);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        assert_eq!(
+            v["injectSteps"][0]["userMessage"]
+                .as_str()
+                .expect("userMessage string"),
+            payload,
+        );
+        // The SSOT invariants ride along (payload was inlined, not a pointer).
+        assert!(
+            v["injectSteps"][0]["userMessage"]
+                .as_str()
+                .is_some_and(|s| s.contains("The edit→diagnostics loop")),
+            "injected payload inlines the invariants: {out}",
+        );
+    }
+
+    #[test]
+    fn empty_pre_invocation_injects_nothing() {
+        // The non-first-sighting / fail-closed output: a bare JSON object with no
+        // `injectSteps`, so a second invocation (and every later one) injects
+        // nothing.
+        let out = empty_pre_invocation();
+        assert_eq!(out, "{}");
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        assert!(
+            v.as_object().expect("object").is_empty(),
+            "no injectSteps on the no-op path: {out}",
+        );
     }
 }

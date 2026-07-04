@@ -1393,6 +1393,24 @@ mod tests {
     }
 
     #[test]
+    fn antigravity_hooks_register_pre_invocation_teaching() {
+        // Teaching-surface ticket 03: the shipped Antigravity hooks.json wires the
+        // `PreInvocation` first-sighting teaching injection. Per the Antigravity
+        // hook contract, `PreInvocation` is a *flat* array of handler objects (no
+        // `matcher`/`hooks` wrapper), unlike `PreToolUse`.
+        let hooks: serde_json::Value =
+            serde_json::from_str(AGY_HOOKS).expect("AGY_HOOKS is valid JSON");
+        let pre = hooks["catenary-editing"]["PreInvocation"]
+            .as_array()
+            .expect("PreInvocation flat array present");
+        assert!(
+            pre.iter().any(|h| h["command"].as_str()
+                == Some("catenary hook pre-invocation --format=antigravity")),
+            "PreInvocation must invoke the antigravity pre-invocation hook: {hooks}",
+        );
+    }
+
+    #[test]
     fn antigravity_bundled_creates_files() {
         let dir = tempfile::tempdir().expect("create tempdir");
         let target = dir.path().join("catenary");
