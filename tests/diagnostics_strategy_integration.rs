@@ -17,9 +17,12 @@
 
 mod common;
 
-use anyhow::{Context, Result};
+use std::time::Duration;
 
-use common::BridgeProcess;
+use anyhow::{Context, Result};
+use serde_json::json;
+
+use common::{BridgeProcess, ipc_request, ipc_request_progress_aware};
 
 const MOCK_LANG_A: &str = "yX4Za";
 
@@ -455,6 +458,99 @@ fn test_near_threshold_flycheck() -> Result<()> {
         text.contains("mock diagnostic"),
         "Near-threshold flycheck should return diagnostics (mockls sleeps \
          while mockc runs, threshold not drained). Got: {text}"
+    );
+
+    Ok(())
+}
+
+/// Sends a signal to `pid` via the `kill(1)` utility.
+///
+/// The daemon is a detached grandchild with no `Child` handle to reach, and the
+/// workspace-wide `forbid(unsafe_code)` rules out a direct `libc::kill`, so the
+/// safe path is the `kill` binary. Used only by the wedged-daemon regression.
+#[cfg(unix)]
+fn signal_process(pid: u32, signal: &str) -> Result<()> {
+    let status = std::process::Command::new("kill")
+        .arg(format!("-{signal}"))
+        .arg(pid.to_string())
+        .status()
+        .context("spawn kill")?;
+    anyhow::ensure!(status.success(), "kill -{signal} {pid} exited {status}");
+    Ok(())
+}
+
+/// A wedged daemon — SIGSTOP'd mid-request — must fail the progress-aware
+/// `tool/editing-stop` wait within its no-progress budget, not hang for minutes
+/// on a wall clock (misc 130 / bug 59). While the daemon is frozen it shows no
+/// progress (flat `utime`/`stime`/`pfc`/context-switch counters, stopped
+/// scheduler state), so the wait charges its budget across consecutive dead
+/// windows and bails; a saturated-but-*working* daemon would keep advancing its
+/// counters every window and never trip it.
+///
+/// Drives the identical mechanism `ipc_request_long` uses, via
+/// `ipc_request_progress_aware` on a short budget, so the regression is fast and
+/// deterministic — it need not sit out the production 45-second budget to prove
+/// the fail-fast path.
+#[cfg(unix)]
+#[test]
+fn wedged_daemon_fails_within_no_progress_budget() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
+    std::fs::write(&file, "echo hello\n")?;
+    let file_str = file.to_str().context("path")?;
+
+    let mut bridge = spawn_mockls(&[], dir.path().to_str().context("path")?)?;
+    bridge.initialize()?;
+    let socket = bridge.wait_for_ipc_socket()?;
+    let pid = bridge.daemon_pid().context("daemon PID from state.json")?;
+
+    // Stage the editing handoff while the daemon is still alive — the short
+    // `ipc_request` calls `call_diagnostics` makes before the long wait.
+    ipc_request(
+        &socket,
+        &json!({"method": "pre-tool/editing-start", "agent_id": ""}),
+    )?;
+    ipc_request(
+        &socket,
+        &json!({
+            "method": "pre-tool/editing-state",
+            "tool_name": "Edit",
+            "file_path": file_str,
+            "agent_id": ""
+        }),
+    )?;
+    ipc_request(
+        &socket,
+        &json!({"method": "pre-tool/editing-stop", "agent_id": ""}),
+    )?;
+
+    // Freeze the daemon: it can no longer make progress on the pipeline.
+    signal_process(pid, "STOP")?;
+
+    // The progress-aware wait must give up within the (short) no-progress budget.
+    let budget = Duration::from_secs(3);
+    let started = std::time::Instant::now();
+    let result = ipc_request_progress_aware(
+        &socket,
+        Some(pid),
+        &json!({"method": "tool/editing-stop"}),
+        budget,
+    );
+    let elapsed = started.elapsed();
+
+    // Resume and reap the frozen daemon before asserting, so a failing assert
+    // never leaves a stopped process behind.
+    let _ = signal_process(pid, "CONT");
+    let _ = signal_process(pid, "KILL");
+
+    assert!(
+        result.is_err(),
+        "a wedged (SIGSTOP) daemon must fail the wait, not return a response: {result:?}"
+    );
+    assert!(
+        elapsed < budget + Duration::from_secs(30),
+        "wedged wait must fail fast within its no-progress budget (~{budget:?}), \
+         took {elapsed:?}"
     );
 
     Ok(())

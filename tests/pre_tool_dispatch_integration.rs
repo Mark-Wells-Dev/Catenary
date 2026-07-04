@@ -99,7 +99,11 @@ fn piped_diagnostics_denied_before_prepare_drain() -> Result<()> {
     // Claim the staged handoff. A non-empty result proves the set survived the
     // piped deny and was drained by the bare run; had the piped form drained it,
     // the bare prepare would have found nothing to report.
-    let claimed = ipc_request_long(&socket, &json!({"method": "tool/editing-stop"}))?;
+    let claimed = ipc_request_long(
+        &socket,
+        bridge.daemon_pid(),
+        &json!({"method": "tool/editing-stop"}),
+    )?;
     let diag = diagnostics_output(&claimed);
     assert!(
         diag.contains("mock diagnostic"),

@@ -10,7 +10,7 @@
 
 #![allow(dead_code, reason = "each test crate compiles common separately")]
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -452,6 +452,36 @@ impl BridgeProcess {
         Ok(path)
     }
 
+    /// Resolves the running daemon's PID from its `state.json` session-board
+    /// snapshot (`runtime_dir()/catenary/state.json`, field `daemon.pid`).
+    ///
+    /// The daemon is a *detached grandchild* of this bridge (it is spawned by
+    /// `router::spawn_daemon` in its own process group), so its PID is not one
+    /// of our direct `Child` handles — the snapshot the daemon writes on startup
+    /// is the test-visible source of truth (the same one the TUI reads). The
+    /// progress-aware [`ipc_request_long`] wait and the wedged-daemon regression
+    /// need this PID to watch the actual daemon process rather than a wall clock.
+    ///
+    /// Polls the snapshot on [`POLL_SPACING`] until the PID is present and
+    /// nonzero, backstopped by [`POLL_BACKSTOP`] (a genuine-hang guard, never the
+    /// happy path — the daemon has already answered IPC by the time a caller
+    /// needs its PID). Returns `None` only if the daemon never published a PID.
+    pub fn daemon_pid(&self) -> Option<u32> {
+        let state_json = xdg_runtime_dir(&self.state_home)
+            .join("catenary")
+            .join("state.json");
+        let deadline = std::time::Instant::now() + POLL_BACKSTOP;
+        loop {
+            if let Some(pid) = read_daemon_pid(&state_json) {
+                return Some(pid);
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(POLL_SPACING);
+        }
+    }
+
     /// Polls `ls-roots` until the given path appears as a tracked root.
     ///
     /// Used after MCP roots/list sync to ensure the daemon has processed
@@ -505,11 +535,12 @@ impl BridgeProcess {
             }),
         )?;
 
-        // Run diagnostics via handoff slot. Uses the long timeout because
-        // the diagnostics pipeline (settle + flycheck) can take tens of
+        // Run diagnostics via handoff slot. Uses the progress-aware wait
+        // because the diagnostics pipeline (settle + flycheck) can take tens of
         // seconds under CPU contention from parallel tests.
         let text = ipc_request_long(
             &socket_path,
+            self.daemon_pid(),
             &json!({
                 "method": "tool/editing-stop"
             }),
@@ -555,11 +586,12 @@ impl BridgeProcess {
             }),
         )?;
 
-        // Run diagnostics via handoff slot. Uses the long timeout because
-        // the diagnostics pipeline (settle + flycheck) can take tens of
+        // Run diagnostics via handoff slot. Uses the progress-aware wait
+        // because the diagnostics pipeline (settle + flycheck) can take tens of
         // seconds under CPU contention from parallel tests.
         let text = ipc_request_long(
             &socket_path,
+            self.daemon_pid(),
             &json!({
                 "method": "tool/editing-stop"
             }),
@@ -597,6 +629,7 @@ impl BridgeProcess {
         // Consume with the explicit scoped `files` set.
         let text = ipc_request_long(
             &socket_path,
+            self.daemon_pid(),
             &json!({
                 "method": "tool/editing-stop",
                 "files": paths,
@@ -843,33 +876,189 @@ pub fn ipc_request(socket_path: &Path, request: &Value) -> Result<String> {
     ipc_request_with_timeout(socket_path, request, Duration::from_secs(10))
 }
 
-/// Like [`ipc_request`], but with a 3-minute read timeout and — crucially — it
-/// does NOT shutdown the write side after sending.
+/// No-progress budget for [`ipc_request_long`]: wall time is only charged
+/// against this across *consecutive* [`IPC_PROGRESS_POLL`] windows in which the
+/// watched daemon shows **zero** progress. A daemon making progress — even a
+/// saturated-but-working one whose flycheck child is starved of a core — resets
+/// it every window and so never times out; only a genuinely wedged daemon
+/// (SIGSTOP, deadlock) burns it down and fails fast.
 ///
-/// Used for `tool/editing-stop`, which blocks on the diagnostics pipeline.
-/// Under parallel test load, CPU contention stretches flycheck wall time well
-/// past the default 10-second timeout — and since the bug-55 fix the settle
-/// *correctly holds* while a starved-but-runnable flycheck child waits for a
-/// core, so saturated wall time inflates several-fold rather than settling
-/// over the busy child. The budget here is harness liveness only (nextest's
-/// own per-test termination still bounds a genuine wedge); it must comfortably
-/// exceed worst-case saturation inflation, not measure anything. The daemon
-/// races the pipeline against client disconnect (bug 24); a write-shutdown
-/// reads as EOF on the daemon side and would trip the disconnect branch before
-/// the response is sent. This mirrors the production `catenary diagnostics`
-/// client (`run_done_editing`), which keeps the write half open while awaiting
-/// the response — same non-half-closing contract as [`ipc_tool_request`].
-pub fn ipc_request_long(socket_path: &Path, request: &Value) -> Result<String> {
+/// Kept small on purpose (order 30–60s per misc 130): it is a hang detector,
+/// not a saturation cushion. Bug 59 died here — the old flat 3-minute
+/// `set_read_timeout` was a wall clock that inflated with CPU contention and
+/// eventually failed a *working* daemon. This mirrors the daemon's own
+/// tick-budget settle model (`src/lsp/settle.rs`): measure the process, not the
+/// clock.
+const IPC_NO_PROGRESS_BUDGET: Duration = Duration::from_secs(45);
+
+/// Poll cadence for the progress-aware wait: the socket read timeout doubles as
+/// the daemon-sampling interval, so each blocked read returns within one window
+/// and we re-check progress. Short enough that the daemon's own 50 ms settle
+/// loop advances its counters within every window; this is cadence, not a
+/// readiness guess.
+const IPC_PROGRESS_POLL: Duration = Duration::from_millis(200);
+
+/// Progress-aware replacement for the old flat 3-minute `tool/editing-stop`
+/// read timeout (misc 130). Blocks on the diagnostics pipeline while the daemon
+/// keeps working; fails fast only when the daemon genuinely stops making
+/// progress. Delegates to [`ipc_request_progress_aware`] with the default
+/// [`IPC_NO_PROGRESS_BUDGET`].
+///
+/// Crucially it does NOT shut down the write side after sending. The daemon
+/// races the pipeline against client disconnect (bug 24); a write-shutdown reads
+/// as EOF on the daemon side and would trip the disconnect branch before the
+/// response is sent. This mirrors the production `catenary diagnostics` client
+/// (`run_done_editing`), which likewise keeps the write half open and reads to
+/// EOF with no wall-clock budget — same non-half-closing contract as
+/// [`ipc_tool_request`].
+///
+/// `daemon_pid` is the process to watch (from [`BridgeProcess::daemon_pid`]).
+/// `None` (or a PID that can no longer be sampled) means the daemon is
+/// unwatchable — every window then reads as no-progress, so an unmonitorable
+/// daemon fails within the budget instead of hanging.
+pub fn ipc_request_long(
+    socket_path: &Path,
+    daemon_pid: Option<u32>,
+    request: &Value,
+) -> Result<String> {
+    ipc_request_progress_aware(socket_path, daemon_pid, request, IPC_NO_PROGRESS_BUDGET)
+}
+
+/// [`ipc_request_long`] with an explicit no-progress budget.
+///
+/// Polls the socket on [`IPC_PROGRESS_POLL`] (the read timeout *is* the poll
+/// cadence) and, on every window that returns no response bytes, samples the
+/// daemon process via [`catenary_proc::ProcessMonitor`]. A window counts as
+/// progress when the daemon's cumulative counters (`utime + stime + pfc +
+/// voluntary context switches`) advanced, or when its scheduler state is pending
+/// work (runnable / uninterruptible I/O) — the same signals the daemon's own
+/// settle loop uses. Progress (including any received bytes) resets the budget;
+/// only consecutive flat windows charge it, and the wait bails once they sum to
+/// `no_progress_budget`.
+///
+/// Exposed with an explicit budget so the wedged-daemon regression can drive the
+/// identical mechanism on a short budget without a multi-second test.
+pub fn ipc_request_progress_aware(
+    socket_path: &Path,
+    daemon_pid: Option<u32>,
+    request: &Value,
+    no_progress_budget: Duration,
+) -> Result<String> {
     use std::io::Read as _;
+
     let mut stream =
         std::os::unix::net::UnixStream::connect(socket_path).context("connect to notify socket")?;
-    stream.set_read_timeout(Some(Duration::from_mins(3)))?;
-    writeln!(stream, "{request}").context("write to notify socket")?;
-    let mut response = String::new();
+    // The read timeout is poll cadence, not a budget: a blocked read returns
+    // within one window so we can re-sample the daemon. Do NOT shut down the
+    // write side (bug 24 — see the doc comment).
     stream
-        .read_to_string(&mut response)
-        .context("read from notify socket")?;
-    Ok(response)
+        .set_read_timeout(Some(IPC_PROGRESS_POLL))
+        .context("set poll-cadence read timeout")?;
+    writeln!(stream, "{request}").context("write to notify socket")?;
+
+    // Watch the actual daemon process. Prime the monitor so the first in-loop
+    // sample yields a real delta (the first `sample()` always reports zero).
+    let mut monitor = daemon_pid.and_then(catenary_proc::ProcessMonitor::new);
+    if let Some(m) = monitor.as_mut() {
+        let _ = m.sample();
+    }
+    let mut prev_ticks = monitor
+        .as_ref()
+        .map_or(0, catenary_proc::ProcessMonitor::cumulative_ticks);
+
+    let mut response: Vec<u8> = Vec::new();
+    let mut no_progress = Duration::ZERO;
+    let mut chunk = [0u8; 8192];
+    loop {
+        match stream.read(&mut chunk) {
+            // EOF: the daemon wrote the full response and closed the write side.
+            Ok(0) => break,
+            // Bytes arrived — unambiguous progress. Re-baseline the monitor.
+            Ok(n) => {
+                response.extend_from_slice(&chunk[..n]);
+                no_progress = Duration::ZERO;
+                if let Some(m) = monitor.as_mut() {
+                    let _ = m.sample();
+                    prev_ticks = m.cumulative_ticks();
+                }
+            }
+            // Poll window elapsed with no data: charge the budget only if the
+            // daemon itself made no progress this window.
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                if daemon_progressed(monitor.as_mut(), &mut prev_ticks) {
+                    no_progress = Duration::ZERO;
+                } else {
+                    no_progress += IPC_PROGRESS_POLL;
+                    if no_progress >= no_progress_budget {
+                        let method = request
+                            .get("method")
+                            .and_then(Value::as_str)
+                            .unwrap_or("<unknown>");
+                        bail!(
+                            "daemon (pid {daemon_pid:?}) showed no progress for \
+                             {no_progress_budget:?} awaiting `{method}` — wedged"
+                        );
+                    }
+                }
+            }
+            Err(e) => return Err(e).context("read from notify socket"),
+        }
+    }
+
+    String::from_utf8(response).context("notify socket response was not valid UTF-8")
+}
+
+/// Samples the watched daemon once and reports whether it made progress since
+/// the previous sample, advancing `prev_ticks` to the new cumulative value.
+///
+/// Progress = the cumulative counters (`utime + stime + pfc + voluntary context
+/// switches`, via [`catenary_proc::ProcessMonitor::cumulative_ticks`]) advanced,
+/// **or** the daemon is in a pending-work scheduler state
+/// ([`daemon_pending_work`]). An absent monitor (no PID) or a PID that can no
+/// longer be sampled (process gone) reports no progress, so an unwatchable
+/// daemon fails fast rather than hanging.
+fn daemon_progressed(
+    monitor: Option<&mut catenary_proc::ProcessMonitor>,
+    prev_ticks: &mut u64,
+) -> bool {
+    let Some(m) = monitor else {
+        return false;
+    };
+    let Some(delta) = m.sample() else {
+        return false;
+    };
+    let now = m.cumulative_ticks();
+    let advanced = now > *prev_ticks;
+    *prev_ticks = now;
+    advanced || daemon_pending_work(delta.state)
+}
+
+/// Whether a daemon [`catenary_proc::ProcessState`] counts as pending work for
+/// the progress-aware wait — a mirror of `is_pending_work` in
+/// `src/lsp/settle.rs`.
+///
+/// Where scheduler state is observable, a runnable (`Running`) or
+/// uninterruptible-I/O (`Blocked`) daemon has pending work regardless of the
+/// sampled deltas, so a window in either state is progress even when the
+/// counters happen to round flat. A SIGSTOP'd daemon reports `Dead` (stopped),
+/// so it is correctly *not* pending. Off observable-scheduler platforms this is
+/// always `false` and progress falls back to the cumulative counters alone.
+const fn daemon_pending_work(state: catenary_proc::ProcessState) -> bool {
+    catenary_proc::SCHEDULER_STATE_OBSERVABLE
+        && matches!(
+            state,
+            catenary_proc::ProcessState::Running | catenary_proc::ProcessState::Blocked
+        )
+}
+
+/// Parses `daemon.pid` from a `state.json` snapshot (see
+/// [`BridgeProcess::daemon_pid`]). Returns `None` if the file is absent,
+/// unparseable, or the `pid` field is missing or zero.
+fn read_daemon_pid(state_json: &Path) -> Option<u32> {
+    let text = std::fs::read_to_string(state_json).ok()?;
+    let value: Value = serde_json::from_str(&text).ok()?;
+    let pid = value.get("daemon")?.get("pid")?.as_u64()?;
+    u32::try_from(pid).ok().filter(|&p| p != 0)
 }
 
 fn ipc_request_with_timeout(
