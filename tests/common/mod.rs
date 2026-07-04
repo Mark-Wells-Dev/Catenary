@@ -708,7 +708,8 @@ impl BridgeProcess {
         obj.insert("method".to_string(), json!("tool/grep"));
         self.resolve_ipc_cwd(obj);
 
-        let response = ipc_tool_request(&socket_path, &Value::Object(obj.clone()))?;
+        let response =
+            ipc_tool_request(&socket_path, self.daemon_pid(), &Value::Object(obj.clone()))?;
         let parsed: Value =
             serde_json::from_str(&response).context("failed to parse grep response")?;
         let output = parsed
@@ -730,7 +731,8 @@ impl BridgeProcess {
         obj.insert("method".to_string(), json!("tool/glob"));
         self.resolve_ipc_cwd(obj);
 
-        let response = ipc_tool_request(&socket_path, &Value::Object(obj.clone()))?;
+        let response =
+            ipc_tool_request(&socket_path, self.daemon_pid(), &Value::Object(obj.clone()))?;
         let parsed: Value =
             serde_json::from_str(&response).context("failed to parse glob response")?;
         let output = parsed
@@ -753,7 +755,8 @@ impl BridgeProcess {
         obj.insert("method".to_string(), json!(method));
         self.resolve_ipc_cwd(obj);
 
-        let response = ipc_tool_request(&socket_path, &Value::Object(obj.clone()))?;
+        let response =
+            ipc_tool_request(&socket_path, self.daemon_pid(), &Value::Object(obj.clone()))?;
         serde_json::from_str(&response).context("failed to parse search response")
     }
 
@@ -834,25 +837,34 @@ impl Drop for BridgeProcess {
 
 // ── IPC helpers ──────────────────────────────────────────────────────
 
-/// Sends an IPC tool query (grep/glob) and reads the response line.
+/// Sends an IPC tool query (grep/glob) and reads the response, watching the
+/// daemon process for progress instead of a wall clock (misc 136, applying the
+/// bug-59 ruling misc 130 landed for the diagnostics wait).
 ///
-/// Unlike [`ipc_request`], this does NOT shutdown the write side after
-/// sending — the daemon's tool handler races the query against client
-/// disconnect, and a write-shutdown would trigger the disconnect branch
-/// before the response is sent.
-pub fn ipc_tool_request(socket_path: &Path, request: &Value) -> Result<String> {
-    let mut stream =
-        std::os::unix::net::UnixStream::connect(socket_path).context("connect to IPC socket")?;
-    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-    writeln!(stream, "{request}").context("write to IPC socket")?;
-
-    // Read response line (the daemon writes JSON + newline then shuts down).
-    let mut reader = BufReader::new(&stream);
-    let mut line = String::new();
-    reader
-        .read_line(&mut line)
-        .context("read from IPC socket")?;
-    Ok(line)
+/// The old flat 30s `set_read_timeout` per attempt was a pressure-dependent
+/// wall budget of the very family bug 59 condemned: the file's own
+/// [`POLL_BACKSTOP`] note records cold searches exceeding 60s under 3×
+/// overcommit — a working-but-saturated daemon (per-root server respawn +
+/// `--scan-roots` reindex) could blow the flat budget and fail a *working*
+/// search. Delegating to [`ipc_request_progress_aware`] on the default
+/// [`IPC_NO_PROGRESS_BUDGET`] swaps that clock for the same `catenary-proc`
+/// no-progress budget the diagnostics wait uses: a saturated-but-working daemon
+/// never times out, and only a genuinely wedged one fails fast.
+///
+/// Like [`ipc_request_progress_aware`] (and unlike [`ipc_request`]) it does NOT
+/// shut down the write side after sending — the daemon's tool handler races the
+/// query against client disconnect (bug 24), and a write-shutdown would trigger
+/// the disconnect branch before the response is sent.
+///
+/// `daemon_pid` is the process to watch (from [`BridgeProcess::daemon_pid`]),
+/// threaded by the grep/glob callers exactly as the diagnostics callers thread
+/// it into [`ipc_request_long`].
+pub fn ipc_tool_request(
+    socket_path: &Path,
+    daemon_pid: Option<u32>,
+    request: &Value,
+) -> Result<String> {
+    ipc_request_progress_aware(socket_path, daemon_pid, request, IPC_NO_PROGRESS_BUDGET)
 }
 
 /// Extract the diagnostics text from a `tool/editing-stop` response.
