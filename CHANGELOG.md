@@ -104,6 +104,18 @@ upgrading.
   labels a `catenary diagnostics` run "dirty" (vs "clean"). A status label only:
   the run always exits `0` and prints every diagnostic; it does not gate an exit
   code.
+- **Diagnostics receipts persist per session.** The daemon now writes the full
+  rendered `catenary diagnostics` receipt to a per-session store under
+  `runtime_dir()/catenary/receipts/` at **compute time**, before the response
+  leaves for the client — so a CLI invocation killed after dispatch (a
+  backgrounded command reaped by the host, a tool-call timeout, a Ctrl-C) can no
+  longer pay the editing debt without anyone seeing the receipt. Every run prints
+  a trailing pointer line naming the store and the files it covered; a later bare
+  `catenary diagnostics` that finds nothing edited (`[no edited files]`) still
+  names the prior store and its covered set, so the agent can tell at a glance
+  whether it holds the set just edited or a stale one. The store is regenerable
+  ephemera (same tmpfs lifecycle as `state.json`); a failed store write is
+  fail-soft and never breaks the receipt. Closes the killed-client witness gap.
 - **`[notifications].threshold`** (default `"warn"`) — documents and exposes the
   minimum severity promoted to user-facing notifications (one of `"debug"`,
   `"info"`, `"warn"`, `"error"`).

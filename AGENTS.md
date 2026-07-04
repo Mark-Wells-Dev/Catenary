@@ -35,7 +35,8 @@ others.
   `catenary.db` is drained on startup). State spans three XDG base dirs, chosen for
   their durability semantics (see `src/paths.rs`): the durable Unix **socket**
   under `state_dir`; the ephemeral `state.json` **session-board snapshot** and
-  per-session diagnostics-overflow reports under `runtime_dir` (tmpfs); and the
+  per-session diagnostics-receipt stores (`receipts/<session>.txt`) under
+  `runtime_dir` (tmpfs); and the
   regenerable, per-root-sharded **JSONL telemetry firehose** under `cache_dir`.
 - **CLI search commands:** `catenary grep` and `catenary glob`, invoked via the
   host's shell tool. Stateless queries — no session identity, no connection

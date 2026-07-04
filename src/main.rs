@@ -1843,6 +1843,14 @@ struct DiagnosticsResponse {
     /// a silent exit. Absent on a pre-fix daemon → defaults to 0.
     #[serde(default)]
     covered: usize,
+    /// Trailing pointer line naming the per-session receipt store and its
+    /// covered files (misc 139 / bug 60). Printed after the receipt or the
+    /// `[no edited files]` sentinel so the agent always knows where the last
+    /// computed diagnostics live — and, on a bare run that finds nothing edited,
+    /// whether the store holds the set it just edited. Absent (`null`) when no
+    /// receipt is stored and none was recovered; absent on a pre-fix daemon.
+    #[serde(default)]
+    store_pointer: Option<String>,
 }
 
 /// Implements `catenary diagnostics [paths…]`: prints diagnostics for the
@@ -1946,6 +1954,18 @@ fn emit_diagnostics_response(out: &mut cli::Output, response: &str) -> Result<()
         }
     } else {
         let _ = out.writeln(format_args!("{trimmed}"));
+    }
+
+    // Trailing store pointer (misc 139 / bug 60): names the per-session receipt
+    // store and its covered files. Printed after the receipt or the
+    // `[no edited files]` sentinel so a killed-client recovery run tells the
+    // agent at a glance where the last computed diagnostics live and whether the
+    // store holds the set it just edited. Absent when nothing is stored.
+    if let Some(pointer) = parsed.store_pointer.as_deref() {
+        let pointer = pointer.trim();
+        if !pointer.is_empty() {
+            let _ = out.writeln(format_args!("{pointer}"));
+        }
     }
 
     Ok(())

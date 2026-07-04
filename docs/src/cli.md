@@ -156,6 +156,19 @@ truthful. The gate drains the degraded file exactly as a paid one — editing
 it again re-arms it, and a server that is back next run resumes the normal
 contract. When nothing was edited it prints `[no edited files]`.
 
+**The receipt persists per session.** The daemon writes the full rendered
+receipt to a per-session store under `runtime_dir()/catenary/receipts/` at
+compute time — before the response reaches the CLI — so a `catenary
+diagnostics` invocation killed after dispatch (a backgrounded command reaped
+by the host, a tool-call timeout, a Ctrl-C) can no longer pay the edit debt
+without anyone seeing the result. Every run ends with a short pointer line
+naming the store and the files it covered; a later bare `catenary diagnostics`
+that finds nothing edited still names the prior store and its covered set, so
+you can tell at a glance whether it holds the set you just edited or a stale
+one — `cat` the named path to reread the full receipt. The store is
+regenerable ephemera (same tmpfs lifecycle as `state.json`), and a failed
+store write never affects the printed receipt.
+
 ```bash
 catenary diagnostics                 # the whole edited set
 catenary diagnostics src/main.rs     # lint one file on demand

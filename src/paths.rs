@@ -8,11 +8,13 @@
 //!
 //! - [`state_dir`] — durable, per-host state (the Unix socket).
 //! - [`runtime_dir`] — ephemeral, tmpfs-backed runtime files (the `state.json`
-//!   snapshot).
+//!   snapshot and the per-session diagnostics receipt stores).
 //! - [`cache_dir`] — regenerable, high-volume telemetry (the JSONL firehose).
 //!
 //! [`encode_cwd`] flattens an absolute path into a single filesystem-safe
 //! directory-name component, used as the per-root shard key in the firehose tree.
+//! [`diagnostics_receipt_dir`] / [`diagnostics_receipt_file`] locate the
+//! per-session `catenary diagnostics` receipt store under [`runtime_dir`].
 
 use std::path::{Path, PathBuf};
 
@@ -71,6 +73,20 @@ pub fn cache_dir() -> PathBuf {
         .unwrap_or_else(state_dir)
 }
 
+/// Flatten a string into one filesystem-safe path component.
+///
+/// Every character that is not ASCII alphanumeric (path separators, `.`, `_`,
+/// spaces, …) becomes `-`. Shared by [`encode_cwd`] (the firehose shard key)
+/// and [`diagnostics_receipt_file`] (the per-session receipt-store name). The
+/// mapping is stable but intentionally lossy — distinct inputs can collide
+/// (e.g. `a/b` and `a.b`) — which is acceptable for the regenerable ephemera
+/// both callers key.
+fn flatten_component(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
 /// Flatten an absolute path into one filesystem-safe directory-name component.
 ///
 /// Matches the encoding Claude Code uses for `~/.claude/projects/`: every
@@ -85,10 +101,31 @@ pub fn cache_dir() -> PathBuf {
 /// acceptable for a regenerable cache.
 #[must_use]
 pub fn encode_cwd(path: &Path) -> String {
-    path.to_string_lossy()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect()
+    flatten_component(&path.to_string_lossy())
+}
+
+/// Directory holding the per-session `catenary diagnostics` receipt stores.
+///
+/// Co-located with the `state.json` snapshot under `runtime_dir()/catenary/`, so
+/// it shares that ephemeral, tmpfs-backed, OS-cleared-on-logout lifecycle. The
+/// daemon writes the full rendered receipt here at compute time (misc 139 / bug
+/// 60) so a `catenary diagnostics` CLI client killed after dispatch cannot lose
+/// it; the next bare run points the agent back at the store. The receipt is
+/// regenerable ephemera — a lost store just means the next run recomputes.
+#[must_use]
+pub fn diagnostics_receipt_dir() -> PathBuf {
+    runtime_dir().join("catenary").join("receipts")
+}
+
+/// The per-session receipt-store filename: the host `session_id` flattened to a
+/// single filesystem-safe component (same rule as [`encode_cwd`]) plus `.txt`.
+///
+/// The flattening is lossy — matching the firehose shard-key tradeoff — so two
+/// session ids differing only in punctuation could share a store; realistic host
+/// session ids (UUIDs) never collide, and the store is regenerable ephemera.
+#[must_use]
+pub fn diagnostics_receipt_file(session_id: &str) -> String {
+    format!("{}.txt", flatten_component(session_id))
 }
 
 #[cfg(test)]
@@ -118,5 +155,31 @@ mod tests {
     fn encode_cwd_is_stable() {
         let p = Path::new("/a/b/c");
         assert_eq!(encode_cwd(p), encode_cwd(p));
+    }
+
+    #[test]
+    fn diagnostics_receipt_file_flattens_session_id() {
+        // A UUID-shaped session id survives verbatim (hex + dashes are all
+        // preserved), so the store name is legible.
+        assert_eq!(
+            diagnostics_receipt_file("7da239b1-d3c7-42b7-a7a4-38b4205f576a"),
+            "7da239b1-d3c7-42b7-a7a4-38b4205f576a.txt"
+        );
+        // Punctuation that is unsafe in a filename flattens to `-`.
+        assert_eq!(diagnostics_receipt_file("sess/1.2"), "sess-1-2.txt");
+    }
+
+    #[test]
+    fn diagnostics_receipt_dir_sits_beside_state_json() {
+        // The receipt store shares the `runtime_dir()/catenary/` parent with the
+        // `state.json` snapshot (same ephemeral lifecycle).
+        let dir = diagnostics_receipt_dir();
+        assert_eq!(dir.file_name().and_then(|n| n.to_str()), Some("receipts"));
+        assert_eq!(
+            dir.parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str()),
+            Some("catenary")
+        );
     }
 }

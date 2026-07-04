@@ -606,6 +606,17 @@ struct HookDispatchContext {
     /// `conversationId` the hook has taught, so the persisted `userMessage` is
     /// injected exactly once per conversation.
     first_sightings: FirstSightings,
+    /// Directory holding the per-session `catenary diagnostics` receipt stores
+    /// (misc 139 / bug 60). Defaults to [`crate::paths::diagnostics_receipt_dir`]
+    /// (`runtime_dir()/catenary/receipts`); tests point it at a tempdir so the
+    /// daemon-side store write is isolated from the host runtime dir.
+    receipt_store_dir: PathBuf,
+    /// Covered-file set of each session's last stored receipt, keyed by
+    /// `session_id` (misc 139 / bug 60). Recorded at compute time whenever a
+    /// receipt is persisted; read on a later bare run that diagnosed nothing so
+    /// its `[no edited files]` can still name the prior store and its covered
+    /// files — the killed-client recovery shape.
+    last_receipts: Arc<std::sync::Mutex<HashMap<String, Vec<PathBuf>>>>,
 }
 
 /// A staged hook→CLI handoff, deposited under a [`HandoffKey`] by the
@@ -1876,6 +1887,8 @@ impl SessionManager {
             worktree_watcher,
             ephemeral_mounts: EphemeralMounts::new(),
             first_sightings: FirstSightings::new(),
+            receipt_store_dir: crate::paths::diagnostics_receipt_dir(),
+            last_receipts: Arc::new(std::sync::Mutex::new(HashMap::new())),
         });
         self
     }
@@ -2358,6 +2371,116 @@ fn with_out_of_roots_note(
     } else {
         format!("{output}\n{note}")
     }
+}
+
+/// Formats the trailing store-pointer line for a diagnostics receipt (misc 139 /
+/// bug 60).
+///
+/// Names the store path plus the covered-file list, so the agent always knows
+/// where the last computed diagnostics live and can tell at a glance whether the
+/// store holds the set it just edited or a stale/different one (the maintainer's
+/// "tell at a glance" clause). The store path is rendered absolute so the agent
+/// can `cat` it directly; covered files use the receipt's home-compressed style.
+#[cfg(unix)]
+fn format_receipt_pointer(store_path: &Path, covered: &[PathBuf]) -> String {
+    let mut files: Vec<String> = covered
+        .iter()
+        .map(|p| crate::bridge::compress_home(p))
+        .collect();
+    files.sort();
+    let n = files.len();
+    let plural = if n == 1 { "" } else { "s" };
+    format!(
+        "last computed diagnostics saved to {} \u{b7} covered {n} file{plural}: {}",
+        store_path.display(),
+        files.join(", "),
+    )
+}
+
+/// Persists the rendered diagnostics receipt to the per-session store and returns
+/// the trailing pointer line for stdout (misc 139 / bug 60).
+///
+/// Called at COMPUTE time — after the receipt is rendered, before the response is
+/// written — so a `catenary diagnostics` CLI client killed after dispatch
+/// (SIGKILL, host-tool timeout, Ctrl-C) cannot lose the receipt: the store holds
+/// it and the pointer names it. The bytes written match what stdout carries.
+///
+/// Behaviour by run shape:
+///
+/// - A run that diagnosed files (`covered` non-empty, non-empty `receipt`) writes
+///   `receipt` to the store, records the covered set for the session, and returns
+///   the pointer.
+/// - A bare run that diagnosed nothing (`covered` empty) writes nothing but, when
+///   a prior store for the session still exists on disk, returns the pointer
+///   naming it and its remembered covered set — the killed-client recovery shape.
+///
+/// Fail-soft: any filesystem error is logged at debug and yields `None` (no
+/// pointer), never breaking the receipt — delivery robustness must not add a new
+/// failure mode.
+#[cfg(unix)]
+fn persist_receipt(
+    ctx: &HookDispatchContext,
+    session_id: &str,
+    receipt: &str,
+    covered: &[PathBuf],
+) -> Option<String> {
+    let store_path = ctx
+        .receipt_store_dir
+        .join(crate::paths::diagnostics_receipt_file(session_id));
+
+    if covered.is_empty() {
+        // Recovery shape: this run diagnosed nothing. Point at a prior store when
+        // one still exists, so the agent can compare its covered set against what
+        // it just edited (bug 60's killed-client witness gap).
+        let prior = ctx
+            .last_receipts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .cloned()?;
+        if !store_path.exists() {
+            return None;
+        }
+        return Some(format_receipt_pointer(&store_path, &prior));
+    }
+
+    if receipt.trim().is_empty() {
+        // Covered files but an empty receipt is a rare defensive edge (every file
+        // dropped during resolve/validate) with nothing worth storing.
+        return None;
+    }
+
+    if let Some(parent) = store_path.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        debug!(
+            source = Source::DaemonDispatch.as_str(),
+            session_id = %session_id,
+            error = %e,
+            "diagnostics receipt store: create_dir_all failed — receipt not persisted",
+        );
+        return None;
+    }
+    if let Err(e) = std::fs::write(&store_path, receipt) {
+        debug!(
+            source = Source::DaemonDispatch.as_str(),
+            session_id = %session_id,
+            error = %e,
+            "diagnostics receipt store: write failed — receipt not persisted",
+        );
+        return None;
+    }
+    ctx.last_receipts
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(session_id.to_string(), covered.to_vec());
+    debug!(
+        source = Source::DaemonDispatch.as_str(),
+        session_id = %session_id,
+        covered = covered.len(),
+        "diagnostics receipt persisted to per-session store",
+    );
+    Some(format_receipt_pointer(&store_path, covered))
 }
 
 /// Decides whether an edited file should auto-mount its enclosing git worktree.
@@ -3336,14 +3459,19 @@ async fn handle_hook_dispatch(
             "incoming hook",
         );
 
+        // Session id from the handoff (tuple index 3), kept for the receipt-store
+        // write after the borrow-consuming match below (misc 139 / bug 60).
+        let handoff_session_id: Option<String> = handoff.as_ref().map(|h| h.3.clone());
+
         // `dirty` is a status label only (ws37 ticket 01): the CLI exits `0`
         // whether clean or dirty — the clean/dirty distinction lives in the
         // per-file receipt (`output`), where clean files carry `[clean]` and
         // dirty files their diagnostics. Faults (no daemon, IPC/parse failure)
         // are detected CLI-side and exit `2`. `covered` is the count of covered
         // files in the handoff: it lets the CLI print `[no edited files]` for a
-        // genuinely empty set (covered == 0, empty receipt).
-        let (dirty, output, covered) =
+        // genuinely empty set (covered == 0, empty receipt). `covered_files` is
+        // that same set as paths, for the receipt-store pointer (misc 139).
+        let (dirty, output, covered, covered_files) =
             if let Some((files, filtered, filtered_roots, session_id, _, _, _)) = handoff {
                 // A scoped pull diagnoses exactly the named paths; the bare form
                 // diagnoses the drained debt snapshot. The accumulation-time
@@ -3373,6 +3501,7 @@ async fn handle_hook_dispatch(
                         false,
                         with_out_of_roots_note(String::new(), filtered, &filtered_roots),
                         covered,
+                        Vec::new(),
                     )
                 } else {
                     // Ephemeral mount (ticket 02): any diagnosed file outside
@@ -3462,6 +3591,7 @@ async fn handle_hook_dispatch(
                         outcome.dirty,
                         with_out_of_roots_note(outcome.output, filtered, &filtered_roots),
                         covered,
+                        diag_files,
                     )
                 }
             } else {
@@ -3470,8 +3600,19 @@ async fn handle_hook_dispatch(
                     false,
                     "diagnostics handoff expired — no files available".to_string(),
                     0,
+                    Vec::new(),
                 )
             };
+
+        // Persist the rendered receipt to the per-session store at COMPUTE time,
+        // before the response leaves — so a `catenary diagnostics` CLI client
+        // killed after dispatch cannot lose it — and build the trailing pointer
+        // line stdout appends (misc 139 / bug 60). A bare run that diagnosed
+        // nothing still surfaces a prior store when one exists (killed-client
+        // recovery). Fail-soft: a store error yields no pointer, never a fault.
+        let store_pointer = handoff_session_id
+            .as_deref()
+            .and_then(|session_id| persist_receipt(&ctx, session_id, &output, &covered_files));
 
         emit_hook_event(
             tracing::Level::INFO,
@@ -3489,10 +3630,14 @@ async fn handle_hook_dispatch(
         // count — the scoped paths, or the drained debt set for a bare pull)
         // lets the CLI print `[no edited files]` for a genuinely empty set
         // (covered == 0, empty receipt; scoped pulls are always non-empty).
+        // `store_pointer` (misc 139) names the per-session receipt store and its
+        // covered files; the CLI prints it after the receipt/sentinel. `null`
+        // when no receipt is stored and none was recovered.
         let envelope = serde_json::json!({
             "status": if dirty { "dirty" } else { "clean" },
             "output": output,
             "covered": covered,
+            "store_pointer": store_pointer,
         });
         let mut payload = serde_json::to_vec(&envelope)?;
         payload.push(b'\n');
@@ -5031,9 +5176,16 @@ mod tests {
             None,
         ));
 
-        SessionManager::bind_at(&mcp_socket_in(dir), &ipc_socket_in(dir), logging)
-            .expect("bind")
-            .with_session(session)
+        let mut manager =
+            SessionManager::bind_at(&mcp_socket_in(dir), &ipc_socket_in(dir), logging)
+                .expect("bind")
+                .with_session(session);
+        // Isolate the diagnostics receipt store under the test's tempdir so the
+        // daemon-side write never touches the host runtime dir (misc 139).
+        if let Some(ctx) = manager.hook_ctx.as_mut() {
+            ctx.receipt_store_dir = dir.join("receipts");
+        }
+        manager
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6072,6 +6224,394 @@ mod tests {
                 "the bare form empties the bucket, so the gate releases at consume",
             );
         }
+
+        shutdown.cancel();
+    }
+
+    /// misc 139 / bug 60: a normal bare `catenary diagnostics` run persists the
+    /// full rendered receipt to the per-session store at compute time and returns
+    /// a trailing pointer naming the store plus its covered files. The stored
+    /// bytes match the receipt the response carried — a killed client loses
+    /// nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn diagnostics_persists_receipt_and_points_at_store() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let ipc_path = ipc_socket_in(dir.path());
+
+        let manager = Arc::new(bind_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        let start = serde_json::json!({
+            "method": "pre-tool/editing-start",
+            "agent_id": "",
+            "session_id": "sess-1"
+        });
+        let _ = hook_roundtrip(&ipc_path, &start).await;
+
+        let root = dir.path().to_path_buf();
+        let file_a = root.join("a.rs");
+        let file_b = root.join("b.rs");
+        std::fs::write(&file_a, "fn a() {}\n").expect("write a.rs");
+        std::fs::write(&file_b, "fn b() {}\n").expect("write b.rs");
+        {
+            let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
+            let sessions = ctx.sessions.lock().expect("lock");
+            let router = Arc::clone(&sessions.get("sess-1").expect("sess-1").router);
+            drop(sessions);
+            router
+                .session
+                .editing
+                .add_file(Some("sess-1"), "", file_a.clone());
+            router
+                .session
+                .editing
+                .add_file(Some("sess-1"), "", file_b.clone());
+        }
+
+        let prepare = serde_json::json!({
+            "method": "pre-tool/editing-stop",
+            "agent_id": "",
+            "session_id": "sess-1"
+        });
+        let _ = hook_roundtrip(&ipc_path, &prepare).await;
+
+        let consume = serde_json::json!({"method": "tool/editing-stop"});
+        let response = hook_roundtrip_full(&ipc_path, &consume).await;
+        let parsed: serde_json::Value =
+            serde_json::from_str(response.trim()).expect("valid diagnostics envelope");
+        let output = parsed["output"].as_str().unwrap_or_default();
+        assert!(
+            !output.trim().is_empty(),
+            "the covered receipt must be non-empty, got: {response}",
+        );
+
+        // The store holds the full receipt, byte-for-byte what the response
+        // carried — so a client killed after dispatch recovers it losslessly.
+        let store_path = dir
+            .path()
+            .join("receipts")
+            .join(crate::paths::diagnostics_receipt_file("sess-1"));
+        let stored = std::fs::read_to_string(&store_path).expect("receipt store written");
+        assert_eq!(
+            stored, output,
+            "the store bytes must match the receipt stdout carried",
+        );
+
+        // The pointer names the store and both covered files.
+        let pointer = parsed["store_pointer"]
+            .as_str()
+            .expect("store_pointer present on a persisted run");
+        assert!(
+            pointer.contains(&store_path.display().to_string()),
+            "the pointer names the store path: {pointer}",
+        );
+        assert!(
+            pointer.contains("covered 2 files"),
+            "the pointer counts the covered files: {pointer}",
+        );
+        assert!(
+            pointer.contains("a.rs") && pointer.contains("b.rs"),
+            "the pointer lists both covered files: {pointer}",
+        );
+
+        shutdown.cancel();
+    }
+
+    /// misc 139 / bug 60: a `catenary diagnostics` CLI client killed after
+    /// dispatch never surfaces the receipt, but the daemon wrote it to the store
+    /// at compute time (before the response leaves). The next bare run that finds
+    /// nothing edited still names the store and its covered files, so the agent
+    /// recovers the witness it lost.
+    ///
+    /// The daemon-side write precedes the response, so a completed run leaves the
+    /// same store whether or not the client read its output; the test models the
+    /// kill by discarding run 1's output and recovering it on run 2.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn killed_client_receipt_survives_and_next_bare_run_points_at_it() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let ipc_path = ipc_socket_in(dir.path());
+
+        let manager = Arc::new(bind_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        // ── Run 1: the daemon completes the run; its client is "killed" ──
+        let start = serde_json::json!({
+            "method": "pre-tool/editing-start",
+            "agent_id": "",
+            "session_id": "sess-1"
+        });
+        let _ = hook_roundtrip(&ipc_path, &start).await;
+
+        let root = dir.path().to_path_buf();
+        let file_a = root.join("a.rs");
+        let file_b = root.join("b.rs");
+        std::fs::write(&file_a, "fn a() {}\n").expect("write a.rs");
+        std::fs::write(&file_b, "fn b() {}\n").expect("write b.rs");
+        {
+            let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
+            let sessions = ctx.sessions.lock().expect("lock");
+            let router = Arc::clone(&sessions.get("sess-1").expect("sess-1").router);
+            drop(sessions);
+            router
+                .session
+                .editing
+                .add_file(Some("sess-1"), "", file_a.clone());
+            router
+                .session
+                .editing
+                .add_file(Some("sess-1"), "", file_b.clone());
+        }
+
+        let prepare = serde_json::json!({
+            "method": "pre-tool/editing-stop",
+            "agent_id": "",
+            "session_id": "sess-1"
+        });
+        let _ = hook_roundtrip(&ipc_path, &prepare).await;
+        // Run 1 completes daemon-side. Its output is DISCARDED here — the agent
+        // never saw it (the killed-client witness gap).
+        let _ = hook_roundtrip_full(
+            &ipc_path,
+            &serde_json::json!({"method": "tool/editing-stop"}),
+        )
+        .await;
+
+        let store_path = dir
+            .path()
+            .join("receipts")
+            .join(crate::paths::diagnostics_receipt_file("sess-1"));
+        let stored = std::fs::read_to_string(&store_path)
+            .expect("the killed run's receipt survives in the store");
+        assert!(
+            !stored.trim().is_empty(),
+            "the store holds the full receipt of the killed run",
+        );
+
+        // ── Run 2: a fresh bare run finds nothing edited ────────────────
+        let prepare2 = serde_json::json!({
+            "method": "pre-tool/editing-stop",
+            "agent_id": "",
+            "session_id": "sess-1"
+        });
+        let _ = hook_roundtrip(&ipc_path, &prepare2).await;
+        let response2 = hook_roundtrip_full(
+            &ipc_path,
+            &serde_json::json!({"method": "tool/editing-stop"}),
+        )
+        .await;
+        let parsed2: serde_json::Value =
+            serde_json::from_str(response2.trim()).expect("valid diagnostics envelope");
+        // Nothing diagnosed → covered 0, empty receipt (the CLI's `[no edited
+        // files]` case).
+        assert_eq!(
+            parsed2["covered"].as_u64(),
+            Some(0),
+            "run 2 diagnosed nothing, got: {response2}",
+        );
+        assert!(
+            parsed2["output"]
+                .as_str()
+                .unwrap_or_default()
+                .trim()
+                .is_empty(),
+            "run 2 renders no receipt of its own, got: {response2}",
+        );
+        // But the recovery pointer names the prior store and run 1's covered set.
+        let pointer2 = parsed2["store_pointer"]
+            .as_str()
+            .expect("recovery pointer present when a prior store exists");
+        assert!(
+            pointer2.contains(&store_path.display().to_string()),
+            "the recovery pointer names the store: {pointer2}",
+        );
+        assert!(
+            pointer2.contains("a.rs") && pointer2.contains("b.rs"),
+            "the recovery pointer lists run 1's covered files: {pointer2}",
+        );
+
+        shutdown.cancel();
+    }
+
+    /// misc 139: a scoped `catenary diagnostics <path>` updates the store with the
+    /// scoped set — the pointer's covered list is exactly the named files, not the
+    /// whole prior debt.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scoped_diagnostics_updates_store_with_scoped_set() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let ipc_path = ipc_socket_in(dir.path());
+
+        let manager = Arc::new(bind_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        let start = serde_json::json!({
+            "method": "pre-tool/editing-start",
+            "agent_id": "",
+            "session_id": "sess-1"
+        });
+        let _ = hook_roundtrip(&ipc_path, &start).await;
+
+        let root = dir.path().to_path_buf();
+        let file_a = root.join("a.rs");
+        let file_b = root.join("b.rs");
+        std::fs::write(&file_a, "fn a() {}\n").expect("write a.rs");
+        std::fs::write(&file_b, "fn b() {}\n").expect("write b.rs");
+        {
+            let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
+            let sessions = ctx.sessions.lock().expect("lock");
+            let router = Arc::clone(&sessions.get("sess-1").expect("sess-1").router);
+            drop(sessions);
+            router
+                .session
+                .editing
+                .add_file(Some("sess-1"), "", file_a.clone());
+            router
+                .session
+                .editing
+                .add_file(Some("sess-1"), "", file_b.clone());
+        }
+
+        let prepare = serde_json::json!({
+            "method": "pre-tool/editing-stop",
+            "agent_id": "",
+            "session_id": "sess-1"
+        });
+        let _ = hook_roundtrip(&ipc_path, &prepare).await;
+
+        // Scoped consume: diagnose ONLY a.rs.
+        let consume = serde_json::json!({
+            "method": "tool/editing-stop",
+            "files": [file_a.to_string_lossy()],
+        });
+        let response = hook_roundtrip_full(&ipc_path, &consume).await;
+        let parsed: serde_json::Value =
+            serde_json::from_str(response.trim()).expect("valid diagnostics envelope");
+
+        let pointer = parsed["store_pointer"]
+            .as_str()
+            .expect("store_pointer present on a scoped run");
+        assert!(
+            pointer.contains("covered 1 file:"),
+            "the scoped pointer covers exactly the named file: {pointer}",
+        );
+        assert!(
+            pointer.contains("a.rs") && !pointer.contains("b.rs"),
+            "the scoped pointer names a.rs and not b.rs: {pointer}",
+        );
+
+        // The store matches the scoped receipt and never mentions b.rs.
+        let store_path = dir
+            .path()
+            .join("receipts")
+            .join(crate::paths::diagnostics_receipt_file("sess-1"));
+        let stored = std::fs::read_to_string(&store_path).expect("receipt store written");
+        assert_eq!(
+            stored,
+            parsed["output"].as_str().unwrap_or_default(),
+            "the store matches the scoped receipt",
+        );
+        assert!(
+            !stored.contains("b.rs"),
+            "the scoped store covers only a.rs: {stored}",
+        );
+
+        shutdown.cancel();
+    }
+
+    /// misc 139: two sessions' receipt stores never cross — each is named by its
+    /// own `session_id` and holds only its own receipt.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_sessions_receipt_stores_never_cross() {
+        // Drive one session through a full bare run over a single distinctive
+        // file (declared first so it precedes the test's statements).
+        async fn run_session(
+            ipc_path: &Path,
+            manager: &SessionManager,
+            session_id: &str,
+            file: &Path,
+        ) {
+            let start = serde_json::json!({
+                "method": "pre-tool/editing-start",
+                "agent_id": "",
+                "session_id": session_id,
+            });
+            let _ = hook_roundtrip(ipc_path, &start).await;
+            {
+                let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
+                let sessions = ctx.sessions.lock().expect("lock");
+                let router = Arc::clone(&sessions.get(session_id).expect("session").router);
+                drop(sessions);
+                router
+                    .session
+                    .editing
+                    .add_file(Some(session_id), "", file.to_path_buf());
+            }
+            let prepare = serde_json::json!({
+                "method": "pre-tool/editing-stop",
+                "agent_id": "",
+                "session_id": session_id,
+            });
+            let _ = hook_roundtrip(ipc_path, &prepare).await;
+            let _ = hook_roundtrip_full(
+                ipc_path,
+                &serde_json::json!({"method": "tool/editing-stop"}),
+            )
+            .await;
+        }
+
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let ipc_path = ipc_socket_in(dir.path());
+
+        let manager = Arc::new(bind_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        let root = dir.path().to_path_buf();
+        let file_one = root.join("sess_one_file.rs");
+        let file_two = root.join("sess_two_file.rs");
+        std::fs::write(&file_one, "fn one() {}\n").expect("write file one");
+        std::fs::write(&file_two, "fn two() {}\n").expect("write file two");
+
+        run_session(&ipc_path, &manager, "sess-1", &file_one).await;
+        run_session(&ipc_path, &manager, "sess-2", &file_two).await;
+
+        let store_one = dir
+            .path()
+            .join("receipts")
+            .join(crate::paths::diagnostics_receipt_file("sess-1"));
+        let store_two = dir
+            .path()
+            .join("receipts")
+            .join(crate::paths::diagnostics_receipt_file("sess-2"));
+        assert_ne!(
+            store_one, store_two,
+            "the two sessions map to distinct stores"
+        );
+
+        let one = std::fs::read_to_string(&store_one).expect("sess-1 store written");
+        let two = std::fs::read_to_string(&store_two).expect("sess-2 store written");
+        assert!(
+            one.contains("sess_one_file.rs") && !one.contains("sess_two_file.rs"),
+            "sess-1's store holds only its own receipt: {one}",
+        );
+        assert!(
+            two.contains("sess_two_file.rs") && !two.contains("sess_one_file.rs"),
+            "sess-2's store holds only its own receipt: {two}",
+        );
 
         shutdown.cancel();
     }
