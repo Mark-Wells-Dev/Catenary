@@ -38,7 +38,7 @@ Navigate through Catenary
   plain pass over the stream — complete matches, no enrichment — so matches
   come back with no source coverage.
 
-Flag synopses (long forms; each has a short `-x` alias too)
+Flag synopses (long forms)
   catenary grep PATTERN [PATH…]
     --ignore-case --case-sensitive --word-regexp --fixed-strings
     --invert-match --files-with-matches --count

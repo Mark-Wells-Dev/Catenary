@@ -80,7 +80,7 @@ Navigate through Catenary
 /// the PATH positional, `--type` as a ripgrep file-type) carry a gloss. Each
 /// command closes with its `--help` breadcrumb for point-of-use depth.
 const FLAG_SYNOPSES: &str = "\
-Flag synopses (long forms; each has a short `-x` alias too)
+Flag synopses (long forms)
   catenary grep PATTERN [PATH…]
     --ignore-case --case-sensitive --word-regexp --fixed-strings
     --invert-match --files-with-matches --count

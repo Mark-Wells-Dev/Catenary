@@ -62,6 +62,15 @@ upgrading.
 
 ### Added
 
+- **`catenary grep` accepts the always-on ripgrep reflex flags as hidden
+  no-ops.** `-n`/`--line-number` and `-H`/`--with-filename` now parse and do
+  nothing — line numbers (`path:N`) and filenames are unconditional in the
+  output, so the `grep`/ripgrep muscle-memory reach succeeds instead of
+  erroring. `-c` joins as a hidden ripgrep-letter short for `--count`.
+  Suppressor spellings we don't honor (`--no-line-number`, `--no-filename`)
+  stay an honest unknown-flag error. Every existing short (`-i -s -w -F -v -l
+  -A -B -C -g -t`) becomes a hidden `short_alias`: it keeps working, but
+  `catenary grep --help` and the teaching surface now show long forms only.
 - **JSON Schema for the config files.** Catenary now ships two
   `schemars`-generated JSON Schemas under `schemas/` — `config.json` for the user
   config (`~/.config/catenary/config.toml`) and `catenary-project.json` for a

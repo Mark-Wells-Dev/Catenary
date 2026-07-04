@@ -61,50 +61,50 @@ enum Command {
         scope: Vec<String>,
 
         /// Case-insensitive matching (overrides the smart-case default).
-        #[arg(short = 'i', long = "ignore-case")]
+        #[arg(short_alias = 'i', long = "ignore-case")]
         ignore_case: bool,
 
         /// Case-sensitive matching (overrides the smart-case default).
-        #[arg(short = 's', long = "case-sensitive")]
+        #[arg(short_alias = 's', long = "case-sensitive")]
         case_sensitive: bool,
 
         /// Only match whole words (word-boundary anchored).
-        #[arg(short = 'w', long = "word-regexp")]
+        #[arg(short_alias = 'w', long = "word-regexp")]
         word: bool,
 
         /// Treat the pattern as a literal string, not a regex.
-        #[arg(short = 'F', long = "fixed-strings")]
+        #[arg(short_alias = 'F', long = "fixed-strings")]
         fixed_strings: bool,
 
         /// Select non-matching lines (invert the match).
-        #[arg(short = 'v', long = "invert-match")]
+        #[arg(short_alias = 'v', long = "invert-match")]
         invert_match: bool,
 
         /// Print only the paths of files containing a match (takes precedence
         /// over results; `--count` still wins over this).
-        #[arg(short = 'l', long = "files-with-matches")]
+        #[arg(short_alias = 'l', long = "files-with-matches")]
         files_with_matches: bool,
 
         /// Show NUM lines of context after each match.
-        #[arg(short = 'A', long = "after-context", value_name = "NUM")]
+        #[arg(short_alias = 'A', long = "after-context", value_name = "NUM")]
         after_context: Option<usize>,
 
         /// Show NUM lines of context before each match.
-        #[arg(short = 'B', long = "before-context", value_name = "NUM")]
+        #[arg(short_alias = 'B', long = "before-context", value_name = "NUM")]
         before_context: Option<usize>,
 
         /// Show NUM lines of context before AND after each match.
-        #[arg(short = 'C', long = "context", value_name = "NUM")]
+        #[arg(short_alias = 'C', long = "context", value_name = "NUM")]
         context: Option<usize>,
 
         /// Include only files matching this glob (repeatable; a leading `!`
         /// excludes, ripgrep semantics).
-        #[arg(short = 'g', long = "glob", value_name = "GLOB")]
+        #[arg(short_alias = 'g', long = "glob", value_name = "GLOB")]
         glob: Vec<String>,
 
         /// Include only files of this ripgrep type, e.g. `rust`, `md`
         /// (repeatable).
-        #[arg(short = 't', long = "type", value_name = "TYPE")]
+        #[arg(short_alias = 't', long = "type", value_name = "TYPE")]
         type_filter: Vec<String>,
 
         /// Exclude matches by glob pattern (e.g., tests/**).
@@ -112,7 +112,7 @@ enum Command {
         exclude: Option<String>,
 
         /// Report the match count ("N matches in M files") instead of results.
-        #[arg(long)]
+        #[arg(short_alias = 'c', long)]
         count: bool,
 
         /// Include files ignored by .gitignore.
@@ -122,6 +122,18 @@ enum Command {
         /// Include hidden files and directories.
         #[arg(long)]
         include_hidden: bool,
+
+        /// No-op: line numbers are unconditional in the output (`path:N`
+        /// prefixes every result). Accepted for ripgrep/grep muscle-memory
+        /// parity; hidden because it changes nothing.
+        #[arg(short = 'n', long = "line-number", hide = true)]
+        line_number: bool,
+
+        /// No-op: filenames are always shown in the output. Accepted for
+        /// ripgrep/grep muscle-memory parity; hidden because it changes
+        /// nothing.
+        #[arg(short = 'H', long = "with-filename", hide = true)]
+        with_filename: bool,
     },
 
     /// Browse the filesystem: file outlines, directory listings.
@@ -545,6 +557,10 @@ fn main() -> Result<()> {
             count,
             include_gitignored,
             include_hidden,
+            // Hidden ripgrep-parity no-ops: line numbers and filenames are
+            // unconditional in the output, so these accept-and-ignore.
+            line_number: _,
+            with_filename: _,
         }) => {
             let paths = to_literal_paths(scope);
             // `-C N` sets both sides; `-A`/`-B` override their side (ripgrep
@@ -2452,6 +2468,8 @@ mod tests {
             count,
             include_gitignored,
             include_hidden,
+            line_number,
+            with_filename,
         }) = args.command
         else {
             unreachable!("expected Grep command");
@@ -2462,6 +2480,9 @@ mod tests {
         assert!(!count);
         assert!(!include_gitignored);
         assert!(!include_hidden);
+        // Hidden ripgrep-parity no-ops default off.
+        assert!(!line_number);
+        assert!(!with_filename);
         // Ripgrep-parity flags default off / unset.
         assert!(!ignore_case);
         assert!(!case_sensitive);
@@ -2639,6 +2660,114 @@ mod tests {
         use clap::Parser;
         let result = Args::try_parse_from(["catenary", "grep"]);
         assert!(result.is_err(), "grep without pattern should fail");
+    }
+
+    #[test]
+    fn test_cli_grep_line_number_is_accepted_noop() {
+        use clap::Parser;
+        // misc 134: `-n`/`--line-number` parse (ripgrep muscle memory) but do
+        // nothing — line numbers are unconditional in the output (`path:N`).
+        for spelling in ["-n", "--line-number"] {
+            let args = Args::try_parse_from(["catenary", "grep", "foo", spelling])
+                .expect("grep -n/--line-number should parse");
+            let Some(Command::Grep { line_number, .. }) = args.command else {
+                unreachable!("expected Grep command");
+            };
+            assert!(line_number, "{spelling} sets the no-op flag");
+        }
+    }
+
+    #[test]
+    fn test_cli_grep_with_filename_is_accepted_noop() {
+        use clap::Parser;
+        // misc 134: `-H`/`--with-filename` parse but do nothing — filenames are
+        // always shown in the output.
+        for spelling in ["-H", "--with-filename"] {
+            let args = Args::try_parse_from(["catenary", "grep", "foo", spelling])
+                .expect("grep -H/--with-filename should parse");
+            let Some(Command::Grep { with_filename, .. }) = args.command else {
+                unreachable!("expected Grep command");
+            };
+            assert!(with_filename, "{spelling} sets the no-op flag");
+        }
+    }
+
+    #[test]
+    fn test_cli_grep_count_short_alias() {
+        use clap::Parser;
+        // misc 134: `-c` is a hidden ripgrep-letter short for `--count`.
+        let args = Args::try_parse_from(["catenary", "grep", "foo", "-c"])
+            .expect("grep -c should parse as --count");
+        let Some(Command::Grep { count, .. }) = args.command else {
+            unreachable!("expected Grep command");
+        };
+        assert!(count, "-c tallies like --count");
+    }
+
+    #[test]
+    fn test_cli_grep_suppressor_flags_still_rejected() {
+        use clap::Parser;
+        // misc 134: the no-ops accept only the affirmative spelling. A
+        // suppressor whose requested behavior we don't honor stays an honest
+        // error rather than lying by silently accepting it.
+        for flag in ["--no-line-number", "--no-filename"] {
+            assert!(
+                Args::try_parse_from(["catenary", "grep", "foo", flag]).is_err(),
+                "{flag} must not parse"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn test_cli_grep_help_shows_only_long_forms() {
+        // misc 134 (maintainer ruling): only long forms are agent-facing. Every
+        // grep short is a hidden `short_alias`, so `catenary grep --help` renders
+        // long forms only. clap prints `-x, --long` when a short is visible, so
+        // the absence of every `-x, --long` combined form proves no short shows.
+        use clap::CommandFactory;
+        let app = Args::command();
+        let mut grep = app
+            .find_subcommand("grep")
+            .expect("grep subcommand present")
+            .clone();
+        let help = grep.render_long_help().to_string();
+        for combined in [
+            "-i, --ignore-case",
+            "-s, --case-sensitive",
+            "-w, --word-regexp",
+            "-F, --fixed-strings",
+            "-v, --invert-match",
+            "-l, --files-with-matches",
+            "-A, --after-context",
+            "-B, --before-context",
+            "-C, --context",
+            "-g, --glob",
+            "-t, --type",
+            "-c, --count",
+        ] {
+            assert!(
+                !help.contains(combined),
+                "grep --help must not show short form `{combined}`: {help}"
+            );
+        }
+        // The long forms are still documented (help still teaches the surface).
+        for long in [
+            "--ignore-case",
+            "--count",
+            "--after-context",
+            "--glob",
+            "--type",
+        ] {
+            assert!(help.contains(long), "long form {long} present: {help}");
+        }
+        // The hidden ripgrep-parity no-ops appear nowhere in help.
+        for hidden in ["--line-number", "--with-filename"] {
+            assert!(
+                !help.contains(hidden),
+                "hidden no-op {hidden} must not surface in help: {help}"
+            );
+        }
     }
 
     // ── CLI glob subcommand tests ──────────────────────────────────
