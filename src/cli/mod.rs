@@ -6,6 +6,7 @@
 pub mod command_filter;
 pub mod commands;
 pub mod config_template;
+pub mod context_files;
 pub mod doctor;
 pub mod hooks;
 pub mod install;

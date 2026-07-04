@@ -247,6 +247,100 @@ pub fn fallback_body() -> String {
     s
 }
 
+// ── Runtime context-file delivery (teaching-surface ticket 12) ───────────────
+
+/// Opening marker of the generation-stamp line every runtime-regenerated
+/// context/rules file carries.
+///
+/// Both context-file hosts re-read their file per prompt/turn, so `catenary hook`
+/// rewrites the *installed* file to the live workspace-invariant surface — which,
+/// by design, diverges from the shipped cold-bootstrap content ([`fallback_body`]).
+/// This HTML-comment marker lets `catenary doctor` recognize such a runtime-updated
+/// file as valid rather than "stale", while staying invisible in the markdown both
+/// hosts render. The stamp carries the generating CLI's build version (never a
+/// timestamp) so identical config yields identical bytes and the hook's hash gate
+/// stays a true no-op.
+const CONTEXT_STAMP_MARKER: &str = "<!-- catenary:generated";
+
+/// The YAML frontmatter block that opens the Antigravity rules file, pinning
+/// `trigger: always_on` so the host loads it unconditionally every turn
+/// (teaching-surface ticket 10). The runtime rewrite preserves it and places the
+/// generation stamp immediately after.
+const ANTIGRAVITY_RULES_FRONTMATTER: &str = "---\ntrigger: always_on\n---\n\n";
+
+/// The generation-stamp line for the current build.
+///
+/// Version-pinned via `CATENARY_VERSION` — never a timestamp — so two renders from
+/// one binary are byte-identical and the hook's hash gate is a true no-op.
+fn context_stamp_line() -> String {
+    format!("{CONTEXT_STAMP_MARKER} {} -->", env!("CATENARY_VERSION"))
+}
+
+/// Whether `content` is a valid runtime-regenerated context/rules file — i.e. its
+/// body opens with the generation stamp.
+///
+/// `catenary doctor` accepts such a file as up to date: the runtime rewrite is by
+/// design, so it will not byte-match the shipped bootstrap. The Antigravity
+/// frontmatter block is stripped first so the stamp — which sits immediately after
+/// it — is recognized for both hosts (Gemini's file opens with the stamp directly).
+#[must_use]
+pub fn is_runtime_stamped(content: &str) -> bool {
+    content
+        .strip_prefix(ANTIGRAVITY_RULES_FRONTMATTER)
+        .unwrap_or(content)
+        .starts_with(CONTEXT_STAMP_MARKER)
+}
+
+/// The workspace-invariant live teaching surface written into the runtime context
+/// files.
+///
+/// The user-global surface only: the header, the live commands surface resolved
+/// from user config (allow / pipeline / deny, forms, script hosts, write-model
+/// line — today's live Tier 1 **minus** the per-session cwd build tool and roots),
+/// the invariants, and the flag synopses. One context file serves every concurrent
+/// session of a host, so it must carry no per-session data; unlike [`payload_body`]
+/// it therefore resolves the *user-global* commands
+/// ([`crate::config::Config::load`], cwd-invariant) and renders with an empty
+/// build-tool set. The daemon-staleness note is prepended on a known version skew
+/// under the same condition as [`emitted_payload`] — a version comparison, itself
+/// cwd-invariant. A config-load failure degrades to an empty surface rather than
+/// propagating, so a hook never breaks the host's flow.
+#[must_use]
+pub fn context_file_body() -> String {
+    let resolved = crate::config::Config::load()
+        .ok()
+        .and_then(|c| c.resolved_commands);
+    with_staleness_note(
+        crate::cli::version::daemon_is_stale(),
+        render(resolved.as_ref(), &[]),
+    )
+}
+
+/// The full Gemini context-file content written at hook time.
+///
+/// The generation stamp, a blank line, then [`context_file_body`], closed with the
+/// trailing newline files carry. Gemini re-reads the file every prompt, so this
+/// rides every request once written.
+#[must_use]
+pub fn gemini_context_file() -> String {
+    format!("{}\n\n{}\n", context_stamp_line(), context_file_body())
+}
+
+/// The full Antigravity rules-file content written at hook time.
+///
+/// The `trigger: always_on` frontmatter (so the host loads it every turn), then
+/// the generation stamp, then [`context_file_body`]. Same version-stamped,
+/// cwd-invariant construction as [`gemini_context_file`]; the rules file re-injects
+/// per conversation turn.
+#[must_use]
+pub fn antigravity_rules_file() -> String {
+    format!(
+        "{ANTIGRAVITY_RULES_FRONTMATTER}{}\n\n{}\n",
+        context_stamp_line(),
+        context_file_body(),
+    )
+}
+
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
@@ -657,6 +751,132 @@ mod tests {
             format!("{}\n", fallback_body()),
             "rules/catenary.md body is stale — regenerate it from \
              `catenary::cli::teaching::fallback_body()` (preserve the frontmatter block)"
+        );
+    }
+
+    // ── Runtime context-file delivery (teaching-surface ticket 12) ──────
+
+    #[test]
+    fn context_body_is_workspace_invariant() {
+        // One context file serves every concurrent session, so it must exclude
+        // per-session (cwd-derived) data. The live payload interleaves the cwd
+        // build tool into Tier 1 — two sessions whose cwds resolve different
+        // build tools get different payloads — but the context render passes an
+        // empty build set, so it is byte-identical regardless of cwd.
+        let surface = fixture_surface();
+        let session_a = render(Some(&surface), &["make".to_string()]);
+        let session_b = render(Some(&surface), &["bazel".to_string()]);
+        assert_ne!(
+            session_a, session_b,
+            "live payloads differ by the cwd build tool"
+        );
+
+        // The context render (empty build set) is the workspace-invariant body:
+        // no cwd input, so identical for every session.
+        let ctx = render(Some(&surface), &[]);
+        assert_eq!(ctx, render(Some(&surface), &[]));
+        assert!(
+            !ctx.contains("Build tool:"),
+            "context body must omit the per-session cwd build tool: {ctx}"
+        );
+        // It still carries the user-global surface and the static tiers.
+        assert!(
+            ctx.contains("distinctivecmd"),
+            "context body carries the user-global allow surface: {ctx}"
+        );
+        assert!(
+            ctx.contains(SHELL_SURFACE_LABEL),
+            "context body carries the Tier-1 label: {ctx}"
+        );
+        assert!(
+            ctx.contains("The edit→diagnostics loop"),
+            "context body carries the invariants: {ctx}"
+        );
+    }
+
+    #[test]
+    fn gemini_context_file_is_stamped_and_doctor_accepted() {
+        let file = gemini_context_file();
+        assert!(
+            file.starts_with(CONTEXT_STAMP_MARKER),
+            "gemini file opens with the generation stamp: {file}"
+        );
+        assert!(
+            is_runtime_stamped(&file),
+            "doctor must accept the runtime-stamped gemini file"
+        );
+        assert!(
+            file.ends_with('\n'),
+            "file carries a trailing newline: {file}"
+        );
+        assert!(
+            file.contains(HEADER),
+            "gemini file carries the header: {file}"
+        );
+        assert!(
+            file.contains("The edit→diagnostics loop"),
+            "gemini file carries the invariants: {file}"
+        );
+    }
+
+    #[test]
+    fn antigravity_rules_file_keeps_frontmatter_then_stamp() {
+        let file = antigravity_rules_file();
+        assert!(
+            file.starts_with(ANTIGRAVITY_RULES_FRONTMATTER),
+            "rules file opens with the always_on frontmatter: {file}"
+        );
+        let body = file
+            .strip_prefix(ANTIGRAVITY_RULES_FRONTMATTER)
+            .expect("frontmatter present");
+        assert!(
+            body.starts_with(CONTEXT_STAMP_MARKER),
+            "the stamp follows the frontmatter: {body}"
+        );
+        assert!(
+            file.starts_with("---\ntrigger: always_on"),
+            "frontmatter stays the very first bytes for the host parser: {file}"
+        );
+        assert!(
+            is_runtime_stamped(&file),
+            "doctor must accept the runtime-stamped rules file"
+        );
+        assert!(
+            file.ends_with('\n'),
+            "file carries a trailing newline: {file}"
+        );
+    }
+
+    #[test]
+    fn is_runtime_stamped_rejects_the_shipped_bootstrap() {
+        // The shipped cold-bootstrap content bears no stamp — doctor must not
+        // mistake it for a runtime-updated file (it is the fallback, not the
+        // live surface).
+        assert!(
+            !is_runtime_stamped(&format!("{}\n", fallback_body())),
+            "shipped gemini bootstrap is not runtime-stamped"
+        );
+        let shipped_agy = format!("{ANTIGRAVITY_RULES_FRONTMATTER}{}\n", fallback_body());
+        assert!(
+            !is_runtime_stamped(&shipped_agy),
+            "shipped antigravity bootstrap is not runtime-stamped"
+        );
+    }
+
+    #[test]
+    fn runtime_stamp_is_version_pinned_not_time() {
+        // The hash gate depends on identical config → identical bytes; a
+        // timestamp would defeat it. Two renders must match, and the stamp
+        // carries the build version.
+        assert_eq!(
+            context_stamp_line(),
+            context_stamp_line(),
+            "the stamp is deterministic (no timestamp)"
+        );
+        assert!(
+            context_stamp_line().contains(env!("CATENARY_VERSION")),
+            "the stamp names the build version: {}",
+            context_stamp_line()
         );
     }
 

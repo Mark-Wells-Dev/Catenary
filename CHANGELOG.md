@@ -255,6 +255,26 @@ upgrading.
   signal). The two now form a hybrid mirroring Gemini's: the rules file carries the
   static tiers per turn, the `PreInvocation` `userMessage` carries the live surface
   once.
+- **Gemini and Antigravity context files now carry the live surface.** Both hosts
+  re-read their context file every prompt/turn, so Catenary rewrites its own
+  installed artifact at hook time — the file becomes the compaction-proof delivery
+  channel, not just a static bootstrap. A Gemini `SessionStart` regenerates the
+  extension's [gemini-context.md](gemini-context.md); an Antigravity
+  `PreInvocation` regenerates the plugin's
+  [rules/catenary.md](plugins/catenary-antigravity/rules/catenary.md). Each
+  rewrite carries the workspace-invariant live
+  surface (the header, the user-global commands surface —
+  allow/pipeline/deny/forms/script-hosts + write-model line — the invariants, and
+  the flag synopses; per-session data like the cwd build tool stays on the
+  injection channels). Writes are hash-gated and atomic (render → compare →
+  temp-file + rename only on a change), so the per-model-call path is a cheap
+  no-op, and fail-open (any error is swallowed so the hook's injection is never
+  blocked). A link-install guard skips the rewrite when the install resolves into a
+  git worktree (the dev-repo symlink case), so a development checkout is never
+  dirtied. The shipped files stay the cold bootstrap; the runtime-rewritten copy
+  carries an invisible generation stamp so `catenary doctor` accepts it as current.
+  The `SessionStart` `additionalContext` and `PreInvocation` `userMessage`
+  injection channels are unchanged.
 - **`catenary glob` outlines show types and callables only.** The file and
   directory outline is now a map, not a mirror: it recurses into containers
   (modules/namespaces/packages and classes/interfaces/enums/structs/impls) and

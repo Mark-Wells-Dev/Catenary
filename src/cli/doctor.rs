@@ -1973,7 +1973,11 @@ fn check_gemini_instructions(out: &mut Output, show_diff: bool) {
             ));
         }
         Ok(content) => {
-            if is_stale && show_diff {
+            // Teaching-surface 12: the installed context file is rewritten per
+            // prompt to the live surface, so it diverges from the shipped
+            // bootstrap by design. Only diff a non-stamped, version-stale file
+            // against the bootstrap — a runtime-stamped file is current, not drift.
+            if is_stale && show_diff && !crate::cli::teaching::is_runtime_stamped(&content) {
                 show_unified_diff(
                     out,
                     &content,
@@ -2043,6 +2047,14 @@ fn check_antigravity_instructions(out: &mut Output, show_diff: bool, project_roo
             let _ = out.writeln(format_args!(
                 "  {label}{}",
                 out.colors.green("✓ rules up to date"),
+            ));
+        } else if crate::cli::teaching::is_runtime_stamped(&content) {
+            // Teaching-surface 12: the installed rules file is rewritten per turn
+            // to the live surface, so it diverges from the shipped bootstrap by
+            // design. A valid runtime generation stamp marks it as current.
+            let _ = out.writeln(format_args!(
+                "  {label}{}",
+                out.colors.green("✓ rules up to date (runtime-updated)"),
             ));
         } else {
             let _ = out.writeln(format_args!("  {label}{}", out.colors.red("✗ stale rules")));
@@ -2589,6 +2601,53 @@ mod tests {
         assert!(
             !ANTIGRAVITY_RULES_EXPECTED.trim().is_empty(),
             "embedded antigravity rules should not be empty",
+        );
+    }
+
+    // ── runtime-updated instruction files (teaching-surface 12) ─────────
+
+    #[test]
+    fn antigravity_instructions_accepts_runtime_stamped_rules() {
+        // The installed rules file is rewritten per turn to the live surface, so
+        // it no longer byte-matches the shipped bootstrap. A valid runtime
+        // generation stamp must read as current, not "stale rules".
+        let root = tempfile::tempdir().expect("tempdir");
+        let plugin_dir = root.path().join(".agents/plugins/catenary/rules");
+        fs::create_dir_all(&plugin_dir).expect("create workspace plugin dir");
+        fs::write(
+            plugin_dir.join("catenary.md"),
+            crate::cli::teaching::antigravity_rules_file(),
+        )
+        .expect("write runtime-stamped rules");
+
+        let mut out = Output::buffer(80);
+        check_antigravity_instructions(&mut out, false, root.path());
+        let text = out.into_string();
+        assert!(
+            text.contains("runtime-updated"),
+            "a runtime-stamped rules file must read as current, got: {text}",
+        );
+        assert!(
+            !text.contains("stale rules"),
+            "a runtime-stamped rules file must not read as stale, got: {text}",
+        );
+    }
+
+    #[test]
+    fn antigravity_instructions_flags_unstamped_divergent_rules() {
+        // A file that neither byte-matches the bootstrap nor carries a stamp is
+        // genuine drift and must still be flagged.
+        let root = tempfile::tempdir().expect("tempdir");
+        let plugin_dir = root.path().join(".agents/plugins/catenary/rules");
+        fs::create_dir_all(&plugin_dir).expect("create workspace plugin dir");
+        fs::write(plugin_dir.join("catenary.md"), "handwritten drift\n").expect("write drift");
+
+        let mut out = Output::buffer(80);
+        check_antigravity_instructions(&mut out, false, root.path());
+        let text = out.into_string();
+        assert!(
+            text.contains("stale rules"),
+            "unstamped divergent rules must be flagged stale, got: {text}",
         );
     }
 

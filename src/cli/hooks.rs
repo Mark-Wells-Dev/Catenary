@@ -456,6 +456,14 @@ pub fn run_session_start(format: HostFormat) {
         return;
     }
 
+    // Teaching-surface 12: Gemini's extension context file is re-read per prompt,
+    // so a `SessionStart` firing means "Gemini is active" — regenerate the
+    // installed context file to the live workspace-invariant surface. Fail-open
+    // and hash-gated (see `context_files`); it never blocks the injection below.
+    if matches!(format, HostFormat::Gemini) {
+        crate::cli::context_files::regenerate_gemini_context();
+    }
+
     let mut builder = SystemMessageBuilder::new();
 
     // Config validation — runs before IPC, no session needed.
@@ -551,6 +559,14 @@ pub fn run_pre_invocation(format: HostFormat) {
         print!("{}", empty_pre_invocation());
         return;
     }
+
+    // Teaching-surface 12: the Antigravity rules file is re-injected per turn, so
+    // a `PreInvocation` firing means "Antigravity is active" — regenerate the
+    // installed rules file to the live workspace-invariant surface. Hash-gated so
+    // this per-model-call path is render + read + compare; fail-open so it never
+    // blocks the first-sighting injection below (see `context_files`).
+    crate::cli::context_files::regenerate_antigravity_rules();
+
     let Ok(stdin_data) = std::io::read_to_string(std::io::stdin()) else {
         print!("{}", empty_pre_invocation());
         return;
