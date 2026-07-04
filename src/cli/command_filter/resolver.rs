@@ -202,6 +202,11 @@ struct State {
     /// `perl`/`awk`/`sed`'s program-file / bare form relaxes to the
     /// unbounded-interpreter executor boundary instead of the audit denial.
     script_hosts: ScriptHosts,
+    /// Directories an earlier `mkdir` in this command line is set to create
+    /// (misc 138): a `cd` into one is reachable at run time even when the
+    /// filesystem has not caught up at resolve time (`mkdir sub; cd sub`), so
+    /// it need not fail toward poison.
+    created_dirs: BTreeSet<PathBuf>,
 }
 
 impl State {
@@ -213,6 +218,7 @@ impl State {
             barrier: false,
             toolset: WriteToolset::unrestricted(),
             script_hosts: ScriptHosts::default(),
+            created_dirs: BTreeSet::new(),
         }
     }
 }
@@ -226,6 +232,12 @@ struct SegCtx {
     /// The segment is the only stage of its pipeline. Multi-stage segments
     /// run in subshells: their assignments and `cd`s never escape.
     sole_stage: bool,
+    /// This segment's pipeline is `&&`-terminated: a `cd` here that fails at
+    /// run time short-circuits everything after it, so recording the intended
+    /// directory stays honest (phantom debt, never written). Without the guard
+    /// (`;`/`||`/end) a failing `cd` leaves execution in the *old* cwd, so an
+    /// unreachable target must fail toward poison instead (misc 138, bug 63).
+    and_guarded: bool,
 }
 
 /// Walk a script's pipelines in document order, resolving every segment and
@@ -238,10 +250,12 @@ fn resolve_into(
     let mut conditional = false;
     for pipeline in &script.pipelines {
         let sole_stage = pipeline.commands.len() == 1;
+        let and_guarded = matches!(pipeline.terminator, Some(ListOp::And));
         for command in &pipeline.commands {
             let ctx = SegCtx {
                 conditional,
                 sole_stage,
+                and_guarded,
             };
             match resolve_segment(command, state, ctx) {
                 SegmentClass::Recorded(paths) => writes.extend(paths),
@@ -467,6 +481,11 @@ fn resolve_segment(cmd: &SimpleCommand, state: &mut State, ctx: SegCtx) -> Segme
         return finish(recorded, SegmentClass::NoWrite);
     }
 
+    if name == "mkdir" {
+        note_mkdir(cmd, state, ctx);
+        return finish(recorded, SegmentClass::NoWrite);
+    }
+
     // The registry: argument-convention writers, wrappers, git's authorship
     // split, and the explicit opaque executors. Everything else is NoWrite —
     // program-internal writes of allowlisted tools keep decision 022's
@@ -633,6 +652,15 @@ fn is_plain_value(value: &str) -> bool {
 /// Apply a `cd` segment to the threaded cwd. Failure to resolve never denies
 /// by itself — it poisons the cwd, and only a later *relative* write target
 /// turns that into an opaque denial.
+///
+/// A `cd` whose target neither exists at resolve time nor is provably created
+/// by an earlier `mkdir` in this command line (see [`cd_target_reachable`])
+/// may fail at run time. The consequence turns on the following separator
+/// (misc 138, bug 63): with `&&` a failed `cd` short-circuits everything after
+/// it, so recording the intended (never reached) directory stays honest and
+/// today's threading is pinned; with `;`/`||`/end execution continues in the
+/// *old* cwd, so threading the simulated directory would mis-attribute a later
+/// relative write — that unreachable target fails toward poison instead.
 fn apply_cd(cmd: &SimpleCommand, state: &mut State, ctx: SegCtx) {
     if !ctx.sole_stage {
         // A pipeline-stage `cd` runs in a subshell and never escapes.
@@ -656,6 +684,10 @@ fn apply_cd(cmd: &SimpleCommand, state: &mut State, ctx: SegCtx) {
     match expand_word(target, meta, state, Position::Single) {
         Ok(paths) if paths.len() == 1 => {
             let p = paths.into_iter().next().unwrap_or_default();
+            if !ctx.and_guarded && !cd_target_reachable(&p, state) {
+                state.cwd = Cwd::Poisoned;
+                return;
+            }
             state.cwd = if p.is_absolute() {
                 Cwd::Abs(p)
             } else {
@@ -663,6 +695,37 @@ fn apply_cd(cmd: &SimpleCommand, state: &mut State, ctx: SegCtx) {
             };
         }
         _ => state.cwd = Cwd::Poisoned,
+    }
+}
+
+/// Whether a resolved `cd` target is reachable at resolve time: an earlier
+/// `mkdir` in this command line is set to create it, or (for an absolute path)
+/// it already exists on disk as a directory. A relative target (unknown host
+/// cwd) can only be vouched for by an earlier `mkdir` — the filesystem is
+/// unqueryable without an absolute base.
+fn cd_target_reachable(target: &Path, state: &State) -> bool {
+    state.created_dirs.contains(target) || (target.is_absolute() && target.is_dir())
+}
+
+/// Record the directories an `mkdir` is set to create, so a later `cd` into
+/// one resolves even though the filesystem has not caught up at resolve time
+/// (`mkdir sub; cd sub`). Only an unconditional, sole-stage, non-compound
+/// `mkdir` provably runs before the later `cd`; a conditional or subshell one
+/// might not, so it is skipped (a missed record only makes a later `cd` more
+/// conservative, never less). Operands that don't expand to concrete paths are
+/// simply not recorded.
+fn note_mkdir(cmd: &SimpleCommand, state: &mut State, ctx: SegCtx) {
+    if !ctx.sole_stage || cmd.is_compound || ctx.conditional {
+        return;
+    }
+    for (i, arg) in cmd.argv.iter().enumerate() {
+        if arg.starts_with('-') && arg != "-" {
+            continue;
+        }
+        let meta = cmd.argv_meta.get(i).copied().unwrap_or_default();
+        if let Ok(paths) = expand_word(arg, meta, state, Position::Single) {
+            state.created_dirs.extend(paths);
+        }
     }
 }
 
@@ -2449,6 +2512,9 @@ fn resolve_shell_wrapper(cmd: &SimpleCommand, state: &State, seg_name: &str) -> 
         // The script-host opt-in is line-wide config — a wrapped program's
         // interpreters relax the same way (misc 129).
         script_hosts: state.script_hosts.clone(),
+        // A `mkdir` in an earlier segment has already run, so a `cd` into that
+        // directory inside the wrapped program is reachable too (misc 138).
+        created_dirs: state.created_dirs.clone(),
     };
     let mut writes = BTreeSet::new();
     match resolve_into(&script, &mut inner_state, &mut writes) {

@@ -392,6 +392,20 @@ upgrading.
 
 ### Fixed
 
+- **A failing `cd` before a `;` no longer mis-attributes a later relative
+  write.** The write resolver simulates `cd` by threading the target through
+  the effective cwd, but couldn't tell a `cd` would fail at run time. For
+  `cd missing; printf x > f` the shell writes `./f` (the `cd` fails, execution
+  continues in the old cwd) while the resolver recorded `missing/f` — a path
+  nobody wrote, missing the one that was. The resolver now existence-checks the
+  `cd` target: a directory that neither exists at resolve time nor is provably
+  created by an earlier `mkdir` in the same command line fails toward the
+  existing cwd-poison, so a later *relative* target becomes an honest denial
+  instead of a mis-attributed record. Separator semantics are preserved:
+  after `&&` a failed `cd` short-circuits everything after it, so the intended
+  path is still recorded (pinned unchanged); the poison is applied only where a
+  `;`/`||` continuation would diverge. Absolute targets after a failing `cd`
+  stay resolvable — the cwd is irrelevant to them (bug 63).
 - **`catenary diagnostics` never renders silence for an out-of-root or
   nonexistent named path.** A scoped `catenary diagnostics <path>` that named a
   path outside every mounted root — or one that did not exist (a relative path

@@ -90,6 +90,7 @@ fn classify(cmd: &str, cwd: Option<&Path>) -> SegmentClass {
         SegCtx {
             conditional: false,
             sole_stage: pipeline.commands.len() == 1,
+            and_guarded: false,
         },
     )
 }
@@ -395,18 +396,29 @@ fn relative_glob_without_cwd_is_opaque() {
 
 #[test]
 fn literal_cd_threads_relative_targets() {
+    // `&&`-guarded `cd`s thread relative targets even into a directory that
+    // doesn't exist yet: a failed `cd` short-circuits the rest, so recording
+    // the intended path stays honest (misc 138).
     let t = tmp();
     assert_eq!(
         ok("cd sub && echo x > gen.rs", t.path()),
         paths(t.path(), &["sub/gen.rs"]),
     );
     assert_eq!(
-        ok("cd sub; cd more; echo x > f", t.path()),
-        paths(t.path(), &["sub/more/f"]),
-    );
-    assert_eq!(
         ok("cd sub && cd .. && echo x > f", t.path()),
         paths(t.path(), &["f"])
+    );
+}
+
+#[test]
+fn semicolon_cd_threads_into_existing_directories() {
+    // With `;` the target must exist at resolve time (a failed `cd` would
+    // otherwise continue in the old cwd); when it does, threading is unchanged.
+    let t = tmp();
+    std::fs::create_dir_all(t.path().join("sub/more")).expect("mkdir");
+    assert_eq!(
+        ok("cd sub; cd more; echo x > f", t.path()),
+        paths(t.path(), &["sub/more/f"]),
     );
 }
 
@@ -451,6 +463,70 @@ fn subshell_cd_poisons_conservatively() {
     // `( cd … )` scoping isn't modeled — the cwd fails toward poison, and
     // only a later relative target turns that into a denial.
     assert_eq!(err("(cd /tmp); echo x > f", None).construct, "opaque-cwd");
+}
+
+// ── The failing-`cd` window (misc 138, bug 63): existence-check the target,
+//    poison only where a `;`/`||` continuation would diverge ────────────────
+
+#[test]
+fn semicolon_after_unreachable_cd_poisons_a_relative_target() {
+    // `cd missing` fails at run time; with `;` the write continues in the old
+    // cwd, so recording `missing/f` would mis-attribute — poison instead.
+    let t = tmp();
+    let op = err("cd missing; printf x > f", Some(t.path()));
+    assert_eq!(op.construct, "opaque-cwd");
+}
+
+#[test]
+fn and_after_unreachable_cd_is_pinned_unchanged() {
+    // `&&` short-circuits a failed `cd`, so today's honest record of the
+    // intended path is left exactly as it was — no poison.
+    let t = tmp();
+    assert_eq!(
+        ok("cd missing && printf x > f", t.path()),
+        paths(t.path(), &["missing/f"]),
+    );
+}
+
+#[test]
+fn mkdir_created_directory_makes_a_later_cd_reachable() {
+    // A directory a preceding `mkdir` is set to create counts as reachable,
+    // across both `&&` and `;`, even though it isn't on disk at resolve time.
+    let t = tmp();
+    assert_eq!(
+        ok("mkdir -p sub && cd sub && printf x > f", t.path()),
+        paths(t.path(), &["sub/f"]),
+    );
+    assert_eq!(
+        ok("mkdir -p sub2; cd sub2; printf x > f", t.path()),
+        paths(t.path(), &["sub2/f"]),
+    );
+}
+
+#[test]
+fn semicolon_after_existing_cd_still_threads() {
+    // The target exists at resolve time, so the `cd` succeeds and threading is
+    // unchanged even across `;`.
+    let t = tmp();
+    std::fs::create_dir(t.path().join("existing")).expect("mkdir");
+    assert_eq!(
+        ok("cd existing; printf x > f", t.path()),
+        paths(t.path(), &["existing/f"]),
+    );
+}
+
+#[test]
+fn absolute_target_after_unreachable_cd_still_resolves() {
+    // The poisoned cwd is irrelevant to an absolute write target.
+    let t = tmp();
+    let abs = t.path().join("abs.txt");
+    assert_eq!(
+        ok(
+            &format!("cd missing; printf x > {}", abs.display()),
+            t.path()
+        ),
+        BTreeSet::from([abs]),
+    );
 }
 
 #[test]
