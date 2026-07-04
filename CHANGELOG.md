@@ -186,6 +186,11 @@ upgrading.
   shared module (`src/cli/teaching.rs`), so the on-demand command and the
   pushed hook context cannot drift; `catenary commands` is unchanged.
   `SubagentStart` adds a per-agent diagnostic-debt line.
+- **Claude Code's `catenary:primer` skill is dropped.** With SessionStart
+  inlining the full payload on `startup`/`clear`/`compact`, the static skill was
+  pure duplication; it no longer ships in the plugin and disappears from Claude
+  Code's skill list. The `catenary primer` command is unchanged — it renders the
+  same payload on demand.
 - **OpenCode joins the runtime-sourced teaching column.** `catenary hook
   session-start --format=opencode` emits the same SSOT payload (the live allow
   surface + invariants + flag synopses) as raw text, and the OpenCode plugin's

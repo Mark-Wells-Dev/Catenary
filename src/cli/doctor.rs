@@ -24,10 +24,6 @@ const GEMINI_HOOKS_EXPECTED: &str = include_str!("../../hooks/hooks.json");
 const ANTIGRAVITY_HOOKS_EXPECTED: &str =
     include_str!("../../plugins/catenary-antigravity/hooks.json");
 
-/// Expected Claude Code primer SKILL.md, embedded at compile time.
-const PRIMER_SKILL_MD_EXPECTED: &str =
-    include_str!("../../plugins/catenary/skills/primer/SKILL.md");
-
 /// Expected Gemini CLI context file, embedded at compile time.
 const GEMINI_CONTEXT_EXPECTED: &str = include_str!("../../gemini-context.md");
 
@@ -532,7 +528,7 @@ pub async fn run_doctor(out: &mut Output, project_root: &Path, show_diff: bool) 
     // Agent instructions section
     let _ = out.writeln(format_args!(""));
     let _ = out.writeln(format_args!("{}:", out.colors.bold("Agent instructions")));
-    check_claude_instructions(out, show_diff);
+    check_claude_instructions(out);
     check_gemini_instructions(out, show_diff);
     check_antigravity_instructions(out, show_diff, project_root);
 
@@ -1774,11 +1770,10 @@ fn check_path_binary(out: &mut Output) {
     }
 }
 
-/// Check Claude Code agent instruction files (SKILL.md).
+/// Check the Claude Code plugin registration.
 ///
-/// Validates plugin version against the current binary version and
-/// checks SKILL.md frontmatter format per the Agent Skills spec.
-fn check_claude_instructions(out: &mut Output, show_diff: bool) {
+/// Validates the installed plugin version against the current binary version.
+fn check_claude_instructions(out: &mut Output) {
     let label = format!("{:<14}", "Claude Code");
     let Ok(home_str) = std::env::var("HOME") else {
         let _ = out.writeln(format_args!(
@@ -1831,15 +1826,17 @@ fn check_claude_instructions(out: &mut Output, show_diff: bool) {
     // git-describe commit distance on dev builds.
     let expected_version = env!("CARGO_PKG_VERSION");
 
-    let Some(install_path_str) = entry.get("installPath").and_then(serde_json::Value::as_str)
-    else {
+    if entry
+        .get("installPath")
+        .and_then(serde_json::Value::as_str)
+        .is_none()
+    {
         let _ = out.writeln(format_args!(
             "  {label}{}",
             out.colors.yellow("? missing installPath"),
         ));
         return;
-    };
-    let install_path = PathBuf::from(install_path_str);
+    }
 
     // Version staleness check
     let is_stale = installed_version != expected_version;
@@ -1860,50 +1857,6 @@ fn check_claude_instructions(out: &mut Output, show_diff: bool) {
             out.colors
                 .green(&format!("✓ up to date (v{installed_version})")),
         ));
-    }
-
-    // Skill content comparison against embedded versions
-    check_skill_content(
-        out,
-        &install_path,
-        "primer",
-        PRIMER_SKILL_MD_EXPECTED,
-        is_stale,
-        show_diff,
-    );
-}
-
-/// Check a single skill's `SKILL.md` against the expected content.
-fn check_skill_content(
-    out: &mut Output,
-    install_path: &Path,
-    skill_name: &str,
-    expected: &str,
-    is_stale: bool,
-    show_diff: bool,
-) {
-    let label = format!("{:<14}", format!("  skill/{skill_name}"));
-    let skill_path = install_path.join(format!("skills/{skill_name}/SKILL.md"));
-    match std::fs::read_to_string(&skill_path) {
-        Ok(content) if content != expected => {
-            if !is_stale {
-                let _ = out.writeln(format_args!(
-                    "  {label}{}",
-                    out.colors
-                        .yellow("⚠ SKILL.md content differs from expected"),
-                ));
-            }
-            if show_diff {
-                show_unified_diff(out, &content, expected, "installed", "expected");
-            }
-        }
-        Ok(_) => {} // Content matches
-        Err(_) => {
-            let _ = out.writeln(format_args!(
-                "  {label}{}",
-                out.colors.red("✗ SKILL.md not found"),
-            ));
-        }
     }
 }
 
@@ -2117,133 +2070,6 @@ fn check_antigravity_instructions(out: &mut Output, show_diff: bool, project_roo
             out.colors.dim("  run: catenary install antigravity"),
         ));
     }
-}
-
-/// Valid skill names for Catenary's Claude Code plugin.
-#[cfg(test)]
-const VALID_SKILL_NAMES: &[&str] = &["primer"];
-
-/// Validate SKILL.md frontmatter format per the Claude Code Agent Skills spec.
-///
-/// Returns a list of validation error messages. Empty list means valid.
-/// Checks: valid YAML frontmatter delimiters, `name` field (must be one of
-/// `VALID_SKILL_NAMES`, lowercase alphanumeric + hyphens, 1-64 chars),
-/// `description` field (non-empty, max 1024 chars), and non-empty body after
-/// frontmatter.
-#[cfg(test)]
-fn validate_skill_frontmatter(content: &str) -> Vec<String> {
-    let mut errors = Vec::new();
-
-    let trimmed = content.trim_start();
-    if !trimmed.starts_with("---") {
-        errors.push("missing opening `---` delimiter".to_string());
-        return errors;
-    }
-
-    let after_opening = trimmed[3..]
-        .strip_prefix('\n')
-        .unwrap_or_else(|| &trimmed[3..]);
-    let Some(end_pos) = after_opening.find("\n---") else {
-        errors.push("missing closing `---` delimiter".to_string());
-        return errors;
-    };
-
-    let frontmatter = &after_opening[..end_pos];
-    let body_start = end_pos + 4; // skip "\n---"
-    let body = if body_start < after_opening.len() {
-        &after_opening[body_start..]
-    } else {
-        ""
-    };
-
-    // Validate name
-    match extract_frontmatter_value(frontmatter, "name") {
-        None => errors.push("`name` field missing".to_string()),
-        Some(name) => {
-            if !VALID_SKILL_NAMES.contains(&name.as_str()) {
-                errors.push(format!(
-                    "`name` is '{name}', expected one of: {}",
-                    VALID_SKILL_NAMES.join(", "),
-                ));
-            }
-            if !is_valid_skill_name(&name) {
-                errors.push(format!(
-                    "`name` '{name}': must be 1-64 lowercase alphanumeric/hyphen chars, \
-                     no leading/trailing/consecutive hyphens"
-                ));
-            }
-        }
-    }
-
-    // Validate description
-    match extract_frontmatter_value(frontmatter, "description") {
-        None => errors.push("`description` field missing".to_string()),
-        Some(desc) if desc.len() > 1024 => {
-            errors.push(format!("`description` is {} chars (max 1024)", desc.len()));
-        }
-        Some(_) => {}
-    }
-
-    // Validate body
-    if body.trim().is_empty() {
-        errors.push("no body content after frontmatter".to_string());
-    }
-
-    errors
-}
-
-/// Check whether a skill name conforms to the Claude Code Agent Skills spec.
-///
-/// Valid: 1-64 characters, lowercase alphanumeric + hyphens,
-/// no leading/trailing/consecutive hyphens.
-#[cfg(test)]
-fn is_valid_skill_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 64
-        && !name.starts_with('-')
-        && !name.ends_with('-')
-        && !name.contains("--")
-        && name
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-}
-
-/// Extract a simple value from YAML frontmatter.
-///
-/// Handles inline values (`key: value`) and multi-line folded/literal
-/// scalars (`key: >` / `key: |` followed by indented continuation lines).
-#[cfg(test)]
-fn extract_frontmatter_value(frontmatter: &str, key: &str) -> Option<String> {
-    let prefix = format!("{key}:");
-    let mut lines = frontmatter.lines().peekable();
-
-    while let Some(line) = lines.next() {
-        let trimmed = line.trim_start();
-        if let Some(rest) = trimmed.strip_prefix(&prefix) {
-            let rest = rest.trim();
-
-            if rest.is_empty() || rest == ">" || rest == "|" {
-                // Multi-line: collect indented continuation lines
-                let mut parts = Vec::new();
-                while let Some(&next) = lines.peek() {
-                    if next.starts_with(' ') || next.starts_with('\t') {
-                        parts.push(next.trim());
-                        lines.next();
-                    } else {
-                        break;
-                    }
-                }
-                return if parts.is_empty() {
-                    None
-                } else {
-                    Some(parts.join(" "))
-                };
-            }
-
-            return Some(rest.to_string());
-        }
-    }
-    None
 }
 
 /// Check whether `~/.claude/settings.json` still references the legacy Python script.
@@ -2748,166 +2574,7 @@ mod tests {
         );
     }
 
-    // ── validate_skill_frontmatter tests ───────────────────────────
-
-    #[test]
-    fn valid_skill_frontmatter_inline() {
-        let content = "---\nname: primer\ndescription: A tool\n---\n\nBody content here.\n";
-        let errors = validate_skill_frontmatter(content);
-        assert!(errors.is_empty(), "should be valid, got: {errors:?}");
-    }
-
-    #[test]
-    fn valid_skill_frontmatter_multiline_description() {
-        let content =
-            "---\nname: primer\ndescription: >\n  Multi-line\n  description.\n---\n\nBody.\n";
-        let errors = validate_skill_frontmatter(content);
-        assert!(
-            errors.is_empty(),
-            "should be valid with folded description, got: {errors:?}",
-        );
-    }
-
-    #[test]
-    fn skill_frontmatter_missing_opening_delimiter() {
-        let content = "name: editing\ndescription: A tool\n---\n\nBody.\n";
-        let errors = validate_skill_frontmatter(content);
-        assert!(
-            errors.iter().any(|e| e.contains("opening")),
-            "should report missing opening delimiter, got: {errors:?}",
-        );
-    }
-
-    #[test]
-    fn skill_frontmatter_missing_closing_delimiter() {
-        let content = "---\nname: editing\ndescription: A tool\n\nBody.\n";
-        let errors = validate_skill_frontmatter(content);
-        assert!(
-            errors.iter().any(|e| e.contains("closing")),
-            "should report missing closing delimiter, got: {errors:?}",
-        );
-    }
-
-    #[test]
-    fn skill_frontmatter_missing_name() {
-        let content = "---\ndescription: A tool\n---\n\nBody.\n";
-        let errors = validate_skill_frontmatter(content);
-        assert!(
-            errors.iter().any(|e| e.contains("`name`")),
-            "should report missing name, got: {errors:?}",
-        );
-    }
-
-    #[test]
-    fn skill_frontmatter_wrong_name() {
-        let content = "---\nname: wrong\ndescription: A tool\n---\n\nBody.\n";
-        let errors = validate_skill_frontmatter(content);
-        assert!(
-            errors.iter().any(|e| e.contains("'wrong'")),
-            "should report wrong name, got: {errors:?}",
-        );
-    }
-
-    #[test]
-    fn skill_frontmatter_missing_description() {
-        let content = "---\nname: editing\n---\n\nBody.\n";
-        let errors = validate_skill_frontmatter(content);
-        assert!(
-            errors.iter().any(|e| e.contains("`description`")),
-            "should report missing description, got: {errors:?}",
-        );
-    }
-
-    #[test]
-    fn skill_frontmatter_empty_body() {
-        let content = "---\nname: editing\ndescription: A tool\n---\n";
-        let errors = validate_skill_frontmatter(content);
-        assert!(
-            errors.iter().any(|e| e.contains("body")),
-            "should report empty body, got: {errors:?}",
-        );
-    }
-
-    #[test]
-    fn skill_frontmatter_long_description() {
-        let long = "a".repeat(1025);
-        let content = format!("---\nname: editing\ndescription: {long}\n---\n\nBody.\n");
-        let errors = validate_skill_frontmatter(&content);
-        assert!(
-            errors.iter().any(|e| e.contains("1024")),
-            "should report long description, got: {errors:?}",
-        );
-    }
-
-    // ── is_valid_skill_name tests ──────────────────────────────────
-
-    #[test]
-    fn valid_skill_names() {
-        assert!(is_valid_skill_name("catenary"));
-        assert!(is_valid_skill_name("my-tool"));
-        assert!(is_valid_skill_name("a"));
-        assert!(is_valid_skill_name("tool123"));
-    }
-
-    #[test]
-    fn invalid_skill_names() {
-        assert!(!is_valid_skill_name(""), "empty");
-        assert!(!is_valid_skill_name("-leading"), "leading hyphen");
-        assert!(!is_valid_skill_name("trailing-"), "trailing hyphen");
-        assert!(
-            !is_valid_skill_name("double--hyphen"),
-            "consecutive hyphens",
-        );
-        assert!(!is_valid_skill_name("UPPERCASE"), "uppercase");
-        assert!(!is_valid_skill_name("has spaces"), "spaces");
-        assert!(!is_valid_skill_name(&"a".repeat(65)), "too long");
-    }
-
-    // ── extract_frontmatter_value tests ────────────────────────────
-
-    #[test]
-    fn extract_inline_value() {
-        let fm = "name: editing\ndescription: A tool";
-        assert_eq!(
-            extract_frontmatter_value(fm, "name"),
-            Some("editing".to_string()),
-        );
-    }
-
-    #[test]
-    fn extract_multiline_value() {
-        let fm = "name: editing\ndescription: >\n  Multi\n  line";
-        assert_eq!(
-            extract_frontmatter_value(fm, "description"),
-            Some("Multi line".to_string()),
-        );
-    }
-
-    #[test]
-    fn extract_missing_key() {
-        let fm = "name: editing";
-        assert_eq!(extract_frontmatter_value(fm, "description"), None);
-    }
-
-    #[test]
-    fn extract_literal_block_scalar() {
-        let fm = "name: editing\ndescription: |\n  Line one.\n  Line two.";
-        assert_eq!(
-            extract_frontmatter_value(fm, "description"),
-            Some("Line one. Line two.".to_string()),
-        );
-    }
-
     // ── embedded instruction file tests ────────────────────────────
-
-    #[test]
-    fn embedded_primer_skill_md_valid() {
-        let errors = validate_skill_frontmatter(PRIMER_SKILL_MD_EXPECTED);
-        assert!(
-            errors.is_empty(),
-            "embedded primer SKILL.md should pass validation, got: {errors:?}",
-        );
-    }
 
     #[test]
     fn embedded_gemini_context_non_empty() {
