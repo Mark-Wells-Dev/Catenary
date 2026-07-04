@@ -25,7 +25,8 @@
 //! - `dispatch` — message routing, method dispatch, capability checks
 //! - `firehose` — JSONL firehose sink write path
 //! - `lifecycle` — spawn, init, crash, recovery, shutdown
-//! - `logging` — forwarded log streams (e.g., server's `window/logMessage`)
+//! - `logging` — forwarded server window messages (`window/logMessage`,
+//!   `window/showMessage`)
 //! - `parse` — parsing and deserialization
 //! - `stderr` — raw server process stderr output
 //! - `validation` — semantic correctness checks
@@ -54,7 +55,10 @@ pub enum Source {
     LspDispatch,
     /// LSP server spawn, init, crash, recovery, and shutdown.
     LspLifecycle,
-    /// Forwarded LSP server log streams (`window/logMessage`).
+    /// Forwarded LSP server window messages (`window/logMessage` and
+    /// `window/showMessage`). Firehose-only — the notification sinks exclude
+    /// this source by origin, so server chatter never reaches the user queue
+    /// regardless of mapped severity (misc 125).
     LspLogging,
     /// Raw server process stderr output.
     LspStderr,

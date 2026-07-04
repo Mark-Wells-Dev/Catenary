@@ -23,6 +23,20 @@ Use `error!()` only for conditions that indicate a systemic failure
 degradation that the user should know about but that Catenary can
 recover from (e.g., server died, roots/list failed).
 
+### Server-forwarded events are firehose-only
+
+Events forwarded verbatim from an LSP server's `window/logMessage` or
+`window/showMessage` (tagged `source = lsp.logging` at the forwarding
+site) **never** reach the notification queue, regardless of their mapped
+severity. A server's `showMessage` type 1 maps to `error`, but it is
+still just that server's own chatter about itself — and the maintainer
+ruled (CatenaryInternal misc 125) that the notification queue is reserved
+for Catenary's **own** user-actionable events. Server chatter stays fully
+queryable in the JSONL firehose and visible on the TUI; a genuinely
+broken server already surfaces where it matters (the `unavailable:`
+banner on the diagnostics receipt). The `[notifications] threshold` gate
+applies only to Catenary's own events.
+
 ## Reserved structured fields
 
 ```
@@ -65,7 +79,7 @@ convenience constants are derived from it for use in `tracing` macros.
 | `bootstrap` | Startup sequencing |
 | `dispatch` | Message routing, method dispatch, capability checks |
 | `lifecycle` | Spawn, init, crash, recovery, shutdown |
-| `logging` | Forwarded log streams (e.g., server `window/logMessage`) |
+| `logging` | Forwarded server window messages (`window/logMessage`, `window/showMessage`) |
 | `parse` | Parsing and deserialization |
 | `stderr` | Raw server process stderr output |
 | `validation` | Semantic correctness checks |
@@ -82,7 +96,7 @@ convenience constants are derived from it for use in `tracing` macros.
 | `logging.bootstrap` | Logging infrastructure startup sequencing | `LoggingBootstrap` |
 | `lsp.dispatch` | LSP message routing, method dispatch, capability checks | `LspDispatch` |
 | `lsp.lifecycle` | Server spawn, init, crash, recovery, shutdown | `LspLifecycle` |
-| `lsp.logging` | Server `window/logMessage` telemetry | `LspLogging` |
+| `lsp.logging` | Server `window/logMessage` / `window/showMessage` telemetry (firehose-only, never promoted to the notification queue) | `LspLogging` |
 | `lsp.stderr` | Raw server process stderr output | `LspStderr` |
 | `mcp.dispatch` | MCP message dispatch and roots handling | `McpDispatch` |
 

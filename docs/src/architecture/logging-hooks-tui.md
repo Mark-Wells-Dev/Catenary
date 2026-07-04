@@ -383,7 +383,11 @@ severity guidelines, reserved field names, and source taxonomy that
 all code must follow. Key rules:
 
 - `warn!()` and `error!()` reach the notification queue by default.
-  Only use these for user-relevant, actionable conditions.
+  Only use these for user-relevant, actionable conditions. The one
+  exception is server-forwarded window messages (`source = lsp.logging`,
+  from `window/logMessage` / `window/showMessage`): those are
+  firehose-only and never enqueue, regardless of severity — the queue is
+  reserved for Catenary's own events (misc 125).
 - The `kind` field (`"lsp"`, `"mcp"`, `"hook"`) routes protocol events
   to the message DB. Internal events (no `kind` field) also go to the
   message DB with `type = "internal"`.

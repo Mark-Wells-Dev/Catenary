@@ -282,6 +282,19 @@ upgrading.
   run; everything else is denied with a dump of the allowed configuration. Read
   and stdout-only tools (`cat`, `head`, `diff`, …) live in `allow`; the
   resolve-or-deny write model, not command blocking, handles redirected writes.
+- **Server window messages are firehose-only — the notification queue is
+  reserved for Catenary's own events.** LSP-server-forwarded `window/logMessage`
+  **and** `window/showMessage` notifications no longer reach the user
+  notification queue at any severity; they are recorded to the JSONL firehose
+  (queryable, TUI-visible) only. Previously a server's `window/showMessage`
+  type 1 (Error) cleared the `[notifications] threshold` and surfaced as a user
+  notification — the noise even crossed sessions, promoting one session's
+  transient per-server chatter (e.g. rust-analyzer's "Failed to load workspaces"
+  under load) into another session's stream. Both forwarded window methods are
+  now tagged `source = lsp.logging` at the forwarding site, and the notification
+  sinks exclude that origin. A genuinely broken server still surfaces where it
+  matters (the `unavailable:` banner on the diagnostics receipt). The
+  `[notifications] threshold` semantics are unchanged for Catenary's own events.
 
 ### Fixed
 

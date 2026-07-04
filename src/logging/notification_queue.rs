@@ -99,6 +99,13 @@ impl NotificationQueueSink {
 
 impl Sink for NotificationQueueSink {
     fn handle(&self, event: &LogEvent<'_>) {
+        // Server-forwarded window messages (`window/logMessage` /
+        // `window/showMessage`) are firehose-only — the queue is reserved for
+        // Catenary's own user-actionable events, so they never enqueue
+        // regardless of mapped severity (misc 125).
+        if event.is_server_forwarded() {
+            return;
+        }
         if event.severity < self.threshold {
             return;
         }
@@ -182,6 +189,32 @@ mod tests {
         let drained = sink.drain();
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].severity, Severity::Error);
+    }
+
+    #[test]
+    fn server_forwarded_never_enqueued() {
+        let sink = NotificationQueueSink::new(Severity::Warn);
+        // A server's `window/showMessage` type 1 maps to Error but is tagged
+        // `lsp.logging` — firehose-only, never promoted to the queue (misc 125).
+        sink.handle(&make_event(
+            Severity::Error,
+            "rust-analyzer: Failed to load workspaces",
+            Some("rust-analyzer"),
+            Some(crate::source::Source::LspLogging.as_str()),
+        ));
+        assert!(
+            sink.is_empty(),
+            "server-forwarded window message must not enqueue"
+        );
+
+        // A Catenary-origin event at the same severity still enqueues.
+        sink.handle(&make_event(
+            Severity::Error,
+            "root resolution failed",
+            None,
+            Some(crate::source::Source::DaemonLifecycle.as_str()),
+        ));
+        assert_eq!(sink.len(), 1);
     }
 
     #[test]

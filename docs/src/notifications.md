@@ -12,6 +12,17 @@ potential notification. `LoggingServer` — Catenary's central tracing
 subscriber — dispatches these events to a notification queue that
 accumulates entries between drain points.
 
+Server-forwarded LSP window messages (`window/logMessage` and
+`window/showMessage`, tagged `source = lsp.logging`) are the one
+exception: they are **firehose-only** and never enqueue, regardless of
+severity. The queue is reserved for Catenary's own user-actionable
+events, so a language server's own chatter — including a `showMessage`
+type 1 that maps to `error` — stays queryable in the firehose and
+visible on the TUI instead of interrupting you. (See CatenaryInternal
+misc 125: such messages are typically transient, per-server hiccups, and
+a genuinely broken server already shows up on the diagnostics receipt's
+`unavailable:` banner.)
+
 Notifications are delivered at **stationary points** — moments when
 the host CLI naturally pauses to display system information:
 

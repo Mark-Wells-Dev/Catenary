@@ -793,8 +793,13 @@ impl Connection {
                             } else {
                                 // Notification — level and source determined by method.
                                 let (notif_level, source) = match method {
-                                    // Server telemetry — always info to stay out of
-                                    // notification drain (warn threshold).
+                                    // Server-forwarded window messages carry the
+                                    // `lsp.logging` source so the notification sinks
+                                    // exclude them by origin (misc 125): server chatter
+                                    // is firehose-only, never promoted to the user
+                                    // queue, regardless of mapped severity. logMessage
+                                    // stays at info; showMessage keeps its type-mapped
+                                    // level so the firehose/TUI record its true severity.
                                     "window/logMessage" => (
                                         tracing::Level::INFO,
                                         Some(crate::source::Source::LspLogging.as_str()),
@@ -804,7 +809,10 @@ impl Connection {
                                             .get("params")
                                             .and_then(|p| p.get("type"))
                                             .and_then(serde_json::Value::as_u64);
-                                        (window_message_level(msg_type), None)
+                                        (
+                                            window_message_level(msg_type),
+                                            Some(crate::source::Source::LspLogging.as_str()),
+                                        )
                                     }
                                     _ => (lsp_category_level(lsp_category(method)), None),
                                 };

@@ -213,6 +213,16 @@ impl Sink for NotificationRouter {
         reason = "false positive: event.severity < self.threshold is correct"
     )]
     fn handle(&self, event: &LogEvent<'_>) {
+        // Server-forwarded window messages (`window/logMessage` /
+        // `window/showMessage`) are firehose-only — the queue is reserved for
+        // Catenary's own user-actionable events (misc 125). These carry a
+        // `server` but no `session_id`, so they would otherwise broadcast to
+        // every affinity session, leaking one session's server chatter into
+        // another's notification stream. Skip before any routing.
+        if event.is_server_forwarded() {
+            return;
+        }
+
         let has_session = event.session_id.is_some();
         let has_server = event.server.is_some();
 
@@ -268,6 +278,16 @@ mod tests {
         server: Option<&str>,
         session_id: Option<&str>,
     ) -> LogEvent<'a> {
+        make_event_src(severity, message, server, session_id, None)
+    }
+
+    fn make_event_src<'a>(
+        severity: Severity,
+        message: &str,
+        server: Option<&str>,
+        session_id: Option<&str>,
+        source: Option<&str>,
+    ) -> LogEvent<'a> {
         LogEvent {
             severity,
             target: "test",
@@ -277,7 +297,7 @@ mod tests {
             server: server.map(str::to_string),
             client: None,
             parent_id: None,
-            source: None,
+            source: source.map(str::to_string),
             language: None,
             payload: None,
             scope_root: None,
@@ -305,6 +325,35 @@ mod tests {
         let drained = router.drain("session-a");
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].message, "tool error");
+    }
+
+    #[test]
+    fn server_forwarded_not_broadcast() {
+        let router = NotificationRouter::new(Severity::Warn);
+        router.register_session("s1");
+        router.record_affinity("s1", "rust-analyzer");
+
+        // A server's `window/showMessage` type 1 (Error, no session_id) tagged
+        // `lsp.logging` is firehose-only — it must NOT broadcast to affinity
+        // sessions (misc 125).
+        router.handle(&make_event_src(
+            Severity::Error,
+            "rust-analyzer: Failed to load workspaces",
+            Some("rust-analyzer"),
+            None,
+            Some(crate::source::Source::LspLogging.as_str()),
+        ));
+        assert_eq!(router.queue_len("s1"), 0);
+
+        // A Catenary-origin server-crash event still broadcasts to affinity.
+        router.handle(&make_event_src(
+            Severity::Error,
+            "rust-analyzer crashed",
+            Some("rust-analyzer"),
+            None,
+            Some(crate::source::Source::LspLifecycle.as_str()),
+        ));
+        assert_eq!(router.queue_len("s1"), 1);
     }
 
     #[test]

@@ -162,6 +162,24 @@ pub struct LogEvent<'a> {
     pub fields: serde_json::Map<String, serde_json::Value>,
 }
 
+impl LogEvent<'_> {
+    /// Whether this event was forwarded verbatim from an LSP server's
+    /// `window/logMessage` or `window/showMessage` notification.
+    ///
+    /// Server-forwarded window messages are tagged `source = "lsp.logging"`
+    /// (see [`Source::LspLogging`](crate::source::Source::LspLogging)) at the
+    /// forwarding site. They are firehose-only: the notification queue is
+    /// reserved for Catenary's own user-actionable events, so the notification
+    /// sinks exclude these regardless of mapped severity — a server's
+    /// `showMessage` type 1 maps to error but is still just that server's own
+    /// chatter about itself. They remain fully queryable in the JSONL firehose
+    /// and visible on the TUI. See `CatenaryInternal` misc 125.
+    #[must_use]
+    pub fn is_server_forwarded(&self) -> bool {
+        self.source.as_deref() == Some(crate::source::Source::LspLogging.as_str())
+    }
+}
+
 /// Owned counterpart of [`LogEvent`] for buffered replay.
 ///
 /// Identical layout except `target` is an owned [`String`]. Used inside the
@@ -1231,6 +1249,51 @@ mod tests {
         assert_eq!(sink_b.snapshot().len(), 2);
         assert_eq!(sink_a.snapshot()[0].message, "one");
         assert_eq!(sink_b.snapshot()[1].message, "two");
+    }
+
+    #[test]
+    fn server_forwarded_reaches_firehose_not_queue() {
+        use super::notification_queue::NotificationQueueSink;
+
+        let server = LoggingServer::new();
+        // Firehose stand-in: an unfiltered sink that records every event.
+        let firehose = Arc::new(RecorderSink::default());
+        // The user-notification queue at its default `warn` threshold.
+        let queue = NotificationQueueSink::new(Severity::Warn);
+
+        let firehose_sink: Arc<dyn Sink> = firehose.clone();
+        let queue_sink: Arc<dyn Sink> = queue.clone();
+        with_subscriber(server.clone(), || {
+            server.activate(vec![firehose_sink, queue_sink]);
+
+            // A server's `window/showMessage` type 1 (Error) — forwarded
+            // verbatim and tagged `lsp.logging` at the forwarding site.
+            tracing::error!(
+                kind = "lsp",
+                method = "window/showMessage",
+                server = "rust-analyzer",
+                source = crate::source::Source::LspLogging.as_str(),
+                "rust-analyzer: Failed to load workspaces"
+            );
+
+            // Catenary's own user-actionable warning.
+            tracing::warn!(
+                source = crate::source::Source::LspLifecycle.as_str(),
+                server = "rust-analyzer",
+                "rust-analyzer offline"
+            );
+        });
+
+        // The firehose receives both events, server chatter included.
+        let recorded = firehose.snapshot();
+        assert_eq!(recorded.len(), 2, "firehose must see every event");
+
+        // The queue holds only the Catenary-origin warning — the type-1
+        // showMessage was excluded by origin regardless of its error severity.
+        let drained = queue.drain();
+        assert_eq!(drained.len(), 1, "queue must hold only Catenary events");
+        assert_eq!(drained[0].message, "rust-analyzer offline");
+        assert_eq!(drained[0].severity, Severity::Warn);
     }
 
     #[test]
