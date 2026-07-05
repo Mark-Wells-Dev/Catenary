@@ -1550,6 +1550,10 @@ async fn run_grep(
             count,
             include_gitignored,
             include_hidden,
+            // Opt into chunked framing (misc 140 phase 2). A daemon that predates
+            // it ignores the field and replies with the single envelope, which
+            // `search_ipc` still parses.
+            chunked: true,
             flags,
         };
         search_ipc(METHOD_GREP, &request).await?
@@ -1699,11 +1703,13 @@ fn render_glob_count(out: &mut cli::Output, paths: usize) {
 /// parsed [`SearchResponse`].
 ///
 /// Connects to the daemon IPC socket, serializes `request` with `method`
-/// injected, and reads the single response line. An empty response line maps
-/// to a default [`SearchResponse`] (the caller renders the empty outcome). A
-/// non-zero exit is reserved for genuine faults — no daemon, transport
-/// failure, or a malformed response — so soft conditions never cancel a
-/// parallel tool batch.
+/// injected, and reads the response. The first response line decides the shape:
+/// a chunked [`GrepFrame`] stream (misc 140 phase 2, tagged by the `"frame"`
+/// key) is reassembled into a [`SearchResponse`]; a legacy single JSON envelope
+/// (glob, or a daemon that predates framing) is parsed directly. An empty line
+/// maps to a default [`SearchResponse`]. A non-zero exit is reserved for genuine
+/// faults — no daemon, transport failure, or a malformed response — so soft
+/// conditions never cancel a parallel tool batch.
 ///
 /// # Errors
 ///
@@ -1741,7 +1747,85 @@ async fn search_ipc<R: serde::Serialize + Sync>(
     if trimmed.is_empty() {
         return Ok(SearchResponse::default());
     }
-    serde_json::from_str(trimmed).context("invalid search response from daemon")
+    let first: serde_json::Value =
+        serde_json::from_str(trimmed).context("invalid search response from daemon")?;
+
+    // Version-skew hinge: a framed response tags every line with `"frame"`; a
+    // legacy single envelope never does. The absent tag routes to the
+    // single-envelope parse, so a pre-framing daemon (and every glob response)
+    // still deserializes.
+    if first.get("frame").is_some() {
+        return read_grep_frames(first, &mut buf_reader).await;
+    }
+    serde_json::from_value(first).context("invalid search response from daemon")
+}
+
+/// Reassembles a chunked grep response ([`GrepFrame`] stream) into a
+/// [`SearchResponse`] (misc 140 phase 2).
+///
+/// `first` is the already-parsed first frame; subsequent frames are read from
+/// `reader`. Chunk payloads concatenate into the rendered output — trimmed of
+/// its trailing newline to reproduce the pre-framing render byte-for-byte — and
+/// the terminator supplies the count/skip tallies. An unrecognized frame tag (a
+/// future daemon speaking a newer protocol) fails with a comprehensible error
+/// rather than a silent misparse.
+///
+/// # Errors
+///
+/// Returns an error on a transport failure, a malformed/unrecognized frame, or a
+/// stream that ends before its terminator.
+#[cfg(unix)]
+async fn read_grep_frames<R>(
+    first: serde_json::Value,
+    reader: &mut tokio::io::BufReader<R>,
+) -> Result<SearchResponse>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use catenary_mcp::router::GrepFrame;
+    use tokio::io::AsyncBufReadExt;
+
+    let mut response = SearchResponse::default();
+    let mut output = String::new();
+    let mut pending = Some(first);
+
+    loop {
+        let value = if let Some(v) = pending.take() {
+            v
+        } else {
+            let mut line = String::new();
+            let n = reader.read_line(&mut line).await?;
+            if n == 0 {
+                anyhow::bail!("grep response ended before its terminator frame");
+            }
+            let t = line.trim();
+            if t.is_empty() {
+                continue;
+            }
+            serde_json::from_str(t).context("invalid grep frame from daemon")?
+        };
+
+        let frame: GrepFrame = serde_json::from_value(value).context(
+            "unrecognized grep frame from daemon — restart the daemon to match versions",
+        )?;
+        match frame {
+            GrepFrame::Chunk { data } => output.push_str(&data),
+            GrepFrame::End {
+                matches,
+                files,
+                skipped,
+            } => {
+                response.matches = matches;
+                response.files = files;
+                response.skipped = skipped;
+                break;
+            }
+        }
+    }
+
+    output.truncate(output.trim_end().len());
+    response.output = output;
+    Ok(response)
 }
 
 /// Runs a glob query against the running daemon.

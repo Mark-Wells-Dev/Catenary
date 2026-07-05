@@ -222,6 +222,22 @@ upgrading.
   to …` pointer line are retired — recomputing over the surviving batch
   supersedes re-reading stored bytes, so killed-client recovery is now just
   "run it again."
+- **Grep results stream from bounded daemon memory — output unchanged to the
+  byte.** The daemon no longer materializes a whole search result as one
+  in-memory `String` plus its JSON-escaped copy. Each file's rendered hunk
+  lands in a sorted map as its results complete; past an internal buffer
+  threshold, hunks spill to a per-request disk spool under the cache dir
+  (unlinked on completion and on cancellation), and the response streams to
+  the CLI as chunk frames in the same deterministic (file, line) order,
+  terminated by a tally frame. Peak daemon memory is the path index plus one
+  hunk in flight, regardless of result size. stdout is byte-identical
+  (contract-tested with the spool threshold forced to zero), and version skew
+  degrades honestly — either peer lacking the framing falls back to the
+  single-envelope response. A daemon-wide search limiter now bounds
+  concurrent grep/glob walks so one session's monster search cannot starve
+  the pool, and glob's directory walks move off the async runtime
+  (`spawn_blocking`, cancel token threaded inside), closing the phase-1
+  residual: a single massive directory now cancels mid-walk.
 - **The 10 MB size cap falls — content classifies the search.**
   `BINARY_SIZE_THRESHOLD` is deleted: files are classified by a BOM-aware
   quit-at-first-NUL content sniff on every entry path (named, shell-expanded,

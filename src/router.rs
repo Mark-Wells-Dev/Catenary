@@ -23,7 +23,7 @@ use crate::bridge::EditingGuardrail;
 use crate::bridge::HookRouter;
 use crate::bridge::filesystem_manager::Root;
 use crate::bridge::session::Session;
-use crate::bridge::{GlobOutcome, GrepFlags, GrepOutcome, GrepSkips};
+use crate::bridge::{GlobOutcome, GrepFlags, GrepOutcome, GrepSkips, HunkChunk, ShapedOutput};
 use crate::companions::expand_companions;
 use crate::hook::{HookRequest, HookResponseEnvelope, emit_hook_event, hook_outcome_level};
 use crate::logging::LoggingServer;
@@ -95,6 +95,10 @@ fn search_cwd(cwd: Option<&Path>) -> String {
 /// {"method": "tool/grep", "cwd": "/path", "pattern": "foo", "paths": ["src/main.rs"]}
 /// ```
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "1:1 with the clap-parsed grep flags plus the transport-only chunked capability"
+)]
 pub struct GrepRequest {
     /// Working directory from the CLI process.
     ///
@@ -124,6 +128,15 @@ pub struct GrepRequest {
     /// Return a match/file count instead of rendered results (`--count`).
     #[serde(default)]
     pub count: bool,
+    /// Protocol capability (misc 140 phase 2): the CLI understands the chunked
+    /// [`GrepFrame`] response stream. A daemon that predates framing ignores this
+    /// unknown field and replies with the single-envelope [`GrepResponse`]; the
+    /// CLI detects that by the absent frame tag and parses the legacy envelope.
+    /// Absent (a legacy CLI) → the daemon replies with the single envelope, which
+    /// the legacy CLI parses. Every version combination degrades honestly. The
+    /// field is transport-only — never forwarded into the grep pipeline params.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub chunked: bool,
     /// Ripgrep-parity flags (`-i`/`-s`/`-w`/`-F`/`-v`/`-l`, context, `-g`/
     /// `--type`). Flattened onto the wire so the request stays a flat object and
     /// a flagless query serializes exactly as before (each inner field carries
@@ -222,6 +235,43 @@ pub struct GrepResponse {
     /// byte unchanged on the wire (the field is omitted when empty).
     #[serde(default, skip_serializing_if = "GrepSkips::is_empty")]
     pub skipped: GrepSkips,
+}
+
+/// One frame of a chunked `catenary grep` response (misc 140 phase 2).
+///
+/// The framed grep response is a stream of [`GrepFrame::Chunk`] frames — each
+/// carrying one file's rendered hunk, in global (file, line) sort order —
+/// terminated by exactly one [`GrepFrame::End`] frame carrying the tallies the
+/// single-envelope [`GrepResponse`] used to carry (count totals, skip records).
+/// The CLI concatenates the chunk payloads into the rendered output and reads
+/// the terminator for the metadata, reproducing the pre-framing response
+/// byte-for-byte.
+///
+/// Each frame serializes to one JSON line, exactly like the pre-framing envelope,
+/// so the transport is unchanged. The internally-tagged `"frame"` field is the
+/// version-skew hinge: it distinguishes a frame from a legacy single-envelope
+/// response (which has no `"frame"` key), and an unrecognized tag deserializes to
+/// a comprehensible error rather than a silent misparse.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "frame", rename_all = "snake_case")]
+pub enum GrepFrame {
+    /// A slice of the rendered output — one file's hunk — in sort order.
+    Chunk {
+        /// UTF-8 output bytes for this chunk.
+        data: String,
+    },
+    /// The terminator, carrying the same tallies as [`GrepResponse`].
+    End {
+        /// Matching-line count, present only for a `--count` response.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        matches: Option<usize>,
+        /// Distinct-file count, present only for a `--count` response.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        files: Option<usize>,
+        /// Files in the search scope skipped instead of searched.
+        #[serde(default, skip_serializing_if = "GrepSkips::is_empty")]
+        skipped: GrepSkips,
+    },
 }
 
 /// IPC request payload for `catenary glob`.
@@ -558,6 +608,45 @@ fn root_is_ephemeral(sources: &[String]) -> bool {
             .all(|s| s.starts_with(EPHEMERAL_CONTRIBUTOR_PREFIX))
 }
 
+/// Bounds concurrent `catenary grep`/`glob` walks daemon-wide so one session's
+/// monster search cannot starve concurrent sessions (misc 140 phase 2, decision
+/// 029 §5 — a daemon-side guard, invisible to any single caller's output).
+///
+/// A shared, FIFO [`tokio::sync::Semaphore`]: each search acquires one permit for
+/// the duration of its walk and releases it before streaming results, so a burst
+/// of sessions can never pile up unbounded parallel walks that thrash the daemon
+/// — excess searches queue fairly and the runtime keeps serving other sessions'
+/// requests. The permit count leaves headroom below saturation.
+#[cfg(unix)]
+#[derive(Clone)]
+struct SearchLimiter {
+    semaphore: Arc<tokio::sync::Semaphore>,
+}
+
+#[cfg(unix)]
+impl SearchLimiter {
+    /// Creates a limiter with `permits` concurrent-search slots (at least one).
+    fn new(permits: usize) -> Self {
+        Self {
+            semaphore: Arc::new(tokio::sync::Semaphore::new(permits.max(1))),
+        }
+    }
+
+    /// A limiter sized to the host's parallelism — the default daemon guard.
+    fn with_default_permits() -> Self {
+        let permits = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
+        Self::new(permits)
+    }
+
+    /// Acquires a search permit, awaiting a free slot. The owned permit is held
+    /// for the walk's duration and released on drop. `None` only if the
+    /// semaphore were closed (it never is) — the caller then proceeds unlimited,
+    /// which is safe.
+    async fn acquire(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        Arc::clone(&self.semaphore).acquire_owned().await.ok()
+    }
+}
+
 /// Shared context for session-aware hook dispatch.
 ///
 /// When set on [`SessionManager`], hook connections are routed to
@@ -573,6 +662,9 @@ struct HookDispatchContext {
     /// `Session` (per-session state) and `HookRouter` (turn counter,
     /// debounce).
     sessions: Arc<std::sync::Mutex<HashMap<String, SessionEntry>>>,
+    /// Bounds concurrent grep/glob walks so one session's monster search cannot
+    /// starve the others (misc 140 phase 2).
+    search_limiter: SearchLimiter,
     /// Daemon's primary session — used as the template for creating
     /// per-session sessions via [`Session::new_for_daemon`].
     primary: Arc<Session>,
@@ -1870,6 +1962,7 @@ impl SessionManager {
 
         self.hook_ctx = Some(HookDispatchContext {
             sessions,
+            search_limiter: SearchLimiter::with_default_permits(),
             primary: session,
             _logging: self.logging.clone(),
             root_tracker: Some(root_tracker),
@@ -2411,6 +2504,145 @@ fn worktree_to_auto_mount(file_path: &Path, tracked: &HashSet<PathBuf>) -> Optio
     }
 }
 
+/// Streams a grep outcome as a chunk-frame sequence (misc 140 phase 2).
+///
+/// One [`GrepFrame::Chunk`] per rendered hunk in global sort order, then one
+/// [`GrepFrame::End`] terminator carrying the count/skip tallies. Chunk payloads
+/// are the raw hunk bytes (trailing newlines intact); the CLI concatenates them
+/// and applies the trailing-whitespace trim, reproducing the pre-framing output
+/// byte-for-byte. Spooled hunks are read one at a time on a blocking task so a
+/// giant hunk never pins the runtime — peak memory is the path index plus one
+/// hunk in flight.
+///
+/// # Errors
+///
+/// Returns an error if a spool read fails or the socket write fails.
+#[cfg(unix)]
+async fn write_grep_frames<W>(writer: &mut W, outcome: Result<GrepOutcome>) -> Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    match outcome {
+        Ok(GrepOutcome::Count {
+            matches,
+            files,
+            skipped,
+        }) => {
+            write_grep_frame(
+                writer,
+                &GrepFrame::End {
+                    matches: Some(matches),
+                    files: Some(files),
+                    skipped,
+                },
+            )
+            .await?;
+        }
+        Ok(GrepOutcome::Rendered { output, skipped }) => {
+            let (chunks, spool) = output.into_parts();
+            for chunk in chunks {
+                let data = match chunk {
+                    HunkChunk::InMemory(s) => s,
+                    HunkChunk::Spooled { offset, len } => {
+                        let spool = spool
+                            .clone()
+                            .ok_or_else(|| anyhow!("spooled grep hunk without a spool"))?;
+                        let bytes =
+                            tokio::task::spawn_blocking(move || spool.read_hunk(offset, len))
+                                .await
+                                .map_err(|e| anyhow!("grep spool read task failed: {e}"))??;
+                        String::from_utf8(bytes)
+                            .map_err(|e| anyhow!("grep spool hunk is not utf-8: {e}"))?
+                    }
+                };
+                write_grep_frame(writer, &GrepFrame::Chunk { data }).await?;
+            }
+            write_grep_frame(
+                writer,
+                &GrepFrame::End {
+                    matches: None,
+                    files: None,
+                    skipped,
+                },
+            )
+            .await?;
+        }
+        Err(e) => {
+            // A grep error becomes the rendered output, exactly as the legacy
+            // envelope carried it — one chunk, then a bare terminator.
+            write_grep_frame(
+                writer,
+                &GrepFrame::Chunk {
+                    data: format!("grep error: {e}"),
+                },
+            )
+            .await?;
+            write_grep_frame(
+                writer,
+                &GrepFrame::End {
+                    matches: None,
+                    files: None,
+                    skipped: GrepSkips::default(),
+                },
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Writes one [`GrepFrame`] as a single JSON line.
+///
+/// # Errors
+///
+/// Returns an error if serialization or the socket write fails.
+#[cfg(unix)]
+async fn write_grep_frame<W>(writer: &mut W, frame: &GrepFrame) -> Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+    let mut bytes = serde_json::to_vec(frame)?;
+    bytes.push(b'\n');
+    writer.write_all(&bytes).await?;
+    Ok(())
+}
+
+/// Materializes a [`ShapedOutput`] into the single trimmed output string the
+/// legacy single-envelope [`GrepResponse`] carries — the version-skew compat
+/// path for a CLI that predates chunked framing.
+///
+/// Reads every hunk (including spooled ones) and applies the trailing-whitespace
+/// trim the pre-framing render applied, so the bytes match a pre-framing daemon
+/// exactly. Unbounded in memory, but reached only by a legacy CLI.
+///
+/// # Errors
+///
+/// Returns an error if a spool read fails or a hunk is not valid UTF-8.
+#[cfg(unix)]
+fn shaped_to_string(output: ShapedOutput) -> Result<String> {
+    let (chunks, spool) = output.into_parts();
+    let mut out = String::new();
+    for chunk in chunks {
+        match chunk {
+            HunkChunk::InMemory(s) => out.push_str(&s),
+            HunkChunk::Spooled { offset, len } => {
+                let spool = spool
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("spooled grep hunk without a spool"))?;
+                let bytes = spool.read_hunk(offset, len)?;
+                out.push_str(
+                    &String::from_utf8(bytes)
+                        .map_err(|e| anyhow!("grep spool hunk is not utf-8: {e}"))?,
+                );
+            }
+        }
+    }
+    let trimmed_len = out.trim_end().len();
+    out.truncate(trimmed_len);
+    Ok(out)
+}
+
 /// Handles a single hook connection with session-aware dispatch.
 ///
 /// Reads the JSON request, extracts `session_id` for routing, looks up
@@ -2887,36 +3119,16 @@ async fn handle_hook_dispatch(
             .instrument(span.clone())
             .await;
 
+        // Bound concurrent walks so one session's monster search cannot starve
+        // the others (misc 140 phase 2). Held for the walk, released before the
+        // results stream.
+        let search_permit = ctx.search_limiter.acquire().await;
+
         // Race grep execution against client disconnect so a killed
         // CLI process doesn't leave the pipeline running indefinitely.
         let cancel_on_disconnect = cancel.clone();
-        let response = tokio::select! {
-            result = ctx.primary.grep.execute(&params, Some(&parent_id), &cancel).instrument(span.clone()) => {
-                match result {
-                    Ok(GrepOutcome::Rendered { output, skipped }) => GrepResponse {
-                        output,
-                        matches: None,
-                        files: None,
-                        skipped,
-                    },
-                    Ok(GrepOutcome::Count {
-                        matches,
-                        files,
-                        skipped,
-                    }) => GrepResponse {
-                        output: String::new(),
-                        matches: Some(matches),
-                        files: Some(files),
-                        skipped,
-                    },
-                    Err(e) => GrepResponse {
-                        output: format!("grep error: {e}"),
-                        matches: None,
-                        files: None,
-                        skipped: GrepSkips::default(),
-                    },
-                }
-            }
+        let outcome = tokio::select! {
+            result = ctx.primary.grep.execute(&params, Some(&parent_id), &cancel).instrument(span.clone()) => result,
             () = async {
                 use tokio::io::AsyncReadExt;
                 let mut buf = [0u8; 1];
@@ -2937,8 +3149,62 @@ async fn handle_hook_dispatch(
                         "outgoing hook response",
                     );
                 });
+                // The dropped `ShapedOutput` (if any) unlinks its spool.
                 return Ok(());
             }
+        };
+
+        // The walk is done — free the permit so a queued search can proceed
+        // while these results stream.
+        drop(search_permit);
+
+        if grep_req.chunked {
+            // Chunked framing (misc 140 phase 2): stream one chunk frame per
+            // hunk in global sort order, then a terminator carrying the tallies.
+            // Peak memory is the path index plus one hunk in flight; the CLI
+            // concatenates the chunk payloads and trims, reproducing the
+            // pre-framing output byte-for-byte.
+            write_grep_frames(&mut writer, outcome).await?;
+            span.in_scope(|| {
+                emit_hook_event(
+                    tracing::Level::INFO,
+                    "cli",
+                    &method,
+                    Some(&parent_id),
+                    "streamed grep frames",
+                    "outgoing hook response",
+                );
+            });
+            writer.shutdown().await?;
+            return Ok(());
+        }
+
+        // Legacy single-envelope response (a CLI that predates framing): build
+        // the whole output into one `GrepResponse`. Unbounded in memory, but
+        // reached only by a pre-framing CLI — a transient version-skew path.
+        let response = match outcome {
+            Ok(GrepOutcome::Rendered { output, skipped }) => GrepResponse {
+                output: shaped_to_string(output)?,
+                matches: None,
+                files: None,
+                skipped,
+            },
+            Ok(GrepOutcome::Count {
+                matches,
+                files,
+                skipped,
+            }) => GrepResponse {
+                output: String::new(),
+                matches: Some(matches),
+                files: Some(files),
+                skipped,
+            },
+            Err(e) => GrepResponse {
+                output: format!("grep error: {e}"),
+                matches: None,
+                files: None,
+                skipped: GrepSkips::default(),
+            },
         };
 
         let mut payload = serde_json::to_vec(&response)?;
@@ -3008,6 +3274,11 @@ async fn handle_hook_dispatch(
         ensure_ephemeral_mounts(&ctx, &glob_touched, Instant::now(), "")
             .instrument(span.clone())
             .await;
+
+        // Bound concurrent walks so one session's monster listing cannot starve
+        // the others (misc 140 phase 2) — the same shared limiter as grep. Held
+        // for the walk; dropped at the end of the block.
+        let _search_permit = ctx.search_limiter.acquire().await;
 
         // Race glob execution against client disconnect so a killed
         // CLI process doesn't leave the pipeline running indefinitely.
@@ -8703,6 +8974,7 @@ mod tests {
             include_gitignored: true,
             include_hidden: false,
             count: false,
+            chunked: true,
             flags: GrepFlags::default(),
         };
         let json = serde_json::to_string(&req).expect("serialize");
@@ -8741,6 +9013,7 @@ mod tests {
             include_gitignored: false,
             include_hidden: false,
             count: false,
+            chunked: false,
             flags: GrepFlags::default(),
         };
         let json = serde_json::to_string(&req).expect("serialize");
@@ -8753,6 +9026,10 @@ mod tests {
             "default flags should be skipped"
         );
         assert!(!json.contains("globs"), "empty globs should be skipped");
+        assert!(
+            !json.contains("chunked"),
+            "chunked:false should be skipped — a legacy CLI's wire form is unchanged"
+        );
     }
 
     /// `GrepResponse` roundtrips through JSON.
@@ -8773,6 +9050,87 @@ mod tests {
         assert!(parsed.matches.is_none());
         assert!(parsed.files.is_none());
         assert!(parsed.skipped.is_empty());
+    }
+
+    /// Chunked grep frames (misc 140 phase 2) roundtrip, carry the `"frame"`
+    /// version-skew tag, and reject an unrecognized kind rather than misparse.
+    #[test]
+    fn grep_frame_roundtrips_and_carries_version_tag() {
+        let chunk = GrepFrame::Chunk {
+            data: "src/a.rs:1:hit\n".to_string(),
+        };
+        let line = serde_json::to_string(&chunk).expect("serialize chunk");
+        assert!(
+            line.contains("\"frame\":\"chunk\""),
+            "chunk carries the frame tag: {line}"
+        );
+        assert!(
+            matches!(
+                serde_json::from_str::<GrepFrame>(&line).expect("parse chunk"),
+                GrepFrame::Chunk { data } if data == "src/a.rs:1:hit\n"
+            ),
+            "chunk roundtrips",
+        );
+
+        let end = GrepFrame::End {
+            matches: Some(3),
+            files: Some(2),
+            skipped: GrepSkips::default(),
+        };
+        let end_line = serde_json::to_string(&end).expect("serialize end");
+        assert!(
+            end_line.contains("\"frame\":\"end\""),
+            "terminator carries the frame tag: {end_line}"
+        );
+
+        // The version-skew hinge: a legacy single envelope never carries the
+        // frame tag, so the CLI routes it to the single-envelope parse.
+        let legacy = GrepResponse {
+            output: "x".to_string(),
+            matches: None,
+            files: None,
+            skipped: GrepSkips::default(),
+        };
+        let legacy_json = serde_json::to_string(&legacy).expect("serialize legacy");
+        assert!(
+            !legacy_json.contains("\"frame\""),
+            "legacy envelope has no frame tag: {legacy_json}"
+        );
+
+        // A newer daemon's unknown frame kind fails to parse — honest degradation,
+        // never a silent misparse.
+        assert!(
+            serde_json::from_str::<GrepFrame>(r#"{"frame":"future_kind","data":"x"}"#).is_err(),
+            "an unrecognized frame kind is a comprehensible error",
+        );
+    }
+
+    /// The fairness guard (misc 140 phase 2): the shared search limiter bounds
+    /// concurrent walks. Deterministic — asserts permit accounting, never timing.
+    #[test]
+    fn search_limiter_permits_are_bounded() {
+        let limiter = SearchLimiter::new(2);
+        assert_eq!(limiter.semaphore.available_permits(), 2);
+        let p1 = limiter.semaphore.try_acquire().expect("permit 1");
+        let p2 = limiter.semaphore.try_acquire().expect("permit 2");
+        assert_eq!(limiter.semaphore.available_permits(), 0);
+        assert!(
+            limiter.semaphore.try_acquire().is_err(),
+            "no third permit while both are held — a burst of searches queues",
+        );
+        drop(p1);
+        assert_eq!(limiter.semaphore.available_permits(), 1);
+        assert!(
+            limiter.semaphore.try_acquire().is_ok(),
+            "a freed permit admits a queued search",
+        );
+        drop(p2);
+    }
+
+    /// The limiter never deadlocks: a zero request clamps to at least one permit.
+    #[test]
+    fn search_limiter_clamps_to_at_least_one_permit() {
+        assert_eq!(SearchLimiter::new(0).semaphore.available_permits(), 1);
     }
 
     /// `GlobRequest` roundtrips through JSON with all fields.

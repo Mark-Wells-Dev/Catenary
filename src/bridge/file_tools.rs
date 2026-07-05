@@ -35,7 +35,9 @@ use super::SourceLines;
 use super::filesystem_manager::{
     FilesystemManager, STAT_RETRY_ATTEMPTS, format_file_size, mtime_nanos,
 };
-use super::session::{ResolvedGlob, expand_search_paths, expand_search_paths_grouped};
+use super::session::{
+    ResolvedGlob, expand_search_paths_cancellable, expand_search_paths_grouped_cancellable,
+};
 use crate::lsp::{LspClientManager, WalkBreadth};
 use crate::symbol_index::{Symbol, SymbolIndex};
 
@@ -176,9 +178,18 @@ impl GlobServer {
             .transpose()?;
 
         // Count mode short-circuits enrichment — report the number of resolved
-        // paths, not a rendered tree.
+        // paths, not a rendered tree. The count walks run off the runtime thread
+        // so a massive directory is cancellable mid-walk (misc 140 phase 2).
         if input.count {
-            let paths = self.count_paths(&input, exclude.as_ref(), cancel)?;
+            let paths = self
+                .count_paths_off_thread(
+                    input.paths.clone(),
+                    input.include_gitignored,
+                    input.include_hidden,
+                    exclude.clone(),
+                    cancel,
+                )
+                .await?;
             return Ok(GlobOutcome::Count { paths });
         }
 
@@ -303,7 +314,8 @@ impl GlobServer {
     ///
     /// Paths that exist are dispatched directly; non-existent paths are treated
     /// as glob patterns and expanded daemon-side via the gitignore-aware
-    /// `ignore` walker ([`expand_search_paths`]). A shell-expanded (unquoted)
+    /// `ignore` walker ([`expand_search_paths`](super::session::expand_search_paths)).
+    /// A shell-expanded (unquoted)
     /// glob arrives as concrete paths and an unexpanded (quoted) glob arrives
     /// as a pattern — both resolve to the same set here.
     ///
@@ -331,8 +343,24 @@ impl GlobServer {
     ) -> Result<(String, Vec<usize>)> {
         // Per-argument resolution so each pattern's matches stay grouped for its
         // cardinality header; the flat set drives the nudge, exactly as before.
-        let groups =
-            expand_search_paths_grouped(paths, input.include_gitignored, input.include_hidden);
+        // The pattern expansion runs off the runtime thread so a massive pattern
+        // base directory is cancellable mid-walk (misc 140 phase 2).
+        let groups = {
+            let paths = paths.to_vec();
+            let include_gitignored = input.include_gitignored;
+            let include_hidden = input.include_hidden;
+            let cancel = cancel.clone();
+            tokio::task::spawn_blocking(move || {
+                expand_search_paths_grouped_cancellable(
+                    &paths,
+                    include_gitignored,
+                    include_hidden,
+                    &cancel,
+                )
+            })
+            .await
+            .map_err(|e| anyhow!("glob path expansion task failed: {e}"))?
+        };
         let resolved: Vec<PathBuf> = groups
             .iter()
             .flat_map(|g| g.resolved.iter().cloned())
@@ -424,7 +452,8 @@ impl GlobServer {
     /// [`WalkBreadth::Scoped`](crate::lsp::WalkBreadth::Scoped)).
     ///
     /// `resolved` is the glob pattern's resolved path set (from
-    /// [`expand_search_paths`]). The breadth of a glob walk is exactly the
+    /// [`expand_search_paths`](super::session::expand_search_paths)). The breadth
+    /// of a glob walk is exactly the
     /// pattern, so the observation set is: each resolved file, and each resolved
     /// directory's **immediate** entries (the files glob lists) — the same
     /// visibility (`include_gitignored`/`include_hidden`) and `exclude` filters
@@ -503,7 +532,15 @@ impl GlobServer {
             .canonicalize()
             .map_err(|e| anyhow!("Path does not exist: {}: {e}", dir.display()))?;
 
-        let entries = self.collect_dir_entries(&canonical, input, exclude, cancel)?;
+        let entries = self
+            .collect_dir_entries_off_thread(
+                canonical.clone(),
+                input.include_gitignored,
+                input.include_hidden,
+                exclude.cloned(),
+                cancel,
+            )
+            .await?;
 
         // The target's own count = its immediate entries (what this glob
         // enumerated), split into files and directories — the same split a
@@ -572,13 +609,17 @@ impl GlobServer {
     }
 
     /// Extracts file info: `(line_count, binary_size)`.
+    ///
+    /// A free helper over [`FilesystemManager`] (not `&self`) so the directory
+    /// walk that calls it can run off the runtime thread in a `spawn_blocking`
+    /// task (misc 140 phase 2).
     fn file_info(
-        &self,
+        fs_manager: &FilesystemManager,
         path: &Path,
         metadata: Option<&std::fs::Metadata>,
     ) -> (Option<usize>, Option<String>) {
         metadata.map_or((None, None), |m| {
-            self.fs_manager.line_count(path, m).map_or_else(
+            fs_manager.line_count(path, m).map_or_else(
                 || (None, Some(format_file_size(m.len()))),
                 |lc| (Some(lc), None),
             )
@@ -598,20 +639,26 @@ impl GlobServer {
     /// to completion for a client that is gone (misc 140). The walk is
     /// `max_depth(1)`, so this bounds a single wide directory rather than a
     /// recursive tree.
+    ///
+    /// A free helper over [`FilesystemManager`] (not `&self`) so
+    /// [`Self::collect_dir_entries_off_thread`] can run it in a `spawn_blocking`
+    /// task — a single massive directory is then cancellable mid-walk once off
+    /// the runtime thread (misc 140 phase 2).
     #[allow(clippy::too_many_lines, reason = "sequential per-entry classification")]
     fn collect_dir_entries(
-        &self,
+        fs_manager: &FilesystemManager,
         canonical: &Path,
-        input: &GlobInput,
+        include_gitignored: bool,
+        include_hidden: bool,
         exclude: Option<&ResolvedGlob>,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<Vec<GlobEntry>> {
         // Build non-gitignored set for flag detection.
-        let non_ignored: HashSet<PathBuf> = if input.include_gitignored {
+        let non_ignored: HashSet<PathBuf> = if include_gitignored {
             WalkBuilder::new(canonical)
                 .max_depth(Some(1))
                 .git_ignore(true)
-                .hidden(!input.include_hidden)
+                .hidden(!include_hidden)
                 .build()
                 .flatten()
                 .map(ignore::DirEntry::into_path)
@@ -622,8 +669,8 @@ impl GlobServer {
 
         let walker = WalkBuilder::new(canonical)
             .max_depth(Some(1))
-            .git_ignore(!input.include_gitignored)
-            .hidden(!input.include_hidden)
+            .git_ignore(!include_gitignored)
+            .hidden(!include_hidden)
             .build();
 
         let mut entries = Vec::new();
@@ -649,7 +696,7 @@ impl GlobServer {
                 continue;
             }
 
-            let is_gitignored = input.include_gitignored && !non_ignored.contains(&entry_path);
+            let is_gitignored = include_gitignored && !non_ignored.contains(&entry_path);
             let is_snap = is_snapshot(&name);
 
             let metadata = entry_path
@@ -665,7 +712,7 @@ impl GlobServer {
                 let (line_count, binary_size) = if is_broken || is_snap {
                     (None, None)
                 } else {
-                    self.file_info(&entry_path, resolved_meta.as_ref())
+                    Self::file_info(fs_manager, &entry_path, resolved_meta.as_ref())
                 };
 
                 entries.push(GlobEntry {
@@ -699,7 +746,7 @@ impl GlobServer {
                 let (line_count, binary_size) = if is_snap {
                     (None, None)
                 } else {
-                    self.file_info(&entry_path, Some(&metadata))
+                    Self::file_info(fs_manager, &entry_path, Some(&metadata))
                 };
                 entries.push(GlobEntry {
                     name,
@@ -719,6 +766,43 @@ impl GlobServer {
         Ok(entries)
     }
 
+    /// Runs [`Self::collect_dir_entries`] on a blocking thread (misc 140 phase 2).
+    ///
+    /// The one-level directory enumeration is synchronous; left on an async
+    /// runtime worker it would pin that thread, so the router's disconnect
+    /// `select!` could never poll its cancel branch — a single massive directory
+    /// would be read to completion for a dead client. `spawn_blocking` frees the
+    /// runtime to fire the cancel token, which the walk observes per entry
+    /// (mirroring grep's `ripgrep_matches_blocking`). Owned inputs move into the
+    /// task; `GlobEntry`/`ResolvedGlob` are `Send`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if metadata reads fail or the blocking task panics.
+    async fn collect_dir_entries_off_thread(
+        &self,
+        canonical: PathBuf,
+        include_gitignored: bool,
+        include_hidden: bool,
+        exclude: Option<ResolvedGlob>,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<Vec<GlobEntry>> {
+        let fs_manager = Arc::clone(&self.fs_manager);
+        let cancel = cancel.clone();
+        tokio::task::spawn_blocking(move || {
+            Self::collect_dir_entries(
+                &fs_manager,
+                &canonical,
+                include_gitignored,
+                include_hidden,
+                exclude.as_ref(),
+                &cancel,
+            )
+        })
+        .await
+        .map_err(|e| anyhow!("glob directory walk task failed: {e}"))?
+    }
+
     /// Counts the filesystem paths a glob query resolves to (`--count`).
     ///
     /// Mirrors [`Self::handle_literal_paths`] dispatch — **directories first**,
@@ -728,14 +812,22 @@ impl GlobServer {
     /// same filtered set [`Self::handle_glob_dir`] renders; each remaining
     /// resolved file or symlink-to-file counts once. LSP enrichment is skipped —
     /// a count is pure filesystem.
+    ///
+    /// A free helper over [`FilesystemManager`] (not `&self`) so
+    /// [`Self::count_paths_off_thread`] can run it in a `spawn_blocking` task —
+    /// the pattern expansion and per-directory walks are then cancellable
+    /// mid-walk once off the runtime thread (misc 140 phase 2). Every walk is the
+    /// cancellable form, so a fired token stops it promptly.
     fn count_paths(
-        &self,
-        input: &GlobInput,
+        fs_manager: &FilesystemManager,
+        paths: &[PathBuf],
+        include_gitignored: bool,
+        include_hidden: bool,
         exclude: Option<&ResolvedGlob>,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<usize> {
         let resolved =
-            expand_search_paths(&input.paths, input.include_gitignored, input.include_hidden);
+            expand_search_paths_cancellable(paths, include_gitignored, include_hidden, cancel);
         let mut total = 0usize;
         for path in &resolved {
             if cancel.is_cancelled() {
@@ -745,14 +837,55 @@ impl GlobServer {
                 let canonical = path
                     .canonicalize()
                     .map_err(|e| anyhow!("Path does not exist: {}: {e}", path.display()))?;
-                total += self
-                    .collect_dir_entries(&canonical, input, exclude, cancel)?
-                    .len();
+                total += Self::collect_dir_entries(
+                    fs_manager,
+                    &canonical,
+                    include_gitignored,
+                    include_hidden,
+                    exclude,
+                    cancel,
+                )?
+                .len();
             } else if path.is_file() || path.is_symlink() {
                 total += 1;
             }
         }
         Ok(total)
+    }
+
+    /// Runs [`Self::count_paths`] on a blocking thread (misc 140 phase 2).
+    ///
+    /// Same rationale as [`Self::collect_dir_entries_off_thread`]: the count walks
+    /// (pattern expansion + per-directory enumeration) are synchronous, so
+    /// `spawn_blocking` keeps the router's disconnect `select!` pollable and lets
+    /// the cancel token actually fire mid-walk.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a path cannot be canonicalized or the blocking task
+    /// panics.
+    async fn count_paths_off_thread(
+        &self,
+        paths: Vec<PathBuf>,
+        include_gitignored: bool,
+        include_hidden: bool,
+        exclude: Option<ResolvedGlob>,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<usize> {
+        let fs_manager = Arc::clone(&self.fs_manager);
+        let cancel = cancel.clone();
+        tokio::task::spawn_blocking(move || {
+            Self::count_paths(
+                &fs_manager,
+                &paths,
+                include_gitignored,
+                include_hidden,
+                exclude.as_ref(),
+                &cancel,
+            )
+        })
+        .await
+        .map_err(|e| anyhow!("glob count walk task failed: {e}"))?
     }
 }
 
@@ -2060,9 +2193,15 @@ mod tests {
         }))
         .expect("deserialize GlobInput");
 
-        let count = server
-            .count_paths(&input, None, &tokio_util::sync::CancellationToken::new())
-            .expect("count_paths");
+        let count = GlobServer::count_paths(
+            &server.fs_manager,
+            &input.paths,
+            input.include_gitignored,
+            input.include_hidden,
+            None,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .expect("count_paths");
 
         assert_eq!(
             count, N,
@@ -2147,6 +2286,46 @@ mod tests {
             no_match_indices,
             vec![0],
             "the sole pattern argument (index 0) is flagged as a no-match"
+        );
+    }
+
+    // ─── off-thread directory walk cancellation (misc 140 phase 2) ──────
+
+    /// A single massive directory is cancellable mid-walk once the enumeration
+    /// runs off the runtime thread (`spawn_blocking`): a fired token quits the
+    /// walk instead of reading every child. Mirrors grep's
+    /// `ripgrep_matches_quits_when_token_fires` — the phase-1 pattern, now for
+    /// glob's residual sync walk.
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn collect_dir_entries_off_thread_quits_on_cancel() {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let dir = tmp.path().canonicalize().expect("canonicalize");
+        for i in 0..200 {
+            std::fs::write(dir.join(format!("f{i}.txt")), "x\n").expect("write child");
+        }
+
+        let server = test_glob_server();
+
+        // Baseline: without cancellation the walk enumerates every child.
+        let live = tokio_util::sync::CancellationToken::new();
+        let full = rt
+            .block_on(server.collect_dir_entries_off_thread(dir.clone(), false, false, None, &live))
+            .expect("walk uncancelled");
+        assert_eq!(full.len(), 200, "uncancelled walk lists every child");
+
+        // A token fired before the walk quits it at the first entry — the walk
+        // ran off-thread, so the token is actually observed.
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        let cancelled = rt
+            .block_on(server.collect_dir_entries_off_thread(dir, false, false, None, &cancel))
+            .expect("walk cancelled");
+        assert!(
+            cancelled.is_empty(),
+            "a fired token quits the off-thread directory walk (got {} entries)",
+            cancelled.len(),
         );
     }
 }

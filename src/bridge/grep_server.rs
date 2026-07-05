@@ -4,7 +4,7 @@
 //! Grep tool: ripgrep + symbol index pipeline with LSP enrichment.
 
 use super::session::ResolvedGlob;
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use grep_matcher::Matcher;
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::{Searcher, SearcherBuilder, Sink, SinkContext, SinkMatch};
@@ -163,8 +163,11 @@ enum Anchor {
 pub enum GrepOutcome {
     /// The complete rendered output for stdout.
     Rendered {
-        /// The complete output for stdout.
-        output: String,
+        /// The complete rendered output for stdout, shaped into per-file hunks
+        /// (misc 140 phase 2): small totals stay in memory (the hot path),
+        /// oversized ones spill to a per-request spool file. Emitted hunk by
+        /// hunk in global sort order, byte-identical either way.
+        output: ShapedOutput,
         /// Files in the search scope skipped instead of searched.
         skipped: GrepSkips,
     },
@@ -354,7 +357,7 @@ impl GrepServer {
                     }
                 } else {
                     GrepOutcome::Rendered {
-                        output: String::new(),
+                        output: ShapedOutput::empty(),
                         skipped: GrepSkips::default(),
                     }
                 });
@@ -543,7 +546,7 @@ impl GrepServer {
 
         if rg.file_lines.is_empty() {
             return Ok(GrepOutcome::Rendered {
-                output: String::new(),
+                output: ShapedOutput::empty(),
                 skipped,
             });
         }
@@ -556,7 +559,13 @@ impl GrepServer {
         paths.sort();
         let output = paths.join("\n");
 
-        Ok(GrepOutcome::Rendered { output, skipped })
+        // `-l` output is a small path list — a single in-memory hunk, never
+        // spooled. Wrapped so it streams over the same chunked framing as the
+        // enriched path (misc 140 phase 2).
+        Ok(GrepOutcome::Rendered {
+            output: ShapedOutput::from_string(output),
+            skipped,
+        })
     }
 
     /// Grep pipeline: ripgrep + `documentSymbol` index + hit classification.
@@ -567,7 +576,7 @@ impl GrepServer {
         parent_id: Option<&str>,
         cancel: &tokio_util::sync::CancellationToken,
         cwd: Option<&Path>,
-    ) -> Result<(String, GrepSkips)> {
+    ) -> Result<(ShapedOutput, GrepSkips)> {
         debug!("Grep request: pattern={}", input.pattern);
 
         // All paths are literal — no glob interpretation. When no paths are
@@ -606,7 +615,7 @@ impl GrepServer {
         let skipped = GrepSkips::from_records(&rg.skips, &self.fs_manager, cwd);
 
         if rg.file_lines.is_empty() {
-            return Ok((String::new(), skipped));
+            return Ok((ShapedOutput::empty(), skipped));
         }
 
         // Step 2: Ensure servers exist for matched files and wait for readiness.
@@ -769,10 +778,16 @@ impl GrepServer {
         }
 
         if hits.is_empty() {
-            return Ok((String::new(), skipped));
+            return Ok((ShapedOutput::empty(), skipped));
         }
 
-        Ok((render_results(&hits, &self.fs_manager, cwd), skipped))
+        // Shape the hits into per-file hunks, buffering small totals in memory
+        // (the hot path) and spilling above the threshold to a per-request spool
+        // file — bounded shaping memory, invisible to the output contract (misc
+        // 140 phase 2, decision 029 §5). Emission (the router) iterates the map
+        // in key order, preserving the deterministic global (file, line) sort.
+        let shaped = shape_hits(&hits, &self.fs_manager, cwd, GREP_SPOOL_THRESHOLD)?;
+        Ok((shaped, skipped))
     }
 
     /// Runs [`Self::ripgrep_matches`] on a blocking thread.
@@ -1183,46 +1198,355 @@ impl Sink for StreamSink {
 
 // ─── Rendering ─────────────────────────────────────────────────────────
 
+/// Renders one grep hit as its self-contained deep-link line into `out`,
+/// terminated by a newline: `path:line#scope:<verbatim>`.
+///
+/// `rel` is the hit's precomputed display path ([`rel_path`]). The `#scope`
+/// fragment is omitted when the hit is top-level and `#?` when it could not be
+/// enriched; stripping it (up to the next `:`) yields byte-exact ripgrep
+/// (`path:line:text`) — the superset contract. The single source of the grep
+/// line format, shared by [`shape_hits`] (production) and `render_results` (the
+/// byte-identity test oracle) so the two can never drift.
+fn render_hit_line(out: &mut String, hit: &GrepHit, rel: &str) {
+    use std::fmt::Write;
+
+    let line_1 = hit.line + 1;
+    match &hit.anchor {
+        Anchor::Scope(trail) => {
+            let _ = writeln!(out, "{rel}:{line_1}#{trail}:{}", hit.matched_text);
+        }
+        Anchor::TopLevel => {
+            let _ = writeln!(out, "{rel}:{line_1}:{}", hit.matched_text);
+        }
+        Anchor::Unknown => {
+            let _ = writeln!(out, "{rel}:{line_1}#?:{}", hit.matched_text);
+        }
+    }
+}
+
 /// Renders grep hits as one self-contained URL-style deep-link line each —
 /// `path:line#scope:<verbatim>` — ordered by `(file, line)` for byte-stable
 /// output (the misc-32 determinism pattern).
 ///
-/// There is **no header** of any kind (no root header, no `cwd:` context line):
-/// every line carries its own cwd-relative path, exactly like ripgrep, so the
-/// output is pipe-safe and the alternation-header glitch is retired. Stripping
-/// the `#…` fragment (up to the next `:`) yields byte-exact ripgrep
-/// (`path:line:text`) — the superset contract, mechanized. The verbatim payload
-/// floats (variable start column, indentation preserved) with no padding.
-///
-/// Returns the complete output (decision 025) — every match, no volume branch.
+/// The single-string reference renderer: production streams the equivalent
+/// bytes hunk by hunk via [`shape_hits`], and the byte-identity test asserts the
+/// two agree. There is **no header** of any kind: every line carries its own
+/// cwd-relative path, exactly like ripgrep, so the output is pipe-safe. The
+/// verbatim payload floats (variable start column, indentation preserved) with
+/// no padding. Returns the complete output (decision 025) — every match, no
+/// volume branch.
+#[cfg(test)]
 fn render_results(hits: &[GrepHit], fs_manager: &FilesystemManager, cwd: Option<&Path>) -> String {
-    use std::fmt::Write;
-
     let mut ordered: Vec<&GrepHit> = hits.iter().collect();
     ordered.sort_by(|a, b| a.file.cmp(&b.file).then_with(|| a.line.cmp(&b.line)));
 
     let mut out = String::new();
     for hit in ordered {
         let rel = rel_path(&hit.file, fs_manager, cwd);
-        let line_1 = hit.line + 1;
-        // `path:line` + the `#scope` fragment (omitted when top-level, `#?` when
-        // un-enrichable) + the ripgrep `:` delimiter + the byte-verbatim line.
-        match &hit.anchor {
-            Anchor::Scope(trail) => {
-                let _ = writeln!(out, "{rel}:{line_1}#{trail}:{}", hit.matched_text);
-            }
-            Anchor::TopLevel => {
-                let _ = writeln!(out, "{rel}:{line_1}:{}", hit.matched_text);
-            }
-            Anchor::Unknown => {
-                let _ = writeln!(out, "{rel}:{line_1}#?:{}", hit.matched_text);
-            }
-        }
+        render_hit_line(&mut out, hit, &rel);
     }
 
     let trimmed_len = out.trim_end().len();
     out.truncate(trimmed_len);
     out
+}
+
+// ─── Bounded shaping memory: per-file hunks + spool (misc 140 phase 2) ────
+
+/// Default daemon-side buffer threshold (bytes). Rendered grep output up to this
+/// total stays entirely in memory — the hot path, no disk I/O, no behavior
+/// change; above it, later per-file hunks spill to a per-request spool file. The
+/// threshold decides only *where the daemon buffers*, never *what the requester
+/// receives* (decision 029 §5): output is byte-identical either way.
+const GREP_SPOOL_THRESHOLD: usize = 1 << 20;
+
+/// One rendered per-file grep hunk, either buffered in memory (the hot path) or
+/// spilled to the per-request spool file at `[offset, offset + len)`.
+enum Hunk {
+    /// Small hunk kept in RAM.
+    InMemory(String),
+    /// Oversized hunk spilled to the spool file.
+    Spooled {
+        /// Byte offset of the hunk in the spool file.
+        offset: u64,
+        /// Byte length of the hunk.
+        len: u64,
+    },
+}
+
+/// One rendered grep hunk in global sort order, ready for the router to stream.
+///
+/// Either buffered in memory (the hot path) or a `[offset, offset + len)` slice
+/// of the per-request spool file, read back through the [`HunkSpool`] handle
+/// returned alongside it by [`ShapedOutput::into_parts`].
+pub enum HunkChunk {
+    /// Buffered in RAM — stream its bytes directly.
+    InMemory(String),
+    /// Spilled to the spool — read `len` bytes at `offset` from the spool file.
+    Spooled {
+        /// Byte offset of the hunk in the spool file.
+        offset: u64,
+        /// Byte length of the hunk.
+        len: u64,
+    },
+}
+
+/// The shaped grep output: per-file rendered hunks in global (file, line) sort
+/// order, plus the per-request spool file (when any hunk overflowed the
+/// in-memory threshold).
+///
+/// Peak memory is the path index plus one hunk in flight: the router iterates
+/// [`into_parts`](Self::into_parts) in key order, streaming each hunk as a chunk
+/// frame and reading spooled hunks one at a time. The spool is unlinked when
+/// this value drops — on normal completion and on cancellation alike.
+#[derive(Default)]
+pub struct ShapedOutput {
+    /// Rendered hunks keyed by file path — the key order *is* the deterministic
+    /// global (file, line) sort (line order within a hunk is already correct).
+    hunks: BTreeMap<PathBuf, Hunk>,
+    /// The per-request spool, shared so a hunk read can move it into a blocking
+    /// task; `None` when everything fit in memory (the hot path).
+    spool: Option<Arc<HunkSpool>>,
+}
+
+impl ShapedOutput {
+    /// An empty shaped output (no matches, or a `--count`/`-l` empty result).
+    fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Wraps a single already-rendered string as one in-memory hunk — the `-l`
+    /// (files-with-matches) path, whose small path list is never spooled. An
+    /// empty string yields no hunk.
+    fn from_string(s: String) -> Self {
+        let mut hunks = BTreeMap::new();
+        if !s.is_empty() {
+            hunks.insert(PathBuf::new(), Hunk::InMemory(s));
+        }
+        Self { hunks, spool: None }
+    }
+
+    /// True when there is no rendered output to stream (no chunk frames).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.hunks.is_empty()
+    }
+
+    /// Consumes the shaped output into its ordered hunks (global sort order) plus
+    /// the shared spool handle. In-memory hunks carry their bytes; spooled hunks
+    /// carry `[offset, len)` and are read back through the returned spool.
+    #[must_use]
+    pub fn into_parts(self) -> (Vec<HunkChunk>, Option<Arc<HunkSpool>>) {
+        let chunks = self
+            .hunks
+            .into_values()
+            .map(|h| match h {
+                Hunk::InMemory(s) => HunkChunk::InMemory(s),
+                Hunk::Spooled { offset, len } => HunkChunk::Spooled { offset, len },
+            })
+            .collect();
+        (chunks, self.spool)
+    }
+
+    /// Reads every hunk (in-memory and spooled) in sort order, concatenates,
+    /// and trims the trailing newline — exactly what the CLI reconstructs from
+    /// the chunk stream. The byte-identity oracle for the spool path.
+    #[cfg(test)]
+    #[allow(clippy::expect_used, reason = "test-only oracle helper")]
+    fn materialize(&self) -> String {
+        let mut out = String::new();
+        for hunk in self.hunks.values() {
+            match hunk {
+                Hunk::InMemory(s) => out.push_str(s),
+                Hunk::Spooled { offset, len } => {
+                    let spool = self.spool.as_ref().expect("spooled hunk needs a spool");
+                    let bytes = spool.read_hunk(*offset, *len).expect("read spooled hunk");
+                    out.push_str(&String::from_utf8(bytes).expect("spool hunk is utf-8"));
+                }
+            }
+        }
+        out.truncate(out.trim_end().len());
+        out
+    }
+
+    /// The spool file path, when any hunk spilled — for lifecycle assertions.
+    #[cfg(test)]
+    fn spool_path(&self) -> Option<PathBuf> {
+        self.spool.as_ref().map(|s| s.path.clone())
+    }
+}
+
+/// Per-request disk-backed spool for grep hunks that overflow the in-memory
+/// buffer threshold (misc 140 phase 2).
+///
+/// Lives under [`cache_dir`](crate::paths::cache_dir) — regenerable — never
+/// [`runtime_dir`](crate::paths::runtime_dir), whose tmpfs backing would make
+/// the spool RAM and the guard a no-op. The file is unlinked on drop, so it is
+/// removed on both normal completion and cancellation (the owning
+/// [`ShapedOutput`] drops on either path). Writes during shaping are sequential
+/// through the owned handle; reads during emission open a fresh handle and seek,
+/// so the spool can be shared behind an `Arc` for a blocking read.
+pub struct HunkSpool {
+    /// Sequential write handle, used only while shaping appends hunks.
+    writer: std::fs::File,
+    /// The spool file path (unlinked on drop; reopened per read).
+    path: PathBuf,
+    /// Bytes written so far — the offset of the next appended hunk.
+    len: u64,
+}
+
+impl HunkSpool {
+    /// Creates a fresh, uniquely-named spool file under `cache_dir`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the spool directory cannot be created or the file
+    /// cannot be opened.
+    fn create() -> Result<Self> {
+        let dir = crate::paths::cache_dir()
+            .join("catenary")
+            .join("grep-spool");
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("create grep spool dir: {}", dir.display()))?;
+        let path = dir.join(format!("{}.spool", uuid::Uuid::new_v4()));
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .with_context(|| format!("create grep spool file: {}", path.display()))?;
+        Ok(Self {
+            writer,
+            path,
+            len: 0,
+        })
+    }
+
+    /// Appends one hunk's bytes, returning its `(offset, len)` in the spool.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the write fails.
+    fn append(&mut self, bytes: &[u8]) -> Result<(u64, u64)> {
+        use std::io::Write;
+        let offset = self.len;
+        self.writer
+            .write_all(bytes)
+            .with_context(|| format!("append to grep spool: {}", self.path.display()))?;
+        let len = bytes.len() as u64;
+        self.len += len;
+        Ok((offset, len))
+    }
+
+    /// Flushes buffered writes so a fresh read handle sees every appended hunk.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the flush fails.
+    fn finish(&mut self) -> Result<()> {
+        use std::io::Write;
+        self.writer
+            .flush()
+            .with_context(|| format!("flush grep spool: {}", self.path.display()))
+    }
+
+    /// Reads back one hunk's bytes: `len` bytes at `offset`.
+    ///
+    /// Opens a fresh read handle and seeks, so this needs only `&self` and can
+    /// run inside a blocking task against an `Arc`-shared spool.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be opened, sought, or read.
+    pub fn read_hunk(&self, offset: u64, len: u64) -> Result<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut reader = std::fs::File::open(&self.path)
+            .with_context(|| format!("open grep spool for read: {}", self.path.display()))?;
+        reader
+            .seek(SeekFrom::Start(offset))
+            .with_context(|| format!("seek grep spool: {}", self.path.display()))?;
+        let mut buf = vec![0u8; usize::try_from(len).context("spool hunk length overflows usize")?];
+        reader
+            .read_exact(&mut buf)
+            .with_context(|| format!("read grep spool hunk: {}", self.path.display()))?;
+        Ok(buf)
+    }
+}
+
+impl Drop for HunkSpool {
+    fn drop(&mut self) {
+        // Best-effort per-request cleanup: the spool is regenerable ephemera, so
+        // a failed unlink is a debug note, not a user-facing warning.
+        if let Err(e) = std::fs::remove_file(&self.path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            debug!("grep spool cleanup failed for {}: {e}", self.path.display());
+        }
+    }
+}
+
+/// Shapes rendered grep hits into per-file hunks, buffering small totals in
+/// memory (the hot path) and spilling above `threshold` bytes to a per-request
+/// spool file (misc 140 phase 2, decision 029 §5).
+///
+/// Hits are grouped by file — shaping is file-local (audit §2) — and each file's
+/// hunk is rendered in ascending line order via [`render_hit_line`]. The
+/// `BTreeMap<PathBuf, _>` key order reproduces the exact `(file, line)` global
+/// sort [`render_results`] produces, so concatenating the hunks in key order and
+/// trimming the trailing newline is byte-identical to the single-string render —
+/// the invariant the byte-identity test pins. The running in-memory total is
+/// what the threshold gates: once it would exceed `threshold`, later hunks spill.
+///
+/// # Errors
+///
+/// Returns an error if the spool file cannot be created or written.
+fn shape_hits(
+    hits: &[GrepHit],
+    fs_manager: &FilesystemManager,
+    cwd: Option<&Path>,
+    threshold: usize,
+) -> Result<ShapedOutput> {
+    let mut by_file: BTreeMap<PathBuf, Vec<&GrepHit>> = BTreeMap::new();
+    for hit in hits {
+        by_file.entry(hit.file.clone()).or_default().push(hit);
+    }
+
+    let mut hunks: BTreeMap<PathBuf, Hunk> = BTreeMap::new();
+    let mut spool: Option<HunkSpool> = None;
+    let mut in_memory_bytes: usize = 0;
+
+    for (file, mut file_hits) in by_file {
+        // Line order within a file is the second sort key; one hit per line
+        // (built one per `(file, line)` in `run`), so this is a total order.
+        file_hits.sort_by_key(|h| h.line);
+        let rel = rel_path(&file, fs_manager, cwd);
+        let mut block = String::new();
+        for hit in file_hits {
+            render_hit_line(&mut block, hit, &rel);
+        }
+
+        if in_memory_bytes.saturating_add(block.len()) <= threshold {
+            in_memory_bytes = in_memory_bytes.saturating_add(block.len());
+            hunks.insert(file, Hunk::InMemory(block));
+        } else {
+            if spool.is_none() {
+                spool = Some(HunkSpool::create()?);
+            }
+            let sp = spool
+                .as_mut()
+                .ok_or_else(|| anyhow!("grep spool missing after creation"))?;
+            let (offset, len) = sp.append(block.as_bytes())?;
+            hunks.insert(file, Hunk::Spooled { offset, len });
+        }
+    }
+
+    if let Some(sp) = spool.as_mut() {
+        sp.finish()?;
+    }
+
+    Ok(ShapedOutput {
+        hunks,
+        spool: spool.map(Arc::new),
+    })
 }
 
 /// The displayed path for a hit: cwd-relative when a `cwd` is set (the normal
@@ -1604,6 +1928,140 @@ mod tests {
             matched_text: text.to_string(),
             anchor,
         }
+    }
+
+    // ─── Bounded shaping memory: shape_hits + spool (misc 140 phase 2) ─────
+
+    /// Representative result shapes for the byte-identity contract: empty,
+    /// single-file, multi-file with walk order ≠ sort order and mixed anchors,
+    /// context-style multi-line, scope-trail enrichment, and trailing whitespace
+    /// on the final line (which the render trims).
+    fn shape_fixtures() -> Vec<Vec<GrepHit>> {
+        vec![
+            vec![],
+            vec![hit("/project/src/a.rs", 9, "fn run() {", Anchor::TopLevel)],
+            vec![
+                hit("/project/src/b.rs", 4, "b4", Anchor::TopLevel),
+                hit(
+                    "/project/src/a.rs",
+                    9,
+                    "a9",
+                    Anchor::Scope("Outer/inner".to_string()),
+                ),
+                hit("/project/src/a.rs", 2, "a2", Anchor::Unknown),
+                hit("/project/src/c.rs", 1, "c1", Anchor::TopLevel),
+            ],
+            vec![
+                hit(
+                    "/project/x.rs",
+                    10,
+                    "let x = 1;",
+                    Anchor::Scope("m".to_string()),
+                ),
+                hit(
+                    "/project/x.rs",
+                    11,
+                    "let y = 2;",
+                    Anchor::Scope("m".to_string()),
+                ),
+                hit(
+                    "/project/x.rs",
+                    12,
+                    "let z = 3;",
+                    Anchor::Scope("m".to_string()),
+                ),
+            ],
+            vec![
+                hit("/project/a.rs", 1, "first", Anchor::TopLevel),
+                hit(
+                    "/project/z.rs",
+                    1,
+                    "trailing spaces here   ",
+                    Anchor::TopLevel,
+                ),
+            ],
+        ]
+    }
+
+    #[test]
+    fn shape_hits_byte_identical_to_render_across_threshold() {
+        let fs = test_fs("/project");
+        let cwd = Some(Path::new("/project"));
+        for hits in shape_fixtures() {
+            let oracle = render_results(&hits, &fs, cwd);
+
+            // Everything in memory (the hot path): a huge threshold never spools.
+            let hot = shape_hits(&hits, &fs, cwd, usize::MAX).expect("shape hot");
+            assert!(hot.spool_path().is_none(), "hot path must not spool");
+            assert_eq!(
+                hot.materialize(),
+                oracle,
+                "in-memory shaping must match the single-string render",
+            );
+
+            // Everything spooled: a zero threshold forces disk for every hunk.
+            let spooled = shape_hits(&hits, &fs, cwd, 0).expect("shape spooled");
+            assert_eq!(
+                spooled.materialize(),
+                oracle,
+                "spooled shaping must be byte-identical to the in-memory hot path",
+            );
+
+            // Mixed: a small threshold keeps the first hunk in memory, spills the
+            // rest — the boundary the hot/cold split runs through.
+            let mixed = shape_hits(&hits, &fs, cwd, 8).expect("shape mixed");
+            assert_eq!(
+                mixed.materialize(),
+                oracle,
+                "mixed in-memory/spooled shaping must match the render",
+            );
+        }
+    }
+
+    #[test]
+    fn shape_hits_preserves_sort_order_when_spooled() {
+        let fs = test_fs("/project");
+        let cwd = Some(Path::new("/project"));
+        // Insertion order deliberately unsorted (mimicking parallel-walk order).
+        let hits = vec![
+            hit("/project/z.rs", 1, "z", Anchor::TopLevel),
+            hit("/project/a.rs", 2, "a2", Anchor::TopLevel),
+            hit("/project/a.rs", 1, "a1", Anchor::TopLevel),
+            hit("/project/m.rs", 1, "m", Anchor::TopLevel),
+        ];
+        let spooled = shape_hits(&hits, &fs, cwd, 0).expect("shape spooled");
+        // Line numbers render 1-based (`hit.line + 1`); sort is by (file, line).
+        assert_eq!(
+            spooled.materialize(),
+            "a.rs:2:a1\na.rs:3:a2\nm.rs:2:m\nz.rs:2:z",
+            "spooled hunks emit in (file, line) sort order, not insertion/walk order",
+        );
+    }
+
+    #[test]
+    fn spool_created_under_cache_dir_and_removed_on_drop() {
+        let fs = test_fs("/project");
+        let cwd = Some(Path::new("/project"));
+        let hits = vec![hit("/project/a.rs", 1, "spooled hit", Anchor::TopLevel)];
+        let shaped = shape_hits(&hits, &fs, cwd, 0).expect("shape spooled");
+
+        let path = shaped
+            .spool_path()
+            .expect("a zero-threshold result spools to disk");
+        assert!(
+            path.starts_with(crate::paths::cache_dir()),
+            "spool lives under cache_dir (never runtime_dir/tmpfs): {path:?}",
+        );
+        assert!(
+            path.exists(),
+            "spool exists while the shaped output is alive"
+        );
+
+        drop(shaped);
+        assert!(
+            !path.exists(),
+            "spool is unlinked on drop — completion AND cancellation both drop ShapedOutput",
+        );
     }
 
     #[test]

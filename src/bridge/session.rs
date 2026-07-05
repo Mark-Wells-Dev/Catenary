@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::runtime::Handle;
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 
 use super::diagnostics_server::DiagnosticsServer;
 use super::editing_guardrail::EditingGuardrail;
@@ -37,6 +38,10 @@ use crate::symbol_index::SymbolIndex;
 /// to workspace roots. For absolute patterns (e.g. `~/other-project/*.rs`),
 /// extracts the non-glob base directory as a search root and matches against
 /// full paths.
+///
+/// `Clone` so it can move into the `spawn_blocking` task that runs glob's
+/// off-thread directory walks (misc 140 phase 2).
+#[derive(Clone)]
 pub struct ResolvedGlob {
     glob: LspGlob,
     match_full_path: bool,
@@ -137,17 +142,46 @@ impl ResolvedGlob {
     /// list.
     #[must_use]
     pub fn expand(&self, include_gitignored: bool, include_hidden: bool) -> Vec<PathBuf> {
+        self.expand_cancellable(
+            include_gitignored,
+            include_hidden,
+            &CancellationToken::new(),
+        )
+    }
+
+    /// Like [`expand`](Self::expand), but quits the base-directory walk the
+    /// instant `cancel` fires (misc 140 phase 2).
+    ///
+    /// The walk is checked per entry so a massive base directory — the residual
+    /// phase-1 named — stops mid-walk once the router's disconnect `select!`
+    /// fires the token (the walk runs off the runtime thread via
+    /// `spawn_blocking`). A cancelled walk yields no partial result: the caller
+    /// discards it, exactly as a cancelled grep walk discards its matches.
+    #[must_use]
+    pub fn expand_cancellable(
+        &self,
+        include_gitignored: bool,
+        include_hidden: bool,
+        cancel: &CancellationToken,
+    ) -> Vec<PathBuf> {
         let Some(base) = self.override_root.as_deref() else {
             return Vec::new();
         };
-        let mut matches: Vec<PathBuf> = WalkBuilder::new(base)
+        let mut matches: Vec<PathBuf> = Vec::new();
+        for entry in WalkBuilder::new(base)
             .git_ignore(!include_gitignored)
             .hidden(!include_hidden)
             .build()
             .flatten()
-            .map(ignore::DirEntry::into_path)
-            .filter(|path| self.is_match(path, base))
-            .collect();
+        {
+            if cancel.is_cancelled() {
+                return Vec::new();
+            }
+            let path = entry.into_path();
+            if self.is_match(&path, base) {
+                matches.push(path);
+            }
+        }
         matches.sort();
         matches
     }
@@ -183,6 +217,21 @@ pub fn expand_search_paths(
     include_hidden: bool,
 ) -> Vec<PathBuf> {
     expand_search_paths_reporting(paths, include_gitignored, include_hidden).0
+}
+
+/// Like [`expand_search_paths`], but quits the moment `cancel` fires (misc 140
+/// phase 2) — the cancellable flat form glob's off-thread `--count` walk uses.
+#[must_use]
+pub fn expand_search_paths_cancellable(
+    paths: &[PathBuf],
+    include_gitignored: bool,
+    include_hidden: bool,
+    cancel: &CancellationToken,
+) -> Vec<PathBuf> {
+    expand_search_paths_grouped_cancellable(paths, include_gitignored, include_hidden, cancel)
+        .into_iter()
+        .flat_map(|g| g.resolved)
+        .collect()
 }
 
 /// One search-path argument's resolution: the concrete paths it contributed and
@@ -223,11 +272,38 @@ pub fn expand_search_paths_grouped(
     include_gitignored: bool,
     include_hidden: bool,
 ) -> Vec<ArgResolution> {
+    expand_search_paths_grouped_cancellable(
+        paths,
+        include_gitignored,
+        include_hidden,
+        &CancellationToken::new(),
+    )
+}
+
+/// Like [`expand_search_paths_grouped`], but quits the moment `cancel` fires
+/// (misc 140 phase 2).
+///
+/// The per-argument loop is checked before each argument, and every glob
+/// expansion is the cancellable [`ResolvedGlob::expand_cancellable`], so a
+/// single massive pattern base directory stops mid-walk once the router's
+/// disconnect `select!` fires the token. A cancelled resolution returns whatever
+/// arguments completed before the token fired — the caller discards the whole
+/// result on cancellation, so partial content never reaches output.
+#[must_use]
+pub fn expand_search_paths_grouped_cancellable(
+    paths: &[PathBuf],
+    include_gitignored: bool,
+    include_hidden: bool,
+    cancel: &CancellationToken,
+) -> Vec<ArgResolution> {
     let mut groups = Vec::with_capacity(paths.len());
     // Per-parent cache of gitignore-visible entries, so a batch of
     // shell-expanded siblings only walks their directory once.
     let mut visible: HashMap<PathBuf, HashSet<PathBuf>> = HashMap::new();
     for path in paths {
+        if cancel.is_cancelled() {
+            break;
+        }
         // Re-stat with a bounded retry before treating a literal path as a
         // glob — a transient stat miss (e.g. an atomic-rename write between the
         // CLI probe and here) must never silently zero a path present on disk.
@@ -253,7 +329,11 @@ pub fn expand_search_paths_grouped(
             // a glob that silently expands to an empty set.
             let mut resolved = Vec::new();
             if let Ok(glob) = ResolvedGlob::new(&path.to_string_lossy()) {
-                resolved.extend(glob.expand(include_gitignored, include_hidden));
+                resolved.extend(glob.expand_cancellable(
+                    include_gitignored,
+                    include_hidden,
+                    cancel,
+                ));
             }
             groups.push(ArgResolution {
                 resolved,
