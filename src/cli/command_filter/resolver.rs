@@ -747,7 +747,10 @@ fn resolve_redirects(cmd: &SimpleCommand, state: &State) -> Result<BTreeSet<Path
                 }
                 out.extend(expand_redirect_target(redirect, state)?);
             }
-            RedirectOp::Write | RedirectOp::Append | RedirectOp::WriteBoth => {
+            RedirectOp::Write
+            | RedirectOp::Append
+            | RedirectOp::WriteBoth
+            | RedirectOp::ReadWrite => {
                 if super::target_is_device_sink(&redirect.target) {
                     continue;
                 }

@@ -204,6 +204,11 @@ pub(crate) enum RedirectOp {
     WriteBoth,
     /// `<<<` — here-string.
     HereString,
+    /// `<>` / `N<>` — open the target for both reading and writing (fd 0 by
+    /// default). Because the file is opened writable, the gate classes it as an
+    /// output write, mirroring brush's `ReadAndWrite` → output-file projection
+    /// (bug 41) — it is one operator, not a `<` followed by a `>`.
+    ReadWrite,
 }
 
 /// Parse a shell command string into a [`ParsedScript`].
@@ -770,6 +775,12 @@ fn lex_operator(bytes: &[u8], i: usize, op: OpByte, tokens: &mut Vec<Token>) -> 
                 i + 2
             } else if i + 1 < n && bytes[i + 1] == b'&' {
                 tokens.push(Token::Redir(RedirectOp::DupIn));
+                i + 2
+            } else if i + 1 < n && bytes[i + 1] == b'>' {
+                // `<>` read-write: one operator opening the target for both
+                // reading and writing, not a `<` then a `>` (bug 41). The two
+                // bytes are consumed whole so the following word is its target.
+                tokens.push(Token::Redir(RedirectOp::ReadWrite));
                 i + 2
             } else {
                 tokens.push(Token::Redir(RedirectOp::Read));
@@ -2422,6 +2433,31 @@ mod tests {
         assert_eq!(cmd.redirects[0].target, "a");
         assert_eq!(cmd.redirects[1].op, RedirectOp::Read);
         assert_eq!(cmd.redirects[1].target, "b");
+    }
+
+    #[test]
+    fn read_write_redirect_is_single_operator() {
+        // Bug 41: `<>` is one read-write redirect (`ReadWrite`), target `dd` —
+        // not a `<` (Read) followed by a `>` (Write). The command is `git`; the
+        // `<>dd` binds as its redirect. The differential fuzz soak surfaced this
+        // as our over-count (two redirects) vs brush's single `ReadAndWrite`.
+        let cmd = sole("git <>dd");
+        assert_eq!(cmd.name.as_deref(), Some("git"));
+        assert_eq!(cmd.argv, Vec::<String>::new());
+        assert_eq!(cmd.redirects.len(), 1);
+        assert_eq!(cmd.redirects[0].op, RedirectOp::ReadWrite);
+        assert_eq!(cmd.redirects[0].target, "dd");
+    }
+
+    #[test]
+    fn read_write_redirect_at_eof_is_empty_target() {
+        // `<>` with no following word must not index past the end (`i + 1 < n`
+        // boundary); it is a single `ReadWrite` with an empty target.
+        let cmd = sole("cat <>");
+        assert_eq!(cmd.name.as_deref(), Some("cat"));
+        assert_eq!(cmd.redirects.len(), 1);
+        assert_eq!(cmd.redirects[0].op, RedirectOp::ReadWrite);
+        assert_eq!(cmd.redirects[0].target, "");
     }
 
     // ── Multibyte UTF-8 in words (bug 43) ────────────────────────────────────

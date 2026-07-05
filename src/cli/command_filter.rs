@@ -82,8 +82,10 @@ fn redirect_writes_file(redirect: &parse::Redirect) -> bool {
     match redirect.op {
         // Input-side operators never write a file.
         RedirectOp::Read | RedirectOp::DupIn | RedirectOp::HereString => false,
-        // Plain / append / combined-stream output writes a file.
-        RedirectOp::Write | RedirectOp::Append | RedirectOp::WriteBoth => {
+        // Plain / append / combined-stream / read-write output writes a file.
+        // `<>` opens the target writable (fd 0 by default), so it must route
+        // through the edit path like any other write (bug 41).
+        RedirectOp::Write | RedirectOp::Append | RedirectOp::WriteBoth | RedirectOp::ReadWrite => {
             !target_is_device_sink(&redirect.target)
         }
         // `>&word`: a bare fd number (`>&1`) or close (`>&-`) is a descriptor

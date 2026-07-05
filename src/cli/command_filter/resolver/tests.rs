@@ -123,6 +123,15 @@ fn redirect_literal_target_recorded() {
 }
 
 #[test]
+fn read_write_redirect_target_recorded() {
+    // Bug 41: `<>` opens its target writable (fd 0 by default), so the write
+    // resolver must record it like any other output redirect — the file changed,
+    // so diagnostics must see it (ADR 020 §8a edit-visibility).
+    let t = tmp();
+    assert_eq!(ok("cat <>rw.txt", t.path()), paths(t.path(), &["rw.txt"]));
+}
+
+#[test]
 fn redirect_absolute_target_recorded() {
     let t = tmp();
     let target = t.path().join("abs.txt");

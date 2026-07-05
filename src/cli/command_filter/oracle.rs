@@ -150,7 +150,7 @@ fn collect_ours_redirects(script: &parse::ParsedScript, out: &mut Vec<RedirectKi
 /// Map our [`RedirectOp`] onto the shared [`RedirectKind`].
 const fn our_redirect_kind(op: RedirectOp) -> RedirectKind {
     match op {
-        RedirectOp::Write | RedirectOp::Append => RedirectKind::OutputFile,
+        RedirectOp::Write | RedirectOp::Append | RedirectOp::ReadWrite => RedirectKind::OutputFile,
         RedirectOp::Read => RedirectKind::InputFile,
         RedirectOp::DupOut | RedirectOp::DupIn => RedirectKind::Dup,
         RedirectOp::WriteBoth => RedirectKind::OutputBoth,
@@ -1020,6 +1020,11 @@ const SEED_CORPUS: &[&str] = &[
     "git commit -F - <<EOF\nran tests; shipped\nEOF",
     // ── Bug 52 — quoted assignment value must not leak to command position ────
     "VAR='/a/b/x'",
+    // ── Bug 41 — `<>` read-write redirect is one operator, not `<` then `>` ───
+    // The differential soak surfaced our over-count (a Read + a Write) where
+    // brush projects a single `ReadAndWrite` output redirect. `<>` opens the
+    // target writable, so both sides now agree on one output-file redirect.
+    "git <>dd",
 ];
 
 // ── proptest strategy ─────────────────────────────────────────────────────────
@@ -1790,6 +1795,12 @@ mod tests {
         assert_eq!(
             our_redirect_kind(RedirectOp::HereString),
             RedirectKind::HereString
+        );
+        // `<>` (read-write) projects to the output-file class, matching brush's
+        // `ReadAndWrite` → output-file mapping (bug 41).
+        assert_eq!(
+            our_redirect_kind(RedirectOp::ReadWrite),
+            RedirectKind::OutputFile
         );
     }
 

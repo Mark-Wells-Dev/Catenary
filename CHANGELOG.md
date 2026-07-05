@@ -504,6 +504,17 @@ upgrading.
 
 ### Fixed
 
+- **`<>` (read-write) redirects lex as one operator.** The faithful shell
+  parser had no read-write redirect: `<>` split into a `<` then a `>` — two
+  redirects where bash performs one — diverging from the brush oracle (found
+  by the differential fuzz soak). `<>` and `N<>` now lex as a single
+  `ReadWrite` operator projected to the output-file class: it opens its
+  target writable, so the redirect guard and write resolver gate it as a
+  write (edit-visibility preserved; the deny outcome is unchanged — only the
+  operator count and a spurious input-file projection were wrong). The
+  minimized case is graduated into the differential corpus with
+  assert-on-value pins for the tokenization, the oracle projection, and the
+  write resolution.
 - **Top-level `catenary --version`/`--help` admit only as sole flags.** The
   canonical-form matcher admits the global informational flags (`--version`/
   `-V`/`--help`/`-h`) only when the flag is the entire argument vector —
