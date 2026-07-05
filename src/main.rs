@@ -3563,33 +3563,34 @@ mod tests {
 
     #[test]
     fn grep_count_reports_skip_without_conflating_no_match() {
-        // A named file skipped (over the size cap) is a skip, not a no-match:
-        // the `--count` line reports it in a suffix, never as `0 … 0` silence
+        // A named file skipped (binary content) is a skip, not a no-match: the
+        // `--count` line reports it in a suffix, never as `0 … 0` silence
         // (misc 135, bug 62).
         let skipped = catenary_mcp::bridge::GrepSkips {
-            named: vec![("big.js".to_string(), "too large (>10 MB)".to_string())],
+            named: vec![("blob.bin".to_string(), "binary".to_string())],
             walked: vec![],
         };
         let mut out = cli::Output::buffer(80);
         render_grep_count(&mut out, 0, 0, &skipped);
         assert_eq!(
             out.into_string(),
-            "0 matches in 0 files (1 skipped: too large (>10 MB))\n"
+            "0 matches in 0 files (1 skipped: binary)\n"
         );
     }
 
     #[test]
-    fn grep_count_skip_suffix_breaks_down_multiple_reasons() {
-        // Mixed reasons list a per-reason breakdown so the tally is honest.
+    fn grep_count_skip_suffix_aggregates_binary_reason() {
+        // Content classification leaves a single skip reason (misc 140): named
+        // and walked binary skips fold into one honest `binary` tally.
         let skipped = catenary_mcp::bridge::GrepSkips {
-            named: vec![("big.js".to_string(), "too large (>10 MB)".to_string())],
+            named: vec![("blob.bin".to_string(), "binary".to_string())],
             walked: vec![("binary".to_string(), 2)],
         };
         let mut out = cli::Output::buffer(80);
         render_grep_count(&mut out, 5, 1, &skipped);
         assert_eq!(
             out.into_string(),
-            "5 matches in 1 files (3 skipped: 2 binary, 1 too large (>10 MB))\n"
+            "5 matches in 1 files (3 skipped: binary)\n"
         );
     }
 
@@ -3597,14 +3598,14 @@ mod tests {
     fn grep_skips_render_named_and_walked_lines() {
         // A named file gets a per-file line; walked files aggregate by reason.
         let skipped = catenary_mcp::bridge::GrepSkips {
-            named: vec![("big.js".to_string(), "too large (>10 MB)".to_string())],
+            named: vec![("blob.bin".to_string(), "binary".to_string())],
             walked: vec![("binary".to_string(), 3)],
         };
         let mut out = cli::Output::buffer(80);
         render_grep_skips(&mut out, &skipped);
         assert_eq!(
             out.into_string(),
-            "skipped (too large (>10 MB)): big.js\n3 files skipped (binary)\n"
+            "skipped (binary): blob.bin\n3 files skipped (binary)\n"
         );
     }
 

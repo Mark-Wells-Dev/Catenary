@@ -233,10 +233,12 @@ impl GrepSkips {
         lines
     }
 
-    /// The `--count` suffix, e.g. ` (1 skipped: too large (>10 MB))`, or `None`
-    /// when nothing was skipped (the count then renders exactly as before). A
-    /// single distinct reason is named plainly; multiple reasons list a
-    /// per-reason breakdown so `skipped` is never conflated with no-match.
+    /// The `--count` suffix, e.g. ` (1 skipped: binary)`, or `None` when nothing
+    /// was skipped (the count then renders exactly as before). A single distinct
+    /// reason is named plainly; multiple reasons list a per-reason breakdown so
+    /// `skipped` is never conflated with no-match. Content classification now
+    /// leaves `binary` as the only reason (misc 140), but the breakdown stays
+    /// generic over the reason label.
     #[must_use]
     pub fn count_suffix(&self) -> Option<String> {
         if self.is_empty() {
@@ -367,14 +369,18 @@ impl GrepServer {
         // takes precedence over `-l` when both are given (the more specific
         // tally wins).
         if input.count {
-            return self.count_matches(&input, &search_paths, cwd.as_deref());
+            return self
+                .count_matches(&input, &search_paths, cwd.as_deref(), cancel)
+                .await;
         }
 
         // `-l`/`--files-with-matches`: a plain ripgrep pass, then just the
         // distinct matching files as cwd-relative paths (one per line) — no
         // enrichment, no `#scope`, no context (ripgrep drops context with `-l`).
         if input.flags.files_with_matches {
-            return self.files_with_matches(&input, &search_paths, cwd.as_deref());
+            return self
+                .files_with_matches(&input, &search_paths, cwd.as_deref(), cancel)
+                .await;
         }
 
         // Run the whole pattern in a single pass. Top-level `|` alternation is
@@ -445,11 +451,12 @@ impl GrepServer {
     /// matches counts once (`file_line_texts` is keyed by line), matching
     /// `grep -c`. `cwd` and `search_paths` scope the walk exactly as
     /// [`Self::run`] does.
-    fn count_matches(
+    async fn count_matches(
         &self,
         input: &GrepInput,
         search_paths: &[PathBuf],
         cwd: Option<&Path>,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<GrepOutcome> {
         let effective_roots = self.effective_search_roots(search_paths, cwd);
         let resolved_exclude = input
@@ -467,15 +474,17 @@ impl GrepServer {
             files_with_matches: false,
             ..input.flags.clone()
         };
-        let rg = Self::ripgrep_matches(
-            &input.pattern,
-            &effective_roots,
-            resolved_exclude.as_ref(),
+        let rg = Self::ripgrep_matches_blocking(
+            input.pattern.clone(),
+            effective_roots,
+            resolved_exclude,
             input.include_gitignored,
             input.include_hidden,
-            &self.fs_manager,
-            &flags,
-        )?;
+            Arc::clone(&self.fs_manager),
+            flags,
+            cancel.clone(),
+        )
+        .await?;
 
         let matches: usize = rg.file_line_texts.values().map(HashMap::len).sum();
         let files = rg.file_line_texts.len();
@@ -494,11 +503,12 @@ impl GrepServer {
     /// byte-stable output. No enrichment, no `#scope`, no context (ripgrep drops
     /// context with `-l`) — the complete list prints, and a path per line keeps
     /// it pipe-safe (`-l` composes with `| head`/`| grep`).
-    fn files_with_matches(
+    async fn files_with_matches(
         &self,
         input: &GrepInput,
         search_paths: &[PathBuf],
         cwd: Option<&Path>,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<GrepOutcome> {
         let effective_roots = self.effective_search_roots(search_paths, cwd);
         let resolved_exclude = input
@@ -515,15 +525,17 @@ impl GrepServer {
             files_with_matches: false,
             ..input.flags.clone()
         };
-        let rg = Self::ripgrep_matches(
-            &input.pattern,
-            &effective_roots,
-            resolved_exclude.as_ref(),
+        let rg = Self::ripgrep_matches_blocking(
+            input.pattern.clone(),
+            effective_roots,
+            resolved_exclude,
             input.include_gitignored,
             input.include_hidden,
-            &self.fs_manager,
-            &flags,
-        )?;
+            Arc::clone(&self.fs_manager),
+            flags,
+            cancel.clone(),
+        )
+        .await?;
 
         // Skips ride along even for `-l`: a named file skipped instead of
         // searched must not silently vanish from the file list (misc 135).
@@ -573,16 +585,20 @@ impl GrepServer {
         // Step 1: Ripgrep scoped to file set → raw hits with matched text.
         // Context lines (`-A`/`-B`/`-C`) and inverted selection (`-v`) are
         // captured here too — each becomes a hit and is anchored by containment
-        // exactly like a match line.
-        let rg = Self::ripgrep_matches(
-            &input.pattern,
-            &effective_roots,
-            resolved_exclude.as_ref(),
+        // exactly like a match line. The synchronous parallel walk runs on a
+        // blocking thread so the router's disconnect `select!` stays pollable and
+        // the cancel token can actually fire mid-walk (misc 140).
+        let rg = Self::ripgrep_matches_blocking(
+            input.pattern.clone(),
+            effective_roots.clone(),
+            resolved_exclude.clone(),
             input.include_gitignored,
             input.include_hidden,
-            &self.fs_manager,
-            &input.flags,
-        )?;
+            Arc::clone(&self.fs_manager),
+            input.flags.clone(),
+            cancel.clone(),
+        )
+        .await?;
 
         // Fold the walk's skip records (built before any early return) so a
         // skip-only search — the bug-62 case, every match hidden behind a
@@ -759,16 +775,67 @@ impl GrepServer {
         Ok((render_results(&hits, &self.fs_manager, cwd), skipped))
     }
 
+    /// Runs [`Self::ripgrep_matches`] on a blocking thread.
+    ///
+    /// The walk is a synchronous `walker.run()` (ripgrep's parallel walker). Left
+    /// on an async runtime worker it would pin that thread for the whole walk, so
+    /// the router's disconnect-`select!` could never poll its cancel branch — the
+    /// walk would read a dead client's tree to completion (misc 140 audit §4).
+    /// Moving it to [`tokio::task::spawn_blocking`] keeps the runtime free to fire
+    /// the cancel token, which the walker visitors observe per file and answer
+    /// with `WalkState::Quit`. Dropping the join handle on cancel detaches the
+    /// blocking task; the threaded token is what actually stops its work promptly.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the pattern is not a valid regex, or if the blocking
+    /// walk task panics.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "mirrors ripgrep_matches, owned for the blocking boundary"
+    )]
+    async fn ripgrep_matches_blocking(
+        pattern: String,
+        roots: Vec<PathBuf>,
+        exclude: Option<Arc<ResolvedGlob>>,
+        include_gitignored: bool,
+        include_hidden: bool,
+        fs_manager: Arc<FilesystemManager>,
+        flags: GrepFlags,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<RipgrepMatches> {
+        tokio::task::spawn_blocking(move || {
+            Self::ripgrep_matches(
+                &pattern,
+                &roots,
+                exclude.as_ref(),
+                include_gitignored,
+                include_hidden,
+                &fs_manager,
+                &flags,
+                &cancel,
+            )
+        })
+        .await
+        .map_err(|e| anyhow!("grep walk task failed: {e}"))?
+    }
+
     /// Searches workspace roots for pattern matches using the `grep-*` crates
     /// (ripgrep's internals). Walks files in parallel and returns matched
     /// strings and per-file line numbers in a single pass per file.
+    ///
+    /// `cancel` is threaded into every parallel walker visitor: a fired token
+    /// (the CLI client disconnected) quits the walk at the next file rather than
+    /// reading the tree to completion (misc 140). Runs synchronously — callers on
+    /// the async runtime go through [`Self::ripgrep_matches_blocking`].
     ///
     /// # Errors
     ///
     /// Returns an error if the pattern is not a valid regex.
     #[allow(
         clippy::too_many_lines,
-        reason = "Single-pass parallel walk + skip recording"
+        clippy::too_many_arguments,
+        reason = "Single-pass parallel walk + skip recording; cancel token threaded in"
     )]
     fn ripgrep_matches(
         pattern: &str,
@@ -778,6 +845,7 @@ impl GrepServer {
         include_hidden: bool,
         fs_manager: &Arc<FilesystemManager>,
         flags: &GrepFlags,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<RipgrepMatches> {
         use ignore::WalkState;
         use std::sync::Mutex as StdMutex;
@@ -852,12 +920,23 @@ impl GrepServer {
                 // it (mirroring `invert` above).
                 let named_root = root_is_file;
                 let fs_manager = Arc::clone(fs_manager);
+                // Per-thread cancel handle (the token is cheap to clone — Arc
+                // inside). A fired token quits this thread's walk (misc 140).
+                let cancel = cancel.clone();
                 let mut state = CollectOnDrop {
                     local: ThreadMatches::default(),
                     collected: Arc::clone(&collected),
                 };
 
                 Box::new(move |entry| {
+                    // Real walk cancellation (misc 140): the router fires this
+                    // token when the CLI client disconnects. Quit the parallel
+                    // walk at the first entry a cancelled thread reaches instead
+                    // of reading the tree to completion — the incident this guard
+                    // closes (a terabyte-scale walk for a client that is gone).
+                    if cancel.is_cancelled() {
+                        return WalkState::Quit;
+                    }
                     let Ok(entry) = entry else {
                         return WalkState::Continue;
                     };
@@ -916,17 +995,16 @@ impl GrepServer {
                         return WalkState::Continue;
                     }
 
-                    // Skip a file the classifier treats as binary — either
-                    // genuine NUL-byte content or a file over the size cap
-                    // assumed binary without reading. The size-cap case is the
-                    // misc-135 / bug-62 mechanism: a large *text* file (e.g. a
-                    // 15.7 MB minified JS bundle) is misclassified because
-                    // `scan_file` returns `None` for `len > BINARY_SIZE_THRESHOLD`
-                    // (`filesystem_manager.rs`) WITHOUT reading a byte. Rather
-                    // than drop it silently — the old `0 matches in 0 files`
-                    // indistinguishable from a true no-match — record the skip
-                    // with its reason and whether it was explicitly named, so the
-                    // outcome reports it (never silence).
+                    // Skip a file the classifier treats as binary — a NUL byte
+                    // before any text BOM. Classification is now purely
+                    // content-based at any size (misc 140, decision 029): the
+                    // former size cap that skipped large *text* files unread is
+                    // gone, so a 15.7 MB pure-UTF-8 bundle is searched to EOF, not
+                    // skipped (bug 62). Rather than drop a genuinely binary file
+                    // silently — the old `0 matches in 0 files` indistinguishable
+                    // from a true no-match — record the skip with its reason and
+                    // whether it was explicitly named, so the outcome reports it
+                    // (never silence, misc 135).
                     if let Some(md) = &metadata
                         && let Some(reason) = fs_manager.binary_skip_reason(path, md)
                     {
@@ -1346,6 +1424,7 @@ impl Sink for MatchSink<'_> {
 /// root — a positional arg or a glob that expanded to it) versus reached by a
 /// directory walk. Folded into the wire-ready [`GrepSkips`] by
 /// [`GrepSkips::from_records`] (misc 135, bug 62).
+#[derive(Debug)]
 struct SkipRecord {
     /// Absolute path of the skipped file.
     path: PathBuf,
@@ -1371,8 +1450,8 @@ struct RipgrepMatches {
     /// the delta per server. The stat is free here — the walk already reads each
     /// file (`grep_server.rs` ripgrep walk).
     files: Vec<(PathBuf, i64)>,
-    /// Files skipped instead of searched (binary content or over the size cap),
-    /// so the skip is reported rather than read as a no-match (misc 135).
+    /// Files skipped instead of searched (binary content — a NUL before any text
+    /// BOM), so the skip is reported rather than read as a no-match (misc 135).
     skips: Vec<SkipRecord>,
 }
 
@@ -1592,15 +1671,15 @@ mod tests {
     fn skips_single_reason_count_suffix_names_it_plainly() {
         let skips = GrepSkips {
             named: vec![(
-                "big.js".to_string(),
-                BinarySkip::TooLarge.label().to_string(),
+                "blob.bin".to_string(),
+                BinarySkip::Binary.label().to_string(),
             )],
             walked: vec![],
         };
         assert_eq!(skips.total(), 1);
         assert_eq!(
             skips.count_suffix().as_deref(),
-            Some(" (1 skipped: too large (>10 MB))")
+            Some(" (1 skipped: binary)")
         );
     }
 
@@ -1608,15 +1687,15 @@ mod tests {
     fn skips_render_lines_names_then_aggregates() {
         let skips = GrepSkips {
             named: vec![(
-                "big.js".to_string(),
-                BinarySkip::TooLarge.label().to_string(),
+                "blob.bin".to_string(),
+                BinarySkip::Binary.label().to_string(),
             )],
             walked: vec![(BinarySkip::Binary.label().to_string(), 1)],
         };
         assert_eq!(
             skips.render_lines(),
             vec![
-                "skipped (too large (>10 MB)): big.js".to_string(),
+                "skipped (binary): blob.bin".to_string(),
                 "1 file skipped (binary)".to_string(),
             ]
         );
@@ -1625,10 +1704,12 @@ mod tests {
     #[test]
     fn skips_from_records_splits_named_and_walked_dedup() {
         let fs = test_fs("/project");
+        // Every skip is now content-binary (the size-cap reason retired, misc 140):
+        // the named/walked split and dedup are unchanged.
         let records = vec![
             SkipRecord {
-                path: PathBuf::from("/project/big.js"),
-                reason: BinarySkip::TooLarge,
+                path: PathBuf::from("/project/blob.bin"),
+                reason: BinarySkip::Binary,
                 named: true,
             },
             SkipRecord {
@@ -1643,15 +1724,15 @@ mod tests {
             },
             // Same path both named and walked → reported once, as named.
             SkipRecord {
-                path: PathBuf::from("/project/big.js"),
-                reason: BinarySkip::TooLarge,
+                path: PathBuf::from("/project/blob.bin"),
+                reason: BinarySkip::Binary,
                 named: false,
             },
         ];
         let skips = GrepSkips::from_records(&records, &fs, Some(Path::new("/project")));
         assert_eq!(
             skips.named,
-            vec![("big.js".to_string(), "too large (>10 MB)".to_string())]
+            vec![("blob.bin".to_string(), "binary".to_string())]
         );
         assert_eq!(skips.walked, vec![("binary".to_string(), 2)]);
         assert_eq!(skips.total(), 3);
@@ -2079,6 +2160,7 @@ mod tests {
             false,
             &fs,
             &GrepFlags::default(),
+            &tokio_util::sync::CancellationToken::new(),
         )
         .expect("ripgrep_matches");
 
@@ -2166,6 +2248,7 @@ mod tests {
             false,
             &fs,
             flags,
+            &tokio_util::sync::CancellationToken::new(),
         )
         .expect("ripgrep_matches")
     }
@@ -2385,6 +2468,7 @@ mod tests {
             false,
             &fs,
             &GrepFlags::default(),
+            &tokio_util::sync::CancellationToken::new(),
         )
         .expect("ripgrep_matches");
         assert!(
@@ -2408,6 +2492,7 @@ mod tests {
             false,
             &fs,
             &GrepFlags::default(),
+            &tokio_util::sync::CancellationToken::new(),
         )
         .expect("ripgrep_matches");
         assert!(
@@ -2417,6 +2502,180 @@ mod tests {
                 .any(|k| k.ends_with("ignored.rs")),
             "--include-gitignored surfaces the ignored dir's contents: {:?}",
             with_ignored.file_lines
+        );
+    }
+
+    // ─── content classification & cancellation (misc 140) ──────────────────
+
+    /// bug 62: a pure-UTF-8 file well over the retired 10 MB cap is searched to
+    /// EOF and matched from both a named path and a directory walk — never
+    /// skipped-by-size (the cap that misclassified such files is gone).
+    #[test]
+    fn ripgrep_matches_searches_large_utf8_file_uncapped() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let big = root.join("bundle.js");
+        // 29 bytes/line * 400_000 ≈ 11.6 MB, every line holds the needle.
+        std::fs::write(&big, "NEEDLE and some padding text\n".repeat(400_000)).expect("write");
+        assert!(
+            std::fs::metadata(&big).expect("meta").len() > 10 * 1024 * 1024,
+            "fixture must exceed the retired cap"
+        );
+        let fs = Arc::new(FilesystemManager::new());
+        let token = tokio_util::sync::CancellationToken::new();
+
+        let named = GrepServer::ripgrep_matches(
+            "NEEDLE",
+            std::slice::from_ref(&big),
+            None,
+            false,
+            false,
+            &fs,
+            &GrepFlags::default(),
+            &token,
+        )
+        .expect("ripgrep_matches named");
+        assert!(
+            named.skips.is_empty(),
+            "a large pure-UTF-8 file is not a skip: {:?}",
+            named.skips
+        );
+        assert!(
+            named.file_lines.keys().any(|k| k.ends_with("bundle.js")),
+            "the named large file matched: {:?}",
+            named.file_lines
+        );
+
+        let walked = GrepServer::ripgrep_matches(
+            "NEEDLE",
+            std::slice::from_ref(&root.to_path_buf()),
+            None,
+            false,
+            false,
+            &fs,
+            &GrepFlags::default(),
+            &token,
+        )
+        .expect("ripgrep_matches walk");
+        assert!(walked.skips.is_empty(), "walk: large UTF-8 is not a skip");
+        assert!(
+            walked.file_lines.keys().any(|k| k.ends_with("bundle.js")),
+            "the walked large file matched: {:?}",
+            walked.file_lines
+        );
+    }
+
+    /// A file with an early NUL (no BOM) is skipped as binary from both a named
+    /// path (per-file skip) and a directory walk (aggregated skip) — the only
+    /// skips left are content skips (misc 140).
+    #[test]
+    fn ripgrep_matches_skips_early_nul_file_named_and_walked() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let blob = root.join("blob.dat");
+        let mut bytes = b"NEEDLE".to_vec();
+        bytes.push(0x00); // NUL before any BOM ⇒ binary
+        bytes.extend_from_slice(b"more NEEDLE bytes");
+        std::fs::write(&blob, &bytes).expect("write");
+        let fs = Arc::new(FilesystemManager::new());
+        let token = tokio_util::sync::CancellationToken::new();
+
+        let named = GrepServer::ripgrep_matches(
+            "NEEDLE",
+            std::slice::from_ref(&blob),
+            None,
+            false,
+            false,
+            &fs,
+            &GrepFlags::default(),
+            &token,
+        )
+        .expect("named");
+        assert!(
+            named.file_lines.is_empty(),
+            "a binary file yields no matches"
+        );
+        assert_eq!(named.skips.len(), 1, "one skip recorded: {:?}", named.skips);
+        assert!(named.skips[0].named, "a named binary file skips per-file");
+        assert_eq!(named.skips[0].reason, BinarySkip::Binary);
+
+        let walked = GrepServer::ripgrep_matches(
+            "NEEDLE",
+            std::slice::from_ref(&root.to_path_buf()),
+            None,
+            false,
+            false,
+            &fs,
+            &GrepFlags::default(),
+            &token,
+        )
+        .expect("walked");
+        assert!(walked.file_lines.is_empty());
+        assert!(
+            walked
+                .skips
+                .iter()
+                .any(|s| !s.named && s.reason == BinarySkip::Binary),
+            "a walked binary file is an unnamed skip: {:?}",
+            walked.skips
+        );
+    }
+
+    /// A fired cancel token quits the parallel walk (`WalkState::Quit`) before it
+    /// records any file — the visit count collapses from the full tree to zero
+    /// (misc 140 real walk cancellation). The un-fired baseline visits every file.
+    #[test]
+    fn ripgrep_matches_quits_when_token_fires() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let total = 400;
+        for i in 0..total {
+            std::fs::write(root.join(format!("f{i}.txt")), "needle\n").expect("write");
+        }
+        let fs = Arc::new(FilesystemManager::new());
+
+        // Baseline: an un-fired token visits every file.
+        let fresh = tokio_util::sync::CancellationToken::new();
+        let full = GrepServer::ripgrep_matches(
+            "needle",
+            std::slice::from_ref(&root.to_path_buf()),
+            None,
+            false,
+            false,
+            &fs,
+            &GrepFlags::default(),
+            &fresh,
+        )
+        .expect("full walk");
+        assert_eq!(
+            full.files.len(),
+            total,
+            "the un-cancelled walk visits every file"
+        );
+
+        // A pre-fired token quits at the first entry each thread reaches; the
+        // cancel check precedes the file-record push, so the visit set is empty.
+        let cancelled = tokio_util::sync::CancellationToken::new();
+        cancelled.cancel();
+        let quit = GrepServer::ripgrep_matches(
+            "needle",
+            std::slice::from_ref(&root.to_path_buf()),
+            None,
+            false,
+            false,
+            &fs,
+            &GrepFlags::default(),
+            &cancelled,
+        )
+        .expect("cancelled walk");
+        assert!(
+            quit.files.is_empty(),
+            "a cancelled walk visits no files, got {}",
+            quit.files.len()
+        );
+        assert!(
+            quit.file_lines.is_empty(),
+            "a cancelled walk matches nothing"
         );
     }
 }

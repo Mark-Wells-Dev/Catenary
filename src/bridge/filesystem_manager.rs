@@ -17,9 +17,6 @@ use ignore::WalkBuilder;
 use crate::config::{LinterConfig, ProjectConfig};
 use crate::source::Source;
 
-/// Files above this size are assumed binary without reading.
-const BINARY_SIZE_THRESHOLD: u64 = 10 * 1024 * 1024; // 10 MB
-
 /// File classification result.
 #[derive(Debug, Clone)]
 pub struct FileInfo {
@@ -49,7 +46,7 @@ impl FileInfo {
 /// File classification: binary, text, or folder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileKind {
-    /// Binary file (contains null bytes or exceeds size threshold).
+    /// Binary file (a NUL byte appeared before any text byte-order mark).
     Binary,
     /// Text file with line count and optional language ID.
     Text {
@@ -67,27 +64,22 @@ pub enum FileKind {
 
 /// Why the classifier treats a file as unsearchable binary.
 ///
-/// The two causes collapsed into the single [`FileKind::Binary`] verdict, split
-/// back out so a caller can report an honest skip reason (misc 135, bug 62).
+/// Classification is purely content-based: a file is binary when a NUL byte
+/// appears before any text byte-order mark (misc 140, decision 029 — the former
+/// size cap that also skipped large *text* files unread is gone, bug 62). The
+/// reason is kept as an enum so the grep skip-honesty surface (misc 135) has one
+/// place to label it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinarySkip {
-    /// Larger than [`BINARY_SIZE_THRESHOLD`] — assumed binary and skipped
-    /// **without reading a byte**. This is the bug-62 mechanism: a large *text*
-    /// file (e.g. a 15.7 MB minified JS bundle) is misclassified purely by size.
-    TooLarge,
     /// A NUL byte was found while scanning — genuinely binary content.
     Binary,
 }
 
 impl BinarySkip {
     /// Human-readable reason label for the grep skip-honesty surface (misc 135).
-    ///
-    /// The `TooLarge` label names the [`BINARY_SIZE_THRESHOLD`] (10 MB); keep the
-    /// two in sync if the threshold ever changes.
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
-            Self::TooLarge => "too large (>10 MB)",
             Self::Binary => "binary",
         }
     }
@@ -559,7 +551,7 @@ impl FilesystemManager {
         // Shebang is checked first here, but in practice it only matters
         // for extensionless scripts — `language_id()` short-circuits on
         // filename/extension before reaching `classify()`.
-        let kind = scan_file(path, metadata).map_or(FileKind::Binary, |scan| {
+        let kind = scan_file(path).map_or(FileKind::Binary, |scan| {
             // Per-root shebang → per-root path → global shebang → global path.
             let language_id = root
                 .as_ref()
@@ -617,21 +609,18 @@ impl FilesystemManager {
     /// Why a file is treated as unsearchable binary, or `None` when it is
     /// searchable text.
     ///
-    /// Splits the single [`is_binary`](Self::is_binary) verdict into its two
-    /// causes so a caller can report an honest skip reason (misc 135, bug 62):
-    /// the size-cap heuristic ([`BinarySkip::TooLarge`] — a file over
-    /// [`BINARY_SIZE_THRESHOLD`] assumed binary without reading, the bug-62
-    /// mechanism) versus genuine NUL-byte content ([`BinarySkip::Binary`]). The
-    /// size check is a metadata comparison (no I/O) and is tested **first**, so
-    /// the subsequent NUL check reflects only sub-threshold content.
+    /// A thin reason-carrying wrapper over [`is_binary`](Self::is_binary): the
+    /// verdict is purely content-based (a NUL byte before any text BOM), so the
+    /// only reason is [`BinarySkip::Binary`]. The former size-cap heuristic —
+    /// which skipped large *text* files without reading a byte — is gone
+    /// (misc 140, decision 029; the bug-62 mechanism), so a large pure-UTF-8 file
+    /// is searchable text like any other (misc 135 keeps the honest skip line for
+    /// genuinely binary content).
     pub fn binary_skip_reason(
         &self,
         path: &Path,
         metadata: &std::fs::Metadata,
     ) -> Option<BinarySkip> {
-        if metadata.len() > BINARY_SIZE_THRESHOLD {
-            return Some(BinarySkip::TooLarge);
-        }
         if self.is_binary(path, metadata) {
             return Some(BinarySkip::Binary);
         }
@@ -685,8 +674,7 @@ impl FilesystemManager {
     /// routing can match it against a linter's declared shebang list.
     #[must_use]
     pub fn shebang_interpreter(&self, path: &Path) -> Option<String> {
-        let metadata = std::fs::metadata(path).ok()?;
-        scan_file(path, &metadata).and_then(|scan| scan.shebang_interpreter)
+        scan_file(path).and_then(|scan| scan.shebang_interpreter)
     }
 
     /// Whether `linter` routes to `file` (whose root-relative path is `rel`).
@@ -1356,15 +1344,17 @@ struct ScanResult {
     shebang_interpreter: Option<String>,
 }
 
-/// Scans a file for null bytes, counts lines, and extracts shebang in one pass.
+/// Scans a file for its binary/text verdict, line count, and shebang in one pass.
 ///
-/// Returns `Some(ScanResult)` for text files, `None` for binary files.
-/// Files above the size threshold are assumed binary without reading.
-fn scan_file(path: &Path, metadata: &std::fs::Metadata) -> Option<ScanResult> {
-    if metadata.len() > BINARY_SIZE_THRESHOLD {
-        return None;
-    }
-
+/// Returns `Some(ScanResult)` for text files, `None` for binary files. The
+/// verdict is content-based at **any size** (misc 140, decision 029): the file is
+/// read in 8 KB chunks and declared binary at the first NUL byte — unless a text
+/// byte-order mark opens it. A UTF-16/UTF-32 BOM marks NUL-dense text, so a BOM at
+/// offset 0 suppresses the NUL verdict and the scan counts lines to EOF; a NUL
+/// *before* any BOM is binary (rg's "binary file matches" contract stays declined,
+/// misc 135). There is no size cap: a large pure-UTF-8 file is text and is counted
+/// in full (the bug-62 fix — the former size cap misclassified such files unread).
+fn scan_file(path: &Path) -> Option<ScanResult> {
     let Ok(file) = std::fs::File::open(path) else {
         return Some(ScanResult {
             lines: 0,
@@ -1377,6 +1367,9 @@ fn scan_file(path: &Path, metadata: &std::fs::Metadata) -> Option<ScanResult> {
     let mut lines = 0;
     let mut shebang_interpreter = None;
     let mut first_chunk = true;
+    // A text byte-order mark at offset 0 marks NUL-dense UTF-16/UTF-32 text, so
+    // the NUL verdict is suppressed for the rest of the scan (misc 140).
+    let mut bom_text = false;
 
     loop {
         let Ok(n) = reader.read(&mut buf) else {
@@ -1391,18 +1384,35 @@ fn scan_file(path: &Path, metadata: &std::fs::Metadata) -> Option<ScanResult> {
                 shebang_interpreter,
             });
         }
-        if memchr::memchr(0, &buf[..n]).is_some() {
-            return None; // Binary
-        }
 
+        // BOM detection precedes the NUL verdict: a UTF-16 BOM file is text even
+        // though it is NUL-dense. Shebang extraction shares this first-chunk pass.
         if first_chunk {
             first_chunk = false;
+            bom_text = starts_with_text_bom(&buf[..n]);
             let first_line_end = memchr::memchr(b'\n', &buf[..n]).unwrap_or(n);
             shebang_interpreter = extract_shebang_interpreter(&buf[..first_line_end]);
         }
 
+        if !bom_text && memchr::memchr(0, &buf[..n]).is_some() {
+            return None; // Binary: a NUL before any text BOM.
+        }
+
         lines += memchr::memchr_iter(b'\n', &buf[..n]).count();
     }
+}
+
+/// Returns `true` when `head` opens with a UTF-8 or UTF-16 byte-order mark.
+///
+/// UTF-16 (and UTF-32 LE, which shares the `FF FE` prefix) text is NUL-dense, so
+/// a quit-at-first-NUL scan would misclassify it as binary; a BOM at offset 0
+/// marks it as text (misc 140). A NUL that appears *before* any BOM — including a
+/// UTF-32 BE file, whose `00 00 FE FF` opens with NULs — stays binary, per the
+/// ticket's NUL-before-BOM rule.
+fn starts_with_text_bom(head: &[u8]) -> bool {
+    head.starts_with(&[0xEF, 0xBB, 0xBF]) // UTF-8
+        || head.starts_with(&[0xFF, 0xFE]) // UTF-16 LE (also UTF-32 LE prefix)
+        || head.starts_with(&[0xFE, 0xFF]) // UTF-16 BE
 }
 
 /// Extracts the interpreter basename from a shebang line.
@@ -1755,6 +1765,119 @@ mod tests {
         content.push(0x00);
         content.extend_from_slice(b"echo hello\n");
         std::fs::write(&path, &content).expect("write");
+
+        let mgr = FilesystemManager::new();
+        let metadata = std::fs::metadata(&path).expect("metadata");
+        assert_eq!(mgr.classify(&path, &metadata).kind, FileKind::Binary);
+    }
+
+    // --- Content classification without a size cap (misc 140, bug 62) ---
+
+    /// A pure-UTF-8 file well over the retired 10 MB cap classifies as text with
+    /// a full streaming line count, not binary-by-size. This is the bug-62 fix:
+    /// the former cap misclassified a large text file (a 15.7 MB minified bundle)
+    /// as binary without reading a byte.
+    #[test]
+    fn classify_large_pure_utf8_is_text() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("bundle.js");
+        // 20 bytes/line * 600_000 = 12 MB, comfortably over the retired cap.
+        let lines = 600_000;
+        std::fs::write(&path, "the quick brown fox\n".repeat(lines)).expect("write");
+        assert!(
+            std::fs::metadata(&path).expect("metadata").len() > 10 * 1024 * 1024,
+            "fixture must exceed the retired 10 MB cap"
+        );
+
+        let mgr = FilesystemManager::new();
+        let metadata = std::fs::metadata(&path).expect("metadata");
+        assert!(
+            !mgr.is_binary(&path, &metadata),
+            "large UTF-8 is not binary"
+        );
+        assert_eq!(
+            mgr.line_count(&path, &metadata),
+            Some(lines),
+            "line count streams the whole file at any size (no early return)"
+        );
+        assert!(
+            mgr.binary_skip_reason(&path, &metadata).is_none(),
+            "a large pure-UTF-8 file is never a skip"
+        );
+    }
+
+    /// A UTF-16LE-BOM file is NUL-dense but is text: the BOM check precedes the
+    /// NUL verdict (misc 140).
+    #[test]
+    fn classify_utf16le_bom_is_text() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("utf16le.txt");
+        let mut content = vec![0xFF, 0xFE]; // UTF-16 LE BOM
+        for ch in "hi\nyo\n".chars() {
+            content.push(ch as u8);
+            content.push(0x00);
+        }
+        std::fs::write(&path, &content).expect("write");
+
+        let mgr = FilesystemManager::new();
+        let metadata = std::fs::metadata(&path).expect("metadata");
+        assert_eq!(
+            mgr.classify(&path, &metadata).kind,
+            FileKind::Text {
+                lines: 2,
+                language_id: None,
+            },
+            "a UTF-16LE BOM file is text, not binary"
+        );
+    }
+
+    /// A UTF-16BE-BOM file (NUL as the high byte of every code unit) is also text.
+    #[test]
+    fn classify_utf16be_bom_is_text() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("utf16be.txt");
+        let mut content = vec![0xFE, 0xFF]; // UTF-16 BE BOM
+        for ch in "hi\nyo\n".chars() {
+            content.push(0x00);
+            content.push(ch as u8);
+        }
+        std::fs::write(&path, &content).expect("write");
+
+        let mgr = FilesystemManager::new();
+        let metadata = std::fs::metadata(&path).expect("metadata");
+        assert!(
+            matches!(mgr.classify(&path, &metadata).kind, FileKind::Text { .. }),
+            "a UTF-16BE BOM file is text, not binary"
+        );
+    }
+
+    /// A UTF-8-BOM prefix does not derail classification (no NULs, still text).
+    #[test]
+    fn classify_utf8_bom_is_text() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("utf8bom.txt");
+        let mut content = vec![0xEF, 0xBB, 0xBF]; // UTF-8 BOM
+        content.extend_from_slice(b"hello world\n");
+        std::fs::write(&path, &content).expect("write");
+
+        let mgr = FilesystemManager::new();
+        let metadata = std::fs::metadata(&path).expect("metadata");
+        assert_eq!(
+            mgr.classify(&path, &metadata).kind,
+            FileKind::Text {
+                lines: 1,
+                language_id: None,
+            }
+        );
+    }
+
+    /// A NUL *before* any BOM is binary — including a `00 00 FE FF` head (which a
+    /// UTF-32BE reader would take as a BOM): the ticket's NUL-before-BOM rule.
+    #[test]
+    fn classify_nul_before_bom_is_binary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("nul_first.bin");
+        std::fs::write(&path, [0x00, 0x00, 0xFE, 0xFF, b'h', b'i']).expect("write");
 
         let mgr = FilesystemManager::new();
         let metadata = std::fs::metadata(&path).expect("metadata");

@@ -208,6 +208,21 @@ upgrading.
 
 ### Changed
 
+- **The 10 MB size cap falls — content classifies the search.**
+  `BINARY_SIZE_THRESHOLD` is deleted: files are classified by a BOM-aware
+  quit-at-first-NUL content sniff on every entry path (named, shell-expanded,
+  walked, quoted-glob), at any size. A >10 MB pure-UTF-8 file is searched to
+  EOF and matched like any other text file (previously
+  `skipped (too large (>10 MB))` even when explicitly named), and
+  `catenary glob` renders it with a line count and outline; a UTF-16 BOM file
+  classifies as text (the BOM check precedes the NUL verdict). The only skip
+  left is the honest `skipped (binary): path`, decided by content after about
+  one head block. Doctrine: serve the request; guard the daemon — and the
+  guard became real: the parallel grep walk now runs on `spawn_blocking` with
+  the disconnect-cancel token threaded into every walker visitor
+  (`WalkState::Quit`), so a dead client's search actually stops instead of
+  reading the tree to completion; `catenary glob` wires its previously-ignored
+  cancel token the same way.
 - **Write-resolver denials rewritten for a cold agent.** Every denial from the
   write resolver (an opaque redirect target, `git -C`/`--work-tree`, `sed`/`awk`/
   `perl` writers and computed programs, `xargs`-driven targets, `dd`/`install`/

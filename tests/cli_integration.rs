@@ -911,43 +911,43 @@ fn test_glob_pattern_header_matches_count_via_binary() -> Result<()> {
     Ok(())
 }
 
-// ── grep skip honesty (misc 135 / bug 62) ─────────────────────────
+// ── grep serves large files uncapped (misc 140 / bug 62) ──────────
 
-/// End-to-end regression for bug 62: `catenary grep` on an explicitly named
-/// file over the 10 MB binary-scan cap used to render `0 matches in 0 files`
-/// (and empty default output), indistinguishable from a genuine no-match. The
-/// file is now reported as skipped — never silent — while a real no-match and a
-/// genuinely searchable file are unaffected.
+/// End-to-end regression for bug 62: `catenary grep` on a pure-UTF-8 file well
+/// over the retired 10 MB size cap used to render `0 matches in 0 files`
+/// (skipped-by-size), indistinguishable from a genuine no-match. Classification
+/// is now content-based (misc 140, decision 029), so the file is searched to EOF
+/// and matched from every entry path — named, quoted glob, and directory walk —
+/// and `catenary glob` renders it with a line count, not a byte size.
 ///
-/// The fixture is a synthetic >10 MB single-line pure-UTF-8 file built in the
+/// The fixture is a synthetic >10 MB multi-line pure-UTF-8 file built in the
 /// tempdir, so the suite never depends on the system path the bug was sighted
 /// against.
 #[test]
-fn test_grep_skip_over_size_cap_is_reported_not_silent() -> Result<()> {
+fn test_grep_searches_large_utf8_file_uncapped() -> Result<()> {
     let state_dir = tempfile::tempdir()?;
     let state_home = state_dir.path().to_str().context("state dir")?;
 
     let root = tempfile::tempdir()?;
     let root_str = root.path().to_str().context("root path")?;
 
-    // A >10 MB single-line UTF-8 file with no NUL bytes: `const` thousands of
-    // times, so a genuine search would match — the skip is the only reason for
-    // zero. `"const x=1; "` is 11 bytes; 1_100_000 copies ≈ 11.5 MB, one line.
+    // A >10 MB pure-UTF-8 file with no NUL bytes: `"const x = 1;\n"` (13 bytes)
+    // repeated, so every line matches `const` and a genuine search returns the
+    // full tally. 900_000 lines ≈ 11.7 MB, comfortably over the retired cap.
+    let lines = 900_000;
     let big = root.path().join("big.js");
-    std::fs::write(&big, "const x=1; ".repeat(1_100_000))?;
+    std::fs::write(&big, "const x = 1;\n".repeat(lines))?;
     let big_str = big.to_str().context("big path")?;
     assert!(
         std::fs::metadata(&big)?.len() > 10 * 1024 * 1024,
-        "fixture must exceed the 10 MB binary-scan cap"
+        "fixture must exceed the retired 10 MB cap"
     );
 
-    // A small, searchable control and a genuine no-match control.
+    // A neighbouring searchable file and a genuine no-match control.
     let small = root.path().join("small.js");
-    std::fs::write(&small, "const y=2;\n")?;
-    let small_str = small.to_str().context("small path")?;
+    std::fs::write(&small, "const y = 2;\n")?;
     let plain = root.path().join("plain.txt");
     std::fs::write(&plain, "nothing to see here\n")?;
-    let plain_str = plain.to_str().context("plain path")?;
 
     let mut bridge = common::BridgeProcess::spawn_in_state(state_home, |cmd| {
         cmd.env("CATENARY_ROOTS", root_str);
@@ -969,43 +969,63 @@ fn test_grep_skip_over_size_cap_is_reported_not_silent() -> Result<()> {
             .args(args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let output = cmd.output().context("failed to run catenary grep")?;
+        let output = cmd.output().context("failed to run catenary")?;
         assert!(
             output.status.success(),
-            "catenary grep must exit 0 on a soft skip, got {:?}; stderr:\n{}",
+            "catenary must exit 0, got {:?}; stderr:\n{}",
             output.status.code(),
             String::from_utf8_lossy(&output.stderr),
         );
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     };
 
-    // 1. `--count` on the oversized file: reported as skipped, never conflated
-    //    with a no-match.
-    let count_big = run(&["grep", "const", big_str, "--count"])?;
-    assert_eq!(
-        count_big.trim(),
-        "0 matches in 0 files (1 skipped: too large (>10 MB))",
-        "an oversized named file counts as skipped, not a no-match, got:\n{count_big}"
-    );
+    let want_count = format!("{lines} matches in 1 files");
 
-    // 2. Default output on the oversized file: a per-file skip line names it
-    //    (cwd == root, so the path renders relative).
-    let default_big = run(&["grep", "const", big_str])?;
+    // (a) Named path: the large file is searched to EOF, every line matched, no
+    //     skip suffix (the size cap is gone).
+    let count_named = run(&["grep", "const", big_str, "--count"])?;
+    assert_eq!(
+        count_named.trim(),
+        want_count,
+        "a named large pure-UTF-8 file is searched in full, got:\n{count_named}"
+    );
     assert!(
-        default_big.contains("skipped (too large (>10 MB)): big.js"),
-        "default output must carry a per-file skip line naming the file, got:\n{default_big}"
+        !count_named.contains("skipped"),
+        "a large pure-UTF-8 file is never skipped, got:\n{count_named}"
     );
 
-    // 3. The searchable control still matches — no skip, unchanged tally.
-    let count_small = run(&["grep", "const", small_str, "--count"])?;
+    // (b) Quoted glob: `big*.js` expands daemon-side to the large file, searched
+    //     the same way.
+    let count_glob = run(&["grep", "const", "big*.js", "--count"])?;
     assert_eq!(
-        count_small.trim(),
-        "1 matches in 1 files",
-        "a sub-cap file is searched normally, got:\n{count_small}"
+        count_glob.trim(),
+        want_count,
+        "a quoted-glob large file is searched in full, got:\n{count_glob}"
     );
 
-    // 4. A genuine no-match still renders the plain zero — no skip noise.
-    let count_plain = run(&["grep", "const", plain_str, "--count"])?;
+    // (c) Directory walk: pathless grep over the cwd finds the large file among
+    //     its neighbours (`-l` lists it without dumping 900k lines).
+    let walked = run(&["grep", "const", "-l"])?;
+    assert!(
+        walked.contains("big.js"),
+        "a directory walk searches the large file, got:\n{walked}"
+    );
+
+    // `catenary glob` renders the large text file with a line count, not a byte
+    // size (the enrichment size gate is gone too).
+    let glob_big = run(&["glob", "big.js"])?;
+    assert!(
+        glob_big.contains(&format!("{lines} lines")),
+        "glob shows the large file's line count, got:\n{glob_big}"
+    );
+    assert!(
+        !glob_big.contains(" MB"),
+        "glob shows a line count, not a byte size, got:\n{glob_big}"
+    );
+
+    // A genuine no-match still renders the plain zero — no skip noise.
+    let plain_str = plain.to_str().context("plain path")?;
+    let count_plain = run(&["grep", "needle-absent", plain_str, "--count"])?;
     assert_eq!(
         count_plain.trim(),
         "0 matches in 0 files",

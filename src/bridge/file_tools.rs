@@ -154,7 +154,7 @@ impl GlobServer {
         &self,
         params: &serde_json::Value,
         parent_id: Option<&str>,
-        _cancel: &tokio_util::sync::CancellationToken,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<GlobOutcome> {
         let input: GlobInput = serde_json::from_value(params.clone())
             .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
@@ -178,7 +178,7 @@ impl GlobServer {
         // Count mode short-circuits enrichment — report the number of resolved
         // paths, not a rendered tree.
         if input.count {
-            let paths = self.count_paths(&input, exclude.as_ref())?;
+            let paths = self.count_paths(&input, exclude.as_ref(), cancel)?;
             return Ok(GlobOutcome::Count { paths });
         }
 
@@ -188,9 +188,18 @@ impl GlobServer {
         // Run pipeline — handlers return the complete output. Existing paths
         // dispatch directly; unexpanded glob patterns are expanded daemon-side.
         // The output is always complete (decision 025): the full outline prints,
-        // with no volume branch — the host caps only the final read.
+        // with no volume branch — the host caps only the final read. `cancel` is
+        // threaded into the directory walk so a disconnected client's listing
+        // stops promptly instead of running to completion (misc 140).
         let (output, no_match_indices) = self
-            .handle_literal_paths(&input.paths, &input, exclude.as_ref(), cwd, parent_id)
+            .handle_literal_paths(
+                &input.paths,
+                &input,
+                exclude.as_ref(),
+                cwd,
+                parent_id,
+                cancel,
+            )
             .await?;
 
         Ok(GlobOutcome::Rendered {
@@ -318,6 +327,7 @@ impl GlobServer {
         exclude: Option<&ResolvedGlob>,
         cwd: Option<&Path>,
         parent_id: Option<&str>,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<(String, Vec<usize>)> {
         // Per-argument resolution so each pattern's matches stay grouped for its
         // cardinality header; the flat set drives the nudge, exactly as before.
@@ -343,6 +353,14 @@ impl GlobServer {
         let mut full = String::new();
         let mut no_match_indices = Vec::new();
         for (i, group) in groups.iter().enumerate() {
+            // Real walk cancellation (misc 140): the router fires this token when
+            // the CLI client disconnects. Between paths — after the awaits above
+            // and each path's own LSP round-trips — a fired token stops the
+            // listing before the next path. A cancelled walk yields no partial
+            // response (the router already returned); this just ends the work.
+            if cancel.is_cancelled() {
+                break;
+            }
             if group.is_pattern {
                 if group.resolved.is_empty() {
                     // A pattern that matched nothing is reported loudly CLI-side
@@ -374,7 +392,7 @@ impl GlobServer {
                 // nudge classify a symlink-to-dir the same way (WS31-review walk-2).
                 if path.is_dir() {
                     let output = self
-                        .handle_glob_dir(path, input, exclude, cwd, parent_id)
+                        .handle_glob_dir(path, input, exclude, cwd, parent_id, cancel)
                         .await?;
                     full.push_str(&output);
                 } else if path_is_file_or_symlink_with_retry(path) {
@@ -479,12 +497,13 @@ impl GlobServer {
         exclude: Option<&ResolvedGlob>,
         cwd: Option<&Path>,
         parent_id: Option<&str>,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<String> {
         let canonical = dir
             .canonicalize()
             .map_err(|e| anyhow!("Path does not exist: {}: {e}", dir.display()))?;
 
-        let entries = self.collect_dir_entries(&canonical, input, exclude)?;
+        let entries = self.collect_dir_entries(&canonical, input, exclude, cancel)?;
 
         // The target's own count = its immediate entries (what this glob
         // enumerated), split into files and directories — the same split a
@@ -573,12 +592,19 @@ impl GlobServer {
     /// by [`Self::handle_glob_dir`] (which renders the rows) and
     /// [`Self::count_paths`] (which counts them) so the two never diverge.
     /// `canonical` must be the canonicalized directory path.
+    ///
+    /// `cancel` is checked per entry: a fired token (the CLI client disconnected)
+    /// stops the one-level enumeration so a directory of many children is not read
+    /// to completion for a client that is gone (misc 140). The walk is
+    /// `max_depth(1)`, so this bounds a single wide directory rather than a
+    /// recursive tree.
     #[allow(clippy::too_many_lines, reason = "sequential per-entry classification")]
     fn collect_dir_entries(
         &self,
         canonical: &Path,
         input: &GlobInput,
         exclude: Option<&ResolvedGlob>,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<Vec<GlobEntry>> {
         // Build non-gitignored set for flag detection.
         let non_ignored: HashSet<PathBuf> = if input.include_gitignored {
@@ -603,6 +629,9 @@ impl GlobServer {
         let mut entries = Vec::new();
 
         for entry in walker.flatten() {
+            if cancel.is_cancelled() {
+                break;
+            }
             let entry_path = entry.into_path();
             if entry_path.as_path() == canonical {
                 continue;
@@ -699,16 +728,26 @@ impl GlobServer {
     /// same filtered set [`Self::handle_glob_dir`] renders; each remaining
     /// resolved file or symlink-to-file counts once. LSP enrichment is skipped —
     /// a count is pure filesystem.
-    fn count_paths(&self, input: &GlobInput, exclude: Option<&ResolvedGlob>) -> Result<usize> {
+    fn count_paths(
+        &self,
+        input: &GlobInput,
+        exclude: Option<&ResolvedGlob>,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<usize> {
         let resolved =
             expand_search_paths(&input.paths, input.include_gitignored, input.include_hidden);
         let mut total = 0usize;
         for path in &resolved {
+            if cancel.is_cancelled() {
+                break;
+            }
             if path.is_dir() {
                 let canonical = path
                     .canonicalize()
                     .map_err(|e| anyhow!("Path does not exist: {}: {e}", path.display()))?;
-                total += self.collect_dir_entries(&canonical, input, exclude)?.len();
+                total += self
+                    .collect_dir_entries(&canonical, input, exclude, cancel)?
+                    .len();
             } else if path.is_file() || path.is_symlink() {
                 total += 1;
             }
@@ -2021,7 +2060,9 @@ mod tests {
         }))
         .expect("deserialize GlobInput");
 
-        let count = server.count_paths(&input, None).expect("count_paths");
+        let count = server
+            .count_paths(&input, None, &tokio_util::sync::CancellationToken::new())
+            .expect("count_paths");
 
         assert_eq!(
             count, N,
